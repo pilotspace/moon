@@ -217,23 +217,43 @@ impl<'a> ListRef<'a> {
     }
 
     /// Get element at index.
+    ///
+    /// A listpack is entered from its NEARER end and the entry is borrowed
+    /// until the one copy the caller keeps (moon#1174 §2).
     pub fn get(&self, index: usize) -> Option<Bytes> {
         match self {
             ListRef::Deque(d) => d.get(index).cloned(),
-            ListRef::Listpack(lp) => lp.get_at(index).map(|e| e.to_bytes()),
+            ListRef::Listpack(lp) => lp.get_ref(index).map(|e| e.to_bytes()),
             ListRef::Owned(d) => d.get(index).cloned(),
+        }
+    }
+
+    /// Hand every element of `[start..=end]` to `f`, in order. Caller clamps.
+    ///
+    /// moon#1174 §2: on a listpack this is ONE seek, from the nearer end, then
+    /// a walk (`Listpack::range_refs`). It used to be `get_at(i)` per index,
+    /// each walking from the head: `LRANGE 0 -1` on 128 entries decoded 8,256.
+    pub fn for_each_in_range(&self, start: usize, end: usize, mut f: impl FnMut(Bytes)) {
+        let len = self.len();
+        if start > end || start >= len {
+            return;
+        }
+        let end = end.min(len - 1);
+        match self {
+            ListRef::Deque(d) => d.range(start..=end).for_each(|b| f(b.clone())),
+            ListRef::Owned(d) => d.range(start..=end).for_each(|b| f(b.clone())),
+            ListRef::Listpack(lp) => lp
+                .range_refs(start, end - start + 1)
+                .for_each(|e| f(e.to_bytes())),
         }
     }
 
     /// Get a range of elements [start..=end]. Caller must clamp bounds.
     pub fn range(&self, start: usize, end: usize) -> Vec<Bytes> {
-        match self {
-            ListRef::Deque(d) => (start..=end).filter_map(|i| d.get(i).cloned()).collect(),
-            ListRef::Listpack(lp) => (start..=end)
-                .filter_map(|i| lp.get_at(i).map(|e| e.to_bytes()))
-                .collect(),
-            ListRef::Owned(d) => (start..=end).filter_map(|i| d.get(i).cloned()).collect(),
-        }
+        let mut out =
+            Vec::with_capacity(end.saturating_sub(start).saturating_add(1).min(self.len()));
+        self.for_each_in_range(start, end, |b| out.push(b));
+        out
     }
 
     /// Visit the indices of the elements equal to `element`, among the first

@@ -6,6 +6,8 @@ use std::collections::{HashMap, VecDeque};
 // this module's private decoder, so no entry width is decided twice.
 mod list_ops;
 pub use list_ops::ListpackRevRefIter;
+#[cfg(test)]
+pub(crate) use list_ops::seeks_from_either_end;
 
 const LP_HDR_SIZE: usize = 7; // 4 bytes total_bytes + 2 bytes num_elements + 1 byte terminator
 const LP_TERMINATOR: u8 = 0xFF;
@@ -113,6 +115,23 @@ impl ListpackRef<'_> {
         match self {
             ListpackRef::Integer(v) => Some(*v as f64),
             ListpackRef::Str(s) => crate::storage::zset_score::parse_score(s),
+        }
+    }
+
+    /// The entry as `Bytes`, in exactly ONE allocation: the bytes are copied
+    /// once, straight out of the listpack (a string entry) or out of an `itoa`
+    /// stack buffer (an integer entry, rendered in the canonical spelling it
+    /// was admitted under, so the bytes are the ones the client wrote --
+    /// moon#795). Owned reads go through this rather than through
+    /// [`ListpackEntry`], whose decode already copies once into a `Vec`
+    /// (moon#1174 §3).
+    pub fn to_bytes(&self) -> Bytes {
+        match self {
+            ListpackRef::Str(s) => Bytes::copy_from_slice(s),
+            ListpackRef::Integer(v) => {
+                let mut buf = itoa::Buffer::new();
+                Bytes::copy_from_slice(buf.format(*v).as_bytes())
+            }
         }
     }
 
@@ -1092,7 +1111,7 @@ thread_local! {
 
 /// Reads [`HEAD_SEEKS`] for the current thread.
 #[cfg(test)]
-fn head_seeks() -> usize {
+pub(crate) fn head_seeks() -> usize {
     HEAD_SEEKS.with(std::cell::Cell::get)
 }
 

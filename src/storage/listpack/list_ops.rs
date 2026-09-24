@@ -10,9 +10,11 @@
 //! in place, move each kept byte at most once, and never decode an entry into an
 //! owned `Vec` just to look at it or step over it.
 
+use bytes::Bytes;
+
 use super::{
-    LP_TERMINATOR, Listpack, ListpackRef, decode_backlen, decode_entry_ref_at, encode_entry,
-    seek_to,
+    LP_TERMINATOR, Listpack, ListpackRef, ListpackRefIter, decode_backlen, decode_entry_ref_at,
+    encode_entry, seek_to,
 };
 
 /// Byte offset of the first entry: `total_bytes: u32` + `num_elements: u16`.
@@ -204,6 +206,89 @@ impl Listpack {
             pos -= backlen_size + entry_len;
         }
         Some(pos)
+    }
+
+    /// The entry at `index`, borrowed, reached from the NEARER end.
+    ///
+    /// `LINDEX l -1` on a listpack used to walk the whole list from the head
+    /// (`get_at` -> `seek_to`) and then decode the entry it landed on into an
+    /// owned `Vec`; this steps back over one backlen and borrows.
+    pub fn get_ref(&self, index: usize) -> Option<ListpackRef<'_>> {
+        if index >= self.len() {
+            return None;
+        }
+        let pos = self.offset_of(index)?;
+        Some(decode_entry_ref_at(&self.data, pos).0)
+    }
+
+    /// Borrowed forward iterator over the `count` entries starting at `start`:
+    /// ONE seek, from the nearer end, then a plain walk (moon#1174 §2).
+    ///
+    /// `ListRef::range` -- `LRANGE` -- used to call `get_at(i)` for every `i`
+    /// in the window, and every `get_at` walks from the HEAD: `LRANGE 0 -1` on
+    /// a 128-entry list decoded 8,256 entries to return 128. A `start` past the
+    /// end yields nothing; a `count` past the end stops at the end.
+    pub fn range_refs(&self, start: usize, count: usize) -> ListpackRefIter<'_> {
+        let len = self.len();
+        let (pos, remaining) = match self.offset_of(start.min(len)) {
+            Some(pos) if start < len => (pos, count.min(len - start)),
+            _ => (self.data.len() - 1, 0),
+        };
+        ListpackRefIter {
+            data: &self.data,
+            pos,
+            remaining,
+        }
+    }
+
+    /// Remove and return the entry at one END, materialised exactly once.
+    ///
+    /// `LPOP`/`RPOP`/`LMOVE` on a listpack. The back used to be reached TWICE
+    /// from the head -- `iter_refs().nth(len - 1)` to read it, then
+    /// `remove_at(len - 1)` to seek to it again -- where one backlen from the
+    /// terminator names it. The one allocation is the reply's own copy
+    /// (`tests/list_pop_alloc_942.rs` pins that floor): it must own its bytes,
+    /// because the buffer is mutated out from under them on the next line.
+    pub fn pop_end(&mut self, front: bool) -> Option<Bytes> {
+        let len = self.len();
+        let index = if front { 0 } else { len.checked_sub(1)? };
+        if index >= len {
+            return None;
+        }
+        let pos = self.offset_of(index)?;
+        let (value, next) = {
+            let (entry, next) = decode_entry_ref_at(&self.data, pos);
+            (entry.to_bytes(), next)
+        };
+        self.data.drain(pos..next);
+        self.update_header_sub(1);
+        Some(value)
+    }
+
+    /// Hand the entries at several indices to `f`, in ONE forward walk.
+    ///
+    /// `picks` holds `(index, slot)` pairs; it is sorted by index here, and
+    /// `f(slot, entry)` is called once per pair -- repeatedly for a repeated
+    /// index -- so the caller can put every answer back in the order it drew
+    /// the indices in. Out-of-range indices are skipped. This is SRANDMEMBER
+    /// with a count on a listpack set (moon#1174 §2), which used to walk from
+    /// the head once PER sampled member.
+    pub fn for_each_at(
+        &self,
+        picks: &mut [(usize, usize)],
+        mut f: impl FnMut(usize, ListpackRef<'_>),
+    ) {
+        picks.sort_unstable_by_key(|&(index, _)| index);
+        let mut next_pick = 0;
+        for (index, entry) in self.iter_refs().enumerate() {
+            while next_pick < picks.len() && picks[next_pick].0 == index {
+                f(picks[next_pick].1, entry);
+                next_pick += 1;
+            }
+            if next_pick == picks.len() {
+                break;
+            }
+        }
     }
 
     /// Stamp both header fields: `total_bytes` from the buffer, the element
@@ -556,5 +641,95 @@ mod tests {
         let mut empty = Listpack::new();
         assert!(!empty.insert_relative(b"x", b"y", true));
         assert_eq!(empty.data, Listpack::new().data);
+    }
+
+    /// moon#1174 §2: a range read costs ONE seek, whatever the window, and
+    /// returns exactly what slicing returns.
+    #[test]
+    fn range_refs_seeks_once_and_agrees_with_slicing() {
+        let values: Vec<Vec<u8>> = (0..128)
+            .map(|i| format!("element-{i:04}").into_bytes())
+            .collect();
+        let lp = build(&values);
+        for start in [0usize, 1, 63, 64, 100, 127, 128, 200] {
+            for count in [0usize, 1, 5, 64, 128, 500] {
+                let mark = seeks_from_either_end();
+                let got: Vec<Vec<u8>> = lp.range_refs(start, count).map(|e| e.to_vec()).collect();
+                let seeks = seeks_from_either_end() - mark;
+                let want: Vec<Vec<u8>> = values.iter().skip(start).take(count).cloned().collect();
+                assert_eq!(got, want, "range_refs({start}, {count})");
+                assert!(
+                    seeks <= 1,
+                    "range_refs({start}, {count}) took {seeks} seeks"
+                );
+            }
+        }
+        // The shape it replaced, measured in the same test so the bound has
+        // something to be compared against: one head seek PER element.
+        let mark = super::super::head_seeks();
+        let old: Vec<Vec<u8>> = (0..128)
+            .filter_map(|i| lp.get_at(i).map(|e| e.as_bytes()))
+            .collect();
+        assert_eq!(old, values);
+        assert_eq!(super::super::head_seeks() - mark, 128);
+    }
+
+    #[test]
+    fn get_ref_and_pop_end_reach_the_nearer_end() {
+        let values = alphabet();
+        let lp = build(&values);
+        for (i, v) in values.iter().enumerate() {
+            assert_eq!(
+                lp.get_ref(i).map(|e| e.to_vec()),
+                Some(v.clone()),
+                "index {i}"
+            );
+        }
+        assert!(lp.get_ref(values.len()).is_none());
+
+        let mut lp = build(&values);
+        let head = super::super::head_seeks();
+        let back = lp.pop_end(false).expect("non-empty");
+        assert_eq!(back.as_ref(), values.last().unwrap().as_slice());
+        assert_eq!(
+            super::super::head_seeks(),
+            head,
+            "RPOP walked from the head"
+        );
+        let front = lp.pop_end(true).expect("non-empty");
+        assert_eq!(front.as_ref(), values[0].as_slice());
+        assert_eq!(contents(&lp), values[1..values.len() - 1].to_vec());
+        assert_eq!(lp.data, build(&values[1..values.len() - 1]).data);
+        let mut empty = Listpack::new();
+        assert!(empty.pop_end(true).is_none());
+        assert!(empty.pop_end(false).is_none());
+    }
+
+    #[test]
+    fn for_each_at_walks_once_and_keeps_draw_order() {
+        let values: Vec<Vec<u8>> = (0..100).map(|i| format!("m{i}").into_bytes()).collect();
+        let lp = build(&values);
+        // Draw order 42, 7, 99, 7 (a repeat), 500 (out of range).
+        let draws = [42usize, 7, 99, 7, 500];
+        let mut picks: Vec<(usize, usize)> =
+            draws.iter().enumerate().map(|(s, &i)| (i, s)).collect();
+        let mut out: Vec<Option<Vec<u8>>> = vec![None; draws.len()];
+        let mark = seeks_from_either_end();
+        lp.for_each_at(&mut picks, |slot, e| out[slot] = Some(e.to_vec()));
+        assert_eq!(
+            seeks_from_either_end(),
+            mark,
+            "no seek at all: one plain walk"
+        );
+        assert_eq!(
+            out,
+            vec![
+                Some(values[42].clone()),
+                Some(values[7].clone()),
+                Some(values[99].clone()),
+                Some(values[7].clone()),
+                None
+            ]
+        );
     }
 }

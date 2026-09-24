@@ -469,3 +469,70 @@ fn refusals_create_nothing_and_pop_nothing() {
     assert_eq!(db.estimated_memory(), floor);
     assert_ledger_exact(&mut db, "refusals");
 }
+
+/// moon#1174 §2: LRANGE on a listpack is ONE seek, whatever the window --
+/// HEAD walked from the head once PER returned element (`LRANGE 0 -1` on 128
+/// entries decoded 8,256). LINDEX near the tail is reached from the tail.
+#[test]
+fn lrange_and_lindex_on_a_listpack_seek_once() {
+    use crate::storage::listpack::{head_seeks, seeks_from_either_end};
+    let values: Vec<Vec<u8>> = (0..128)
+        .map(|i| format!("element:{i:05}").into_bytes())
+        .collect();
+    let mut db = Database::new();
+    let mut args = vec![bs(b"l")];
+    args.extend(values.iter().map(|v| bs(v)));
+    rpush(&mut db, &args);
+    assert_eq!(encoding_of(&mut db, b"l"), "listpack", "fixture");
+    let len = values.len() as i64;
+    for (start, stop) in [
+        (0i64, -1i64),
+        (10, 20),
+        (-5, -1),
+        (100, 127),
+        (0, 0),
+        (-1, -1),
+        (64, 64),
+        (130, 140),
+        (5, 2),
+        (-500, 500),
+    ] {
+        let mark = seeks_from_either_end();
+        let got = lrange_readonly(
+            &db,
+            &[
+                bs(b"l"),
+                bs(start.to_string().as_bytes()),
+                bs(stop.to_string().as_bytes()),
+            ],
+            0,
+        );
+        let seeks = seeks_from_either_end() - mark;
+        assert!(seeks <= 1, "LRANGE {start} {stop} took {seeks} seeks");
+        let s = if start < 0 {
+            (len + start).max(0)
+        } else {
+            start
+        };
+        let e = if stop < 0 {
+            len + stop
+        } else {
+            stop.min(len - 1)
+        };
+        let want: Vec<Frame> = if s > e || s >= len {
+            Vec::new()
+        } else {
+            values[s as usize..=e as usize]
+                .iter()
+                .map(|v| bs(v))
+                .collect()
+        };
+        assert_eq!(got, Frame::Array(want.into()), "LRANGE {start} {stop}");
+    }
+    let head = head_seeks();
+    assert_eq!(
+        super::lindex_readonly(&db, &[bs(b"l"), bs(b"-1")], 0),
+        bs(values.last().unwrap())
+    );
+    assert_eq!(head_seeks(), head, "LINDEX -1 walked from the head");
+}

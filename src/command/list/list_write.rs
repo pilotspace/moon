@@ -282,19 +282,13 @@ fn promote_list_listpack(db: &mut Database, key: &[u8], after: usize) {
 /// (moon#795/#903). `itoa` here and `i64::to_string` in `ListpackEntry`
 /// produce the same bytes for every `i64`; `a_listpack_pop_returns_the_exact_bytes_that_were_pushed`
 /// asks both ends for `007`, `+7`, `-0` and both limits.
+///
+/// moon#1174 §2: the BACK used to be reached twice from the head
+/// (`iter_refs().nth(len - 1)` to read it, `remove_at(len - 1)` to seek to it
+/// again). `Listpack::pop_end` steps back over one backlen instead.
 #[inline]
 fn listpack_pop_end(lp: &mut crate::storage::listpack::Listpack, front: bool) -> Option<Bytes> {
-    use crate::storage::listpack::ListpackRef;
-    let idx = if front { 0 } else { lp.len().checked_sub(1)? };
-    let value = match lp.iter_refs().nth(idx)? {
-        ListpackRef::Str(s) => Bytes::copy_from_slice(s),
-        ListpackRef::Integer(v) => {
-            let mut buf = itoa::Buffer::new();
-            Bytes::copy_from_slice(buf.format(v).as_bytes())
-        }
-    };
-    lp.remove_at(idx);
-    Some(value)
+    lp.pop_end(front)
 }
 
 /// The shared body of `LPOP` and `RPOP`.

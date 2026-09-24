@@ -149,11 +149,10 @@ pub fn lrange_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
     if s > e || s >= len {
         return Frame::Array(framevec![]);
     }
-    let items: Vec<Frame> = lref
-        .range(s as usize, e as usize)
-        .into_iter()
-        .map(Frame::BulkString)
-        .collect();
+    // One pass straight into the reply (moon#1174 §2): no intermediate
+    // `Vec<Bytes>`, and one seek on a listpack instead of one per element.
+    let mut items: Vec<Frame> = Vec::with_capacity((e - s + 1) as usize);
+    lref.for_each_in_range(s as usize, e as usize, |b| items.push(Frame::BulkString(b)));
     Frame::Array(items.into())
 }
 
