@@ -445,6 +445,45 @@ impl DrainOutcome {
     }
 }
 
+/// Resolve a rewrite request that a drain consumed instead of the writer's
+/// recv loop (moon#1158) — never drop it silently.
+///
+/// A drain only runs while its writer is inside a rewrite, and the
+/// in-progress flag serializes rewrites, so this is unreachable while that
+/// invariant holds. If it is ever broken, a silently dropped
+/// `RewritePerShard` never decrements its countdown: every other writer
+/// that folded blocks at the commit barrier forever and the flag is never
+/// released, so no rewrite runs again and the incr AOF grows without bound.
+/// Abort it instead — `mark_failed` + this shard's `shard_done` close the
+/// countdown, the other writers roll back to the committed generation, and
+/// the flag is released when the last of them lets go, so the monitor can
+/// retry. A TopLevel `Rewrite`/`RewriteSharded` holds no countdown (its only
+/// writer is the one already rewriting, which releases the flag itself);
+/// dropping it is safe, but still reported.
+#[cfg(any(feature = "runtime-monoio", feature = "runtime-tokio"))]
+pub(crate) fn resolve_unrunnable_rewrite(msg: AofMessage) {
+    match msg {
+        AofMessage::RewritePerShard { coord, .. } => {
+            error!(
+                "AOF rewrite to seq {} reached a writer still inside a rewrite drain; \
+                 aborting it (old generation stays authoritative) so it cannot wedge \
+                 the rewrite countdown (moon#1158)",
+                coord.new_seq()
+            );
+            coord.mark_failed();
+            coord.shard_done();
+        }
+        AofMessage::Rewrite(..) | AofMessage::RewriteSharded(..) => {
+            error!(
+                "AOF rewrite request reached a writer still inside a rewrite drain; \
+                 dropped — the rewrite in progress releases the in-progress flag \
+                 (moon#1158)"
+            );
+        }
+        _ => {}
+    }
+}
+
 /// Fsync `file` at a rewrite drain boundary, then resolve the drained batch's
 /// parked AppendSync acks against the result: `Synced` on success, or
 /// `FsyncFailed` + propagate the IO error on failure. Centralizes the issue-#140
@@ -546,11 +585,9 @@ pub(crate) fn drain_pending_appends_bounded(
                 AofMessage::Shutdown => {
                     outcome.shutdown_requested = true;
                 }
-                AofMessage::Rewrite(..)
+                rewrite @ (AofMessage::Rewrite(..)
                 | AofMessage::RewriteSharded(..)
-                | AofMessage::RewritePerShard { .. } => {
-                    // Already rewriting — drop redundant request.
-                }
+                | AofMessage::RewritePerShard { .. }) => resolve_unrunnable_rewrite(rewrite),
             },
             Err(flume::TryRecvError::Empty) => break,
             Err(flume::TryRecvError::Disconnected) => break,
@@ -663,11 +700,9 @@ pub(crate) fn drain_pending_appends_framed(
                 AofMessage::Shutdown => {
                     outcome.shutdown_requested = true;
                 }
-                AofMessage::Rewrite(..)
+                rewrite @ (AofMessage::Rewrite(..)
                 | AofMessage::RewriteSharded(..)
-                | AofMessage::RewritePerShard { .. } => {
-                    // Already rewriting this shard — drop redundant request.
-                }
+                | AofMessage::RewritePerShard { .. }) => resolve_unrunnable_rewrite(rewrite),
             },
             Err(flume::TryRecvError::Empty) => break,
             Err(flume::TryRecvError::Disconnected) => break,
@@ -1400,9 +1435,9 @@ pub(crate) fn rewrite_aof_sharded_sync(
                 AofMessage::Shutdown => {
                     pre_shutdown_requested = true;
                 }
-                AofMessage::Rewrite(..)
+                rewrite @ (AofMessage::Rewrite(..)
                 | AofMessage::RewriteSharded(..)
-                | AofMessage::RewritePerShard { .. } => {}
+                | AofMessage::RewritePerShard { .. }) => resolve_unrunnable_rewrite(rewrite),
             }
         }
         let _ = old_file.flush();
@@ -1541,9 +1576,9 @@ pub(crate) fn rewrite_aof_sharded_sync(
                     AofMessage::Shutdown => {
                         mid_shutdown_requested = true;
                     }
-                    AofMessage::Rewrite(..)
+                    rewrite @ (AofMessage::Rewrite(..)
                     | AofMessage::RewriteSharded(..)
-                    | AofMessage::RewritePerShard { .. } => {}
+                    | AofMessage::RewritePerShard { .. }) => resolve_unrunnable_rewrite(rewrite),
                 },
                 Err(_) => break,
             }
@@ -1865,3 +1900,6 @@ mod fold_tests {
 
 #[cfg(test)]
 mod flat_file_fold_tests;
+
+#[cfg(test)]
+mod rewrite_stall_1158_tests;

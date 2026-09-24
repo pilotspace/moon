@@ -467,6 +467,11 @@ pub struct PerShardRewriteCoord {
     /// ignores (silent data loss; the old "RESTART recommended" hazard).
     outcome: parking_lot::Mutex<Option<u64>>,
     outcome_cv: parking_lot::Condvar,
+    /// The BGREWRITEAOF in-progress flag this rewrite holds:
+    /// [`crate::command::persistence::AOF_REWRITE_IN_PROGRESS`] in
+    /// production; a test-local flag in unit tests so parallel tests that
+    /// build coordinators never observe each other's flag.
+    in_progress: &'static std::sync::atomic::AtomicBool,
 }
 
 impl PerShardRewriteCoord {
@@ -477,6 +482,22 @@ impl PerShardRewriteCoord {
         current_seq: u64,
         n_shards: usize,
     ) -> Arc<Self> {
+        Self::with_in_progress_flag(
+            manifest,
+            current_seq,
+            n_shards,
+            &crate::command::persistence::AOF_REWRITE_IN_PROGRESS,
+        )
+    }
+
+    /// [`new`](Self::new) holding `in_progress` instead of the global
+    /// BGREWRITEAOF flag (test seam — see the field doc).
+    pub(crate) fn with_in_progress_flag(
+        manifest: Arc<parking_lot::Mutex<crate::persistence::aof_manifest::AofManifest>>,
+        current_seq: u64,
+        n_shards: usize,
+        in_progress: &'static std::sync::atomic::AtomicBool,
+    ) -> Arc<Self> {
         Arc::new(Self {
             remaining: std::sync::atomic::AtomicUsize::new(n_shards),
             manifest,
@@ -486,6 +507,7 @@ impl PerShardRewriteCoord {
             failed: std::sync::atomic::AtomicBool::new(false),
             outcome: parking_lot::Mutex::new(None),
             outcome_cv: parking_lot::Condvar::new(),
+            in_progress,
         })
     }
 
@@ -536,7 +558,8 @@ impl PerShardRewriteCoord {
     /// Called by each writer AFTER it has durably written its new base+incr at
     /// `new_seq` and reopened its append file. Decrements the countdown; the
     /// final caller commits the manifest (single seq flip) and prunes the old
-    /// generation, then clears the global in-progress flag.
+    /// generation. The in-progress flag is NOT cleared here: it is released
+    /// when the last writer drops the coordinator (see the `Drop` impl).
     ///
     /// Crash-safety: the commit (`write_manifest`) is the atomic flip point;
     /// pruning runs strictly after it, so a crash mid-prune only orphans
@@ -567,7 +590,6 @@ impl PerShardRewriteCoord {
                 // writer wakes and reopens onto the (still-authoritative) old gen.
                 self.publish_outcome(self.old_seq);
                 AOF_REWRITE_LAST_OK.store(false, Ordering::SeqCst);
-                crate::command::persistence::AOF_REWRITE_IN_PROGRESS.store(false, Ordering::SeqCst);
                 return;
             }
             let mut m = self.manifest.lock();
@@ -585,7 +607,6 @@ impl PerShardRewriteCoord {
                 // new_seq, which never committed).
                 self.publish_outcome(self.old_seq);
                 AOF_REWRITE_LAST_OK.store(false, Ordering::SeqCst);
-                crate::command::persistence::AOF_REWRITE_IN_PROGRESS.store(false, Ordering::SeqCst);
                 return;
             }
             // Deep-review D1/D4: prune the old generation ONLY once (a) every
@@ -645,8 +666,28 @@ impl PerShardRewriteCoord {
             // still unblock them.
             self.publish_outcome(self.new_seq);
             AOF_REWRITE_LAST_OK.store(true, Ordering::SeqCst);
-            crate::command::persistence::AOF_REWRITE_IN_PROGRESS.store(false, Ordering::SeqCst);
         }
+    }
+}
+
+/// Releases the BGREWRITEAOF in-progress flag when the LAST participant lets
+/// go of the rewrite (moon#1158).
+///
+/// Every writer holds its `RewritePerShard` — and so an `Arc` of this
+/// coordinator — until it has finished the post-fold overflow drain and is
+/// back in its recv loop. Releasing the flag at the terminal `shard_done`
+/// (the old behaviour) let the next rewrite be dispatched while a writer was
+/// still inside `RewriteOverflow::finish_*`, which can take seconds on a real
+/// disk; the drain consumed that request, its countdown never closed, the
+/// flag stayed set forever and the incr AOF grew until the disk filled.
+/// Tying the release to the last `Arc` makes it unconditional on every exit
+/// — commit, abort, fan-out failure, a writer thread unwinding — and keeps
+/// the invariant a TopLevel writer already has: a rewrite request only ever
+/// reaches a writer that is in its recv loop.
+impl Drop for PerShardRewriteCoord {
+    fn drop(&mut self) {
+        self.in_progress
+            .store(false, std::sync::atomic::Ordering::SeqCst);
     }
 }
 

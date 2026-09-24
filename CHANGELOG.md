@@ -177,6 +177,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **An AOF rewrite that is started while the previous one is still draining
+  is no longer lost** (moon#1158). A per-shard rewrite released the
+  in-progress flag when its manifest committed, before every writer had
+  written out the appends that spilled during the fold. On a real disk under
+  sustained writes that drain takes seconds, so the auto-rewrite monitor
+  could start the next rewrite during it. The drain then consumed and dropped
+  the new rewrite request. Its countdown never finished, the flag stayed set,
+  and no rewrite ran again: the incr AOF grew until appends were dropped and
+  the disk filled. The flag is now released when the last writer finishes
+  its drain. The same ordering is fixed on the `--shards 1` tokio writer,
+  and a per-shard rewrite whose fan-out fails part-way no longer clears the
+  flag while the writers that received it are still working. A rewrite
+  request that reaches a drain anyway aborts loudly instead of disappearing,
+  and the monitor logs an error when a rewrite has been running for more
+  than 5 minutes.
+
 - **The boot crash-orphan sweep no longer lets a cold file id be issued twice
   in one AOF generation** (moon#1114). A spill's `MOON.SPILLED <N>` marker
   reaches the AOF before its deferred manifest commit; a crash in between

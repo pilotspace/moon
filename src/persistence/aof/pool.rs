@@ -1301,6 +1301,11 @@ impl AofWriterPool {
     /// draining continuously, so `send` blocks only until a channel slot frees
     /// (sub-millisecond), which is acceptable for a rare admin command.
     ///
+    /// The caller must already hold the BGREWRITEAOF in-progress flag and
+    /// must NOT touch it after this returns, `Ok` or `Err` (moon#1158): it is
+    /// released here when no writer received the rewrite, otherwise by the
+    /// last writer to let go of it — after its post-fold drain.
+    ///
     /// Returns `SendFailed` if `base_dir` is unset, the manifest can't be
     /// loaded, or a writer thread is gone (disconnected channel). On the last
     /// case the rewrite aborts WITHOUT committing — the old generation stays
@@ -1310,13 +1315,37 @@ impl AofWriterPool {
         &self,
         shard_dbs: Arc<crate::shard::shared_databases::ShardDatabases>,
     ) -> Result<(), AofPoolSendError> {
+        self.try_send_rewrite_per_shard_with_flag(
+            shard_dbs,
+            &crate::command::persistence::AOF_REWRITE_IN_PROGRESS,
+        )
+    }
+
+    /// [`try_send_rewrite_per_shard`](Self::try_send_rewrite_per_shard) for a
+    /// rewrite holding `in_progress` instead of the global BGREWRITEAOF flag
+    /// (test seam: parallel unit tests must not share the global flag).
+    pub(crate) fn try_send_rewrite_per_shard_with_flag(
+        &self,
+        shard_dbs: Arc<crate::shard::shared_databases::ShardDatabases>,
+        in_progress: &'static std::sync::atomic::AtomicBool,
+    ) -> Result<(), AofPoolSendError> {
         use crate::persistence::aof_manifest::{AofLayout, AofManifest};
+        // Flag ownership (moon#1158): the caller hands the held flag to this
+        // call. Until a coordinator exists nothing else can release it, so
+        // every early return below releases it here; from the coordinator's
+        // construction on, it is released when the last holder of the
+        // coordinator drops it (see `PerShardRewriteCoord`'s `Drop`).
+        let release = || in_progress.store(false, std::sync::atomic::Ordering::SeqCst);
         if self.layout != AofLayout::PerShard {
             // A TopLevel pool rewrites via try_send_rewrite; this entry point
             // is PerShard-only.
+            release();
             return Err(AofPoolSendError::RewriteUnsupportedInPerShard);
         }
-        let base_dir = self.base_dir.as_ref().ok_or(AofPoolSendError::SendFailed)?;
+        let Some(base_dir) = self.base_dir.as_ref() else {
+            release();
+            return Err(AofPoolSendError::SendFailed);
+        };
         let manifest = match AofManifest::load(base_dir) {
             Ok(Some(m)) if m.layout == AofLayout::PerShard => m,
             Ok(_) => {
@@ -1324,6 +1353,7 @@ impl AofWriterPool {
                     "F6 per-shard rewrite: manifest at {} missing or not PerShard; aborting",
                     base_dir.display()
                 );
+                release();
                 return Err(AofPoolSendError::SendFailed);
             }
             Err(e) => {
@@ -1332,13 +1362,19 @@ impl AofWriterPool {
                     base_dir.display(),
                     e
                 );
+                release();
                 return Err(AofPoolSendError::SendFailed);
             }
         };
         let current_seq = manifest.seq;
         let n_shards = self.senders.len();
         let shared_manifest = Arc::new(parking_lot::Mutex::new(manifest));
-        let coord = PerShardRewriteCoord::new(shared_manifest, current_seq, n_shards);
+        let coord = PerShardRewriteCoord::with_in_progress_flag(
+            shared_manifest,
+            current_seq,
+            n_shards,
+            in_progress,
+        );
         // C4 deadlock guard: fold channels MUST be wired before a per-shard
         // rewrite is attempted. If they are absent the AofFold push would
         // succeed into a 1-slot ring whose consumer was dropped at construction
@@ -1453,8 +1489,9 @@ mod pool_tests {
     /// leaving the old generation authoritative.
     #[test]
     fn rewrite_fan_out_partial_failure_clears_in_progress_flag() {
-        use crate::command::persistence::AOF_REWRITE_IN_PROGRESS;
-        use std::sync::atomic::Ordering;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        // Test-local flag: the global one is shared by parallel tests.
+        static AOF_REWRITE_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 
         let tmp = tempfile::tempdir().unwrap();
         // PerShard manifest on disk so the rewrite reaches the fan-out loop.
@@ -1479,7 +1516,7 @@ mod pool_tests {
 
         // The command handler sets this before dispatching the rewrite.
         AOF_REWRITE_IN_PROGRESS.store(true, Ordering::SeqCst);
-        let res = pool.try_send_rewrite_per_shard(shard_dbs);
+        let res = pool.try_send_rewrite_per_shard_with_flag(shard_dbs, &AOF_REWRITE_IN_PROGRESS);
         assert!(res.is_err(), "disconnected writer must fail the fan-out");
         assert!(
             !AOF_REWRITE_IN_PROGRESS.load(Ordering::SeqCst),
@@ -1497,9 +1534,10 @@ mod pool_tests {
     /// post-abort appends land in the COMMITTED old-gen incr.
     #[test]
     fn rewrite_abort_reopens_writer_onto_committed_old_generation() {
-        use crate::command::persistence::AOF_REWRITE_IN_PROGRESS;
         use std::io::Write;
-        use std::sync::atomic::Ordering;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        // Test-local flag: the global one is shared by parallel tests.
+        static AOF_REWRITE_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 
         let tmp = tempfile::tempdir().unwrap();
         // 2-shard manifest at seq=1 on disk; share it through the coord's Arc.
@@ -1510,7 +1548,12 @@ mod pool_tests {
         assert!(old_incr_s0.exists(), "old-gen incr must exist pre-rewrite");
         let manifest = std::sync::Arc::new(parking_lot::Mutex::new(manifest));
 
-        let coord = PerShardRewriteCoord::new(manifest.clone(), old_seq, 2);
+        let coord = PerShardRewriteCoord::with_in_progress_flag(
+            manifest.clone(),
+            old_seq,
+            2,
+            &AOF_REWRITE_IN_PROGRESS,
+        );
         let new_seq = coord.new_seq();
         assert_ne!(new_seq, old_seq);
 
@@ -1609,7 +1652,9 @@ mod pool_tests {
             crate::persistence::aof_manifest::AofManifest::initialize_multi(tmp.path(), 2).unwrap();
         let old_seq = manifest.seq;
         let manifest = std::sync::Arc::new(parking_lot::Mutex::new(manifest));
-        let coord = PerShardRewriteCoord::new(manifest, old_seq, 2);
+        static IN_PROGRESS: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
+        let coord = PerShardRewriteCoord::with_in_progress_flag(manifest, old_seq, 2, &IN_PROGRESS);
 
         // Shard A: decrement (countdown 2 -> 1, non-terminal) then block.
         let c_a = coord.clone();
@@ -1646,7 +1691,9 @@ mod pool_tests {
             crate::persistence::aof_manifest::AofManifest::initialize_multi(tmp.path(), 2).unwrap();
         let old_seq = manifest.seq;
         let manifest = std::sync::Arc::new(parking_lot::Mutex::new(manifest));
-        let coord = PerShardRewriteCoord::new(manifest, old_seq, 2);
+        static IN_PROGRESS: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
+        let coord = PerShardRewriteCoord::with_in_progress_flag(manifest, old_seq, 2, &IN_PROGRESS);
 
         // Shard A folds, decrements, then blocks on the barrier in a thread.
         let c_a = coord.clone();
