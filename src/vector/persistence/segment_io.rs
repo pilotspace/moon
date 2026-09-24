@@ -29,6 +29,12 @@
 //!   never written for SQ8 or for a segment without signs, never an all-zero
 //!   placeholder; the reader skips SQ8 and ignores an all-zero file (the
 //!   placeholder a pre-release v2 build wrote — moon#1221 review).
+//!
+//! A directory whose `version` is NEWER than [`SEGMENT_FORMAT_VERSION`] is
+//! refused with [`SegmentIoError::UnsupportedVersion`] — never interpreted
+//! with this build's rules — and the reader leaves it untouched (moon#1221
+//! review; `version` used to be parsed and ignored). B3 recovery then treats
+//! the segment as not loadable and re-indexes its keys from the keyspace.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -50,8 +56,18 @@ use crate::vector::types::DistanceMetric;
 pub enum SegmentIoError {
     Io(std::io::Error),
     GraphDeserialize(String),
-    MetadataChecksum { expected: u64, actual: u64 },
+    MetadataChecksum {
+        expected: u64,
+        actual: u64,
+    },
     InvalidMetadata(String),
+    /// `segment_meta.json` names a format NEWER than this build supports
+    /// (a newer moon wrote it). Refused, never misread; nothing on disk is
+    /// touched.
+    UnsupportedVersion {
+        found: u32,
+        supported: u32,
+    },
 }
 
 impl std::fmt::Display for SegmentIoError {
@@ -66,6 +82,12 @@ impl std::fmt::Display for SegmentIoError {
                 )
             }
             Self::InvalidMetadata(msg) => write!(f, "invalid metadata: {msg}"),
+            Self::UnsupportedVersion { found, supported } => write!(
+                f,
+                "segment format version {found} is newer than this build supports \
+                 ({supported}): written by a newer moon — refusing to load it \
+                 (the directory is left untouched)"
+            ),
         }
     }
 }
@@ -79,6 +101,14 @@ impl From<std::io::Error> for SegmentIoError {
 /// Current `segment_meta.json` format version written by this build (see
 /// the module docs for the version history).
 pub(crate) const SEGMENT_FORMAT_VERSION: u32 = 2;
+
+/// Only the `version` of a `segment_meta.json`: read before the full
+/// [`SegmentMeta`], so a newer format is recognised as newer even when its
+/// other fields no longer parse with this build's schema.
+#[derive(Deserialize)]
+struct SegmentMetaVersion {
+    version: u32,
+}
 
 /// On-disk JSON metadata for an immutable segment.
 #[derive(Serialize, Deserialize)]
@@ -542,6 +572,18 @@ pub fn read_immutable_segment(
 
     // 1. Read and parse metadata
     let meta_json = fs::read_to_string(seg_dir.join("segment_meta.json"))?;
+    // Refuse a NEWER format before interpreting anything else (moon#1221
+    // review): its files may mean something this build does not know (a
+    // sign layout, a code layout), and misreading them is worse than not
+    // loading. A read-only check — the directory is never modified here.
+    if let Ok(probe) = serde_json::from_str::<SegmentMetaVersion>(&meta_json)
+        && probe.version > SEGMENT_FORMAT_VERSION
+    {
+        return Err(SegmentIoError::UnsupportedVersion {
+            found: probe.version,
+            supported: SEGMENT_FORMAT_VERSION,
+        });
+    }
     let meta: SegmentMeta = serde_json::from_str(&meta_json)
         .map_err(|e| SegmentIoError::InvalidMetadata(e.to_string()))?;
 
@@ -926,6 +968,81 @@ mod tests {
         let (restored, _) = read_immutable_segment(tmp.path(), 1).unwrap();
 
         assert_eq!(restored.suggested_ef(), None);
+    }
+
+    /// moon#1221 review: `version` was parsed but never checked. A directory
+    /// written by a NEWER format must be refused with a clear error — never
+    /// interpreted with this build's rules — and the reader must leave the
+    /// directory exactly as it found it. Current and older versions load.
+    #[test]
+    fn newer_segment_format_is_refused_and_the_directory_left_untouched() {
+        let (segment, collection) = build_test_segment(20, 64);
+        let tmp = tempfile::tempdir().unwrap();
+        write_immutable_segment(tmp.path(), 5, &segment, &collection).unwrap();
+        let dir = tmp.path().join("segment-5");
+        let meta_path = dir.join("segment_meta.json");
+        let meta = fs::read_to_string(&meta_path).unwrap();
+        let current = format!("\"version\": {SEGMENT_FORMAT_VERSION}");
+        assert!(meta.contains(&current), "{meta}");
+        let snapshot = |d: &Path| -> Vec<(std::ffi::OsString, Vec<u8>)> {
+            let mut files: Vec<_> = fs::read_dir(d)
+                .unwrap()
+                .map(|e| {
+                    let e = e.unwrap();
+                    (e.file_name(), fs::read(e.path()).unwrap())
+                })
+                .collect();
+            files.sort();
+            files
+        };
+
+        let newer_metas = [
+            meta.replace(
+                &current,
+                &format!("\"version\": {}", SEGMENT_FORMAT_VERSION + 1),
+            ),
+            meta.replace(&current, &format!("\"version\": {}", u32::MAX)),
+            // A future format whose other fields no longer parse must still
+            // be reported as "newer", not as generic bad metadata.
+            format!(
+                "{{\"version\": {}, \"codebook\": \"moved elsewhere\"}}",
+                SEGMENT_FORMAT_VERSION + 1
+            ),
+        ];
+        for newer in &newer_metas {
+            fs::write(&meta_path, newer).unwrap();
+            let before = snapshot(&dir);
+            let err = match read_immutable_segment(tmp.path(), 5) {
+                Ok(_) => panic!("a newer-format segment was loaded (misread): {newer}"),
+                Err(e) => e,
+            };
+            let msg = err.to_string();
+            assert!(
+                msg.contains("newer") && msg.contains(&SEGMENT_FORMAT_VERSION.to_string()),
+                "unclear error: {msg}"
+            );
+            assert!(
+                matches!(
+                    err,
+                    SegmentIoError::UnsupportedVersion { supported, .. }
+                        if supported == SEGMENT_FORMAT_VERSION
+                ),
+                "{msg}"
+            );
+            assert_eq!(snapshot(&dir), before, "the reader must not touch the dir");
+        }
+
+        for older in 1..=SEGMENT_FORMAT_VERSION {
+            fs::write(
+                &meta_path,
+                meta.replace(&current, &format!("\"version\": {older}")),
+            )
+            .unwrap();
+            assert!(
+                read_immutable_segment(tmp.path(), 5).is_ok(),
+                "version {older} must still load"
+            );
+        }
     }
 
     /// Backward compatibility: a `segment_meta.json` written before the

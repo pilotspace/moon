@@ -208,6 +208,9 @@ shared 4-vCPU Linux container against HEAD `935c555` — re-measure on the GCE r
   query, takes the tombstone guard once, and no longer clones the SESSION member map; the f16 rerank
   sidecar is served from its mapped file once persisted; payload-index keys no longer pin request
   buffers. New opt-out `MOON_VECTOR_PAYLOAD_TEXT=off` skips payload full-text indexing.
+  Format v2 compatibility: older binaries ignore `sub_signs.bin` and load v2 segments with the
+  16-level LUT; a segment directory of a newer format than the binary supports is refused rather
+  than misread (the loader leaves it untouched; its keys are re-indexed from the keyspace).
 - **Full-text search scores each match once** (moon#1191): bitmap membership, one BM25 pass with
   doc-ordered cursors, a bounded top-k, keys cloned for the returned page only — broad-term
   `FT.SEARCH … LIMIT 0 10` 70–103× faster at shards 1 (25× at shards 4), scores bit-identical.
