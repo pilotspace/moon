@@ -32,6 +32,9 @@
 pub mod dispatch;
 pub mod execute;
 pub mod parse;
+mod payload_filter;
+#[cfg(all(test, feature = "text-index"))]
+mod payload_schema_tests;
 pub mod response;
 
 // Re-export to preserve the public API path `crate::command::vector_search::ft_search::X`.

@@ -18,6 +18,7 @@ use bytes::Bytes;
 use smallvec::SmallVec;
 
 use crate::protocol::Frame;
+use crate::text::store::TextStore;
 use crate::vector::filter::FilterExpr;
 use crate::vector::keymap::BucketedKeyMap;
 use crate::vector::store::VectorStore;
@@ -40,6 +41,7 @@ pub(super) enum SearchRawResult {
 ///
 /// `field_name` selects which named vector field to search. `None` uses the default
 /// (first) field. `Some(name)` dispatches to the named field's segments.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn search_local_raw(
     store: &mut VectorStore,
     index_name: &[u8],
@@ -49,6 +51,7 @@ pub(super) fn search_local_raw(
     field_name: Option<&Bytes>,
     as_of_lsn: u64,
     db_index: u8,
+    text_store: Option<&TextStore>,
 ) -> SearchRawResult {
     // Clone committed treemap BEFORE get_index_mut to satisfy the borrow checker.
     // Non-TXN readers need this to see entries whose owning txn has committed
@@ -126,7 +129,7 @@ pub(super) fn search_local_raw(
 
     let filter_bitmap = filter.map(|f| {
         let total = idx.segments.total_vectors();
-        idx.payload_index.evaluate_bitmap(f, total)
+        super::payload_filter::evaluate_filter(idx, f, total, text_store, db_index)
     });
 
     // Dispatch to correct field's segments
@@ -237,6 +240,29 @@ pub fn search_local_filtered(
     as_of_lsn: u64,
     db_index: u8,
 ) -> Frame {
+    search_local_filtered_with_text(
+        store, index_name, query_blob, k, filter, offset, count, field_name, as_of_lsn, db_index,
+        None,
+    )
+}
+
+/// [`search_local_filtered`] with the BM25 plane reachable, so a
+/// schema-aware index answers `TextMatch` filters on its declared TEXT
+/// fields (moon#1194, see `payload_filter`).
+#[allow(clippy::too_many_arguments)]
+pub fn search_local_filtered_with_text(
+    store: &mut VectorStore,
+    index_name: &[u8],
+    query_blob: &[u8],
+    k: usize,
+    filter: Option<&FilterExpr>,
+    offset: usize,
+    count: usize,
+    field_name: Option<&Bytes>,
+    as_of_lsn: u64,
+    db_index: u8,
+    text_store: Option<&TextStore>,
+) -> Frame {
     // Clone committed treemap BEFORE get_index_mut (borrow-checker ordering).
     // Ensures non-TXN readers see entries whose owning txn has committed.
     let committed = store.txn_manager().committed_snapshot();
@@ -315,7 +341,7 @@ pub fn search_local_filtered(
 
     let filter_bitmap = filter.map(|f| {
         let total = idx.segments.total_vectors();
-        idx.payload_index.evaluate_bitmap(f, total)
+        super::payload_filter::evaluate_filter(idx, f, total, text_store, db_index)
     });
 
     // Dispatch to correct field's segments

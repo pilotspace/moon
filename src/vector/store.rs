@@ -1985,6 +1985,8 @@ impl VectorStore {
         }
 
         let name = meta.name.clone();
+        let payload_schema =
+            crate::vector::filter::payload_schema::schema_for_index(&meta.schema_fields);
 
         // B2 (durability): defensive id-space floor. If this index's
         // `idx-<hex>` dir already has a manifest — e.g. FLUSHALL/DROP just
@@ -2013,7 +2015,9 @@ impl VectorStore {
                 segments,
                 scratch,
                 collection,
-                payload_index: PayloadIndex::new(),
+                // moon#1194: opt-in schema-aware payload indexing
+                // (`MOON_VECTOR_PAYLOAD_SCHEMA=declared`); `None` otherwise.
+                payload_index: PayloadIndex::with_schema(payload_schema),
                 key_hash_to_key: BucketedKeyMap::new(),
                 key_hash_to_global_id: BucketedKeyMap::new(),
                 key_hash_to_vec_checksum: BucketedKeyMap::new(),
@@ -2137,6 +2141,8 @@ impl VectorStore {
         }
 
         let name = meta.name.clone();
+        let payload_schema =
+            crate::vector::filter::payload_schema::schema_for_index(&meta.schema_fields);
 
         self.indexes.insert(
             name.clone(),
@@ -2145,7 +2151,9 @@ impl VectorStore {
                 segments,
                 scratch,
                 collection,
-                payload_index: PayloadIndex::new(),
+                // moon#1194: opt-in schema-aware payload indexing
+                // (`MOON_VECTOR_PAYLOAD_SCHEMA=declared`); `None` otherwise.
+                payload_index: PayloadIndex::with_schema(payload_schema),
                 key_hash_to_key: BucketedKeyMap::new(),
                 key_hash_to_global_id: BucketedKeyMap::new(),
                 key_hash_to_vec_checksum: BucketedKeyMap::new(),
