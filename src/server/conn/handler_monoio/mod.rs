@@ -1582,10 +1582,13 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 .is_replica_mirror
                 .as_ref()
                 .is_some_and(|m| m.load(std::sync::atomic::Ordering::Acquire));
-            // `!tracking_active()`: inline writes bypass the dispatch-path
-            // CLIENT TRACKING invalidation hook, so ANY tracking client in
-            // the process (not just this conn) forces writes through the
-            // normal path. One relaxed atomic load; free when tracking is off.
+            // moon#1166: there used to be a `!tracking_active()` term on the
+            // write gate — inline writes bypassed the dispatch-path CLIENT
+            // TRACKING hook, so ONE idle tracking client anywhere pushed every
+            // connection's SETs off this path (review: -41%). The inline SET
+            // now invalidates the key it wrote itself
+            // (`invalidation::invalidate_inline_write`). A connection that is
+            // itself tracking still stands down (`!tracking_state.enabled`).
             //
             // task #34 (Wave A) fix: `try_inline_dispatch`'s SET fast path
             // (`server::conn::blocking`) does NOT feed the replication
@@ -1789,7 +1792,6 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 && !conn.in_multi
                 && !conn.in_cross_txn()
                 && !conn.tracking_state.enabled
-                && !crate::tracking::tracking_active()
                 && !is_replica
                 && !crate::replication::state::fanout_hint_active();
             // moon#660: refresh the shard's cached clock once per batch, the
@@ -1842,6 +1844,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 // spill thread, so the inline path must NOT resolve eviction
                 // itself — it stands down to generic dispatch under pressure.
                 spill_sender_active,
+                client_id,
                 &mut probe,
             );
             drop(probe);

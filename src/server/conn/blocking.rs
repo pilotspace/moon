@@ -2573,6 +2573,9 @@ pub(crate) fn try_inline_dispatch(
     // pressure, leaving `read_buf` untouched. See the block comment on
     // `can_inline_writes` in `handler_monoio/mod.rs` for the full invariant.
     spill_sender_active: bool,
+    // moon#1166: the writing connection's id, for the CLIENT TRACKING
+    // invalidation this path now performs itself (NOLOOP needs the writer).
+    writer_client_id: u64,
     // moon#963: the connection's latency probe. This path answers `GET`/`SET`
     // without entering generic dispatch, so it has to time them itself — and
     // the parameter is mandatory rather than an `Option` precisely so that
@@ -3192,6 +3195,16 @@ pub(crate) fn try_inline_dispatch(
                 })
             },
         );
+        // moon#1166: CLIENT TRACKING. This path used to be switched off for
+        // EVERY connection while any client tracked anything; it now
+        // invalidates the key it just wrote itself, through the same global
+        // table and routing as every other write. Nobody tracking: one
+        // relaxed load. Somebody tracking, not this key: a hash and a load,
+        // no lock (see `tracking::prefilter`).
+        crate::tracking::invalidation::invalidate_inline_write(
+            &frozen[key_start..key_end],
+            writer_client_id,
+        );
     }
 
     // AOF: reuse the frozen RESP bytes directly (Arc clone, zero-copy).
@@ -3260,6 +3273,8 @@ pub(crate) fn try_inline_dispatch_loop(
     runtime_config: &parking_lot::RwLock<crate::config::RuntimeConfig>,
     // moon#660: forwarded verbatim to `try_inline_dispatch`.
     spill_sender_active: bool,
+    // moon#1166: forwarded verbatim to `try_inline_dispatch`.
+    writer_client_id: u64,
     // moon#963: forwarded verbatim to `try_inline_dispatch`.
     probe: &mut crate::admin::metrics_setup::LatencyProbe<'_>,
 ) -> usize {
@@ -3284,6 +3299,7 @@ pub(crate) fn try_inline_dispatch_loop(
             resp3,
             runtime_config,
             spill_sender_active,
+            writer_client_id,
             probe,
         );
         if n == 0 {
