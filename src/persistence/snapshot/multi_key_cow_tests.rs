@@ -33,6 +33,11 @@ fn canonical(dbs: &mut [Database]) -> BTreeMap<(usize, Vec<u8>), String> {
                 Frame::SimpleString(t) => String::from_utf8_lossy(&t).into_owned(),
                 other => panic!("TYPE answered {other:?}"),
             };
+            if ty == "stream" {
+                let state = stream_state(&mut dbs[db], &key);
+                out.insert((db, key), format!("stream:{state}"));
+                continue;
+            }
             let read: Vec<&[u8]> = match ty.as_str() {
                 "string" => vec![b"GET", &key],
                 "list" => vec![b"LRANGE", &key, b"0", b"-1"],
@@ -54,6 +59,46 @@ fn canonical(dbs: &mut [Database]) -> BTreeMap<(usize, Vec<u8>), String> {
         }
     }
     out
+}
+
+/// A stream's entries AND its consumer groups — last-delivered id, pending
+/// entries with their owner, consumers: the state a group read writes.
+fn stream_state(db: &mut Database, key: &[u8]) -> String {
+    let Ok(Some(stream)) = db.get_stream(key) else {
+        panic!("TYPE said stream");
+    };
+    let id = |id: &crate::storage::stream::StreamId| format!("{}-{}", id.ms, id.seq);
+    let entries: Vec<String> = stream
+        .entries
+        .iter()
+        .map(|(eid, fields)| format!("{}{fields:?}", id(eid)))
+        .collect();
+    let mut groups: Vec<String> = stream
+        .groups
+        .iter()
+        .map(|(name, g)| {
+            let pel: Vec<String> = g
+                .pel
+                .iter()
+                .map(|(pid, p)| format!("{}@{}", id(pid), String::from_utf8_lossy(&p.consumer)))
+                .collect();
+            let mut consumers: Vec<String> = g
+                .consumers
+                .keys()
+                .map(|c| String::from_utf8_lossy(c).into_owned())
+                .collect();
+            consumers.sort();
+            format!(
+                "{}:last={},pel=[{}],consumers=[{}]",
+                String::from_utf8_lossy(name),
+                id(&g.last_delivered_id),
+                pel.join(","),
+                consumers.join(",")
+            )
+        })
+        .collect();
+    groups.sort();
+    format!("{}|{}", entries.join(","), groups.join(";"))
 }
 
 fn flatten(f: Frame) -> Vec<String> {
@@ -90,6 +135,17 @@ fn load(n: usize, records: Vec<Record>) -> Vec<Database> {
 /// table has many segments), begin an epoch, run `cmd` through dispatch,
 /// finish, and diff the file against the epoch-start keyspace.
 fn family(name: &str, setup: &[&[&[u8]]], cmd: &[&[u8]]) -> Option<String> {
+    family_with(name, setup, cmd, |dbs, parts| run(dbs, 0, parts))
+}
+
+/// [`family`], with `cmd` run by `exec` — for write paths that do not go
+/// through `command::dispatch`.
+fn family_with(
+    name: &str,
+    setup: &[&[&[u8]]],
+    cmd: &[&[u8]],
+    exec: impl Fn(&mut [Database], &[&[u8]]) -> Frame,
+) -> Option<String> {
     let mut dbs = vec![Database::new()];
     for i in 0..1500u32 {
         dbs[0].set_string(format!("f:{i:05}").as_bytes(), Bytes::from_static(b"."));
@@ -103,9 +159,9 @@ fn family(name: &str, setup: &[&[&[u8]]], cmd: &[&[u8]]) -> Option<String> {
     }
     let expected = canonical(&mut dbs);
     let epoch = Epoch::begin(&dbs);
-    let reply = run(&mut dbs, 0, cmd);
+    let reply = exec(&mut dbs, cmd);
     assert!(
-        !matches!(reply, Frame::Error(_)),
+        !matches!(reply, Frame::Error(_) | Frame::Null | Frame::NullArray),
         "{name}: {reply:?} — the command must run for the test to mean anything"
     );
     let changed = canonical(&mut dbs) != expected;
@@ -476,4 +532,257 @@ fn a_woken_blmove_keeps_its_destination_point_in_time() {
         "the woken move's destination must keep its epoch-start state"
     );
     assert_eq!(got, expected);
+}
+
+// ---------------------------------------------------------------------------
+// moon#1227 review F2 (moon#1217 completeness): a blocking command whose data
+// is ALREADY there never parks. The connection serves it on the spot —
+// `handle_blocking_command{,_monoio}` -> `immediate_serve` (both runtimes),
+// and `blocking_txn::try_exec_blocking_in_txn` for one queued in MULTI —
+// popping, pushing a move's destination and advancing a group's cursor
+// straight through `Database` methods, outside `command::dispatch`. Nothing
+// captured a pre-image there, so a BGSAVE crossed by the standard BLMOVE
+// reliable-queue path wrote post-epoch states (and could drop the element).
+// ---------------------------------------------------------------------------
+
+fn bulk_args(parts: &[&[u8]]) -> Vec<Frame> {
+    parts
+        .iter()
+        .map(|p| Frame::BulkString(Bytes::copy_from_slice(p)))
+        .collect()
+}
+
+/// The connection-side immediate serve, exactly as both runtimes' blocking
+/// handlers run it before deciding to park (`--shards 1`, db 0).
+fn serve_now(dbs: &mut [Database], parts: &[&[u8]]) -> Frame {
+    let args = bulk_args(&parts[1..]);
+    let Ok((keys, _)) = crate::server::conn::blocking::parse_blocking_args(parts[0], &args) else {
+        panic!("{parts:?}: not a valid blocking command");
+    };
+    let Some((frame, popped)) = crate::server::conn::blocking::immediate_serve(
+        parts[0],
+        &args,
+        &keys,
+        &mut dbs[0],
+        0,
+        0,
+        1,
+    ) else {
+        panic!("{parts:?}: the data is there, so it must be served now");
+    };
+    assert!(popped, "{parts:?}: served nothing: {frame:?}");
+    frame
+}
+
+/// Every key an immediately-served blocking command writes keeps its
+/// epoch-start state in the file — both keys pending, so each non-captured
+/// key shows up as a post-epoch value (for BLMOVE: `src=[b]`, `dst=[x,a]`
+/// instead of `src=[a,b]`, `dst=[x]`; a WAL tail then replays the logged
+/// LMOVE on top and duplicates `a`).
+#[test]
+fn an_immediately_served_blocking_command_keeps_every_key_it_writes_point_in_time() {
+    let cases: Vec<(&str, Vec<&[&[u8]]>, &[&[u8]])> = vec![
+        (
+            "BLMOVE",
+            vec![
+                &[b"RPUSH", b"im:src", b"a", b"b"],
+                &[b"RPUSH", b"im:dst", b"x"],
+            ],
+            &[b"BLMOVE", b"im:src", b"im:dst", b"LEFT", b"RIGHT", b"0"],
+        ),
+        (
+            "BRPOPLPUSH",
+            vec![
+                &[b"RPUSH", b"im:src", b"a", b"b"],
+                &[b"RPUSH", b"im:dst", b"x"],
+            ],
+            &[b"BRPOPLPUSH", b"im:src", b"im:dst", b"0"],
+        ),
+        (
+            "BLPOP",
+            vec![&[b"RPUSH", b"im:l", b"a", b"b"]],
+            &[b"BLPOP", b"im:none", b"im:l", b"0"],
+        ),
+        (
+            "BRPOP",
+            vec![&[b"RPUSH", b"im:l", b"a", b"b"]],
+            &[b"BRPOP", b"im:l", b"0"],
+        ),
+        (
+            "BLMPOP",
+            vec![&[b"RPUSH", b"im:l", b"a", b"b", b"c"]],
+            &[
+                b"BLMPOP", b"0", b"2", b"im:none", b"im:l", b"LEFT", b"COUNT", b"2",
+            ],
+        ),
+        (
+            "BZPOPMIN",
+            vec![&[b"ZADD", b"im:z", b"1", b"a", b"2", b"b"]],
+            &[b"BZPOPMIN", b"im:z", b"0"],
+        ),
+        (
+            "BZPOPMAX",
+            vec![&[b"ZADD", b"im:z", b"1", b"a", b"2", b"b"]],
+            &[b"BZPOPMAX", b"im:z", b"0"],
+        ),
+        (
+            "BZMPOP",
+            vec![&[b"ZADD", b"im:z", b"1", b"a", b"2", b"b"]],
+            &[b"BZMPOP", b"0", b"1", b"im:z", b"MIN"],
+        ),
+        (
+            "XREADGROUP",
+            vec![
+                &[b"XADD", b"im:s", b"1-1", b"f", b"v"],
+                &[b"XADD", b"im:s", b"2-1", b"f", b"w"],
+                &[b"XGROUP", b"CREATE", b"im:s", b"g", b"0"],
+            ],
+            &[
+                b"XREADGROUP",
+                b"GROUP",
+                b"g",
+                b"c",
+                b"COUNT",
+                b"1",
+                b"BLOCK",
+                b"0",
+                b"STREAMS",
+                b"im:s",
+                b">",
+            ],
+        ),
+    ];
+    let failures: Vec<String> = cases
+        .iter()
+        .filter_map(|(name, setup, cmd)| family_with(name, setup, cmd, serve_now))
+        .collect();
+    assert!(
+        failures.is_empty(),
+        "{} of {} immediately-served blocking commands left a post-epoch state in the file:\n{}",
+        failures.len(),
+        cases.len(),
+        failures.join("\n")
+    );
+}
+
+/// The reliable-queue shape across the cursor: the destination's range is
+/// already WRITTEN, the source's still pending. Before the fix the file held
+/// the destination's epoch-start `[x]` and the source's post-move `[b]`, so
+/// the moved element was in NEITHER key — an RDB-only restore lost it.
+#[test]
+fn an_immediate_move_across_the_cursor_keeps_its_element() {
+    let hash = crate::storage::dashtable::hash_key;
+    let find = |prefix: &str, want: &dyn Fn(u64) -> bool| -> String {
+        (0u32..)
+            .map(|i| format!("{prefix}{i}"))
+            .find(|k| want(hash(k.as_bytes())))
+            .unwrap_or_default()
+    };
+    let dst = find("q:dst:", &|h| h < u64::MAX / 4);
+    let src = find("q:src:", &|h| h > u64::MAX / 4 * 3);
+    for mv in [
+        vec![
+            src.as_bytes(),
+            dst.as_bytes(),
+            &b"LEFT"[..],
+            &b"RIGHT"[..],
+            &b"0"[..],
+        ],
+        vec![src.as_bytes(), dst.as_bytes(), &b"0"[..]],
+    ] {
+        let cmd: &[u8] = if mv.len() == 5 {
+            b"BLMOVE"
+        } else {
+            b"BRPOPLPUSH"
+        };
+        let mut dbs = vec![Database::new()];
+        for i in 0..1500u32 {
+            dbs[0].set_string(format!("f:{i:05}").as_bytes(), Bytes::from_static(b"."));
+        }
+        run(&mut dbs, 0, &[b"RPUSH", src.as_bytes(), b"a", b"b"]);
+        run(&mut dbs, 0, &[b"RPUSH", dst.as_bytes(), b"x"]);
+        let expected = canonical(&mut dbs);
+        let mut epoch = Epoch::begin(&dbs);
+        let pending = |epoch: &Epoch, key: &str| {
+            epoch
+                .state
+                .as_ref()
+                .is_some_and(|s| s.is_key_pending(0, key.as_bytes()))
+        };
+        while pending(&epoch, &dst) {
+            assert!(!epoch.tick_one(&dbs));
+        }
+        assert!(
+            pending(&epoch, &src),
+            "fixture: the source must still be pending"
+        );
+        let mut parts: Vec<&[u8]> = vec![cmd];
+        parts.extend(mv);
+        assert!(matches!(serve_now(&mut dbs, &parts), Frame::BulkString(_)));
+        let mut loaded = load(1, epoch.finish(&dbs));
+        let got = canonical(&mut loaded);
+        let queue = |m: &BTreeMap<(usize, Vec<u8>), String>| {
+            m.iter()
+                .filter(|((_, k), _)| k.starts_with(b"q:"))
+                .map(|((_, k), v)| (String::from_utf8_lossy(k).into_owned(), v.clone()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            queue(&got),
+            queue(&expected),
+            "{}: the element an immediate move took during BGSAVE is missing from the file",
+            String::from_utf8_lossy(cmd)
+        );
+    }
+}
+
+/// A blocking pop queued inside MULTI runs at EXEC in immediate-only mode
+/// (`blocking_txn::try_exec_blocking_in_txn`), also outside dispatch.
+#[test]
+fn a_blocking_pop_queued_in_multi_keeps_its_key_point_in_time() {
+    let exec = |dbs: &mut [Database], parts: &[&[u8]]| -> Frame {
+        let args = bulk_args(&parts[1..]);
+        let Some(outcome) = crate::server::conn::blocking_txn::try_exec_blocking_in_txn(
+            parts[0],
+            &args,
+            &mut dbs[0],
+            0,
+        ) else {
+            panic!("{parts:?} is queued unrewritten");
+        };
+        outcome.reply
+    };
+    let cases: Vec<(&str, Vec<&[&[u8]]>, &[&[u8]])> = vec![
+        (
+            "BLPOP",
+            vec![&[b"RPUSH", b"tx:l", b"a", b"b"]],
+            &[b"BLPOP", b"tx:none", b"tx:l", b"0"],
+        ),
+        (
+            "BRPOP",
+            vec![&[b"RPUSH", b"tx:l", b"a", b"b"]],
+            &[b"BRPOP", b"tx:l", b"0"],
+        ),
+        (
+            "BZPOPMIN",
+            vec![&[b"ZADD", b"tx:z", b"1", b"a", b"2", b"b"]],
+            &[b"BZPOPMIN", b"tx:z", b"0"],
+        ),
+        (
+            "BZPOPMAX",
+            vec![&[b"ZADD", b"tx:z", b"1", b"a", b"2", b"b"]],
+            &[b"BZPOPMAX", b"tx:z", b"0"],
+        ),
+    ];
+    let failures: Vec<String> = cases
+        .iter()
+        .filter_map(|(name, setup, cmd)| family_with(name, setup, cmd, exec))
+        .collect();
+    assert!(
+        failures.is_empty(),
+        "{} of {} blocking pops queued in MULTI left a post-epoch state in the file:\n{}",
+        failures.len(),
+        cases.len(),
+        failures.join("\n")
+    );
 }

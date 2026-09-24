@@ -402,6 +402,7 @@ pub(crate) fn execute_transaction(
                 cmd,
                 cmd_args,
                 locks.primary(entry_db),
+                entry_db,
             ) {
                 if let Some(effect) = outcome.effect {
                     let mut buf = BytesMut::new();
@@ -656,7 +657,9 @@ pub(crate) fn execute_transaction_sharded(
         if crate::server::conn::blocking_txn::queues_unrewritten(cmd) {
             let outcome = crate::shard::slice::with_shard_db(selected, |db| {
                 db.refresh_now_from_cache(cached_clock);
-                crate::server::conn::blocking_txn::try_exec_blocking_in_txn(cmd, cmd_args, db)
+                crate::server::conn::blocking_txn::try_exec_blocking_in_txn(
+                    cmd, cmd_args, db, selected,
+                )
             });
             if let Some(outcome) = outcome {
                 // The AOF/replication record is the SYNTHESISED single-key

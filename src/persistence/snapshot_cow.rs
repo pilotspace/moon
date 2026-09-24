@@ -34,8 +34,10 @@
 //! 1. A snapshot starting on this shard [`arm`]s a thread-local queue.
 //! 2. Every write path — `command::dispatch`, the routed arms'
 //!    `cow_intercept`, the monoio inline SET, a script's `redis.call`, the
-//!    blocking waker — captures before it mutates, for EVERY key it may
-//!    write (moon#1217). Armed: the old entry, or a tombstone when the key
+//!    blocking waker, a blocking command served on the spot by its
+//!    connection (`conn::blocking::immediate_serve`, and in MULTI
+//!    `blocking_txn::try_exec_blocking_in_txn`) — captures before it
+//!    mutates, for EVERY key it may write (moon#1217). Armed: the old entry, or a tombstone when the key
 //!    does not exist yet (first capture of a key wins — a later one would
 //!    be a post-epoch state). Disarmed (the overwhelmingly common case, no
 //!    BGSAVE in flight): one thread-local `bool` load and return.
