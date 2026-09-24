@@ -701,19 +701,6 @@ fn local_fold_stamp(
     })
 }
 
-/// Serialize an `MSET k v ...` command over `pairs` for AOF logging of a local
-/// MSET leg. Used for both the fast path (all keys local) and a scattered MSET's
-/// local slice (only the local keys) — never the full scattered command.
-fn serialize_local_mset(pairs: &[(Bytes, Bytes)]) -> Bytes {
-    let mut parts: Vec<Frame> = Vec::with_capacity(pairs.len() * 2 + 1);
-    parts.push(Frame::BulkString(Bytes::from_static(b"MSET")));
-    for (k, v) in pairs {
-        parts.push(Frame::BulkString(k.clone()));
-        parts.push(Frame::BulkString(v.clone()));
-    }
-    crate::persistence::aof::serialize_command(&Frame::Array(parts.into()))
-}
-
 fn bulk(b: &Bytes) -> Frame {
     Frame::BulkString(b.clone())
 }
@@ -1556,8 +1543,12 @@ async fn coordinate_mget(
 
 /// Coordinate MSET across shards using VLL pattern.
 ///
-/// Groups key-value pairs by shard in ascending order, dispatches SET
-/// sub-commands per shard. Returns OK when all complete.
+/// Groups the pairs by owner shard in ascending order and sends each remote
+/// owner ONE `MSET k v …` over its pairs (moon#1184 — it used to be one `SET`
+/// per pair, so an owner took its lock, serialized an AOF record and appended
+/// a replication record per KEY). The local slice runs in-process through
+/// [`run_local`]. Returns OK when every leg confirmed.
+#[allow(clippy::too_many_arguments)]
 async fn coordinate_mset(
     args: &[Frame],
     my_shard: usize,
@@ -1572,34 +1563,20 @@ async fn coordinate_mset(
     local_barrier_pending: &mut bool,
     _response_pool: &(), // placeholder — coordinator uses oneshot internally
 ) -> Frame {
-    if args.is_empty() || !args.len().is_multiple_of(2) {
+    if args.is_empty()
+        || !args.len().is_multiple_of(2)
+        || args.iter().any(|a| arg_bytes(a).is_none())
+    {
         return Frame::Error(Bytes::from_static(
             b"ERR wrong number of arguments for 'mset' command",
         ));
     }
 
-    // Group key-value pairs by shard in ascending order (BTreeMap = VLL)
-    let mut groups: BTreeMap<usize, Vec<(Bytes, Bytes)>> = BTreeMap::new();
-    for pair in args.chunks(2) {
-        let key = match extract_key(&pair[0]) {
-            Some(k) => k,
-            None => {
-                return Frame::Error(Bytes::from_static(
-                    b"ERR wrong number of arguments for 'mset' command",
-                ));
-            }
-        };
-        let value = match extract_key(&pair[1]) {
-            Some(v) => v,
-            None => {
-                return Frame::Error(Bytes::from_static(
-                    b"ERR wrong number of arguments for 'mset' command",
-                ));
-            }
-        };
-        let shard = key_to_shard(&key, num_shards);
-        groups.entry(shard).or_default().push((key, value));
-    }
+    // One `MSET k v …` per owner, ascending shard order (VLL). Each group is
+    // the whole sub-command, name first, so it serves as the remote leg's
+    // frame, the local leg's argv (`[1..]`) and the local AOF record alike.
+    let groups = group_by_owner(b"MSET", args, 2, num_shards);
+    let owners = groups.iter().filter(|g| !g.is_empty()).count();
 
     // Fast path: all keys on local shard.
     //
@@ -1607,98 +1584,65 @@ async fn coordinate_mset(
     // directly — `cmd_dispatch` is where an armed BGSAVE epoch captures the
     // pre-image of every key a write overwrites. Calling `string::mset` here
     // put the post-MSET value of a not-yet-serialized key into the snapshot.
-    if groups.len() == 1 && groups.contains_key(&my_shard) {
+    if owners == 1 && !groups[my_shard].is_empty() {
         let resp = run_local(shard_databases, db_index, cached_clock, b"MSET", args);
         if matches!(resp, Frame::Error(_)) {
             return resp;
         }
         // Local leg (review Finding 1): persist the whole MSET — every key is
         // owned by my_shard — matching the local single-key write contract.
-        if let Some(pairs) = groups.get(&my_shard) {
-            let serialized = serialize_local_mset(pairs);
-            match persist_local_leg(
-                aof_pool,
-                repl_state,
-                my_shard,
-                db_index,
-                serialized,
-                local_fold_stamp(aof_pool, my_shard),
-            )
-            .await
-            {
-                Ok(needs_barrier) => *local_barrier_pending |= needs_barrier,
-                Err(()) => {
-                    return Frame::Error(Bytes::from_static(
-                        crate::persistence::aof::AOF_FSYNC_ERR,
-                    ));
-                }
+        return match persist_local_group(
+            aof_pool,
+            repl_state,
+            my_shard,
+            db_index,
+            &groups[my_shard],
+        )
+        .await
+        {
+            Ok(needs_barrier) => {
+                *local_barrier_pending |= needs_barrier;
+                resp
             }
-        }
-        return resp;
+            Err(()) => Frame::Error(Bytes::from_static(crate::persistence::aof::AOF_FSYNC_ERR)),
+        };
     }
 
-    let mut pending_shards: Vec<channel::OneshotReceiver<Vec<Frame>>> = Vec::new();
-    let mut local_append_failed = false;
+    // Every remote leg is sent BEFORE the local slice runs, so the owners
+    // apply theirs while this shard applies its own.
+    let mut groups = groups;
+    let local_group = std::mem::take(&mut groups[my_shard]);
+    let pending_shards =
+        send_owner_legs(groups, my_shard, db_index, dispatch_tx, spsc_notifiers).await;
 
-    for (shard_id, kv_pairs) in &groups {
-        if *shard_id == my_shard {
-            // moon#1228: an `MSET` over this shard's pairs through `run_local`,
-            // so the BGSAVE capture hook in `cmd_dispatch` sees every key it
-            // overwrites (a bare `set_string` loop captured nothing).
-            let local_args: Vec<Frame> = kv_pairs
-                .iter()
-                .flat_map(|(k, v)| [bulk(k), bulk(v)])
-                .collect();
-            let _ = run_local(
-                shard_databases,
-                db_index,
-                cached_clock,
-                b"MSET",
-                &local_args,
-            );
-            // Local leg (review Finding 1): persist a synthesized MSET over
-            // ONLY the local keys. The remote slices persist themselves on
-            // their owner shards via MultiExecute -> wal_append_and_fanout;
-            // my_shard must not log their keys (replay re-dispatches raw
-            // commands, so a full-command log here would try to write keys
-            // this shard doesn't own).
-            //
-            // moon#1084: logged HERE, right after the apply and before the
-            // remote legs are awaited. Logged after them, a write another
-            // client made to one of these keys during the wait reached the
-            // log first although it was applied second, and replay put this
-            // slice back on top of it. A failed append is reported once every
-            // leg has been dispatched and drained, as before.
-            let serialized = serialize_local_mset(kv_pairs);
-            // Stamped here, in the same synchronous stretch as the apply
-            // above: the append below may park before it enqueues (#455).
-            let stamp = local_fold_stamp(aof_pool, my_shard);
-            match persist_local_leg(aof_pool, repl_state, my_shard, db_index, serialized, stamp)
-                .await
-            {
-                Ok(needs_barrier) => *local_barrier_pending |= needs_barrier,
-                Err(()) => local_append_failed = true,
-            }
-        } else {
-            let (reply_tx, reply_rx) = channel::oneshot();
-            let commands: Vec<(Bytes, Frame)> = kv_pairs
-                .iter()
-                .map(|(k, v)| {
-                    let cmd = Frame::Array(framevec![
-                        Frame::BulkString(Bytes::from_static(b"SET")),
-                        Frame::BulkString(k.clone()),
-                        Frame::BulkString(v.clone()),
-                    ]);
-                    (k.clone(), cmd)
-                })
-                .collect();
-            let msg = ShardMessage::MultiExecute {
-                db_index,
-                commands,
-                reply_tx,
-            };
-            let _ = spsc_send(dispatch_tx, my_shard, *shard_id, msg, spsc_notifiers).await;
-            pending_shards.push(reply_rx);
+    let mut local_append_failed = false;
+    if !local_group.is_empty() {
+        // moon#1228: an `MSET` over this shard's pairs through `run_local`,
+        // so the BGSAVE capture hook in `cmd_dispatch` sees every key it
+        // overwrites (a bare `set_string` loop captured nothing).
+        let _ = run_local(
+            shard_databases,
+            db_index,
+            cached_clock,
+            b"MSET",
+            &local_group[1..],
+        );
+        // Local leg (review Finding 1): persist a synthesized MSET over
+        // ONLY the local keys. The remote slices persist themselves on
+        // their owner shards via MultiExecute -> wal_append_and_fanout;
+        // my_shard must not log their keys (replay re-dispatches raw
+        // commands, so a full-command log here would try to write keys
+        // this shard doesn't own).
+        //
+        // moon#1084: logged HERE, right after the apply and before the
+        // remote legs are awaited. Logged after them, a write another
+        // client made to one of these keys during the wait reached the
+        // log first although it was applied second, and replay put this
+        // slice back on top of it. A failed append is reported once every
+        // leg has been dispatched and drained, as before.
+        match persist_local_group(aof_pool, repl_state, my_shard, db_index, &local_group).await {
+            Ok(needs_barrier) => *local_barrier_pending |= needs_barrier,
+            Err(()) => local_append_failed = true,
         }
     }
 
@@ -1708,7 +1652,7 @@ async fn coordinate_mset(
     let mut leg_err: Option<Frame> = None;
     // Whether any part of the MSET ran: the local slice, or a remote leg
     // that answered without an error.
-    let mut applied_parts = usize::from(groups.contains_key(&my_shard));
+    let mut applied_parts = usize::from(!local_group.is_empty());
     for reply_rx in pending_shards {
         match recv_reply_bounded(reply_rx).await {
             Ok(frames) => match frames.into_iter().find(|f| matches!(f, Frame::Error(_))) {
@@ -1736,6 +1680,122 @@ async fn coordinate_mset(
         return refused_leg_error(err, applied_parts > 0);
     }
     Frame::SimpleString(Bytes::from_static(b"OK"))
+}
+
+/// The bytes of a key/value argument: a bulk or simple string, else `None`
+/// (the argument shape every multi-key coordinator accepts).
+#[inline]
+fn arg_bytes(frame: &Frame) -> Option<&Bytes> {
+    match frame {
+        Frame::BulkString(b) | Frame::SimpleString(b) => Some(b),
+        _ => None,
+    }
+}
+
+/// Split `args` into one sub-command per owner shard (moon#1184).
+///
+/// `args` is a run of `stride`-sized items whose first element is the key
+/// (`stride` 2 for `k v` pairs, 1 for bare keys); every argument must already
+/// have passed [`arg_bytes`]. Returns `num_shards` groups indexed by shard
+/// id: empty for a shard that owns none of the keys, otherwise
+/// `[name, item, item, …]` in argument order — so the owner applies its items
+/// in the order the client sent them, and duplicates stay together on the
+/// one shard that owns them (`EXISTS k k` still counts 2, `DEL k k` 1).
+fn group_by_owner(
+    name: &'static [u8],
+    args: &[Frame],
+    stride: usize,
+    num_shards: usize,
+) -> Vec<Vec<Frame>> {
+    let mut groups: Vec<Vec<Frame>> = (0..num_shards).map(|_| Vec::new()).collect();
+    for item in args.chunks(stride) {
+        let Some(key) = item.first().and_then(arg_bytes) else {
+            continue;
+        };
+        let group = &mut groups[key_to_shard(key, num_shards)];
+        if group.is_empty() {
+            group.reserve(1 + args.len() / num_shards.max(1));
+            group.push(bulk_static(name));
+        }
+        group.extend_from_slice(item);
+    }
+    groups
+}
+
+/// Send each non-empty `groups[shard]` (never `my_shard`'s — the caller
+/// takes that one out first) to its owner as ONE `MultiExecute`
+/// sub-command, in ascending shard order. Returns the reply receivers.
+async fn send_owner_legs(
+    groups: Vec<Vec<Frame>>,
+    my_shard: usize,
+    db_index: usize,
+    dispatch_tx: &Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
+    spsc_notifiers: &[Arc<channel::Notify>],
+) -> Vec<channel::OneshotReceiver<Vec<Frame>>> {
+    let mut pending = Vec::with_capacity(groups.iter().filter(|g| !g.is_empty()).count());
+    for (shard_id, group) in groups.into_iter().enumerate() {
+        if group.is_empty() {
+            continue;
+        }
+        debug_assert_ne!(shard_id, my_shard, "the local group is run in-process");
+        // The routing key is informational on this arm; the first key names
+        // the leg in logs and admission accounting.
+        let routing_key = group
+            .get(1)
+            .and_then(arg_bytes)
+            .cloned()
+            .unwrap_or_default();
+        let (reply_tx, reply_rx) = channel::oneshot();
+        let msg = ShardMessage::MultiExecute {
+            db_index,
+            commands: vec![(routing_key, Frame::Array(group.into()))],
+            reply_tx,
+        };
+        let _ = spsc_send(dispatch_tx, my_shard, shard_id, msg, spsc_notifiers).await;
+        pending.push(reply_rx);
+    }
+    pending
+}
+
+/// Persist a coordinator LOCAL leg whose whole sub-command is `group`
+/// (`[name, args…]`, every key owned by `my_shard`) — see
+/// [`persist_local_leg`]. Skips the serialization when nothing would take
+/// the record (no AOF pool and no live replica).
+async fn persist_local_group(
+    aof_pool: Option<&Arc<crate::persistence::aof::AofWriterPool>>,
+    repl_state: ReplStateRef<'_>,
+    my_shard: usize,
+    db_index: usize,
+    group: &[Frame],
+) -> Result<bool, ()> {
+    if aof_pool.is_none() && !crate::replication::state::fanout_active_for(repl_state) {
+        return Ok(false);
+    }
+    let serialized = serialize_command_parts(group);
+    // Stamped before the append, in the same synchronous stretch as the
+    // caller's apply: the append below may park before it enqueues (#455).
+    let stamp = local_fold_stamp(aof_pool, my_shard);
+    persist_local_leg(aof_pool, repl_state, my_shard, db_index, serialized, stamp).await
+}
+
+/// RESP-serialize a command given as its parts — the bytes
+/// `aof::serialize_command(&Frame::Array(parts))` produces, without first
+/// copying the argv into an owned `Frame::Array`.
+fn serialize_command_parts(parts: &[Frame]) -> Bytes {
+    // A size hint, not an exact length: bulk payloads plus their headers.
+    let hint = 16
+        + parts
+            .iter()
+            .map(|p| arg_bytes(p).map_or(16, |b| b.len() + 16))
+            .sum::<usize>();
+    let mut buf = bytes::BytesMut::with_capacity(hint);
+    buf.extend_from_slice(b"*");
+    buf.extend_from_slice(itoa::Buffer::new().format(parts.len()).as_bytes());
+    buf.extend_from_slice(b"\r\n");
+    for part in parts {
+        crate::protocol::serialize::serialize(part, &mut buf);
+    }
+    buf.freeze()
 }
 
 /// Coordinate MSETNX across shards.
@@ -1840,10 +1900,23 @@ async fn coordinate_msetnx(
     }
 }
 
-/// Coordinate DEL/UNLINK/EXISTS with multiple keys across shards using VLL pattern.
+/// The canonical, static spelling of a command this coordinator sums over
+/// (`DEL`, `UNLINK`, `EXISTS`, `TOUCH`), matched case-insensitively. Replaces
+/// a per-call `to_ascii_uppercase` allocation (moon#1184).
+fn summed_command_name(cmd: &[u8]) -> Option<&'static [u8]> {
+    [&b"DEL"[..], b"UNLINK", b"EXISTS", b"TOUCH"]
+        .into_iter()
+        .find(|name| cmd.eq_ignore_ascii_case(name))
+}
+
+/// Coordinate DEL/UNLINK/EXISTS/TOUCH with multiple keys across shards
+/// using VLL pattern.
 ///
-/// Groups keys by shard in ascending order (BTreeMap), dispatches sub-commands
-/// per shard via MultiExecute, sums integer results.
+/// Groups keys by owner shard in ascending order and sends each remote owner
+/// ONE `<CMD> k1 k2 …` (moon#1184 — it used to be one sub-command per key:
+/// per key, a lock acquire, an AOF record and a replication record on the
+/// owner), runs the local slice in-process, and sums the integer replies.
+#[allow(clippy::too_many_arguments)]
 async fn coordinate_multi_del_or_exists(
     cmd: &[u8],
     args: &[Frame],
@@ -1859,44 +1932,31 @@ async fn coordinate_multi_del_or_exists(
     local_barrier_pending: &mut bool,
     _response_pool: &(), // placeholder — coordinator uses oneshot internally
 ) -> Frame {
-    let cmd_upper = cmd.to_ascii_uppercase();
+    let Some(name) = summed_command_name(cmd) else {
+        return Frame::Error(Bytes::from_static(
+            b"ERR multi-key coordinator: unsupported command",
+        ));
+    };
     // DEL/UNLINK mutate and must persist their in-process legs; EXISTS/TOUCH
     // read (TOUCH updates access time only — never AOF-logged, like Redis).
-    let is_delete = cmd_upper == b"DEL" || cmd_upper == b"UNLINK";
+    let is_delete = name == b"DEL" || name == b"UNLINK";
 
-    // Group keys by shard in ascending order (BTreeMap = VLL)
-    let mut groups: BTreeMap<usize, Vec<Frame>> = BTreeMap::new();
-    for arg in args {
-        if let Some(key) = extract_key(arg) {
-            let shard = key_to_shard(&key, num_shards);
-            groups.entry(shard).or_default().push(arg.clone());
-        }
-    }
+    // One `<CMD> k …` per owner, ascending shard order (VLL); name first.
+    let mut groups = group_by_owner(name, args, 1, num_shards);
+    let owners = groups.iter().filter(|g| !g.is_empty()).count();
 
     // Fast path: all keys on local shard. `run_local` also runs the
     // index/queue hooks (moon#1162) — `cmd_dispatch` alone left the deleted
     // documents in every vector index.
-    if groups.len() == 1 && groups.contains_key(&my_shard) {
+    if owners == 1 && !groups[my_shard].is_empty() {
         let resp = run_local(shard_databases, db_index, cached_clock, cmd, args);
         // v3-5 carried gap: the in-process DEL/UNLINK never reached the AOF —
         // deleted keys RESURRECTED from the seed writes on restart. Persist
         // only when something was actually removed (n=0 replays identically
         // without a record).
         if is_delete && matches!(resp, Frame::Integer(n) if n > 0) {
-            let mut parts: Vec<Frame> = Vec::with_capacity(args.len() + 1);
-            parts.push(Frame::BulkString(Bytes::from(cmd_upper.clone())));
-            parts.extend_from_slice(args);
-            let serialized =
-                crate::persistence::aof::serialize_command(&Frame::Array(parts.into()));
-            match persist_local_leg(
-                aof_pool,
-                repl_state,
-                my_shard,
-                db_index,
-                serialized,
-                local_fold_stamp(aof_pool, my_shard),
-            )
-            .await
+            match persist_local_group(aof_pool, repl_state, my_shard, db_index, &groups[my_shard])
+                .await
             {
                 Ok(needs_barrier) => *local_barrier_pending |= needs_barrier,
                 Err(()) => {
@@ -1909,71 +1969,51 @@ async fn coordinate_multi_del_or_exists(
         return resp;
     }
 
-    let mut total_count: i64 = 0;
-    let mut pending_shards: Vec<channel::OneshotReceiver<Vec<Frame>>> = Vec::new();
+    // Every remote leg is sent BEFORE the local slice runs.
+    let local_group = std::mem::take(&mut groups[my_shard]);
+    let pending_shards =
+        send_owner_legs(groups, my_shard, db_index, dispatch_tx, spsc_notifiers).await;
 
-    for (shard_id, key_args) in &groups {
-        if *shard_id == my_shard {
-            // moon#1162: through `run_local`, so this slice's deleted
-            // documents are tombstoned like the remote slices' are.
-            let result = run_local(shard_databases, db_index, cached_clock, cmd, key_args);
-            if let Frame::Integer(n) = result {
-                total_count += n;
-                // v3-5 carried gap: persist the local slice (synthesized over
-                // ONLY the keys this shard owns — remote slices persist on
-                // their owners via MultiExecute). Skip when nothing removed.
-                if is_delete && n > 0 {
-                    let mut parts: Vec<Frame> = Vec::with_capacity(key_args.len() + 1);
-                    parts.push(Frame::BulkString(Bytes::from(cmd_upper.clone())));
-                    parts.extend_from_slice(key_args);
-                    let serialized =
-                        crate::persistence::aof::serialize_command(&Frame::Array(parts.into()));
-                    match persist_local_leg(
-                        aof_pool,
-                        repl_state,
-                        my_shard,
-                        db_index,
-                        serialized,
-                        local_fold_stamp(aof_pool, my_shard),
-                    )
+    let mut total_count: i64 = 0;
+    if !local_group.is_empty() {
+        // moon#1162: through `run_local`, so this slice's deleted
+        // documents are tombstoned like the remote slices' are.
+        let result = run_local(
+            shard_databases,
+            db_index,
+            cached_clock,
+            name,
+            &local_group[1..],
+        );
+        if let Frame::Integer(n) = result {
+            total_count += n;
+            // v3-5 carried gap: persist the local slice (synthesized over
+            // ONLY the keys this shard owns — remote slices persist on
+            // their owners via MultiExecute). Skip when nothing removed.
+            if is_delete && n > 0 {
+                match persist_local_group(aof_pool, repl_state, my_shard, db_index, &local_group)
                     .await
-                    {
-                        Ok(needs_barrier) => *local_barrier_pending |= needs_barrier,
-                        Err(()) => {
-                            return Frame::Error(Bytes::from_static(
-                                crate::persistence::aof::AOF_FSYNC_ERR,
-                            ));
+                {
+                    Ok(needs_barrier) => *local_barrier_pending |= needs_barrier,
+                    Err(()) => {
+                        // Drain the dispatched legs first: their owners apply
+                        // them whether or not this shard answers.
+                        for reply_rx in pending_shards {
+                            let _ = recv_reply_bounded(reply_rx).await;
                         }
+                        return Frame::Error(Bytes::from_static(
+                            crate::persistence::aof::AOF_FSYNC_ERR,
+                        ));
                     }
                 }
             }
-        } else {
-            let (reply_tx, reply_rx) = channel::oneshot();
-            let commands: Vec<(Bytes, Frame)> = key_args
-                .iter()
-                .map(|arg| {
-                    let key = extract_key(arg).unwrap_or_default();
-                    let cmd_frame = Frame::Array(framevec![
-                        Frame::BulkString(Bytes::from(cmd_upper.clone())),
-                        arg.clone(),
-                    ]);
-                    (key, cmd_frame)
-                })
-                .collect();
-            let msg = ShardMessage::MultiExecute {
-                db_index,
-                commands,
-                reply_tx,
-            };
-            let _ = spsc_send(dispatch_tx, my_shard, *shard_id, msg, spsc_notifiers).await;
-            pending_shards.push(reply_rx);
         }
     }
 
     // Every leg is drained even after an error, so the reply can say
     // whether any part of the command ran.
     let mut leg_err: Option<Frame> = None;
-    let mut applied_parts = usize::from(groups.contains_key(&my_shard));
+    let mut applied_parts = usize::from(!local_group.is_empty());
     for reply_rx in pending_shards {
         match recv_reply_bounded(reply_rx).await {
             Ok(frames) => {

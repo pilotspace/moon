@@ -68,6 +68,15 @@ pub(crate) fn hook_kind(cmd: &[u8]) -> HookKind {
     }
 }
 
+/// Whether `reply` proves a `DEL`/`UNLINK` removed nothing, so there is
+/// nothing to log or replicate (redis propagates a delete only when it
+/// deleted something). The coordinator's merged per-owner `DEL k1 k2 …`
+/// legs (moon#1184) would otherwise log one no-op record per owner shard.
+#[inline]
+pub(crate) fn deleted_nothing(cmd: &[u8], reply: &Frame) -> bool {
+    matches!(reply, Frame::Integer(0)) && hook_kind(cmd) == HookKind::Delete
+}
+
 /// Run the index and queue hooks `cmd args..` owes after it executed against
 /// database `db_index` of this shard and answered `reply`.
 ///
@@ -139,6 +148,15 @@ mod tests {
         assert_eq!(hook_kind(b"HDEL"), HookKind::Hdel);
         assert_eq!(hook_kind(b"flushdb"), HookKind::FlushDb);
         assert_eq!(hook_kind(b"FLUSHALL"), HookKind::FlushAll);
+    }
+
+    #[test]
+    fn deleted_nothing_only_for_a_zero_delete() {
+        assert!(deleted_nothing(b"DEL", &Frame::Integer(0)));
+        assert!(deleted_nothing(b"unlink", &Frame::Integer(0)));
+        assert!(!deleted_nothing(b"DEL", &Frame::Integer(2)));
+        assert!(!deleted_nothing(b"HDEL", &Frame::Integer(0)));
+        assert!(!deleted_nothing(b"SREM", &Frame::Integer(0)));
     }
 
     #[test]

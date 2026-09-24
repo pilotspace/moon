@@ -1300,8 +1300,12 @@ pub(crate) fn handle_shard_message_shared(
                     if is_write && !matches!(frame, crate::protocol::Frame::Error(_)) {
                         // Skip the serialization alloc when the fanout would
                         // no-op (persistence + replication all off) — it was
-                        // pure waste on every cross-shard write.
-                        if wal_fanout_has_work(wal_writer, replica_txs, aof_pool, wal_kv_log) {
+                        // pure waste on every cross-shard write. moon#1184: a
+                        // merged `DEL k1 k2 …` leg that deleted nothing has
+                        // nothing to log either (redis propagates no such DEL).
+                        if wal_fanout_has_work(wal_writer, replica_txs, aof_pool, wal_kv_log)
+                            && !crate::shard::write_hooks::deleted_nothing(cmd, &frame)
+                        {
                             // moon#825: the record is derived from the REPLY, never the
                             // verbatim frame — `SPOP`/`XADD *` and the relative-TTL family
                             // do not reproduce themselves on replay. No record means the reply

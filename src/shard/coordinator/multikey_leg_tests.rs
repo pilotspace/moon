@@ -10,6 +10,9 @@
 //! - moon#1228: an armed BGSAVE epoch must capture the pre-image of every key
 //!   an `MSET` local leg overwrites (the all-local fast path and the local
 //!   slice of a spanning `MSET`).
+//! - moon#1184: a spanning `MSET`/`DEL`/`UNLINK`/`EXISTS` sends each remote
+//!   owner ONE sub-command over all its keys, not one per key, and the
+//!   replies still combine to the client's answer.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -160,6 +163,47 @@ impl TwoShards {
             &(),
         ))
     }
+}
+
+impl TwoShards {
+    fn multi(&self, cmd: &[u8], args: &[Frame]) -> Frame {
+        let clock = CachedClock::new();
+        let mut barrier = false;
+        block_on_with_timer(super::coordinate_multi_del_or_exists(
+            cmd,
+            args,
+            0,
+            2,
+            0,
+            &self.shard_databases,
+            &self.dispatch_tx,
+            &self.notifiers,
+            &clock,
+            None,
+            &None,
+            &mut barrier,
+            &(),
+        ))
+    }
+
+    /// The sub-commands the fake shard received, one `Vec` per message.
+    fn messages(&self) -> Vec<SeenMessage> {
+        self.seen.lock().clone()
+    }
+}
+
+/// `[name, args…]` of a sub-command frame, as byte strings.
+fn argv(command: &Frame) -> Vec<Bytes> {
+    let Frame::Array(parts) = command else {
+        panic!("sub-command is not an array: {command:?}");
+    };
+    parts
+        .iter()
+        .map(|p| match p {
+            Frame::BulkString(b) => b.clone(),
+            other => panic!("non-bulk argument {other:?}"),
+        })
+        .collect()
 }
 
 impl Drop for TwoShards {
@@ -338,4 +382,106 @@ fn spanning_mset_local_slice_captures_every_pre_image() {
         sorted(&remote),
         "the remote leg carries the remote keys"
     );
+}
+
+/// moon#1184: the remote slice of a spanning MSET is ONE `MSET k v …` in the
+/// client's argument order — not one `SET` per pair (per pair the owner took
+/// its lock, serialized an AOF record and appended a replication record).
+#[test]
+fn spanning_mset_sends_one_mset_per_remote_owner() {
+    let local = keys_on(0, 2, 2, "m");
+    let remote = keys_on(1, 2, 5, "m");
+    let two = TwoShards::new(&[]);
+    // Interleave local and remote keys: argument order must survive grouping.
+    let order = [
+        &remote[0], &local[0], &remote[1], &remote[2], &local[1], &remote[3], &remote[4],
+    ];
+    let mut args = Vec::new();
+    for (i, k) in order.iter().enumerate() {
+        args.push(Frame::BulkString((*k).clone()));
+        args.push(Frame::BulkString(Bytes::from(format!("v{i}"))));
+    }
+
+    assert_eq!(
+        two.mset(&args),
+        Frame::SimpleString(Bytes::from_static(b"OK"))
+    );
+
+    let messages = two.messages();
+    assert_eq!(messages.len(), 1, "one message to the one remote owner");
+    assert_eq!(
+        messages[0].len(),
+        1,
+        "one sub-command per owner, not one per key: {:?}",
+        messages[0]
+    );
+    let mut want = vec![Bytes::from_static(b"MSET")];
+    for (i, k) in order.iter().enumerate() {
+        if remote.contains(k) {
+            want.push((*k).clone());
+            want.push(Bytes::from(format!("v{i}")));
+        }
+    }
+    assert_eq!(
+        argv(&messages[0][0]),
+        want,
+        "the owner's pairs, in argument order"
+    );
+    // The local slice was applied here.
+    crate::shard::slice::with_shard_db(0, |db| {
+        assert_eq!(
+            db.get(&local[0])
+                .and_then(|e| e.value.as_bytes().map(<[u8]>::to_vec)),
+            Some(b"v1".to_vec())
+        );
+    });
+}
+
+/// moon#1184: DEL/UNLINK/EXISTS/TOUCH send each remote owner ONE
+/// `<CMD> k1 k2 …`, and the integer replies still sum to the client's count —
+/// duplicates included (`EXISTS k k` counts 2).
+#[test]
+fn spanning_del_family_sends_one_sub_command_per_remote_owner_and_sums() {
+    let local = keys_on(0, 2, 3, "d");
+    let remote = keys_on(1, 2, 4, "d");
+    for (cmd, name) in [
+        (&b"del"[..], &b"DEL"[..]),
+        (b"UNLINK", b"UNLINK"),
+        (b"exists", b"EXISTS"),
+        (b"TOUCH", b"TOUCH"),
+    ] {
+        // local[0] and local[1] exist on shard 0; local[2] does not.
+        let two = TwoShards::new(&[(&local[0], b"x"), (&local[1], b"y")]);
+        let mut args: Vec<Frame> = Vec::new();
+        for k in [
+            &local[0], &remote[0], &remote[1], &local[1], &remote[2], &local[2], &remote[3],
+        ] {
+            args.push(Frame::BulkString(k.clone()));
+        }
+        // A duplicate remote key: counted twice by EXISTS/TOUCH, and the
+        // fake owner counts every key it is sent.
+        args.push(Frame::BulkString(remote[0].clone()));
+
+        // 2 local hits + 5 remote keys the fake owner counts.
+        assert_eq!(two.multi(cmd, &args), Frame::Integer(2 + 5), "{cmd:?}");
+
+        let messages = two.messages();
+        assert_eq!(
+            messages.len(),
+            1,
+            "{cmd:?}: one message to the remote owner"
+        );
+        assert_eq!(
+            messages[0].len(),
+            1,
+            "{cmd:?}: one sub-command, not one per key"
+        );
+        let mut want = vec![Bytes::from_static(name)];
+        want.extend([&remote[0], &remote[1], &remote[2], &remote[3], &remote[0]].map(Clone::clone));
+        assert_eq!(
+            argv(&messages[0][0]),
+            want,
+            "{cmd:?}: remote keys in argument order"
+        );
+    }
 }
