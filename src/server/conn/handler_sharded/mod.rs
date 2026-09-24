@@ -3629,7 +3629,10 @@ pub(crate) async fn handle_connection_sharded_inner<
                 // c10k W1: shrink floor lowered 64 KiB → 16 KiB (see
                 // super::util::IO_BUF_SHRINK_TRIGGER). moon#1179 item 4: with
                 // hysteresis, so large values every batch do not regrow and
-                // re-copy the buffers on every request.
+                // re-copy the buffers on every request. moon#1227 review: this
+                // handler has no idle downshift, so this batch end is the last
+                // chance before the connection may go quiet — past
+                // `IO_BUF_SHRINK_CEILING` the governor shrinks at once.
                 if write_shrink.should_shrink(write_buf.capacity(), write_buf.len()) {
                     write_buf = BytesMut::with_capacity(8192);
                 }

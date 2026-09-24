@@ -4891,7 +4891,9 @@ pub(crate) async fn handle_connection_sharded_monoio<
         // moon#1179 item 4: with hysteresis — only after a streak of batches
         // that left the big buffer mostly unused, so a client sending large
         // values every batch no longer regrows (and re-copies) its buffer
-        // 8 -> 16 -> ... -> 128 KiB on every request.
+        // 8 -> 16 -> ... -> 128 KiB on every request. Past
+        // `IO_BUF_SHRINK_CEILING` a buffer is given back at once (moon#1227
+        // review; the idle downshift covers the rest of an idle connection).
         if read_shrink.should_shrink(read_buf.capacity(), read_high_water.max(read_buf.len())) {
             let remaining = read_buf.split();
             read_buf = BytesMut::with_capacity(8192);

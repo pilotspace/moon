@@ -282,8 +282,14 @@ pub(crate) const IO_BUF_SHRINK_TRIGGER: usize = 16384;
 /// before [`IoBufShrink`] gives its capacity back.
 pub(crate) const IO_BUF_SHRINK_AFTER_BATCHES: u32 = 8;
 
+/// Capacity above which [`IoBufShrink`] gives an I/O buffer back at EVERY batch
+/// end, used or not (moon#1227 review). The hysteresis only ever acts at a
+/// batch end, so a connection that goes quiet right after a large value would
+/// otherwise keep the buffer for as long as it stays open.
+pub(crate) const IO_BUF_SHRINK_CEILING: usize = 1024 * 1024;
+
 /// Batch-end shrink governor for a connection's read or write buffer, with
-/// hysteresis (moon#1179 item 4).
+/// hysteresis (moon#1179 item 4) below a hard ceiling (moon#1227 review).
 ///
 /// The old rule shrank on EVERY batch end whose buffer capacity exceeded
 /// [`IO_BUF_SHRINK_TRIGGER`]. A client sending one 64 KiB `SET` per batch
@@ -294,8 +300,16 @@ pub(crate) const IO_BUF_SHRINK_AFTER_BATCHES: u32 = 8;
 /// needs the shrink to happen once the buffer has STOPPED being used, so:
 /// a batch that used more than half the trigger resets the streak, and the
 /// buffer is shrunk after [`IO_BUF_SHRINK_AFTER_BATCHES`] consecutive batches
-/// that did not. An idle connection is covered separately and sooner by the
-/// idle downshift, which releases empty buffers outright.
+/// that did not.
+///
+/// A streak needs batches, and an idle connection has none. On monoio the
+/// idle downshift releases an idle connection's empty buffers after about a
+/// second; the tokio handler has no idle downshift, so there a buffer the
+/// streak never reached stayed allocated until disconnect. Above
+/// [`IO_BUF_SHRINK_CEILING`] the buffer is therefore shrunk at every batch end
+/// on both runtimes: an idle connection holds at most the ceiling, and a
+/// client that really does send values past it every batch pays a regrow
+/// that copies no more than the value it is sending.
 #[derive(Debug, Default)]
 pub(crate) struct IoBufShrink {
     small_batches: u32,
@@ -307,6 +321,10 @@ impl IoBufShrink {
     /// "shrink it now".
     #[inline]
     pub(crate) fn should_shrink(&mut self, capacity: usize, used: usize) -> bool {
+        if capacity > IO_BUF_SHRINK_CEILING {
+            self.small_batches = 0;
+            return true;
+        }
         if capacity <= IO_BUF_SHRINK_TRIGGER || used > IO_BUF_SHRINK_TRIGGER / 2 {
             self.small_batches = 0;
             return false;
@@ -387,6 +405,37 @@ mod shrink_tests {
         for _ in 0..100 {
             assert!(!g.should_shrink(IO_BUF_SHRINK_TRIGGER, 0));
         }
+    }
+
+    /// moon#1227 review: the hysteresis acts only at batch ends, so a buffer
+    /// grown past the ceiling by one large value is given back at the end of
+    /// THAT batch — it must not wait for a streak an idle connection (tokio
+    /// has no idle downshift) never produces. Below the ceiling nothing
+    /// changes, and the ceiling shrink restarts the streak.
+    #[test]
+    fn io_buf_shrink_releases_past_the_ceiling_at_once() {
+        let mut g = IoBufShrink::default();
+        let huge = IO_BUF_SHRINK_CEILING + 1;
+        // Used every batch or not: shrunk at the first batch end.
+        assert!(g.should_shrink(huge, huge));
+        assert!(g.should_shrink(4 * IO_BUF_SHRINK_CEILING, 0));
+        // At the ceiling a busy buffer is still kept (hysteresis rules)...
+        for _ in 0..100 {
+            assert!(!g.should_shrink(IO_BUF_SHRINK_CEILING, IO_BUF_SHRINK_CEILING));
+        }
+        // ...and an unused one waits for the full streak, which the ceiling
+        // shrink in the middle of it restarts.
+        for _ in 1..IO_BUF_SHRINK_AFTER_BATCHES {
+            assert!(!g.should_shrink(IO_BUF_SHRINK_CEILING, 100));
+        }
+        assert!(g.should_shrink(huge, 100));
+        for i in 1..IO_BUF_SHRINK_AFTER_BATCHES {
+            assert!(
+                !g.should_shrink(IO_BUF_SHRINK_CEILING, 100),
+                "streak survived the ceiling shrink at batch {i}"
+            );
+        }
+        assert!(g.should_shrink(IO_BUF_SHRINK_CEILING, 100));
     }
 
     #[test]
