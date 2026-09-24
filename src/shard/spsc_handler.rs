@@ -1897,7 +1897,11 @@ pub(crate) fn handle_shard_message_shared(
                 keys,
                 reply_tx,
             } = *payload;
-            let versions = crate::shard::slice::with_shard_db(db_index, |db| {
+            // moon#1183: `get_version` is `&self` — the SHARED guard, so a
+            // foreign fast-path reader of this db is not turned away for the
+            // length of a WATCH snapshot (the exclusive hold it took was one
+            // more window for a parked hop, cost model §8.3).
+            let versions = crate::shard::slice::with_shard_db_read(db_index, |db| {
                 keys.iter().map(|k| db.get_version(k)).collect::<Vec<u32>>()
             });
             let _ = reply_tx.send(versions);

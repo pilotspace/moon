@@ -361,8 +361,24 @@ pub(crate) async fn execute_txn_on_owner(
 ///
 /// Returns versions positionally aligned with `keys`; `0` means absent, which
 /// is a real token (watching a key that does not exist and seeing it created
-/// IS a conflict). Local keys are read inline; remote keys are grouped per
-/// owner so a WATCH of N keys costs at most one hop per shard, not per key.
+/// IS a conflict).
+///
+/// moon#1183 — three changes, each removing a park or a hold:
+/// - **Local group**: read under the SHARED guard (`get_version` is `&self`);
+///   the exclusive one it took was a window in which foreign `try_read`s of
+///   this db declined into parked hops (cost model §8.3).
+/// - **Remote owners, fast path first**: `try_foreign_db_read` serves the
+///   read on this thread with one CAS and no park, exactly as the GET fast
+///   path does, gated on the same `--cross-shard-fast-path` switch. The GET
+///   path's other gate — this connection's `pending_mask` — holds trivially
+///   here: `WATCH` is a connection-level intercept, which the ordering guard
+///   (`must_wait_for_pending_remote`) defers whenever the batch has ANY
+///   pending remote work, so no write of this connection is in flight when
+///   this runs and the read cannot overtake one. No `is_hot` gate either:
+///   the owner arm calls the very same `get_version`, which never consults
+///   the cold tier, so both paths answer identically for a spilled key.
+/// - **Declined owners**: every `ReadVersions` is sent before any reply is
+///   awaited, so m owners cost one round trip of latency, not m in series.
 ///
 /// A dead owner yields `0` for its keys, which is fail-SAFE in the only
 /// direction that matters: `0` almost never matches a live key's version, so
@@ -376,40 +392,52 @@ pub(crate) async fn snapshot_versions(
     spsc_notifiers: &[Arc<channel::Notify>],
 ) -> Vec<u32> {
     let mut out = vec![0u32; keys.len()];
-    // owner -> (original indices, keys)
-    let mut groups: std::collections::HashMap<usize, (Vec<usize>, Vec<Bytes>)> =
-        std::collections::HashMap::new();
+    // Owner -> positions in `keys`, indexed by shard (ascending = VLL order).
+    let mut groups: Vec<smallvec::SmallVec<[usize; 4]>> = (0..num_shards.max(1))
+        .map(|_| smallvec::SmallVec::new())
+        .collect();
     for (i, k) in keys.iter().enumerate() {
-        let owner = key_to_shard(k, num_shards);
-        let e = groups.entry(owner).or_default();
-        e.0.push(i);
-        e.1.push(k.clone());
+        groups[key_to_shard(k, num_shards)].push(i);
     }
 
-    for (owner, (idxs, group_keys)) in groups {
-        if owner == my_shard {
-            let versions = crate::shard::slice::with_shard_db(db_index, |db| {
-                group_keys
-                    .iter()
-                    .map(|k| db.get_version(k))
-                    .collect::<Vec<u32>>()
-            });
-            for (slot, v) in idxs.iter().zip(versions) {
-                out[*slot] = v;
+    if !groups[my_shard].is_empty() {
+        crate::shard::slice::with_shard_db_read(db_index, |db| {
+            for &i in &groups[my_shard] {
+                out[i] = db.get_version(&keys[i]);
             }
+        });
+    }
+
+    let fast_path = crate::shard::db_plane::cross_shard_fast_path_enabled();
+    let mut pending = Vec::new();
+    for (owner, idxs) in groups.iter().enumerate() {
+        if owner == my_shard || idxs.is_empty() {
+            continue;
+        }
+        if fast_path
+            && crate::shard::slice::try_foreign_db_read(owner, db_index, |db| {
+                for &i in idxs {
+                    out[i] = db.get_version(&keys[i]);
+                }
+            })
+            .is_some()
+        {
             continue;
         }
         let (reply_tx, reply_rx) = channel::oneshot();
         let payload = crate::shard::dispatch::ReadVersionsPayload {
             db_index,
-            keys: group_keys,
+            keys: idxs.iter().map(|&i| keys[i].clone()).collect(),
             reply_tx,
         };
         let msg = ShardMessage::ReadVersions(Box::new(payload));
         let _ = spsc_send(dispatch_tx, my_shard, owner, msg, spsc_notifiers).await;
+        pending.push((owner, reply_rx));
+    }
+    for (owner, reply_rx) in pending {
         if let Ok(versions) = recv_reply_bounded(reply_rx).await {
-            for (slot, v) in idxs.iter().zip(versions) {
-                out[*slot] = v;
+            for (&i, v) in groups[owner].iter().zip(versions) {
+                out[i] = v;
             }
         }
     }
@@ -4499,3 +4527,6 @@ mod refused_leg_tests;
 
 #[cfg(test)]
 mod multikey_leg_tests;
+
+#[cfg(test)]
+mod watch_versions_tests;
