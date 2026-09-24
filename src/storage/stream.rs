@@ -69,8 +69,24 @@ impl StreamId {
     }
 
     /// Format as "ms-seq" Bytes.
+    ///
+    /// moon#1198: two `itoa` renders into a stack buffer and ONE exact-size
+    /// copy — this runs per entry of every XRANGE/XREAD/XREADGROUP reply.
+    /// `format!` built a growing `String` and `Bytes::from` then allocated a
+    /// shared header for its slack capacity.
     pub fn to_bytes(self) -> Bytes {
-        Bytes::from(format!("{}-{}", self.ms, self.seq))
+        // u64::MAX renders in 20 digits: 20 + 1 + 20.
+        let mut buf = [0u8; 41];
+        let mut ms = itoa::Buffer::new();
+        let ms = ms.format(self.ms).as_bytes();
+        let mut seq = itoa::Buffer::new();
+        let seq = seq.format(self.seq).as_bytes();
+        let dash = ms.len();
+        let end = dash + 1 + seq.len();
+        buf[..dash].copy_from_slice(ms);
+        buf[dash] = b'-';
+        buf[dash + 1..end].copy_from_slice(seq);
+        Bytes::copy_from_slice(&buf[..end])
     }
 }
 
@@ -988,6 +1004,34 @@ pub fn validate_explicit_id_against(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// moon#1198: the rendering is exact for every width, and lands in an
+    /// exact-size buffer — `format!`'s `String` carried slack capacity that
+    /// `Bytes::from` then had to wrap in a second, shared allocation.
+    #[test]
+    fn stream_id_renders_exactly_into_an_exact_buffer() {
+        for (ms, seq) in [
+            (0u64, 0u64),
+            (1, 2),
+            (1_700_000_000_123, 7),
+            (u64::MAX, u64::MAX),
+            (u64::MAX, 0),
+            (9, 10),
+        ] {
+            let b = StreamId { ms, seq }.to_bytes();
+            assert_eq!(b, Bytes::from(format!("{ms}-{seq}")));
+            let len = b.len();
+            let m = b
+                .try_into_mut()
+                .unwrap_or_else(|b| bytes::BytesMut::from(&b[..]));
+            assert_eq!(
+                m.capacity(),
+                len,
+                "{ms}-{seq}: rendered through a buffer with {} B of slack",
+                m.capacity() - len
+            );
+        }
+    }
 
     #[test]
     fn test_stream_id_parse_ms_seq() {
