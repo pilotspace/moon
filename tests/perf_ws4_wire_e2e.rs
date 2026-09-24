@@ -193,3 +193,42 @@ fn pipeline_larger_than_a_read_is_answered_in_order() {
     }
     assert_eq!(got, want);
 }
+
+#[cfg(target_os = "linux")]
+fn rss_kb(pid: u32) -> u64 {
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).expect("proc status");
+    status
+        .lines()
+        .find_map(|l| l.strip_prefix("VmRSS:"))
+        .and_then(|v| v.trim().trim_end_matches("kB").trim().parse().ok())
+        .expect("VmRSS")
+}
+
+/// Reads land in the connection buffer's spare capacity, and that buffer's
+/// allocation stays SHARED while stored collection elements are slices of it
+/// (moon#1160). A read must keep filling that tail instead of allocating a
+/// fresh buffer per read: the first cut of the direct-read change did the
+/// latter and grew RSS by +107 MB for 30K one-at-a-time SADDs (baseline:
+/// +3.8 MB). 20K members at p=1 must stay within a few MB of the data.
+#[cfg(target_os = "linux")]
+#[test]
+fn p1_collection_writes_do_not_pin_a_buffer_per_read() {
+    let moon = spawn_moon("1");
+    let mut c = Conn::open(moon.port);
+    // Warm the connection's buffers, then measure the steady state.
+    for i in 0..200 {
+        c.send(&["SADD", "warm", &format!("w{i}")]);
+    }
+    let before = rss_kb(moon.child.id());
+    for i in 0..20_000 {
+        assert_eq!(
+            c.send(&["SADD", "pins", &format!("member:{i:08}")]),
+            ":1\r\n"
+        );
+    }
+    let grown_mb = (rss_kb(moon.child.id()).saturating_sub(before)) as f64 / 1024.0;
+    assert!(
+        grown_mb < 40.0,
+        "20K p=1 SADDs grew RSS by {grown_mb:.1} MB — a read buffer is being pinned per request"
+    );
+}

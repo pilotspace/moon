@@ -1112,6 +1112,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
         } else {
             idle_park::PARK_BUF_FULL
         };
+        let mut read_grow = false;
         let read_want = if downshifted {
             idle_park::IDLE_PROBE_BUF
         } else {
@@ -1134,6 +1135,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                             preauth,
                         )
                     });
+            read_grow = hinted.is_some();
             hinted.unwrap_or(read_base)
         };
         // c10k A1: a blocking command's peer watch may have pulled bytes the
@@ -1416,7 +1418,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
             if let (true, Some(reg)) = (parkable, idle_reg.as_ref()) {
                 let handle = reg.slot.handle();
                 reg.slot.mark_parked_stage2(ctx.cached_clock.ms());
-                let target = idle_park::spare_read_target::<S>(&mut read_buf, read_want);
+                let target = idle_park::spare_read_target::<S>(&mut read_buf, read_want, read_grow);
                 let (result, returned_buf) = stream.idle_park_read(target, handle).await;
                 reg.slot.mark_unparked();
                 read_buf = returned_buf.into_inner();
@@ -1466,7 +1468,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                     }
                 }
             } else {
-                let target = idle_park::spare_read_target::<S>(&mut read_buf, read_want);
+                let target = idle_park::spare_read_target::<S>(&mut read_buf, read_want, read_grow);
                 let (result, returned_buf) = stream.read(target).await;
                 read_buf = returned_buf.into_inner();
                 match result {
@@ -1483,7 +1485,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
             // completion that raced the cancel still delivers its bytes.
             let handle = reg.slot.handle();
             reg.slot.mark_parked(ctx.cached_clock.ms());
-            let target = idle_park::spare_read_target::<S>(&mut read_buf, read_want);
+            let target = idle_park::spare_read_target::<S>(&mut read_buf, read_want, read_grow);
             let (result, returned_buf) = stream.idle_park_read(target, handle).await;
             reg.slot.mark_unparked();
             read_buf = returned_buf.into_inner();
@@ -1517,7 +1519,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 }
             }
         } else {
-            let target = idle_park::spare_read_target::<S>(&mut read_buf, read_want);
+            let target = idle_park::spare_read_target::<S>(&mut read_buf, read_want, read_grow);
             let (result, returned_buf) = stream.read(target).await;
             read_buf = returned_buf.into_inner();
             match result {

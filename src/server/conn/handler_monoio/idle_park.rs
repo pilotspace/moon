@@ -52,6 +52,9 @@ pub(crate) use crate::runtime::conn_park_after_ms as park_after_ms;
 pub(super) const IDLE_PROBE_BUF: usize = 512;
 /// Full rent-buffer size (the pre-W11 constant working size).
 pub(super) const PARK_BUF_FULL: usize = 8192;
+/// Smallest spare tail of a SHARED read buffer still worth reading into
+/// before a fresh allocation is made (see [`spare_read_target`]).
+pub(super) const MIN_READ_SPARE: usize = 1024;
 
 /// Per-connection shared state between the handler task and the shard chore.
 pub(super) struct IdleSlot {
@@ -262,14 +265,33 @@ pub(super) fn downshift_idle_buffers(
 /// cancel-and-await, loss-free); a `select!` arm, whose losing future DROPS
 /// its buffer, must keep using a separate rent buffer instead.
 ///
-/// `want` is reserved first (so one read can take at least that much); the
-/// read may fill all spare capacity beyond it. For streams that are not
-/// [`IdleParkRead::READ_INTO_UNINIT`] the spare is zeroed first.
+/// Room for `want` bytes is made WITHOUT allocating whenever possible, and the
+/// read may fill all spare capacity beyond it:
+///
+/// 1. enough spare already: read into it;
+/// 2. otherwise `try_reclaim` — when nothing else references the allocation
+///    it is reused in place (the unparsed tail moves to the front);
+/// 3. otherwise the allocation is SHARED — frames of this batch, or stored
+///    collection elements that are slices of it (moon#1160). Allocating a
+///    fresh buffer there would abandon the tail and leave the old buffer
+///    pinned, one per read: measured at p=1 `SADD`, +107 MB RSS for 30K
+///    members against +3.8 MB. So a shared buffer keeps being filled while
+///    at least [`MIN_READ_SPARE`] of its tail is left — what the old
+///    `extend_from_slice` path did — and only `grow` (the incomplete front
+///    frame is known to need `want` more contiguous bytes) or an exhausted
+///    tail allocates.
+///
+/// For streams that are not [`IdleParkRead::READ_INTO_UNINIT`] the spare is
+/// zeroed first.
 pub(super) fn spare_read_target<S: IdleParkRead>(
     read_buf: &mut bytes::BytesMut,
     want: usize,
+    grow: bool,
 ) -> SliceMut<bytes::BytesMut> {
-    read_buf.reserve(want);
+    let spare = read_buf.capacity() - read_buf.len();
+    if spare < want && !read_buf.try_reclaim(want) && (grow || spare < MIN_READ_SPARE) {
+        read_buf.reserve(want);
+    }
     let len = read_buf.len();
     if !S::READ_INTO_UNINIT {
         let cap = read_buf.capacity();
@@ -544,7 +566,7 @@ mod idle_park_tests {
         use monoio::buf::IoBuf;
         let mut rb = bytes::BytesMut::with_capacity(16);
         rb.extend_from_slice(b"*1\r\n$4\r\nPI");
-        let target = spare_read_target::<monoio::net::TcpStream>(&mut rb, 4096);
+        let target = spare_read_target::<monoio::net::TcpStream>(&mut rb, 4096, false);
         assert!(
             rb.is_empty() && rb.capacity() == 0,
             "the buffer moved into the read"
@@ -565,13 +587,59 @@ mod idle_park_tests {
         // The zeroing path (TLS): same view, spare zero-filled, data intact.
         let mut rb = back;
         let target = spare_read_target::<monoio_rustls::ServerTlsStream<monoio::net::TcpStream>>(
-            &mut rb, 64,
+            &mut rb, 64, false,
         );
         let (begin, end) = (target.begin(), target.end());
         let back = target.into_inner();
         assert_eq!(&back[..], b"*1\r\n$4\r\nPI");
         assert_eq!(begin, 10);
         assert!(end - begin >= 64);
+    }
+
+    /// The shared-buffer rule: a buffer still referenced elsewhere (stored
+    /// slices, moon#1160) keeps being FILLED rather than reallocated per
+    /// read — the regression this guards measured +107 MB RSS for 30K p=1
+    /// SADDs — while a unique one is reclaimed in place, and a hinted large
+    /// frame (`grow`) still gets its contiguous room.
+    #[test]
+    fn spare_read_target_packs_a_shared_tail_instead_of_reallocating() {
+        type Tcp = monoio::net::TcpStream;
+        let mut rb = bytes::BytesMut::with_capacity(PARK_BUF_FULL);
+        rb.extend_from_slice(&[b'x'; 40]);
+        let pinned = rb.split_to(40).freeze(); // e.g. a stored set member
+        let base = rb.as_ptr() as usize;
+        let spare = rb.capacity();
+        assert!((MIN_READ_SPARE..PARK_BUF_FULL).contains(&spare));
+
+        // Shared + enough tail left: read into the SAME allocation's tail.
+        let target = spare_read_target::<Tcp>(&mut rb, PARK_BUF_FULL, false);
+        rb = target.into_inner();
+        assert_eq!(
+            rb.as_ptr() as usize,
+            base,
+            "a shared buffer was reallocated per read"
+        );
+        assert_eq!(rb.capacity(), spare);
+
+        // A hinted large frame needs contiguous room: grow.
+        let target = spare_read_target::<Tcp>(&mut rb, 64 * 1024, true);
+        rb = target.into_inner();
+        assert!(rb.capacity() >= 64 * 1024);
+        drop(pinned);
+
+        // Unique (nothing else references it): reclaimed in place.
+        let mut rb = bytes::BytesMut::with_capacity(PARK_BUF_FULL);
+        rb.extend_from_slice(&[b'y'; 100]);
+        let base = rb.as_ptr() as usize;
+        drop(rb.split_to(100));
+        let target = spare_read_target::<Tcp>(&mut rb, PARK_BUF_FULL, false);
+        rb = target.into_inner();
+        assert_eq!(
+            rb.as_ptr() as usize,
+            base,
+            "a unique buffer must be reclaimed, not replaced"
+        );
+        assert!(rb.capacity() >= PARK_BUF_FULL);
     }
 
     #[test]
