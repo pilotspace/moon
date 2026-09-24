@@ -1663,7 +1663,7 @@ mod tests {
     ) -> crate::vector::turbo_quant::inner_product::TqProdQueryState {
         crate::vector::turbo_quant::inner_product::prepare_query_prod(
             query,
-            &col.qjl_matrices,
+            &col.qjl_matrices(),
             col.fwht_sign_flips.as_slice(),
             col.padded_dimension as usize,
         )

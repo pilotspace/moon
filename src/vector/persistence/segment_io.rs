@@ -565,25 +565,10 @@ pub fn read_immutable_segment(
         }
     };
 
-    // Reconstruct dense Gaussian QJL matrices from deterministic seeds.
-    // Only generated in Exact mode — Light mode uses sub-centroid reranking instead.
-    const QJL_NUM_PROJECTIONS: usize = 8;
-    let (qjl_matrices, qjl_num_projections) = if build_mode
-        == crate::vector::turbo_quant::collection::BuildMode::Exact
-        && quantization.is_turbo_quant()
-    {
-        let matrices: Vec<Vec<f32>> = (0..QJL_NUM_PROJECTIONS)
-            .map(|m| {
-                crate::vector::turbo_quant::qjl::generate_qjl_matrix(
-                    meta.dimension as usize,
-                    meta.collection_id.wrapping_add(1 + m as u64),
-                )
-            })
-            .collect();
-        (matrices, QJL_NUM_PROJECTIONS)
-    } else {
-        (Vec::new(), 0)
-    };
+    // QJL matrices are seeded by the collection id and only hashed into the
+    // checksum (never materialized, moon#1213).
+    let qjl_num_projections =
+        crate::vector::turbo_quant::collection::qjl_projections_for(build_mode, quantization);
 
     let sub_centroid_table = if quantization.is_turbo_quant() {
         Some(
@@ -611,7 +596,7 @@ pub fn read_immutable_segment(
         codebook: codebook.clone(),
         codebook_boundaries: boundaries.clone(),
         metadata_checksum: meta.metadata_checksum,
-        qjl_matrices,
+        qjl_seed: meta.collection_id,
         qjl_num_projections,
         build_mode,
         sub_centroid_table,

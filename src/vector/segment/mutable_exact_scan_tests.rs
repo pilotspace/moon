@@ -124,11 +124,11 @@ fn exact_scan_estimator_study() {
                 .collect();
             let st = prepare_query_prod(
                 &q,
-                &col.qjl_matrices,
+                &col.qjl_matrices(),
                 col.fwht_sign_flips.as_slice(),
                 padded,
             );
-            let qjl0 = vec![0u8; col.qjl_matrices.len() * dim.div_ceil(8)];
+            let qjl0 = vec![0u8; col.qjl_num_projections * dim.div_ceil(8)];
             let prod: Vec<(f32, usize)> = codes
                 .iter()
                 .enumerate()
@@ -283,10 +283,10 @@ fn prod_estimator_premise_qjl_term_vanishes_at_zero_residual_but_ranking_differs
     let padded = c.padded_dimension as usize;
     let data = clustered(50, dim, 9, 0.5);
     let q = data[3].clone();
-    let st = prepare_query_prod(&q, &c.qjl_matrices, c.fwht_sign_flips.as_slice(), padded);
+    let st = prepare_query_prod(&q, &c.qjl_matrices(), c.fwht_sign_flips.as_slice(), padded);
     let single = dim.div_ceil(8);
-    let zeros = vec![0u8; c.qjl_matrices.len() * single];
-    let ones = vec![0xFFu8; c.qjl_matrices.len() * single];
+    let zeros = vec![0u8; c.qjl_num_projections * single];
+    let ones = vec![0xFFu8; c.qjl_num_projections * single];
     let mut work = vec![0.0f32; padded];
     for v in &data {
         let code = encode_tq_mse_scaled(
@@ -370,7 +370,7 @@ fn recall_pair(
         .collect();
     let cb = c.codebook_16();
     let single = dim.div_ceil(8);
-    let qjl0 = vec![0u8; c.qjl_matrices.len() * single];
+    let qjl0 = vec![0u8; c.qjl_num_projections * single];
     let (mut rp, mut ra) = (0usize, 0usize);
     for qi in 0..queries {
         let mut q: Vec<f32> = data[(qi * 53) % n]
@@ -399,7 +399,7 @@ fn recall_pair(
                 (d, i)
             })
             .collect();
-        let st = prepare_query_prod(&q, &c.qjl_matrices, c.fwht_sign_flips.as_slice(), padded);
+        let st = prepare_query_prod(&q, &c.qjl_matrices(), c.fwht_sign_flips.as_slice(), padded);
         let qn: f32 = q.iter().map(|x| x * x).sum::<f32>().sqrt();
         let prod = codes
             .iter()

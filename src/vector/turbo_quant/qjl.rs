@@ -7,15 +7,32 @@
 /// Generate a d x d random Gaussian matrix (row-major) using LCG PRNG.
 ///
 /// Each element is drawn from approximate N(0, 1) via Box-Muller.
-/// The matrix is stored once per collection (~d^2 * 4 bytes, e.g., 2.25 MB for d=768).
-/// Seed is deterministic for reproducibility.
+/// Seed is deterministic for reproducibility. `d² · 4` bytes (2.25 MB at
+/// d=768): collections no longer hold these (moon#1213) — see
+/// [`for_each_qjl_chunk`] for the allocation-free stream the metadata
+/// checksum uses.
 pub fn generate_qjl_matrix(dim: usize, seed: u64) -> Vec<f32> {
+    let mut matrix = Vec::with_capacity(dim * dim);
+    for_each_qjl_chunk(dim, seed, |chunk| matrix.extend_from_slice(chunk));
+    matrix
+}
+
+/// Stream the `dim * dim` values of [`generate_qjl_matrix`]`(dim, seed)`, in
+/// order, to `sink` in chunks of at most [`QJL_STREAM_CHUNK`] values —
+/// without materializing the matrix. [`generate_qjl_matrix`] is this stream
+/// collected, so the two can never drift apart.
+pub fn for_each_qjl_chunk(dim: usize, seed: u64, mut sink: impl FnMut(&[f32])) {
     let n = dim * dim;
-    let mut matrix = Vec::with_capacity(n);
+    let mut buf = [0.0f32; QJL_STREAM_CHUNK];
+    let mut len = 0usize;
     let mut state = seed;
 
     let mut i = 0;
     while i < n {
+        if len + 2 > QJL_STREAM_CHUNK {
+            sink(&buf[..len]);
+            len = 0;
+        }
         // LCG (Knuth MMIX constants)
         state = state
             .wrapping_mul(6_364_136_223_846_793_005)
@@ -26,18 +43,25 @@ pub fn generate_qjl_matrix(dim: usize, seed: u64) -> Vec<f32> {
             .wrapping_add(1_442_695_040_888_963_407);
         let u2 = (state >> 40) as f32 / (1u64 << 24) as f32;
 
-        let z0 = (-2.0 * u1.ln()).sqrt() * (2.0 * std::f32::consts::PI * u2).cos();
-        let z1 = (-2.0 * u1.ln()).sqrt() * (2.0 * std::f32::consts::PI * u2).sin();
-
-        matrix.push(z0);
+        // Box-Muller; the radius is computed once (same value both times).
+        let r = (-2.0 * u1.ln()).sqrt();
+        let theta = 2.0 * std::f32::consts::PI * u2;
+        buf[len] = r * theta.cos();
+        len += 1;
         i += 1;
         if i < n {
-            matrix.push(z1);
+            buf[len] = r * theta.sin();
+            len += 1;
             i += 1;
         }
     }
-    matrix
+    if len > 0 {
+        sink(&buf[..len]);
+    }
 }
+
+/// Maximum values per [`for_each_qjl_chunk`] callback (16 KiB of f32).
+pub const QJL_STREAM_CHUNK: usize = 4096;
 
 /// Compute sign(S * x) and pack into bits.
 ///
@@ -137,6 +161,50 @@ pub fn qjl_decode_correction(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn qjl_stream_chunks_concatenate_to_the_reference_generator() {
+        // Reference: the pre-moon#1213 generator, verbatim.
+        fn reference(dim: usize, seed: u64) -> Vec<f32> {
+            let n = dim * dim;
+            let mut matrix = Vec::with_capacity(n);
+            let mut state = seed;
+            let mut i = 0;
+            while i < n {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                let u1 = ((state >> 40) as f32 / (1u64 << 24) as f32).max(1e-7);
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                let u2 = (state >> 40) as f32 / (1u64 << 24) as f32;
+                let z0 = (-2.0 * u1.ln()).sqrt() * (2.0 * std::f32::consts::PI * u2).cos();
+                let z1 = (-2.0 * u1.ln()).sqrt() * (2.0 * std::f32::consts::PI * u2).sin();
+                matrix.push(z0);
+                i += 1;
+                if i < n {
+                    matrix.push(z1);
+                    i += 1;
+                }
+            }
+            matrix
+        }
+        // Odd d² (last pair truncated), chunk-boundary sizes, and 0.
+        for (dim, seed) in [(0usize, 1u64), (1, 2), (7, 3), (64, 4), (65, 5), (91, 6)] {
+            let want = reference(dim, seed);
+            let mut got = Vec::new();
+            let mut max_chunk = 0;
+            for_each_qjl_chunk(dim, seed, |c| {
+                max_chunk = max_chunk.max(c.len());
+                got.extend_from_slice(c);
+            });
+            assert!(max_chunk <= QJL_STREAM_CHUNK);
+            let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+            assert_eq!(bits(&got), bits(&want), "dim={dim}");
+            assert_eq!(bits(&generate_qjl_matrix(dim, seed)), bits(&want));
+        }
+    }
 
     #[test]
     fn test_generate_qjl_matrix_deterministic() {
