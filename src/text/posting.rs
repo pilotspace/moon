@@ -328,6 +328,27 @@ impl PostingList {
             .copied()
     }
 
+    /// Call `f(doc, tf)` for every entry in ascending doc-id order, stopping
+    /// early when `f` returns `false` — the term-at-a-time scan (moon#1220):
+    /// the tf column is walked slice by slice alongside the bitmap.
+    #[inline]
+    pub fn for_each_tf(&self, mut f: impl FnMut(u32, u32) -> bool) {
+        let mut ids = self.doc_ids.iter();
+        let runs: &[Run] = self.chunks.as_ref().map_or(&[], |c| &c.runs);
+        let slices =
+            std::iter::once(self.term_freqs.as_slice()).chain(runs.iter().map(|r| r.tf.as_slice()));
+        for slice in slices {
+            for &tf in slice {
+                let Some(doc) = ids.next() else {
+                    return;
+                };
+                if !f(doc, tf) {
+                    return;
+                }
+            }
+        }
+    }
+
     /// Position lists in rank order — empty when positions are not tracked.
     pub fn position_lists(&self) -> impl Iterator<Item = &[u32]> + '_ {
         let flat: &[Vec<u32>] = self.positions.as_deref().unwrap_or(&[]);

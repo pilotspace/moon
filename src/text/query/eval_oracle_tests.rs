@@ -721,6 +721,143 @@ fn differential_search_field_paths_match_head() {
     assert!(nonempty > 300, "only {nonempty} non-empty comparisons");
 }
 
+/// Queries dominated by fuzzy/prefix leaves: bare (the candidates are the expansion's union, so
+/// the cost model picks term-at-a-time), scoped, and combined with AND / OR / grouping / TAG /
+/// NUMERIC / exact terms / a second expansion (candidates narrower than the union).
+fn random_expansion_query(rng: &mut Rng, vocab: &[String]) -> String {
+    let zipf = Zipf::new(vocab.len());
+    let w = |rng: &mut Rng| vocab[zipf.sample(rng)].clone();
+    let p2 = |rng: &mut Rng| w(rng)[..2].to_owned();
+    let p4 = |rng: &mut Rng| {
+        let word = w(rng);
+        word[..word.len().min(4)].to_owned()
+    };
+    match rng.below(14) {
+        0 => format!("{}*", p2(rng)),
+        1 => format!("{}*", p4(rng)),
+        2 => format!("%{}%", w(rng)),
+        3 => format!("%%{}%%", w(rng)),
+        4 => format!("@title:{}*", p2(rng)),
+        5 => format!("@body:{}*", p2(rng)),
+        6 => format!("{}* @tag:{{red}}", p2(rng)),
+        7 => format!("{}* {}", p2(rng), w(rng)),
+        8 => format!("{}* | {}", p2(rng), w(rng)),
+        9 => format!("({}* | {}*) {}", p2(rng), p2(rng), w(rng)),
+        10 => format!(
+            "@num:[{} {}] {}*",
+            rng.below(10),
+            10 + rng.below(15),
+            p2(rng)
+        ),
+        11 => format!("{}* {}*", p2(rng), p2(rng)),
+        12 => format!("%{}% | {}*", w(rng), p2(rng)),
+        _ => format!("the {}* a", p2(rng)),
+    }
+}
+
+/// moon#1220: a wide fuzzy/prefix leaf may be scored term-at-a-time. Forced either way AND left
+/// to the cost model, results must equal HEAD on ids, keys, order, total and score bits — through
+/// `eval_query_counted` (with and without DFS weights) and the `search_field_or` / AS_OF paths.
+#[test]
+fn differential_term_at_a_time_matches_head() {
+    use crate::text::score::{taat_folds, with_forced_taat};
+    let modes = [None, Some(true), Some(false)];
+    let (mut compared, mut nonempty) = (0usize, 0usize);
+    let folds_at_start = taat_folds();
+    let mut auto_folds = 0usize;
+    for (seed, with_fst) in [(41u64, true), (42, false)] {
+        let corpus = build_corpus(seed, 600, with_fst);
+        let idx = &corpus.idx;
+        let schema = QuerySchema::from_index(idx);
+        let mut rng = Rng(seed ^ 0x1220);
+        for _ in 0..70 {
+            let q = random_expansion_query(&mut rng, &corpus.vocab);
+            let Ok(node) = parse_query(q.as_bytes(), &schema) else {
+                continue;
+            };
+            for &k in &[1usize, 10, usize::MAX / 2] {
+                let (want, want_total) = head_eval_query_counted(idx, &node, None, None, k);
+                for force in modes {
+                    let before = taat_folds();
+                    let (got, got_total) =
+                        with_forced_taat(force, || eval_query_counted(idx, &node, None, None, k));
+                    if force.is_none() {
+                        auto_folds += taat_folds() - before;
+                    }
+                    assert_eq!(got_total, want_total, "{q:?} k={k} force={force:?}: total");
+                    assert_same(&format!("{q:?} k={k} force={force:?}"), &got, &want);
+                    compared += 1;
+                    nonempty += usize::from(!want.is_empty());
+                }
+            }
+            let gn = Some(idx.num_docs() * 3 + 11);
+            let mut gdf: HashMap<String, u32> = HashMap::new();
+            for (_, terms) in collect_df_field_terms(&node, idx) {
+                for t in terms {
+                    gdf.insert(t.clone(), 1 + (t.len() as u32 * 5) % 17);
+                }
+            }
+            let (want, want_total) = head_eval_query_counted(idx, &node, Some(&gdf), gn, 7);
+            for force in modes {
+                let (got, got_total) =
+                    with_forced_taat(force, || eval_query_counted(idx, &node, Some(&gdf), gn, 7));
+                assert_eq!(got_total, want_total, "DFS {q:?} force={force:?}: total");
+                assert_same(&format!("DFS {q:?} force={force:?}"), &got, &want);
+            }
+        }
+        // The OR path over expanded ids, plain and AS_OF, per field.
+        for _ in 0..30 {
+            let field = rng.below(2) as usize;
+            let word = corpus.vocab[rng.below(corpus.vocab.len() as u64) as usize].clone();
+            let (probe, modifier) = if rng.below(2) == 0 {
+                (word[..2].to_owned(), TermModifier::Prefix)
+            } else {
+                (word, TermModifier::Fuzzy(1 + rng.below(2) as u8))
+            };
+            let ids = idx.expand_terms(field, &probe, &modifier);
+            let k = [1usize, 10, usize::MAX / 2][rng.below(3) as usize];
+            let lsn = 1 + rng.below(corpus.max_lsn);
+            let oversample = (idx.next_doc_id() as usize).max(k).max(16);
+            let want = head_search_field_or(idx, field, &ids, None, k);
+            let want_as_of = head_as_of(
+                idx,
+                head_search_field_or(idx, field, &ids, None, oversample),
+                k,
+                lsn,
+            );
+            for force in modes {
+                let got =
+                    with_forced_taat(force, || idx.search_field_or(field, &ids, None, None, k));
+                assert_same(&format!("or {probe:?} k={k} force={force:?}"), &got, &want);
+                let got = with_forced_taat(force, || {
+                    idx.search_field_or_as_of(field, &ids, None, None, k, lsn)
+                });
+                assert_same(
+                    &format!("or_as_of {probe:?} lsn={lsn} k={k} force={force:?}"),
+                    &got,
+                    &want_as_of,
+                );
+                nonempty += usize::from(!want.is_empty());
+            }
+        }
+    }
+    assert!(
+        compared > 1000,
+        "compared only {compared} query/k/mode triples"
+    );
+    assert!(nonempty > 700, "only {nonempty} non-empty comparisons");
+    // The comparison is only evidence if both strategies ran: forced-on always folds, and the
+    // cost model must pick term-at-a-time for the bare wide expansions.
+    assert!(
+        taat_folds() - folds_at_start > 500,
+        "term-at-a-time barely ran"
+    );
+    assert!(
+        auto_folds > 30,
+        "the cost model never chose term-at-a-time ({auto_folds})"
+    );
+}
+
 /// The two-pass HEAD evaluator re-ran BM25 for every leaf; the live one must score each matched
 /// doc once. Pinned behaviourally: on a broad single-term query the single pass returns the same
 /// page as HEAD while doing strictly less work — measured as a wall-time ratio on the same corpus
