@@ -250,6 +250,21 @@ pub(crate) fn note_swapdb(a: usize, b: usize) {
     }
 }
 
+/// Every database of this shard is about to be REPLACED wholesale outside
+/// `command::dispatch` (moon#1227 review F6): a replica full resync
+/// (`replication::apply::load_snapshot`) clears each table and loads the
+/// master's RDB in its place. Neither the FLUSH hook in
+/// [`capture_dispatch_pre_image`] nor [`note_swapdb`] sees that, and an
+/// epoch still writing would publish a file mixing this node's epoch-start
+/// data with the master's. Same answer as FLUSHALL: an unfinished epoch is
+/// aborted — the BGSAVE fails loudly and the previous file stays. One
+/// thread-local `bool` load when nothing is armed.
+pub(crate) fn note_table_replace(why: &'static str) {
+    if is_armed() && epoch_unfinished(None) {
+        abort_epoch(why);
+    }
+}
+
 /// A FLUSHDB / FLUSHALL is about to run against `db` (`databases[db_index]`)
 /// while an epoch is armed (moon#1224). `Database::clear` replaces the whole
 /// table, so the epoch-start contents of an unfinished database are gone

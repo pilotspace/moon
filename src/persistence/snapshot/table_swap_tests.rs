@@ -209,6 +209,53 @@ fn shard_db_set_swap_notifies_the_armed_epoch() {
     assert!(snapshot_cow::abort_pending_for_test().is_none());
 }
 
+/// moon#1227 review F6: a replica FULL RESYNC replaces every database of the
+/// shard outside `command::dispatch` — `replication::apply::load_snapshot`
+/// clears each table and loads the master's RDB in its place — so neither
+/// the FLUSH hook nor `ShardDbSet::swap` saw it, and an epoch armed on the
+/// replica published a file mixing its own epoch-start data with the
+/// master's. It must abort exactly like FLUSHALL (BGSAVE fails, the previous
+/// file stays); a resync with nothing armed, or after the epoch finished
+/// writing, changes nothing.
+#[test]
+fn a_replica_full_resync_aborts_an_unfinished_epoch() {
+    let (shared, mut inits) = crate::shard::shared_databases::ShardDatabases::new(vec![vec![
+        Database::new(),
+        Database::new(),
+    ]]);
+    crate::shard::slice::reset_test_shard(crate::shard::slice::ShardSlice::new(inits.remove(0)));
+    crate::shard::slice::with_shard_db(0, |db| preload(db, "replica", 100));
+    let mut master = vec![Database::new(), Database::new()];
+    preload(&mut master[0], "master", 10);
+    let mut rdb = Vec::new();
+    crate::persistence::redis_rdb::write_rdb(&master, &mut rdb);
+
+    snapshot_cow::disarm();
+    snapshot_cow::arm_with_layout(vec![1, 1]);
+    let loaded = crate::replication::apply::load_snapshot(&rdb, &shared).map_err(|e| e.to_string());
+    let aborted = snapshot_cow::abort_pending_for_test();
+    snapshot_cow::disarm();
+    assert_eq!(loaded, Ok(10), "setup: the resync loads the master's keys");
+    assert!(
+        aborted.is_some(),
+        "a full resync under an armed epoch went unnoticed: the file would mix \
+         the replica's epoch-start data with the master's"
+    );
+
+    // Armed, but every database already written: the file is complete and
+    // point-in-time; the resync replays nothing into it. No abort.
+    snapshot_cow::arm_with_layout(vec![1, 1]);
+    snapshot_cow::note_progress(2, 0);
+    assert!(crate::replication::apply::load_snapshot(&rdb, &shared).is_ok());
+    let finished = snapshot_cow::abort_pending_for_test();
+    snapshot_cow::disarm();
+    assert!(finished.is_none(), "a finished epoch must not be failed");
+
+    // Unarmed: free, leaves nothing behind.
+    assert!(crate::replication::apply::load_snapshot(&rdb, &shared).is_ok());
+    assert!(snapshot_cow::abort_pending_for_test().is_none());
+}
+
 /// FLUSHDB of a database the epoch already wrote: the file keeps its
 /// epoch-start contents, and loading it then replaying the logged tail
 /// (the FLUSHDB, later writes) lands exactly on the live keyspace.

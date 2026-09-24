@@ -1001,6 +1001,14 @@ pub(crate) fn load_snapshot(
     // entry PER shard.
     let mq_blobs = redis_rdb::read_moon_aux_all(rdb, redis_rdb::MOON_AUX_MQ_REGISTRY);
     let result: anyhow::Result<usize> = match crate::shard::slice::try_with_shard(|s| {
+        // moon#1227 review F6: this replaces every table outside `dispatch`;
+        // a BGSAVE epoch still writing on this shard (the replica's own
+        // `--save` / BGSAVE) must fail rather than publish a mixed image —
+        // FLUSHALL's answer (moon#1224). This closure runs on the shard
+        // thread, where the epoch's capture state lives.
+        crate::persistence::snapshot_cow::note_table_replace(
+            "a replica full resync replaced databases the snapshot had not finished writing",
+        );
         // Clear-then-load under ONE batch of write guards on every database:
         // a full resync replaces the whole keyspace atomically, so no reader
         // may observe the window where the old contents are gone and the new
