@@ -541,6 +541,9 @@ fn merge_graph_union(
     if let Some((dir, segment_id)) = persist {
         segment_io::write_immutable_segment_staged(dir, segment_id, &merged, collection)
             .map_err(|e| CompactionError::PersistFailed(format!("{e}")))?;
+        // moon#1194: the sidecar now lives in a sealed file — serve it from
+        // the page cache like a reloaded segment instead of the heap.
+        return Ok(segment_io::map_persisted_raw_f16(merged, dir, segment_id));
     }
 
     Ok(merged)

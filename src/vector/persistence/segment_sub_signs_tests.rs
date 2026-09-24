@@ -241,3 +241,33 @@ fn merge_without_signs_or_sidecar_drops_signs_instead_of_zero_filling() {
         "partial signs must not be zero-filled"
     );
 }
+
+#[test]
+fn persisted_compaction_serves_the_f16_sidecar_from_the_mapped_file() {
+    // moon#1194 red test: compaction wrote raw_f16.bin and returned the
+    // segment still heap-`Owned` (2*dim B/vector); only a restart mapped it.
+    let dim = 96;
+    let col = collection(dim);
+    let data = vecs(300, dim, 11);
+    let seg = MutableSegment::new(col.dimension, col.clone());
+    for (i, v) in data.iter().enumerate() {
+        seg.append(i as u64, v, i as u64 + 1);
+    }
+    let frozen = seg.freeze();
+    let heap = compact(&frozen, &col, 4242, None).expect("compact");
+    let tmp = tempfile::tempdir().unwrap();
+    let persisted = compact(&frozen, &col, 4242, Some((tmp.path(), 12))).expect("compact+persist");
+    assert!(!heap.raw_f16_is_mapped());
+    assert!(
+        persisted.raw_f16_is_mapped(),
+        "sidecar must be mapped after persist"
+    );
+    assert_eq!(
+        heap.resident_bytes() - persisted.resident_bytes(),
+        300 * dim * 2,
+        "exactly the sidecar leaves the heap"
+    );
+    assert_eq!(persisted.raw_f16(), heap.raw_f16());
+    let qs: Vec<Vec<f32>> = data.iter().step_by(29).cloned().collect();
+    assert_eq!(search_all(&persisted, &qs), search_all(&heap, &qs));
+}

@@ -208,6 +208,44 @@ pub fn write_immutable_segment_staged(
     Ok(())
 }
 
+/// Swap a freshly persisted segment's heap-owned f16 exact-rerank sidecar
+/// for a read-only memory map of the `raw_f16.bin` just written under
+/// `{root_dir}/segment-{segment_id}/` (moon#1194).
+///
+/// Compaction and merge used to return the segment still `Owned` — 2·dim
+/// bytes per vector of heap (1.5 KB at 768d vs 516 B of TQ4 codes) — while
+/// the same segment reloaded after a restart maps the file, so the
+/// post-compaction RSS of a persisted index sat far above its post-restart
+/// RSS for identical data. The rerank touches only `mult·k` rows per segment
+/// per query. Called only after [`write_immutable_segment_staged`] returned
+/// `Ok` (the directory is fsynced and renamed into place, so the file is
+/// sealed — the `RawF16Store` mmap contract), while the segment is still
+/// uniquely owned. Any failure (map error, size mismatch) keeps the `Owned`
+/// buffer: search is unaffected either way.
+pub(crate) fn map_persisted_raw_f16(
+    segment: ImmutableSegment,
+    root_dir: &Path,
+    segment_id: u64,
+) -> ImmutableSegment {
+    if segment.raw_f16_is_mapped() {
+        return segment;
+    }
+    let Some(halves) = segment.raw_f16().map(<[u16]>::len) else {
+        return segment;
+    };
+    let path = segment_dir(root_dir, segment_id).join("raw_f16.bin");
+    match RawF16Store::map_file(&path, halves) {
+        Ok(Some(store)) => segment.with_raw_f16_store(Some(store)),
+        Ok(None) | Err(_) => {
+            tracing::warn!(
+                "segment-{segment_id}: could not map the just-written raw_f16.bin — \
+                 keeping the heap copy of the exact-rerank sidecar"
+            );
+            segment
+        }
+    }
+}
+
 /// Shared file-writing body for both [`write_immutable_segment`] (writes
 /// directly to the final name) and [`write_immutable_segment_staged`]
 /// (writes to a staging name first). `seg_dir` is the exact target
