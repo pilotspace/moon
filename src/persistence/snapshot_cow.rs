@@ -25,19 +25,24 @@
 //! # Design: capture eagerly, filter at the drain
 //!
 //! The pre-image must be taken at mutation time (only then is the old value
-//! still there), but the "is this segment still pending?" question can be
+//! still there), but the "is this key still pending?" question can be
 //! answered later — because ONLY the event loop's per-tick
-//! `advance_snapshot_segment` ever marks a segment serialized. So:
+//! `advance_snapshot_segment` ever moves the snapshot's hash-space cursor
+//! (moon#1216: pending ⇔ `hash(key) >= cursor` in the current database, a
+//! question no DashTable split can change the answer to). So:
 //!
 //! 1. A snapshot starting on this shard [`arm`]s a thread-local queue.
-//! 2. Every off-loop write path calls [`capture_command_pre_image`] before
-//!    it mutates. Armed: clone the old entry into the queue (first write to
-//!    a key wins — later ones would overwrite the epoch-start value).
-//!    Disarmed (the overwhelmingly common case, no BGSAVE in flight): one
-//!    thread-local `bool` load and return.
+//! 2. Every write path — `command::dispatch`, the routed arms'
+//!    `cow_intercept`, the monoio inline SET, a script's `redis.call`, the
+//!    blocking waker — captures before it mutates, for EVERY key it may
+//!    write (moon#1217). Armed: the old entry, or a tombstone when the key
+//!    does not exist yet (first capture of a key wins — a later one would
+//!    be a post-epoch state). Disarmed (the overwhelmingly common case, no
+//!    BGSAVE in flight): one thread-local `bool` load and return.
 //! 3. The next tick [`drain_into`]s the queue into the live `SnapshotState`
-//!    **before** advancing another segment, dropping entries whose segment
-//!    was already written (their pre-image is already in the file).
+//!    **before** advancing, dropping pre-images whose range was already
+//!    written (the file already holds their epoch-start bytes), and first
+//!    applying any abort a FLUSH*/SWAPDB queued (moon#1224).
 //!
 //! One shard per OS thread, and every producer/consumer here runs on that
 //! shard's thread, so a `thread_local!` IS the per-shard queue — same
