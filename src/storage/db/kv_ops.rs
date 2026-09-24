@@ -18,8 +18,25 @@ impl Database {
     /// (the cold fallback below mutates `self`, so the first borrow cannot
     /// be returned directly): 2 probes on a live hit, 1 on a miss — down
     /// from 3/2 with the previous expiry-check + `is_some()` + get chain.
-    /// No LRU touch on reads (callers requiring LRU updates use `get_mut()`).
+    ///
+    /// Records the access for the eviction policy (moon#1161) — redis's
+    /// `lookupKeyRead`. Metadata commands that redis serves with
+    /// `LOOKUP_NOTOUCH` (`TTL`, `TYPE`, `OBJECT`, …) use [`Self::peek`].
+    #[inline]
     pub fn get(&mut self, key: &[u8]) -> Option<&Entry> {
+        self.lookup(key, true)
+    }
+
+    /// [`Self::get`] WITHOUT recording an access (redis `LOOKUP_NOTOUCH`):
+    /// same lazy-expiry hiding and cold promotion, but `OBJECT IDLETIME` /
+    /// `OBJECT FREQ` do not see this read. For metadata commands and for
+    /// internal lookups that must not look like client traffic.
+    #[inline]
+    pub fn peek(&mut self, key: &[u8]) -> Option<&Entry> {
+        self.lookup(key, false)
+    }
+
+    fn lookup(&mut self, key: &[u8], touch: bool) -> Option<&Entry> {
         let now_ms = self.cached_now_ms;
         enum KeyState {
             Live,
@@ -33,7 +50,13 @@ impl Database {
         };
         match state {
             // Hot path: single re-probe, borrow returned to caller.
-            KeyState::Live => self.data.get(key),
+            KeyState::Live => {
+                let entry = self.data.get(key);
+                if touch && let Some(e) = entry {
+                    e.note_access(crate::storage::eviction::access_tracking(), self.cached_now);
+                }
+                entry
+            }
             KeyState::Expired => {
                 // moon#542: HIDE, don't remove. Deletion belongs to the
                 // active-expiry drain, which emits the keyspace `expired`
@@ -428,8 +451,12 @@ impl Database {
             self.note_lazy_expired(key);
             return None;
         }
-        // Single get_mut: touch LRU + return
+        // Single get_mut: touch LRU + return. moon#1161: under an LFU policy
+        // a write is an access too (redis `lookupKeyWrite`), so the counter
+        // is decayed + incremented before the unconditional stamp below.
+        let tracking = crate::storage::eviction::access_tracking();
         let entry = self.data.get_mut(key)?;
+        entry.note_access(tracking, now);
         entry.set_last_access(now);
         // moon#926: this hands out a raw `&mut Entry`, the broadest mutable
         // handle there is — stamp the WATCH version with it. A miss returns
@@ -490,6 +517,11 @@ impl Database {
         // the hit path, which is deliberate: the counter is a ticket dispenser,
         // not a count, and a gap costs nothing.
         let birth = self.next_birth_version();
+        // moon#1161: under an LFU policy an overwrite keeps (and bumps) the
+        // key's frequency, as redis's `lookupKeyWrite` + `dbSetValue` do —
+        // otherwise every write reset a hot key to `LFU_INIT_VAL`.
+        let tracking = crate::storage::eviction::access_tracking();
+        let now_secs = self.cached_now;
 
         // `insert_or_update` invariant: exactly one of the two closures fires
         // exactly once per call, so the `Cell::take()` below cannot observe
@@ -507,8 +539,18 @@ impl Database {
                 old_cost = entry_overhead(key, existing);
                 old_ttl = existing.expires_at_ms();
                 let new_version = Entry::bump_version(existing.version());
+                let carried_lfu = match tracking {
+                    crate::storage::entry::AccessTracking::Lfu { .. } => {
+                        existing.note_access(tracking, now_secs);
+                        Some(existing.access_counter())
+                    }
+                    _ => None,
+                };
                 *existing = new_entry;
                 existing.set_version(new_version);
+                if let Some(counter) = carried_lfu {
+                    existing.set_access_counter(counter);
+                }
             },
             || {
                 // Miss path: stamp the creation ticket. Constructors all start
@@ -1223,6 +1265,41 @@ impl Database {
         }
     }
 
+    /// `TOUCH` for one key (moon#1161): answer whether it exists (hot,
+    /// cold-only or mid-spill — the same answer as [`Self::exists`]) and
+    /// record an access on a live hot entry.
+    ///
+    /// Unlike an ordinary read this records even when the policy tracks
+    /// nothing: touching is the command's whole purpose, so `OBJECT
+    /// IDLETIME` restarts from zero as it does on redis. One probe.
+    pub fn touch_key(&mut self, key: &[u8]) -> bool {
+        let now_ms = self.cached_now_ms;
+        match self.data.get(key) {
+            None => self.cold_contains_alive(key, now_ms),
+            Some(entry) if entry.is_expired_at(now_ms) => {
+                // Same as `exists`: hide + defer, never shadow a live cold copy.
+                self.note_lazy_expired(key);
+                self.cold_contains_alive(key, now_ms)
+            }
+            Some(entry) => {
+                entry.note_access(touch_tracking(), self.cached_now);
+                true
+            }
+        }
+    }
+}
+
+/// What `TOUCH` records: the policy's tracking, or a plain LRU stamp when the
+/// policy tracks nothing (TOUCH is an explicit request to be recorded).
+#[inline]
+pub(super) fn touch_tracking() -> crate::storage::entry::AccessTracking {
+    match crate::storage::eviction::access_tracking() {
+        crate::storage::entry::AccessTracking::Off => crate::storage::entry::AccessTracking::Lru,
+        tracking => tracking,
+    }
+}
+
+impl Database {
     /// Touch access time of a key for LRU tracking (for reads).
     pub fn touch_access(&mut self, key: &[u8]) {
         let now = self.cached_now;

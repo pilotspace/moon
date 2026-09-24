@@ -2,6 +2,8 @@ use bytes::Bytes;
 use ordered_float::OrderedFloat;
 use rand::RngExt;
 use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::sync::atomic::AtomicU32;
+use std::sync::atomic::Ordering::Relaxed;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::bptree::BPTree;
@@ -450,14 +452,40 @@ pub fn lfu_log_incr(counter: u8, lfu_log_factor: u8) -> u8 {
 /// last_access must yield zero decay, not a near-2^32 elapsed time that would
 /// zero every counter.
 pub fn lfu_decay(counter: u8, last_access: u32, lfu_decay_time: u64) -> u8 {
+    lfu_decay_at(counter, last_access, lfu_decay_time, current_secs())
+}
+
+/// [`lfu_decay`] against a caller-supplied clock (`now` in the same epoch-
+/// seconds domain as `last_access`) — for the read path, which already holds
+/// the shard's cached clock and must not pay a thread-local read per key.
+#[inline]
+pub fn lfu_decay_at(counter: u8, last_access: u32, lfu_decay_time: u64, now: u32) -> u8 {
     if lfu_decay_time == 0 {
         return counter;
     }
-    let now = current_secs();
     let elapsed_secs = now.saturating_sub(last_access) as u64;
     let elapsed_min = elapsed_secs / 60;
     let decay = (elapsed_min / lfu_decay_time).min(u8::MAX as u64) as u8;
     counter.saturating_sub(decay)
+}
+
+/// What a READ records on an entry for the eviction policy (moon#1161).
+///
+/// Derived from the published `maxmemory-policy` (see
+/// `storage::eviction::access_tracking`): `*-lru` policies track recency,
+/// `*-lfu` policies track a decayed Morris counter plus the time it was last
+/// updated, and every other policy (`noeviction`, the default when an
+/// operator sets `--maxmemory 0`; `*-random`; `volatile-ttl`) records
+/// nothing, so a read there costs one relaxed load of the mode and a branch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccessTracking {
+    /// No policy reads access metadata: reads record nothing.
+    Off,
+    /// `allkeys-lru` / `volatile-lru`: reads refresh `last_access`.
+    Lru,
+    /// `allkeys-lfu` / `volatile-lfu`: reads decay + increment the counter
+    /// (`lfu-log-factor`, `lfu-decay-time` minutes) and refresh `last_access`.
+    Lfu { log_factor: u8, decay_time: u64 },
 }
 
 /// First version assigned to a newly created entry. Never 0: `get_version()`
@@ -481,8 +509,8 @@ fn pack_metadata_u32(version: u32, access_counter: u8) -> u32 {
 ///   overflow fix, then W3 used the extra range to store milliseconds instead of seconds —
 ///   PEXPIRE/PEXPIREAT precision previously truncated to whole seconds, expiring keys up to
 ///   999ms EARLY and misreporting PTTL).
-/// - `metadata: u32` (4 bytes, offset 24) -- packed [version:24 | counter:8]
-/// - `last_access_secs: u32` (4 bytes, offset 28) -- full epoch-seconds LRU clock
+/// - `metadata: AtomicU32` (4 bytes, offset 24) -- packed [version:24 | counter:8]
+/// - `last_access_secs: AtomicU32` (4 bytes, offset 28) -- full epoch-seconds LRU clock
 ///   (formerly alignment padding; repurposed so LRU/LFU/IDLETIME are exact
 ///   beyond the old 16-bit field's 18.2h wrap, at zero size cost). The freed
 ///   16 metadata bits widened `version` 8→24 bits, pushing the WATCH/EXEC ABA
@@ -492,19 +520,48 @@ fn pack_metadata_u32(version: u32, access_counter: u8) -> u32 {
 /// Memory overhead per key increases by 8 bytes (1/3 overhead on a 100M-key dataset = ~800 MB).
 /// The correctness gain (no silent TTL overflow, full ms fidelity) outweighs the cost for all
 /// realistic key counts.
+///
+/// ## Why `metadata` and `last_access_secs` are atomics (moon#1161)
+///
+/// A READ must be able to record an access, and reads reach the entry through
+/// `&Entry`: the inline GET and the whole `dispatch_read` family run under the
+/// SHARED guard, and so do foreign shards' fast-path reads of this database.
+/// `AtomicU32` has the size and alignment of `u32`, so the entry stays 32 B.
+/// Every access is `Relaxed`: the fields are statistics — nothing is
+/// published through them — and a plain `mov` on x86_64/aarch64.
+///
+/// The WATCH version shares `metadata` with the LFU counter. It is written
+/// ONLY through `&mut self` (`set_version` / `increment_version`), which
+/// cannot coexist with any `&self` borrow, so the read path's load-modify-
+/// store of the counter byte always writes back the version it loaded.
+/// Two concurrent `&self` recorders can lose one counter increment — harmless
+/// for a probabilistic Morris counter, and never a torn version.
 #[repr(C)]
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct CompactEntry {
     pub value: CompactValue,
     /// Absolute expiry time in Unix milliseconds. 0 = no expiry.
     pub ttl_ms: u64,
     /// Packed metadata: [version:24 | access_counter:8]
-    pub metadata: u32,
+    metadata: AtomicU32,
     /// Last access time, full epoch seconds (`current_secs()` domain).
-    last_access_secs: u32,
+    last_access_secs: AtomicU32,
 }
 
 const _: () = assert!(std::mem::size_of::<CompactEntry>() == 32);
+const _: () = assert!(std::mem::align_of::<AtomicU32>() == std::mem::align_of::<u32>());
+
+impl Clone for CompactEntry {
+    #[inline]
+    fn clone(&self) -> Self {
+        CompactEntry {
+            value: self.value.clone(),
+            ttl_ms: self.ttl_ms,
+            metadata: AtomicU32::new(self.metadata.load(Relaxed)),
+            last_access_secs: AtomicU32::new(self.last_access_secs.load(Relaxed)),
+        }
+    }
+}
 
 /// Type alias for backward compatibility during migration.
 pub type Entry = CompactEntry;
@@ -515,37 +572,100 @@ impl CompactEntry {
     /// Get the version (24-bit, wraps to [`INITIAL_VERSION`], never 0).
     #[inline]
     pub fn version(&self) -> u32 {
-        (self.metadata >> 8) & 0xFF_FFFF
+        (self.metadata.load(Relaxed) >> 8) & 0xFF_FFFF
     }
 
     /// Get the last access time (full u32 epoch seconds).
     #[inline]
     pub fn last_access(&self) -> u32 {
-        self.last_access_secs
+        self.last_access_secs.load(Relaxed)
     }
 
     /// Get the LFU access counter (8-bit Morris counter).
     #[inline]
     pub fn access_counter(&self) -> u8 {
-        (self.metadata & 0xFF) as u8
+        (self.metadata.load(Relaxed) & 0xFF) as u8
     }
 
     /// Set the version (24-bit, truncated to lower 24 bits).
     #[inline]
     pub fn set_version(&mut self, v: u32) {
-        self.metadata = (self.metadata & 0xFF) | ((v & 0xFF_FFFF) << 8);
+        let m = self.metadata.get_mut();
+        *m = (*m & 0xFF) | ((v & 0xFF_FFFF) << 8);
     }
 
     /// Set the last access time (full u32 epoch seconds).
     #[inline]
     pub fn set_last_access(&mut self, t: u32) {
-        self.last_access_secs = t;
+        *self.last_access_secs.get_mut() = t;
     }
 
     /// Set the LFU access counter.
     #[inline]
     pub fn set_access_counter(&mut self, c: u8) {
-        self.metadata = (self.metadata & !0xFF) | (c as u32);
+        let m = self.metadata.get_mut();
+        *m = (*m & !0xFF) | (c as u32);
+    }
+
+    /// Record one access for the eviction policy THROUGH `&self` (moon#1161).
+    ///
+    /// Redis's `lookupKey` does exactly this on every read and write that is
+    /// not `LOOKUP_NOTOUCH`: under an LFU policy it decays the counter by the
+    /// idle minutes, applies one logarithmic increment and stamps the time;
+    /// otherwise it stamps the LRU clock. Before moon#1161 no production read
+    /// path recorded anything, so `allkeys-lru` evicted the least recently
+    /// WRITTEN key and the canonical write-once/read-hot cache lost its
+    /// hottest keys first (0.6% hot-key retention against redis's 100%).
+    ///
+    /// Cost: under `Lru`, one load of a field on the cache line the probe
+    /// already pulled in (`ttl_ms` shares it) and — only when the second
+    /// changed — one store, so a hot key is written at most once a second.
+    /// `Lfu` adds the RNG draw of the Morris increment. `Off` is a branch.
+    #[inline]
+    pub fn note_access(&self, tracking: AccessTracking, now_secs: u32) {
+        match tracking {
+            AccessTracking::Off => {}
+            AccessTracking::Lru => self.stamp_access(now_secs),
+            AccessTracking::Lfu {
+                log_factor,
+                decay_time,
+            } => self.note_access_lfu(now_secs, log_factor, decay_time),
+        }
+    }
+
+    /// LRU stamp: store only when the second changed (keeps a hot key's
+    /// cache line clean between ticks of the clock).
+    #[inline]
+    fn stamp_access(&self, now_secs: u32) {
+        if self.last_access_secs.load(Relaxed) != now_secs {
+            self.last_access_secs.store(now_secs, Relaxed);
+        }
+    }
+
+    /// LFU update: decay by the time since the last update, one Morris
+    /// increment, then stamp. See the type docs for why a plain
+    /// load/modify/store of `metadata` cannot disturb the WATCH version.
+    fn note_access_lfu(&self, now_secs: u32, log_factor: u8, decay_time: u64) {
+        let m = self.metadata.load(Relaxed);
+        let decayed = lfu_decay_at(m as u8, self.last_access(), decay_time, now_secs);
+        let counter = lfu_log_incr(decayed, log_factor);
+        let updated = (m & !0xFF) | u32::from(counter);
+        if updated != m {
+            self.metadata.store(updated, Relaxed);
+        }
+        self.stamp_access(now_secs);
+    }
+
+    /// The LFU counter as `OBJECT FREQ` reports it: decayed to `now_secs`,
+    /// without recording an access (redis `LFUDecrAndReturn`).
+    #[inline]
+    pub fn lfu_frequency_at(&self, decay_time: u64, now_secs: u32) -> u8 {
+        lfu_decay_at(
+            self.access_counter(),
+            self.last_access(),
+            decay_time,
+            now_secs,
+        )
     }
 
     /// Next version after `v`: 24-bit wrap that skips 0 (the WATCH
@@ -620,8 +740,8 @@ impl CompactEntry {
         CompactEntry {
             value: CompactValue::from_redis_value(RedisValue::String(value)),
             ttl_ms: 0,
-            metadata: pack_metadata_u32(INITIAL_VERSION, LFU_INIT_VAL),
-            last_access_secs: current_secs(),
+            metadata: AtomicU32::new(pack_metadata_u32(INITIAL_VERSION, LFU_INIT_VAL)),
+            last_access_secs: AtomicU32::new(current_secs()),
         }
     }
 
@@ -630,8 +750,8 @@ impl CompactEntry {
         CompactEntry {
             value: CompactValue::from_redis_value(RedisValue::String(value)),
             ttl_ms: expires_at_ms,
-            metadata: pack_metadata_u32(INITIAL_VERSION, LFU_INIT_VAL),
-            last_access_secs: current_secs(),
+            metadata: AtomicU32::new(pack_metadata_u32(INITIAL_VERSION, LFU_INIT_VAL)),
+            last_access_secs: AtomicU32::new(current_secs()),
         }
     }
 
@@ -645,8 +765,8 @@ impl CompactEntry {
         CompactEntry {
             value: CompactValue::from_slice(value),
             ttl_ms: 0,
-            metadata: pack_metadata_u32(INITIAL_VERSION, LFU_INIT_VAL),
-            last_access_secs: current_secs(),
+            metadata: AtomicU32::new(pack_metadata_u32(INITIAL_VERSION, LFU_INIT_VAL)),
+            last_access_secs: AtomicU32::new(current_secs()),
         }
     }
 
@@ -655,8 +775,8 @@ impl CompactEntry {
         CompactEntry {
             value: CompactValue::from_slice(value),
             ttl_ms: expires_at_ms,
-            metadata: pack_metadata_u32(INITIAL_VERSION, LFU_INIT_VAL),
-            last_access_secs: current_secs(),
+            metadata: AtomicU32::new(pack_metadata_u32(INITIAL_VERSION, LFU_INIT_VAL)),
+            last_access_secs: AtomicU32::new(current_secs()),
         }
     }
 
@@ -665,8 +785,8 @@ impl CompactEntry {
         CompactEntry {
             value: CompactValue::from_redis_value(RedisValue::Hash(Box::default())),
             ttl_ms: 0,
-            metadata: pack_metadata_u32(INITIAL_VERSION, LFU_INIT_VAL),
-            last_access_secs: current_secs(),
+            metadata: AtomicU32::new(pack_metadata_u32(INITIAL_VERSION, LFU_INIT_VAL)),
+            last_access_secs: AtomicU32::new(current_secs()),
         }
     }
 
@@ -675,8 +795,8 @@ impl CompactEntry {
         CompactEntry {
             value: CompactValue::from_redis_value(RedisValue::List(VecDeque::new())),
             ttl_ms: 0,
-            metadata: pack_metadata_u32(INITIAL_VERSION, LFU_INIT_VAL),
-            last_access_secs: current_secs(),
+            metadata: AtomicU32::new(pack_metadata_u32(INITIAL_VERSION, LFU_INIT_VAL)),
+            last_access_secs: AtomicU32::new(current_secs()),
         }
     }
 
@@ -685,8 +805,8 @@ impl CompactEntry {
         CompactEntry {
             value: CompactValue::from_redis_value(RedisValue::Set(Box::default())),
             ttl_ms: 0,
-            metadata: pack_metadata_u32(INITIAL_VERSION, LFU_INIT_VAL),
-            last_access_secs: current_secs(),
+            metadata: AtomicU32::new(pack_metadata_u32(INITIAL_VERSION, LFU_INIT_VAL)),
+            last_access_secs: AtomicU32::new(current_secs()),
         }
     }
 
@@ -698,8 +818,8 @@ impl CompactEntry {
                 scores: Box::default(),
             }),
             ttl_ms: 0,
-            metadata: pack_metadata_u32(INITIAL_VERSION, LFU_INIT_VAL),
-            last_access_secs: current_secs(),
+            metadata: AtomicU32::new(pack_metadata_u32(INITIAL_VERSION, LFU_INIT_VAL)),
+            last_access_secs: AtomicU32::new(current_secs()),
         }
     }
 
@@ -708,8 +828,8 @@ impl CompactEntry {
         CompactEntry {
             value: CompactValue::from_redis_value(RedisValue::HashListpack(Listpack::new())),
             ttl_ms: 0,
-            metadata: pack_metadata_u32(INITIAL_VERSION, LFU_INIT_VAL),
-            last_access_secs: current_secs(),
+            metadata: AtomicU32::new(pack_metadata_u32(INITIAL_VERSION, LFU_INIT_VAL)),
+            last_access_secs: AtomicU32::new(current_secs()),
         }
     }
 
@@ -718,8 +838,8 @@ impl CompactEntry {
         CompactEntry {
             value: CompactValue::from_redis_value(RedisValue::ListListpack(Listpack::new())),
             ttl_ms: 0,
-            metadata: pack_metadata_u32(INITIAL_VERSION, LFU_INIT_VAL),
-            last_access_secs: current_secs(),
+            metadata: AtomicU32::new(pack_metadata_u32(INITIAL_VERSION, LFU_INIT_VAL)),
+            last_access_secs: AtomicU32::new(current_secs()),
         }
     }
 
@@ -728,8 +848,8 @@ impl CompactEntry {
         CompactEntry {
             value: CompactValue::from_redis_value(RedisValue::SetListpack(Listpack::new())),
             ttl_ms: 0,
-            metadata: pack_metadata_u32(INITIAL_VERSION, LFU_INIT_VAL),
-            last_access_secs: current_secs(),
+            metadata: AtomicU32::new(pack_metadata_u32(INITIAL_VERSION, LFU_INIT_VAL)),
+            last_access_secs: AtomicU32::new(current_secs()),
         }
     }
 
@@ -738,8 +858,8 @@ impl CompactEntry {
         CompactEntry {
             value: CompactValue::from_redis_value(RedisValue::SetIntset(Intset::new())),
             ttl_ms: 0,
-            metadata: pack_metadata_u32(INITIAL_VERSION, LFU_INIT_VAL),
-            last_access_secs: current_secs(),
+            metadata: AtomicU32::new(pack_metadata_u32(INITIAL_VERSION, LFU_INIT_VAL)),
+            last_access_secs: AtomicU32::new(current_secs()),
         }
     }
 
@@ -751,8 +871,8 @@ impl CompactEntry {
                 members: Box::default(),
             }),
             ttl_ms: 0,
-            metadata: pack_metadata_u32(INITIAL_VERSION, LFU_INIT_VAL),
-            last_access_secs: current_secs(),
+            metadata: AtomicU32::new(pack_metadata_u32(INITIAL_VERSION, LFU_INIT_VAL)),
+            last_access_secs: AtomicU32::new(current_secs()),
         }
     }
 
@@ -761,8 +881,8 @@ impl CompactEntry {
         CompactEntry {
             value: CompactValue::from_redis_value(RedisValue::SortedSetListpack(Listpack::new())),
             ttl_ms: 0,
-            metadata: pack_metadata_u32(INITIAL_VERSION, LFU_INIT_VAL),
-            last_access_secs: current_secs(),
+            metadata: AtomicU32::new(pack_metadata_u32(INITIAL_VERSION, LFU_INIT_VAL)),
+            last_access_secs: AtomicU32::new(current_secs()),
         }
     }
 
@@ -771,8 +891,8 @@ impl CompactEntry {
         CompactEntry {
             value: CompactValue::from_redis_value(RedisValue::Stream(Box::new(StreamData::new()))),
             ttl_ms: 0,
-            metadata: pack_metadata_u32(INITIAL_VERSION, LFU_INIT_VAL),
-            last_access_secs: current_secs(),
+            metadata: AtomicU32::new(pack_metadata_u32(INITIAL_VERSION, LFU_INIT_VAL)),
+            last_access_secs: AtomicU32::new(current_secs()),
         }
     }
 

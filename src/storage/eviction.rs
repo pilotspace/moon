@@ -2,7 +2,6 @@ use std::path::{Path, PathBuf};
 
 use bytes::Bytes;
 use rand::RngExt;
-use smallvec::SmallVec;
 use tracing::warn;
 
 use crate::config::RuntimeConfig;
@@ -12,14 +11,13 @@ use crate::protocol::Frame;
 use crate::storage::Database;
 use crate::storage::compact_key::CompactKey;
 use crate::storage::compact_value::RedisValueRef;
-use crate::storage::entry::{RedisValue, lfu_decay};
+use crate::storage::entry::{Entry, RedisValue, lfu_decay_at};
 use crate::storage::tiered::kv_serde;
 use crate::storage::tiered::kv_spill;
 use crate::storage::tiered::spill_thread::SpillRequest;
 
-/// Maximum number of victim candidates we will sample in a single
-/// `find_victim_*` call. This bounds the inline storage of the SmallVec
-/// returned by `sample_random_keys` and matches a generous upper bound on
+/// Maximum number of victim candidates we will judge in a single
+/// `find_victim_*` call (`sample_victim`). Matches a generous upper bound on
 /// the user-tunable `maxmemory-samples` (Redis default 5; we accept up to 16).
 const MAX_VICTIM_SAMPLES: usize = 16;
 
@@ -67,10 +65,151 @@ static MAXMEMORY_POLICY_GLOBAL: std::sync::atomic::AtomicU8 = std::sync::atomic:
 /// `CONFIG SET maxmemory-policy`.
 #[inline]
 pub fn publish_maxmemory_policy(name: &str) {
-    MAXMEMORY_POLICY_GLOBAL.store(
-        EvictionPolicy::from_str(name).as_u8(),
-        std::sync::atomic::Ordering::Relaxed,
-    );
+    let policy = EvictionPolicy::from_str(name);
+    MAXMEMORY_POLICY_GLOBAL.store(policy.as_u8(), std::sync::atomic::Ordering::Relaxed);
+    // moon#1161: the read path's access tracking follows the policy.
+    update_access_tracking(|_, log_factor, decay| (access_mode_for(policy), log_factor, decay));
+}
+
+/// Published read-path access-tracking word (moon#1161): what a READ records
+/// on an entry, derived from the published policy and the LFU parameters.
+///
+/// Packed `[lfu_decay_time:48 | lfu_log_factor:8 | mode:8]` so the read path
+/// decodes all of it from ONE relaxed load — it runs on every GET, HGET,
+/// LRANGE, … and must stay a load and a branch when the mode is `Off`.
+/// Defaults: mode `Off` (the `noeviction` default), redis's `lfu-log-factor
+/// 10` / `lfu-decay-time 1`.
+static ACCESS_TRACKING: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(pack_access_tracking(ACCESS_MODE_OFF, 10, 1));
+
+const ACCESS_MODE_OFF: u8 = 0;
+const ACCESS_MODE_LRU: u8 = 1;
+const ACCESS_MODE_LFU: u8 = 2;
+const LFU_DECAY_TIME_MAX: u64 = (1 << 48) - 1;
+
+const fn pack_access_tracking(mode: u8, log_factor: u8, decay_time: u64) -> u64 {
+    let decay = if decay_time > LFU_DECAY_TIME_MAX {
+        LFU_DECAY_TIME_MAX
+    } else {
+        decay_time
+    };
+    (decay << 16) | ((log_factor as u64) << 8) | mode as u64
+}
+
+/// The access-tracking mode a policy implies. Tracking follows the POLICY,
+/// not `maxmemory`: redis answers `OBJECT FREQ` under an LFU policy (and
+/// ages `OBJECT IDLETIME` under an LRU one) whether or not a limit is set,
+/// and moon's startup guardrail runs `allkeys-lru` with a derived limit.
+/// Every other policy never reads the metadata, so its reads stay free.
+const fn access_mode_for(policy: EvictionPolicy) -> u8 {
+    match policy {
+        EvictionPolicy::AllKeysLru | EvictionPolicy::VolatileLru => ACCESS_MODE_LRU,
+        EvictionPolicy::AllKeysLfu | EvictionPolicy::VolatileLfu => ACCESS_MODE_LFU,
+        EvictionPolicy::NoEviction
+        | EvictionPolicy::AllKeysRandom
+        | EvictionPolicy::VolatileRandom
+        | EvictionPolicy::VolatileTtl => ACCESS_MODE_OFF,
+    }
+}
+
+/// Replace some fields of [`ACCESS_TRACKING`] atomically (CAS loop: the two
+/// publishers write disjoint fields and may race on a `CONFIG SET` pair).
+fn update_access_tracking(f: impl Fn(u8, u8, u64) -> (u8, u8, u64)) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let _ = ACCESS_TRACKING.fetch_update(Relaxed, Relaxed, |w| {
+        let (mode, log_factor, decay) = f(w as u8, (w >> 8) as u8, w >> 16);
+        Some(pack_access_tracking(mode, log_factor, decay))
+    });
+}
+
+/// Publish `lfu-log-factor` / `lfu-decay-time` for the read path (moon#1161).
+/// Same contract as [`publish_maxmemory_policy`]: startup and every
+/// `CONFIG SET` of either parameter.
+pub fn publish_lfu_params(log_factor: u8, decay_time: u64) {
+    update_access_tracking(|mode, _, _| (mode, log_factor, decay_time));
+}
+
+/// What a read records on an entry right now (moon#1161). ONE relaxed load.
+#[inline]
+pub fn access_tracking() -> crate::storage::entry::AccessTracking {
+    decode_access_tracking(access_tracking_word())
+}
+
+#[inline]
+fn decode_access_tracking(w: u64) -> crate::storage::entry::AccessTracking {
+    use crate::storage::entry::AccessTracking;
+    match w as u8 {
+        ACCESS_MODE_LRU => AccessTracking::Lru,
+        ACCESS_MODE_LFU => AccessTracking::Lfu {
+            log_factor: (w >> 8) as u8,
+            decay_time: w >> 16,
+        },
+        _ => AccessTracking::Off,
+    }
+}
+
+#[cfg(not(test))]
+#[inline(always)]
+fn access_tracking_word() -> u64 {
+    ACCESS_TRACKING.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+// Test builds read a PER-THREAD override instead of the process-global word
+// (moon#1161): `cargo test --lib` runs ~6000 tests in one process, and a test
+// that published `allkeys-lfu` would otherwise make every concurrently
+// running test's reads mutate LFU counters and LRU stamps — exactly the
+// cross-test bleed moon#856 documents for the other published atomics. A
+// test that wants reads to record opts in with `force_access_tracking`; the
+// publish path itself is pinned by `published_access_tracking`.
+#[cfg(test)]
+thread_local! {
+    static ACCESS_TRACKING_OVERRIDE: std::cell::Cell<Option<u64>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+fn access_tracking_word() -> u64 {
+    ACCESS_TRACKING_OVERRIDE
+        .with(|c| c.get())
+        .unwrap_or(pack_access_tracking(ACCESS_MODE_OFF, 10, 1))
+}
+
+/// Test-only: the PUBLISHED word, decoded — what production reads.
+#[cfg(test)]
+pub(crate) fn published_access_tracking() -> crate::storage::entry::AccessTracking {
+    decode_access_tracking(ACCESS_TRACKING.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+/// Test-only guard: make reads on THIS thread record `tracking` until dropped
+/// (restores the previous override, LIFO-safe).
+#[cfg(test)]
+#[must_use]
+pub(crate) fn force_access_tracking(
+    tracking: crate::storage::entry::AccessTracking,
+) -> ForceAccessTracking {
+    use crate::storage::entry::AccessTracking;
+    let word = match tracking {
+        AccessTracking::Off => pack_access_tracking(ACCESS_MODE_OFF, 10, 1),
+        AccessTracking::Lru => pack_access_tracking(ACCESS_MODE_LRU, 10, 1),
+        AccessTracking::Lfu {
+            log_factor,
+            decay_time,
+        } => pack_access_tracking(ACCESS_MODE_LFU, log_factor, decay_time),
+    };
+    let prev = ACCESS_TRACKING_OVERRIDE.with(|c| c.replace(Some(word)));
+    ForceAccessTracking { prev }
+}
+
+#[cfg(test)]
+pub(crate) struct ForceAccessTracking {
+    prev: Option<u64>,
+}
+
+#[cfg(test)]
+impl Drop for ForceAccessTracking {
+    fn drop(&mut self) {
+        ACCESS_TRACKING_OVERRIDE.with(|c| c.set(self.prev));
+    }
 }
 
 /// Canonical name of the published eviction policy, for INFO.
@@ -218,12 +357,13 @@ pub(crate) struct PublishedLimits {
     maxmemory_hint: usize,
     maxmemory_per_shard_hint: usize,
     maxmemory_policy: u8,
+    access_tracking: u64,
     db_maxmemory_any_set: bool,
 }
 
 #[cfg(test)]
 impl PublishedLimits {
-    /// Snapshot all five published atomics; restored when the guard drops.
+    /// Snapshot all six published atomics; restored when the guard drops.
     #[must_use]
     pub(crate) fn capture() -> Self {
         use std::sync::atomic::Ordering::Relaxed;
@@ -232,6 +372,7 @@ impl PublishedLimits {
             maxmemory_hint: MAXMEMORY_HINT.load(Relaxed),
             maxmemory_per_shard_hint: MAXMEMORY_PER_SHARD_HINT.load(Relaxed),
             maxmemory_policy: MAXMEMORY_POLICY_GLOBAL.load(Relaxed),
+            access_tracking: ACCESS_TRACKING.load(Relaxed),
             db_maxmemory_any_set: crate::storage::db_quota::db_maxmemory_any_set(),
         }
     }
@@ -245,6 +386,7 @@ impl Drop for PublishedLimits {
         MAXMEMORY_HINT.store(self.maxmemory_hint, Relaxed);
         MAXMEMORY_PER_SHARD_HINT.store(self.maxmemory_per_shard_hint, Relaxed);
         MAXMEMORY_POLICY_GLOBAL.store(self.maxmemory_policy, Relaxed);
+        ACCESS_TRACKING.store(self.access_tracking, Relaxed);
         crate::storage::db_quota::restore_db_maxmemory_any_set(self.db_maxmemory_any_set);
     }
 }
@@ -362,67 +504,80 @@ fn can_skip_eviction(
     estimated_memory <= effective_budget(elastic_budget, mm, per_shard, footprint_ratio)
 }
 
-/// Reservoir-sample up to `samples` random keys from the database without
-/// materializing the entire keyspace.
+/// Pick the best eviction victim from up to `samples` random candidates, in
+/// ONE pass (moon#1161).
 ///
-/// Algorithm: pick a random `Segment`, then reservoir-sample one slot inside
-/// it (Algorithm R with reservoir size 1). Repeat until either `samples` keys
-/// have been collected or the per-segment retry budget is exhausted (which
-/// can happen if `volatile_only` is true and most segments contain no
-/// volatile keys). The returned vector is bounded by `MAX_VICTIM_SAMPLES`.
+/// Each attempt picks a random `Segment` and one occupied slot inside it
+/// (volatile-only: one TTL-carrying slot), then judges that candidate on the
+/// spot with `better(candidate, best_so_far)` — the entry it is judged by is
+/// the `&Entry` the scan is already holding. Only the WINNER's key is cloned.
 ///
-/// Cost: each iteration touches one segment (≤ a few hundred slots), so the
-/// total work per call is `O(samples × segment_capacity)` instead of
-/// `O(total_keys)` — the previous implementation cloned every key in the
-/// database into a `Vec<CompactKey>` per eviction loop iteration, which
-/// dominated CPU cost on hot eviction.
-fn sample_random_keys(
-    db: &Database,
+/// The previous shape reservoir-sampled keys (one RNG draw per occupied slot,
+/// ~40 per segment), cloned EVERY sampled `CompactKey` (a heap allocation for
+/// keys over 23 bytes) into a `SmallVec`, and then re-hashed and re-probed
+/// each sample just to read the `last_access` / counter the scan had already
+/// had in hand. At steady-state `maxmemory` this runs once per write.
+///
+/// One RNG draw picks the segment and one picks the slot: `Segment::count()`
+/// is exact, so the in-segment choice is uniform (the volatile filter counts
+/// its candidates first). The segment choice is uniform over segments, not
+/// keys — the same bias the reservoir version had, and irrelevant to an
+/// approximate sampler. Attempts are bounded (`samples x 8`) so a sparse
+/// volatile keyspace cannot loop.
+fn sample_victim<'a>(
+    db: &'a Database,
     samples: usize,
     volatile_only: bool,
-) -> SmallVec<[CompactKey; MAX_VICTIM_SAMPLES]> {
+    better: impl Fn(&Entry, &Entry) -> bool,
+) -> Option<&'a CompactKey> {
     let table = db.data();
-    let mut out: SmallVec<[CompactKey; MAX_VICTIM_SAMPLES]> = SmallVec::new();
-
     let seg_count = table.segment_count();
     if seg_count == 0 || table.is_empty() {
-        return out;
+        return None;
     }
-    let want = samples.min(MAX_VICTIM_SAMPLES);
-    if want == 0 {
-        return out;
-    }
+    let want = samples.clamp(1, MAX_VICTIM_SAMPLES);
+    let max_attempts = want.saturating_mul(8);
 
     let mut rng = rand::rng();
-    // Per-segment retries: bounded so a sparse volatile keyspace cannot
-    // turn this into an unbounded loop.
-    let max_attempts = want.saturating_mul(8);
+    let mut best: Option<(&CompactKey, &Entry)> = None;
+    let mut judged = 0usize;
     let mut attempts = 0usize;
-
-    while out.len() < want && attempts < max_attempts {
+    while judged < want && attempts < max_attempts {
         attempts += 1;
-        let seg_idx = rng.random_range(0..seg_count);
-        let seg = table.segment(seg_idx);
-
-        // Reservoir-sample one occupied slot from this segment with the
-        // optional volatile filter applied. Algorithm R with k=1.
-        let mut chosen: Option<&CompactKey> = None;
-        let mut seen = 0u32;
-        for (k, v) in seg.iter_occupied() {
-            if volatile_only && !v.has_expiry() {
-                continue;
-            }
-            seen += 1;
-            if rng.random_range(0..seen) == 0 {
-                chosen = Some(k);
-            }
-        }
-        if let Some(k) = chosen {
-            out.push(k.clone());
+        let seg = table.segment(rng.random_range(0..seg_count));
+        let Some((k, v)) = pick_in_segment(seg, volatile_only, &mut rng) else {
+            continue;
+        };
+        judged += 1;
+        if best.is_none_or(|(_, b)| better(v, b)) {
+            best = Some((k, v));
         }
     }
+    best.map(|(k, _)| k)
+}
 
-    out
+/// One uniformly chosen occupied slot of `seg` (volatile-only: one uniformly
+/// chosen TTL-carrying slot), or `None` if it has no candidate.
+#[inline]
+fn pick_in_segment<'a>(
+    seg: &'a crate::storage::dashtable::segment::Segment<CompactKey, Entry>,
+    volatile_only: bool,
+    rng: &mut impl rand::Rng,
+) -> Option<(&'a CompactKey, &'a Entry)> {
+    if volatile_only {
+        let n = seg.iter_occupied().filter(|(_, v)| v.has_expiry()).count();
+        if n == 0 {
+            return None;
+        }
+        let nth = rng.random_range(0..n);
+        seg.iter_occupied().filter(|(_, v)| v.has_expiry()).nth(nth)
+    } else {
+        let n = seg.count() as usize;
+        if n == 0 {
+            return None;
+        }
+        seg.iter_occupied().nth(rng.random_range(0..n))
+    }
 }
 
 /// Compare two LRU timestamps with u32 wraparound handling.
@@ -711,7 +866,11 @@ pub fn evict_to_budget(
         return Ok(());
     }
 
-    let policy = EvictionPolicy::from_str(&config.maxmemory_policy);
+    // moon#1161: the policy is parsed only once a victim is actually needed.
+    // Parsing it up front (seven case-insensitive string compares) ran on
+    // EVERY write under `maxmemory`, including the overwhelming majority that
+    // are under budget and return below without looking at it.
+    let mut parsed_policy: Option<EvictionPolicy> = None;
 
     // Scale the budget down by how far the OS-charged footprint exceeds what
     // the allocator says is live.
@@ -762,6 +921,8 @@ pub fn evict_to_budget(
     // NOTHING observable. See `EVICTION_STALL_LIMIT`.
     let mut stalled = 0usize;
     while current_total > budget {
+        let policy = *parsed_policy
+            .get_or_insert_with(|| EvictionPolicy::from_str(&config.maxmemory_policy));
         if policy == EvictionPolicy::NoEviction {
             return Err(oom_error());
         }
@@ -1023,7 +1184,7 @@ const NO_AOF_BATCH_CAP: usize = 256;
 /// current batch (possible because, unlike the single-victim paths, this
 /// function does NOT remove a key from `db` between picks -- removal must
 /// wait until the whole batch is durable). Random re-sampling (see
-/// `sample_random_keys`) makes an infinite repeat vanishingly unlikely; this
+/// `sample_victim`) makes an infinite repeat vanishingly unlikely; this
 /// only guards a pathological near-empty or heavily-duplicate keyspace.
 const NO_AOF_BATCH_STALL_LIMIT: usize = 16;
 
@@ -1035,7 +1196,7 @@ const NO_AOF_BATCH_STALL_LIMIT: usize = 16;
 /// **Postcondition (moon#600): a returned key is present in the hot plane.**
 /// Every caller's only way to make progress is `db.remove`, so a victim that
 /// is not in `data` is not a victim — it is an infinite loop. The sampling
-/// pickers satisfy this by construction (`sample_random_keys` iterates
+/// pickers satisfy this by construction (`sample_victim` iterates
 /// occupied DashTable slots); `volatile-ttl` reads a maintained index and
 /// must therefore verify, which is why this takes `&mut Database`.
 fn select_victim(
@@ -1540,80 +1701,33 @@ pub(crate) fn evict_one_with_spill(
 
 /// Find the victim key with the oldest last_access from a random sample.
 fn find_victim_lru(db: &Database, samples: usize, volatile_only: bool) -> Option<CompactKey> {
-    let sampled = sample_random_keys(db, samples, volatile_only);
-    if sampled.is_empty() {
-        return None;
-    }
-
-    let mut oldest_key: Option<CompactKey> = None;
-    let mut oldest_access: Option<u32> = None;
-
-    for key in sampled.iter() {
-        if let Some(entry) = db.data().get(key.as_bytes()) {
-            let la = entry.last_access();
-            match oldest_access {
-                None => {
-                    oldest_key = Some(key.clone());
-                    oldest_access = Some(la);
-                }
-                Some(oldest) => {
-                    if lru_is_older(la, oldest) {
-                        oldest_key = Some(key.clone());
-                        oldest_access = Some(la);
-                    }
-                }
-            }
-        }
-    }
-
-    oldest_key
+    sample_victim(db, samples, volatile_only, |cand, best| {
+        lru_is_older(cand.last_access(), best.last_access())
+    })
+    .cloned()
 }
 
-/// Find the victim key with the lowest LFU counter from a random sample.
+/// Find the victim key with the lowest (decayed) LFU counter from a random
+/// sample; ties go to the least recently used.
 fn find_victim_lfu(
     db: &Database,
     samples: usize,
     lfu_decay_time: u64,
     volatile_only: bool,
 ) -> Option<CompactKey> {
-    let sampled = sample_random_keys(db, samples, volatile_only);
-    if sampled.is_empty() {
-        return None;
-    }
-
-    let mut evict_key: Option<CompactKey> = None;
-    let mut lowest_counter: Option<u8> = None;
-    let mut oldest_access_for_tie: Option<u32> = None;
-
-    for key in sampled.iter() {
-        if let Some(entry) = db.data().get(key.as_bytes()) {
-            let effective_counter =
-                lfu_decay(entry.access_counter(), entry.last_access(), lfu_decay_time);
-
-            let la = entry.last_access();
-            let should_evict = match lowest_counter {
-                None => true,
-                Some(lowest) => {
-                    effective_counter < lowest
-                        || (effective_counter == lowest
-                            && oldest_access_for_tie.map_or(true, |t| lru_is_older(la, t)))
-                }
-            };
-
-            if should_evict {
-                evict_key = Some(key.clone());
-                lowest_counter = Some(effective_counter);
-                oldest_access_for_tie = Some(la);
-            }
-        }
-    }
-
-    evict_key
+    // One clock read per victim, not one per candidate.
+    let now = crate::storage::entry::current_secs();
+    let freq = |e: &Entry| lfu_decay_at(e.access_counter(), e.last_access(), lfu_decay_time, now);
+    sample_victim(db, samples, volatile_only, |cand, best| {
+        let (fc, fb) = (freq(cand), freq(best));
+        fc < fb || (fc == fb && lru_is_older(cand.last_access(), best.last_access()))
+    })
+    .cloned()
 }
 
 /// Find a random victim key.
 fn find_victim_random(db: &Database, volatile_only: bool) -> Option<CompactKey> {
-    sample_random_keys(db, 1, volatile_only).into_iter().next()
+    sample_victim(db, 1, volatile_only, |_, _| false).cloned()
 }
 
 /// Bounded number of provably-stale expiry pairs [`find_victim_volatile_ttl`]

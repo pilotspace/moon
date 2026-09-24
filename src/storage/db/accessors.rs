@@ -255,6 +255,10 @@ impl Database {
             if entry.is_expired_at(now_ms) {
                 return Ok(None);
             }
+            // moon#1161: a typed read (HGET, LRANGE, SMEMBERS, ZRANGE, …) is
+            // an access for the eviction policy — through `&self`, so the
+            // shared-guard read path records it too.
+            note_read(entry, now_ms);
             return match K::classify_hot(entry.value.as_redis_value(), now_ms) {
                 Ok(r) => Ok(Some(r)),
                 Err(db_kind::WrongType) => Err(Self::wrongtype_error()),
@@ -277,6 +281,7 @@ impl Database {
     /// upgrades the kind's compact encoding(s) in place.
     pub fn get_or_create<K: OwnedKind>(&mut self, key: &[u8]) -> Result<K::Mut<'_>, Frame> {
         let now_ms = self.cached_now_ms;
+        let now_secs = self.cached_now;
         // moon#942: ONE lookup decides the whole preamble. What used to be a
         // `get` (expiry) + `contains_key` + `get_mut` is now `hot_state` +
         // `get_mut`; the create arm drops a second `contains_key` by reading
@@ -302,6 +307,12 @@ impl Database {
                 b"ERR internal: lookup failed after insert",
             )));
         };
+        // moon#1161: a write to an EXISTING key is an access (redis
+        // `lookupKeyWrite`); a key this call just fabricated is not — redis
+        // creates it with a fresh `LFU_INIT_VAL` counter.
+        if state == HotState::Live {
+            entry.note_access(crate::storage::eviction::access_tracking(), now_secs);
+        }
         // moon#788: a compact→full encoding upgrade changes the entry's real
         // size; charge the difference or the ledger silently desynchronises
         // from the keyspace. Disjoint field borrows: `entry` borrows
@@ -355,6 +366,7 @@ impl Database {
         key: &[u8],
     ) -> Result<Option<K::Mut<'_>>, Frame> {
         let now_ms = self.cached_now_ms;
+        let now_secs = self.cached_now;
         // moon#942: one lookup for the preamble, one to hand the entry out.
         let state = self.hot_state(key, now_ms);
         if state != HotState::Live {
@@ -363,6 +375,8 @@ impl Database {
         let Some(entry) = self.data.get_mut(key) else {
             return Ok(None);
         };
+        // moon#1161: a write (or pop) on a present key is an access.
+        entry.note_access(crate::storage::eviction::access_tracking(), now_secs);
         // moon#788: see `get_or_create` — the upgrade is a no-op on another
         // kind, so it is safe ahead of the type decision.
         let encoding_delta = K::upgrade(entry);
@@ -417,6 +431,7 @@ impl Database {
         key: &[u8],
     ) -> Result<Option<K::Shared<'_>>, Frame> {
         let now_ms = self.cached_now_ms;
+        let now_secs = self.cached_now;
         // moon#942: two lookups, not four. The old shape paid a `get` for
         // expiry, a `contains_key`, a `get_mut` to run the upgrade, and then
         // a FOURTH `get` purely to re-borrow the same entry immutably — the
@@ -428,6 +443,8 @@ impl Database {
         let Some(entry) = self.data.get_mut(key) else {
             return Ok(None);
         };
+        // moon#1161: an access for the eviction policy.
+        entry.note_access(crate::storage::eviction::access_tracking(), now_secs);
         // moon#788: a compact→full encoding upgrade changes the entry's real
         // size; charge the difference or the ledger silently desynchronises
         // from the keyspace. Disjoint field borrows: `entry` borrows
@@ -1075,8 +1092,11 @@ impl Database {
     }
 
     // ---- Read-only methods for RwLock read path ----
-    // These take `now_ms` as a parameter and do NOT mutate state:
-    // no expired-key removal, no LRU touch.
+    // These take `now_ms` as a parameter and do NOT mutate keyspace state:
+    // no expired-key removal, no promotion. The `get_*` forms DO record the
+    // access for the eviction policy (moon#1161) — through `&self`, via the
+    // entry's atomic metadata; the `peek_*` forms are redis's
+    // `LOOKUP_NOTOUCH` and record nothing.
 
     /// Read-only get: checks expiry, returns None if expired, but does NOT
     /// remove expired keys or touch LRU. Used with RwLock read path.
@@ -1086,7 +1106,21 @@ impl Database {
     /// from "no such key". Any command that would answer differently for a
     /// tiered key than for a missing one must use
     /// [`Self::get_if_alive_any_plane`] instead (moon#610).
+    ///
+    /// Records the read for the eviction policy (moon#1161); see
+    /// [`Self::peek_if_alive`] for the `LOOKUP_NOTOUCH` form.
+    #[inline]
     pub fn get_if_alive(&self, key: &[u8], now_ms: u64) -> Option<&Entry> {
+        let entry = self.peek_if_alive(key, now_ms)?;
+        note_read(entry, now_ms);
+        Some(entry)
+    }
+
+    /// [`Self::get_if_alive`] WITHOUT recording an access (redis
+    /// `LOOKUP_NOTOUCH`): for `KEYS`/`SCAN` membership checks, metadata
+    /// commands and internal probes, none of which may make a key look hot.
+    #[inline]
+    pub fn peek_if_alive(&self, key: &[u8], now_ms: u64) -> Option<&Entry> {
         let entry = self.data.get(key)?;
         if entry.is_expired_at(now_ms) {
             return None;
@@ -1116,7 +1150,21 @@ impl Database {
     /// WARNING: inherits [`Self::get_cold_value`]'s synchronous disk read on
     /// a cold hit. Callers on the shard event loop must have released any
     /// shard guard first — identical to the existing typed-access path.
+    ///
+    /// Records a hot read for the eviction policy (moon#1161); see
+    /// [`Self::peek_if_alive_any_plane`] for the `LOOKUP_NOTOUCH` form.
     pub fn get_if_alive_any_plane(&self, key: &[u8], now_ms: u64) -> Option<EntryView<'_>> {
+        let view = self.peek_if_alive_any_plane(key, now_ms)?;
+        if let EntryView::Hot(entry) = view {
+            note_read(entry, now_ms);
+        }
+        Some(view)
+    }
+
+    /// [`Self::get_if_alive_any_plane`] WITHOUT recording an access (redis
+    /// `LOOKUP_NOTOUCH`) — `OBJECT`, `TTL`, `TYPE`, `EXPIRETIME`, … read
+    /// metadata and must not refresh the very idle time they report.
+    pub fn peek_if_alive_any_plane(&self, key: &[u8], now_ms: u64) -> Option<EntryView<'_>> {
         if let Some(entry) = self.data.get(key) {
             if entry.is_expired_at(now_ms) {
                 return None;
@@ -1232,6 +1280,22 @@ impl Database {
     pub fn exists_if_alive(&self, key: &[u8], now_ms: u64) -> bool {
         match self.data.get(key) {
             Some(e) if !e.is_expired_at(now_ms) => true,
+            _ => self.cold_contains_alive(key, now_ms),
+        }
+    }
+
+    /// `TOUCH` on the shared-guard read path (moon#1161): the answer of
+    /// [`Self::exists_if_alive`], plus an access recorded on a live hot
+    /// entry — see [`Self::touch_key`].
+    pub fn touch_key_if_alive(&self, key: &[u8], now_ms: u64) -> bool {
+        match self.data.get(key) {
+            Some(e) if !e.is_expired_at(now_ms) => {
+                e.note_access(
+                    crate::storage::db::kv_ops::touch_tracking(),
+                    secs_of(now_ms),
+                );
+                true
+            }
             _ => self.cold_contains_alive(key, now_ms),
         }
     }
@@ -1499,5 +1563,22 @@ impl Database {
                 }
             }
         }
+    }
+}
+
+/// Epoch seconds of a shard-clock millisecond reading — the domain of
+/// `Entry::last_access`.
+#[inline]
+fn secs_of(now_ms: u64) -> u32 {
+    (now_ms / 1000) as u32
+}
+
+/// Record a READ on `entry` for the eviction policy (moon#1161). One relaxed
+/// load and a branch when the policy tracks nothing.
+#[inline]
+fn note_read(entry: &Entry, now_ms: u64) {
+    let tracking = crate::storage::eviction::access_tracking();
+    if tracking != crate::storage::entry::AccessTracking::Off {
+        entry.note_access(tracking, secs_of(now_ms));
     }
 }
