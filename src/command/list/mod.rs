@@ -9,6 +9,9 @@ mod lrem_lpos_1173_tests;
 // moon#1174 §1 guards (listpack arms of the list secondary writes).
 #[cfg(test)]
 mod listpack_arms_1174_tests;
+// moon#1225 guards (a list move never pops what it cannot place).
+#[cfg(test)]
+mod cold_fault_1225_tests;
 
 use crate::protocol::Frame;
 

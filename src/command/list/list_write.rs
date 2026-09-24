@@ -241,6 +241,7 @@ enum ListRoute {
 /// A probe, not the command's access (moon#1221 review INTEG-5): every route
 /// it answers ends in a write accessor that records the one access redis's
 /// `lookupKeyWrite` would, so the probe is `LOOKUP_NOTOUCH`.
+/// moon#1225: an indexed-but-unreadable cold key is `Err(-IOERR)`, never absent.
 fn list_route(db: &Database, key: &[u8]) -> Result<Option<ListRoute>, Frame> {
     match db.peek_list_ref_if_alive(key, db.now_ms()) {
         Ok(None) => Ok(None),
@@ -1133,7 +1134,13 @@ fn lmove_inner(
             }
         }
     };
-    push_one(db, &destination, &value, push_front);
+    if let Err(e) = push_one(db, &destination, &value, push_front) {
+        // moon#1225: refused, not lost — back to the end it came from.
+        if push_one(db, &source, &value, pop_front).is_err() {
+            tracing::error!("LMOVE: destination refused and source restore failed (moon#1225)");
+        }
+        return e;
+    }
     Frame::BulkString(value)
 }
 
@@ -1194,38 +1201,37 @@ fn lmove_rotate(
 /// is missing and the element fits the policy), promoting past the policy,
 /// and onto the full `VecDeque` otherwise.
 ///
-/// The caller has already routed `key` and refused a wrong type, so an error
-/// here is not reachable by type; it is swallowed exactly as the
-/// `Database::list_push_*` accessors this replaced swallowed it.
-fn push_one(db: &mut Database, key: &Bytes, value: &Bytes, front: bool) {
+/// moon#1225: a refusal is RETURNED, not swallowed. The route refuses a wrong
+/// type or unreadable cold copy before the pop; a cold file that fails only on
+/// this promotion's second read is still reachable, and dropped the element.
+fn push_one(db: &mut Database, key: &Bytes, value: &Bytes, front: bool) -> Result<(), Frame> {
     let limits = db.encoding_limits();
     if limits.fits(Shape::List, 1, value.len()) {
-        match db.get_or_create_list_listpack(key) {
-            Ok(Some(lp)) => {
-                let before = lp.estimate_memory();
-                if front {
-                    lp.push_front(value);
-                } else {
-                    lp.push_back(value);
-                }
-                let after = lp.estimate_memory();
-                let should_upgrade = !limits.listpack_fits(Shape::List, lp);
-                // `lp`'s borrow of `db` ends here.
-                db.adjust_memory(before, after);
-                if should_upgrade {
-                    promote_list_listpack(db, key, after);
-                }
-                return;
+        if let Some(lp) = db.get_or_create_list_listpack(key)? {
+            let before = lp.estimate_memory();
+            if front {
+                lp.push_front(value);
+            } else {
+                lp.push_back(value);
             }
-            Ok(None) => {}
-            Err(_) => return,
+            let after = lp.estimate_memory();
+            let should_upgrade = !limits.listpack_fits(Shape::List, lp);
+            // `lp`'s borrow of `db` ends here.
+            db.adjust_memory(before, after);
+            if should_upgrade {
+                promote_list_listpack(db, key, after);
+            }
+            return Ok(());
         }
     }
+    let list = db.get_or_create_list(key)?;
     if front {
-        db.list_push_front(key, value.clone());
+        list.push_front(value.clone());
     } else {
-        db.list_push_back(key, value.clone());
+        list.push_back(value.clone());
     }
+    db.charge_memory(list_elem_cost(value));
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

@@ -1390,12 +1390,16 @@ impl Database {
     /// See [`Self::get_hash_ref_if_alive`] for why this consults the cold
     /// tier without promoting on a hot miss (P0 cold-collection-visibility
     /// fix).
+    ///
+    /// A key that is INDEXED in the cold tier but whose bytes cannot be read
+    /// answers `Err(-IOERR)`, never `Ok(None)` — see
+    /// [`Self::list_absent_unless_cold_fault`] (moon#1225).
     pub fn get_list_ref_if_alive(
         &self,
         key: &[u8],
         now_ms: u64,
     ) -> Result<Option<ListRef<'_>>, Frame> {
-        self.get_ref_if_alive::<db_kind::ListKind>(key, now_ms)
+        self.list_absent_unless_cold_fault(self.get_ref_if_alive::<db_kind::ListKind>(key, now_ms))
     }
 
     /// [`Self::get_list_ref_if_alive`] without recording an access — a list
@@ -1405,7 +1409,35 @@ impl Database {
         key: &[u8],
         now_ms: u64,
     ) -> Result<Option<ListRef<'_>>, Frame> {
-        self.peek_ref_if_alive::<db_kind::ListKind>(key, now_ms)
+        self.list_absent_unless_cold_fault(self.peek_ref_if_alive::<db_kind::ListKind>(key, now_ms))
+    }
+
+    /// moon#1225: a list probe's "no such key" is only true when the cold
+    /// read behind the hot miss did not FAULT.
+    ///
+    /// The generic read-through raises the moon#875 flag and answers `None`,
+    /// leaving the reply to the dispatch-boundary gate. That is enough for a
+    /// read, but not for the list writes that act on the answer BEFORE the
+    /// reply is built: `LMOVE`/`RPOPLPUSH` (and the blocking `BLMOVE`
+    /// immediate and wake paths) took a faulted destination for an absent one,
+    /// popped the source, and the push's refusal was swallowed — the element
+    /// was acked and existed nowhere; `LMPOP` skipped a faulted key and popped
+    /// a later one. Every caller of these two probes already forwards an `Err`
+    /// to the client before mutating, so turning the fault into an `Err` HERE
+    /// refuses all of them before any pop, with no caller-side change.
+    ///
+    /// List-only on purpose: some hash/set/zset/stream callers map `Err(_)` to
+    /// "skip" (they only expect WRONGTYPE), and would swallow an `-IOERR` the
+    /// gate could then no longer see. Cost: one relaxed load on a miss.
+    #[inline]
+    fn list_absent_unless_cold_fault<'a>(
+        &self,
+        probe: Result<Option<ListRef<'a>>, Frame>,
+    ) -> Result<Option<ListRef<'a>>, Frame> {
+        match probe {
+            Ok(None) if self.take_cold_fault().is_some() => Err(Self::cold_fault_error()),
+            other => other,
+        }
     }
 
     /// Read-only set access via SetRef enum. Handles HashSet, Listpack, and Intset.
@@ -1494,21 +1526,35 @@ impl Database {
     }
 
     /// Push an element to the front of a list. Creates the list if it does not exist.
+    ///
+    /// A refusal (wrong type, or an unreadable cold copy — moon#1225) cannot
+    /// be returned through this signature; the callers (the blocking serve
+    /// paths) refuse both BEFORE they pop, via `get_list_ref_if_alive`. What
+    /// is left — a cold destination whose file read cleanly for that probe and
+    /// then failed on this promotion's second read — is logged, never silent.
     pub fn list_push_front(&mut self, key: &[u8], value: Bytes) {
         // get_or_create_list creates the key if missing
         let cost = list_elem_cost(&value);
-        if let Ok(list) = self.get_or_create_list(key) {
-            list.push_front(value);
-            self.charge_memory(cost);
+        match self.get_or_create_list(key) {
+            Ok(list) => {
+                list.push_front(value);
+                self.charge_memory(cost);
+            }
+            Err(_) => log_refused_list_push(key, value.len()),
         }
     }
 
     /// Push an element to the back of a list. Creates the list if it does not exist.
+    ///
+    /// See [`Self::list_push_front`] for the refusal contract.
     pub fn list_push_back(&mut self, key: &[u8], value: Bytes) {
         let cost = list_elem_cost(&value);
-        if let Ok(list) = self.get_or_create_list(key) {
-            list.push_back(value);
-            self.charge_memory(cost);
+        match self.get_or_create_list(key) {
+            Ok(list) => {
+                list.push_back(value);
+                self.charge_memory(cost);
+            }
+            Err(_) => log_refused_list_push(key, value.len()),
         }
     }
 
@@ -1645,6 +1691,20 @@ impl Database {
             }
         }
     }
+}
+
+/// moon#1225: a blocking-path list push was refused after its element had
+/// already been popped. Not reachable by type (the callers probe first); a
+/// transient cold-tier fault between the probe and the push is the one way
+/// in, and a dropped element must leave evidence.
+#[cold]
+fn log_refused_list_push(key: &[u8], value_len: usize) {
+    tracing::error!(
+        key_len = key.len(),
+        value_len,
+        "list push refused after the element was popped (cold-tier fault or wrong type); \
+         the element was not stored (moon#1225)"
+    );
 }
 
 /// Epoch seconds of a shard-clock millisecond reading — the domain of
