@@ -146,19 +146,35 @@ fn release_shell(work: Work, weight: usize) {
 fn shell_dropper() -> Option<&'static flume::Sender<Work>> {
     static DROPPER: std::sync::OnceLock<Option<flume::Sender<Work>>> = std::sync::OnceLock::new();
     DROPPER
-        .get_or_init(|| {
-            let (tx, rx) = flume::unbounded::<Work>();
-            std::thread::Builder::new()
-                .name("moon-lazyfree".to_string())
-                .spawn(move || {
-                    while let Ok(shell) = rx.recv() {
-                        drop(shell);
-                    }
-                })
-                .ok()
-                .map(|_| tx)
-        })
+        .get_or_init(|| spawn_shell_dropper("moon-lazyfree"))
         .as_ref()
+}
+
+/// Start a shell-dropping thread named `name`; `None` if the OS refused.
+/// Split from [`shell_dropper`] so a test can start one from a thread it
+/// controls — the process-wide one is spawned once, by whichever shard
+/// thread happens to need it first.
+fn spawn_shell_dropper(name: &str) -> Option<flume::Sender<Work>> {
+    let (tx, rx) = flume::unbounded::<Work>();
+    let label = name.to_string();
+    std::thread::Builder::new()
+        .name(name.to_string())
+        .spawn(move || {
+            // moon#1221 review INTEG-4: this thread is spawned from whichever
+            // shard thread first frees a huge value — a thread pinned to one
+            // core — and Linux threads inherit their creator's affinity mask.
+            // Re-pin onto the non-shard core set first, as every other
+            // auxiliary thread does (`snapshot_stream`, `cdc/read_pool`), or
+            // the helper is confined to that shard's core and competes with it
+            // for the very frees it exists to take off it. A no-op off Linux,
+            // with `MOON_NO_AUX_PIN=1`, or when there is no non-shard core.
+            crate::shard::numa::pin_current_aux_thread(&label);
+            while let Ok(shell) = rx.recv() {
+                drop(shell);
+            }
+        })
+        .ok()
+        .map(|_| tx)
 }
 
 /// The per-database queue.
@@ -549,5 +565,77 @@ impl Database {
             item.charged = false;
         }
         self.lazy_free.charged_items = 0;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    // ── moon#1221 review INTEG-4 ─────────────────────────────────────────
+
+    /// The helper is spawned lazily, from whichever shard thread first frees
+    /// a huge value — a thread pinned to ONE core. Linux threads inherit
+    /// their creator's affinity mask, so without a re-pin the helper is born
+    /// confined to that shard's core and competes with it for every shell it
+    /// frees (observed: `Cpus_allowed_list: 0`).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_helper_thread_does_not_inherit_the_spawning_shard_core() {
+        fn affinity(tid: &str) -> Option<String> {
+            let s = std::fs::read_to_string(format!("/proc/self/task/{tid}/status")).ok()?;
+            s.lines()
+                .find_map(|l| l.strip_prefix("Cpus_allowed_list:"))
+                .map(|v| v.trim().to_string())
+        }
+        fn thread_affinity(name: &str) -> Option<String> {
+            std::fs::read_dir("/proc/self/task")
+                .ok()?
+                .flatten()
+                .map(|t| t.file_name().to_string_lossy().into_owned())
+                .find(|tid| {
+                    std::fs::read_to_string(format!("/proc/self/task/{tid}/comm"))
+                        .is_ok_and(|c| c.trim() == name)
+                })
+                .and_then(|tid| affinity(&tid))
+        }
+        crate::shard::numa::init_aux_pinning(1);
+        if crate::shard::numa::aux_core_at(0).is_none() {
+            eprintln!("SKIPPED: no non-shard core to pin auxiliary threads to");
+            return;
+        }
+        const NAME: &str = "moon-lazyfree-t";
+        let outcome = std::thread::spawn(|| {
+            crate::shard::numa::pin_to_core(0);
+            let me = std::fs::read_link("/proc/thread-self")
+                .ok()
+                .and_then(|p| p.file_name().map(|f| f.to_string_lossy().into_owned()))
+                .unwrap_or_default();
+            let mine = affinity(&me);
+            if mine.as_deref() != Some("0") {
+                return Err(format!("cannot pin the test thread (affinity {mine:?})"));
+            }
+            let tx = super::spawn_shell_dropper(NAME).expect("spawn the helper");
+            // The helper re-pins itself as the first act of its closure,
+            // after `spawn` returned: poll until it has, or give up.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            let mut seen = thread_affinity(NAME);
+            while std::time::Instant::now() < deadline && seen.as_deref().is_none_or(|a| a == "0") {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                seen = thread_affinity(NAME);
+            }
+            drop(tx);
+            Ok(seen)
+        })
+        .join()
+        .expect("test thread");
+        match outcome {
+            Err(skip) => eprintln!("SKIPPED: {skip}"),
+            Ok(seen) => {
+                let seen = seen.expect("the helper thread exists");
+                assert_ne!(
+                    seen, "0",
+                    "moon-lazyfree inherited the spawning shard's single-core affinity"
+                );
+            }
+        }
     }
 }
