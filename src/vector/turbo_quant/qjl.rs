@@ -48,20 +48,44 @@ pub fn generate_qjl_matrix(dim: usize, seed: u64) -> Vec<f32> {
 /// Returns packed sign bits: dim bits = ceil(dim/8) bytes.
 /// Bit layout: byte[i] bit j = sign of (S * x)[i*8 + j], 1 = positive/zero, 0 = negative.
 pub fn qjl_encode(matrix_s: &[f32], vector: &[f32], dim: usize) -> Vec<u8> {
+    let mut signs = vec![0u8; dim.div_ceil(8)];
+    qjl_encode_into(matrix_s, vector, dim, &mut signs);
+    signs
+}
+
+/// [`qjl_encode`] into a caller-provided, ZEROED `out` (`ceil(dim/8)` bytes).
+///
+/// Each row's `S[row, :] · x` runs on the runtime-dispatched SIMD `dot_f32`
+/// kernel (`distance::table()`, scalar fallback on every target) instead of
+/// a serial scalar loop (moon#1192). SIMD reassociation can flip the sign of
+/// a row whose dot product is within rounding of zero — such a row carries
+/// no information about the residual's direction either way.
+pub fn qjl_encode_into(matrix_s: &[f32], vector: &[f32], dim: usize, out: &mut [u8]) {
     debug_assert_eq!(matrix_s.len(), dim * dim);
     debug_assert_eq!(vector.len(), dim);
+    debug_assert!(out.len() >= dim.div_ceil(8));
+    if dim == 0 {
+        return;
+    }
+    let dot = crate::vector::distance::table().dot_f32;
+    for (row, s_row) in matrix_s.chunks_exact(dim).take(dim).enumerate() {
+        // Store sign bit: 1 = non-negative, 0 = negative
+        if dot(s_row, vector) >= 0.0 {
+            out[row / 8] |= 1 << (row % 8);
+        }
+    }
+}
 
-    let num_bytes = (dim + 7) / 8;
-    let mut signs = vec![0u8; num_bytes];
-
+/// The pre-moon#1192 scalar matvec, kept as the reference for tests.
+#[cfg(test)]
+pub(crate) fn qjl_encode_scalar_reference(matrix_s: &[f32], vector: &[f32], dim: usize) -> Vec<u8> {
+    let mut signs = vec![0u8; dim.div_ceil(8)];
     for row in 0..dim {
-        // Compute dot product: S[row, :] . vector
         let row_start = row * dim;
         let mut dot = 0.0f32;
         for col in 0..dim {
             dot += matrix_s[row_start + col] * vector[col];
         }
-        // Store sign bit: 1 = non-negative, 0 = negative
         if dot >= 0.0 {
             signs[row / 8] |= 1 << (row % 8);
         }

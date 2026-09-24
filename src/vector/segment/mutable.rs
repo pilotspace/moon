@@ -80,6 +80,8 @@ pub struct BruteForceQuery {
     prepared: Vec<f32>,
     /// Whether the TQ-ADC distance path applies (resolved once at prepare).
     use_tq_adc: bool,
+    /// TQ4A2 decoded-L2 path: the pair codebook, built once per query.
+    a2_cb: Option<crate::vector::turbo_quant::a2_lattice::A2Codebook>,
     /// SQ8 (HQ-2): per-query ADC constants `(Σq_i, Σq_i²)` over the PREPARED
     /// (possibly normalized) query — computed once here, combined per
     /// candidate via `sq8_l2_from_stats`. Zero for non-SQ8 collections.
@@ -143,10 +145,6 @@ pub struct FrozenSegment {
     pub entries: Vec<MutableEntry>,
     /// TQ-4bit nibble-packed codes, `bytes_per_code` per vector.
     pub tq_codes: Vec<u8>,
-    /// QJL sign bits per vector (ceil(dim/8) bytes each), contiguous.
-    pub qjl_signs: Vec<u8>,
-    /// Residual norms (one f32 per vector).
-    pub residual_norms: Vec<f32>,
     /// Raw f32 vectors for exact pairwise distance during HNSW build.
     /// Layout: dim floats per vector, contiguous. Dropped after compaction.
     pub raw_f32: Vec<f32>,
@@ -176,14 +174,14 @@ struct MutableSegmentInner {
     /// lets the MVCC brute-force scan batch 32 candidates per SIMD LUT pass.
     /// Costs padded_dim/2 bytes per vector on top of `tq_codes`.
     fs_blocks: Vec<u8>,
-    /// QJL sign bits per vector — for TurboQuant_prod unbiased IP scoring.
-    /// Zero-filled at insert time; recomputed from raw_f32 during freeze().
-    qjl_signs: Vec<u8>,
-    /// Residual norms per vector — ||x - decode(TQ(x))||.
-    /// Zero at insert time; recomputed during freeze().
-    residual_norms: Vec<f32>,
-    /// Raw f32 vectors retained for deferred QJL encoding at freeze time.
-    /// Layout: dim floats per vector, contiguous.
+    // moon#1192: no per-vector QJL sign / residual-norm buffers. They were
+    // zero-filled at insert, never assigned in place, and only fed (a) the
+    // EXACT brute-force estimator, where `residual_norm == 0` multiplied the
+    // QJL term away, and (b) freeze(), which recomputed them anyway. The
+    // compaction worker now derives both from `raw_f32` for the frozen live
+    // entries only. EXACT inserts save `M·ceil(d/8) + 4` B/vector.
+    /// Raw f32 vectors retained (EXACT only) for the exact-L2 HNSW build and
+    /// the compaction-time QJL encoding. Layout: dim floats per vector.
     raw_f32: Vec<f32>,
     /// f16 copies of the original vectors (HQ-1 exact-rerank sidecar source).
     /// Layout: dim halves per vector, contiguous — retained in BOTH build
@@ -225,6 +223,32 @@ impl PartialOrd for DistF32 {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))
     }
+}
+
+/// Squared L2 between the FWHT-rotated unit query and a TQ4A2 code decoded
+/// pair by pair (4 coordinates per byte), summed serially in coordinate
+/// order over `q_rot.len()` coordinates.
+#[inline]
+fn a2_decoded_l2(
+    q_rot: &[f32],
+    code: &[u8],
+    cb: &crate::vector::turbo_quant::a2_lattice::A2Codebook,
+) -> f32 {
+    let padded = q_rot.len();
+    let mut sum = 0.0f32;
+    let mut j = 0usize;
+    for &byte in code {
+        let (x0, y0) = cb.decode_pair(byte & 0x0F);
+        let (x1, y1) = cb.decode_pair(byte >> 4);
+        for c in [x0, y0, x1, y1] {
+            if j < padded {
+                let d = q_rot[j] - c;
+                sum += d * d;
+            }
+            j += 1;
+        }
+    }
+    sum
 }
 
 /// Encode one vector into a self-contained SQ8 slot: `dim` u8 affine codes
@@ -329,8 +353,6 @@ impl MutableSegment {
             inner: RwLock::new(MutableSegmentInner {
                 tq_codes: Vec::new(),
                 fs_blocks: Vec::new(),
-                qjl_signs: Vec::new(),
-                residual_norms: Vec::new(),
                 raw_f32: Vec::new(),
                 raw_f16: Vec::new(),
                 sub_centroid_signs: Vec::new(),
@@ -378,12 +400,8 @@ impl MutableSegment {
             crate::vector::f16::encode_f16_slice(vector_f32, &mut inner.raw_f16);
             let mut extra_bytes = dim * 2; // f16 sidecar source
             if is_exact {
-                let qjl_bpv = inner.qjl_bytes_per_vec;
-                let new_qjl_len = inner.qjl_signs.len() + qjl_bpv;
-                inner.qjl_signs.resize(new_qjl_len, 0u8);
-                inner.residual_norms.push(0.0);
                 inner.raw_f32.extend_from_slice(vector_f32);
-                extra_bytes += qjl_bpv + 4 + dim * 4;
+                extra_bytes += dim * 4;
             }
 
             inner.entries.push(MutableEntry {
@@ -461,12 +479,8 @@ impl MutableSegment {
         crate::vector::f16::encode_f16_slice(vector_f32, &mut inner.raw_f16);
         let mut extra_bytes = dim * 2; // f16 sidecar source
         if is_exact {
-            let qjl_bpv = inner.qjl_bytes_per_vec;
-            let new_qjl_len = inner.qjl_signs.len() + qjl_bpv;
-            inner.qjl_signs.resize(new_qjl_len, 0u8);
-            inner.residual_norms.push(0.0);
             inner.raw_f32.extend_from_slice(vector_f32);
-            extra_bytes += qjl_bpv + 4 + dim * 4;
+            extra_bytes += dim * 4;
         }
 
         inner.entries.push(MutableEntry {
@@ -485,22 +499,28 @@ impl MutableSegment {
 
     /// Brute-force search on mutable segment.
     ///
-    /// Light mode: TQ-ADC scoring (fast, no QJL overhead).
-    /// Exact mode: TurboQuant_prod unbiased L2 (higher accuracy).
+    /// Scalar TQ4 scores with TQ-ADC in BOTH build modes (moon#1192): the
+    /// TurboQuant_prod estimator EXACT used to route here only ever saw
+    /// `residual_norm == 0` (mutable rows are never QJL-corrected — see
+    /// [`Self::append`]), so its QJL term was multiplied by zero while the
+    /// query paid 8 dense d×d matvecs for it. `_query_state` is ignored and
+    /// kept only for call-site compatibility.
     pub fn brute_force_search(
         &self,
         query_f32: &[f32],
-        query_state: Option<&crate::vector::turbo_quant::inner_product::TqProdQueryState>,
+        _query_state: Option<&crate::vector::turbo_quant::inner_product::TqProdQueryState>,
         k: usize,
     ) -> SmallVec<[SearchResult; 32]> {
-        self.brute_force_search_filtered(query_f32, query_state, k, None)
+        self.brute_force_search_filtered(query_f32, None, k, None)
     }
 
-    /// Brute-force filtered search. Routes to TQ-ADC or TQ_prod based on build_mode.
+    /// Brute-force filtered search: TQ-ADC for scalar TQ4 (both build modes,
+    /// moon#1192), decoded-L2 for TQ4A2, SQ8 ADC for SQ8. `_query_state` is
+    /// ignored (see [`Self::brute_force_search`]).
     pub fn brute_force_search_filtered(
         &self,
         query_f32: &[f32],
-        query_state: Option<&crate::vector::turbo_quant::inner_product::TqProdQueryState>,
+        _query_state: Option<&crate::vector::turbo_quant::inner_product::TqProdQueryState>,
         k: usize,
         allow_bitmap: Option<&RoaringBitmap>,
     ) -> SmallVec<[SearchResult; 32]> {
@@ -591,14 +611,10 @@ impl MutableSegment {
 
         let mut heap: BinaryHeap<DistF32> = BinaryHeap::with_capacity(k + 1);
 
-        // Distance strategy:
-        // - Scalar TQ4 (Light mode or no query_state): TQ-ADC with rotated query
-        // - Scalar TQ4 (Exact mode with query_state): TurboQuant_prod scoring
+        // Distance strategy (moon#1192: independent of build mode):
+        // - Scalar TQ4: TQ-ADC with rotated query
         // - A2 TQ4A2: decoded-vector symmetric L2 (no scalar ADC available)
-        let use_tq_adc = !is_a2
-            && (query_state.is_none()
-                || self.collection.build_mode
-                    == crate::vector::turbo_quant::collection::BuildMode::Light);
+        let use_tq_adc = !is_a2;
         let use_a2_decoded_l2 = is_a2;
 
         // Prepare FWHT-rotated query for TQ-ADC or A2 decoded-L2 path
@@ -683,29 +699,12 @@ impl MutableSegment {
                 } else {
                     f32::MAX
                 }
-            } else if use_tq_adc {
+            } else {
+                // use_tq_adc (scalar TQ4, both build modes — moon#1192)
                 tq_fin(
                     tq_l2_adc_scaled(&q_rotated, tq_code, entry.norm, centroids),
                     entry.norm,
                 )
-            } else if let Some(qs) = query_state {
-                let qjl_bpv = inner.qjl_bytes_per_vec;
-                let qjl_offset = id * qjl_bpv;
-                let qjl_signs = &inner.qjl_signs[qjl_offset..qjl_offset + qjl_bpv];
-                let residual_norm = inner.residual_norms[id];
-                let single_qjl_bpv = (dim + 7) / 8;
-                crate::vector::turbo_quant::inner_product::score_l2_prod(
-                    qs,
-                    tq_code,
-                    entry.norm,
-                    qjl_signs,
-                    residual_norm,
-                    centroids,
-                    dim,
-                    single_qjl_bpv,
-                )
-            } else {
-                f32::MAX // unreachable: non-A2, non-ADC, no query_state
             };
 
             let global_id = inner.global_id_base + entry.internal_id;
@@ -773,16 +772,21 @@ impl MutableSegment {
     /// prepares the (possibly normalized/FWHT-rotated) query buffer and the
     /// shared top-k heap that persist across yield chunks. A single per-query
     /// allocation at capture — never per-chunk (G-HOTPATH SAFETY-NET clause).
+    ///
+    /// `_have_query_state` is ignored since moon#1192 (scalar TQ4 scores with
+    /// TQ-ADC + FastScan in both build modes); kept for call-site
+    /// compatibility.
     pub fn prepare_brute_force_query(
         &self,
         query_f32: &[f32],
-        have_query_state: bool,
+        _have_query_state: bool,
         k: usize,
     ) -> BruteForceQuery {
         let dim = query_f32.len();
         let padded = self.collection.padded_dimension as usize;
         let prepared: Vec<f32>;
         let use_tq_adc: bool;
+        let mut a2_cb = None;
         if self.collection.quantization == QuantizationConfig::Sq8 {
             // Mirrors `Sq8Query::prepare`, owned: copy for L2, normalize otherwise.
             use_tq_adc = false;
@@ -798,25 +802,28 @@ impl MutableSegment {
             }
             prepared = q;
         } else {
+            // moon#1192: TQ-ADC (+ FastScan) for scalar TQ4 in BOTH build
+            // modes. EXACT used to score with TurboQuant_prod here, whose QJL
+            // term is always multiplied by a zero mutable residual norm.
             let is_a2 = self.collection.quantization == QuantizationConfig::TurboQuant4A2;
-            use_tq_adc = !is_a2
-                && (!have_query_state
-                    || self.collection.build_mode
-                        == crate::vector::turbo_quant::collection::BuildMode::Light);
-            if use_tq_adc {
-                let mut buf = vec![0.0f32; padded];
-                buf[..dim].copy_from_slice(query_f32);
-                let norm: f32 = query_f32.iter().map(|x| x * x).sum::<f32>().sqrt();
-                if norm > 0.0 {
-                    let inv = 1.0 / norm;
-                    for v in buf[..dim].iter_mut() {
-                        *v *= inv;
-                    }
+            use_tq_adc = !is_a2;
+            // TQ-ADC and the A2 decoded-L2 path both score against the
+            // FWHT-rotated unit query.
+            let mut buf = vec![0.0f32; padded];
+            buf[..dim].copy_from_slice(query_f32);
+            let norm: f32 = query_f32.iter().map(|x| x * x).sum::<f32>().sqrt();
+            if norm > 0.0 {
+                let inv = 1.0 / norm;
+                for v in buf[..dim].iter_mut() {
+                    *v *= inv;
                 }
-                fwht::fwht(&mut buf, self.collection.fwht_sign_flips.as_slice());
-                prepared = buf;
-            } else {
-                prepared = Vec::new();
+            }
+            fwht::fwht(&mut buf, self.collection.fwht_sign_flips.as_slice());
+            prepared = buf;
+            if is_a2 {
+                a2_cb = Some(crate::vector::turbo_quant::a2_lattice::A2Codebook::new(
+                    self.collection.padded_dimension,
+                ));
             }
         }
         // HQ-2: per-query ADC constants over the prepared (normalized) query —
@@ -860,7 +867,11 @@ impl MutableSegment {
                 (Vec::new(), 0.0, 0.0, 0.0)
             };
 
-        let l2_adjust = use_tq_adc && self.collection.metric == DistanceMetric::L2;
+        // L2-on-TQ correction applies to TQ-ADC and A2 decoded-L2 alike
+        // (both score unit directions + a norm trailer), exactly as the sync
+        // `brute_force_search_filtered` path does.
+        let l2_adjust =
+            (use_tq_adc || a2_cb.is_some()) && self.collection.metric == DistanceMetric::L2;
         let l2_q_norm: f32 = if l2_adjust {
             query_f32.iter().map(|x| x * x).sum::<f32>().sqrt()
         } else {
@@ -869,6 +880,7 @@ impl MutableSegment {
         BruteForceQuery {
             prepared,
             use_tq_adc,
+            a2_cb,
             l2_adjust,
             l2_q_norm,
             sq8_q_sum,
@@ -892,7 +904,7 @@ impl MutableSegment {
     pub fn brute_force_scan_mvcc_chunk(
         &self,
         q: &mut BruteForceQuery,
-        query_state: Option<&crate::vector::turbo_quant::inner_product::TqProdQueryState>,
+        _query_state: Option<&crate::vector::turbo_quant::inner_product::TqProdQueryState>,
         k: usize,
         allow_bitmap: Option<&RoaringBitmap>,
         snapshot_lsn: u64,
@@ -1102,6 +1114,7 @@ impl MutableSegment {
             }
             diff * diff + (l2_qn / na) * v
         };
+        let a2_cb = q.a2_cb.as_ref();
         let heap = &mut q.heap;
 
         for entry in &inner.entries[lo..hi] {
@@ -1130,23 +1143,18 @@ impl MutableSegment {
                     tq_l2_adc_scaled(q_rotated, tq_code, entry.norm, centroids),
                     entry.norm,
                 )
+            } else if let Some(cb) = a2_cb {
+                // TQ4A2: decoded-pair symmetric L2 against the rotated query,
+                // the same arithmetic (and summation order) as the sync
+                // `brute_force_search_filtered` A2 path, without its
+                // per-candidate decode buffer. HEAD reached a
+                // `query_state.unwrap()` here: a LIGHT TQ4A2 index (no QJL
+                // state) panicked the shard on its first MVCC scan.
+                // `norm_sq` first, as the sync path does, for bit-identity.
+                let norm_sq = entry.norm * entry.norm;
+                tq_fin(a2_decoded_l2(q_rotated, tq_code, cb) * norm_sq, entry.norm)
             } else {
-                let qs = query_state.unwrap();
-                let qjl_bpv = inner.qjl_bytes_per_vec;
-                let qjl_offset = id * qjl_bpv;
-                let qjl_signs = &inner.qjl_signs[qjl_offset..qjl_offset + qjl_bpv];
-                let residual_norm = inner.residual_norms[id];
-                let single_qjl_bpv = (dim + 7) / 8;
-                crate::vector::turbo_quant::inner_product::score_l2_prod(
-                    qs,
-                    tq_code,
-                    entry.norm,
-                    qjl_signs,
-                    residual_norm,
-                    centroids,
-                    dim,
-                    single_qjl_bpv,
-                )
+                f32::MAX
             };
 
             let global_id = inner.global_id_base + entry.internal_id;
@@ -1197,12 +1205,8 @@ impl MutableSegment {
             crate::vector::f16::encode_f16_slice(vector_f32, &mut inner.raw_f16);
             let mut extra_bytes = dim * 2; // f16 sidecar source
             if is_exact {
-                let qjl_bpv = inner.qjl_bytes_per_vec;
-                let new_qjl_len = inner.qjl_signs.len() + qjl_bpv;
-                inner.qjl_signs.resize(new_qjl_len, 0u8);
-                inner.residual_norms.push(0.0);
                 inner.raw_f32.extend_from_slice(vector_f32);
-                extra_bytes += qjl_bpv + 4 + dim * 4;
+                extra_bytes += dim * 4;
             }
 
             inner.entries.push(MutableEntry {
@@ -1242,12 +1246,8 @@ impl MutableSegment {
         crate::vector::f16::encode_f16_slice(vector_f32, &mut inner.raw_f16);
         let mut extra_bytes = dim * 2; // f16 sidecar source
         if is_exact {
-            let qjl_bpv = inner.qjl_bytes_per_vec;
-            let new_qjl_len = inner.qjl_signs.len() + qjl_bpv;
-            inner.qjl_signs.resize(new_qjl_len, 0u8);
-            inner.residual_norms.push(0.0);
             inner.raw_f32.extend_from_slice(vector_f32);
-            extra_bytes += qjl_bpv + 4 + dim * 4;
+            extra_bytes += dim * 4;
         }
 
         inner.entries.push(MutableEntry {
@@ -1464,24 +1464,12 @@ impl MutableSegment {
         let inner = self.inner.read();
         let n = n.min(inner.entries.len());
         let dim = inner.dimension as usize;
-        // SQ8 has no QJL/residual side data; its codes are not TQ-decodable, so
-        // the recompute paths (which assume TQ layout) must be skipped entirely.
-        let exact_tq = self.collection.build_mode
-            == crate::vector::turbo_quant::collection::BuildMode::Exact
-            && self.collection.quantization != QuantizationConfig::Sq8;
-        // Recompute is whole-buffer; truncate to the frozen window afterwards.
-        let mut qjl_signs = if exact_tq {
-            self.recompute_qjl_signs(&inner)
-        } else {
-            Vec::new()
-        };
-        qjl_signs.truncate(n * inner.qjl_bytes_per_vec);
-        let mut residual_norms = if exact_tq {
-            self.recompute_residual_norms(&inner)
-        } else {
-            Vec::new()
-        };
-        residual_norms.truncate(n);
+        // moon#1192: freeze is a plain O(n) copy on the shard thread. It used
+        // to recompute QJL signs + residual norms for the WHOLE mutable
+        // buffer here (8 scalar d×d matvecs per vector: ~1 s per 1K vectors
+        // at 384d, synchronously, at every background-compaction submit).
+        // The compaction worker now does it for the frozen live entries only
+        // (`compaction::exact_qjl`).
         FrozenSegment {
             entries: inner.entries[..n]
                 .iter()
@@ -1496,8 +1484,6 @@ impl MutableSegment {
                 })
                 .collect(),
             tq_codes: inner.tq_codes[..n * inner.bytes_per_code].to_vec(),
-            qjl_signs,
-            residual_norms,
             // empty in Light mode (nothing was appended)
             raw_f32: if inner.raw_f32.is_empty() {
                 Vec::new()
@@ -1531,8 +1517,8 @@ impl MutableSegment {
     /// ## Byte-copy semantics
     ///
     /// TQ codes and sub-centroid signs are copied verbatim — no re-encoding.
-    /// In Light mode `raw_f32`, `qjl_signs`, and `residual_norms` are empty and
-    /// are skipped. In Exact mode they are copied slice-by-slice.
+    /// In Light mode `raw_f32` is empty and skipped. In Exact mode it is
+    /// copied slice-by-slice.
     ///
     /// Entries whose `delete_lsn != 0` in the window are copied as-is (deleted).
     /// The brute-force path in the new segment already skips `delete_lsn != 0`
@@ -1562,17 +1548,6 @@ impl MutableSegment {
         let sub_centroid_signs = inner.sub_centroid_signs[sub_start..].to_vec();
 
         // ── Exact-mode optional fields ───────────────────────────────────────
-        let qjl_signs = if inner.qjl_signs.is_empty() {
-            Vec::new()
-        } else {
-            let qs = start * qjl_bpv;
-            inner.qjl_signs[qs..].to_vec()
-        };
-        let residual_norms = if inner.residual_norms.is_empty() {
-            Vec::new()
-        } else {
-            inner.residual_norms[start..].to_vec()
-        };
         let raw_f32 = if inner.raw_f32.is_empty() {
             Vec::new()
         } else {
@@ -1616,16 +1591,6 @@ impl MutableSegment {
         let byte_size = count * (bpc + std::mem::size_of::<MutableEntry>())
             + fs_blocks.len()
             + count * sub_bpv
-            + (if !qjl_signs.is_empty() {
-                count * qjl_bpv
-            } else {
-                0
-            })
-            + (if !residual_norms.is_empty() {
-                count * 4
-            } else {
-                0
-            })
             + (if !raw_f32.is_empty() {
                 count * dim * 4
             } else {
@@ -1640,8 +1605,6 @@ impl MutableSegment {
         let new_inner = MutableSegmentInner {
             tq_codes,
             fs_blocks,
-            qjl_signs,
-            residual_norms,
             raw_f32,
             raw_f16,
             sub_centroid_signs,
@@ -1659,148 +1622,6 @@ impl MutableSegment {
             inner: parking_lot::RwLock::new(new_inner),
             collection: self.collection.clone(),
         })
-    }
-
-    /// Recompute QJL signs from retained raw f32 vectors.
-    ///
-    /// Called during freeze() to produce correct QJL signs for the immutable segment.
-    /// Cost: O(N × M × d²) — amortized, runs once per compaction cycle.
-    fn recompute_qjl_signs(&self, inner: &MutableSegmentInner) -> Vec<u8> {
-        let dim = inner.dimension as usize;
-        let padded = inner.padded_dimension as usize;
-        let signs = self.collection.fwht_sign_flips.as_slice();
-        let is_a2 = self.collection.quantization == QuantizationConfig::TurboQuant4A2;
-        let a2_cb = if is_a2 {
-            Some(crate::vector::turbo_quant::a2_lattice::A2Codebook::new(
-                self.collection.padded_dimension,
-            ))
-        } else {
-            None
-        };
-        let centroids_opt: Option<&[f32; 16]> = if !is_a2 {
-            Some(self.collection.codebook_16())
-        } else {
-            None
-        };
-        let bytes_per_code = inner.bytes_per_code;
-
-        let mut qjl_signs = Vec::new();
-        let mut work_buf = vec![0.0f32; padded];
-
-        for (i, entry) in inner.entries.iter().enumerate() {
-            let raw = &inner.raw_f32[i * dim..(i + 1) * dim];
-
-            // Decode TQ to get residual
-            let offset = entry.internal_id as usize * bytes_per_code;
-            let code_end = offset + bytes_per_code - 4;
-            let code_slice = &inner.tq_codes[offset..code_end];
-            let norm_bytes = &inner.tq_codes[code_end..offset + bytes_per_code];
-            let norm =
-                f32::from_le_bytes([norm_bytes[0], norm_bytes[1], norm_bytes[2], norm_bytes[3]]);
-
-            let tq_code = crate::vector::turbo_quant::encoder::TqCode {
-                codes: code_slice.to_vec(),
-                norm,
-            };
-            let decoded = match (is_a2, a2_cb.as_ref(), centroids_opt) {
-                (true, Some(cb), _) => crate::vector::turbo_quant::encoder::decode_tq_mse_a2(
-                    &tq_code,
-                    signs,
-                    cb,
-                    dim,
-                    &mut work_buf,
-                ),
-                (false, _, Some(c)) => crate::vector::turbo_quant::encoder::decode_tq_mse_scaled(
-                    &tq_code,
-                    signs,
-                    c,
-                    dim,
-                    &mut work_buf,
-                ),
-                _ => vec![0.0f32; dim], // fallback: zero vector (should not happen)
-            };
-
-            // Compute residual
-            let mut residual = Vec::with_capacity(dim);
-            for j in 0..dim {
-                residual.push(raw[j] - decoded[j]);
-            }
-
-            // QJL encode residual for each projection matrix
-            for matrix in &self.collection.qjl_matrices {
-                let qs = crate::vector::turbo_quant::qjl::qjl_encode(matrix, &residual, dim);
-                qjl_signs.extend_from_slice(&qs);
-            }
-            if self.collection.qjl_matrices.is_empty() {
-                let qjl_bpv = inner.qjl_bytes_per_vec;
-                qjl_signs.extend(std::iter::repeat_n(0u8, qjl_bpv));
-            }
-        }
-        qjl_signs
-    }
-
-    /// Recompute residual norms from retained raw f32 vectors.
-    fn recompute_residual_norms(&self, inner: &MutableSegmentInner) -> Vec<f32> {
-        let dim = inner.dimension as usize;
-        let padded = inner.padded_dimension as usize;
-        let signs = self.collection.fwht_sign_flips.as_slice();
-        let is_a2 = self.collection.quantization == QuantizationConfig::TurboQuant4A2;
-        let a2_cb = if is_a2 {
-            Some(crate::vector::turbo_quant::a2_lattice::A2Codebook::new(
-                self.collection.padded_dimension,
-            ))
-        } else {
-            None
-        };
-        let centroids_opt: Option<&[f32; 16]> = if !is_a2 {
-            Some(self.collection.codebook_16())
-        } else {
-            None
-        };
-        let bytes_per_code = inner.bytes_per_code;
-
-        let mut norms = Vec::with_capacity(inner.entries.len());
-        let mut work_buf = vec![0.0f32; padded];
-
-        for (i, entry) in inner.entries.iter().enumerate() {
-            let raw = &inner.raw_f32[i * dim..(i + 1) * dim];
-            let offset = entry.internal_id as usize * bytes_per_code;
-            let code_end = offset + bytes_per_code - 4;
-            let code_slice = &inner.tq_codes[offset..code_end];
-            let norm_bytes = &inner.tq_codes[code_end..offset + bytes_per_code];
-            let norm =
-                f32::from_le_bytes([norm_bytes[0], norm_bytes[1], norm_bytes[2], norm_bytes[3]]);
-
-            let tq_code = crate::vector::turbo_quant::encoder::TqCode {
-                codes: code_slice.to_vec(),
-                norm,
-            };
-            let decoded = match (is_a2, a2_cb.as_ref(), centroids_opt) {
-                (true, Some(cb), _) => crate::vector::turbo_quant::encoder::decode_tq_mse_a2(
-                    &tq_code,
-                    signs,
-                    cb,
-                    dim,
-                    &mut work_buf,
-                ),
-                (false, _, Some(c)) => crate::vector::turbo_quant::encoder::decode_tq_mse_scaled(
-                    &tq_code,
-                    signs,
-                    c,
-                    dim,
-                    &mut work_buf,
-                ),
-                _ => vec![0.0f32; dim],
-            };
-
-            let mut r_norm_sq = 0.0f32;
-            for j in 0..dim {
-                let r = raw[j] - decoded[j];
-                r_norm_sq += r * r;
-            }
-            norms.push(r_norm_sq.sqrt());
-        }
-        norms
     }
 
     /// Access collection metadata.

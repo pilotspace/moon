@@ -269,25 +269,13 @@ pub fn compact(
             .copy_from_slice(&tq_buffer_orig[src..src + bytes_per_code]);
     }
 
-    // BFS reorder QJL signs and residual norms for TurboQuant_prod reranking.
-    let qjl_bpv = frozen.qjl_bytes_per_vec;
-    let mut qjl_signs_bfs = vec![0u8; n * qjl_bpv];
-    let mut residual_norms_bfs = vec![0.0f32; n];
-    for bfs_pos in 0..n {
-        let orig_id = graph.to_original(bfs_pos as u32) as usize;
-        let live_idx = orig_id;
-        // QJL signs
-        let src_qjl = live_idx * qjl_bpv;
-        let dst_qjl = bfs_pos * qjl_bpv;
-        if src_qjl + qjl_bpv <= frozen.qjl_signs.len() {
-            qjl_signs_bfs[dst_qjl..dst_qjl + qjl_bpv]
-                .copy_from_slice(&frozen.qjl_signs[src_qjl..src_qjl + qjl_bpv]);
-        }
-        // Residual norms
-        if live_idx < frozen.residual_norms.len() {
-            residual_norms_bfs[bfs_pos] = frozen.residual_norms[live_idx];
-        }
-    }
+    // EXACT: QJL signs + residual norms for the live entries, BFS-ordered,
+    // computed HERE — on the compaction worker — instead of in freeze() on
+    // the shard thread (moon#1192). Empty for LIGHT / SQ8 / raw-less builds
+    // (HEAD stored an all-zero `n * ceil(dim/8)` QJL buffer + `n` zero norms
+    // there, which nothing reads).
+    let exact_qjl =
+        super::exact_qjl::exact_qjl_bfs(collection, frozen, &live_entries, &graph, &tq_bfs);
 
     // Compute sub-centroid sign bits from raw f32 vectors (FWHT-rotated).
     // For each coordinate: compare the ACTUAL rotated value against its quantized centroid.
@@ -376,9 +364,9 @@ pub fn compact(
     let segment = ImmutableSegment::new(
         graph,
         AlignedBuffer::from_vec(tq_bfs),
-        qjl_signs_bfs,
-        residual_norms_bfs,
-        qjl_bpv,
+        exact_qjl.signs,
+        exact_qjl.residual_norms,
+        exact_qjl.bytes_per_vec,
         sub_signs_bfs,
         sub_bpv,
         mvcc,

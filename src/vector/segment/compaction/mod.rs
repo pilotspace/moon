@@ -11,6 +11,7 @@
 //! 8. Construct ImmutableSegment
 
 mod compact_path;
+mod exact_qjl;
 mod graph_build;
 mod merge;
 mod recall;

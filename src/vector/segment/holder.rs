@@ -464,20 +464,12 @@ impl SegmentHolder {
         let segment_count = 1 + snapshot.immutable.len() + snapshot.warm.len();
         let mut all: SmallVec<[SearchResult; 32]> = SmallVec::with_capacity(k * segment_count);
 
-        // Prepare query state: Exact mode uses TQ_prod (QJL), Light mode skips it.
-        let collection = snapshot.mutable.collection();
-        let query_state = if !collection.qjl_matrices.is_empty() {
-            Some(
-                crate::vector::turbo_quant::inner_product::prepare_query_prod(
-                    query_f32,
-                    &collection.qjl_matrices,
-                    collection.fwht_sign_flips.as_slice(),
-                    collection.padded_dimension as usize,
-                ),
-            )
-        } else {
-            None // Light mode: no QJL matrices, use TQ-ADC brute force
-        };
+        // moon#1192: no TurboQuant_prod query state. The mutable scan scores
+        // with TQ-ADC in both build modes (EXACT's prod estimator multiplied
+        // its QJL term by a zero mutable residual norm), so the 8 dense d×d
+        // matvecs `prepare_query_prod` paid per query had no consumer.
+        let query_state: Option<&crate::vector::turbo_quant::inner_product::TqProdQueryState> =
+            None;
 
         // Full resolved ef per segment (no ef_defaulted context on this path,
         // so the AE-1 per-segment reduction never applies here).
@@ -488,7 +480,7 @@ impl SegmentHolder {
                 all.extend(
                     snapshot
                         .mutable
-                        .brute_force_search(query_f32, query_state.as_ref(), k),
+                        .brute_force_search(query_f32, query_state, k),
                 );
                 for imm in &snapshot.immutable {
                     all.extend(imm.search(query_f32, k, graph_ef, _scratch));
@@ -500,7 +492,7 @@ impl SegmentHolder {
             FilterStrategy::BruteForceFiltered => {
                 all.extend(snapshot.mutable.brute_force_search_filtered(
                     query_f32,
-                    query_state.as_ref(),
+                    query_state,
                     k,
                     filter_bitmap,
                 ));
@@ -526,7 +518,7 @@ impl SegmentHolder {
             FilterStrategy::HnswFiltered => {
                 all.extend(snapshot.mutable.brute_force_search_filtered(
                     query_f32,
-                    query_state.as_ref(),
+                    query_state,
                     k,
                     filter_bitmap,
                 ));
@@ -553,7 +545,7 @@ impl SegmentHolder {
                 let oversample_k = k * 3;
                 all.extend(snapshot.mutable.brute_force_search_filtered(
                     query_f32,
-                    query_state.as_ref(),
+                    query_state,
                     oversample_k,
                     filter_bitmap,
                 ));
@@ -661,25 +653,14 @@ impl SegmentHolder {
         self.promote_unloaded();
         let snapshot = self.load();
 
-        // Prepare TurboQuant_prod query state for mutable search.
-        let collection = snapshot.mutable.collection();
-        let query_state = if !collection.qjl_matrices.is_empty() {
-            Some(
-                crate::vector::turbo_quant::inner_product::prepare_query_prod(
-                    query_f32,
-                    &collection.qjl_matrices,
-                    collection.fwht_sign_flips.as_slice(),
-                    collection.padded_dimension as usize,
-                ),
-            )
-        } else {
-            None
-        };
+        // moon#1192: no TurboQuant_prod query state (see `search_filtered`).
+        let query_state: Option<&crate::vector::turbo_quant::inner_product::TqProdQueryState> =
+            None;
 
         // 1. MVCC-aware brute-force (full mutable scan: 0..len)
         let mut all = snapshot.mutable.brute_force_search_mvcc(
             query_f32,
-            query_state.as_ref(),
+            query_state,
             k,
             filter_bitmap,
             mvcc.snapshot_lsn,
@@ -869,20 +850,9 @@ impl SegmentHolder {
         let mutable_len = snap.mutable_len;
         let tuning = snap.tuning;
 
-        // Prepare TurboQuant_prod query state for mutable search (same as sync).
-        let collection = segments.mutable.collection();
-        let query_state = if !collection.qjl_matrices.is_empty() {
-            Some(
-                crate::vector::turbo_quant::inner_product::prepare_query_prod(
-                    query_f32,
-                    &collection.qjl_matrices,
-                    collection.fwht_sign_flips.as_slice(),
-                    collection.padded_dimension as usize,
-                ),
-            )
-        } else {
-            None
-        };
+        // moon#1192: no TurboQuant_prod query state (see `search_filtered`).
+        let query_state: Option<&crate::vector::turbo_quant::inner_product::TqProdQueryState> =
+            None;
 
         let mut all: SmallVec<[SearchResult; 32]> = SmallVec::new();
 
@@ -1001,7 +971,7 @@ impl SegmentHolder {
                 let end = (start + chunk).min(mutable_len);
                 segments.mutable.brute_force_scan_mvcc_chunk(
                     &mut bf_query,
-                    query_state.as_ref(),
+                    query_state,
                     fetch_k,
                     filter_ref,
                     snapshot_lsn,
