@@ -53,8 +53,8 @@ impl BPTree {
             let l = self.leaf(id);
             let want_next = leaves.get(i + 1).copied();
             let want_prev = if i == 0 { None } else { Some(leaves[i - 1]) };
-            assert_eq!(l.next, want_next, "leaf {i}: next pointer broken");
-            assert_eq!(l.prev, want_prev, "leaf {i}: prev pointer broken");
+            assert_eq!(l.next(), want_next, "leaf {i}: next pointer broken");
+            assert_eq!(l.prev(), want_prev, "leaf {i}: prev pointer broken");
         }
     }
 
@@ -223,5 +223,89 @@ mod tests {
             tree.check_invariants();
             assert_eq!(tree.len(), 0);
         }
+    }
+}
+
+/// moon#1189 — arena layout, fill and growth.
+#[cfg(test)]
+mod memory_1189 {
+    use super::*;
+
+    fn build(n: u64, pattern: &str) -> BPTree {
+        let mut tree = BPTree::new();
+        let mut state = 42u64;
+        for i in 0..n {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let s = match pattern {
+                "rising" => i as f64,
+                "falling" => -(i as f64),
+                _ => (state >> 11) as f64,
+            };
+            tree.insert(OrderedFloat(s), Bytes::from(format!("member:{i:08}")));
+        }
+        tree
+    }
+
+    /// Rising (timestamp / counter) scores used to split every leaf 7/7 and
+    /// leave the arena half empty; the lopsided split at the chain's ends
+    /// fills them. Falling scores mirror it at the head. Random inserts keep
+    /// the classic ~70% fill. RED on HEAD `935c555` (fill 7.00 rising).
+    #[test]
+    fn end_of_chain_inserts_fill_leaves_completely() {
+        for (pattern, min_fill) in [("rising", 13.9), ("falling", 13.9), ("random", 9.0)] {
+            let tree = build(50_000, pattern);
+            tree.check_invariants();
+            let fill = tree.len() as f64 / tree.leaf_count() as f64;
+            assert!(
+                fill >= min_fill,
+                "{pattern}: leaf fill {fill:.2} < {min_fill}"
+            );
+        }
+    }
+
+    /// A leaf slot no longer pays for the (larger) internal-node variant,
+    /// and `node_capacity() * NODE_BYTES` stays a floor under the exact
+    /// `memory_bytes()` the ledger bills (moon#788's accounting contract).
+    #[test]
+    fn leaf_slots_are_leaf_sized_and_accounting_stays_exact() {
+        const {
+            assert!(NODE_BYTES < INTERNAL_NODE_BYTES);
+            assert!(
+                NODE_BYTES <= LEAF_CAPACITY * std::mem::size_of::<Key>() + 16,
+                "leaf padded past its payload"
+            );
+        }
+        for pattern in ["rising", "random"] {
+            let tree = build(40_000, pattern);
+            let floor = tree.node_capacity() * NODE_BYTES;
+            let exact = tree.memory_bytes();
+            assert!(floor <= exact, "{pattern}: floor {floor} > billed {exact}");
+            let live = tree.leaves.len() * NODE_BYTES + tree.internals.len() * INTERNAL_NODE_BYTES;
+            // Chunking bounds the unused tail at one chunk per arena (plus
+            // size-class rounding), where a doubling Vec wasted up to half.
+            let slack = exact - live;
+            let bound = (1usize << LEAF_CHUNK_SHIFT) * NODE_BYTES
+                + (1usize << INTERNAL_CHUNK_SHIFT) * INTERNAL_NODE_BYTES
+                + exact / 8;
+            assert!(slack <= bound, "{pattern}: {slack} B of slack > {bound}");
+        }
+    }
+
+    /// Growth never moves a leaf that already sits in a full chunk: there is
+    /// no whole-arena `realloc` on the shard thread as the zset grows.
+    #[test]
+    fn growth_does_not_move_full_chunks() {
+        let mut tree = build(20_000, "random");
+        let probe = std::ptr::from_ref(tree.leaves.get(300));
+        for i in 0..20_000u64 {
+            tree.insert(
+                OrderedFloat(1e15 + i as f64),
+                Bytes::from(format!("late:{i}")),
+            );
+        }
+        assert_eq!(probe, std::ptr::from_ref(tree.leaves.get(300)));
+        tree.check_invariants();
     }
 }

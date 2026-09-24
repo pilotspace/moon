@@ -8,13 +8,14 @@ use super::bptree::{BPTree, NodeId};
 // ---------------------------------------------------------------------------
 
 impl BPTree {
+    /// Whether `(score, member)` is stored. The probe is borrowed — no
+    /// `Bytes::copy_from_slice` per lookup (moon#1189).
     pub fn contains(&self, score: OrderedFloat<f64>, member: &[u8]) -> bool {
         if self.is_empty() {
             return false;
         }
-        let key = (score, Bytes::copy_from_slice(member));
-        let leaf_id = self.find_leaf_pub(&key);
-        self.leaf_pub(leaf_id).search(&key).is_ok()
+        let leaf_id = self.find_leaf_by(score.0, member);
+        self.leaf_pub(leaf_id).search_by(score.0, member).is_ok()
     }
 
     /// Get score for a member by doing a linear scan of all leaves.
@@ -38,34 +39,25 @@ impl BPTree {
     // Rank queries
     // -----------------------------------------------------------------------
 
-    /// Return 0-based rank of (score, member) in ascending order, or None if not found.
+    /// Return 0-based rank of (score, member) in ascending order, or None if
+    /// not found. One descent summing the counts left of the path; the probe
+    /// is borrowed (moon#1189).
     pub fn rank(&self, score: OrderedFloat<f64>, member: &[u8]) -> Option<usize> {
-        let key = (score, Bytes::copy_from_slice(member));
-        self.rank_internal(self.root_id(), &key, self.height())
-    }
-
-    fn rank_internal(
-        &self,
-        node_id: NodeId,
-        key: &(OrderedFloat<f64>, Bytes),
-        level: usize,
-    ) -> Option<usize> {
-        if level == 1 {
-            // Leaf
-            let leaf = self.leaf_pub(node_id);
-            match leaf.search(key) {
-                Ok(idx) => Some(idx),
-                Err(_) => None,
-            }
-        } else {
-            let node = self.internal_pub(node_id);
-            let child_idx = node.search(key);
-            // Sum counts of all children to the left
-            let left_count: usize = (0..child_idx).map(|i| node.counts()[i] as usize).sum();
-            let child_id = node.children()[child_idx];
-            self.rank_internal(child_id, key, level - 1)
-                .map(|r| left_count + r)
+        let mut cur = self.root_id();
+        let mut left = 0usize;
+        for _ in 1..self.height() {
+            let node = self.internal_pub(cur);
+            let child_idx = node.search_by(score.0, member);
+            left += node.counts()[..child_idx]
+                .iter()
+                .map(|&c| c as usize)
+                .sum::<usize>();
+            cur = node.children()[child_idx];
         }
+        self.leaf_pub(cur)
+            .search_by(score.0, member)
+            .ok()
+            .map(|idx| left + idx)
     }
 
     /// Return 0-based rank from the end (descending order).
@@ -203,10 +195,10 @@ impl BPTree {
 
     /// Find the leaf and index for the first entry >= min_key.
     fn find_start(&self, min: OrderedFloat<f64>) -> (Option<NodeId>, usize) {
-        let min_key = (min, Bytes::new());
-        let leaf_id = self.find_leaf_pub(&min_key);
+        // `(min, b"")` sorts before every stored `(min, member)`.
+        let leaf_id = self.find_leaf_by(min.0, b"");
         let leaf = self.leaf_pub(leaf_id);
-        match leaf.search(&min_key) {
+        match leaf.search_by(min.0, b"") {
             Ok(idx) | Err(idx) => {
                 if idx < leaf.entry_count() {
                     (Some(leaf_id), idx)
