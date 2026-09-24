@@ -26,6 +26,9 @@ does not OOM, fill the disk, or corrupt each other's work.
   `cargo clippy --no-default-features --features runtime-tokio,jemalloc -- -D warnings`, and
   `cargo check --all-targets --no-default-features --features runtime-tokio,jemalloc` (the tokio leg has
   no `graph`/`text-index`: a new bench/test using them needs `required-features` or a `cfg` gate).
+- NEVER `git stash`: `refs/stash` is shared by every worktree of the repo, and two agents once popped
+  each other's entries. Park WIP with `git diff > <scratchpad>/<ws>-wip.diff` + `git checkout -- <files>`,
+  restore with `git apply`.
 - An in-process test result counts only if a failing backtrace path points into YOUR worktree:
   the shared target aliases artifacts, and a binary built in another tree once satisfied a gate.
 - Release measurement builds: `cargo build --profile release-fast --bin moon` — at most TWO per
