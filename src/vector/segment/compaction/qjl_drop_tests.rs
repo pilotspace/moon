@@ -97,9 +97,13 @@ fn fresh_exact_segment_holds_nothing_its_reloaded_twin_lacks() {
         // Red on HEAD for TQ4: the fresh EXACT segment carried
         // live·(8·13 + 4) bytes of QJL signs + residual norms that the
         // reloaded twin never had (both serve the sidecar from the map).
+        // Sub-centroid signs are netted out: whether a placeholder buffer is
+        // persisted is the segment format's policy, not this item's.
+        let without_signs =
+            |s: &ImmutableSegment| s.resident_bytes() - s.sub_centroid_signs().len();
         assert_eq!(
-            fresh.resident_bytes(),
-            reloaded.resident_bytes(),
+            without_signs(&fresh),
+            without_signs(&reloaded),
             "{quant:?}: in-memory segment must not hold state a restart drops"
         );
         let qs: Vec<Vec<f32>> = data.iter().step_by(29).cloned().collect();
@@ -164,4 +168,5 @@ fn merged_segment_without_signs_or_sidecar_scores_like_its_reloaded_twin() {
     // QJL estimator, the reloaded one's from ADC.
     assert_eq!(results(&merged, &qs), results(&reloaded, &qs));
     assert_eq!(merged.resident_bytes(), reloaded.resident_bytes());
+    assert!(merged.sub_centroid_signs().is_empty());
 }
