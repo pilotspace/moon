@@ -77,6 +77,19 @@ const WAL_BUF_SHRINK_THRESHOLD: usize = DEFAULT_WAL_BUF_CAPACITY * 4;
 /// durability claim instead (moon#1221 review R2).
 const PENDING_ROTATION_MAX_BUFFER: usize = 4 * 1024 * 1024;
 
+/// How long a rotation may wait for the agent's fsync of the old segment
+/// before the writer completes it with an inline fsync (moon#1221 review
+/// R3). While a rotation is pending every append stays in PROCESS memory —
+/// the next segment does not exist yet — so a SIGKILL loses it, where
+/// outside a rotation a buffer of 4 KiB or more reaches the page cache
+/// within one tick. [`PENDING_ROTATION_MAX_BUFFER`] bounds that window in
+/// bytes; this bounds it in time, to the everysec contract's one second
+/// (the WAL's own 1 s sync timer). A healthy disk completes the rotation in
+/// milliseconds and never gets here; a disk whose fsync takes longer than a
+/// second stalls the shard for the rest of it, as every rotation did before
+/// moon#1188.
+const PENDING_ROTATION_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// The error every durability call returns once an fsync on the WAL failed
 /// (moon#1221 review R2): the watermark is frozen and nothing is ever
 /// reported durable again — restart the server.
@@ -103,6 +116,9 @@ fn poisoned_error() -> std::io::Error {
 struct PendingRotation {
     /// Every record `<= upto_lsn` is in the old segment, and no other is.
     upto_lsn: u64,
+    /// When the rotation began: past [`PENDING_ROTATION_MAX_AGE`] it is
+    /// completed inline.
+    since: std::time::Instant,
     /// A `request_sync` arrived while the rotation was pending. The buffered
     /// records it asked for belong to the next segment, which does not exist
     /// yet; the request is re-issued the moment the rotation completes.
@@ -530,6 +546,8 @@ pub struct WalWriterV3 {
     /// cleared it, so any retry would succeed whether or not the data
     /// reached the disk (moon#1221 review R2).
     fsync_failed: bool,
+    /// [`PENDING_ROTATION_MAX_AGE`], overridable by tests.
+    pending_rotation_max_age: std::time::Duration,
     /// Test hook: the next inline fsync fails.
     #[cfg(test)]
     inline_fsync_fault: bool,
@@ -600,6 +618,7 @@ impl WalWriterV3 {
             rotations_inline: 0,
             rotations_degraded: 0,
             fsync_failed: false,
+            pending_rotation_max_age: PENDING_ROTATION_MAX_AGE,
             #[cfg(test)]
             inline_fsync_fault: false,
         };
@@ -653,6 +672,10 @@ impl WalWriterV3 {
     fn flush_write(&mut self) -> std::io::Result<()> {
         // moon#1188: while a rotation waits for the old segment's off-loop
         // fsync, appends stay buffered — the next segment may not exist yet.
+        // They are in process memory only: a SIGKILL in this window loses
+        // them, where outside a rotation 4 KiB would reach the page cache
+        // within a tick. The window is bounded by PENDING_ROTATION_MAX_BUFFER
+        // and PENDING_ROTATION_MAX_AGE (moon#1221 review R3).
         if self.pending_rotation.is_some() && !self.poll_pending_rotation()? {
             return Ok(());
         }
@@ -978,12 +1001,23 @@ impl WalWriterV3 {
 
     /// Install a sync agent with an injected fsync backend (tests gate or
     /// fail it to force every interleaving of a pending rotation).
+    ///
+    /// Such a test controls when the agent's fsync completes, so the
+    /// wall-clock bound on a pending rotation is lifted with it (a loaded box
+    /// must not complete a rotation the test holds open); a test of that
+    /// bound sets it back with [`Self::set_pending_rotation_max_age_for_test`].
     #[cfg(test)]
     pub(crate) fn install_sync_agent_for_test(&mut self, agent: super::sync_agent::WalSyncAgent) {
         if self.fsync_failed {
             agent.shared.poison();
         }
         self.sync_agent = Some(agent);
+        self.pending_rotation_max_age = std::time::Duration::from_secs(3600);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_pending_rotation_max_age_for_test(&mut self, age: std::time::Duration) {
+        self.pending_rotation_max_age = age;
     }
 
     /// True while a rotation waits for the old segment's off-loop fsync
@@ -1338,6 +1372,7 @@ impl WalWriterV3 {
         }
         self.pending_rotation = Some(PendingRotation {
             upto_lsn,
+            since: std::time::Instant::now(),
             sync_requested: false,
         });
         self.complete_pending_rotation(true)
@@ -1367,6 +1402,7 @@ impl WalWriterV3 {
         }
         self.pending_rotation = Some(PendingRotation {
             upto_lsn,
+            since: std::time::Instant::now(),
             sync_requested: false,
         });
         self.rotations_offloaded += 1;
@@ -1379,7 +1415,8 @@ impl WalWriterV3 {
     /// The decision is [`super::watermark::rotation_step`] (loom-modeled):
     /// open the next segment once the agent's watermark covers the old one;
     /// complete it with an inline fsync when the in-memory buffer outgrows
-    /// [`PENDING_ROTATION_MAX_BUFFER`] (or there is no agent to wait for).
+    /// [`PENDING_ROTATION_MAX_BUFFER`] or the rotation outlives
+    /// [`PENDING_ROTATION_MAX_AGE`] (or there is no agent to wait for).
     /// On a poisoned WAL — the agent's fsync or an inline one failed — it
     /// NEVER retries the fsync (moon#1221 review R2: after a failure a retry
     /// succeeds without proving anything, and the PR head published the
@@ -1390,7 +1427,10 @@ impl WalWriterV3 {
         let Some(pending) = self.pending_rotation else {
             return Ok(true);
         };
-        let over_bound = self.buf.len() > PENDING_ROTATION_MAX_BUFFER;
+        // `elapsed` reads the clock once per poll, and only while a rotation
+        // is pending (a few ms per 16 MiB segment on a healthy disk).
+        let over_bound = self.buf.len() > PENDING_ROTATION_MAX_BUFFER
+            || pending.since.elapsed() >= self.pending_rotation_max_age;
         let step = super::watermark::rotation_step(
             self.sync_agent.as_ref().map(|a| &a.shared.wm),
             pending.upto_lsn,

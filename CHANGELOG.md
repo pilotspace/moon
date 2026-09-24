@@ -223,9 +223,12 @@ shared 4-vCPU Linux container against HEAD `935c555` — re-measure on the GCE r
   to a writer thread and finalizes (fsync/rename) off the shard (max stall on 1.5M keys 1.3 s →
   12 ms, peak RSS growth +257 → +2 MiB); AOF rewrite streams its base image instead of deep-copying
   the keyspace (peak RSS growth +567 → +6 MiB; the fold is still O(dataset) on the shard — moon#1185
-  stays open); WAL segment-rotation fsync goes through the sync agent; each AOF record costs exactly
-  one allocation; CDC.READ seeks by segment header and reads in chunks on a CDC read pool (a poll at
-  a ~1M-record tail 5.8 s → 0.17 ms).
+  stays open);
+  WAL segment-rotation fsync goes through the sync agent (while it is in flight new WAL records wait
+  in process memory — at most 4 MiB or 1 s, then the rotation completes inline — so a SIGKILL there
+  can lose up to that much of the WAL-only planes, workspace / MQ / temporal, still within
+  everysec's second); each AOF record costs exactly one allocation; CDC.READ seeks by segment header
+  and reads in chunks on a CDC read pool (a poll at a ~1M-record tail 5.8 s → 0.17 ms).
 
 ### Fixed
 

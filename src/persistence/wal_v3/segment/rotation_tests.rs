@@ -159,7 +159,14 @@ fn test_1188_kill_during_pending_rotation_leaves_a_final_segment_tail() {
     std::mem::forget(writer);
     assert!(!WalSegment::segment_path(&wal_dir, 2).exists());
     // Records 1..=30 reached the old segment's page cache; 31..=35 were
-    // only in memory — exactly what a kill loses today.
+    // only in process memory, and a kill loses them. HEAD `935c555` loses
+    // these five too (a buffer under 4 KiB waits for the 1 s sync timer),
+    // but a pending rotation holds EVERY append in memory — up to
+    // PENDING_ROTATION_MAX_BUFFER or PENDING_ROTATION_MAX_AGE — where HEAD
+    // wrote 4 KiB and more to the page cache each tick, so a kill in the
+    // window loses more of the WAL-only planes (workspace, MQ, temporal)
+    // than at HEAD; still within the everysec second (moon#1221 review R3).
+    // `test_1221_r3_pending_rotation_is_bounded_in_time` pins the bound.
     assert_eq!(replayed_lsns(&wal_dir), (1..=30).collect::<Vec<_>>());
     gate.open(); // release the leaked agent thread
 }
@@ -664,6 +671,51 @@ fn test_1221_r2_a_failed_inline_fsync_poisons_the_agent() {
             .is_err()
     );
     assert_eq!(gate.calls(), 0, "a poisoned WAL never fsyncs again");
+}
+
+// ---------------------------------------------------------------------
+// moon#1221 review R3 — the in-memory window of a pending rotation.
+// ---------------------------------------------------------------------
+
+/// While a rotation is pending every append stays in process memory — the
+/// next segment does not exist yet — so a SIGKILL loses it. The window is
+/// bounded in time as well as bytes: past the age bound the rotation
+/// completes with an inline fsync and the buffer reaches the page cache,
+/// even while the agent's fsync is stuck — and without claiming anything
+/// over that fsync still in flight.
+#[test]
+fn test_1221_r3_pending_rotation_is_bounded_in_time() {
+    let tmp = tempfile::tempdir().unwrap();
+    let wal_dir = tmp.path().join("wal");
+    let mut writer = WalWriterV3::new(0, &wal_dir, 512, WalBounds::DEFAULT).unwrap();
+    let gate = FsyncGate::new();
+    writer.install_sync_agent_for_test(gate.agent());
+    writer.set_pending_rotation_max_age_for_test(std::time::Duration::from_millis(50));
+    for _ in 0..30 {
+        writer.append(WalRecordType::Command, b"SET k v");
+    }
+    writer.flush_write().unwrap();
+    assert!(writer.rotation_pending());
+    wait_until(|| gate.calls() == 1); // the agent's fsync is stuck in the gate
+    for _ in 0..5 {
+        writer.append(WalRecordType::Command, b"SET k2 v2");
+    }
+    std::thread::sleep(std::time::Duration::from_millis(60));
+    writer.flush_if_needed().unwrap();
+    assert!(
+        !writer.rotation_pending(),
+        "the age bound must complete the rotation"
+    );
+    assert_eq!(writer.rotation_counts(), (1, 1));
+    // What a SIGKILL would leave now: every record, in the page cache.
+    assert_eq!(replayed_lsns(&wal_dir), (1..=35).collect::<Vec<_>>());
+    assert_eq!(
+        writer.sync_agent.as_ref().unwrap().durable_lsn(),
+        0,
+        "nothing published over the agent's fsync still in flight"
+    );
+    gate.open();
+    writer.wait_durable(35, WAIT_DURABLE_TIMEOUT).unwrap();
 }
 
 /// Overwrite segment `seq`'s header `base_lsn` (bytes 28..36).
