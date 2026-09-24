@@ -2337,6 +2337,17 @@ pub(crate) fn handle_shard_message_shared(
                 let _ = ack.send(computed == sha1);
             }
         }
+        ShardMessage::ScriptFlush { ack } => {
+            // moon#1229: another shard's connection ran `SCRIPT FLUSH`; the
+            // script cache is per shard, so without this every EVALSHA whose
+            // keys route here kept running a flushed script. `flush` drops the
+            // source map, the compiled functions (moon#1167) and the fan-out
+            // duties, exactly as on the originating shard.
+            script_cache.borrow_mut().flush();
+            if let Some(ack) = ack {
+                let _ = ack.send(true);
+            }
+        }
         ShardMessage::FunctionRegistry { op, ack } => {
             // moon#514: replay a FUNCTION LOAD/DELETE/FLUSH that another
             // shard's connection accepted, so this shard's registry agrees.

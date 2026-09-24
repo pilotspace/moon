@@ -290,6 +290,25 @@ pub fn handle_script_subcommand(
             .collect();
         (Frame::Array(results.into()), None)
     } else if sub.eq_ignore_ascii_case(b"FLUSH") {
+        // `SCRIPT FLUSH [ASYNC|SYNC]`: anything else is refused BEFORE the
+        // cache is touched, with redis's exact text (moon#1229 — a refused
+        // flush must not be fanned out to the other shards either; the caller
+        // keys the fan-out on a non-error reply).
+        let mode_ok = match &args[1..] {
+            [] => true,
+            [Frame::BulkString(m)] => {
+                m.eq_ignore_ascii_case(b"SYNC") || m.eq_ignore_ascii_case(b"ASYNC")
+            }
+            _ => false,
+        };
+        if !mode_ok {
+            return (
+                Frame::Error(Bytes::from_static(
+                    b"ERR SCRIPT FLUSH only support SYNC|ASYNC option",
+                )),
+                None,
+            );
+        }
         cache.borrow_mut().flush();
         (Frame::SimpleString(Bytes::from_static(b"OK")), None)
     } else {
@@ -1262,6 +1281,36 @@ mod tests {
         assert!(matches!(response, Frame::SimpleString(_)));
         assert!(fanout.is_none());
         assert_eq!(cache.borrow().len(), 0);
+    }
+
+    /// moon#1229: `SCRIPT FLUSH [ASYNC|SYNC]` — the modes flush, anything else
+    /// is refused with redis 7.0.15's text and leaves the cache (and so the
+    /// other shards, which are only told about an accepted flush) untouched.
+    #[test]
+    fn script_flush_accepts_sync_async_and_refuses_other_modes() {
+        let b = |s: &'static [u8]| Frame::BulkString(Bytes::from_static(s));
+        for mode in [&b"SYNC"[..], b"async"] {
+            let cache = Rc::new(RefCell::new(ScriptCache::new()));
+            cache.borrow_mut().load(Bytes::from_static(b"return 1"));
+            let (response, _) = handle_script_subcommand(&cache, &[b(b"FLUSH"), b(mode)]);
+            assert_eq!(response, Frame::SimpleString(Bytes::from_static(b"OK")));
+            assert_eq!(cache.borrow().len(), 0, "{mode:?} flushes");
+        }
+        for bad in [
+            vec![b(b"FLUSH"), b(b"BOGUS")],
+            vec![b(b"FLUSH"), b(b"SYNC"), b(b"ASYNC")],
+        ] {
+            let cache = Rc::new(RefCell::new(ScriptCache::new()));
+            cache.borrow_mut().load(Bytes::from_static(b"return 1"));
+            let (response, _) = handle_script_subcommand(&cache, &bad);
+            assert_eq!(
+                response,
+                Frame::Error(Bytes::from_static(
+                    b"ERR SCRIPT FLUSH only support SYNC|ASYNC option"
+                ))
+            );
+            assert_eq!(cache.borrow().len(), 1, "a refused flush keeps the cache");
+        }
     }
 
     // -- moon#569: `redis.call` runs under the CALLER's ACL ----------------

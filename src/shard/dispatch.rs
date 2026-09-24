@@ -781,6 +781,14 @@ pub enum ShardMessage {
         add_slots: Vec<u16>,
         remove_slots: Vec<u16>,
     },
+    /// Fan-out of `SCRIPT FLUSH` to every other shard (moon#1229): each shard
+    /// owns its own script cache, so a flush that reached only the
+    /// connection's shard left `EVALSHA` working for keys routed anywhere
+    /// else. `ack` follows [`Self::ScriptLoad`]'s contract: the sender replies
+    /// to its client only once every shard has flushed.
+    ScriptFlush {
+        ack: Option<channel::OneshotSender<bool>>,
+    },
     /// Fan-out a loaded script to all shards so EVALSHA works regardless of which shard receives it.
     /// Sent by the connection handler on SCRIPT LOAD; received by all other shards' SPSC drain loops.
     ///

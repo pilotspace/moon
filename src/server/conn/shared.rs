@@ -1360,6 +1360,55 @@ pub(crate) async fn script_fanout_bounded(
     .await
 }
 
+/// Replay `SCRIPT FLUSH` on every other shard and wait until each has flushed
+/// (moon#1229).
+///
+/// The script cache is per shard. A flush that cleared only the connection's
+/// shard left every `EVALSHA` whose keys routed elsewhere running the flushed
+/// body — measured at `--shards 2` as 18 of 40 calls still executing — and
+/// `SCRIPT EXISTS` answering 1 or 0 depending on which shard the connection
+/// landed on. redis answers `NOSCRIPT` everywhere once the flush returns.
+///
+/// Returns the reply the client gets INSTEAD of `+OK` when some shard did not
+/// confirm the flush, on the same contract as [`function_registry_fanout`]: a
+/// flush is idempotent, so telling the client and letting it re-issue beats
+/// an `+OK` over caches that still run the script. `SYNC` and `ASYNC` take the
+/// same path: moon's flush is a map clear either way, and redis's `ASYNC`
+/// only defers freeing memory — the scripts are gone when it replies.
+#[must_use]
+pub(crate) async fn script_flush_fanout(
+    ctx: &super::core::ConnectionContext,
+    shutdown: &crate::runtime::cancel::CancellationToken,
+) -> Option<Frame> {
+    if ctx.num_shards <= 1 {
+        return None;
+    }
+    match fanout_to_other_shards(ctx, shutdown, "script_flush", |ack| {
+        crate::shard::dispatch::ShardMessage::ScriptFlush { ack: Some(ack) }
+    })
+    .await
+    {
+        FanoutOutcome::Complete => None,
+        FanoutOutcome::Partial { reached, targets } => Some(Frame::Error(Bytes::from(format!(
+            "MOONERR partialfanout SCRIPT FLUSH applied on {} of {} shards; re-issue it to \
+             converge",
+            reached + 1,
+            targets + 1,
+        )))),
+    }
+}
+
+/// Whether `SCRIPT <args>` was a `FLUSH` the local cache accepted — one the
+/// other shards are still owed (moon#1229).
+#[must_use]
+pub(crate) fn is_accepted_script_flush(cmd_args: &[Frame], response: &Frame) -> bool {
+    !matches!(response, Frame::Error(_))
+        && matches!(
+            cmd_args.first(),
+            Some(Frame::BulkString(sub)) if sub.eq_ignore_ascii_case(b"FLUSH")
+        )
+}
+
 /// Shards whose inbound fan-out pushes are forced to fail, from
 /// `MOON_TEST_DROP_FANOUT_TO_SHARD` (comma-separated ids). Read ONCE, into a
 /// bitmask; never set in production.
