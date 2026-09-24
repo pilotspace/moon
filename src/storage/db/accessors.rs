@@ -1479,7 +1479,8 @@ impl Database {
     // ---- Low-level helpers for blocking wakeup hooks ----
 
     /// Pop the front element from a list. Returns None if key missing/empty/wrong type.
-    /// Removes the key if the list becomes empty. Handles compact listpack upgrade.
+    /// Removes the key if the list becomes empty. A listpack stays a listpack
+    /// (moon#1212, see [`Self::list_pop_listpack`]).
     ///
     /// moon#523/#539: the lookup is deliberately NON-creating. This helper
     /// backs the blocking fast path (`try_immediate_pop` → BLPOP/BLMOVE/…),
@@ -1487,6 +1488,9 @@ impl Database {
     /// miss — a phantom key that EXISTS/TYPE/DBSIZE reported, that a later
     /// RPUSH rejected with WRONGTYPE, and that no path ever removed.
     pub fn list_pop_front(&mut self, key: &[u8]) -> Option<Bytes> {
+        if let Some(popped) = self.list_pop_listpack(key, true) {
+            return popped;
+        }
         let list = self.get_mut_if_present::<db_kind::ListKind>(key).ok()??;
         let val = list.pop_front()?;
         let empty = list.is_empty();
@@ -1514,6 +1518,9 @@ impl Database {
     ///
     /// Non-creating on a missing key — see [`Self::list_pop_front`].
     pub fn list_pop_back(&mut self, key: &[u8]) -> Option<Bytes> {
+        if let Some(popped) = self.list_pop_listpack(key, false) {
+            return popped;
+        }
         let list = self.get_mut_if_present::<db_kind::ListKind>(key).ok()??;
         let val = list.pop_back()?;
         let empty = list.is_empty();
@@ -1525,6 +1532,86 @@ impl Database {
         Some(val)
     }
 
+    /// The listpack arm of the blocking-path pops (moon#1212): `Some(result)`
+    /// when `key` holds a `ListListpack`, popped IN PLACE — the full-form
+    /// accessor below them upgrades on access, so every BLPOP/BRPOP/BLMOVE
+    /// served on wake turned a small list into a `linkedlist` for good.
+    /// `None` hands the key to the full-form path unchanged (full, missing,
+    /// wrong type). Non-creating: the `&self` probe answers "absent" without
+    /// inserting, and the write accessor only runs on a present listpack.
+    fn list_pop_listpack(&mut self, key: &[u8], front: bool) -> Option<Option<Bytes>> {
+        let now_ms = self.cached_now_ms;
+        if !matches!(
+            self.peek_list_ref_if_alive(key, now_ms),
+            Ok(Some(ListRef::Listpack(_)))
+        ) {
+            return None;
+        }
+        let Ok(Some(lp)) = self.get_or_create_list_listpack(key) else {
+            return Some(None);
+        };
+        // Listpack `estimate_memory()` is O(1) (capacity-based).
+        let before = lp.estimate_memory();
+        let popped = lp.pop_end(front);
+        let after = lp.estimate_memory();
+        let empty = lp.is_empty();
+        // `lp`'s borrow of `self` ends here.
+        self.adjust_memory(before, after);
+        if empty {
+            self.remove(key);
+        }
+        Some(popped)
+    }
+
+    /// Push one element onto an end of `key` exactly as a one-element
+    /// `LPUSH`/`RPUSH` would: onto a listpack in place (a missing key is born
+    /// a listpack when the element fits the policy), promoting past the
+    /// policy, and onto the full `VecDeque` otherwise (moon#1212 — this is
+    /// `LMOVE`'s push and the blocking wake path's, which used to flatten).
+    ///
+    /// A refusal is RETURNED (moon#1225): a wrong type, or a cold copy whose
+    /// bytes cannot be read.
+    pub fn list_push_end(&mut self, key: &[u8], value: &Bytes, front: bool) -> Result<(), Frame> {
+        let limits = self.encoding_limits();
+        if limits.fits(crate::storage::db::Shape::List, 1, value.len())
+            && let Some(lp) = self.get_or_create_list_listpack(key)?
+        {
+            let before = lp.estimate_memory();
+            if front {
+                lp.push_front(value);
+            } else {
+                lp.push_back(value);
+            }
+            let after = lp.estimate_memory();
+            let should_upgrade = !limits.listpack_fits(crate::storage::db::Shape::List, lp);
+            // `lp`'s borrow of `self` ends here.
+            self.adjust_memory(before, after);
+            if should_upgrade {
+                self.promote_list_listpack(key, after);
+            }
+            return Ok(());
+        }
+        let cost = list_elem_cost(value);
+        let list = self.get_or_create_list(key)?;
+        if front {
+            list.push_front(value.clone());
+        } else {
+            list.push_back(value.clone());
+        }
+        self.charge_memory(cost);
+        Ok(())
+    }
+
+    /// Promote a `ListListpack` to the full `VecDeque` and settle the one-time
+    /// cost-model swing, `after` being the listpack's last billed size — the
+    /// block every list writer runs when a push crosses the policy.
+    pub fn promote_list_listpack(&mut self, key: &[u8], after: usize) {
+        let list = self.upgrade_list_listpack_to_list(key);
+        let new_cost: usize = list.iter().map(|e| list_elem_cost(e)).sum();
+        self.credit_memory(after);
+        self.charge_memory(new_cost);
+    }
+
     /// Push an element to the front of a list. Creates the list if it does not exist.
     ///
     /// A refusal (wrong type, or an unreadable cold copy — moon#1225) cannot
@@ -1533,14 +1620,8 @@ impl Database {
     /// is left — a cold destination whose file read cleanly for that probe and
     /// then failed on this promotion's second read — is logged, never silent.
     pub fn list_push_front(&mut self, key: &[u8], value: Bytes) {
-        // get_or_create_list creates the key if missing
-        let cost = list_elem_cost(&value);
-        match self.get_or_create_list(key) {
-            Ok(list) => {
-                list.push_front(value);
-                self.charge_memory(cost);
-            }
-            Err(_) => log_refused_list_push(key, value.len()),
+        if self.list_push_end(key, &value, true).is_err() {
+            log_refused_list_push(key, value.len());
         }
     }
 
@@ -1548,13 +1629,8 @@ impl Database {
     ///
     /// See [`Self::list_push_front`] for the refusal contract.
     pub fn list_push_back(&mut self, key: &[u8], value: Bytes) {
-        let cost = list_elem_cost(&value);
-        match self.get_or_create_list(key) {
-            Ok(list) => {
-                list.push_back(value);
-                self.charge_memory(cost);
-            }
-            Err(_) => log_refused_list_push(key, value.len()),
+        if self.list_push_end(key, &value, false).is_err() {
+            log_refused_list_push(key, value.len());
         }
     }
 

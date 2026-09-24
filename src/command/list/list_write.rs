@@ -82,6 +82,19 @@ pub fn lpush(db: &mut Database, args: &[Frame]) -> Frame {
         }
     }
 
+    push_full(db, key, args, "LPUSH", true)
+}
+
+/// The full-encoding push loop of `LPUSH`/`RPUSH` and their X forms: onto the
+/// `VecDeque` `get_or_create_list` hands out (promoting a listpack the entry
+/// gate refused), one ledger charge for the batch.
+fn push_full(
+    db: &mut Database,
+    key: &[u8],
+    args: &[Frame],
+    name: &'static str,
+    front: bool,
+) -> Frame {
     let list = match db.get_or_create_list(key) {
         Ok(l) => l,
         Err(e) => return e,
@@ -91,10 +104,14 @@ pub fn lpush(db: &mut Database, args: &[Frame]) -> Frame {
         // moon#1160: an exact-size copy, never a slice of the request buffer.
         let val = match extract_bytes(arg) {
             Some(v) => detach(v),
-            None => return err_wrong_args("LPUSH"),
+            None => return err_wrong_args(name),
         };
         mem_delta += list_elem_cost(&val);
-        list.push_front(val);
+        if front {
+            list.push_front(val);
+        } else {
+            list.push_back(val);
+        }
     }
     let len = list.len() as i64;
     // `list`'s borrow of `db` ends above.
@@ -170,24 +187,7 @@ pub fn rpush(db: &mut Database, args: &[Frame]) -> Frame {
         }
     }
 
-    let list = match db.get_or_create_list(key) {
-        Ok(l) => l,
-        Err(e) => return e,
-    };
-    let mut mem_delta: usize = 0;
-    for arg in &args[1..] {
-        // moon#1160: an exact-size copy, never a slice of the request buffer.
-        let val = match extract_bytes(arg) {
-            Some(v) => detach(v),
-            None => return err_wrong_args("RPUSH"),
-        };
-        mem_delta += list_elem_cost(&val);
-        list.push_back(val);
-    }
-    let len = list.len() as i64;
-    // `list`'s borrow of `db` ends above.
-    db.charge_memory(mem_delta);
-    Frame::Integer(len)
+    push_full(db, key, args, "RPUSH", false)
 }
 
 // ---------------------------------------------------------------------------
@@ -261,10 +261,7 @@ fn list_route(db: &Database, key: &[u8]) -> Result<Option<ListRoute>, Frame> {
 /// policy; factored out so the four sites that can now cross a threshold
 /// cannot drift apart the way the three consultation sites did in moon#896.
 fn promote_list_listpack(db: &mut Database, key: &[u8], after: usize) {
-    let list = db.upgrade_list_listpack_to_list(key);
-    let new_cost: usize = list.iter().map(|e| list_elem_cost(e)).sum();
-    db.credit_memory(after);
-    db.charge_memory(new_cost);
+    db.promote_list_listpack(key, after);
 }
 
 /// Remove and return one end of a listpack, materialising the popped element
@@ -1202,41 +1199,14 @@ fn lmove_rotate(
 }
 
 /// Push one element onto `key` exactly as a one-element `LPUSH`/`RPUSH`
-/// would: onto a listpack in place (creating the key as a listpack when it
-/// is missing and the element fits the policy), promoting past the policy,
-/// and onto the full `VecDeque` otherwise.
+/// would — `Database::list_push_end`, shared with the blocking wake path
+/// (moon#1212) so the two cannot drift.
 ///
 /// moon#1225: a refusal is RETURNED, not swallowed. The route refuses a wrong
 /// type or unreadable cold copy before the pop; a cold file that fails only on
 /// this promotion's second read is still reachable, and dropped the element.
 fn push_one(db: &mut Database, key: &Bytes, value: &Bytes, front: bool) -> Result<(), Frame> {
-    let limits = db.encoding_limits();
-    if limits.fits(Shape::List, 1, value.len()) {
-        if let Some(lp) = db.get_or_create_list_listpack(key)? {
-            let before = lp.estimate_memory();
-            if front {
-                lp.push_front(value);
-            } else {
-                lp.push_back(value);
-            }
-            let after = lp.estimate_memory();
-            let should_upgrade = !limits.listpack_fits(Shape::List, lp);
-            // `lp`'s borrow of `db` ends here.
-            db.adjust_memory(before, after);
-            if should_upgrade {
-                promote_list_listpack(db, key, after);
-            }
-            return Ok(());
-        }
-    }
-    let list = db.get_or_create_list(key)?;
-    if front {
-        list.push_front(value.clone());
-    } else {
-        list.push_back(value.clone());
-    }
-    db.charge_memory(list_elem_cost(value));
-    Ok(())
+    db.list_push_end(key, value, front)
 }
 
 // ---------------------------------------------------------------------------
@@ -1270,37 +1240,24 @@ pub fn lpushx(db: &mut Database, args: &[Frame]) -> Frame {
     // moon#897 took out of `LPOP`'s gate. `list_route` is the `&self` router:
     // one probe, and its receiver makes the rewrite unrepresentable.
     //
-    // The mutable accessor below is deliberately unchanged, so the ENCODING
-    // outcome is unchanged too (LPUSHX still flattens a listpack — moon#832,
-    // still open, pinned by `lpushx_and_rpushx_still_flatten_a_listpack_moon832`).
-    // Nor is this `get_mut_if_present`, which would fold both accessors into
-    // one and save a second probe: that one stamps the mutation BEFORE it can
-    // answer WRONGTYPE, so it would widen moon#940 to a command that today
+    // Nor is this `get_mut_if_present`, which would fold the gate and the
+    // write into one and save a probe: that one stamps the mutation BEFORE it
+    // can answer WRONGTYPE, so it would widen moon#940 to a command that
     // refuses without dirtying a watched key.
+    //
+    // moon#1212: an existing list is then pushed EXACTLY as `LPUSH` pushes it
+    // — listpack in place, promotion past the policy — where this used to take
+    // the flattening `get_or_create_list` and turn a small list into a
+    // `linkedlist` for good. That is redis 7.2+'s `pushxGenericCommand`
+    // (the same `listTypePush` path as LPUSH). The key exists, so LPUSH's
+    // accessor creates nothing; the argument checks above are LPUSH's own.
+    // A list the route already saw in full form skips LPUSH's listpack probe.
     match list_route(db, key) {
-        Ok(None) => return Frame::Integer(0),
-        Err(e) => return e,
-        Ok(Some(_)) => {}
+        Ok(None) => Frame::Integer(0),
+        Err(e) => e,
+        Ok(Some(ListRoute::Listpack)) => lpush(db, args),
+        Ok(Some(ListRoute::Full)) => push_full(db, key, args, "LPUSHX", true),
     }
-
-    let list = match db.get_or_create_list(key) {
-        Ok(l) => l,
-        Err(e) => return e,
-    };
-    let mut mem_delta: usize = 0;
-    for arg in &args[1..] {
-        // moon#1160: an exact-size copy, never a slice of the request buffer.
-        let val = match extract_bytes(arg) {
-            Some(v) => detach(v),
-            None => return err_wrong_args("LPUSHX"),
-        };
-        mem_delta += list_elem_cost(&val);
-        list.push_front(val);
-    }
-    let len = list.len() as i64;
-    // `list`'s borrow of `db` ends above.
-    db.charge_memory(mem_delta);
-    Frame::Integer(len)
 }
 
 // ---------------------------------------------------------------------------
@@ -1327,32 +1284,14 @@ pub fn rpushx(db: &mut Database, args: &[Frame]) -> Frame {
         return err_wrong_args("RPUSHX");
     }
 
-    // The same one-probe, non-flattening gate `LPUSHX` takes; see the comment
-    // there for why it is not `get_promoted` and not `get_mut_if_present`.
+    // The same one-probe, non-flattening gate `LPUSHX` takes, and then
+    // `RPUSH`'s own push (moon#1212); see `lpushx`.
     match list_route(db, key) {
-        Ok(None) => return Frame::Integer(0),
-        Err(e) => return e,
-        Ok(Some(_)) => {}
+        Ok(None) => Frame::Integer(0),
+        Err(e) => e,
+        Ok(Some(ListRoute::Listpack)) => rpush(db, args),
+        Ok(Some(ListRoute::Full)) => push_full(db, key, args, "RPUSHX", false),
     }
-
-    let list = match db.get_or_create_list(key) {
-        Ok(l) => l,
-        Err(e) => return e,
-    };
-    let mut mem_delta: usize = 0;
-    for arg in &args[1..] {
-        // moon#1160: an exact-size copy, never a slice of the request buffer.
-        let val = match extract_bytes(arg) {
-            Some(v) => detach(v),
-            None => return err_wrong_args("RPUSHX"),
-        };
-        mem_delta += list_elem_cost(&val);
-        list.push_back(val);
-    }
-    let len = list.len() as i64;
-    // `list`'s borrow of `db` ends above.
-    db.charge_memory(mem_delta);
-    Frame::Integer(len)
 }
 
 // ---------------------------------------------------------------------------

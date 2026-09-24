@@ -12,6 +12,9 @@ mod listpack_arms_1174_tests;
 // moon#1225 guards (a list move never pops what it cannot place).
 #[cfg(test)]
 mod cold_fault_1225_tests;
+// moon#1212 guards (the listpack residuals).
+#[cfg(test)]
+mod listpack_residuals_1212_tests;
 
 use crate::protocol::Frame;
 
@@ -1762,25 +1765,19 @@ mod ledger_and_encoding_942 {
         }
     }
 
-    /// moon#832, and the guard the LPUSHX/RPUSHX gate swap is pinned against:
-    /// these two STILL flatten a listpack-encoded list, and must keep doing
-    /// exactly that until someone changes it deliberately.
+    /// moon#1212 (formerly the moon#832 pin): `LPUSHX`/`RPUSHX` keep a
+    /// listpack a listpack, and still promote past the policy.
     ///
-    /// moon#897 made `LPOP`, `RPOP` and `LSET` encoding-preserving and left
-    /// `LPUSHX`, `RPUSHX`, `LINSERT`, `LREM`, `LTRIM` and `LMOVE` behind. All
-    /// six still reach `get_or_create_list`, whose `ListKind::upgrade`
-    /// materialises the `VecDeque` unconditionally and never comes back —
-    /// redis 8.x keeps a small list a `listpack` through every one of them.
-    /// That is a real divergence and it is NOT this change's to fix: moon#942
-    /// is a probe budget, and swapping a two-probe flattening gate for a
-    /// one-probe `&self` one must leave the OUTCOME byte for byte alone.
-    ///
-    /// So this test asserts the divergence, deliberately. If someone makes
-    /// `LPUSHX` encoding-preserving, this test is the thing that says so out
-    /// loud instead of letting an encoding change ride along inside a
-    /// performance commit.
+    /// This test used to ASSERT the flatten, deliberately, so that the day
+    /// someone made the X forms encoding-preserving it would say so out loud
+    /// instead of riding inside a probe-budget commit. That day is moon#1212:
+    /// redis 7.2+ pushes the X forms through the same `listTypePush` as
+    /// `LPUSH`/`RPUSH` (redis 7.0.15, the oracle on the fix-wave box, reports
+    /// `quicklist` for every list and cannot arbitrate), and moon's own
+    /// `LPUSH`/`RPUSH` have preserved the listpack since moon#897. The X forms
+    /// now run the very same push, so they cannot disagree with it.
     #[test]
-    fn lpushx_and_rpushx_still_flatten_a_listpack_moon832() {
+    fn lpushx_and_rpushx_keep_a_listpack_moon1212() {
         for (name, f) in [
             (
                 "LPUSHX",
@@ -1798,13 +1795,20 @@ mod ledger_and_encoding_942 {
             assert_eq!(f(&mut db, &push), Frame::Integer(4), "{name} must push");
             assert_eq!(
                 encoding_of(&mut db, b"l"),
-                "linkedlist",
-                "{name} is expected to flatten (moon#832, still open). A \
-                 `listpack` here means the encoding changed — which may well \
-                 be the right thing to do, but not silently and not inside a \
-                 probe-budget commit"
+                "listpack",
+                "{name} flattened a small list (moon#1212)"
             );
-            assert_ledger_exact(&mut db, "after the X-form flattened the list");
+            assert_ledger_exact(&mut db, "after the X-form kept the listpack");
+
+            // Past the element limit it promotes, exactly as LPUSH/RPUSH do.
+            let wide = [bs(b"l"), bs(&[b'w'; 65])];
+            assert_eq!(f(&mut db, &wide), Frame::Integer(5), "{name} must push");
+            assert_eq!(
+                encoding_of(&mut db, b"l"),
+                "linkedlist",
+                "{name} past the policy"
+            );
+            assert_ledger_exact(&mut db, "after the X-form promoted the list");
         }
     }
 
