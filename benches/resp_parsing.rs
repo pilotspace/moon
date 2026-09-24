@@ -262,12 +262,14 @@ fn bench_parse_set_single(c: &mut Criterion) {
 
 /// The `argc > 4` boundary, isolated.
 ///
-/// `FrameVec` is `Box<SmallVec<[Frame; 4]>>`, so `FrameVec::with_capacity(count)`
-/// HEAP-SPILLS past four elements: a `*5` command pays two allocations where a
-/// `*3` pays one. `tmp/CAMPAIGN_S8_CONTEXT.md` records `SET k v` at 2.08x and
-/// `SET k v EX 100` at 0.87x against Redis, and attributes the step to the inline
-/// byte path -- but this second, independent step sits at exactly the same
-/// boundary and nothing has separated them.
+/// `FrameVec` used to be `Box<SmallVec<[Frame; 4]>>`, so
+/// `FrameVec::with_capacity(count)` HEAP-SPILLED past four elements: a `*5`
+/// command paid two allocations where a `*3` paid one. `tmp/CAMPAIGN_S8_CONTEXT.md`
+/// recorded `SET k v` at 2.08x and `SET k v EX 100` at 0.87x against Redis and
+/// attributed the step to the inline byte path -- but that second, independent
+/// step sat at exactly the same boundary. Since moon#1179 item 1 `FrameVec` is a
+/// plain `Vec<Frame>` newtype (one allocation for any argument count), so these
+/// benches now check that no step is left at the boundary.
 ///
 /// The HSET pair is the clean control: same command, same work per argument, only
 /// the argument count differs, so a step between `*4` and `*6` cannot be blamed on
