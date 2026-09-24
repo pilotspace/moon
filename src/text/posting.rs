@@ -25,17 +25,24 @@ use smallvec::SmallVec;
 use std::collections::HashMap;
 
 /// Columns stay one flat run up to this many entries: an insert/remove then
-/// memmoves at most `FLAT_MAX × (4 + 24)` bytes (~28 KiB).
-const FLAT_MAX: usize = 1024;
+/// memmoves at most `FLAT_MAX × (4 + 24)` bytes (~7 KiB).
+///
+/// Sizing (measured, moon#1195): re-indexing a document costs one memmove of
+/// its run per touched term (O(RUN_MAX), position-dependent) plus one `u32`
+/// shift per later run (O(len / RUN_MAX), cheap). With 1024-entry runs the
+/// oldest document of a 200K corpus still re-indexed ~2x slower than the
+/// newest (28 KiB memmoves); 256-entry runs bring the two within noise while
+/// the run-start shift stays a few µs even for million-entry postings.
+const FLAT_MAX: usize = 256;
 /// A chunked posting converts back to one flat run below this many entries
 /// (hysteresis against `FLAT_MAX`, so a posting hovering at the boundary does
 /// not convert back and forth).
-const FLAT_MIN: usize = 256;
+const FLAT_MIN: usize = 64;
 /// A run is split in half once it exceeds this many entries.
-const RUN_MAX: usize = 1024;
+const RUN_MAX: usize = 256;
 /// A run shrinking below this many entries merges into a neighbour when the
 /// result fits in `RUN_MAX`, keeping the run count O(len / RUN_MIN).
-const RUN_MIN: usize = 128;
+const RUN_MIN: usize = 32;
 
 /// One contiguous slice of the rank-aligned columns of a chunked posting.
 #[derive(Debug, Default)]
@@ -856,13 +863,14 @@ mod tests {
     #[test]
     fn remove_doc_shrinks_now_empty_posting_capacity() {
         let mut store = PostingStore::new();
-        for doc_id in 0..500u32 {
+        // Below FLAT_MAX: the flat-column capacity is what this test watches.
+        for doc_id in 0..200u32 {
             store.add_term_occurrence(7, doc_id, None);
         }
         let peak_cap = store.get_posting(7).unwrap().term_freqs.capacity();
-        assert!(peak_cap >= 500, "expected growth to >=500, got {peak_cap}");
+        assert!(peak_cap >= 200, "expected growth to >=200, got {peak_cap}");
 
-        for doc_id in 0..500u32 {
+        for doc_id in 0..200u32 {
             store.remove_doc(doc_id);
         }
 
@@ -883,7 +891,7 @@ mod tests {
     #[test]
     fn remove_doc_shrinks_now_empty_posting_positions_capacity() {
         let mut store = PostingStore::new();
-        for doc_id in 0..300u32 {
+        for doc_id in 0..200u32 {
             store.add_term_occurrence(3, doc_id, Some(vec![doc_id]));
         }
         let peak_cap = store
@@ -893,9 +901,9 @@ mod tests {
             .as_ref()
             .unwrap()
             .capacity();
-        assert!(peak_cap >= 300);
+        assert!(peak_cap >= 200);
 
-        for doc_id in 0..300u32 {
+        for doc_id in 0..200u32 {
             store.remove_doc(doc_id);
         }
 
@@ -1198,7 +1206,7 @@ mod tests {
         assert_matches(&store, T, &model, N, &mut rng);
         // Drain below FLAT_MIN: converts back to one flat run.
         let live: Vec<u32> = model.keys().copied().collect();
-        for &d in live.iter().skip(200) {
+        for &d in live.iter().skip(FLAT_MIN - 14) {
             store.remove_doc(d);
             model.remove(&d);
         }

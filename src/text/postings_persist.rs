@@ -1026,7 +1026,7 @@ mod tests {
     }
 
     /// Mirror of `posting::FLAT_MAX` (private there) for fixture sizing.
-    const FLAT_MAX_FOR_TESTS: usize = 1024;
+    const FLAT_MAX_FOR_TESTS: usize = 256;
 
     #[cfg(feature = "text-index")]
     #[test]
