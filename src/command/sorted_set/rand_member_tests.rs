@@ -181,3 +181,84 @@ fn zrandmember_does_not_scale_with_n() {
         );
     }
 }
+
+/// m2 (moon#1227 review): redis 7.0.15 parses `count [FLAG]` before it looks
+/// the key up — a bad count is an error on a missing or wrong-typed key too,
+/// where moon answered `[]` / WRONGTYPE — and with `string2ll`, which refuses
+/// `+1`, `01` and `-0`. `(tail, reply on every key)`, captured from
+/// redis-server 7.0.15.
+const ZRANDMEMBER_COUNT_ERRORS: &[(&[&str], &str)] = &[
+    (&["abc"], "ERR value is not an integer or out of range"),
+    (&["1.5"], "ERR value is not an integer or out of range"),
+    (&["-0"], "ERR value is not an integer or out of range"),
+    (&["+1"], "ERR value is not an integer or out of range"),
+    (&["01"], "ERR value is not an integer or out of range"),
+    (&[""], "ERR value is not an integer or out of range"),
+    (
+        &["99999999999999999999"],
+        "ERR value is not an integer or out of range",
+    ),
+    (
+        &["-9223372036854775808"],
+        "ERR value is out of range, value must between -9223372036854775807 and 9223372036854775807",
+    ),
+    (&["1", "WITHSCORE"], "ERR syntax error"),
+    (&["1", "WITHSCORES", "extra"], "ERR syntax error"),
+    (
+        &["abc", "WITHSCORES", "extra"],
+        "ERR value is not an integer or out of range",
+    ),
+    (
+        &["4611686018427387904", "WITHSCORES"],
+        "ERR value is out of range",
+    ),
+    (
+        &["-4611686018427387904", "WITHSCORES"],
+        "ERR value is out of range",
+    ),
+];
+
+#[test]
+fn count_is_parsed_like_redis_before_the_key() {
+    let mut db = Database::new();
+    load(&mut db, b"z", 3);
+    db.set_string(b"str", Bytes::from_static(b"v"));
+    for key in ["z", "missing", "str"] {
+        for (tail, msg) in ZRANDMEMBER_COUNT_ERRORS {
+            let mut args: Vec<&[u8]> = vec![key.as_bytes()];
+            args.extend(tail.iter().map(|a| a.as_bytes()));
+            let f = frames(&args);
+            let want = Frame::Error(Bytes::copy_from_slice(msg.as_bytes()));
+            assert_eq!(zrandmember_readonly(&db, &f, 0), want, "{key} {tail:?}");
+            assert_eq!(
+                zrandmember(&mut db, &f),
+                want,
+                "{key} {tail:?} (mutable path)"
+            );
+        }
+    }
+    // A valid count reaches the key: WRONGTYPE, or `[]` for a missing key.
+    let wrongtype = Frame::Error(Bytes::from_static(
+        b"WRONGTYPE Operation against a key holding the wrong kind of value",
+    ));
+    for tail in [&["1"][..], &["-4611686018427387903", "WITHSCORES"], &["0"]] {
+        let mut args: Vec<&[u8]> = vec![b"str"];
+        args.extend(tail.iter().map(|a| a.as_bytes()));
+        assert_eq!(
+            zrandmember_readonly(&db, &frames(&args), 0),
+            wrongtype,
+            "{tail:?}"
+        );
+        args[0] = b"missing";
+        assert_eq!(
+            zrandmember_readonly(&db, &frames(&args), 0),
+            Frame::Array(Vec::new().into()),
+            "{tail:?}"
+        );
+    }
+    assert_eq!(zrandmember_readonly(&db, &frames(&[b"str"]), 0), wrongtype);
+    assert_eq!(
+        zrandmember_readonly(&db, &frames(&[b"missing"]), 0),
+        Frame::Null
+    );
+}

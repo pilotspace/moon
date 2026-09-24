@@ -733,17 +733,24 @@ fn pairs_to_frame(pairs: Vec<(Bytes, Option<Bytes>)>, with_values: bool) -> Fram
 /// HRANDFIELD readonly path
 pub fn hrandfield_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
     use rand::RngExt;
-    if args.is_empty() || args.len() > 3 {
+    let Some(key) = args.first().and_then(extract_bytes) else {
         return err_wrong_args("HRANDFIELD");
-    }
-    let key = match extract_bytes(&args[0]) {
-        Some(k) => k.as_ref(),
-        None => return err_wrong_args("HRANDFIELD"),
+    };
+    // redis parses `count [WITHVALUES]` before it looks the key up: a bad
+    // count is an error on a missing or wrong-typed key too.
+    let with_count = match args.get(1..) {
+        Some(tail) if !tail.is_empty() => {
+            match crate::command::helpers::parse_rand_count(tail, b"WITHVALUES") {
+                Ok(parsed) => Some(parsed),
+                Err(e) => return e,
+            }
+        }
+        _ => None,
     };
     let href = match db.get_hash_ref_if_alive(key, now_ms) {
         Ok(Some(h)) => h,
         Ok(None) => {
-            return if args.len() == 1 {
+            return if with_count.is_none() {
                 Frame::Null
             } else {
                 Frame::Array(framevec![])
@@ -753,14 +760,14 @@ pub fn hrandfield_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame 
     };
     let len = href.len();
     if len == 0 {
-        return if args.len() == 1 {
+        return if with_count.is_none() {
             Frame::Null
         } else {
             Frame::Array(framevec![])
         };
     }
     let mut rng = rand::rng();
-    if args.len() == 1 {
+    let Some((count, with_values)) = with_count else {
         let idx = rng.random_range(0..len);
         let mut chosen = None;
         let mut pos = 0usize;
@@ -776,34 +783,6 @@ pub fn hrandfield_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame 
             Some(field) => Frame::BulkString(field),
             None => Frame::Null,
         };
-    }
-    let count_bytes = match extract_bytes(&args[1]) {
-        Some(b) => b,
-        None => return err_wrong_args("HRANDFIELD"),
-    };
-    let count: i64 = match std::str::from_utf8(count_bytes)
-        .ok()
-        .and_then(|s| s.parse().ok())
-    {
-        Some(c) => c,
-        None => {
-            return Frame::Error(Bytes::from_static(
-                b"ERR value is not an integer or out of range",
-            ));
-        }
-    };
-    let with_values = if args.len() == 3 {
-        let opt = match extract_bytes(&args[2]) {
-            Some(b) => b,
-            None => return err_wrong_args("HRANDFIELD"),
-        };
-        if opt.eq_ignore_ascii_case(b"WITHVALUES") {
-            true
-        } else {
-            return Frame::Error(Bytes::from_static(b"ERR syntax error"));
-        }
-    } else {
-        false
     };
     if count == 0 {
         return Frame::Array(framevec![]);
@@ -1118,5 +1097,87 @@ mod hrandfield_1171 {
                 args.len()
             );
         }
+    }
+
+    /// m2 (moon#1227 review): redis 7.0.15 parses `count [FLAG]` before it looks
+    /// the key up — a bad count is an error on a missing or wrong-typed key too,
+    /// where moon answered `[]` / WRONGTYPE — and with `string2ll`, which refuses
+    /// `+1`, `01` and `-0`. `(tail, reply on every key)`, captured from
+    /// redis-server 7.0.15.
+    const HRANDFIELD_COUNT_ERRORS: &[(&[&str], &str)] = &[
+        (&["abc"], "ERR value is not an integer or out of range"),
+        (&["1.5"], "ERR value is not an integer or out of range"),
+        (&["-0"], "ERR value is not an integer or out of range"),
+        (&["+1"], "ERR value is not an integer or out of range"),
+        (&["01"], "ERR value is not an integer or out of range"),
+        (&[""], "ERR value is not an integer or out of range"),
+        (
+            &["99999999999999999999"],
+            "ERR value is not an integer or out of range",
+        ),
+        (
+            &["-9223372036854775808"],
+            "ERR value is out of range, value must between -9223372036854775807 and 9223372036854775807",
+        ),
+        (&["1", "WITHVALUE"], "ERR syntax error"),
+        (&["1", "WITHVALUES", "extra"], "ERR syntax error"),
+        (
+            &["abc", "WITHVALUES", "extra"],
+            "ERR value is not an integer or out of range",
+        ),
+        (
+            &["4611686018427387904", "WITHVALUES"],
+            "ERR value is out of range",
+        ),
+        (
+            &["-4611686018427387904", "WITHVALUES"],
+            "ERR value is out of range",
+        ),
+    ];
+
+    #[test]
+    fn count_is_parsed_like_redis_before_the_key() {
+        let mut db = Database::new();
+        load(&mut db, b"h", 3);
+        db.set_string(b"str", Bytes::from_static(b"v"));
+        let now = db.now_ms();
+        for key in ["h", "missing", "str"] {
+            for (tail, msg) in HRANDFIELD_COUNT_ERRORS {
+                let mut args: Vec<&[u8]> = vec![key.as_bytes()];
+                args.extend(tail.iter().map(|a| a.as_bytes()));
+                let f = frames(&args);
+                let want = Frame::Error(Bytes::copy_from_slice(msg.as_bytes()));
+                assert_eq!(hrandfield_readonly(&db, &f, now), want, "{key} {tail:?}");
+                assert_eq!(
+                    hrandfield(&mut db, &f),
+                    want,
+                    "{key} {tail:?} (mutable path)"
+                );
+            }
+        }
+        // A valid count reaches the key: WRONGTYPE, or `[]` for a missing key.
+        let wrongtype = Frame::Error(Bytes::from_static(
+            b"WRONGTYPE Operation against a key holding the wrong kind of value",
+        ));
+        for tail in [&["1"][..], &["-4611686018427387903", "WITHVALUES"], &["0"]] {
+            let mut args: Vec<&[u8]> = vec![b"str"];
+            args.extend(tail.iter().map(|a| a.as_bytes()));
+            assert_eq!(
+                hrandfield_readonly(&db, &frames(&args), now),
+                wrongtype,
+                "{tail:?}"
+            );
+            args[0] = b"missing";
+            assert_eq!(
+                hrandfield_readonly(&db, &frames(&args), now),
+                Frame::Array(Vec::new().into()),
+                "{tail:?}"
+            );
+        }
+        assert_eq!(hrandfield_readonly(&db, &frames(&[b"str"]), now), wrongtype);
+        assert_eq!(
+            hrandfield_readonly(&db, &frames(&[b"missing"]), now),
+            Frame::Null
+        );
     }
 }

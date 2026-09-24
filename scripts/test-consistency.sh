@@ -1499,6 +1499,16 @@ assert_both "BITFIELD OVERFLOW FAIL still grows the key" BITFIELD "{ws2}:bf" OVE
 assert_both "BITFIELD OVERFLOW FAIL still grows (STRLEN)" STRLEN "{ws2}:bf"
 both ZADD "{ws2}:z" 1 a 2 b 3 c 3 d
 assert_both "ZRANDMEMBER count>=size is highest-first" ZRANDMEMBER "{ws2}:z" 10 WITHSCORES
+# moon#1227 review m2: ZRANDMEMBER / HRANDFIELD parse `count [WITH*]` before
+# the key lookup, as a `string2ll` integer (verified on redis-server 7.0.15).
+assert_both "ZRANDMEMBER bad count on a missing key" ZRANDMEMBER "{ws2}:nokey" notanint
+assert_both "ZRANDMEMBER bad count on a string" ZRANDMEMBER "{ws2}:str" abc
+assert_both "ZRANDMEMBER -0 is not an integer" ZRANDMEMBER "{ws2}:z" -0
+assert_both "ZRANDMEMBER argument after WITHSCORES" ZRANDMEMBER "{ws2}:z" 1 WITHSCORES extra
+assert_both "ZRANDMEMBER WITHSCORES count range" ZRANDMEMBER "{ws2}:nokey" 4611686018427387904 WITHSCORES
+assert_both "HRANDFIELD bad count on a missing key" HRANDFIELD "{ws2}:nokey" notanint
+assert_both "HRANDFIELD +1 is not an integer" HRANDFIELD "{ws2}:str" +1
+assert_both "HRANDFIELD WITHVALUE is a syntax error" HRANDFIELD "{ws2}:nokey" 1 WITHVALUE
 assert_both "GEOSEARCH ANY without COUNT" GEOSEARCH edge:geo FROMLONLAT 15 37 BYRADIUS 200 km ANY
 assert_both "GEOSEARCH COUNT 0" GEOSEARCH edge:geo FROMLONLAT 15 37 BYRADIUS 200 km COUNT 0
 assert_both "GEOSEARCH FROMLONLAT out of range" GEOSEARCH edge:geo FROMLONLAT 200 37 BYRADIUS 200 km

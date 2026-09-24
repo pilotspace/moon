@@ -1443,19 +1443,26 @@ impl RandPool<'_> {
 /// unchanged: a uniform position is a uniform member.
 pub fn zrandmember_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
     use rand::RngExt;
-    if args.is_empty() || args.len() > 3 {
+    let Some(key) = args.first().and_then(extract_bytes) else {
         return err_wrong_args("ZRANDMEMBER");
-    }
-    let key = match extract_bytes(&args[0]) {
-        Some(k) => k,
-        None => return err_wrong_args("ZRANDMEMBER"),
+    };
+    // redis parses `count [WITHSCORES]` before it looks the key up: a bad
+    // count is an error on a missing or wrong-typed key too.
+    let with_count = match args.get(1..) {
+        Some(tail) if !tail.is_empty() => {
+            match crate::command::helpers::parse_rand_count(tail, b"WITHSCORES") {
+                Ok(parsed) => Some(parsed),
+                Err(e) => return e,
+            }
+        }
+        _ => None,
     };
     // Ref accessor: handles every encoding (BPTree, Listpack from RDB load,
     // Legacy) — the BPTree-only accessor would treat a listpack zset as missing.
     let zref = match db.get_sorted_set_ref_if_alive(key, now_ms) {
         Ok(Some(z)) => z,
         Ok(None) => {
-            return if args.len() == 1 {
+            return if with_count.is_none() {
                 Frame::Null
             } else {
                 Frame::Array(framevec![])
@@ -1465,7 +1472,7 @@ pub fn zrandmember_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame
     };
     let len = zref.len();
     if len == 0 {
-        return if args.len() == 1 {
+        return if with_count.is_none() {
             Frame::Null
         } else {
             Frame::Array(framevec![])
@@ -1476,35 +1483,11 @@ pub fn zrandmember_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame
         None => RandPool::Flat(zref.entries_unordered()),
     };
     let mut rng = rand::rng();
-    if args.len() == 1 {
+    let Some((count, withscores)) = with_count else {
         return match pool.get(rng.random_range(0..len)) {
             Some((member, _)) => Frame::BulkString(member.clone()),
             None => Frame::Null,
         };
-    }
-    let count_bytes = match extract_bytes(&args[1]) {
-        Some(b) => b,
-        None => return err_wrong_args("ZRANDMEMBER"),
-    };
-    let count: i64 = match std::str::from_utf8(count_bytes)
-        .ok()
-        .and_then(|s| s.parse().ok())
-    {
-        Some(c) => c,
-        None => return err("ERR value is not an integer or out of range"),
-    };
-    let withscores = if args.len() == 3 {
-        let opt = match extract_bytes(&args[2]) {
-            Some(b) => b,
-            None => return err("ERR syntax error"),
-        };
-        if opt.eq_ignore_ascii_case(b"WITHSCORES") {
-            true
-        } else {
-            return err("ERR syntax error");
-        }
-    } else {
-        false
     };
     if count == 0 {
         return Frame::Array(framevec![]);

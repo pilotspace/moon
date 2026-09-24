@@ -1180,6 +1180,11 @@ if should_run "key"; then
     rcli ZADD {ws2}:z 1 a 2 b 3 c 3 d >/dev/null 2>&1
     mcli ZADD {ws2}:z 1 a 2 b 3 c 3 d >/dev/null 2>&1
     assert_match "ZRANDMEMBER count>=size is highest-first" ZRANDMEMBER {ws2}:z 10 WITHSCORES
+    # moon#1227 review m2: the count is parsed before the key lookup.
+    assert_match "ZRANDMEMBER bad count on a missing key" ZRANDMEMBER {ws2}:nokey notanint
+    assert_match "ZRANDMEMBER argument after WITHSCORES" ZRANDMEMBER {ws2}:z 1 WITHSCORES extra
+    assert_match "HRANDFIELD bad count on a missing key" HRANDFIELD {ws2}:nokey notanint
+    assert_match "HRANDFIELD -0 on a string"   HRANDFIELD {ws2}:str -0
     assert_match "GEOSEARCH ANY without COUNT" GEOSEARCH k:geo FROMLONLAT 15 37 BYRADIUS 200 km ANY
     assert_match "GEOSEARCH COUNT 0"          GEOSEARCH k:geo FROMLONLAT 15 37 BYRADIUS 200 km COUNT 0
     assert_match "GEOSEARCH unsorted cell order" GEOSEARCH k:geo FROMLONLAT 15 37 BYRADIUS 2000 km
