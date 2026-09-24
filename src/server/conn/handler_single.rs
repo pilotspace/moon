@@ -1415,9 +1415,9 @@ pub async fn handle_connection(
                                     (Some(ch), Some(msg)) => {
                                         // Channel ACL (parity with sharded/monoio
                                         // handlers, which already gate PUBLISH).
-                                        if let Some(err) = crate::server::conn::shared::publish_channel_acl_deny(
+                                        if let Some(err) = crate::server::conn::shared::conn_publish_channel_acl_deny(
+                                            &conn,
                                             &acl_table,
-                                            &conn.current_user,
                                             &ch,
                                         ) {
                                             responses.push(err);
@@ -1532,9 +1532,9 @@ pub async fn handle_connection(
                                 // moon#1043: SPUBLISH lands in the shard-channel
                                 // namespace, never the global one.
                                 for p in exec_publishes.drain(..) {
-                                    let patched = match crate::server::conn::shared::publish_channel_acl_deny(
+                                    let patched = match crate::server::conn::shared::conn_publish_channel_acl_deny(
+                                        &conn,
                                         &acl_table,
-                                        &conn.current_user,
                                         &p.channel,
                                     ) {
                                         Some(err) => err,
@@ -1884,9 +1884,9 @@ pub async fn handle_connection(
                         // HERE, poisoning the block, not at EXEC after the rest ran.
                         if let Some((cmd, cmd_args)) = extract_command(&frame)
                             && let Some(err) =
-                                crate::server::conn::shared::queued_publish_channel_deny(
+                                crate::server::conn::shared::conn_queued_publish_channel_deny(
+                                    &conn,
                                     &acl_table,
-                                    &conn.current_user,
                                     cmd,
                                     cmd_args,
                                 )

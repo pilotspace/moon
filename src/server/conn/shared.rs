@@ -1193,6 +1193,34 @@ pub(crate) fn queued_publish_channel_deny(
     publish_channel_acl_deny(acl_table, user, channel)
 }
 
+/// [`publish_channel_acl_deny`] for a connection (moon#1165): no table lock
+/// when the connection's fresh cached verdict says its current user is
+/// unrestricted — the check would return `None` for it.
+pub(crate) fn conn_publish_channel_acl_deny(
+    conn: &super::core::ConnectionState,
+    acl_table: &parking_lot::RwLock<crate::acl::AclTable>,
+    channel: &[u8],
+) -> Option<Frame> {
+    if conn.acl_skip_allowed_for_current_user() {
+        return None;
+    }
+    publish_channel_acl_deny(acl_table, &conn.current_user, channel)
+}
+
+/// [`queued_publish_channel_deny`] for a connection (moon#1165): the same
+/// lock-free skip as [`conn_publish_channel_acl_deny`].
+pub(crate) fn conn_queued_publish_channel_deny(
+    conn: &super::core::ConnectionState,
+    acl_table: &parking_lot::RwLock<crate::acl::AclTable>,
+    cmd: &[u8],
+    args: &[Frame],
+) -> Option<Frame> {
+    if conn.acl_skip_allowed_for_current_user() {
+        return None;
+    }
+    queued_publish_channel_deny(acl_table, &conn.current_user, cmd, args)
+}
+
 /// Command-level ACL gate for the pub/sub intercepts (H-3). PUBLISH/SUBSCRIBE/
 /// PSUBSCRIBE are handled BEFORE the generic ACL gate in every handler, so
 /// without this the command-level `+`/`-`/`-@pubsub` rules were never

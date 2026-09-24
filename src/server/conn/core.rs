@@ -570,6 +570,45 @@ impl ConnectionState {
         self.cached_acl_unrestricted && self.acl_cache_fresh()
     }
 
+    /// [`Self::acl_skip_allowed`] for the permission checks OUTSIDE the
+    /// per-command gate — PUBLISH/SPUBLISH channels, the EXEC-time publish
+    /// re-check, a script's inner `redis.call`s (moon#1165). They used to take
+    /// the table lock for every caller; they skip it only when the cached
+    /// verdict is fresh, unrestricted AND was resolved for the identity the
+    /// connection has now (the same conservative bind as
+    /// [`Self::acl_snapshot`]), so no skip is ever granted on a verdict
+    /// resolved for another name.
+    #[inline]
+    pub fn acl_skip_allowed_for_current_user(&self) -> bool {
+        self.acl_skip_allowed()
+            && self
+                .acl_cache_user
+                .as_ref()
+                .is_some_and(|u| u.username == self.current_user)
+    }
+
+    /// The ACL identity a script run by this connection executes under
+    /// (moon#569). For a user that may skip ACL checks, built from the
+    /// connection's cached (version, verdict) pair without the table lock
+    /// (moon#1165); otherwise resolved under the lock as before. Either way
+    /// every inner `redis.call` re-checks the version, so a mutation during
+    /// the script still bites on its next call.
+    pub fn script_acl(
+        &self,
+        acl_table: &Arc<parking_lot::RwLock<crate::acl::AclTable>>,
+    ) -> crate::acl::ScriptAcl {
+        if self.acl_skip_allowed_for_current_user() {
+            crate::acl::ScriptAcl::for_unrestricted_at(
+                acl_table,
+                &self.current_user,
+                Arc::clone(&self.acl_version_handle),
+                self.cached_acl_version,
+            )
+        } else {
+            crate::acl::ScriptAcl::for_user(acl_table, &self.current_user)
+        }
+    }
+
     /// This connection's resolved user, when the snapshot may stand in for
     /// the live table: the table has not changed since it was taken
     /// (`acl_cache_fresh`) AND it was resolved for the name the connection
@@ -989,6 +1028,96 @@ mod acl_cache_tests {
         assert!(snap.enabled, "held snapshot changed under its reader");
         assert!(
             snap.command_denial("alice", b"GET", &bulk(&["app:1"]))
+                .is_none()
+        );
+    }
+
+    /// Runs `f` on another thread while the test holds the table WRITE lock;
+    /// `Ok` iff `f` finished within the deadline (i.e. took no table lock).
+    fn runs_without_the_table_lock<T: Send + 'static>(
+        table: &std::sync::Arc<parking_lot::RwLock<AclTable>>,
+        f: impl FnOnce() -> T + Send + 'static,
+    ) -> Result<T, std::sync::mpsc::RecvTimeoutError> {
+        let held = table.write();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let _ = tx.send(f());
+        });
+        let got = rx.recv_timeout(std::time::Duration::from_millis(500));
+        drop(held);
+        #[allow(clippy::unwrap_used)] // test thread
+        worker.join().unwrap();
+        got
+    }
+
+    /// moon#1165: an unrestricted connection builds its script identity and
+    /// clears a PUBLISH channel check without the table lock.
+    ///
+    /// Reddening mutation: make `script_acl` always call
+    /// `ScriptAcl::for_user` (or drop the skip in
+    /// `conn_publish_channel_acl_deny`) — the worker blocks behind the held
+    /// write lock and the deadline fires.
+    #[test]
+    fn unrestricted_script_and_publish_checks_take_no_table_lock() {
+        let table = std::sync::Arc::new(table());
+        let mut c = conn();
+        c.refresh_acl_cache(&table);
+        assert!(c.acl_skip_allowed_for_current_user());
+        let t2 = std::sync::Arc::clone(&table);
+        let got = runs_without_the_table_lock(&table, move || {
+            let acl = c.script_acl(&t2);
+            let script_ok = acl.check(b"GET", &bulk(&["k"])).is_none();
+            let publish_ok =
+                crate::server::conn::shared::conn_publish_channel_acl_deny(&c, &t2, b"news")
+                    .is_none();
+            (script_ok, publish_ok)
+        });
+        assert_eq!(
+            got,
+            Ok((true, true)),
+            "an unrestricted connection's script identity / PUBLISH channel \
+             check took the process-wide ACL table lock"
+        );
+    }
+
+    /// The lock-free script identity is exactly as strict as the locked one:
+    /// a revocation after it was built bites on the next `redis.call`.
+    #[test]
+    fn lock_free_script_identity_still_sees_a_revocation() {
+        let table = std::sync::Arc::new(table());
+        let mut c = conn();
+        c.refresh_acl_cache(&table);
+        let acl = c.script_acl(&table);
+        assert!(acl.check(b"GET", &bulk(&["k"])).is_none());
+        table.write().apply_setuser("default", &["-get"]);
+        assert!(
+            acl.check(b"GET", &bulk(&["k"])).is_some(),
+            "a revoked command must be refused inside a running script"
+        );
+    }
+
+    /// The skip is bound to the name the verdict was resolved for: for any
+    /// other name the checks resolve that name under the lock.
+    #[test]
+    fn publish_and_script_skip_is_bound_to_the_resolved_name() {
+        let table = std::sync::Arc::new(restricted_table());
+        table
+            .write()
+            .apply_setuser("carol", &["on", "nopass", "~*", "&allowed", "+@all"]);
+        let mut c = conn();
+        c.refresh_acl_cache(&table); // resolved for `default` (unrestricted)
+        c.current_user = "carol".into();
+        assert!(!c.acl_skip_allowed_for_current_user());
+        assert!(
+            crate::server::conn::shared::conn_publish_channel_acl_deny(&c, &table, b"secret")
+                .is_some(),
+            "carol may only publish to `allowed`"
+        );
+        assert!(
+            c.script_acl(&table).is_enforcing()
+                && crate::server::conn::shared::conn_publish_channel_acl_deny(
+                    &c, &table, b"allowed"
+                )
                 .is_none()
         );
     }

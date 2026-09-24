@@ -236,7 +236,8 @@ pub(super) async fn try_handle_evalsha(
     // moon#569: resolve the caller ONCE per script, then let every inner
     // `redis.call` be authorized against it (locally or on the shard this
     // script routes to).
-    let script_acl = crate::acl::ScriptAcl::for_user(&ctx.acl_table, &conn.current_user)
+    let script_acl = conn
+        .script_acl(&ctx.acl_table)
         .with_caller(conn.tracking_state.script_caller(conn.client_id));
     if let Some(routed) = crate::server::conn::shared::route_script_elsewhere(
         cmd,
@@ -325,7 +326,8 @@ pub(super) async fn try_handle_eval(
     // in that order over the same SPSC ring.
     crate::server::conn::shared::eval_script_fanout(ctx, shutdown, cmd_args).await;
     // moon#569: see `try_handle_evalsha`.
-    let script_acl = crate::acl::ScriptAcl::for_user(&ctx.acl_table, &conn.current_user)
+    let script_acl = conn
+        .script_acl(&ctx.acl_table)
         .with_caller(conn.tracking_state.script_caller(conn.client_id));
     if let Some(routed) = crate::server::conn::shared::route_script_elsewhere(
         cmd,
@@ -1624,7 +1626,8 @@ pub(super) async fn try_handle_functions(
         // EVAL. Resolved BEFORE routing so the same identity is used whether
         // the call runs here or on the shard that owns the key — routing must
         // never change what a caller is allowed to do.
-        let script_acl = crate::acl::ScriptAcl::for_user(&ctx.acl_table, &conn.current_user)
+        let script_acl = conn
+            .script_acl(&ctx.acl_table)
             .with_caller(conn.tracking_state.script_caller(conn.client_id));
         // moon#514 defect 1 — the same root cause as moon#508. FCALL used to
         // require every key to hash to the CONNECTION's shard, so a single

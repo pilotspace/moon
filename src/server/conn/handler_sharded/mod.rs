@@ -1178,9 +1178,9 @@ pub(crate) async fn handle_connection_sharded_inner<
                         // moon#1035: the ACL gate above checks command and keys,
                         // never a PUBLISH channel — refuse a denied one HERE so
                         // the block aborts, instead of at EXEC after the rest ran.
-                        if let Some(err) = crate::server::conn::shared::queued_publish_channel_deny(
+                        if let Some(err) = crate::server::conn::shared::conn_queued_publish_channel_deny(
+                            &conn,
                             &ctx.acl_table,
-                            &conn.current_user,
                             cmd,
                             cmd_args,
                         ) {
@@ -1305,10 +1305,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                         // moon#569: resolve the caller once, authorize every
                         // inner `redis.call` against it — locally and on the
                         // shard this script may route to.
-                        let script_acl = crate::acl::ScriptAcl::for_user(
-                            &ctx.acl_table,
-                            &conn.current_user,
-                        )
+                        let script_acl = conn.script_acl(&ctx.acl_table)
                         .with_caller(conn.tracking_state.script_caller(conn.client_id));
                         if let Some(routed) = crate::server::conn::shared::route_script_elsewhere(
                             cmd,
@@ -1499,10 +1496,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                             // routing so the same identity applies whether the
                             // call runs here or on the shard owning the key —
                             // routing must never change what a caller may do.
-                            let script_acl = crate::acl::ScriptAcl::for_user(
-                                &ctx.acl_table,
-                                &conn.current_user,
-                            )
+                            let script_acl = conn.script_acl(&ctx.acl_table)
                             .with_caller(conn.tracking_state.script_caller(conn.client_id));
                             // moon#514 defect 1 (== moon#508): route to the
                             // shard owning the key instead of refusing
@@ -1693,9 +1687,9 @@ pub(crate) async fn handle_connection_sharded_inner<
                                 // Channel ACL gates the txn publish path (C2
                                 // security): a denied channel is patched with
                                 // NOPERM and never fanned out.
-                                let patched = match crate::server::conn::shared::publish_channel_acl_deny(
+                                let patched = match crate::server::conn::shared::conn_publish_channel_acl_deny(
+                                    &conn,
                                     &ctx.acl_table,
-                                    &conn.current_user,
                                     &p.channel,
                                 ) {
                                     Some(err) => err,

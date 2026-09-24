@@ -41,7 +41,14 @@ pub(super) fn try_handle_publish(
     // command-level `-@pubsub`/allow-list gate was previously skipped here —
     // only the `&pattern` channel rule was consulted — so a `-@pubsub`
     // carve-out was silently ineffective for a user with `&*`.
-    {
+    //
+    // moon#1165: skipped outright (no table lock) for a connection whose
+    // fresh cached verdict says its current user is unrestricted — both
+    // checks would return `None` for it. The command check is kept for
+    // everyone else: `try_enforce_acl` ran it moments earlier, but keeping it
+    // here costs only restricted callers and keeps this intercept correct on
+    // its own.
+    if !conn.acl_skip_allowed_for_current_user() {
         let acl_guard = ctx.acl_table.read();
         if let Some(deny_reason) =
             acl_guard.check_command_permission(&conn.current_user, cmd, cmd_args)

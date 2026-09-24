@@ -171,6 +171,29 @@ impl ScriptAcl {
         })))
     }
 
+    /// [`Self::for_user`] without the table lock, for a caller that already
+    /// holds the verdict (moon#1165): `username` was resolved UNRESTRICTED at
+    /// `snapshot` of `version`, read under one guard — a connection's fresh
+    /// cache (`ConnectionState::script_acl`). The identity behaves exactly
+    /// like one from `for_user` at that version: the unrestricted verdict is
+    /// trusted only while `version` still equals `snapshot`, and every check
+    /// after a mutation re-resolves under the lock.
+    #[must_use]
+    pub(crate) fn for_unrestricted_at(
+        table: &Arc<parking_lot::RwLock<AclTable>>,
+        username: &str,
+        version: Arc<AtomicU64>,
+        snapshot: u64,
+    ) -> Self {
+        ScriptAcl::from_repr(Arc::new(Repr::User(ScriptAclUser {
+            table: Arc::clone(table),
+            username: username.into(),
+            version,
+            snapshot,
+            unrestricted: true,
+        })))
+    }
+
     fn from_repr(repr: Arc<Repr>) -> Self {
         ScriptAcl {
             repr,

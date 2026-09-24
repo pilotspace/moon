@@ -2365,9 +2365,9 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 // moon#1035: the ACL gate above checks command and keys, never
                 // a PUBLISH channel — refuse a denied one HERE so the block
                 // aborts, instead of at EXEC after the rest of it ran.
-                if let Some(err) = crate::server::conn::shared::queued_publish_channel_deny(
+                if let Some(err) = crate::server::conn::shared::conn_queued_publish_channel_deny(
+                    &conn,
                     &ctx.acl_table,
-                    &conn.current_user,
                     cmd,
                     cmd_args,
                 ) {
@@ -2846,19 +2846,20 @@ pub(crate) async fn handle_connection_sharded_monoio<
                     for p in exec_publishes.drain(..) {
                         // Channel ACL gates the txn publish path (C2 security):
                         // a denied channel is patched with NOPERM, never sent.
-                        let patched = match crate::server::conn::shared::publish_channel_acl_deny(
-                            &ctx.acl_table,
-                            &conn.current_user,
-                            &p.channel,
-                        ) {
-                            Some(err) => err,
-                            None => Frame::Integer(
-                                crate::server::conn::shared::publish_post_txn(
-                                    ctx, &shutdown, &p.channel, &p.message, p.kind,
-                                )
-                                .await,
-                            ),
-                        };
+                        let patched =
+                            match crate::server::conn::shared::conn_publish_channel_acl_deny(
+                                &conn,
+                                &ctx.acl_table,
+                                &p.channel,
+                            ) {
+                                Some(err) => err,
+                                None => Frame::Integer(
+                                    crate::server::conn::shared::publish_post_txn(
+                                        ctx, &shutdown, &p.channel, &p.message, p.kind,
+                                    )
+                                    .await,
+                                ),
+                            };
                         if let Frame::Array(items) = &mut responses[exec_idx] {
                             if p.slot < items.len() {
                                 items[p.slot] = patched;

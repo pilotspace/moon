@@ -802,7 +802,7 @@ pub(super) async fn try_handle_multi_exec(
                     // CACHING`/`TRACKING` queued BEFORE the script in the
                     // same body is not applied to it (redis applies it).
                     Some(
-                        crate::acl::ScriptAcl::for_user(&ctx.acl_table, &conn.current_user)
+                        conn.script_acl(&ctx.acl_table)
                             .with_caller(tracking_before.script_caller(conn.client_id)),
                     )
                 } else {

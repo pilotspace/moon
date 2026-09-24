@@ -591,8 +591,12 @@ pub(super) fn try_handle_publish(
     } else {
         let channel_arg = extract_bytes(&cmd_args[0]);
         let message_arg = extract_bytes(&cmd_args[1]);
-        // ACL channel permission check for PUBLISH
-        if let Some(ref ch) = channel_arg {
+        // ACL channel permission check for PUBLISH. moon#1165: no table lock
+        // for a connection whose fresh cached verdict says its current user
+        // is unrestricted (the check would return `None` for it).
+        if !conn.acl_skip_allowed_for_current_user()
+            && let Some(ref ch) = channel_arg
+        {
             let acl_guard = ctx.acl_table.read();
             if let Some(deny_reason) =
                 acl_guard.check_channel_permission(&conn.current_user, ch.as_ref())
