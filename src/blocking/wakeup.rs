@@ -424,6 +424,9 @@ fn serve_ready_key(
     pending_from: usize,
     budget: &mut std::time::Duration,
 ) -> bool {
+    // moon#1217: a wake below may pop `key`; an armed snapshot must hold its
+    // epoch-start state first (one thread-local load when none is armed).
+    crate::persistence::snapshot_cow::capture_wake_pre_image(db, db_index, key);
     let now_ms = db.now_ms();
     let served = if matches!(db.get_list_ref_if_alive(key, now_ms), Ok(Some(_))) {
         serve_list_key(registry, db, db_index, key, worklist, pending_from, budget)
@@ -463,6 +466,8 @@ fn serve_list_key(
     pending_from: usize,
     budget: &mut std::time::Duration,
 ) -> bool {
+    // moon#1217: the pops below write `key` (see `serve_ready_key`).
+    crate::persistence::snapshot_cow::capture_wake_pre_image(db, db_index, key);
     // Loop: try waiters until one succeeds (oneshot receiver may be dropped = skip)
     // moon#535: pop only waiters THIS waker can serve. The old blind
     // `pop_front` handed us waiters of every family, and the cleanup below —
@@ -597,6 +602,12 @@ fn serve_list_key(
                     // No undo: nothing was popped.
                     (Some(err), None)
                 } else {
+                    // moon#1217: the move also writes the destination.
+                    crate::persistence::snapshot_cow::capture_wake_pre_image(
+                        db,
+                        db_index,
+                        destination,
+                    );
                     let val = match wherefrom {
                         Direction::Left => db.list_pop_front(key),
                         Direction::Right => db.list_pop_back(key),
@@ -869,6 +880,8 @@ fn serve_zset_key(
     key: &Bytes,
     budget: &mut std::time::Duration,
 ) -> bool {
+    // moon#1217: the pops below write `key` (see `serve_ready_key`).
+    crate::persistence::snapshot_cow::capture_wake_pre_image(db, db_index, key);
     // moon#535: pop only waiters THIS waker can serve. The old blind
     // `pop_front` handed us waiters of every family, and the cleanup below —
     // `remove_wait` + `send(None)` — runs for every waiter we pop, so an

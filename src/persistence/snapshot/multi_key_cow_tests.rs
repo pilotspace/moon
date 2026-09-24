@@ -407,3 +407,73 @@ fn routed_and_script_captures_cover_every_written_key() {
     snapshot_cow::disarm();
     assert_eq!(got, want, "script redis.call");
 }
+
+/// A BLMOVE parked on an empty source is served by the WAKER when a later
+/// write fills the source: the waker pops the source and pushes the
+/// destination itself (and logs the move at that moment). The destination
+/// is a key that move writes, so its epoch-start state must reach the file
+/// too — otherwise the logged move replays on top of a destination that
+/// already holds its element.
+#[test]
+fn a_woken_blmove_keeps_its_destination_point_in_time() {
+    use crate::blocking::{BlockedCommand, BlockingRegistry, Direction, WaitEntry};
+    let mut dbs = vec![Database::new()];
+    for i in 0..1500u32 {
+        dbs[0].set_string(format!("f:{i:05}").as_bytes(), Bytes::from_static(b"."));
+    }
+    run(&mut dbs, 0, &[b"RPUSH", b"bm:dst", b"x"]);
+    let expected = canonical(&mut dbs);
+
+    let src = Bytes::from_static(b"bm:src");
+    let dst = Bytes::from_static(b"bm:dst");
+    let mut reg = BlockingRegistry::new(0);
+    let wait_id = reg.next_wait_id();
+    let (tx, rx) = crate::runtime::channel::oneshot();
+    reg.register(
+        0,
+        src.clone(),
+        WaitEntry {
+            wait_id,
+            cmd: BlockedCommand::BLMove {
+                destination: dst.clone(),
+                wherefrom: Direction::Left,
+                whereto: Direction::Right,
+            },
+            reply_tx: tx,
+            deadline: None,
+            claim: None,
+        },
+    );
+
+    let epoch = Epoch::begin(&dbs);
+    run(&mut dbs, 0, &[b"LPUSH", b"bm:src", b"v"]);
+    assert!(crate::blocking::wakeup::try_wake_list_waiter(
+        &mut reg,
+        &mut dbs[0],
+        0,
+        &src
+    ));
+    assert!(
+        matches!(rx.try_recv(), Ok(Some(Frame::BulkString(_)))),
+        "setup: the waiter must be served"
+    );
+    assert_ne!(
+        canonical(&mut dbs),
+        expected,
+        "setup: the wake moved nothing"
+    );
+    let mut loaded = load(1, epoch.finish(&dbs));
+    let got = canonical(&mut loaded);
+    let moved = |m: &BTreeMap<(usize, Vec<u8>), String>| {
+        m.iter()
+            .filter(|((_, k), _)| k.starts_with(b"bm:"))
+            .map(|((_, k), v)| (String::from_utf8_lossy(k).into_owned(), v.clone()))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        moved(&got),
+        moved(&expected),
+        "the woken move's destination must keep its epoch-start state"
+    );
+    assert_eq!(got, expected);
+}

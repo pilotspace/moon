@@ -402,6 +402,23 @@ pub(crate) fn capture_key_pre_image(db: &Database, db_index: usize, key: &Bytes)
     capture_key(db, db_index, key);
 }
 
+/// Capture the pre-image of a key a blocking-command WAKE is about to
+/// modify (moon#1217): the waker serves a parked `BLPOP`/`BLMOVE`/`BZPOPMIN`
+/// /`XREADGROUP` by popping (and, for a move, pushing the destination)
+/// straight through `Database` methods, outside `command::dispatch`, and
+/// logs the pop at that moment — so a key it writes that no capture has
+/// seen (a `BLMOVE` destination) would otherwise reach the file at its
+/// post-wake state while the logged move replays on top.
+///
+/// One thread-local `bool` load when no snapshot is in flight.
+#[inline]
+pub(crate) fn capture_wake_pre_image(db: &Database, db_index: usize, key: &Bytes) {
+    if !is_armed() {
+        return;
+    }
+    capture_key(db, db_index, key);
+}
+
 /// Out-of-line slow path: record the key's current state, first write wins.
 fn capture_key(db: &Database, db_index: usize, key: &Bytes) {
     // moon#1186: a key whose range is already written needs no pre-image —
