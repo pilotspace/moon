@@ -2,28 +2,215 @@
 ///
 /// Each term maps to a `PostingList` containing:
 /// - `doc_ids`: RoaringBitmap of document IDs containing this term
-/// - `term_freqs`: Per-document term frequency (parallel to doc_ids iteration order)
-/// - `positions`: Optional per-document position lists (for phrase queries)
+/// - rank-aligned term frequencies (parallel to `doc_ids` iteration order)
+/// - optional rank-aligned per-document position lists (for phrase queries)
 ///
-/// Positions are stored as `Option<Vec<Vec<u32>>>` per D-04: saves memory when
-/// positions are not needed, but stores them from day one for future phrase
-/// queries and HIGHLIGHT support.
+/// Positions are optional per D-04: saves memory when positions are not
+/// needed, but stores them from day one for future phrase queries and
+/// HIGHLIGHT support.
+///
+/// # Column layout (moon#1195)
+///
+/// The rank-aligned `(tf, positions)` columns are ONE flat run while a posting
+/// holds at most `FLAT_MAX` documents, and a sequence of runs of at most
+/// `RUN_MAX` entries (with their starting rank indexes) beyond that. A flat
+/// `Vec` made every insert/remove at rank `i` memmove `(len - i) × 28` bytes,
+/// so re-indexing an OLD document of a large corpus moved O(Σ posting length)
+/// bytes — ~110 MB for 20 terms with 100K-long postings. Runs bound each
+/// memmove by `RUN_MAX` entries; locating a run is a binary search over the run
+/// starts. Document ids never change, so upserts keep their identity (and their
+/// `score DESC, doc_id ASC` tie position) and `.tpost` is byte-identical.
 use roaring::RoaringBitmap;
 use smallvec::SmallVec;
 use std::collections::HashMap;
 
+/// Columns stay one flat run up to this many entries: an insert/remove then
+/// memmoves at most `FLAT_MAX × (4 + 24)` bytes (~28 KiB).
+const FLAT_MAX: usize = 1024;
+/// A chunked posting converts back to one flat run below this many entries
+/// (hysteresis against `FLAT_MAX`, so a posting hovering at the boundary does
+/// not convert back and forth).
+const FLAT_MIN: usize = 256;
+/// A run is split in half once it exceeds this many entries.
+const RUN_MAX: usize = 1024;
+/// A run shrinking below this many entries merges into a neighbour when the
+/// result fits in `RUN_MAX`, keeping the run count O(len / RUN_MIN).
+const RUN_MIN: usize = 128;
+
+/// One contiguous slice of the rank-aligned columns of a chunked posting.
+#[derive(Debug, Default)]
+struct Run {
+    tf: Vec<u32>,
+    /// Parallel to `tf` when positions are tracked, else empty.
+    pos: Vec<Vec<u32>>,
+}
+
+/// Columns of a long posting: consecutive runs; `starts[i]` is the rank index
+/// of `runs[i]`'s first entry (`starts[0] == 0`).
+#[derive(Debug, Default)]
+struct Chunks {
+    runs: Vec<Run>,
+    starts: Vec<u32>,
+}
+
+impl Chunks {
+    fn len(&self) -> usize {
+        match (self.starts.last(), self.runs.last()) {
+            (Some(&s), Some(r)) => s as usize + r.tf.len(),
+            _ => 0,
+        }
+    }
+
+    /// Split flat columns into runs of `RUN_MAX / 2` entries.
+    fn from_flat(tf: Vec<u32>, pos: Option<Vec<Vec<u32>>>) -> Self {
+        let tracked = pos.is_some();
+        let run_len = RUN_MAX / 2;
+        let mut runs = Vec::with_capacity(tf.len() / run_len + 1);
+        let mut starts = Vec::with_capacity(runs.capacity());
+        let mut pos_iter = pos.into_iter().flatten();
+        for (i, chunk) in tf.chunks(run_len).enumerate() {
+            let pos: Vec<Vec<u32>> = if tracked {
+                pos_iter.by_ref().take(chunk.len()).collect()
+            } else {
+                Vec::new()
+            };
+            starts.push((i * run_len) as u32);
+            runs.push(Run {
+                tf: chunk.to_vec(),
+                pos,
+            });
+        }
+        Self { runs, starts }
+    }
+
+    /// Concatenate the runs back into flat columns.
+    fn into_flat(self, tracked: bool) -> (Vec<u32>, Option<Vec<Vec<u32>>>) {
+        let len = self.len();
+        let mut tf = Vec::with_capacity(len);
+        let mut pos = tracked.then(|| Vec::with_capacity(len));
+        for run in self.runs {
+            tf.extend_from_slice(&run.tf);
+            if let Some(p) = &mut pos {
+                p.extend(run.pos);
+            }
+        }
+        (tf, pos)
+    }
+
+    /// `(run, offset)` of rank index `idx`. `idx == len()` resolves to one past
+    /// the end of the last run (the append position).
+    #[inline]
+    fn locate(&self, idx: usize) -> (usize, usize) {
+        let r = self
+            .starts
+            .partition_point(|&s| s as usize <= idx)
+            .saturating_sub(1);
+        (r, idx - self.starts.get(r).map_or(0, |&s| s as usize))
+    }
+
+    #[inline]
+    fn get(&self, idx: usize) -> Option<(&Run, usize)> {
+        let (r, off) = self.locate(idx);
+        let run = self.runs.get(r)?;
+        (off < run.tf.len()).then_some((run, off))
+    }
+
+    #[inline]
+    fn get_mut(&mut self, idx: usize) -> Option<(&mut Run, usize)> {
+        let (r, off) = self.locate(idx);
+        let run = self.runs.get_mut(r)?;
+        (off < run.tf.len()).then_some((run, off))
+    }
+
+    fn insert(&mut self, idx: usize, tf: u32, pos: Option<Vec<u32>>) {
+        if self.runs.is_empty() {
+            self.runs.push(Run::default());
+            self.starts.push(0);
+        }
+        let (r, off) = self.locate(idx);
+        let run = &mut self.runs[r];
+        run.tf.insert(off, tf);
+        if let Some(p) = pos {
+            run.pos.insert(off, p);
+        }
+        for s in &mut self.starts[r + 1..] {
+            *s += 1;
+        }
+        if self.runs[r].tf.len() > RUN_MAX {
+            let half = self.runs[r].tf.len() / 2;
+            let run = &mut self.runs[r];
+            let tail = Run {
+                tf: run.tf.split_off(half),
+                pos: if run.pos.is_empty() {
+                    Vec::new()
+                } else {
+                    run.pos.split_off(half)
+                },
+            };
+            let start = self.starts[r] + half as u32;
+            self.runs.insert(r + 1, tail);
+            self.starts.insert(r + 1, start);
+        }
+    }
+
+    /// Remove rank index `idx` (`< len()`), returning its tf and positions.
+    fn remove(&mut self, idx: usize, tracked: bool) -> Option<(u32, Vec<u32>)> {
+        let (r, off) = self.locate(idx);
+        let run = self.runs.get_mut(r)?;
+        if off >= run.tf.len() {
+            return None;
+        }
+        let tf = run.tf.remove(off);
+        let pos = if tracked && off < run.pos.len() {
+            run.pos.remove(off)
+        } else {
+            Vec::new()
+        };
+        for s in &mut self.starts[r + 1..] {
+            *s -= 1;
+        }
+        let run_len = self.runs[r].tf.len();
+        if run_len == 0 {
+            self.runs.remove(r);
+            self.starts.remove(r);
+        } else if run_len < RUN_MIN {
+            let fits = |n: &Run| n.tf.len() + run_len <= RUN_MAX;
+            if self.runs.get(r + 1).is_some_and(fits) {
+                self.merge_into_left(r);
+            } else if r > 0 && fits(&self.runs[r - 1]) {
+                self.merge_into_left(r - 1);
+            }
+        }
+        Some((tf, pos))
+    }
+
+    /// Append `runs[left + 1]` onto `runs[left]`.
+    fn merge_into_left(&mut self, left: usize) {
+        let right = self.runs.remove(left + 1);
+        self.starts.remove(left + 1);
+        let run = &mut self.runs[left];
+        run.tf.extend_from_slice(&right.tf);
+        run.pos.extend(right.pos);
+    }
+}
+
 /// A single term's posting data across all documents.
+///
+/// INVARIANT (fts-posting-rank-tf, frozen): the i-th tf / position list
+/// belongs to the i-th document of `doc_ids` in ascending order —
+/// `idx(d) = doc_ids.rank(d) - 1`. Maintained only by
+/// `PostingStore::add_term_occurrence` / `remove_doc` (and `from_parts`).
 #[derive(Debug)]
 pub struct PostingList {
     /// Bitmap of document IDs containing this term.
     pub doc_ids: RoaringBitmap,
-    /// Term frequency per document, indexed parallel to `doc_ids` iteration order.
-    /// `term_freqs[i]` corresponds to the i-th document in `doc_ids`.
-    pub term_freqs: Vec<u32>,
-    /// Optional per-document position lists.
-    /// When `Some`, `positions[i]` is the list of token positions for the i-th doc.
-    /// When `None`, positions are not tracked (saves memory).
-    pub positions: Option<Vec<Vec<u32>>>,
+    /// Flat rank-aligned term frequencies; empty while `chunks` is `Some`.
+    term_freqs: Vec<u32>,
+    /// `None` = positions not tracked. `Some` = tracked: the flat rank-aligned
+    /// position lists, or empty while `chunks` is `Some`.
+    positions: Option<Vec<Vec<u32>>>,
+    /// Chunked columns of a posting longer than `FLAT_MAX` (moon#1195).
+    chunks: Option<Box<Chunks>>,
 }
 
 impl PostingList {
@@ -33,6 +220,7 @@ impl PostingList {
             doc_ids: RoaringBitmap::new(),
             term_freqs: Vec::new(),
             positions: Some(Vec::new()),
+            chunks: None,
         }
     }
 
@@ -42,6 +230,7 @@ impl PostingList {
             doc_ids: RoaringBitmap::new(),
             term_freqs: Vec::new(),
             positions: None,
+            chunks: None,
         }
     }
 
@@ -57,19 +246,16 @@ impl PostingList {
 
     /// Term frequency of `doc_id` in this posting list.
     ///
-    /// Returns the rank-aligned `term_freqs` entry when the doc is present, else `0`
+    /// Returns the rank-aligned tf entry when the doc is present, else `0`
     /// (the `tf_absent` default — BM25 treats the term as not occurring). Never panics:
     /// the rank-alignment invariant guarantees the index is valid, and a defensive
-    /// `get` degrades to `0` rather than indexing out of bounds.
+    /// lookup degrades to `0` rather than indexing out of bounds.
     #[inline]
     pub fn tf(&self, doc_id: u32) -> u32 {
         if !self.doc_ids.contains(doc_id) {
             return 0;
         }
-        self.term_freqs
-            .get(self.rank_index(doc_id))
-            .copied()
-            .unwrap_or(0)
+        self.tf_at(self.rank_index(doc_id))
     }
 
     /// Rebuild a posting list from its persisted parts (`.tpost` load).
@@ -97,11 +283,14 @@ impl PostingList {
         // check above already guarantees it, so `ok()?` is a belt-and-braces
         // failure path, never a panic.
         let doc_ids = RoaringBitmap::from_sorted_iter(doc_ids.iter().copied()).ok()?;
-        Some(Self {
+        let mut list = Self {
             doc_ids,
             term_freqs,
             positions,
-        })
+            chunks: None,
+        };
+        list.rebalance_layout();
+        Some(list)
     }
 
     /// Position list for `doc_id` (rank-aligned), or `None` when positions are not
@@ -111,17 +300,160 @@ impl PostingList {
         if !self.doc_ids.contains(doc_id) {
             return None;
         }
-        let idx = self.rank_index(doc_id);
-        self.positions
-            .as_ref()
-            .and_then(|p| p.get(idx))
+        self.positions_at(self.rank_index(doc_id))
+    }
+
+    /// Whether per-document positions are tracked for this term.
+    #[inline]
+    #[must_use]
+    pub fn has_positions(&self) -> bool {
+        self.positions.is_some()
+    }
+
+    /// Term frequencies in rank (ascending doc id) order.
+    pub fn tf_values(&self) -> impl Iterator<Item = u32> + '_ {
+        let runs: &[Run] = self.chunks.as_ref().map_or(&[], |c| &c.runs);
+        self.term_freqs
+            .iter()
+            .chain(runs.iter().flat_map(|r| r.tf.iter()))
+            .copied()
+    }
+
+    /// Position lists in rank order — empty when positions are not tracked.
+    pub fn position_lists(&self) -> impl Iterator<Item = &[u32]> + '_ {
+        let flat: &[Vec<u32>] = self.positions.as_deref().unwrap_or(&[]);
+        let runs: &[Run] = match &self.chunks {
+            Some(c) if self.positions.is_some() => &c.runs,
+            _ => &[],
+        };
+        flat.iter()
+            .chain(runs.iter().flat_map(|r| r.pos.iter()))
             .map(Vec::as_slice)
     }
 
     /// Term frequency at a rank index (`0` when out of range — never panics).
     #[inline]
     fn tf_at(&self, idx: usize) -> u32 {
-        self.term_freqs.get(idx).copied().unwrap_or(0)
+        match &self.chunks {
+            Some(c) => c
+                .get(idx)
+                .and_then(|(run, off)| run.tf.get(off).copied())
+                .unwrap_or(0),
+            None => self.term_freqs.get(idx).copied().unwrap_or(0),
+        }
+    }
+
+    #[inline]
+    fn positions_at(&self, idx: usize) -> Option<&[u32]> {
+        let flat = self.positions.as_ref()?;
+        match &self.chunks {
+            Some(c) => c
+                .get(idx)
+                .and_then(|(run, off)| run.pos.get(off))
+                .map(Vec::as_slice),
+            None => flat.get(idx).map(Vec::as_slice),
+        }
+    }
+
+    /// Mutable `(tf, positions)` at a rank index; positions `None` when untracked.
+    fn entry_mut(&mut self, idx: usize) -> Option<(&mut u32, Option<&mut Vec<u32>>)> {
+        match &mut self.chunks {
+            Some(c) => {
+                let (run, off) = c.get_mut(idx)?;
+                let Run { tf, pos } = run;
+                Some((tf.get_mut(off)?, pos.get_mut(off)))
+            }
+            None => {
+                let tf = self.term_freqs.get_mut(idx)?;
+                let pos = self.positions.as_mut().and_then(|p| p.get_mut(idx));
+                Some((tf, pos))
+            }
+        }
+    }
+
+    /// Insert a new entry at rank index `idx`. `pos` is stored when positions
+    /// are tracked and dropped otherwise.
+    fn insert_entry(&mut self, idx: usize, tf: u32, pos: Vec<u32>) {
+        let tracked = self.positions.is_some();
+        match &mut self.chunks {
+            Some(c) => c.insert(idx, tf, tracked.then_some(pos)),
+            None => {
+                self.term_freqs.insert(idx, tf);
+                if let Some(p) = &mut self.positions {
+                    p.insert(idx, pos);
+                }
+            }
+        }
+        self.rebalance_layout();
+    }
+
+    /// Remove the entry at rank index `idx`, returning `(tf, positions)`.
+    fn remove_entry(&mut self, idx: usize) -> Option<(u32, Vec<u32>)> {
+        let tracked = self.positions.is_some();
+        let removed = match &mut self.chunks {
+            Some(c) => c.remove(idx, tracked)?,
+            None => {
+                if idx >= self.term_freqs.len() {
+                    return None;
+                }
+                let tf = self.term_freqs.remove(idx);
+                let pos = match &mut self.positions {
+                    Some(p) if idx < p.len() => p.remove(idx),
+                    _ => Vec::new(),
+                };
+                (tf, pos)
+            }
+        };
+        self.rebalance_layout();
+        Some(removed)
+    }
+
+    /// Start tracking positions: every existing entry gets an empty list.
+    fn track_positions(&mut self) {
+        if self.positions.is_some() {
+            return;
+        }
+        match &mut self.chunks {
+            Some(c) => {
+                for run in &mut c.runs {
+                    run.pos = vec![Vec::new(); run.tf.len()];
+                }
+                self.positions = Some(Vec::new());
+            }
+            None => self.positions = Some(vec![Vec::new(); self.term_freqs.len()]),
+        }
+    }
+
+    /// Flat below `FLAT_MIN`, chunked above `FLAT_MAX`, unchanged in between.
+    fn rebalance_layout(&mut self) {
+        match &self.chunks {
+            None if self.term_freqs.len() > FLAT_MAX => {
+                let tf = std::mem::take(&mut self.term_freqs);
+                let pos = self.positions.as_mut().map(std::mem::take);
+                self.chunks = Some(Box::new(Chunks::from_flat(tf, pos)));
+            }
+            Some(c) if c.len() < FLAT_MIN => {
+                let tracked = self.positions.is_some();
+                if let Some(c) = self.chunks.take() {
+                    let (tf, pos) = c.into_flat(tracked);
+                    self.term_freqs = tf;
+                    self.positions = pos;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Release column capacity once the last document has left (the entry
+    /// itself survives — see `PostingStore::remove_doc`).
+    fn release_if_empty(&mut self) {
+        if self.doc_ids.is_empty() {
+            self.chunks = None;
+            self.term_freqs.shrink_to_fit();
+            if let Some(pos_list) = &mut self.positions {
+                pos_list.shrink_to_fit();
+            }
+        }
     }
 
     /// A doc-ordered TF cursor over this posting (moon#1191).
@@ -144,6 +476,8 @@ impl PostingList {
             iter,
             cur,
             idx: 0,
+            run: 0,
+            off: 0,
             density: len as f64 / span as f64,
         }
     }
@@ -164,8 +498,11 @@ pub struct PostingCursor<'a> {
     iter: roaring::bitmap::Iter<'a>,
     /// Posting entry the cursor rests on (`None` once exhausted).
     cur: Option<u32>,
-    /// Rank index of `cur` in the rank-aligned arrays.
+    /// Rank index of `cur` in the rank-aligned columns.
     idx: usize,
+    /// `(run, off)` of `idx` when the posting is chunked (unused when flat).
+    run: usize,
+    off: usize,
     density: f64,
 }
 
@@ -182,6 +519,9 @@ impl PostingCursor<'_> {
                 self.cur = self.iter.next();
                 if let Some(n) = self.cur {
                     self.idx = self.list.rank_index(n);
+                    if let Some(chunks) = &self.list.chunks {
+                        (self.run, self.off) = chunks.locate(self.idx);
+                    }
                 }
             } else {
                 while let Some(c) = self.cur {
@@ -189,14 +529,44 @@ impl PostingCursor<'_> {
                         break;
                     }
                     self.cur = self.iter.next();
-                    self.idx += 1;
+                    self.step();
                 }
             }
         }
         if self.cur == Some(doc) {
-            Some(self.list.tf_at(self.idx))
+            Some(self.tf_here())
         } else {
             None
+        }
+    }
+
+    /// Move the rank position forward by one entry.
+    #[inline]
+    fn step(&mut self) {
+        self.idx += 1;
+        if let Some(chunks) = &self.list.chunks {
+            self.off += 1;
+            if chunks
+                .runs
+                .get(self.run)
+                .is_some_and(|r| self.off >= r.tf.len())
+            {
+                self.run += 1;
+                self.off = 0;
+            }
+        }
+    }
+
+    #[inline]
+    fn tf_here(&self) -> u32 {
+        match &self.list.chunks {
+            Some(chunks) => chunks
+                .runs
+                .get(self.run)
+                .and_then(|r| r.tf.get(self.off))
+                .copied()
+                .unwrap_or(0),
+            None => self.list.term_freqs.get(self.idx).copied().unwrap_or(0),
         }
     }
 }
@@ -273,46 +643,37 @@ impl PostingStore {
         }
 
         if posting.doc_ids.contains(doc_id) {
-            // Existing doc: increment at the rank-aligned index.
+            // Existing doc: increment at the rank-aligned index; append positions.
             let idx = posting.rank_index(doc_id);
-            posting.term_freqs[idx] += 1;
-            // Append positions if provided.
             let mut added_positions = 0usize;
-            if let Some(pos) = &positions {
+            if let Some(pos) = positions {
                 added_positions = pos.len();
-                if let Some(pos_list) = &mut posting.positions {
-                    pos_list[idx].extend_from_slice(pos);
-                } else {
-                    // Upgrade: create position tracking, aligned to current docs.
-                    let mut pos_list = vec![Vec::new(); posting.term_freqs.len()];
-                    pos_list[idx] = pos.clone();
-                    posting.positions = Some(pos_list);
+                // Upgrade (first positioned occurrence of an untracked term):
+                // every existing doc gets an empty list, this doc its positions.
+                posting.track_positions();
+                if let Some((tf, pos_list)) = posting.entry_mut(idx) {
+                    *tf += 1;
+                    if let Some(pos_list) = pos_list {
+                        pos_list.extend_from_slice(&pos);
+                    }
                 }
+            } else if let Some((tf, _)) = posting.entry_mut(idx) {
+                *tf += 1;
             }
             self.resident_bytes += added_positions * POSITION_COST;
         } else {
             // New document: insert into the bitmap, then insert tf/positions AT THE RANK
-            // INDEX (not push) so term_freqs/positions stay rank-aligned with doc_ids — correct
+            // INDEX (not push) so the columns stay rank-aligned with doc_ids — correct
             // even when doc_id is not the current maximum (the document-update re-add path).
             posting.doc_ids.insert(doc_id);
             let idx = posting.rank_index(doc_id);
-            posting.term_freqs.insert(idx, 1);
-            let mut added_positions = 0usize;
-            match (&mut posting.positions, &positions) {
-                (Some(pos_list), Some(pos)) => {
-                    added_positions = pos.len();
-                    pos_list.insert(idx, pos.clone());
-                }
-                (Some(pos_list), None) => pos_list.insert(idx, Vec::new()),
-                (None, Some(pos)) => {
-                    // Upgrade: track positions for all docs; this doc's positions at idx.
-                    added_positions = pos.len();
-                    let mut pos_list = vec![Vec::new(); posting.term_freqs.len()];
-                    pos_list[idx] = pos.clone();
-                    posting.positions = Some(pos_list);
-                }
-                (None, None) => {}
+            let added_positions = positions.as_ref().map_or(0, Vec::len);
+            if positions.is_some() {
+                // Upgrade: track positions for all docs; this doc's positions at idx.
+                posting.track_positions();
             }
+            // The occurrence's position list is moved in, not cloned (moon#884).
+            posting.insert_entry(idx, 1, positions.unwrap_or_default());
             // Record the (doc -> term) reverse edge exactly once: this branch fires only the first
             // time `doc_id` joins `term_id`'s posting, so no de-dup is needed. `posting`'s borrow of
             // `self.postings` has ended (last use above), so this disjoint-field access is sound.
@@ -344,12 +705,10 @@ impl PostingStore {
         for (term_id, list) in lists {
             resident_bytes += POSTING_ENTRY_OVERHEAD;
             resident_bytes += list.doc_ids.len() as usize * POSTING_OCCURRENCE_COST;
-            if let Some(pos_list) = &list.positions {
-                resident_bytes += pos_list
-                    .iter()
-                    .map(|p| p.len() * POSITION_COST)
-                    .sum::<usize>();
-            }
+            resident_bytes += list
+                .position_lists()
+                .map(|p| p.len() * POSITION_COST)
+                .sum::<usize>();
             for doc_id in &list.doc_ids {
                 doc_terms.entry(doc_id).or_default().push(term_id);
             }
@@ -402,16 +761,8 @@ impl PostingStore {
             }
             // Rank-aligned index — compute BEFORE removing from the bitmap.
             let idx = posting.rank_index(doc_id);
-            if idx < posting.term_freqs.len() {
-                let old_tf = posting.term_freqs.remove(idx);
+            if let Some((old_tf, old_positions)) = posting.remove_entry(idx) {
                 posting.doc_ids.remove(doc_id);
-                let mut freed_positions = 0usize;
-                if let Some(pos_list) = &mut posting.positions {
-                    if idx < pos_list.len() {
-                        freed_positions = pos_list[idx].len();
-                        pos_list.remove(idx);
-                    }
-                }
                 removed.push((term_id, old_tf));
                 // K4 (P0 fix): symmetric uncharge for the occurrence + its positions
                 // added by `add_term_occurrence`. The entry's `POSTING_ENTRY_OVERHEAD`
@@ -419,22 +770,17 @@ impl PostingStore {
                 // survives (see below), matching the never-refunded charge on creation.
                 self.resident_bytes = self
                     .resident_bytes
-                    .saturating_sub(POSTING_OCCURRENCE_COST + freed_positions * POSITION_COST);
+                    .saturating_sub(POSTING_OCCURRENCE_COST + old_positions.len() * POSITION_COST);
                 // The `postings` HashMap entry itself is kept even when empty
                 // (see doc comment on `remove_doc` — callers rely on
                 // `tf`/`doc_freq` for a "term with zero live docs" staying
                 // answerable without a fresh insert). But once the LAST doc
-                // leaves, the entry's Vec buffers have no reason to keep
+                // leaves, the entry's column buffers have no reason to keep
                 // capacity sized for a document count of zero — release it.
                 // Reallocation on the next occurrence of this term is a
                 // one-time, bounded cost; the alternative is holding peak
                 // capacity forever for a term that may never recur.
-                if posting.doc_ids.is_empty() {
-                    posting.term_freqs.shrink_to_fit();
-                    if let Some(pos_list) = &mut posting.positions {
-                        pos_list.shrink_to_fit();
-                    }
-                }
+                posting.release_if_empty();
             }
         }
         removed
@@ -459,15 +805,8 @@ impl PostingStore {
         if let Some(posting) = self.postings.get_mut(&term_id) {
             if posting.doc_ids.contains(doc_id) {
                 let idx = posting.rank_index(doc_id);
-                if idx < posting.term_freqs.len() {
-                    posting.term_freqs.remove(idx);
-                }
+                posting.remove_entry(idx);
                 posting.doc_ids.remove(doc_id);
-                if let Some(p) = &mut posting.positions {
-                    if idx < p.len() {
-                        p.remove(idx);
-                    }
-                }
             }
         }
     }
@@ -496,10 +835,8 @@ impl PostingStore {
         for posting in self.postings.values() {
             total += POSTING_ENTRY_OVERHEAD;
             total += posting.doc_ids.len() as usize * POSTING_OCCURRENCE_COST;
-            if let Some(ref pos_list) = posting.positions {
-                for positions in pos_list {
-                    total += positions.len() * POSITION_COST;
-                }
+            for positions in posting.position_lists() {
+                total += positions.len() * POSITION_COST;
             }
         }
         total
@@ -694,5 +1031,245 @@ mod tests {
             elapsed < std::time::Duration::from_millis(200),
             "100k reads of estimated_bytes() took {elapsed:?} -- looks like a walk, not O(1)"
         );
+    }
+
+    // ── moon#1195: chunked rank-aligned columns ─────────────────────────────
+
+    /// SplitMix64 — deterministic, dependency-free.
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        }
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n.max(1)
+        }
+    }
+
+    type Model = std::collections::BTreeMap<u32, (u32, Vec<u32>)>;
+
+    /// Layout invariants of a chunked posting (flat postings trivially hold).
+    fn assert_layout(p: &PostingList) {
+        if let Some(c) = &p.chunks {
+            assert!(!c.runs.is_empty());
+            assert_eq!(c.runs.len(), c.starts.len());
+            assert_eq!(c.starts[0], 0);
+            let mut expect = 0u32;
+            for (run, &start) in c.runs.iter().zip(&c.starts) {
+                assert_eq!(start, expect, "run starts are the running entry count");
+                assert!(!run.tf.is_empty() && run.tf.len() <= RUN_MAX);
+                if p.has_positions() {
+                    assert_eq!(run.pos.len(), run.tf.len());
+                } else {
+                    assert!(run.pos.is_empty());
+                }
+                expect += run.tf.len() as u32;
+            }
+            assert!(p.term_freqs.is_empty());
+            assert!(p.positions.as_ref().is_none_or(Vec::is_empty));
+            assert!(c.len() >= FLAT_MIN);
+        } else {
+            assert!(p.term_freqs.len() <= FLAT_MAX);
+        }
+    }
+
+    /// Every read path of the posting agrees with the model.
+    fn assert_matches(
+        store: &PostingStore,
+        term: u32,
+        model: &Model,
+        universe: u32,
+        rng: &mut Rng,
+    ) {
+        let p = store.get_posting(term).expect("posting");
+        assert_layout(p);
+        assert_eq!(p.doc_ids.len() as usize, model.len());
+        assert_eq!(store.doc_freq(term) as usize, model.len());
+        assert_eq!(
+            p.tf_values().collect::<Vec<_>>(),
+            model.values().map(|(tf, _)| *tf).collect::<Vec<_>>(),
+            "tf column in rank order"
+        );
+        if p.has_positions() {
+            assert_eq!(
+                p.position_lists().map(<[u32]>::to_vec).collect::<Vec<_>>(),
+                model
+                    .values()
+                    .map(|(_, pos)| pos.clone())
+                    .collect::<Vec<_>>(),
+                "position column in rank order"
+            );
+        }
+        for d in 0..universe {
+            let want = model.get(&d);
+            assert_eq!(p.tf(d), want.map_or(0, |(tf, _)| *tf), "tf({d})");
+            if p.has_positions() {
+                assert_eq!(p.positions_for(d), want.map(|(_, pos)| pos.as_slice()));
+            }
+        }
+        // Cursor over a random ascending probe set (sparse and dense stretches).
+        let mut cursor = p.cursor();
+        let mut d = 0u32;
+        while d < universe {
+            let want = model.get(&d).map(|(tf, _)| *tf);
+            assert_eq!(cursor.seek(d), want, "cursor seek({d})");
+            d += 1 + if rng.below(4) == 0 {
+                rng.below(600) as u32
+            } else {
+                0
+            };
+        }
+        assert_eq!(
+            store.estimated_bytes(),
+            store.estimated_bytes_ground_truth()
+        );
+    }
+
+    fn add(store: &mut PostingStore, model: &mut Model, term: u32, doc: u32, pos: u32) {
+        store.add_term_occurrence(term, doc, Some(vec![pos]));
+        let e = model.entry(doc).or_insert((0, Vec::new()));
+        e.0 += 1;
+        e.1.push(pos);
+    }
+
+    /// moon#1195: random churn across every layout transition — flat → chunked
+    /// (> FLAT_MAX), run splits (> RUN_MAX), run merges / removals (< RUN_MIN),
+    /// chunked → flat (< FLAT_MIN), a position-tracking upgrade while chunked —
+    /// with DISTINCT per-doc tfs (CONVENTIONS: equal tfs hide misalignment).
+    #[test]
+    fn chunked_columns_match_the_model_under_churn() {
+        const T: u32 = 1; // dense, tracked
+        const U: u32 = 2; // untracked until upgraded while chunked
+        const N: u32 = 4_000;
+        let mut rng = Rng(1195);
+        let mut store = PostingStore::new();
+        let mut model = Model::new();
+        let mut order: Vec<u32> = (0..N).collect();
+        for i in (1..order.len()).rev() {
+            order.swap(i, rng.below(i as u64 + 1) as usize);
+        }
+        // Random-order inserts: crosses FLAT_MAX, then splits runs repeatedly.
+        for (n, &d) in order.iter().enumerate() {
+            for k in 0..=(d % 5) {
+                add(&mut store, &mut model, T, d, d * 8 + k);
+            }
+            store.add_term_occurrence(U, d, None);
+            if n % 997 == 0 {
+                assert_matches(&store, T, &model, N, &mut rng);
+            }
+        }
+        assert!(store.get_posting(T).is_some_and(|p| p.chunks.is_some()));
+        assert_matches(&store, T, &model, N, &mut rng);
+
+        // Upgrade the untracked, chunked posting U: every doc gets [] except one.
+        assert!(!store.get_posting(U).is_some_and(PostingList::has_positions));
+        store.add_term_occurrence(U, 17, Some(vec![99, 100]));
+        let u = store.get_posting(U).expect("U");
+        assert!(u.chunks.is_some() && u.has_positions());
+        assert_layout(u);
+        assert_eq!(u.positions_for(17), Some(&[99u32, 100][..]));
+        assert_eq!(u.tf(17), 2);
+        assert_eq!(u.positions_for(18), Some(&[][..]));
+
+        // Remove a contiguous block (run merges/removals) and random docs.
+        for d in 1_000..2_200 {
+            store.remove_doc(d);
+            model.remove(&d);
+        }
+        for _ in 0..800 {
+            let d = rng.below(u64::from(N)) as u32;
+            store.remove_doc(d);
+            model.remove(&d);
+        }
+        assert_matches(&store, T, &model, N, &mut rng);
+        // Re-add (upsert) old docs mid-posting with new, distinct tfs.
+        for _ in 0..600 {
+            let d = rng.below(u64::from(N)) as u32;
+            store.remove_doc(d);
+            model.remove(&d);
+            for k in 0..(1 + rng.below(4) as u32) {
+                add(&mut store, &mut model, T, d, 7 * k + d % 3);
+            }
+        }
+        assert_matches(&store, T, &model, N, &mut rng);
+        // Drain below FLAT_MIN: converts back to one flat run.
+        let live: Vec<u32> = model.keys().copied().collect();
+        for &d in live.iter().skip(200) {
+            store.remove_doc(d);
+            model.remove(&d);
+        }
+        assert!(store.get_posting(T).is_some_and(|p| p.chunks.is_none()));
+        assert_matches(&store, T, &model, N, &mut rng);
+    }
+
+    /// `from_parts` (the `.tpost` load path) builds the same columns as
+    /// incremental indexing, for a posting long enough to be chunked.
+    #[test]
+    fn from_parts_chunks_long_postings_identically() {
+        let n = 5_000u32;
+        let doc_ids: Vec<u32> = (0..n).map(|i| i * 3 + (i % 2)).collect();
+        let tfs: Vec<u32> = (0..n).map(|i| 1 + i % 9).collect();
+        let pos: Vec<Vec<u32>> = (0..n).map(|i| vec![i; (1 + i % 9) as usize]).collect();
+        let p = PostingList::from_parts(&doc_ids, tfs.clone(), Some(pos.clone())).expect("parts");
+        assert!(p.chunks.is_some());
+        assert_layout(&p);
+        assert_eq!(p.tf_values().collect::<Vec<_>>(), tfs);
+        assert_eq!(
+            p.position_lists().map(<[u32]>::to_vec).collect::<Vec<_>>(),
+            pos
+        );
+        for (i, &d) in doc_ids.iter().enumerate() {
+            assert_eq!(p.tf(d), tfs[i]);
+            assert_eq!(p.positions_for(d), Some(pos[i].as_slice()));
+        }
+    }
+
+    /// moon#1195 red test: re-indexing the OLDEST document of a large corpus
+    /// must cost the same as re-indexing the NEWEST. HEAD's flat rank-aligned
+    /// columns memmoved `(len - rank) × 28` bytes per term on both the remove
+    /// and the re-insert, so doc 0 paid O(Σ posting length) (~70 MB here) while
+    /// the newest doc paid ~0. Best-of-N, alternating, generous 4x bound.
+    #[test]
+    fn upsert_cost_is_flat_across_doc_position() {
+        const N: u32 = 200_000;
+        const TERMS: u32 = 6;
+        // Bulk-load through the `.tpost` path so the setup is O(N) even unoptimised.
+        let doc_ids: Vec<u32> = (0..N).collect();
+        let lists = (0..TERMS)
+            .map(|t| {
+                let tfs = (0..N).map(|d| 1 + (d + t) % 3).collect();
+                let pos = (0..N)
+                    .map(|d| vec![t; (1 + (d + t) % 3) as usize])
+                    .collect();
+                (
+                    t,
+                    PostingList::from_parts(&doc_ids, tfs, Some(pos)).expect("parts"),
+                )
+            })
+            .collect();
+        let mut store = PostingStore::from_lists(lists).expect("store");
+        let upsert = |store: &mut PostingStore, d: u32| {
+            let t0 = std::time::Instant::now();
+            store.remove_doc(d);
+            for t in 0..TERMS {
+                store.add_term_occurrence(t, d, Some(vec![t]));
+            }
+            t0.elapsed()
+        };
+        let (mut first, mut last) = (std::time::Duration::MAX, std::time::Duration::MAX);
+        for _ in 0..9 {
+            first = first.min(upsert(&mut store, 0));
+            last = last.min(upsert(&mut store, N - 1));
+        }
+        let floor = std::time::Duration::from_micros(50);
+        assert!(
+            first <= last.max(floor) * 4,
+            "upserting doc 0 took {first:?} vs doc N-1 {last:?}: cost grows with posting length"
+        );
+        assert_eq!(store.doc_freq(0), N);
     }
 }

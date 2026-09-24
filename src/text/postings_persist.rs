@@ -278,21 +278,19 @@ pub fn encode_index(idx: &TextIndex) -> Vec<u8> {
         w.u32(postings.len() as u32);
         for (term_id, list) in postings {
             w.u32(term_id);
-            let has_positions = list.positions.is_some();
-            w.u8(has_positions as u8);
+            w.u8(list.has_positions() as u8);
             w.u32(list.doc_ids.len() as u32);
             for d in &list.doc_ids {
                 w.u32(d);
             }
-            for &tf in &list.term_freqs {
+            for tf in list.tf_values() {
                 w.u32(tf);
             }
-            if let Some(pos) = &list.positions {
-                for p in pos {
-                    w.u32(p.len() as u32);
-                    for &v in p {
-                        w.u32(v);
-                    }
+            // Empty when positions are untracked.
+            for p in list.position_lists() {
+                w.u32(p.len() as u32);
+                for &v in p {
+                    w.u32(v);
                 }
             }
         }
@@ -947,6 +945,91 @@ mod tests {
         // and it re-encodes to the very same bytes
         assert_eq!(encode_index(&loaded), bytes);
     }
+
+    /// moon#1195: postings longer than the flat threshold live in chunked
+    /// columns. Their `.tpost` encoding is the same flat rank-order stream, a
+    /// decode rebuilds the same columns, and the installed index answers — and
+    /// re-encodes — identically, including after upserts of OLD documents
+    /// (mid-posting re-inserts) and deletions.
+    #[cfg(feature = "text-index")]
+    #[test]
+    fn chunked_postings_round_trip_through_tpost() {
+        let mut live = TextIndex::new(
+            Bytes::from_static(b"big"),
+            vec![Bytes::from_static(b"b:")],
+            vec![TextFieldDef::new(Bytes::from_static(b"body"))],
+            BM25Config::default(),
+        );
+        let words = ["alpha", "bravo", "charlie", "delta", "echo", "foxtrot"];
+        let body = |i: usize| {
+            // Distinct, asymmetric tfs: "alpha" i%4+1 times, the rest by stride.
+            let mut s = String::new();
+            for _ in 0..=(i % 4) {
+                s.push_str("alpha ");
+            }
+            for (w, word) in words.iter().enumerate().skip(1) {
+                if i % (w + 1) == 0 {
+                    s.push_str(word);
+                    s.push(' ');
+                }
+            }
+            s
+        };
+        let index = |idx: &mut TextIndex, i: usize, text: &str| {
+            let key = format!("b:{i}");
+            let kh = xxhash_rust::xxh64::xxh64(key.as_bytes(), 0);
+            let args = frames(&[("body", text)]);
+            idx.index_document_with_lsn(kh, key.as_bytes(), &args, 1 + i as u64);
+            idx.record_content_checksum(kh, &args);
+        };
+        for i in 0..3_000 {
+            index(&mut live, i, &body(i));
+        }
+        // Upserts of old docs (rank re-inserts deep inside chunked postings).
+        for i in (0..600).step_by(7) {
+            index(&mut live, i, &body(i + 1));
+        }
+        for d in (5..3_000u32).step_by(11) {
+            live.remove_doc_by_doc_id(d);
+        }
+        assert!(
+            live.field_postings[0]
+                .iter()
+                .any(|(_, p)| p.doc_ids.len() as usize > FLAT_MAX_FOR_TESTS),
+            "the fixture must exercise chunked columns"
+        );
+        let bytes = encode_index(&live);
+        let mut loaded = empty_like(&live);
+        loaded
+            .install_recovered(decode(&bytes).expect("decode"))
+            .expect("install");
+        for terms in [
+            vec!["alpha"],
+            vec!["bravo"],
+            vec!["foxtrot"],
+            vec!["alpha", "charlie"],
+            vec!["delta", "echo"],
+        ] {
+            assert_eq!(
+                hits(&live, 0, &terms),
+                hits(&loaded, 0, &terms),
+                "{terms:?}"
+            );
+        }
+        for (term, p) in live.field_postings[0].iter() {
+            let q = loaded.field_postings[0].get_posting(term).expect("term");
+            assert_eq!(p.doc_ids, q.doc_ids);
+            assert_eq!(
+                p.tf_values().collect::<Vec<_>>(),
+                q.tf_values().collect::<Vec<_>>()
+            );
+            assert!(p.position_lists().eq(q.position_lists()));
+        }
+        assert_eq!(encode_index(&loaded), bytes, "re-encodes byte-identically");
+    }
+
+    /// Mirror of `posting::FLAT_MAX` (private there) for fixture sizing.
+    const FLAT_MAX_FOR_TESTS: usize = 1024;
 
     #[cfg(feature = "text-index")]
     #[test]
