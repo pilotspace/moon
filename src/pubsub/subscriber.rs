@@ -12,11 +12,37 @@ use bytes::Bytes;
 /// RESP3 via `HELLO 3`. When true, `publish()` frames pub/sub messages as
 /// RESP3 Push (`>`) instead of RESP2 Array (`*`). Backwards-compatible:
 /// RESP2 subscribers continue to receive Array frames unchanged.
-#[derive(Clone)]
 pub struct Subscriber {
     pub tx: channel::MpscSender<Bytes>,
     pub id: u64,
     pub is_resp3: bool,
+}
+
+/// Cloning a handle clones its flume `Sender`: two atomic RMWs, and two more
+/// when the clone drops. Written out (not derived) so tests can count it.
+impl Clone for Subscriber {
+    fn clone(&self) -> Self {
+        #[cfg(test)]
+        CLONES.with(|c| c.set(c.get() + 1));
+        Self {
+            tx: self.tx.clone(),
+            id: self.id,
+            is_resp3: self.is_resp3,
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static CLONES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Subscriber handles cloned on this thread so far (tests only; per thread so
+/// concurrently running tests cannot disturb each other's counts). Read by
+/// the registry tests, which run on the tokio leg.
+#[cfg(all(test, feature = "runtime-tokio"))]
+pub(crate) fn clones_on_this_thread() -> u64 {
+    CLONES.with(|c| c.get())
 }
 
 impl Subscriber {
