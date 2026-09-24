@@ -694,6 +694,67 @@ mod tests {
         );
     }
 
+    /// moon#1201: a value whose overflow chain is longer than 1000 pages
+    /// (~4.03 MB) was spilled fine but could never be read back -- the
+    /// chain walker's fixed 1000-page cycle guard rejected an intact chain
+    /// as `OverflowBroken`, so an INDEXED key answered IOERR forever. The
+    /// release soak's consumer-group streams (PEL grows without XACK) hit
+    /// 1003-1007-page chains. The spill side has no size cap, so the read
+    /// side must accept every chain the spill side can write.
+    #[test]
+    fn test_cold_read_overflow_chain_longer_than_1000_pages_1201() {
+        let tmp = tempfile::tempdir().unwrap();
+        let shard_dir = tmp.path();
+        let manifest_path = shard_dir.join("shard.manifest");
+        let mut manifest = ShardManifest::create(&manifest_path).unwrap();
+        let mut cold_index = ColdIndex::new();
+
+        // 4.5 MB incompressible -> ~1117 overflow pages (> 1000).
+        let mut big_value = vec![0u8; 4_500_000];
+        let mut state: u64 = 0x1201_1201_CAFE_BABE;
+        for b in big_value.iter_mut() {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            *b = state as u8;
+        }
+        let entry = Entry::new_string(Bytes::from(big_value.clone()));
+        spill_to_datafile(
+            shard_dir,
+            31,
+            b"huge_key",
+            &entry,
+            0,
+            &mut manifest,
+            Some(&mut cold_index),
+        )
+        .unwrap();
+
+        let file_size = std::fs::metadata(shard_dir.join("data/heap-000031.mpf"))
+            .unwrap()
+            .len();
+        assert!(
+            file_size / PAGE_4K as u64 > 1001,
+            "precondition: chain must exceed 1000 pages, file has {} pages",
+            file_size / PAGE_4K as u64
+        );
+
+        match cold_read_through_outcome(&cold_index, shard_dir, b"huge_key", 0) {
+            ColdReadOutcome::Hit(RedisValue::String(v), None) => {
+                assert_eq!(v.as_ref(), big_value.as_slice(), "value must round-trip");
+            }
+            ColdReadOutcome::Unreadable(f) => {
+                panic!(
+                    "intact >1000-page chain reported unreadable: {:?}",
+                    f.reason
+                )
+            }
+            ColdReadOutcome::Hit(..) => panic!("expected a string Hit without TTL"),
+            ColdReadOutcome::Expired => panic!("expected Hit, got Expired"),
+            ColdReadOutcome::Miss => panic!("expected Hit, got Miss"),
+        }
+    }
+
     #[test]
     fn test_cold_read_overflow_entry() {
         let tmp = tempfile::tempdir().unwrap();
