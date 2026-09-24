@@ -201,8 +201,9 @@ pub struct SearchSnapshot {
     pub k: usize,
     /// HNSW ef_search (resolved at capture).
     pub ef_search: usize,
-    /// Pre-evaluated payload/numeric filter bitmap (owned), or None.
-    pub filter_bitmap: Option<RoaringBitmap>,
+    /// Pre-evaluated payload/numeric filter bitmap, or None. `Arc` so the
+    /// search pool's jobs share it without a second deep clone (moon#1196).
+    pub filter_bitmap: Option<Arc<RoaringBitmap>>,
     /// Selectivity-based filter strategy resolved at capture (XC-3), matching
     /// the sync path's `select_strategy` dispatch. `Unfiltered` when
     /// `filter_bitmap` is None.
@@ -318,6 +319,19 @@ pub struct SegmentHolder {
     /// Single-flight guard for `promote_unloaded` (blocking, never held
     /// across `.await`).
     reload_lock: parking_lot::Mutex<()>,
+}
+
+/// One [`PreparedTqQuery`] per query for every graph-tier segment it will
+/// visit (moon#1196), built against the index collection. `None` when the
+/// query visits no graph segment (nothing to share) or the collection is SQ8.
+fn prepare_graph_query(
+    list: &SegmentList,
+    query: &[f32],
+) -> Option<crate::vector::hnsw::prepared::PreparedTqQuery> {
+    if list.immutable.is_empty() && list.warm.is_empty() {
+        return None;
+    }
+    crate::vector::hnsw::prepared::PreparedTqQuery::new(query, list.mutable.collection())
 }
 
 impl SegmentHolder {
@@ -474,6 +488,10 @@ impl SegmentHolder {
         // Full resolved ef per segment (no ef_defaulted context on this path,
         // so the AE-1 per-segment reduction never applies here).
         let graph_ef = ef_search;
+        // moon#1196: rotation + ADC LUT + unit query once for all segments.
+        let prepared = prepare_graph_query(&snapshot, query_f32);
+        let prepared = prepared.as_ref();
+        let default_tuning = crate::vector::types::SearchTuning::default();
 
         match strategy {
             FilterStrategy::Unfiltered => {
@@ -483,10 +501,20 @@ impl SegmentHolder {
                         .brute_force_search(query_f32, query_state, k),
                 );
                 for imm in &snapshot.immutable {
-                    all.extend(imm.search(query_f32, k, graph_ef, _scratch));
+                    all.extend(imm.search_prepared(
+                        query_f32,
+                        prepared,
+                        k,
+                        graph_ef,
+                        _scratch,
+                        None,
+                        default_tuning,
+                    ));
                 }
                 for warm_seg in &snapshot.warm {
-                    all.extend(warm_seg.search(query_f32, k, graph_ef, _scratch));
+                    all.extend(
+                        warm_seg.search_prepared(query_f32, prepared, k, graph_ef, _scratch, None),
+                    );
                 }
             }
             FilterStrategy::BruteForceFiltered => {
@@ -497,17 +525,20 @@ impl SegmentHolder {
                     filter_bitmap,
                 ));
                 for imm in &snapshot.immutable {
-                    all.extend(imm.search_filtered(
+                    all.extend(imm.search_prepared(
                         query_f32,
+                        prepared,
                         k,
                         graph_ef,
                         _scratch,
                         filter_bitmap,
+                        default_tuning,
                     ));
                 }
                 for warm_seg in &snapshot.warm {
-                    all.extend(warm_seg.search_filtered(
+                    all.extend(warm_seg.search_prepared(
                         query_f32,
+                        prepared,
                         k,
                         graph_ef,
                         _scratch,
@@ -523,17 +554,20 @@ impl SegmentHolder {
                     filter_bitmap,
                 ));
                 for imm in &snapshot.immutable {
-                    all.extend(imm.search_filtered(
+                    all.extend(imm.search_prepared(
                         query_f32,
+                        prepared,
                         k,
                         graph_ef,
                         _scratch,
                         filter_bitmap,
+                        default_tuning,
                     ));
                 }
                 for warm_seg in &snapshot.warm {
-                    all.extend(warm_seg.search_filtered(
+                    all.extend(warm_seg.search_prepared(
                         query_f32,
+                        prepared,
                         k,
                         graph_ef,
                         _scratch,
@@ -551,7 +585,15 @@ impl SegmentHolder {
                 ));
                 let post_ef = ef_search.max(oversample_k);
                 for imm in &snapshot.immutable {
-                    let imm_results = imm.search(query_f32, oversample_k, post_ef, _scratch);
+                    let imm_results = imm.search_prepared(
+                        query_f32,
+                        prepared,
+                        oversample_k,
+                        post_ef,
+                        _scratch,
+                        None,
+                        default_tuning,
+                    );
                     if let Some(bm) = filter_bitmap {
                         for r in imm_results {
                             if bm.contains(r.id.0) {
@@ -563,7 +605,14 @@ impl SegmentHolder {
                     }
                 }
                 for warm_seg in &snapshot.warm {
-                    let warm_results = warm_seg.search(query_f32, oversample_k, post_ef, _scratch);
+                    let warm_results = warm_seg.search_prepared(
+                        query_f32,
+                        prepared,
+                        oversample_k,
+                        post_ef,
+                        _scratch,
+                        None,
+                    );
                     if let Some(bm) = filter_bitmap {
                         for r in warm_results {
                             if bm.contains(r.id.0) {
@@ -684,35 +733,32 @@ impl SegmentHolder {
                 _ => graph_ef,
             }
         };
+        // moon#1196: rotation + ADC LUT + unit query once for all segments.
+        let prepared = prepare_graph_query(&snapshot, query_f32);
+        let prepared = prepared.as_ref();
         for imm in &snapshot.immutable {
             let ef_i = seg_ef(imm.suggested_ef());
-            if filter_bitmap.is_some() {
-                all.extend(imm.search_filtered_with_tuning(
-                    query_f32,
-                    k,
-                    ef_i,
-                    _scratch,
-                    filter_bitmap,
-                    mvcc.tuning,
-                ));
-            } else {
-                all.extend(imm.search_with_tuning(query_f32, k, ef_i, _scratch, mvcc.tuning));
-            }
+            all.extend(imm.search_prepared(
+                query_f32,
+                prepared,
+                k,
+                ef_i,
+                _scratch,
+                filter_bitmap,
+                mvcc.tuning,
+            ));
         }
 
         // 2a. Warm segment search (committed by definition, same as immutable).
         for warm_seg in &snapshot.warm {
-            if filter_bitmap.is_some() {
-                all.extend(warm_seg.search_filtered(
-                    query_f32,
-                    k,
-                    graph_ef,
-                    _scratch,
-                    filter_bitmap,
-                ));
-            } else {
-                all.extend(warm_seg.search(query_f32, k, graph_ef, _scratch));
-            }
+            all.extend(warm_seg.search_prepared(
+                query_f32,
+                prepared,
+                k,
+                graph_ef,
+                _scratch,
+                filter_bitmap,
+            ));
         }
 
         // 2b. IVF segment search (IVF entries are committed by definition).
@@ -813,7 +859,7 @@ impl SegmentHolder {
         let filter_bitmap = snap.filter_bitmap.take();
         let committed = std::mem::take(&mut snap.committed);
         let query_f32 = query_f32.as_slice();
-        let filter_ref = filter_bitmap.as_ref();
+        let filter_ref = filter_bitmap.as_deref();
         let k = snap.k;
         let ef_search = snap.ef_search;
         // XC-3: high-selectivity filters (>80% of vectors pass) run the graph
@@ -856,6 +902,11 @@ impl SegmentHolder {
 
         let mut all: SmallVec<[SearchResult; 32]> = SmallVec::new();
 
+        // moon#1196: rotation + ADC LUTs + unit query built ONCE for every
+        // graph segment of this query — serial loops, inline fallbacks and
+        // pool jobs (shared by `Arc`) alike.
+        let prepared = prepare_graph_query(&segments, query_f32).map(Arc::new);
+
         // 0. Intra-query fan-out (search_pool): submit every graph-tier
         //    (immutable/warm) segment search to the worker pool BEFORE the
         //    mutable scan so workers overlap with it. Filter semantics mirror
@@ -868,10 +919,15 @@ impl SegmentHolder {
         let mut reply_rx = None;
         if let Some(pool) = pooled {
             let (tx, rx) = flume::bounded::<SmallVec<[SearchResult; 32]>>(graph_jobs);
-            // One owned query copy + optional bitmap clone per query — shared
-            // across this query's jobs via Arc (not per-segment copies).
+            // One owned query copy per query, shared across this query's jobs
+            // via Arc. The filter bitmap is already an `Arc` from capture
+            // (moon#1196: it was cloned a SECOND time here) — refcount bump.
             let query_arc: std::sync::Arc<[f32]> = std::sync::Arc::from(query_f32);
-            let filter_arc = graph_filter.map(|bm| std::sync::Arc::new(bm.clone()));
+            let filter_arc = if graph_filter.is_some() {
+                filter_bitmap.clone()
+            } else {
+                None
+            };
             // On submit failure (pool shut down at process teardown) the
             // segment is searched inline — the query still answers correctly.
             for seg in &segments.immutable {
@@ -881,6 +937,7 @@ impl SegmentHolder {
                         std::sync::Arc::clone(seg),
                     ),
                     query: std::sync::Arc::clone(&query_arc),
+                    prepared: prepared.clone(),
                     fetch_k,
                     ef_search: ef_seg,
                     filter: filter_arc.clone(),
@@ -890,8 +947,9 @@ impl SegmentHolder {
                 if pool.submit(job) {
                     pending_replies += 1;
                 } else if graph_filter.is_some() {
-                    all.extend(seg.search_filtered_with_tuning(
+                    all.extend(seg.search_prepared(
                         query_f32,
+                        prepared.as_deref(),
                         fetch_k,
                         ef_seg,
                         &mut snap.scratch,
@@ -899,11 +957,13 @@ impl SegmentHolder {
                         tuning,
                     ));
                 } else {
-                    let results = seg.search_with_tuning(
+                    let results = seg.search_prepared(
                         query_f32,
+                        prepared.as_deref(),
                         fetch_k,
                         ef_seg,
                         &mut snap.scratch,
+                        None,
                         tuning,
                     );
                     if post_filter {
@@ -921,6 +981,7 @@ impl SegmentHolder {
                         std::sync::Arc::clone(seg),
                     ),
                     query: std::sync::Arc::clone(&query_arc),
+                    prepared: prepared.clone(),
                     fetch_k,
                     ef_search: graph_ef,
                     filter: filter_arc.clone(),
@@ -930,15 +991,23 @@ impl SegmentHolder {
                 if pool.submit(job) {
                     pending_replies += 1;
                 } else if graph_filter.is_some() {
-                    all.extend(seg.search_filtered(
+                    all.extend(seg.search_prepared(
                         query_f32,
+                        prepared.as_deref(),
                         fetch_k,
                         graph_ef,
                         &mut snap.scratch,
                         graph_filter,
                     ));
                 } else {
-                    let results = seg.search(query_f32, fetch_k, graph_ef, &mut snap.scratch);
+                    let results = seg.search_prepared(
+                        query_f32,
+                        prepared.as_deref(),
+                        fetch_k,
+                        graph_ef,
+                        &mut snap.scratch,
+                        None,
+                    );
                     if post_filter {
                         if let Some(bm) = filter_ref {
                             all.extend(results.into_iter().filter(|r| bm.contains(r.id.0)));
@@ -1031,8 +1100,9 @@ impl SegmentHolder {
             for imm in &segments.immutable {
                 let ef_seg = seg_ef(imm.suggested_ef());
                 if graph_filter.is_some() {
-                    all.extend(imm.search_filtered_with_tuning(
+                    all.extend(imm.search_prepared(
                         query_f32,
+                        prepared.as_deref(),
                         fetch_k,
                         ef_seg,
                         &mut snap.scratch,
@@ -1040,11 +1110,13 @@ impl SegmentHolder {
                         tuning,
                     ));
                 } else {
-                    let results = imm.search_with_tuning(
+                    let results = imm.search_prepared(
                         query_f32,
+                        prepared.as_deref(),
                         fetch_k,
                         ef_seg,
                         &mut snap.scratch,
+                        None,
                         tuning,
                     );
                     if post_filter {
@@ -1068,15 +1140,23 @@ impl SegmentHolder {
         if !pooled_graph {
             for warm_seg in &segments.warm {
                 if graph_filter.is_some() {
-                    all.extend(warm_seg.search_filtered(
+                    all.extend(warm_seg.search_prepared(
                         query_f32,
+                        prepared.as_deref(),
                         fetch_k,
                         graph_ef,
                         &mut snap.scratch,
                         graph_filter,
                     ));
                 } else {
-                    let results = warm_seg.search(query_f32, fetch_k, graph_ef, &mut snap.scratch);
+                    let results = warm_seg.search_prepared(
+                        query_f32,
+                        prepared.as_deref(),
+                        fetch_k,
+                        graph_ef,
+                        &mut snap.scratch,
+                        None,
+                    );
                     if post_filter {
                         if let Some(bm) = filter_ref {
                             all.extend(results.into_iter().filter(|r| bm.contains(r.id.0)));

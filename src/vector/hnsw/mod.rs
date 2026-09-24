@@ -10,6 +10,7 @@ pub mod graph;
 pub mod graph_serde;
 pub mod neighbor_codec;
 pub mod parallel_build;
+pub mod prepared;
 pub mod search;
 pub mod search_sq;
 

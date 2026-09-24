@@ -6,6 +6,8 @@ pub mod key_index;
 pub mod mutable;
 #[cfg(test)]
 mod mutable_exact_scan_tests;
+#[cfg(test)]
+mod prepared_query_tests;
 pub mod raw_f16_store;
 pub(crate) mod sub_signs;
 

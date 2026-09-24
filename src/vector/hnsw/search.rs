@@ -9,9 +9,11 @@ use smallvec::SmallVec;
 
 use super::adc_kernel;
 use super::graph::{HnswGraph, SENTINEL};
+use super::prepared::{self, PreparedTqQuery};
 use crate::vector::aligned_buffer::AlignedBuffer;
 use crate::vector::distance;
 use crate::vector::turbo_quant::collection::{CollectionMetadata, QuantizationConfig};
+#[cfg(test)]
 use crate::vector::turbo_quant::fwht;
 use crate::vector::turbo_quant::sq8::{
     SQ8_INT8_QMAX, sq8_int8_dot_to_f32, sq8_l2_from_stats, sq8_params, sq8_quantize_query_scalar,
@@ -288,6 +290,42 @@ pub fn hnsw_search_filtered(
     sub_sign_bpv: usize,
     exact_f16: Option<&[u16]>,
 ) -> SmallVec<[SearchResult; 32]> {
+    hnsw_search_filtered_prepared(
+        graph,
+        vectors_tq,
+        query,
+        collection,
+        k,
+        ef_search,
+        scratch,
+        allow_bitmap,
+        sub_centroid_signs,
+        sub_sign_bpv,
+        exact_f16,
+        None,
+    )
+}
+
+/// [`hnsw_search_filtered`] with an optional per-query [`PreparedTqQuery`]
+/// (moon#1196): when it was prepared for this segment's collection, the
+/// query rotation, the 16/32-level ADC LUT and the unit query are taken from
+/// it instead of being rebuilt for every segment. Results are bit-identical
+/// either way (same routines, see `hnsw::prepared`).
+#[allow(clippy::too_many_arguments)]
+pub fn hnsw_search_filtered_prepared(
+    graph: &HnswGraph,
+    vectors_tq: &[u8],
+    query: &[f32],
+    collection: &CollectionMetadata,
+    k: usize,
+    ef_search: usize,
+    scratch: &mut SearchScratch,
+    allow_bitmap: Option<&RoaringBitmap>,
+    sub_centroid_signs: &[u8],
+    sub_sign_bpv: usize,
+    exact_f16: Option<&[u16]>,
+    prepared: Option<&PreparedTqQuery>,
+) -> SmallVec<[SearchResult; 32]> {
     let num_nodes = graph.num_nodes();
     if num_nodes == 0 {
         return SmallVec::new();
@@ -352,32 +390,24 @@ pub fn hnsw_search_filtered(
         }
     }
 
-    let q_rot = scratch.query_rotated.as_mut_slice();
-    // Copy query and zero-pad
-    q_rot[..dim].copy_from_slice(query);
-    for v in q_rot[dim..padded].iter_mut() {
-        *v = 0.0;
-    }
-    // Compute query norm BEFORE normalization (needed for distance correction)
-    let mut q_norm_sq = 0.0f32;
-    for &v in &q_rot[..dim] {
-        q_norm_sq += v * v;
-    }
-    let q_norm = q_norm_sq.sqrt();
-    // Normalize query to unit length (TQ operates on unit sphere)
-    if q_norm > 0.0 {
-        let inv = 1.0 / q_norm;
-        for v in q_rot[..dim].iter_mut() {
-            *v *= inv;
-        }
-    }
-    // Apply FWHT with collection's sign flips (TQ only — SQ8 is axis-aligned).
-    if !is_sq8 {
-        fwht::fwht(&mut q_rot[..padded], collection.fwht_sign_flips.as_slice());
-    }
-
-    // Capture immutable slice of rotated query (after mutation phase is done)
-    let q_rotated: &[f32] = scratch.query_rotated.as_slice();
+    // moon#1196: take the rotated query (and below, the ADC LUT and unit
+    // query) from the query's shared PreparedTqQuery when it was prepared for
+    // THIS collection; otherwise rotate into scratch exactly as before. SQ8
+    // is axis-aligned: normalized only, never rotated, never prepared.
+    let prepared = prepared.filter(|p| !is_sq8 && p.dim() == dim && p.matches(collection));
+    let q_norm: f32;
+    let q_rotated: &[f32] = if let Some(p) = prepared {
+        q_norm = p.q_norm();
+        p.q_rotated()
+    } else {
+        let q_rot = &mut scratch.query_rotated.as_mut_slice()[..padded];
+        q_norm = if is_sq8 {
+            prepared::normalize_query_into(query, q_rot)
+        } else {
+            prepared::rotate_query_into(query, collection.fwht_sign_flips.as_slice(), q_rot)
+        };
+        scratch.query_rotated.as_slice()
+    };
     // TQ's LUT sum is a UNIT-SPHERE distance d̂² between the normalized query
     // and the decoded unit direction; scaling by ‖a‖² ranks correctly only for
     // unit-sphere metrics (COSINE/IP, where encode normalizes too). For raw L2
@@ -403,20 +433,13 @@ pub fn hnsw_search_filtered(
     // the sidecar is BFS-complete) fall through to the quantized path.
     let exact_kernels = distance::table();
     let mut exact_q_unit: SmallVec<[f32; 512]> = SmallVec::new();
-    if exact_f16.is_some() && collection.metric != DistanceMetric::L2 {
-        exact_q_unit = SmallVec::from_slice(query);
-        let n: f32 = exact_q_unit.iter().map(|x| x * x).sum::<f32>().sqrt();
-        if n > 0.0 {
-            let inv = 1.0 / n;
-            for v in exact_q_unit.iter_mut() {
-                *v *= inv;
-            }
-        }
-    }
     let exact_metric_is_l2 = collection.metric == DistanceMetric::L2;
-    let exact_q: &[f32] = if exact_metric_is_l2 {
+    let exact_q: &[f32] = if exact_metric_is_l2 || exact_f16.is_none() {
         query
+    } else if let Some(p) = prepared {
+        p.q_unit()
     } else {
+        prepared::unit_query_into(query, &mut exact_q_unit);
         &exact_q_unit
     };
     let exact_dist = move |vec_f16: &[u16]| -> f32 {
@@ -472,43 +495,39 @@ pub fn hnsw_search_filtered(
         && sub_centroid_signs.len() >= (num_nodes as usize).saturating_mul(sub_sign_bpv);
     let entries_per_coord: usize = if use_subcent { 32 } else { 16 };
 
-    // Use pre-allocated scratch.adc_lut (zero alloc per query).
-    // Capacity was reserved in SearchScratch::new() for worst case (32 entries).
-    // clear() is called in scratch.clear() at the start of this function.
-    let lut_needed = padded_dim * entries_per_coord;
-    if scratch.adc_lut.capacity() < lut_needed {
-        scratch
-            .adc_lut
-            .reserve(lut_needed - scratch.adc_lut.capacity());
-    }
-
-    // SQ8 distance is computed directly from the affine codes; no per-query LUT.
-    if is_sq8 {
-        // adc_lut stays empty (cleared above); the SQ8 closures never read it.
-    } else if let Some(st) = sub_table.filter(|_| use_subcent) {
-        for j in 0..padded_dim {
-            let q = q_rotated[j];
-            for e in 0..32 {
-                let d = q - st.table[e];
-                scratch.adc_lut.push(d * d);
-            }
+    // Per-query distance LUT: the prepared one (moon#1196), else built into
+    // scratch.adc_lut (capacity reserved in SearchScratch::new for the
+    // 32-entry worst case; cleared by scratch.clear() above) by the same
+    // vectorizable fill the prepared path uses. SQ8 computes its distance
+    // directly from the affine codes and never reads a LUT.
+    let adc_lut: &[f32] = if is_sq8 {
+        &scratch.adc_lut
+    } else if let Some(p) = prepared {
+        if use_subcent {
+            p.lut32().unwrap_or(&[])
+        } else {
+            p.lut16()
         }
     } else {
-        for j in 0..padded_dim {
-            let q = q_rotated[j];
-            for c in 0..16 {
-                let d = q - codebook[c];
-                scratch.adc_lut.push(d * d);
-            }
+        scratch.adc_lut.resize(padded_dim * entries_per_coord, 0.0);
+        match sub_table.filter(|_| use_subcent) {
+            Some(st) => prepared::fill_lut32(q_rotated, &st.table, &mut scratch.adc_lut),
+            None => prepared::fill_lut16(q_rotated, codebook, &mut scratch.adc_lut),
         }
-    }
-    // Take an immutable slice reference for use in closures below.
-    let adc_lut: &[f32] = &scratch.adc_lut;
+        &scratch.adc_lut
+    };
 
     // Pre-compute code layout for inlined offset computation.
     let bytes_per_code = graph.bytes_per_code() as usize;
     let code_len = bytes_per_code - 4; // nibble-packed codes (last 4 bytes are norm)
     let _epc = entries_per_coord;
+    // The unsafe LUT loops below read rows `< 2·code_len`: make that a
+    // checked precondition (the LUT may now come from a shared prepared
+    // query) rather than a debug-only one. Never expected to fire.
+    if !is_sq8 && adc_lut.len() < code_len.saturating_mul(2).saturating_mul(entries_per_coord) {
+        debug_assert!(false, "ADC LUT shorter than the segment's code layout");
+        return SmallVec::new();
+    }
 
     // Invariants relied on by the unsafe ADC LUT inner loops below. These are
     // free in release builds and catch refactor bugs that would otherwise

@@ -257,4 +257,6 @@ pub(crate) fn parse_u32(frame: &Frame) -> Option<u32> {
 }
 
 #[cfg(test)]
+mod session_tests;
+#[cfg(test)]
 mod tests;

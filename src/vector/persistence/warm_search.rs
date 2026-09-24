@@ -30,7 +30,8 @@ use crate::persistence::page::{
 };
 use crate::storage::tiered::SegmentHandle;
 use crate::vector::hnsw::graph::HnswGraph;
-use crate::vector::hnsw::search::{SearchScratch, hnsw_search_filtered};
+use crate::vector::hnsw::prepared::PreparedTqQuery;
+use crate::vector::hnsw::search::{SearchScratch, hnsw_search_filtered_prepared};
 use crate::vector::persistence::warm_segment::{
     VEC_CODES_SUB_HEADER_SIZE, VEC_FULL_SUB_HEADER_SIZE, VEC_GRAPH_SUB_HEADER_SIZE,
     VEC_MVCC_SUB_HEADER_SIZE,
@@ -508,6 +509,22 @@ impl WarmSearchSegment {
         scratch: &mut SearchScratch,
         allow_bitmap: Option<&RoaringBitmap>,
     ) -> SmallVec<[SearchResult; 32]> {
+        self.search_prepared(query, None, k, ef_search, scratch, allow_bitmap)
+    }
+
+    /// [`Self::search_filtered`] with an optional per-query
+    /// [`PreparedTqQuery`] shared across the query's segments (moon#1196):
+    /// rotation, 16-level LUT and unit query are reused when it matches this
+    /// segment's collection. Bit-identical results either way.
+    pub fn search_prepared(
+        &self,
+        query: &[f32],
+        prepared: Option<&PreparedTqQuery>,
+        k: usize,
+        ef_search: usize,
+        scratch: &mut SearchScratch,
+        allow_bitmap: Option<&RoaringBitmap>,
+    ) -> SmallVec<[SearchResult; 32]> {
         // Record this search so the mmap budget can make accurate LRU decisions.
         self.touch_last_access();
         if self.total_count == 0 {
@@ -517,7 +534,7 @@ impl WarmSearchSegment {
         // Use hnsw_search_filtered (same function ImmutableSegment uses).
         // No sub-centroid signs available for warm segments (not persisted in .mpf).
         let empty_sub_signs: &[u8] = &[];
-        let mut candidates = hnsw_search_filtered(
+        let mut candidates = hnsw_search_filtered_prepared(
             &self.graph,
             &self.codes_data,
             query,
@@ -530,6 +547,7 @@ impl WarmSearchSegment {
             0,
             // Warm segments carry no f16 sidecar — quantized ADC beam only.
             None,
+            prepared,
         );
 
         // Drop steady-state-tombstoned entries BEFORE rerank/truncate, mirroring `ImmutableSegment::search`'s
@@ -558,7 +576,10 @@ impl WarmSearchSegment {
         // WS3 / HQ-1 parity: exact rerank from the f16 sidecar when the
         // HOT->WARM transition carried one over. No-op (falls back to ADC)
         // when `raw_f16` is `None` — same contract as `ImmutableSegment`.
-        self.rerank_exact(&mut candidates, query, k);
+        let q_unit = prepared
+            .filter(|p| p.matches(&self.collection_meta))
+            .map(PreparedTqQuery::q_unit);
+        self.rerank_exact(&mut candidates, query, q_unit, k);
 
         candidates.truncate(k);
         self.remap_to_global_ids(&mut candidates);
@@ -573,7 +594,13 @@ impl WarmSearchSegment {
     /// conventions: true squared L2 for `DistanceMetric::L2`, `2 - 2*cos`
     /// for the unit-sphere metrics) so cross-segment merge stays consistent
     /// whether a candidate came from a HOT or WARM segment.
-    fn rerank_exact(&self, candidates: &mut SmallVec<[SearchResult; 32]>, query: &[f32], k: usize) {
+    fn rerank_exact(
+        &self,
+        candidates: &mut SmallVec<[SearchResult; 32]>,
+        query: &[f32],
+        prepared_q_unit: Option<&[f32]>,
+        k: usize,
+    ) {
         let Some(store) = self.raw_f16.as_ref() else {
             return;
         };
@@ -585,17 +612,15 @@ impl WarmSearchSegment {
         let dim = self.collection_meta.dimension as usize;
         let is_l2 = self.collection_meta.metric == crate::vector::types::DistanceMetric::L2;
 
-        let mut q_unit: Vec<f32> = Vec::new();
+        // Shared unit query (moon#1196), else an inline buffer (heap-free
+        // for dim <= 512).
+        let mut q_unit: SmallVec<[f32; 512]> = SmallVec::new();
         let q_ref: &[f32] = if is_l2 {
             query
+        } else if let Some(u) = prepared_q_unit.filter(|u| u.len() == query.len()) {
+            u
         } else {
-            let norm: f32 = query.iter().map(|x| x * x).sum::<f32>().sqrt();
-            if norm > 0.0 {
-                let inv = 1.0 / norm;
-                q_unit.extend(query.iter().map(|x| x * inv));
-            } else {
-                q_unit.extend_from_slice(query);
-            }
+            crate::vector::hnsw::prepared::unit_query_into(query, &mut q_unit);
             &q_unit
         };
 

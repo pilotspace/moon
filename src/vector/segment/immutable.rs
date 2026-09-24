@@ -16,9 +16,8 @@ use smallvec::SmallVec;
 
 use crate::vector::aligned_buffer::AlignedBuffer;
 use crate::vector::hnsw::graph::HnswGraph;
-use crate::vector::hnsw::search::{
-    SearchScratch, hnsw_search, hnsw_search_filtered, hnsw_search_subcent,
-};
+use crate::vector::hnsw::prepared::PreparedTqQuery;
+use crate::vector::hnsw::search::{SearchScratch, hnsw_search_filtered_prepared};
 #[allow(unused_imports)]
 use crate::vector::hnsw::search_sq::hnsw_search_f32;
 use crate::vector::segment::key_index::KeyHashIndex;
@@ -42,6 +41,12 @@ use crate::vector::types::VectorId;
 /// with the microsecond field below) is sufficient: every caller here only
 /// ever compares `age_secs`/`idle_secs` at second granularity.
 #[inline]
+#[cfg(test)]
+thread_local! {
+    /// Test-only: tombstone read-guard acquisitions on the search path.
+    pub(crate) static TOMBSTONE_GUARDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 fn now_micros() -> u64 {
     crate::storage::entry::current_time_ms() * 1000
 }
@@ -471,6 +476,7 @@ impl ImmutableSegment {
         &self,
         candidates: &mut SmallVec<[SearchResult; 32]>,
         query: &[f32],
+        prepared_q_unit: Option<&[f32]>,
         k: usize,
         mult: u32,
     ) {
@@ -484,18 +490,16 @@ impl ImmutableSegment {
         let dim = self.collection_meta.dimension as usize;
         let is_l2 = self.collection_meta.metric == crate::vector::types::DistanceMetric::L2;
 
-        // Unit-sphere metrics: normalize the query once per call.
-        let mut q_unit: Vec<f32> = Vec::new();
+        // Unit-sphere metrics: the query's shared unit vector (moon#1196),
+        // else normalized here into an inline buffer (heap-free for
+        // dim <= 512; was a `Vec` per segment per query).
+        let mut q_unit: SmallVec<[f32; 512]> = SmallVec::new();
         let q_ref: &[f32] = if is_l2 {
             query
+        } else if let Some(u) = prepared_q_unit.filter(|u| u.len() == query.len()) {
+            u
         } else {
-            let norm: f32 = query.iter().map(|x| x * x).sum::<f32>().sqrt();
-            if norm > 0.0 {
-                let inv = 1.0 / norm;
-                q_unit.extend(query.iter().map(|x| x * inv));
-            } else {
-                q_unit.extend_from_slice(query);
-            }
+            crate::vector::hnsw::prepared::unit_query_into(query, &mut q_unit);
             &q_unit
         };
 
@@ -594,6 +598,28 @@ impl ImmutableSegment {
         !self.tombstoned_keys.read().contains(&hdr.key_hash)
     }
 
+    /// Drop candidates whose row is dead (install-time `delete_lsn` or a
+    /// steady-state key tombstone), taking the tombstone read guard ONCE for
+    /// the whole candidate list (moon#1196) — `is_live_bfs` per candidate
+    /// re-acquired it for each of the `ef` candidates once the segment had
+    /// any tombstone. Same predicate as `is_live_bfs`.
+    fn retain_live(&self, candidates: &mut SmallVec<[SearchResult; 32]>) {
+        let guard = if self.has_tombstones.load(Ordering::Acquire) {
+            #[cfg(test)]
+            TOMBSTONE_GUARDS.with(|c| c.set(c.get() + 1));
+            Some(self.tombstoned_keys.read())
+        } else {
+            None
+        };
+        candidates.retain(|c| {
+            let bfs = self.graph.to_bfs(c.id.0) as usize;
+            let Some(hdr) = self.mvcc.get(bfs) else {
+                return false;
+            };
+            hdr.delete_lsn == 0 && guard.as_ref().is_none_or(|g| !g.contains(&hdr.key_hash))
+        });
+    }
+
     /// Two-stage HNSW search: TQ-ADC beam + TurboQuant_prod reranking.
     ///
     /// Stage 1: HNSW beam search with TQ-ADC distance → ef candidates.
@@ -619,6 +645,37 @@ impl ImmutableSegment {
         scratch: &mut SearchScratch,
         tuning: SearchTuning,
     ) -> SmallVec<[SearchResult; 32]> {
+        self.search_prepared(query, None, k, ef_search, scratch, None, tuning)
+    }
+
+    /// Two-stage search with an optional filter bitmap and an optional
+    /// per-query [`PreparedTqQuery`] shared across every segment of the
+    /// query (moon#1196) — the rotation, ADC LUT and unit query are reused
+    /// instead of rebuilt here when it matches this segment's collection.
+    /// `allow_bitmap = None` is exactly [`Self::search_with_tuning`];
+    /// `Some` is exactly [`Self::search_filtered_with_tuning`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn search_prepared(
+        &self,
+        query: &[f32],
+        prepared: Option<&PreparedTqQuery>,
+        k: usize,
+        ef_search: usize,
+        scratch: &mut SearchScratch,
+        allow_bitmap: Option<&RoaringBitmap>,
+        tuning: SearchTuning,
+    ) -> SmallVec<[SearchResult; 32]> {
+        if allow_bitmap.is_some() {
+            return self.search_filtered_impl(
+                query,
+                prepared,
+                k,
+                ef_search,
+                scratch,
+                allow_bitmap,
+                tuning,
+            );
+        }
         // WS3 idle-unload: record this search so the HOT->WARM idle-eligibility
         // check has an accurate recency signal (see `idle_secs`).
         self.touch_last_access();
@@ -637,56 +694,30 @@ impl ImmutableSegment {
         // HNSW returns up to `ef_search` candidates (no early truncation to k).
         // This preserves candidates for cross-segment merging in the caller,
         // which does the final top-k selection after merging all segments.
-        let mut candidates = if exact_f16.is_some() {
-            hnsw_search_filtered(
-                &self.graph,
-                self.vectors_tq.as_slice(),
-                query,
-                &self.collection_meta,
-                ef_search,
-                ef_search,
-                scratch,
-                None,
-                &self.sub_centroid_signs,
-                self.sub_sign_bytes_per_vec,
-                exact_f16,
-            )
-        } else if !self.sub_centroid_signs.is_empty() {
-            hnsw_search_subcent(
-                &self.graph,
-                self.vectors_tq.as_slice(),
-                query,
-                &self.collection_meta,
-                ef_search,
-                ef_search,
-                scratch,
-                &self.sub_centroid_signs,
-                self.sub_sign_bytes_per_vec,
-            )
-        } else {
-            let mut cands = hnsw_search(
-                &self.graph,
-                self.vectors_tq.as_slice(),
-                query,
-                &self.collection_meta,
-                ef_search,
-                ef_search,
-                scratch,
-            );
-            // Fallback: rerank with TQ_prod when no sub-centroid data AND no
-            // exact sidecar (rerank_exact below supersedes the estimator).
-            if self.raw_f16.is_none() {
-                self.rerank_with_prod(&mut cands, query);
-            }
-            cands
-        };
+        // (Empty `sub_centroid_signs` ⇒ the plain 16-level beam.)
+        let mut candidates = hnsw_search_filtered_prepared(
+            &self.graph,
+            self.vectors_tq.as_slice(),
+            query,
+            &self.collection_meta,
+            ef_search,
+            ef_search,
+            scratch,
+            None,
+            &self.sub_centroid_signs,
+            self.sub_sign_bytes_per_vec,
+            exact_f16,
+            prepared,
+        );
+        // Fallback: rerank with TQ_prod when no sub-centroid data AND no
+        // exact sidecar (rerank_exact below supersedes the estimator).
+        if exact_f16.is_none() && self.sub_centroid_signs.is_empty() && self.raw_f16.is_none() {
+            self.rerank_with_prod(&mut candidates, query);
+        }
         // Filter deleted entries first so tombstones neither consume the
         // exact-rerank mult·k budget nor leave stale ADC scores mixed into the
         // post-rerank ordering.
-        candidates.retain(|c| {
-            let bfs = self.graph.to_bfs(c.id.0);
-            self.is_live_bfs(bfs)
-        });
+        self.retain_live(&mut candidates);
         // HQ-1: exact rerank of the top mult·k live beam candidates from the
         // f16 sidecar — replaces quantized estimates with true metric
         // distances before top-k truncation. No-op without a sidecar. Runs
@@ -695,7 +726,10 @@ impl ImmutableSegment {
         // and the SIMD sidecar kernels make the pass ~3% of a query.
         // Skipped under EXACT_BEAM: the beam already produced true distances.
         if exact_f16.is_none() {
-            self.rerank_exact(&mut candidates, query, k, tuning.rerank_mult);
+            let q_unit = prepared
+                .filter(|p| p.matches(&self.collection_meta))
+                .map(PreparedTqQuery::q_unit);
+            self.rerank_exact(&mut candidates, query, q_unit, k, tuning.rerank_mult);
         }
         candidates.truncate(k);
         self.remap_to_global_ids(&mut candidates);
@@ -731,6 +765,20 @@ impl ImmutableSegment {
         allow_bitmap: Option<&RoaringBitmap>,
         tuning: SearchTuning,
     ) -> SmallVec<[SearchResult; 32]> {
+        self.search_filtered_impl(query, None, k, ef_search, scratch, allow_bitmap, tuning)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn search_filtered_impl(
+        &self,
+        query: &[f32],
+        prepared: Option<&PreparedTqQuery>,
+        k: usize,
+        ef_search: usize,
+        scratch: &mut SearchScratch,
+        allow_bitmap: Option<&RoaringBitmap>,
+        tuning: SearchTuning,
+    ) -> SmallVec<[SearchResult; 32]> {
         // WS3 idle-unload: see comment in `search_with_tuning()` above.
         self.touch_last_access();
         // EXACT_BEAM (see `search_with_tuning`): exact f16 beam navigation.
@@ -741,7 +789,7 @@ impl ImmutableSegment {
         };
         // Note: passing ef_search for both k and ef_search is intentional
         // (see comment in search() method above).
-        let mut candidates = hnsw_search_filtered(
+        let mut candidates = hnsw_search_filtered_prepared(
             &self.graph,
             self.vectors_tq.as_slice(),
             query,
@@ -753,6 +801,7 @@ impl ImmutableSegment {
             &self.sub_centroid_signs,
             self.sub_sign_bytes_per_vec,
             exact_f16,
+            prepared,
         );
 
         // When sub-centroid signs are used in beam, no rerank needed.
@@ -762,15 +811,15 @@ impl ImmutableSegment {
             self.rerank_with_prod(&mut candidates, query);
         }
         // Filter deleted entries first (see comment in search()).
-        candidates.retain(|c| {
-            let bfs = self.graph.to_bfs(c.id.0);
-            self.is_live_bfs(bfs)
-        });
+        self.retain_live(&mut candidates);
         // HQ-1: exact rerank of the live beam from the f16 sidecar (see the
         // recall A/B note in `search`). Skipped under EXACT_BEAM — the beam
         // already produced true distances.
         if exact_f16.is_none() {
-            self.rerank_exact(&mut candidates, query, k, tuning.rerank_mult);
+            let q_unit = prepared
+                .filter(|p| p.matches(&self.collection_meta))
+                .map(PreparedTqQuery::q_unit);
+            self.rerank_exact(&mut candidates, query, q_unit, k, tuning.rerank_mult);
         }
         candidates.truncate(k);
         self.remap_to_global_ids(&mut candidates);
