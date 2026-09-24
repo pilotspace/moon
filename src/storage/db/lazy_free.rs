@@ -50,14 +50,14 @@
 //! hot table alone; they first mark every queued item uncharged so the drain
 //! cannot credit bytes the rebuild already dropped from the ledger.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use ordered_float::OrderedFloat;
 
-use crate::storage::bptree::BPTree;
+use crate::storage::bptree::NodeDrain;
 use crate::storage::compact_value::RedisValueRef;
 use crate::storage::db::{
     Database, hash_field_cost, hash_ttl_field_cost, legacy_zset_member_cost, list_elem_cost,
@@ -230,11 +230,20 @@ enum Work {
         members: std::collections::hash_map::IntoIter<Bytes, f64>,
         scores: std::collections::btree_map::IntoIter<(OrderedFloat<f64>, Bytes), ()>,
     },
-    /// Popped from the tree's minimum, so the arena empties leaf by leaf;
-    /// each pop also retires the member's `members` slot (and credits it).
+    /// moon#1221 review F4: every member is credited once, from the
+    /// `members` map; the B+tree — which holds the other reference to each
+    /// member's bytes — is then released node by node (bounded per step).
+    /// It used to be emptied by popping its minimum: one rebalancing
+    /// `BPTree::remove`, a key copy and a `Bytes` clone per member, 6.0–6.7x
+    /// the cost of a plain drop. The arena's emptied allocation is the shell.
+    /// A member is credited when its map slot goes, while the tree's
+    /// reference still keeps its payload resident until the node phase of
+    /// the same item — a bounded number of steps later. (Tree first would
+    /// credit nothing for most of the drain: the members map would still
+    /// hold every payload.)
     BpZset {
-        tree: Box<BPTree>,
-        members: HashMap<Bytes, f64>,
+        members: std::collections::hash_map::IntoIter<Bytes, f64>,
+        nodes: NodeDrain,
     },
     Stream {
         entries: std::collections::btree_map::IntoIter<StreamId, Vec<(Bytes, Bytes)>>,
@@ -290,8 +299,8 @@ impl Work {
                 let table = zset_table_bytes(&members, &tree);
                 (
                     Work::BpZset {
-                        tree,
-                        members: *members,
+                        members: (*members).into_iter(),
+                        nodes: (*tree).into_node_drain(),
                     },
                     boxed + table,
                 )
@@ -354,34 +363,23 @@ impl Work {
                 drain!(scores, |_| 0);
                 n < budget
             }
-            Work::BpZset { tree, members } => {
+            Work::BpZset { members, nodes } => {
+                // Members first: each is billed once, whatever the tree holds.
+                drain!(members, |(m, _)| zset_member_cost(&m));
+                // Then the tree, whose nodes hold the last reference to every
+                // member's bytes. Its arena was billed from capacity and is in
+                // `tail_credit`, so the nodes credit nothing here. A node is
+                // released whole: a step may overshoot by one node.
+                let mut finished = false;
                 while n < budget {
-                    let Some((score, member)) = tree.iter().next().map(|(s, m)| (s, m.clone()))
-                    else {
-                        break;
-                    };
-                    if !tree.remove(score, &member) {
-                        // The tree disagrees with its own iterator. Never
-                        // loop on it: drop the arena whole (bounded by its
-                        // size) and let the members tail below finish.
-                        **tree = BPTree::new();
+                    let (released, done) = nodes.drop_nodes(budget - n);
+                    n += released;
+                    if done {
+                        finished = true;
                         break;
                     }
-                    if members.remove(&member).is_some() {
-                        credit += zset_member_cost(&member);
-                    }
-                    n += 1;
                 }
-                if n < budget {
-                    // Tree empty: any member it did not index is still billed.
-                    let rest = std::mem::take(members);
-                    for (m, _) in rest {
-                        credit += zset_member_cost(&m);
-                    }
-                    true
-                } else {
-                    false
-                }
+                finished
             }
             Work::Stream { entries, rest } => {
                 drain!(entries, |(_, fields)| stream_entry_cost(&fields));
@@ -512,8 +510,9 @@ impl Database {
         !self.lazy_free.items.is_empty()
     }
 
-    /// Free at most `max_elements` queued elements (deterministic; tests and
-    /// the time-budgeted drain above). Returns the number freed.
+    /// Free about `max_elements` queued elements (deterministic; tests and
+    /// the time-budgeted drain above) — a B+tree node is released whole, so a
+    /// call may overshoot by one node (17). Returns the number freed.
     pub fn drain_lazy_free_elements(&mut self, max_elements: usize) -> usize {
         let mut freed = 0usize;
         while freed < max_elements {
@@ -570,6 +569,125 @@ impl Database {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
+    use bytes::Bytes;
+    use ordered_float::OrderedFloat;
+
+    use crate::storage::bptree::BPTree;
+    use crate::storage::compact_value::CompactValue;
+    use crate::storage::db::Database;
+    use crate::storage::entry::{Entry, RedisValue};
+
+    fn zset_entry(n: usize, probe: &Bytes) -> Entry {
+        let mut tree = BPTree::new();
+        let mut members = HashMap::new();
+        for i in 0..n {
+            let m = Bytes::from(format!("member-{i:08}").into_bytes());
+            tree.insert(OrderedFloat(i as f64), m.clone());
+            members.insert(m, i as f64);
+        }
+        tree.insert(OrderedFloat(-1.0), probe.clone());
+        members.insert(probe.clone(), -1.0);
+        let mut e = Entry::new_string(Bytes::new());
+        e.value = CompactValue::from_redis_value(RedisValue::SortedSetBPTree {
+            tree: Box::new(tree),
+            members: Box::new(members),
+        });
+        e
+    }
+
+    fn hash_entry(n: usize) -> Entry {
+        let mut h = HashMap::new();
+        for i in 0..n {
+            h.insert(
+                Bytes::from(format!("member-{i:08}").into_bytes()),
+                Bytes::from_static(b"v"),
+            );
+        }
+        let mut e = Entry::new_string(Bytes::new());
+        e.value = CompactValue::from_redis_value(RedisValue::Hash(Box::new(h)));
+        e
+    }
+
+    // ── moon#1221 review F4 ──────────────────────────────────────────────
+
+    /// A B+tree zset is freed by releasing its `members` map element by
+    /// element and its node arena node by node — never by popping the
+    /// minimum with one rebalancing `BPTree::remove` (plus a key copy and a
+    /// `Bytes` clone) per member, which cost 6.0–6.7x a plain drop.
+    #[test]
+    fn a_bptree_zset_is_freed_without_a_tree_remove_per_member() {
+        let probe = Bytes::from(b"probe-payload-held-by-the-test".to_vec());
+        let mut db = Database::new();
+        db.set(b"z", zset_entry(5_000, &probe));
+        assert!(db.unlink(b"z"));
+        let _ = crate::storage::bptree::take_remove_calls();
+        let mut steps = 0usize;
+        while db.lazy_free_len() != 0 {
+            let freed = db.drain_lazy_free_elements(256);
+            assert!(
+                freed <= 256 + 32,
+                "one step freed {freed} elements (budget 256, at most one node over)"
+            );
+            steps += 1;
+            assert!(steps < 10_000, "no progress");
+        }
+        let removes = crate::storage::bptree::take_remove_calls();
+        assert_eq!(
+            removes, 0,
+            "the drain called BPTree::remove {removes} times"
+        );
+        assert!(steps >= 5_000 / 256, "the value must span bounded steps");
+        assert!(probe.is_unique(), "the drain must free every member");
+        assert_eq!(
+            db.estimated_memory(),
+            0,
+            "credited exactly what SET charged"
+        );
+    }
+
+    /// Measurement, not a gate (`--ignored --nocapture`): shard-thread time
+    /// of UNLINK + drain against a plain drop, per kind, N = 100K. Relative
+    /// numbers from one process, back to back.
+    #[test]
+    #[ignore = "measurement; run with --ignored --nocapture"]
+    fn measure_lazy_free_cost_against_a_plain_drop() {
+        use std::time::{Duration, Instant};
+        const N: usize = 100_000;
+        fn lazy_cost(e: Entry) -> Duration {
+            let mut db = Database::new();
+            db.set(b"k", e);
+            let t = Instant::now();
+            assert!(db.unlink(b"k"));
+            while db.lazy_free_len() != 0 {
+                db.drain_lazy_free_elements(256);
+            }
+            t.elapsed()
+        }
+        fn drop_cost(e: Entry) -> Duration {
+            let t = Instant::now();
+            drop(e);
+            t.elapsed()
+        }
+        let probe = Bytes::from_static(b"p");
+        let zset = || zset_entry(N, &probe);
+        let hash = || hash_entry(N);
+        for (kind, make) in [
+            ("hash", &hash as &dyn Fn() -> Entry),
+            ("zset-bptree", &zset as &dyn Fn() -> Entry),
+        ] {
+            for rep in 0..3 {
+                let d = drop_cost(make());
+                let l = lazy_cost(make());
+                eprintln!(
+                    "LAZY-FREE-COST N={N} {kind} rep {rep}: drop {d:?} lazy {l:?} ratio {:.2}",
+                    l.as_secs_f64() / d.as_secs_f64().max(1e-9)
+                );
+            }
+        }
+    }
+
     // ── moon#1221 review INTEG-4 ─────────────────────────────────────────
 
     /// The helper is spawned lazily, from whichever shard thread first frees

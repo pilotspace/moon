@@ -158,6 +158,48 @@ pub const NODE_BYTES: usize = std::mem::size_of::<Node>();
 // BPTree
 // ---------------------------------------------------------------------------
 
+/// A B+tree taken apart for incremental freeing (moon#1190's lazy free,
+/// moon#1221 review F4): the arena's nodes in slot order, each dropped whole
+/// — no search, no rebalancing, no key copy. What is left once every node is
+/// gone is the arena's own allocation, freed when this is dropped.
+pub(crate) struct NodeDrain {
+    nodes: std::vec::IntoIter<Node>,
+}
+
+impl NodeDrain {
+    /// Drop nodes until at least `budget` stored keys have been released
+    /// (each node counts its keys plus one, so an overshoot is at most one
+    /// node: 17 units) or none is left. Returns (units released, finished).
+    pub(crate) fn drop_nodes(&mut self, budget: usize) -> (usize, bool) {
+        let mut released = 0usize;
+        while released < budget {
+            let Some(node) = self.nodes.next() else {
+                return (released, true);
+            };
+            released += 1 + match &node {
+                Node::Internal(n) => n.key_count(),
+                Node::Leaf(l) => l.entry_count(),
+            };
+            drop(node);
+        }
+        (released, self.nodes.len() == 0)
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only: `BPTree::remove` calls on this thread. The lazy-free drain
+    /// must take a tree apart without paying one rebalancing `remove` (and
+    /// one key copy) per member (moon#1221 review F4).
+    static REMOVE_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Test-only: `BPTree::remove` calls on this thread since the last take.
+#[cfg(test)]
+pub(crate) fn take_remove_calls() -> u64 {
+    REMOVE_CALLS.with(|c| c.replace(0))
+}
+
 #[derive(Debug, Clone)]
 pub struct BPTree {
     root: NodeId,
@@ -270,6 +312,14 @@ impl BPTree {
     #[inline]
     pub(crate) fn find_leaf_pub(&self, key: &(OrderedFloat<f64>, Bytes)) -> NodeId {
         self.find_leaf(key)
+    }
+
+    /// Consume the tree into a [`NodeDrain`] that frees it a bounded number
+    /// of nodes at a time. O(1): the node arena moves, nothing is walked.
+    pub(crate) fn into_node_drain(self) -> NodeDrain {
+        NodeDrain {
+            nodes: self.nodes.into_iter(),
+        }
     }
 
     pub fn clear(&mut self) {
@@ -693,6 +743,8 @@ impl BPTree {
 
     /// Remove entry by (score, member). Returns true if existed.
     pub fn remove(&mut self, score: OrderedFloat<f64>, member: &[u8]) -> bool {
+        #[cfg(test)]
+        REMOVE_CALLS.with(|c| c.set(c.get() + 1));
         if self.len == 0 {
             return false;
         }
