@@ -222,7 +222,9 @@ fn writer_failure_is_reported_not_published() {
 }
 
 /// A snapshot dropped before finalize (shard exit, error) leaves no temp
-/// file behind: the writer thread sees the channel close and deletes it.
+/// file behind: the writer thread sees the channel close and deletes it —
+/// and since moon#1227 review F1 the drop CANCELS and JOINS the writer, so
+/// the file and the thread are both gone the moment the drop returns.
 #[test]
 fn abandoned_snapshot_removes_its_temp_file() {
     let dir = tempfile::tempdir().unwrap();
@@ -243,15 +245,118 @@ fn abandoned_snapshot_removes_its_temp_file() {
         std::thread::sleep(std::time::Duration::from_millis(1));
     }
     drop(state);
-    while tmp.exists() {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "temp file left behind"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(1));
-    }
+    assert!(
+        !tmp.exists(),
+        "temp file left behind after the drop returned"
+    );
+    assert_eq!(
+        crate::persistence::snapshot_stream::live_writers_for_test(&path),
+        0,
+        "the writer outlived its abandoned snapshot"
+    );
     assert!(
         !path.exists(),
         "an abandoned snapshot must never be published"
     );
+}
+
+/// Snapshot the writer thread of a still-running epoch can take a long while
+/// to drain: 1,024 x 48 KiB values, ~48 MiB queued ahead of the disk.
+fn large_dataset() -> Vec<Database> {
+    let mut dbs: Vec<Database> = (0..3).map(|_| Database::new()).collect();
+    let value = Bytes::from(vec![b'L'; 48 * 1024]);
+    for i in 0..1024u32 {
+        dbs[0].set_string(format!("big:{i:05}").as_bytes(), value.clone());
+    }
+    dbs
+}
+
+/// Wait until no writer thread for `path` is running any more — so a writer
+/// that outlived its snapshot has done ALL the damage it was going to do.
+fn wait_writers_gone(path: &Path) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while crate::persistence::snapshot_stream::live_writers_for_test(path) > 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "a snapshot writer never exited"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+}
+
+/// moon#1227 review F1: an ABORTED epoch (FLUSH*/SWAPDB, moon#1224) drops its
+/// state — `finalize_snapshot_error` — while the writer thread is healthy and
+/// still holds up to `SNAPSHOT_STREAM_MAX_IN_FLIGHT` of queued blocks. That
+/// writer kept draining them into `shard-N.rrdshard.tmp` and unlinked the path
+/// when done. The NEXT BGSAVE of the shard (one tick later) opened the same
+/// path — truncating the SAME inode — and renamed it into place while the old
+/// writer was still appending. Two outcomes, both covered here:
+///
+/// - the next save is quick: `BGSAVE OK`, then the straggler keeps appending
+///   into the PUBLISHED file, which fails its global checksum at restart —
+///   the shard comes up empty (the review's 3/3 repro);
+/// - the next save is slow: the straggler finishes first and unlinks the
+///   next save's temp file, whose publish fails with ENOENT.
+///
+/// Red before the fix, either way.
+#[test]
+fn an_aborted_snapshot_cannot_corrupt_a_quick_next_save_of_the_same_file() {
+    let mut quick: Vec<Database> = (0..3).map(|_| Database::new()).collect();
+    for i in 0..40u32 {
+        quick[0].set_string(format!("q:{i}").as_bytes(), Bytes::from_static(b"quick"));
+    }
+    abort_then_save_again("quick next save", quick, 40);
+}
+
+/// [`an_aborted_snapshot_cannot_corrupt_a_quick_next_save_of_the_same_file`],
+/// with a next save slow enough for the straggler to finish first.
+#[test]
+fn an_aborted_snapshot_cannot_unlink_a_slow_next_save_of_the_same_file() {
+    abort_then_save_again("slow next save", dataset(), 12040);
+}
+
+fn abort_then_save_again(case: &str, next_dbs: Vec<Database>, next_keys: usize) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("shard-0.rrdshard");
+    let tmp = path.with_extension("rrdshard.tmp");
+
+    // Epoch 1, aborted with a deep backlog, exactly as
+    // `drive_snapshot_finalize` -> `finalize_snapshot_error` handles an epoch
+    // a FLUSHALL aborted. The whole file is serialized first and handed to
+    // the writer as ONE ~48 MiB block (the in-memory path's hand-off), so the
+    // writer is certainly mid-backlog when the abort lands: a tick-streamed
+    // backlog of 256 KiB blocks drains at a speed the test cannot control.
+    let big = large_dataset();
+    let mut aborted = SnapshotState::new(0, 1, &big, path.clone());
+    while !aborted.advance_one_segment(&big) {}
+    aborted.start_streaming().unwrap();
+    assert!(
+        aborted.stream_in_flight() > 32 << 20,
+        "{case}: fixture: the writer must still hold a backlog when the epoch aborts"
+    );
+    aborted.abort("test: FLUSHALL during BGSAVE");
+    assert!(aborted.begin_finalize().is_err());
+    let dropped_at = std::time::Instant::now();
+    drop(aborted);
+    let drop_cost = dropped_at.elapsed();
+
+    // Epoch 2, the shard's next BGSAVE, right away: same path, same temp name.
+    let mut next = SnapshotState::new(0, 2, &next_dbs, path.clone());
+    next.start_streaming().unwrap();
+    while !next.advance_one_segment(&next_dbs) {}
+    next.begin_finalize().unwrap();
+    let outcome = wait_finalized(&next);
+    drop(next);
+    // Whatever the aborted writer was still going to do, it has done now.
+    wait_writers_gone(&path);
+    eprintln!("{case}: the aborted snapshot's drop took {drop_cost:?}");
+
+    assert_eq!(outcome, Ok(()), "{case}: the next save must publish");
+    let mut loaded: Vec<Database> = (0..3).map(|_| Database::new()).collect();
+    assert_eq!(
+        shard_snapshot_load(&mut loaded, &path).map_err(|e| e.to_string()),
+        Ok(next_keys),
+        "{case}: BGSAVE reported OK, so the published file must load completely"
+    );
+    assert!(!tmp.exists(), "{case}: no temp file left behind");
 }

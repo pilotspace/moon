@@ -2,7 +2,8 @@
 //! inserting (so the DashTable keeps splitting mid-epoch) must restore every
 //! key that existed before the save started, with its value (moon#1216);
 //! and a FLUSHDB / FLUSHALL / SWAPDB landing mid-BGSAVE must neither crash
-//! the shard (moon#1224) nor publish a mixed file.
+//! the shard (moon#1224) nor publish a mixed file — nor, once it aborted the
+//! save, let that save's writer corrupt the NEXT one (moon#1227 review F1).
 //!
 //! Pin the binary: `MOON_BIN=<moon> cargo test --test perf_ws12_bgsave_split`
 //! (falls back to the binary Cargo built for this run).
@@ -43,7 +44,9 @@ fn spawn(dir: &std::path::Path, shards: usize) -> (ServerGuard, u16) {
                 "--disk-free-min-pct",
                 "0",
             ])
-            .stdout(std::process::Stdio::null())
+            // The server logs to stdout; keep it with stderr in the test's
+            // own directory, so a test can see what the server said.
+            .stdout(common::server_stderr(dir))
             .stderr(common::server_stderr(dir))
             .spawn()
             .expect("spawn moon")
@@ -235,4 +238,80 @@ fn table_swaps_during_bgsave_fail_the_save_not_the_server() {
         assert!(probe.send(&["PING"]).contains("PONG"));
         let _ = std::fs::remove_dir_all(&dir);
     }
+}
+
+/// moon#1227 review F1, end to end. A BGSAVE aborted by FLUSHALL while its
+/// writer thread still holds a backlog, then the next BGSAVE as soon as the
+/// shard takes it. The aborted save's writer used to keep appending that
+/// backlog into `shard-0.rrdshard.tmp` — the same inode the next save had
+/// just truncated and was renaming into place: the second save completed
+/// ("BGSAVE OK"), and the file it published held ~65 MiB of the aborted
+/// save's blocks behind its own ~300 bytes, failing its checksum at restart
+/// (the canary written between the saves gone). Or the straggler unlinked
+/// the new temp file and the second save failed.
+///
+/// `rdb_last_bgsave_status` cannot judge the second save: the sharded
+/// BGSAVE path never resets it to `ok` after a failure (pre-existing), so
+/// the server log and the restart do.
+#[test]
+fn an_aborted_bgsave_cannot_corrupt_the_next_one() {
+    let dir = common::unique_test_dir("ws12-abort-resave");
+    std::fs::create_dir_all(&dir).unwrap();
+    let (mut server, port) = spawn(&dir, 1);
+    let mut c = Conn::open(port);
+    // ~190 MiB of 64 KiB values: the writer thread, not the walk, is the
+    // bottleneck of this epoch, so it holds a deep backlog when FLUSHALL
+    // lands.
+    let value = "v".repeat(64 * 1024);
+    for batch in 0..30u32 {
+        let keys: Vec<String> = (0..100).map(|i| format!("big:{batch}:{i}")).collect();
+        let cmds: Vec<Vec<&str>> = keys
+            .iter()
+            .map(|k| vec!["SET", k.as_str(), value.as_str()])
+            .collect();
+        let refs: Vec<&[&str]> = cmds.iter().map(|c| c.as_slice()).collect();
+        let reply = c.pipeline(&refs);
+        assert!(!reply.contains('-'), "preload refused: {reply:.200}");
+    }
+    assert!(c.send(&["BGSAVE"]).contains("Background saving started"));
+    std::thread::sleep(Duration::from_millis(10));
+    assert!(c.send(&["FLUSHALL"]).starts_with('+'));
+    assert!(c.send(&["SET", "canary", "after-abort"]).starts_with('+'));
+    // The next BGSAVE, the moment the shard has dropped the aborted one.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let reply = c.send(&["BGSAVE"]);
+        if reply.contains("Background saving started") {
+            break;
+        }
+        assert!(Instant::now() < deadline, "BGSAVE never accepted: {reply}");
+        std::thread::sleep(Duration::from_micros(200));
+    }
+    let _ = wait_bgsave(&mut c, Duration::from_secs(120));
+    // A straggler writer of the aborted save has at most tens of MiB left.
+    std::thread::sleep(Duration::from_millis(500));
+    let log = std::fs::read_to_string(dir.join("server.err")).unwrap_or_default();
+    assert!(
+        log.contains("aborted: FLUSHALL"),
+        "fixture: the first BGSAVE must have been aborted by the FLUSHALL"
+    );
+    assert!(
+        log.lines()
+            .any(|l| l.contains("snapshot epoch") && l.trim_end().ends_with(" complete")),
+        "the BGSAVE after the aborted one must publish:\n{log:.3000}"
+    );
+    let published = std::fs::metadata(dir.join("shard-0.rrdshard"))
+        .map(|m| m.len())
+        .unwrap_or(0);
+
+    server.kill_now();
+    common::wait_for_port_down(port);
+    let (_server2, port2) = spawn(&dir, 1);
+    let mut c2 = Conn::open(port2);
+    assert!(
+        c2.send(&["GET", "canary"]).contains("after-abort"),
+        "the second BGSAVE completed, but its {published}-byte file did not restore"
+    );
+    assert_eq!(c2.send(&["DBSIZE"]), ":1\r\n");
+    let _ = std::fs::remove_dir_all(&dir);
 }
