@@ -3113,7 +3113,7 @@ mod tests {
             };
 
             let (tx, rx) = crate::runtime::channel::mpsc_bounded::<AofMessage>(capacity);
-            let pool = AofWriterPool::per_shard(vec![tx]);
+            let pool = AofWriterPool::top_level(tx);
             for _ in 0..prefill {
                 assert!(pool.try_send_append(0, 1, 0, bytes::Bytes::from_static(b"filler")));
             }
