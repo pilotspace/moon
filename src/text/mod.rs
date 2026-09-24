@@ -9,6 +9,7 @@
 /// - `types` — Field definitions and BM25 configuration
 /// - `analyzer` — Tokenization pipeline (NFKD, stemming, stop words)
 /// - `bm25` — Scoring function and field statistics
+/// - `doc_columns` — Dense doc-id-indexed side tables (keys, lengths, LSNs, TAG/NUMERIC entries)
 /// - `posting` — Inverted index posting lists with RoaringBitmap
 /// - `score` — Single-pass BM25 scoring kernel (cursors + bounded top-k)
 /// - `term_dict` — Mutable term-to-ID dictionary
@@ -16,6 +17,7 @@
 pub mod aggregate;
 pub mod analyzer;
 pub mod bm25;
+pub mod doc_columns;
 pub mod fst_dict;
 pub mod index_persist;
 #[cfg(feature = "text-index")]

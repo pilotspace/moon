@@ -445,7 +445,7 @@ pub fn materialize_rows(
     // Resolve candidate doc_ids. `*` and empty query ⇒ match-all; anything
     // else goes through the Phase 150 BM25 text parser.
     let candidate_doc_ids: Vec<u32> = if query.as_ref() == b"*" || query.is_empty() {
-        text_index.doc_id_to_key.keys().copied().collect()
+        text_index.doc_id_to_key.keys().collect()
     } else {
         bm25_candidate_doc_ids(text_index, query)?
     };

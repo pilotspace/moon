@@ -11,6 +11,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::text::analyzer::{AnalysisCache, AnalyzerPipeline};
 use crate::text::bm25::FieldStats;
+#[cfg(feature = "text-index")]
+use crate::text::doc_columns::DocSlices;
+use crate::text::doc_columns::{DocKeys, DocLengths, DocU64s};
 use crate::text::index_persist::TextIndexMeta;
 use crate::text::posting::PostingStore;
 use crate::text::term_dict::TermDictionary;
@@ -86,6 +89,15 @@ pub struct TextSearchResult {
     pub score: f32,
 }
 
+/// One TAG value indexed for a document: `(index into tag_fields, normalized value)`.
+/// The value `Bytes` shares the `tag_indexes` map key's allocation (moon#1194).
+#[cfg(feature = "text-index")]
+pub type TagEntry = (u32, Bytes);
+
+/// One NUMERIC value indexed for a document: `(index into numeric_fields, value)`.
+#[cfg(feature = "text-index")]
+pub type NumericEntry = (u32, ordered_float::OrderedFloat<f64>);
+
 /// A single full-text search index with per-field BM25 data.
 ///
 /// Created by FT.CREATE, populated by auto_index_hset on HSET commands.
@@ -112,17 +124,14 @@ pub struct TextIndex {
     /// None = no FST built yet (built at FT.COMPACT time). Exact queries unaffected when None (D-13).
     #[cfg(feature = "text-index")]
     pub fst_maps: Vec<Option<fst::Map<Vec<u8>>>>,
-    /// Per-document field lengths: doc_id -> lengths per field index.
-    pub doc_field_lengths: HashMap<u32, Vec<u32>>,
+    /// Per-document field lengths: one `u32` per TEXT field per doc id (moon#1194:
+    /// a dense column, not a `HashMap<u32, Vec<u32>>` entry + heap `Vec` per doc).
+    pub doc_field_lengths: DocLengths,
     /// Key hash -> doc_id mapping (same pattern as VectorIndex).
     pub key_hash_to_doc_id: HashMap<u64, u32>,
-    /// doc_id -> original Redis key bytes.
-    pub doc_id_to_key: HashMap<u32, Bytes>,
-    /// Exactly the key set of `doc_id_to_key`, as a bitmap (moon#1191): query
-    /// membership is pure bitmap algebra, and "resolvable" (has a key) is one
-    /// `&=` instead of a hash probe per matched document. Maintained at every
-    /// `doc_id_to_key` insert/remove site in this file.
-    live_docs: roaring::RoaringBitmap,
+    /// doc_id -> original Redis key bytes, plus the bitmap of ids that have a key
+    /// (moon#1191: "resolvable" is one `&=`). A dense column (moon#1194).
+    pub doc_id_to_key: DocKeys,
     /// Next doc_id to assign.
     next_doc_id: u32,
 
@@ -136,7 +145,7 @@ pub struct TextIndex {
     /// `doc_id -> insert LSN` (monotonic LSN from `VectorStore::txn_manager_mut().allocate_lsn()`).
     /// Used by `search_field_as_of` + `search_field_or_as_of` to filter
     /// candidates to those committed at or before the requested AS_OF.
-    pub doc_id_to_insert_lsn: HashMap<u32, u64>,
+    pub doc_id_to_insert_lsn: DocU64s,
     /// `doc_id -> delete LSN`. Reserved for v0.2 logical-delete wiring so
     /// historical AS_OF queries can still see deleted docs. Present today
     /// so the visibility helper is future-proof.
@@ -156,10 +165,13 @@ pub struct TextIndex {
     /// Inner key is the normalized tag value (ASCII-lowercased unless CASESENSITIVE).
     #[cfg(feature = "text-index")]
     pub tag_indexes: HashMap<Bytes, HashMap<Bytes, roaring::RoaringBitmap>>,
-    /// `doc_id -> list of (canonical_field, normalized_value)` entries currently
+    /// `doc_id -> [(tag field index, normalized_value)]` entries currently
     /// indexed for that document. Used to revoke stale entries on per-field upsert.
+    /// moon#1194: a dense column of exact-size slices (16 B slot + 40 B/value);
+    /// the former `HashMap<u32, SmallVec<[(Bytes, Bytes); 8]>>` held 528 B inline
+    /// per tagged doc while billing ~100 B.
     #[cfg(feature = "text-index")]
-    pub doc_tag_entries: HashMap<u32, smallvec::SmallVec<[(Bytes, Bytes); 8]>>,
+    pub doc_tag_entries: DocSlices<TagEntry>,
 
     // ── NUMERIC index (Plan 152-07, Phase 152) ────────────────────────────
     //
@@ -179,11 +191,11 @@ pub struct TextIndex {
         Bytes,
         std::collections::BTreeMap<ordered_float::OrderedFloat<f64>, roaring::RoaringBitmap>,
     >,
-    /// `doc_id -> list of (canonical_field, parsed_value)` entries currently
+    /// `doc_id -> [(numeric field index, parsed_value)]` entries currently
     /// indexed for that document. Used to revoke stale entries on per-field upsert.
+    /// moon#1194: dense column of exact-size slices (16 B slot + 16 B/value).
     #[cfg(feature = "text-index")]
-    pub doc_numeric_entries:
-        HashMap<u32, smallvec::SmallVec<[(Bytes, ordered_float::OrderedFloat<f64>); 4]>>,
+    pub doc_numeric_entries: DocSlices<NumericEntry>,
 
     /// Logical database this index was created in (WS5a db-scoped indexes —
     /// mirrors `IndexMeta::db_index` in `src/vector/store.rs`). Defaults to
@@ -216,7 +228,7 @@ pub struct TextIndex {
     /// fields as they were indexed) — the `.tpost` validity stamp, mirroring
     /// the vector plane's `key_hash_to_vec_checksum`. Absent for docs indexed
     /// by a path that did not record one (treated as "changed" on reconcile).
-    pub doc_id_to_content_checksum: HashMap<u32, u64>,
+    pub doc_id_to_content_checksum: DocU64s,
     /// Bumped by every mutator; `persisted_seq` trails it. Dirty when they
     /// differ. Both start at 0 so a fresh empty index is clean.
     mutation_seq: u64,
@@ -273,29 +285,28 @@ impl TextIndex {
             field_term_dicts,
             #[cfg(feature = "text-index")]
             fst_maps: (0..field_count).map(|_| None).collect(),
-            doc_field_lengths: HashMap::new(),
+            doc_field_lengths: DocLengths::new(field_count),
             key_hash_to_doc_id: HashMap::new(),
-            doc_id_to_key: HashMap::new(),
-            live_docs: roaring::RoaringBitmap::new(),
+            doc_id_to_key: DocKeys::new(),
             next_doc_id: 0,
-            doc_id_to_insert_lsn: HashMap::new(),
+            doc_id_to_insert_lsn: DocU64s::new(),
             doc_id_to_delete_lsn: HashMap::new(),
             #[cfg(feature = "text-index")]
             tag_fields: Vec::new(),
             #[cfg(feature = "text-index")]
             tag_indexes: HashMap::new(),
             #[cfg(feature = "text-index")]
-            doc_tag_entries: HashMap::new(),
+            doc_tag_entries: DocSlices::new(),
             #[cfg(feature = "text-index")]
             numeric_fields: Vec::new(),
             #[cfg(feature = "text-index")]
             numeric_indexes: HashMap::new(),
             #[cfg(feature = "text-index")]
-            doc_numeric_entries: HashMap::new(),
+            doc_numeric_entries: DocSlices::new(),
             db_index: 0,
             resident_bytes_extra: 0,
             recovered_from_sidecar: false,
-            doc_id_to_content_checksum: HashMap::new(),
+            doc_id_to_content_checksum: DocU64s::new(),
             mutation_seq: 0,
             persisted_seq: 0,
             last_encode_at: None,
@@ -389,7 +400,6 @@ impl TextIndex {
         self.next_doc_id += 1;
         self.key_hash_to_doc_id.insert(key_hash, id);
         self.doc_id_to_key.insert(id, Bytes::copy_from_slice(key));
-        self.live_docs.insert(id);
         self.charge_new_doc_key(key.len());
         id
     }
@@ -415,13 +425,27 @@ impl TextIndex {
             .saturating_sub(Self::doc_key_entry_cost(key_len));
     }
 
+    /// The `key_hash_to_doc_id` entry plus the key's bytes. The key's
+    /// `doc_id_to_key` slot is billed with the column (`columns_footprint`).
     fn doc_key_entry_cost(key_len: usize) -> usize {
         std::mem::size_of::<u64>()
             + std::mem::size_of::<u32>()
             + MAP_ENTRY_OVERHEAD // key_hash_to_doc_id entry
-            + std::mem::size_of::<u32>()
             + key_len
-            + MAP_ENTRY_OVERHEAD // doc_id_to_key entry
+    }
+
+    /// Exact bytes of the dense per-document columns (`capacity × slot size`,
+    /// moon#1194) — O(1), so `resident_bytes()` stays O(1). Per-doc heap
+    /// contents (key bytes, TAG/NUMERIC entry slices) are billed incrementally
+    /// in `resident_bytes_extra`.
+    fn columns_footprint(&self) -> usize {
+        let base = self.doc_id_to_key.footprint()
+            + self.doc_field_lengths.footprint()
+            + self.doc_id_to_insert_lsn.footprint()
+            + self.doc_id_to_content_checksum.footprint();
+        #[cfg(feature = "text-index")]
+        let base = base + self.doc_tag_entries.footprint() + self.doc_numeric_entries.footprint();
+        base
     }
 
     /// Return `true` if a document is visible at the requested `as_of_lsn`
@@ -455,9 +479,6 @@ impl TextIndex {
     // ── `.tpost` persistence support ─────────────────────────────────────
     //
     // Design and contract: `docs/internal/text-postings-persistence.md`.
-
-    const CONTENT_CHECKSUM_ENTRY_COST: usize =
-        std::mem::size_of::<u32>() + std::mem::size_of::<u64>() + MAP_ENTRY_OVERHEAD;
 
     #[inline]
     fn mark_dirty(&mut self) {
@@ -576,13 +597,7 @@ impl TextIndex {
             return;
         };
         let sum = self.content_checksum(args);
-        if self
-            .doc_id_to_content_checksum
-            .insert(doc_id, sum)
-            .is_none()
-        {
-            self.resident_bytes_extra += Self::CONTENT_CHECKSUM_ENTRY_COST;
-        }
+        self.doc_id_to_content_checksum.insert(doc_id, sum);
         self.mark_dirty();
     }
 
@@ -603,11 +618,7 @@ impl TextIndex {
         let docs = self.doc_id_to_key.len() as u32;
         for (f, stats) in self.field_stats.iter_mut().enumerate() {
             stats.num_docs = docs;
-            stats.total_field_length = self
-                .doc_field_lengths
-                .values()
-                .map(|l| l.get(f).copied().unwrap_or(0) as u64)
-                .sum();
+            stats.total_field_length = self.doc_field_lengths.sum_field(f);
         }
     }
 
@@ -690,22 +701,16 @@ impl TextIndex {
 
         // Validated — assign.
         self.next_doc_id = p.next_doc_id;
-        let field_count = self.text_fields.len();
         for d in p.docs {
             let key_hash = xxhash_rust::xxh64::xxh64(&d.key, 0);
             self.key_hash_to_doc_id.insert(key_hash, d.doc_id);
             self.charge_new_doc_key(d.key.len());
             self.doc_id_to_key.insert(d.doc_id, d.key);
-            self.live_docs.insert(d.doc_id);
-            self.doc_field_lengths.insert(d.doc_id, d.field_lengths);
-            self.resident_bytes_extra += std::mem::size_of::<u32>()
-                + field_count * std::mem::size_of::<u32>()
-                + MAP_ENTRY_OVERHEAD;
+            self.doc_field_lengths.set(d.doc_id, &d.field_lengths);
             self.set_doc_insert_lsn(d.doc_id, d.insert_lsn);
             if d.content_checksum != 0 {
                 self.doc_id_to_content_checksum
                     .insert(d.doc_id, d.content_checksum);
-                self.resident_bytes_extra += Self::CONTENT_CHECKSUM_ENTRY_COST;
             }
         }
         self.field_term_dicts = dicts;
@@ -714,26 +719,36 @@ impl TextIndex {
             self.set_fst_map(f, fst);
         }
         for (doc_id, entries) in p.tag_docs {
-            let mut next: smallvec::SmallVec<[(Bytes, Bytes); 8]> = smallvec::SmallVec::new();
+            let mut next: Vec<TagEntry> = Vec::with_capacity(entries.len());
             for (field, value) in entries {
-                self.tag_bitmap_insert(&field, &value, doc_id);
-                next.push((field, value));
+                // Validated above: every field is in the schema.
+                let Some(fi) = self.tag_fields.iter().position(|t| t.field_name == field) else {
+                    continue;
+                };
+                let stored = self.tag_bitmap_insert(&field, &value, doc_id);
+                next.push((fi as u32, stored));
             }
             self.resident_bytes_extra += Self::tag_entries_cost(&next);
-            self.doc_tag_entries.insert(doc_id, next);
+            self.doc_tag_entries.set(doc_id, next);
         }
         for (doc_id, entries) in p.numeric_docs {
-            let mut next: smallvec::SmallVec<[(Bytes, ordered_float::OrderedFloat<f64>); 4]> =
-                smallvec::SmallVec::new();
+            let mut next: Vec<NumericEntry> = Vec::with_capacity(entries.len());
             for (field, value) in entries {
+                let Some(fi) = self
+                    .numeric_fields
+                    .iter()
+                    .position(|n| n.field_name == field)
+                else {
+                    continue;
+                };
                 let of = ordered_float::OrderedFloat(value);
                 if self.numeric_bitmap_insert(&field, of, doc_id) {
-                    next.push((field, of));
+                    next.push((fi as u32, of));
                 }
             }
             if !next.is_empty() {
                 self.resident_bytes_extra += Self::numeric_entries_cost(&next);
-                self.doc_numeric_entries.insert(doc_id, next);
+                self.doc_numeric_entries.set(doc_id, next);
             }
         }
         self.recompute_field_stats();
@@ -779,12 +794,8 @@ impl TextIndex {
     #[inline]
     pub fn set_doc_insert_lsn(&mut self, doc_id: u32, lsn: u64) {
         if lsn != 0 {
-            let is_new = !self.doc_id_to_insert_lsn.contains_key(&doc_id);
+            // Dense column: billed by capacity (`columns_footprint`).
             self.doc_id_to_insert_lsn.insert(doc_id, lsn);
-            if is_new {
-                self.resident_bytes_extra +=
-                    std::mem::size_of::<u32>() + std::mem::size_of::<u64>() + MAP_ENTRY_OVERHEAD;
-            }
         }
     }
 
@@ -866,15 +877,10 @@ impl TextIndex {
                 // Remove old postings for this doc
                 self.field_postings[field_idx].remove_doc(existing_id);
                 // Subtract old field length from stats
-                if let Some(old_lengths) = self.doc_field_lengths.get(&existing_id) {
-                    if field_idx < old_lengths.len() {
-                        let old_len = old_lengths[field_idx] as u64;
-                        self.field_stats[field_idx].total_field_length = self.field_stats
-                            [field_idx]
-                            .total_field_length
-                            .saturating_sub(old_len);
-                    }
-                }
+                let old_len = u64::from(self.doc_field_lengths.get(existing_id, field_idx));
+                self.field_stats[field_idx].total_field_length = self.field_stats[field_idx]
+                    .total_field_length
+                    .saturating_sub(old_len);
             }
             existing_id
         } else {
@@ -890,14 +896,14 @@ impl TextIndex {
         self.key_hash_to_doc_id.insert(key_hash, doc_id);
         self.doc_id_to_key
             .insert(doc_id, Bytes::copy_from_slice(key));
-        self.live_docs.insert(doc_id);
         if !is_upsert {
             self.charge_new_doc_key(key.len());
         }
 
         // Initialize field lengths for this document
         let field_count = self.text_fields.len();
-        let mut field_lengths = vec![0u32; field_count];
+        let mut field_lengths: smallvec::SmallVec<[u32; 8]> =
+            smallvec::smallvec![0u32; field_count];
 
         // Index each TEXT field
         for field_idx in 0..field_count {
@@ -950,16 +956,8 @@ impl TextIndex {
             self.field_stats[field_idx].total_field_length += token_count as u64;
         }
 
-        // K4 (P0 fix): charge only on a genuinely new doc -- on upsert this
-        // `insert` replaces an existing entry with a Vec of the SAME length
-        // (`field_count`, constant for this index), a byte-size-identical
-        // overwrite that must not be re-charged.
-        if !is_upsert {
-            self.resident_bytes_extra += std::mem::size_of::<u32>()
-                + field_count * std::mem::size_of::<u32>()
-                + MAP_ENTRY_OVERHEAD;
-        }
-        self.doc_field_lengths.insert(doc_id, field_lengths);
+        // Dense column: billed by capacity (`columns_footprint`, moon#1194).
+        self.doc_field_lengths.set(doc_id, &field_lengths);
         self.mark_dirty();
     }
 
@@ -1016,24 +1014,21 @@ impl TextIndex {
     /// `set` restricted to documents that resolve to a key (`doc_id_to_key`).
     #[must_use]
     pub fn restrict_to_live(&self, mut set: roaring::RoaringBitmap) -> roaring::RoaringBitmap {
-        set &= &self.live_docs;
+        set &= self.doc_id_to_key.live();
         set
     }
 
     /// Every document that resolves to a key — the `*` (match-all) set.
     #[must_use]
     pub fn live_docs(&self) -> &roaring::RoaringBitmap {
-        &self.live_docs
+        self.doc_id_to_key.live()
     }
 
     /// Token length of `doc_id`'s `field_idx` field (`0` when unknown).
     #[inline]
     #[must_use]
     pub fn doc_field_len(&self, doc_id: u32, field_idx: usize) -> u32 {
-        self.doc_field_lengths
-            .get(&doc_id)
-            .and_then(|lens| lens.get(field_idx).copied())
-            .unwrap_or(0)
+        self.doc_field_lengths.get(doc_id, field_idx)
     }
 
     /// Collect document frequency for each term + total N for the DFS pre-pass.
@@ -1310,20 +1305,27 @@ impl TextIndex {
         // actually existed (`doc_tag_entries` never stores an empty Vec --
         // see the `!next.is_empty()` guard below -- so `Some(_)` always
         // means real, previously-charged content).
-        let prior_opt = self.doc_tag_entries.remove(&doc_id);
+        let prior_opt = self.doc_tag_entries.take(doc_id);
         if let Some(prior_entries) = &prior_opt {
             self.resident_bytes_extra = self
                 .resident_bytes_extra
                 .saturating_sub(Self::tag_entries_cost(prior_entries));
         }
-        let prior = prior_opt.unwrap_or_default();
-        let mut next: smallvec::SmallVec<[(Bytes, Bytes); 8]> = smallvec::SmallVec::new();
-        for (field, value) in prior.into_iter() {
+        let prior = prior_opt.map(Vec::from).unwrap_or_default();
+        let mut next: Vec<TagEntry> = Vec::with_capacity(prior.len() + touched.len());
+        for (fi, value) in prior {
+            let Some(field) = self
+                .tag_fields
+                .get(fi as usize)
+                .map(|t| t.field_name.clone())
+            else {
+                continue;
+            };
             let is_touched = touched.iter().any(|f| f == &field);
             if is_touched {
                 self.tag_bitmap_revoke(&field, &value, doc_id);
             } else {
-                next.push((field, value));
+                next.push((fi, value));
             }
         }
 
@@ -1395,28 +1397,36 @@ impl TextIndex {
 
             let canonical_field = tag_def.field_name.clone(); // Arc bump
             for value in seen.into_iter() {
-                self.tag_bitmap_insert(&canonical_field, &value, doc_id);
-                next.push((canonical_field.clone(), value));
+                // The entry shares the map key's allocation; this doc's raw
+                // value copy is freed when the call returns (moon#1194).
+                let stored = self.tag_bitmap_insert(&canonical_field, &value, doc_id);
+                next.push((i as u32, stored));
             }
         }
 
         if !next.is_empty() {
             self.resident_bytes_extra += Self::tag_entries_cost(&next);
-            self.doc_tag_entries.insert(doc_id, next);
+            self.doc_tag_entries.set(doc_id, next);
         }
     }
 
     /// K4 (P0 fix): insert `doc_id` into `tag_indexes[field][value]`,
     /// charging the O(1) fixed-cost delta for any newly-created field/value/
     /// doc-bit. Shared by `tag_index_document`'s insert loop.
+    ///
+    /// Returns the map's own key for `value`, so per-document entries share one
+    /// allocation per distinct value. A NEW value is stored as its own copy:
+    /// `value` may be a slice of the document's whole raw field value, which
+    /// would otherwise stay pinned by the map key.
     #[cfg(feature = "text-index")]
-    fn tag_bitmap_insert(&mut self, field: &Bytes, value: &Bytes, doc_id: u32) {
+    fn tag_bitmap_insert(&mut self, field: &Bytes, value: &Bytes, doc_id: u32) -> Bytes {
         let field_is_new = !self.tag_indexes.contains_key(field);
         let field_map = self.tag_indexes.entry(field.clone()).or_default();
-        let value_is_new = !field_map.contains_key(value);
-        let bm = field_map.entry(value.clone()).or_default();
-        let doc_is_new = !bm.contains(doc_id);
-        bm.insert(doc_id);
+        let existing = field_map.get_key_value(value).map(|(k, _)| k.clone());
+        let value_is_new = existing.is_none();
+        let stored = existing.unwrap_or_else(|| Bytes::copy_from_slice(value));
+        let bm = field_map.entry(stored.clone()).or_default();
+        let doc_is_new = bm.insert(doc_id);
         if doc_is_new {
             self.resident_bytes_extra += ROARING_BIT_APPROX_COST;
         }
@@ -1426,6 +1436,7 @@ impl TextIndex {
         if field_is_new {
             self.resident_bytes_extra += field.len() + MAP_ENTRY_OVERHEAD;
         }
+        stored
     }
 
     /// K4 (P0 fix): revoke `doc_id` from `tag_indexes[field][value]`,
@@ -1455,19 +1466,13 @@ impl TextIndex {
         }
     }
 
-    /// K4 (P0 fix): fixed-cost approximation of one `doc_tag_entries[doc_id]`
-    /// entry (mirrors the removed inline formula from the old
-    /// `resident_bytes()` walk). Pure function of the entries slice so it
-    /// can be called both before insert (to charge) and after remove (to
-    /// uncharge) without borrowing `self`.
+    /// Exact heap bytes of one `doc_tag_entries[doc_id]` slice (moon#1194: its
+    /// allocation request; the slot is billed with the column and the value
+    /// bytes with the shared `tag_indexes` key). Pure function of the entries
+    /// so it charges on insert and uncharges on removal symmetrically.
     #[cfg(feature = "text-index")]
-    fn tag_entries_cost(entries: &[(Bytes, Bytes)]) -> usize {
-        std::mem::size_of::<u32>()
-            + MAP_ENTRY_OVERHEAD
-            + entries
-                .iter()
-                .map(|(a, b)| a.len() + b.len() + 32)
-                .sum::<usize>()
+    fn tag_entries_cost(entries: &[TagEntry]) -> usize {
+        DocSlices::<TagEntry>::entries_bytes(entries)
     }
 
     /// LSN-aware wrapper around [`Self::search_field`] — only documents visible
@@ -1611,21 +1616,27 @@ impl TextIndex {
         // actually existed (mirrors the TAG-side reasoning in
         // `tag_index_document` -- `doc_numeric_entries` never stores an
         // empty Vec, see the `!next.is_empty()` guard below).
-        let prior_opt = self.doc_numeric_entries.remove(&doc_id);
+        let prior_opt = self.doc_numeric_entries.take(doc_id);
         if let Some(prior_entries) = &prior_opt {
             self.resident_bytes_extra = self
                 .resident_bytes_extra
                 .saturating_sub(Self::numeric_entries_cost(prior_entries));
         }
-        let prior = prior_opt.unwrap_or_default();
-        let mut next: smallvec::SmallVec<[(Bytes, ordered_float::OrderedFloat<f64>); 4]> =
-            smallvec::SmallVec::new();
-        for (field, value) in prior.into_iter() {
+        let prior = prior_opt.map(Vec::from).unwrap_or_default();
+        let mut next: Vec<NumericEntry> = Vec::with_capacity(prior.len() + touched.len());
+        for (fi, value) in prior {
+            let Some(field) = self
+                .numeric_fields
+                .get(fi as usize)
+                .map(|n| n.field_name.clone())
+            else {
+                continue;
+            };
             let is_touched = touched.iter().any(|f| f == &field);
             if is_touched {
                 self.numeric_bitmap_revoke(&field, &value, doc_id);
             } else {
-                next.push((field, value));
+                next.push((fi, value));
             }
         }
 
@@ -1671,13 +1682,13 @@ impl TextIndex {
             let of = ordered_float::OrderedFloat(parsed);
             let canonical_field = num_def.field_name.clone();
             if self.numeric_bitmap_insert(&canonical_field, of, doc_id) {
-                next.push((canonical_field, of));
+                next.push((i as u32, of));
             }
         }
 
         if !next.is_empty() {
             self.resident_bytes_extra += Self::numeric_entries_cost(&next);
-            self.doc_numeric_entries.insert(doc_id, next);
+            self.doc_numeric_entries.set(doc_id, next);
         }
     }
 
@@ -1749,13 +1760,11 @@ impl TextIndex {
         }
     }
 
-    /// K4 (P0 fix): fixed-cost approximation of one
-    /// `doc_numeric_entries[doc_id]` entry. Mirrors `tag_entries_cost`.
+    /// Exact heap bytes of one `doc_numeric_entries[doc_id]` slice (moon#1194).
+    /// Mirrors `tag_entries_cost`.
     #[cfg(feature = "text-index")]
-    fn numeric_entries_cost(entries: &[(Bytes, ordered_float::OrderedFloat<f64>)]) -> usize {
-        std::mem::size_of::<u32>()
-            + MAP_ENTRY_OVERHEAD
-            + entries.iter().map(|(a, _)| a.len() + 16).sum::<usize>()
+    fn numeric_entries_cost(entries: &[NumericEntry]) -> usize {
+        DocSlices::<NumericEntry>::entries_bytes(entries)
     }
 
     /// Resolve a NUMERIC range filter to sorted doc_ids.
@@ -1911,7 +1920,7 @@ impl TextIndex {
             .iter()
             .map(TermDictionary::resident_bytes)
             .sum();
-        postings + term_dicts + self.resident_bytes_extra
+        postings + term_dicts + self.resident_bytes_extra + self.columns_footprint()
     }
 
     /// Ground-truth full recompute of `resident_bytes()`, using the exact
@@ -1946,25 +1955,13 @@ impl TextIndex {
         #[cfg(not(feature = "text-index"))]
         let fst: usize = 0;
 
-        let doc_field_lengths: usize = self
-            .doc_field_lengths
-            .values()
-            .map(|v| {
-                std::mem::size_of::<u32>()
-                    + v.len() * std::mem::size_of::<u32>()
-                    + MAP_ENTRY_OVERHEAD
-            })
-            .sum();
+        // Dense columns (moon#1194): exact slot-array bytes, recomputed from
+        // the capacities rather than read from a cache.
+        let columns = self.columns_footprint();
         let key_hash_to_doc_id = self.key_hash_to_doc_id.len()
             * (std::mem::size_of::<u64>() + std::mem::size_of::<u32>() + MAP_ENTRY_OVERHEAD);
-        let doc_id_to_key: usize = self
-            .doc_id_to_key
-            .values()
-            .map(|k| std::mem::size_of::<u32>() + k.len() + MAP_ENTRY_OVERHEAD)
-            .sum();
-        let lsn_maps = (self.doc_id_to_insert_lsn.len()
-            + self.doc_id_to_delete_lsn.len()
-            + self.doc_id_to_content_checksum.len())
+        let doc_id_to_key: usize = self.doc_id_to_key.values().map(Bytes::len).sum();
+        let lsn_maps = self.doc_id_to_delete_lsn.len()
             * (std::mem::size_of::<u32>() + std::mem::size_of::<u64>() + MAP_ENTRY_OVERHEAD);
 
         #[cfg(feature = "text-index")]
@@ -1987,8 +1984,8 @@ impl TextIndex {
             .sum::<usize>()
             + self
                 .doc_tag_entries
-                .values()
-                .map(|entries| Self::tag_entries_cost(entries))
+                .iter()
+                .map(|(_, entries)| Self::tag_entries_cost(entries))
                 .sum::<usize>();
         #[cfg(not(feature = "text-index"))]
         let tag: usize = 0;
@@ -2013,8 +2010,8 @@ impl TextIndex {
             .sum::<usize>()
             + self
                 .doc_numeric_entries
-                .values()
-                .map(|entries| Self::numeric_entries_cost(entries))
+                .iter()
+                .map(|(_, entries)| Self::numeric_entries_cost(entries))
                 .sum::<usize>();
         #[cfg(not(feature = "text-index"))]
         let numeric: usize = 0;
@@ -2022,7 +2019,7 @@ impl TextIndex {
         postings
             + term_dicts
             + fst
-            + doc_field_lengths
+            + columns
             + key_hash_to_doc_id
             + doc_id_to_key
             + lsn_maps
@@ -2056,17 +2053,13 @@ impl TextIndex {
                 continue;
             }
             // Subtract field length from stats before clearing postings.
-            if let Some(lengths) = self.doc_field_lengths.get(&doc_id) {
-                if let Some(&len) = lengths.get(field_idx) {
-                    let len64 = len as u64;
-                    self.field_stats[field_idx].total_field_length = self.field_stats[field_idx]
-                        .total_field_length
-                        .saturating_sub(len64);
-                    if len64 > 0 {
-                        self.field_stats[field_idx].num_docs =
-                            self.field_stats[field_idx].num_docs.saturating_sub(1);
-                    }
-                }
+            let len64 = u64::from(self.doc_field_lengths.get(doc_id, field_idx));
+            self.field_stats[field_idx].total_field_length = self.field_stats[field_idx]
+                .total_field_length
+                .saturating_sub(len64);
+            if len64 > 0 {
+                self.field_stats[field_idx].num_docs =
+                    self.field_stats[field_idx].num_docs.saturating_sub(1);
             }
             self.field_postings[field_idx].remove_doc(doc_id);
         }
@@ -2076,24 +2069,36 @@ impl TextIndex {
         // -- same logic `tag_index_document`'s revoke loop uses -- so the two
         // call sites cannot drift apart.
         #[cfg(feature = "text-index")]
-        if let Some(entries) = self.doc_tag_entries.remove(&doc_id) {
+        if let Some(entries) = self.doc_tag_entries.take(doc_id) {
             self.resident_bytes_extra = self
                 .resident_bytes_extra
                 .saturating_sub(Self::tag_entries_cost(&entries));
-            for (field, value) in entries {
-                self.tag_bitmap_revoke(&field, &value, doc_id);
+            for (fi, value) in entries.iter() {
+                if let Some(field) = self
+                    .tag_fields
+                    .get(*fi as usize)
+                    .map(|t| t.field_name.clone())
+                {
+                    self.tag_bitmap_revoke(&field, value, doc_id);
+                }
             }
         }
 
         // ── NUMERIC field removal ─────────────────────────────────────────────
         // K4 (P0 fix): shared `numeric_bitmap_revoke`/`numeric_entries_cost`.
         #[cfg(feature = "text-index")]
-        if let Some(entries) = self.doc_numeric_entries.remove(&doc_id) {
+        if let Some(entries) = self.doc_numeric_entries.take(doc_id) {
             self.resident_bytes_extra = self
                 .resident_bytes_extra
                 .saturating_sub(Self::numeric_entries_cost(&entries));
-            for (field, value) in entries {
-                self.numeric_bitmap_revoke(&field, &value, doc_id);
+            for (fi, value) in entries.iter() {
+                if let Some(field) = self
+                    .numeric_fields
+                    .get(*fi as usize)
+                    .map(|n| n.field_name.clone())
+                {
+                    self.numeric_bitmap_revoke(&field, value, doc_id);
+                }
             }
         }
 
@@ -2101,30 +2106,16 @@ impl TextIndex {
         // K4 (P0 fix): uncharge using the ACTUAL removed Vec's length --
         // self-correcting even if field_count ever varied per doc (it
         // currently doesn't).
-        if let Some(lengths) = self.doc_field_lengths.remove(&doc_id) {
-            self.resident_bytes_extra = self.resident_bytes_extra.saturating_sub(
-                std::mem::size_of::<u32>()
-                    + lengths.len() * std::mem::size_of::<u32>()
-                    + MAP_ENTRY_OVERHEAD,
-            );
-        }
+        // Dense columns: the slots stay (billed by capacity) and read as empty.
+        self.doc_field_lengths.clear(doc_id);
         // Remove from key_hash -> doc_id map (need to find the key_hash).
-        self.live_docs.remove(doc_id);
         if let Some(key) = self.doc_id_to_key.remove(&doc_id) {
             let key_hash = xxhash_rust::xxh64::xxh64(&key, 0);
             self.key_hash_to_doc_id.remove(&key_hash);
             self.uncharge_doc_key(key.len());
         }
-        if self.doc_id_to_insert_lsn.remove(&doc_id).is_some() {
-            self.resident_bytes_extra = self.resident_bytes_extra.saturating_sub(
-                std::mem::size_of::<u32>() + std::mem::size_of::<u64>() + MAP_ENTRY_OVERHEAD,
-            );
-        }
-        if self.doc_id_to_content_checksum.remove(&doc_id).is_some() {
-            self.resident_bytes_extra = self
-                .resident_bytes_extra
-                .saturating_sub(Self::CONTENT_CHECKSUM_ENTRY_COST);
-        }
+        self.doc_id_to_insert_lsn.remove(&doc_id);
+        self.doc_id_to_content_checksum.remove(&doc_id);
         self.mark_dirty();
         // `doc_id_to_delete_lsn` currently has no insertion call site anywhere
         // in the codebase (reserved for future v0.2 logical-delete wiring --

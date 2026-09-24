@@ -213,8 +213,8 @@ pub fn encode_index(idx: &TextIndex) -> Vec<u8> {
     w.u16(field_count as u16);
 
     // Docs, ascending doc_id.
-    let mut doc_ids: Vec<u32> = idx.doc_id_to_key.keys().copied().collect();
-    doc_ids.sort_unstable();
+    // Ascending by construction (dense column).
+    let doc_ids: Vec<u32> = idx.doc_id_to_key.keys().collect();
     w.u32(doc_ids.len() as u32);
     for &doc_id in &doc_ids {
         w.u32(doc_id);
@@ -232,12 +232,7 @@ pub fn encode_index(idx: &TextIndex) -> Vec<u8> {
         );
         w.u64(idx.doc_id_to_insert_lsn.get(&doc_id).copied().unwrap_or(0));
         for f in 0..field_count {
-            let len = idx
-                .doc_field_lengths
-                .get(&doc_id)
-                .and_then(|l| l.get(f).copied())
-                .unwrap_or(0);
-            w.u32(len);
+            w.u32(idx.doc_field_lengths.get(doc_id, f));
         }
     }
 
@@ -299,28 +294,30 @@ pub fn encode_index(idx: &TextIndex) -> Vec<u8> {
     // TAG / NUMERIC per-doc entries, ascending doc_id.
     #[cfg(feature = "text-index")]
     {
-        let mut tag_docs: Vec<(&u32, &smallvec::SmallVec<[(Bytes, Bytes); 8]>)> =
-            idx.doc_tag_entries.iter().collect();
-        tag_docs.sort_unstable_by_key(|(d, _)| **d);
-        w.u32(tag_docs.len() as u32);
-        for (doc_id, entries) in tag_docs {
-            w.u32(*doc_id);
+        // Field names are written, not indices, so the format is unchanged
+        // (moon#1194 stores `(field index, value)` in memory).
+        w.u32(idx.doc_tag_entries.len() as u32);
+        for (doc_id, entries) in idx.doc_tag_entries.iter() {
+            w.u32(doc_id);
             w.u16(entries.len() as u16);
-            for (field, value) in entries.iter() {
+            for (fi, value) in entries {
+                let field = idx
+                    .tag_fields
+                    .get(*fi as usize)
+                    .map_or(&[][..], |t| t.field_name.as_ref());
                 w.bytes32(field);
                 w.bytes32(value);
             }
         }
-        let mut num_docs: Vec<(
-            &u32,
-            &smallvec::SmallVec<[(Bytes, ordered_float::OrderedFloat<f64>); 4]>,
-        )> = idx.doc_numeric_entries.iter().collect();
-        num_docs.sort_unstable_by_key(|(d, _)| **d);
-        w.u32(num_docs.len() as u32);
-        for (doc_id, entries) in num_docs {
-            w.u32(*doc_id);
+        w.u32(idx.doc_numeric_entries.len() as u32);
+        for (doc_id, entries) in idx.doc_numeric_entries.iter() {
+            w.u32(doc_id);
             w.u16(entries.len() as u16);
-            for (field, value) in entries.iter() {
+            for (fi, value) in entries {
+                let field = idx
+                    .numeric_fields
+                    .get(*fi as usize)
+                    .map_or(&[][..], |n| n.field_name.as_ref());
                 w.bytes32(field);
                 w.u64(value.0.to_bits());
             }

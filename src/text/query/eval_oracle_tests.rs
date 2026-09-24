@@ -178,7 +178,7 @@ fn head_as_of(
 fn head_eval_set(node: &QueryNode, idx: &TextIndex) -> RoaringBitmap {
     match node {
         QueryNode::Empty => RoaringBitmap::new(),
-        QueryNode::MatchAll => idx.doc_id_to_key.keys().copied().collect(),
+        QueryNode::MatchAll => idx.doc_id_to_key.keys().collect(),
         QueryNode::Term {
             field,
             token,
