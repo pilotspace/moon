@@ -89,7 +89,10 @@ pub fn expand_fuzzy(
     }
 
     // Sort by doc_freq descending, cap at max_terms (D-09).
-    expanded.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+    // df DESC, then term id ASC: with the cap, a df tie at the boundary must not
+    // be broken by HashMap iteration order (random per process) — that made the
+    // same query expand to different terms on different servers/restarts.
+    expanded.sort_unstable_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
     expanded.truncate(max_terms);
     expanded.into_iter().map(|(_, id)| id).collect()
 }
@@ -122,7 +125,10 @@ pub fn expand_prefix(
         expanded.push((df, id));
     }
 
-    expanded.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+    // df DESC, then term id ASC: with the cap, a df tie at the boundary must not
+    // be broken by HashMap iteration order (random per process) — that made the
+    // same query expand to different terms on different servers/restarts.
+    expanded.sort_unstable_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
     expanded.truncate(max_terms);
     expanded.into_iter().map(|(_, id)| id).collect()
 }
@@ -165,7 +171,10 @@ pub fn expand_fuzzy_hashmap(
         }
     }
 
-    expanded.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+    // df DESC, then term id ASC: with the cap, a df tie at the boundary must not
+    // be broken by HashMap iteration order (random per process) — that made the
+    // same query expand to different terms on different servers/restarts.
+    expanded.sort_unstable_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
     expanded.truncate(max_terms);
     expanded.into_iter().map(|(_, id)| id).collect()
 }
@@ -205,7 +214,10 @@ pub fn expand_prefix_hashmap(
         }
     }
 
-    expanded.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+    // df DESC, then term id ASC: with the cap, a df tie at the boundary must not
+    // be broken by HashMap iteration order (random per process) — that made the
+    // same query expand to different terms on different servers/restarts.
+    expanded.sort_unstable_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
     expanded.truncate(max_terms);
     expanded.into_iter().map(|(_, id)| id).collect()
 }
@@ -401,6 +413,59 @@ mod tests {
         assert!(
             !results.contains(&_id_old),
             "apple (id=0) should be skipped (below high_water_mark)"
+        );
+    }
+
+    /// Capped expansion must not depend on HashMap iteration order: two
+    /// dictionaries with the same terms (inserted in different orders, each
+    /// with its own random hasher) expand a >cap, all-df-tied prefix to the
+    /// same, lowest-id terms.
+    #[test]
+    fn capped_expansion_is_deterministic_on_df_ties() {
+        let words: Vec<String> = (0..120).map(|i| format!("pre{i:03}")).collect();
+        let build = |order: &mut dyn Iterator<Item = &String>| {
+            let mut dict = TermDictionary::new();
+            let mut ids = std::collections::HashMap::new();
+            for w in order {
+                ids.insert(w.clone(), dict.get_or_insert(w));
+            }
+            let mut ps = PostingStore::new();
+            for (w, &id) in &ids {
+                // Every term df = 2: a full tie at the cap boundary.
+                let d = w[3..].parse::<u32>().unwrap_or(0);
+                ps.add_term_occurrence(id, d, None);
+                ps.add_term_occurrence(id, d + 1000, None);
+            }
+            (dict, ps, ids)
+        };
+        let (d1, p1, ids1) = build(&mut words.iter());
+        let (d2, p2, ids2) = build(&mut words.iter().rev());
+        let names = |ids: &std::collections::HashMap<String, u32>, got: Vec<u32>| {
+            let by_id: std::collections::HashMap<u32, &String> =
+                ids.iter().map(|(w, &i)| (i, w)).collect();
+            let mut v: Vec<String> = got.iter().map(|i| by_id[i].clone()).collect();
+            v.sort();
+            v
+        };
+        let a = expand_prefix_hashmap(&d1, "pre", &p1, 0, 50);
+        let b = expand_prefix_hashmap(&d2, "pre", &p2, 0, 50);
+        assert_eq!(a.len(), 50);
+        // Same ids within each dictionary regardless of iteration order: the
+        // 50 lowest ids (first-inserted terms).
+        let mut sorted_a = a.clone();
+        sorted_a.sort_unstable();
+        assert_eq!(sorted_a, (0..50).collect::<Vec<u32>>());
+        assert_eq!(names(&ids1, a), words[..50].to_vec());
+        let mut rev: Vec<String> = words.iter().rev().take(50).cloned().collect();
+        rev.sort();
+        assert_eq!(names(&ids2, b), rev);
+        // Re-running on the same dictionary is stable too (fuzzy path).
+        let f1 = expand_fuzzy_hashmap(&d1, "pre000", 3, &p1, 0, 50);
+        let f2 = expand_fuzzy_hashmap(&d1, "pre000", 3, &p1, 0, 50);
+        assert_eq!(f1, f2);
+        assert!(
+            f1.windows(2).all(|w| w[0] < w[1]),
+            "df tie -> ascending ids"
         );
     }
 }
