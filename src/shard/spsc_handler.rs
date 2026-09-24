@@ -1865,28 +1865,48 @@ pub(crate) fn handle_shard_message_shared(
                 reply_tx,
                 db_index,
             } = *payload;
-            // Phase 171 SCAT-01: honor coordinator-resolved AS_OF / TXN LSN
-            // for multi-shard FT.SEARCH. When `as_of_lsn == 0` the filter is a
-            // no-op and behavior matches the pre-171 path. Route through
-            // `search_local_filtered` with AS_OF threaded in to apply MVCC
-            // filtering against the committed treemap inside `search_local_raw`.
-            // Flat with_shard borrow — no outer borrow active, no re-entrancy.
-            // WS5a: db_index forwarded from the originating connection.
-            let response = crate::shard::slice::with_shard(|s| {
-                vector_search::search_local_filtered(
+            // moon#1182: this shard's leg of a multi-shard FT.SEARCH no longer
+            // searches synchronously inside the drain — that stopped this
+            // shard's 1 ms tick, SPSC drain and local connections for the whole
+            // search. The owned snapshot is captured HERE, in message order (so
+            // every write drained before this message is visible and none after
+            // it), then a local task awaits the cooperative search
+            // (`search_mvcc_yielding`, the C5 path the `--shards 1` handler
+            // uses) and sends the reply. Shapes the snapshot does not cover
+            // (unknown index, dimension mismatch) take the synchronous search,
+            // whose error frames they need. Phase 171 SCAT-01: `as_of_lsn` is
+            // honoured on both paths; WS5a: `db_index` from the origin.
+            let snapshot = crate::shard::slice::with_shard(|s| {
+                crate::shard::vector_scatter::capture_knn(
                     &mut s.vector_store,
+                    &s.text_store,
                     &index_name,
                     &query_blob,
                     k,
-                    None,
-                    0,
-                    usize::MAX,
-                    None,
                     as_of_lsn,
                     db_index,
                 )
             });
-            let _ = reply_tx.send(response);
+            match snapshot {
+                Some(snapshot) => crate::shard::vector_scatter::spawn_knn_reply(snapshot, reply_tx),
+                None => {
+                    let response = crate::shard::slice::with_shard(|s| {
+                        vector_search::search_local_filtered(
+                            &mut s.vector_store,
+                            &index_name,
+                            &query_blob,
+                            k,
+                            None,
+                            0,
+                            usize::MAX,
+                            None,
+                            as_of_lsn,
+                            db_index,
+                        )
+                    });
+                    let _ = reply_tx.send(response);
+                }
+            }
         }
         ShardMessage::ReadVersions(payload) => {
             // WATCH snapshot on the owning shard (task `watch-cas-transactions`).

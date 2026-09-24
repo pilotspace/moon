@@ -2206,9 +2206,35 @@ pub async fn coordinate_keys(
 
     let mut all_keys: Vec<Frame> = Vec::new();
     let mut pending_shards: Vec<channel::OneshotReceiver<crate::shard::dispatch::ExecReply>> =
-        Vec::new();
+        Vec::with_capacity(num_shards.saturating_sub(1));
 
-    // Execute locally on this shard
+    // moon#1182: every remote shard gets its KEYS BEFORE the local scan runs —
+    // a full keyspace scan here used to finish before any other shard started
+    // its own. One request frame, shared (refcount) by every leg.
+    let cmd_frame = {
+        let mut parts = Vec::with_capacity(args.len() + 1);
+        parts.push(Frame::BulkString(Bytes::from_static(b"KEYS")));
+        parts.extend_from_slice(args);
+        std::sync::Arc::new(Frame::Array(parts.into()))
+    };
+    for target in 0..num_shards {
+        if target == my_shard {
+            continue;
+        }
+        let (reply_tx, reply_rx) = channel::oneshot();
+        let msg = ShardMessage::Execute {
+            db_index,
+            command: std::sync::Arc::clone(&cmd_frame),
+            // Never a script: this fan-out builds its own keyspace command.
+            // Fail-closed anyway (moon#569).
+            script_acl: crate::acl::ScriptAcl::deny(),
+            reply_tx,
+        };
+        let _ = spsc_send(dispatch_tx, my_shard, target, msg, spsc_notifiers).await;
+        pending_shards.push(reply_rx);
+    }
+
+    // Execute locally on this shard (its keys lead the reply, as before).
     {
         let db_count = shard_databases.db_count();
         let mut selected = db_index;
@@ -2219,31 +2245,6 @@ pub async fn coordinate_keys(
         if let DispatchResult::Response(Frame::Array(keys)) = result {
             all_keys.extend(keys);
         }
-    }
-
-    // Dispatch to all remote shards
-    for target in 0..num_shards {
-        if target == my_shard {
-            continue;
-        }
-        let (reply_tx, reply_rx) = channel::oneshot();
-        let cmd_frame = {
-            let mut parts = vec![Frame::BulkString(Bytes::from_static(b"KEYS"))];
-            for a in args {
-                parts.push(a.clone());
-            }
-            Frame::Array(parts.into())
-        };
-        let msg = ShardMessage::Execute {
-            db_index,
-            command: std::sync::Arc::new(cmd_frame),
-            // Never a script: this fan-out builds its own keyspace command.
-            // Fail-closed anyway (moon#569).
-            script_acl: crate::acl::ScriptAcl::deny(),
-            reply_tx,
-        };
-        let _ = spsc_send(dispatch_tx, my_shard, target, msg, spsc_notifiers).await;
-        pending_shards.push(reply_rx);
     }
 
     // Collect remote results
@@ -2778,91 +2779,14 @@ pub async fn coordinate_hotkeys(
     Frame::Array(out.into())
 }
 
-/// Scatter a vector search query to all shards, collect per-shard results,
-/// and merge into a global top-K response.
+/// Scatter a KNN FT.SEARCH to every shard and merge the per-shard top-K.
 ///
-/// Used when the connection handler receives FT.SEARCH and num_shards > 1.
-/// Each shard runs a local search and returns its local top-K. The coordinator
-/// merges all per-shard results and returns the globally correct top-K.
-///
-/// For single-shard deployments, FT.SEARCH executes directly without scatter.
-pub async fn scatter_vector_search(
-    index_name: Bytes,
-    query_blob: Bytes,
-    k: usize,
-    as_of_lsn: u64,
-    my_shard: usize,
-    num_shards: usize,
-    dispatch_tx: &Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
-    spsc_notifiers: &[Arc<channel::Notify>],
-    vector_store: &mut crate::vector::store::VectorStore,
-    db_index: u8,
-) -> Frame {
-    let mut receivers = Vec::with_capacity(num_shards);
-    let mut local_result: Option<Frame> = None;
-
-    for shard_id in 0..num_shards {
-        if shard_id == my_shard {
-            // Execute locally -- avoid SPSC overhead for local shard.
-            // Phase 171 SCAT-01: thread as_of_lsn through the local branch so
-            // the coordinator honors temporal filtering on its own shard too.
-            // WS5a: db_index scopes index visibility on this shard too.
-            local_result = Some(crate::command::vector_search::search_local_filtered(
-                vector_store,
-                &index_name,
-                &query_blob,
-                k,
-                None,
-                0,
-                usize::MAX,
-                None,
-                as_of_lsn,
-                db_index,
-            ));
-        } else {
-            let (reply_tx, reply_rx) = channel::oneshot();
-            let msg =
-                ShardMessage::VectorSearch(Box::new(crate::shard::dispatch::VectorSearchPayload {
-                    index_name: index_name.clone(),
-                    query_blob: query_blob.clone(),
-                    k,
-                    as_of_lsn,
-                    reply_tx,
-                    db_index,
-                }));
-            let _ = spsc_send(dispatch_tx, my_shard, shard_id, msg, spsc_notifiers).await;
-            receivers.push(reply_rx);
-        }
-    }
-
-    let mut shard_responses = Vec::with_capacity(num_shards);
-    if let Some(local) = local_result {
-        shard_responses.push(local);
-    }
-    for rx in receivers {
-        match rx.recv().await {
-            Ok(frame) => shard_responses.push(frame),
-            Err(_) => {
-                return Frame::Error(bytes::Bytes::from_static(
-                    b"ERR shard reply channel closed during vector search scatter-gather",
-                ));
-            }
-        }
-    }
-
-    crate::command::vector_search::merge_search_results(&shard_responses, k, 0, usize::MAX)
-}
-
-/// Scatter FT.SEARCH to all shards via SPSC (no local vector_store needed).
-///
-/// Used by connection handlers that don't have direct vector_store access.
-/// Sends VectorSearch to every shard (including local) via SPSC, collects
-/// results, and merges into a global top-K response.
-/// Scatter FT.SEARCH to all shards (local + remote), merge top-K results.
-///
-/// Local shard: direct VectorStore access via shard_databases (no SPSC self-send).
-/// Remote shards: SPSC dispatch with VectorSearch message.
-/// Single-shard (num_shards == 1): local-only, no SPSC needed.
+/// moon#1182: every remote shard gets its request BEFORE the local leg runs,
+/// and every leg — this one here, the others in their `VectorSearch` arms —
+/// searches on the cooperative path (`shard::vector_scatter`), so neither the
+/// coordinator's connection task nor a remote shard's event loop is held for
+/// the length of a search. Merge input order is unchanged: local first, then
+/// the remote shards in ascending order.
 pub async fn scatter_vector_search_remote(
     index_name: Bytes,
     query_blob: Bytes,
@@ -2876,27 +2800,9 @@ pub async fn scatter_vector_search_remote(
     db_index: u8,
 ) -> Frame {
     let _ = shard_databases; // E2 removes
-    // LOCAL: direct vector store access (avoids SPSC self-send).
-    // Phase 171 SCAT-01: honor AS_OF on the coordinator's own shard by
-    // routing through `search_local_filtered` with the resolved LSN rather
-    // than the AS_OF-unaware `search_local` helper. WS5a: db_index scopes
-    // index visibility here too.
-    let local_result = crate::shard::slice::with_shard(|s| {
-        crate::command::vector_search::search_local_filtered(
-            &mut s.vector_store,
-            &index_name,
-            &query_blob,
-            k,
-            None,
-            0,
-            usize::MAX,
-            None,
-            as_of_lsn,
-            db_index,
-        )
-    });
-
-    // REMOTE: SPSC to all other shards
+    // moon#1182: REMOTE legs first. The local search used to run before any
+    // other shard received its request, so end-to-end latency was local
+    // search + hop + slowest remote search instead of hop + slowest search.
     let mut receivers = Vec::with_capacity(num_shards.saturating_sub(1));
     for shard_id in 0..num_shards {
         if shard_id == my_shard {
@@ -2915,6 +2821,41 @@ pub async fn scatter_vector_search_remote(
         let _ = spsc_send(dispatch_tx, my_shard, shard_id, msg, spsc_notifiers).await;
         receivers.push(reply_rx);
     }
+
+    // LOCAL: this shard's leg on the cooperative search path (moon#1182 —
+    // the C5 `search_mvcc_yielding` path was `--shards 1` only), yielding to
+    // the event loop between chunks instead of searching in one stretch.
+    // Phase 171 SCAT-01: AS_OF honoured; WS5a: db-scoped. Shapes the snapshot
+    // does not cover (unknown index, dimension mismatch) take the synchronous
+    // search, whose error frames they need.
+    let snapshot = crate::shard::slice::with_shard(|s| {
+        crate::shard::vector_scatter::capture_knn(
+            &mut s.vector_store,
+            &s.text_store,
+            &index_name,
+            &query_blob,
+            k,
+            as_of_lsn,
+            db_index,
+        )
+    });
+    let local_result = match snapshot {
+        Some(snapshot) => crate::shard::vector_scatter::run_knn(snapshot).await,
+        None => crate::shard::slice::with_shard(|s| {
+            crate::command::vector_search::search_local_filtered(
+                &mut s.vector_store,
+                &index_name,
+                &query_blob,
+                k,
+                None,
+                0,
+                usize::MAX,
+                None,
+                as_of_lsn,
+                db_index,
+            )
+        }),
+    };
 
     let mut shard_responses = Vec::with_capacity(num_shards);
     shard_responses.push(local_result);
@@ -3450,44 +3391,43 @@ pub async fn scatter_text_search(
     // field_queries comes from collect_df_field_terms (above); shape unchanged.
     let mut doc_freq_receivers: Vec<crate::runtime::channel::OneshotReceiver<Frame>> =
         Vec::with_capacity(num_shards.saturating_sub(1));
-    let mut local_doc_freq: Option<Frame> = None;
 
+    // moon#1182: every remote request goes out BEFORE the local leg runs.
     for shard_id in 0..num_shards {
         if shard_id == my_shard {
-            // Local: extract df/N directly — no SPSC overhead.
-            // Shard slice released before any .await.
-            let response = crate::shard::slice::with_shard(|s| {
-                match s.text_store.get_index_for_db(&index_name, db_index) {
-                    Some(text_index) => {
-                        let mut items: Vec<Frame> = Vec::new();
-                        for (field_idx_opt, terms) in &field_queries {
-                            let fidx = field_idx_opt.unwrap_or(0);
-                            let (term_dfs, n) = text_index.doc_freq_for_terms(fidx, terms);
-                            for (term, df) in term_dfs {
-                                items.push(Frame::BulkString(Bytes::from(term)));
-                                items.push(Frame::Integer(i64::from(df)));
-                            }
-                            items.push(Frame::BulkString(Bytes::from_static(b"N")));
-                            items.push(Frame::Integer(i64::from(n)));
-                        }
-                        Frame::Array(items.into())
-                    }
-                    None => Frame::Error(Bytes::from_static(b"ERR unknown index")),
-                }
-            });
-            local_doc_freq = Some(response);
-        } else {
-            let (reply_tx, reply_rx) = channel::oneshot();
-            let msg = ShardMessage::DocFreq(Box::new(crate::shard::dispatch::DocFreqPayload {
-                index_name: index_name.clone(),
-                field_queries: field_queries.clone(),
-                reply_tx,
-                db_index,
-            }));
-            let _ = spsc_send(dispatch_tx, my_shard, shard_id, msg, spsc_notifiers).await;
-            doc_freq_receivers.push(reply_rx);
+            continue;
         }
+        let (reply_tx, reply_rx) = channel::oneshot();
+        let msg = ShardMessage::DocFreq(Box::new(crate::shard::dispatch::DocFreqPayload {
+            index_name: index_name.clone(),
+            field_queries: field_queries.clone(),
+            reply_tx,
+            db_index,
+        }));
+        let _ = spsc_send(dispatch_tx, my_shard, shard_id, msg, spsc_notifiers).await;
+        doc_freq_receivers.push(reply_rx);
     }
+    // Local: extract df/N directly — no SPSC overhead.
+    // Shard slice released before any .await.
+    let local_doc_freq: Option<Frame> = Some(crate::shard::slice::with_shard(|s| {
+        match s.text_store.get_index_for_db(&index_name, db_index) {
+            Some(text_index) => {
+                let mut items: Vec<Frame> = Vec::new();
+                for (field_idx_opt, terms) in &field_queries {
+                    let fidx = field_idx_opt.unwrap_or(0);
+                    let (term_dfs, n) = text_index.doc_freq_for_terms(fidx, terms);
+                    for (term, df) in term_dfs {
+                        items.push(Frame::BulkString(Bytes::from(term)));
+                        items.push(Frame::Integer(i64::from(df)));
+                    }
+                    items.push(Frame::BulkString(Bytes::from_static(b"N")));
+                    items.push(Frame::Integer(i64::from(n)));
+                }
+                Frame::Array(items.into())
+            }
+            None => Frame::Error(Bytes::from_static(b"ERR unknown index")),
+        }
+    }));
 
     // Collect Phase 1 responses and aggregate.
     let mut doc_freq_responses = Vec::with_capacity(num_shards);
@@ -3510,73 +3450,74 @@ pub async fn scatter_text_search(
     // ── Phase 2: scatter TextSearch with global IDF to all shards ─────────────
     let mut search_receivers: Vec<crate::runtime::channel::OneshotReceiver<Frame>> =
         Vec::with_capacity(num_shards.saturating_sub(1));
-    let mut local_search: Option<Frame> = None;
 
+    // moon#1182: every remote search goes out BEFORE the local one runs —
+    // the local search used to finish before any other shard started.
     for shard_id in 0..num_shards {
         if shard_id == my_shard {
-            // Local: execute with global IDF via run_text_query_on_index.
-            // text_store + databases[0] folded into a single `with_shard` to
-            // avoid reentrant `with_shard*` panic. Slice released before .await.
-            let response = crate::shard::slice::with_shard(|s| {
-                match s.text_store.get_index_for_db(&index_name, db_index) {
-                    Some(text_index) => {
-                        #[cfg(feature = "text-index")]
-                        {
-                            let mut r = crate::command::vector_search::ft_text_search::run_text_query_on_index(
+            continue;
+        }
+        let (reply_tx, reply_rx) = channel::oneshot();
+        let msg = ShardMessage::TextSearch(Box::new(crate::shard::dispatch::TextSearchPayload {
+            index_name: index_name.clone(),
+            // Send raw query bytes; each remote shard re-parses with the full AST.
+            query: query.clone(),
+            global_df: global_df.clone(),
+            global_n,
+            top_k,
+            offset: 0, // each shard returns top_k; coordinator applies final offset+count
+            count: top_k,
+            // Pass opts to each remote shard — each applies post-processing locally.
+            highlight_opts: highlight_opts.clone(),
+            summarize_opts: summarize_opts.clone(),
+            reply_tx,
+            db_index,
+        }));
+        let _ = spsc_send(dispatch_tx, my_shard, shard_id, msg, spsc_notifiers).await;
+        search_receivers.push(reply_rx);
+    }
+    // Local: execute with global IDF via run_text_query_on_index.
+    // text_store + databases[0] folded into a single `with_shard` to
+    // avoid reentrant `with_shard*` panic. Slice released before .await.
+    let response = crate::shard::slice::with_shard(|s| {
+        match s.text_store.get_index_for_db(&index_name, db_index) {
+            Some(text_index) => {
+                #[cfg(feature = "text-index")]
+                {
+                    let mut r =
+                        crate::command::vector_search::ft_text_search::run_text_query_on_index(
+                            text_index,
+                            &query,
+                            Some(&global_df),
+                            Some(global_n),
+                            top_k,
+                            0, // each shard returns top_k; coordinator applies final offset
+                            top_k,
+                        );
+                    if highlight_opts.is_some() || summarize_opts.is_some() {
+                        if let Some(db) = s.databases.try_write(db_index as usize) {
+                            crate::command::vector_search::ft_text_search::apply_post_processing(
+                                &mut r,
+                                &term_strings,
                                 text_index,
-                                &query,
-                                Some(&global_df),
-                                Some(global_n),
-                                top_k,
-                                0,      // each shard returns top_k; coordinator applies final offset
-                                top_k,
+                                &db,
+                                highlight_opts.as_ref(),
+                                summarize_opts.as_ref(),
                             );
-                            if highlight_opts.is_some() || summarize_opts.is_some() {
-                                if let Some(db) = s.databases.try_write(db_index as usize) {
-                                    crate::command::vector_search::ft_text_search::apply_post_processing(
-                                        &mut r,
-                                        &term_strings,
-                                        text_index,
-                                        &db,
-                                        highlight_opts.as_ref(),
-                                        summarize_opts.as_ref(),
-                                    );
-                                }
-                            }
-                            r
-                        }
-                        #[cfg(not(feature = "text-index"))]
-                        {
-                            let _ = text_index;
-                            Frame::Error(Bytes::from_static(b"ERR text-index feature not enabled"))
                         }
                     }
-                    None => Frame::Error(Bytes::from_static(b"ERR unknown index")),
+                    r
                 }
-            });
-            local_search = Some(response);
-        } else {
-            let (reply_tx, reply_rx) = channel::oneshot();
-            let msg =
-                ShardMessage::TextSearch(Box::new(crate::shard::dispatch::TextSearchPayload {
-                    index_name: index_name.clone(),
-                    // Send raw query bytes; each remote shard re-parses with the full AST.
-                    query: query.clone(),
-                    global_df: global_df.clone(),
-                    global_n,
-                    top_k,
-                    offset: 0, // each shard returns top_k; coordinator applies final offset+count
-                    count: top_k,
-                    // Pass opts to each remote shard — each applies post-processing locally.
-                    highlight_opts: highlight_opts.clone(),
-                    summarize_opts: summarize_opts.clone(),
-                    reply_tx,
-                    db_index,
-                }));
-            let _ = spsc_send(dispatch_tx, my_shard, shard_id, msg, spsc_notifiers).await;
-            search_receivers.push(reply_rx);
+                #[cfg(not(feature = "text-index"))]
+                {
+                    let _ = text_index;
+                    Frame::Error(Bytes::from_static(b"ERR text-index feature not enabled"))
+                }
+            }
+            None => Frame::Error(Bytes::from_static(b"ERR unknown index")),
         }
-    }
+    });
+    let local_search: Option<Frame> = Some(response);
 
     // Collect Phase 2 responses.
     let mut search_responses = Vec::with_capacity(num_shards);

@@ -48,6 +48,8 @@ pub mod spsc_handler;
 pub(crate) mod spsc_two_db;
 pub mod timers;
 pub mod uring_handler;
+/// moon#1182: multi-shard FT.SEARCH KNN legs on the cooperative search path.
+pub(crate) mod vector_scatter;
 /// moon#1162: the post-write index/queue hooks every shard-side write path
 /// runs — one list, so the dispatch arms cannot drift apart again.
 pub(crate) mod write_hooks;
