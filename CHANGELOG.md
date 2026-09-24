@@ -175,7 +175,70 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   tokio `CLUSTER REPLICATE`) and the replica task's own guard, so they cannot
   drift apart. An admin script that retried until `+OK` will now see the error.
 
+### Performance
+
+2026-09 performance review fix wave, part 1 (index moon#1199; per-workstream evidence in
+`.add/milestones/v0-9-2-perf-review/plans/*/SUMMARY.md`). Numbers are relative A/Bs on a
+shared 4-vCPU Linux container against HEAD `935c555` — re-measure on the GCE rig before quoting.
+
+- **DashTable probes compare ~1 key instead of ~7** (moon#1159). The H2 fingerprint came from the
+  same top hash bits the segment directory routes on, so past ~5K keys every key in a segment had
+  the same fingerprint. H2 now uses bits 32–38: key compares per hit 6.7 → 1.0, per miss 20.5 →
+  0.16; GET +11–17%, SET +36% at 1M keys. Segment splits move only the upper half in place, and a
+  SET overwrite of a >23-byte key no longer builds and drops an owned key.
+- **Removing a large collection no longer stalls the shard** (moon#1190, partial). UNLINK and active
+  expiry of values with ≥ 65,536 elements hand them to a per-db lazy-free queue drained on the tick
+  and a lazily started `moon-lazyfree` thread (both runtimes): UNLINK of a 1M-field hash replies in
+  ≤ 0.5 ms (was 105–173 ms). The freed bytes stay in `used_memory` until the drain releases them.
+- **Expiry sweep: one table probe per expired key** (moon#1189, expiry-index part), no key clone,
+  ~65% more keys expired per sweep budget.
+- **LREM is one pass, LPOS scans in place** (moon#1173): LREM on a 200K list 13.2 s → 2.5 ms,
+  `LPOS … MAXLEN 10` on 1M elements 39 ms → 71 µs.
+- **Small lists stay listpack** (moon#1174 §1–§3): LTRIM/LREM/LINSERT/LMOVE/RPOPLPUSH/LMPOP no
+  longer convert a listpack list to linkedlist (10K capped lists: RSS 201 → 62 MB); listpack range
+  reads seek once (LRANGE ~2.3×); owned listpack reads allocate once; HKEYS/HVALS/HEXISTS/HSTRLEN
+  read fields in place.
+- **Vector search** (moon#1192, #1193, #1194 part, #1196): the budgeted 16-level TQ-ADC kernel is
+  8-accumulator and safe (2.6–3.4× per candidate); sub-centroid signs are persisted
+  (`sub_signs.bin`, segment format v2 — additive, v1 directories load unchanged) so restarted
+  segments keep the 32-level LUT; BUILD_MODE EXACT computes QJL data on the compaction worker
+  (compaction-submit stall 3.2 s → 12 ms) and scans the mutable segment with TQ-ADC + FastScan
+  (**EXACT rankings change**: recall vs exact rises in-distribution 0.71 → 0.83 and for non-unit
+  L2 0.12 → 0.83, falls for far queries 0.83 → 0.73); FT.SEARCH builds its rotation/LUT once per
+  query, takes the tombstone guard once, and no longer clones the SESSION member map; the f16 rerank
+  sidecar is served from its mapped file once persisted; payload-index keys no longer pin request
+  buffers. New opt-out `MOON_VECTOR_PAYLOAD_TEXT=off` skips payload full-text indexing.
+- **Full-text search scores each match once** (moon#1191): bitmap membership, one BM25 pass with
+  doc-ordered cursors, a bounded top-k, keys cloned for the returned page only — broad-term
+  `FT.SEARCH … LIMIT 0 10` 70–103× faster at shards 1 (25× at shards 4), scores bit-identical.
+- **Text upserts no longer memmove whole postings** (moon#1195): re-indexing the oldest of 200K docs
+  15.5 → 0.42 ms. **Text side tables are dense columns** (moon#1194, text part): RSS for 100K tagged
+  docs −55%, and their `used_memory` billing now matches real size.
+- **Cypher `LIMIT` streams and `ORDER BY … LIMIT` keeps only the page** (moon#1197): `MATCH (n:L)
+  RETURN n.x LIMIT 10` on 200K nodes 143 → 0.18 ms.
+- **Persistence off the event loop** (moon#1181, #1185 part, #1186, #1187 part, #1188): BGSAVE streams
+  to a writer thread and finalizes (fsync/rename) off the shard (max stall on 1.5M keys 1.3 s →
+  12 ms, peak RSS growth +257 → +2 MiB); AOF rewrite streams its base image instead of deep-copying
+  the keyspace (peak RSS growth +567 → +6 MiB; the fold is still O(dataset) on the shard — moon#1185
+  stays open); WAL segment-rotation fsync goes through the sync agent; each AOF record costs exactly
+  one allocation; CDC.READ seeks by segment header and reads in chunks on a CDC read pool (a poll at
+  a ~1M-record tail 5.8 s → 0.17 ms).
+
 ### Fixed
+
+- **Reads never refreshed LRU/LFU metadata, so `allkeys-lru`/`allkeys-lfu` evicted the most-read
+  keys first** (moon#1161): hot-key retention in the review scenario 0.6% → 99.5% (LRU) / 100%
+  (LFU). `OBJECT IDLETIME` resets on read, `OBJECT FREQ` grows under LFU, `TOUCH` touches, `OBJECT`
+  on a missing key answers nil. `lfu-log-factor` / `lfu-decay-time` now take effect, and
+  `MEMORY USAGE`, `DEBUG OBJECT` and `DEBUG DIGEST` no longer count as access (moon#1211).
+- **LPOS / LMOVE Redis parity** (moon#1209): option errors are checked before values
+  (`ERR syntax error`), the RANK 0 and COUNT/MAXLEN error texts match redis, `LMOVE k k` keeps the
+  key's TTL, and a refused LMOVE no longer converts its source list.
+- **FT.SEARCH panicked on a LIGHT TQ4A2 index** over a non-empty mutable segment (moon#1207), and
+  EXACT compaction gave rows after a deleted vector their neighbour's QJL signs (moon#1208).
+- **FT.SEARCH prefix/fuzzy results differed between processes** (moon#1218): the 50-term expansion
+  cap broke document-frequency ties in HashMap order; ties now break by term id.
+
 
 - **The boot crash-orphan sweep no longer lets a cold file id be issued twice
   in one AOF generation** (moon#1114). A spill's `MOON.SPILLED <N>` marker
