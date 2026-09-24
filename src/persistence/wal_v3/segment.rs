@@ -24,6 +24,19 @@
 //! 36      8     segment_size (u64 LE)
 //! 44      20    reserved_1 (zeroes)
 //! ```
+//!
+//! `base_lsn` is the LSN of the segment's first record — the next LSN to be
+//! assigned while the segment holds none. LSNs are dense, so a segment opened
+//! by a rotation starts at the old segment's last LSN + 1, whatever was
+//! appended (and buffered) while the old segment's fsync was in flight
+//! (moon#1221 review R1). Readers rely only on the bound it implies — every
+//! record of every EARLIER segment has an LSN `< base_lsn`: the recyclers
+//! free a segment once the next one's `base_lsn <= redo_lsn`, and CDC.READ
+//! starts at the last segment whose `base_lsn <= from_lsn`. A header that
+//! overstates it is therefore safe, only conservative. That is what the
+//! unreleased moon#1188 build wrote before this fix (`next_lsn` at open
+//! time, past the records buffered during the in-flight fsync); its WAL
+//! directories stay readable and recycle a little later.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
@@ -563,7 +576,7 @@ impl WalWriterV3 {
             rotations_inline: 0,
         };
 
-        writer.open_new_segment()?;
+        writer.open_new_segment(next_lsn)?;
         Ok(writer)
     }
 
@@ -1101,8 +1114,10 @@ impl WalWriterV3 {
                 continue;
             }
             // A segment is safe to recycle when its last record lies strictly
-            // before redo_lsn. Determine the segment's end LSN by peeking the
-            // next segment's base_lsn (which equals this segment's end LSN).
+            // before redo_lsn. The next segment's base_lsn bounds every record
+            // of this one from above (it is this segment's last LSN + 1, or
+            // more in a header an older build overstated — then this only
+            // waits longer; see the module docs).
             let next_base = all_segments.get(i + 1).map(|s| s.base_lsn).unwrap_or(0);
             if next_base == 0 || next_base > redo_lsn {
                 continue;
@@ -1306,7 +1321,9 @@ impl WalWriterV3 {
         // segment may exist now. The sequence moves only once it does, so a
         // failed open never leaves a gap in the chain.
         self.current_sequence += 1;
-        if let Err(e) = self.open_new_segment() {
+        // Its first record is the one after the old segment's last: the
+        // records buffered past `upto_lsn` land here (moon#1221 review R1).
+        if let Err(e) = self.open_new_segment(pending.upto_lsn + 1) {
             self.current_sequence -= 1;
             // The old segment stays current and durable; appends keep going
             // into it (the pre-moon#1188 recovery from a failed open).
@@ -1327,8 +1344,9 @@ impl WalWriterV3 {
         Ok(())
     }
 
-    /// Open a new segment file and write its 64-byte header.
-    fn open_new_segment(&mut self) -> std::io::Result<()> {
+    /// Open a new segment file and write its 64-byte header; `first_lsn` is
+    /// the LSN its first record will carry (the header's `base_lsn`).
+    fn open_new_segment(&mut self, first_lsn: u64) -> std::io::Result<()> {
         // Self-repair a vanished parent (#366 heal path): `create(true)`
         // only creates the LEAF file, so a shallow `mkdir -p <dir>` after a
         // dir-lost incident would leave this rotation failing ENOENT on
@@ -1341,7 +1359,7 @@ impl WalWriterV3 {
             .truncate(true)
             .open(&path)?;
 
-        self.write_segment_header(&mut file)?;
+        self.write_segment_header(&mut file, first_lsn)?;
         self.write_offset = WAL_V3_HEADER_SIZE as u64;
         self.current_file = Some(file);
         Ok(())
@@ -1362,7 +1380,7 @@ impl WalWriterV3 {
     /// 36..44  segment_size (u64 LE)
     /// 44..64  reserved_1 (zero)
     /// ```
-    fn write_segment_header(&self, file: &mut File) -> std::io::Result<()> {
+    fn write_segment_header(&self, file: &mut File, first_lsn: u64) -> std::io::Result<()> {
         let mut header = [0u8; WAL_V3_HEADER_SIZE];
 
         // magic (6 bytes)
@@ -1378,8 +1396,10 @@ impl WalWriterV3 {
         header[12..20].copy_from_slice(&self.epoch.to_le_bytes());
         // redo_lsn (8 bytes LE) — REDO point from last checkpoint
         header[20..28].copy_from_slice(&self.base_lsn.to_le_bytes());
-        // base_lsn (8 bytes LE) — LSN of first record in this segment
-        header[28..36].copy_from_slice(&self.next_lsn.to_le_bytes());
+        // base_lsn (8 bytes LE) — LSN of first record in this segment. NOT
+        // `next_lsn`: records appended while a rotation's fsync was in
+        // flight are buffered for this segment and carry lower LSNs.
+        header[28..36].copy_from_slice(&first_lsn.to_le_bytes());
         // segment_size (8 bytes LE)
         header[36..44].copy_from_slice(&self.segment_size.to_le_bytes());
         // bytes 44..64 remain zero (reserved_1)
@@ -1461,7 +1481,8 @@ impl WalWriterV3 {
             // Determine segment end by peeking the next segment's base_lsn.
             // A segment is only safe to recycle when its last record lies
             // strictly before redo_lsn — i.e. the next segment's base_lsn
-            // (which equals this segment's end LSN) is <= redo_lsn.
+            // (this segment's last LSN + 1; an overstated header from an
+            // older build only makes this wait longer) is <= redo_lsn.
             let next_base = all_segments.get(i + 1).map(|s| s.base_lsn).unwrap_or(0);
             if next_base == 0 || next_base > redo_lsn {
                 continue;

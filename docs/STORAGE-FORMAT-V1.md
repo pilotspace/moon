@@ -49,7 +49,13 @@ For the duration of the Moon v0.2.x minor series (≥ 18 months of LTS — see
 
 Authoritative source: `src/persistence/wal_v3/`.
 
-- **Segment header (64 bytes):** `RRDWAL` magic + version=3 + shard id + epoch + segment number + reserved.
+- **Segment header (64 bytes):** `RRDWAL` magic + version=3 + flags + shard id + epoch + `redo_lsn` + `base_lsn` + segment size + reserved (byte layout in `segment.rs`).
+  `base_lsn` is the LSN of the segment's first record (the next LSN to be assigned, while the segment holds none).
+  Readers — the WAL recyclers and CDC.READ's seek — rely only on the bound it implies: every record of every *earlier*
+  segment has an LSN `< base_lsn`. A header that overstates it therefore makes them conservative (a segment recycled
+  later, a seek that starts one segment early), never wrong. Such headers exist only in WAL directories written by the
+  unreleased moon#1188 build before the moon#1221 review fix, which stamped a segment opened after an off-loop rotation
+  fsync with the LSN *after* the records appended while that fsync was in flight.
 - **Record (variable):** little-endian, self-describing.
   ```
   Offset  Size  Field

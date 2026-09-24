@@ -31,6 +31,9 @@ impl FsyncGate {
         *self.open.lock() = true;
         self.cv.notify_all();
     }
+    fn close(&self) {
+        *self.open.lock() = false;
+    }
     fn calls(&self) -> usize {
         self.calls.load(std::sync::atomic::Ordering::SeqCst)
     }
@@ -39,8 +42,13 @@ impl FsyncGate {
         crate::persistence::wal_v3::sync_agent::WalSyncAgent::spawn_with_backend(0, move |f| {
             gate.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let mut open = gate.open.lock();
-            while !*open {
-                gate.cv.wait(&mut open);
+            // Released by `open()` — or once the test dropped its handle: a
+            // failing test unwinds and drops the writer, which joins this
+            // agent, so an fsync held in the gate forever would hang the
+            // test binary instead of reporting the failure.
+            while !*open && std::sync::Arc::strong_count(&gate) > 1 {
+                gate.cv
+                    .wait_for(&mut open, std::time::Duration::from_millis(10));
             }
             drop(open);
             if gate.fail.load(std::sync::atomic::Ordering::SeqCst) {
@@ -276,5 +284,236 @@ fn test_1188_flush_sync_completes_a_pending_rotation() {
             WalSegment::segment_path(&wal_dir, seq).exists(),
             "gap at {seq}"
         );
+    }
+}
+
+// ---------------------------------------------------------------------
+// moon#1221 review R1 — a rotated segment's header `base_lsn` is the LSN
+// of its first record (refs moon#1188).
+// ---------------------------------------------------------------------
+
+/// `(header base_lsn, first record's LSN)` of segment `seq`; the second is
+/// `None` for a header-only segment.
+fn header_and_first_lsn(wal_dir: &std::path::Path, seq: u64) -> (u64, Option<u64>) {
+    let data = std::fs::read(WalSegment::segment_path(wal_dir, seq)).unwrap();
+    let base = u64::from_le_bytes(data[28..36].try_into().unwrap());
+    let first = (data.len() > WAL_V3_HEADER_SIZE)
+        .then(|| read_wal_v3_record(&data[WAL_V3_HEADER_SIZE..]).map(|r| r.lsn))
+        .flatten();
+    (base, first)
+}
+
+/// The reviewer's reproduction: records appended while the old segment's
+/// fsync is in flight land in the NEXT segment, so its header must name the
+/// first of them (`upto + 1`), not `next_lsn` at the moment it was opened.
+/// At the PR head the header read 36 for a segment whose first record is 31.
+#[test]
+fn test_1221_r1_rotated_segment_header_names_its_first_record() {
+    let tmp = tempfile::tempdir().unwrap();
+    let wal_dir = tmp.path().join("wal");
+    let mut writer = WalWriterV3::new(0, &wal_dir, 512, WalBounds::DEFAULT).unwrap();
+    let gate = FsyncGate::new();
+    writer.install_sync_agent_for_test(gate.agent());
+    for _ in 0..30 {
+        writer.append(WalRecordType::Command, b"SET k v");
+    }
+    writer.request_sync().unwrap();
+    wait_until(|| gate.calls() == 1);
+    assert!(writer.rotation_pending());
+    for _ in 0..5 {
+        writer.append(WalRecordType::Command, b"SET k2 v2");
+    }
+    gate.open();
+    wait_until(|| {
+        writer.flush_if_needed().unwrap();
+        !writer.rotation_pending()
+    });
+    writer.flush_sync().unwrap();
+    let (base, first) = header_and_first_lsn(&wal_dir, 2);
+    assert_eq!(
+        first,
+        Some(31),
+        "segment 2 must start at the first buffered record"
+    );
+    assert_eq!(
+        Some(base),
+        first,
+        "segment 2 header base_lsn must be its first record's LSN"
+    );
+}
+
+/// Every segment a rotation opens names its first record: with appends
+/// buffered during the in-flight fsync, with none, and back to back (the
+/// buffer released by one rotation overflows the new segment at once).
+#[test]
+fn test_1221_r1_every_rotated_segment_header_names_its_first_record() {
+    let tmp = tempfile::tempdir().unwrap();
+    let wal_dir = tmp.path().join("wal");
+    let mut writer = WalWriterV3::new(0, &wal_dir, 512, WalBounds::DEFAULT).unwrap();
+    let gate = FsyncGate::new();
+    writer.install_sync_agent_for_test(gate.agent());
+    let finish = |writer: &mut WalWriterV3| {
+        wait_until(|| {
+            writer.flush_if_needed().unwrap();
+            !writer.rotation_pending()
+        })
+    };
+
+    // (a) 5 appends buffered while segment 1's fsync is in flight.
+    for _ in 0..30 {
+        writer.append(WalRecordType::Command, b"SET k v");
+    }
+    writer.request_sync().unwrap();
+    assert!(writer.rotation_pending());
+    for _ in 0..5 {
+        writer.append(WalRecordType::Command, b"SET a v");
+    }
+    gate.open();
+    finish(&mut writer);
+
+    // (b) no append while segment 2's fsync is in flight.
+    for _ in 0..20 {
+        writer.append(WalRecordType::Command, b"SET b v");
+    }
+    writer.flush_write().unwrap();
+    assert!(writer.rotation_pending());
+    finish(&mut writer);
+    writer.append(WalRecordType::Command, b"SET b2 v");
+    writer.flush_write().unwrap();
+
+    // (c) back to back: more than a segment buffered while segment 3's
+    // fsync is in flight, so completing the rotation rotates again.
+    gate.close();
+    for _ in 0..20 {
+        writer.append(WalRecordType::Command, b"SET c v");
+    }
+    writer.flush_write().unwrap();
+    assert!(writer.rotation_pending());
+    for _ in 0..40 {
+        writer.append(WalRecordType::Command, b"SET d v");
+    }
+    writer.request_sync().unwrap();
+    gate.open();
+    finish(&mut writer);
+    for _ in 0..3 {
+        writer.append(WalRecordType::Command, b"SET e v");
+    }
+    writer.flush_sync().unwrap();
+
+    let last = writer.current_lsn() - 1;
+    assert_eq!(replayed_lsns(&wal_dir), (1..=last).collect::<Vec<_>>());
+    let max = writer.current_segment_sequence();
+    assert!(
+        max >= 5,
+        "the scenario must rotate at least 4 times, got {max}"
+    );
+    for seq in 1..=max {
+        let (base, first) = header_and_first_lsn(&wal_dir, seq);
+        match first {
+            Some(first) => assert_eq!(base, first, "segment {seq}: header base_lsn"),
+            // Only the active segment can be header-only: it names the
+            // next LSN to be assigned.
+            None => {
+                assert_eq!(seq, max, "sealed segment {seq} holds no record");
+                assert_eq!(base, writer.current_lsn(), "segment {seq}: header base_lsn");
+            }
+        }
+    }
+}
+
+/// Overwrite segment `seq`'s header `base_lsn` (bytes 28..36).
+fn set_header_base(wal_dir: &std::path::Path, seq: u64, base: u64) {
+    let path = WalSegment::segment_path(wal_dir, seq);
+    let mut data = std::fs::read(&path).unwrap();
+    data[28..36].copy_from_slice(&base.to_le_bytes());
+    std::fs::write(&path, &data).unwrap();
+}
+
+fn copy_dir(from: &std::path::Path, to: &std::path::Path) {
+    std::fs::create_dir_all(to).unwrap();
+    for e in std::fs::read_dir(from).unwrap().flatten() {
+        std::fs::copy(e.path(), to.join(e.file_name())).unwrap();
+    }
+}
+
+/// A WAL directory written by the unreleased moon#1188 build (headers that
+/// overstate `base_lsn`: the LSN after the records appended during the
+/// in-flight fsync) stays correct under this fix's readers — the recyclers
+/// only ever free LESS than with exact headers, and never a segment holding
+/// a record at or past `redo_lsn`.
+#[test]
+fn test_1221_r1_an_overstated_header_only_makes_recycling_conservative() {
+    let tmp = tempfile::tempdir().unwrap();
+    let exact = tmp.path().join("exact");
+    let mut firsts = Vec::new();
+    let last_lsn;
+    {
+        let mut writer = WalWriterV3::new(0, &exact, 512, WalBounds::UNBOUNDED).unwrap();
+        for _ in 0..6 {
+            for _ in 0..20 {
+                writer.append(WalRecordType::Command, b"SET k v");
+            }
+            writer.flush_sync().unwrap();
+        }
+        last_lsn = writer.current_lsn() - 1;
+        for seq in 1..=writer.current_segment_sequence() {
+            let (base, first) = header_and_first_lsn(&exact, seq);
+            assert_eq!(Some(base), first.or(Some(last_lsn + 1)), "segment {seq}");
+            firsts.push(base);
+        }
+    }
+    assert!(firsts.len() >= 5, "fixture must span several segments");
+    // The PR head's header for segment N lay in [first_N, first_{N+1}].
+    let overstated = tmp.path().join("overstated");
+    copy_dir(&exact, &overstated);
+    for (i, pair) in firsts.windows(2).enumerate().skip(1) {
+        set_header_base(&overstated, i as u64 + 1, (pair[0] + pair[1]) / 2);
+    }
+
+    let remaining = |dir: &std::path::Path| -> Vec<u64> {
+        let mut seqs: Vec<u64> = std::fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .filter_map(|e| e.file_name().to_str()?.strip_suffix(".wal")?.parse().ok())
+            .collect();
+        seqs.sort_unstable();
+        seqs
+    };
+    let last = *firsts.last().unwrap();
+    for redo in firsts
+        .iter()
+        .flat_map(|&f| [f - 1, f, f + 1])
+        .chain([last + 5])
+    {
+        for aggressive in [false, true] {
+            let mut kept = Vec::new();
+            for (name, src) in [("exact", &exact), ("overstated", &overstated)] {
+                let dir = tmp.path().join(format!("run-{name}-{redo}-{aggressive}"));
+                copy_dir(src, &dir);
+                let mut writer = WalWriterV3::new(0, &dir, 512, WalBounds::UNBOUNDED).unwrap();
+                if aggressive {
+                    writer.recycle_aggressive(redo).unwrap();
+                } else {
+                    writer.recycle_segments_before(redo).unwrap();
+                }
+                let left = remaining(&dir);
+                // Never freed: a segment holding a record at or past redo.
+                for (seq, &first) in firsts.iter().enumerate() {
+                    let seq = seq as u64 + 1;
+                    let next_first = firsts.get(seq as usize).copied().unwrap_or(last_lsn + 1);
+                    if next_first > redo && first < next_first {
+                        assert!(
+                            left.contains(&seq),
+                            "{name}: segment {seq} (LSNs {first}..{next_first}) freed at redo {redo}"
+                        );
+                    }
+                }
+                kept.push(left);
+            }
+            assert!(
+                kept[0].iter().all(|seq| kept[1].contains(seq)),
+                "an overstated header freed a segment exact headers keep (redo {redo}): {kept:?}"
+            );
+        }
     }
 }

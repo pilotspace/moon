@@ -231,6 +231,41 @@ fn sequential_polls_match_the_full_scan_on_a_live_wal() {
     assert!(cursor > 300, "consumer must have advanced, at {cursor}");
 }
 
+/// moon#1221 review R1: a WAL written by the unreleased moon#1188 build —
+/// whose segment headers overstate `base_lsn` (the LSN after the records
+/// appended while a rotation's fsync was in flight) — still reads exactly
+/// as the full scan does: the header seek only ever starts early.
+#[test]
+fn an_overstated_segment_header_still_reads_like_the_full_scan() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("wal");
+    let last = write_wal(&dir, 2048, 900);
+    let header_base = |seq: u64| -> Option<u64> {
+        let data = std::fs::read(WalSegment::segment_path(&dir, seq)).ok()?;
+        Some(u64::from_le_bytes(data[28..36].try_into().ok()?))
+    };
+    let firsts: Vec<u64> = (1..).map_while(header_base).collect();
+    assert!(firsts.len() > 10, "fixture must span many segments");
+    // The PR head's header for segment N lay in [first_N, first_{N+1}].
+    for (i, pair) in firsts.windows(2).enumerate().skip(1) {
+        let path = WalSegment::segment_path(&dir, i as u64 + 1);
+        let mut data = std::fs::read(&path).unwrap();
+        data[28..36].copy_from_slice(&((pair[0] + pair[1]) / 2).to_le_bytes());
+        std::fs::write(&path, &data).unwrap();
+    }
+    let froms = firsts
+        .iter()
+        .flat_map(|&f| [f.saturating_sub(1), f, f + 1, f + 3])
+        .chain([last, last + 1]);
+    for from in froms {
+        for limit in [1usize, 7, 10_000] {
+            let got = execute(&req(&dir, from, limit), TS);
+            let want = head::cdc_read(&dir, from, limit, TS);
+            assert_eq!(got, want, "from={from} limit={limit}");
+        }
+    }
+}
+
 /// A stale hint (the directory was wiped and rebuilt with other contents)
 /// is rejected, never trusted.
 #[test]
