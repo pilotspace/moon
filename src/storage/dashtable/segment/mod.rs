@@ -17,7 +17,7 @@
 //! Module layout:
 //! - `mod.rs` — types, constants, Segment struct + basic accessors, Drop, Send/Sync, tests
 //! - `find.rs` — find / get / get_mut / get_key_value / find_slot_mut
-//! - `insert.rs` — insert / insert_or_update_at + helpers
+//! - `insert.rs` — insert / probe_for_upsert + write_vacant / insert_or_update_at + helpers
 //! - `ops.rs` — remove / split / insert_during_split / home_buckets
 
 use std::mem::MaybeUninit;
@@ -113,6 +113,22 @@ pub enum SegmentInsertOrUpdate<F, G> {
     /// The unconsumed closures are returned so the caller can retry without
     /// re-constructing them.
     NeedsSplit { update: F, make: G },
+}
+
+/// Where [`Segment::probe_for_upsert`] found a key, or where it would go.
+///
+/// Plain slot indexes: the answer holds no borrow of the probed key, so the
+/// caller can move an owned key in (or build one from the probed slice)
+/// after the scan (moon#1159 follow-up).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpsertProbe {
+    /// The key is stored at this slot (ctrl byte FULL, key compared equal).
+    Found(usize),
+    /// The key is absent; this free slot is where it goes. Valid only for an
+    /// immediate [`Segment::write_vacant`].
+    Vacant(usize),
+    /// The key is absent and the segment is at `LOAD_THRESHOLD`: split first.
+    Full,
 }
 
 /// A segment holding up to 60 key-value pairs with Swiss Table control bytes.

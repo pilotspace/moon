@@ -10,6 +10,10 @@ mod kv_ops;
 /// rather than a clock. Test-only; see the module docs for why.
 #[cfg(test)]
 mod probe_budget;
+/// WS1 (2026-09 perf review) storage-core regression tests: moon#1159,
+/// moon#1161, moon#1190, moon#1189. Test-only.
+#[cfg(test)]
+mod ws1_tests;
 
 pub use cold_replay_gate::{ReplayColdGate, ReplayColdReconcile, close_replay_generation};
 pub(crate) use incr::IncrOutcome;

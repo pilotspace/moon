@@ -454,7 +454,7 @@ impl Database {
     ///
     /// `key` is BORROWED on purpose. Every use below is by reference —
     /// `spill_inflight_forget`, `entry_overhead`, `hash_expiry_index_note_value`,
-    /// `CompactKey::from` (which copies the bytes either way), `ColdIndex::remove`
+    /// the upsert (which builds a `CompactKey` only on a miss), `ColdIndex::remove`
     /// and both expiry-index writers all take `&[u8]`, and the `Bytes` is never
     /// moved anywhere. Taking `Bytes` forced a `key.clone()` at every write
     /// command's call site: one `shared_v_clone` on the way in and one
@@ -495,8 +495,12 @@ impl Database {
         // exactly once per call, so the `Cell::take()` below cannot observe
         // a None value. Annotated for the hot-path unwrap ratchet.
         #[allow(clippy::expect_used)]
-        let result = self.data.insert_or_update(
-            CompactKey::from(key), // CompactKey copies the bytes either way
+        // moon#1159: keyed by the borrowed slice — the owned `CompactKey` is
+        // built only on a miss. `insert_or_update(CompactKey::from(key), ..)`
+        // allocated (and dropped) a heap key block on every overwrite of a
+        // key longer than 23 bytes.
+        let result = self.data.insert_or_update_slice(
+            key,
             |existing: &mut Entry| {
                 // Hit path: replace existing entry, bump version.
                 let new_entry = entry_cell.take().expect("update closure called once");

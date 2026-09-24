@@ -5,7 +5,7 @@ use std::mem::MaybeUninit;
 
 use super::{
     DELETED, EMPTY, InsertResult, REGULAR_SLOTS, Segment, SegmentInsertOrUpdate, TOTAL_SLOTS,
-    prefetch_ptr,
+    UpsertProbe, prefetch_ptr,
 };
 
 impl<K, V> Segment<K, V> {
@@ -138,8 +138,8 @@ impl<K, V> Segment<K, V> {
     /// On miss + room: calls `make()` to produce `(K, V)`, writes to a free slot.
     /// On miss + full: returns `NeedsSplit` with the unconsumed closures.
     ///
-    /// Hot path: one `match_h2` + one `match_empty_or_deleted` per group scanned.
-    #[allow(unused_unsafe)] // prefetch_ptr is unsafe on x86_64 but safe on aarch64
+    /// A thin wrapper over [`Self::probe_for_upsert`] + [`Self::write_vacant`];
+    /// see those for the scan itself.
     pub fn insert_or_update_at<Q: ?Sized, F, G>(
         &mut self,
         h2: u8,
@@ -154,6 +154,49 @@ impl<K, V> Segment<K, V> {
         Q: Eq,
         F: FnOnce(&mut V),
         G: FnOnce() -> (K, V),
+    {
+        match self.probe_for_upsert(h2, key_lookup, bucket_a, bucket_b) {
+            UpsertProbe::Found(slot) => {
+                // SAFETY: `probe_for_upsert` answers `Found` only for a slot
+                // whose ctrl byte matched `h2` AND whose key compared equal,
+                // so the slot is FULL and `values[slot]` is initialized.
+                update(unsafe { self.values[slot].assume_init_mut() });
+                SegmentInsertOrUpdate::Updated { slot }
+            }
+            UpsertProbe::Vacant(slot) => {
+                let (k, v) = make();
+                self.write_vacant(slot, h2, k, v, bucket_a, bucket_b);
+                SegmentInsertOrUpdate::Inserted { slot }
+            }
+            UpsertProbe::Full => SegmentInsertOrUpdate::NeedsSplit { update, make },
+        }
+    }
+
+    /// Phase 1 of an upsert: ONE pass over the control bytes that answers
+    /// both "where is this key?" and "where would it go?" (moon#1159
+    /// follow-up).
+    ///
+    /// Returns plain slot indexes and holds no borrow of `key_lookup`, which
+    /// is what lets `DashTable::insert_or_update_slice` look a key up by
+    /// `&[u8]` and build the owned `CompactKey` ONLY on a miss — and lets
+    /// `DashTable::insert_or_update` move its owned key in after the scan
+    /// without the raw-pointer aliasing it used to need.
+    ///
+    /// Hot path: one `match_h2` + one `match_empty_or_deleted` per group
+    /// scanned — exactly the scan `insert_or_update_at` always did.
+    /// `Vacant(slot)` is only valid for an immediate [`Self::write_vacant`]
+    /// with no other mutation of this segment in between.
+    #[allow(unused_unsafe)] // prefetch_ptr is unsafe on x86_64 but safe on aarch64
+    pub fn probe_for_upsert<Q: ?Sized>(
+        &mut self,
+        h2: u8,
+        key_lookup: &Q,
+        bucket_a: usize,
+        bucket_b: usize,
+    ) -> UpsertProbe
+    where
+        K: Borrow<Q>,
+        Q: Eq,
     {
         // Track the first free slot found during our scan so we can reuse it on miss.
         let mut first_free: Option<usize> = None;
@@ -190,11 +233,7 @@ impl<K, V> Segment<K, V> {
                 let k = unsafe { self.keys[slot].assume_init_ref() };
                 super::note_key_compare();
                 if k.borrow() == key_lookup {
-                    // SAFETY: ctrl byte matches h2 and key compares equal (mirrors find),
-                    // so values[slot] is initialized.
-                    let v = unsafe { self.values[slot].assume_init_mut() };
-                    update(v);
-                    return SegmentInsertOrUpdate::Updated { slot };
+                    return UpsertProbe::Found(slot);
                 }
             }
         }
@@ -245,10 +284,7 @@ impl<K, V> Segment<K, V> {
                     let k = unsafe { self.keys[slot].assume_init_ref() };
                     super::note_key_compare();
                     if k.borrow() == key_lookup {
-                        // SAFETY: key match confirmed (mirrors find).
-                        let v = unsafe { self.values[slot].assume_init_mut() };
-                        update(v);
-                        return SegmentInsertOrUpdate::Updated { slot };
+                        return UpsertProbe::Found(slot);
                     }
                 }
             }
@@ -279,10 +315,7 @@ impl<K, V> Segment<K, V> {
                 let k = unsafe { self.keys[slot].assume_init_ref() };
                 super::note_key_compare();
                 if k.borrow() == key_lookup {
-                    // SAFETY: key match confirmed (mirrors find).
-                    let v = unsafe { self.values[slot].assume_init_mut() };
-                    update(v);
-                    return SegmentInsertOrUpdate::Updated { slot };
+                    return UpsertProbe::Found(slot);
                 }
             } else if (ctrl == EMPTY || ctrl == DELETED) && first_free.is_none() {
                 first_free = Some(slot);
@@ -319,10 +352,7 @@ impl<K, V> Segment<K, V> {
                         let k = unsafe { self.keys[slot].assume_init_ref() };
                         super::note_key_compare();
                         if k.borrow() == key_lookup {
-                            // SAFETY: key match confirmed (mirrors find).
-                            let v = unsafe { self.values[slot].assume_init_mut() };
-                            update(v);
-                            return SegmentInsertOrUpdate::Updated { slot };
+                            return UpsertProbe::Found(slot);
                         }
                     }
                 }
@@ -349,7 +379,7 @@ impl<K, V> Segment<K, V> {
 
         // --- Key not found: decide insert vs NeedsSplit ---
         if self.is_full() {
-            return SegmentInsertOrUpdate::NeedsSplit { update, make };
+            return UpsertProbe::Full;
         }
 
         // We have room. Use the first free slot found, or do a linear scan.
@@ -365,21 +395,40 @@ impl<K, V> Segment<K, V> {
             // Should never reach here since !is_full() guarantees a free slot.
             unreachable!("Segment not full but no free slot found")
         });
+        UpsertProbe::Vacant(free_slot)
+    }
 
-        // If the chosen slot is in a regular (non-stash) group that is neither
-        // home group, mark `has_non_home_keys` so the `find()` fallback scan is
-        // re-enabled. Otherwise subsequent lookups for this key would miss —
-        // they're gated on the flag (PERF-09). Mirrors the equivalent guard in
-        // `insert()` (lines 72-79).
-        if free_slot < REGULAR_SLOTS {
-            let slot_group = free_slot / 16;
-            if slot_group != group_a && slot_group != group_b {
+    /// Phase 2 of an upsert: fill the slot [`Self::probe_for_upsert`] just
+    /// answered `Vacant(slot)` for, and hand back the stored value.
+    ///
+    /// If the slot is in a regular (non-stash) group that is neither home
+    /// group, `has_non_home_keys` is raised so the `find()` fallback scan is
+    /// re-enabled — otherwise later lookups for this key would miss (they are
+    /// gated on the flag, PERF-09). Mirrors the equivalent guard in
+    /// `insert()`.
+    #[inline]
+    pub fn write_vacant(
+        &mut self,
+        slot: usize,
+        h2: u8,
+        key: K,
+        value: V,
+        bucket_a: usize,
+        bucket_b: usize,
+    ) -> &mut V {
+        debug_assert!(
+            slot < TOTAL_SLOTS && !Self::is_full_ctrl(self.ctrl_byte(slot)),
+            "write_vacant on an occupied slot {slot}"
+        );
+        if slot < REGULAR_SLOTS {
+            let slot_group = slot / 16;
+            if slot_group != bucket_a / 16 && slot_group != bucket_b / 16 {
                 self.has_non_home_keys = true;
             }
         }
-
-        let (k, v) = make();
-        self.write_slot(free_slot, h2, k, v);
-        SegmentInsertOrUpdate::Inserted { slot: free_slot }
+        self.set_ctrl_byte(slot, h2);
+        self.keys[slot] = MaybeUninit::new(key);
+        self.count += 1;
+        self.values[slot].write(value)
     }
 }

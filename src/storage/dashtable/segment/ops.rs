@@ -88,10 +88,10 @@ impl<K, V> Segment<K, V> {
                 continue;
             }
 
-            // SAFETY: the ctrl byte is FULL, so key and value are initialized.
             // The slot is marked EMPTY immediately below, before anything else
             // can observe it, so the moved-out pair is never read or dropped
             // through this segment again.
+            // SAFETY: the ctrl byte is FULL, so key and value are initialized.
             let (key, value) = unsafe {
                 (
                     self.keys[slot].assume_init_read(),
