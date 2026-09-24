@@ -1,3 +1,5 @@
+#[cfg(test)]
+mod cold_del_rewrite_tests;
 pub mod cold_index;
 #[cfg(test)]
 mod cold_index_rebuild_tests;
