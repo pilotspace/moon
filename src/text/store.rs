@@ -939,14 +939,22 @@ impl TextIndex {
             let token_count = tokens.len() as u32;
             field_lengths[field_idx] = token_count;
 
-            // Index each token
+            // Term ids in token order (a first occurrence assigns the id), then
+            // ONE posting insert per distinct term carrying all its positions:
+            // no `Vec` per token, no insert-then-extend (moon#884, moon#1220).
+            // The stable sort keeps each term's positions in token order, so
+            // the postings end up exactly as per-token appends left them.
+            let mut occurrences: Vec<(u32, u32)> = Vec::with_capacity(tokens.len());
             for (term, position) in &tokens {
                 let term_id = self.field_term_dicts[field_idx].get_or_insert(term);
-                self.field_postings[field_idx].add_term_occurrence(
-                    term_id,
-                    doc_id,
-                    Some(vec![*position]),
-                );
+                occurrences.push((term_id, *position));
+            }
+            occurrences.sort_by_key(|&(term_id, _)| term_id);
+            let mut positions: Vec<u32> = Vec::with_capacity(occurrences.len());
+            for group in occurrences.chunk_by(|a, b| a.0 == b.0) {
+                positions.clear();
+                positions.extend(group.iter().map(|&(_, p)| p));
+                self.field_postings[field_idx].add_term_positions(group[0].0, doc_id, &positions);
             }
 
             // Update field stats
