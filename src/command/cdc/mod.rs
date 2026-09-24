@@ -11,4 +11,4 @@
 
 pub mod read;
 
-pub use read::cdc_read;
+pub use read::{cdc_read, cdc_read_async};

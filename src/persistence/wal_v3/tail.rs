@@ -9,9 +9,9 @@
 //! - **Cursor-resumable.** `TailCursor` snapshots `(segment_seq, byte_offset,
 //!   last_lsn)`. A fresh reader constructed from a saved cursor picks up
 //!   exactly where the previous one left off, even across process restarts.
-//! - **Torn-write safe.** Each call re-reads the file metadata to learn the
-//!   current durable length. Records straddling the durable tail are
-//!   treated as "not ready yet" and return `Ok(None)`.
+//! - **Torn-write safe.** The reader re-reads the segment's length whenever
+//!   the cursor reaches the length it last observed. Records straddling the
+//!   durable tail are treated as "not ready yet" and return `Ok(None)`.
 //! - **Rotation aware.** When the current segment runs dry but a higher
 //!   sequence number exists on disk, the cursor advances to the next
 //!   segment automatically.
@@ -24,8 +24,12 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use super::record::{WalRecord, read_wal_v3_record};
+use super::record::{WalRecord, peek_wal_v3_record_lsn, read_wal_v3_record};
 use super::segment::{WAL_V3_HEADER_SIZE, WAL_V3_MAGIC, WAL_V3_VERSION, WalSegment};
+
+/// Bytes read per `pread` into the reader's buffer (moon#1181). Records are
+/// parsed out of the buffer; a record larger than this is read whole.
+pub const TAIL_READ_CHUNK: usize = 256 * 1024;
 
 /// Resumable position inside a per-shard WAL stream.
 ///
@@ -70,14 +74,46 @@ impl TailCursor {
     }
 }
 
+/// The segment the cursor is in, held open between records (moon#1181).
+struct OpenSegment {
+    seq: u64,
+    file: fs::File,
+    /// File length as last observed — re-read only when the cursor reaches it.
+    len: u64,
+    /// The header was validated (the first time the cursor sat at it).
+    header_checked: bool,
+}
+
+/// Outcome of [`WalTailReader::skip_below`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SkipOutcome {
+    /// The cursor is at the first record with `lsn >= from_lsn`, or at the
+    /// point where no further record is available yet (end of data, a torn
+    /// or corrupt record) — exactly where `read_next` would stop.
+    Reached,
+    /// The skip budget ran out first; the cursor is at the next record to
+    /// examine (every record before it has `lsn < from_lsn`).
+    BudgetExhausted,
+}
+
 /// Pull-based WAL tail reader.
 ///
 /// One instance per consumer. Not `Send` across threads concurrently — the
 /// internal cursor mutates on every `read_next`; wrap in a mutex if shared
 /// access is required.
+///
+/// moon#1181: the reader keeps its segment open and reads it in
+/// [`TAIL_READ_CHUNK`] blocks, parsing records out of the buffer. It used to
+/// re-stat the segment and open/seek/read/close it twice for EVERY record
+/// (~9 syscalls per record). The file length is re-read only when the cursor
+/// reaches the length last observed, so a live tail still sees new records.
 pub struct WalTailReader {
     wal_dir: PathBuf,
     cursor: TailCursor,
+    seg: Option<OpenSegment>,
+    /// Bytes `[buf_start, buf_start + buf.len())` of the open segment.
+    buf: Vec<u8>,
+    buf_start: u64,
 }
 
 impl WalTailReader {
@@ -86,6 +122,9 @@ impl WalTailReader {
         Self {
             wal_dir: wal_dir.as_ref().to_path_buf(),
             cursor,
+            seg: None,
+            buf: Vec::new(),
+            buf_start: 0,
         }
     }
 
@@ -115,32 +154,82 @@ impl WalTailReader {
     ///   (We never silently skip over corrupt records — that would mask
     ///   real durability bugs.)
     pub fn read_next(&mut self) -> std::io::Result<Option<WalRecord>> {
-        loop {
-            let seg_path = WalSegment::segment_path(&self.wal_dir, self.cursor.segment_seq);
-            let seg_meta = match fs::metadata(&seg_path) {
-                Ok(m) => m,
-                Err(_) => {
-                    // Current segment doesn't exist. Look for any later
-                    // segment that does — that lets us survive a recycled
-                    // segment 1 after WAL truncation.
-                    if let Some(next) = self.find_segment_after(self.cursor.segment_seq) {
-                        self.cursor.segment_seq = next;
-                        self.cursor.byte_offset = WAL_V3_HEADER_SIZE as u64;
-                        continue;
-                    }
-                    return Ok(None);
-                }
+        let Some(record_len) = self.next_record_len()? else {
+            return Ok(None);
+        };
+        let off = self.cursor.byte_offset;
+        let Some(bytes) = self.bytes_at(off, record_len)? else {
+            return Ok(None);
+        };
+        let Some(record) = read_wal_v3_record(bytes) else {
+            // Corrupt record — don't advance past it. Surface as "no data"
+            // so the caller can decide (panic, alert, skip-with-warning).
+            // Leaving the cursor pinned at the corrupt offset is the safe
+            // default.
+            return Ok(None);
+        };
+        self.cursor.byte_offset += record_len as u64;
+        if record.lsn > self.cursor.last_lsn {
+            self.cursor.last_lsn = record.lsn;
+        }
+        Ok(Some(record))
+    }
+
+    /// Advance past records with `lsn < from_lsn` without decoding their
+    /// payloads, validating each exactly as `read_next` would (a corrupt or
+    /// torn record stops the skip where `read_next` would stop), examining
+    /// at most `budget` records.
+    pub fn skip_below(&mut self, from_lsn: u64, budget: usize) -> std::io::Result<SkipOutcome> {
+        for _ in 0..budget {
+            let Some(record_len) = self.next_record_len()? else {
+                return Ok(SkipOutcome::Reached);
             };
-            let durable_len = seg_meta.len();
+            let off = self.cursor.byte_offset;
+            let Some(bytes) = self.bytes_at(off, record_len)? else {
+                return Ok(SkipOutcome::Reached);
+            };
+            match peek_wal_v3_record_lsn(bytes) {
+                Some(lsn) if lsn < from_lsn => {
+                    self.cursor.byte_offset += record_len as u64;
+                    if lsn > self.cursor.last_lsn {
+                        self.cursor.last_lsn = lsn;
+                    }
+                }
+                // At the target, or a corrupt record `read_next` stops on.
+                _ => return Ok(SkipOutcome::Reached),
+            }
+        }
+        Ok(SkipOutcome::BudgetExhausted)
+    }
+
+    /// Position on the next record and return its declared length, moving
+    /// to the next segment when the current one is exhausted. `None` when no
+    /// complete record is available (end of data, torn tail, zero padding).
+    fn next_record_len(&mut self) -> std::io::Result<Option<usize>> {
+        let mut refreshed = false;
+        loop {
+            if !self.ensure_segment_open()? {
+                return Ok(None);
+            }
+            let off = self.cursor.byte_offset;
+            let Some(seg) = self.seg.as_mut() else {
+                return Ok(None);
+            };
 
             // Need at least 4 bytes for the length prefix.
-            if self.cursor.byte_offset + 4 > durable_len {
+            if off + 4 > seg.len {
+                if !refreshed {
+                    // The segment may have grown since it was stat'd.
+                    refreshed = true;
+                    seg.len = seg.file.metadata()?.len();
+                    continue;
+                }
                 // No more data in the current segment. If a higher-sequence
                 // segment exists, jump to it; otherwise return None.
                 let next_seq = self.cursor.segment_seq + 1;
                 if WalSegment::segment_path(&self.wal_dir, next_seq).exists() {
-                    self.cursor.segment_seq = next_seq;
-                    self.cursor.byte_offset = WAL_V3_HEADER_SIZE as u64;
+                    self.move_to_segment(next_seq);
+                    refreshed = false;
                     continue;
                 }
                 return Ok(None);
@@ -148,59 +237,122 @@ impl WalTailReader {
 
             // Header sanity check on the first read of a new segment — guards
             // against pointing the cursor at a non-WAL file.
-            if self.cursor.byte_offset == WAL_V3_HEADER_SIZE as u64 {
+            if off == WAL_V3_HEADER_SIZE as u64 && !seg.header_checked {
+                let seq = seg.seq;
                 let mut hdr = [0u8; 7];
-                let bytes_read = read_at(&seg_path, 0, &mut hdr)?;
-                if bytes_read < 7 || &hdr[..6] != WAL_V3_MAGIC || hdr[6] != WAL_V3_VERSION {
+                let n = read_at(&seg.file, 0, &mut hdr)?;
+                if n < 7 || &hdr[..6] != WAL_V3_MAGIC || hdr[6] != WAL_V3_VERSION {
+                    let path = WalSegment::segment_path(&self.wal_dir, seq);
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
                         format!(
                             "not a WAL v3 segment: {:?}",
-                            seg_path.file_name().unwrap_or_default()
+                            path.file_name().unwrap_or_default()
                         ),
                     ));
+                }
+                if let Some(seg) = self.seg.as_mut() {
+                    seg.header_checked = true;
                 }
             }
 
             // Read just enough to learn the record length.
-            let mut len_buf = [0u8; 4];
-            let n = read_at(&seg_path, self.cursor.byte_offset, &mut len_buf)?;
-            if n < 4 {
+            let Some(len_bytes) = self.bytes_at(off, 4)? else {
                 return Ok(None);
-            }
-            let record_len = u32::from_le_bytes(len_buf) as u64;
+            };
+            let record_len =
+                u32::from_le_bytes([len_bytes[0], len_bytes[1], len_bytes[2], len_bytes[3]]) as u64;
             if record_len == 0 {
                 // Zero-padded tail — treat as "no record here yet".
                 return Ok(None);
             }
-            if self.cursor.byte_offset + record_len > durable_len {
+            let seg_len = self.seg.as_ref().map_or(0, |s| s.len);
+            if off + record_len > seg_len {
+                if !refreshed {
+                    refreshed = true;
+                    if let Some(seg) = self.seg.as_mut() {
+                        seg.len = seg.file.metadata()?.len();
+                    }
+                    continue;
+                }
                 // Record length declared but the tail isn't durable yet.
                 return Ok(None);
             }
+            return Ok(Some(record_len as usize));
+        }
+    }
 
-            // Pull the full record into a buffer (records are small — bytes,
-            // not pages — so this allocation is cheap and isolated).
-            let mut buf = vec![0u8; record_len as usize];
-            let n = read_at(&seg_path, self.cursor.byte_offset, &mut buf)?;
-            if (n as u64) < record_len {
-                return Ok(None);
+    /// Make sure the cursor's segment is open. `false` when no segment at or
+    /// after the cursor exists.
+    fn ensure_segment_open(&mut self) -> std::io::Result<bool> {
+        loop {
+            if self
+                .seg
+                .as_ref()
+                .is_some_and(|s| s.seq == self.cursor.segment_seq)
+            {
+                return Ok(true);
             }
-            let record = match read_wal_v3_record(&buf) {
-                Some(r) => r,
-                None => {
-                    // Corrupt record — don't advance past it. Surface as
-                    // "no data" so the caller can decide (panic, alert,
-                    // skip-with-warning). Leaving the cursor pinned at the
-                    // corrupt offset is the safe default.
-                    return Ok(None);
+            let path = WalSegment::segment_path(&self.wal_dir, self.cursor.segment_seq);
+            let file = match fs::File::open(&path) {
+                Ok(f) => f,
+                Err(_) => {
+                    // Current segment doesn't exist. Look for any later
+                    // segment that does — that lets us survive a recycled
+                    // segment 1 after WAL truncation.
+                    if let Some(next) = self.find_segment_after(self.cursor.segment_seq) {
+                        self.move_to_segment(next);
+                        continue;
+                    }
+                    self.seg = None;
+                    return Ok(false);
                 }
             };
-            self.cursor.byte_offset += record_len;
-            if record.lsn > self.cursor.last_lsn {
-                self.cursor.last_lsn = record.lsn;
-            }
-            return Ok(Some(record));
+            let len = file.metadata()?.len();
+            self.seg = Some(OpenSegment {
+                seq: self.cursor.segment_seq,
+                file,
+                len,
+                header_checked: false,
+            });
+            self.buf.clear();
+            self.buf_start = 0;
+            return Ok(true);
         }
+    }
+
+    fn move_to_segment(&mut self, seq: u64) {
+        self.cursor.segment_seq = seq;
+        self.cursor.byte_offset = WAL_V3_HEADER_SIZE as u64;
+        self.seg = None;
+        self.buf.clear();
+        self.buf_start = 0;
+    }
+
+    /// `n` bytes of the open segment at `off`, from the read-ahead buffer
+    /// (refilled with one `pread` of at least [`TAIL_READ_CHUNK`] bytes when
+    /// they are not buffered). `None` if the file holds fewer.
+    fn bytes_at(&mut self, off: u64, n: usize) -> std::io::Result<Option<&[u8]>> {
+        let buffered_end = self.buf_start + self.buf.len() as u64;
+        if !(off >= self.buf_start && off + n as u64 <= buffered_end) {
+            let Some(seg) = self.seg.as_ref() else {
+                return Ok(None);
+            };
+            let avail = seg.len.saturating_sub(off) as usize;
+            if avail < n {
+                return Ok(None);
+            }
+            let want = n.max(TAIL_READ_CHUNK).min(avail);
+            self.buf.resize(want, 0);
+            let got = read_at(&seg.file, off, &mut self.buf)?;
+            self.buf.truncate(got);
+            self.buf_start = off;
+            if got < n {
+                return Ok(None);
+            }
+        }
+        let start = (off - self.buf_start) as usize;
+        Ok(Some(&self.buf[start..start + n]))
     }
 
     /// Find the smallest segment sequence strictly greater than `after_seq`.
@@ -222,21 +374,28 @@ impl WalTailReader {
     }
 }
 
-/// Pread helper — reads up to `buf.len()` bytes at `offset` from `path`.
-/// Returns the number of bytes actually read (may be < buf.len() if the
-/// file ended). Reuses a fresh `File` per call to avoid holding file
-/// descriptors across `read_next` invocations; segments are small in number
-/// and the kernel page cache absorbs the open cost.
-fn read_at(path: &Path, offset: u64, buf: &mut [u8]) -> std::io::Result<usize> {
-    use std::io::{Read, Seek, SeekFrom};
-    let mut file = fs::File::open(path)?;
-    file.seek(SeekFrom::Start(offset))?;
+/// Read up to `buf.len()` bytes at `offset` from an open file; returns the
+/// number read (short only at end of file). Positional (`pread`) on unix, so
+/// the file's cursor is never moved.
+pub(crate) fn read_at(file: &fs::File, offset: u64, buf: &mut [u8]) -> std::io::Result<usize> {
     let mut total = 0;
     while total < buf.len() {
-        match file.read(&mut buf[total..])? {
-            0 => break,
-            n => total += n,
+        #[cfg(unix)]
+        let n = {
+            use std::os::unix::fs::FileExt;
+            file.read_at(&mut buf[total..], offset + total as u64)?
+        };
+        #[cfg(not(unix))]
+        let n = {
+            use std::io::{Read, Seek, SeekFrom};
+            let mut f = file;
+            f.seek(SeekFrom::Start(offset + total as u64))?;
+            f.read(&mut buf[total..])?
+        };
+        if n == 0 {
+            break;
         }
+        total += n;
     }
     Ok(total)
 }

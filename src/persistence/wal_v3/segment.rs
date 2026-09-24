@@ -1027,10 +1027,11 @@ impl WalWriterV3 {
     ///
     /// # Safety of in-flight readers
     ///
-    /// `WalTailReader` (CDC, replication) opens a fresh `File` per `read_at`
-    /// call and handles missing segments by advancing to the next available
-    /// sequence number (`find_segment_after`). Deletion under an open fd on
-    /// Linux is POSIX-safe. This method does not break in-flight readers.
+    /// `WalTailReader` (CDC, replication) holds its current segment open
+    /// (moon#1181) and handles missing segments by advancing to the next
+    /// available sequence number (`find_segment_after`). Deletion under an
+    /// open fd on Linux is POSIX-safe: the reader finishes the unlinked
+    /// segment it holds. This method does not break in-flight readers.
     ///
     /// # Arguments
     ///

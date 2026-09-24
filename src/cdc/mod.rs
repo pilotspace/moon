@@ -27,6 +27,8 @@ pub mod debezium;
 pub mod decode;
 pub mod event;
 pub mod fanout;
+/// Off-shard-thread pool for `CDC.READ` (moon#1181).
+pub(crate) mod read_pool;
 
 pub use debezium::{DebeziumEnvelope, encode_debezium};
 pub use decode::decode_wal_record;

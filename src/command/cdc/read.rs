@@ -14,16 +14,41 @@
 //!
 //! Notes / limitations (v1):
 //! - **Polling**, not streaming. Push-based CDC ships in C3b.
-//! - The handler opens a `WalTailReader` on every call. Consumers should
-//!   request `LIMIT >= 100` to amortize the per-poll filesystem walk.
 //! - When the WAL has no records `>= from_lsn`, returns `[from_lsn]` with
 //!   no envelopes -- a stable "no new data" signal the consumer can detect
 //!   without parsing the timestamp.
+//!
+//! Cost (moon#1181). A poll used to rebuild a tail reader at segment 1 and
+//! walk every retained record with ~9 syscalls each, on the shard thread —
+//! proportional to the retained WAL, not to `LIMIT` or to how far behind the
+//! consumer is. Now:
+//! - the connection task hands the read to a small off-shard pool
+//!   ([`cdc_read_async`], `cdc::read_pool`) and awaits it;
+//! - the start position comes from the position hint the previous poll left
+//!   for exactly this `(wal_dir, from_lsn)` (a sequential consumer), else
+//!   from the segment headers' first-LSN field (one 64-byte read per
+//!   segment), so at most one segment's records are skipped;
+//! - skipped records are validated without copying their payload, and a
+//!   call examines at most [`CDC_SKIP_BUDGET`] of them (the rest resumes on
+//!   the next poll from a hint);
+//! - the reader keeps each segment open and reads it in large `pread`
+//!   chunks.
+//!
+//! Envelopes and cursors are identical to the full scan for a well-formed
+//! WAL: records are yielded in the same order with the same `lsn >=
+//! from_lsn` filter. One difference: a corrupt record in a segment wholly
+//! BELOW `from_lsn` used to stall every later poll at that record; it is now
+//! skipped with its segment (a corrupt record at or after the cursor still
+//! stops the read exactly as before).
+
+use std::path::{Path, PathBuf};
 
 use bytes::Bytes;
 
 use crate::cdc::{decode_wal_record, encode_debezium};
-use crate::persistence::wal_v3::{TailCursor, WalTailReader};
+use crate::persistence::wal_v3::segment::{WAL_V3_HEADER_SIZE, WAL_V3_MAGIC, WAL_V3_VERSION};
+use crate::persistence::wal_v3::tail::SkipOutcome;
+use crate::persistence::wal_v3::{TailCursor, WalSegment, WalTailReader};
 use crate::protocol::{Frame, FrameVec};
 
 /// Default events per poll if LIMIT is omitted. Sized to fit comfortably in
@@ -33,20 +58,89 @@ const DEFAULT_CDC_LIMIT: usize = 256;
 /// Hard ceiling -- prevents a runaway consumer from pinning a poll-thread.
 const MAX_CDC_LIMIT: usize = 10_000;
 
-/// Handle `CDC.READ <wal_dir> <from_lsn> [LIMIT N]`.
+/// Records one poll may skip on the way to `from_lsn` (moon#1181). A
+/// default 16 MiB segment holds fewer, so with the header seek this only
+/// binds for oversized segments; when it does, the poll answers "no new
+/// data" and leaves a hint the next poll resumes from.
+pub const CDC_SKIP_BUDGET: usize = 1 << 20;
+
+/// A parsed `CDC.READ` request.
+#[derive(Debug, Clone)]
+pub struct CdcReadRequest {
+    wal_dir: PathBuf,
+    from_lsn: u64,
+    limit: usize,
+}
+
+/// Handle `CDC.READ <wal_dir> <from_lsn> [LIMIT N]` synchronously, on the
+/// caller's thread (tests; the server uses [`cdc_read_async`]).
 pub fn cdc_read(args: &[Frame]) -> Frame {
-    // ── argument parsing ────────────────────────────────────────────
-    let (wal_dir, from_lsn, limit) = match parse_args(args) {
-        Ok(t) => t,
-        Err(e) => return Frame::Error(Bytes::from(format!("ERR CDC.READ: {}", e))),
+    match parse_request(args) {
+        Ok(req) => execute(&req, current_time_ms()),
+        Err(e) => e,
+    }
+}
+
+/// Handle `CDC.READ` OFF the shard thread (moon#1181): parse here, read the
+/// WAL on the CDC read pool, await the reply. Falls back to an inline read
+/// if the pool has no worker.
+pub async fn cdc_read_async(args: &[Frame]) -> Frame {
+    let req = match parse_request(args) {
+        Ok(req) => req,
+        Err(e) => return e,
     };
+    let ts_ms = current_time_ms();
+    let (tx, rx) = flume::bounded::<Frame>(1);
+    let job = move || {
+        let _ = tx.send(execute(&req, ts_ms));
+    };
+    if let Err(job) = crate::cdc::read_pool::submit(job) {
+        job();
+    }
+    rx.recv_async().await.unwrap_or_else(|_| {
+        Frame::Error(Bytes::from_static(
+            b"ERR CDC.READ reader exited without a reply",
+        ))
+    })
+}
+
+/// Parse the arguments; `Err` is the error reply.
+pub fn parse_request(args: &[Frame]) -> Result<CdcReadRequest, Frame> {
+    match parse_args(args) {
+        Ok((wal_dir, from_lsn, limit)) => Ok(CdcReadRequest {
+            wal_dir: PathBuf::from(wal_dir),
+            from_lsn,
+            limit,
+        }),
+        Err(e) => Err(Frame::Error(Bytes::from(format!("ERR CDC.READ: {}", e)))),
+    }
+}
+
+/// Drain a batch of envelopes for `req` (the blocking part).
+pub fn execute(req: &CdcReadRequest, ts_ms: i64) -> Frame {
+    let wal_dir = req.wal_dir.as_path();
+    let from_lsn = req.from_lsn;
+    let limit = req.limit;
+
+    // ── position ───────────────────────────────────────────────────
+    let start = locate_start(wal_dir, from_lsn);
+    let mut tail = WalTailReader::new(wal_dir, start);
+    match tail.skip_below(from_lsn, CDC_SKIP_BUDGET) {
+        Ok(SkipOutcome::Reached) => {}
+        Ok(SkipOutcome::BudgetExhausted) => {
+            // Every record before the cursor is below `from_lsn`: the next
+            // poll resumes here instead of skipping them again.
+            remember(wal_dir, from_lsn, tail.cursor());
+            return Frame::Array(FrameVec::from_elem(Frame::Integer(from_lsn as i64)));
+        }
+        Err(e) => {
+            return Frame::Error(Bytes::from(format!("ERR CDC.READ tail error: {}", e)));
+        }
+    }
 
     // ── drain ──────────────────────────────────────────────────────
-    let mut tail = WalTailReader::new(&wal_dir, TailCursor::start());
     let mut envelopes: FrameVec = FrameVec::new();
     let mut next_lsn = from_lsn;
-    let ts_ms = current_time_ms();
-
     while envelopes.len() < limit {
         match tail.read_next() {
             Ok(Some(rec)) => {
@@ -64,6 +158,8 @@ pub fn cdc_read(args: &[Frame]) -> Frame {
             }
         }
     }
+    // The consumer's next poll asks for `next_lsn`: leave it the position.
+    remember(wal_dir, next_lsn, tail.cursor());
 
     // ── response ───────────────────────────────────────────────────
     // First element is the cursor (next_lsn). Subsequent elements are
@@ -74,6 +170,150 @@ pub fn cdc_read(args: &[Frame]) -> Frame {
         out.push(env);
     }
     Frame::Array(out)
+}
+
+// ── start position ─────────────────────────────────────────────────────
+
+/// A position a previous poll left for `(wal_dir, lsn)`: every record before
+/// it in the chain has `lsn < lsn`. `base_lsn` is the segment header's
+/// first-LSN at the time, which revalidates the hint against a recreated
+/// directory.
+#[derive(Debug, Clone)]
+struct PositionHint {
+    wal_dir: PathBuf,
+    lsn: u64,
+    seq: u64,
+    offset: u64,
+    base_lsn: u64,
+}
+
+/// Hints for the most recent consumers (a handful at most in practice).
+const CDC_HINT_SLOTS: usize = 64;
+
+static HINTS: parking_lot::Mutex<Vec<PositionHint>> = parking_lot::const_mutex(Vec::new());
+
+/// Header of segment `seq`: its first-LSN when the file is a WAL v3 segment.
+fn segment_base_lsn(wal_dir: &Path, seq: u64) -> Option<u64> {
+    let file = std::fs::File::open(WalSegment::segment_path(wal_dir, seq)).ok()?;
+    let mut hdr = [0u8; WAL_V3_HEADER_SIZE];
+    let n = crate::persistence::wal_v3::tail::read_at(&file, 0, &mut hdr).ok()?;
+    if n < WAL_V3_HEADER_SIZE || &hdr[..6] != WAL_V3_MAGIC || hdr[6] != WAL_V3_VERSION {
+        return None;
+    }
+    Some(u64::from_le_bytes(hdr[28..36].try_into().ok()?))
+}
+
+fn remember(wal_dir: &Path, lsn: u64, cursor: TailCursor) {
+    let Some(base_lsn) = segment_base_lsn(wal_dir, cursor.segment_seq) else {
+        return;
+    };
+    let hint = PositionHint {
+        wal_dir: wal_dir.to_path_buf(),
+        lsn,
+        seq: cursor.segment_seq,
+        offset: cursor.byte_offset,
+        base_lsn,
+    };
+    let mut hints = HINTS.lock();
+    hints.retain(|h| !(h.lsn == lsn && h.wal_dir == hint.wal_dir));
+    if hints.len() >= CDC_HINT_SLOTS {
+        hints.remove(0);
+    }
+    hints.push(hint);
+}
+
+/// A remembered position for `(wal_dir, from_lsn)` that still describes the
+/// same file: header first-LSN unchanged, offset inside the file, and the
+/// record there (if any) valid with an LSN not past `from_lsn`.
+fn hinted_start(wal_dir: &Path, from_lsn: u64) -> Option<TailCursor> {
+    let hint = HINTS
+        .lock()
+        .iter()
+        .find(|h| h.lsn == from_lsn && h.wal_dir == wal_dir)
+        .cloned()?;
+    if segment_base_lsn(wal_dir, hint.seq)? != hint.base_lsn {
+        return None;
+    }
+    let file = std::fs::File::open(WalSegment::segment_path(wal_dir, hint.seq)).ok()?;
+    let len = file.metadata().ok()?.len();
+    if hint.offset < WAL_V3_HEADER_SIZE as u64 || hint.offset > len {
+        return None;
+    }
+    if hint.offset < len {
+        let mut head = [0u8; 4];
+        let n = crate::persistence::wal_v3::tail::read_at(&file, hint.offset, &mut head).ok()?;
+        if n == 4 {
+            let rlen = u32::from_le_bytes(head) as u64;
+            if rlen > 0 && hint.offset + rlen <= len {
+                let mut rec = vec![0u8; rlen as usize];
+                let n =
+                    crate::persistence::wal_v3::tail::read_at(&file, hint.offset, &mut rec).ok()?;
+                if n as u64 == rlen {
+                    let lsn = crate::persistence::wal_v3::record::peek_wal_v3_record_lsn(&rec)?;
+                    if lsn > from_lsn {
+                        return None;
+                    }
+                }
+            }
+        }
+    }
+    Some(TailCursor {
+        segment_seq: hint.seq,
+        byte_offset: hint.offset,
+        last_lsn: 0,
+    })
+}
+
+/// Where a scan for `from_lsn` starts: a validated hint, else the last
+/// segment of the chain whose header first-LSN is `<= from_lsn`, else (no
+/// readable, monotonic headers) the origin — the full scan.
+///
+/// The chain is the one the full scan walks: the first segment at or after
+/// sequence 1, then each next sequence while it exists.
+fn locate_start(wal_dir: &Path, from_lsn: u64) -> TailCursor {
+    if let Some(cursor) = hinted_start(wal_dir, from_lsn) {
+        return cursor;
+    }
+    let Ok(entries) = std::fs::read_dir(wal_dir) else {
+        return TailCursor::start();
+    };
+    let mut seqs: Vec<u64> = entries
+        .flatten()
+        .filter_map(|e| {
+            e.file_name()
+                .to_str()?
+                .strip_suffix(".wal")?
+                .parse::<u64>()
+                .ok()
+        })
+        .filter(|&seq| seq >= 1)
+        .collect();
+    seqs.sort_unstable();
+    let Some(&first) = seqs.first() else {
+        return TailCursor::start();
+    };
+    let mut best = first;
+    let mut prev_base = 0u64;
+    let mut expected = first;
+    for &seq in &seqs {
+        if seq != expected {
+            break; // the full scan stops at a gap
+        }
+        expected += 1;
+        let Some(base) = segment_base_lsn(wal_dir, seq) else {
+            return TailCursor::start();
+        };
+        if base < prev_base {
+            // Non-monotonic first-LSNs (a pre-P0 WAL): only the full scan
+            // reproduces the record order.
+            return TailCursor::start();
+        }
+        prev_base = base;
+        if base <= from_lsn {
+            best = seq;
+        }
+    }
+    TailCursor::at_segment(best)
 }
 
 fn parse_args(args: &[Frame]) -> Result<(String, u64, usize), String> {
@@ -259,3 +499,6 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod seek_tests;
