@@ -7,6 +7,7 @@ use std::collections::BinaryHeap;
 use roaring::RoaringBitmap;
 use smallvec::SmallVec;
 
+use super::adc_kernel;
 use super::graph::{HnswGraph, SENTINEL};
 use crate::vector::aligned_buffer::AlignedBuffer;
 use crate::vector::distance;
@@ -145,6 +146,15 @@ thread_local! {
     /// simply miss the cache and allocate, exactly like before.
     static SCRATCH_TLS: std::cell::RefCell<Option<SearchScratch>> =
         const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only switch: route the budgeted 16-level arm through the
+    /// pre-moon#1193 serial loop so equivalence tests can run the SAME
+    /// search old-vs-new on one fixture.
+    pub(crate) static LEGACY_BUDGETED_ADC: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
 }
 
 /// Take this thread's cached [`SearchScratch`], or build a fresh one.
@@ -815,26 +825,21 @@ pub fn hnsw_search_filtered(
                 sum += adc_lut[(qi + 1) * 32 + (byte >> 4) as usize * 2 + s_hi];
             }
         } else {
-            for chunk in 0..chunks {
-                let base = chunk * check_interval;
-                for j in 0..check_interval {
-                    let i = base + j;
-                    let byte = code_only[i];
-                    let qi = i * 2;
-                    sum += adc_lut[qi * 16 + (byte & 0x0F) as usize];
-                    sum += adc_lut[(qi + 1) * 16 + (byte >> 4) as usize];
-                }
-                if sum > scaled_budget {
-                    return f32::MAX;
-                }
-            }
-            let tail = chunks * check_interval;
-            for j in 0..remainder {
-                let i = tail + j;
-                let byte = code_only[i];
-                let qi = i * 2;
-                sum += adc_lut[qi * 16 + (byte & 0x0F) as usize];
-                sum += adc_lut[(qi + 1) * 16 + (byte >> 4) as usize];
+            // moon#1193: the 16-level arm — WARM segments always take it, as
+            // do HOT segments without sub-centroid signs. 8 accumulators / 4
+            // bytes per step like the unbudgeted twin (bit-identical to it
+            // whenever the budget does not fire), no bounds checks, no unsafe.
+            #[cfg(test)]
+            let kernel = if LEGACY_BUDGETED_ADC.with(std::cell::Cell::get) {
+                adc_kernel::adc16_sum_budgeted_legacy
+            } else {
+                adc_kernel::adc16_sum_budgeted
+            };
+            #[cfg(not(test))]
+            let kernel = adc_kernel::adc16_sum_budgeted;
+            match kernel(code_only, adc_lut, scaled_budget) {
+                Some(s) => sum = s,
+                None => return f32::MAX,
             }
         }
         finish_tq(sum, norm)
