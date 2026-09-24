@@ -32,7 +32,7 @@
 //! | 6 | `maybe_has_expiring_keys` when the entry has a TTL | reproduced |
 //! | 7 | TTL re-supplied by the rebuilt entry, expiry index untouched | the TTL is simply never touched |
 //! | 8 | `last_access = now` (rebuilt entry) | reproduced |
-//! | 9 | LFU counter RESET to `LFU_INIT_VAL` (a side effect of rebuilding) | **preserved** — the key's access history survives a write, as the entry's other metadata does (moon#1168 asks for exactly this; redis's `lookupKeyWrite` bumps, never resets, the counter) |
+//! | 9 | LFU counter RESET to `LFU_INIT_VAL` (a side effect of rebuilding) | **preserved and bumped once** — the key's access history survives a write, and the lookup records ONE access (`note_access`), as redis's `lookupKeyWrite` does and as the INCR family does since moon#1221 review F3 (moon#1168, moon#1161) |
 //!
 //! A closure that did NOT write (BITFIELD whose every INCRBY hit `OVERFLOW
 //! FAIL` on a string already long enough) leaves the entry bit-for-bit
@@ -141,6 +141,9 @@ impl Database {
                 if entry.value.as_bytes().is_none() {
                     return StringMut::WrongType;
                 }
+                // (9) One access per command, recorded by the lookup like
+                // redis's `lookupKeyWrite` — whether or not `f` writes.
+                entry.note_access(crate::storage::eviction::access_tracking(), now_secs);
                 let old_cost = entry.value.estimate_memory();
                 let mut buf = StringBuf {
                     value: &mut entry.value,

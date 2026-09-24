@@ -159,3 +159,31 @@ fn a_counter_incr_creates_starts_at_the_initial_frequency() {
     assert_eq!(run(&mut db, b"INCR", &[b"fresh"]), Frame::Integer(1));
     assert_eq!(counter(&db, b"fresh"), INIT);
 }
+
+/// WS2's in-place string mutators (moon#1168) record exactly one access per
+/// command too: APPEND, SETRANGE and SETBIT on an existing key bump the LFU
+/// counter once, like SET's overwrite and the INCR family.
+#[test]
+fn in_place_string_mutators_record_exactly_one_access() {
+    let _lfu = exact_lfu();
+    for (name, args) in [
+        ("APPEND", &[b"k" as &[u8], b"x"][..]),
+        ("SETRANGE", &[b"k" as &[u8], b"0", b"y"][..]),
+        ("SETBIT", &[b"k" as &[u8], b"0", b"1"][..]),
+    ] {
+        let mut db = Database::new();
+        let _p = ClockPin::set(T0, u64::from(T0) * 1000);
+        db.refresh_now();
+        db.set(b"k", Entry::new_string(Bytes::from_static(b"v")));
+        assert_eq!(counter(&db, b"k"), INIT, "{name}: fixture");
+        for _ in 0..ROUNDS {
+            let r = run(&mut db, name.as_bytes(), args);
+            assert!(matches!(r, Frame::Integer(_)), "{name} failed: {r:?}");
+        }
+        assert_eq!(
+            counter(&db, b"k"),
+            INIT + ROUNDS,
+            "{name}: {ROUNDS} commands must record exactly {ROUNDS} accesses"
+        );
+    }
+}
