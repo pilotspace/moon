@@ -517,11 +517,11 @@ mod tests {
         // Real-clock deadlines: loading the image also drops entries that
         // are expired NOW, so the kept one must outlive the test.
         let now = crate::storage::entry::current_time_ms();
-        let mut dbs = vec![Database::new()];
-        in_flight(&mut dbs[0], b"gone", b"x", Some(now - 1));
-        in_flight(&mut dbs[0], b"kept", b"y", Some(now + 3_600_000));
+        let mut db = Database::new();
+        in_flight(&mut db, b"gone", b"x", Some(now - 1));
+        in_flight(&mut db, b"kept", b"y", Some(now + 3_600_000));
         let (sink, image) = fold_image_channel();
-        stream_fold_image(&[&dbs[0]], now, sink);
+        stream_fold_image(&[&db], now, sink);
         let mut out = Vec::new();
         write_fold_image(image, &mut out, "test").expect("image");
         assert!(
