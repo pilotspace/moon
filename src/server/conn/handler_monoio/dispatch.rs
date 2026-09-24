@@ -1520,8 +1520,7 @@ pub(super) fn try_enforce_acl(
     if conn.acl_skip_allowed() {
         return false;
     }
-    #[allow(clippy::unwrap_used)] // std RwLock: poison = prior panic = unrecoverable
-    let acl_guard = ctx.acl_table.read().unwrap();
+    let acl_guard = ctx.acl_table.read();
     if let Some(deny_reason) = acl_guard.check_command_permission(&conn.current_user, cmd, cmd_args)
     {
         drop(acl_guard);

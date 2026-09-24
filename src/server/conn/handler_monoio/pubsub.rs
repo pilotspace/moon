@@ -42,9 +42,7 @@ pub(super) fn try_handle_publish(
     // only the `&pattern` channel rule was consulted — so a `-@pubsub`
     // carve-out was silently ineffective for a user with `&*`.
     {
-        #[allow(clippy::unwrap_used)]
-        // std RwLock: poison = prior panic = unrecoverable
-        let acl_guard = ctx.acl_table.read().unwrap();
+        let acl_guard = ctx.acl_table.read();
         if let Some(deny_reason) =
             acl_guard.check_command_permission(&conn.current_user, cmd, cmd_args)
         {
@@ -182,9 +180,7 @@ pub(super) async fn try_handle_subscribe_entry<S: monoio::io::AsyncWriteRent>(
     // NOPERM error and bail via ArgError (caller flushes it and continues,
     // never entering the subscriber loop).
     {
-        #[allow(clippy::unwrap_used)]
-        // std RwLock: poison = prior panic = unrecoverable
-        let acl_guard = ctx.acl_table.read().unwrap();
+        let acl_guard = ctx.acl_table.read();
         if let Some(deny_reason) =
             acl_guard.check_command_permission(&conn.current_user, cmd, cmd_args)
         {
@@ -230,9 +226,7 @@ pub(super) async fn try_handle_subscribe_entry<S: monoio::io::AsyncWriteRent>(
         if let Some(ch) = extract_bytes(arg) {
             // ACL channel permission check
             {
-                #[allow(clippy::unwrap_used)]
-                // std RwLock: poison = prior panic = unrecoverable
-                let acl_guard = ctx.acl_table.read().unwrap();
+                let acl_guard = ctx.acl_table.read();
                 if let Some(deny_reason) =
                     acl_guard.check_channel_permission(&conn.current_user, ch.as_ref())
                 {

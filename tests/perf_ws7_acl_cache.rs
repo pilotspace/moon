@@ -192,3 +192,47 @@ fn restricted_user_revocation_applies_immediately() {
     );
     assert_eq!(b.send(&["GET", "app:2"]), "$1\r\ny\r\n");
 }
+
+/// CLAUDE.md "parking_lot only": the process-wide `AclTable` lock was a
+/// `std::sync::RwLock` (moon#1165), with a poison `unwrap()` at every site.
+/// Scans `src/` (or `MOON_SRC_ROOT`, to record the red run on an extracted
+/// `ae21476` tree) for either coming back.
+#[test]
+fn acl_table_lock_is_parking_lot() {
+    fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        for e in std::fs::read_dir(dir).unwrap().flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                walk(&p, out);
+            } else if p.extension().is_some_and(|x| x == "rs") {
+                out.push(p);
+            }
+        }
+    }
+    let root =
+        std::env::var("MOON_SRC_ROOT").unwrap_or_else(|_| env!("CARGO_MANIFEST_DIR").to_string());
+    let mut files = Vec::new();
+    walk(&std::path::Path::new(&root).join("src"), &mut files);
+    let mut hits = Vec::new();
+    for f in &files {
+        let src = std::fs::read_to_string(f).unwrap();
+        for (i, line) in src.lines().enumerate() {
+            let code = line.split("//").next().unwrap_or("");
+            let std_lock = code.contains("std::sync::RwLock") || code.contains("StdRwLock");
+            let poison_unwrap = code.contains("acl_table.read().unwrap()")
+                || code.contains("acl_table.write().unwrap()");
+            if (std_lock && (code.contains("AclTable") || code.contains("type StdRwLock")))
+                || poison_unwrap
+            {
+                hits.push(format!("{}:{}: {}", f.display(), i + 1, line.trim()));
+            }
+        }
+    }
+    assert!(
+        hits.is_empty(),
+        "the AclTable lock must be parking_lot::RwLock (no poison unwraps); \
+         {} std::sync::RwLock sites remain:\n{}",
+        hits.len(),
+        hits.join("\n")
+    );
+}

@@ -737,8 +737,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                                                         if let Some(channel) = extract_bytes(arg) {
                                                             // ACL channel permission check
                                                             let denied = {
-                                                                #[allow(clippy::unwrap_used)] // std RwLock: poison = prior panic = unrecoverable
-                                                                let acl_guard = ctx.acl_table.read().unwrap();
+                                                                let acl_guard = ctx.acl_table.read();
                                                                 acl_guard.check_channel_permission(&conn.current_user, channel.as_ref())
                                                             };
                                                             if let Some(deny_reason) = denied {
@@ -797,8 +796,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                                                     for arg in cmd_args {
                                                         if let Some(channel) = extract_bytes(arg) {
                                                             let denied = {
-                                                                #[allow(clippy::unwrap_used)] // std RwLock: poison = prior panic = unrecoverable
-                                                                let acl_guard = ctx.acl_table.read().unwrap();
+                                                                let acl_guard = ctx.acl_table.read();
                                                                 acl_guard.check_channel_permission(&conn.current_user, channel.as_ref())
                                                             };
                                                             if let Some(deny_reason) = denied {
@@ -911,8 +909,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                                                         if let Some(pattern) = extract_bytes(arg) {
                                                             // ACL channel permission check
                                                             let denied = {
-                                                                #[allow(clippy::unwrap_used)] // std RwLock: poison = prior panic = unrecoverable
-                                                                let acl_guard = ctx.acl_table.read().unwrap();
+                                                                let acl_guard = ctx.acl_table.read();
                                                                 acl_guard.check_channel_permission(&conn.current_user, pattern.as_ref())
                                                             };
                                                             if let Some(deny_reason) = denied {

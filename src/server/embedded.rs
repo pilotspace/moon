@@ -220,9 +220,9 @@ pub async fn run_embedded(
     crate::admin::metrics_setup::set_global_repl_state(repl_state.clone());
 
     // ACL table (loads aclfile if configured; default no-op otherwise).
-    let acl_table: Arc<std::sync::RwLock<crate::acl::AclTable>> = Arc::new(std::sync::RwLock::new(
-        crate::acl::AclTable::load_or_default(&config),
-    ));
+    let acl_table: Arc<parking_lot::RwLock<crate::acl::AclTable>> = Arc::new(
+        parking_lot::RwLock::new(crate::acl::AclTable::load_or_default(&config)),
+    );
 
     // WS5b fix-first review (item 3): `--db-maxmemory` is trusted operator
     // config, not wire input — fail fast on a malformed/out-of-range entry

@@ -102,8 +102,7 @@ pub(super) async fn run_subscriber_step<S: tokio::io::AsyncRead + tokio::io::Asy
                                 }
                                 for arg in cmd_args {
                                     if let Some(ch) = extract_bytes(arg) {
-                                        #[allow(clippy::unwrap_used)] // std RwLock: poison = prior panic = unrecoverable
-                                        let acl_deny = { ctx.acl_table.read().unwrap().check_channel_permission(&conn.current_user, ch.as_ref()) };
+                                        let acl_deny = { ctx.acl_table.read().check_channel_permission(&conn.current_user, ch.as_ref()) };
                                         if let Some(reason) = acl_deny {
                                             let err = Frame::Error(Bytes::from(format!("NOPERM {}", reason)));
                                             write_buf.clear();
@@ -144,8 +143,7 @@ pub(super) async fn run_subscriber_step<S: tokio::io::AsyncRead + tokio::io::Asy
                                 }
                                 for arg in cmd_args {
                                     if let Some(ch) = extract_bytes(arg) {
-                                        #[allow(clippy::unwrap_used)] // std RwLock: poison = prior panic = unrecoverable
-                                        let acl_deny = { ctx.acl_table.read().unwrap().check_channel_permission(&conn.current_user, ch.as_ref()) };
+                                        let acl_deny = { ctx.acl_table.read().check_channel_permission(&conn.current_user, ch.as_ref()) };
                                         if let Some(reason) = acl_deny {
                                             let err = Frame::Error(Bytes::from(format!("NOPERM {}", reason)));
                                             write_buf.clear();
@@ -199,8 +197,7 @@ pub(super) async fn run_subscriber_step<S: tokio::io::AsyncRead + tokio::io::Asy
                                 }
                                 for arg in cmd_args {
                                     if let Some(pat) = extract_bytes(arg) {
-                                        #[allow(clippy::unwrap_used)] // std RwLock: poison = prior panic = unrecoverable
-                                        let acl_deny = { ctx.acl_table.read().unwrap().check_channel_permission(&conn.current_user, pat.as_ref()) };
+                                        let acl_deny = { ctx.acl_table.read().check_channel_permission(&conn.current_user, pat.as_ref()) };
                                         if let Some(reason) = acl_deny {
                                             let err = Frame::Error(Bytes::from(format!("NOPERM {}", reason)));
                                             write_buf.clear();
@@ -474,11 +471,9 @@ pub(super) async fn try_handle_subscribe<
     // Process subscribe arguments
     for arg in cmd_args {
         if let Some(ch) = extract_bytes(arg) {
-            #[allow(clippy::unwrap_used)] // std RwLock: poison = prior panic = unrecoverable
             let acl_deny = {
                 ctx.acl_table
                     .read()
-                    .unwrap()
                     .check_channel_permission(&conn.current_user, ch.as_ref())
             };
             if let Some(reason) = acl_deny {
@@ -598,8 +593,7 @@ pub(super) fn try_handle_publish(
         let message_arg = extract_bytes(&cmd_args[1]);
         // ACL channel permission check for PUBLISH
         if let Some(ref ch) = channel_arg {
-            #[allow(clippy::unwrap_used)] // std RwLock: poison = prior panic = unrecoverable
-            let acl_guard = ctx.acl_table.read().unwrap();
+            let acl_guard = ctx.acl_table.read();
             if let Some(deny_reason) =
                 acl_guard.check_channel_permission(&conn.current_user, ch.as_ref())
             {

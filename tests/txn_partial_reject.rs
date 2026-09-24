@@ -142,7 +142,7 @@ fn spawn_txn_server_thread(config: ServerConfig, num_shards: usize, cancel: Canc
                     let local = tokio::task::LocalSet::new();
 
                     let (snap_tx, snap_rx) = channel::watch(0u64);
-                    let acl_t = std::sync::Arc::new(std::sync::RwLock::new(
+                    let acl_t = std::sync::Arc::new(parking_lot::RwLock::new(
                         moon::acl::AclTable::load_or_default(&shard_config),
                     ));
                     let rt_cfg = std::sync::Arc::new(parking_lot::RwLock::new(

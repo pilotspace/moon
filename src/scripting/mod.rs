@@ -1270,7 +1270,7 @@ mod tests {
         let mut t = crate::acl::AclTable::new();
         t.ensure_default_user(None);
         t.apply_setuser("app", &["on", ">pw", "~app:*", "+@all"]);
-        crate::acl::ScriptAcl::for_user(&std::sync::Arc::new(std::sync::RwLock::new(t)), "app")
+        crate::acl::ScriptAcl::for_user(&std::sync::Arc::new(parking_lot::RwLock::new(t)), "app")
     }
 
     /// The bug: a script that DECLARES no key used to reach any key at all,

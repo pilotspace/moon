@@ -96,7 +96,7 @@ impl super::Shard {
         repl_state_ext: Option<Arc<parking_lot::RwLock<ReplicationState>>>,
         cluster_state: Option<std::sync::Arc<parking_lot::RwLock<crate::cluster::ClusterState>>>,
         config_port: u16,
-        acl_table: Arc<std::sync::RwLock<crate::acl::AclTable>>,
+        acl_table: Arc<parking_lot::RwLock<crate::acl::AclTable>>,
         runtime_config: Arc<parking_lot::RwLock<RuntimeConfig>>,
         server_config: Arc<crate::config::ServerConfig>,
         spsc_notify: Arc<channel::Notify>,

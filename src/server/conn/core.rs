@@ -34,12 +34,6 @@ use crate::workspace::WorkspaceId;
 
 use super::affinity::{AffinityTracker, MigratedConnectionState};
 
-/// Type alias for std::sync::RwLock to distinguish from parking_lot::RwLock.
-/// `ReplicationState` no longer uses this (task #70 — migrated to
-/// `parking_lot::RwLock`, see `repl_state` below); it remains in use for
-/// `acl_table` and `cluster_state`, which are out of scope for that migration.
-pub(crate) type StdRwLock<T> = std::sync::RwLock<T>;
-
 /// Immutable context shared across all connections on a shard.
 ///
 /// Created once per shard and passed by reference to each connection handler.
@@ -70,7 +64,7 @@ pub(crate) struct ConnectionContext {
     pub lua: Rc<mlua::Lua>,
     pub script_cache: Rc<RefCell<crate::scripting::ScriptCache>>,
     pub config_port: u16,
-    pub acl_table: Arc<StdRwLock<AclTable>>,
+    pub acl_table: Arc<parking_lot::RwLock<AclTable>>,
     pub runtime_config: Arc<parking_lot::RwLock<RuntimeConfig>>,
     pub config: Arc<ServerConfig>,
     pub dispatch_tx: Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
@@ -113,7 +107,7 @@ impl ConnectionContext {
         lua: Rc<mlua::Lua>,
         script_cache: Rc<RefCell<crate::scripting::ScriptCache>>,
         config_port: u16,
-        acl_table: Arc<StdRwLock<AclTable>>,
+        acl_table: Arc<parking_lot::RwLock<AclTable>>,
         runtime_config: Arc<parking_lot::RwLock<RuntimeConfig>>,
         config: Arc<ServerConfig>,
         dispatch_tx: Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
@@ -478,7 +472,11 @@ impl ConnectionState {
     ///
     /// The registry write takes a stripe lock, which is fine here: AUTH and
     /// HELLO are per-session events, never the steady-state batch loop.
-    pub fn adopt_user(&mut self, username: String, acl_table: &StdRwLock<crate::acl::AclTable>) {
+    pub fn adopt_user(
+        &mut self,
+        username: String,
+        acl_table: &parking_lot::RwLock<crate::acl::AclTable>,
+    ) {
         self.current_user = username;
         self.refresh_acl_cache(acl_table);
         let user = self.current_user.clone();
@@ -497,11 +495,8 @@ impl ConnectionState {
     /// `try_apply_setuser`, `replace_with`), so a reader holding the read
     /// guard sees data and version from the same side of every mutation.
     #[inline]
-    pub fn refresh_acl_cache(&mut self, acl_table: &StdRwLock<crate::acl::AclTable>) {
-        // std RwLock: poison = prior panic = unrecoverable. Same convention
-        // used throughout the server for the acl_table lock.
-        #[allow(clippy::unwrap_used)]
-        let guard = acl_table.read().unwrap();
+    pub fn refresh_acl_cache(&mut self, acl_table: &parking_lot::RwLock<crate::acl::AclTable>) {
+        let guard = acl_table.read();
         self.acl_version_handle = guard.version_handle();
         self.cached_acl_unrestricted = guard.is_user_unrestricted(&self.current_user);
         self.cached_acl_version = guard.version();
@@ -527,7 +522,10 @@ impl ConnectionState {
     /// It never changes `current_user` (identity changes stay with
     /// AUTH/HELLO/RESET). Cost when nothing changed: one Acquire load.
     #[inline]
-    pub fn refresh_acl_cache_if_stale(&mut self, acl_table: &StdRwLock<crate::acl::AclTable>) {
+    pub fn refresh_acl_cache_if_stale(
+        &mut self,
+        acl_table: &parking_lot::RwLock<crate::acl::AclTable>,
+    ) {
         if !self.acl_cache_fresh() {
             self.refresh_acl_cache(acl_table);
         }
@@ -733,10 +731,10 @@ mod acl_cache_tests {
         ConnectionState::new(1, "127.0.0.1:1".into(), &None, 0, 1, false, 16, None)
     }
 
-    fn table() -> StdRwLock<AclTable> {
+    fn table() -> parking_lot::RwLock<AclTable> {
         let mut t = AclTable::new();
         t.ensure_default_user(None);
-        StdRwLock::new(t)
+        parking_lot::RwLock::new(t)
     }
 
     /// moon#1165: an unrelated mutation stales the cache; the batch-top
@@ -748,10 +746,8 @@ mod acl_cache_tests {
         c.refresh_acl_cache(&table);
         assert!(c.acl_skip_allowed());
 
-        #[allow(clippy::unwrap_used)]
         table
             .write()
-            .unwrap()
             .apply_setuser("probe", &["on", "nopass", "+ping"]);
         assert!(!c.acl_skip_allowed(), "a mutation must stale the cache");
         c.refresh_acl_cache_if_stale(&table);
@@ -768,8 +764,7 @@ mod acl_cache_tests {
         let table = table();
         let mut c = conn();
         c.refresh_acl_cache(&table);
-        #[allow(clippy::unwrap_used)]
-        table.write().unwrap().apply_setuser("default", &["-get"]);
+        table.write().apply_setuser("default", &["-get"]);
         c.refresh_acl_cache_if_stale(&table);
         assert!(
             !c.acl_skip_allowed(),
@@ -778,8 +773,7 @@ mod acl_cache_tests {
 
         // A deleted user never caches unrestricted either.
         c.current_user = "ghost".into();
-        #[allow(clippy::unwrap_used)]
-        table.write().unwrap().apply_setuser("default", &["+get"]);
+        table.write().apply_setuser("default", &["+get"]);
         c.refresh_acl_cache_if_stale(&table);
         assert!(!c.acl_skip_allowed(), "an unknown user must not skip");
     }

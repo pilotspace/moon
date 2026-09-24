@@ -63,7 +63,7 @@ pub fn script_acl_error(reason: &str) -> String {
 /// A resolved ACL identity plus the cached verdict that lets the hot path
 /// skip the lock.
 struct ScriptAclUser {
-    table: Arc<std::sync::RwLock<AclTable>>,
+    table: Arc<parking_lot::RwLock<AclTable>>,
     username: Box<str>,
     /// Shared ACL mutation counter (`AclTable::version_handle`). Survives
     /// `ACL LOAD`, which swaps the user set but preserves this handle.
@@ -153,10 +153,9 @@ impl ScriptAcl {
     /// `redis.call`) to snapshot the "unrestricted" verdict and the ACL
     /// version it was valid at.
     #[must_use]
-    pub fn for_user(table: &Arc<std::sync::RwLock<AclTable>>, username: &str) -> Self {
-        #[allow(clippy::unwrap_used)] // std RwLock: poison = prior panic = unrecoverable
+    pub fn for_user(table: &Arc<parking_lot::RwLock<AclTable>>, username: &str) -> Self {
         let (unrestricted, snapshot, version) = {
-            let guard = table.read().unwrap();
+            let guard = table.read();
             (
                 guard.is_user_unrestricted(username),
                 guard.version(),
@@ -233,8 +232,7 @@ impl ScriptAcl {
     /// Cold path: re-resolve under the ACL read lock.
     #[cold]
     fn check_locked(user: &ScriptAclUser, cmd: &[u8], args: &[Frame]) -> Option<String> {
-        #[allow(clippy::unwrap_used)] // std RwLock: poison = prior panic = unrecoverable
-        let guard = user.table.read().unwrap();
+        let guard = user.table.read();
         if let Some(reason) = guard.check_command_permission(&user.username, cmd, args) {
             return Some(reason);
         }
@@ -251,11 +249,11 @@ mod tests {
     use super::*;
     use bytes::Bytes;
 
-    fn table_with(user: &str, rules: &[&str]) -> Arc<std::sync::RwLock<AclTable>> {
+    fn table_with(user: &str, rules: &[&str]) -> Arc<parking_lot::RwLock<AclTable>> {
         let mut t = AclTable::new();
         t.ensure_default_user(None);
         t.apply_setuser(user, rules);
-        Arc::new(std::sync::RwLock::new(t))
+        Arc::new(parking_lot::RwLock::new(t))
     }
 
     fn arg(s: &str) -> Frame {
@@ -340,10 +338,8 @@ mod tests {
 
         // Revoke MID-SCRIPT: the cached "unrestricted" verdict must not
         // survive the version bump.
-        #[allow(clippy::unwrap_used)]
         table
             .write()
-            .unwrap()
             .apply_setuser("wide", &["resetkeys", "~app:*"]);
         assert!(
             acl.check(b"GET", &[arg("secret:x")]).is_some(),
@@ -356,8 +352,7 @@ mod tests {
     fn deleted_user_is_denied_not_promoted() {
         let table = table_with("app", &["on", ">pw", "~app:*", "+@all"]);
         let acl = ScriptAcl::for_user(&table, "app");
-        #[allow(clippy::unwrap_used)]
-        table.write().unwrap().del_user("app");
+        table.write().del_user("app");
         assert!(acl.check(b"GET", &[arg("app:ok")]).is_some());
     }
 

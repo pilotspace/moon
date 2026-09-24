@@ -1142,12 +1142,11 @@ mod exec_publish_queue_tests {
 /// which poisons the transaction as redis does; this EXEC-time check remains
 /// for rules that change between queue and EXEC.
 pub(crate) fn publish_channel_acl_deny(
-    acl_table: &std::sync::RwLock<crate::acl::AclTable>,
+    acl_table: &parking_lot::RwLock<crate::acl::AclTable>,
     user: &str,
     channel: &[u8],
 ) -> Option<Frame> {
-    #[allow(clippy::unwrap_used)] // std RwLock: poison = prior panic = unrecoverable
-    let guard = acl_table.read().unwrap();
+    let guard = acl_table.read();
     guard
         .check_channel_permission(user, channel)
         .map(|reason| Frame::Error(Bytes::from(format!("NOPERM {reason}"))))
@@ -1179,7 +1178,7 @@ pub(crate) fn publish_channel_acl_deny(
 /// A malformed argv (no channel) returns `None`; the queue gate's arity check
 /// has already refused it.
 pub(crate) fn queued_publish_channel_deny(
-    acl_table: &std::sync::RwLock<crate::acl::AclTable>,
+    acl_table: &parking_lot::RwLock<crate::acl::AclTable>,
     user: &str,
     cmd: &[u8],
     args: &[Frame],
@@ -1206,13 +1205,12 @@ pub(crate) fn queued_publish_channel_deny(
 /// default (monoio) build doesn't flag it as dead code.
 #[cfg(feature = "runtime-tokio")]
 pub(crate) fn pubsub_command_acl_deny(
-    acl_table: &std::sync::RwLock<crate::acl::AclTable>,
+    acl_table: &parking_lot::RwLock<crate::acl::AclTable>,
     user: &str,
     cmd: &[u8],
     cmd_args: &[Frame],
 ) -> Option<Frame> {
-    #[allow(clippy::unwrap_used)] // std RwLock: poison = prior panic = unrecoverable
-    let guard = acl_table.read().unwrap();
+    let guard = acl_table.read();
     guard
         .check_command_permission(user, cmd, cmd_args)
         .map(|reason| Frame::Error(Bytes::from(format!("NOPERM {reason}"))))
@@ -6636,13 +6634,13 @@ mod queued_publish_channel_tests {
     use crate::protocol::Frame;
     use bytes::Bytes;
 
-    fn table() -> std::sync::RwLock<AclTable> {
+    fn table() -> parking_lot::RwLock<AclTable> {
         let mut t = AclTable::new();
         t.apply_setuser(
             "c",
             &["on", "nopass", "~*", "resetchannels", "&allowed", "+@all"],
         );
-        std::sync::RwLock::new(t)
+        parking_lot::RwLock::new(t)
     }
 
     fn argv(parts: &[&str]) -> Vec<Frame> {

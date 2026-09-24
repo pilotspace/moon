@@ -46,8 +46,8 @@ macro_rules! send_bounded {
 
 use futures::{FutureExt, SinkExt, StreamExt};
 use parking_lot::Mutex;
+use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
-use std::sync::{Arc, RwLock};
 use tokio_util::codec::Framed;
 
 use crate::command::connection as conn_cmd;
@@ -153,7 +153,7 @@ pub async fn handle_connection(
     tracking_table: Arc<Mutex<TrackingTable>>,
     client_id: u64,
     repl_state: Option<Arc<parking_lot::RwLock<crate::replication::state::ReplicationState>>>,
-    acl_table: Arc<RwLock<crate::acl::AclTable>>,
+    acl_table: Arc<parking_lot::RwLock<crate::acl::AclTable>>,
     vector_store: Option<Arc<Mutex<crate::vector::store::VectorStore>>>,
     text_store: Option<Arc<Mutex<crate::text::store::TextStore>>>,
     #[cfg(feature = "graph")] graph_store: Option<Arc<Mutex<crate::graph::store::GraphStore>>>,
@@ -248,8 +248,7 @@ pub async fn handle_connection(
                                             if let Some(channel) = extract_bytes(arg) {
                                                 // ACL channel permission check
                                                 let deny = {
-                                                    #[allow(clippy::unwrap_used)] // std RwLock: poison = prior panic = unrecoverable
-                                                    let acl_guard = acl_table.read().unwrap();
+                                                    let acl_guard = acl_table.read();
                                                     acl_guard.check_channel_permission(&conn.current_user, channel.as_ref())
                                                 };
                                                 if let Some(deny_reason) = deny {
@@ -312,8 +311,7 @@ pub async fn handle_connection(
                                             if let Some(pattern) = extract_bytes(arg) {
                                                 // ACL channel permission check
                                                 let deny = {
-                                                    #[allow(clippy::unwrap_used)] // std RwLock: poison = prior panic = unrecoverable
-                                                    let acl_guard = acl_table.read().unwrap();
+                                                    let acl_guard = acl_table.read();
                                                     acl_guard.check_channel_permission(&conn.current_user, pattern.as_ref())
                                                 };
                                                 if let Some(deny_reason) = deny {
@@ -1354,8 +1352,7 @@ pub async fn handle_connection(
                                     if let Some(channel_or_pattern) = extract_bytes(arg) {
                                         // ACL channel permission check
                                         let deny = {
-                                            #[allow(clippy::unwrap_used)] // std RwLock: poison = prior panic = unrecoverable
-                                            let acl_guard = acl_table.read().unwrap();
+                                            let acl_guard = acl_table.read();
                                             acl_guard.check_channel_permission(&conn.current_user, channel_or_pattern.as_ref()).map(|r| r.to_string())
                                         };
                                         if let Some(deny_reason) = deny {
@@ -1764,8 +1761,7 @@ pub async fn handle_connection(
                         // whose cache is still fresh.  Stale caches (after ACL
                         // SETUSER / DELUSER / LOAD) fall through to the full check.
                         if !conn.acl_skip_allowed() {
-                            #[allow(clippy::unwrap_used)] // std RwLock: poison = prior panic = unrecoverable
-                            if let Some(deny_reason) = acl_table.read().unwrap().check_command_permission(
+                            if let Some(deny_reason) = acl_table.read().check_command_permission(
                                 &conn.current_user, cmd, cmd_args,
                             ) {
                                 conn.acl_log.push(crate::acl::AclLogEntry {
@@ -1788,8 +1784,7 @@ pub async fn handle_connection(
 
                             // === ACL key pattern check ===
                             let is_write = metadata::is_write(cmd);
-                            #[allow(clippy::unwrap_used)] // std RwLock: poison = prior panic = unrecoverable
-                            if let Some(deny_reason) = acl_table.read().unwrap().check_key_permission(
+                            if let Some(deny_reason) = acl_table.read().check_key_permission(
                                 &conn.current_user, cmd, cmd_args, is_write,
                             ) {
                                 conn.acl_log.push(crate::acl::AclLogEntry {

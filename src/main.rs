@@ -1112,9 +1112,9 @@ fn main() -> anyhow::Result<()> {
         };
 
     // Build ACL table from config (load aclfile if configured, else bootstrap from requirepass)
-    let acl_table: std::sync::Arc<std::sync::RwLock<moon::acl::AclTable>> = {
+    let acl_table: std::sync::Arc<parking_lot::RwLock<moon::acl::AclTable>> = {
         let table = moon::acl::AclTable::load_or_default(&config);
-        std::sync::Arc::new(std::sync::RwLock::new(table))
+        std::sync::Arc::new(parking_lot::RwLock::new(table))
     };
 
     // I/O driver selection — must land BEFORE any shard thread spawns so
