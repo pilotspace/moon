@@ -135,23 +135,23 @@ fn relative_expiry_rewrite_costs_one_allocation() {
     for (frame, expected) in [
         (
             cmd(&[b"SET", b"k", b"v", b"EX", b"100"]),
-            vec!["SET", "k", "v", "PXAT", "{ABS:100000}"].join("|"),
+            ["SET", "k", "v", "PXAT", "{ABS:100000}"].join("|"),
         ),
         (
             cmd(&[b"SET", b"k", b"v", b"NX", b"PX", b"250", b"GET"]),
-            vec!["SET", "k", "v", "NX", "PXAT", "{ABS:250}", "GET"].join("|"),
+            ["SET", "k", "v", "NX", "PXAT", "{ABS:250}", "GET"].join("|"),
         ),
         (
             cmd(&[b"SETEX", b"k", b"100", b"v"]),
-            vec!["SET", "k", "v", "PXAT", "{ABS:100000}"].join("|"),
+            ["SET", "k", "v", "PXAT", "{ABS:100000}"].join("|"),
         ),
         (
             cmd(&[b"PSETEX", b"k", b"500", b"v"]),
-            vec!["SET", "k", "v", "PXAT", "{ABS:500}"].join("|"),
+            ["SET", "k", "v", "PXAT", "{ABS:500}"].join("|"),
         ),
         (
             cmd(&[b"GETEX", b"k", b"EX", b"7"]),
-            vec!["PEXPIREAT", "k", "{ABS:7000}"].join("|"),
+            ["PEXPIREAT", "k", "{ABS:7000}"].join("|"),
         ),
     ] {
         let reply = if matches!(&frame, Frame::Array(a) if a.len() == 4 && matches!(&a[0], Frame::BulkString(b) if b.as_ref() == b"GETEX"))
