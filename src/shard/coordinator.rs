@@ -1644,17 +1644,26 @@ async fn coordinate_mset(
         send_owner_legs(groups, my_shard, db_index, dispatch_tx, spsc_notifiers).await;
 
     let mut local_append_failed = false;
+    // An error from the local slice (as the all-local fast path above
+    // checks): nothing was written, so nothing is logged and the slice does
+    // not count as applied.
+    let mut local_err: Option<Frame> = None;
     if !local_group.is_empty() {
         // moon#1228: an `MSET` over this shard's pairs through `run_local`,
         // so the BGSAVE capture hook in `cmd_dispatch` sees every key it
         // overwrites (a bare `set_string` loop captured nothing).
-        let _ = run_local(
+        let local_resp = run_local(
             shard_databases,
             db_index,
             cached_clock,
             b"MSET",
             &local_group[1..],
         );
+        if matches!(local_resp, Frame::Error(_)) {
+            local_err = Some(local_resp);
+        }
+    }
+    if local_err.is_none() && !local_group.is_empty() {
         // Local leg (review Finding 1): persist a synthesized MSET over
         // ONLY the local keys. The remote slices persist themselves on
         // their owner shards via MultiExecute -> wal_append_and_fanout;
@@ -1677,10 +1686,11 @@ async fn coordinate_mset(
     // Drain ALL remote acks even after a failure (every leg was already
     // dispatched) — but a timed-out, closed, or errored leg must NOT collapse
     // into OK: that would acknowledge an unconfirmed distributed write.
-    let mut leg_err: Option<Frame> = None;
+    let local_applied = !local_group.is_empty() && local_err.is_none();
+    let mut leg_err: Option<Frame> = local_err;
     // Whether any part of the MSET ran: the local slice, or a remote leg
     // that answered without an error.
-    let mut applied_parts = usize::from(!local_group.is_empty());
+    let mut applied_parts = usize::from(local_applied);
     for reply_rx in pending_shards {
         match recv_reply_bounded(reply_rx).await {
             Ok(frames) => match frames.into_iter().find(|f| matches!(f, Frame::Error(_))) {
