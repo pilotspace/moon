@@ -1330,3 +1330,37 @@ fn list_writes_bump_the_watch_version_exactly_once() {
          exists to refuse"
     );
 }
+
+/// moon#1198: KEYS walks the table and judges each entry it is ON — no
+/// per-key probe. The mutable path (the coordinator's multi-shard KEYS)
+/// cloned every key and probed each twice (`exists` + `peek_if_alive`); the
+/// shared-read path probed each once.
+#[test]
+fn keys_probes_nothing_per_key() {
+    let mut db = db_at(NOW);
+    for i in 0..100 {
+        db.set(
+            format!("k{i:03}").as_bytes(),
+            Entry::new_string(Bytes::from_static(b"v")),
+        );
+    }
+    // One already-expired key, which KEYS must skip.
+    let mut dead = Entry::new_string(Bytes::from_static(b"v"));
+    dead.set_expires_at_ms(NOW - 1);
+    db.set(b"k999", dead);
+    let (r, mutable) = probes(|| crate::command::key::keys(&mut db, &[bulk("k0*")]));
+    let Frame::Array(items) = r else {
+        panic!("KEYS answered {r:?}")
+    };
+    assert_eq!(items.len(), 100);
+    let (r, shared) = probes(|| crate::command::key::keys_readonly(&db, &[bulk("k*")], NOW));
+    let Frame::Array(items) = r else {
+        panic!("KEYS answered {r:?}")
+    };
+    assert_eq!(items.len(), 100, "the expired key is skipped");
+    assert_eq!(
+        (mutable, shared),
+        (0, 0),
+        "KEYS probed the table per key (mutable={mutable}, shared={shared}) — moon#1198"
+    );
+}
