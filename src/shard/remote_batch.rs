@@ -118,7 +118,11 @@ impl RemoteBatch {
     #[inline]
     pub(crate) fn recycle(&mut self, target: usize, mut meta: Vec<RemoteMeta>) {
         meta.clear();
+        // Only an EMPTY slot is replaced: a `push` for `target` between
+        // `take` and `recycle` put live bookkeeping there, and swapping it
+        // out would leave that queued frame without its `RemoteMeta`.
         if let Some(slot) = self.meta.get_mut(target)
+            && slot.is_empty()
             && slot.capacity() < meta.capacity()
         {
             *slot = meta;
