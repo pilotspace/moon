@@ -179,8 +179,14 @@ pub enum Frame {
     Boolean(bool),
     /// `=<len>\r\n<enc>:<data>\r\n` -- Verbatim string with encoding hint
     VerbatimString {
-        /// 3-byte encoding hint (e.g. "txt", "mkd")
-        encoding: Bytes,
+        /// 3-byte encoding hint (e.g. "txt", "mkd").
+        ///
+        /// Inline bytes, not a `Bytes`: the RESP3 wire fixes it at exactly
+        /// three, and a second `Bytes` here was the ONLY thing making `Frame`
+        /// 72 bytes instead of 40 — every `Frame` move (`push`,
+        /// `mem::replace`, `DispatchResult`, `ResponseSlot`) paid for it, and
+        /// the parser mallocs a 3-byte copy per verbatim reply (moon#1179).
+        encoding: [u8; 3],
         /// The string data
         data: Bytes,
     },
@@ -408,11 +414,12 @@ mod tests {
 
     #[test]
     fn frame_size_measurement() {
-        let size = std::mem::size_of::<Frame>();
-        println!("Frame size after FrameVec change: {} bytes (was 72)", size);
-        println!("FrameVec size: {} bytes", std::mem::size_of::<FrameVec>());
-        // Frame should stay small since FrameVec wraps Box (8 byte pointer)
-        assert!(size <= 72, "Frame size {} exceeds 72 bytes", size);
+        // moon#1179 item 2: every variant fits in 32 payload bytes once the
+        // verbatim encoding tag is inline `[u8; 3]` (it was a second `Bytes`,
+        // making every `Frame` 72 bytes). A regression here is a 44% bigger
+        // copy on every `push`, `mem::replace` and cross-shard reply.
+        assert_eq!(std::mem::size_of::<Frame>(), 40);
+        assert_eq!(std::mem::size_of::<FrameVec>(), 24);
     }
 
     /// moon#1179 item 1: `FrameVec` is a `Vec<Frame>` newtype — no box, so an

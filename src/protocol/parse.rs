@@ -394,7 +394,7 @@ fn parse_frame_zerocopy(buf: &Bytes, pos: &mut usize, config: &ParseConfig, dept
                 return Frame::Null;
             }
             let payload = &buf[*pos..*pos + len];
-            let encoding = Bytes::copy_from_slice(&payload[..3]);
+            let encoding = [payload[0], payload[1], payload[2]];
             let data = buf.slice(*pos + 4..*pos + len);
             *pos += len + 2;
             Frame::VerbatimString { encoding, data }
@@ -936,7 +936,7 @@ fn parse_single_frame(
                     offset: *pos + 3,
                 });
             }
-            let encoding = Bytes::copy_from_slice(&payload[..3]);
+            let encoding = [payload[0], payload[1], payload[2]];
             let data = Bytes::copy_from_slice(&payload[4..]);
             *pos += len + 2;
             Ok(Frame::VerbatimString { encoding, data })
@@ -1874,10 +1874,31 @@ mod tests {
         assert_eq!(
             result,
             Frame::VerbatimString {
-                encoding: Bytes::from_static(b"txt"),
+                encoding: *b"txt",
                 data: Bytes::from_static(b"Some string"),
             }
         );
+    }
+
+    /// moon#1179 item 2: the inline `[u8; 3]` tag round-trips byte-for-byte
+    /// on the RESP3 wire for any encoding, and RESP2 still downgrades to the
+    /// bare payload.
+    #[test]
+    fn verbatim_encoding_tag_round_trips_byte_identical() {
+        for wire in [
+            &b"=15\r\ntxt:Some string\r\n"[..],
+            &b"=11\r\nmkd:# hello\r\n"[..],
+        ] {
+            let frame = parse_bytes(wire).unwrap().unwrap();
+            let mut out = BytesMut::new();
+            crate::protocol::serialize_resp3(&frame, &mut out);
+            assert_eq!(&out[..], wire);
+        }
+        let frame = parse_bytes(b"=11\r\nmkd:# hello\r\n").unwrap().unwrap();
+        assert!(matches!(&frame, Frame::VerbatimString { encoding, .. } if encoding == b"mkd"));
+        let mut out = BytesMut::new();
+        crate::protocol::serialize(&frame, &mut out);
+        assert_eq!(&out[..], b"$7\r\n# hello\r\n");
     }
 
     #[test]

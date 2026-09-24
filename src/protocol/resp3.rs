@@ -21,7 +21,6 @@
 //! `WITHSCORES`, `WITHVALUES` and a `<count>` argument change the reply SHAPE.
 
 use super::{Frame, FrameVec};
-use bytes::Bytes;
 
 /// The RESP3 shape a command's reply must take.
 ///
@@ -332,7 +331,7 @@ fn bulk_to_double(frame: Frame) -> Frame {
 fn bulk_to_verbatim(frame: Frame) -> Frame {
     match frame {
         Frame::BulkString(data) => Frame::VerbatimString {
-            encoding: Bytes::from_static(b"txt"),
+            encoding: *b"txt",
             data,
         },
         other => other,
@@ -939,7 +938,7 @@ mod tests {
         assert_eq!(
             apply_shape(Resp3Shape::Verbatim, bulk("id=1 addr=x"), 3),
             Frame::VerbatimString {
-                encoding: Bytes::from_static(b"txt"),
+                encoding: *b"txt",
                 data: Bytes::from_static(b"id=1 addr=x"),
             }
         );
