@@ -163,25 +163,33 @@ fn warm_segment_ranks_exactly_like_its_hot_source() {
     }
 }
 
-/// A TQ4 segment whose sign buffer is all zeros — the shape of an
-/// insert-time placeholder (LIGHT TQ4A2 / SQ8) — via a persisted round trip.
+/// A TQ4 HOT segment whose sign buffer is all zeros — the shape of the
+/// insert-time placeholder pre-PR-#1221 builds carried for LIGHT TQ4A2/SQ8 —
+/// assembled in memory, so it holds whatever loaders do with such a file.
 fn zero_signed_segment(col: &Arc<CollectionMetadata>, data: &[Vec<f32>]) -> ImmutableSegment {
     let imm = segment(col, data);
-    let tmp = tempfile::tempdir().expect("tempdir");
-    write_immutable_segment(tmp.path(), 1, &imm, col).expect("persist");
-    let signs = tmp.path().join("segment-1/sub_signs.bin");
-    let len = std::fs::metadata(&signs).expect("signs").len() as usize;
-    std::fs::write(&signs, vec![0u8; len]).expect("zero signs");
-    let _ = std::fs::remove_file(tmp.path().join("segment-1/raw_f16.bin"));
-    read_immutable_segment(tmp.path(), 1).expect("reload").0
+    let graph = crate::vector::hnsw::graph::HnswGraph::from_bytes(&imm.graph().to_bytes())
+        .expect("graph round trip");
+    ImmutableSegment::new(
+        graph,
+        crate::vector::aligned_buffer::AlignedBuffer::from_vec(
+            imm.vectors_tq().as_slice().to_vec(),
+        ),
+        vec![0u8; imm.sub_centroid_signs().len()],
+        imm.sub_sign_bytes_per_vec(),
+        imm.mvcc_headers().to_vec(),
+        col.clone(),
+        imm.live_count(),
+        imm.total_count(),
+    )
 }
 
 #[test]
 fn placeholder_sign_buffers_are_not_carried_to_warm() {
-    // An all-zero buffer (LIGHT TQ4A2/SQ8 insert-time placeholders) would pin
-    // every coordinate to the lower sub-bin; SQ8 never reads signs at all.
-    // (TQ4A2 itself cannot be compacted in a debug build here: its beam trips
-    // a pre-existing code-layout assertion that a separate fix owns.)
+    // An all-zero buffer would pin every coordinate to the lower sub-bin, and
+    // SQ8 never reads signs: neither reaches codes.mpf. (TQ4A2 itself cannot
+    // be searched in a debug build on this base: its beam trips the ADC
+    // code-layout assertion fixed separately in PR #1221.)
     for (quant, build) in [
         (
             QuantizationConfig::Sq8,
@@ -191,7 +199,8 @@ fn placeholder_sign_buffers_are_not_carried_to_warm() {
     ] {
         let (_hot, warm, hot_signs, warm_seg, tmp) =
             hot_then_warm(quant, DistanceMetric::L2, 64, build);
-        assert!(!hot_signs.is_empty(), "{quant:?} fixture");
+        // SQ8: a zero-filled buffer on this base, EMPTY after PR #1221's
+        // "only real signs" fix — no signs either way.
         assert!(hot_signs.iter().all(|&b| b == 0), "{quant:?} fixture");
         assert!(warm_seg.sub_centroid_signs().is_empty(), "{quant:?}");
         let codes = std::fs::read(tmp.path().join("vectors/segment-1/codes.mpf")).unwrap();
