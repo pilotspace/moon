@@ -34,7 +34,7 @@ use crate::vector::hnsw::prepared::PreparedTqQuery;
 use crate::vector::hnsw::search::{SearchScratch, hnsw_search_filtered_prepared};
 use crate::vector::persistence::warm_segment::{
     VEC_CODES_SUB_HEADER_SIZE, VEC_FULL_SUB_HEADER_SIZE, VEC_GRAPH_SUB_HEADER_SIZE,
-    VEC_MVCC_SUB_HEADER_SIZE,
+    VEC_MVCC_SUB_HEADER_SIZE, codes_mpf_has_sub_signs,
 };
 use crate::vector::segment::key_index::KeyHashIndex;
 use crate::vector::segment::raw_f16_store::RawF16Store;
@@ -55,6 +55,12 @@ pub struct WarmSearchSegment {
     /// Contiguous TQ codes extracted from codes.mpf page payloads.
     /// Codes are in BFS order, same layout as ImmutableSegment.vectors_tq.
     codes_data: Vec<u8>,
+    /// Sub-centroid sign bits, BFS order, `sub_sign_bpv` bytes per vector —
+    /// carried in codes.mpf after the codes when `has_sub_signs` is set
+    /// (moon#1213), so the beam uses the same 32-level LUT the HOT segment
+    /// did. Empty for files written before that (16-level search).
+    sub_signs: Vec<u8>,
+    sub_sign_bpv: usize,
     /// HNSW graph deserialized from graph.mpf page payloads.
     graph: HnswGraph,
     /// Collection metadata (needed for TQ-ADC distance computation).
@@ -162,6 +168,45 @@ fn extract_payloads(mmap: &memmap2::Mmap, page_size: usize, sub_hdr_size: usize)
     }
 
     result
+}
+
+/// Split the sub-centroid signs off the codes.mpf payload stream
+/// (`codes ++ signs`, see `warm_segment::write_codes_mpf_with_sub_signs`).
+///
+/// Unflagged (every file written before moon#1213): no signs, codes
+/// untouched. Flagged: the stream must be exactly `n * (bytes_per_code +
+/// sub_bpv)` bytes — the beam reads signs by BFS position without bounds
+/// checks per read — otherwise the signs are dropped with a warning (16-level
+/// search) and the codes are kept.
+fn split_sub_signs(
+    segment_id: u64,
+    codes_data: &mut Vec<u8>,
+    flagged: bool,
+    n: usize,
+    bytes_per_code: usize,
+    sub_bpv: usize,
+) -> Vec<u8> {
+    if !flagged {
+        return Vec::new();
+    }
+    let codes_len = n * bytes_per_code;
+    let signs = if n > 0 && sub_bpv > 0 && codes_data.len() == codes_len + n * sub_bpv {
+        codes_data[codes_len..].to_vec()
+    } else {
+        tracing::warn!(
+            "warm segment {segment_id}: codes.mpf declares sub-centroid signs but holds {} \
+             bytes, expected {} ({n} x ({bytes_per_code} + {sub_bpv})) — ignoring them \
+             (search falls back to the 16-level LUT)",
+            codes_data.len(),
+            codes_len + n * sub_bpv
+        );
+        Vec::new()
+    };
+    if codes_data.len() > codes_len {
+        codes_data.truncate(codes_len);
+        codes_data.shrink_to_fit();
+    }
+    signs
 }
 
 /// Parse MVCC entries from mvcc.mpf payload bytes to extract global IDs and
@@ -349,7 +394,8 @@ impl WarmSearchSegment {
         }
 
         // Extract contiguous data from each file (skipping per-page sub-headers)
-        let codes_data = extract_payloads(&codes_mmap, PAGE_64K, VEC_CODES_SUB_HEADER_SIZE);
+        let codes_flagged = codes_mpf_has_sub_signs(&codes_mmap);
+        let mut codes_data = extract_payloads(&codes_mmap, PAGE_64K, VEC_CODES_SUB_HEADER_SIZE);
         let graph_payload = extract_payloads(&graph_mmap, PAGE_4K, VEC_GRAPH_SUB_HEADER_SIZE);
         let mvcc_payload = extract_payloads(&mvcc_mmap, PAGE_4K, VEC_MVCC_SUB_HEADER_SIZE);
 
@@ -405,6 +451,15 @@ impl WarmSearchSegment {
         })?;
 
         let total_count = graph.num_nodes();
+        let sub_sign_bpv = (collection_meta.padded_dimension as usize).div_ceil(8);
+        let sub_signs = split_sub_signs(
+            segment_id,
+            &mut codes_data,
+            codes_flagged,
+            total_count as usize,
+            graph.bytes_per_code() as usize,
+            sub_sign_bpv,
+        );
         let MvccRows {
             global_ids,
             key_hashes,
@@ -424,6 +479,8 @@ impl WarmSearchSegment {
         Ok(Self {
             segment_id,
             codes_data,
+            sub_signs,
+            sub_sign_bpv,
             graph,
             collection_meta,
             total_count,
@@ -531,9 +588,9 @@ impl WarmSearchSegment {
             return SmallVec::new();
         }
 
-        // Use hnsw_search_filtered (same function ImmutableSegment uses).
-        // No sub-centroid signs available for warm segments (not persisted in .mpf).
-        let empty_sub_signs: &[u8] = &[];
+        // Use hnsw_search_filtered (same function ImmutableSegment uses),
+        // with the HOT segment's sub-centroid signs when codes.mpf carried
+        // them (moon#1213; empty ⇒ the 16-level LUT, as before).
         let mut candidates = hnsw_search_filtered_prepared(
             &self.graph,
             &self.codes_data,
@@ -543,8 +600,8 @@ impl WarmSearchSegment {
             ef_search,
             scratch,
             allow_bitmap,
-            empty_sub_signs,
-            0,
+            &self.sub_signs,
+            self.sub_sign_bpv,
             // Warm segments carry no f16 sidecar — quantized ADC beam only.
             None,
             prepared,
@@ -761,6 +818,7 @@ impl WarmSearchSegment {
     #[inline]
     pub fn resident_bytes(&self) -> usize {
         self.codes_data.len()
+            + self.sub_signs.len()
             + self.graph.resident_bytes()
             + self.global_ids.len() * std::mem::size_of::<u32>()
             + self.key_hashes.len() * std::mem::size_of::<u64>()
@@ -773,6 +831,13 @@ impl WarmSearchSegment {
     #[inline]
     pub fn codes_data(&self) -> &[u8] {
         &self.codes_data
+    }
+
+    /// Sub-centroid sign bits (BFS order, `ceil(padded_dim/8)` bytes per
+    /// vector) — empty when the warm files carry none.
+    #[inline]
+    pub fn sub_centroid_signs(&self) -> &[u8] {
+        &self.sub_signs
     }
 
     /// Read-only access to the HNSW graph (for Vamana warm-start during cold transition).

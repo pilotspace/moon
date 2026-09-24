@@ -1520,12 +1520,29 @@ impl VectorIndex {
                 .raw_f16()
                 .filter(|halves| !halves.is_empty())
                 .map(crate::vector::segment::raw_f16_store::RawF16Store::le_bytes);
+            // moon#1213: carry the sub-centroid signs too, so the WARM beam
+            // keeps the HOT segment's 32-level LUT. Only a complete buffer
+            // (one row per entry) of REAL signs: SQ8's buffer is never read,
+            // and an all-zero buffer is an insert-time placeholder (LIGHT
+            // A2/SQ8) that would pin every coordinate to the lower sub-bin —
+            // the 16-level LUT is the unbiased fallback for those.
+            let sub_signs = imm.sub_centroid_signs();
+            let sub_signs: &[u8] = if self.collection.quantization != QuantizationConfig::Sq8
+                && !sub_signs.is_empty()
+                && sub_signs.len() == imm.mvcc_headers().len() * imm.sub_sign_bytes_per_vec()
+                && sub_signs.iter().any(|&b| b != 0)
+            {
+                sub_signs
+            } else {
+                &[]
+            };
 
-            match crate::storage::tiered::warm_tier::transition_to_warm(
+            match crate::storage::tiered::warm_tier::transition_to_warm_with_sub_signs(
                 shard_dir,
                 file_id, // segment_id == file_id
                 file_id,
                 codes_data,
+                sub_signs,
                 &graph_bytes,
                 raw_f16_bytes.as_deref(),
                 &mvcc_data,
