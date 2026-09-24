@@ -155,10 +155,13 @@ fn slot() -> Arc<ResponseSlot> {
     Arc::new(ResponseSlot::new())
 }
 
+/// A single routed command, as the connection handlers send one: a
+/// one-command `PipelineBatchSlotted` (the `ExecuteSlotted` variant this used
+/// had no production producer and was removed, moon#1198).
 fn one(command: Frame, slot: &Arc<ResponseSlot>) -> ShardMessage {
-    ShardMessage::ExecuteSlotted {
+    ShardMessage::PipelineBatchSlotted {
         db_index: 0,
-        command: Arc::new(command),
+        commands: vec![Arc::new(command)],
         response_slot: ResponseSlotPtr(Arc::clone(slot)),
     }
 }

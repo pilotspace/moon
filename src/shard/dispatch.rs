@@ -682,13 +682,6 @@ pub enum ShardMessage {
         commands: Vec<(Bytes, Frame)>, // (key, command) pairs for this shard
         reply_tx: channel::OneshotSender<Vec<Frame>>,
     },
-    /// Execute a batch of pipelined commands on this shard.
-    /// Each command is independent (not transactional). Returns one response per command.
-    PipelineBatch {
-        db_index: usize,
-        commands: Vec<std::sync::Arc<Frame>>,
-        reply_tx: channel::OneshotSender<Vec<Frame>>,
-    },
     /// Begin a cooperative snapshot at the given epoch.
     /// Shard creates SnapshotState and advances one segment per tick.
     /// Sends reply when snapshot is complete.
@@ -827,22 +820,11 @@ pub enum ShardMessage {
     ///
     /// Boxed (Phase 177) — `MigratedConnectionState` exceeds 120 B.
     MigrateConnection(Box<MigrateConnectionPayload>),
-    /// Execute a single command with pre-allocated response slot (zero allocation).
-    /// Used instead of Execute for cross-shard write dispatch.
-    ExecuteSlotted {
-        db_index: usize,
-        command: std::sync::Arc<Frame>,
-        response_slot: ResponseSlotPtr,
-    },
-    /// Execute multi-key sub-operation with pre-allocated response slot.
-    /// Used instead of MultiExecute for cross-shard multi-key dispatch.
-    MultiExecuteSlotted {
-        db_index: usize,
-        commands: Vec<(Bytes, Frame)>,
-        response_slot: ResponseSlotPtr,
-    },
-    /// Execute pipelined batch with pre-allocated response slot.
-    /// Used instead of PipelineBatch for cross-shard pipeline dispatch.
+    /// Execute pipelined batch with pre-allocated response slot — the
+    /// connection handlers' one routed-command message (a single remote
+    /// command is a batch of one). `ExecuteSlotted`, `MultiExecuteSlotted`
+    /// and the oneshot `PipelineBatch` had no producer and were removed
+    /// (moon#1198): duplicated arms drift, which is how moon#1162 happened.
     PipelineBatchSlotted {
         db_index: usize,
         commands: Vec<std::sync::Arc<Frame>>,

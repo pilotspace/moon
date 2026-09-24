@@ -289,11 +289,9 @@ fn frame_may_log(frame: &Frame) -> bool {
 /// command leg. No classification.
 pub(crate) fn routed_leg_len(msg: &ShardMessage) -> Option<usize> {
     match msg {
-        ShardMessage::Execute { .. } | ShardMessage::ExecuteSlotted { .. } => Some(1),
-        ShardMessage::PipelineBatch { commands, .. }
-        | ShardMessage::PipelineBatchSlotted { commands, .. } => Some(commands.len()),
-        ShardMessage::MultiExecute { commands, .. }
-        | ShardMessage::MultiExecuteSlotted { commands, .. } => Some(commands.len()),
+        ShardMessage::Execute { .. } => Some(1),
+        ShardMessage::PipelineBatchSlotted { commands, .. } => Some(commands.len()),
+        ShardMessage::MultiExecute { commands, .. } => Some(commands.len()),
         ShardMessage::TxnExecute(payload) => Some(payload.commands.len()),
         _ => None,
     }
@@ -303,15 +301,11 @@ pub(crate) fn routed_leg_len(msg: &ShardMessage) -> Option<usize> {
 /// log. A script counts as one; its extra records come out of the headroom.
 fn routed_leg_records(msg: &ShardMessage) -> usize {
     match msg {
-        ShardMessage::Execute { command, .. } | ShardMessage::ExecuteSlotted { command, .. } => {
-            usize::from(frame_may_log(command))
-        }
-        ShardMessage::PipelineBatch { commands, .. }
-        | ShardMessage::PipelineBatchSlotted { commands, .. } => {
+        ShardMessage::Execute { command, .. } => usize::from(frame_may_log(command)),
+        ShardMessage::PipelineBatchSlotted { commands, .. } => {
             commands.iter().filter(|c| frame_may_log(c)).count()
         }
-        ShardMessage::MultiExecute { commands, .. }
-        | ShardMessage::MultiExecuteSlotted { commands, .. } => {
+        ShardMessage::MultiExecute { commands, .. } => {
             commands.iter().filter(|(_, c)| frame_may_log(c)).count()
         }
         ShardMessage::TxnExecute(payload) => {
@@ -332,30 +326,12 @@ pub(crate) fn refuse_routed_leg(msg: ShardMessage) {
         ShardMessage::Execute { reply_tx, .. } => {
             let _ = reply_tx.send(crate::shard::dispatch::ExecReply::plain(err()));
         }
-        ShardMessage::PipelineBatch {
-            commands, reply_tx, ..
-        } => {
-            let _ = reply_tx.send(commands.iter().map(|_| err()).collect());
-        }
         ShardMessage::MultiExecute {
             commands, reply_tx, ..
         } => {
             let _ = reply_tx.send(commands.iter().map(|_| err()).collect());
         }
-        ShardMessage::ExecuteSlotted { response_slot, .. } => {
-            // Arc-owned slot: the refcount keeps it alive.
-            response_slot.0.fill(vec![err()]);
-        }
         ShardMessage::PipelineBatchSlotted {
-            commands,
-            response_slot,
-            ..
-        } => {
-            response_slot
-                .0
-                .fill(commands.iter().map(|_| err()).collect());
-        }
-        ShardMessage::MultiExecuteSlotted {
             commands,
             response_slot,
             ..

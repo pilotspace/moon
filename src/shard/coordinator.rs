@@ -1160,7 +1160,7 @@ fn extract_key(frame: &Frame) -> Option<Bytes> {
 /// backoff — and (b) could block graceful shutdown forever on a wedged target.
 ///
 /// **Give-up semantics:** on `Backpressure` the message (`pending`) is dropped.
-/// For a reply-carrying message (`MultiExecute`/`MultiExecuteSlotted`/…) this
+/// For a reply-carrying message (`MultiExecute`/`Execute`/…) this
 /// drops the embedded reply sender, so the awaiting caller's `reply_rx.recv()`
 /// resolves to `Err` and it synthesizes a per-shard error for that slice of the
 /// response — the same closed-channel path callers already handle. Fire-and-
@@ -1491,7 +1491,7 @@ async fn coordinate_mget(
                 }
             });
         } else {
-            // Remote dispatch: batch of GET commands via MultiExecuteSlotted
+            // Remote dispatch: batch of GET commands via MultiExecute
             let (reply_tx, reply_rx) = channel::oneshot();
             let commands: Vec<(Bytes, Frame)> = indexed_keys
                 .iter()
