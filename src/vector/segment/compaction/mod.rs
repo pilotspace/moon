@@ -12,6 +12,8 @@
 
 mod compact_path;
 mod graph_build;
+#[cfg(test)]
+mod graph_oracle_tests;
 mod merge;
 #[cfg(test)]
 mod qjl_drop_tests;

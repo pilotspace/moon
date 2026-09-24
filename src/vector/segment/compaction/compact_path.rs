@@ -20,6 +20,13 @@ use crate::vector::segment::sub_signs::SubSignEncoder;
 use crate::vector::turbo_quant::collection::{CollectionMetadata, QuantizationConfig};
 use crate::vector::turbo_quant::sq8::{decode_sq8, sq8_params};
 
+#[cfg(test)]
+thread_local! {
+    /// Test-only: vectors decoded into the graph-build oracle by `compact`
+    /// on this thread (mechanism proxy for the EXACT no-decode fix).
+    pub(super) static DECODED_BUILD_ROWS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Convert a frozen mutable segment into an optimized immutable segment.
 ///
 /// Steps: filter dead -> encode TQ -> build HNSW -> verify recall -> BFS reorder ->
@@ -154,8 +161,15 @@ pub fn compact(
         Vec::new()
     };
 
-    // Also decode TQ → centroid for sub-centroid sign computation (needed later).
-    let all_rotated: Vec<Vec<f32>> = if need_cpu_build {
+    // Decoded TQ/SQ8 vectors: the graph-build oracle when no raw f32 is
+    // retained (LIGHT, or a rebuild from reloaded codes). EXACT builds from
+    // `live_f32` and used to decode these anyway — nothing read them (sub-
+    // centroid signs come from the raw vectors): n·(4·padded + 24) bytes of
+    // transient heap, 78.6 MB at 20K × 768d, plus the decode work
+    // (moon#1213).
+    let all_rotated: Vec<Vec<f32>> = if need_cpu_build && !has_raw {
+        #[cfg(test)]
+        DECODED_BUILD_ROWS.with(|c| c.set(c.get() + n));
         let mut rotated: Vec<Vec<f32>> = Vec::with_capacity(n);
         if is_sq8 {
             // SQ8: decode `dim` u8 codes via per-vector (min, scale) into an f32
