@@ -535,10 +535,14 @@ pub fn hnsw_search_filtered_prepared(
     // These invariants describe the TQ nibble-packed layout; SQ8 uses a different
     // slot (dim u8 codes + 8-byte trailer) and its own ADC, so they don't apply.
     if !is_sq8 {
+        // The collection's packed layout, NOT `padded_dim / 2`: TQ4A2 packs
+        // a coordinate PAIR per nibble (`padded_dim / 4` bytes), so the old
+        // `padded_dim / 2` form fired on every TQ4A2 graph search in debug.
+        // The loops only need `2·code_len` LUT rows, checked above.
         debug_assert_eq!(
             code_len,
-            padded_dim / 2,
-            "code_len must equal padded_dim/2 for nibble-packed codes",
+            collection.code_bytes_per_vector(),
+            "code_len must match the collection's packed code layout",
         );
         debug_assert_eq!(
             adc_lut.len(),
@@ -665,9 +669,11 @@ pub fn hnsw_search_filtered_prepared(
         } else {
             // 4-way unrolled with independent accumulators for ILP.
             // Uses unsafe get_unchecked to eliminate bounds checks in the hot loop.
-            // SAFETY: qi*16 + nibble is always < padded_dim*16 = adc_lut.len(),
-            // because i < code_only.len() == code_len, and code_len = padded_dim/2.
-            // So qi = i*2 < padded_dim, and qi*16 + 15 < padded_dim*16.
+            // SAFETY: qi*16 + nibble < 2·code_len·16 <= adc_lut.len(): i <
+            // code_only.len() == code_len, so qi = i*2 < 2·code_len, and the
+            // LUT length is checked against 2·code_len rows once per search
+            // above (code_len is padded_dim/2 for scalar TQ, padded_dim/4 for
+            // TQ4A2 — whose LUT holds more rows than the code reads).
             let lut_ptr = adc_lut.as_ptr();
             let code_ptr = code_only.as_ptr();
             let n = code_only.len();

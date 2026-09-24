@@ -5,10 +5,18 @@
 //! deterministic TQ4 fixture and runs the SAME searches through the legacy
 //! and the new code paths.
 
+use std::path::Path;
+use std::sync::Arc;
+
+use crate::storage::tiered::SegmentHandle;
 use crate::vector::distance;
 use crate::vector::hnsw::build::HnswBuilder;
 use crate::vector::hnsw::graph::HnswGraph;
 use crate::vector::hnsw::search::{LEGACY_BUDGETED_ADC, SearchScratch, hnsw_search};
+use crate::vector::persistence::warm_search::WarmSearchSegment;
+use crate::vector::persistence::warm_segment::{write_codes_mpf, write_graph_mpf, write_mvcc_mpf};
+use crate::vector::segment::compaction::compact;
+use crate::vector::segment::mutable::MutableSegment;
 use crate::vector::turbo_quant::collection::{CollectionMetadata, QuantizationConfig};
 use crate::vector::turbo_quant::encoder::encode_tq_mse_scaled;
 use crate::vector::turbo_quant::fwht;
@@ -161,5 +169,91 @@ fn budgeted_adc_rewrite_keeps_topk_identical_on_fixture() {
             }
         }
         assert_eq!(compared, 48);
+    }
+}
+
+/// A TQ4A2 segment built by the production path (MutableSegment insert ->
+/// `compact`), laid out as a WARM segment (codes/graph/mvcc `.mpf`, no
+/// `vectors.mpf` so no sidecar rerank): the shape every WARM TQ4A2 index
+/// searches with — no sub-centroid signs, so every candidate past the first
+/// `ef` goes through the budgeted 16-level kernel with a `padded`-row LUT
+/// against `padded/4`-byte codes.
+fn warm_a2_segment(
+    dim: usize,
+    metric: DistanceMetric,
+    n: usize,
+    root: &Path,
+) -> (WarmSearchSegment, Vec<Vec<f32>>) {
+    distance::init();
+    fwht::init_fwht();
+    let col = Arc::new(CollectionMetadata::new(
+        11,
+        dim as u32,
+        metric,
+        QuantizationConfig::TurboQuant4A2,
+        1234,
+    ));
+    let padded = col.padded_dimension as usize;
+    assert_eq!(col.code_bytes_per_vector(), padded / 4, "A2 packs pairs");
+    let vectors = clustered(n, dim, 0x0A2A_2A2A ^ dim as u64);
+    let seg = MutableSegment::new(col.dimension, col.clone());
+    for (i, v) in vectors.iter().enumerate() {
+        seg.append(i as u64 + 1, v, i as u64 + 1);
+    }
+    let hot = compact(&seg.freeze(), &col, 4242, None).expect("A2 compact");
+    let seg_dir = root.join(format!("segment-{dim}"));
+    std::fs::create_dir_all(&seg_dir).unwrap();
+    write_codes_mpf(&seg_dir.join("codes.mpf"), 1, hot.vectors_tq().as_slice()).unwrap();
+    write_graph_mpf(&seg_dir.join("graph.mpf"), 1, &hot.graph().to_bytes()).unwrap();
+    write_mvcc_mpf(&seg_dir.join("mvcc.mpf"), 1, &hot.mvcc_raw_bytes()).unwrap();
+    let handle = SegmentHandle::new(1, seg_dir.clone());
+    let warm = WarmSearchSegment::from_files(&seg_dir, 1, col, handle, false).expect("warm");
+    (warm, vectors)
+}
+
+#[test]
+fn warm_tq4a2_graph_search_matches_the_legacy_budgeted_loop() {
+    // moon#1221 review red test. TQ4A2's LUT has `padded` rows but its code
+    // only `padded/4` bytes; the PR-head kernel chunked the LUT rows
+    // independently of the code: A2 DIM 5-8 (padded 8) panicked with an
+    // index out of bounds on the shard thread; A2 DIM 17-32 (padded 32)
+    // scored every budgeted candidate 0.0 (garbage ranking). HEAD's serial
+    // loop — the legacy reference here — indexed `lut[qi*16 + nibble]`
+    // directly. padded 128 (DIM 100) is the control: correct either way.
+    let tmp = tempfile::tempdir().unwrap();
+    for (dim, metric) in [
+        (6usize, DistanceMetric::L2),
+        (8, DistanceMetric::Cosine),
+        (20, DistanceMetric::L2),
+        (32, DistanceMetric::Cosine),
+        (100, DistanceMetric::L2),
+    ] {
+        let (warm, vectors) = warm_a2_segment(dim, metric, 300, tmp.path());
+        let padded = warm.collection_meta().padded_dimension;
+        for (qi, q) in vectors.iter().step_by(23).enumerate() {
+            for (k, ef) in [(10usize, 24usize), (5, 64)] {
+                let mut scratch = SearchScratch::new(0, padded);
+                LEGACY_BUDGETED_ADC.with(|c| c.set(true));
+                let old = warm.search(q, k, ef, &mut scratch);
+                LEGACY_BUDGETED_ADC.with(|c| c.set(false));
+                let new = warm.search(q, k, ef, &mut scratch);
+                assert_eq!(new.len(), k.min(300), "dim={dim} q={qi}");
+                let old_ids: Vec<u32> = old.iter().map(|r| r.id.0).collect();
+                let new_ids: Vec<u32> = new.iter().map(|r| r.id.0).collect();
+                assert_eq!(
+                    new_ids, old_ids,
+                    "dim={dim} {metric:?} q={qi} k={k} ef={ef}"
+                );
+                for (a, b) in new.iter().zip(old.iter()) {
+                    let tol = 1e-5 * a.distance.abs().max(b.distance.abs()).max(1e-6);
+                    assert!(
+                        (a.distance - b.distance).abs() <= tol,
+                        "dim={dim} {metric:?} q={qi}: distance {} vs legacy {}",
+                        a.distance,
+                        b.distance
+                    );
+                }
+            }
+        }
     }
 }

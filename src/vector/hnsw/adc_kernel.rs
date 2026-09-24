@@ -15,6 +15,16 @@
 //! fixed-size array or a nibble (`b & 0x0F`, `b >> 4` of a `u8`, both < 16)
 //! into a `[f32; 16]` row — the compiler proves all of them in bounds.
 //!
+//! **LUT shape.** The code reads exactly `2·code.len()` LUT rows (one per
+//! nibble), but the search hands over its whole `padded`-row LUT: for scalar
+//! TQ4 that is the same count (`code_len = padded/2`), for TQ4A2 twice as
+//! many (`code_len = padded/4` — one nibble per coordinate PAIR). Both
+//! kernels therefore cut the row view to the code's extent ([`code_rows`])
+//! BEFORE chunking, so the block/tail pairing of code bytes and rows holds
+//! for any LUT that is at least that long (moon#1221 review: chunking the
+//! whole LUT panicked on A2 padded 8 and scored every A2 padded-32 candidate
+//! 0.0).
+//!
 //! **Numeric contract.** The accumulator assignment (nibble `j` of each
 //! 4-byte step feeds `s[j]`) and the final reduction
 //! `(s0+s1)+(s2+s3)+(s4+s5)+(s6+s7)` are identical to the unbudgeted
@@ -64,6 +74,8 @@ fn block16(s: &mut Acc, code: &[u8; CHECK_BYTES], rows: &[[f32; 16]; 2 * CHECK_B
 
 /// Trailing `< CHECK_BYTES` code bytes: whole 4-byte steps first, then the
 /// last `< 4` bytes into `s[0]`/`s[1]` — the unbudgeted twin's tail order.
+/// `rows` must be exactly `2·code.len()` rows ([`code_rows`]); every pairing
+/// is then a zip of equal-length chunk views — no index can go out of bounds.
 #[inline(always)]
 fn tail(s: &mut Acc, code: &[u8], rows: &[[f32; 16]]) {
     let (b4, b_rem) = code.as_chunks::<4>();
@@ -71,22 +83,28 @@ fn tail(s: &mut Acc, code: &[u8], rows: &[[f32; 16]]) {
     for (b, r) in b4.iter().zip(r8.iter()) {
         step4(s, b, r);
     }
-    for (i, &b) in b_rem.iter().enumerate() {
-        s[0] += r_rem[2 * i][(b & 0x0F) as usize];
-        s[1] += r_rem[2 * i + 1][(b >> 4) as usize];
+    let (r2, _) = r_rem.as_chunks::<2>();
+    for (&b, r) in b_rem.iter().zip(r2.iter()) {
+        s[0] += r[0][(b & 0x0F) as usize];
+        s[1] += r[1][(b >> 4) as usize];
     }
 }
 
-/// Split the flat `padded_dim × 16` LUT into rows; `lut.len()` must be a
-/// multiple of 16 and hold at least `2·code.len()` rows.
+/// The LUT rows `code` reads: the first `2·code.len()` rows of the flat
+/// `rows × 16` LUT, or `None` when the LUT is shorter (a caller bug —
+/// `hnsw_search_filtered` checks the length once per search).
+///
+/// Cutting to the code's extent is what keeps the chunked loops correct for
+/// a LUT with MORE rows than the code reads (TQ4A2, see the module docs):
+/// blocks and tail of the code and of the rows then line up one to one.
 #[inline(always)]
-fn rows_of(lut: &[f32]) -> &[[f32; 16]] {
+fn code_rows<'a>(code: &[u8], lut: &'a [f32]) -> Option<&'a [[f32; 16]]> {
     let (rows, rest) = lut.as_chunks::<16>();
     debug_assert!(
         rest.is_empty(),
         "16-level ADC LUT length must be a multiple of 16"
     );
-    rows
+    rows.get(..code.len() * 2)
 }
 
 /// Unbudgeted 16-level TQ-ADC sphere sum over nibble-packed `code` — the
@@ -96,11 +114,10 @@ fn rows_of(lut: &[f32]) -> &[[f32; 16]] {
 #[cfg(test)]
 #[inline]
 pub(crate) fn adc16_sum(code: &[u8], lut: &[f32]) -> f32 {
-    let rows = rows_of(lut);
-    debug_assert!(
-        rows.len() >= code.len() * 2,
-        "ADC LUT shorter than the code"
-    );
+    let Some(rows) = code_rows(code, lut) else {
+        debug_assert!(false, "ADC LUT shorter than the code");
+        return f32::MAX;
+    };
     let mut s: Acc = [0.0; 8];
     let (blocks, code_tail) = code.as_chunks::<CHECK_BYTES>();
     let (row_blocks, row_tail) = rows.as_chunks::<{ 2 * CHECK_BYTES }>();
@@ -118,13 +135,17 @@ pub(crate) fn adc16_sum(code: &[u8], lut: &[f32]) -> f32 {
 /// the full sum — bit-identical to [`adc16_sum`]. LUT entries are squared
 /// differences (≥ 0), so partial sums are monotone and the early exit never
 /// rejects a candidate whose full sum would have qualified.
+///
+/// `lut` may hold more rows than the code reads (TQ4A2); only the first
+/// `2·code.len()` are used. A LUT shorter than that is a caller bug: it
+/// asserts in debug builds and returns `None` (candidate rejected) in
+/// release — never an out-of-bounds panic on the shard thread.
 #[inline]
 pub(crate) fn adc16_sum_budgeted(code: &[u8], lut: &[f32], scaled_budget: f32) -> Option<f32> {
-    let rows = rows_of(lut);
-    debug_assert!(
-        rows.len() >= code.len() * 2,
-        "ADC LUT shorter than the code"
-    );
+    let Some(rows) = code_rows(code, lut) else {
+        debug_assert!(false, "ADC LUT shorter than the code");
+        return None;
+    };
     let mut s: Acc = [0.0; 8];
     let (blocks, code_tail) = code.as_chunks::<CHECK_BYTES>();
     let (row_blocks, row_tail) = rows.as_chunks::<{ 2 * CHECK_BYTES }>();
@@ -233,11 +254,20 @@ mod tests {
         }
     }
 
-    /// A realistic LUT: `(q_j - c)^2` for a unit-ish rotated query and a
-    /// dimension-scaled 16-centroid codebook.
+    /// Scalar-TQ4 shape: `2 · code_len` LUT rows (see [`make_case_rows`]).
     fn make_case(rng: &mut Rng, code_len: usize) -> (Vec<u8>, Vec<f32>) {
-        let padded = code_len * 2;
-        let scale = 1.0 / (padded as f32).sqrt();
+        make_case_rows(rng, code_len, 2)
+    }
+
+    /// A realistic LUT: `(q_j - c)^2` for a unit-ish rotated query and a
+    /// dimension-scaled 16-centroid codebook, `rows_per_byte · code_len`
+    /// rows. The search always builds `padded` rows: scalar TQ4 has
+    /// `code_len = padded/2` (2 rows per code byte — exactly the rows the
+    /// code reads); TQ4A2 packs a coordinate PAIR per nibble, so `code_len =
+    /// padded/4` (4 rows per code byte — the code reads only the first half).
+    fn make_case_rows(rng: &mut Rng, code_len: usize, rows_per_byte: usize) -> (Vec<u8>, Vec<f32>) {
+        let padded = code_len * rows_per_byte;
+        let scale = 1.0 / (padded.max(1) as f32).sqrt();
         let centroids: Vec<f32> = (0..16)
             .map(|c| (c as f32 - 7.5) / 4.0 * scale * 1.5)
             .collect();
@@ -254,32 +284,51 @@ mod tests {
     }
 
     /// Every code length the kernel can see: padded dims are powers of two
-    /// (code_len = padded/2), plus odd/non-multiple-of-4/16 lengths to pin
-    /// the tail handling for any future layout.
+    /// (code_len = padded/2 for scalar TQ4, padded/4 for TQ4A2), plus
+    /// odd/non-multiple-of-4/16 lengths to pin the tail handling for any
+    /// future layout.
     const CODE_LENS: &[usize] = &[
         1, 2, 3, 4, 5, 7, 8, 12, 15, 16, 17, 31, 32, 33, 48, 64, 100, 128, 192, 256, 384, 512,
     ];
+
+    /// LUT rows per code byte the search hands the kernel: 2 (scalar TQ4 —
+    /// the LUT has exactly one row per code nibble) and 4 (TQ4A2 — the LUT
+    /// has `padded` rows, twice what the `padded/4`-byte code reads).
+    const ROWS_PER_BYTE: &[usize] = &[2, 4];
+
+    /// Every `(code_len, rows_per_byte)` shape the equivalence tests sweep.
+    fn shapes() -> impl Iterator<Item = (usize, usize)> {
+        ROWS_PER_BYTE
+            .iter()
+            .flat_map(|&r| CODE_LENS.iter().map(move |&c| (c, r)))
+    }
 
     #[test]
     fn budgeted_matches_unbudgeted_twin_bit_for_bit() {
         // moon#1193 red test: the legacy serial loop only agrees with the
         // unbudgeted 8-accumulator path to within reassociation error, so the
         // same candidate could score differently depending on which closure
-        // ran. The new kernel must reproduce the unbudgeted bits exactly.
+        // ran. The new kernel must reproduce the unbudgeted bits exactly —
+        // for both LUT shapes (2 and 4 rows per code byte).
         let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
         let mut legacy_mismatch = 0usize;
         let mut total = 0usize;
-        for &code_len in CODE_LENS {
+        for (code_len, rows_per_byte) in shapes() {
             for _ in 0..64 {
-                let (code, lut) = make_case(&mut rng, code_len);
+                let (code, lut) = make_case_rows(&mut rng, code_len, rows_per_byte);
                 let reference = adc16_sum_unbudgeted_reference(&code, &lut);
                 let new = adc16_sum_budgeted(&code, &lut, f32::MAX).expect("no budget");
                 assert_eq!(
                     new.to_bits(),
                     reference.to_bits(),
-                    "code_len={code_len}: budgeted {new} != unbudgeted {reference}"
+                    "code_len={code_len} rows/byte={rows_per_byte}: \
+                     budgeted {new} != unbudgeted {reference}"
                 );
-                assert_eq!(adc16_sum(&code, &lut).to_bits(), reference.to_bits());
+                assert_eq!(
+                    adc16_sum(&code, &lut).to_bits(),
+                    reference.to_bits(),
+                    "code_len={code_len} rows/byte={rows_per_byte}"
+                );
                 let legacy = adc16_sum_budgeted_legacy(&code, &lut, f32::MAX).expect("no budget");
                 total += 1;
                 if legacy.to_bits() != reference.to_bits() {
@@ -295,21 +344,77 @@ mod tests {
     }
 
     #[test]
+    fn a2_lut_rows_past_the_code_never_reach_the_sum() {
+        // moon#1221 review red test. With 4 LUT rows per code byte (TQ4A2)
+        // the block/tail chunking was cut from the WHOLE LUT instead of the
+        // code's extent: padded 8 (A2 DIM 5-8, code_len 2) indexed an empty
+        // row tail — an index-out-of-bounds panic on the shard thread — and
+        // padded 32 (A2 DIM 17-32, code_len 8) zipped the code tail against
+        // no rows, scoring every candidate 0.0. Rows past `2·code_len` must
+        // never be read: poison them with NaN.
+        for code_len in [0usize, 1, 2, 3, 4, 5, 7, 8, 15, 16, 17, 31, 32, 64, 256] {
+            let mut rng = Rng(0x5851_F42D_4C95_7F2D ^ code_len as u64);
+            let (code, mut lut) = make_case_rows(&mut rng, code_len, 4);
+            let reference = adc16_sum_unbudgeted_reference(&code, &lut);
+            for v in &mut lut[code_len * 2 * 16..] {
+                *v = f32::NAN;
+            }
+            let new = adc16_sum_budgeted(&code, &lut, f32::MAX);
+            assert_eq!(
+                new.map(f32::to_bits),
+                Some(reference.to_bits()),
+                "code_len={code_len}: budgeted {new:?} != reference {reference}"
+            );
+            assert_eq!(adc16_sum(&code, &lut).to_bits(), reference.to_bits());
+            assert_eq!(reference > 0.0, code_len > 0, "code_len={code_len}");
+        }
+    }
+
+    #[test]
+    fn empty_code_sums_to_zero_for_any_lut() {
+        // TQ4A2 at padded 1/2 (DIM 1-2) has code_len = padded/4 = 0.
+        for rows in [0usize, 2, 4, 16] {
+            let lut = vec![1.0f32; rows * 16];
+            assert_eq!(adc16_sum_budgeted(&[], &lut, f32::MAX), Some(0.0));
+            assert_eq!(adc16_sum_budgeted(&[], &lut, -1.0), Some(0.0));
+            assert_eq!(adc16_sum(&[], &lut), 0.0);
+        }
+    }
+
+    /// A LUT shorter than the code is a caller bug (`hnsw_search_filtered`
+    /// checks it once per search): a debug build asserts; a release build
+    /// rejects the candidate instead of panicking on an index.
+    #[test]
+    #[cfg_attr(
+        debug_assertions,
+        should_panic(expected = "ADC LUT shorter than the code")
+    )]
+    fn short_lut_rejects_the_candidate_instead_of_panicking() {
+        let mut rng = Rng(3);
+        for code_len in [1usize, 2, 17, 20] {
+            let (code, lut) = make_case_rows(&mut rng, code_len, 2);
+            let short = &lut[..lut.len() - 16];
+            assert_eq!(adc16_sum_budgeted(&code, short, f32::MAX), None);
+        }
+    }
+
+    #[test]
     fn budgeted_matches_legacy_within_reassociation_tolerance() {
         // Old vs new: same terms, different association order. The accepted
         // bound is the f32 reassociation bound the unbudgeted twin already
         // lives with: |Δ| <= n·eps·Σ|terms| (terms are ≥ 0 so Σ|t| = sum).
         let mut rng = Rng(0xD1B5_4A32_D192_ED03);
-        for &code_len in CODE_LENS {
+        for (code_len, rows_per_byte) in shapes() {
             for _ in 0..64 {
-                let (code, lut) = make_case(&mut rng, code_len);
+                let (code, lut) = make_case_rows(&mut rng, code_len, rows_per_byte);
                 let new = adc16_sum_budgeted(&code, &lut, f32::MAX).unwrap();
                 let old = adc16_sum_budgeted_legacy(&code, &lut, f32::MAX).unwrap();
                 let n = (code_len * 2) as f32;
                 let tol = n * f32::EPSILON * old.abs().max(new.abs());
                 assert!(
                     (new - old).abs() <= tol,
-                    "code_len={code_len}: new {new} old {old} tol {tol}"
+                    "code_len={code_len} rows/byte={rows_per_byte}: \
+                     new {new} old {old} tol {tol}"
                 );
             }
         }
@@ -322,9 +427,9 @@ mod tests {
         // error of the budget at some check.
         let mut rng = Rng(0x94D0_49BB_1331_11EB);
         let mut rejected = 0usize;
-        for &code_len in CODE_LENS {
+        for (code_len, rows_per_byte) in shapes() {
             for _ in 0..128 {
-                let (code, lut) = make_case(&mut rng, code_len);
+                let (code, lut) = make_case_rows(&mut rng, code_len, rows_per_byte);
                 let full = adc16_sum(&code, &lut);
                 // Budgets straddling the full sum and each partial boundary.
                 let budget = full * (0.25 + rng.f32_unit());
