@@ -128,9 +128,13 @@ struct Doc {
 }
 
 fn doc(i: u32) -> Doc {
-    let status = if i % 3 == 0 { "closed" } else { "open" };
+    let status = if i.is_multiple_of(3) {
+        "closed"
+    } else {
+        "open"
+    };
     let score = i64::from((i * 7) % 23) - 5;
-    let price = (i % 5 != 0).then(|| {
+    let price = (!i.is_multiple_of(5)).then(|| {
         let v = f64::from(i) * 1.25 - 10.0;
         let text = if i % 4 == 1 {
             format!("{v:e}")
@@ -139,7 +143,11 @@ fn doc(i: u32) -> Doc {
         };
         (text, v)
     });
-    let title = if i % 2 == 0 { "alpha" } else { "gamma" };
+    let title = if i.is_multiple_of(2) {
+        "alpha"
+    } else {
+        "gamma"
+    };
     Doc {
         status,
         score,
@@ -389,7 +397,7 @@ fn run_numeric_matrix(c1: &mut redis::Connection, c4: &mut redis::Connection, ns
         score(i) <= 0 || price_in(i, 40.0, f64::INFINITY)
     });
     ran += check(c1, c4, ns, "@score:[5 15] alpha", |i| {
-        (5..=15).contains(&score(i)) && i % 2 == 0
+        (5..=15).contains(&score(i)) && i.is_multiple_of(2)
     });
     ran += check(c1, c4, ns, "@score:[0 10] @price:[0 50]", |i| {
         (0..=10).contains(&score(i)) && price_in(i, 0.0, 50.0)

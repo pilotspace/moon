@@ -126,11 +126,11 @@ struct Doc {
 }
 
 fn doc(i: u32) -> Doc {
-    let status = if i % 5 == 0 {
+    let status = if i.is_multiple_of(5) {
         "closed"
-    } else if i % 13 == 0 {
+    } else if i.is_multiple_of(13) {
         "Pending"
-    } else if i % 3 == 0 {
+    } else if i.is_multiple_of(3) {
         "BLOCKED"
     } else {
         "open"
@@ -141,7 +141,7 @@ fn doc(i: u32) -> Doc {
         _ => "mid",
     };
     let mut labels = Vec::new();
-    if i % 3 == 0 {
+    if i.is_multiple_of(3) {
         labels.push("bug");
     }
     if i % 5 == 1 {
@@ -150,8 +150,12 @@ fn doc(i: u32) -> Doc {
     if i % 6 == 2 {
         labels.push("perf");
     }
-    let word = if i % 2 == 0 { "alpha" } else { "gamma" };
-    let extra = if i % 7 == 0 { " beta" } else { "" };
+    let word = if i.is_multiple_of(2) {
+        "alpha"
+    } else {
+        "gamma"
+    };
+    let extra = if i.is_multiple_of(7) { " beta" } else { "" };
     Doc {
         status,
         priority,
@@ -397,6 +401,9 @@ fn check(
     1
 }
 
+/// A query's expected-membership predicate over fixture doc numbers.
+type Oracle = fn(u32) -> bool;
+
 fn status(i: u32) -> String {
     doc(i).status.to_ascii_lowercase()
 }
@@ -435,10 +442,10 @@ fn run_tag_matrix(c1: &mut redis::Connection, c4: &mut redis::Connection, ns: &N
         |i| has_label(i, "ui") && (status(i) == "open" || status(i) == "blocked"),
     );
     ran += check(c1, c4, ns, "alpha @status:{open}", |i| {
-        i % 2 == 0 && status(i) == "open"
+        i.is_multiple_of(2) && status(i) == "open"
     });
     ran += check(c1, c4, ns, "@title:beta @labels:{bug}", |i| {
-        i % 7 == 0 && has_label(i, "bug")
+        i.is_multiple_of(7) && has_label(i, "bug")
     });
     ran += check(c1, c4, ns, "@status:{nosuchvalue}", |_| false);
     ran
@@ -490,14 +497,14 @@ fn tag_filter_after_upserts_1_shard_vs_4_shard_identical() {
         }
     }
     let st = |i: u32| {
-        if i % 4 == 0 {
+        if i.is_multiple_of(4) {
             "closed".to_string()
         } else {
             status(i)
         }
     };
     let label = |i: u32, l: &str| {
-        if i % 4 == 0 {
+        if i.is_multiple_of(4) {
             l == "perf"
         } else {
             has_label(i, l)
@@ -529,12 +536,12 @@ fn tag_filter_pages_partition_the_answer_at_both_shard_counts() {
     let ns = Ns::new("paging");
     let (s1, s4) = (start(1), start(4));
     let (mut c1, mut c4) = (seed(&s1, &ns), seed(&s4, &ns));
-    let queries: [(&str, fn(u32) -> bool); 3] = [
+    let queries: [(&str, Oracle); 3] = [
         ("@status:{open}", |i| status(i) == "open"),
         ("@labels:{bug|ui}", |i| {
             has_label(i, "bug") || has_label(i, "ui")
         }),
-        ("alpha", |i| i % 2 == 0),
+        ("alpha", |i| i.is_multiple_of(2)),
     ];
     let mut ran = 0;
     for (query, oracle) in queries {
