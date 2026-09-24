@@ -608,7 +608,7 @@ pub fn execute_with_slots(
         first = end;
     }
     for (op, &keep) in ops.iter().zip(&demand).skip(first) {
-        apply_op(op, &mut st, &env, keep)?;
+        apply_op(op, &mut st, &env, keep, 0)?;
     }
 
     let pipeline::OpState {
@@ -649,13 +649,25 @@ pub fn execute_with_slots(
     })
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Rows every variable-length `Expand` emitted on this thread — test-only
+    /// instrumentation for the expansion bound (moon#1221 review).
+    pub(super) static VAR_LEN_ROWS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Apply one operator to the row stream. `keep` bounds how many of its output
-/// rows the rest of the plan can use (only `Sort` exploits it).
+/// rows the rest of the plan can use (only `Sort` exploits it). `emitted_before`
+/// is how many rows this operator already produced for EARLIER chunks of the
+/// same input (the streamed prefix feeds it chunk by chunk; 0 otherwise): the
+/// variable-length `Expand`'s output cap counts them, so it spans the whole
+/// input exactly as one-shot evaluation does (moon#1221 review).
 fn apply_op<'t>(
     op: &PhysicalOp,
     st: &mut pipeline::OpState<'t>,
     env: &pipeline::OpEnv<'_, 't>,
     keep: usize,
+    emitted_before: usize,
 ) -> Result<(), ExecError> {
     let memgraph = env.memgraph;
     let csr_segs = env.csr_segs;
@@ -809,6 +821,9 @@ fn apply_op<'t>(
                     const MAX_HOPS_LIMIT: u32 = 20;
                     const MAX_RESULT_ROWS: usize = 100_000;
                     let capped_max_hops = (*max_hops).min(MAX_HOPS_LIMIT);
+                    // The cap counts this operator's rows for the WHOLE input, earlier
+                    // streamed chunks included.
+                    let cap = MAX_RESULT_ROWS.saturating_sub(emitted_before);
 
                     let mut frontier = vec![src_key];
                     let mut visited = crate::graph::fasthash::FxHashSet::default();
@@ -833,17 +848,17 @@ fn apply_op<'t>(
                                     let mut new_row = row.clone();
                                     new_row.insert(target, Value::Node(merged.node));
                                     new_rows.push(new_row);
-                                    if new_rows.len() >= MAX_RESULT_ROWS {
+                                    if new_rows.len() >= cap {
                                         break;
                                     }
                                 }
                             }
-                            if new_rows.len() >= MAX_RESULT_ROWS {
+                            if new_rows.len() >= cap {
                                 break;
                             }
                         }
                         frontier = next_frontier;
-                        if frontier.is_empty() || new_rows.len() >= MAX_RESULT_ROWS {
+                        if frontier.is_empty() || new_rows.len() >= cap {
                             break;
                         }
                     }
@@ -854,6 +869,10 @@ fn apply_op<'t>(
                 if *optional && new_rows.len() == row_start {
                     push_null_padded(row, target, edge_variable, &mut new_rows);
                 }
+            }
+            #[cfg(test)]
+            if *max_hops > 1 {
+                VAR_LEN_ROWS.with(|n| n.set(n.get() + new_rows.len()));
             }
             st.rows = new_rows;
         }

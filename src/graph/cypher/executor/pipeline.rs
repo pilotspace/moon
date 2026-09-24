@@ -13,9 +13,11 @@
 //! * [`streamable_prefix`] — the leading `scan → (Filter | Expand | Unwind)* →
 //!   [1:1 Project]` run whose output demand is bounded: the executor feeds scan
 //!   keys through it in chunks and stops once enough rows exist. Every op in
-//!   the run maps each input row to an ordered run of output rows independently
-//!   of the others, so the chunked output is exactly a prefix of the full
-//!   output.
+//!   the run maps each input row to an ordered run of output rows that depends
+//!   only on that row — except the variable-length `Expand`, whose 100K output
+//!   cap counts rows across its whole input; the sink carries each op's emitted
+//!   count from chunk to chunk (moon#1221 review), so the chunked output is
+//!   exactly a prefix of the full output and the cap still bounds the work.
 //! * [`stable_order`] — the stable sort permutation, truncated to the demand
 //!   with a selection when the comparator is a total preorder (no NaN, no
 //!   precision-losing int/float mix) and a plain stable sort otherwise, so the
@@ -25,9 +27,10 @@ use std::cmp::Ordering;
 
 use super::*;
 
-/// Demand beyond which the chunked scan is not used: a variable-length
-/// `Expand` caps its output at this many rows per invocation, so only a
-/// demand within the cap keeps the chunked output a prefix of the full one.
+/// Demand beyond which the chunked scan is not used (the moon#1197 bound, equal
+/// to the variable-length `Expand` output cap). Since that cap is carried across
+/// chunks, the prefix property no longer depends on it; it only keeps a huge
+/// `LIMIT` on the one-shot path.
 pub(super) const STREAM_MAX_ROWS: usize = 100_000;
 
 /// Whether a projection aggregates (then it needs every input row).
@@ -225,7 +228,7 @@ pub(super) fn run_streamed_prefix<'t>(
     let Some((scan, segment)) = prefix.split_first() else {
         return Ok(());
     };
-    let mut sink = StreamSink::new(need);
+    let mut sink = StreamSink::new(need, segment.len());
     match scan {
         PhysicalOp::NodeScan { variable, label } => {
             let label_id = label.as_ref().map(|l| label_to_id(l.as_bytes()));
@@ -304,11 +307,15 @@ struct StreamSink<'t> {
     rows: Vec<Row<'t>>,
     projected: Option<Vec<Vec<Value>>>,
     columns: Vec<String>,
+    /// Per segment op: rows it emitted for the chunks fed so far (`apply_op`'s
+    /// `emitted_before`).
+    emitted: SmallVec<[usize; 8]>,
 }
 
 impl<'t> StreamSink<'t> {
-    fn new(need: usize) -> Self {
+    fn new(need: usize, segment_len: usize) -> Self {
         Self {
+            emitted: SmallVec::from_elem(0, segment_len),
             need,
             // Start near the demand; double per chunk so a selective filter
             // costs O(log) chunk rounds, not O(n / demand).
@@ -356,8 +363,11 @@ impl<'t> StreamSink<'t> {
             columns: Vec::new(),
             nodes_scanned: 0,
         };
-        for op in segment {
-            apply_op(op, &mut part, env, usize::MAX)?;
+        for (op, emitted) in segment.iter().zip(self.emitted.iter_mut()) {
+            apply_op(op, &mut part, env, usize::MAX, *emitted)?;
+            // Row-stream ops (Filter / Expand / Unwind) leave their output in `rows`;
+            // only the var-length Expand reads the count back.
+            *emitted = emitted.saturating_add(part.rows.len());
         }
         match part.projected_rows {
             Some(p) => self.projected.get_or_insert_with(Vec::new).extend(p),

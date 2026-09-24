@@ -106,6 +106,10 @@ const QUERIES: &[&str] = &[
     "MATCH (n:L)-[:R]->(m) RETURN n.z, m.z LIMIT 12",
     "MATCH (n:L)-[e:R]->(m) WHERE m.x < 20 RETURN n.z, m.z SKIP 3 LIMIT 9",
     "MATCH (n:L)-[:R*1..3]->(m) RETURN m.z LIMIT 40",
+    // moon#1221 review: row-dropping ops after a var-length Expand, *0..N, *2..N.
+    "MATCH (n:L)-[:R*1..3]->(m) WHERE m.x < 30 RETURN n.z, m.z SKIP 2 LIMIT 9",
+    "MATCH (n:L)-[:R*2..3]->(m) WHERE m.z > 100 RETURN m.z LIMIT 6",
+    "MATCH (n:L)-[:R*0..2]->(m) RETURN m.z LIMIT 7",
     "MATCH (n:L) UNWIND [1, 2, 3] AS k RETURN n.z, k LIMIT 8",
     "MATCH (n:L) WITH n LIMIT 6 MATCH (n)-[:R]->(m) RETURN n.z, m.z",
     "MATCH (n:L) RETURN n.z LIMIT $k",
@@ -253,5 +257,104 @@ fn order_by_limit_evaluates_keys_once_and_selects_the_page() {
     assert!(
         live.as_secs_f64() * 2.0 < full.as_secs_f64(),
         "{q}: {live:?} not clearly cheaper than the full sort {full:?}"
+    );
+}
+
+/// 48 `S` sources; the first 16 reach a hub with 7,000 leaves (7,001 rows each at `*1..2`), the
+/// other 32 reach a node `a` and then `b` with `t = 1`. `hubs` more sources point at the hub
+/// after them, and none of hub/leaves/`a` carries `t`.
+fn var_length_store(hubs: usize) -> GraphStore {
+    let mut store = GraphStore::new();
+    store
+        .create_graph(Bytes::from_static(b"g"), 10_000_000, 0)
+        .expect("create");
+    let graph = store.get_graph_mut(b"g").expect("graph");
+    let (s, r, pt) = (label_to_id(b"S"), label_to_id(b"R"), label_to_id(b"t"));
+    let node = |graph: &mut crate::graph::store::NamedGraph, label: u16, props: PropertyMap| {
+        graph
+            .write_buf
+            .add_node(SmallVec::from_elem(label, 1), props, None, 1)
+    };
+    let other = label_to_id(b"O");
+    let sources: Vec<_> = (0..48 + hubs)
+        .map(|_| node(graph, s, SmallVec::new()))
+        .collect();
+    let hub = node(graph, other, SmallVec::new());
+    for _ in 0..7_000 {
+        let leaf = node(graph, other, SmallVec::new());
+        let _ = graph.write_buf.add_edge(hub, leaf, r, 1.0, None, 1);
+    }
+    for (i, &src) in sources.iter().enumerate() {
+        if !(16..48).contains(&i) {
+            let _ = graph.write_buf.add_edge(src, hub, r, 1.0, None, 1);
+        } else {
+            let a = node(graph, other, SmallVec::new());
+            let mut props: PropertyMap = SmallVec::new();
+            props.push((pt, PropertyValue::Int(1)));
+            let b = node(graph, other, props);
+            let _ = graph.write_buf.add_edge(src, a, r, 1.0, None, 1);
+            let _ = graph.write_buf.add_edge(a, b, r, 1.0, None, 1);
+        }
+    }
+    store
+}
+
+/// `execute` on `q`, returning the rows every variable-length Expand emitted on this thread.
+fn var_len_rows_of(store: &GraphStore, q: &str) -> (ExecResult, usize) {
+    let parsed = crate::graph::cypher::parse_cypher(q.as_bytes()).expect("parse");
+    let plan = crate::graph::cypher::planner::compile(&parsed).expect("compile");
+    let graph = store.get_graph(b"g").expect("graph");
+    super::read::VAR_LEN_ROWS.with(|n| n.set(0));
+    let got = execute(graph, &plan, &HashMap::new(), &ExecutionContext::default()).expect("exec");
+    (got, super::read::VAR_LEN_ROWS.with(std::cell::Cell::get))
+}
+
+/// moon#1221 review (refs moon#1197): the variable-length Expand caps its output at 100K rows
+/// across ALL its input rows. The streamed prefix used to invoke it once per scan chunk with a
+/// fresh count, so a Filter after it saw rows full evaluation never produced: `execute` returned
+/// `[[1]]` where GRAPH.PROFILE (full evaluation) returns `[]`. The sink now carries the count.
+#[test]
+fn var_length_cap_spans_streamed_chunks() {
+    let store = var_length_store(0);
+    let q = "MATCH (s:S)-[:R*1..2]->(b) WHERE b.t = 1 RETURN b.t LIMIT 1";
+    let (got, want) = run(&store, q, &HashMap::new());
+    assert!(want.rows.is_empty(), "full evaluation hits the cap first");
+    assert_eq!(
+        render(&got),
+        render(&want),
+        "{q}: streamed != full evaluation"
+    );
+    // Same for the other shapes the stream serves: SKIP, LIMIT 0, *0..N, *1..1, a projection.
+    for q in [
+        "MATCH (s:S)-[:R*1..2]->(b) WHERE b.t = 1 RETURN b.t SKIP 1 LIMIT 2",
+        "MATCH (s:S)-[:R*1..2]->(b) WHERE b.t = 1 RETURN b.t LIMIT 0",
+        "MATCH (s:S)-[:R*0..2]->(b) WHERE b.t = 1 RETURN b.t LIMIT 3",
+        "MATCH (s:S)-[:R*1..1]->(b) RETURN b.t LIMIT 5",
+        "MATCH (s:S)-[:R*2..2]->(b) RETURN b.t LIMIT 5",
+        "MATCH (s:S)-[:R*1..2]->(b) RETURN b.t LIMIT 20",
+    ] {
+        let (got, want) = run(&store, q, &HashMap::new());
+        assert_eq!(render(&got), render(&want), "{q}");
+    }
+}
+
+/// The DoS bound: however many chunks the stream feeds, the variable-length Expand emits at most
+/// its cap plus one row per source row after the cap (HEAD's one-shot bound) — not cap × chunks.
+/// Here 64 extra hub sources after the first chunk pushed a per-chunk cap past 200K expansions.
+#[test]
+fn var_length_expansion_stays_within_one_cap_when_streamed() {
+    let sources = 48 + 64;
+    let store = var_length_store(64);
+    let q = "MATCH (s:S)-[:R*1..2]->(b) WHERE b.t = 7 RETURN b.t LIMIT 1";
+    let (got, want) = run(&store, q, &HashMap::new());
+    assert_eq!(render(&got), render(&want));
+    assert_eq!(
+        got.nodes_scanned, sources as u64,
+        "the filter never fills the page"
+    );
+    let (_, expanded) = var_len_rows_of(&store, q);
+    assert!(
+        (100_000..=100_000 + sources).contains(&expanded),
+        "streamed var-length expansion emitted {expanded} rows (cap 100,000 + {sources} sources)"
     );
 }
