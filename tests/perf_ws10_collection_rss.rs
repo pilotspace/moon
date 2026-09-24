@@ -256,7 +256,10 @@ fn aof_replay_does_not_pin_the_replayed_log() {
     std::thread::sleep(std::time::Duration::from_millis(500));
     let rss = rss_bytes(server.id());
     let used = used_memory(&mut c);
-    let aof_bytes: u64 = walk_len(&dir.join("appendonlydir"));
+    // monoio `--shards 1` replays the multi-part manifest under
+    // `appendonlydir/`; tokio `--shards 1` the legacy `appendonly.aof`.
+    let aof_bytes: u64 =
+        walk_len(&dir.join("appendonlydir")) + walk_len(&dir.join("appendonly.aof"));
     eprintln!(
         "[1160] replay: fresh RSS {:.1} MiB; after replaying a {:.1} MiB log RSS {:.1} MiB, \
          used_memory {:.1} MiB",
