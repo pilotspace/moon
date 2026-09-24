@@ -174,6 +174,9 @@ pub(crate) fn parse_unit(unit: &[u8]) -> Option<f64> {
 mod search_tests;
 
 #[cfg(test)]
+mod validation_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::protocol::Frame;

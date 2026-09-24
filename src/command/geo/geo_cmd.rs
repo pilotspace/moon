@@ -6,7 +6,9 @@ use crate::storage::Database;
 
 use crate::command::helpers::{err_wrong_args, extract_bytes};
 
-use super::geo_search::{GeoMatch, GeoOpts, fmt_distance, geosearch_arity, geosearch_core};
+use super::geo_search::{
+    GeoForm, GeoMatch, GeoOpts, fmt_distance, geosearch_arity, geosearch_core,
+};
 use super::{
     convert_distance, fmt_geo_coord, geohash_decode, geohash_encode, geohash_to_string,
     haversine_distance, parse_unit,
@@ -204,147 +206,70 @@ pub fn geohash(db: &mut Database, args: &[Frame]) -> Frame {
 ///   BYRADIUS radius M|KM|FT|MI|BYBOX width height M|KM|FT|MI
 ///   [ASC|DESC] [COUNT count [ANY]] [WITHCOORD] [WITHDIST] [WITHHASH]
 pub fn geosearch(db: &mut Database, args: &[Frame]) -> Frame {
-    let (_matches, _opts, results) = geosearch_inner(db, args, false);
+    let (_matches, _opts, results) = geosearch_inner(db, args, GeoForm::Search);
     results
 }
 
-/// GEORADIUS key longitude latitude radius M|KM|FT|MI [WITHCOORD] [WITHDIST] [WITHHASH] [COUNT n] [ASC|DESC]
+/// GEORADIUS key longitude latitude radius M|KM|FT|MI [WITHCOORD] [WITHDIST]
+///   [WITHHASH] [COUNT n [ANY]] [ASC|DESC] [STORE key|STOREDIST key]
 ///
-/// Deprecated since Redis 6.2 — translates to GEOSEARCH internally.
+/// Deprecated since Redis 6.2. Parsed by its own grammar in `geosearch_core`
+/// (redis's `RADIUS_COORDS`), then searched exactly as GEOSEARCH is.
 pub fn georadius(db: &mut Database, args: &[Frame]) -> Frame {
     if args.len() < 5 {
         return err_wrong_args("GEORADIUS");
     }
-    let (opts, store) = match split_store_clause(&args[5..]) {
-        Ok(v) => v,
-        Err(e) => return e,
-    };
-    // Translate: GEORADIUS key lon lat radius unit [opts...]
-    // → GEOSEARCH key FROMLONLAT lon lat BYRADIUS radius unit [opts...]
-    let mut new_args = Vec::with_capacity(opts.len() + 7);
-    new_args.push(args[0].clone()); // key
-    new_args.push(Frame::BulkString(Bytes::from_static(b"FROMLONLAT")));
-    new_args.push(args[1].clone()); // lon
-    new_args.push(args[2].clone()); // lat
-    new_args.push(Frame::BulkString(Bytes::from_static(b"BYRADIUS")));
-    new_args.push(args[3].clone()); // radius
-    new_args.push(args[4].clone()); // unit
-    new_args.extend_from_slice(&opts); // remaining options, STORE clause removed
-    run_geosearch(db, &new_args, store)
+    run_legacy(db, args, GeoForm::RadiusCoords { store: true })
 }
 
-/// GEORADIUSBYMEMBER key member radius M|KM|FT|MI [opts...]
+/// GEORADIUSBYMEMBER key member radius M|KM|FT|MI [opts...] [STORE key|STOREDIST key]
 ///
-/// Deprecated since Redis 6.2 — translates to GEOSEARCH internally.
+/// Deprecated since Redis 6.2 (redis's `RADIUS_MEMBER`).
 pub fn georadiusbymember(db: &mut Database, args: &[Frame]) -> Frame {
     if args.len() < 4 {
         return err_wrong_args("GEORADIUSBYMEMBER");
     }
-    let (opts, store) = match split_store_clause(&args[4..]) {
-        Ok(v) => v,
-        Err(e) => return e,
-    };
-    let mut new_args = Vec::with_capacity(opts.len() + 6);
-    new_args.push(args[0].clone()); // key
-    new_args.push(Frame::BulkString(Bytes::from_static(b"FROMMEMBER")));
-    new_args.push(args[1].clone()); // member
-    new_args.push(Frame::BulkString(Bytes::from_static(b"BYRADIUS")));
-    new_args.push(args[2].clone()); // radius
-    new_args.push(args[3].clone()); // unit
-    new_args.extend_from_slice(&opts); // remaining options, STORE clause removed
-    run_geosearch(db, &new_args, store)
-}
-
-/// Reject GEORADIUS_RO/GEORADIUSBYMEMBER_RO args containing STORE/STOREDIST.
-///
-/// This is LOAD-BEARING, not cosmetic. Both `_RO` entry points delegate to
-/// `georadius`/`georadiusbymember`, and since moon#645 those implement the
-/// clause — so deleting this check turns a command declared read-only
-/// (`flags: R`, routable to a replica, dispatched on the shared-lock read
-/// path) into one that writes a key. `test_georadius_ro_rejects_store` pins
-/// both halves: the error, and the destination staying absent.
-///
-/// The message is redis's own `ERR syntax error`: `_RO` simply has no STORE
-/// clause in its grammar, and a client that matches on redis's text must see
-/// redis's text. (moon used to answer a bespoke "does not support
-/// STORE/STOREDIST" here, which additionally implied the writable forms did
-/// support it back when they did not — the self-inconsistency moon#645 was
-/// filed for.)
-fn geo_ro_rejects(args: &[Frame]) -> Option<Frame> {
-    for a in args.iter().skip(1) {
-        if let Some(tok) = extract_bytes(a) {
-            if tok.eq_ignore_ascii_case(b"STORE") || tok.eq_ignore_ascii_case(b"STOREDIST") {
-                return Some(Frame::Error(Bytes::from_static(b"ERR syntax error")));
-            }
-        }
-    }
-    None
+    run_legacy(db, args, GeoForm::RadiusMember { store: true })
 }
 
 /// GEORADIUS_RO key longitude latitude radius M|KM|FT|MI [WITHCOORD] [WITHDIST] [WITHHASH] [COUNT n] [ASC|DESC]
 ///
-/// Read-only twin of GEORADIUS — rejects STORE/STOREDIST so it stays safely
-/// routable to replicas. Used on the mutable dispatch track; delegates to
-/// `georadius()` (itself a GEOSEARCH translation) once STORE is ruled out.
+/// Read-only twin of GEORADIUS, on the mutable dispatch track. Its grammar has
+/// no STORE/STOREDIST clause (`GeoForm::RadiusCoords { store: false }`), so
+/// the keyword is redis's own `ERR syntax error` and the command can never
+/// write — which is what keeps it safely routable to replicas (moon#645).
 pub fn georadius_ro(db: &mut Database, args: &[Frame]) -> Frame {
-    if let Some(e) = geo_ro_rejects(args) {
-        return e;
+    if args.len() < 5 {
+        return err_wrong_args("GEORADIUS_RO");
     }
-    georadius(db, args)
+    run_legacy(db, args, GeoForm::RadiusCoords { store: false })
 }
 
-/// Read-only twin of `georadius_ro` for the `dispatch_read` fast path:
-/// translates to GEOSEARCH args and calls `geosearch_readonly` (immutable
-/// member-map access throughout).
+/// Read-only twin of `georadius_ro` for the `dispatch_read` fast path.
 pub fn georadius_ro_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
     if args.len() < 5 {
         return err_wrong_args("GEORADIUS_RO");
     }
-    if let Some(e) = geo_ro_rejects(args) {
-        return e;
-    }
-    let mut new_args = Vec::with_capacity(args.len() + 3);
-    new_args.push(args[0].clone()); // key
-    new_args.push(Frame::BulkString(Bytes::from_static(b"FROMLONLAT")));
-    new_args.push(args[1].clone()); // lon
-    new_args.push(args[2].clone()); // lat
-    new_args.push(Frame::BulkString(Bytes::from_static(b"BYRADIUS")));
-    new_args.push(args[3].clone()); // radius
-    new_args.push(args[4].clone()); // unit
-    new_args.extend_from_slice(&args[5..]); // remaining options
-    geosearch_readonly(db, &new_args, now_ms)
+    geosearch_shared(db, args, now_ms, GeoForm::RadiusCoords { store: false })
 }
 
 /// GEORADIUSBYMEMBER_RO key member radius M|KM|FT|MI [opts...]
 ///
-/// Read-only twin of GEORADIUSBYMEMBER — rejects STORE/STOREDIST so it stays
-/// safely routable to replicas. Used on the mutable dispatch track;
-/// delegates to `georadiusbymember()` once STORE is ruled out.
+/// Read-only twin of GEORADIUSBYMEMBER, on the mutable dispatch track; no
+/// STORE/STOREDIST clause, as for `georadius_ro`.
 pub fn georadiusbymember_ro(db: &mut Database, args: &[Frame]) -> Frame {
-    if let Some(e) = geo_ro_rejects(args) {
-        return e;
+    if args.len() < 4 {
+        return err_wrong_args("GEORADIUSBYMEMBER_RO");
     }
-    georadiusbymember(db, args)
+    run_legacy(db, args, GeoForm::RadiusMember { store: false })
 }
 
-/// Read-only twin of `georadiusbymember_ro` for the `dispatch_read` fast
-/// path: translates to GEOSEARCH args and calls `geosearch_readonly`.
+/// Read-only twin of `georadiusbymember_ro` for the `dispatch_read` fast path.
 pub fn georadiusbymember_ro_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
     if args.len() < 4 {
         return err_wrong_args("GEORADIUSBYMEMBER_RO");
     }
-    if let Some(e) = geo_ro_rejects(args) {
-        return e;
-    }
-    let mut new_args = Vec::with_capacity(args.len() + 3);
-    new_args.push(args[0].clone()); // key
-    new_args.push(Frame::BulkString(Bytes::from_static(b"FROMMEMBER")));
-    new_args.push(args[1].clone()); // member
-    new_args.push(Frame::BulkString(Bytes::from_static(b"BYRADIUS")));
-    new_args.push(args[2].clone()); // radius
-    new_args.push(args[3].clone()); // unit
-    new_args.extend_from_slice(&args[4..]); // remaining options
-    geosearch_readonly(db, &new_args, now_ms)
+    geosearch_shared(db, args, now_ms, GeoForm::RadiusMember { store: false })
 }
 
 /// GEOSEARCHSTORE destination source ... [STOREDIST]
@@ -352,13 +277,12 @@ pub fn geosearchstore(db: &mut Database, args: &[Frame]) -> Frame {
     if args.len() < 2 {
         return err_wrong_args("GEOSEARCHSTORE");
     }
-    let dest = match extract_bytes(&args[0]) {
-        Some(k) => Bytes::copy_from_slice(k),
-        None => return err_wrong_args("GEOSEARCHSTORE"),
+    let Some(dest) = extract_bytes(&args[0]) else {
+        return err_wrong_args("GEOSEARCHSTORE");
     };
 
     // Shift args so args[0] is now the source key
-    let (matches, opts, reply) = geosearch_inner(db, &args[1..], true);
+    let (matches, opts, reply) = geosearch_inner(db, &args[1..], GeoForm::SearchStore);
 
     // A parse failure is an ERROR, not "nothing matched". Reading only the
     // (empty) match list answered `:0` AND deleted the destination — redis
@@ -370,34 +294,23 @@ pub fn geosearchstore(db: &mut Database, args: &[Frame]) -> Frame {
     store_geo_matches(db, dest, &matches, opts.unit_mult, opts.storedist)
 }
 
-/// The destination clause of the legacy `GEORADIUS*` forms: `STORE key` or
-/// `STOREDIST key`.
-struct StoreClause {
-    dest: Bytes,
-    /// `STOREDIST`: score each member by its distance in the query's unit
-    /// rather than by the 52-bit geohash.
-    by_distance: bool,
-}
-
-/// Run a translated GEOSEARCH and, if the legacy form carried one, apply its
-/// destination clause. Without a clause the reply is the member array, with
-/// one it is the stored count — exactly redis's split.
-fn run_geosearch(db: &mut Database, args: &[Frame], store: Option<StoreClause>) -> Frame {
-    let Some(clause) = store else {
-        let (_matches, _opts, reply) = geosearch_inner(db, args, false);
-        return reply;
-    };
-    let (matches, opts, reply) = geosearch_inner(db, args, false);
+/// Run a legacy GEORADIUS* form and, if it carried a `STORE`/`STOREDIST`
+/// clause, apply it. Without a clause the reply is the member array, with
+/// one it is the stored count — exactly redis's split. A parse error is
+/// reported and leaves the destination alone (moon#645).
+fn run_legacy(db: &mut Database, args: &[Frame], form: GeoForm) -> Frame {
+    let (matches, opts, reply) = geosearch_inner(db, args, form);
     if matches!(reply, Frame::Error(_)) {
         return reply;
     }
-    store_geo_matches(
-        db,
-        clause.dest,
-        &matches,
-        opts.unit_mult,
-        clause.by_distance,
-    )
+    match opts
+        .store_dest
+        .and_then(|i| args.get(i))
+        .and_then(extract_bytes)
+    {
+        Some(dest) => store_geo_matches(db, dest, &matches, opts.unit_mult, opts.storedist),
+        None => reply,
+    }
 }
 
 /// Write `matches` to `dest` as a fresh sorted set — the shared tail of
@@ -405,13 +318,13 @@ fn run_geosearch(db: &mut Database, args: &[Frame], store: Option<StoreClause>) 
 /// match list deletes the destination and answers `:0`, as redis does.
 fn store_geo_matches(
     db: &mut Database,
-    dest: Bytes,
+    dest: &[u8],
     matches: &[GeoMatch],
     unit_mult: f64,
     by_distance: bool,
 ) -> Frame {
     if matches.is_empty() {
-        db.remove(&dest);
+        db.remove(dest);
         return Frame::Integer(0);
     }
 
@@ -436,101 +349,52 @@ fn store_geo_matches(
             members: Box::new(new_members),
         },
     );
-    db.set(&dest, entry);
+    db.set(dest, entry);
 
     Frame::Integer(matches.len() as i64)
 }
 
-/// Split a legacy `GEORADIUS*` option tail into the options GEOSEARCH
-/// understands and the optional destination clause.
-///
-/// The scan is grammar-aware, not a token search: `STORE` consumes the next
-/// argv slot whatever it spells, so `STORE WITHDIST` names a destination key
-/// called `WITHDIST` and must NOT trip the WITH* incompatibility check
-/// (measured against redis-server 8.6.1, which answers `:2` there). When both
-/// clauses appear the LAST one wins and the earlier destination is never
-/// written.
-fn split_store_clause(opts: &[Frame]) -> Result<(Vec<Frame>, Option<StoreClause>), Frame> {
-    let mut kept = Vec::with_capacity(opts.len());
-    let mut clause: Option<StoreClause> = None;
-    let mut with_flag = false;
-    let mut i = 0;
-    while i < opts.len() {
-        let Some(tok) = extract_bytes(&opts[i]) else {
-            kept.push(opts[i].clone());
-            i += 1;
-            continue;
-        };
-        if tok.eq_ignore_ascii_case(b"STORE") || tok.eq_ignore_ascii_case(b"STOREDIST") {
-            let by_distance = tok.eq_ignore_ascii_case(b"STOREDIST");
-            let Some(dest) = opts.get(i + 1).and_then(extract_bytes) else {
-                return Err(Frame::Error(Bytes::from_static(b"ERR syntax error")));
-            };
-            clause = Some(StoreClause {
-                dest: Bytes::copy_from_slice(dest),
-                by_distance,
-            });
-            i += 2;
-            continue;
-        }
-        if tok.eq_ignore_ascii_case(b"WITHCOORD")
-            || tok.eq_ignore_ascii_case(b"WITHDIST")
-            || tok.eq_ignore_ascii_case(b"WITHHASH")
-        {
-            with_flag = true;
-        } else if tok.eq_ignore_ascii_case(b"COUNT") {
-            // COUNT's value — and an optional ANY — are data, not options;
-            // stepping over them keeps a count of, say, `1` from ever being
-            // mistaken for a clause keyword.
-            kept.push(opts[i].clone());
-            i += 1;
-            if let Some(v) = opts.get(i) {
-                kept.push(v.clone());
-                i += 1;
-            }
-            if let Some(any) = opts.get(i)
-                && extract_bytes(any).is_some_and(|a| a.eq_ignore_ascii_case(b"ANY"))
-            {
-                kept.push(any.clone());
-                i += 1;
-            }
-            continue;
-        }
-        kept.push(opts[i].clone());
-        i += 1;
-    }
-    if clause.is_some() && with_flag {
-        // Redis names the three flags in this fixed order, and says
-        // "in GEORADIUS" even when the command was GEORADIUSBYMEMBER.
-        return Err(Frame::Error(Bytes::from_static(
-            b"ERR STORE option in GEORADIUS is not compatible with WITHDIST, WITHHASH and WITHCOORD options",
-        )));
-    }
-    Ok((kept, clause))
-}
-
-/// The mutable track's GEOSEARCH: the same shared-borrow read as
-/// `geosearch_readonly` (moon#1172), then the search in `geo_search`.
+/// The mutable track's geo search: the same shared-borrow read as the
+/// `_readonly` twins (moon#1172), then the parse + search in `geo_search`.
 /// Returns the matches and options too, for the STORE paths.
 fn geosearch_inner(
     db: &Database,
     args: &[Frame],
-    store_mode: bool,
+    form: GeoForm,
 ) -> (Vec<GeoMatch>, GeoOpts, Frame) {
-    if let Some(e) = geosearch_arity(args) {
+    geosearch_at(db, args, db.now_ms(), form)
+}
+
+/// Every geo search's key fetch. The legacy forms' callers have checked their
+/// arity; GEOSEARCH's is checked here.
+fn geosearch_at(
+    db: &Database,
+    args: &[Frame],
+    now_ms: u64,
+    form: GeoForm,
+) -> (Vec<GeoMatch>, GeoOpts, Frame) {
+    if matches!(form, GeoForm::Search | GeoForm::SearchStore)
+        && let Some(e) = geosearch_arity(args)
+    {
         return (Vec::new(), GeoOpts::default(), e);
     }
-    let key = match extract_bytes(&args[0]) {
-        Some(k) => k,
-        None => return (Vec::new(), GeoOpts::default(), err_wrong_args("GEOSEARCH")),
+    let Some(key) = args.first().and_then(extract_bytes) else {
+        return (Vec::new(), GeoOpts::default(), err_wrong_args("GEOSEARCH"));
     };
-    // Single up-front fetch (Redis also resolves the key object before
-    // validating options).
-    let zref = match db.get_sorted_set_ref_if_alive(key, db.now_ms()) {
+    // Single up-front fetch: redis resolves the key object (and answers
+    // WRONGTYPE) before it validates any option.
+    let zref = match db.get_sorted_set_ref_if_alive(key, now_ms) {
         Ok(z) => z,
         Err(e) => return (Vec::new(), GeoOpts::default(), e),
     };
-    geosearch_core(zref.as_ref(), args, store_mode)
+    geosearch_core(zref.as_ref(), args, form)
+}
+
+/// A read-only geo search on the shared-lock path: the reply only (these
+/// forms have no store clause).
+fn geosearch_shared(db: &Database, args: &[Frame], now_ms: u64, form: GeoForm) -> Frame {
+    let (_matches, _opts, reply) = geosearch_at(db, args, now_ms, form);
+    reply
 }
 
 // ---------------------------------------------------------------------------
@@ -694,17 +558,5 @@ pub fn geohash_readonly(db: &crate::storage::db::Database, args: &[Frame], now_m
 /// `geo_search::geosearch_core` (moon#1172). The ref accessor handles every
 /// encoding without converting it.
 pub fn geosearch_readonly(db: &crate::storage::db::Database, args: &[Frame], now_ms: u64) -> Frame {
-    if let Some(e) = geosearch_arity(args) {
-        return e;
-    }
-    let key = match extract_bytes(&args[0]) {
-        Some(k) => k,
-        None => return err_wrong_args("GEOSEARCH"),
-    };
-    let zref = match db.get_sorted_set_ref_if_alive(key, now_ms) {
-        Ok(z) => z,
-        Err(e) => return e,
-    };
-    let (_matches, _opts, results) = geosearch_core(zref.as_ref(), args, false);
-    results
+    geosearch_shared(db, args, now_ms, GeoForm::Search)
 }

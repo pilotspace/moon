@@ -1504,6 +1504,30 @@ assert_both "GEOSEARCH COUNT 0" GEOSEARCH edge:geo FROMLONLAT 15 37 BYRADIUS 200
 assert_both "GEOSEARCH FROMLONLAT out of range" GEOSEARCH edge:geo FROMLONLAT 200 37 BYRADIUS 200 km
 assert_both "GEOSEARCH unsorted keeps the cell-walk order" GEOSEARCH edge:geo FROMLONLAT 15 37 BYRADIUS 2000 km
 assert_both "GEOSEARCH COUNT 1 ANY" GEOSEARCH edge:geo FROMLONLAT 15 37 BYRADIUS 2000 km COUNT 1 ANY
+# moon#1227 review (refs moon#1172), each verified on redis-server 7.0.15:
+# the radius / width / height are validated as they are parsed, with redis's
+# texts, on every form; a missing key still parses every option (GEORADIUSBYMEMBER
+# alone skips its positional head there, as redis does); FROMMEMBER of an
+# absent member is an error; GEOSEARCH clauses come in any order.
+assert_both "GEOSEARCH negative radius" GEOSEARCH edge:geo FROMLONLAT 15 37 BYRADIUS -1 km
+assert_both "GEOSEARCH NaN radius" GEOSEARCH edge:geo FROMLONLAT 15 37 BYRADIUS nan km
+assert_both "GEOSEARCH non-numeric radius" GEOSEARCH edge:geo FROMLONLAT 15 37 BYRADIUS abc km
+assert_both "GEOSEARCH radius before unit" GEOSEARCH edge:geo FROMLONLAT 15 37 BYRADIUS -1 parsecs
+assert_both "GEOSEARCH negative box" GEOSEARCH edge:geo FROMLONLAT 15 37 BYBOX -1 5 km
+assert_both "GEOSEARCH NaN box height" GEOSEARCH edge:geo FROMLONLAT 15 37 BYBOX 5 nan km
+assert_both "GEOSEARCHSTORE negative radius" GEOSEARCHSTORE "{eg}:d1" "{eg}:src" FROMLONLAT 15 37 BYRADIUS -1 km
+assert_both "GEORADIUS negative radius" GEORADIUS edge:geo 15 37 -1 km
+assert_both "GEORADIUS STORE NaN radius" GEORADIUS "{eg}:src" 15 37 nan km STORE "{eg}:d1"
+assert_both "GEORADIUS_RO non-numeric radius" GEORADIUS_RO edge:geo 15 37 abc km
+assert_both "GEORADIUSBYMEMBER negative radius" GEORADIUSBYMEMBER edge:geo Palermo -1 km
+assert_both "GEORADIUSBYMEMBER_RO NaN radius" GEORADIUSBYMEMBER_RO edge:geo Palermo nan km
+assert_both "GEORADIUSBYMEMBER missing key skips the radius" GEORADIUSBYMEMBER edge:nogeo Palermo -1 km
+assert_both "GEOSEARCH missing key bad COUNT" GEOSEARCH edge:nogeo FROMMEMBER x BYRADIUS 1 km COUNT abc
+assert_both "GEOSEARCH missing key negative radius" GEOSEARCH edge:nogeo FROMLONLAT 15 37 BYRADIUS -1 km
+assert_both "GEOSEARCH absent FROMMEMBER" GEOSEARCH edge:geo FROMMEMBER nope BYRADIUS 1 km
+assert_both "GEOSEARCH infinite radius" GEOSEARCH edge:geo FROMLONLAT 15 37 BYRADIUS inf km ASC
+assert_both "GEOSEARCH BYRADIUS before FROMLONLAT" GEOSEARCH edge:geo BYRADIUS 200 km FROMLONLAT 15 37 ASC
+assert_both "GEOSEARCH centre not a float" GEOSEARCH edge:geo FROMLONLAT abc 37 BYRADIUS 1 km
 
 # EXPIREAT / PEXPIREAT / EXPIRETIME / PEXPIRETIME
 both SET edge:eat "val"

@@ -39,7 +39,9 @@ use crate::protocol::Frame;
 use crate::storage::bptree::BPTree;
 use crate::storage::db::SortedSetRef;
 
-use super::{deinterleave_even, fmt_geo_coord, geohash_decode, interleave64, parse_unit};
+use super::{
+    GEO_STEP_MAX, deinterleave_even, fmt_geo_coord, geohash_decode, interleave64, parse_unit,
+};
 
 const GEO_LAT_MIN: f64 = -85.05112878;
 const GEO_LAT_MAX: f64 = 85.05112878;
@@ -217,14 +219,33 @@ type Cells = [HashBits; 9];
 // geohash_helper.c
 // ---------------------------------------------------------------------------
 
-/// `geohashEstimateStepsByRadius`
-fn estimate_steps_by_radius(range_meters: f64, lat: f64) -> u8 {
-    if range_meters == 0.0 {
-        return 26;
+/// `geohashEstimateStepsByRadius`, defined and bounded for every input.
+///
+/// redis only calls it with a radius its parser accepted — a number, not
+/// negative — and so does moon (`parse_radius`, `parse_box`). The function
+/// is total anyway:
+///
+/// * a range that is not a positive number — 0, redis's own early return,
+///   and a negative or NaN one no caller passes — is the finest step, 26:
+///   the smallest search area, which a zero radius needs and which is
+///   harmless for a shape nothing can lie inside;
+/// * `+inf` is the coarsest step, 1: what redis's loop yields when its
+///   condition is false from the start;
+/// * the doubling loop stops once `step` reaches 26 + 4. From there the two
+///   base-case decrements and at most two polar ones leave it at or above
+///   26, the clamp's ceiling, so doubling further cannot change the answer
+///   (`step_estimate_bound_matches_redis_for_every_positive_radius`).
+pub(super) fn estimate_steps_by_radius(range_meters: f64, lat: f64) -> u8 {
+    const STEP_MAX: i32 = GEO_STEP_MAX as i32;
+    if range_meters.is_nan() || range_meters <= 0.0 {
+        return GEO_STEP_MAX;
+    }
+    if range_meters == f64::INFINITY {
+        return 1;
     }
     let mut range = range_meters;
     let mut step: i32 = 1;
-    while range < MERCATOR_MAX {
+    while range < MERCATOR_MAX && step < STEP_MAX + 4 {
         range *= 2.0;
         step += 1;
     }
@@ -237,7 +258,7 @@ fn estimate_steps_by_radius(range_meters: f64, lat: f64) -> u8 {
             step -= 1;
         }
     }
-    step.clamp(1, 26) as u8
+    step.clamp(1, STEP_MAX) as u8
 }
 
 /// What is searched: a radius or an axis-aligned box, in the query's unit,
@@ -468,14 +489,20 @@ fn members_of_all_neighbors(
 }
 
 /// What the option tail asked for, beyond the match list itself. The store
-/// paths need both: `unit_mult` to turn the meters every match carries back
-/// into the query's unit, and `storedist` for GEOSEARCHSTORE's bare flag.
+/// paths need it: `unit_mult` turns the meters every match carries back into
+/// the query's unit, `storedist` picks the stored score, and `store_dest`
+/// names the legacy forms' destination.
 #[derive(Clone, Copy)]
 pub(super) struct GeoOpts {
     /// Meters per unit of the query's BYRADIUS/BYBOX unit.
     pub(super) unit_mult: f64,
-    /// GEOSEARCHSTORE's `STOREDIST`: score by distance, not by geohash.
+    /// Score the stored set by distance, not by geohash: GEOSEARCHSTORE's
+    /// bare `STOREDIST`, or a legacy `STOREDIST key` clause.
     pub(super) storedist: bool,
+    /// The legacy `STORE key` / `STOREDIST key` destination, as an index into
+    /// the `args` that were parsed. The LAST clause wins, as in redis. Always
+    /// `None` for GEOSEARCH and GEOSEARCHSTORE.
+    pub(super) store_dest: Option<usize>,
 }
 
 impl Default for GeoOpts {
@@ -485,7 +512,41 @@ impl Default for GeoOpts {
         Self {
             unit_mult: 1.0,
             storedist: false,
+            store_dest: None,
         }
+    }
+}
+
+/// Which grammar [`geosearch_core`] parses — the `flags` redis's
+/// `georadiusGeneric` is called with (`GEOSEARCH`, `GEOSEARCHSTORE`,
+/// `RADIUS_COORDS`, `RADIUS_MEMBER`, `RADIUS_NOSTORE`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum GeoForm {
+    /// `GEOSEARCH key <options>`.
+    Search,
+    /// `GEOSEARCHSTORE dest key <options>`, parsed from the source key on.
+    SearchStore,
+    /// `GEORADIUS key lon lat radius unit <options>`. `store` is false for
+    /// `GEORADIUS_RO`: its grammar has no `STORE`/`STOREDIST` clause, so the
+    /// keyword is a syntax error like any unknown one. That is what keeps the
+    /// read-only twin (`flags: R`, replica-routable, served on the shared-lock
+    /// read path) from ever writing a key.
+    RadiusCoords { store: bool },
+    /// `GEORADIUSBYMEMBER key member radius unit <options>`; `store` as above
+    /// for `GEORADIUSBYMEMBER_RO`.
+    RadiusMember { store: bool },
+}
+
+impl GeoForm {
+    fn is_search(self) -> bool {
+        matches!(self, GeoForm::Search | GeoForm::SearchStore)
+    }
+
+    fn has_store_clause(self) -> bool {
+        matches!(
+            self,
+            GeoForm::RadiusCoords { store: true } | GeoForm::RadiusMember { store: true }
+        )
     }
 }
 
@@ -496,240 +557,335 @@ enum Sort {
     Desc,
 }
 
-fn parse_f64(frame: &Frame) -> Option<f64> {
-    let b = extract_bytes(frame)?;
-    std::str::from_utf8(b).ok()?.parse().ok()
+type CoreReply = (Vec<GeoMatch>, GeoOpts, Frame);
+
+const SYNTAX_ERR: &[u8] = b"ERR syntax error";
+const NOT_A_FLOAT: &[u8] = b"ERR value is not a valid float";
+const NOT_AN_INTEGER: &[u8] = b"ERR value is not an integer or out of range";
+const UNIT_ERR: &[u8] = b"ERR unsupported unit provided. please use M, KM, FT, MI";
+const NO_SUCH_MEMBER: &[u8] = b"ERR could not decode requested zset member";
+
+fn fail(msg: &'static [u8]) -> CoreReply {
+    fail_with(Frame::Error(Bytes::from_static(msg)))
 }
 
-fn fail(msg: &'static [u8]) -> (Vec<GeoMatch>, GeoOpts, Frame) {
-    (
-        Vec::new(),
-        GeoOpts::default(),
-        Frame::Error(Bytes::from_static(msg)),
-    )
+fn fail_with(reply: Frame) -> CoreReply {
+    (Vec::new(), GeoOpts::default(), reply)
 }
 
-fn empty() -> (Vec<GeoMatch>, GeoOpts, Frame) {
-    (
-        Vec::new(),
-        GeoOpts::default(),
-        Frame::Array(Vec::new().into()),
-    )
+fn error(msg: &'static [u8]) -> Frame {
+    Frame::Error(Bytes::from_static(msg))
+}
+
+/// redis's `string2d` (`getDoubleFromObject`): the whole argument is one
+/// decimal, `inf` or `infinity` literal (any case, optional sign) — no
+/// surrounding space, not NaN, and not a literal `strtod` flags `ERANGE` on
+/// (one that overflows to infinity or underflows to zero). `strtod`'s
+/// hexadecimal floats are the one spelling this does not read.
+fn parse_double(arg: &Frame) -> Option<f64> {
+    let s = std::str::from_utf8(extract_bytes(arg)?).ok()?;
+    let v: f64 = s.parse().ok()?;
+    if v.is_nan() {
+        return None;
+    }
+    let unsigned = s.strip_prefix(['+', '-']).unwrap_or(s);
+    if v.is_infinite()
+        && !(unsigned.eq_ignore_ascii_case("inf") || unsigned.eq_ignore_ascii_case("infinity"))
+    {
+        return None;
+    }
+    let nonzero_mantissa = unsigned
+        .bytes()
+        .take_while(|b| !matches!(b, b'e' | b'E'))
+        .any(|b| b.is_ascii_digit() && b != b'0');
+    if v == 0.0 && nonzero_mantissa {
+        return None;
+    }
+    Some(v)
 }
 
 /// `-ERR invalid longitude,latitude pair %f,%f` (redis's
 /// `extractLongLatOrReply`). `%f` is six fixed decimals.
-fn invalid_lonlat(lon: f64, lat: f64) -> (Vec<GeoMatch>, GeoOpts, Frame) {
+fn invalid_lonlat(lon: f64, lat: f64) -> Frame {
     use std::io::Write;
     let mut msg = Vec::with_capacity(64);
     // Writing into a Vec cannot fail.
     let _ = write!(msg, "ERR invalid longitude,latitude pair {lon:.6},{lat:.6}");
-    (
-        Vec::new(),
-        GeoOpts::default(),
-        Frame::Error(Bytes::from(msg)),
-    )
+    Frame::Error(Bytes::from(msg))
 }
 
-/// Shared GEOSEARCH parse + search, independent of how the sorted set was
-/// fetched — every dispatch path reads it through `get_sorted_set_ref_if_
-/// alive` (moon#1172: the mutable path used `get_sorted_set`, which
-/// flattened a listpack geo set for good). `args` still has the key at index
-/// 0 — parsing starts at index 1. A missing key (`None`) yields an empty
-/// array at exactly the points the old code answered one.
+/// `extractLongLatOrReply`: both numbers, then the WGS84 range the cell
+/// search can encode.
+fn parse_lonlat(lon: &Frame, lat: &Frame) -> Result<(f64, f64), Frame> {
+    let lon = parse_double(lon).ok_or_else(|| error(NOT_A_FLOAT))?;
+    let lat = parse_double(lat).ok_or_else(|| error(NOT_A_FLOAT))?;
+    if !(GEO_LONG_MIN..=GEO_LONG_MAX).contains(&lon) || !(GEO_LAT_MIN..=GEO_LAT_MAX).contains(&lat)
+    {
+        return Err(invalid_lonlat(lon, lat));
+    }
+    Ok((lon, lat))
+}
+
+/// `extractUnitOrReply`: meters per unit.
+fn parse_unit_arg(unit: &Frame) -> Result<f64, Frame> {
+    extract_bytes(unit)
+        .and_then(|u| parse_unit(u))
+        .ok_or_else(|| error(UNIT_ERR))
+}
+
+/// `extractDistanceOrReply`: the radius must be a number, then not negative
+/// (`-0` is zero), and only then is the unit read. `+inf` is accepted, as in
+/// redis. Returns `(radius, meters per unit)`.
+fn parse_radius(radius: &Frame, unit: &Frame) -> Result<(f64, f64), Frame> {
+    let r = parse_double(radius).ok_or_else(|| error(b"ERR need numeric radius"))?;
+    if r < 0.0 {
+        return Err(error(b"ERR radius cannot be negative"));
+    }
+    Ok((r, parse_unit_arg(unit)?))
+}
+
+/// `extractBoxOrReply`: width then height must be numbers, then neither may
+/// be negative, and only then is the unit read. Returns `(width, height,
+/// meters per unit)`.
+fn parse_box(width: &Frame, height: &Frame, unit: &Frame) -> Result<(f64, f64, f64), Frame> {
+    let w = parse_double(width).ok_or_else(|| error(b"ERR need numeric width"))?;
+    let h = parse_double(height).ok_or_else(|| error(b"ERR need numeric height"))?;
+    if w < 0.0 || h < 0.0 {
+        return Err(error(b"ERR height or width cannot be negative"));
+    }
+    Ok((w, h, parse_unit_arg(unit)?))
+}
+
+/// `longLatFromMember`: the decoded position of a member, or `None` when the
+/// set does not hold it.
+fn member_position(zref: &SortedSetRef<'_>, member: &Frame) -> Option<(f64, f64)> {
+    zref.score(extract_bytes(member)?).map(geohash_decode)
+}
+
+/// GEOSEARCH / GEOSEARCHSTORE / GEORADIUS* parse + search, independent of
+/// how the sorted set was fetched — every dispatch path reads it through
+/// `get_sorted_set_ref_if_alive` (moon#1172: the mutable path used
+/// `get_sorted_set`, which flattened a listpack geo set for good). `args`
+/// starts at the source key.
+///
+/// The parse is redis 7.0.15's `georadiusGeneric`, clause for clause, so the
+/// errors are redis's and come in redis's order:
+///
+/// 1. the legacy forms' positional head — GEORADIUS's centre (`value is not
+///    a valid float`, `invalid longitude,latitude pair`) then radius;
+///    GEORADIUSBYMEMBER's member (`could not decode requested zset member`)
+///    then radius. On a MISSING key GEORADIUSBYMEMBER skips its head
+///    entirely (there is no member to decode) — redis does exactly that;
+/// 2. every option, left to right, GEOSEARCH's FROM*/BY* clauses included
+///    and in any order (a repeated one overrides). The radius, width and
+///    height are validated as they are parsed (`need numeric radius`,
+///    `radius cannot be negative`, `need numeric width|height`, `height or
+///    width cannot be negative`) and before their unit;
+/// 3. WITH* with a store, a missing FROM*/BY*, ANY without COUNT;
+/// 4. only then a missing key: an empty array, or for a store the empty
+///    match list its caller turns into `:0` plus a deleted destination.
+///
+/// So a missing key still validates every option (moon answered `[]` for a
+/// bad COUNT there), and the cell search only ever sees a radius, width and
+/// height that are numbers and not negative.
 pub(super) fn geosearch_core(
     zref: Option<&SortedSetRef<'_>>,
     args: &[Frame],
-    store_mode: bool,
-) -> (Vec<GeoMatch>, GeoOpts, Frame) {
-    // Parse source: FROMMEMBER or FROMLONLAT
-    let mut center_lon = 0.0f64;
-    let mut center_lat = 0.0f64;
-    let mut i = 1;
-    let mut found_from = false;
-
-    while i < args.len() && !found_from {
-        let arg = match extract_bytes(&args[i]) {
-            Some(a) => a,
-            None => {
-                i += 1;
-                continue;
-            }
-        };
-        if arg.eq_ignore_ascii_case(b"FROMMEMBER") {
-            i += 1;
-            let member = match extract_bytes(args.get(i).unwrap_or(&Frame::Null)) {
-                Some(m) => m,
-                None => return fail(b"ERR syntax error"),
-            };
-            let Some(zref) = zref else {
-                return empty();
-            };
-            match zref.score(member) {
-                Some(score) => {
-                    let (lon, lat) = geohash_decode(score);
-                    center_lon = lon;
-                    center_lat = lat;
-                }
-                None => return empty(),
-            }
-            found_from = true;
-        } else if arg.eq_ignore_ascii_case(b"FROMLONLAT") {
-            i += 1;
-            center_lon = match args.get(i).and_then(parse_f64) {
-                Some(v) => v,
-                None => return fail(b"ERR syntax error"),
-            };
-            i += 1;
-            center_lat = match args.get(i).and_then(parse_f64) {
-                Some(v) => v,
-                None => return fail(b"ERR syntax error"),
-            };
-            // The cell search needs an encodable centre, and redis refuses
-            // one that is not (`extractLongLatOrReply`).
-            if !(GEO_LONG_MIN..=GEO_LONG_MAX).contains(&center_lon)
-                || !(GEO_LAT_MIN..=GEO_LAT_MAX).contains(&center_lat)
-            {
-                return invalid_lonlat(center_lon, center_lat);
-            }
-            found_from = true;
-        }
-        i += 1;
-    }
-
-    if !found_from {
-        return fail(b"ERR syntax error");
-    }
-
-    // Parse shape: BYRADIUS or BYBOX
+    form: GeoForm,
+) -> CoreReply {
+    let mut center: Option<(f64, f64)> = None;
     let mut kind: Option<ShapeKind> = None;
     let mut conversion = 1.0f64;
+
+    // The legacy forms' positional head (`base_args`).
+    let base = match form {
+        GeoForm::RadiusCoords { .. } => {
+            let [_key, lon, lat, radius, unit, ..] = args else {
+                return fail_with(err_wrong_args("GEORADIUS"));
+            };
+            let c = match parse_lonlat(lon, lat) {
+                Ok(c) => c,
+                Err(e) => return fail_with(e),
+            };
+            match parse_radius(radius, unit) {
+                Ok((r, conv)) => {
+                    center = Some(c);
+                    kind = Some(ShapeKind::Radius(r));
+                    conversion = conv;
+                }
+                Err(e) => return fail_with(e),
+            }
+            5
+        }
+        GeoForm::RadiusMember { .. } => {
+            let [_key, member, radius, unit, ..] = args else {
+                return fail_with(err_wrong_args("GEORADIUSBYMEMBER"));
+            };
+            if let Some(zref) = zref {
+                let Some(c) = member_position(zref, member) else {
+                    return fail(NO_SUCH_MEMBER);
+                };
+                match parse_radius(radius, unit) {
+                    Ok((r, conv)) => {
+                        center = Some(c);
+                        kind = Some(ShapeKind::Radius(r));
+                        conversion = conv;
+                    }
+                    Err(e) => return fail_with(e),
+                }
+            }
+            4
+        }
+        GeoForm::Search | GeoForm::SearchStore => 1,
+    };
+
     let mut sort = Sort::None;
-    let mut count: Option<usize> = None;
+    // 0 = unlimited, as redis's `count`.
+    let mut count: i64 = 0;
     let mut any = false;
     let mut withcoord = false;
     let mut withdist = false;
     let mut withhash = false;
     let mut storedist = false;
+    let mut store_dest: Option<usize> = None;
+    let mut frommember = false;
+    let mut fromloc = false;
+    let mut byradius = false;
+    let mut bybox = false;
 
-    const UNIT_ERR: &[u8] = b"ERR unsupported unit provided. please use M, KM, FT, MI";
-    const EXACTLY_ONE: &[u8] = b"ERR exactly one of BYRADIUS and BYBOX arguments must be provided";
-
+    let mut i = base;
     while i < args.len() {
-        let arg = match extract_bytes(&args[i]) {
-            Some(a) => a,
-            None => {
-                i += 1;
-                continue;
-            }
+        let Some(arg) = extract_bytes(&args[i]) else {
+            return fail(SYNTAX_ERR);
         };
-        if arg.eq_ignore_ascii_case(b"BYRADIUS") {
-            if matches!(kind, Some(ShapeKind::Box { .. })) {
-                return fail(EXACTLY_ONE);
-            }
-            i += 1;
-            let r = match args.get(i).and_then(parse_f64) {
-                Some(v) => v,
-                None => return fail(b"ERR syntax error"),
-            };
-            i += 1;
-            conversion = match args
-                .get(i)
-                .and_then(extract_bytes)
-                .and_then(|b| parse_unit(b))
-            {
-                Some(v) => v,
-                None => return fail(UNIT_ERR),
-            };
-            kind = Some(ShapeKind::Radius(r));
-        } else if arg.eq_ignore_ascii_case(b"BYBOX") {
-            if matches!(kind, Some(ShapeKind::Radius(_))) {
-                return fail(EXACTLY_ONE);
-            }
-            i += 1;
-            let w = match args.get(i).and_then(parse_f64) {
-                Some(v) => v,
-                None => return fail(b"ERR syntax error"),
-            };
-            i += 1;
-            let h = match args.get(i).and_then(parse_f64) {
-                Some(v) => v,
-                None => return fail(b"ERR syntax error"),
-            };
-            i += 1;
-            conversion = match args
-                .get(i)
-                .and_then(extract_bytes)
-                .and_then(|b| parse_unit(b))
-            {
-                Some(v) => v,
-                None => return fail(UNIT_ERR),
-            };
-            kind = Some(ShapeKind::Box {
-                width: w,
-                height: h,
-            });
-        } else if arg.eq_ignore_ascii_case(b"ASC") {
-            sort = Sort::Asc;
-        } else if arg.eq_ignore_ascii_case(b"DESC") {
-            sort = Sort::Desc;
-        } else if arg.eq_ignore_ascii_case(b"ANY") {
+        // How many arguments follow this one: a clause with too few
+        // operands is not that clause, and ends as a syntax error.
+        let left = args.len() - i - 1;
+        let is = |kw: &[u8]| arg.eq_ignore_ascii_case(kw);
+        if is(b"WITHDIST") {
+            withdist = true;
+        } else if is(b"WITHHASH") {
+            withhash = true;
+        } else if is(b"WITHCOORD") {
+            withcoord = true;
+        } else if is(b"ANY") {
             any = true;
-        } else if arg.eq_ignore_ascii_case(b"COUNT") {
-            i += 1;
-            // redis: `getLongLongFromObjectOrReply` then `count <= 0`.
-            let Some(raw) = args.get(i).and_then(extract_bytes) else {
-                return fail(b"ERR syntax error");
-            };
-            let c: i64 = match std::str::from_utf8(raw).ok().and_then(|s| s.parse().ok()) {
-                Some(c) => c,
-                None => return fail(b"ERR value is not an integer or out of range"),
+        } else if is(b"ASC") {
+            sort = Sort::Asc;
+        } else if is(b"DESC") {
+            sort = Sort::Desc;
+        } else if is(b"COUNT") && left >= 1 {
+            // `getLongLongFromObjectOrReply` (`string2ll`), then `count <= 0`.
+            let Some(c) =
+                extract_bytes(&args[i + 1]).and_then(|b| crate::storage::numeric::canonical_i64(b))
+            else {
+                return fail(NOT_AN_INTEGER);
             };
             if c <= 0 {
                 return fail(b"ERR COUNT must be > 0");
             }
-            count = Some(usize::try_from(c).unwrap_or(usize::MAX));
-        } else if arg.eq_ignore_ascii_case(b"WITHCOORD")
-            || arg.eq_ignore_ascii_case(b"WITHDIST")
-            || arg.eq_ignore_ascii_case(b"WITHHASH")
-        {
-            // GEOSEARCHSTORE stores a sorted set, so it has nowhere to put
-            // the extras and redis refuses them by name rather than quietly
-            // dropping them (moon#645).
-            if store_mode {
-                return fail(
-                    b"ERR GEOSEARCHSTORE is not compatible with WITHDIST, WITHHASH and WITHCOORD options",
-                );
-            }
-            withcoord |= arg.eq_ignore_ascii_case(b"WITHCOORD");
-            withdist |= arg.eq_ignore_ascii_case(b"WITHDIST");
-            withhash |= arg.eq_ignore_ascii_case(b"WITHHASH");
-        } else if store_mode && arg.eq_ignore_ascii_case(b"STOREDIST") {
-            // GEOSEARCHSTORE's STOREDIST is a bare flag with no argument.
-            // Plain GEOSEARCH has no such clause at all, so it stays a
-            // syntax error there.
+            count = c;
+            i += 1;
+        } else if form.has_store_clause() && (is(b"STORE") || is(b"STOREDIST")) && left >= 1 {
+            // The next slot is the destination whatever it spells.
+            storedist = is(b"STOREDIST");
+            store_dest = Some(i + 1);
+            i += 1;
+        } else if form == GeoForm::SearchStore && is(b"STOREDIST") {
+            // GEOSEARCHSTORE's STOREDIST is a bare flag.
             storedist = true;
+        } else if form.is_search() && is(b"FROMMEMBER") && left >= 1 && !fromloc {
+            // No source key: nothing to decode; the parse goes on and the
+            // empty reply comes at the end.
+            if let Some(zref) = zref {
+                let Some(c) = member_position(zref, &args[i + 1]) else {
+                    return fail(NO_SUCH_MEMBER);
+                };
+                center = Some(c);
+            }
+            frommember = true;
+            i += 1;
+        } else if form.is_search() && is(b"FROMLONLAT") && left >= 2 && !frommember {
+            match parse_lonlat(&args[i + 1], &args[i + 2]) {
+                Ok(c) => center = Some(c),
+                Err(e) => return fail_with(e),
+            }
+            fromloc = true;
+            i += 2;
+        } else if form.is_search() && is(b"BYRADIUS") && left >= 2 && !bybox {
+            match parse_radius(&args[i + 1], &args[i + 2]) {
+                Ok((r, conv)) => {
+                    kind = Some(ShapeKind::Radius(r));
+                    conversion = conv;
+                }
+                Err(e) => return fail_with(e),
+            }
+            byradius = true;
+            i += 2;
+        } else if form.is_search() && is(b"BYBOX") && left >= 3 && !byradius {
+            match parse_box(&args[i + 1], &args[i + 2], &args[i + 3]) {
+                Ok((width, height, conv)) => {
+                    kind = Some(ShapeKind::Box { width, height });
+                    conversion = conv;
+                }
+                Err(e) => return fail_with(e),
+            }
+            bybox = true;
+            i += 3;
         } else {
-            return fail(b"ERR syntax error");
+            return fail(SYNTAX_ERR);
         }
         i += 1;
     }
 
-    let Some(kind) = kind else {
-        return fail(EXACTLY_ONE);
-    };
-    if any && count.is_none() {
+    // Options not compatible with a store: it has nowhere to put the extras,
+    // and redis refuses them by name rather than quietly dropping them
+    // (moon#645) — in this fixed order, and saying "in GEORADIUS" for
+    // GEORADIUSBYMEMBER too.
+    let storing = store_dest.is_some() || form == GeoForm::SearchStore;
+    if storing && (withdist || withhash || withcoord) {
+        return fail(if form == GeoForm::SearchStore {
+            b"ERR GEOSEARCHSTORE is not compatible with WITHDIST, WITHHASH and WITHCOORD options"
+        } else {
+            b"ERR STORE option in GEORADIUS is not compatible with WITHDIST, WITHHASH and WITHCOORD options"
+        });
+    }
+    // redis names the command as it was called; these are its canonical
+    // (upper-case) spellings.
+    if form.is_search() && !(frommember || fromloc) {
+        return fail(if form == GeoForm::SearchStore {
+            b"ERR exactly one of FROMMEMBER or FROMLONLAT can be specified for GEOSEARCHSTORE"
+        } else {
+            b"ERR exactly one of FROMMEMBER or FROMLONLAT can be specified for GEOSEARCH"
+        });
+    }
+    if form.is_search() && !(byradius || bybox) {
+        return fail(if form == GeoForm::SearchStore {
+            b"ERR exactly one of BYRADIUS and BYBOX can be specified for GEOSEARCHSTORE"
+        } else {
+            b"ERR exactly one of BYRADIUS and BYBOX can be specified for GEOSEARCH"
+        });
+    }
+    if any && count == 0 {
         return fail(b"ERR the ANY argument requires COUNT argument");
     }
-    let Some(zref) = zref else {
-        return empty();
+
+    let opts = GeoOpts {
+        unit_mult: conversion,
+        storedist,
+        store_dest,
+    };
+    // Return ASAP when the source key does not exist.
+    let (Some(zref), Some((center_lon, center_lat)), Some(kind)) = (zref, center, kind) else {
+        return (Vec::new(), opts, Frame::Array(Vec::new().into()));
     };
 
     // COUNT without ordering does not make much sense (the N closest are
     // wanted): redis forces ASC — but not for ANY.
-    if count.is_some() && sort == Sort::None && !any {
+    if count != 0 && sort == Sort::None && !any {
         sort = Sort::Asc;
     }
+    let count = (count != 0).then(|| usize::try_from(count).unwrap_or(usize::MAX));
 
     let shape = Shape {
         lon: center_lon,
@@ -758,6 +914,11 @@ pub(super) fn geosearch_core(
         matches.sort_by(cmp);
     }
     matches.truncate(returned);
+
+    // A store replies with its count; its caller never reads this frame.
+    if storing {
+        return (matches, opts, Frame::Array(Vec::new().into()));
+    }
 
     let has_extras = withcoord || withdist || withhash;
     let results: Vec<Frame> = matches
@@ -789,14 +950,7 @@ pub(super) fn geosearch_core(
         })
         .collect();
 
-    (
-        matches,
-        GeoOpts {
-            unit_mult: conversion,
-            storedist,
-        },
-        Frame::Array(results.into()),
-    )
+    (matches, opts, Frame::Array(results.into()))
 }
 
 /// `GEOSEARCH` arity guard shared by the entry points.
