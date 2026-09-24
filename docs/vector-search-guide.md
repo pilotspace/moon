@@ -126,11 +126,13 @@ FT.SEARCH <index> "*=>[KNN <k> @<field> $<param>]"
 ```
 Returns up to `k` nearest neighbors. The query vector must be a binary blob of `DIM × 4` bytes (little-endian f32).
 
+A KNN prefilter goes before the arrow (`@lang:{en}=>[KNN …]`) or in `FILTER`. A tag value containing a space (`@body:{red apple}`) is a **full-text** filter: every word must occur in the field. Full-text filters are answered by the index's payload text index, which the process-wide opt-out `MOON_VECTOR_PAYLOAD_TEXT=off` drops to save memory (typically the largest per-document cost of a RAG-shaped index). With it off, a full-text filter is refused with `ERR full-text KNN filter … disabled by MOON_VECTOR_PAYLOAD_TEXT=off` rather than matching nothing; `FT.INFO` reports the setting as `payload_text_index` (`on`/`off`). The setting is environment-only, so give a primary and its replicas the same value. (Under `MOON_VECTOR_PAYLOAD_SCHEMA=declared`, a full-text filter on a declared `TEXT` field is answered by the BM25 plane and works either way.)
+
 ### FT.INFO
 ```
 FT.INFO <index>
 ```
-Returns index configuration (name, dimension, metric, quantization, build_mode) plus observability counters, additive across shards: `graph_segments` (immutable HNSW segment count) and `segments_with_exact_rerank` (how many of those segments still carry the f16 exact-rerank sidecar). Coverage below `graph_segments` means some segments answer with quantized ADC-only distances — a GraphUnion merge that drops a sidecar logs a `tracing::warn` when it happens.
+Returns index configuration (name, dimension, metric, quantization, build_mode) plus observability counters, additive across shards: `graph_segments` (immutable HNSW segment count) and `segments_with_exact_rerank` (how many of those segments still carry the f16 exact-rerank sidecar). Coverage below `graph_segments` means some segments answer with quantized ADC-only distances — a GraphUnion merge that drops a sidecar logs a `tracing::warn` when it happens. `payload_text_index` (`on`/`off`) says whether this process answers full-text KNN prefilters (see FT.SEARCH above).
 
 ### FT.COMPACT
 ```

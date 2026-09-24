@@ -59,7 +59,10 @@ pub fn tag_value_is_matchable(value: &[u8]) -> bool {
 /// index — typically the largest per-document cost of a RAG-shaped vector
 /// index — for deployments that never use `TextMatch` filters in vector
 /// queries (full-text search through FT.SEARCH's BM25 plane is unaffected);
-/// with it off, a `TextMatch` filter matches no document. Read once.
+/// with it off, a `TextMatch` filter that would need this index is REFUSED
+/// (moon#1226 — it used to match no document, silently; see
+/// `super::text_match_refusal`), and FT.INFO reports the setting as
+/// `payload_text_index`. Read once.
 pub fn payload_text_index_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
@@ -136,6 +139,19 @@ impl PayloadIndex {
             text_indexes: crate::vector::filter::text_index::TextIndex::new(),
             schema,
         }
+    }
+
+    /// The error `expr` must answer on THIS index instead of a silently empty
+    /// result (moon#1226): some `TextMatch` node targets a field whose only
+    /// route is the payload text index, and that index is unavailable
+    /// (`super::text_match_refusal`). A declared TEXT field under the
+    /// schema-aware policy is answered by the BM25 plane and never refused.
+    pub fn text_match_refusal(&self, expr: &FilterExpr) -> Option<&'static [u8]> {
+        use super::text_match_refusal::{payload_text_unavailable, text_match_refusal_with};
+        text_match_refusal_with(expr, payload_text_unavailable(), |field| {
+            cfg!(feature = "text-index")
+                && self.schema.as_ref().is_some_and(|s| s.is_bm25_text(field))
+        })
     }
 
     /// The schema-aware policy, if this index has one.
@@ -780,9 +796,14 @@ mod tests {
             &b"@content:{some long prose value}=>[KNN 3 @vec $q]"[..],
             &b"@content:{a b}=>[KNN 3 @vec $q]"[..],
         ] {
-            match parse_inline_filter(q) {
-                FilterParse::Parsed(FilterExpr::TextMatch { .. }) => {}
-                other => panic!("space-containing tag query must be TextMatch, got {other:?}"),
+            // moon#1226: refused outright where no index can answer it.
+            let refusal = crate::vector::filter::text_match_refusal::payload_text_unavailable();
+            match (parse_inline_filter(q), refusal) {
+                (FilterParse::Parsed(FilterExpr::TextMatch { .. }), None) => {}
+                (FilterParse::Invalid(msg), Some(why)) => assert_eq!(msg, why),
+                (other, _) => {
+                    panic!("space-containing tag query must be TextMatch, got {other:?}")
+                }
             }
         }
         match parse_inline_filter(b"@content:{oneword}=>[KNN 3 @vec $q]") {

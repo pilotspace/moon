@@ -170,6 +170,19 @@ pub(crate) enum FilterParse {
 pub(crate) const ERR_INVALID_FILTER: &[u8] = b"ERR invalid FILTER expression";
 
 impl FilterParse {
+    /// A readable filter, or `Invalid` when it holds a full-text node
+    /// (`@field:{multi word}`) that no index can answer in this process —
+    /// the payload text index is off and nothing routes to BM25 (moon#1226:
+    /// it matched no document, silently). Decided at parse time so every
+    /// search path (sync, yielding, cache, cross-shard) refuses alike; see
+    /// `vector::filter::text_match_refusal`.
+    fn parsed(expr: FilterExpr) -> FilterParse {
+        match crate::vector::filter::text_match_refusal::text_match_refusal_unscoped(&expr) {
+            Some(msg) => FilterParse::Invalid(msg),
+            None => FilterParse::Parsed(expr),
+        }
+    }
+
     /// Try `next` only when nothing was supplied here. An `Invalid` short-
     /// circuits: falling through from an unreadable explicit FILTER to the
     /// inline prefix is how a rejected filter turned back into no filter.
@@ -205,7 +218,7 @@ pub(crate) fn parse_filter_clause(args: &[Frame]) -> FilterParse {
                 return FilterParse::Invalid(ERR_INVALID_FILTER);
             };
             return match parse_filter_string(&filter_str) {
-                Some(e) => FilterParse::Parsed(e),
+                Some(e) => FilterParse::parsed(e),
                 None => FilterParse::Invalid(ERR_INVALID_FILTER),
             };
         }
@@ -235,7 +248,7 @@ pub(crate) fn parse_inline_filter(query: &[u8]) -> FilterParse {
         return FilterParse::Absent;
     }
     match parse_filter_string(prefix.as_bytes()) {
-        Some(e) => FilterParse::Parsed(e),
+        Some(e) => FilterParse::parsed(e),
         None => FilterParse::Invalid(ERR_INVALID_FILTER),
     }
 }

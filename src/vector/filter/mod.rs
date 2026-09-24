@@ -4,6 +4,7 @@ pub mod payload_schema;
 pub mod selectivity;
 #[cfg(feature = "text-index")]
 pub mod text_index;
+pub mod text_match_refusal;
 
 pub use expression::FilterExpr;
 pub use payload_index::PayloadIndex;
