@@ -1,10 +1,13 @@
 //! Dense per-document side tables of a [`TextIndex`](crate::text::store::TextIndex) (moon#1194).
 //!
-//! Text doc ids are dense: `next_doc_id` hands them out sequentially and an upsert reuses its id,
-//! so a document's side data is a `Vec` slot indexed by its id rather than a `HashMap` entry —
-//! no hash, no bucket padding, no load-factor slack. The only holes are ids removed by
-//! `remove_doc_by_doc_id` (`FT.INVALIDATE_RANGE`, the boot deletion probe); a hole costs one empty
-//! slot per column (see [`DocKeys::footprint`] and friends for the exact sizes).
+//! Text doc ids are dense: an upsert keeps its id and a new document takes the SMALLEST id no live
+//! document holds (`TextIndex::alloc_doc_id`, moon#1221 review), so a document's side data is a
+//! `Vec` slot indexed by its id rather than a `HashMap` entry — no hash, no bucket padding, no
+//! load-factor slack. Ids freed by `remove_doc_by_doc_id` (`FT.INVALIDATE_RANGE`, the boot deletion
+//! probe) are empty slots until the next new document reuses them, so every column holds at most
+//! one slot per id below the PEAK live-document count — never one per id ever handed out. When the
+//! highest ids are freed the columns are cut back ([`DocKeys::truncate`] and friends) and give
+//! their memory back once three quarters of the capacity is unused.
 //!
 //! Each column reports its REAL footprint (`capacity × slot size`), which is what the index bills
 //! (`TextIndex::resident_bytes`). The APIs mirror the `HashMap` methods callers used, so call sites
@@ -12,6 +15,15 @@
 
 use bytes::Bytes;
 use roaring::RoaringBitmap;
+
+/// Cut `v` to `len` elements and release memory once at most a quarter of the capacity is used
+/// (down to half), so repeated shrink/grow cycles reallocate O(log) times, not per call.
+fn cut<T>(v: &mut Vec<T>, len: usize) {
+    v.truncate(len);
+    if v.capacity() > 4 * len.max(16) {
+        v.shrink_to(2 * len);
+    }
+}
 
 /// `doc_id -> key` plus the bitmap of ids that resolve to a key.
 ///
@@ -102,6 +114,12 @@ impl DocKeys {
     #[must_use]
     pub fn footprint(&self) -> usize {
         self.slots.capacity() * std::mem::size_of::<Option<Bytes>>()
+    }
+
+    /// Drop every slot at or above `len` (keys included) and trim the capacity.
+    pub fn truncate(&mut self, len: u32) {
+        self.live.remove_range(len..);
+        cut(&mut self.slots, len as usize);
     }
 }
 
@@ -200,6 +218,15 @@ impl DocU64s {
     pub fn footprint(&self) -> usize {
         self.vals.capacity() * std::mem::size_of::<u64>()
     }
+
+    /// Drop every value at or above `len` and trim the capacity.
+    pub fn truncate(&mut self, len: u32) {
+        let len = len as usize;
+        if let Some(tail) = self.vals.get(len..) {
+            self.len -= tail.iter().filter(|v| **v != 0).count();
+        }
+        cut(&mut self.vals, len);
+    }
 }
 
 impl PartialEq for DocU64s {
@@ -294,6 +321,11 @@ impl DocLengths {
     pub fn footprint(&self) -> usize {
         self.vals.capacity() * std::mem::size_of::<u32>()
     }
+
+    /// Drop every row at or above `len` and trim the capacity.
+    pub fn truncate(&mut self, len: u32) {
+        cut(&mut self.vals, (len as usize).saturating_mul(self.stride));
+    }
 }
 
 /// `doc_id -> boxed slice` column for small per-document lists (TAG / NUMERIC entries). A doc with
@@ -376,6 +408,15 @@ impl<T> DocSlices<T> {
         self.slots.capacity() * std::mem::size_of::<Option<Box<[T]>>>()
     }
 
+    /// Drop every slot at or above `len` (entries included) and trim the capacity.
+    pub fn truncate(&mut self, len: u32) {
+        let len = len as usize;
+        if let Some(tail) = self.slots.get(len..) {
+            self.len -= tail.iter().filter(|s| s.is_some()).count();
+        }
+        cut(&mut self.slots, len);
+    }
+
     /// Heap bytes of one doc's entry slice — its exact allocation request.
     #[inline]
     #[must_use]
@@ -444,6 +485,50 @@ mod tests {
         l.clear(4);
         assert_eq!(l.sum_field(0), 3);
         assert_eq!(l.row(1), Some(&[3u32, 0][..]));
+    }
+
+    /// `truncate` drops the tail (counts included) and gives memory back once ≤ 1/4 is used.
+    #[test]
+    fn truncate_drops_the_tail_and_releases_capacity() {
+        let mut k = DocKeys::new();
+        let mut u = DocU64s::new();
+        let mut l = DocLengths::new(3);
+        let mut s: DocSlices<u32> = DocSlices::new();
+        for d in 0..1_000u32 {
+            k.insert(d, Bytes::from_static(b"k"));
+            u.insert(d, u64::from(d) + 1);
+            l.set(d, &[d, 1, 2]);
+            s.set(d, vec![d]);
+        }
+        k.truncate(600);
+        u.truncate(600);
+        l.truncate(600);
+        s.truncate(600);
+        assert_eq!((k.len(), u.len(), s.len()), (600, 600, 600));
+        assert_eq!(k.get(&600), None);
+        assert_eq!(k.live().max(), Some(599));
+        assert_eq!(u.get(&650), None);
+        assert_eq!(l.row(600), None);
+        assert_eq!(l.get(599, 0), 599);
+        assert_eq!(s.get(700), None);
+        let before = k.footprint();
+        assert!(
+            before >= 1_000 * std::mem::size_of::<Option<Bytes>>(),
+            "no shrink at 60%"
+        );
+        for c in [0u32, 10] {
+            k.truncate(c);
+            u.truncate(c);
+            l.truncate(c);
+            s.truncate(c);
+        }
+        assert_eq!((k.len(), u.len(), s.len()), (0, 0, 0));
+        assert_eq!(
+            k.footprint() + u.footprint() + l.footprint() + s.footprint(),
+            0
+        );
+        k.insert(3, Bytes::from_static(b"again"));
+        assert_eq!(k.keys().collect::<Vec<_>>(), vec![3]);
     }
 
     #[test]

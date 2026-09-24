@@ -132,8 +132,14 @@ pub struct TextIndex {
     /// doc_id -> original Redis key bytes, plus the bitmap of ids that have a key
     /// (moon#1191: "resolvable" is one `&=`). A dense column (moon#1194).
     pub doc_id_to_key: DocKeys,
-    /// Next doc_id to assign.
+    /// One past the highest live doc_id (`0` when empty) — the id a new document takes when no
+    /// freed id is available.
     next_doc_id: u32,
+    /// Ids below `next_doc_id` that no document holds: exactly `[0, next_doc_id) \ live`. A new
+    /// document takes the smallest ([`Self::alloc_doc_id`]), so the dense columns stay bounded by
+    /// the peak live-document count instead of growing with every id ever handed out (moon#1221
+    /// review: FT.INVALIDATE_RANGE → re-HSET cycles used to leave a hole per cycle, forever).
+    free_doc_ids: roaring::RoaringBitmap,
 
     // ── Bi-temporal MVCC (v0.1.10 G-1, closing HYB-03 deferral) ──────────
     //
@@ -289,6 +295,7 @@ impl TextIndex {
             key_hash_to_doc_id: HashMap::new(),
             doc_id_to_key: DocKeys::new(),
             next_doc_id: 0,
+            free_doc_ids: roaring::RoaringBitmap::new(),
             doc_id_to_insert_lsn: DocU64s::new(),
             doc_id_to_delete_lsn: HashMap::new(),
             #[cfg(feature = "text-index")]
@@ -396,12 +403,58 @@ impl TextIndex {
         if let Some(&id) = self.key_hash_to_doc_id.get(&key_hash) {
             return id;
         }
-        let id = self.next_doc_id;
-        self.next_doc_id += 1;
+        let id = self.alloc_doc_id();
         self.key_hash_to_doc_id.insert(key_hash, id);
         self.doc_id_to_key.insert(id, Bytes::copy_from_slice(key));
         self.charge_new_doc_key(key.len());
         id
+    }
+
+    /// The id for a genuinely NEW document: the smallest freed id, else `next_doc_id`.
+    ///
+    /// Reuse is safe because `remove_doc_by_doc_id` clears EVERY structure keyed by the id before
+    /// it becomes free — postings (via the doc→terms reverse map), field lengths, key and key-hash
+    /// entry, insert/delete LSNs, content checksum, TAG/NUMERIC entries and bitmaps — so the new
+    /// document starts from exactly the state a never-used id has. Nothing outside the index holds
+    /// a doc_id across commands (results carry keys; DFS carries df/N, not ids). Tie order between
+    /// equal scores is `doc_id ASC`, as before; a reused id simply sorts where its number is.
+    fn alloc_doc_id(&mut self) -> u32 {
+        if let Some(id) = self.free_doc_ids.min() {
+            self.free_doc_ids.remove(id);
+            return id;
+        }
+        let id = self.next_doc_id;
+        self.next_doc_id += 1;
+        id
+    }
+
+    /// Return `doc_id` (already cleared from every structure, key included) to the free set. When
+    /// it was the highest live id, `next_doc_id` drops to one past the new highest one, the free
+    /// ids above it are forgotten, and the dense columns are cut back — so an index emptied by
+    /// `FT.INVALIDATE_RANGE` gives its column memory back.
+    fn release_doc_id(&mut self, doc_id: u32) {
+        if doc_id.saturating_add(1) < self.next_doc_id {
+            self.free_doc_ids.insert(doc_id);
+            return;
+        }
+        let top = self.doc_id_to_key.live().max().map_or(0, |m| m + 1);
+        self.free_doc_ids.remove_range(top..);
+        self.next_doc_id = top;
+        self.doc_id_to_key.truncate(top);
+        self.doc_field_lengths.truncate(top);
+        self.doc_id_to_insert_lsn.truncate(top);
+        self.doc_id_to_content_checksum.truncate(top);
+        #[cfg(feature = "text-index")]
+        {
+            self.doc_tag_entries.truncate(top);
+            self.doc_numeric_entries.truncate(top);
+        }
+    }
+
+    /// Ids below `next_doc_id` that no document holds (`[0, next_doc_id) \ live`).
+    #[must_use]
+    pub fn free_doc_ids(&self) -> &roaring::RoaringBitmap {
+        &self.free_doc_ids
     }
 
     /// K4 (P0 fix): charge the bookkeeping cost of a genuinely NEW document
@@ -439,10 +492,15 @@ impl TextIndex {
     /// contents (key bytes, TAG/NUMERIC entry slices) are billed incrementally
     /// in `resident_bytes_extra`.
     fn columns_footprint(&self) -> usize {
+        // The free-id bitmap: ≤ 2 B per free id (roaring array containers; a bitmap container is
+        // 1 bit per id). O(1) — the live count is the key-hash map's length.
+        let free_ids =
+            2 * (self.next_doc_id as usize).saturating_sub(self.key_hash_to_doc_id.len());
         let base = self.doc_id_to_key.footprint()
             + self.doc_field_lengths.footprint()
             + self.doc_id_to_insert_lsn.footprint()
-            + self.doc_id_to_content_checksum.footprint();
+            + self.doc_id_to_content_checksum.footprint()
+            + free_ids;
         #[cfg(feature = "text-index")]
         let base = base + self.doc_tag_entries.footprint() + self.doc_numeric_entries.footprint();
         base
@@ -699,8 +757,32 @@ impl TextIndex {
             }
         }
 
-        // Validated — assign.
-        self.next_doc_id = p.next_doc_id;
+        // The columns below get one slot per id up to the highest loaded one: refuse sparse ids
+        // (`decode` already did; this guards a hand-built `PersistedTextIndex`), so install
+        // allocates O(doc count), never O(a claimed id).
+        let top = p
+            .docs
+            .iter()
+            .map(|d| d.doc_id.saturating_add(1))
+            .max()
+            .unwrap_or(0);
+        if !crate::text::postings_persist::doc_ids_dense_enough(
+            top.max(p.next_doc_id),
+            p.docs.len(),
+        ) {
+            return Err("doc ids too sparse");
+        }
+
+        // Validated — assign. `next_doc_id` is normalised to one past the highest loaded id and
+        // every id below it that no document holds is free (a file written before freed ids were
+        // reused may carry a higher counter and holes).
+        let mut free = roaring::RoaringBitmap::new();
+        free.insert_range(0..top);
+        for d in &p.docs {
+            free.remove(d.doc_id);
+        }
+        self.next_doc_id = top;
+        self.free_doc_ids = free;
         for d in p.docs {
             let key_hash = xxhash_rust::xxh64::xxh64(&d.key, 0);
             self.key_hash_to_doc_id.insert(key_hash, d.doc_id);
@@ -884,9 +966,7 @@ impl TextIndex {
             }
             existing_id
         } else {
-            let id = self.next_doc_id;
-            self.next_doc_id += 1;
-            id
+            self.alloc_doc_id()
         };
 
         // Store key mapping. K4 (P0 fix): the bookkeeping charge fires only
@@ -2106,12 +2186,19 @@ impl TextIndex {
         // K4 (P0 fix): uncharge using the ACTUAL removed Vec's length --
         // self-correcting even if field_count ever varied per doc (it
         // currently doesn't).
-        // Dense columns: the slots stay (billed by capacity) and read as empty.
+        // Dense columns: the slots read as empty until the id is reused (`release_doc_id` below).
         self.doc_field_lengths.clear(doc_id);
         // Remove from key_hash -> doc_id map (need to find the key_hash).
         if let Some(key) = self.doc_id_to_key.remove(&doc_id) {
             let key_hash = xxhash_rust::xxh64::xxh64(&key, 0);
-            self.key_hash_to_doc_id.remove(&key_hash);
+            if self.key_hash_to_doc_id.get(&key_hash) == Some(&doc_id) {
+                self.key_hash_to_doc_id.remove(&key_hash);
+            } else {
+                // Indexed under a hash other than xxh64(key) (unit tests only — every production
+                // caller hashes the key). The id is about to be reused, so no stale hash may
+                // still reach it.
+                self.key_hash_to_doc_id.retain(|_, d| *d != doc_id);
+            }
             self.uncharge_doc_key(key.len());
         }
         self.doc_id_to_insert_lsn.remove(&doc_id);
@@ -2127,6 +2214,8 @@ impl TextIndex {
                 std::mem::size_of::<u32>() + std::mem::size_of::<u64>() + MAP_ENTRY_OVERHEAD,
             );
         }
+        // Every structure keyed by `doc_id` is clear: the id may now be reused (moon#1221 review).
+        self.release_doc_id(doc_id);
     }
 }
 
@@ -3884,3 +3973,9 @@ mod tag_tests;
 #[cfg(feature = "text-index")]
 #[path = "store_numeric_tests.rs"]
 mod numeric_tests;
+
+// moon#1221 review: freed doc-id reuse — same sibling-file pattern.
+#[cfg(test)]
+#[cfg(feature = "text-index")]
+#[path = "store_doc_id_tests.rs"]
+mod doc_id_tests;

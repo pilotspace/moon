@@ -1043,6 +1043,48 @@ mod tests {
         );
     }
 
+    /// moon#1221 review: `PostingCursor::seek` agrees with `tf()` over roaring bitmap AND array
+    /// containers and across chunked columns, under forward seeks of every stride. Reused doc ids
+    /// (freed by FT.INVALIDATE_RANGE) make mid-posting inserts routine, so the cursor must hold on
+    /// any id layout, not only an append-only one.
+    #[test]
+    fn cursor_matches_tf_over_bitmap_and_array_containers() {
+        let mut rng = Rng(0x5eed);
+        let dense: Vec<u32> = (0..200_000u32)
+            .filter(|d| d % 3 != 1 || d % 7 == 0)
+            .collect();
+        let sparse: Vec<u32> = (0..4_000u32).map(|i| i * 997).collect();
+        let mut mixed: Vec<u32> = (0..70_000u32).filter(|d| d % 5 != 2).collect();
+        mixed.extend((0..3_000u32).map(|i| 70_000 + i * 613));
+        let mut checked = 0usize;
+        for ids in [dense, sparse, mixed] {
+            let tfs: Vec<u32> = ids.iter().map(|d| 1 + (d * 7 + d / 3) % 11).collect();
+            let p = PostingList::from_parts(&ids, tfs, None).expect("parts");
+            assert!(p.chunks.is_some(), "fixture must be chunked");
+            let max = *ids.last().expect("non-empty") + 5_000;
+            for trial in 0..60 {
+                let mut c = p.cursor();
+                let mut d = rng.below(64) as u32;
+                while d < max {
+                    let tf = p.tf(d);
+                    assert_eq!(
+                        c.seek(d),
+                        (tf != 0).then_some(tf),
+                        "trial {trial} seek({d})"
+                    );
+                    checked += 1;
+                    d += match rng.below(10) {
+                        0..=4 => 1,
+                        5 | 6 => 1 + rng.below(100) as u32,
+                        7 | 8 => 1 + rng.below(3_000) as u32,
+                        _ => 1 + rng.below(70_000) as u32,
+                    };
+                }
+            }
+        }
+        assert!(checked > 10_000, "only {checked} seeks");
+    }
+
     // ── moon#1195: chunked rank-aligned columns ─────────────────────────────
 
     /// SplitMix64 — deterministic, dependency-free.

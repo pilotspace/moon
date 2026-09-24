@@ -57,6 +57,21 @@ const TRAILER_LEN: usize = 8;
 /// Refuse files whose header claims more than this; the decoder never
 /// allocates on the claim, but the read itself should not be unbounded.
 pub const MAX_FILE_LEN: u64 = 16 << 30;
+/// Ids a file may leave unused beyond one per document (see [`doc_ids_dense_enough`]).
+pub const DOC_ID_SLACK: u64 = 65_536;
+
+/// `true` when `next_doc_id` (one past every id in the file) is at most `2 × doc_count +`
+/// [`DOC_ID_SLACK`]. `TextIndex::install_recovered` gives every per-document column one slot per
+/// id up to the highest one, so a sparse file would make a few bytes allocate by a claimed id — a
+/// 107-byte file naming doc 2,000,000 billed 72 MB, one near `u32::MAX` aborts every boot (moon#1221
+/// review). A live index reuses freed ids, so its files stay dense; one that is not (written before
+/// that, or after a mass removal the index never re-filled) is refused and REBUILT, which numbers
+/// the documents densely again. Install is therefore O(file size): ≤ 2 slots per document plus a
+/// fixed 64 Ki-slot allowance.
+#[must_use]
+pub fn doc_ids_dense_enough(next_doc_id: u32, doc_count: usize) -> bool {
+    u64::from(next_doc_id) <= (doc_count as u64).saturating_mul(2) + DOC_ID_SLACK
+}
 
 /// Why a `.tpost` file was refused. Every variant means "rebuild this
 /// index" — the caller logs it and takes the pre-existing rescan path.
@@ -479,6 +494,10 @@ pub fn decode(data: &[u8]) -> Result<PersistedTextIndex, PostingsDecodeError> {
             field_lengths,
         });
     }
+    // Every doc id is below `next_doc_id`, so this bounds the highest one too.
+    if !doc_ids_dense_enough(next_doc_id, doc_count) {
+        return Err(PostingsDecodeError::Invalid("doc ids too sparse"));
+    }
 
     // Fields.
     let mut fields = Vec::with_capacity(field_count);
@@ -859,6 +878,87 @@ mod tests {
             numeric_fields: idx.numeric_fields.clone(),
         };
         TextIndex::from_meta(&meta)
+    }
+
+    /// moon#1221 review (refs moon#1194): FT.INVALIDATE_RANGE-style hard deletes followed by a
+    /// re-index of the same keys (the Lunaris force-push cycle). Each re-index used to take a FRESH
+    /// doc id while the dense columns kept a slot for every id ever handed out: a ZERO-document
+    /// index grew 278,949 → 4,456,869 B over 12 cycles, and a 1-doc index reloaded from the
+    /// 168-byte `.tpost` billed 2,496,427 B. Freed ids are reused now and an emptied index cuts its
+    /// columns back, so every cycle ends in the same state and the reloaded index is tiny.
+    #[cfg(feature = "text-index")]
+    #[test]
+    fn invalidate_reindex_cycles_keep_columns_bounded_across_restart() {
+        use crate::text::types::TagFieldDef;
+        let mut idx = TextIndex::new_with_schema(
+            Bytes::from_static(b"churn"),
+            vec![Bytes::from_static(b"c:")],
+            vec![TextFieldDef::new(Bytes::from_static(b"body"))],
+            vec![TagFieldDef::new(Bytes::from_static(b"node"))],
+            vec![],
+            BM25Config::default(),
+        );
+        const N: usize = 4_000;
+        let mut billed = Vec::new();
+        let mut peak = 0;
+        for cycle in 0..12u64 {
+            for i in 0..N {
+                let key = format!("c:{i}");
+                let kh = xxhash_rust::xxh64::xxh64(key.as_bytes(), 0);
+                let args = frames(&[("body", "alpha beta"), ("node", "n1")]);
+                idx.index_document_with_lsn(
+                    kh,
+                    key.as_bytes(),
+                    &args,
+                    1 + cycle * N as u64 + i as u64,
+                );
+                idx.tag_index_document(kh, key.as_bytes(), &args);
+                idx.record_content_checksum(kh, &args);
+            }
+            assert_eq!(idx.next_doc_id(), N as u32, "cycle {cycle}: ids reused");
+            peak = peak.max(idx.resident_bytes());
+            let ids: Vec<u32> = idx.doc_id_to_key.keys().collect();
+            for id in ids {
+                idx.remove_doc_by_doc_id(id);
+            }
+            assert_eq!(idx.doc_id_to_key.len(), 0);
+            assert_eq!(idx.next_doc_id(), 0);
+            billed.push(idx.resident_bytes());
+            assert_eq!(
+                idx.doc_id_to_key.footprint() + idx.doc_field_lengths.footprint(),
+                0,
+                "cycle {cycle}: an empty index holds no column slots"
+            );
+        }
+        assert!(
+            billed.iter().all(|&b| b == billed[0]),
+            "a 0-document index must end every cycle in the same state: {billed:?}"
+        );
+        assert!(billed[0] * 50 < peak, "{} vs peak {peak}", billed[0]);
+        let kh = xxhash_rust::xxh64::xxh64(b"c:survivor", 0);
+        let args = frames(&[("body", "alpha"), ("node", "n1")]);
+        idx.index_document_with_lsn(kh, b"c:survivor", &args, 999_999);
+        idx.record_content_checksum(kh, &args);
+        assert_eq!(idx.key_hash_to_doc_id[&kh], 0);
+        let bytes = encode_index(&idx);
+        let mut loaded = empty_like(&idx);
+        loaded
+            .install_recovered(decode(&bytes).expect("decode"))
+            .expect("install");
+        assert_eq!(loaded.next_doc_id(), 1);
+        eprintln!(
+            "moon#1221 churn: {N}-doc peak bills {peak} B; 0 docs after every cycle {} B; \
+             1-doc index reloaded from a {} B .tpost bills {} B",
+            billed[0],
+            bytes.len(),
+            loaded.resident_bytes()
+        );
+        assert!(
+            loaded.resident_bytes() < 2_048,
+            "a 1-doc index reloaded from a {} B .tpost bills {} B",
+            bytes.len(),
+            loaded.resident_bytes()
+        );
     }
 
     fn hits(idx: &TextIndex, field: usize, terms: &[&str]) -> Vec<(Bytes, f32)> {
