@@ -16,6 +16,7 @@ use crate::vector::segment::compaction::graph_build::build_graph_auto;
 use crate::vector::segment::compaction::{HNSW_EF_CONSTRUCTION, HNSW_M};
 use crate::vector::segment::immutable::{ImmutableSegment, MvccHeader};
 use crate::vector::segment::mutable::FrozenSegment;
+use crate::vector::segment::sub_signs::SubSignEncoder;
 use crate::vector::turbo_quant::collection::{CollectionMetadata, QuantizationConfig};
 use crate::vector::turbo_quant::sq8::{decode_sq8, sq8_params};
 
@@ -37,7 +38,6 @@ pub fn compact(
 ) -> Result<ImmutableSegment, CompactionError> {
     let _dim = frozen.dimension as usize;
     let padded = collection.padded_dimension as usize;
-    let signs = collection.fwht_sign_flips.as_slice();
     let bytes_per_code = frozen.bytes_per_code;
 
     // ── Step 1: Filter dead entries ──────────────────────────────────
@@ -300,77 +300,21 @@ pub fn compact(
     // The zero-filled buffer is exactly the SQ8 contract.
     if has_raw && !is_sq8 {
         // Use raw f32 → FWHT rotate → compare against centroid per TQ index
-        let mut work = vec![0.0f32; padded];
-        for bfs_pos in 0..n {
-            let orig_id = graph.to_original(bfs_pos as u32) as usize;
-            let live_idx = orig_id;
-            let raw = &frozen.raw_f32[live_entries[live_idx].internal_id as usize * dim
-                ..(live_entries[live_idx].internal_id as usize + 1) * dim];
-
-            // Normalize + pad + FWHT to get actual rotated coordinates
-            let norm_sq: f32 = raw.iter().map(|x| x * x).sum();
-            let norm = norm_sq.sqrt();
-            if norm > 0.0 {
-                let inv = 1.0 / norm;
-                for (dst, &src) in work[..dim].iter_mut().zip(raw.iter()) {
-                    *dst = src * inv;
-                }
-            } else {
-                for v in work[..dim].iter_mut() {
-                    *v = 0.0;
-                }
-            }
-            for v in work[dim..padded].iter_mut() {
-                *v = 0.0;
-            }
-            crate::vector::turbo_quant::fwht::fwht(&mut work[..padded], signs);
-
-            let code_offset = bfs_pos * bytes_per_code;
-            let code_slice = &tq_bfs[code_offset..code_offset + code_len];
-            let sign_offset = bfs_pos * sub_bpv;
-
-            if is_a2 {
-                // A2: each nibble is a pair index, decode via A2Codebook
-                let cb = if let Some(c) = a2_cb.as_ref() {
-                    c
-                } else {
-                    continue;
-                };
-                for j in 0..code_slice.len() {
-                    let byte = code_slice[j];
-                    let qi = j * 4; // each byte = 2 pairs = 4 coordinates
-                    let (x0, y0) = cb.decode_pair(byte & 0x0F);
-                    let (x1, y1) = cb.decode_pair(byte >> 4);
-                    if qi < padded && work[qi] >= x0 {
-                        sub_signs_bfs[sign_offset + qi / 8] |= 1 << (qi % 8);
-                    }
-                    if qi + 1 < padded && work[qi + 1] >= y0 {
-                        sub_signs_bfs[sign_offset + (qi + 1) / 8] |= 1 << ((qi + 1) % 8);
-                    }
-                    if qi + 2 < padded && work[qi + 2] >= x1 {
-                        sub_signs_bfs[sign_offset + (qi + 2) / 8] |= 1 << ((qi + 2) % 8);
-                    }
-                    if qi + 3 < padded && work[qi + 3] >= y1 {
-                        sub_signs_bfs[sign_offset + (qi + 3) / 8] |= 1 << ((qi + 3) % 8);
-                    }
-                }
-            } else {
-                // Scalar TQ: each nibble is a single-coordinate index
-                let codebook = if let Some(c) = codebook_opt {
-                    c
-                } else {
-                    continue;
-                };
-                for j in 0..code_slice.len() {
-                    let byte = code_slice[j];
-                    let qi = j * 2;
-                    if work[qi] >= codebook[(byte & 0x0F) as usize] {
-                        sub_signs_bfs[sign_offset + qi / 8] |= 1 << (qi % 8);
-                    }
-                    if work[qi + 1] >= codebook[(byte >> 4) as usize] {
-                        sub_signs_bfs[sign_offset + (qi + 1) / 8] |= 1 << ((qi + 1) % 8);
-                    }
-                }
+        // (shared encoder: the same routine merge uses on f16 sidecar rows).
+        if let Some(mut enc) = SubSignEncoder::new(collection) {
+            debug_assert_eq!(enc.bytes_per_vec(), sub_bpv);
+            for bfs_pos in 0..n {
+                let orig_id = graph.to_original(bfs_pos as u32) as usize;
+                let internal = live_entries[orig_id].internal_id as usize;
+                let raw = &frozen.raw_f32[internal * dim..(internal + 1) * dim];
+                let code_offset = bfs_pos * bytes_per_code;
+                let code_slice = &tq_bfs[code_offset..code_offset + code_len];
+                let sign_offset = bfs_pos * sub_bpv;
+                enc.encode_f32(
+                    raw,
+                    code_slice,
+                    &mut sub_signs_bfs[sign_offset..sign_offset + sub_bpv],
+                );
             }
         }
     } else if need_cpu_build && !is_sq8 && !frozen.sub_centroid_signs.is_empty() {

@@ -1337,6 +1337,18 @@ impl ImmutableSegment {
         self.qjl_signs[src..src + qjl_bpv].to_vec()
     }
 
+    /// All sub-centroid sign bits, BFS-ordered, `sub_sign_bytes_per_vec()`
+    /// bytes per entry — empty when the segment has none (16-level search).
+    /// Persisted as `sub_signs.bin` (moon#1193).
+    pub fn sub_centroid_signs(&self) -> &[u8] {
+        &self.sub_centroid_signs
+    }
+
+    /// Sign bytes per entry (`ceil(padded_dim / 8)`).
+    pub fn sub_sign_bytes_per_vec(&self) -> usize {
+        self.sub_sign_bytes_per_vec
+    }
+
     /// Sub-centroid sign bytes for a specific BFS-ordered position.
     /// Returns an empty Vec if not available or position is out of bounds.
     pub fn sub_centroid_bytes_for(&self, bfs_pos: usize, sub_bpv: usize) -> Vec<u8> {

@@ -5,6 +5,7 @@ pub mod ivf;
 pub mod key_index;
 pub mod mutable;
 pub mod raw_f16_store;
+pub(crate) mod sub_signs;
 
 pub use compaction::{
     CompactionError, MergeMode, MergeStats, compact, merge_immutable, needs_vacuum,

@@ -14,6 +14,7 @@ use crate::vector::segment::compaction::{
     CompactionError, HNSW_EF_CONSTRUCTION, HNSW_M, MERGE_MEMORY_CEILING, MergeMode,
 };
 use crate::vector::segment::immutable::{ImmutableSegment, MvccHeader};
+use crate::vector::segment::sub_signs::SubSignEncoder;
 use crate::vector::turbo_quant::collection::{CollectionMetadata, QuantizationConfig};
 use crate::vector::turbo_quant::sq8::{SQ8_PARAMS_BYTES, decode_sq8, sq8_params};
 
@@ -134,6 +135,20 @@ fn merge_graph_union(
     // sidecar would silently mix exact and ADC distances within one segment).
     let mut all_have_raw = true;
 
+    // moon#1193: every merged entry must carry real sub-centroid signs, or
+    // the merged segment carries none (all-or-nothing, like the sidecar). A
+    // source reloaded from a pre-v2 segment directory has no signs; they are
+    // recomputed from its f16 sidecar row instead of zero-filled (a zero row
+    // pins every coordinate to the lower sub-bin and biases its 32-level
+    // score). SQ8 keeps its zero-filled buffer — the search never reads it.
+    let mut sign_enc = if is_sq8 {
+        None
+    } else {
+        SubSignEncoder::new(collection).filter(|e| e.bytes_per_vec() == sub_bpv)
+    };
+    let mut all_have_signs = sign_enc.is_some();
+    let mut recomputed_signs = 0usize;
+
     for seg in segments {
         let tq_buf = seg.vectors_tq().as_slice();
         let headers = seg.mvcc_headers();
@@ -169,18 +184,30 @@ fn merge_graph_union(
                 Vec::new()
             };
 
-            // Sub-centroid sign bytes.
-            let sub_bytes = seg.sub_centroid_bytes_for(bfs_pos, sub_bpv);
-
             // Exact-rerank sidecar slice for this entry (HQ-1).
-            let raw_bytes: Vec<u16> =
-                match seg_raw.and_then(|r| r.get(bfs_pos * dim..(bfs_pos + 1) * dim)) {
-                    Some(slice) => slice.to_vec(),
-                    None => {
-                        all_have_raw = false;
-                        Vec::new()
+            let raw_slice = seg_raw.and_then(|r| r.get(bfs_pos * dim..(bfs_pos + 1) * dim));
+
+            // Sub-centroid sign bytes: the source's own, else recomputed
+            // from the sidecar row (moon#1193), else the merge drops signs.
+            let mut sub_bytes = seg.sub_centroid_bytes_for(bfs_pos, sub_bpv);
+            if all_have_signs && sub_bytes.len() != sub_bpv {
+                match (sign_enc.as_mut(), raw_slice) {
+                    (Some(enc), Some(raw)) if enc.code_len() == code_len => {
+                        sub_bytes = vec![0u8; sub_bpv];
+                        enc.encode_f16(raw, &code_bytes[..code_len], &mut sub_bytes);
+                        recomputed_signs += 1;
                     }
-                };
+                    _ => all_have_signs = false,
+                }
+            }
+
+            let raw_bytes: Vec<u16> = match raw_slice {
+                Some(slice) => slice.to_vec(),
+                None => {
+                    all_have_raw = false;
+                    Vec::new()
+                }
+            };
 
             // Deduplicate: keep highest insert_lsn.
             let entry = by_key_hash.entry(hdr.key_hash).or_insert((
@@ -467,6 +494,25 @@ fn merge_graph_union(
             recall,
             required: recall_tolerance,
         });
+    }
+
+    // moon#1193: never ship a partially zero-filled sign buffer.
+    let sub_bfs = if is_sq8 || all_have_signs {
+        sub_bfs
+    } else {
+        tracing::debug!(
+            sources = segments.len(),
+            "GraphUnion merge: a source row has neither sub-centroid signs nor an \
+             f16 sidecar to recompute them from — merged segment searches with \
+             the 16-level LUT"
+        );
+        Vec::new()
+    };
+    if recomputed_signs > 0 {
+        tracing::debug!(
+            recomputed_signs,
+            "GraphUnion merge recomputed sub-centroid signs from the f16 sidecar"
+        );
     }
 
     // ── Step 8: Build merged ImmutableSegment ────────────────────────────────

@@ -459,8 +459,17 @@ pub fn hnsw_search_filtered(
     let padded_dim = q_rotated.len();
     let _active_code_bytes = original_dim / 2; // nibble-packed bytes for original dim
     let sub_table = collection.sub_centroid_table.as_ref();
-    // Guard use_subcent on sub_table availability to avoid panic
-    let use_subcent = use_subcent && sub_table.is_some();
+    // Guard use_subcent on sub_table availability to avoid panic, and on the
+    // sign buffer actually covering every node: the sub-centroid inner loops
+    // below read `sign_ptr + bfs_pos * sub_sign_bpv + (0..code_len/4)`
+    // unchecked. Sign buffers now also come from disk (`sub_signs.bin`,
+    // moon#1193), so this is checked here, once per search, instead of being
+    // a caller promise.
+    let sub_code_len = (graph.bytes_per_code() as usize).saturating_sub(4);
+    let use_subcent = use_subcent
+        && sub_table.is_some()
+        && sub_sign_bpv.saturating_mul(4) >= sub_code_len
+        && sub_centroid_signs.len() >= (num_nodes as usize).saturating_mul(sub_sign_bpv);
     let entries_per_coord: usize = if use_subcent { 32 } else { 16 };
 
     // Use pre-allocated scratch.adc_lut (zero alloc per query).

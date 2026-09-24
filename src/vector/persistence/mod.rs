@@ -9,6 +9,8 @@ pub mod mmap_budget;
 pub mod recover_v2;
 pub mod sealed_mmap;
 pub mod segment_io;
+#[cfg(test)]
+mod segment_sub_signs_tests;
 pub mod unloaded_segment;
 pub mod warm_search;
 pub mod warm_segment;

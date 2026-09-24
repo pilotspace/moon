@@ -10,7 +10,21 @@
 //!   segment_meta.json   -- JSON metadata with checksum verification
 //!   raw_f16.bin         -- optional HQ-1 exact-rerank sidecar (f16 halves,
 //!                          BFS-ordered); absent when built without raw vectors
+//!   sub_signs.bin       -- optional sub-centroid sign bits (segment format
+//!                          v2, moon#1193): `ceil(padded_dim/8)` bytes per
+//!                          entry, BFS-ordered; absent in v1 directories and
+//!                          for segments built without signs
 //! ```
+//!
+//! ## Segment format versions (`segment_meta.json` `version`)
+//! - **v1**: the four core files + optional `raw_f16.bin`.
+//! - **v2** (moon#1193): v1 + optional `sub_signs.bin`, so a HOT segment
+//!   reloaded after a restart keeps the 32-level sub-centroid LUT instead of
+//!   silently dropping to 16-level ADC. Additive: a v1 reader (older binary)
+//!   ignores the extra file and the version number (it never checked it); a
+//!   v2 reader loads v1 directories exactly as before (no signs, 16-level).
+//!   A present-but-wrong-sized `sub_signs.bin` is ignored with a warning —
+//!   never trusted, because the beam indexes it without per-read checks.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -56,6 +70,10 @@ impl From<std::io::Error> for SegmentIoError {
         Self::Io(e)
     }
 }
+
+/// Current `segment_meta.json` format version written by this build (see
+/// the module docs for the version history).
+pub(crate) const SEGMENT_FORMAT_VERSION: u32 = 2;
 
 /// On-disk JSON metadata for an immutable segment.
 #[derive(Serialize, Deserialize)]
@@ -227,6 +245,20 @@ fn write_segment_files(
         fsync_file(&raw_path)?;
     }
 
+    // 3b. sub_signs.bin — sub-centroid sign bits (format v2, moon#1193).
+    // Written only when the segment carries a complete buffer (one
+    // `sub_sign_bytes_per_vec` row per entry); readers validate the size.
+    let sub_signs = segment.sub_centroid_signs();
+    let sub_bpv = segment.sub_sign_bytes_per_vec();
+    if !sub_signs.is_empty()
+        && sub_bpv > 0
+        && sub_signs.len() == segment.mvcc_headers().len() * sub_bpv
+    {
+        let sub_path = seg_dir.join("sub_signs.bin");
+        fs::write(&sub_path, sub_signs)?;
+        fsync_file(&sub_path)?;
+    }
+
     // 4. mvcc_headers.bin: [version:u8][count:u32 LE][MvccHeader; count]
     // v2 format: 32 bytes/header (internal_id + global_id + key_hash + insert_lsn + delete_lsn)
     let mvcc = segment.mvcc_headers();
@@ -247,7 +279,7 @@ fn write_segment_files(
 
     // 5. segment_meta.json
     let meta = SegmentMeta {
-        version: 1,
+        version: SEGMENT_FORMAT_VERSION,
         segment_id,
         collection_id: collection.collection_id,
         created_at_lsn: collection.created_at_lsn,
@@ -397,6 +429,42 @@ pub fn read_mvcc_headers_only(dir: &Path, segment_id: u64) -> Option<Vec<MvccHea
     let seg_dir = segment_dir(dir, segment_id);
     let mvcc_bytes = fs::read(seg_dir.join("mvcc_headers.bin")).ok()?;
     parse_mvcc_headers(&mvcc_bytes).ok()
+}
+
+/// Load `sub_signs.bin` if present and exactly `entries * sub_bpv` bytes
+/// (with `entries` agreeing between the graph and the MVCC headers);
+/// otherwise an empty buffer (16-level search). Missing is the silent v1
+/// case; a present file of the wrong size is corruption and warns.
+fn read_sub_signs(
+    seg_dir: &Path,
+    segment_id: u64,
+    headers: usize,
+    graph_nodes: u32,
+    sub_bpv: usize,
+) -> Vec<u8> {
+    let path = seg_dir.join("sub_signs.bin");
+    let bytes = match fs::read(&path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+        Err(e) => {
+            tracing::warn!(
+                "segment-{segment_id}: cannot read sub_signs.bin ({e}) — \
+                 searching with the 16-level LUT"
+            );
+            return Vec::new();
+        }
+    };
+    let expected = headers * sub_bpv;
+    if sub_bpv == 0 || headers != graph_nodes as usize || bytes.len() != expected {
+        tracing::warn!(
+            "segment-{segment_id}: sub_signs.bin has {} bytes, expected {expected} \
+             ({headers} headers, {graph_nodes} graph nodes) — ignoring it \
+             (search falls back to the 16-level LUT)",
+            bytes.len()
+        );
+        return Vec::new();
+    }
+    bytes
 }
 
 /// Read an immutable segment from disk.
@@ -577,13 +645,25 @@ pub fn read_immutable_segment(
         }
     }
 
+    // 6c. sub_signs.bin — sub-centroid signs (format v2, moon#1193). v1
+    // directories have none (16-level search, exactly as before). The size
+    // must match the graph AND the headers: the beam indexes this buffer by
+    // BFS position, so a short or long file is dropped, never trusted.
+    let sub_signs = read_sub_signs(
+        &seg_dir,
+        segment_id,
+        mvcc.len(),
+        graph.num_nodes(),
+        sub_sign_bpv,
+    );
+
     let segment = ImmutableSegment::new(
         graph,
         vectors_tq,
-        Vec::new(), // QJL signs — not persisted yet
-        Vec::new(), // residual norms — not persisted yet
+        Vec::new(), // QJL signs — not persisted (never read on a reloaded segment)
+        Vec::new(), // residual norms — not persisted
         qjl_bpv,
-        Vec::new(), // sub-centroid signs — not persisted yet
+        sub_signs,
         sub_sign_bpv,
         mvcc,
         collection.clone(),
