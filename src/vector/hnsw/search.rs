@@ -500,14 +500,21 @@ pub fn hnsw_search_filtered_prepared(
     // 32-entry worst case; cleared by scratch.clear() above) by the same
     // vectorizable fill the prepared path uses. SQ8 computes its distance
     // directly from the affine codes and never reads a LUT.
+    //
+    // moon#1226: a prepared LUT without this segment's exact layout (a
+    // checksum-matching collection may lack the sub-centroid table, which the
+    // checksum does not cover) is built locally instead — it used to be read
+    // as an empty LUT, and the guard below then returned NO results, silently.
+    let prepared_lut = match prepared {
+        Some(p) if !is_sq8 && use_subcent => p.lut32(),
+        Some(p) if !is_sq8 => Some(p.lut16()),
+        _ => None,
+    }
+    .filter(|lut| lut.len() == padded_dim * entries_per_coord);
     let adc_lut: &[f32] = if is_sq8 {
         &scratch.adc_lut
-    } else if let Some(p) = prepared {
-        if use_subcent {
-            p.lut32().unwrap_or(&[])
-        } else {
-            p.lut16()
-        }
+    } else if let Some(lut) = prepared_lut {
+        lut
     } else {
         scratch.adc_lut.resize(padded_dim * entries_per_coord, 0.0);
         match sub_table.filter(|_| use_subcent) {

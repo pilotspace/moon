@@ -243,3 +243,69 @@ fn tombstone_guard_taken_once_per_segment_search() {
     );
     assert_eq!(hits.len(), 10);
 }
+
+#[test]
+fn prepared_state_without_the_sub_centroid_table_falls_back_to_a_local_lut() {
+    // moon#1226 red test: a collection that `matches` the segment's (same
+    // id, dimension, quantization, metric and checksum) can still lack the
+    // sub-centroid table — the checksum does not cover it — so the prepared
+    // `lut32()` is `None` while the segment scores 32-level. HEAD read that as
+    // an EMPTY LUT and the search returned no results at all, silently.
+    distance::init();
+    crate::vector::turbo_quant::fwht::init_fwht();
+    let dim = 64u32;
+    let make = || {
+        CollectionMetadata::new(
+            77,
+            dim,
+            DistanceMetric::Cosine,
+            QuantizationConfig::TurboQuant4,
+            77,
+        )
+    };
+    let col = Arc::new(make());
+    assert!(col.sub_centroid_table.is_some(), "TQ4 builds the table");
+    let seg = crate::vector::segment::mutable::MutableSegment::new(dim, Arc::clone(&col));
+    for i in 0..300u64 {
+        seg.append(i, &random_vec(dim as usize, 50_000 + i), i + 1);
+    }
+    let imm =
+        crate::vector::segment::compaction::compact(&seg.freeze(), &col, 5, None).expect("compact");
+    assert!(
+        !imm.sub_centroid_signs().is_empty(),
+        "the segment must score with the 32-level LUT"
+    );
+
+    let mut stripped = make();
+    stripped.sub_centroid_table = None;
+    let stripped = Arc::new(stripped);
+    let q = random_vec(dim as usize, 9);
+    let p = PreparedTqQuery::new(&q, &stripped).expect("TQ collection");
+    assert!(p.matches(imm.collection_meta()), "checksum-equal twin");
+    assert!(p.lut32().is_none(), "no table, no 32-level LUT");
+
+    let padded = crate::vector::turbo_quant::encoder::padded_dimension(dim);
+    for tuning in [
+        SearchTuning::default(),
+        SearchTuning {
+            rerank_mult: 1,
+            exact_beam: false,
+        },
+    ] {
+        let mut s1 = SearchScratch::new(0, padded);
+        let mut s2 = SearchScratch::new(0, padded);
+        let with = imm.search_prepared(&q, Some(&p), 10, 64, &mut s1, None, tuning);
+        let without = imm.search_prepared(&q, None, 10, 64, &mut s2, None, tuning);
+        assert_eq!(without.len(), 10);
+        assert_eq!(
+            with.iter()
+                .map(|r| (r.id.0, r.distance.to_bits()))
+                .collect::<Vec<_>>(),
+            without
+                .iter()
+                .map(|r| (r.id.0, r.distance.to_bits()))
+                .collect::<Vec<_>>(),
+            "a prepared state without the table must answer like no prepared state"
+        );
+    }
+}
