@@ -899,6 +899,12 @@ pub fn hnsw_search_filtered_prepared(
     }
 
     // Step 3: Layer 0 beam search (BFS space) with ACORN 2-hop filter expansion
+    // Sign rows are prefetched only when the beam reads them (moon#1213).
+    let (pf_signs, pf_sign_bpv): (&[u8], usize) = if use_subcent {
+        (sub_centroid_signs, sub_sign_bpv)
+    } else {
+        (&[], 0)
+    };
     let entry_bfs = graph.to_bfs(current_orig);
     scratch.visited.test_and_set(entry_bfs);
 
@@ -926,7 +932,7 @@ pub fn hnsw_search_filtered_prepared(
         // Prefetch first neighbor's data
         if let Some(&first_nb) = neighbors.first() {
             if first_nb != SENTINEL {
-                graph.prefetch_node(first_nb, vectors_tq);
+                graph.prefetch_node(first_nb, vectors_tq, pf_signs, pf_sign_bpv);
             }
         }
 
@@ -942,7 +948,7 @@ pub fn hnsw_search_filtered_prepared(
             if idx + 2 < neighbors.len() {
                 let next = neighbors[idx + 2];
                 if next != SENTINEL {
-                    graph.prefetch_node(next, vectors_tq);
+                    graph.prefetch_node(next, vectors_tq, pf_signs, pf_sign_bpv);
                 }
             }
 
