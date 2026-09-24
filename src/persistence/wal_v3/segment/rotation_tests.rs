@@ -164,11 +164,14 @@ fn test_1188_kill_during_pending_rotation_leaves_a_final_segment_tail() {
     gate.open(); // release the leaked agent thread
 }
 
-/// A poisoned agent never publishes the watermark: the pending rotation
-/// falls back to the inline fsync (the pre-moon#1188 path) instead of
-/// buffering forever.
+/// A poisoned agent never publishes the watermark, and the pending rotation
+/// must not stand in for it (moon#1221 review R2): after a failed fsync a
+/// retry succeeds without proving anything, so the rotation does not fsync
+/// again — it fails loudly and keeps the next segment unopened while under
+/// the memory bound, and past the bound opens the next segment WITHOUT any
+/// durability claim so memory stays bounded. The data is kept either way.
 #[test]
-fn test_1188_poisoned_agent_completes_rotation_inline() {
+fn test_1188_poisoned_rotation_fails_loud_and_stays_bounded() {
     let tmp = tempfile::tempdir().unwrap();
     let wal_dir = tmp.path().join("wal");
     let mut writer = WalWriterV3::new(0, &wal_dir, 512, WalBounds::DEFAULT).unwrap();
@@ -182,12 +185,31 @@ fn test_1188_poisoned_agent_completes_rotation_inline() {
     assert!(writer.rotation_pending());
     gate.open();
     wait_until(|| writer.sync_agent.as_ref().is_some_and(|a| a.is_poisoned()));
-    writer.flush_if_needed().unwrap();
+    assert!(writer.flush_if_needed().is_err(), "must fail loudly");
+    assert!(writer.rotation_pending());
+    assert!(!WalSegment::segment_path(&wal_dir, 2).exists());
+    assert_eq!(writer.rotation_counts(), (1, 0), "no inline fsync retry");
+
+    // Past the memory bound: the next segment opens, with no claim.
+    let big = vec![0x5Au8; 64 * 1024];
+    let mut last = 30;
+    while writer.buffered_bytes() <= PENDING_ROTATION_MAX_BUFFER {
+        last = writer.append(WalRecordType::Command, &big);
+    }
+    assert!(writer.flush_if_needed().is_err(), "still failing loudly");
     assert!(!writer.rotation_pending());
     assert!(WalSegment::segment_path(&wal_dir, 2).exists());
-    assert_eq!(writer.rotation_counts(), (1, 1));
-    // Durability requests keep failing loudly after the poison.
+    assert_eq!(writer.rotations_degraded(), 1);
+    assert_eq!(writer.buffered_bytes(), 0, "the buffer left process memory");
+    assert!(writer.sync_agent.as_ref().unwrap().durable_lsn() < 30);
+    assert!(
+        writer
+            .wait_durable(1, std::time::Duration::from_millis(50))
+            .is_err()
+    );
     assert!(writer.request_sync().is_err());
+    assert_eq!(replayed_lsns(&wal_dir), (1..=last).collect::<Vec<_>>());
+    assert_eq!(gate.calls(), 1, "a poisoned WAL never fsyncs again");
 }
 
 /// Memory stays bounded when the disk is the bottleneck: past
@@ -419,6 +441,229 @@ fn test_1221_r1_every_rotated_segment_header_names_its_first_record() {
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------
+// moon#1221 review R2 — an fsync that failed is never followed by a
+// durability claim.
+// ---------------------------------------------------------------------
+
+/// The reviewer's reproduction. The agent's fsync of segment 1 fails and
+/// poisons it; at the PR head the next tick's fallback fsynced the same file
+/// inline — the kernel had already reported the error to the agent's fd, so
+/// that fsync succeeds whatever reached the disk — and published LSN 30:
+/// `wait_durable(30)` returned Ok and the checkpoint's log-before-data rule
+/// accepted pages whose WAL fsync failed.
+#[test]
+fn test_1221_r2_fallback_never_publishes_a_failed_agent_fsync() {
+    let tmp = tempfile::tempdir().unwrap();
+    let wal_dir = tmp.path().join("wal");
+    let mut writer = WalWriterV3::new(0, &wal_dir, 512, WalBounds::DEFAULT).unwrap();
+    let gate = FsyncGate::new();
+    gate.fail.store(true, std::sync::atomic::Ordering::SeqCst);
+    writer.install_sync_agent_for_test(gate.agent());
+    for _ in 0..30 {
+        writer.append(WalRecordType::Command, b"SET k v");
+    }
+    writer.flush_write().unwrap();
+    assert!(writer.rotation_pending());
+    gate.open();
+    wait_until(|| writer.sync_agent.as_ref().is_some_and(|a| a.is_poisoned()));
+    let polled = writer.flush_if_needed();
+    let watermark = writer.sync_agent.as_ref().unwrap().durable_lsn();
+    assert!(
+        watermark < 30,
+        "the fallback published the failed segment as durable: watermark {watermark}"
+    );
+    let waited = writer.wait_durable(30, std::time::Duration::from_millis(50));
+    assert!(
+        waited.is_err(),
+        "wait_durable(30) returned Ok after the fsync covering it failed"
+    );
+    assert!(polled.is_err(), "a poisoned rotation must fail loudly");
+    assert!(
+        writer.rotation_pending() && !WalSegment::segment_path(&wal_dir, 2).exists(),
+        "a poisoned rotation under the memory bound neither retries the fsync nor opens the next segment"
+    );
+}
+
+/// Poison is checked BEFORE the watermark: once any fsync on the WAL failed,
+/// no LSN is reported durable again, even one a genuine fsync covered — the
+/// contract the module docs state ("fail every subsequent wait_durable").
+/// At the PR head the fast path returned Ok for any LSN under the watermark.
+#[test]
+fn test_1221_r2_poison_is_checked_before_the_watermark() {
+    let tmp = tempfile::tempdir().unwrap();
+    let wal_dir = tmp.path().join("wal");
+    let mut writer =
+        WalWriterV3::new(0, &wal_dir, DEFAULT_SEGMENT_SIZE, WalBounds::DEFAULT).unwrap();
+    let gate = FsyncGate::new();
+    gate.open();
+    writer.install_sync_agent_for_test(gate.agent());
+    for _ in 0..10 {
+        writer.append(WalRecordType::Command, b"SET k v");
+    }
+    writer.request_sync().unwrap();
+    writer.wait_durable(10, WAIT_DURABLE_TIMEOUT).unwrap();
+    gate.fail.store(true, std::sync::atomic::Ordering::SeqCst);
+    for _ in 0..10 {
+        writer.append(WalRecordType::Command, b"SET k v");
+    }
+    writer.request_sync().unwrap();
+    wait_until(|| writer.sync_agent.as_ref().is_some_and(|a| a.is_poisoned()));
+    assert!(
+        writer
+            .wait_durable(5, std::time::Duration::from_millis(50))
+            .is_err(),
+        "a poisoned WAL must fail every durability wait, below the watermark too"
+    );
+    assert!(writer.request_sync().is_err());
+}
+
+/// The finer race behind R2: the old segment's fsync is still in flight on
+/// the agent when the memory bound makes the writer complete the rotation
+/// with its own inline fsync. If the agent's fsync then fails, the kernel
+/// reported the error to the agent's fd — the writer's inline fsync proved
+/// nothing — so the writer must not have published the watermark over it.
+/// At the PR head the inline completion published LSN 30 at once, and
+/// `wait_durable(30)` returned Ok after the agent's fsync failed.
+#[test]
+fn test_1221_r2_inline_completion_never_publishes_over_an_in_flight_agent_fsync() {
+    let tmp = tempfile::tempdir().unwrap();
+    let wal_dir = tmp.path().join("wal");
+    let mut writer = WalWriterV3::new(0, &wal_dir, 512, WalBounds::DEFAULT).unwrap();
+    let gate = FsyncGate::new();
+    gate.fail.store(true, std::sync::atomic::Ordering::SeqCst);
+    writer.install_sync_agent_for_test(gate.agent());
+    for _ in 0..30 {
+        writer.append(WalRecordType::Command, b"SET k v");
+    }
+    writer.flush_write().unwrap();
+    wait_until(|| gate.calls() == 1); // the agent is inside the (gated) fsync
+    let big = vec![0x5Au8; 64 * 1024];
+    while writer.rotation_counts().1 == 0 {
+        writer.append(WalRecordType::Command, &big);
+        writer.flush_if_needed().unwrap();
+    }
+    // The memory bound completed segment 1's rotation inline.
+    assert!(
+        writer.sync_agent.as_ref().unwrap().durable_lsn() < 30,
+        "the inline completion published over an agent fsync still in flight"
+    );
+    gate.open(); // ... which now fails
+    wait_until(|| writer.sync_agent.as_ref().is_some_and(|a| a.is_poisoned()));
+    assert!(
+        writer
+            .wait_durable(30, std::time::Duration::from_millis(50))
+            .is_err(),
+        "wait_durable(30) returned Ok after the agent's fsync of segment 1 failed"
+    );
+}
+
+/// `flush_sync` (shutdown, the inline fallback) on a WAL whose agent fsync
+/// failed: at the PR head it completed the pending rotation with an inline
+/// fsync of the same file and published every LSN durable. It must keep the
+/// data (page cache) but claim nothing and fail loudly.
+#[test]
+fn test_1221_r2_flush_sync_on_a_poisoned_wal_keeps_the_data_and_claims_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let wal_dir = tmp.path().join("wal");
+    let mut writer = WalWriterV3::new(0, &wal_dir, 512, WalBounds::DEFAULT).unwrap();
+    let gate = FsyncGate::new();
+    gate.fail.store(true, std::sync::atomic::Ordering::SeqCst);
+    writer.install_sync_agent_for_test(gate.agent());
+    for _ in 0..30 {
+        writer.append(WalRecordType::Command, b"SET k v");
+    }
+    writer.flush_write().unwrap();
+    for _ in 0..5 {
+        writer.append(WalRecordType::Command, b"SET k2 v2");
+    }
+    gate.open();
+    wait_until(|| writer.sync_agent.as_ref().is_some_and(|a| a.is_poisoned()));
+    let flushed = writer.flush_sync();
+    let watermark = writer.sync_agent.as_ref().unwrap().durable_lsn();
+    assert!(
+        watermark < 30,
+        "flush_sync published a WAL whose fsync failed: watermark {watermark}"
+    );
+    assert!(
+        flushed.is_err(),
+        "flush_sync on a poisoned WAL must fail loudly"
+    );
+    assert!(
+        writer
+            .wait_durable(35, std::time::Duration::from_millis(50))
+            .is_err()
+    );
+    // Nothing is dropped: every record reached a segment file.
+    assert!(!writer.rotation_pending());
+    assert_eq!(replayed_lsns(&wal_dir), (1..=35).collect::<Vec<_>>());
+}
+
+/// A failed INLINE fsync (no agent: the writer's own thread) is never
+/// retried into a durability claim: at the PR head a second `flush_sync`
+/// fsynced again — which succeeds once the kernel has reported the error —
+/// and returned Ok, and `wait_durable` with no agent returned Ok with it.
+#[test]
+fn test_1221_r2_a_failed_inline_fsync_is_never_retried_into_a_claim() {
+    let tmp = tempfile::tempdir().unwrap();
+    let wal_dir = tmp.path().join("wal");
+    let mut writer =
+        WalWriterV3::new(0, &wal_dir, DEFAULT_SEGMENT_SIZE, WalBounds::DEFAULT).unwrap();
+    writer.sync_agent_unavailable = true; // inline fsync only
+    for _ in 0..10 {
+        writer.append(WalRecordType::Command, b"SET k v");
+    }
+    writer.inline_fsync_fault = true;
+    assert!(writer.flush_sync().is_err());
+    assert!(writer.durability_poisoned());
+    assert!(
+        writer.flush_sync().is_err(),
+        "a retried fsync reported the WAL durable"
+    );
+    assert!(writer.request_sync().is_err());
+    assert!(
+        writer
+            .wait_durable(10, std::time::Duration::from_millis(50))
+            .is_err()
+    );
+    // The data is kept — in the page cache, never claimed.
+    assert_eq!(replayed_lsns(&wal_dir), (1..=10).collect::<Vec<_>>());
+}
+
+/// ... and with an agent running, the inline failure poisons it too: it
+/// stops fsyncing and never publishes again.
+#[test]
+fn test_1221_r2_a_failed_inline_fsync_poisons_the_agent() {
+    let tmp = tempfile::tempdir().unwrap();
+    let wal_dir = tmp.path().join("wal");
+    let mut writer =
+        WalWriterV3::new(0, &wal_dir, DEFAULT_SEGMENT_SIZE, WalBounds::DEFAULT).unwrap();
+    let gate = FsyncGate::new();
+    gate.open();
+    writer.install_sync_agent_for_test(gate.agent());
+    for _ in 0..10 {
+        writer.append(WalRecordType::Command, b"SET k v");
+    }
+    writer.inline_fsync_fault = true;
+    assert!(writer.flush_sync().is_err());
+    let agent = writer.sync_agent.as_ref().unwrap();
+    assert!(
+        agent.is_poisoned(),
+        "the agent must share the writer's poison"
+    );
+    assert_eq!(agent.durable_lsn(), 0);
+    for _ in 0..10 {
+        writer.append(WalRecordType::Command, b"SET k v");
+    }
+    assert!(writer.request_sync().is_err());
+    assert!(
+        writer
+            .wait_durable(1, std::time::Duration::from_millis(50))
+            .is_err()
+    );
+    assert_eq!(gate.calls(), 0, "a poisoned WAL never fsyncs again");
 }
 
 /// Overwrite segment `seq`'s header `base_lsn` (bytes 28..36).

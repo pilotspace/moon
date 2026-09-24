@@ -26,19 +26,25 @@
 //! before the old one is durable: `rotate_segment` hands the old segment's
 //! fsync to this agent and `poll_pending_rotation` opens the next segment
 //! only once the watermark covers it (moon#1188), with the inline fsync as
-//! the fallback when the agent is absent, full or poisoned.
+//! the fallback when the agent is absent or full. A poisoned WAL never
+//! fsyncs again, on either thread (moon#1221 review R2).
 //!
-//! Failure policy: an fsync error POISONS the agent permanently (POSIX
+//! Failure policy: an fsync error POISONS the WAL permanently (POSIX
 //! leaves post-error fsync semantics undefined — fail loud, PR #211
-//! precedent). Poisoned agents fail every subsequent `request_sync` /
-//! `wait_durable`; the checkpoint protocol then refuses to advance
-//! `redo_lsn`, so no data-loss window opens silently.
+//! precedent), whichever thread's fsync got it. Poisoned agents fail every
+//! subsequent `request_sync` / `wait_durable` — the poison is checked before
+//! the watermark — and the checkpoint protocol then refuses to advance
+//! `redo_lsn`, so no data-loss window opens silently. The watermark state and
+//! every decision taken from it live in [`super::watermark`] (loom-modeled
+//! against that very file); this module adds the thread, the queue and the
+//! monitor waiters block on (moon#1221 review R2).
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use parking_lot::{Condvar, Mutex};
+
+use super::watermark::{Durability, InlinePublish, Watermark};
 
 /// One durability request: fsync `file`, then publish `upto_lsn`.
 pub(crate) struct SyncRequest {
@@ -49,42 +55,82 @@ pub(crate) struct SyncRequest {
     pub(crate) upto_lsn: u64,
 }
 
-/// Shared state between the shard thread and the agent thread.
+/// Shared state between the shard thread and the agent thread: the
+/// [`Watermark`] state machine plus the monitor every outcome is notified
+/// under.
 ///
-/// This is the atomic state machine loom-modeled in
-/// `tests/loom_wal_sync_agent.rs` — keep transitions in sync with the model.
+/// The decisions are loom-modeled in `tests/loom_wal_sync_agent.rs`, which
+/// compiles `watermark.rs` itself; the monitor loops below are mirrored
+/// there — keep them in sync with the model.
 pub(crate) struct SyncShared {
-    /// Highest LSN known durable. Monotonic (fetch_max publish).
-    pub(crate) durable_lsn: AtomicU64,
-    /// Set (never cleared) on the first fsync error.
-    pub(crate) poisoned: AtomicBool,
-    /// Wakes `wait_durable` after each watermark publish / poison.
-    pub(crate) mutex: Mutex<()>,
-    pub(crate) condvar: Condvar,
+    /// Durable-LSN watermark, poison, agent fsync accounting.
+    pub(crate) wm: Watermark,
+    /// Wakes `wait_watermark` / `publish_after_inline_fsync` after each
+    /// publish, poison or settled agent fsync.
+    mutex: Mutex<()>,
+    condvar: Condvar,
 }
 
 impl SyncShared {
     fn new() -> Self {
         Self {
-            durable_lsn: AtomicU64::new(0),
-            poisoned: AtomicBool::new(false),
+            wm: Watermark::new(),
             mutex: Mutex::new(()),
             condvar: Condvar::new(),
         }
     }
 
-    /// Publish `lsn` as durable (monotonic max) and wake waiters.
-    pub(crate) fn publish(&self, lsn: u64) {
-        self.durable_lsn.fetch_max(lsn, Ordering::Release);
+    /// Wake every waiter. Taking the mutex orders the notify after a
+    /// waiter's under-lock check — no lost wakeup.
+    fn notify(&self) {
         let _g = self.mutex.lock();
         self.condvar.notify_all();
     }
 
-    /// Poison the agent and wake waiters so they observe the failure.
+    /// Poison the WAL (an fsync on it failed, on either thread) and wake
+    /// waiters so they observe the failure.
     pub(crate) fn poison(&self) {
-        self.poisoned.store(true, Ordering::Release);
-        let _g = self.mutex.lock();
-        self.condvar.notify_all();
+        self.wm.poison();
+        self.notify();
+    }
+
+    /// Publish `lsn` after the WRITER's own inline fsync covering it
+    /// returned Ok — non-blocking. `AgentInFlight` means an agent fsync of
+    /// the same description may have consumed an error the writer's fsync
+    /// is blind to; the caller then leaves the publish to the agent.
+    pub(crate) fn try_publish_inline(&self, lsn: u64) -> InlinePublish {
+        let started = self.wm.fsyncs_started();
+        let verdict = self.wm.try_publish_inline(lsn, started);
+        if verdict == InlinePublish::Published {
+            self.notify();
+        }
+        verdict
+    }
+
+    /// [`Self::try_publish_inline`], waiting (bounded by `timeout`) for the
+    /// agent fsyncs in flight to settle instead of giving up. `AgentInFlight`
+    /// is returned only on timeout.
+    pub(crate) fn publish_after_inline_fsync(&self, lsn: u64, timeout: Duration) -> InlinePublish {
+        // Snapshot AFTER the caller's fsync returned — see `watermark.rs`.
+        let started = self.wm.fsyncs_started();
+        let deadline = Instant::now() + timeout;
+        let mut guard = self.mutex.lock();
+        loop {
+            match self.wm.try_publish_inline(lsn, started) {
+                InlinePublish::AgentInFlight => {
+                    if Instant::now() >= deadline {
+                        return InlinePublish::AgentInFlight;
+                    }
+                    self.condvar.wait_until(&mut guard, deadline);
+                }
+                verdict => {
+                    if verdict == InlinePublish::Published {
+                        self.condvar.notify_all();
+                    }
+                    return verdict;
+                }
+            }
+        }
     }
 }
 
@@ -128,23 +174,29 @@ impl WalSyncAgent {
                 // in publish() guards the watermark even if that ever
                 // changes.
                 while let Ok(req) = rx.recv() {
-                    if shared_agent.poisoned.load(Ordering::Acquire) {
+                    if shared_agent.wm.is_poisoned() {
                         // Drain without acting: post-error fsync semantics
                         // are undefined; durability can no longer be
                         // promised on this WAL.
                         continue;
                     }
-                    match backend(&req.file) {
-                        Ok(()) => shared_agent.publish(req.upto_lsn),
-                        Err(e) => {
-                            tracing::error!(
-                                shard_id,
-                                upto_lsn = req.upto_lsn,
-                                "WAL v3 off-loop fsync FAILED — agent poisoned, \
-                                 durability can no longer be guaranteed: {e}"
-                            );
-                            shared_agent.poison();
-                        }
+                    // Counted started BEFORE the fsync and settled only once
+                    // its outcome is stored: the writer's inline publish
+                    // waits these out (moon#1221 review R2).
+                    shared_agent.wm.agent_fsync_started();
+                    let result = backend(&req.file);
+                    shared_agent
+                        .wm
+                        .agent_fsync_settled(result.is_ok(), req.upto_lsn);
+                    shared_agent.notify();
+                    if let Err(e) = result {
+                        // Logged after the poison is visible, never before.
+                        tracing::error!(
+                            shard_id,
+                            upto_lsn = req.upto_lsn,
+                            "WAL v3 off-loop fsync FAILED — WAL poisoned, \
+                             durability can no longer be guaranteed: {e}"
+                        );
                     }
                 }
                 // Channel disconnected: writer dropped — exit.
@@ -160,7 +212,7 @@ impl WalSyncAgent {
     /// queue is full or the agent thread is gone — the caller MUST fsync
     /// inline (a durability request is never dropped).
     pub(crate) fn try_send(&self, req: SyncRequest) -> Result<(), SyncRequest> {
-        if self.shared.poisoned.load(Ordering::Acquire) {
+        if self.shared.wm.is_poisoned() {
             // Poisoned: inline fallback would also be a lie (see module
             // docs) — surface via the poisoned check at the call site.
             return Err(req);
@@ -170,32 +222,39 @@ impl WalSyncAgent {
         })
     }
 
+    /// The raw watermark, for tests. Durability decisions go through
+    /// [`Watermark::check`], which puts the poison first.
+    #[cfg(test)]
     pub(crate) fn durable_lsn(&self) -> u64 {
-        self.shared.durable_lsn.load(Ordering::Acquire)
+        self.shared.wm.durable_lsn()
     }
 
     pub(crate) fn is_poisoned(&self) -> bool {
-        self.shared.poisoned.load(Ordering::Acquire)
+        self.shared.wm.is_poisoned()
     }
 
-    /// Block until `durable_lsn >= lsn`, the agent poisons, or `timeout`.
+    /// Block until `lsn` is durable, the WAL is poisoned, or `timeout`.
     ///
-    /// The caller is responsible for having enqueued a sync request that
-    /// covers `lsn` (see `WalWriterV3::wait_durable`).
+    /// The poison wins over the watermark (moon#1221 review R2): once any
+    /// fsync on the WAL failed this fails for every `lsn`, including one a
+    /// genuine fsync covered earlier. The caller is responsible for having
+    /// enqueued a sync request that covers `lsn` (see
+    /// `WalWriterV3::wait_durable`).
     pub(crate) fn wait_watermark(&self, lsn: u64, timeout: Duration) -> std::io::Result<()> {
         let deadline = Instant::now() + timeout;
         let mut guard = self.shared.mutex.lock();
         loop {
-            // Check under the lock: publish() takes the lock before
-            // notify_all, so a watermark stored before we locked is
+            // Check under the lock: every outcome is stored before the
+            // notifier takes the lock, so one stored before we locked is
             // visible here — no lost-wakeup window.
-            if self.shared.durable_lsn.load(Ordering::Acquire) >= lsn {
-                return Ok(());
-            }
-            if self.shared.poisoned.load(Ordering::Acquire) {
-                return Err(std::io::Error::other(
-                    "WAL v3 sync agent poisoned by a prior fsync failure",
-                ));
+            match self.shared.wm.check(lsn) {
+                Durability::Durable => return Ok(()),
+                Durability::Poisoned => {
+                    return Err(std::io::Error::other(
+                        "WAL v3 sync agent poisoned by a prior fsync failure",
+                    ));
+                }
+                Durability::Pending => {}
             }
             let now = Instant::now();
             if now >= deadline {
@@ -204,9 +263,7 @@ impl WalSyncAgent {
                     format!("WAL v3 wait_durable({lsn}) timed out"),
                 ));
             }
-            self.shared
-                .condvar
-                .wait_until(&mut guard, now + (deadline - now));
+            self.shared.condvar.wait_until(&mut guard, deadline);
         }
     }
 }
@@ -228,7 +285,7 @@ impl Drop for WalSyncAgent {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn temp_file() -> std::fs::File {
         tempfile::tempfile().expect("tempfile")
@@ -361,6 +418,28 @@ mod tests {
         assert_eq!(agent.durable_lsn(), 0, "no watermark after poison");
     }
 
+    /// moon#1221 review R2: a poisoned agent fails every wait — the poison
+    /// is checked before the watermark, so an LSN under it is no exception.
+    #[test]
+    fn test_wait_watermark_reports_poison_before_the_watermark() {
+        let gate = Gate::new(true);
+        let agent = WalSyncAgent::spawn_with_backend(0, gate.backend()).expect("spawn agent");
+        agent
+            .try_send(SyncRequest {
+                file: temp_file(),
+                upto_lsn: 10,
+            })
+            .unwrap_or_else(|_| panic!("queue accepts request"));
+        agent
+            .wait_watermark(10, Duration::from_secs(5))
+            .expect("watermark reaches 10");
+        agent.shared.poison();
+        assert!(
+            agent.wait_watermark(5, Duration::from_millis(50)).is_err(),
+            "a poisoned agent reported LSN 5 durable"
+        );
+    }
+
     #[test]
     fn test_try_send_backpressure_hands_request_back() {
         let gate = Gate::new(false);
@@ -437,8 +516,72 @@ mod tests {
         // Even if publishes arrive out of order (future multi-producer),
         // fetch_max keeps the watermark monotonic.
         let shared = SyncShared::new();
-        shared.publish(10);
-        shared.publish(3);
-        assert_eq!(shared.durable_lsn.load(Ordering::Acquire), 10);
+        for lsn in [10, 3] {
+            shared.wm.agent_fsync_started();
+            shared.wm.agent_fsync_settled(true, lsn);
+        }
+        assert_eq!(shared.wm.durable_lsn(), 10);
+    }
+
+    /// moon#1221 review R2: the writer's inline publish waits out an agent
+    /// fsync that started before it — that fsync may have consumed an error
+    /// the writer's own (successful) fsync is blind to.
+    #[test]
+    fn test_inline_publish_waits_for_the_agent_fsync_in_flight() {
+        let shared = Arc::new(SyncShared::new());
+        shared.wm.agent_fsync_started(); // in flight, outcome unknown
+        assert_eq!(
+            shared.try_publish_inline(7),
+            InlinePublish::AgentInFlight,
+            "the non-blocking form must not publish over it"
+        );
+        assert_eq!(
+            shared.publish_after_inline_fsync(7, Duration::from_millis(20)),
+            InlinePublish::AgentInFlight,
+            "the waiting form gives up at its bound without publishing"
+        );
+        assert_eq!(shared.wm.durable_lsn(), 0);
+
+        // The agent's fsync failed: the waiting writer wakes and refuses.
+        let settle = {
+            let shared = Arc::clone(&shared);
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(30));
+                shared.wm.agent_fsync_settled(false, 5);
+                shared.notify();
+            })
+        };
+        assert_eq!(
+            shared.publish_after_inline_fsync(7, Duration::from_secs(5)),
+            InlinePublish::Poisoned
+        );
+        settle.join().unwrap();
+        assert_eq!(
+            shared.wm.durable_lsn(),
+            0,
+            "nothing published over the failure"
+        );
+        assert_eq!(shared.wm.check(1), Durability::Poisoned);
+    }
+
+    /// ... and publishes once the agent fsync in flight settled healthy.
+    #[test]
+    fn test_inline_publish_after_a_healthy_agent_fsync() {
+        let shared = Arc::new(SyncShared::new());
+        shared.wm.agent_fsync_started();
+        let settle = {
+            let shared = Arc::clone(&shared);
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(30));
+                shared.wm.agent_fsync_settled(true, 5);
+                shared.notify();
+            })
+        };
+        assert_eq!(
+            shared.publish_after_inline_fsync(7, Duration::from_secs(5)),
+            InlinePublish::Published
+        );
+        settle.join().unwrap();
+        assert_eq!(shared.wm.check(7), Durability::Durable);
     }
 }

@@ -229,6 +229,20 @@ shared 4-vCPU Linux container against HEAD `935c555` — re-measure on the GCE r
 
 ### Fixed
 
+- **A failed WAL v3 fsync is never followed by a durability claim** (moon#1221
+  review, refs moon#1188). Once the off-loop sync agent's fsync of a segment
+  failed, the writer completed the pending rotation by fsyncing the same file
+  inline — which succeeds after the kernel has reported the error to the
+  agent's descriptor — and published the watermark over it, so the
+  checkpoint's log-before-data wait accepted pages whose WAL fsync had failed
+  (a retried inline fsync did the same without an agent). Any failed fsync now
+  poisons the WAL for good: every durability wait checks the poison before the
+  watermark and fails, no fsync is retried, a pending rotation fails loudly and
+  past its memory bound opens the next segment with no durability claim, a
+  graceful shutdown still writes buffered records to the page cache, and an
+  inline fsync publishes only once the agent fsyncs of the same file that could
+  have consumed the error have settled. The decisions are loom-checked in
+  `tests/loom_wal_sync_agent.rs` against the shipping code.
 - **A spill's `MOON.SPILLED` cut record is never dropped under AOF
   backpressure** (moon#1202). When the AOF writer's channel stayed full past
   the 500 ms bound, the record was dropped while its keys stayed published to
