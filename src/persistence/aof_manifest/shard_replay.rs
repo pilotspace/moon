@@ -108,7 +108,7 @@ pub fn replay_multi_part(
         let file = std::fs::File::open(&incr_path)?;
         if file.metadata()?.len() > 0 {
             // Pure RESP — no RDB preamble detection needed.
-            let count = replay_incr_resp_from(databases, file, engine)?;
+            let count = replay_incr_resp(databases, file, engine)?;
             info!(
                 "AOF incr replayed: {} commands from {}",
                 count,
@@ -121,7 +121,9 @@ pub fn replay_multi_part(
     Ok(total)
 }
 
-/// Replay pure RESP commands from a byte slice.
+/// Replay pure RESP commands from `src`, streamed through the bounded
+/// [`ReplayChunks`](crate::persistence::replay::chunks::ReplayChunks) buffer
+/// (moon#1160) rather than held — twice — in memory.
 ///
 /// **Corruption handling:** On mid-stream parse errors this returns an error
 /// rather than silently resyncing to the next `*` byte. Silent resync in a
@@ -130,18 +132,7 @@ pub fn replay_multi_part(
 /// Truncated tails (parser returns `Ok(None)` with bytes remaining) are
 /// logged and treated as the legitimate end of the incremental log, matching
 /// `replay_aof` semantics for crash-time tail truncation.
-#[cfg(test)]
 fn replay_incr_resp(
-    databases: &mut [crate::storage::Database],
-    data: &[u8],
-    engine: &dyn crate::persistence::replay::CommandReplayEngine,
-) -> Result<usize, crate::error::MoonError> {
-    replay_incr_resp_from(databases, data, engine)
-}
-
-/// [`replay_incr_resp`] over any reader, through the bounded
-/// [`ReplayChunks`](crate::persistence::replay::chunks::ReplayChunks) buffer.
-fn replay_incr_resp_from(
     databases: &mut [crate::storage::Database],
     src: impl std::io::Read,
     engine: &dyn crate::persistence::replay::CommandReplayEngine,
