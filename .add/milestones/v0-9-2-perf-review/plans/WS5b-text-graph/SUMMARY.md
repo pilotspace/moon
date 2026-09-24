@@ -60,3 +60,12 @@ Suites run: lib `text:: command::vector_search graph::text_index` 564 (incl. the
 
 ## Self-evaluation (0–1)
 Completeness 0.9 · Clarity 0.9 · Practicality 0.92 · Optimization 0.9 · Edge cases 0.92 · Self-evaluation 0.9. Not done: term-at-a-time scoring for 50-term expansions; top-k-only projection in the Cypher planner; contiguous per-run position storage.
+
+## PR #1221 review fixes (orchestrator-committed from the fix agent's report)
+Branch `fix/pr1221-ws5b`, cherry-picked onto the PR as `bd47cc0` (F1), `0415bda` (F2), `40b744b` (F5), `02478f2` (F3).
+Every new test is red with only its fix reverted (`scratchpad/ws5b-revert-red-keep.log`).
+- **F1 (MAJOR)** freed doc ids are reused smallest-first (`free_doc_ids` = `[0, next_doc_id) \ live`) and dense columns shrink when the top ids go. 12 invalidate→re-index cycles × 4K docs, 0 live docs: resident bytes **4,456,869 → 421 B**; a 1-doc index reloaded from a 168 B `.tpost` **2,496,427 → 583 B**. `reused_doc_ids_answer_exactly_like_a_fresh_index` checks FT.SEARCH keys, score bits, totals, N/avgdl/df, TAG, NUMERIC and AS_OF across a reused id.
+- **F2** load-time density guard `next_doc_id ≤ 2 × docs + 65,536` (else `Invalid` → rebuild): the 107-byte file that billed 72 MB is refused; the `text_postings_file` fuzz target now also installs.
+- **F3** the var-length Expand cap spans streamed chunks (`emitted_before` per op): GRAPH.QUERY == GRAPH.PROFILE; expansion ≤ 100K + N rows (was 200,114).
+- **F5** capped fuzzy/prefix expansion ranks df DESC then TERM BYTES ASC in one bounded selection over FST and post-FST terms — independent of term-id assignment, so reproducible across rebuilds and replicas.
+- Residual: equal-score tie order after churn differs from HEAD (reused low ids); one-time rebuild of sparse `.tpost` files; up to 65,536 empty slots in an accepted file; pre-existing Damerau (FST) vs Levenshtein (post-FST) fuzzy difference; fuzzer not run locally; `read.rs` 1815 lines.
