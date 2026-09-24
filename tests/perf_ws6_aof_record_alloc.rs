@@ -128,28 +128,30 @@ fn verbatim_record_costs_one_allocation() {
 /// borrowed arguments: one allocation (HEAD: ~6), bytes as before.
 #[test]
 fn relative_expiry_rewrite_costs_one_allocation() {
-    let now = moon::storage::entry::current_time_ms();
-    let abs = |ms: u64| (now + ms).to_string();
+    // Outside a shard event loop the clock can tick between the test's read
+    // and the encoder's: build the expectation from the deadline the encoder
+    // chose, after checking it lies in [before, after] + ttl.
+    let before = moon::storage::entry::current_time_ms();
     for (frame, expected) in [
         (
             cmd(&[b"SET", b"k", b"v", b"EX", b"100"]),
-            vec!["SET", "k", "v", "PXAT", &abs(100_000)].join("|"),
+            vec!["SET", "k", "v", "PXAT", "{ABS:100000}"].join("|"),
         ),
         (
             cmd(&[b"SET", b"k", b"v", b"NX", b"PX", b"250", b"GET"]),
-            vec!["SET", "k", "v", "NX", "PXAT", &abs(250), "GET"].join("|"),
+            vec!["SET", "k", "v", "NX", "PXAT", "{ABS:250}", "GET"].join("|"),
         ),
         (
             cmd(&[b"SETEX", b"k", b"100", b"v"]),
-            vec!["SET", "k", "v", "PXAT", &abs(100_000)].join("|"),
+            vec!["SET", "k", "v", "PXAT", "{ABS:100000}"].join("|"),
         ),
         (
             cmd(&[b"PSETEX", b"k", b"500", b"v"]),
-            vec!["SET", "k", "v", "PXAT", &abs(500)].join("|"),
+            vec!["SET", "k", "v", "PXAT", "{ABS:500}"].join("|"),
         ),
         (
             cmd(&[b"GETEX", b"k", b"EX", b"7"]),
-            vec!["PEXPIREAT", "k", &abs(7_000)].join("|"),
+            vec!["PEXPIREAT", "k", "{ABS:7000}"].join("|"),
         ),
     ] {
         let reply = if matches!(&frame, Frame::Array(a) if a.len() == 4 && matches!(&a[0], Frame::BulkString(b) if b.as_ref() == b"GETEX"))
@@ -159,8 +161,22 @@ fn relative_expiry_rewrite_costs_one_allocation() {
             ok()
         };
         let (n, out) = measure(&frame, &reply);
+        let after = moon::storage::entry::current_time_ms();
         assert_eq!(out.len(), 1);
-        assert_eq!(decode(&out[0]), expected, "rewrite of {frame:?}");
+        let got = decode(&out[0]);
+        // Substitute the deadline the encoder chose once it is proven in range.
+        let (head, tail) = expected.split_once("{ABS:").expect("placeholder");
+        let (ttl, rest) = tail.split_once('}').expect("placeholder end");
+        let ttl: u64 = ttl.parse().unwrap();
+        let abs_str = &got[head.len()..got.len() - rest.len()];
+        let abs: u64 = abs_str.parse().expect("deadline");
+        assert!(
+            abs >= before + ttl && abs <= after + ttl,
+            "deadline {abs} outside [{}, {}]",
+            before + ttl,
+            after + ttl
+        );
+        assert_eq!(got, format!("{head}{abs}{rest}"), "rewrite of {frame:?}");
         assert_eq!(n, 1, "allocations for {frame:?}");
     }
 }
