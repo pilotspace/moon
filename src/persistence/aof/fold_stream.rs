@@ -253,16 +253,14 @@ pub(crate) fn cold_deletes_of(
         }
         db.spill_inflight_alive(key, now_ms) || ci.lookup(key).is_some()
     };
-    let mut seen: std::collections::HashSet<Bytes> = std::collections::HashSet::new();
-    let mut dead = Vec::new();
-    for key in expired_shadows {
-        if seen.insert(key.clone()) {
-            dead.push(key);
-        }
-    }
+    // No dedupe here: this runs on the shard thread inside the `AofFold` arm,
+    // where every nanosecond per ledger key is stall. A key dead in several
+    // files (or also an expired shadow) is listed more than once, and
+    // `generation_head` dedupes on the writer thread.
+    let mut dead = expired_shadows;
+    dead.reserve(ci.dead_slots().len());
     for key in ci.dead_slots().keys() {
-        if !seen.contains(key.as_ref()) && !alive(key) {
-            seen.insert(key.clone());
+        if !alive(key) {
             dead.push(key.clone());
         }
     }
@@ -744,8 +742,15 @@ mod tests {
         assert_eq!(deletes.per_db.len(), 1);
         let (db_idx, keys) = &deletes.per_db[0];
         assert_eq!(*db_idx, 1, "the deletes are tagged with their database");
+        let mut unique = sorted(keys);
+        unique.dedup();
         assert_eq!(
-            sorted(keys),
+            keys.len(),
+            unique.len() + 1,
+            "`twice` is listed once per dead slot; the head dedupes"
+        );
+        assert_eq!(
+            unique,
             vec![
                 &b"deleted"[..],
                 b"flying_expired",
