@@ -55,6 +55,12 @@ pub(super) const PARK_BUF_FULL: usize = 8192;
 /// Smallest spare tail of a SHARED read buffer still worth reading into
 /// before a fresh allocation is made (see [`spare_read_target`]).
 pub(super) const MIN_READ_SPARE: usize = 1024;
+/// Most of the read buffer's spare capacity one read of a stream that is not
+/// [`IdleParkRead::READ_INTO_UNINIT`] (TLS) is handed — and so the most it
+/// zeroes per read (see [`spare_read_target`]).
+pub(super) const ZEROED_READ_ROOM: usize = 32 * 1024;
+// An ordinary (unhinted) read's `want` must fit in the capped view.
+const _: () = assert!(ZEROED_READ_ROOM >= PARK_BUF_FULL);
 
 /// Per-connection shared state between the handler task and the shard chore.
 pub(super) struct IdleSlot {
@@ -281,8 +287,17 @@ pub(super) fn downshift_idle_buffers(
 ///    frame is known to need `want` more contiguous bytes) or an exhausted
 ///    tail allocates.
 ///
-/// For streams that are not [`IdleParkRead::READ_INTO_UNINIT`] the spare is
-/// zeroed first.
+/// For streams that are not [`IdleParkRead::READ_INTO_UNINIT`] (TLS) the
+/// target is zeroed first, so it is capped at [`ZEROED_READ_ROOM`] of the
+/// spare (moon#1227 review): zeroing ALL of it before every read made the
+/// work quadratic in a value's size — the parse hint reserves up to 1 MiB
+/// ahead for a large bulk, a TLS read returns about one 16 KiB record, and a
+/// 4 MiB upload zeroed 159x the bytes it read. A TLS read hands back the
+/// plaintext rustls holds, so the cap rarely shortens one (a short read only
+/// means another read); `want` up to the cap — the 512 B probe, the 8 KiB
+/// base — still gets its full room, and a larger hinted reservation keeps its
+/// contiguous capacity: only the per-read view is capped. Plain TCP reads
+/// into the whole spare, as before.
 pub(super) fn spare_read_target<S: IdleParkRead>(
     read_buf: &mut bytes::BytesMut,
     want: usize,
@@ -293,13 +308,15 @@ pub(super) fn spare_read_target<S: IdleParkRead>(
         read_buf.reserve(want);
     }
     let len = read_buf.len();
-    if !S::READ_INTO_UNINIT {
-        let cap = read_buf.capacity();
-        read_buf.resize(cap, 0);
+    let end = if S::READ_INTO_UNINIT {
+        read_buf.capacity()
+    } else {
+        let end = len + (read_buf.capacity() - len).min(ZEROED_READ_ROOM);
+        read_buf.resize(end, 0);
         read_buf.truncate(len);
-    }
-    let cap = read_buf.capacity();
-    std::mem::take(read_buf).slice_mut(len..cap)
+        end
+    };
+    std::mem::take(read_buf).slice_mut(len..end)
 }
 
 /// The sweep's cancelled-op error, as monoio constructs it on BOTH drivers:
@@ -349,8 +366,9 @@ pub(crate) trait IdleParkRead: AsyncReadRent {
     /// pointer (plain TCP: io_uring or `read(2)`) and nothing ever forms a
     /// `&mut [u8]` over it. The vendored TLS stream builds a `&mut [u8]` over
     /// the whole target for rustls to write into, so for it (and any stream
-    /// not audited) [`spare_read_target`] zeroes the spare first — a memset,
-    /// still cheaper than the decrypt, and never a reference to uninit bytes.
+    /// not audited) [`spare_read_target`] zeroes the target first — at most
+    /// [`ZEROED_READ_ROOM`] of the spare, so the memset stays proportional to
+    /// what one read can return — and never forms a reference to uninit bytes.
     const READ_INTO_UNINIT: bool = false;
 
     fn idle_park_read<T: IoBufMut>(
@@ -640,6 +658,77 @@ mod idle_park_tests {
             "a unique buffer must be reclaimed, not replaced"
         );
         assert!(rb.capacity() >= PARK_BUF_FULL);
+    }
+
+    /// moon#1227 review: a stream that cannot read into uninitialized memory
+    /// (TLS) gets its read target ZEROED first, and one TLS read returns about
+    /// 16 KiB. Zeroing the whole spare before every read made the work
+    /// quadratic in a value's size — the parse hint reserves up to 1 MiB ahead
+    /// for a large bulk, and a 4 MiB upload zeroed ~159x the bytes it read.
+    /// Driven exactly as the handler sizes its reads (parse hint, `grow`,
+    /// `PARK_BUF_FULL` base), the zeroed bytes must stay linear in the bytes
+    /// read; small wants must still get their full room.
+    #[test]
+    fn tls_reads_zero_only_what_they_can_fill() {
+        use crate::protocol::{ParseConfig, ParseState, parse_resumable};
+        use crate::server::conn::util::hinted_read_len;
+        type Tls = monoio_rustls::ServerTlsStream<monoio::net::TcpStream>;
+        const TLS_READ: usize = 16 * 1024;
+
+        let value_len = 4 << 20;
+        let mut wire = format!("*3\r\n$3\r\nSET\r\n$1\r\nk\r\n${value_len}\r\n").into_bytes();
+        wire.resize(wire.len() + value_len, b'v');
+        wire.extend_from_slice(b"\r\n");
+
+        let config = ParseConfig::default();
+        let mut state = ParseState::new();
+        let mut rb = bytes::BytesMut::with_capacity(PARK_BUF_FULL);
+        let (mut read, mut zeroed) = (0usize, 0usize);
+        let frame = loop {
+            let hinted = hinted_read_len(rb.len(), state.pending_len(), true, 1 << 30, 64 << 10);
+            let want = hinted.unwrap_or(PARK_BUF_FULL);
+            let target = spare_read_target::<Tls>(&mut rb, want, hinted.is_some());
+            // Not READ_INTO_UNINIT: the whole target is zeroed before the read.
+            let room = target.end() - target.begin();
+            assert!(
+                room >= want.min(ZEROED_READ_ROOM),
+                "room {room} < want {want}"
+            );
+            zeroed += room;
+            rb = target.into_inner();
+            // The read: at most one TLS read's worth, landing in the target.
+            let n = room.min(TLS_READ).min(wire.len() - read);
+            rb.extend_from_slice(&wire[read..read + n]);
+            read += n;
+            if let Some(frame) = parse_resumable(&mut rb, &config, &mut state).unwrap() {
+                break frame;
+            }
+            assert!(read < wire.len(), "frame complete but not parsed");
+        };
+        assert!(matches!(frame, crate::protocol::Frame::Array(_)));
+        assert_eq!(read, wire.len());
+        assert!(
+            zeroed <= 4 * read,
+            "zeroed {zeroed} bytes to read {read} ({}x)",
+            zeroed / read
+        );
+
+        // Small wants keep their full room: the downshifted probe read and
+        // the ordinary base read.
+        let mut rb = bytes::BytesMut::new();
+        let target = spare_read_target::<Tls>(&mut rb, IDLE_PROBE_BUF, false);
+        assert!(target.end() - target.begin() >= IDLE_PROBE_BUF);
+        let mut rb = target.into_inner();
+        rb.reserve(1 << 20);
+        let target = spare_read_target::<Tls>(&mut rb, PARK_BUF_FULL, false);
+        let room = target.end() - target.begin();
+        assert!((PARK_BUF_FULL..=ZEROED_READ_ROOM).contains(&room), "{room}");
+
+        // Plain TCP is unchanged: its reads may fill the whole spare.
+        let mut rb = target.into_inner();
+        let cap = rb.capacity();
+        let target = spare_read_target::<monoio::net::TcpStream>(&mut rb, PARK_BUF_FULL, false);
+        assert_eq!(target.end() - target.begin(), cap);
     }
 
     #[test]
