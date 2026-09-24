@@ -6,8 +6,9 @@
 
 use std::sync::atomic::Ordering;
 
-use metrics::{counter, histogram};
+use metrics::histogram;
 
+use crate::admin::metrics_setup::sharded::{bump_cmd_call, bump_cmd_error};
 use crate::admin::metrics_setup::{METRICS_INITIALIZED, bump_total_commands};
 
 // ── Command metrics ─────────────────────────────────────────────────────
@@ -19,242 +20,448 @@ pub fn is_metrics_enabled() -> bool {
     METRICS_INITIALIZED.load(Ordering::Relaxed)
 }
 
-/// Sanitize a command name for use as a Prometheus label.
+/// Number of distinct `cmd` labels, `"unknown"` included (moon#1178).
+pub(super) const CMD_LABEL_COUNT: usize = 194;
+
+/// Every label `moon_commands_total{cmd}` can carry, by label index; index 0
+/// is `"unknown"`. The index is what the per-thread counters in `sharded.rs`
+/// are keyed by, so a command's count never touches the recorder on the hot
+/// path.
+pub(super) static CMD_LABELS: [&str; CMD_LABEL_COUNT] = [
+    "unknown",
+    "get",
+    "set",
+    "mget",
+    "mset",
+    "append",
+    "incr",
+    "incrby",
+    "incrbyfloat",
+    "decr",
+    "decrby",
+    "getrange",
+    "setrange",
+    "strlen",
+    "setnx",
+    "setex",
+    "psetex",
+    "msetnx",
+    "getset",
+    "getdel",
+    "getex",
+    "substr",
+    "lcs",
+    "del",
+    "exists",
+    "expire",
+    "expireat",
+    "pexpire",
+    "pexpireat",
+    "expiretime",
+    "pexpiretime",
+    "ttl",
+    "pttl",
+    "persist",
+    "type",
+    "rename",
+    "renamenx",
+    "keys",
+    "scan",
+    "randomkey",
+    "unlink",
+    "object",
+    "dump",
+    "restore",
+    "sort",
+    "touch",
+    "copy",
+    "wait",
+    "hget",
+    "hset",
+    "hdel",
+    "hexists",
+    "hgetall",
+    "hincrby",
+    "hincrbyfloat",
+    "hkeys",
+    "hvals",
+    "hlen",
+    "hmget",
+    "hmset",
+    "hsetnx",
+    "hrandfield",
+    "hscan",
+    "lpush",
+    "rpush",
+    "lpop",
+    "rpop",
+    "llen",
+    "lrange",
+    "lindex",
+    "lset",
+    "linsert",
+    "lrem",
+    "ltrim",
+    "rpoplpush",
+    "lmove",
+    "lpos",
+    "lmpop",
+    "lpushx",
+    "rpushx",
+    "sadd",
+    "srem",
+    "smembers",
+    "sismember",
+    "smismember",
+    "scard",
+    "srandmember",
+    "spop",
+    "sunion",
+    "sinter",
+    "sdiff",
+    "sunionstore",
+    "sinterstore",
+    "sdiffstore",
+    "sintercard",
+    "sscan",
+    "smove",
+    "zadd",
+    "zrem",
+    "zscore",
+    "zrank",
+    "zrevrank",
+    "zrange",
+    "zrevrange",
+    "zrangebyscore",
+    "zrevrangebyscore",
+    "zrangebylex",
+    "zrevrangebylex",
+    "zcard",
+    "zcount",
+    "zlexcount",
+    "zincrby",
+    "zpopmin",
+    "zpopmax",
+    "zrandmember",
+    "zrangestore",
+    "zunionstore",
+    "zinterstore",
+    "zdiffstore",
+    "zmscore",
+    "zunion",
+    "zinter",
+    "zdiff",
+    "zscan",
+    "xadd",
+    "xlen",
+    "xrange",
+    "xrevrange",
+    "xread",
+    "xinfo",
+    "xtrim",
+    "xack",
+    "xclaim",
+    "xdel",
+    "xgroup",
+    "xreadgroup",
+    "xpending",
+    "xautoclaim",
+    "xsetid",
+    "subscribe",
+    "unsubscribe",
+    "publish",
+    "psubscribe",
+    "punsubscribe",
+    "ssubscribe",
+    "sunsubscribe",
+    "pubsub",
+    "ping",
+    "echo",
+    "quit",
+    "info",
+    "dbsize",
+    "flushdb",
+    "flushall",
+    "select",
+    "auth",
+    "command",
+    "config",
+    "client",
+    "debug",
+    "time",
+    "slowlog",
+    "hello",
+    "reset",
+    "swapdb",
+    "lastsave",
+    "save",
+    "bgsave",
+    "bgrewriteaof",
+    "multi",
+    "exec",
+    "discard",
+    "watch",
+    "unwatch",
+    "eval",
+    "evalsha",
+    "script",
+    "ft.create",
+    "ft.dropindex",
+    "ft.info",
+    "ft.search",
+    "ft.compact",
+    "ft.cachesearch",
+    "ft.recommend",
+    "ft.navigate",
+    "ft.expand",
+    "acl",
+    "cluster",
+    "blpop",
+    "brpop",
+    "blmove",
+    "blmpop",
+    "bzpopmin",
+    "bzpopmax",
+];
+
+/// The label index of `cmd` (see [`CMD_LABELS`]): the Prometheus cardinality
+/// guard. Only ASCII-alpha (and `.`) names up to 20 bytes can map to a known
+/// command; everything else is `"unknown"` (0).
 ///
-/// Prevents unbounded label cardinality (DoS vector): only ASCII-alpha
-/// commands up to 20 chars (longest Redis command) are accepted. Everything
-/// else maps to the static `"unknown"` label.
-///
-/// Zero-allocation: uses a stack buffer for case-insensitive matching
-/// instead of `to_ascii_lowercase()` which allocates on every call.
+/// Zero-allocation: lowercases into a stack buffer.
 #[inline]
-fn sanitize_cmd_label(cmd: &str) -> &'static str {
+pub(super) fn cmd_label_index(cmd: &[u8]) -> usize {
     if cmd.len() > 20 || cmd.is_empty() {
-        return "unknown";
+        return 0;
     }
-    if !cmd.bytes().all(|b| b.is_ascii_alphabetic() || b == b'.') {
-        return "unknown";
+    if !cmd.iter().all(|&b| b.is_ascii_alphabetic() || b == b'.') {
+        return 0;
     }
-    // Stack-allocated lowercase: avoids heap allocation on the hot path.
     let mut buf = [0u8; 20];
-    let bytes = cmd.as_bytes();
-    for (i, &b) in bytes.iter().enumerate() {
-        buf[i] = b.to_ascii_lowercase();
+    for (d, s) in buf.iter_mut().zip(cmd) {
+        *d = s.to_ascii_lowercase();
     }
-    // SAFETY: we validated all bytes are ASCII alphabetic or '.', so UTF-8 is guaranteed.
-    let lowered = std::str::from_utf8(&buf[..cmd.len()]).unwrap_or("unknown");
-    // Map to a static string to avoid per-call allocation.
-    // The match covers all commands Moon dispatches; anything else is "unknown".
+    // Validated ASCII above, so this cannot fail; "" maps to "unknown".
+    let lowered = std::str::from_utf8(&buf[..cmd.len()]).unwrap_or("");
     match lowered {
-        // String
-        "get" => "get",
-        "set" => "set",
-        "mget" => "mget",
-        "mset" => "mset",
-        "append" => "append",
-        "incr" => "incr",
-        "incrby" => "incrby",
-        "incrbyfloat" => "incrbyfloat",
-        "decr" => "decr",
-        "decrby" => "decrby",
-        "getrange" => "getrange",
-        "setrange" => "setrange",
-        "strlen" => "strlen",
-        "setnx" => "setnx",
-        "setex" => "setex",
-        "psetex" => "psetex",
-        "msetnx" => "msetnx",
-        "getset" => "getset",
-        "getdel" => "getdel",
-        "getex" => "getex",
-        "substr" => "substr",
-        "lcs" => "lcs",
-        // Key
-        "del" => "del",
-        "exists" => "exists",
-        "expire" => "expire",
-        "expireat" => "expireat",
-        "pexpire" => "pexpire",
-        "pexpireat" => "pexpireat",
-        "expiretime" => "expiretime",
-        "pexpiretime" => "pexpiretime",
-        "ttl" => "ttl",
-        "pttl" => "pttl",
-        "persist" => "persist",
-        "type" => "type",
-        "rename" => "rename",
-        "renamenx" => "renamenx",
-        "keys" => "keys",
-        "scan" => "scan",
-        "randomkey" => "randomkey",
-        "unlink" => "unlink",
-        "object" => "object",
-        "dump" => "dump",
-        "restore" => "restore",
-        "sort" => "sort",
-        "touch" => "touch",
-        "copy" => "copy",
-        "wait" => "wait",
-        // Hash
-        "hget" => "hget",
-        "hset" => "hset",
-        "hdel" => "hdel",
-        "hexists" => "hexists",
-        "hgetall" => "hgetall",
-        "hincrby" => "hincrby",
-        "hincrbyfloat" => "hincrbyfloat",
-        "hkeys" => "hkeys",
-        "hvals" => "hvals",
-        "hlen" => "hlen",
-        "hmget" => "hmget",
-        "hmset" => "hmset",
-        "hsetnx" => "hsetnx",
-        "hrandfield" => "hrandfield",
-        "hscan" => "hscan",
-        // List
-        "lpush" => "lpush",
-        "rpush" => "rpush",
-        "lpop" => "lpop",
-        "rpop" => "rpop",
-        "llen" => "llen",
-        "lrange" => "lrange",
-        "lindex" => "lindex",
-        "lset" => "lset",
-        "linsert" => "linsert",
-        "lrem" => "lrem",
-        "ltrim" => "ltrim",
-        "rpoplpush" => "rpoplpush",
-        "lmove" => "lmove",
-        "lpos" => "lpos",
-        "lmpop" => "lmpop",
-        "lpushx" => "lpushx",
-        "rpushx" => "rpushx",
-        // Set
-        "sadd" => "sadd",
-        "srem" => "srem",
-        "smembers" => "smembers",
-        "sismember" => "sismember",
-        "smismember" => "smismember",
-        "scard" => "scard",
-        "srandmember" => "srandmember",
-        "spop" => "spop",
-        "sunion" => "sunion",
-        "sinter" => "sinter",
-        "sdiff" => "sdiff",
-        "sunionstore" => "sunionstore",
-        "sinterstore" => "sinterstore",
-        "sdiffstore" => "sdiffstore",
-        "sintercard" => "sintercard",
-        "sscan" => "sscan",
-        "smove" => "smove",
-        // Sorted Set
-        "zadd" => "zadd",
-        "zrem" => "zrem",
-        "zscore" => "zscore",
-        "zrank" => "zrank",
-        "zrevrank" => "zrevrank",
-        "zrange" => "zrange",
-        "zrevrange" => "zrevrange",
-        "zrangebyscore" => "zrangebyscore",
-        "zrevrangebyscore" => "zrevrangebyscore",
-        "zrangebylex" => "zrangebylex",
-        "zrevrangebylex" => "zrevrangebylex",
-        "zcard" => "zcard",
-        "zcount" => "zcount",
-        "zlexcount" => "zlexcount",
-        "zincrby" => "zincrby",
-        "zpopmin" => "zpopmin",
-        "zpopmax" => "zpopmax",
-        "zrandmember" => "zrandmember",
-        "zrangestore" => "zrangestore",
-        "zunionstore" => "zunionstore",
-        "zinterstore" => "zinterstore",
-        "zdiffstore" => "zdiffstore",
-        "zmscore" => "zmscore",
-        "zunion" => "zunion",
-        "zinter" => "zinter",
-        "zdiff" => "zdiff",
-        "zscan" => "zscan",
-        // Stream
-        "xadd" => "xadd",
-        "xlen" => "xlen",
-        "xrange" => "xrange",
-        "xrevrange" => "xrevrange",
-        "xread" => "xread",
-        "xinfo" => "xinfo",
-        "xtrim" => "xtrim",
-        "xack" => "xack",
-        "xclaim" => "xclaim",
-        "xdel" => "xdel",
-        "xgroup" => "xgroup",
-        "xreadgroup" => "xreadgroup",
-        "xpending" => "xpending",
-        "xautoclaim" => "xautoclaim",
-        "xsetid" => "xsetid",
-        // Pub/Sub
-        "subscribe" => "subscribe",
-        "unsubscribe" => "unsubscribe",
-        "publish" => "publish",
-        "psubscribe" => "psubscribe",
-        "punsubscribe" => "punsubscribe",
-        "ssubscribe" => "ssubscribe",
-        "sunsubscribe" => "sunsubscribe",
-        "pubsub" => "pubsub",
-        // Server/Connection
-        "ping" => "ping",
-        "echo" => "echo",
-        "quit" => "quit",
-        "info" => "info",
-        "dbsize" => "dbsize",
-        "flushdb" => "flushdb",
-        "flushall" => "flushall",
-        "select" => "select",
-        "auth" => "auth",
-        "command" => "command",
-        "config" => "config",
-        "client" => "client",
-        "debug" => "debug",
-        "time" => "time",
-        "slowlog" => "slowlog",
-        "hello" => "hello",
-        "reset" => "reset",
-        "swapdb" => "swapdb",
-        "lastsave" => "lastsave",
-        "save" => "save",
-        "bgsave" => "bgsave",
-        "bgrewriteaof" => "bgrewriteaof",
-        "multi" => "multi",
-        "exec" => "exec",
-        "discard" => "discard",
-        "watch" => "watch",
-        "unwatch" => "unwatch",
-        // Scripting
-        "eval" => "eval",
-        "evalsha" => "evalsha",
-        "script" => "script",
-        // Vector search
-        "ft.create" => "ft.create",
-        "ft.dropindex" => "ft.dropindex",
-        "ft.info" => "ft.info",
-        "ft.search" => "ft.search",
-        "ft.compact" => "ft.compact",
-        "ft.cachesearch" => "ft.cachesearch",
-        "ft.recommend" => "ft.recommend",
-        "ft.navigate" => "ft.navigate",
-        "ft.expand" => "ft.expand",
-        // ACL
-        "acl" => "acl",
-        // Cluster
-        "cluster" => "cluster",
-        // Blocking
-        "blpop" => "blpop",
-        "brpop" => "brpop",
-        "blmove" => "blmove",
-        "blmpop" => "blmpop",
-        "bzpopmin" => "bzpopmin",
-        "bzpopmax" => "bzpopmax",
-        _ => "unknown",
+        "get" => 1,
+        "set" => 2,
+        "mget" => 3,
+        "mset" => 4,
+        "append" => 5,
+        "incr" => 6,
+        "incrby" => 7,
+        "incrbyfloat" => 8,
+        "decr" => 9,
+        "decrby" => 10,
+        "getrange" => 11,
+        "setrange" => 12,
+        "strlen" => 13,
+        "setnx" => 14,
+        "setex" => 15,
+        "psetex" => 16,
+        "msetnx" => 17,
+        "getset" => 18,
+        "getdel" => 19,
+        "getex" => 20,
+        "substr" => 21,
+        "lcs" => 22,
+        "del" => 23,
+        "exists" => 24,
+        "expire" => 25,
+        "expireat" => 26,
+        "pexpire" => 27,
+        "pexpireat" => 28,
+        "expiretime" => 29,
+        "pexpiretime" => 30,
+        "ttl" => 31,
+        "pttl" => 32,
+        "persist" => 33,
+        "type" => 34,
+        "rename" => 35,
+        "renamenx" => 36,
+        "keys" => 37,
+        "scan" => 38,
+        "randomkey" => 39,
+        "unlink" => 40,
+        "object" => 41,
+        "dump" => 42,
+        "restore" => 43,
+        "sort" => 44,
+        "touch" => 45,
+        "copy" => 46,
+        "wait" => 47,
+        "hget" => 48,
+        "hset" => 49,
+        "hdel" => 50,
+        "hexists" => 51,
+        "hgetall" => 52,
+        "hincrby" => 53,
+        "hincrbyfloat" => 54,
+        "hkeys" => 55,
+        "hvals" => 56,
+        "hlen" => 57,
+        "hmget" => 58,
+        "hmset" => 59,
+        "hsetnx" => 60,
+        "hrandfield" => 61,
+        "hscan" => 62,
+        "lpush" => 63,
+        "rpush" => 64,
+        "lpop" => 65,
+        "rpop" => 66,
+        "llen" => 67,
+        "lrange" => 68,
+        "lindex" => 69,
+        "lset" => 70,
+        "linsert" => 71,
+        "lrem" => 72,
+        "ltrim" => 73,
+        "rpoplpush" => 74,
+        "lmove" => 75,
+        "lpos" => 76,
+        "lmpop" => 77,
+        "lpushx" => 78,
+        "rpushx" => 79,
+        "sadd" => 80,
+        "srem" => 81,
+        "smembers" => 82,
+        "sismember" => 83,
+        "smismember" => 84,
+        "scard" => 85,
+        "srandmember" => 86,
+        "spop" => 87,
+        "sunion" => 88,
+        "sinter" => 89,
+        "sdiff" => 90,
+        "sunionstore" => 91,
+        "sinterstore" => 92,
+        "sdiffstore" => 93,
+        "sintercard" => 94,
+        "sscan" => 95,
+        "smove" => 96,
+        "zadd" => 97,
+        "zrem" => 98,
+        "zscore" => 99,
+        "zrank" => 100,
+        "zrevrank" => 101,
+        "zrange" => 102,
+        "zrevrange" => 103,
+        "zrangebyscore" => 104,
+        "zrevrangebyscore" => 105,
+        "zrangebylex" => 106,
+        "zrevrangebylex" => 107,
+        "zcard" => 108,
+        "zcount" => 109,
+        "zlexcount" => 110,
+        "zincrby" => 111,
+        "zpopmin" => 112,
+        "zpopmax" => 113,
+        "zrandmember" => 114,
+        "zrangestore" => 115,
+        "zunionstore" => 116,
+        "zinterstore" => 117,
+        "zdiffstore" => 118,
+        "zmscore" => 119,
+        "zunion" => 120,
+        "zinter" => 121,
+        "zdiff" => 122,
+        "zscan" => 123,
+        "xadd" => 124,
+        "xlen" => 125,
+        "xrange" => 126,
+        "xrevrange" => 127,
+        "xread" => 128,
+        "xinfo" => 129,
+        "xtrim" => 130,
+        "xack" => 131,
+        "xclaim" => 132,
+        "xdel" => 133,
+        "xgroup" => 134,
+        "xreadgroup" => 135,
+        "xpending" => 136,
+        "xautoclaim" => 137,
+        "xsetid" => 138,
+        "subscribe" => 139,
+        "unsubscribe" => 140,
+        "publish" => 141,
+        "psubscribe" => 142,
+        "punsubscribe" => 143,
+        "ssubscribe" => 144,
+        "sunsubscribe" => 145,
+        "pubsub" => 146,
+        "ping" => 147,
+        "echo" => 148,
+        "quit" => 149,
+        "info" => 150,
+        "dbsize" => 151,
+        "flushdb" => 152,
+        "flushall" => 153,
+        "select" => 154,
+        "auth" => 155,
+        "command" => 156,
+        "config" => 157,
+        "client" => 158,
+        "debug" => 159,
+        "time" => 160,
+        "slowlog" => 161,
+        "hello" => 162,
+        "reset" => 163,
+        "swapdb" => 164,
+        "lastsave" => 165,
+        "save" => 166,
+        "bgsave" => 167,
+        "bgrewriteaof" => 168,
+        "multi" => 169,
+        "exec" => 170,
+        "discard" => 171,
+        "watch" => 172,
+        "unwatch" => 173,
+        "eval" => 174,
+        "evalsha" => 175,
+        "script" => 176,
+        "ft.create" => 177,
+        "ft.dropindex" => 178,
+        "ft.info" => 179,
+        "ft.search" => 180,
+        "ft.compact" => 181,
+        "ft.cachesearch" => 182,
+        "ft.recommend" => 183,
+        "ft.navigate" => 184,
+        "ft.expand" => 185,
+        "acl" => 186,
+        "cluster" => 187,
+        "blpop" => 188,
+        "brpop" => 189,
+        "blmove" => 190,
+        "blmpop" => 191,
+        "bzpopmin" => 192,
+        "bzpopmax" => 193,
+        _ => 0,
     }
+}
+
+thread_local! {
+    /// This thread's `moon_command_duration_microseconds{cmd}` handles, by
+    /// label index, registered on first use (moon#1178). The histogram is
+    /// recorded for the 1-in-16 sampled commands only; caching its handle per
+    /// thread means a mixed pipeline never re-registers it.
+    static CMD_HISTOGRAMS: std::cell::RefCell<Vec<Option<metrics::Histogram>>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// The duration histogram for label index `idx` on this thread.
+#[inline]
+fn cmd_histogram(idx: usize) -> metrics::Histogram {
+    CMD_HISTOGRAMS.with_borrow_mut(|hs| {
+        if hs.len() < CMD_LABEL_COUNT {
+            hs.resize(CMD_LABEL_COUNT, None);
+        }
+        let label = CMD_LABELS.get(idx).copied().unwrap_or("unknown");
+        hs[idx.min(CMD_LABEL_COUNT - 1)]
+            .get_or_insert_with(|| histogram!("moon_command_duration_microseconds", "cmd" => label))
+            .clone()
+    })
 }
 
 /// Record a command execution.
@@ -264,9 +471,9 @@ pub fn record_command(cmd: &str, latency_us: u64) {
     if !METRICS_INITIALIZED.load(Ordering::Relaxed) {
         return;
     }
-    let label = sanitize_cmd_label(cmd);
-    counter!("moon_commands_total", "cmd" => label).increment(1);
-    histogram!("moon_command_duration_microseconds", "cmd" => label).record(latency_us as f64);
+    let idx = cmd_label_index(cmd.as_bytes());
+    bump_cmd_call(idx);
+    cmd_histogram(idx).record(latency_us as f64);
 }
 
 /// Record a command execution **without** latency sampling.
@@ -281,8 +488,7 @@ pub fn record_command_no_latency(cmd: &str) {
     if !METRICS_INITIALIZED.load(Ordering::Relaxed) {
         return;
     }
-    let label = sanitize_cmd_label(cmd);
-    counter!("moon_commands_total", "cmd" => label).increment(1);
+    bump_cmd_call(cmd_label_index(cmd.as_bytes()));
 }
 
 /// Record a command error.
@@ -291,22 +497,19 @@ pub fn record_command_error(cmd: &str) {
     if !METRICS_INITIALIZED.load(Ordering::Relaxed) {
         return;
     }
-    counter!("moon_command_errors_total", "cmd" => sanitize_cmd_label(cmd)).increment(1);
+    bump_cmd_error(cmd_label_index(cmd.as_bytes()));
 }
 
-/// Per-connection cached Prometheus metric handles.
+/// Per-connection cache of the last command's label index and duration
+/// histogram handle.
 ///
-/// The `metrics!` macros call `with_recorder(|rec| rec.register_counter(...))`
-/// on every invocation, which for `metrics-exporter-prometheus` resolves to a
-/// DashMap lookup keyed on `(name, labels)`. Under a steady single-command
-/// workload (e.g. redis-benchmark -t set) the label is constant, so the lookup
-/// is pure overhead. The flamegraph attributes ~6% of shard CPU to the
-/// recorder backend on SET p=64.
-///
-/// This struct caches the last-seen command's counter / histogram / error
-/// counter handles, keyed on the raw command bytes. Cache hit avoids both
-/// `sanitize_cmd_label` and the registry lookup — the hot path collapses to
-/// one atomic fetch + two atomic handle operations.
+/// moon#1178: the counts no longer go through a recorder handle at all — they
+/// land in this thread's slot of `sharded::CMD_COUNTS` and are published at
+/// scrape — so this cache only saves the label match (one byte compare on a
+/// hit) and the histogram handle for the sampled 1-in-16. It used to cache
+/// ONE command's three registry handles, so every command switch in a mixed
+/// pipeline re-registered all three (a registry lookup each), and the cached
+/// counter was one `AtomicU64` every shard incremented.
 ///
 /// Held by `ConnectionState` (`!Send` because the handler is thread-pinned),
 /// so there is no cross-thread synchronisation.
@@ -316,18 +519,17 @@ pub struct CachedMetricsHandles {
     // module was one file: reachable from `metrics_setup` (where the unit
     // tests live), nothing wider.
     pub(super) last_cmd: smallvec::SmallVec<[u8; 20]>,
-    counter: metrics::Counter,
+    /// Label index of `last_cmd` (see [`CMD_LABELS`]).
+    idx: usize,
     histogram: metrics::Histogram,
-    error_counter: metrics::Counter,
 }
 
 impl Default for CachedMetricsHandles {
     fn default() -> Self {
         Self {
             last_cmd: smallvec::SmallVec::new(),
-            counter: metrics::Counter::noop(),
+            idx: 0,
             histogram: metrics::Histogram::noop(),
-            error_counter: metrics::Counter::noop(),
         }
     }
 }
@@ -338,23 +540,20 @@ impl CachedMetricsHandles {
         Self::default()
     }
 
-    /// Ensure the cached handles refer to `cmd`. No-op when the previous
-    /// call used the same bytes (cache hit).
+    /// Ensure the cache refers to `cmd`. No-op when the previous call used
+    /// the same bytes (cache hit).
     #[inline]
     pub(super) fn ensure(&mut self, cmd: &[u8]) {
         if self.last_cmd.as_slice() == cmd {
             return;
         }
-        let cmd_str = std::str::from_utf8(cmd).unwrap_or("unknown");
-        let label = sanitize_cmd_label(cmd_str);
         self.last_cmd.clear();
         self.last_cmd.extend_from_slice(cmd);
-        self.counter = counter!("moon_commands_total", "cmd" => label);
-        self.histogram = histogram!("moon_command_duration_microseconds", "cmd" => label);
-        self.error_counter = counter!("moon_command_errors_total", "cmd" => label);
+        self.idx = cmd_label_index(cmd);
+        self.histogram = cmd_histogram(self.idx);
     }
 
-    /// One execution of `cmd`: bump its counter and, when the call was a
+    /// One execution of `cmd`: bump its count and, when the call was a
     /// sampled one, record its duration. The single sink behind
     /// [`LatencyProbe::observe`](crate::admin::metrics_setup::LatencyProbe::observe);
     /// does NOT touch `total_commands_processed` (the probe batches that).
@@ -364,7 +563,7 @@ impl CachedMetricsHandles {
             return;
         }
         self.ensure(cmd);
-        self.counter.increment(1);
+        bump_cmd_call(self.idx);
         if let Some(us) = elapsed_us {
             self.histogram.record(us as f64);
         }
@@ -372,8 +571,7 @@ impl CachedMetricsHandles {
 }
 
 /// Record a command execution with latency using a per-connection handle
-/// cache. Functionally identical to [`record_command`] but avoids the
-/// recorder-backend DashMap lookup on cache hit.
+/// cache. Functionally identical to [`record_command`].
 #[inline]
 pub fn record_command_cached(cmd: &str, latency_us: u64, cache: &mut CachedMetricsHandles) {
     bump_total_commands();
@@ -381,13 +579,12 @@ pub fn record_command_cached(cmd: &str, latency_us: u64, cache: &mut CachedMetri
         return;
     }
     cache.ensure(cmd.as_bytes());
-    cache.counter.increment(1);
+    bump_cmd_call(cache.idx);
     cache.histogram.record(latency_us as f64);
 }
 
 /// Record a command execution without latency using a per-connection handle
-/// cache. Functionally identical to [`record_command_no_latency`] but avoids
-/// the recorder-backend DashMap lookup on cache hit.
+/// cache. Functionally identical to [`record_command_no_latency`].
 #[inline]
 pub fn record_command_no_latency_cached(cmd: &str, cache: &mut CachedMetricsHandles) {
     bump_total_commands();
@@ -395,17 +592,16 @@ pub fn record_command_no_latency_cached(cmd: &str, cache: &mut CachedMetricsHand
         return;
     }
     cache.ensure(cmd.as_bytes());
-    cache.counter.increment(1);
+    bump_cmd_call(cache.idx);
 }
 
 /// Record a command error using a per-connection handle cache.
-/// Functionally identical to [`record_command_error`] but avoids the
-/// recorder-backend DashMap lookup on cache hit.
+/// Functionally identical to [`record_command_error`].
 #[inline]
 pub fn record_command_error_cached(cmd: &str, cache: &mut CachedMetricsHandles) {
     if !METRICS_INITIALIZED.load(Ordering::Relaxed) {
         return;
     }
     cache.ensure(cmd.as_bytes());
-    cache.error_counter.increment(1);
+    bump_cmd_error(cache.idx);
 }

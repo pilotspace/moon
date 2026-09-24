@@ -146,6 +146,10 @@ async fn handle_request(
         }
 
         "/metrics" => {
+            // moon#1178: counters kept in per-thread slots reach the recorder
+            // here, once per scrape, instead of through a registry lookup per
+            // event on the shard threads.
+            crate::admin::metrics_setup::publish_sharded_counters();
             // Run upkeep to flush pending metric values before rendering.
             state.prometheus_handle.run_upkeep();
             let rendered = state.prometheus_handle.render();
@@ -797,6 +801,24 @@ pub fn spawn_admin_server(
                 // Per-subsystem memory gauge publisher (15 s tick).
                 // Not console-gated — always active when admin port is enabled.
                 crate::admin::metrics_setup::spawn_moon_memory_publisher();
+
+                // moon#1178: histogram upkeep on a timer. The recorder is
+                // built with `build_recorder()`, whose contract makes the
+                // caller run upkeep; it used to run only on a `/metrics`
+                // scrape, so with the exporter on and nobody scraping, every
+                // histogram sample (1-in-16 commands, every SPSC drain) piled
+                // up in its bucket without bound. 5 s is the exporter's own
+                // default upkeep interval.
+                {
+                    let handle = state.prometheus_handle.clone();
+                    tokio::spawn(async move {
+                        let mut tick = tokio::time::interval(std::time::Duration::from_secs(5));
+                        loop {
+                            tick.tick().await;
+                            handle.run_upkeep();
+                        }
+                    });
+                }
 
                 loop {
                     let (stream, peer) = match listener.accept().await {
