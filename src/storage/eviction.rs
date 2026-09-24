@@ -524,12 +524,12 @@ fn can_skip_eviction(
 /// keys — the same bias the reservoir version had, and irrelevant to an
 /// approximate sampler. Attempts are bounded (`samples x 8`) so a sparse
 /// volatile keyspace cannot loop.
-fn sample_victim<'a>(
-    db: &'a Database,
+fn sample_victim(
+    db: &Database,
     samples: usize,
     volatile_only: bool,
     better: impl Fn(&Entry, &Entry) -> bool,
-) -> Option<&'a CompactKey> {
+) -> Option<&CompactKey> {
     let table = db.data();
     let seg_count = table.segment_count();
     if seg_count == 0 || table.is_empty() {
