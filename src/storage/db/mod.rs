@@ -10,6 +10,7 @@ mod kv_ops;
 /// rather than a clock. Test-only; see the module docs for why.
 #[cfg(test)]
 mod probe_budget;
+pub(crate) mod string_mut;
 
 pub use cold_replay_gate::{ReplayColdGate, ReplayColdReconcile, close_replay_generation};
 pub(crate) use incr::IncrOutcome;

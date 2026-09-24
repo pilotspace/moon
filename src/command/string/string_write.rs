@@ -3,6 +3,7 @@ use bytes::Bytes;
 use crate::protocol::Frame;
 use crate::storage::Database;
 use crate::storage::db::IncrOutcome;
+use crate::storage::db::string_mut::StringMut;
 use crate::storage::entry::{Entry, current_time_ms};
 
 use super::{format_float, parse_f64, parse_i64, parse_positive_i64};
@@ -603,63 +604,39 @@ pub fn append(db: &mut Database, args: &[Frame]) -> Frame {
         None => return err_wrong_args("APPEND"),
     };
     let append_val = match extract_bytes(&args[1]) {
-        Some(v) => v.clone(),
+        Some(v) => v,
         None => return err_wrong_args("APPEND"),
     };
 
-    // Check if key exists, get existing data + expiry
-    let (existing_data, existing_expiry_ms) = match db.get(key) {
-        Some(entry) => {
-            let expiry = entry.expires_at_ms();
-            match entry.value.as_bytes_owned() {
-                Some(v) => (Some(v), expiry),
-                None => {
-                    return Frame::Error(Bytes::from_static(
-                        b"WRONGTYPE Operation against a key holding the wrong kind of value",
-                    ));
-                }
-            }
+    // moon#1168: append IN PLACE, growing the stored buffer by an exact
+    // realloc — amortized O(1) per byte (see `CompactValue::string_grow_with`)
+    // — where the existing value used to be copied twice and the Entry
+    // rebuilt on every call: quadratic, 11.2 s for 40K x 100 B. The TTL and
+    // LFU metadata are kept; WATCH/ledger/cold-shadow bookkeeping and the
+    // moon#875 cold-fault refusal live in `mutate_string`.
+    //
+    // The 512MB limit (matching SETRANGE/SETBIT) is checked before anything
+    // is written, against the length the append would produce.
+    match db.mutate_string(key, |buf| {
+        let combined_len = buf.len() + append_val.len();
+        if combined_len > 512 * 1024 * 1024 {
+            return None;
         }
-        None => {
-            // moon#875: an indexed-but-unreadable cold copy must not be
-            // silently replaced by a value built from nothing.
-            if db.take_cold_fault().is_some() {
-                return Database::cold_fault_error();
-            }
-            (None, 0)
-        }
-    };
-
-    // Enforce the 512MB max string size (matches SETRANGE/SETBIT); APPEND
-    // previously let a string grow past the documented limit unbounded.
-    let combined_len = existing_data.as_ref().map_or(0, |v| v.len()) + append_val.len();
-    if combined_len > 512 * 1024 * 1024 {
-        return Frame::Error(Bytes::from_static(
+        buf.append(append_val);
+        Some(combined_len)
+    }) {
+        StringMut::Applied(Some(new_len)) => Frame::Integer(new_len as i64),
+        StringMut::Applied(None) => Frame::Error(Bytes::from_static(
             b"ERR string exceeds maximum allowed size (512MB)",
-        ));
-    }
-
-    let new_val = match existing_data {
-        Some(existing) => {
-            let mut combined = Vec::with_capacity(existing.len() + append_val.len());
-            combined.extend_from_slice(&existing);
-            combined.extend_from_slice(&append_val);
-            Bytes::from(combined)
+        )),
+        StringMut::WrongType => Frame::Error(Bytes::from_static(
+            b"WRONGTYPE Operation against a key holding the wrong kind of value",
+        )),
+        StringMut::ColdFault => {
+            let _ = db.take_cold_fault();
+            Database::cold_fault_error()
         }
-        None => append_val,
-    };
-
-    let new_len = new_val.len() as i64;
-    let mut entry = if existing_expiry_ms > 0 {
-        Entry::new_string_with_expiry(new_val, existing_expiry_ms)
-    } else {
-        Entry::new_string(new_val)
-    };
-    entry.set_last_access(db.now());
-    entry.set_access_counter(5);
-    db.set(key, entry);
-
-    Frame::Integer(new_len)
+    }
 }
 
 /// SETRANGE key offset value — overwrite part of string at offset.
@@ -705,48 +682,23 @@ pub fn setrange(db: &mut Database, args: &[Frame]) -> Frame {
         }
     };
 
-    let (existing_data, existing_expiry_ms) = match db.get(key) {
-        Some(entry) => {
-            let expiry = entry.expires_at_ms();
-            match entry.value.as_bytes() {
-                Some(v) => (Some(v.to_vec()), expiry),
-                None => {
-                    return Frame::Error(Bytes::from_static(
-                        b"WRONGTYPE Operation against a key holding the wrong kind of value",
-                    ));
-                }
-            }
+    // moon#1168: overwrite IN PLACE (O(len(value)) in bounds, amortized
+    // growth past the end) instead of copying the whole string, rebuilding
+    // the Entry and `set`ting it back. TTL and LFU metadata are kept.
+    match db.mutate_string(key, |buf| {
+        buf.grow_zeroed(required);
+        buf.bytes_mut()[offset..required].copy_from_slice(value);
+        buf.len()
+    }) {
+        StringMut::Applied(new_len) => Frame::Integer(new_len as i64),
+        StringMut::WrongType => Frame::Error(Bytes::from_static(
+            b"WRONGTYPE Operation against a key holding the wrong kind of value",
+        )),
+        StringMut::ColdFault => {
+            let _ = db.take_cold_fault();
+            Database::cold_fault_error()
         }
-        None => {
-            // moon#875: an indexed-but-unreadable cold copy must not be
-            // silently replaced by a value built from nothing.
-            if db.take_cold_fault().is_some() {
-                return Database::cold_fault_error();
-            }
-            (None, 0)
-        }
-    };
-
-    let mut buf = existing_data.unwrap_or_default();
-    // Extend with zero bytes if needed
-    if required > buf.len() {
-        buf.resize(required, 0);
     }
-    // Overwrite at offset
-    buf[offset..offset + value.len()].copy_from_slice(value);
-
-    let new_len = buf.len() as i64;
-    let new_val = Bytes::from(buf);
-    let mut entry = if existing_expiry_ms > 0 {
-        Entry::new_string_with_expiry(new_val, existing_expiry_ms)
-    } else {
-        Entry::new_string(new_val)
-    };
-    entry.set_last_access(db.now());
-    entry.set_access_counter(5);
-    db.set(key, entry);
-
-    Frame::Integer(new_len)
 }
 
 /// SETNX command handler (legacy wrapper).
