@@ -222,10 +222,19 @@ pub(crate) fn cancel_all_parked() -> usize {
 /// pre-park sizing reallocates the probe size next iteration); the scratch
 /// buffers are only released when empty — a non-empty `read_buf` holds a
 /// partial frame that must survive the re-park.
+///
+/// moon#1179 item 3: the batch scratch (`frames`, `responses`) is released
+/// too. Both are always empty at the park point — `responses` is fully
+/// serialized and `frames` fully dispatched before the loop parks — but they
+/// kept their high-water capacity (64 frames each at least), which a parked
+/// connection has no use for. The emptiness guard is the same belt as for the
+/// byte buffers: a non-empty vec is never dropped.
 pub(super) fn downshift_idle_buffers(
     tmp_buf: &mut Vec<u8>,
     read_buf: &mut bytes::BytesMut,
     write_buf: &mut bytes::BytesMut,
+    frames: &mut Vec<crate::protocol::Frame>,
+    responses: &mut Vec<crate::protocol::Frame>,
 ) {
     *tmp_buf = Vec::new();
     if read_buf.is_empty() && read_buf.capacity() > 0 {
@@ -233,6 +242,11 @@ pub(super) fn downshift_idle_buffers(
     }
     if write_buf.is_empty() && write_buf.capacity() > 0 {
         *write_buf = bytes::BytesMut::new();
+    }
+    for v in [frames, responses] {
+        if v.is_empty() && v.capacity() > 0 {
+            *v = Vec::new();
+        }
     }
 }
 
@@ -480,11 +494,29 @@ mod idle_park_tests {
 
     #[test]
     fn downshift_releases_only_empty_scratch() {
+        use crate::protocol::Frame;
         let mut tmp = vec![0u8; PARK_BUF_FULL];
         let mut rb = bytes::BytesMut::with_capacity(PARK_BUF_FULL);
         let mut wb = bytes::BytesMut::with_capacity(PARK_BUF_FULL);
         rb.extend_from_slice(b"partial-frame"); // must survive
-        downshift_idle_buffers(&mut tmp, &mut rb, &mut wb);
+        // moon#1179 item 3: emptied batch scratch at its high-water mark is
+        // released; a non-empty one (never the case at the park point) is kept.
+        let mut frames: Vec<Frame> = Vec::with_capacity(1024);
+        let mut responses: Vec<Frame> = vec![Frame::Integer(1)];
+        downshift_idle_buffers(&mut tmp, &mut rb, &mut wb, &mut frames, &mut responses);
+        assert_eq!(
+            frames.capacity(),
+            0,
+            "empty frames scratch must be released"
+        );
+        assert_eq!(responses.len(), 1, "non-empty scratch must be kept");
+        responses.clear();
+        downshift_idle_buffers(&mut tmp, &mut rb, &mut wb, &mut frames, &mut responses);
+        assert_eq!(
+            responses.capacity(),
+            0,
+            "empty responses scratch must be released"
+        );
         assert_eq!(tmp.capacity(), 0, "rent buffer must be dropped");
         assert_eq!(wb.capacity(), 0, "empty write buffer must be released");
         assert_eq!(&rb[..], b"partial-frame", "partial frame must be kept");

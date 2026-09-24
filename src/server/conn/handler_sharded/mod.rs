@@ -464,7 +464,7 @@ pub(crate) async fn handle_connection_sharded_inner<
     // fan-out costs nothing on the overwhelming majority of batches that have
     // none.)
     let mut fanout_state = crate::server::conn::fanout::FanoutState::default();
-    let mut fanout_scratch: Vec<(usize, Frame, usize)> = Vec::with_capacity(ctx.num_shards);
+    let mut fanout_scratch: Vec<(usize, Frame, usize)> = Vec::new(); // grown on first fan-out
     loop {
         // Check if CLIENT KILL targeted this connection (lock-free, QW8)
         if client_live.is_killed() {
@@ -660,7 +660,8 @@ pub(crate) async fn handle_connection_sharded_inner<
                 let mut should_quit = false;
                 // moon#513 (A2a): the leading index is a `ReplySink`, not a bare
                 // `responses` index — see the twin in `handler_monoio`.
-                let mut remote_groups: HashMap<usize, Vec<(crate::server::conn::fanout::ReplySink, std::sync::Arc<Frame>, Option<Bytes>, usize, Option<crate::tracking::invalidation::TrackedWriteKeys>, crate::protocol::resp3::Resp3Shape)>> = HashMap::with_capacity(ctx.num_shards);
+                // moon#1179 item 3: no allocation unless the batch crosses a shard.
+                let mut remote_groups: HashMap<usize, Vec<(crate::server::conn::fanout::ReplySink, std::sync::Arc<Frame>, Option<Bytes>, usize, Option<crate::tracking::invalidation::TrackedWriteKeys>, crate::protocol::resp3::Resp3Shape)>> = HashMap::new();
                 // moon#513 (A2a): reset the hoisted fan-out buffers for this
                 // batch, beside the `remote_groups` they are folded against.
                 fanout_state.clear();

@@ -482,9 +482,12 @@ pub(crate) async fn handle_connection_sharded_monoio<
         )
     };
 
-    // Pre-allocate batch containers outside the loop to avoid per-batch heap allocation.
-    // These are cleared and reused each iteration instead of being recreated.
-    let mut responses: Vec<Frame> = Vec::with_capacity(64);
+    // Batch containers live outside the loop and are cleared and reused each
+    // iteration, so a batch allocates nothing once they have grown. They
+    // start EMPTY (moon#1179 item 3): a connection that sends one command at
+    // a time holds a few frames, not 64 x 40 B each, and the idle downshift
+    // releases them again (`idle_park::downshift_idle_buffers`).
+    let mut responses: Vec<Frame> = Vec::new();
     // The trailing `Resp3Shape` is the reply shape, classified at ENQUEUE time
     // where the command's args are still in scope. The batch reply carries only
     // the command NAME, so without this tag a cross-shard reply could not be
@@ -515,13 +518,14 @@ pub(crate) async fn handle_connection_sharded_monoio<
             Option<crate::tracking::invalidation::TrackedWriteKeys>,
             crate::protocol::resp3::Resp3Shape,
         )>,
-    > = HashMap::with_capacity(ctx.num_shards);
+    > = HashMap::new(); // moon#1179: allocated on first cross-shard use
     // moon#513 (A2a): batch-scoped fan-out buffers, allocated once per
     // connection and cleared beside `remote_groups` — the batch loop is a hot
     // path and must not allocate a plan per command.
     let mut fanout_state = crate::server::conn::fanout::FanoutState::default();
-    let mut fanout_scratch: Vec<(usize, Frame, usize)> = Vec::with_capacity(ctx.num_shards);
-    let mut reply_futures: Vec<(Vec<RemoteMeta>, usize)> = Vec::with_capacity(ctx.num_shards);
+    // moon#1179 item 3: both grow on first cross-shard use, not at connect.
+    let mut fanout_scratch: Vec<(usize, Frame, usize)> = Vec::new();
+    let mut reply_futures: Vec<(Vec<RemoteMeta>, usize)> = Vec::new();
     // v3-5 group commit: response indexes of coordinator LOCAL-leg writes whose
     // AOF append was enqueued but not yet fsync-confirmed (appendfsync=always).
     // Drained by ONE fsync_barrier(ctx.shard_id) at end of batch.
@@ -535,8 +539,9 @@ pub(crate) async fn handle_connection_sharded_monoio<
     // note in Phase 2b for the lifetime contract.
     let response_pool = ResponseSlotPool::new(ctx.num_shards, ctx.shard_id);
 
-    // Pre-allocate frames Vec outside the loop; reused via .clear() each iteration.
-    let mut frames: Vec<Frame> = Vec::with_capacity(64);
+    // Parsed frames of the current batch; reused via .clear() each iteration,
+    // grown on demand (moon#1179 item 3, see `responses` above).
+    let mut frames: Vec<Frame> = Vec::new();
     // Set when the parser rejects a frame. The connection still dies, but not
     // silently and not before the valid frames that preceded the fault in the
     // same read have been executed and answered.
@@ -1380,7 +1385,13 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 Err(_) => {
                     // Cancelled by the idle sweep: shed the working set,
                     // re-park small.
-                    idle_park::downshift_idle_buffers(&mut tmp_buf, &mut read_buf, &mut write_buf);
+                    idle_park::downshift_idle_buffers(
+                        &mut tmp_buf,
+                        &mut read_buf,
+                        &mut write_buf,
+                        &mut frames,
+                        &mut responses,
+                    );
                     stream.on_idle_downshift();
                     downshifted = true;
                     continue;
