@@ -1,51 +1,55 @@
 use bytes::Bytes;
 use ordered_float::OrderedFloat;
-use smallvec::SmallVec;
 use thiserror::Error;
 
-/// SmallVec-backed Frame collection, boxed for recursive type safety.
+/// The element collection of `Frame::Array` / `Set` / `Push`.
 ///
-/// Frame is recursive (Array contains Frames), so inline SmallVec would create
-/// an infinitely-sized type. Boxing provides the indirection the compiler needs
-/// while SmallVec provides inline storage for up to 4 elements within the Box
-/// allocation -- no separate data pointer needed for small arrays.
+/// A plain `Vec<Frame>` behind a newtype (moon#1179 item 1). It used to be
+/// `Box<SmallVec<[Frame; 4]>>`: the box was the indirection a recursive type
+/// needs, and the inline four were meant to save the element allocation. In
+/// practice it cost MORE: every array paid the ~300 B box, a request with more
+/// than four arguments (`SET k v EX 100`, `HSET k f1 v1 f2 v2`) spilled and
+/// paid the box AND a heap array, and every `Vec -> FrameVec` reply site
+/// either copied into the inline slots or adopted the `Vec` and boxed it
+/// anyway. A `Vec` is one allocation for any length, adopted for free from
+/// the reply sites that build one, and 24 bytes inline in `Frame`.
 ///
-/// For Redis commands with <= 4 args (GET=2, SET=3, HSET=4 -- 95%+ of commands),
-/// FrameVec uses a single fixed-size heap allocation (~300 bytes) with no
-/// additional data allocation, vs Vec's variable-size allocation.
-#[derive(Debug, Clone, PartialEq)]
-pub struct FrameVec(Box<SmallVec<[Frame; 4]>>);
+/// No `SmallVec`-specific method was ever used through the `Deref`, so the API
+/// is unchanged: it derefs to `Vec<Frame>` (and from there to `[Frame]`).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct FrameVec(Vec<Frame>);
 
 impl FrameVec {
     #[inline]
-    pub fn new() -> Self {
-        Self(Box::new(SmallVec::new()))
+    pub const fn new() -> Self {
+        Self(Vec::new())
     }
 
     #[inline]
     pub fn with_capacity(cap: usize) -> Self {
-        Self(Box::new(SmallVec::with_capacity(cap)))
+        Self(Vec::with_capacity(cap))
     }
 
+    /// Adopt a `Vec` without copying or allocating.
     #[inline]
     pub fn from_vec(v: Vec<Frame>) -> Self {
-        Self(Box::new(SmallVec::from_vec(v)))
+        Self(v)
     }
 
     #[inline]
     pub fn from_elem(elem: Frame) -> Self {
-        Self(Box::new(smallvec::smallvec![elem]))
+        Self(vec![elem])
     }
-}
 
-impl Default for FrameVec {
-    fn default() -> Self {
-        Self::new()
+    /// The underlying `Vec`, without copying.
+    #[inline]
+    pub fn into_vec(self) -> Vec<Frame> {
+        self.0
     }
 }
 
 impl std::ops::Deref for FrameVec {
-    type Target = SmallVec<[Frame; 4]>;
+    type Target = Vec<Frame>;
     #[inline]
     fn deref(&self) -> &Self::Target {
         &self.0
@@ -61,10 +65,10 @@ impl std::ops::DerefMut for FrameVec {
 
 impl IntoIterator for FrameVec {
     type Item = Frame;
-    type IntoIter = smallvec::IntoIter<[Frame; 4]>;
+    type IntoIter = std::vec::IntoIter<Frame>;
     #[inline]
     fn into_iter(self) -> Self::IntoIter {
-        (*self.0).into_iter()
+        self.0.into_iter()
     }
 }
 
@@ -78,14 +82,23 @@ impl<'a> IntoIterator for &'a FrameVec {
 }
 
 impl FromIterator<Frame> for FrameVec {
+    #[inline]
     fn from_iter<I: IntoIterator<Item = Frame>>(iter: I) -> Self {
-        Self(Box::new(iter.into_iter().collect()))
+        Self(iter.into_iter().collect())
     }
 }
 
 impl From<Vec<Frame>> for FrameVec {
+    #[inline]
     fn from(v: Vec<Frame>) -> Self {
-        Self::from_vec(v)
+        Self(v)
+    }
+}
+
+impl From<FrameVec> for Vec<Frame> {
+    #[inline]
+    fn from(v: FrameVec) -> Self {
+        v.0
     }
 }
 
@@ -166,8 +179,14 @@ pub enum Frame {
     Boolean(bool),
     /// `=<len>\r\n<enc>:<data>\r\n` -- Verbatim string with encoding hint
     VerbatimString {
-        /// 3-byte encoding hint (e.g. "txt", "mkd")
-        encoding: Bytes,
+        /// 3-byte encoding hint (e.g. "txt", "mkd").
+        ///
+        /// Inline bytes, not a `Bytes`: the RESP3 wire fixes it at exactly
+        /// three, and a second `Bytes` here was the ONLY thing making `Frame`
+        /// 72 bytes instead of 40 — every `Frame` move (`push`,
+        /// `mem::replace`, `DispatchResult`, `ResponseSlot`) paid for it, and
+        /// the parser mallocs a 3-byte copy per verbatim reply (moon#1179).
+        encoding: [u8; 3],
         /// The string data
         data: Bytes,
     },
@@ -395,11 +414,48 @@ mod tests {
 
     #[test]
     fn frame_size_measurement() {
-        let size = std::mem::size_of::<Frame>();
-        println!("Frame size after FrameVec change: {} bytes (was 72)", size);
-        println!("FrameVec size: {} bytes", std::mem::size_of::<FrameVec>());
-        // Frame should stay small since FrameVec wraps Box (8 byte pointer)
-        assert!(size <= 72, "Frame size {} exceeds 72 bytes", size);
+        // moon#1179 item 2: every variant fits in 32 payload bytes once the
+        // verbatim encoding tag is inline `[u8; 3]` (it was a second `Bytes`,
+        // making every `Frame` 72 bytes). A regression here is a 44% bigger
+        // copy on every `push`, `mem::replace` and cross-shard reply.
+        assert_eq!(std::mem::size_of::<Frame>(), 40);
+        assert_eq!(std::mem::size_of::<FrameVec>(), 24);
+    }
+
+    /// moon#1179 item 1: `FrameVec` is a `Vec<Frame>` newtype — no box, so an
+    /// array costs one allocation at any length (the old
+    /// `Box<SmallVec<[Frame; 4]>>` paid the box always and a spill past four
+    /// arguments on top), and a `Vec` built by a reply site is ADOPTED, never
+    /// copied (the old `from_vec` copied short vecs into the inline slots).
+    #[test]
+    fn framevec_is_an_unboxed_vec_and_adopts_without_copying() {
+        assert_eq!(
+            std::mem::size_of::<FrameVec>(),
+            std::mem::size_of::<Vec<Frame>>(),
+            "FrameVec must be a bare Vec (no Box indirection)"
+        );
+        for n in [1usize, 3, 4, 5, 17] {
+            let v: Vec<Frame> = (0..n as i64).map(Frame::Integer).collect();
+            let ptr = v.as_ptr();
+            let fv = FrameVec::from_vec(v);
+            assert_eq!(fv.as_ptr(), ptr, "from_vec copied a {n}-element Vec");
+            let fv2: FrameVec = fv.into_vec().into();
+            assert_eq!(fv2.as_ptr(), ptr, "From<Vec> copied a {n}-element Vec");
+            let back: Vec<Frame> = fv2.into();
+            assert_eq!(back.as_ptr(), ptr);
+        }
+        // A parsed 5-argument request holds its arguments in ONE exact-size
+        // allocation — the shape that used to take a box plus a spill.
+        let mut buf = bytes::BytesMut::from(
+            &b"*5\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n$2\r\nEX\r\n$3\r\n100\r\n"[..],
+        );
+        match crate::protocol::parse(&mut buf, &ParseConfig::default()) {
+            Ok(Some(Frame::Array(items))) => {
+                assert_eq!(items.len(), 5);
+                assert_eq!(items.capacity(), 5);
+            }
+            other => panic!("expected Array, got {other:?}"),
+        }
     }
 
     #[test]

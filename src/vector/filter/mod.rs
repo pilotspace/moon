@@ -1,5 +1,6 @@
 pub mod expression;
 pub mod payload_index;
+pub mod payload_schema;
 pub mod selectivity;
 #[cfg(feature = "text-index")]
 pub mod text_index;

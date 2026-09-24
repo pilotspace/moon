@@ -2,6 +2,7 @@ use bytes::Bytes;
 
 use crate::protocol::Frame;
 use crate::storage::Database;
+use crate::storage::db::string_mut::StringMut;
 use crate::storage::entry::Entry;
 
 use super::parse_i64;
@@ -118,48 +119,33 @@ pub fn setbit(db: &mut Database, args: &[Frame]) -> Frame {
     let byte_idx = offset / 8;
     let bit_idx = 7 - (offset % 8);
 
-    let (existing_data, existing_expiry_ms) = match db.get(key) {
-        Some(entry) => {
-            let expiry = entry.expires_at_ms();
-            match entry.value.as_bytes() {
-                Some(v) => (Some(v.to_vec()), expiry),
-                None => {
-                    return Frame::Error(Bytes::from_static(
-                        b"WRONGTYPE Operation against a key holding the wrong kind of value",
-                    ));
-                }
-            }
+    // moon#1168: flip the bit IN PLACE — O(1) in-bounds, amortized O(1)
+    // growth — where the whole string used to be copied into a Vec, the
+    // Entry rebuilt and `set` back (8.3 ms per SETBIT on a 12.5 MB bitmap).
+    // The TTL and LFU metadata are kept; the WATCH version, ledger, cold
+    // shadow and in-flight spill are maintained by `mutate_string`. SETBIT is
+    // always a write on redis (even when the bit is unchanged), so the byte
+    // is always touched through `bytes_mut`.
+    match db.mutate_string(key, |buf| {
+        buf.grow_zeroed(byte_idx + 1);
+        let byte = &mut buf.bytes_mut()[byte_idx];
+        let original = (*byte >> bit_idx) & 1;
+        if bit_val == 1 {
+            *byte |= 1 << bit_idx;
+        } else {
+            *byte &= !(1 << bit_idx);
         }
-        None => (None, 0),
-    };
-
-    let mut buf = existing_data.unwrap_or_default();
-    // Extend with zero bytes if needed
-    if byte_idx >= buf.len() {
-        buf.resize(byte_idx + 1, 0);
+        original
+    }) {
+        StringMut::Applied(original) => Frame::Integer(original as i64),
+        StringMut::WrongType => Frame::Error(Bytes::from_static(
+            b"WRONGTYPE Operation against a key holding the wrong kind of value",
+        )),
+        StringMut::ColdFault => {
+            let _ = db.take_cold_fault();
+            Database::cold_fault_error()
+        }
     }
-
-    // Get original bit
-    let original = (buf[byte_idx] >> bit_idx) & 1;
-
-    // Set or clear bit
-    if bit_val == 1 {
-        buf[byte_idx] |= 1 << bit_idx;
-    } else {
-        buf[byte_idx] &= !(1 << bit_idx);
-    }
-
-    let new_val = Bytes::from(buf);
-    let mut entry = if existing_expiry_ms > 0 {
-        Entry::new_string_with_expiry(new_val, existing_expiry_ms)
-    } else {
-        Entry::new_string(new_val)
-    };
-    entry.set_last_access(db.now());
-    entry.set_access_counter(5);
-    db.set(key, entry);
-
-    Frame::Integer(original as i64)
 }
 
 /// BITCOUNT key [start end [BYTE|BIT]]
@@ -769,40 +755,37 @@ fn count_bits_in_range(data: &[u8], start_bit: usize, end_bit: usize) -> u32 {
     count
 }
 
-/// BITFIELD key [GET encoding offset] [SET encoding offset value]
-///   [INCRBY encoding offset increment] [OVERFLOW WRAP|SAT|FAIL]
-///
-/// Treat a string as an array of packed integers of configurable width.
-pub fn bitfield(db: &mut Database, args: &[Frame]) -> Frame {
-    if args.is_empty() {
-        return err_wrong_args("BITFIELD");
-    }
-    let key = match extract_bytes(&args[0]) {
-        Some(k) => k,
-        None => return err_wrong_args("BITFIELD"),
-    };
+/// One parsed BITFIELD operation.
+#[derive(Clone, Copy)]
+enum BfOp {
+    Get {
+        signed: bool,
+        bits: u32,
+        offset: usize,
+    },
+    Set {
+        signed: bool,
+        bits: u32,
+        offset: usize,
+        value: i64,
+    },
+    IncrBy {
+        signed: bool,
+        bits: u32,
+        offset: usize,
+        increment: i64,
+        overflow: Overflow,
+    },
+}
 
-    let (existing_data, existing_expiry_ms) = match db.get(key) {
-        Some(entry) => {
-            let expiry = entry.expires_at_ms();
-            match entry.value.as_bytes() {
-                Some(v) => (v.to_vec(), expiry),
-                None => {
-                    return Frame::Error(Bytes::from_static(
-                        b"WRONGTYPE Operation against a key holding the wrong kind of value",
-                    ));
-                }
-            }
-        }
-        None => (Vec::new(), 0),
-    };
-
-    let mut buf = existing_data;
-    let mut results = Vec::new();
+/// Parse every BITFIELD subcommand BEFORE touching the key, as redis's
+/// `bitfieldGeneric` does: a syntax error anywhere means nothing is written.
+/// The checks and their order per subcommand are the ones the old
+/// interleaved loop made, so every error reply is unchanged.
+fn parse_bitfield_ops(args: &[Frame]) -> Result<Vec<BfOp>, Frame> {
+    let mut ops = Vec::with_capacity(args.len() / 3);
     let mut overflow = Overflow::Wrap;
-    let mut modified = false;
     let mut i = 1;
-
     while i < args.len() {
         let subcmd = match extract_bytes(&args[i]) {
             Some(s) => s,
@@ -816,7 +799,7 @@ pub fn bitfield(db: &mut Database, args: &[Frame]) -> Frame {
             i += 1;
             let mode = match args.get(i).and_then(|f| extract_bytes(f)) {
                 Some(m) => m,
-                None => return Frame::Error(Bytes::from_static(b"ERR syntax error")),
+                None => return Err(Frame::Error(Bytes::from_static(b"ERR syntax error"))),
             };
             if mode.eq_ignore_ascii_case(b"WRAP") {
                 overflow = Overflow::Wrap;
@@ -825,7 +808,7 @@ pub fn bitfield(db: &mut Database, args: &[Frame]) -> Frame {
             } else if mode.eq_ignore_ascii_case(b"FAIL") {
                 overflow = Overflow::Fail;
             } else {
-                return Frame::Error(Bytes::from_static(b"ERR syntax error"));
+                return Err(Frame::Error(Bytes::from_static(b"ERR syntax error")));
             }
             i += 1;
             continue;
@@ -834,94 +817,200 @@ pub fn bitfield(db: &mut Database, args: &[Frame]) -> Frame {
         // Parse encoding and offset
         let enc = match args.get(i + 1).and_then(|f| extract_bytes(f)) {
             Some(e) => e,
-            None => return Frame::Error(Bytes::from_static(b"ERR syntax error")),
+            None => return Err(Frame::Error(Bytes::from_static(b"ERR syntax error"))),
         };
         let offset_arg = match args.get(i + 2).and_then(|f| extract_bytes(f)) {
             Some(o) => o,
-            None => return Frame::Error(Bytes::from_static(b"ERR syntax error")),
+            None => return Err(Frame::Error(Bytes::from_static(b"ERR syntax error"))),
         };
 
         let (signed, bits) = match parse_encoding(enc) {
             Some(v) => v,
             None => {
-                return Frame::Error(Bytes::from_static(
+                return Err(Frame::Error(Bytes::from_static(
                     b"ERR Invalid bitfield type. Use something like i8 u8 i16 u16 ...",
-                ));
+                )));
             }
         };
-        let bit_offset = match parse_bit_offset(offset_arg, bits) {
+        let offset = match parse_bit_offset(offset_arg, bits) {
             Some(v) => v,
             None => {
-                return Frame::Error(Bytes::from_static(
+                return Err(Frame::Error(Bytes::from_static(
                     b"ERR bit offset is not an integer or out of range",
-                ));
+                )));
             }
         };
 
-        // DoS guard: SET/INCRBY grow the buffer to cover bit_offset; reject
+        // DoS guard: SET/INCRBY grow the buffer to cover the offset; reject
         // offsets past the 512MB string limit (matches SETBIT) so a client
-        // offset can't drive an unbounded Vec::resize -> allocator abort. GET
-        // is exempt (bf_get reads within data.len(), returning 0 past the end).
+        // offset can't drive an unbounded resize -> allocator abort. GET is
+        // exempt (bf_get reads within data.len(), returning 0 past the end).
         if !subcmd.eq_ignore_ascii_case(b"GET")
-            && bit_offset.saturating_add(bits as usize) > 512 * 1024 * 1024 * 8
+            && offset.saturating_add(bits as usize) > 512 * 1024 * 1024 * 8
         {
-            return Frame::Error(Bytes::from_static(
+            return Err(Frame::Error(Bytes::from_static(
                 b"ERR bit offset is not an integer or out of range",
-            ));
+            )));
         }
 
         if subcmd.eq_ignore_ascii_case(b"GET") {
-            let val = bf_get(&buf, bit_offset, bits, signed);
-            results.push(Frame::Integer(val));
+            ops.push(BfOp::Get {
+                signed,
+                bits,
+                offset,
+            });
             i += 3;
         } else if subcmd.eq_ignore_ascii_case(b"SET") {
             let value = match args.get(i + 3).and_then(|f| parse_i64(f)) {
                 Some(v) => v,
-                None => return Frame::Error(Bytes::from_static(b"ERR syntax error")),
+                None => return Err(Frame::Error(Bytes::from_static(b"ERR syntax error"))),
             };
-            let old = bf_get(&buf, bit_offset, bits, signed);
-            bf_set(&mut buf, bit_offset, bits, value);
-            results.push(Frame::Integer(old));
-            modified = true;
+            ops.push(BfOp::Set {
+                signed,
+                bits,
+                offset,
+                value,
+            });
             i += 4;
         } else if subcmd.eq_ignore_ascii_case(b"INCRBY") {
             let increment = match args.get(i + 3).and_then(|f| parse_i64(f)) {
                 Some(v) => v,
-                None => return Frame::Error(Bytes::from_static(b"ERR syntax error")),
+                None => return Err(Frame::Error(Bytes::from_static(b"ERR syntax error"))),
             };
-            let old = bf_get(&buf, bit_offset, bits, signed);
-            let (new_val, overflowed) = bf_incr(old, increment, bits, signed);
-            if overflowed && matches!(overflow, Overflow::Fail) {
-                results.push(Frame::Null);
-            } else {
-                let clamped = if overflowed && matches!(overflow, Overflow::Sat) {
-                    bf_saturate(old, increment, bits, signed)
-                } else {
-                    new_val
-                };
-                bf_set(&mut buf, bit_offset, bits, clamped);
-                results.push(Frame::Integer(clamped));
-                modified = true;
-            }
+            ops.push(BfOp::IncrBy {
+                signed,
+                bits,
+                offset,
+                increment,
+                overflow,
+            });
             i += 4;
         } else {
-            return Frame::Error(Bytes::from_static(b"ERR syntax error"));
+            return Err(Frame::Error(Bytes::from_static(b"ERR syntax error")));
         }
     }
+    Ok(ops)
+}
 
-    if modified {
-        let new_val = Bytes::from(buf);
-        let mut entry = if existing_expiry_ms > 0 {
-            Entry::new_string_with_expiry(new_val, existing_expiry_ms)
-        } else {
-            Entry::new_string(new_val)
-        };
-        entry.set_last_access(db.now());
-        entry.set_access_counter(5);
-        db.set(key, entry);
+/// BITFIELD key [GET encoding offset] [SET encoding offset value]
+///   [INCRBY encoding offset increment] [OVERFLOW WRAP|SAT|FAIL]
+///
+/// Treat a string as an array of packed integers of configurable width.
+///
+/// moon#1168: the string is edited IN PLACE (`Database::mutate_string`)
+/// instead of copied into a Vec, rebuilt and `set` back — and a GET-only
+/// call no longer copies it at all. As in redis's `bitfieldGeneric`, every
+/// operation is parsed first, and a call with any SET/INCRBY first grows the
+/// string (zero-filled) to cover the highest bit any of them addresses —
+/// creating the key if needed — even when an `OVERFLOW FAIL` then leaves
+/// every INCRBY unapplied (redis's `lookupStringForBitCommand`). The old
+/// code grew lazily per applied write, so such a call created nothing.
+pub fn bitfield(db: &mut Database, args: &[Frame]) -> Frame {
+    if args.is_empty() {
+        return err_wrong_args("BITFIELD");
     }
+    let key = match extract_bytes(&args[0]) {
+        Some(k) => k,
+        None => return err_wrong_args("BITFIELD"),
+    };
+    let ops = match parse_bitfield_ops(args) {
+        Ok(ops) => ops,
+        Err(e) => return e,
+    };
 
-    Frame::Array(results.into())
+    // The byte length every write op needs: `ceil((offset + bits) / 8)`.
+    let needed = ops
+        .iter()
+        .filter_map(|op| match *op {
+            BfOp::Get { .. } => None,
+            BfOp::Set { bits, offset, .. } | BfOp::IncrBy { bits, offset, .. } => {
+                Some((offset + bits as usize).div_ceil(8))
+            }
+        })
+        .max();
+
+    let Some(needed) = needed else {
+        // Read-only: answer from the stored bytes, borrowed.
+        let data: &[u8] = match db.get(key) {
+            Some(entry) => match entry.value.as_bytes() {
+                Some(v) => v,
+                None => {
+                    return Frame::Error(Bytes::from_static(
+                        b"WRONGTYPE Operation against a key holding the wrong kind of value",
+                    ));
+                }
+            },
+            None => &[],
+        };
+        let results: Vec<Frame> = ops
+            .iter()
+            .map(|op| match *op {
+                BfOp::Get {
+                    signed,
+                    bits,
+                    offset,
+                } => Frame::Integer(bf_get(data, offset, bits, signed)),
+                // `needed` is None only when every op is a GET.
+                BfOp::Set { .. } | BfOp::IncrBy { .. } => Frame::Null,
+            })
+            .collect();
+        return Frame::Array(results.into());
+    };
+
+    match db.mutate_string(key, |buf| {
+        buf.grow_zeroed(needed);
+        let mut results = Vec::with_capacity(ops.len());
+        for op in &ops {
+            match *op {
+                BfOp::Get {
+                    signed,
+                    bits,
+                    offset,
+                } => results.push(Frame::Integer(bf_get(buf.bytes(), offset, bits, signed))),
+                BfOp::Set {
+                    signed,
+                    bits,
+                    offset,
+                    value,
+                } => {
+                    let old = bf_get(buf.bytes(), offset, bits, signed);
+                    bf_set(buf.bytes_mut(), offset, bits, value);
+                    results.push(Frame::Integer(old));
+                }
+                BfOp::IncrBy {
+                    signed,
+                    bits,
+                    offset,
+                    increment,
+                    overflow,
+                } => {
+                    let old = bf_get(buf.bytes(), offset, bits, signed);
+                    let (new_val, overflowed) = bf_incr(old, increment, bits, signed);
+                    if overflowed && matches!(overflow, Overflow::Fail) {
+                        results.push(Frame::Null);
+                    } else {
+                        let clamped = if overflowed && matches!(overflow, Overflow::Sat) {
+                            bf_saturate(old, increment, bits, signed)
+                        } else {
+                            new_val
+                        };
+                        bf_set(buf.bytes_mut(), offset, bits, clamped);
+                        results.push(Frame::Integer(clamped));
+                    }
+                }
+            }
+        }
+        results
+    }) {
+        StringMut::Applied(results) => Frame::Array(results.into()),
+        StringMut::WrongType => Frame::Error(Bytes::from_static(
+            b"WRONGTYPE Operation against a key holding the wrong kind of value",
+        )),
+        StringMut::ColdFault => {
+            let _ = db.take_cold_fault();
+            Database::cold_fault_error()
+        }
+    }
 }
 
 const BITFIELD_RO_ERR: &[u8] = b"ERR BITFIELD_RO only supports the GET subcommand";
@@ -1086,13 +1175,10 @@ fn bf_get(data: &[u8], bit_offset: usize, bits: u32, signed: bool) -> i64 {
     val as i64
 }
 
-/// Write `bits` bits starting at `bit_offset` into `data`.
-fn bf_set(data: &mut Vec<u8>, bit_offset: usize, bits: u32, value: i64) {
+/// Write `bits` bits starting at `bit_offset` into `data`, which the caller
+/// has already grown to cover them (`bitfield` grows once, up front).
+fn bf_set(data: &mut [u8], bit_offset: usize, bits: u32, value: i64) {
     let val = value as u64;
-    let needed_bytes = (bit_offset + bits as usize + 7) / 8;
-    if data.len() < needed_bytes {
-        data.resize(needed_bytes, 0);
-    }
     for b in 0..bits as usize {
         let pos = bit_offset + b;
         let byte_idx = pos / 8;

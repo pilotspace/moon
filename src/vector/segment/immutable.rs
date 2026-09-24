@@ -23,7 +23,6 @@ use crate::vector::hnsw::search_sq::hnsw_search_f32;
 use crate::vector::segment::key_index::KeyHashIndex;
 use crate::vector::segment::raw_f16_store::RawF16Store;
 use crate::vector::turbo_quant::collection::{CollectionMetadata, QuantizationConfig};
-use crate::vector::turbo_quant::inner_product::{prepare_query_prod, score_l2_prod};
 use crate::vector::turbo_quant::sq8::{decode_sq8, sq8_params};
 use crate::vector::turbo_quant::sub_centroid;
 use crate::vector::types::SearchResult;
@@ -69,17 +68,19 @@ pub struct MvccHeader {
 
 /// Read-only segment. Truly immutable after construction -- no locks needed.
 ///
-/// Two-stage search: HNSW beam search with TQ-ADC (fast candidate retrieval),
-/// then TurboQuant_prod reranking (unbiased L2 distance estimation).
-/// No f32 vectors stored — only TQ codes + QJL sign bits.
+/// Two-stage search: HNSW beam search with TQ-ADC (32-level sub-centroid LUT
+/// when the segment carries signs), then an exact rerank from the f16
+/// sidecar when it has one.
+///
+/// No QJL data (moon#1213): the TurboQuant_prod signs + residual norms that
+/// EXACT compaction used to attach were never persisted, so every reloaded
+/// segment searched without them, and a fresh segment never read them
+/// either (its non-empty sign buffer gated the `rerank_with_prod` fallback
+/// off). Dropping them made an EXACT segment `M·⌈d/8⌉ + 4` B/vector smaller
+/// and its in-memory results those of its reloaded twin.
 pub struct ImmutableSegment {
     graph: HnswGraph,
     vectors_tq: AlignedBuffer<u8>,
-    /// QJL sign bits per vector, contiguous, qjl_bytes_per_vec per entry.
-    qjl_signs: Vec<u8>,
-    /// Residual norms per vector (one f32 each).
-    residual_norms: Vec<f32>,
-    qjl_bytes_per_vec: usize,
     /// Sub-centroid sign bits per vector (ceil(padded_dim/8) bytes each).
     /// For sign-bit refinement reranking (2× effective quantization resolution).
     sub_centroid_signs: Vec<u8>,
@@ -158,9 +159,6 @@ impl ImmutableSegment {
     pub fn new(
         graph: HnswGraph,
         vectors_tq: AlignedBuffer<u8>,
-        qjl_signs: Vec<u8>,
-        residual_norms: Vec<f32>,
-        qjl_bytes_per_vec: usize,
         sub_centroid_signs: Vec<u8>,
         sub_sign_bytes_per_vec: usize,
         mvcc: Vec<MvccHeader>,
@@ -172,9 +170,6 @@ impl ImmutableSegment {
         Self {
             graph,
             vectors_tq,
-            qjl_signs,
-            residual_norms,
-            qjl_bytes_per_vec,
             sub_centroid_signs,
             sub_sign_bytes_per_vec,
             mvcc,
@@ -620,11 +615,11 @@ impl ImmutableSegment {
         });
     }
 
-    /// Two-stage HNSW search: TQ-ADC beam + TurboQuant_prod reranking.
+    /// Two-stage HNSW search: TQ-ADC beam + exact f16 rerank.
     ///
     /// Stage 1: HNSW beam search with TQ-ADC distance → ef candidates.
-    /// Stage 2: Rerank candidates using TurboQuant_prod inner product estimator
-    ///   for unbiased L2 distance. No f32 needed.
+    /// Stage 2: re-score the top `mult·k` live candidates from the f16
+    ///   sidecar (no-op without one — ADC distances are then final).
     pub fn search(
         &self,
         query: &[f32],
@@ -709,11 +704,6 @@ impl ImmutableSegment {
             exact_f16,
             prepared,
         );
-        // Fallback: rerank with TQ_prod when no sub-centroid data AND no
-        // exact sidecar (rerank_exact below supersedes the estimator).
-        if exact_f16.is_none() && self.sub_centroid_signs.is_empty() && self.raw_f16.is_none() {
-            self.rerank_with_prod(&mut candidates, query);
-        }
         // Filter deleted entries first so tombstones neither consume the
         // exact-rerank mult·k budget nor leave stale ADC scores mixed into the
         // post-rerank ordering.
@@ -804,12 +794,6 @@ impl ImmutableSegment {
             prepared,
         );
 
-        // When sub-centroid signs are used in beam, no rerank needed.
-        // Only rerank if beam used standard 16-level scoring (and no exact
-        // sidecar — rerank_exact below supersedes the estimator).
-        if exact_f16.is_none() && self.sub_centroid_signs.is_empty() && self.raw_f16.is_none() {
-            self.rerank_with_prod(&mut candidates, query);
-        }
         // Filter deleted entries first (see comment in search()).
         self.retain_live(&mut candidates);
         // HQ-1: exact rerank of the live beam from the f16 sidecar (see the
@@ -901,63 +885,6 @@ impl ImmutableSegment {
         candidates.sort_unstable();
     }
 
-    /// Rerank candidates using TurboQuant_prod unbiased inner product estimator.
-    ///
-    /// For each candidate: compute L2 distance via
-    ///   ||q - x||² = ||q||² + ||x||² - 2 * (<q, x_mse> + QJL_correction)
-    ///
-    /// Term 1 (<q, x_mse>) computed in rotated space: O(padded_dim).
-    /// Term 2 (QJL correction) uses precomputed S*y: O(dim).
-    /// Total per candidate: O(padded_dim) — same cost as TQ-ADC.
-    fn rerank_with_prod(&self, candidates: &mut SmallVec<[SearchResult; 32]>, query: &[f32]) {
-        if candidates.is_empty() || self.qjl_signs.is_empty() {
-            return;
-        }
-
-        let dim = self.collection_meta.dimension as usize;
-        let padded = self.collection_meta.padded_dimension as usize;
-        let centroids = self.collection_meta.codebook_16();
-        let bytes_per_code = self.graph.bytes_per_code() as usize;
-        let code_len = bytes_per_code - 4;
-        let qjl_bpv = self.qjl_bytes_per_vec;
-
-        // Precompute query state: M × S_m*y (O(M*d²)) + q_rotated (O(d log d))
-        let query_state = prepare_query_prod(
-            query,
-            &self.collection_meta.qjl_matrices,
-            self.collection_meta.fwht_sign_flips.as_slice(),
-            padded,
-        );
-
-        let tq_buf = self.vectors_tq.as_slice();
-        let single_qjl_bpv = (dim + 7) / 8;
-
-        for result in candidates.iter_mut() {
-            let bfs_pos = self.graph.to_bfs(result.id.0) as usize;
-            let tq_offset = bfs_pos * bytes_per_code;
-            let tq_code = &tq_buf[tq_offset..tq_offset + code_len];
-            let norm_bytes = &tq_buf[tq_offset + code_len..tq_offset + bytes_per_code];
-            let norm =
-                f32::from_le_bytes([norm_bytes[0], norm_bytes[1], norm_bytes[2], norm_bytes[3]]);
-
-            let qjl_offset = bfs_pos * qjl_bpv;
-            let qjl_signs = &self.qjl_signs[qjl_offset..qjl_offset + qjl_bpv];
-            let residual_norm = self.residual_norms[bfs_pos];
-
-            result.distance = score_l2_prod(
-                &query_state,
-                tq_code,
-                norm,
-                qjl_signs,
-                residual_norm,
-                centroids,
-                dim,
-                single_qjl_bpv,
-            );
-        }
-        candidates.sort_unstable();
-    }
-
     /// Access the HNSW graph.
     pub fn graph(&self) -> &HnswGraph {
         &self.graph
@@ -967,8 +894,6 @@ impl ImmutableSegment {
     pub fn vectors_tq(&self) -> &AlignedBuffer<u8> {
         &self.vectors_tq
     }
-
-    // vectors_sq and vectors_f32 removed — TurboQuant_prod used for reranking.
 
     /// Access MVCC headers.
     pub fn mvcc_headers(&self) -> &[MvccHeader] {
@@ -1081,19 +1006,18 @@ impl ImmutableSegment {
     }
 
     /// Resident bytes used by this immutable segment: HNSW graph structure +
-    /// TQ vector codes + QJL signs + residual norms + sub-centroid signs + MVCC headers.
+    /// TQ vector codes + sub-centroid signs + MVCC headers + key index +
+    /// a heap-owned f16 sidecar.
     pub fn resident_bytes(&self) -> usize {
         let graph = self.graph.resident_bytes();
         let tq = self.vectors_tq.len() * std::mem::size_of::<u8>();
-        let qjl = self.qjl_signs.len();
-        let norms = self.residual_norms.len() * std::mem::size_of::<f32>();
         let sub = self.sub_centroid_signs.len();
         let mvcc = self.mvcc.len() * std::mem::size_of::<MvccHeader>();
         // Mapped sidecars report 0: their pages are kernel page cache, not
         // pinned heap — see RawF16Store::resident_bytes.
         let sidecar = self.raw_f16.as_ref().map_or(0, RawF16Store::resident_bytes);
         let key_index = self.key_index.resident_bytes();
-        graph + tq + qjl + norms + sub + mvcc + sidecar + key_index
+        graph + tq + sub + mvcc + sidecar + key_index
     }
 
     /// Fraction of dead entries: (total - live) / total.
@@ -1367,25 +1291,6 @@ impl ImmutableSegment {
         self.tombstoned_keys.read().iter().copied().collect()
     }
 
-    /// Total QJL bytes across all entries. 0 if QJL not encoded for this segment.
-    #[inline]
-    pub fn qjl_bytes(&self) -> usize {
-        self.qjl_signs.len()
-    }
-
-    /// QJL sign bytes for a specific BFS-ordered position.
-    /// Returns an empty Vec if QJL is not available or position is out of bounds.
-    pub fn qjl_bytes_for(&self, bfs_pos: usize, qjl_bpv: usize) -> Vec<u8> {
-        if qjl_bpv == 0 || self.qjl_signs.is_empty() {
-            return Vec::new();
-        }
-        let src = bfs_pos * qjl_bpv;
-        if src + qjl_bpv > self.qjl_signs.len() {
-            return Vec::new();
-        }
-        self.qjl_signs[src..src + qjl_bpv].to_vec()
-    }
-
     /// All sub-centroid sign bits, BFS-ordered, `sub_sign_bytes_per_vec()`
     /// bytes per entry — empty when the segment has none (16-level search).
     /// Persisted as `sub_signs.bin` (moon#1193).
@@ -1454,9 +1359,6 @@ mod tests {
             graph,
             AlignedBuffer::new(0),
             Vec::new(),
-            Vec::new(),
-            16,
-            Vec::new(),
             16,
             Vec::new(),
             collection,
@@ -1502,9 +1404,6 @@ mod tests {
         let seg = ImmutableSegment::new(
             graph,
             AlignedBuffer::new(0),
-            Vec::new(),
-            Vec::new(),
-            16,
             Vec::new(),
             16,
             Vec::new(),
@@ -1576,9 +1475,6 @@ mod tests {
             graph,
             AlignedBuffer::new(0),
             Vec::new(),
-            Vec::new(),
-            16,
-            Vec::new(),
             16,
             mvcc,
             collection,
@@ -1630,9 +1526,6 @@ mod tests {
         let _seg = ImmutableSegment::new(
             graph,
             AlignedBuffer::new(0),
-            Vec::new(),
-            Vec::new(),
-            16, // 128/8 = qjl_bytes_per_vec
             Vec::new(),
             16, // 128/8 = sub_sign_bytes_per_vec
             Vec::new(),
@@ -1703,9 +1596,6 @@ mod tests {
             graph,
             AlignedBuffer::new(0),
             Vec::new(),
-            Vec::new(),
-            16,
-            Vec::new(),
             16,
             mvcc,
             collection,
@@ -1763,9 +1653,6 @@ mod tests {
         let seg = ImmutableSegment::new(
             graph,
             AlignedBuffer::new(0),
-            Vec::new(),
-            Vec::new(),
-            16,
             Vec::new(),
             16,
             mvcc,

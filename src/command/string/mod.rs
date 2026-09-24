@@ -68,6 +68,9 @@ pub(crate) fn format_float(val: f64) -> String {
 }
 
 #[cfg(test)]
+mod inplace_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::framevec;

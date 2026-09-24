@@ -18,8 +18,19 @@
 //! Crash safety is the pre-existing temp + fsync + rename + dir-fsync
 //! sequence, now run by the helper: a kill at any point leaves either the
 //! previous `.rrdshard` or the new one, never a torn file under the real
-//! name. A snapshot abandoned before finalize (shard exit, error) disconnects
-//! the channel and the helper deletes its temp file.
+//! name.
+//!
+//! A snapshot abandoned before finalize (an epoch a FLUSH*/SWAPDB aborted,
+//! shard exit, error) CANCELS its helper and JOINS it (moon#1227 review F1):
+//! the helper stops writing at its next chunk boundary, drops the rest of its
+//! backlog unwritten, deletes its temp file and exits before the shard can
+//! start the next snapshot of the same path. It used to keep draining up to
+//! [`SNAPSHOT_STREAM_MAX_IN_FLIGHT`] of queued blocks into
+//! `shard-N.rrdshard.tmp` while the next BGSAVE truncated and published that
+//! same inode — `BGSAVE OK` for a file that failed its checksum at restart.
+//! The join waits for at most one [`SNAPSHOT_STREAM_CHUNK`]-sized write plus
+//! the unwritten backlog being freed, never for the backlog to reach the disk
+//! and never for an fsync (a finishing snapshot is not cancelled).
 //!
 //! Memory in flight is bounded: while more than
 //! [`SNAPSHOT_STREAM_MAX_IN_FLIGHT`] bytes are handed over but not yet
@@ -46,13 +57,82 @@ enum StreamMsg {
     Finish,
 }
 
+/// Writer threads alive, by published path (tests only): lets a test wait
+/// for — or assert the absence of — a writer that outlived its snapshot.
+#[cfg(test)]
+static LIVE_WRITERS: parking_lot::Mutex<Vec<PathBuf>> = parking_lot::Mutex::new(Vec::new());
+
+/// Registered on the spawning thread (so a writer that has not been
+/// scheduled yet already counts) and dropped when the writer thread exits.
+#[cfg(test)]
+struct LiveWriter(PathBuf);
+
+#[cfg(test)]
+impl LiveWriter {
+    fn enter(file_path: &std::path::Path) -> Self {
+        LIVE_WRITERS.lock().push(file_path.to_path_buf());
+        Self(file_path.to_path_buf())
+    }
+}
+
+#[cfg(test)]
+impl Drop for LiveWriter {
+    fn drop(&mut self) {
+        let mut live = LIVE_WRITERS.lock();
+        if let Some(i) = live.iter().position(|p| *p == self.0) {
+            live.swap_remove(i);
+        }
+    }
+}
+
+/// Writer threads still running for a snapshot published at `file_path`.
+#[cfg(test)]
+pub(crate) fn live_writers_for_test(file_path: &std::path::Path) -> usize {
+    LIVE_WRITERS
+        .lock()
+        .iter()
+        .filter(|p| p.as_path() == file_path)
+        .count()
+}
+
 /// Shard-side handle on a snapshot's helper thread.
 pub(crate) struct SnapshotStream {
     tx: Option<flume::Sender<StreamMsg>>,
     done_rx: flume::Receiver<Result<(), String>>,
     in_flight: Arc<AtomicUsize>,
     failed: Arc<AtomicBool>,
+    /// Set when the snapshot is abandoned before finalize: the helper stops
+    /// writing at its next chunk boundary (moon#1227 review F1).
+    cancelled: Arc<AtomicBool>,
+    /// The helper, joined when the snapshot is abandoned so it is gone — its
+    /// temp file closed and removed — before this path can be reused.
+    helper: Option<std::thread::JoinHandle<()>>,
     finishing: bool,
+}
+
+impl Drop for SnapshotStream {
+    /// Abandoned before finalize: cancel the helper and wait for it to exit.
+    ///
+    /// Bounded: the helper checks the flag between chunk-sized writes, so the
+    /// join covers at most one [`SNAPSHOT_STREAM_CHUNK`] write, freeing the
+    /// unwritten backlog, and unlinking the temp file. A FINISHING snapshot
+    /// is left alone: its helper is fsyncing and renaming a complete file,
+    /// and the tick only drops the state once the outcome arrived — the one
+    /// exception is shard exit, which must not wait for that fsync.
+    fn drop(&mut self) {
+        if self.finishing {
+            return;
+        }
+        self.cancelled.store(true, Ordering::Release);
+        // Disconnect: once the (skipped) backlog is drained the helper sees
+        // the channel close, removes its temp file and returns.
+        drop(self.tx.take());
+        if let Some(helper) = self.helper.take() {
+            // A helper that panicked has nothing left to clean up; its temp
+            // file is replaced by the next snapshot's fresh one.
+            let _ = helper.join();
+        }
+    }
 }
 
 impl SnapshotStream {
@@ -63,22 +143,37 @@ impl SnapshotStream {
         let (done_tx, done_rx) = flume::bounded::<Result<(), String>>(1);
         let in_flight = Arc::new(AtomicUsize::new(0));
         let failed = Arc::new(AtomicBool::new(false));
+        let cancelled = Arc::new(AtomicBool::new(false));
         let helper_in_flight = Arc::clone(&in_flight);
         let helper_failed = Arc::clone(&failed);
+        let helper_cancelled = Arc::clone(&cancelled);
         let name = format!("moon-snap-{shard_id}");
-        std::thread::Builder::new()
+        #[cfg(test)]
+        let live = LiveWriter::enter(&file_path);
+        let helper = std::thread::Builder::new()
             .name(name.clone())
             .spawn(move || {
+                #[cfg(test)]
+                let _live = live;
                 // O5: spawned from a pinned shard thread — re-pin to the
                 // non-shard cores before doing any I/O.
                 crate::shard::numa::pin_current_aux_thread(&name);
-                run_helper(file_path, rx, done_tx, helper_in_flight, helper_failed);
+                run_helper(
+                    file_path,
+                    rx,
+                    done_tx,
+                    helper_in_flight,
+                    helper_failed,
+                    helper_cancelled,
+                );
             })?;
         Ok(Self {
             tx: Some(tx),
             done_rx,
             in_flight,
             failed,
+            cancelled,
+            helper: Some(helper),
             finishing: false,
         })
     }
@@ -160,10 +255,11 @@ fn run_helper(
     done_tx: flume::Sender<Result<(), String>>,
     in_flight: Arc<AtomicUsize>,
     failed: Arc<AtomicBool>,
+    cancelled: Arc<AtomicBool>,
 ) {
     let tmp_path = file_path.with_extension("rrdshard.tmp");
     let mut err: Option<String> = None;
-    let mut file = match std::fs::File::create(&tmp_path) {
+    let mut file = match create_fresh(&tmp_path) {
         Ok(f) => Some(f),
         Err(e) => {
             err = Some(format!("{}: {e}", tmp_path.display()));
@@ -178,10 +274,22 @@ fn run_helper(
                 if err.is_none()
                     && let Some(f) = file.as_mut()
                 {
-                    hasher.update(&block);
-                    if let Err(e) = f.write_all(&block) {
-                        err = Some(format!("{}: {e}", tmp_path.display()));
-                        failed.store(true, Ordering::Release);
+                    // Chunk by chunk, checking for cancellation in between: a
+                    // block can be far larger than a chunk (one huge value, or
+                    // the in-memory path's whole buffer), and an abandoned
+                    // snapshot's join must not wait for it (moon#1227 review
+                    // F1). A cancelled helper never publishes, so the partial
+                    // CRC state does not matter.
+                    for piece in block.chunks(SNAPSHOT_STREAM_CHUNK) {
+                        if cancelled.load(Ordering::Acquire) {
+                            break;
+                        }
+                        hasher.update(piece);
+                        if let Err(e) = f.write_all(piece) {
+                            err = Some(format!("{}: {e}", tmp_path.display()));
+                            failed.store(true, Ordering::Release);
+                            break;
+                        }
                     }
                 }
                 in_flight.fetch_sub(block.len(), Ordering::AcqRel);
@@ -207,6 +315,26 @@ fn run_helper(
             }
         }
     }
+}
+
+/// The temp file, on a FRESH inode (moon#1227 review F1, defence in depth
+/// behind the cancel + join): a leftover of a crashed save is unlinked
+/// first and `create_new` refuses a path something re-created meanwhile, so
+/// this helper never shares an inode with any other writer. A straggler of
+/// an earlier snapshot — which the join rules out — could then at worst
+/// unlink this temp file and make the publish fail loudly (the rename finds
+/// nothing); it could never append to the file this helper publishes, so
+/// `BGSAVE OK` keeps meaning "the file is exactly what was serialized".
+fn create_fresh(tmp_path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    match std::fs::remove_file(tmp_path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(tmp_path)
 }
 
 /// CRC footer, fsync, rename, directory fsync — the pre-moon#1186 finalize

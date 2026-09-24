@@ -164,6 +164,87 @@ pub(crate) fn unpropagate_shard_subscription(
     }
 }
 
+/// Re-encode parsed-but-unexecuted command frames into the FRONT of
+/// `read_buf`, ahead of whatever is still unparsed there.
+///
+/// moon#1179 item 5: a pipeline deferral (#438 / #507) used to do this on
+/// EVERY deferral, re-encoding and re-parsing the whole unconsumed tail each
+/// time — with a deferral every d commands a batch of n frames re-encoded and
+/// re-parsed ~n²/2d frames, each with a fresh `FrameVec`. The handlers now
+/// carry the parsed frames themselves into the next iteration, and fall back
+/// to bytes only for a hand-off whose next consumer parses BYTES: the RESP2
+/// subscriber loop, and the migration / task-park state. Command frames
+/// (arrays of bulk strings) round-trip losslessly through `serialize_resp3`.
+///
+/// The caller must reset its `ParseState`: bytes were prepended.
+pub(crate) fn spill_frames_to_front(frames: &[Frame], read_buf: &mut bytes::BytesMut) {
+    if frames.is_empty() {
+        return;
+    }
+    let mut carry = bytes::BytesMut::with_capacity(64 + read_buf.len());
+    for f in frames {
+        crate::protocol::serialize_resp3(f, &mut carry);
+    }
+    carry.extend_from_slice(read_buf);
+    *read_buf = carry;
+}
+
+#[cfg(test)]
+mod spill_tests {
+    use super::*;
+    use crate::protocol::{ParseConfig, parse};
+    use bytes::BytesMut;
+
+    /// moon#1179 item 5: what a byte hand-off re-parses is exactly the frames
+    /// a carry would have kept, in order, followed by the untouched remainder
+    /// — the equivalence that lets the in-loop deferral keep frames instead.
+    #[test]
+    fn spilled_frames_reparse_identically_ahead_of_the_remainder() {
+        let mut wire = BytesMut::new();
+        for cmd in [
+            &b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n"[..],
+            &b"*1\r\n$4\r\nPING\r\n"[..],
+            &b"ECHO inline-arg\r\n"[..],
+            &b"*2\r\n$3\r\nGET\r\n$0\r\n\r\n"[..],
+            &b"*3\r\n$4\r\nMGET\r\n$1\r\na\r\n$4\r\nb\r\nc\r\n"[..],
+        ] {
+            wire.extend_from_slice(cmd);
+        }
+        let config = ParseConfig::default();
+        let mut frames = Vec::new();
+        while let Ok(Some(f)) = parse(&mut wire, &config) {
+            frames.push(f);
+        }
+        assert_eq!(frames.len(), 5);
+        let mut read_buf = BytesMut::from(&b"*1\r\n$4\r\nPI"[..]); // partial remainder
+        spill_frames_to_front(&frames[1..], &mut read_buf);
+        let mut back = Vec::new();
+        while let Ok(Some(f)) = parse(&mut read_buf, &config) {
+            back.push(f);
+        }
+        assert_eq!(back, frames[1..].to_vec());
+        assert_eq!(
+            &read_buf[..],
+            b"*1\r\n$4\r\nPI",
+            "remainder must follow, untouched"
+        );
+
+        let mut untouched = BytesMut::from(&b"abc"[..]);
+        spill_frames_to_front(&[], &mut untouched);
+        assert_eq!(&untouched[..], b"abc");
+    }
+}
+
+/// Most frames one batch parses before it runs (both connection handlers and
+/// the tokio io_uring path).
+///
+/// A read can hold more (moon#1227 review): direct reads fill all of the read
+/// buffer's spare capacity, and 1100 inline `PING`s fit in one 8 KiB read. What
+/// the cap leaves in the buffer has already been SENT — the client is waiting
+/// for its replies, not writing — so a handler that stops here must parse the
+/// rest before it waits on the socket again.
+pub(crate) const MAX_BATCH_FRAMES: usize = 1024;
+
 /// Post-batch capacity governor for the per-connection batch scratch vectors
 /// (c10k W1). `responses`/`frames` are cleared and reused across batches; one
 /// deep pipeline grows them to the 1024-frame batch cap (~74 KB each at
@@ -196,6 +277,66 @@ pub(crate) fn shrink_batch_vec<T>(v: &mut Vec<T>) {
 /// bounds steady-state at 2× the 8 KiB working size while still amortizing
 /// growth for genuinely large frames in flight.
 pub(crate) const IO_BUF_SHRINK_TRIGGER: usize = 16384;
+
+/// Consecutive batches that must leave an oversized I/O buffer mostly unused
+/// before [`IoBufShrink`] gives its capacity back.
+pub(crate) const IO_BUF_SHRINK_AFTER_BATCHES: u32 = 8;
+
+/// Capacity above which [`IoBufShrink`] gives an I/O buffer back at EVERY batch
+/// end, used or not (moon#1227 review). The hysteresis only ever acts at a
+/// batch end, so a connection that goes quiet right after a large value would
+/// otherwise keep the buffer for as long as it stays open.
+pub(crate) const IO_BUF_SHRINK_CEILING: usize = 1024 * 1024;
+
+/// Batch-end shrink governor for a connection's read or write buffer, with
+/// hysteresis (moon#1179 item 4) below a hard ceiling (moon#1227 review).
+///
+/// The old rule shrank on EVERY batch end whose buffer capacity exceeded
+/// [`IO_BUF_SHRINK_TRIGGER`]. A client sending one 64 KiB `SET` per batch
+/// therefore regrew its read buffer 8 -> 16 -> 32 -> 64 -> 128 KiB (copying
+/// each time) on every request, only to have it dropped again at the batch
+/// end: ~4x the payload in memcpy per request. The W1 goal — a connection that
+/// once carried a large value must not keep that high-water forever — only
+/// needs the shrink to happen once the buffer has STOPPED being used, so:
+/// a batch that used more than half the trigger resets the streak, and the
+/// buffer is shrunk after [`IO_BUF_SHRINK_AFTER_BATCHES`] consecutive batches
+/// that did not.
+///
+/// A streak needs batches, and an idle connection has none. On monoio the
+/// idle downshift releases an idle connection's empty buffers after about a
+/// second; the tokio handler has no idle downshift, so there a buffer the
+/// streak never reached stayed allocated until disconnect. Above
+/// [`IO_BUF_SHRINK_CEILING`] the buffer is therefore shrunk at every batch end
+/// on both runtimes: an idle connection holds at most the ceiling, and a
+/// client that really does send values past it every batch pays a regrow
+/// that copies no more than the value it is sending.
+#[derive(Debug, Default)]
+pub(crate) struct IoBufShrink {
+    small_batches: u32,
+}
+
+impl IoBufShrink {
+    /// Record one batch end. `capacity` is the buffer's capacity now; `used`
+    /// the most bytes it held during the batch (or still holds). True means
+    /// "shrink it now".
+    #[inline]
+    pub(crate) fn should_shrink(&mut self, capacity: usize, used: usize) -> bool {
+        if capacity > IO_BUF_SHRINK_CEILING {
+            self.small_batches = 0;
+            return true;
+        }
+        if capacity <= IO_BUF_SHRINK_TRIGGER || used > IO_BUF_SHRINK_TRIGGER / 2 {
+            self.small_batches = 0;
+            return false;
+        }
+        self.small_batches += 1;
+        if self.small_batches >= IO_BUF_SHRINK_AFTER_BATCHES {
+            self.small_batches = 0;
+            return true;
+        }
+        false
+    }
+}
 
 /// Reply size at or above which a write arms the `--client-write-timeout-ms`
 /// watchdog (c10k C1).
@@ -234,6 +375,68 @@ pub(crate) fn arm_write_timeout(
 #[cfg(test)]
 mod shrink_tests {
     use super::*;
+
+    /// moon#1179 item 4: a connection that keeps sending large values keeps
+    /// its buffer (no per-batch shrink/regrow thrash); one that went back to
+    /// small commands gives the capacity back after the streak.
+    #[test]
+    fn io_buf_shrink_has_hysteresis() {
+        let big = 128 * 1024;
+        let mut g = IoBufShrink::default();
+        // Every batch uses the big buffer: never shrink.
+        for _ in 0..100 {
+            assert!(!g.should_shrink(big, 70 * 1024));
+        }
+        // Small batches: shrink exactly on the Nth consecutive one.
+        for i in 1..IO_BUF_SHRINK_AFTER_BATCHES {
+            assert!(!g.should_shrink(big, 100), "shrank early at batch {i}");
+        }
+        assert!(g.should_shrink(big, 100));
+        // A big batch in the middle of a streak restarts it.
+        for _ in 1..IO_BUF_SHRINK_AFTER_BATCHES {
+            assert!(!g.should_shrink(big, 100));
+        }
+        assert!(!g.should_shrink(big, IO_BUF_SHRINK_TRIGGER));
+        for _ in 1..IO_BUF_SHRINK_AFTER_BATCHES {
+            assert!(!g.should_shrink(big, 100));
+        }
+        assert!(g.should_shrink(big, 100));
+        // A buffer at or under the trigger is never shrunk.
+        for _ in 0..100 {
+            assert!(!g.should_shrink(IO_BUF_SHRINK_TRIGGER, 0));
+        }
+    }
+
+    /// moon#1227 review: the hysteresis acts only at batch ends, so a buffer
+    /// grown past the ceiling by one large value is given back at the end of
+    /// THAT batch — it must not wait for a streak an idle connection (tokio
+    /// has no idle downshift) never produces. Below the ceiling nothing
+    /// changes, and the ceiling shrink restarts the streak.
+    #[test]
+    fn io_buf_shrink_releases_past_the_ceiling_at_once() {
+        let mut g = IoBufShrink::default();
+        let huge = IO_BUF_SHRINK_CEILING + 1;
+        // Used every batch or not: shrunk at the first batch end.
+        assert!(g.should_shrink(huge, huge));
+        assert!(g.should_shrink(4 * IO_BUF_SHRINK_CEILING, 0));
+        // At the ceiling a busy buffer is still kept (hysteresis rules)...
+        for _ in 0..100 {
+            assert!(!g.should_shrink(IO_BUF_SHRINK_CEILING, IO_BUF_SHRINK_CEILING));
+        }
+        // ...and an unused one waits for the full streak, which the ceiling
+        // shrink in the middle of it restarts.
+        for _ in 1..IO_BUF_SHRINK_AFTER_BATCHES {
+            assert!(!g.should_shrink(IO_BUF_SHRINK_CEILING, 100));
+        }
+        assert!(g.should_shrink(huge, 100));
+        for i in 1..IO_BUF_SHRINK_AFTER_BATCHES {
+            assert!(
+                !g.should_shrink(IO_BUF_SHRINK_CEILING, 100),
+                "streak survived the ceiling shrink at batch {i}"
+            );
+        }
+        assert!(g.should_shrink(IO_BUF_SHRINK_CEILING, 100));
+    }
 
     #[test]
     fn oversized_batch_vec_shrinks_to_steady_cap() {
@@ -313,6 +516,49 @@ pub(crate) fn query_buf_exceeded(
     resolved != 0 && len > resolved
 }
 
+/// Smallest read the parse hint may ask for. Below this a frame's remainder
+/// fits in an ordinary read and sizing it buys nothing.
+pub(crate) const READ_HINT_MIN: usize = 32 * 1024;
+/// Largest single read the parse hint may ask for. Bounds the capacity one
+/// read reserves ahead of the bytes actually arriving: a `$536870911` header
+/// must not reserve half a gigabyte on the strength of a claim.
+pub(crate) const READ_HINT_MAX: usize = 1024 * 1024;
+
+/// How many bytes the next read should make room for, given the incomplete
+/// frame at the front of the read buffer (moon#1164).
+///
+/// `pending_total` is `ParseState::pending_len()`: the buffer length the front
+/// frame is known to need, or one byte past what is buffered when only "more"
+/// is known. The answer is the larger of that remainder and what is already
+/// buffered — so an unbounded tail (a million small elements) grows reads
+/// geometrically and a known bulk remainder is read in one go — clamped to
+/// [`READ_HINT_MIN`, `READ_HINT_MAX`] and to the query-buffer ceiling.
+///
+/// `None` means "no hint, use the ordinary read size": nothing incomplete, a
+/// remainder small enough for an ordinary read, or an UNAUTHENTICATED
+/// connection — pre-auth clients stay on the small fixed read; the growth a
+/// hint allows is for clients the server has already let in.
+#[inline]
+pub(crate) fn hinted_read_len(
+    buffered: usize,
+    pending_total: usize,
+    authenticated: bool,
+    limit: usize,
+    preauth_limit: usize,
+) -> Option<usize> {
+    if !authenticated || pending_total <= buffered {
+        return None;
+    }
+    let mut want = (pending_total - buffered).max(buffered).min(READ_HINT_MAX);
+    // Never make room past the ceiling: one byte beyond it is all the check
+    // after the read needs to see.
+    let resolved = query_buf_limit(authenticated, limit, preauth_limit);
+    if resolved != 0 {
+        want = want.min(resolved.saturating_sub(buffered).saturating_add(1));
+    }
+    (want >= READ_HINT_MIN).then_some(want)
+}
+
 /// The error moon sends before closing a connection that blew its query
 /// buffer. Redis closes silently (and logs); we say why first, then close —
 /// a silent close on a large pipeline is very hard to tell from a crash.
@@ -352,6 +598,41 @@ mod query_buf_limit_tests {
         // still binds before that.
         assert_eq!(query_buf_limit(true, 0, 64 * 1024), 0);
         assert_eq!(query_buf_limit(false, 0, 64 * 1024), 64 * 1024);
+    }
+
+    /// moon#1164: reads are sized from what the incomplete front frame needs.
+    #[test]
+    fn hinted_read_len_grows_geometrically_and_respects_the_ceilings() {
+        const G: usize = 1 << 30;
+        const P: usize = 64 * 1024;
+        // Nothing pending, or pending already buffered: no hint.
+        assert_eq!(hinted_read_len(100, 0, true, G, P), None);
+        assert_eq!(hinted_read_len(100, 100, true, G, P), None);
+        // A small remainder fits an ordinary read.
+        assert_eq!(hinted_read_len(100, 200, true, G, P), None);
+        // A known bulk remainder is read in one go (up to the max).
+        assert_eq!(
+            hinted_read_len(8192, 8192 + 500_000, true, G, P),
+            Some(500_000)
+        );
+        assert_eq!(
+            hinted_read_len(8192, 50 << 20, true, G, P),
+            Some(READ_HINT_MAX)
+        );
+        // An unbounded tail ("one more byte") doubles what is buffered.
+        assert_eq!(
+            hinted_read_len(64 * 1024, 64 * 1024 + 1, true, G, P),
+            Some(64 * 1024)
+        );
+        assert_eq!(hinted_read_len(16 * 1024, 16 * 1024 + 1, true, G, P), None);
+        // Pre-auth clients never get a hint, whatever they claim.
+        assert_eq!(hinted_read_len(8192, 50 << 20, false, G, P), None);
+        // The query-buffer ceiling bounds the room made.
+        assert_eq!(
+            hinted_read_len(900_000, 5 << 20, true, 1_000_000, P),
+            Some(100_001)
+        );
+        assert_eq!(hinted_read_len(990_000, 5 << 20, true, 1_000_000, P), None);
     }
 
     #[test]

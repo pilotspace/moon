@@ -1,44 +1,109 @@
-#![allow(unused_imports, dead_code)]
 use atoi::FromRadix10SignedChecked;
 use memchr::memchr;
 
 use bytes::{Buf, Bytes, BytesMut};
-use smallvec::SmallVec;
 
+use super::flat::{FlatScan, build_flat, scan_flat};
 use super::frame::{Frame, FrameVec, ParseConfig, ParseError, ProtoFault};
 use super::inline;
 
+pub use super::flat::ParseState;
+
 /// Attempt to parse one RESP2/RESP3 frame from the buffer.
 ///
-/// A flat top-level `*N` of `$`-bulks -- the shape of essentially every client
-/// command -- is scanned in **one** pass: [`scan_flat_multibulk`] records each
-/// argument's span while it validates, and the `Frame` is built straight from
-/// those spans.
-///
-/// Everything else keeps the original two-pass approach:
-/// 1. Validate structure and compute byte length (`validate_frame`, offsets discarded)
-/// 2. Freeze validated bytes and extract frame data via `Bytes::slice`
-///    (Arc refcount bump, no memcpy)
-///
-/// The fast path declines -- falling through to the two-pass path -- on *anything*
-/// it does not handle exactly: incomplete input, malformed lengths, negative or
-/// out-of-range counts, null bulks, nested or non-bulk elements, RESP3
-/// containers, inline commands. Declining is always safe; answering differently
-/// never is, which is what `single_pass_multibulk_agrees_with_two_pass` and the
-/// `resp_parse_fused` fuzz target assert over arbitrary input.
+/// Stateless form of [`parse_resumable`]: every call starts from byte 0 of
+/// `buf`. Use it for buffers that hold whole frames (AOF replay, tests, reply
+/// parsing). A read loop that feeds one buffer across socket reads must use
+/// [`parse_resumable`] with a per-connection [`ParseState`], or a large frame
+/// arriving in many reads is re-scanned from the start on every one of them.
 ///
 /// On success, advances the buffer past the consumed bytes and returns `Ok(Some(frame))`.
 /// Returns `Ok(None)` if the buffer doesn't contain a complete frame (need more data).
 /// Returns `Err` if the data violates the RESP2 protocol specification.
+#[inline]
 pub fn parse(buf: &mut BytesMut, config: &ParseConfig) -> Result<Option<Frame>, ParseError> {
+    parse_resumable(buf, config, &mut ParseState::new())
+}
+
+/// Parse one RESP2/RESP3 frame, resuming the scan of an incomplete frame at the
+/// front of `buf` where the previous call on the same `state` stopped.
+///
+/// A flat top-level `*N` of `$`-bulks -- the shape of essentially every client
+/// command -- is scanned in **one** pass by `flat::scan_flat`, which records
+/// each argument's span while it validates and answers one of three things:
+///
+/// - **Complete**: the `Frame` is built straight from the spans.
+/// - **Incomplete**: `Ok(None)`, and nothing else runs. `validate_frame` would
+///   report `Incomplete` for exactly the same prefixes; asking it too is what
+///   made every read of a large upload cost two full walks (moon#1164).
+/// - **Decline**: anything that is not exactly that shape -- malformed lengths,
+///   negative or out-of-range counts, null bulks, nested or non-bulk elements,
+///   RESP3 containers, inline commands -- takes the original two-pass path:
+///   1. Validate structure and compute byte length (`validate_frame`)
+///   2. Freeze validated bytes and extract frame data via `Bytes::slice`
+///
+/// Declining is always safe; answering differently never is, which is what
+/// `single_pass_multibulk_agrees_with_two_pass`, the every-prefix resumable
+/// tests and the `resp_parse_fused` / `resp_parse_resumable` fuzz targets
+/// assert over arbitrary input.
+///
+/// `state` carries the cursor between calls. See [`ParseState`] for the one
+/// rule callers must follow: anything else that consumes the front of `buf`
+/// resets it.
+pub fn parse_resumable(
+    buf: &mut BytesMut,
+    config: &ParseConfig,
+    state: &mut ParseState,
+) -> Result<Option<Frame>, ParseError> {
+    // Resume the frame at the front where the last call stopped. Only an
+    // "incomplete" answer is taken from the resumed scan; a frame it calls
+    // complete is re-verified from byte 0 below before it is built, so a stale
+    // cursor can cost a scan but never produce a frame.
+    if let Some(cursor) = state.take_resumable(&buf[..]) {
+        if let FlatScan::Incomplete {
+            cursor: Some(next),
+            need,
+        } = scan_flat(&buf[..], config, Some(cursor))
+        {
+            #[cfg(test)]
+            if state.verify_resume() {
+                let fresh = scan_flat(&buf[..], config, None);
+                assert!(
+                    matches!(fresh, FlatScan::Incomplete { cursor: Some(f), .. } if f == next),
+                    "resumed scan disagrees with a from-zero scan: stale ParseState"
+                );
+            }
+            state.note_incomplete(Some(next), buf.len(), need);
+            return Ok(None);
+        }
+    }
+
     match dispatch_prefix(buf, config)? {
-        PrefixOutcome::Done(frame) => return Ok(frame),
+        PrefixOutcome::Done(frame) => {
+            state.note_other();
+            return Ok(frame);
+        }
         PrefixOutcome::Resp => {}
     }
-    if let Some(frame) = parse_flat_multibulk(buf, config) {
-        return Ok(Some(frame));
+    match scan_flat(&buf[..], config, None) {
+        FlatScan::Complete {
+            total_len,
+            count,
+            first_elem,
+            spans,
+        } => {
+            state.note_other();
+            Ok(Some(build_flat(buf, total_len, count, first_elem, &spans)))
+        }
+        FlatScan::Incomplete { cursor, need } => {
+            state.note_incomplete(cursor, buf.len(), need);
+            Ok(None)
+        }
+        FlatScan::Decline => {
+            state.note_other();
+            parse_resp_two_pass(buf, config)
+        }
     }
-    parse_resp_two_pass(buf, config)
 }
 
 /// `parse` with the single-pass fast path removed -- the two-pass pipeline exactly
@@ -153,140 +218,6 @@ fn parse_resp_two_pass(
         Err(ParseError::Incomplete) => Ok(None),
         Err(e) => Err(e),
     }
-}
-
-/// A completed single-pass scan of a flat top-level multibulk.
-struct FlatScan {
-    /// Total byte length of the frame, i.e. what `validate_frame` would have
-    /// left in `pos`.
-    total_len: usize,
-    /// `(offset, len)` of each argument's payload, relative to the frame start.
-    ///
-    /// Sixteen inline covers every command moon has; past that the spill costs
-    /// one allocation, which is still one fewer walk than the two-pass path.
-    spans: SmallVec<[(u32, u32); 16]>,
-}
-
-/// How many argument spans to reserve for a claimed element count.
-///
-/// The count comes off the wire, so reserving `count` outright hands a client a
-/// memory amplifier: `*1048576\r\n` is ten bytes and `max_array_length`
-/// defaults to 1Mi, which would reserve 8 MiB before the scan discovered the
-/// frame was incomplete. The two-pass path never had this problem -- it reaches
-/// `FrameVec::with_capacity` only after `validate_frame` proved the whole frame
-/// is present, so the buffer bounds the count for free.
-///
-/// The shortest an element can be is six bytes (`$0\r\n` plus the two trailing
-/// bytes every bulk is charged), so `buf.len() / 6` is a hard ceiling on how
-/// many can possibly be there. Capping at it never under-allocates for a scan
-/// that goes on to succeed, and `SmallVec` grows anyway if it somehow did.
-#[inline]
-fn span_capacity(count: usize, buf_len: usize) -> usize {
-    count.min(buf_len / 6)
-}
-
-/// Scan a flat top-level `*N` of `$`-bulks in ONE pass, recording each
-/// argument's span.
-///
-/// Returns `None` for **anything** that is not exactly that shape, complete and
-/// within `config`'s limits — incomplete input, a malformed count or length, a
-/// negative count (`*-1`, `*-9`), a null bulk (`$-1`), a nested or non-bulk
-/// element, an over-limit count or payload. The caller then runs the two-pass
-/// path, which owns every one of those cases and their exact error kinds.
-///
-/// Declining more often than strictly necessary is always safe; answering where
-/// the two-pass path would answer differently never is. Every rule below is a
-/// deliberate mirror of `validate_frame`'s `b'*'` and `b'$'` arms, including one
-/// piece of leniency that looks like a bug and is not: **the two bytes after a
-/// bulk payload are never checked**. `validate_frame` does `*pos += len + 2`
-/// without verifying they are CRLF, and `parse_frame_zerocopy` skips them the
-/// same way, so `*1\r\n$1\r\naXY` parses. Verifying them here would make the
-/// fast path stricter than the path it replaces.
-fn scan_flat_multibulk(buf: &[u8], config: &ParseConfig) -> Option<FlatScan> {
-    // Spans are recorded as u32. A buffer that large is not a client command.
-    if buf.len() > u32::MAX as usize {
-        return None;
-    }
-    if buf.first() != Some(&b'*') {
-        return None;
-    }
-
-    // Decline on the BYTE, not on the parsed count. `parse_resp_two_pass`'s
-    // `is_null_multibulk` gate keys on `buf[1] == b'-'`, and `strict_atoi` reads
-    // a lone `-` (and `-0`) as ZERO -- so `*-\r\n` has a non-negative count and
-    // is still silently consumed there while reporting no frame at all. Testing
-    // `count < 0` alone let the fast path answer `*0`-shaped where the two-pass
-    // path answers nothing. Found by the `resp_parse_fused` differential fuzz
-    // target within 90 seconds of its first run.
-    if buf.get(1) == Some(&b'-') {
-        return None;
-    }
-
-    let mut pos = 1usize;
-    let crlf = find_crlf(buf, pos)?;
-    let count = strict_atoi(&buf[pos..crlf])?;
-    pos = crlf + 2;
-
-    // `*-1` is the null array and anything below it is Redis's silently-consumed
-    // case; both live in `parse_resp_two_pass`, which spells them differently.
-    // Unreachable after the byte test above, and kept as the belt to its braces.
-    if count < 0 {
-        return None;
-    }
-    let count = count as usize;
-    if count > config.max_array_length {
-        return None;
-    }
-    // `validate_frame` validates the ELEMENTS at depth 1, so a non-empty array
-    // is a depth error when the limit is 0. Let the two-pass path raise it.
-    if count > 0 && config.max_array_depth < 1 {
-        return None;
-    }
-
-    let mut spans: SmallVec<[(u32, u32); 16]> =
-        SmallVec::with_capacity(span_capacity(count, buf.len()));
-    for _ in 0..count {
-        if buf.get(pos) != Some(&b'$') {
-            return None;
-        }
-        pos += 1;
-        let crlf = find_crlf(buf, pos)?;
-        let len = strict_atoi(&buf[pos..crlf])?;
-        pos = crlf + 2;
-        // `$-1` (null bulk) yields a `Frame::Null` element on the two-pass path.
-        if len < 0 {
-            return None;
-        }
-        let len = len as usize;
-        if len > config.max_bulk_string_size {
-            return None;
-        }
-        if buf.len() - pos < len + 2 {
-            return None; // incomplete
-        }
-        spans.push((pos as u32, len as u32));
-        pos += len + 2;
-    }
-
-    Some(FlatScan {
-        total_len: pos,
-        spans,
-    })
-}
-
-/// Consume and build a flat multibulk from a single scan, or leave `buf`
-/// untouched and return `None` so the caller falls through to the two-pass path.
-fn parse_flat_multibulk(buf: &mut BytesMut, config: &ParseConfig) -> Option<Frame> {
-    let scan = scan_flat_multibulk(&buf[..], config)?;
-    // Same freeze the two-pass path performs: one `Shared` promotion for the
-    // whole frame, amortised across the batch.
-    let frozen = buf.split_to(scan.total_len).freeze();
-    let mut items = FrameVec::with_capacity(scan.spans.len());
-    for (start, len) in scan.spans {
-        let start = start as usize;
-        items.push(Frame::BulkString(frozen.slice(start..start + len as usize)));
-    }
-    Some(Frame::Array(items))
 }
 
 /// Zero-copy frame extraction from a frozen `Bytes` buffer.
@@ -461,7 +392,7 @@ fn parse_frame_zerocopy(buf: &Bytes, pos: &mut usize, config: &ParseConfig, dept
                 return Frame::Null;
             }
             let payload = &buf[*pos..*pos + len];
-            let encoding = Bytes::copy_from_slice(&payload[..3]);
+            let encoding = [payload[0], payload[1], payload[2]];
             let data = buf.slice(*pos + 4..*pos + len);
             *pos += len + 2;
             Frame::VerbatimString { encoding, data }
@@ -487,7 +418,7 @@ fn parse_frame_zerocopy(buf: &Bytes, pos: &mut usize, config: &ParseConfig, dept
 /// SIMD-accelerated CRLF finder. Returns absolute position of \r in buf.
 /// Returns None if no complete \r\n found starting from `start`.
 #[inline]
-fn find_crlf(buf: &[u8], start: usize) -> Option<usize> {
+pub(super) fn find_crlf(buf: &[u8], start: usize) -> Option<usize> {
     if start >= buf.len() {
         return None;
     }
@@ -513,7 +444,7 @@ fn find_crlf(buf: &[u8], start: usize) -> Option<usize> {
 /// Strict decimal parse: all bytes in the slice must be consumed by the integer.
 /// Rejects inputs like `b"5\n"` where `atoi::atoi` would silently ignore trailing bytes.
 #[inline]
-fn strict_atoi(line: &[u8]) -> Option<i64> {
+pub(super) fn strict_atoi(line: &[u8]) -> Option<i64> {
     let (val, used) = i64::from_radix_10_signed_checked(line);
     match val {
         Some(n) if used == line.len() => Some(n),
@@ -784,321 +715,6 @@ fn validate_frame(
     }
 }
 
-/// Parse a single RESP2 frame from buf using direct index tracking.
-///
-/// Validates completeness and extracts frame data simultaneously.
-/// Returns `Err(ParseError::Incomplete)` if not enough data is available.
-fn parse_single_frame(
-    buf: &[u8],
-    pos: &mut usize,
-    config: &ParseConfig,
-    depth: usize,
-) -> Result<Frame, ParseError> {
-    if depth > config.max_array_depth {
-        return Err(ParseError::Invalid {
-            kind: ProtoFault::MultibulkLen,
-            message: format!(
-                "array nesting depth {} exceeds maximum {}",
-                depth, config.max_array_depth
-            ),
-            offset: *pos,
-        });
-    }
-    if *pos >= buf.len() {
-        return Err(ParseError::Incomplete);
-    }
-    let type_byte = buf[*pos];
-    *pos += 1;
-
-    match type_byte {
-        b'+' => {
-            let crlf = find_crlf(buf, *pos).ok_or(ParseError::Incomplete)?;
-            let line = &buf[*pos..crlf];
-            *pos = crlf + 2;
-            Ok(Frame::SimpleString(Bytes::copy_from_slice(line)))
-        }
-        b'-' => {
-            let crlf = find_crlf(buf, *pos).ok_or(ParseError::Incomplete)?;
-            let line = &buf[*pos..crlf];
-            *pos = crlf + 2;
-            Ok(Frame::Error(Bytes::copy_from_slice(line)))
-        }
-        b':' => {
-            let crlf = find_crlf(buf, *pos).ok_or(ParseError::Incomplete)?;
-            let line = &buf[*pos..crlf];
-            let n = strict_atoi(line).ok_or_else(|| ParseError::Invalid {
-                kind: ProtoFault::ExpectedDollar(type_byte),
-                message: format!("invalid integer: {:?}", String::from_utf8_lossy(line)),
-                offset: *pos,
-            })?;
-            *pos = crlf + 2;
-            Ok(Frame::Integer(n))
-        }
-        b'$' => {
-            let len = read_decimal(buf, pos, ProtoFault::BulkLen)?;
-            if len == -1 {
-                return Ok(Frame::Null);
-            }
-            if len < 0 {
-                return Err(ParseError::Invalid {
-                    kind: ProtoFault::BulkLen,
-                    message: format!("invalid bulk string length: {}", len),
-                    offset: *pos,
-                });
-            }
-            let len = len as usize;
-            if len > config.max_bulk_string_size {
-                return Err(ParseError::Invalid {
-                    kind: ProtoFault::BulkLen,
-                    message: format!(
-                        "bulk string size {} exceeds maximum {}",
-                        len, config.max_bulk_string_size
-                    ),
-                    offset: *pos,
-                });
-            }
-            // CRITICAL: Do NOT scan for CRLF inside bulk string data (Pitfall 6).
-            // The length tells us exactly where the terminator is.
-            let remaining = buf.len() - *pos;
-            if remaining < len + 2 {
-                return Err(ParseError::Incomplete);
-            }
-            let data = &buf[*pos..*pos + len];
-            let frame = Frame::BulkString(Bytes::copy_from_slice(data));
-            *pos += len + 2; // skip data + \r\n
-            Ok(frame)
-        }
-        b'*' => {
-            let count = read_decimal(buf, pos, ProtoFault::MultibulkLen)?;
-            if count == -1 {
-                return Ok(Frame::Null);
-            }
-            if count < 0 {
-                return Err(ParseError::Invalid {
-                    kind: ProtoFault::MultibulkLen,
-                    message: format!("invalid array length: {}", count),
-                    offset: *pos,
-                });
-            }
-            let count = count as usize;
-            if count > config.max_array_length {
-                return Err(ParseError::Invalid {
-                    kind: ProtoFault::MultibulkLen,
-                    message: format!(
-                        "array length {} exceeds maximum {}",
-                        count, config.max_array_length
-                    ),
-                    offset: *pos,
-                });
-            }
-            let mut items = FrameVec::with_capacity(count);
-            for _ in 0..count {
-                items.push(parse_single_frame(buf, pos, config, depth + 1)?);
-            }
-            Ok(Frame::Array(items))
-        }
-        // === RESP3 types ===
-        b'_' => {
-            // RESP3 Null: `_\r\n` — CRLF must be immediately at *pos
-            let crlf = find_crlf(buf, *pos).ok_or(ParseError::Incomplete)?;
-            if crlf != *pos {
-                return Err(ParseError::Invalid {
-                    kind: ProtoFault::ExpectedDollar(type_byte),
-                    message: format!(
-                        "RESP3 null has trailing data before CRLF at offset {}",
-                        *pos
-                    ),
-                    offset: *pos,
-                });
-            }
-            *pos = crlf + 2;
-            Ok(Frame::Null)
-        }
-        b'#' => {
-            // RESP3 Boolean: `#t\r\n` or `#f\r\n`
-            let crlf = find_crlf(buf, *pos).ok_or(ParseError::Incomplete)?;
-            let line = &buf[*pos..crlf];
-            let val = match line {
-                b"t" => true,
-                b"f" => false,
-                _ => {
-                    return Err(ParseError::Invalid {
-                        kind: ProtoFault::ExpectedDollar(type_byte),
-                        message: format!(
-                            "invalid boolean value: {:?}",
-                            String::from_utf8_lossy(line)
-                        ),
-                        offset: *pos,
-                    });
-                }
-            };
-            *pos = crlf + 2;
-            Ok(Frame::Boolean(val))
-        }
-        b',' => {
-            // RESP3 Double: `,<double>\r\n`
-            let crlf = find_crlf(buf, *pos).ok_or(ParseError::Incomplete)?;
-            let line = &buf[*pos..crlf];
-            let s = std::str::from_utf8(line).map_err(|_| ParseError::Invalid {
-                kind: ProtoFault::ExpectedDollar(type_byte),
-                message: "invalid UTF-8 in double".into(),
-                offset: *pos,
-            })?;
-            let val = if s.eq_ignore_ascii_case("inf") {
-                f64::INFINITY
-            } else if s.eq_ignore_ascii_case("-inf") {
-                f64::NEG_INFINITY
-            } else if s.eq_ignore_ascii_case("nan") {
-                f64::NAN
-            } else {
-                s.parse::<f64>().map_err(|_| ParseError::Invalid {
-                    kind: ProtoFault::ExpectedDollar(type_byte),
-                    message: format!("invalid double: {:?}", s),
-                    offset: *pos,
-                })?
-            };
-            *pos = crlf + 2;
-            Ok(Frame::Double(val))
-        }
-        b'(' => {
-            // RESP3 BigNumber: `(<number>\r\n`
-            let crlf = find_crlf(buf, *pos).ok_or(ParseError::Incomplete)?;
-            let line = &buf[*pos..crlf];
-            *pos = crlf + 2;
-            Ok(Frame::BigNumber(Bytes::copy_from_slice(line)))
-        }
-        b'=' => {
-            // RESP3 VerbatimString: `=<len>\r\n<enc>:<data>\r\n`
-            let len = read_decimal(buf, pos, ProtoFault::BulkLen)?;
-            if len < 4 {
-                return Err(ParseError::Invalid {
-                    kind: ProtoFault::ExpectedDollar(type_byte),
-                    message: format!(
-                        "verbatim string length {} too short (minimum 4 for encoding + colon)",
-                        len
-                    ),
-                    offset: *pos,
-                });
-            }
-            let len = len as usize;
-            if len > config.max_bulk_string_size {
-                return Err(ParseError::Invalid {
-                    kind: ProtoFault::ExpectedDollar(type_byte),
-                    message: format!(
-                        "verbatim string size {} exceeds maximum {}",
-                        len, config.max_bulk_string_size
-                    ),
-                    offset: *pos,
-                });
-            }
-            let remaining = buf.len() - *pos;
-            if remaining < len + 2 {
-                return Err(ParseError::Incomplete);
-            }
-            let payload = &buf[*pos..*pos + len];
-            if payload[3] != b':' {
-                return Err(ParseError::Invalid {
-                    kind: ProtoFault::ExpectedDollar(type_byte),
-                    message: "verbatim string missing ':' after 3-byte encoding".into(),
-                    offset: *pos + 3,
-                });
-            }
-            let encoding = Bytes::copy_from_slice(&payload[..3]);
-            let data = Bytes::copy_from_slice(&payload[4..]);
-            *pos += len + 2;
-            Ok(Frame::VerbatimString { encoding, data })
-        }
-        b'%' => {
-            // RESP3 Map: `%<count>\r\n<key><value>...`
-            let count = read_decimal(buf, pos, ProtoFault::MultibulkLen)?;
-            if count < 0 {
-                return Err(ParseError::Invalid {
-                    kind: ProtoFault::MultibulkLen,
-                    message: format!("invalid map length: {}", count),
-                    offset: *pos,
-                });
-            }
-            let count = count as usize;
-            if count > config.max_array_length {
-                return Err(ParseError::Invalid {
-                    kind: ProtoFault::MultibulkLen,
-                    message: format!(
-                        "map length {} exceeds maximum {}",
-                        count, config.max_array_length
-                    ),
-                    offset: *pos,
-                });
-            }
-            let mut pairs = Vec::with_capacity(count);
-            for _ in 0..count {
-                let key = parse_single_frame(buf, pos, config, depth + 1)?;
-                let value = parse_single_frame(buf, pos, config, depth + 1)?;
-                pairs.push((key, value));
-            }
-            Ok(Frame::Map(pairs))
-        }
-        b'~' => {
-            // RESP3 Set: `~<count>\r\n<elements...>`
-            let count = read_decimal(buf, pos, ProtoFault::MultibulkLen)?;
-            if count < 0 {
-                return Err(ParseError::Invalid {
-                    kind: ProtoFault::MultibulkLen,
-                    message: format!("invalid set length: {}", count),
-                    offset: *pos,
-                });
-            }
-            let count = count as usize;
-            if count > config.max_array_length {
-                return Err(ParseError::Invalid {
-                    kind: ProtoFault::MultibulkLen,
-                    message: format!(
-                        "set length {} exceeds maximum {}",
-                        count, config.max_array_length
-                    ),
-                    offset: *pos,
-                });
-            }
-            let mut items = FrameVec::with_capacity(count);
-            for _ in 0..count {
-                items.push(parse_single_frame(buf, pos, config, depth + 1)?);
-            }
-            Ok(Frame::Set(items))
-        }
-        b'>' => {
-            // RESP3 Push: `><count>\r\n<elements...>`
-            let count = read_decimal(buf, pos, ProtoFault::MultibulkLen)?;
-            if count < 0 {
-                return Err(ParseError::Invalid {
-                    kind: ProtoFault::MultibulkLen,
-                    message: format!("invalid push length: {}", count),
-                    offset: *pos,
-                });
-            }
-            let count = count as usize;
-            if count > config.max_array_length {
-                return Err(ParseError::Invalid {
-                    kind: ProtoFault::MultibulkLen,
-                    message: format!(
-                        "push length {} exceeds maximum {}",
-                        count, config.max_array_length
-                    ),
-                    offset: *pos,
-                });
-            }
-            let mut items = FrameVec::with_capacity(count);
-            for _ in 0..count {
-                items.push(parse_single_frame(buf, pos, config, depth + 1)?);
-            }
-            Ok(Frame::Push(items))
-        }
-        byte => Err(ParseError::Invalid {
-            kind: ProtoFault::UnknownType(byte),
-            message: format!("unknown type byte: 0x{:02x}", byte),
-            offset: *pos - 1,
-        }),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1335,7 +951,9 @@ mod tests {
 
     /// A differential that both sides decline is worth nothing. This pins that
     /// the fast path really answers the common command shapes, so the test above
-    /// is testing the new code and not the old code twice.
+    /// is testing the new code and not the old code twice — and that the three
+    /// answers are the ones intended: an incomplete frame is `Incomplete` (never
+    /// handed to `validate_frame`), a special shape is `Decline`.
     #[test]
     fn flat_multibulk_fast_path_actually_fires() {
         let config = ParseConfig::default();
@@ -1348,17 +966,18 @@ mod tests {
             &b"*2\r\n$3\r\nGET\r\n$0\r\n\r\n"[..],
         ];
         for case in fires {
-            let mut buf = BytesMut::from(case);
             assert!(
-                scan_flat_multibulk(&buf[..], &config).is_some(),
+                matches!(scan_flat(case, &config, None), FlatScan::Complete { .. }),
                 "fast path declined {:?} — the differential would be vacuous",
                 String::from_utf8_lossy(case)
             );
             // and it produces the frame, not just a scan
+            let mut buf = BytesMut::from(case);
             assert!(matches!(
-                parse_flat_multibulk(&mut buf, &config),
-                Some(Frame::Array(_))
+                parse(&mut buf, &config),
+                Ok(Some(Frame::Array(_)))
             ));
+            assert!(buf.is_empty());
         }
 
         let declines = [
@@ -1366,13 +985,28 @@ mod tests {
             &b"*2\r\n$-1\r\n$1\r\nk\r\n"[..],
             &b"*2\r\n*1\r\n$1\r\na\r\n$1\r\nb\r\n"[..],
             &b"*2\r\n+OK\r\n$1\r\nb\r\n"[..],
-            &b"*2\r\n$3\r\nGET\r\n"[..], // incomplete
             &b"*abc\r\n"[..],
         ];
         for case in declines {
             assert!(
-                scan_flat_multibulk(case, &config).is_none(),
+                matches!(scan_flat(case, &config, None), FlatScan::Decline),
                 "fast path accepted {:?}, which the two-pass path treats specially",
+                String::from_utf8_lossy(case)
+            );
+        }
+
+        let incompletes = [
+            &b"*"[..],
+            &b"*2"[..],
+            &b"*2\r\n"[..],
+            &b"*2\r\n$3\r\nGET\r\n"[..],
+            &b"*2\r\n$3\r\nGET\r\n$1"[..],
+            &b"*2\r\n$3\r\nGET\r\n$1\r\nk"[..],
+        ];
+        for case in incompletes {
+            assert!(
+                matches!(scan_flat(case, &config, None), FlatScan::Incomplete { .. }),
+                "fast path did not call {:?} incomplete",
                 String::from_utf8_lossy(case)
             );
         }
@@ -1401,41 +1035,50 @@ mod tests {
         }
     }
 
-    /// `*1048576\r\n` is ten bytes and `max_array_length` defaults to 1Mi, so a
-    /// naive `SmallVec::with_capacity(count)` would allocate 8 MiB before the scanner
-    /// discovered the frame was incomplete. The two-pass path never had that
-    /// amplification: `parse_frame_zerocopy` only reaches `FrameVec::with_capacity`
-    /// AFTER `validate_frame` proved the whole frame is present, so the buffer itself
-    /// bounds the count. The scanner allocates first, so it must bound the count itself.
-    ///
-    /// Six bytes is the shortest an element can be (`$0\r\n` + the two trailing bytes),
-    /// so a buffer can never hold more than `len / 6` of them and capping there can
-    /// never under-allocate for a scan that goes on to succeed.
+    /// `*1048576\r\n` is ten bytes and `max_array_length` defaults to 1Mi. The
+    /// scanner must not size anything off that claim before the elements are
+    /// actually present: it records spans in 16 INLINE slots only and never
+    /// spills, so an incomplete scan allocates nothing at all, and the only
+    /// count-sized allocation (`FrameVec::with_capacity` in `build_flat`)
+    /// happens after the whole frame was walked — the buffer bounds it, as it
+    /// always did on the two-pass path.
     #[test]
-    fn span_capacity_is_bounded_by_the_buffer_not_the_claimed_count() {
+    fn scan_never_sizes_off_the_claimed_count() {
+        let config = ParseConfig::default();
         // The attack: a huge claimed count in a tiny buffer.
-        assert_eq!(span_capacity(1024 * 1024, b"*1048576\r\n".len()), 1);
-        assert_eq!(span_capacity(usize::MAX, 0), 0);
-        assert_eq!(span_capacity(1_000_000, 60), 10);
-
-        // Honest commands are unaffected: capacity still covers every argument.
-        for case in [
-            &b"*1\r\n$4\r\nPING\r\n"[..],
-            &b"*2\r\n$3\r\nGET\r\n$1\r\nk\r\n"[..],
-            &b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n"[..],
-            &b"*5\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n$2\r\nEX\r\n$3\r\n100\r\n"[..],
-        ] {
-            let scan = scan_flat_multibulk(case, &ParseConfig::default())
-                .expect("honest command must still take the fast path");
-            assert!(
-                span_capacity(scan.spans.len(), case.len()) >= scan.spans.len(),
-                "capped capacity under-allocated for {:?}",
-                String::from_utf8_lossy(case)
-            );
+        match scan_flat(b"*1048576\r\n", &config, None) {
+            FlatScan::Incomplete {
+                cursor: Some(c), ..
+            } => {
+                assert_eq!(c.count, 1 << 20);
+                assert_eq!(c.done, 0);
+            }
+            _ => panic!("a bare huge header must be an incomplete scan"),
         }
-
-        // And end to end: the pathological header must be declined, not answered.
-        assert!(scan_flat_multibulk(b"*1048576\r\n", &ParseConfig::default()).is_none());
+        // A long honest frame: spans stay inline however many elements.
+        let mut frame = b"*40\r\n".to_vec();
+        for i in 0..40 {
+            frame.extend_from_slice(format!("$2\r\n{:02}\r\n", i).as_bytes());
+        }
+        match scan_flat(&frame, &config, None) {
+            FlatScan::Complete { spans, count, .. } => {
+                assert_eq!(count, 40);
+                assert_eq!(spans.len(), crate::protocol::flat::INLINE_SPANS);
+                assert!(!spans.spilled(), "span recording must never allocate");
+            }
+            _ => panic!("honest frame must complete"),
+        }
+        // and the elements past the inline spans are still built correctly
+        let mut buf = BytesMut::from(&frame[..]);
+        match parse(&mut buf, &config).unwrap().unwrap() {
+            Frame::Array(items) => {
+                assert_eq!(items.len(), 40);
+                for (i, f) in items.iter().enumerate() {
+                    assert_eq!(f, &Frame::BulkString(Bytes::from(format!("{:02}", i))));
+                }
+            }
+            other => panic!("expected Array, got {other:?}"),
+        }
     }
 
     // === Simple String tests ===
@@ -1914,10 +1557,31 @@ mod tests {
         assert_eq!(
             result,
             Frame::VerbatimString {
-                encoding: Bytes::from_static(b"txt"),
+                encoding: *b"txt",
                 data: Bytes::from_static(b"Some string"),
             }
         );
+    }
+
+    /// moon#1179 item 2: the inline `[u8; 3]` tag round-trips byte-for-byte
+    /// on the RESP3 wire for any encoding, and RESP2 still downgrades to the
+    /// bare payload.
+    #[test]
+    fn verbatim_encoding_tag_round_trips_byte_identical() {
+        for wire in [
+            &b"=15\r\ntxt:Some string\r\n"[..],
+            &b"=11\r\nmkd:# hello\r\n"[..],
+        ] {
+            let frame = parse_bytes(wire).unwrap().unwrap();
+            let mut out = BytesMut::new();
+            crate::protocol::serialize_resp3(&frame, &mut out);
+            assert_eq!(&out[..], wire);
+        }
+        let frame = parse_bytes(b"=11\r\nmkd:# hello\r\n").unwrap().unwrap();
+        assert!(matches!(&frame, Frame::VerbatimString { encoding, .. } if encoding == b"mkd"));
+        let mut out = BytesMut::new();
+        crate::protocol::serialize(&frame, &mut out);
+        assert_eq!(&out[..], b"$7\r\n# hello\r\n");
     }
 
     #[test]

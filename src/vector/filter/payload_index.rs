@@ -6,6 +6,12 @@ use ordered_float::OrderedFloat;
 use roaring::RoaringBitmap;
 
 use super::expression::FilterExpr;
+use super::payload_schema::PayloadSchema;
+
+/// Resolves a KNN `TextMatch` filter on a BM25-owned (declared TEXT) field
+/// to the matching global ids, through the index's BM25 plane (moon#1194).
+/// `None` = no text plane reachable (the filter then matches nothing).
+pub type Bm25TextResolver<'a> = &'a dyn Fn(&Bytes, &[Bytes]) -> Option<RoaringBitmap>;
 
 /// Suffixes geo fields are recorded under in the forward index -- see
 /// [`PayloadIndex::insert_geo`] and [`PayloadIndex::remove_field`].
@@ -108,18 +114,63 @@ pub struct PayloadIndex {
     /// Full-text indexes (feature-gated behind `text-index`)
     #[cfg(feature = "text-index")]
     text_indexes: crate::vector::filter::text_index::TextIndex,
+    /// Schema-aware indexing policy (moon#1194, opt-in — see
+    /// `payload_schema`). `None`: every field is indexed (HEAD behaviour).
+    schema: Option<PayloadSchema>,
 }
 
 impl PayloadIndex {
-    /// Create an empty payload index.
+    /// Create an empty payload index that indexes every field.
     pub fn new() -> Self {
+        Self::with_schema(None)
+    }
+
+    /// Create an empty payload index with a schema-aware policy (moon#1194):
+    /// `Some` indexes only the declared fields, `None` is [`Self::new`].
+    pub fn with_schema(schema: Option<PayloadSchema>) -> Self {
         Self {
             tag_indexes: HashMap::new(),
             numeric_indexes: HashMap::new(),
             doc_values: HashMap::new(),
             #[cfg(feature = "text-index")]
             text_indexes: crate::vector::filter::text_index::TextIndex::new(),
+            schema,
         }
+    }
+
+    /// The schema-aware policy, if this index has one.
+    pub fn schema(&self) -> Option<&PayloadSchema> {
+        self.schema.as_ref()
+    }
+
+    /// Whether any document has a tag, numeric, or payload-text entry for
+    /// `field` (introspection for tests and diagnostics; not a query path).
+    pub fn holds_field(&self, field: &Bytes) -> bool {
+        #[cfg(feature = "text-index")]
+        let text = self.text_indexes.vocabulary_len(field) > 0;
+        #[cfg(not(feature = "text-index"))]
+        let text = false;
+        self.tag_indexes.get(field).is_some_and(|m| !m.is_empty())
+            || self
+                .numeric_indexes
+                .get(field)
+                .is_some_and(|m| !m.is_empty())
+            || text
+    }
+
+    /// Tag / numeric / geo indexing allowed for `field` under the policy.
+    #[inline]
+    fn indexes_filterable(&self, field: &[u8]) -> bool {
+        self.schema
+            .as_ref()
+            .is_none_or(|s| s.indexes_filterable(field))
+    }
+
+    /// Payload full-text indexing allowed for `field` under the policy.
+    #[cfg(feature = "text-index")]
+    #[inline]
+    fn indexes_text(&self, field: &[u8]) -> bool {
+        self.schema.as_ref().is_none_or(|s| s.indexes_text(field))
     }
 
     /// Insert a tag value for the given internal vector ID.
@@ -132,6 +183,9 @@ impl PayloadIndex {
     /// the document's lifetime. The forward entry now shares the inverted
     /// map's key allocation instead of holding a second reference.
     pub fn insert_tag(&mut self, field: &Bytes, value: &Bytes, internal_id: u32) {
+        if !self.indexes_filterable(field) {
+            return;
+        }
         let fk = owned_key(&self.tag_indexes, field);
         let values = self.tag_indexes.entry(fk.clone()).or_default();
         let vk = owned_key(values, value);
@@ -153,6 +207,15 @@ impl PayloadIndex {
     /// Insert a numeric value for the given internal vector ID. Field names
     /// are owned + interned (see [`Self::insert_tag`]).
     pub fn insert_numeric(&mut self, field: &Bytes, value: f64, internal_id: u32) {
+        if self.indexes_filterable(field) {
+            self.insert_numeric_unchecked(field, value, internal_id);
+        }
+    }
+
+    /// [`Self::insert_numeric`] without the schema check — `insert_geo`'s
+    /// `{field}__lat` / `{field}__lon` sub-fields are admitted by their base
+    /// field's declaration, not their own names.
+    fn insert_numeric_unchecked(&mut self, field: &Bytes, value: f64, internal_id: u32) {
         let fk = owned_key(&self.numeric_indexes, field);
         self.numeric_indexes
             .entry(fk.clone())
@@ -180,11 +243,14 @@ impl PayloadIndex {
     /// Stores lat/lon as two separate numeric sub-fields (`{field}__lat` and `{field}__lon`)
     /// so that range queries can produce candidate bitmaps before Haversine post-filter.
     pub fn insert_geo(&mut self, field: &Bytes, lat: f64, lon: f64, internal_id: u32) {
+        if !self.indexes_filterable(field) {
+            return;
+        }
         let field_str = std::str::from_utf8(field).unwrap_or("");
         let lat_field = Bytes::from(format!("{field_str}__lat"));
         let lon_field = Bytes::from(format!("{field_str}__lon"));
-        self.insert_numeric(&lat_field, lat, internal_id);
-        self.insert_numeric(&lon_field, lon, internal_id);
+        self.insert_numeric_unchecked(&lat_field, lat, internal_id);
+        self.insert_numeric_unchecked(&lon_field, lon, internal_id);
     }
 
     /// Insert a text value into the full-text index for the given field and internal vector ID.
@@ -192,7 +258,9 @@ impl PayloadIndex {
     /// Feature-gated: no-op when `text-index` feature is disabled.
     #[cfg(feature = "text-index")]
     pub fn insert_text(&mut self, field: &Bytes, text: &[u8], internal_id: u32) {
-        self.text_indexes.insert(field, text, internal_id);
+        if self.indexes_text(field) {
+            self.text_indexes.insert(field, text, internal_id);
+        }
     }
 
     /// Insert a text value into the full-text index through an analysis
@@ -210,6 +278,9 @@ impl PayloadIndex {
         internal_id: u32,
         cache: &mut crate::text::analyzer::AnalysisCache,
     ) {
+        if !self.indexes_text(field) {
+            return;
+        }
         if let Some(analysis) = cache.get_or_segment(value) {
             self.text_indexes
                 .insert_terms(field, analysis.english_terms(), internal_id);
@@ -379,6 +450,19 @@ impl PayloadIndex {
     ///
     /// `total_vectors` is needed for NOT (complement against universe 0..total_vectors).
     pub fn evaluate_bitmap(&self, expr: &FilterExpr, total_vectors: u32) -> RoaringBitmap {
+        self.evaluate_bitmap_with(expr, total_vectors, None)
+    }
+
+    /// [`Self::evaluate_bitmap`] with the BM25 plane reachable (moon#1194):
+    /// under a schema-aware policy, a `TextMatch` on a declared TEXT field is
+    /// answered by `bm25` (the payload text index does not hold those
+    /// fields); every other node is evaluated exactly as before.
+    pub fn evaluate_bitmap_with(
+        &self,
+        expr: &FilterExpr,
+        total_vectors: u32,
+        bm25: Option<Bm25TextResolver<'_>>,
+    ) -> RoaringBitmap {
         match expr {
             FilterExpr::TagEq { field, value } => self
                 .tag_indexes
@@ -509,19 +593,19 @@ impl PayloadIndex {
             }
 
             FilterExpr::And(left, right) => {
-                let left_bm = self.evaluate_bitmap(left, total_vectors);
-                let right_bm = self.evaluate_bitmap(right, total_vectors);
+                let left_bm = self.evaluate_bitmap_with(left, total_vectors, bm25);
+                let right_bm = self.evaluate_bitmap_with(right, total_vectors, bm25);
                 left_bm & right_bm
             }
 
             FilterExpr::Or(left, right) => {
-                let left_bm = self.evaluate_bitmap(left, total_vectors);
-                let right_bm = self.evaluate_bitmap(right, total_vectors);
+                let left_bm = self.evaluate_bitmap_with(left, total_vectors, bm25);
+                let right_bm = self.evaluate_bitmap_with(right, total_vectors, bm25);
                 left_bm | right_bm
             }
 
             FilterExpr::Not(inner) => {
-                let inner_bm = self.evaluate_bitmap(inner, total_vectors);
+                let inner_bm = self.evaluate_bitmap_with(inner, total_vectors, bm25);
                 let mut universe = RoaringBitmap::new();
                 if total_vectors > 0 {
                     universe.insert_range(0..total_vectors);
@@ -530,6 +614,11 @@ impl PayloadIndex {
             }
 
             FilterExpr::TextMatch { field, terms } => {
+                if self.schema.as_ref().is_some_and(|s| s.is_bm25_text(field)) {
+                    return bm25
+                        .and_then(|resolve| resolve(field, terms))
+                        .unwrap_or_default();
+                }
                 #[cfg(feature = "text-index")]
                 {
                     // Tokenize/stem each query term through the same pipeline

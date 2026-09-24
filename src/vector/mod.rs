@@ -17,6 +17,8 @@ pub mod search_pool;
 pub mod segment;
 pub mod sparse;
 pub mod store;
+#[cfg(test)]
+pub(crate) mod test_support;
 pub mod turbo_quant;
 pub mod types;
 

@@ -4,11 +4,10 @@
 use std::sync::Arc;
 
 use crate::vector::distance;
-use crate::vector::segment::compaction::compact;
 use crate::vector::segment::holder::{MvccContext, SegmentHolder};
 use crate::vector::segment::mutable::MutableSegment;
 use crate::vector::turbo_quant::collection::{BuildMode, CollectionMetadata, QuantizationConfig};
-use crate::vector::turbo_quant::encoder::{TqCode, decode_tq_mse_scaled, encode_tq_mse_scaled};
+use crate::vector::turbo_quant::encoder::{TqCode, encode_tq_mse_scaled};
 use crate::vector::turbo_quant::inner_product::{prepare_query_prod, score_l2_prod};
 use crate::vector::turbo_quant::qjl::{qjl_encode, qjl_encode_scalar_reference};
 use crate::vector::turbo_quant::tq_adc::tq_l2_adc_scaled;
@@ -125,11 +124,11 @@ fn exact_scan_estimator_study() {
                 .collect();
             let st = prepare_query_prod(
                 &q,
-                &col.qjl_matrices,
+                &col.qjl_matrices(),
                 col.fwht_sign_flips.as_slice(),
                 padded,
             );
-            let qjl0 = vec![0u8; col.qjl_matrices.len() * dim.div_ceil(8)];
+            let qjl0 = vec![0u8; col.qjl_num_projections * dim.div_ceil(8)];
             let prod: Vec<(f32, usize)> = codes
                 .iter()
                 .enumerate()
@@ -284,10 +283,10 @@ fn prod_estimator_premise_qjl_term_vanishes_at_zero_residual_but_ranking_differs
     let padded = c.padded_dimension as usize;
     let data = clustered(50, dim, 9, 0.5);
     let q = data[3].clone();
-    let st = prepare_query_prod(&q, &c.qjl_matrices, c.fwht_sign_flips.as_slice(), padded);
+    let st = prepare_query_prod(&q, &c.qjl_matrices(), c.fwht_sign_flips.as_slice(), padded);
     let single = dim.div_ceil(8);
-    let zeros = vec![0u8; c.qjl_matrices.len() * single];
-    let ones = vec![0xFFu8; c.qjl_matrices.len() * single];
+    let zeros = vec![0u8; c.qjl_num_projections * single];
+    let ones = vec![0xFFu8; c.qjl_num_projections * single];
     let mut work = vec![0.0f32; padded];
     for v in &data {
         let code = encode_tq_mse_scaled(
@@ -371,7 +370,7 @@ fn recall_pair(
         .collect();
     let cb = c.codebook_16();
     let single = dim.div_ceil(8);
-    let qjl0 = vec![0u8; c.qjl_matrices.len() * single];
+    let qjl0 = vec![0u8; c.qjl_num_projections * single];
     let (mut rp, mut ra) = (0usize, 0usize);
     for qi in 0..queries {
         let mut q: Vec<f32> = data[(qi * 53) % n]
@@ -400,7 +399,7 @@ fn recall_pair(
                 (d, i)
             })
             .collect();
-        let st = prepare_query_prod(&q, &c.qjl_matrices, c.fwht_sign_flips.as_slice(), padded);
+        let st = prepare_query_prod(&q, &c.qjl_matrices(), c.fwht_sign_flips.as_slice(), padded);
         let qn: f32 = q.iter().map(|x| x * x).sum::<f32>().sqrt();
         let prod = codes
             .iter()
@@ -501,86 +500,12 @@ fn freeze_no_longer_recomputes_qjl_on_the_shard_thread() {
     );
 }
 
-#[test]
-fn compaction_computes_qjl_for_live_entries_in_bfs_order() {
-    // The worker-side QJL must be the QJL of the vector each BFS row holds.
-    // HEAD also indexed the internal-id-ordered buffer by LIVE position, so
-    // after a dead entry every row carried a neighbour's signs.
-    let dim = 48;
-    let c = col(
-        dim,
-        DistanceMetric::L2,
-        QuantizationConfig::TurboQuant4,
-        BuildMode::Exact,
-    );
-    let seg = MutableSegment::new(dim as u32, c.clone());
-    let data = clustered(160, dim, 8, 0.5);
-    for (i, v) in data.iter().enumerate() {
-        seg.append(1000 + i as u64, v, i as u64 + 1);
-    }
-    for dead in [0u32, 5, 6, 77] {
-        seg.mark_deleted(dead, 999);
-    }
-    let imm = compact(&seg.freeze(), &c, 7, None).expect("compact");
-    let padded = c.padded_dimension as usize;
-    let single = dim.div_ceil(8);
-    let bpv = c.qjl_matrices.len() * single;
-    let mut work = vec![0.0f32; padded];
-    let mut flips = 0u32;
-    for (bfs, h) in imm.mvcc_headers().iter().enumerate() {
-        let v = &data[(h.key_hash - 1000) as usize];
-        let code = encode_tq_mse_scaled(
-            v,
-            c.fwht_sign_flips.as_slice(),
-            c.codebook_boundaries_15(),
-            &mut work,
-        );
-        let dec = decode_tq_mse_scaled(
-            &code,
-            c.fwht_sign_flips.as_slice(),
-            c.codebook_16(),
-            dim,
-            &mut work,
-        );
-        let r: Vec<f32> = v.iter().zip(&dec).map(|(a, b)| a - b).collect();
-        let got = imm.qjl_bytes_for(bfs, bpv);
-        assert_eq!(got.len(), bpv);
-        for (p, m) in c.qjl_matrices.iter().enumerate() {
-            let want = qjl_encode_scalar_reference(m, &r, dim);
-            flips += got[p * single..(p + 1) * single]
-                .iter()
-                .zip(&want)
-                .map(|(a, b)| (a ^ b).count_ones())
-                .sum::<u32>();
-        }
-    }
-    let rows = imm.mvcc_headers().len() as u32;
-    assert_eq!(rows, 156);
-    // SIMD reassociation may flip a near-zero projection; misalignment would
-    // flip ~half of all bits (rows * 8 * dim / 2).
-    assert!(flips <= rows, "{flips} QJL bit mismatches over {rows} rows");
-}
-
-#[test]
-fn light_compaction_carries_no_dead_qjl_buffer() {
-    let dim = 64;
-    let c = col(
-        dim,
-        DistanceMetric::L2,
-        QuantizationConfig::TurboQuant4,
-        BuildMode::Light,
-    );
-    let seg = MutableSegment::new(dim as u32, c.clone());
-    for (i, v) in clustered(100, dim, 4, 0.5).iter().enumerate() {
-        seg.append(i as u64, v, i as u64 + 1);
-    }
-    let imm = compact(&seg.freeze(), &c, 7, None).expect("compact");
-    assert_eq!(
-        imm.qjl_bytes(),
-        0,
-        "LIGHT segments must not hold a zero QJL buffer"
-    );
-}
+// moon#1213: `compaction_computes_qjl_for_live_entries_in_bfs_order` and
+// `light_compaction_carries_no_dead_qjl_buffer` pinned the layout of the
+// immutable QJL buffer (moon#1208's misalignment fix). Immutable segments no
+// longer carry QJL data at all — nothing read it — so the contract they
+// guarded is now `compaction::qjl_drop_tests` (a fresh segment holds exactly
+// what its reloaded twin holds, in both build modes).
 
 #[test]
 fn simd_qjl_encode_matches_scalar_except_near_zero_projections() {

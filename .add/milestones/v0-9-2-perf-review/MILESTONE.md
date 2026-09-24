@@ -40,6 +40,16 @@ Out: the RESET/ACL privilege-retention finding (security — handled privately p
 - From WS5b: #1218 FT prefix/fuzzy expansion nondeterministic across processes (fixed in WS5b), #1219 ignored cross-shard FT consistency suites broken at their seed (WS13).
 - Follow-ups: #1220 (text/graph residuals — WS13), #1212 (listpack residuals — WS10), #1213 (vector follow-ups — WS11), #1214 (needs-profile items — WS8/WS9/WS10).
 
+## Merge protocol (every fix-wave PR)
+- PR body lists `Fixes #N` for every issue the PR FULLY fixes (per the SUMMARY verdict table), so
+  the merge auto-closes them; PARTIAL issues are listed as `Refs #N` with what remains.
+- After each merge the orchestrator closes any fully-fixed issue that did not auto-close (comment
+  naming the merge commit and evidence, `state_reason: completed`) and leaves a status comment on
+  every PARTIAL issue (what landed, what remains, where it is routed). Resolved tasks never stay open.
+- Part 1 (PR #1221, merged `37774e1`): closed #1159 #1161 #1211 #1173 #1209 #1193 #1192 #1196
+  #1207 #1208 #1191 #1195 #1197 #1218 #1188 #1186 #1181; status comments on PARTIAL #1190 #1189
+  #1174 #1194 #1185 #1187.
+
 ## Exit criteria
 - [ ] every workstream has a SUMMARY.md with a per-issue verdict (FIXED / PARTIAL / DEFERRED + reason) and evidence
 - [ ] `cargo fmt --check`, `cargo clippy --lib -- -D warnings` on both feature sets, `cargo test --lib` on both runtimes green on the merged branch

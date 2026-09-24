@@ -262,12 +262,14 @@ fn bench_parse_set_single(c: &mut Criterion) {
 
 /// The `argc > 4` boundary, isolated.
 ///
-/// `FrameVec` is `Box<SmallVec<[Frame; 4]>>`, so `FrameVec::with_capacity(count)`
-/// HEAP-SPILLS past four elements: a `*5` command pays two allocations where a
-/// `*3` pays one. `tmp/CAMPAIGN_S8_CONTEXT.md` records `SET k v` at 2.08x and
-/// `SET k v EX 100` at 0.87x against Redis, and attributes the step to the inline
-/// byte path -- but this second, independent step sits at exactly the same
-/// boundary and nothing has separated them.
+/// `FrameVec` used to be `Box<SmallVec<[Frame; 4]>>`, so
+/// `FrameVec::with_capacity(count)` HEAP-SPILLED past four elements: a `*5`
+/// command paid two allocations where a `*3` paid one. `tmp/CAMPAIGN_S8_CONTEXT.md`
+/// recorded `SET k v` at 2.08x and `SET k v EX 100` at 0.87x against Redis and
+/// attributed the step to the inline byte path -- but that second, independent
+/// step sat at exactly the same boundary. Since moon#1179 item 1 `FrameVec` is a
+/// plain `Vec<Frame>` newtype (one allocation for any argument count), so these
+/// benches now check that no step is left at the boundary.
 ///
 /// The HSET pair is the clean control: same command, same work per argument, only
 /// the argument count differs, so a step between `*4` and `*6` cannot be blamed on
@@ -310,8 +312,35 @@ fn bench_parse_hset_6arg(c: &mut Criterion) {
     });
 }
 
+/// moon#1164: one large command arriving in 8 KiB reads, decoded the way the
+/// read loops do (append a read, decode until "need more"). Linear in the
+/// element count with the resumable parser; it was quadratic before (15.3 s
+/// for 1M elements end to end). 100K elements keeps one iteration short.
+fn bench_parse_incremental_rpush(c: &mut Criterion) {
+    let n = 100_000usize;
+    let mut input = format!("*{}\r\n$5\r\nRPUSH\r\n$4\r\nbigl\r\n", n + 2).into_bytes();
+    for _ in 0..n {
+        input.extend_from_slice(b"$1\r\nx\r\n");
+    }
+    c.bench_function("parse_incremental_rpush_100k", |b| {
+        b.iter(|| {
+            let mut codec = moon::server::codec::RespCodec::default();
+            let mut buf = BytesMut::with_capacity(8192);
+            let mut out = None;
+            for piece in black_box(&input[..]).chunks(8192) {
+                buf.extend_from_slice(piece);
+                if let Some(frame) = codec.decode_frame(&mut buf).unwrap() {
+                    out = Some(frame);
+                }
+            }
+            black_box(out);
+        })
+    });
+}
+
 criterion_group!(
     benches,
+    bench_parse_incremental_rpush,
     bench_parse_simple_string,
     bench_parse_bulk_string,
     bench_parse_integer,

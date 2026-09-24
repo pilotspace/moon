@@ -35,6 +35,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 
+use monoio::buf::{IoBufMut, SliceMut};
 use monoio::io::{AsyncReadRent, CancelHandle, Canceller};
 
 /// Park duration after which the sweep cancels a stage-1 read (ms).
@@ -51,6 +52,15 @@ pub(crate) use crate::runtime::conn_park_after_ms as park_after_ms;
 pub(super) const IDLE_PROBE_BUF: usize = 512;
 /// Full rent-buffer size (the pre-W11 constant working size).
 pub(super) const PARK_BUF_FULL: usize = 8192;
+/// Smallest spare tail of a SHARED read buffer still worth reading into
+/// before a fresh allocation is made (see [`spare_read_target`]).
+pub(super) const MIN_READ_SPARE: usize = 1024;
+/// Most of the read buffer's spare capacity one read of a stream that is not
+/// [`IdleParkRead::READ_INTO_UNINIT`] (TLS) is handed — and so the most it
+/// zeroes per read (see [`spare_read_target`]).
+pub(super) const ZEROED_READ_ROOM: usize = 32 * 1024;
+// An ordinary (unhinted) read's `want` must fit in the capped view.
+const _: () = assert!(ZEROED_READ_ROOM >= PARK_BUF_FULL);
 
 /// Per-connection shared state between the handler task and the shard chore.
 pub(super) struct IdleSlot {
@@ -222,10 +232,19 @@ pub(crate) fn cancel_all_parked() -> usize {
 /// pre-park sizing reallocates the probe size next iteration); the scratch
 /// buffers are only released when empty — a non-empty `read_buf` holds a
 /// partial frame that must survive the re-park.
+///
+/// moon#1179 item 3: the batch scratch (`frames`, `responses`) is released
+/// too. Both are always empty at the park point — `responses` is fully
+/// serialized and `frames` fully dispatched before the loop parks — but they
+/// kept their high-water capacity (64 frames each at least), which a parked
+/// connection has no use for. The emptiness guard is the same belt as for the
+/// byte buffers: a non-empty vec is never dropped.
 pub(super) fn downshift_idle_buffers(
     tmp_buf: &mut Vec<u8>,
     read_buf: &mut bytes::BytesMut,
     write_buf: &mut bytes::BytesMut,
+    frames: &mut Vec<crate::protocol::Frame>,
+    responses: &mut Vec<crate::protocol::Frame>,
 ) {
     *tmp_buf = Vec::new();
     if read_buf.is_empty() && read_buf.capacity() > 0 {
@@ -234,6 +253,70 @@ pub(super) fn downshift_idle_buffers(
     if write_buf.is_empty() && write_buf.capacity() > 0 {
         *write_buf = bytes::BytesMut::new();
     }
+    for v in [frames, responses] {
+        if v.is_empty() && v.capacity() > 0 {
+            *v = Vec::new();
+        }
+    }
+}
+
+/// moon#1179 item 4: hand the connection's read buffer to a monoio read as a
+/// view of its SPARE capacity, so the bytes land in place.
+///
+/// This replaces the 8 KiB rent buffer + `extend_from_slice` of every byte
+/// read: one memcpy of all client input, a hard 8 KiB cap per read, and a
+/// second buffer per connection. The caller must put the buffer back with
+/// `SliceMut::into_inner` when the read returns — the plain and idle-park
+/// read arms always get it back (a cancelled idle-park read is
+/// cancel-and-await, loss-free); a `select!` arm, whose losing future DROPS
+/// its buffer, must keep using a separate rent buffer instead.
+///
+/// Room for `want` bytes is made WITHOUT allocating whenever possible, and the
+/// read may fill all spare capacity beyond it:
+///
+/// 1. enough spare already: read into it;
+/// 2. otherwise `try_reclaim` — when nothing else references the allocation
+///    it is reused in place (the unparsed tail moves to the front);
+/// 3. otherwise the allocation is SHARED — frames of this batch, or stored
+///    collection elements that are slices of it (moon#1160). Allocating a
+///    fresh buffer there would abandon the tail and leave the old buffer
+///    pinned, one per read: measured at p=1 `SADD`, +107 MB RSS for 30K
+///    members against +3.8 MB. So a shared buffer keeps being filled while
+///    at least [`MIN_READ_SPARE`] of its tail is left — what the old
+///    `extend_from_slice` path did — and only `grow` (the incomplete front
+///    frame is known to need `want` more contiguous bytes) or an exhausted
+///    tail allocates.
+///
+/// For streams that are not [`IdleParkRead::READ_INTO_UNINIT`] (TLS) the
+/// target is zeroed first, so it is capped at [`ZEROED_READ_ROOM`] of the
+/// spare (moon#1227 review): zeroing ALL of it before every read made the
+/// work quadratic in a value's size — the parse hint reserves up to 1 MiB
+/// ahead for a large bulk, a TLS read returns about one 16 KiB record, and a
+/// 4 MiB upload zeroed 159x the bytes it read. A TLS read hands back the
+/// plaintext rustls holds, so the cap rarely shortens one (a short read only
+/// means another read); `want` up to the cap — the 512 B probe, the 8 KiB
+/// base — still gets its full room, and a larger hinted reservation keeps its
+/// contiguous capacity: only the per-read view is capped. Plain TCP reads
+/// into the whole spare, as before.
+pub(super) fn spare_read_target<S: IdleParkRead>(
+    read_buf: &mut bytes::BytesMut,
+    want: usize,
+    grow: bool,
+) -> SliceMut<bytes::BytesMut> {
+    let spare = read_buf.capacity() - read_buf.len();
+    if spare < want && !read_buf.try_reclaim(want) && (grow || spare < MIN_READ_SPARE) {
+        read_buf.reserve(want);
+    }
+    let len = read_buf.len();
+    let end = if S::READ_INTO_UNINIT {
+        read_buf.capacity()
+    } else {
+        let end = len + (read_buf.capacity() - len).min(ZEROED_READ_ROOM);
+        read_buf.resize(end, 0);
+        read_buf.truncate(len);
+        end
+    };
+    std::mem::take(read_buf).slice_mut(len..end)
 }
 
 /// The sweep's cancelled-op error, as monoio constructs it on BOTH drivers:
@@ -276,11 +359,23 @@ pub(crate) trait IdleParkRead: AsyncReadRent {
         true
     }
 
-    fn idle_park_read(
+    /// moon#1179 item 4: may a read target the UNINITIALIZED spare capacity
+    /// of the connection's read buffer directly?
+    ///
+    /// True only where the read hands the memory to the kernel as a raw
+    /// pointer (plain TCP: io_uring or `read(2)`) and nothing ever forms a
+    /// `&mut [u8]` over it. The vendored TLS stream builds a `&mut [u8]` over
+    /// the whole target for rustls to write into, so for it (and any stream
+    /// not audited) [`spare_read_target`] zeroes the target first — at most
+    /// [`ZEROED_READ_ROOM`] of the spare, so the memset stays proportional to
+    /// what one read can return — and never forms a reference to uninit bytes.
+    const READ_INTO_UNINIT: bool = false;
+
+    fn idle_park_read<T: IoBufMut>(
         &mut self,
-        buf: Vec<u8>,
+        buf: T,
         _c: CancelHandle,
-    ) -> impl std::future::Future<Output = monoio::BufResult<usize, Vec<u8>>> {
+    ) -> impl std::future::Future<Output = monoio::BufResult<usize, T>> {
         self.read(buf)
     }
 
@@ -314,12 +409,15 @@ pub(crate) trait IdleParkRead: AsyncReadRent {
 impl IdleParkRead for monoio::net::TcpStream {
     const SUPPORTS_IDLE_PARK: bool = true;
     const SUPPORTS_TASK_PARK: bool = true;
+    /// Both drivers pass `write_ptr()`/`bytes_total()` straight to the kernel
+    /// (io_uring `Read` op / `read(2)`) and only then `set_init(n)`.
+    const READ_INTO_UNINIT: bool = true;
 
-    fn idle_park_read(
+    fn idle_park_read<T: IoBufMut>(
         &mut self,
-        buf: Vec<u8>,
+        buf: T,
         c: CancelHandle,
-    ) -> impl std::future::Future<Output = monoio::BufResult<usize, Vec<u8>>> {
+    ) -> impl std::future::Future<Output = monoio::BufResult<usize, T>> {
         monoio::io::CancelableAsyncReadRent::cancelable_read(self, buf, c)
     }
 
@@ -349,11 +447,11 @@ impl IdleParkRead for monoio_rustls::ServerTlsStream<monoio::net::TcpStream> {
         monoio_rustls::ServerTlsStream::task_park_safe(self)
     }
 
-    fn idle_park_read(
+    fn idle_park_read<T: IoBufMut>(
         &mut self,
-        buf: Vec<u8>,
+        buf: T,
         c: CancelHandle,
-    ) -> impl std::future::Future<Output = monoio::BufResult<usize, Vec<u8>>> {
+    ) -> impl std::future::Future<Output = monoio::BufResult<usize, T>> {
         monoio::io::CancelableAsyncReadRent::cancelable_read(self, buf, c)
     }
 
@@ -478,13 +576,186 @@ mod idle_park_tests {
         );
     }
 
+    /// moon#1179 item 4: the read target is exactly `read_buf`'s spare
+    /// capacity (at least `want`), the buffered bytes come back untouched, and
+    /// a stream not audited for uninit targets gets a zeroed spare.
+    #[test]
+    fn spare_read_target_covers_the_spare_capacity() {
+        use monoio::buf::IoBuf;
+        let mut rb = bytes::BytesMut::with_capacity(16);
+        rb.extend_from_slice(b"*1\r\n$4\r\nPI");
+        let target = spare_read_target::<monoio::net::TcpStream>(&mut rb, 4096, false);
+        assert!(
+            rb.is_empty() && rb.capacity() == 0,
+            "the buffer moved into the read"
+        );
+        assert_eq!(target.begin(), 10, "reads append after the buffered bytes");
+        assert!(
+            target.end() - target.begin() >= 4096,
+            "at least `want` of room"
+        );
+        assert_eq!(
+            target.bytes_init(),
+            0,
+            "nothing past the buffered bytes is readable"
+        );
+        let back = target.into_inner();
+        assert_eq!(&back[..], b"*1\r\n$4\r\nPI");
+
+        // The zeroing path (TLS): same view, spare zero-filled, data intact.
+        let mut rb = back;
+        let target = spare_read_target::<monoio_rustls::ServerTlsStream<monoio::net::TcpStream>>(
+            &mut rb, 64, false,
+        );
+        let (begin, end) = (target.begin(), target.end());
+        let back = target.into_inner();
+        assert_eq!(&back[..], b"*1\r\n$4\r\nPI");
+        assert_eq!(begin, 10);
+        assert!(end - begin >= 64);
+    }
+
+    /// The shared-buffer rule: a buffer still referenced elsewhere (stored
+    /// slices, moon#1160) keeps being FILLED rather than reallocated per
+    /// read — the regression this guards measured +107 MB RSS for 30K p=1
+    /// SADDs — while a unique one is reclaimed in place, and a hinted large
+    /// frame (`grow`) still gets its contiguous room.
+    #[test]
+    fn spare_read_target_packs_a_shared_tail_instead_of_reallocating() {
+        type Tcp = monoio::net::TcpStream;
+        let mut rb = bytes::BytesMut::with_capacity(PARK_BUF_FULL);
+        rb.extend_from_slice(&[b'x'; 40]);
+        let pinned = rb.split_to(40).freeze(); // e.g. a stored set member
+        let base = rb.as_ptr() as usize;
+        let spare = rb.capacity();
+        assert!((MIN_READ_SPARE..PARK_BUF_FULL).contains(&spare));
+
+        // Shared + enough tail left: read into the SAME allocation's tail.
+        let target = spare_read_target::<Tcp>(&mut rb, PARK_BUF_FULL, false);
+        rb = target.into_inner();
+        assert_eq!(
+            rb.as_ptr() as usize,
+            base,
+            "a shared buffer was reallocated per read"
+        );
+        assert_eq!(rb.capacity(), spare);
+
+        // A hinted large frame needs contiguous room: grow.
+        let target = spare_read_target::<Tcp>(&mut rb, 64 * 1024, true);
+        rb = target.into_inner();
+        assert!(rb.capacity() >= 64 * 1024);
+        drop(pinned);
+
+        // Unique (nothing else references it): reclaimed in place.
+        let mut rb = bytes::BytesMut::with_capacity(PARK_BUF_FULL);
+        rb.extend_from_slice(&[b'y'; 100]);
+        let base = rb.as_ptr() as usize;
+        drop(rb.split_to(100));
+        let target = spare_read_target::<Tcp>(&mut rb, PARK_BUF_FULL, false);
+        rb = target.into_inner();
+        assert_eq!(
+            rb.as_ptr() as usize,
+            base,
+            "a unique buffer must be reclaimed, not replaced"
+        );
+        assert!(rb.capacity() >= PARK_BUF_FULL);
+    }
+
+    /// moon#1227 review: a stream that cannot read into uninitialized memory
+    /// (TLS) gets its read target ZEROED first, and one TLS read returns about
+    /// 16 KiB. Zeroing the whole spare before every read made the work
+    /// quadratic in a value's size — the parse hint reserves up to 1 MiB ahead
+    /// for a large bulk, and a 4 MiB upload zeroed ~159x the bytes it read.
+    /// Driven exactly as the handler sizes its reads (parse hint, `grow`,
+    /// `PARK_BUF_FULL` base), the zeroed bytes must stay linear in the bytes
+    /// read; small wants must still get their full room.
+    #[test]
+    fn tls_reads_zero_only_what_they_can_fill() {
+        use crate::protocol::{ParseConfig, ParseState, parse_resumable};
+        use crate::server::conn::util::hinted_read_len;
+        type Tls = monoio_rustls::ServerTlsStream<monoio::net::TcpStream>;
+        const TLS_READ: usize = 16 * 1024;
+
+        let value_len = 4 << 20;
+        let mut wire = format!("*3\r\n$3\r\nSET\r\n$1\r\nk\r\n${value_len}\r\n").into_bytes();
+        wire.resize(wire.len() + value_len, b'v');
+        wire.extend_from_slice(b"\r\n");
+
+        let config = ParseConfig::default();
+        let mut state = ParseState::new();
+        let mut rb = bytes::BytesMut::with_capacity(PARK_BUF_FULL);
+        let (mut read, mut zeroed) = (0usize, 0usize);
+        let frame = loop {
+            let hinted = hinted_read_len(rb.len(), state.pending_len(), true, 1 << 30, 64 << 10);
+            let want = hinted.unwrap_or(PARK_BUF_FULL);
+            let target = spare_read_target::<Tls>(&mut rb, want, hinted.is_some());
+            // Not READ_INTO_UNINIT: the whole target is zeroed before the read.
+            let room = target.end() - target.begin();
+            assert!(
+                room >= want.min(ZEROED_READ_ROOM),
+                "room {room} < want {want}"
+            );
+            zeroed += room;
+            rb = target.into_inner();
+            // The read: at most one TLS read's worth, landing in the target.
+            let n = room.min(TLS_READ).min(wire.len() - read);
+            rb.extend_from_slice(&wire[read..read + n]);
+            read += n;
+            if let Some(frame) = parse_resumable(&mut rb, &config, &mut state).unwrap() {
+                break frame;
+            }
+            assert!(read < wire.len(), "frame complete but not parsed");
+        };
+        assert!(matches!(frame, crate::protocol::Frame::Array(_)));
+        assert_eq!(read, wire.len());
+        assert!(
+            zeroed <= 4 * read,
+            "zeroed {zeroed} bytes to read {read} ({}x)",
+            zeroed / read
+        );
+
+        // Small wants keep their full room: the downshifted probe read and
+        // the ordinary base read.
+        let mut rb = bytes::BytesMut::new();
+        let target = spare_read_target::<Tls>(&mut rb, IDLE_PROBE_BUF, false);
+        assert!(target.end() - target.begin() >= IDLE_PROBE_BUF);
+        let mut rb = target.into_inner();
+        rb.reserve(1 << 20);
+        let target = spare_read_target::<Tls>(&mut rb, PARK_BUF_FULL, false);
+        let room = target.end() - target.begin();
+        assert!((PARK_BUF_FULL..=ZEROED_READ_ROOM).contains(&room), "{room}");
+
+        // Plain TCP is unchanged: its reads may fill the whole spare.
+        let mut rb = target.into_inner();
+        let cap = rb.capacity();
+        let target = spare_read_target::<monoio::net::TcpStream>(&mut rb, PARK_BUF_FULL, false);
+        assert_eq!(target.end() - target.begin(), cap);
+    }
+
     #[test]
     fn downshift_releases_only_empty_scratch() {
+        use crate::protocol::Frame;
         let mut tmp = vec![0u8; PARK_BUF_FULL];
         let mut rb = bytes::BytesMut::with_capacity(PARK_BUF_FULL);
         let mut wb = bytes::BytesMut::with_capacity(PARK_BUF_FULL);
         rb.extend_from_slice(b"partial-frame"); // must survive
-        downshift_idle_buffers(&mut tmp, &mut rb, &mut wb);
+        // moon#1179 item 3: emptied batch scratch at its high-water mark is
+        // released; a non-empty one (never the case at the park point) is kept.
+        let mut frames: Vec<Frame> = Vec::with_capacity(1024);
+        let mut responses: Vec<Frame> = vec![Frame::Integer(1)];
+        downshift_idle_buffers(&mut tmp, &mut rb, &mut wb, &mut frames, &mut responses);
+        assert_eq!(
+            frames.capacity(),
+            0,
+            "empty frames scratch must be released"
+        );
+        assert_eq!(responses.len(), 1, "non-empty scratch must be kept");
+        responses.clear();
+        downshift_idle_buffers(&mut tmp, &mut rb, &mut wb, &mut frames, &mut responses);
+        assert_eq!(
+            responses.capacity(),
+            0,
+            "empty responses scratch must be released"
+        );
         assert_eq!(tmp.capacity(), 0, "rent buffer must be dropped");
         assert_eq!(wb.capacity(), 0, "empty write buffer must be released");
         assert_eq!(&rb[..], b"partial-frame", "partial frame must be kept");

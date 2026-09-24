@@ -5,6 +5,7 @@ use crate::framevec;
 use crate::protocol::Frame;
 use crate::storage::Database;
 use crate::storage::db::SortedSetRef;
+use crate::storage::listpack::ListpackRef;
 
 use crate::command::helpers::{err, err_wrong_args, extract_bytes};
 
@@ -12,8 +13,8 @@ use std::collections::HashMap;
 
 use super::{
     AggregateOp, clamp_nan_to_zero, format_score, format_score_bytes, glob_match, lex_in_range,
-    parse_bounded_count, parse_lex_bound, parse_numkeys, parse_score_bound, zrange_by_lex,
-    zrange_by_rank, zrange_by_score, zrange_from_entries,
+    lex_rank_window, parse_bounded_count, parse_lex_bound, parse_numkeys, parse_score_bound,
+    score_rank_window, zrange_by_lex, zrange_by_rank, zrange_by_score, zrange_from_entries,
 };
 
 // ---------------------------------------------------------------------------
@@ -292,37 +293,10 @@ pub fn zrank_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
         None => return err_wrong_args("ZRANK"),
     };
     match db.get_sorted_set_ref_if_alive(key, now_ms) {
-        Ok(Some(zref)) => {
-            // For BPTree/Legacy variants, use the optimized rank
-            match (&zref, zref.score(member)) {
-                (SortedSetRef::BPTree { tree, .. }, Some(score)) => {
-                    match tree.rank(OrderedFloat(score), member) {
-                        Some(rank) => rank_hit(rank, score, withscore),
-                        None => rank_miss(withscore),
-                    }
-                }
-                // Listpack has no O(log n) rank structure; Owned (P0
-                // cold-collection-visibility fix: a value decoded fresh from
-                // the cold tier, see `SortedSetRef::Owned`) carries its own
-                // `BPTree` but `members_map`/`bptree` deliberately return
-                // `None` for it (same as Listpack) — both fall back to the
-                // same O(n) rank-from-sorted-entries computation.
-                (SortedSetRef::Listpack(_), Some(score))
-                | (SortedSetRef::Owned { .. }, Some(score)) => {
-                    let entries = zref.entries_sorted();
-                    let target_score = OrderedFloat(score);
-                    let target_member = Bytes::copy_from_slice(member);
-                    match entries
-                        .iter()
-                        .position(|(m, s)| OrderedFloat(*s) == target_score && *m == target_member)
-                    {
-                        Some(rank) => rank_hit(rank, score, withscore),
-                        None => rank_miss(withscore),
-                    }
-                }
-                _ => rank_miss(withscore),
-            }
-        }
+        Ok(Some(zref)) => match ascending_rank(&zref, member) {
+            Some((rank, score)) => rank_hit(rank, score, withscore),
+            None => rank_miss(withscore),
+        },
         Ok(None) => rank_miss(withscore),
         Err(e) => e,
     }
@@ -344,33 +318,59 @@ pub fn zrevrank_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
         None => return err_wrong_args("ZREVRANK"),
     };
     match db.get_sorted_set_ref_if_alive(key, now_ms) {
-        Ok(Some(zref)) => match (&zref, zref.score(member)) {
-            (SortedSetRef::BPTree { tree, .. }, Some(score)) => {
-                match tree.rev_rank(OrderedFloat(score), member) {
-                    Some(rev_rank) => rank_hit(rev_rank, score, withscore),
-                    None => rank_miss(withscore),
-                }
-            }
-            // See the matching comment in `zrank_readonly`: Owned (P0
-            // cold-collection-visibility fix) falls back to the same
-            // generic path as Listpack.
-            (SortedSetRef::Listpack(_), Some(score))
-            | (SortedSetRef::Owned { .. }, Some(score)) => {
-                let entries = zref.entries_sorted();
-                let target_score = OrderedFloat(score);
-                let target_member = Bytes::copy_from_slice(member);
-                match entries
-                    .iter()
-                    .position(|(m, s)| OrderedFloat(*s) == target_score && *m == target_member)
-                {
-                    Some(rank) => rank_hit(entries.len() - 1 - rank, score, withscore),
-                    None => rank_miss(withscore),
-                }
-            }
-            _ => rank_miss(withscore),
+        Ok(Some(zref)) => match ascending_rank(&zref, member) {
+            Some((rank, score)) => rank_hit(zref.len() - 1 - rank, score, withscore),
+            None => rank_miss(withscore),
         },
         Ok(None) => rank_miss(withscore),
         Err(e) => e,
+    }
+}
+
+/// Compare a borrowed listpack entry with `other` as bytes, without
+/// allocating: an integer entry is rendered into a stack buffer (its
+/// canonical spelling — the only one the encoder integer-encodes).
+fn cmp_lp_ref(entry: ListpackRef<'_>, other: &[u8]) -> std::cmp::Ordering {
+    match entry {
+        ListpackRef::Str(s) => s.cmp(other),
+        ListpackRef::Integer(v) => {
+            let mut buf = itoa::Buffer::new();
+            buf.format(v).as_bytes().cmp(other)
+        }
+    }
+}
+
+/// `(ascending rank, score)` of `member`, or `None` when it is absent.
+///
+/// A B+tree (hot, or the cold-tier `Owned` decode) answers with one
+/// descent. A listpack keeps INSERTION order, so its rank is the number of
+/// pairs that sort strictly before `(score, member)` — ONE borrowed pass,
+/// scores read with the same `as_score` rule ZSCORE uses (moon#1174 §4).
+/// It used to decode every pair into owned `Bytes`, parse every score,
+/// sort the lot and `copy_from_slice` the probe, on every ZRANK.
+fn ascending_rank(zref: &SortedSetRef<'_>, member: &[u8]) -> Option<(usize, f64)> {
+    let score = zref.score(member)?;
+    match zref {
+        SortedSetRef::Listpack(lp) => {
+            let target = OrderedFloat(score);
+            let rank = lp
+                .iter_pair_refs()
+                .filter(|(m, s)| {
+                    let s = OrderedFloat(s.as_score().unwrap_or(0.0));
+                    s.cmp(&target).then_with(|| cmp_lp_ref(*m, member)).is_lt()
+                })
+                .count();
+            Some((rank, score))
+        }
+        _ => match zref.any_tree() {
+            Some(tree) => tree.rank(OrderedFloat(score), member).map(|r| (r, score)),
+            // Legacy: the sorted decode is the only order it has.
+            None => zref
+                .entries_sorted()
+                .iter()
+                .position(|(m, s)| OrderedFloat(*s) == OrderedFloat(score) && m.as_ref() == member)
+                .map(|r| (r, score)),
+        },
     }
 }
 
@@ -802,19 +802,26 @@ pub fn zcount_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
         Err(e) => return e,
     };
     match db.get_sorted_set_ref_if_alive(key, now_ms) {
-        Ok(Some(zref)) => match zref.bptree() {
-            Some(scores) => {
-                let range_min = OrderedFloat(min_bound.value());
-                let range_max = OrderedFloat(max_bound.value());
-                let count = scores
-                    .range(range_min, range_max)
-                    .filter(|(score, _)| {
-                        min_bound.includes(score.0) && max_bound.includes_upper(score.0)
+        Ok(Some(zref)) => match (&zref, zref.any_tree()) {
+            (_, Some(scores)) => {
+                // moon#1170: two O(log N) order-statistic descents instead of
+                // walking every in-range entry (25 ms on a 1M-member zset).
+                let (lo, hi) = score_rank_window(scores, &min_bound, &max_bound);
+                Frame::Integer(hi.saturating_sub(lo) as i64)
+            }
+            (SortedSetRef::Listpack(lp), None) => {
+                // moon#1174 §4: one borrowed pass over the scores — no
+                // decode, no sort, no allocation.
+                let count = lp
+                    .iter_pair_refs()
+                    .filter(|(_, s)| {
+                        let s = s.as_score().unwrap_or(0.0);
+                        min_bound.includes(s) && max_bound.includes_upper(s)
                     })
                     .count();
                 Frame::Integer(count as i64)
             }
-            None => {
+            (_, None) => {
                 let entries = zref.entries_sorted();
                 let count = entries
                     .iter()
@@ -854,15 +861,36 @@ pub fn zlexcount_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
         Err(e) => return e,
     };
     match db.get_sorted_set_ref_if_alive(key, now_ms) {
-        Ok(Some(zref)) => match zref.bptree() {
-            Some(scores) => {
-                let count = scores
-                    .iter()
-                    .filter(|(_, member)| lex_in_range(member, &min_bound, &max_bound))
+        Ok(Some(zref)) => match (&zref, zref.any_tree()) {
+            (SortedSetRef::Listpack(lp), None) => {
+                // moon#1174 §4: the count does not depend on order, so one
+                // borrowed pass over the members answers it — no decode, no
+                // sort, no allocation.
+                let count = lp
+                    .iter_pair_refs()
+                    .filter(|(m, _)| match m {
+                        ListpackRef::Str(b) => lex_in_range(b, &min_bound, &max_bound),
+                        ListpackRef::Integer(v) => {
+                            let mut buf = itoa::Buffer::new();
+                            lex_in_range(buf.format(*v).as_bytes(), &min_bound, &max_bound)
+                        }
+                    })
                     .count();
                 Frame::Integer(count as i64)
             }
-            None => {
+            (_, Some(scores)) => {
+                // moon#1170: O(log N) when every score is equal (the lex
+                // commands' precondition); the scan is kept for mixed scores.
+                let count = match lex_rank_window(scores, &min_bound, &max_bound) {
+                    Some((lo, hi)) => hi.saturating_sub(lo),
+                    None => scores
+                        .iter()
+                        .filter(|(_, member)| lex_in_range(member, &min_bound, &max_bound))
+                        .count(),
+                };
+                Frame::Integer(count as i64)
+            }
+            (_, None) => {
                 let entries = zref.entries_sorted();
                 let count = entries
                     .iter()
@@ -1388,22 +1416,53 @@ pub fn zintercard_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame 
     Frame::Integer(count)
 }
 
-/// ZRANDMEMBER key [count [WITHSCORES]] — read-only twin.
-pub fn zrandmember_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
-    use rand::seq::IndexedRandom;
-    if args.is_empty() || args.len() > 3 {
-        return err_wrong_args("ZRANDMEMBER");
+/// Where ZRANDMEMBER draws from: the B+tree's order statistics (O(log N) per
+/// pick), or a listpack decoded once, unsorted (bounded by
+/// `zset-max-listpack-entries`).
+enum RandPool<'z> {
+    Tree(&'z crate::storage::bptree::BPTree),
+    Flat(Vec<(Bytes, f64)>),
+}
+
+impl RandPool<'_> {
+    fn get(&self, i: usize) -> Option<(&Bytes, f64)> {
+        match self {
+            RandPool::Tree(t) => t.get_by_rank(i).map(|(s, m)| (m, s.0)),
+            RandPool::Flat(v) => v.get(i).map(|(m, s)| (m, *s)),
+        }
     }
-    let key = match extract_bytes(&args[0]) {
-        Some(k) => k,
-        None => return err_wrong_args("ZRANDMEMBER"),
+}
+
+/// ZRANDMEMBER key [count [WITHSCORES]] — read-only twin.
+///
+/// moon#1171: picks by POSITION. A B+tree zset resolves each position with
+/// one `get_by_rank` descent through the subtree counts — O(log N) per
+/// member where the old code collected all N `(member, score)` pairs into a
+/// Vec first (17 ms for one member of a 1M zset, 264x redis). A listpack is
+/// decoded once without the sort `entries_sorted` does. Distribution is
+/// unchanged: a uniform position is a uniform member.
+pub fn zrandmember_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
+    use rand::RngExt;
+    let Some(key) = args.first().and_then(extract_bytes) else {
+        return err_wrong_args("ZRANDMEMBER");
+    };
+    // redis parses `count [WITHSCORES]` before it looks the key up: a bad
+    // count is an error on a missing or wrong-typed key too.
+    let with_count = match args.get(1..) {
+        Some(tail) if !tail.is_empty() => {
+            match crate::command::helpers::parse_rand_count(tail, b"WITHSCORES") {
+                Ok(parsed) => Some(parsed),
+                Err(e) => return e,
+            }
+        }
+        _ => None,
     };
     // Ref accessor: handles every encoding (BPTree, Listpack from RDB load,
     // Legacy) — the BPTree-only accessor would treat a listpack zset as missing.
     let zref = match db.get_sorted_set_ref_if_alive(key, now_ms) {
         Ok(Some(z)) => z,
         Ok(None) => {
-            return if args.len() == 1 {
+            return if with_count.is_none() {
                 Frame::Null
             } else {
                 Frame::Array(framevec![])
@@ -1411,66 +1470,62 @@ pub fn zrandmember_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame
         }
         Err(e) => return e,
     };
-    // Borrow the map when one exists; materialize only for small listpacks.
-    let entries_owned: Vec<(Bytes, f64)>;
-    let entries: Vec<(&Bytes, f64)> = match zref.members_map() {
-        Some(m) => m.iter().map(|(m, s)| (m, *s)).collect(),
-        None => {
-            entries_owned = zref.entries_sorted();
-            entries_owned.iter().map(|(m, s)| (m, *s)).collect()
-        }
-    };
-    if entries.is_empty() {
-        return if args.len() == 1 {
+    let len = zref.len();
+    if len == 0 {
+        return if with_count.is_none() {
             Frame::Null
         } else {
             Frame::Array(framevec![])
         };
     }
+    let pool = match zref.any_tree() {
+        Some(t) => RandPool::Tree(t),
+        None => RandPool::Flat(zref.entries_unordered()),
+    };
     let mut rng = rand::rng();
-    if args.len() == 1 {
-        return if let Some(chosen) = entries.choose(&mut rng) {
-            Frame::BulkString(chosen.0.clone())
-        } else {
-            Frame::Null
+    let Some((count, withscores)) = with_count else {
+        return match pool.get(rng.random_range(0..len)) {
+            Some((member, _)) => Frame::BulkString(member.clone()),
+            None => Frame::Null,
         };
-    }
-    let count_bytes = match extract_bytes(&args[1]) {
-        Some(b) => b,
-        None => return err_wrong_args("ZRANDMEMBER"),
-    };
-    let count: i64 = match std::str::from_utf8(count_bytes)
-        .ok()
-        .and_then(|s| s.parse().ok())
-    {
-        Some(c) => c,
-        None => return err("ERR value is not an integer or out of range"),
-    };
-    let withscores = if args.len() == 3 {
-        let opt = match extract_bytes(&args[2]) {
-            Some(b) => b,
-            None => return err("ERR syntax error"),
-        };
-        if opt.eq_ignore_ascii_case(b"WITHSCORES") {
-            true
-        } else {
-            return err("ERR syntax error");
-        }
-    } else {
-        false
     };
     if count == 0 {
         return Frame::Array(framevec![]);
     }
+    let push = |result: &mut Vec<Frame>, member: &Bytes, score: f64| {
+        result.push(Frame::BulkString(member.clone()));
+        if withscores {
+            result.push(Frame::BulkString(format_score_bytes(score)));
+        }
+    };
     if count > 0 {
-        let n = std::cmp::min(count as usize, entries.len());
-        let chosen: Vec<&(&Bytes, f64)> = entries.sample(&mut rng, n).collect();
-        let cap = if withscores { n * 2 } else { n };
-        let mut result = Vec::with_capacity(cap);
-        for (member, score) in chosen {
-            result.push(Frame::BulkString((*member).clone()));
-            if withscores {
-                result.push(Frame::BulkString(format_score_bytes(*score)));
+        let n = std::cmp::min(count as usize, len);
+        let mut result = Vec::with_capacity(if withscores { n * 2 } else { n });
+        if n == len {
+            // The whole zset with no sampling at all — Redis's CASE 2
+            // ("count >= size: return the whole zset"), which walks it with
+            // `zuiNext`, whose iterator starts at the skiplist TAIL / the
+            // listpack's last pair: DESCENDING (score, member) order.
+            // Verified on redis-server 7.0.15 (`ZRANDMEMBER z 100` on a
+            // 60-member zset answers its highest score first).
+            match &pool {
+                RandPool::Tree(t) => {
+                    for (score, member) in t.iter_rev() {
+                        push(&mut result, member, score.0);
+                    }
+                }
+                RandPool::Flat(_) => {
+                    for (member, score) in zref.entries_sorted().into_iter().rev() {
+                        push(&mut result, &member, score);
+                    }
+                }
+            }
+            return Frame::Array(result.into());
+        }
+        // n distinct positions in O(n), in random order.
+        for i in rand::seq::index::sample(&mut rng, len, n) {
+            if let Some((member, score)) = pool.get(i) {
+                push(&mut result, member, score);
             }
         }
         Frame::Array(result.into())
@@ -1482,14 +1537,10 @@ pub fn zrandmember_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame
         if n > crate::command::RAND_DUP_COUNT_MAX {
             return Frame::Error(Bytes::from_static(crate::command::ERR_RAND_COUNT_RANGE));
         }
-        let cap = if withscores { n * 2 } else { n };
-        let mut result = Vec::with_capacity(cap);
+        let mut result = Vec::with_capacity(if withscores { n * 2 } else { n });
         for _ in 0..n {
-            if let Some(chosen) = entries.choose(&mut rng) {
-                result.push(Frame::BulkString(chosen.0.clone()));
-                if withscores {
-                    result.push(Frame::BulkString(format_score_bytes(chosen.1)));
-                }
+            if let Some((member, score)) = pool.get(rng.random_range(0..len)) {
+                push(&mut result, member, score);
             }
         }
         Frame::Array(result.into())

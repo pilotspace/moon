@@ -86,6 +86,13 @@ pub fn parse_inline(
     // {space, \n, \r, \t}, so `RPUSH k a\rb` is two elements there and was one
     // in Moon (measured). `\n` cannot appear — it is the terminator — so the
     // three bytes below are the whole set this path can ever see.
+    //
+    // Each argument is COPIED out of the read buffer (moon#1227 review). A
+    // zero-copy slice would keep the connection's whole read-buffer
+    // allocation alive for as long as any value stored from it lives — the
+    // pinning moon#1160 tracks for RESP frames — and on this path that bought
+    // one small allocation per argument of telnet / redis-cli / script
+    // traffic. RESP arguments stay zero-copy.
     let mut args = FrameVec::new();
     let mut start = 0;
     while start < line.len() {
@@ -370,6 +377,40 @@ mod tests {
     fn parse_inline_bytes(input: &[u8]) -> Result<Option<Frame>, ParseError> {
         let mut buf = BytesMut::from(input);
         parse_inline(&mut buf, TEST_MAX_INLINE)
+    }
+
+    /// moon#1227 review: unquoted inline arguments are COPIES — none of them
+    /// points into the read buffer's allocation, so a value stored from one
+    /// cannot keep the connection's read buffer alive (moon#1160). The
+    /// remainder of the buffer is untouched and a blank line is consumed
+    /// without producing a frame.
+    #[test]
+    fn inline_args_do_not_alias_the_read_buffer() {
+        let mut buf = BytesMut::from(&b"SET  foo\tbar\r\nPING\r\n"[..]);
+        let alloc = buf.as_ptr() as usize..buf.as_ptr() as usize + buf.capacity();
+        let frame = parse_inline(&mut buf, TEST_MAX_INLINE).unwrap().unwrap();
+        let Frame::Array(args) = frame else {
+            panic!("expected Array")
+        };
+        let want: [&[u8]; 3] = [b"SET", b"foo", b"bar"];
+        assert_eq!(args.len(), want.len());
+        for (arg, want) in args.iter().zip(want) {
+            let Frame::BulkString(b) = arg else {
+                panic!("expected BulkString, got {arg:?}")
+            };
+            assert_eq!(&b[..], want);
+            let p = b.as_ptr() as usize;
+            assert!(
+                !alloc.contains(&p),
+                "{:?} aliases the read buffer",
+                String::from_utf8_lossy(want)
+            );
+        }
+        assert_eq!(&buf[..], b"PING\r\n");
+
+        let mut blank = BytesMut::from(&b" \t \r\nPING\r\n"[..]);
+        assert!(parse_inline(&mut blank, TEST_MAX_INLINE).unwrap().is_none());
+        assert_eq!(&blank[..], b"PING\r\n");
     }
 
     #[test]

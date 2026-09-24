@@ -15,4 +15,6 @@ pub mod search;
 pub mod search_sq;
 
 #[cfg(test)]
+mod prefetch_ab_tests;
+#[cfg(test)]
 mod search_equivalence_tests;

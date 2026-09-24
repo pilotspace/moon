@@ -159,6 +159,52 @@ pub fn err(msg: &str) -> Frame {
     Frame::Error(Bytes::from(msg.to_string()))
 }
 
+/// The `count [WITHSCORES|WITHVALUES]` tail of `ZRANDMEMBER` / `HRANDFIELD`
+/// (`tail` = the arguments after the key, at least one), parsed as redis
+/// 7.0.15's `zrandmemberCommand` / `hrandfieldCommand` do — BEFORE the key is
+/// looked up, so a bad count is an error on a missing or wrong-typed key too:
+///
+/// 1. `getRangeLongFromObjectOrReply(-LONG_MAX, LONG_MAX)`: a `string2ll`
+///    integer (no `+`, no leading zero, no `-0`: [`canonical_i64`]), and not
+///    `LONG_MIN`, which has its own message;
+/// 2. anything after the count but exactly one `flag` is a syntax error;
+/// 3. with the flag, `|count|` must fit `LONG_MAX / 2` (the reply is twice
+///    as long).
+///
+/// Returns `(count, flag given)`.
+///
+/// [`canonical_i64`]: crate::storage::numeric::canonical_i64
+pub fn parse_rand_count(tail: &[Frame], flag: &[u8]) -> Result<(i64, bool), Frame> {
+    let count = match tail
+        .first()
+        .and_then(extract_bytes)
+        .and_then(|b| crate::storage::numeric::canonical_i64(b))
+    {
+        Some(i64::MIN) => {
+            return Err(Frame::Error(Bytes::from_static(
+                b"ERR value is out of range, value must between -9223372036854775807 and 9223372036854775807",
+            )));
+        }
+        Some(c) => c,
+        None => {
+            return Err(Frame::Error(Bytes::from_static(
+                b"ERR value is not an integer or out of range",
+            )));
+        }
+    };
+    let with_flag = match tail.get(1..).unwrap_or_default() {
+        [] => false,
+        [f] if extract_bytes(f).is_some_and(|f| f.eq_ignore_ascii_case(flag)) => true,
+        _ => return Err(Frame::Error(Bytes::from_static(b"ERR syntax error"))),
+    };
+    if with_flag && !(-(i64::MAX / 2)..=i64::MAX / 2).contains(&count) {
+        return Err(Frame::Error(Bytes::from_static(
+            b"ERR value is out of range",
+        )));
+    }
+    Ok((count, with_flag))
+}
+
 /// Whether an absolute expiry (unix millis) is representable without a
 /// client-visible wrap.
 ///

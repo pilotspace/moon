@@ -87,6 +87,65 @@ macro_rules! write_all_bounded {
     }};
 }
 
+/// [`write_all_bounded!`] for the connection's own `write_buf`, written BY
+/// OWNERSHIP and handed back cleared (moon#1179 item 6).
+///
+/// The batch flushes used to write `write_buf.split().freeze()`: a refcount
+/// fetch_add + fetch_sub per batch and a `Shared` promotion of the buffer,
+/// for a `Bytes` that is dropped as soon as the write returns. `BytesMut` is
+/// itself a monoio `IoBuf`, so the buffer goes to `write_all` and comes back
+/// with its capacity intact. Same limit, watchdog and `CLIENT LIST`
+/// accounting as `write_all_bounded!` (see there for the rationale); a write
+/// the watchdog abandons drops the buffer with it, and the connection closes.
+macro_rules! flush_write_buf_bounded {
+    ($stream:expr, $buf:ident, $wt:expr, $cap:expr, $live:expr, $client_id:expr) => {{
+        let pending = $buf.len();
+        if $cap != 0 && pending > $cap {
+            tracing::warn!(
+                "Connection {} reply of {} bytes exceeds the output buffer limit of {} — closing",
+                $client_id,
+                pending,
+                $cap,
+            );
+            false
+        } else {
+            $live.begin_write(pending);
+            let data = std::mem::take(&mut $buf);
+            let ok = match super::util::arm_write_timeout(pending, $wt) {
+                None => {
+                    let (r, back): (std::io::Result<usize>, BytesMut) =
+                        $stream.write_all(data).await;
+                    $buf = back;
+                    $buf.clear();
+                    r.is_ok()
+                }
+                Some(dur) => {
+                    let mut ok = false;
+                    monoio::select! {
+                        res = $stream.write_all(data) => {
+                            let (r, back): (std::io::Result<usize>, BytesMut) = res;
+                            $buf = back;
+                            $buf.clear();
+                            ok = r.is_ok();
+                        }
+                        _ = monoio::time::sleep(dur) => {
+                            tracing::warn!(
+                                "Connection {} reply write made no progress for {}ms — closing ({} bytes held, client is not reading)",
+                                $client_id,
+                                dur.as_millis(),
+                                pending,
+                            );
+                        }
+                    }
+                    ok
+                }
+            };
+            $live.end_write(pending, ok);
+            ok
+        }
+    }};
+}
+
 use crate::runtime::cancel::CancellationToken;
 use bytes::{Bytes, BytesMut};
 use ringbuf::traits::Producer;
@@ -441,12 +500,21 @@ pub(crate) async fn handle_connection_sharded_monoio<
     let func_registry: Rc<RefCell<Option<crate::scripting::FunctionRegistry>>> =
         crate::scripting::shard_function_registry();
 
-    // Pre-allocate read buffer outside the loop to avoid per-read heap allocation.
-    // Monoio's ownership I/O takes ownership and returns the buffer, so we reassign.
-    // D3: same lazy sizing as read_buf/write_buf — the first read of a
-    // rehydrated conn is usually a probe-sized frame (keepalive PING); the
-    // shrink logic at the loop tail governs the steady state either way.
-    let mut tmp_buf = vec![0u8; init_cap];
+    // moon#1179 item 4: ordinary reads land directly in `read_buf`'s spare
+    // capacity (`idle_park::spare_read_target`) — no rent buffer, no copy of
+    // every input byte, no 8 KiB cap per read. `tmp_buf` survives only as the
+    // rent buffer of the `select!` read arms (RESP2/RESP3 subscriber, MONITOR,
+    // tracking), whose losing read future DROPS its buffer, so it must never
+    // be `read_buf`. Allocated on first use by one of those arms.
+    let mut tmp_buf: Vec<u8> = Vec::new();
+    // D3: the size of an ordinary read — the reserve made in `read_buf`
+    // before it. A rehydrated conn starts at its 512 B probe size (its first
+    // read is usually a keepalive PING) and moves to the full size the moment
+    // a read fills it; a fresh conn starts at full size.
+    let mut read_base = init_cap;
+    // Batch-end shrink governors with hysteresis (moon#1179 item 4).
+    let mut read_shrink = super::util::IoBufShrink::default();
+    let mut write_shrink = super::util::IoBufShrink::default();
 
     // c10k W11: two-stage idle park (see idle_park.rs). Cancel-capable
     // streams register for the shard chore's ≥1s sweep; `downshifted` tracks
@@ -482,9 +550,12 @@ pub(crate) async fn handle_connection_sharded_monoio<
         )
     };
 
-    // Pre-allocate batch containers outside the loop to avoid per-batch heap allocation.
-    // These are cleared and reused each iteration instead of being recreated.
-    let mut responses: Vec<Frame> = Vec::with_capacity(64);
+    // Batch containers live outside the loop and are cleared and reused each
+    // iteration, so a batch allocates nothing once they have grown. They
+    // start EMPTY (moon#1179 item 3): a connection that sends one command at
+    // a time holds a few frames, not 64 x 40 B each, and the idle downshift
+    // releases them again (`idle_park::downshift_idle_buffers`).
+    let mut responses: Vec<Frame> = Vec::new();
     // The trailing `Resp3Shape` is the reply shape, classified at ENQUEUE time
     // where the command's args are still in scope. The batch reply carries only
     // the command NAME, so without this tag a cross-shard reply could not be
@@ -515,13 +586,14 @@ pub(crate) async fn handle_connection_sharded_monoio<
             Option<crate::tracking::invalidation::TrackedWriteKeys>,
             crate::protocol::resp3::Resp3Shape,
         )>,
-    > = HashMap::with_capacity(ctx.num_shards);
+    > = HashMap::new(); // moon#1179: allocated on first cross-shard use
     // moon#513 (A2a): batch-scoped fan-out buffers, allocated once per
     // connection and cleared beside `remote_groups` — the batch loop is a hot
     // path and must not allocate a plan per command.
     let mut fanout_state = crate::server::conn::fanout::FanoutState::default();
-    let mut fanout_scratch: Vec<(usize, Frame, usize)> = Vec::with_capacity(ctx.num_shards);
-    let mut reply_futures: Vec<(Vec<RemoteMeta>, usize)> = Vec::with_capacity(ctx.num_shards);
+    // moon#1179 item 3: both grow on first cross-shard use, not at connect.
+    let mut fanout_scratch: Vec<(usize, Frame, usize)> = Vec::new();
+    let mut reply_futures: Vec<(Vec<RemoteMeta>, usize)> = Vec::new();
     // v3-5 group commit: response indexes of coordinator LOCAL-leg writes whose
     // AOF append was enqueued but not yet fsync-confirmed (appendfsync=always).
     // Drained by ONE fsync_barrier(ctx.shard_id) at end of batch.
@@ -535,8 +607,16 @@ pub(crate) async fn handle_connection_sharded_monoio<
     // note in Phase 2b for the lifetime contract.
     let response_pool = ResponseSlotPool::new(ctx.num_shards, ctx.shard_id);
 
-    // Pre-allocate frames Vec outside the loop; reused via .clear() each iteration.
-    let mut frames: Vec<Frame> = Vec::with_capacity(64);
+    // Parsed frames of the current batch; reused via .clear() each iteration,
+    // grown on demand (moon#1179 item 3, see `responses` above).
+    let mut frames: Vec<Frame> = Vec::new();
+    // moon#1179 item 5: `frames` holds a deferred batch tail (#438 / #507)
+    // carried into the next iteration, to run BEFORE anything else is parsed
+    // — instead of being re-encoded into `read_buf` and re-parsed. While set,
+    // the next iteration skips the socket read (`carried_input`) and the
+    // inline fast path (which would answer bytes queued BEHIND these frames
+    // first), and any hand-off that consumes bytes spills them back first.
+    let mut frames_carried = false;
     // Set when the parser rejects a frame. The connection still dies, but not
     // silently and not before the valid frames that preceded the fault in the
     // same read have been executed and answered.
@@ -572,6 +652,15 @@ pub(crate) async fn handle_connection_sharded_monoio<
         // is a reason RESP3 exists and which Redis allows. Entering this loop
         // for a RESP3 connection is what put it in the RESP2 jail.
         if conn.subscription_count > 0 && conn.protocol_version < 3 {
+            // moon#1179 item 5: this loop parses BYTES. A carried tail is
+            // spilled at the deferral when the connection is headed here, so
+            // this is a belt: nothing parsed may be skipped.
+            if std::mem::take(&mut frames_carried) {
+                super::util::spill_frames_to_front(&frames, &mut read_buf);
+                frames.clear();
+                codec.reset_parse_state();
+                carried_input = true;
+            }
             #[allow(clippy::unwrap_used)]
             // conn.pubsub_rx is always Some when conn.subscription_count > 0
             let rx = conn.pubsub_rx.as_ref().unwrap();
@@ -1008,18 +1097,47 @@ pub(crate) async fn handle_connection_sharded_monoio<
             continue;
         }
 
-        // Read data from stream using monoio ownership I/O.
-        // Reuse pre-allocated buffer; restore length for the read. While
-        // downshifted (c10k W11) the park size is the probe buffer; the
-        // resize below re-inflates lazily on the first post-idle iteration.
+        // Read data from stream using monoio ownership I/O. While downshifted
+        // (c10k W11) a read is probe-sized; real data re-inflates it.
+        //
+        // `park_len` sizes the rent buffer of the `select!` arms below;
+        // `read_want` the reserve an ordinary read makes in `read_buf` —
+        // larger when the incomplete front frame is known to need more
+        // (moon#1164: a known bulk remainder in one read, or geometric growth
+        // for a long tail; never for an unauthenticated client). The first
+        // `hinted_read_len` call takes no lock; only a real hint reads the
+        // query-buffer limits.
         let park_len = if downshifted {
             idle_park::IDLE_PROBE_BUF
         } else {
             idle_park::PARK_BUF_FULL
         };
-        if tmp_buf.len() != park_len {
-            tmp_buf.resize(park_len, 0);
-        }
+        let mut read_grow = false;
+        let read_want = if downshifted {
+            idle_park::IDLE_PROBE_BUF
+        } else {
+            let pending = codec.parse_state().pending_len();
+            let hinted =
+                super::util::hinted_read_len(read_buf.len(), pending, conn.authenticated, 0, 0)
+                    .and_then(|_| {
+                        let (limit, preauth) = {
+                            let rt = ctx.runtime_config.read();
+                            (
+                                rt.client_query_buffer_limit,
+                                rt.client_query_buffer_limit_preauth,
+                            )
+                        };
+                        super::util::hinted_read_len(
+                            read_buf.len(),
+                            pending,
+                            conn.authenticated,
+                            limit,
+                            preauth,
+                        )
+                    });
+            read_grow = hinted.is_some();
+            hinted.unwrap_or(read_base)
+        };
         // c10k A1: a blocking command's peer watch may have pulled bytes the
         // client pipelined behind it out of the kernel and into `read_buf`.
         // Pre-A1 those bytes stayed in the socket, so the read below returned
@@ -1053,6 +1171,9 @@ pub(crate) async fn handle_connection_sharded_monoio<
             // this loop only reaches here when no reply is mid-flight.
             #[allow(clippy::unwrap_used)] // guarded by subscription_count > 0
             let rx = conn.pubsub_rx.as_ref().unwrap();
+            if tmp_buf.len() != park_len {
+                tmp_buf.resize(park_len, 0);
+            }
             let sub_buf = std::mem::take(&mut tmp_buf);
             let mut delivery: Option<bytes::Bytes> = None;
             monoio::select! {
@@ -1120,6 +1241,9 @@ pub(crate) async fn handle_connection_sharded_monoio<
             // MONITOR gets `>2 invalidate` for a key it read). Its queue must
             // be drained here too, or it fills to the output-buffer limit and
             // the monitor is disconnected for pushes it never saw.
+            if tmp_buf.len() != park_len {
+                tmp_buf.resize(park_len, 0);
+            }
             let mon_buf = std::mem::take(&mut tmp_buf);
             let mut line: Option<bytes::Bytes> = None;
             let mut push_frame: Option<Frame> = None;
@@ -1188,6 +1312,9 @@ pub(crate) async fn handle_connection_sharded_monoio<
             // in read(). Only tracking connections take this select — the
             // hot path below is untouched for everyone else. Losing-future
             // buffer semantics mirror the other parked reads in this loop.
+            if tmp_buf.len() != park_len {
+                tmp_buf.resize(park_len, 0);
+            }
             let track_buf = std::mem::take(&mut tmp_buf);
             let mut push_frame: Option<Frame> = None;
             monoio::select! {
@@ -1291,13 +1418,13 @@ pub(crate) async fn handle_connection_sharded_monoio<
             if let (true, Some(reg)) = (parkable, idle_reg.as_ref()) {
                 let handle = reg.slot.handle();
                 reg.slot.mark_parked_stage2(ctx.cached_clock.ms());
-                let (result, returned_buf) = stream.idle_park_read(tmp_buf, handle).await;
+                let target = idle_park::spare_read_target::<S>(&mut read_buf, read_want, read_grow);
+                let (result, returned_buf) = stream.idle_park_read(target, handle).await;
                 reg.slot.mark_unparked();
-                tmp_buf = returned_buf;
+                read_buf = returned_buf.into_inner();
                 match result {
                     Ok(0) => break,
-                    Ok(n) => {
-                        read_buf.extend_from_slice(&tmp_buf[..n]);
+                    Ok(_) => {
                         downshifted = false;
                     }
                     // Real socket/TLS error (EOF without close_notify,
@@ -1341,12 +1468,12 @@ pub(crate) async fn handle_connection_sharded_monoio<
                     }
                 }
             } else {
-                let (result, returned_buf) = stream.read(tmp_buf).await;
-                tmp_buf = returned_buf;
+                let target = idle_park::spare_read_target::<S>(&mut read_buf, read_want, read_grow);
+                let (result, returned_buf) = stream.read(target).await;
+                read_buf = returned_buf.into_inner();
                 match result {
                     Ok(0) => break,
-                    Ok(n) => {
-                        read_buf.extend_from_slice(&tmp_buf[..n]);
+                    Ok(_) => {
                         downshifted = false;
                     }
                     Err(_) => break,
@@ -1358,14 +1485,13 @@ pub(crate) async fn handle_connection_sharded_monoio<
             // completion that raced the cancel still delivers its bytes.
             let handle = reg.slot.handle();
             reg.slot.mark_parked(ctx.cached_clock.ms());
-            let (result, returned_buf) = stream.idle_park_read(tmp_buf, handle).await;
+            let target = idle_park::spare_read_target::<S>(&mut read_buf, read_want, read_grow);
+            let (result, returned_buf) = stream.idle_park_read(target, handle).await;
             reg.slot.mark_unparked();
-            tmp_buf = returned_buf;
+            read_buf = returned_buf.into_inner();
             match result {
                 Ok(0) => break,
-                Ok(n) => {
-                    read_buf.extend_from_slice(&tmp_buf[..n]);
-                }
+                Ok(_) => {}
                 // Real socket/TLS error: terminate now. (Pre-P1 this arm
                 // could lump errors in with the cancel because stage 2
                 // always performed a read that re-surfaced them; the
@@ -1380,32 +1506,40 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 Err(_) => {
                     // Cancelled by the idle sweep: shed the working set,
                     // re-park small.
-                    idle_park::downshift_idle_buffers(&mut tmp_buf, &mut read_buf, &mut write_buf);
+                    idle_park::downshift_idle_buffers(
+                        &mut tmp_buf,
+                        &mut read_buf,
+                        &mut write_buf,
+                        &mut frames,
+                        &mut responses,
+                    );
                     stream.on_idle_downshift();
                     downshifted = true;
                     continue;
                 }
             }
         } else {
-            let (result, returned_buf) = stream.read(tmp_buf).await;
-            tmp_buf = returned_buf;
+            let target = idle_park::spare_read_target::<S>(&mut read_buf, read_want, read_grow);
+            let (result, returned_buf) = stream.read(target).await;
+            read_buf = returned_buf.into_inner();
             match result {
                 Ok(0) => break,
-                Ok(n) => {
-                    read_buf.extend_from_slice(&tmp_buf[..n]);
-                }
+                Ok(_) => {}
                 Err(_) => break,
             }
         }
 
-        // D3: a rehydrated conn starts with a small (512 B) owned read buffer;
-        // the moment a read saturates it (real traffic, not a keepalive-sized
+        // D3: a rehydrated conn starts with a small (512 B) read size; the
+        // moment a read saturates it (real traffic, not a keepalive-sized
         // probe), restore the full 8 KiB so bulk transfers aren't capped at
         // 512 B per syscall. Sited with the C2 check below: after every read
         // arm, once per iteration.
-        if tmp_buf.len() < 8192 && read_buf.len() >= tmp_buf.len() {
-            tmp_buf = vec![0u8; 8192];
+        if read_base < idle_park::PARK_BUF_FULL && read_buf.len() >= read_base {
+            read_base = idle_park::PARK_BUF_FULL;
         }
+        // Most bytes buffered this iteration — what the batch-end shrink
+        // governor judges the read buffer's use by.
+        let read_high_water = read_buf.len();
 
         // c10k C2: query-buffer ceiling. One check per read iteration, sited
         // after every read arm and ahead of both parse paths — an incomplete
@@ -1436,7 +1570,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
 
         // Inline dispatch: GET/SET directly from raw bytes, skipping Frame construction.
         // Skip when unauthenticated or workspace-bound (prefix injection in normal path only).
-        if conn.authenticated && conn.workspace_id.is_none() {
+        if !frames_carried && conn.authenticated && conn.workspace_id.is_none() {
             // Inline writes safe only when: ACL unrestricted, !in_multi, !tracking,
             // !is_replica, no spill_sender. Replica check reads the lock-free
             // `is_replica_mirror` (kept in sync by `ReplicationState::set_role`)
@@ -1681,6 +1815,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                     .as_ref()
                     .map_or(b"" as &[u8], |n| n.as_ref()),
             );
+            let len_before_inline = read_buf.len();
             let inlined = try_inline_dispatch_loop(
                 &mut read_buf,
                 &mut write_buf,
@@ -1708,21 +1843,28 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 &mut probe,
             );
             drop(probe);
+            // moon#1164: the inline path consumes from the front of `read_buf`
+            // behind the codec's back, so the codec's resume cursor no longer
+            // describes those bytes. (It can never describe a frame the inline
+            // path consumes — cursors are only kept for `*4`+ frames — but the
+            // reset is what the `ParseState` contract asks of every consumer.)
+            if read_buf.len() != len_before_inline {
+                codec.reset_parse_state();
+            }
             crate::admin::metrics_setup::record_dispatch_local_inline(inlined as u64);
             if inlined > 0 && read_buf.is_empty() {
                 // All commands were inlined -- flush write_buf and continue
-                if !write_buf.is_empty() {
-                    let data = write_buf.split().freeze();
-                    if !write_all_bounded!(
+                if !write_buf.is_empty()
+                    && !flush_write_buf_bounded!(
                         stream,
-                        data,
+                        write_buf,
                         write_timeout,
                         out_cap_normal,
                         client_live,
                         client_id
-                    ) {
-                        break;
-                    }
+                    )
+                {
+                    break;
                 }
                 continue;
             }
@@ -1730,16 +1872,16 @@ pub(crate) async fn handle_connection_sharded_monoio<
             // for remaining commands. Inlined responses are already in write_buf.
         }
 
-        // Parse all complete frames from the read buffer (reuse pre-allocated Vec, cap at 1024)
-        frames.clear();
-        loop {
+        // Parse the complete frames in the read buffer, at most
+        // `MAX_BATCH_FRAMES` per batch (reused Vec). A carried tail (moon#1179
+        // item 5) stays at the front: new frames are appended BEHIND it, which
+        // is exactly the order the bytes had.
+        if !std::mem::take(&mut frames_carried) {
+            frames.clear();
+        }
+        while frames.len() < super::util::MAX_BATCH_FRAMES {
             match codec.decode_frame(&mut read_buf) {
-                Ok(Some(frame)) => {
-                    frames.push(frame);
-                    if frames.len() >= 1024 {
-                        break;
-                    }
-                }
+                Ok(Some(frame)) => frames.push(frame),
                 Ok(None) => break,
                 Err(_) => {
                     // A protocol fault kills the connection, but not before
@@ -1751,6 +1893,14 @@ pub(crate) async fn handle_connection_sharded_monoio<
                     break;
                 }
             }
+        }
+        // moon#1227 review: stopped at the cap with input left over. The client
+        // has already sent it and is waiting for its replies, so the next
+        // iteration must parse it BEFORE reading — a read would wait for bytes
+        // that are never coming. (If only a partial frame is left, that parse
+        // finds nothing and the iteration after it reads, as for any A1 carry.)
+        if frames.len() >= super::util::MAX_BATCH_FRAMES && !read_buf.is_empty() {
+            carried_input = true;
         }
 
         if frames.is_empty() {
@@ -4256,13 +4406,21 @@ pub(crate) async fn handle_connection_sharded_monoio<
         // (arrays of bulk strings) round-trip losslessly through
         // serialize_resp3. If a migration executes at this batch's end, the
         // carried bytes ride along in `read_buf_remainder`.
+        //
+        // moon#1179 item 5: the tail is carried as the parsed frames instead
+        // (`frames_carried`) — re-encoding and re-parsing it on every deferral
+        // cost ~n²/2d frame round trips per n-frame batch deferring every d.
+        // Bytes remain only when the next iteration is the RESP2 subscriber
+        // loop, which parses bytes; migration spills at its own hand-off.
         if let Some(from) = deferred_tail_from {
-            let mut carry = BytesMut::with_capacity(64 + read_buf.len());
-            for f in &frames[from..num_frames] {
-                crate::protocol::serialize_resp3(f, &mut carry);
+            if conn.subscription_count > 0 && conn.protocol_version < 3 {
+                super::util::spill_frames_to_front(&frames[from..num_frames], &mut read_buf);
+                // moon#1164: bytes were prepended — the resume cursor is void.
+                codec.reset_parse_state();
+            } else {
+                frames.drain(..from);
+                frames_carried = true;
             }
-            carry.extend_from_slice(&read_buf);
-            read_buf = carry;
             carried_input = true;
         }
 
@@ -4639,18 +4797,18 @@ pub(crate) async fn handle_connection_sharded_monoio<
         crate::server::conn::shared::encode_response_batch(&mut conn, &responses, &mut write_buf);
 
         // Write all responses in one batch using ownership I/O
-        if !write_buf.is_empty() {
-            let data = write_buf.split().freeze();
-            if !write_all_bounded!(
+        let write_high_water = write_buf.len();
+        if !write_buf.is_empty()
+            && !flush_write_buf_bounded!(
                 stream,
-                data,
+                write_buf,
                 write_timeout,
                 out_cap_normal,
                 client_live,
                 client_id
-            ) {
-                break;
-            }
+            )
+        {
+            break;
         }
 
         // E4: a timed-out cross-shard reply slot must never be reused — the
@@ -4683,6 +4841,11 @@ pub(crate) async fn handle_connection_sharded_monoio<
         if let Some(target_shard) = conn.migration_target
             && conn.migration_eligible()
         {
+            // moon#1179 item 5: a carried tail rides along as bytes, ahead of
+            // the unparsed remainder, exactly as the pre-carry code sent it.
+            if frames_carried {
+                super::util::spill_frames_to_front(&frames, &mut read_buf);
+            }
             let migrated_state = MigratedConnectionState {
                 selected_db: conn.selected_db,
                 authenticated: conn.authenticated,
@@ -4724,18 +4887,25 @@ pub(crate) async fn handle_connection_sharded_monoio<
         // Shrink buffers if they grew too large (c10k W1: floor lowered
         // 64 KiB → 16 KiB — the old floor let 16–64 KiB high-waters ratchet
         // until disconnect; see tmp/C10K-REVIEW.md).
-        if read_buf.capacity() > super::util::IO_BUF_SHRINK_TRIGGER {
+        //
+        // moon#1179 item 4: with hysteresis — only after a streak of batches
+        // that left the big buffer mostly unused, so a client sending large
+        // values every batch no longer regrows (and re-copies) its buffer
+        // 8 -> 16 -> ... -> 128 KiB on every request. Past
+        // `IO_BUF_SHRINK_CEILING` a buffer is given back at once (moon#1227
+        // review; the idle downshift covers the rest of an idle connection).
+        if read_shrink.should_shrink(read_buf.capacity(), read_high_water.max(read_buf.len())) {
             let remaining = read_buf.split();
             read_buf = BytesMut::with_capacity(8192);
             if !remaining.is_empty() {
                 read_buf.extend_from_slice(&remaining);
             }
         }
-        if write_buf.capacity() > super::util::IO_BUF_SHRINK_TRIGGER {
+        if write_shrink.should_shrink(write_buf.capacity(), write_high_water) {
             write_buf = BytesMut::with_capacity(8192);
         }
         if tmp_buf.capacity() > super::util::IO_BUF_SHRINK_TRIGGER {
-            tmp_buf = vec![0u8; 8192];
+            tmp_buf = Vec::new(); // select-arm rent buffer: re-sized on use
         }
         // c10k W1: drop the batch scratch capacity BEFORE parking in read().
         // Both vecs are dead scratch here (responses fully serialized to
@@ -4753,8 +4923,10 @@ pub(crate) async fn handle_connection_sharded_monoio<
 
         responses.clear();
         super::util::shrink_batch_vec(&mut responses);
-        frames.clear();
-        super::util::shrink_batch_vec(&mut frames);
+        if !frames_carried {
+            frames.clear();
+            super::util::shrink_batch_vec(&mut frames);
+        }
     }
 
     // --- Graceful TCP shutdown: send FIN to client to avoid CLOSE_WAIT ---

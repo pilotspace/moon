@@ -260,7 +260,7 @@ pub fn serialize_resp3(frame: &Frame, buf: &mut BytesMut) {
             let mut itoa_buf = itoa::Buffer::new();
             buf.put_slice(itoa_buf.format(total_len).as_bytes());
             buf.put_slice(b"\r\n");
-            buf.put_slice(encoding);
+            buf.put_slice(encoding.as_slice());
             buf.put_u8(b':');
             buf.put_slice(data);
             buf.put_slice(b"\r\n");
@@ -551,7 +551,7 @@ mod tests {
     #[test]
     fn test_serialize_resp3_verbatim_string() {
         let buf = serialize_resp3_frame(&Frame::VerbatimString {
-            encoding: Bytes::from_static(b"txt"),
+            encoding: *b"txt",
             data: Bytes::from_static(b"hello"),
         });
         assert_eq!(&buf[..], b"=9\r\ntxt:hello\r\n");
@@ -625,7 +625,7 @@ mod tests {
     #[test]
     fn test_round_trip_resp3_verbatim_string() {
         round_trip_resp3(&Frame::VerbatimString {
-            encoding: Bytes::from_static(b"txt"),
+            encoding: *b"txt",
             data: Bytes::from_static(b"Some string"),
         });
     }

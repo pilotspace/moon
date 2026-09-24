@@ -113,10 +113,14 @@ fn effect_sibling(cmd: &[u8]) -> Option<(&'static [u8], bool)> {
 ///   would be the quiet regression of the fix: the dispatch table gave the old
 ///   `LPOP` rewrite its type check for free, and a null reads to a caller as
 ///   "queue empty".
+///
+/// `db` MUST be `databases[db_index]` on this shard: the snapshot capture
+/// files its pre-images under `db_index`.
 pub(crate) fn try_exec_blocking_in_txn(
     cmd: &[u8],
     args: &[Frame],
     db: &mut Database,
+    db_index: usize,
 ) -> Option<BlockingTxnOutcome> {
     let (sibling, is_zset) = effect_sibling(cmd)?;
 
@@ -132,6 +136,11 @@ pub(crate) fn try_exec_blocking_in_txn(
     if let Err(e) = parse_blocking_timeout(cmd, args) {
         return Some(BlockingTxnOutcome::reply_only(e));
     }
+    // moon#1227 review F2 (moon#1217 completeness): the pop below runs
+    // straight through `Database` methods, outside `command::dispatch`, so it
+    // takes the armed snapshot's pre-images of the keys first, as dispatch
+    // would. One thread-local `bool` load when no snapshot is in flight.
+    crate::persistence::snapshot_cow::capture_dispatch_pre_image(db, db_index, cmd, args);
 
     for key_frame in &args[..args.len() - 1] {
         let Some(key) = extract_bytes(key_frame) else {
@@ -214,7 +223,7 @@ mod tests {
                 std::str::from_utf8(cmd)
             );
             assert!(
-                try_exec_blocking_in_txn(cmd, &args(&["k", "0"]), &mut db).is_some(),
+                try_exec_blocking_in_txn(cmd, &args(&["k", "0"]), &mut db, 0).is_some(),
                 "{:?} is queued unrewritten but has no EXEC-time executor",
                 std::str::from_utf8(cmd)
             );
@@ -223,7 +232,7 @@ mod tests {
         // through the dispatch table as their non-blocking sibling.
         for cmd in [&b"BLMOVE"[..], &b"BLMPOP"[..], &b"BZMPOP"[..], &b"LPOP"[..]] {
             assert!(!queues_unrewritten(cmd));
-            assert!(try_exec_blocking_in_txn(cmd, &args(&["k", "0"]), &mut db).is_none());
+            assert!(try_exec_blocking_in_txn(cmd, &args(&["k", "0"]), &mut db, 0).is_none());
         }
     }
 
@@ -231,7 +240,7 @@ mod tests {
     fn blpop_hit_replies_key_and_value_and_logs_lpop() {
         let mut db = Database::new();
         db.list_push_back(b"q", Bytes::from_static(b"v1"));
-        let out = try_exec_blocking_in_txn(b"BLPOP", &args(&["q", "0"]), &mut db)
+        let out = try_exec_blocking_in_txn(b"BLPOP", &args(&["q", "0"]), &mut db, 0)
             .expect("BLPOP is executed here");
         assert_eq!(
             out.reply,
@@ -257,7 +266,7 @@ mod tests {
     fn multi_key_blpop_scans_in_order_and_names_the_server() {
         let mut db = Database::new();
         db.list_push_back(b"q2", Bytes::from_static(b"v2"));
-        let out = try_exec_blocking_in_txn(b"BLPOP", &args(&["q1", "q2", "0"]), &mut db)
+        let out = try_exec_blocking_in_txn(b"BLPOP", &args(&["q1", "q2", "0"]), &mut db, 0)
             .expect("BLPOP is executed here");
         assert_eq!(
             out.reply,
@@ -282,7 +291,7 @@ mod tests {
         let mut db = Database::new();
         db.list_push_back(b"r", Bytes::from_static(b"a"));
         db.list_push_back(b"r", Bytes::from_static(b"b"));
-        let out = try_exec_blocking_in_txn(b"BRPOP", &args(&["r", "0"]), &mut db)
+        let out = try_exec_blocking_in_txn(b"BRPOP", &args(&["r", "0"]), &mut db, 0)
             .expect("BRPOP is executed here");
         assert_eq!(
             out.reply,
@@ -306,7 +315,7 @@ mod tests {
         db.zset_restore(b"z", Bytes::from_static(b"lo"), 1.0);
         db.zset_restore(b"z", Bytes::from_static(b"hi"), 9.0);
 
-        let out = try_exec_blocking_in_txn(b"BZPOPMIN", &args(&["z", "0"]), &mut db)
+        let out = try_exec_blocking_in_txn(b"BZPOPMIN", &args(&["z", "0"]), &mut db, 0)
             .expect("BZPOPMIN is executed here");
         assert_eq!(
             out.reply,
@@ -325,7 +334,7 @@ mod tests {
             ]))
         );
 
-        let out = try_exec_blocking_in_txn(b"BZPOPMAX", &args(&["z", "0"]), &mut db)
+        let out = try_exec_blocking_in_txn(b"BZPOPMAX", &args(&["z", "0"]), &mut db, 0)
             .expect("BZPOPMAX is executed here");
         assert_eq!(
             out.reply,
@@ -342,12 +351,12 @@ mod tests {
     #[test]
     fn miss_is_a_null_array_and_mutates_nothing() {
         let mut db = Database::new();
-        let out = try_exec_blocking_in_txn(b"BLPOP", &args(&["absent-l", "0"]), &mut db)
+        let out = try_exec_blocking_in_txn(b"BLPOP", &args(&["absent-l", "0"]), &mut db, 0)
             .expect("BLPOP is executed here");
         assert_eq!(out.reply, Frame::NullArray);
         assert!(out.effect.is_none(), "a miss must not reach the AOF");
 
-        let out = try_exec_blocking_in_txn(b"BZPOPMIN", &args(&["absent-z", "0"]), &mut db)
+        let out = try_exec_blocking_in_txn(b"BZPOPMIN", &args(&["absent-z", "0"]), &mut db, 0)
             .expect("BZPOPMIN is executed here");
         assert_eq!(out.reply, Frame::NullArray);
         assert!(out.effect.is_none());
@@ -365,7 +374,7 @@ mod tests {
     fn a_miss_does_not_conjure_the_key() {
         let mut db = Database::new();
         for cmd in [&b"BLPOP"[..], &b"BRPOP"[..]] {
-            assert!(try_exec_blocking_in_txn(cmd, &args(&["ghost", "0"]), &mut db).is_some());
+            assert!(try_exec_blocking_in_txn(cmd, &args(&["ghost", "0"]), &mut db, 0).is_some());
             assert!(
                 db.get(b"ghost").is_none(),
                 "{:?} on an absent key must leave it absent — a phantom empty \
@@ -374,12 +383,13 @@ mod tests {
             );
         }
         for cmd in [&b"BZPOPMIN"[..], &b"BZPOPMAX"[..]] {
-            assert!(try_exec_blocking_in_txn(cmd, &args(&["ghostz", "0"]), &mut db).is_some());
+            assert!(try_exec_blocking_in_txn(cmd, &args(&["ghostz", "0"]), &mut db, 0).is_some());
             assert!(db.get(b"ghostz").is_none());
         }
         // And a multi-key miss must not conjure ANY of the keys it scanned.
         assert!(
-            try_exec_blocking_in_txn(b"BLPOP", &args(&["g1", "g2", "g3", "0"]), &mut db).is_some()
+            try_exec_blocking_in_txn(b"BLPOP", &args(&["g1", "g2", "g3", "0"]), &mut db, 0)
+                .is_some()
         );
         for k in [&b"g1"[..], &b"g2"[..], &b"g3"[..]] {
             assert!(
@@ -394,7 +404,7 @@ mod tests {
     fn wrong_type_is_an_error_not_a_null() {
         let mut db = Database::new();
         db.set(b"str", Entry::new_string(Bytes::from_static(b"v")));
-        let out = try_exec_blocking_in_txn(b"BLPOP", &args(&["str", "0"]), &mut db)
+        let out = try_exec_blocking_in_txn(b"BLPOP", &args(&["str", "0"]), &mut db, 0)
             .expect("BLPOP is executed here");
         match out.reply {
             Frame::Error(ref e) => assert!(
@@ -408,7 +418,7 @@ mod tests {
 
         // Same for the zset family, against a list this time.
         db.list_push_back(b"l", Bytes::from_static(b"x"));
-        let out = try_exec_blocking_in_txn(b"BZPOPMAX", &args(&["l", "0"]), &mut db)
+        let out = try_exec_blocking_in_txn(b"BZPOPMAX", &args(&["l", "0"]), &mut db, 0)
             .expect("BZPOPMAX is executed here");
         assert!(matches!(out.reply, Frame::Error(_)));
     }
@@ -417,7 +427,7 @@ mod tests {
     fn a_bad_timeout_is_rejected_even_though_it_can_never_elapse() {
         let mut db = Database::new();
         db.list_push_back(b"q", Bytes::from_static(b"v1"));
-        let out = try_exec_blocking_in_txn(b"BLPOP", &args(&["q", "nope"]), &mut db)
+        let out = try_exec_blocking_in_txn(b"BLPOP", &args(&["q", "nope"]), &mut db, 0)
             .expect("BLPOP is executed here");
         assert!(
             matches!(out.reply, Frame::Error(_)),

@@ -1170,6 +1170,41 @@ if should_run "key"; then
     assert_match "GEORADIUS STORE needs a dest"     GEORADIUS {geo}:src 15 37 200 km STORE
     assert_match "GEOSEARCHSTORE rejects WITHCOORD" GEOSEARCHSTORE {geo}:d1 {geo}:src FROMLONLAT 15 37 BYRADIUS 200 km WITHCOORD
     assert_match "GEORADIUS_RO still refuses STORE" GEORADIUS_RO {geo}:src 15 37 200 km STORE {geo}:d1
+    # WS2 (moon#1169 / #1168 / #1171 / #1172) behaviour edges, verified on
+    # redis-server 7.0.15 — see the matching block in test-consistency.sh.
+    rcli SET {ws2}:str x >/dev/null 2>&1
+    mcli SET {ws2}:str x >/dev/null 2>&1
+    assert_match "SINTERCARD: WRONGTYPE beats a missing key" SINTERCARD 2 {ws2}:missing {ws2}:str
+    assert_match "BITFIELD OVERFLOW FAIL still grows the key" BITFIELD {ws2}:bf OVERFLOW FAIL INCRBY u2 0 5
+    assert_match "BITFIELD OVERFLOW FAIL still grows (STRLEN)" STRLEN {ws2}:bf
+    rcli ZADD {ws2}:z 1 a 2 b 3 c 3 d >/dev/null 2>&1
+    mcli ZADD {ws2}:z 1 a 2 b 3 c 3 d >/dev/null 2>&1
+    assert_match "ZRANDMEMBER count>=size is highest-first" ZRANDMEMBER {ws2}:z 10 WITHSCORES
+    # moon#1227 review m2: the count is parsed before the key lookup.
+    assert_match "ZRANDMEMBER bad count on a missing key" ZRANDMEMBER {ws2}:nokey notanint
+    assert_match "ZRANDMEMBER argument after WITHSCORES" ZRANDMEMBER {ws2}:z 1 WITHSCORES extra
+    assert_match "HRANDFIELD bad count on a missing key" HRANDFIELD {ws2}:nokey notanint
+    assert_match "HRANDFIELD -0 on a string"   HRANDFIELD {ws2}:str -0
+    assert_match "GEOSEARCH ANY without COUNT" GEOSEARCH k:geo FROMLONLAT 15 37 BYRADIUS 200 km ANY
+    assert_match "GEOSEARCH COUNT 0"          GEOSEARCH k:geo FROMLONLAT 15 37 BYRADIUS 200 km COUNT 0
+    assert_match "GEOSEARCH unsorted cell order" GEOSEARCH k:geo FROMLONLAT 15 37 BYRADIUS 2000 km
+    assert_match "GEOSEARCH COUNT 1 ANY"      GEOSEARCH k:geo FROMLONLAT 15 37 BYRADIUS 2000 km COUNT 1 ANY
+    # moon#1227 review (refs moon#1172): radius / width / height validated as
+    # parsed with redis's texts on every form, a missing key still parses
+    # every option — see the matching block in test-consistency.sh.
+    assert_match "GEOSEARCH negative radius"  GEOSEARCH k:geo FROMLONLAT 15 37 BYRADIUS -1 km
+    assert_match "GEOSEARCH NaN radius"       GEOSEARCH k:geo FROMLONLAT 15 37 BYRADIUS nan km
+    assert_match "GEOSEARCH negative box"     GEOSEARCH k:geo FROMLONLAT 15 37 BYBOX 5 -1 km
+    assert_match "GEOSEARCH non-numeric box"  GEOSEARCH k:geo FROMLONLAT 15 37 BYBOX abc 5 km
+    assert_match "GEOSEARCHSTORE negative radius" GEOSEARCHSTORE {geo}:d1 {geo}:src FROMLONLAT 15 37 BYRADIUS -1 km
+    assert_match "GEORADIUS negative radius"  GEORADIUS k:geo 15 37 -1 km
+    assert_match "GEORADIUS_RO NaN radius"    GEORADIUS_RO k:geo 15 37 nan km
+    assert_match "GEORADIUSBYMEMBER negative radius" GEORADIUSBYMEMBER k:geo Palermo -1 km
+    assert_match "GEORADIUSBYMEMBER_RO non-numeric radius" GEORADIUSBYMEMBER_RO k:geo Palermo abc km
+    assert_match "GEORADIUSBYMEMBER missing key skips the radius" GEORADIUSBYMEMBER k:nogeo Palermo -1 km
+    assert_match "GEOSEARCH missing key bad COUNT" GEOSEARCH k:nogeo FROMMEMBER x BYRADIUS 1 km COUNT abc
+    assert_match "GEOSEARCH absent FROMMEMBER" GEOSEARCH k:geo FROMMEMBER nope BYRADIUS 1 km
+    assert_match "GEOSEARCH infinite radius"  GEOSEARCH k:geo FROMLONLAT 15 37 BYRADIUS inf km ASC
     # STOREDIST stores the raw f64 distance rather than a %.4f rendering, so
     # this is the one geo reply where moon and redis can differ in the last
     # digit: measured 190.44242984775795 vs 190.44242984775784 for Palermo,

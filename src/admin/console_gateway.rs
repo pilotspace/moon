@@ -415,7 +415,7 @@ mod tests {
     #[test]
     fn test_frame_to_json_verbatim_string() {
         let frame = Frame::VerbatimString {
-            encoding: Bytes::from_static(b"txt"),
+            encoding: *b"txt",
             data: Bytes::from_static(b"hello world"),
         };
         let json = ConsoleGateway::frame_to_json(&frame);

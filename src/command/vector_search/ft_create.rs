@@ -432,6 +432,21 @@ pub fn ft_create(
             noindex: tf.noindex,
         });
     }
+    // moon#1194: TAG / NUMERIC declarations too, so schema-aware payload
+    // indexing knows every declared field (persisted in index_persist v6).
+    #[cfg(feature = "text-index")]
+    {
+        for tf in &tag_field_defs {
+            schema_fields.push(crate::vector::store::FieldType::Tag {
+                field_name: tf.field_name.clone(),
+            });
+        }
+        for nf in &numeric_field_defs {
+            schema_fields.push(crate::vector::store::FieldType::Numeric {
+                field_name: nf.field_name.clone(),
+            });
+        }
+    }
 
     // Server-wide starting values for the tuning knobs
     // (--vector-ef-runtime / --vector-rerank-mult / --vector-exact-beam).

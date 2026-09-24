@@ -2096,7 +2096,11 @@ pub(crate) fn immediate_scan(
 /// THIS shard in the same synchronous stretch (moon#1056, moon#1104). Returns
 /// the reply to send and whether anything was taken, as
 /// [`log_immediate_pop`] does.
-fn immediate_serve(
+///
+/// `db` MUST be `databases[db_index]` of this shard (both callers take it
+/// with `with_shard_db(selected_db, ..)`): the snapshot capture below files
+/// its pre-images under `db_index`.
+pub(crate) fn immediate_serve(
     cmd: &[u8],
     args: &[Frame],
     keys: &[Bytes],
@@ -2105,6 +2109,14 @@ fn immediate_serve(
     shard_id: usize,
     num_shards: usize,
 ) -> Option<(Frame, bool)> {
+    // moon#1227 review F2 (moon#1217 completeness): the serve below pops a
+    // source, pushes a move's destination and advances a group's cursor
+    // straight through `Database` methods, outside `command::dispatch` — so
+    // it takes the armed snapshot's pre-images of every key the command may
+    // write first, exactly as dispatch would. Over-inclusive by design (a key
+    // that ends up not served costs one clone while a BGSAVE is in flight);
+    // one thread-local `bool` load when none is.
+    crate::persistence::snapshot_cow::capture_dispatch_pre_image(db, db_index, cmd, args);
     if let Some(target) = local_group_read(cmd, args, keys, shard_id, num_shards) {
         return immediate_group_read(cmd, args, keys, db, db_index, shard_id, num_shards, &target);
     }
@@ -2768,7 +2780,11 @@ pub(crate) fn try_inline_dispatch(
         );
         match outcome {
             GetOutcome::Handled => {
-                let _ = read_buf.split_to(consumed);
+                // moon#1179 item 6: `advance`, not `split_to` — the consumed
+                // prefix is discarded, so there is nothing to split off and no
+                // reason to promote the buffer to shared (a refcount
+                // fetch_add + fetch_sub for nothing).
+                bytes::Buf::advance(read_buf, consumed);
                 return 1;
             }
             GetOutcome::Miss => {
@@ -2821,7 +2837,7 @@ pub(crate) fn try_inline_dispatch(
                 }
             }
         }
-        let _ = read_buf.split_to(consumed);
+        bytes::Buf::advance(read_buf, consumed); // moon#1179 item 6, as above
         return 1;
     }
 
