@@ -207,3 +207,7 @@ writes go through `command::dispatch`, the file is read back as RAW records
 (duplicates visible). `tests/perf_ws12_bgsave_split.rs`: real server, BGSAVE
 under a concurrent insert stream, SIGKILL, restart, diff every pre-epoch
 key; FLUSH*/SWAPDB mid-BGSAVE must leave the server serving and fail the save.
+
+> **Update (PR #1227 review, `09a1f0b`):** a replica full resync now aborts an unfinished epoch
+> (`snapshot_cow::note_table_replace`), so it is no longer an undetected gap. The remaining capture gaps
+> are tracked in moon#1228.

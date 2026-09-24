@@ -40,7 +40,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **BEHAVIOUR CHANGE — a BGSAVE crossed by FLUSHDB / FLUSHALL / SWAPDB on a database it has not
   finished now fails** (moon#1224) — error log, `rdb_last_bgsave_status:err`, the previous snapshot
-  file kept — instead of panicking the shard (FLUSH*) or writing a mixed file (SWAPDB). Snapshot
+  file kept — instead of panicking the shard (FLUSH*) or writing a mixed file (SWAPDB). A replica full
+  resync during a BGSAVE fails it the same way. Snapshot
   segment blocks are now written in hash order (the loader ignores the segment index field).
 - **BEHAVIOUR CHANGE — data-type edge cases now match redis 7** (moon#1168–#1172): SINTERCARD
   answers WRONGTYPE even when an earlier key is missing; BITFIELD grows the string under
@@ -221,7 +222,8 @@ A/Bs on a shared 4-vCPU Linux container — re-measure on the GCE rig before quo
   with no `__key*` subscriber allocate nothing (moon#1214): SET with `notify-keyspace-events KEA`
   1.53×.
 - **BGSAVE converges under an insert flood** (moon#1216): a per-tick budget over the hash-space walk
-  — 1M keys: 35 s → 1.5 s, max PING 40–420 ms → 1–3 ms, peak RSS 950 → 200 MiB.
+  — 1M keys: 35 s → 1.5 s, max PING 40–420 ms → 1–3 ms, peak RSS 950 → 200 MiB. The budget also caps
+  a tick's output (1 MiB, one segment past at most) and pauses while the snapshot writer is backlogged.
 - **Vector** (moon#1213): immutable segments drop never-read QJL data and collections no longer hold
   QJL matrices (4 shards × 2 EXACT 768d indexes +145.5 → +1.4 MB RSS); EXACT compaction at 768d
   12.3 → 2.5 s; HNSW prefetch widened (−4 to −9% per query, identical results).
@@ -292,7 +294,10 @@ shared 4-vCPU Linux container against HEAD `935c555` — re-measure on the GCE r
   now walks hash space, so a split cannot move keys out of the walk. Copy-on-write also captures
   every key a multi-key write modifies, not only the first (moon#1217; MOVE / COPY … DB n remain),
   including a woken BLMOVE's keys.
-- **FLUSHDB / FLUSHALL / SWAPDB during a BGSAVE no longer panics the shard** (moon#1224; see Changed).
+- **FLUSHDB / FLUSHALL / SWAPDB during a BGSAVE no longer panics the shard** (moon#1224; see Changed),
+  and an aborted save's writer is cancelled and joined before the next save can reuse its temp file.
+  Blocking commands served immediately (BLMOVE, BLPOP, BZPOP*, XREADGROUP, also inside MULTI) capture
+  their keys' pre-images too (moon#1217).
 - **Sorted-set B+tree corruption** (moon#1205): an internal split lost a separator and a subtree and
   a right-borrow lost a subtree count, so ZRANK answered nil for existing members and ZREM'd members
   came back in ZRANGE for any zset over 128 members built from non-monotone scores. Restart after

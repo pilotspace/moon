@@ -60,3 +60,24 @@ Completeness 0.85 · Clarity 0.9 · Practicality 0.92 · Optimization 0.9 · Edg
 Self-evaluation 0.9 — completeness is capped by moon#1185's fold, which is exactly-once only once
 MOVE/COPY … DB n, eviction-with-spill and replica resync capture pre-images; those hooks live in
 other workstreams' files, so the fold is deferred with the design written down.
+
+## PR #1227 review fixes (orchestrator-committed from the fix agent's report)
+Cherry-picked as `5d02343` (F1), `f705c90` (F2), `7f8935d` (F3), `09a1f0b` (F6), `016602a` (F5, WS11), `9dac9ed` (F11).
+- **F1 (blocker)** — an aborted epoch's healthy writer kept writing the fixed temp path while the next save
+  reused it: `finalize=Ok` published a corrupt file (real server: 68,643,361 bytes, global checksum
+  mismatch on restart, canary key gone, 3/3). The writer now has a cancel flag; dropping an unpublished save
+  cancels and joins it (writes in 256 KiB pieces, 4.3–10.8 ms debug), and each save deletes a leftover temp
+  file and creates a fresh one. `stream_tests::an_aborted_snapshot_cannot_corrupt_a_quick_next_save_of_the_same_file`,
+  `…_cannot_unlink_a_slow_next_save_…`, `perf_ws12_bgsave_split::an_aborted_bgsave_cannot_corrupt_the_next_one` red → green.
+- **F2** — blocking commands served immediately (`immediate_serve`, both runtimes, consumer-group reads) and
+  inside MULTI (`try_exec_blocking_in_txn`) capture pre-images first: 9/9 commands and 4/4 MULTI cases were
+  wrong before (e.g. BLMOVE across the cursor lost the moved element).
+- **F3** — a tick also stops after 1 MiB of output (one segment past at most) and while the writer is
+  backlogged: 64 KiB values 69,497,185 → 3,540,415 bytes per tick.
+- **F6** — `snapshot_cow::note_table_replace()` aborts an unfinished epoch on a replica full resync
+  (`table_swap_tests::a_replica_full_resync_aborts_an_unfinished_epoch`). Risk 6's "replica full resync
+  undetected" no longer applies.
+- **F5 (WS11)** — the vector index sidecar is v5 unless `MOON_VECTOR_PAYLOAD_SCHEMA=declared` and an index
+  declares a payload schema, so rolling back keeps vector indexes.
+- Remaining gaps: MOVE / COPY … DB n, the WS drop sweep, MQ and stream-wake writers, MSET's coordinator
+  local leg (moon#1228); `rdb_last_bgsave_status` never returns to `ok` after one failed sharded save (filed).
