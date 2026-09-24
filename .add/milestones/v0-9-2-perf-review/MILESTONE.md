@@ -31,11 +31,14 @@ Out: the RESET/ACL privilege-retention finding (security — handled privately p
 | 2 | WS10-memory-ownership | storage-durability-engineer · performance-engineer | #1160 #1163 #1198 #1206 #1212 #1214(3) |
 | 2 | WS11-vector-followups | performance-engineer · storage-durability-engineer | #1213 #1194(remainder) |
 | 2 | WS12-snapshot-integrity | storage-durability-engineer · performance-engineer | #1216(P0) #1217 #1185(incremental fold) |
+| 2 | WS13-text-graph-followups | performance-engineer · ci-test-integrity-engineer | #1219 #1220 |
+| 3 | WS14-ci-verification | ci-test-integrity-engineer | merged-tree gates, test-consistency.sh / test-commands.sh vs redis, re-measure the review's 📏 numbers |
 
 ## Found during the fix wave (filed 2026-09-24)
 - Bugs: moon#1205 (B+tree corruption — fixed in WS2), #1206 (listpack backlen order — WS10), #1207 (TQ4A2 FT.SEARCH panic — fixed in WS5a), #1208 (EXACT QJL misalignment — fixed in WS5a), #1209 (LPOS/LMOVE parity — fixed in WS3), #1211 (inert LFU params / NOTOUCH introspection — fixed in WS1).
 - More bugs (from WS6): #1216 **P0** BGSAVE loses keys on a mid-epoch DashTable split (WS12), #1217 COW captures only the first key of multi-key writes (WS12).
-- Follow-ups: #1212 (listpack residuals — WS10), #1213 (vector follow-ups — WS11), #1214 (needs-profile items — WS8/WS9/WS10).
+- From WS5b: #1218 FT prefix/fuzzy expansion nondeterministic across processes (fixed in WS5b), #1219 ignored cross-shard FT consistency suites broken at their seed (WS13).
+- Follow-ups: #1220 (text/graph residuals — WS13), #1212 (listpack residuals — WS10), #1213 (vector follow-ups — WS11), #1214 (needs-profile items — WS8/WS9/WS10).
 
 ## Exit criteria
 - [ ] every workstream has a SUMMARY.md with a per-issue verdict (FIXED / PARTIAL / DEFERRED + reason) and evidence
