@@ -497,7 +497,30 @@ impl Database {
     /// moved anywhere. Taking `Bytes` forced a `key.clone()` at every write
     /// command's call site: one `shared_v_clone` on the way in and one
     /// `shared_v_drop` on the way out, per command, producing nothing.
+    ///
+    /// An overwrite is an ACCESS for the eviction policy (redis `setKey` =
+    /// `lookupKeyWrite` + `dbOverwrite`). A command that already looked the
+    /// key up with an access-recording read writes through
+    /// [`Self::set_looked_up`] instead, so it is not counted twice.
+    #[inline]
     pub fn set(&mut self, key: &[u8], entry: Entry) {
+        self.set_recording::<true>(key, entry);
+    }
+
+    /// [`Self::set`] for a read-modify-write command that has ALREADY read
+    /// the key with an access-recording lookup ([`Self::get`]) in this same
+    /// command — redis's `lookupKeyWrite` + `dbOverwrite`: the lookup records
+    /// the one access (refused commands included, as in redis), and the
+    /// overwrite only CARRIES the LFU counter over. Writing through
+    /// [`Self::set`] there recorded a second Morris increment per command
+    /// (moon#1221 review F3). Everything else is `set`, byte for byte.
+    pub fn set_looked_up(&mut self, key: &[u8], entry: Entry) {
+        self.set_recording::<false>(key, entry);
+    }
+
+    /// The body of [`Self::set`] / [`Self::set_looked_up`]. `RECORD` is a
+    /// const so the plain `set` monomorph is exactly the code it always was.
+    fn set_recording<const RECORD: bool>(&mut self, key: &[u8], entry: Entry) {
         crate::admin::metrics_setup::record_keyspace_change();
         // An overwrite makes any in-flight spill payload for this key stale.
         // Retiring the record here stops its completion publishing the OLD
@@ -532,6 +555,13 @@ impl Database {
         // key's frequency, as redis's `lookupKeyWrite` + `dbSetValue` do —
         // otherwise every write reset a hot key to `LFU_INIT_VAL`.
         let tracking = crate::storage::eviction::access_tracking();
+        // `set_looked_up` (moon#1221 review F3): the caller's `get` was the
+        // access; the overwrite below only carries the counter.
+        let record = if RECORD {
+            tracking
+        } else {
+            crate::storage::entry::AccessTracking::Off
+        };
         let now_secs = self.cached_now;
 
         // `insert_or_update` invariant: exactly one of the two closures fires
@@ -552,7 +582,7 @@ impl Database {
                 let new_version = Entry::bump_version(existing.version());
                 let carried_lfu = match tracking {
                     crate::storage::entry::AccessTracking::Lfu { .. } => {
-                        existing.note_access(tracking, now_secs);
+                        existing.note_access(record, now_secs);
                         Some(existing.access_counter())
                     }
                     _ => None,

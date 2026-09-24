@@ -502,7 +502,10 @@ fn incrby_general(db: &mut Database, key: &Bytes, delta: i64) -> Frame {
         key,
         db.db_index,
     );
-    db.set(key, entry);
+    // moon#1221 review F3: `db.get` above was this command's one recorded
+    // access (redis `lookupKeyWrite`); the overwrite only carries the LFU
+    // counter.
+    db.set_looked_up(key, entry);
 
     Frame::Integer(new_val)
 }
@@ -588,7 +591,10 @@ pub fn incrbyfloat(db: &mut Database, args: &[Frame]) -> Frame {
     };
     entry.set_last_access(db.now());
     entry.set_access_counter(5);
-    db.set(key, entry);
+    // moon#1221 review F3: `db.get` above was this command's one recorded
+    // access (redis `lookupKeyWrite`, refusals included); the overwrite only
+    // carries the LFU counter — `db.set` recorded a second one.
+    db.set_looked_up(key, entry);
 
     Frame::BulkString(Bytes::from(formatted))
 }
