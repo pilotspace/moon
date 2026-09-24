@@ -236,8 +236,12 @@ enum ListRoute {
 /// the compact encoding (moon#832). This matters twice over here: the old
 /// shape asked `db.get_list(key)` purely to decide "does the key exist?", so
 /// the MISS CHECK was a flattener before the pop had even started.
+///
+/// A probe, not the command's access (moon#1221 review INTEG-5): every route
+/// it answers ends in a write accessor that records the one access redis's
+/// `lookupKeyWrite` would, so the probe is `LOOKUP_NOTOUCH`.
 fn list_route(db: &Database, key: &[u8]) -> Result<Option<ListRoute>, Frame> {
-    match db.get_list_ref_if_alive(key, db.now_ms()) {
+    match db.peek_list_ref_if_alive(key, db.now_ms()) {
         Ok(None) => Ok(None),
         Ok(Some(ListRef::Listpack(_))) => Ok(Some(ListRoute::Listpack)),
         Ok(Some(ListRef::Deque(_) | ListRef::Owned(_))) => Ok(Some(ListRoute::Full)),

@@ -3,6 +3,9 @@ use std::collections::HashMap;
 
 mod accessors;
 mod cold_replay_gate;
+/// moon#1221 review INTEG-5: writes to compact collections record one access.
+#[cfg(test)]
+mod compact_write_access_tests;
 /// moon#1189: the whole-key deadline index's element + borrowed lookup.
 mod expiry_index;
 mod hash_ttl;
