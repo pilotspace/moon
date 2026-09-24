@@ -1244,7 +1244,7 @@ fn apply_op<'t>(
         PhysicalOp::Limit { count } => {
             let n = match eval_expr(
                 count,
-                &empty_row,
+                empty_row,
                 memgraph,
                 params,
                 csr_segs,
@@ -1264,7 +1264,7 @@ fn apply_op<'t>(
         PhysicalOp::Skip { count } => {
             let n = match eval_expr(
                 count,
-                &empty_row,
+                empty_row,
                 memgraph,
                 params,
                 csr_segs,
