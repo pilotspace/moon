@@ -330,6 +330,21 @@ impl<'a> SetRef<'a> {
     }
 }
 
+// Test-only: how many times a sorted-set read materialized the whole set
+// with `entries_sorted` — the O(n log n) decode + parse + sort moon#1174 §4
+// removed from ZRANK/ZREVRANK/ZCOUNT/ZLEXCOUNT on a listpack. Plain `//`
+// comments: a doc comment on the macro trips `unused_doc_comments`.
+#[cfg(test)]
+thread_local! {
+    static ENTRIES_SORTED_CALLS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Read and reset the per-thread `entries_sorted` call counter (test-only).
+#[cfg(test)]
+pub(crate) fn take_entries_sorted_calls() -> u32 {
+    ENTRIES_SORTED_CALLS.with(|c| c.replace(0))
+}
+
 /// Read-only reference to a sorted set.
 pub enum SortedSetRef<'a> {
     BPTree {
@@ -385,6 +400,8 @@ impl<'a> SortedSetRef<'a> {
 
     /// Get all (member, score) pairs sorted by score then member.
     pub fn entries_sorted(&self) -> Vec<(Bytes, f64)> {
+        #[cfg(test)]
+        ENTRIES_SORTED_CALLS.with(|c| c.set(c.get() + 1));
         match self {
             SortedSetRef::BPTree { tree, .. } => tree
                 .iter()

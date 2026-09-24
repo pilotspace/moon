@@ -908,6 +908,9 @@ mod range_rank_tests;
 mod rand_member_tests;
 
 #[cfg(test)]
+mod listpack_count_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::storage::Database;
