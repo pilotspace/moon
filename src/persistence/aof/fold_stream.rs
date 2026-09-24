@@ -157,6 +157,16 @@ impl Write for FoldImageSink {
 /// Always terminates the stream: `End` on success, `Failed` on an encode
 /// error (the writer aborts the fold). A writer that already dropped the
 /// image stops the serialization at the next chunk boundary.
+///
+/// The image is the keyspace at the fold instant, and that includes every
+/// key whose spill is IN FLIGHT (moon#1223): eviction has removed its hot
+/// copy and its value lives only in the in-flight plane until the spill
+/// completion publishes it. Streaming `db.data()` alone left such a key out
+/// of the base, and every way its spill can end without publishing after the
+/// fold — the `MOON.SPILLED` marker refused under AOF backpressure (the
+/// moon#1202 withdraw), a failed pwrite, a re-issued file id (moon#893) —
+/// puts it back in RAM with no log record: after the fold committed it was
+/// in no durable artifact at all. See [`write_in_flight_entries`].
 pub fn stream_fold_image(dbs: &[&Database], now_ms: u64, mut sink: FoldImageSink) {
     let result = (|| -> Result<(), MoonError> {
         let mut w = RdbStreamWriter::new(&mut sink)?;
@@ -167,6 +177,9 @@ pub fn stream_fold_image(dbs: &[&Database], now_ms: u64, mut sink: FoldImageSink
                 }
                 w.write_entry(db_idx, key.as_bytes(), entry)?;
             }
+            // Same db, right after its hot entries: the writer needs one
+            // database's entries contiguous.
+            write_in_flight_entries(&mut w, db_idx, db, now_ms)?;
         }
         w.finish()?;
         Ok(())
@@ -175,6 +188,76 @@ pub fn stream_fold_image(dbs: &[&Database], now_ms: u64, mut sink: FoldImageSink
         Ok(()) => sink.end(),
         Err(e) => sink.fail(e.to_string()),
     }
+}
+
+/// In-flight spill payloads a fold base image could not carry because they
+/// did not rehydrate (moon#1223). Each is a key whose only copy is its spill
+/// file, IF that file publishes; each is logged when counted.
+pub static FOLD_IN_FLIGHT_UNENCODABLE: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Append db `db_idx`'s in-flight spill payloads to the base image, each as
+/// the key's value at the fold instant (moon#1223).
+///
+/// Every outcome of the spill after the fold is then value-correct: a
+/// completion that publishes WITH its marker logs the marker in the new
+/// generation, whose replay drops this base copy and keeps the key cold (the
+/// restart-as-cold shape, unchanged); one that is withdrawn, fails its
+/// pwrite or is refused its file id puts the key back in RAM with exactly
+/// this value; a DEL or overwrite after the fold is in the new generation's
+/// records and replays on top of it. The spill path itself is untouched.
+///
+/// Skipped: a key that is also hot (the hot copy is newer — `set` retires the
+/// in-flight record, so this is defensive), and a payload expired at
+/// `now_ms` (the base's own filter). A payload that does not rehydrate (it
+/// cannot be produced by `build_spill_payload`; memory corruption) cannot be
+/// written; it is counted in [`FOLD_IN_FLIGHT_UNENCODABLE`] and logged,
+/// never silently dropped.
+fn write_in_flight_entries<W: Write>(
+    w: &mut RdbStreamWriter<W>,
+    db_idx: usize,
+    db: &Database,
+    now_ms: u64,
+) -> Result<(), MoonError> {
+    for_each_in_flight_base_entry(db, db_idx, now_ms, |key, entry| {
+        w.write_entry(db_idx, key, &entry)
+    })
+}
+
+/// Visit every in-flight spill payload of `db` that belongs in a fold base
+/// taken at `now_ms`, rehydrated — the selection [`write_in_flight_entries`]
+/// documents, shared with the legacy cloning fold (`do_rewrite_single`).
+pub(crate) fn for_each_in_flight_base_entry(
+    db: &Database,
+    db_idx: usize,
+    now_ms: u64,
+    mut visit: impl FnMut(&Bytes, crate::storage::entry::Entry) -> Result<(), MoonError>,
+) -> Result<(), MoonError> {
+    if db.spill_inflight_is_empty() {
+        return Ok(());
+    }
+    for key in db.spill_inflight_keys() {
+        if db.data().get(key.as_ref()).is_some() {
+            continue;
+        }
+        match db.spill_inflight_entry(key, now_ms) {
+            Some(entry) => visit(key, entry)?,
+            None if db.spill_inflight_alive(key, now_ms) => {
+                FOLD_IN_FLIGHT_UNENCODABLE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                tracing::error!(
+                    db = db_idx,
+                    key_len = key.len(),
+                    "AOF rewrite fold: an in-flight spill payload does not rehydrate, so the new \
+                     base cannot carry the key; its spill file is its only copy if it publishes \
+                     (moon#1223)"
+                );
+            }
+            // Expired at the fold instant: absent from the base, like a hot
+            // key expired at the same instant.
+            None => {}
+        }
+    }
+    Ok(())
 }
 
 /// How often a writer waiting on a slow image logs that it is still waiting.
@@ -366,6 +449,113 @@ mod tests {
         drop(sink);
         let mut out = Vec::new();
         assert!(write_fold_image(image, &mut out, "test").is_err());
+    }
+
+    fn in_flight(db: &mut Database, key: &'static [u8], value: &'static [u8], ttl: Option<u64>) {
+        db.spill_inflight_mark(
+            Bytes::from_static(key),
+            crate::storage::db::PendingSpill {
+                req_id: 7,
+                value_type: crate::persistence::kv_page::ValueType::String,
+                value_bytes: Bytes::from_static(value),
+                ttl_ms: ttl,
+            },
+        );
+    }
+
+    fn image_of(dbs: &[Database], now_ms: u64) -> Vec<Database> {
+        let (sink, image) = fold_image_channel();
+        let refs: Vec<&Database> = dbs.iter().collect();
+        stream_fold_image(&refs, now_ms, sink);
+        let mut out = Vec::new();
+        write_fold_image(image, &mut out, "test").expect("image");
+        let mut loaded: Vec<Database> = (0..dbs.len()).map(|_| Database::new()).collect();
+        crate::persistence::rdb::load_from_bytes(&mut loaded, &out).expect("load");
+        loaded
+    }
+
+    fn string_at(db: &Database, key: &[u8]) -> Option<Vec<u8>> {
+        db.data()
+            .get(key)
+            .and_then(|e| e.value.as_bytes().map(|b| b.to_vec()))
+    }
+
+    /// moon#1223: a key whose spill is in flight at the fold instant is part
+    /// of the keyspace; the base carries it (in its own db, TTL kept), next
+    /// to the hot keys.
+    #[test]
+    fn in_flight_spills_are_part_of_the_base() {
+        let mut dbs: Vec<Database> = (0..3).map(|_| Database::new()).collect();
+        dbs[0].set_string(b"hot", Bytes::from_static(b"h"));
+        in_flight(&mut dbs[0], b"flying", b"f0", None);
+        in_flight(&mut dbs[2], b"flying2", b"f2", Some(u64::MAX / 2));
+        let loaded = image_of(&dbs, 1_000);
+        assert_eq!(string_at(&loaded[0], b"hot").as_deref(), Some(&b"h"[..]));
+        assert_eq!(
+            string_at(&loaded[0], b"flying").as_deref(),
+            Some(&b"f0"[..])
+        );
+        assert_eq!(
+            string_at(&loaded[2], b"flying2").as_deref(),
+            Some(&b"f2"[..])
+        );
+        assert_eq!(
+            loaded[2]
+                .data()
+                .get(b"flying2".as_slice())
+                .map(|e| e.expires_at_ms()),
+            Some(u64::MAX / 2),
+            "the payload's TTL rides along"
+        );
+        assert!(loaded[1].data().is_empty());
+    }
+
+    /// An in-flight payload expired at the fold instant is left out, like a
+    /// hot key expired at the same instant.
+    #[test]
+    fn expired_in_flight_spills_are_left_out() {
+        // Real-clock deadlines: loading the image also drops entries that
+        // are expired NOW, so the kept one must outlive the test.
+        let now = crate::storage::entry::current_time_ms();
+        let mut dbs = vec![Database::new()];
+        in_flight(&mut dbs[0], b"gone", b"x", Some(now - 1));
+        in_flight(&mut dbs[0], b"kept", b"y", Some(now + 3_600_000));
+        let (sink, image) = fold_image_channel();
+        stream_fold_image(&[&dbs[0]], now, sink);
+        let mut out = Vec::new();
+        write_fold_image(image, &mut out, "test").expect("image");
+        assert!(
+            !out.windows(4).any(|w| w == b"gone"),
+            "an in-flight payload expired at the fold instant must not be written"
+        );
+        let mut loaded = vec![Database::new()];
+        crate::persistence::rdb::load_from_bytes(&mut loaded, &out).expect("load");
+        assert_eq!(string_at(&loaded[0], b"kept").as_deref(), Some(&b"y"[..]));
+    }
+
+    /// A payload that does not rehydrate cannot be encoded: counted and
+    /// logged, and the rest of the image is still produced.
+    #[test]
+    fn an_undecodable_in_flight_payload_is_counted_not_fatal() {
+        let mut dbs = vec![Database::new()];
+        dbs[0].spill_inflight_mark(
+            Bytes::from_static(b"broken"),
+            crate::storage::db::PendingSpill {
+                req_id: 1,
+                value_type: crate::persistence::kv_page::ValueType::Hash,
+                value_bytes: Bytes::from_static(b"\xff\xff not a hash body"),
+                ttl_ms: None,
+            },
+        );
+        in_flight(&mut dbs[0], b"fine", b"ok", None);
+        let before = FOLD_IN_FLIGHT_UNENCODABLE.load(std::sync::atomic::Ordering::Relaxed);
+        let loaded = image_of(&dbs, 0);
+        assert!(
+            FOLD_IN_FLIGHT_UNENCODABLE.load(std::sync::atomic::Ordering::Relaxed) > before,
+            "the unencodable payload must be counted"
+        );
+        assert_eq!(string_at(&loaded[0], b"broken"), None);
+        assert_eq!(string_at(&loaded[0], b"fine").as_deref(), Some(&b"ok"[..]));
     }
 
     /// A reported serialization failure aborts the fold.

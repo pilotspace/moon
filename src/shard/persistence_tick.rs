@@ -2244,6 +2244,9 @@ pub(crate) fn handle_checkpoint_tick(
 mod checkpoint_tick_tests;
 
 #[cfg(test)]
+mod fold_inflight_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::persistence::checkpoint::CheckpointTrigger;

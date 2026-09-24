@@ -1073,7 +1073,7 @@ pub(crate) fn do_rewrite_single(
         .max()
         .unwrap_or(1);
     let now_ms = current_time_ms();
-    let snapshot: Vec<
+    let mut snapshot: Vec<
         Vec<(
             crate::storage::compact_key::CompactKey,
             crate::storage::entry::Entry,
@@ -1090,6 +1090,22 @@ pub(crate) fn do_rewrite_single(
             entries
         })
         .collect();
+    // moon#1223: in-flight spills are part of the keyspace, so of the base —
+    // the rule the streaming folds apply (`fold_stream`).
+    for (db_idx, (guard, entries)) in guards.iter().zip(snapshot.iter_mut()).enumerate() {
+        crate::persistence::aof::fold_stream::for_each_in_flight_base_entry(
+            guard,
+            db_idx,
+            now_ms,
+            |key, entry| {
+                entries.push((
+                    crate::storage::compact_key::CompactKey::from(key.as_ref()),
+                    entry,
+                ));
+                Ok(())
+            },
+        )?;
+    }
 
     // Phase 5: release locks. Handlers resume; new appends queue in the channel
     // and will be processed into the new incr after step 6.
