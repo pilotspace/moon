@@ -57,15 +57,17 @@ pub enum Propagation {
     Skip,
 }
 
+/// A command name or option keyword: a static literal, never copied
+/// (moon#1187).
 #[inline]
-fn bulk(s: &[u8]) -> Frame {
-    Frame::BulkString(Bytes::copy_from_slice(s))
+fn lit(s: &'static [u8]) -> Frame {
+    Frame::BulkString(Bytes::from_static(s))
 }
 
 #[inline]
 fn bulk_u64(n: u64) -> Frame {
     let mut b = itoa::Buffer::new();
-    bulk(b.format(n).as_bytes())
+    Frame::BulkString(Bytes::copy_from_slice(b.format(n).as_bytes()))
 }
 
 #[inline]
@@ -127,30 +129,29 @@ pub fn rewrite_effect_for_propagation(frame: &Frame, reply: &Frame, now_ms: u64)
         return Propagation::Verbatim;
     };
 
-    if eq_ignore_ascii(cmd, b"SPOP") {
-        rewrite_spop(args, reply)
-    } else if eq_ignore_ascii(cmd, b"XADD") {
-        rewrite_xadd(args, reply)
-    } else if eq_ignore_ascii(cmd, b"EXPIRE") {
-        rewrite_expire(args, reply, now_ms, false)
-    } else if eq_ignore_ascii(cmd, b"PEXPIRE") {
-        rewrite_expire(args, reply, now_ms, true)
-    } else if eq_ignore_ascii(cmd, b"HEXPIRE") {
-        rewrite_hexpire(args, reply, now_ms, false)
-    } else if eq_ignore_ascii(cmd, b"HPEXPIRE") {
-        rewrite_hexpire(args, reply, now_ms, true)
-    } else if eq_ignore_ascii(cmd, b"HGETEX") {
-        rewrite_hgetex(args, reply, now_ms)
-    } else if eq_ignore_ascii(cmd, b"RESTORE") {
-        rewrite_restore(args, now_ms)
-    } else if eq_ignore_ascii(cmd, b"XREADGROUP") {
-        crate::replication::stream_effect::rewrite_xreadgroup(args, reply, now_ms)
-    } else if eq_ignore_ascii(cmd, b"XCLAIM") {
-        crate::replication::stream_effect::rewrite_xclaim(args, reply, now_ms)
-    } else if eq_ignore_ascii(cmd, b"XAUTOCLAIM") {
-        crate::replication::stream_effect::rewrite_xautoclaim(args, reply, now_ms)
-    } else {
-        Propagation::Verbatim
+    // Dispatch on the name length first (moon#1187): every write passes
+    // through here, and nearly all of them (`SET`, `HSET`, `INCR`, …) match
+    // no family — a length mismatch rejects them in one compare instead of
+    // up to eleven name comparisons.
+    match cmd.len() {
+        4 if eq_ignore_ascii(cmd, b"SPOP") => rewrite_spop(args, reply),
+        4 if eq_ignore_ascii(cmd, b"XADD") => rewrite_xadd(args, reply),
+        6 if eq_ignore_ascii(cmd, b"EXPIRE") => rewrite_expire(args, reply, now_ms, false),
+        6 if eq_ignore_ascii(cmd, b"HGETEX") => rewrite_hgetex(args, reply, now_ms),
+        6 if eq_ignore_ascii(cmd, b"XCLAIM") => {
+            crate::replication::stream_effect::rewrite_xclaim(args, reply, now_ms)
+        }
+        7 if eq_ignore_ascii(cmd, b"PEXPIRE") => rewrite_expire(args, reply, now_ms, true),
+        7 if eq_ignore_ascii(cmd, b"HEXPIRE") => rewrite_hexpire(args, reply, now_ms, false),
+        7 if eq_ignore_ascii(cmd, b"RESTORE") => rewrite_restore(args, now_ms),
+        8 if eq_ignore_ascii(cmd, b"HPEXPIRE") => rewrite_hexpire(args, reply, now_ms, true),
+        10 if eq_ignore_ascii(cmd, b"XREADGROUP") => {
+            crate::replication::stream_effect::rewrite_xreadgroup(args, reply, now_ms)
+        }
+        10 if eq_ignore_ascii(cmd, b"XAUTOCLAIM") => {
+            crate::replication::stream_effect::rewrite_xautoclaim(args, reply, now_ms)
+        }
+        _ => Propagation::Verbatim,
     }
 }
 
@@ -164,7 +165,7 @@ fn rewrite_spop(args: &FrameVec, reply: &Frame) -> Propagation {
         return Propagation::Verbatim;
     }
     let mut out: Vec<Frame> = Vec::with_capacity(3);
-    out.push(bulk(b"SREM"));
+    out.push(lit(b"SREM"));
     out.push(args[1].clone());
     match reply {
         Frame::BulkString(_) => out.push(reply.clone()),
@@ -248,7 +249,7 @@ fn rewrite_expire(args: &FrameVec, reply: &Frame, now_ms: u64, millis: bool) -> 
     };
     if ttl <= 0 {
         return Propagation::Rewritten(Frame::Array(FrameVec::from_vec(vec![
-            bulk(b"DEL"),
+            lit(b"DEL"),
             args[1].clone(),
         ])));
     }
@@ -261,7 +262,7 @@ fn rewrite_expire(args: &FrameVec, reply: &Frame, now_ms: u64, millis: bool) -> 
         return Propagation::Verbatim;
     };
     Propagation::Rewritten(Frame::Array(FrameVec::from_vec(vec![
-        bulk(b"PEXPIREAT"),
+        lit(b"PEXPIREAT"),
         args[1].clone(),
         bulk_u64(abs),
     ])))
@@ -289,10 +290,10 @@ fn hpexpireat(key: &Frame, abs: u64, fields: Vec<Frame>) -> Propagation {
         return Propagation::Skip;
     }
     let mut out = Vec::with_capacity(5 + fields.len());
-    out.push(bulk(b"HPEXPIREAT"));
+    out.push(lit(b"HPEXPIREAT"));
     out.push(key.clone());
     out.push(bulk_u64(abs));
-    out.push(bulk(b"FIELDS"));
+    out.push(lit(b"FIELDS"));
     out.push(bulk_u64(fields.len() as u64));
     out.extend(fields);
     Propagation::Rewritten(Frame::Array(FrameVec::from_vec(out)))
@@ -392,13 +393,17 @@ fn rewrite_restore(args: &FrameVec, now_ms: u64) -> Propagation {
     };
     let mut out = args.to_vec();
     out[2] = bulk_u64(abs);
-    out.push(bulk(b"ABSTTL"));
+    out.push(lit(b"ABSTTL"));
     Propagation::Rewritten(Frame::Array(FrameVec::from_vec(out)))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn bulk(s: &[u8]) -> Frame {
+        Frame::BulkString(Bytes::copy_from_slice(s))
+    }
 
     fn cmd(parts: &[&[u8]]) -> Frame {
         Frame::Array(FrameVec::from_vec(parts.iter().map(|p| bulk(p)).collect()))

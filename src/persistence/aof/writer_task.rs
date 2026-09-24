@@ -20,7 +20,39 @@ use super::group_commit::{
     collect_group_commit_batch,
 };
 #[cfg(feature = "runtime-monoio")]
-use super::group_commit::{GroupCommitSink, commit_group_commit_batch};
+use super::group_commit::{BatchBuf, GroupCommitSink, commit_group_commit_batch_with};
+
+/// User-space bytes a tokio AOF writer may hold between batches without a
+/// `flush()` into the kernel — the pre-moon#1187 `BufWriter` default
+/// capacity, i.e. the tail a SIGKILL can lose under `everysec`/`no` (the
+/// kernel page cache survives a process kill; a `BufWriter` does not).
+#[cfg(feature = "runtime-tokio")]
+const AOF_TOKIO_UNFLUSHED_TAIL_BOUND: usize = 8 * 1024;
+
+/// The tokio writers' `BufWriter` (moon#1187): sized for a whole group-commit
+/// batch so a batch reaches the kernel in ONE `tokio::fs` blocking-pool hop
+/// instead of one per 8 KiB (~128 per 1 MiB batch). The durability bound is
+/// kept by the batch-end [`flush_tail_if_over_bound`], not by the capacity.
+#[cfg(feature = "runtime-tokio")]
+fn aof_buf_writer(file: tokio::fs::File) -> tokio::io::BufWriter<tokio::fs::File> {
+    tokio::io::BufWriter::with_capacity(AOF_GROUP_COMMIT_MAX_BYTES, file)
+}
+
+/// After a batch is buffered: push it to the kernel when more than
+/// [`AOF_TOKIO_UNFLUSHED_TAIL_BOUND`] bytes sit in user space, so a SIGKILL
+/// never loses more than the pre-moon#1187 8 KiB `BufWriter` could. A batch
+/// smaller than the bound stays buffered exactly as before.
+#[cfg(feature = "runtime-tokio")]
+async fn flush_tail_if_over_bound(
+    writer: &mut tokio::io::BufWriter<tokio::fs::File>,
+) -> std::io::Result<()> {
+    use tokio::io::AsyncWriteExt;
+    if writer.buffer().len() >= AOF_TOKIO_UNFLUSHED_TAIL_BOUND {
+        writer.flush().await
+    } else {
+        Ok(())
+    }
+}
 
 /// Idle-adaptive wake cadence for a background AOF writer's channel poll
 /// (RSS/CPU wave 5, item B).
@@ -343,7 +375,7 @@ pub async fn aof_writer_task(
     };
 
     #[cfg(feature = "runtime-tokio")]
-    let mut writer = tokio::io::BufWriter::new(file);
+    let mut writer = aof_buf_writer(file);
     #[cfg(feature = "runtime-tokio")]
     let mut last_fsync = Instant::now();
     // Torn-write latch (tokio TopLevel): once a batch write fails partway, the
@@ -501,6 +533,9 @@ pub async fn aof_writer_task(
         let mut last_db: usize = 0;
         // #455: see the tokio declaration above.
         let mut fold_floor = FoldEpoch::INITIAL;
+        // moon#1187: persistent batch-coalescing buffer (shrink hysteresis) —
+        // a multi-message batch no longer allocates a fresh buffer.
+        let mut batch_scratch = BatchBuf::new();
 
         loop {
             // Group commit: wait (bounded) for one message, then
@@ -564,7 +599,12 @@ pub async fn aof_writer_task(
                             file: &mut file,
                             fail_sync: fail_fsync_for_test,
                         };
-                        let outcome = commit_group_commit_batch(&mut sink, &mut batch, do_fsync);
+                        let outcome = commit_group_commit_batch_with(
+                            &mut sink,
+                            &mut batch,
+                            do_fsync,
+                            &mut batch_scratch,
+                        );
                         if outcome.write_failed {
                             // A torn write may leave a partial record — latch so no
                             // further bytes are appended after the tear.
@@ -820,6 +860,16 @@ pub async fn aof_writer_task(
                                 }
                             }
                             let do_fsync = matches!(fsync, FsyncPolicy::Always);
+                            // moon#1187: the batch reaches the kernel in one
+                            // hop; the user-space tail stays within the old
+                            // 8 KiB SIGKILL bound. (Always flushes below.)
+                            if !write_failed
+                                && !do_fsync
+                                && let Err(e) = flush_tail_if_over_bound(&mut writer).await
+                            {
+                                error!("AOF batch flush error: {}", e);
+                                write_failed = true;
+                            }
                             let verdict = if write_failed {
                                 // A torn write may leave a partial record — latch so
                                 // no further bytes are appended after the tear.
@@ -905,7 +955,7 @@ pub async fn aof_writer_task(
                                     .await;
                             match reopen_result {
                                 Ok(f) => {
-                                    writer = tokio::io::BufWriter::new(f);
+                                    writer = aof_buf_writer(f);
                                 }
                                 Err(e) => {
                                     error!("Failed to reopen AOF file after rewrite: {}", e);
@@ -929,7 +979,7 @@ pub async fn aof_writer_task(
                                 {
                                     error!("AOF rewrite overflow drain failed: {}", e);
                                 }
-                                writer = tokio::io::BufWriter::new(tokio::fs::File::from_std(sf));
+                                writer = aof_buf_writer(tokio::fs::File::from_std(sf));
                             }
                             // Back-date so the backlog drained right after the
                             // rewrite reaches disk within ~100ms + wake floor,
@@ -998,7 +1048,7 @@ pub async fn aof_writer_task(
                             {
                                 error!("AOF rewrite overflow drain failed: {}", e);
                             }
-                            writer = tokio::io::BufWriter::new(tokio::fs::File::from_std(active));
+                            writer = aof_buf_writer(tokio::fs::File::from_std(active));
                             // Back-date so the channel backlog that accumulated
                             // during the blocking fold reaches disk within ~100ms
                             // + wake floor — a SIGKILL shortly after rewrite
@@ -1207,7 +1257,7 @@ pub async fn per_shard_aof_writer_task(
             incr_path.display()
         );
 
-        let mut writer = tokio::io::BufWriter::new(file);
+        let mut writer = aof_buf_writer(file);
         let mut last_fsync = Instant::now();
         // Idle-adaptive channel-poll wake cadence (RSS/CPU wave 5, item B) —
         // see `IdleWait` docs near the top of this file.
@@ -1365,6 +1415,18 @@ pub async fn per_shard_aof_writer_task(
                                     }
 
                                     let do_fsync = matches!(fsync, FsyncPolicy::Always);
+                                    // moon#1187: see the TopLevel tokio loop.
+                                    if !write_failed
+                                        && !do_fsync
+                                        && let Err(e) =
+                                            flush_tail_if_over_bound(&mut writer).await
+                                    {
+                                        error!(
+                                            "AOF batch flush error shard {}: {}",
+                                            shard_id, e
+                                        );
+                                        write_failed = true;
+                                    }
                                     let verdict = if write_failed {
                                         // A torn write may leave a partial record —
                                         // latch so no further bytes are appended.
@@ -1491,9 +1553,7 @@ pub async fn per_shard_aof_writer_task(
                                                 shard_id, e
                                             );
                                         }
-                                        writer = tokio::io::BufWriter::new(
-                                            tokio::fs::File::from_std(sf),
-                                        );
+                                        writer = aof_buf_writer(tokio::fs::File::from_std(sf));
                                     }
                                 }
                                 Some(AofMessage::Shutdown) => {
@@ -1658,7 +1718,9 @@ pub async fn per_shard_aof_writer_task(
         let _dbg_start = Instant::now();
         // Reusable frame-coalescing buffer: one contiguous write_all per
         // group-commit batch instead of a header+body write pair per record.
-        let mut batch_buf: Vec<u8> = Vec::new();
+        // moon#1187: capacity survives across batches (shrink hysteresis) —
+        // it used to be dropped after every batch over 1 MiB.
+        let mut batch_buf = BatchBuf::new();
         // Idle-adaptive channel-poll wake cadence (RSS/CPU wave 5, item B) —
         // see `IdleWait` docs near the top of this file.
         let mut idle_wait = IdleWait::new();
@@ -1752,7 +1814,15 @@ pub async fn per_shard_aof_writer_task(
                         // under always-P16 (measured 127,812 write(2) calls / 1.25s
                         // of an 8s strace window vs 2,144 fdatasyncs / 0.2s — Redis
                         // batches ~120 records per write via aof_buf).
-                        batch_buf.clear();
+                        let framed_total: usize = batch
+                            .data
+                            .iter()
+                            .map(|m| match group_commit::msg_body(m).len() {
+                                0 => 0,
+                                n => 12 + n,
+                            })
+                            .sum();
+                        let frame_buf = batch_buf.begin(framed_total);
                         for msg in &batch.data {
                             let (lsn, data) = match msg {
                                 AofMessage::Append { lsn, bytes, .. }
@@ -1769,12 +1839,12 @@ pub async fn per_shard_aof_writer_task(
                             let mut header = [0u8; 12];
                             header[..8].copy_from_slice(&lsn.to_le_bytes());
                             header[8..].copy_from_slice(&(data.len() as u32).to_le_bytes());
-                            batch_buf.extend_from_slice(&header);
-                            batch_buf.extend_from_slice(data);
+                            frame_buf.extend_from_slice(&header);
+                            frame_buf.extend_from_slice(data);
                         }
                         let mut write_failed = false;
-                        if !batch_buf.is_empty() {
-                            if let Err(e) = file.write_all(&batch_buf) {
+                        if !batch_buf.as_slice().is_empty() {
+                            if let Err(e) = file.write_all(batch_buf.as_slice()) {
                                 error!(
                                     "AOF batch write failed shard {} (seq {}): {}. Persistence degraded.",
                                     shard_id, manifest.seq, e
@@ -1782,12 +1852,12 @@ pub async fn per_shard_aof_writer_task(
                                 write_failed = true;
                             }
                         }
-                        // Cap the reusable buffer's high-water mark: a rare burst of
-                        // large values (up to AOF_GROUP_COMMIT_MAX_BYTES) must not
-                        // pin megabytes on the writer thread forever.
-                        if batch_buf.capacity() > 1 << 20 {
-                            batch_buf = Vec::new();
-                        }
+                        // A rare burst of large values (up to
+                        // AOF_GROUP_COMMIT_MAX_BYTES) must not pin megabytes on the
+                        // writer thread forever — but a steady large-batch load must
+                        // not reallocate every batch either: `finish` shrinks only
+                        // after a sustained run of small batches.
+                        batch_buf.finish();
 
                         let do_fsync = matches!(fsync, FsyncPolicy::Always);
                         let verdict = if write_failed {
