@@ -277,32 +277,62 @@ impl Drop for ResponseSlotFuture {
     }
 }
 
-/// Per-connection pre-allocated response slots, one per target shard.
+/// Per-connection response slots, one per target shard, created on first use.
 ///
-/// Eliminates oneshot channel allocation on the cross-shard dispatch hot path.
-/// Created once per connection, reused across all dispatches for that connection.
+/// Eliminates oneshot channel allocation on the cross-shard dispatch hot path:
+/// a slot is created the first time this connection targets that shard and is
+/// reused for every later dispatch there.
+///
+/// Lazily (moon#1179 item 3): the pool used to allocate every slot at connect
+/// — one ~80 B `Arc` per shard, including this connection's OWN shard, which
+/// is never targeted — so a connection that never crosses a shard (every
+/// `--shards 1` connection, every hash-tagged client) paid ~2 KB at 8 shards
+/// and ~17 KB at 64. Now an untouched pool allocates nothing, and one that
+/// talks to k shards holds k slots.
 pub struct ResponseSlotPool {
-    slots: Vec<Arc<ResponseSlot>>,
+    slots: std::cell::OnceCell<Box<[std::cell::OnceCell<Arc<ResponseSlot>>]>>,
+    num_shards: usize,
     /// The shard this connection is assigned to (for diagnostics/debugging).
     #[allow(dead_code)]
     my_shard: usize,
 }
 
 impl ResponseSlotPool {
-    /// Create a pool with one slot per shard.
+    /// Create a pool for `num_shards` targets. Allocates nothing yet.
     pub fn new(num_shards: usize, my_shard: usize) -> Self {
-        let mut slots = Vec::with_capacity(num_shards);
-        for _ in 0..num_shards {
-            slots.push(Arc::new(ResponseSlot::new()));
+        Self {
+            slots: std::cell::OnceCell::new(),
+            num_shards,
+            my_shard,
         }
-        Self { slots, my_shard }
+    }
+
+    /// The slot for `target_shard`, created on first use. Panics (index out of
+    /// bounds) for a target outside `0..num_shards`, exactly as the eager
+    /// `Vec` index did.
+    #[inline]
+    fn slot(&self, target_shard: usize) -> &Arc<ResponseSlot> {
+        let slots = self.slots.get_or_init(|| {
+            (0..self.num_shards)
+                .map(|_| std::cell::OnceCell::new())
+                .collect()
+        });
+        slots[target_shard].get_or_init(|| Arc::new(ResponseSlot::new()))
+    }
+
+    /// How many slots have been created — observability for tests.
+    #[cfg(test)]
+    fn created_slots(&self) -> usize {
+        self.slots
+            .get()
+            .map_or(0, |s| s.iter().filter(|c| c.get().is_some()).count())
     }
 
     /// Get a reference to the slot for the given target shard (for the reply-side
     /// spin `try_take()`; borrows the pool, no refcount bump).
     #[inline]
     pub fn slot_for(&self, target_shard: usize) -> &ResponseSlot {
-        &self.slots[target_shard]
+        self.slot(target_shard)
     }
 
     /// Clone the shared handle to the slot for the given target shard, to send
@@ -312,7 +342,7 @@ impl ResponseSlotPool {
     /// connection task is dropped mid-flight (panic-unwind / shutdown).
     #[inline]
     pub fn slot_arc(&self, target_shard: usize) -> Arc<ResponseSlot> {
-        Arc::clone(&self.slots[target_shard])
+        Arc::clone(self.slot(target_shard))
     }
 
     /// Create a future that resolves when the target shard fills the slot.
@@ -322,7 +352,7 @@ impl ResponseSlotPool {
     #[inline]
     pub fn future_for(&self, target_shard: usize) -> ResponseSlotFuture {
         ResponseSlotFuture {
-            slot: Arc::clone(&self.slots[target_shard]),
+            slot: Arc::clone(self.slot(target_shard)),
             polled: false,
             parked: false,
         }
@@ -522,6 +552,28 @@ mod tests {
         for i in 0..8 {
             let _slot = pool.slot_for(i);
         }
+    }
+
+    /// moon#1179 item 3: a pool allocates nothing until a shard is targeted,
+    /// then exactly one slot per targeted shard — never the connection's own
+    /// shard unless it is actually targeted — and a slot's identity is stable.
+    #[test]
+    fn test_pool_creates_slots_lazily_per_target() {
+        let pool = ResponseSlotPool::new(64, 3);
+        assert_eq!(pool.created_slots(), 0);
+        assert!(
+            pool.slots.get().is_none(),
+            "an untouched pool allocates nothing"
+        );
+        let a = pool.slot_arc(5);
+        assert_eq!(pool.created_slots(), 1);
+        let _ = pool.future_for(9);
+        let _ = pool.slot_for(5);
+        assert_eq!(pool.created_slots(), 2);
+        assert!(
+            Arc::ptr_eq(&a, &pool.slot_arc(5)),
+            "slot identity must be stable"
+        );
     }
 
     #[test]
