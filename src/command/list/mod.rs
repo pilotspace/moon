@@ -1,3 +1,4 @@
+mod list_compact;
 mod list_read;
 mod list_write;
 
