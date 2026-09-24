@@ -14,7 +14,7 @@ use crate::persistence::manifest::{FileEntry, FileStatus, ShardManifest, Storage
 use crate::persistence::page::PageType;
 use crate::storage::tiered::SegmentHandle;
 use crate::vector::persistence::warm_segment::{
-    write_codes_mpf, write_graph_mpf, write_mvcc_mpf, write_vectors_mpf,
+    write_codes_mpf_with_sub_signs, write_graph_mpf, write_mvcc_mpf, write_vectors_mpf,
 };
 
 /// Removes a staging directory unless the transition disarms it.
@@ -149,6 +149,38 @@ pub fn transition_to_warm(
     manifest: &mut ShardManifest,
     wal: Option<&mut crate::persistence::wal_v3::segment::WalWriterV3>,
 ) -> std::io::Result<SegmentHandle> {
+    transition_to_warm_with_sub_signs(
+        shard_dir,
+        segment_id,
+        file_id,
+        codes_data,
+        &[],
+        graph_data,
+        vectors_data,
+        mvcc_data,
+        manifest,
+        wal,
+    )
+}
+
+/// [`transition_to_warm`] that also carries the HOT segment's sub-centroid
+/// sign bits (moon#1213): they are written into `codes.mpf` after the codes
+/// with `has_sub_signs` set (see
+/// `vector::persistence::warm_segment::write_codes_mpf_with_sub_signs`), so
+/// the WARM segment keeps the 32-level LUT. Empty `sub_signs` is exactly
+/// [`transition_to_warm`].
+pub fn transition_to_warm_with_sub_signs(
+    shard_dir: &Path,
+    segment_id: u64,
+    file_id: u64,
+    codes_data: &[u8],
+    sub_signs: &[u8],
+    graph_data: &[u8],
+    vectors_data: Option<&[u8]>,
+    mvcc_data: &[u8],
+    manifest: &mut ShardManifest,
+    wal: Option<&mut crate::persistence::wal_v3::segment::WalWriterV3>,
+) -> std::io::Result<SegmentHandle> {
     let vectors_dir = shard_dir.join("vectors");
     std::fs::create_dir_all(&vectors_dir)?;
 
@@ -185,7 +217,7 @@ pub fn transition_to_warm(
     let mut staging_guard = StagingGuard::new(&staging);
 
     // Step 2: Write .mpf files to staging
-    write_codes_mpf(&staging.join("codes.mpf"), file_id, codes_data)?;
+    write_codes_mpf_with_sub_signs(&staging.join("codes.mpf"), file_id, codes_data, sub_signs)?;
     write_graph_mpf(&staging.join("graph.mpf"), file_id, graph_data)?;
     write_mvcc_mpf(&staging.join("mvcc.mpf"), file_id, mvcc_data)?;
 
@@ -211,11 +243,12 @@ pub fn transition_to_warm(
     fsync_directory(&staging)?;
 
     // Step 4-5: Update manifest and commit (atomic durability point)
-    let codes_pages = if codes_data.is_empty() {
+    let codes_len = codes_data.len() + sub_signs.len();
+    let codes_pages = if codes_len == 0 {
         1
     } else {
         let payload_cap = 65536 - 64;
-        (codes_data.len() + payload_cap - 1) / payload_cap
+        (codes_len + payload_cap - 1) / payload_cap
     };
 
     let entry = FileEntry {
@@ -225,7 +258,7 @@ pub fn transition_to_warm(
         tier: StorageTier::Warm,
         page_size_log2: 16, // 64KB
         page_count: codes_pages as u32,
-        byte_size: codes_data.len() as u64,
+        byte_size: codes_len as u64,
         created_lsn: 0,
         db_index: 0,
         max_key_hash: u64::MAX,
