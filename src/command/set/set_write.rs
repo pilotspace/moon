@@ -822,9 +822,16 @@ pub fn smove(db: &mut Database, args: &[Frame]) -> Frame {
         Err(e) => return e,
         Ok(Some(_)) => {}
     }
-    match db.get_set(destination) {
-        Ok(_) => {}
+    let destination_absent = match db.get_set(destination) {
+        Ok(found) => found.is_none(),
         Err(e) => return e,
+    };
+    // moon#1225's sibling: an unreadable cold destination reads as absent
+    // (the probe raises the fault flag and answers `None`). Refuse HERE,
+    // before the member leaves the source — the destination's create below
+    // would refuse it after the fact and the member would exist nowhere.
+    if destination_absent && db.take_cold_fault().is_some() {
+        return Database::cold_fault_error();
     }
 
     if source == destination {
