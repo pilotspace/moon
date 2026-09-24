@@ -12,8 +12,8 @@ use std::collections::HashMap;
 
 use super::{
     AggregateOp, clamp_nan_to_zero, format_score, format_score_bytes, glob_match, lex_in_range,
-    parse_bounded_count, parse_lex_bound, parse_numkeys, parse_score_bound, zrange_by_lex,
-    zrange_by_rank, zrange_by_score, zrange_from_entries,
+    lex_rank_window, parse_bounded_count, parse_lex_bound, parse_numkeys, parse_score_bound,
+    score_rank_window, zrange_by_lex, zrange_by_rank, zrange_by_score, zrange_from_entries,
 };
 
 // ---------------------------------------------------------------------------
@@ -804,15 +804,10 @@ pub fn zcount_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
     match db.get_sorted_set_ref_if_alive(key, now_ms) {
         Ok(Some(zref)) => match zref.bptree() {
             Some(scores) => {
-                let range_min = OrderedFloat(min_bound.value());
-                let range_max = OrderedFloat(max_bound.value());
-                let count = scores
-                    .range(range_min, range_max)
-                    .filter(|(score, _)| {
-                        min_bound.includes(score.0) && max_bound.includes_upper(score.0)
-                    })
-                    .count();
-                Frame::Integer(count as i64)
+                // moon#1170: two O(log N) order-statistic descents instead of
+                // walking every in-range entry (25 ms on a 1M-member zset).
+                let (lo, hi) = score_rank_window(scores, &min_bound, &max_bound);
+                Frame::Integer(hi.saturating_sub(lo) as i64)
             }
             None => {
                 let entries = zref.entries_sorted();
@@ -856,10 +851,15 @@ pub fn zlexcount_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
     match db.get_sorted_set_ref_if_alive(key, now_ms) {
         Ok(Some(zref)) => match zref.bptree() {
             Some(scores) => {
-                let count = scores
-                    .iter()
-                    .filter(|(_, member)| lex_in_range(member, &min_bound, &max_bound))
-                    .count();
+                // moon#1170: O(log N) when every score is equal (the lex
+                // commands' precondition); the scan is kept for mixed scores.
+                let count = match lex_rank_window(scores, &min_bound, &max_bound) {
+                    Some((lo, hi)) => hi.saturating_sub(lo),
+                    None => scores
+                        .iter()
+                        .filter(|(_, member)| lex_in_range(member, &min_bound, &max_bound))
+                        .count(),
+                };
                 Frame::Integer(count as i64)
             }
             None => {

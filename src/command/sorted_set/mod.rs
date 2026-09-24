@@ -282,6 +282,37 @@ impl ScoreBound {
             ScoreBound::Exclusive(v) => score < *v,
         }
     }
+
+    /// Used as the LOWER end of a range: the ascending rank of the first
+    /// entry this bound admits, i.e. how many entries it excludes from
+    /// below. O(log N) (moon#1170).
+    ///
+    /// `includes` is monotone over the tree's order — false for a prefix,
+    /// true for the rest, for every variant including the directional
+    /// infinities of moon#961 — so its negation is exactly the prefix
+    /// predicate `BPTree::count_while` partitions on. The rank therefore
+    /// agrees with the per-entry filter the scan used to apply, by
+    /// construction rather than by a second transcription of the four cases.
+    pub(super) fn lower_rank(&self, tree: &BPTree) -> usize {
+        tree.count_while(|score, _| !self.includes(score))
+    }
+
+    /// Used as the UPPER end of a range: one past the ascending rank of the
+    /// last entry this bound admits. `includes_upper` is true for a prefix.
+    pub(super) fn upper_rank(&self, tree: &BPTree) -> usize {
+        tree.count_while(|score, _| self.includes_upper(score))
+    }
+}
+
+/// `[lo, hi)` in ascending rank space for a score range — empty (`lo >= hi`)
+/// when the bounds cross, exactly as the old filter-everything scan found
+/// nothing for `ZRANGEBYSCORE k 3 1`.
+pub(super) fn score_rank_window(
+    tree: &BPTree,
+    min: &ScoreBound,
+    max: &ScoreBound,
+) -> (usize, usize) {
+    (min.lower_rank(tree), max.upper_rank(tree))
 }
 
 /// Redis's convention for a score that arithmetic turned into NaN: `0.0`.
@@ -371,6 +402,116 @@ pub(super) fn lex_in_range(member: &[u8], min: &LexBound, max: &LexBound) -> boo
     above_min && below_max
 }
 
+/// Does `member` satisfy `min` used as the lower lex bound? The first half of
+/// [`lex_in_range`], split out because it is the monotone predicate a rank
+/// seek needs.
+fn lex_above_min(member: &[u8], min: &LexBound) -> bool {
+    match min {
+        LexBound::NegInf => true,
+        LexBound::PosInf => false,
+        LexBound::Inclusive(v) => member >= v.as_ref(),
+        LexBound::Exclusive(v) => member > v.as_ref(),
+    }
+}
+
+/// The second half of [`lex_in_range`].
+fn lex_below_max(member: &[u8], max: &LexBound) -> bool {
+    match max {
+        LexBound::NegInf => false,
+        LexBound::PosInf => true,
+        LexBound::Inclusive(v) => member <= v.as_ref(),
+        LexBound::Exclusive(v) => member < v.as_ref(),
+    }
+}
+
+/// `[lo, hi)` in ascending rank space for a lex range — but ONLY when every
+/// member carries the same score, which is the precondition Redis documents
+/// for the lex commands: then the `(score, member)` order IS the member
+/// order and both halves of [`lex_in_range`] are monotone over it. `None`
+/// otherwise, and the callers keep the full scan, whose answer for mixed
+/// scores is the one moon has always given.
+///
+/// "Same score" is numeric equality, the tree's own notion: `OrderedFloat`
+/// ranks `-0.0` and `0.0` as one score, so a zset holding both is still
+/// member-ordered. O(log N) for the check (first and last rank) and the two
+/// seeks (moon#1170).
+pub(super) fn lex_rank_window(
+    tree: &BPTree,
+    min: &LexBound,
+    max: &LexBound,
+) -> Option<(usize, usize)> {
+    let len = tree.len();
+    if len == 0 {
+        return Some((0, 0));
+    }
+    let first = tree.get_by_rank(0)?.0;
+    let last = tree.get_by_rank(len - 1)?.0;
+    if first != last {
+        return None;
+    }
+    let lo = tree.count_while(|_, m| !lex_above_min(m, min));
+    let hi = tree.count_while(|_, m| lex_below_max(m, max));
+    Some((lo, hi))
+}
+
+/// Resolve `LIMIT offset count` against a rank window `[lo, hi)`: the
+/// `(first_rank_to_emit, how_many)` pair, or `None` for an empty reply.
+///
+/// moon#967: a negative offset returns nothing; a negative count means "no
+/// limit". The window is walked from the LOW end for an ascending range and
+/// from the HIGH end for a REV one, so for REV the first rank emitted is
+/// `hi - 1 - offset` and the walk goes down.
+fn limit_window(
+    lo: usize,
+    hi: usize,
+    rev: bool,
+    limit_offset: Option<i64>,
+    limit_count: Option<i64>,
+) -> Option<(usize, usize)> {
+    let raw_offset = limit_offset.unwrap_or(0);
+    if raw_offset < 0 || hi <= lo {
+        return None;
+    }
+    let avail = hi - lo;
+    let offset = usize::try_from(raw_offset).unwrap_or(usize::MAX);
+    if offset >= avail {
+        return None;
+    }
+    let left = avail - offset;
+    let n = match limit_count {
+        Some(c) if c >= 0 => left.min(usize::try_from(c).unwrap_or(usize::MAX)),
+        _ => left,
+    };
+    if n == 0 {
+        return None;
+    }
+    let first = if rev { hi - 1 - offset } else { lo + offset };
+    Some((first, n))
+}
+
+/// Emit `n` entries walking from ascending rank `first` — upwards, or
+/// downwards for `rev` — as a ZRANGE-family reply. One descent plus a leaf
+/// walk: O(log N + n) (moon#1170).
+fn emit_ranks(tree: &BPTree, first: usize, n: usize, rev: bool, withscores: bool) -> Frame {
+    let mut result = Vec::with_capacity(if withscores { n.saturating_mul(2) } else { n });
+    let mut push = |score: OrderedFloat<f64>, member: &Bytes| {
+        result.push(Frame::BulkString(member.clone()));
+        if withscores {
+            result.push(Frame::BulkString(format_score_bytes(score.0)));
+        }
+    };
+    if rev {
+        for (score, member) in tree.iter_rev_from_rank(first).take(n) {
+            push(score, member);
+        }
+    } else {
+        for (score, member) in tree.iter_from_rank(first).take(n) {
+            push(score, member);
+        }
+    }
+    Frame::Array(result.into())
+}
+
 // ---------------------------------------------------------------------------
 // Shared range helpers
 // ---------------------------------------------------------------------------
@@ -448,30 +589,16 @@ pub(super) fn zrange_by_rank(
         None => return Frame::Array(framevec![]),
     };
 
-    let mut result = Vec::new();
-
+    // One descent to the window's first entry, then the leaf chain — where
+    // `range_by_rank` used to re-descend from the root for every element
+    // (moon#1170). REV counts ranks from the HIGH end: rev rank `start` is
+    // ascending rank `total - 1 - start`, walked downwards.
+    let n = stop - start + 1;
     if rev {
-        // Reverse: rank 0 = highest score
-        let rev_start = total - 1 - stop;
-        let rev_stop = total - 1 - start;
-        let entries = scores.range_by_rank(rev_start, rev_stop);
-        for (score, member) in entries.into_iter().rev() {
-            result.push(Frame::BulkString(member.clone()));
-            if withscores {
-                result.push(Frame::BulkString(Bytes::from(format_score(score.0))));
-            }
-        }
+        emit_ranks(scores, total - 1 - start, n, true, withscores)
     } else {
-        let entries = scores.range_by_rank(start, stop);
-        for (score, member) in entries {
-            result.push(Frame::BulkString(member.clone()));
-            if withscores {
-                result.push(Frame::BulkString(Bytes::from(format_score(score.0))));
-            }
-        }
+        emit_ranks(scores, start, n, false, withscores)
     }
-
-    Frame::Array(result.into())
 }
 
 pub(super) fn zrange_by_score(
@@ -497,56 +624,17 @@ pub(super) fn zrange_by_score(
 
     let _ = members; // not directly needed; scores has all data
 
-    // Use BPTree range to get entries in the score range, then apply bound filtering
-    let range_min = OrderedFloat(min_bound.value());
-    let range_max = OrderedFloat(max_bound.value());
-    // Ensure min <= max for BPTree range call
-    let (range_lo, range_hi) = if range_min <= range_max {
-        (range_min, range_max)
-    } else {
-        (range_max, range_min)
-    };
-
-    let mut entries: Vec<(f64, &Bytes)> = Vec::new();
-    for (score, member) in scores.range(range_lo, range_hi) {
-        let s = score.0;
-        if min_bound.includes(s) && max_bound.includes_upper(s) {
-            entries.push((s, member));
-        }
+    // moon#1170: O(log N + count), independent of the offset. The bounds become a rank
+    // window by two order-statistic descents, LIMIT becomes arithmetic on
+    // that window, and only the `count` entries actually replied are
+    // visited. The old shape collected EVERY in-range entry into a Vec,
+    // reversed it for REV, and only then applied LIMIT — 45 ms for
+    // `LIMIT 0 10` on a 1M-member zset.
+    let (lo, hi) = score_rank_window(scores, &min_bound, &max_bound);
+    match limit_window(lo, hi, rev, limit_offset, limit_count) {
+        Some((first, n)) => emit_ranks(scores, first, n, rev, withscores),
+        None => Frame::Array(framevec![]),
     }
-
-    if rev {
-        entries.reverse();
-    }
-
-    // Apply LIMIT
-    // moon#967: Redis defines a negative LIMIT offset as "return nothing".
-    // `.max(0)` clamped it to 0 and returned the range instead.
-    let raw_offset = limit_offset.unwrap_or(0);
-    if raw_offset < 0 {
-        return Frame::Array(framevec![]);
-    }
-    let offset = raw_offset as usize;
-    let count = limit_count.unwrap_or(-1);
-    let limited: Vec<_> = if count < 0 {
-        entries.into_iter().skip(offset).collect()
-    } else {
-        entries
-            .into_iter()
-            .skip(offset)
-            .take(count as usize)
-            .collect()
-    };
-
-    let mut result = Vec::new();
-    for (score, member) in limited {
-        result.push(Frame::BulkString(member.clone()));
-        if withscores {
-            result.push(Frame::BulkString(Bytes::from(format_score(score))));
-        }
-    }
-
-    Frame::Array(result.into())
 }
 
 pub(super) fn zrange_by_lex(
@@ -568,46 +656,60 @@ pub(super) fn zrange_by_lex(
         Err(e) => return e,
     };
 
-    let mut entries: Vec<&Bytes> = Vec::new();
-    for (_, member) in scores.iter() {
-        if lex_in_range(member, &min_bound, &max_bound) {
-            entries.push(member);
-        }
+    let _ = members; // the tree carries the score; no second lookup needed
+
+    // moon#1170: when every member shares one score (the documented
+    // precondition of the lex commands) the member order is the tree order,
+    // so the bounds are a rank window like a score range.
+    if let Some((lo, hi)) = lex_rank_window(scores, &min_bound, &max_bound) {
+        return match limit_window(lo, hi, rev, limit_offset, limit_count) {
+            Some((first, n)) => emit_ranks(scores, first, n, rev, withscores),
+            None => Frame::Array(framevec![]),
+        };
     }
 
-    if rev {
-        entries.reverse();
-    }
-
-    // Apply LIMIT
-    // moon#967: Redis defines a negative LIMIT offset as "return nothing".
-    // `.max(0)` clamped it to 0 and returned the range instead.
+    // Mixed scores: the lex filter is not monotone over the tree order, so
+    // this keeps the full scan and its long-standing answer — but lazily,
+    // with no intermediate Vec of every match, and it stops as soon as
+    // LIMIT is satisfied. Walking the tree backwards and filtering yields
+    // exactly the old "collect ascending, then reverse" sequence.
+    // moon#967: a negative LIMIT offset returns nothing.
     let raw_offset = limit_offset.unwrap_or(0);
     if raw_offset < 0 {
         return Frame::Array(framevec![]);
     }
-    let offset = raw_offset as usize;
-    let count = limit_count.unwrap_or(-1);
-    let limited: Vec<_> = if count < 0 {
-        entries.into_iter().skip(offset).collect()
-    } else {
-        entries
-            .into_iter()
-            .skip(offset)
-            .take(count as usize)
-            .collect()
+    let offset = usize::try_from(raw_offset).unwrap_or(usize::MAX);
+    let take = match limit_count {
+        Some(c) if c >= 0 => usize::try_from(c).unwrap_or(usize::MAX),
+        _ => usize::MAX,
     };
-
     let mut result = Vec::new();
-    for member in limited {
+    let mut push = |score: OrderedFloat<f64>, member: &Bytes| {
         result.push(Frame::BulkString(member.clone()));
         if withscores {
-            if let Some(score) = members.get(member) {
-                result.push(Frame::BulkString(Bytes::from(format_score(*score))));
-            }
+            result.push(Frame::BulkString(format_score_bytes(score.0)));
+        }
+    };
+    let in_range = |m: &Bytes| lex_in_range(m, &min_bound, &max_bound);
+    if rev {
+        for (score, member) in scores
+            .iter_rev()
+            .filter(|(_, m)| in_range(m))
+            .skip(offset)
+            .take(take)
+        {
+            push(score, member);
+        }
+    } else {
+        for (score, member) in scores
+            .iter()
+            .filter(|(_, m)| in_range(m))
+            .skip(offset)
+            .take(take)
+        {
+            push(score, member);
         }
     }
-
     Frame::Array(result.into())
 }
 
@@ -798,6 +900,9 @@ pub(super) fn zrange_from_entries(
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod range_rank_tests;
 
 #[cfg(test)]
 mod tests {

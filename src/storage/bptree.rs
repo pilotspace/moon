@@ -91,6 +91,15 @@ impl InternalNode {
         &self.children
     }
 
+    /// The live separator keys, `keys[..key_count()]`. Every entry in
+    /// `children[i]` is `< keys[i]` and every entry in `children[i + 1]` is
+    /// `>= keys[i]` — the invariant the order-statistic descents
+    /// (`BPTree::count_while`) partition on.
+    #[inline]
+    pub(crate) fn live_keys(&self) -> &[Key] {
+        &self.keys[..self.key_count()]
+    }
+
     #[inline]
     pub(crate) fn counts(&self) -> &[u32; INTERNAL_FANOUT + 1] {
         &self.counts
@@ -130,6 +139,13 @@ impl LeafNode {
     #[inline]
     pub(crate) fn entries(&self) -> &[Key; LEAF_CAPACITY] {
         &self.entries
+    }
+
+    /// The live entries, `entries[..entry_count()]`, in `(score, member)`
+    /// order.
+    #[inline]
+    pub(crate) fn live_entries(&self) -> &[Key] {
+        &self.entries[..self.entry_count()]
     }
 
     #[inline]
