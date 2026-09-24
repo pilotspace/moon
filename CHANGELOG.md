@@ -192,6 +192,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   backpressure budget now covers every record in a completion drain, so a
   saturated writer blocks the shard thread for at most 500 ms per drain
   instead of 500 ms per spill file.
+- **A spilled value larger than ~4 MB is readable again** (moon#1201). The
+  cold-tier overflow-chain reader capped a chain at a fixed 1000 pages
+  (~4.03 MB), while the spill writer has no size cap, so every larger value —
+  in practice a consumer-group stream whose PEL grows without `XACK` — was
+  written intact but refused on read as `OverflowBroken`: the key stayed
+  indexed and answered `IOERR` to `XADD`, `XREADGROUP`, `GET` and every other
+  reader until overwritten (in v0.8.9 and earlier the same read was a silent
+  miss, so `XADD` started a fresh stream and the old one was lost). The cycle
+  guard is now the file's own page count, which no acyclic chain can exceed.
+  No on-disk format change; files written by any earlier version read back.
 
 - **An AOF rewrite that is started while the previous one is still draining
   is no longer lost** (moon#1158). A per-shard rewrite released the
