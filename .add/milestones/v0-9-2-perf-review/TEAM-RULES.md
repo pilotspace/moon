@@ -21,9 +21,13 @@ does not OOM, fill the disk, or corrupt each other's work.
 - Iterate with `cargo check --lib` (fast). Unit tests: `cargo test --lib <filter>`.
   Integration tests: ONLY by name, `cargo test --test <name> [filter]` — NEVER a bare
   `cargo test` (272 test binaries ≈ 10 GB + an hour of CPU).
-- Before your LAST commit: `cargo fmt`, `cargo check --lib --no-default-features --features runtime-tokio,jemalloc`,
-  `cargo clippy --lib -- -D warnings`, and the same clippy with the tokio feature set.
-- If you touched `#[cfg(test)]` code or a bench, also `cargo check --lib --tests` (unit tests compile).
+- Before your LAST commit: `cargo fmt`, `cargo clippy --all-targets -- -D warnings` (CI lints tests and
+  benches too — `--lib` alone let a `useless_vec` in a new integration test turn PR #1221's Check red),
+  `cargo clippy --no-default-features --features runtime-tokio,jemalloc -- -D warnings`, and
+  `cargo check --all-targets --no-default-features --features runtime-tokio,jemalloc` (the tokio leg has
+  no `graph`/`text-index`: a new bench/test using them needs `required-features` or a `cfg` gate).
+- An in-process test result counts only if a failing backtrace path points into YOUR worktree:
+  the shared target aliases artifacts, and a binary built in another tree once satisfied a gate.
 - Release measurement builds: `cargo build --profile release-fast --bin moon` — at most TWO per
   workstream (≈4+ min each under contention). Copy the resulting binary to
   `/home/user/wt/bin/<ws-id>-<label>` immediately (the shared target path is overwritten by
