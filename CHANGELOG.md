@@ -53,13 +53,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ZRANDMEMBER / HRANDFIELD parse the count before the key with redis's strict integer rules (`+1`,
   `01`, `-0` and an extra argument are errors).
 - **Vector: WARM segments rank like their HOT source** (moon#1213) — they carry real sub-centroid
-  signs and use the 32-level LUT. New opt-in `MOON_VECTOR_PAYLOAD_SCHEMA=declared` indexes only
-  declared TAG/NUMERIC payload fields and routes KNN TEXT filters to the BM25 plane (filters on
-  undeclared fields then match nothing). `index_persist` sidecars stay v5, which the previous
-  release reads, unless `MOON_VECTOR_PAYLOAD_SCHEMA=declared` is on and an index declares a payload
-  field: only then is v6 written (older binaries refuse a v6 sidecar; replicas still receive v5
-  definitions). A v5 sidecar carries no payload schema, so an index created while the mode was off
-  keeps the index-every-field payload policy after a restart with it on — re-create it to opt in.
+  signs and use the 32-level LUT. The signs cost ⌈padded dim / 8⌉ bytes per vector (+128 B at 768d,
+  padded to 1024) and count in `resident_bytes`, so the WARM mmap budget demotes more segments. New
+  opt-in `MOON_VECTOR_PAYLOAD_SCHEMA=declared` indexes only declared TAG/NUMERIC payload fields and
+  routes KNN TEXT filters to the BM25 plane (filters on undeclared fields then match nothing).
+  `index_persist` sidecars stay v5, which the previous release reads, unless
+  `MOON_VECTOR_PAYLOAD_SCHEMA=declared` is on and an index declares a payload field: only then is v6
+  written (older binaries refuse a v6 sidecar; replicas still receive v5 definitions). A v5 sidecar
+  carries no payload schema, so an index created while the mode was off keeps the index-every-field
+  payload policy after a restart with it on — re-create it to opt in.
 
 - **BEHAVIOUR CHANGE — a command the user's ACL denies inside `MULTI` now
   aborts the whole transaction** (moon#1035). `EXEC` answers
