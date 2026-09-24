@@ -30,6 +30,12 @@ use crate::vector::types::SearchResult;
 use crate::vector::types::SearchTuning;
 use crate::vector::types::VectorId;
 
+#[cfg(test)]
+thread_local! {
+    /// Test-only: tombstone read-guard acquisitions on the search path.
+    pub(crate) static TOMBSTONE_GUARDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Microseconds since UNIX epoch, read from the shard's thread-local cached
 /// clock (`crate::storage::entry::current_time_ms`, one `clock_gettime` per
 /// shard tick, ~1ms) instead of a raw per-call `SystemTime::now()` syscall
@@ -41,12 +47,6 @@ use crate::vector::types::VectorId;
 /// with the microsecond field below) is sufficient: every caller here only
 /// ever compares `age_secs`/`idle_secs` at second granularity.
 #[inline]
-#[cfg(test)]
-thread_local! {
-    /// Test-only: tombstone read-guard acquisitions on the search path.
-    pub(crate) static TOMBSTONE_GUARDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
-
 fn now_micros() -> u64 {
     crate::storage::entry::current_time_ms() * 1000
 }

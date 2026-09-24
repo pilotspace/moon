@@ -44,7 +44,7 @@ fn build_store_metric(
     meta.metric = metric;
     store.create_index(meta).unwrap();
     let mut n = 0u64;
-    let mut put = |store: &mut VectorStore, n: &mut u64| {
+    let put = |store: &mut VectorStore, n: &mut u64| {
         let key = format!("doc:{n}");
         let hash = xxhash_rust::xxh64::xxh64(key.as_bytes(), 0);
         store
