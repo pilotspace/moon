@@ -63,6 +63,22 @@ fn used_memory(c: &mut Conn) -> u64 {
         .unwrap_or_else(|| panic!("INFO memory has no used_memory: {raw:?}"))
 }
 
+/// `used_memory` once INFO's per-shard figure has caught up: the shards
+/// publish it on a tick, so a read straight after a write can be stale. Two
+/// equal reads 150 ms apart.
+fn settled_used_memory(c: &mut Conn) -> u64 {
+    let mut last = used_memory(c);
+    for _ in 0..40 {
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        let now = used_memory(c);
+        if now == last {
+            return now;
+        }
+        last = now;
+    }
+    last
+}
+
 /// XADD `n` entries to `key` in pipelined batches; returns how many were
 /// accepted before the first error reply (all of them if none).
 fn xadd_until_refused(c: &mut Conn, key: &str, n: usize) -> (usize, Option<String>) {
@@ -98,10 +114,10 @@ fn stream_growth_is_charged_and_del_returns_to_baseline() {
         c.send(&["SET", "other", "a-value-past-the-sso-limit"]),
         "+OK\r\n"
     );
-    let base = used_memory(&mut c);
+    let base = settled_used_memory(&mut c);
     let (accepted, err) = xadd_until_refused(&mut c, "st", ENTRIES);
     assert_eq!((accepted, err), (ENTRIES, None));
-    let grown = used_memory(&mut c).saturating_sub(base);
+    let grown = settled_used_memory(&mut c).saturating_sub(base);
     let usage_raw = c.send(&["MEMORY", "USAGE", "st"]);
     eprintln!(
         "[1163] {ENTRIES} XADDs: used_memory +{grown} B ({:.1} B/entry); MEMORY USAGE {}",
@@ -123,7 +139,7 @@ fn stream_growth_is_charged_and_del_returns_to_baseline() {
     );
     assert_eq!(c.send(&["DEL", "st"]), ":1\r\n");
     assert_eq!(
-        used_memory(&mut c),
+        settled_used_memory(&mut c),
         base,
         "DEL of the stream must return used_memory to the baseline exactly"
     );
