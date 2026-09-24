@@ -35,8 +35,13 @@
 //! | 9 | LFU counter RESET to `LFU_INIT_VAL` (a side effect of rebuilding) | **preserved and bumped once** — the key's access history survives a write, and the lookup records ONE access (`note_access`), as redis's `lookupKeyWrite` does and as the INCR family does since moon#1221 review F3 (moon#1168, moon#1161) |
 //!
 //! A closure that did NOT write (BITFIELD whose every INCRBY hit `OVERFLOW
-//! FAIL` on a string already long enough) leaves the entry bit-for-bit
-//! unchanged — no version bump, which is redis's "no dirty" too.
+//! FAIL` on a string already long enough) leaves the value and every write
+//! effect alone — no version bump, no ledger delta, no keyspace change —
+//! which is redis's "no dirty" too. The entry is NOT bit-for-bit unchanged,
+//! though: the lookup has already recorded the command's one access (9,
+//! `note_access`: the LRU clock or the LFU counter, per the eviction policy),
+//! whether or not the closure writes, exactly as redis's `lookupKeyWrite`
+//! does before the command runs.
 //!
 //! The keyspace notification and the AOF/replication record stay with the
 //! command layer, driven by the reply exactly as before.
