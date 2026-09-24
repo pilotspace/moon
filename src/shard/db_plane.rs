@@ -170,6 +170,8 @@ impl ShardDbSet {
     pub fn try_write(&self, idx: usize) -> Option<DbWriteGuard<'_>> {
         let cell = self.dbs.get(idx)?;
         let _depth = guard_depth::acquire(idx);
+        #[cfg(test)]
+        exclusive_count::bump();
         Some(DbWriteGuard {
             inner: cell.write(),
             _depth,
@@ -203,6 +205,8 @@ impl ShardDbSet {
             return None;
         }
         let _depth = guard_depth::acquire(idx);
+        #[cfg(test)]
+        exclusive_count::bump();
         Some(DbWriteGuard {
             inner: cell.write(),
             _depth,
