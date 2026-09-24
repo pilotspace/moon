@@ -551,6 +551,13 @@ pub(crate) async fn handle_connection_sharded_monoio<
     // Parsed frames of the current batch; reused via .clear() each iteration,
     // grown on demand (moon#1179 item 3, see `responses` above).
     let mut frames: Vec<Frame> = Vec::new();
+    // moon#1179 item 5: `frames` holds a deferred batch tail (#438 / #507)
+    // carried into the next iteration, to run BEFORE anything else is parsed
+    // — instead of being re-encoded into `read_buf` and re-parsed. While set,
+    // the next iteration skips the socket read (`carried_input`) and the
+    // inline fast path (which would answer bytes queued BEHIND these frames
+    // first), and any hand-off that consumes bytes spills them back first.
+    let mut frames_carried = false;
     // Set when the parser rejects a frame. The connection still dies, but not
     // silently and not before the valid frames that preceded the fault in the
     // same read have been executed and answered.
@@ -586,6 +593,15 @@ pub(crate) async fn handle_connection_sharded_monoio<
         // is a reason RESP3 exists and which Redis allows. Entering this loop
         // for a RESP3 connection is what put it in the RESP2 jail.
         if conn.subscription_count > 0 && conn.protocol_version < 3 {
+            // moon#1179 item 5: this loop parses BYTES. A carried tail is
+            // spilled at the deferral when the connection is headed here, so
+            // this is a belt: nothing parsed may be skipped.
+            if std::mem::take(&mut frames_carried) {
+                super::util::spill_frames_to_front(&frames, &mut read_buf);
+                frames.clear();
+                codec.reset_parse_state();
+                carried_input = true;
+            }
             #[allow(clippy::unwrap_used)]
             // conn.pubsub_rx is always Some when conn.subscription_count > 0
             let rx = conn.pubsub_rx.as_ref().unwrap();
@@ -1493,7 +1509,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
 
         // Inline dispatch: GET/SET directly from raw bytes, skipping Frame construction.
         // Skip when unauthenticated or workspace-bound (prefix injection in normal path only).
-        if conn.authenticated && conn.workspace_id.is_none() {
+        if !frames_carried && conn.authenticated && conn.workspace_id.is_none() {
             // Inline writes safe only when: ACL unrestricted, !in_multi, !tracking,
             // !is_replica, no spill_sender. Replica check reads the lock-free
             // `is_replica_mirror` (kept in sync by `ReplicationState::set_role`)
@@ -1796,8 +1812,12 @@ pub(crate) async fn handle_connection_sharded_monoio<
             // for remaining commands. Inlined responses are already in write_buf.
         }
 
-        // Parse all complete frames from the read buffer (reuse pre-allocated Vec, cap at 1024)
-        frames.clear();
+        // Parse all complete frames from the read buffer (reuse pre-allocated Vec, cap at 1024).
+        // A carried tail (moon#1179 item 5) stays at the front: new frames
+        // are appended BEHIND it, which is exactly the order the bytes had.
+        if !std::mem::take(&mut frames_carried) {
+            frames.clear();
+        }
         loop {
             match codec.decode_frame(&mut read_buf) {
                 Ok(Some(frame)) => {
@@ -4322,15 +4342,21 @@ pub(crate) async fn handle_connection_sharded_monoio<
         // (arrays of bulk strings) round-trip losslessly through
         // serialize_resp3. If a migration executes at this batch's end, the
         // carried bytes ride along in `read_buf_remainder`.
+        //
+        // moon#1179 item 5: the tail is carried as the parsed frames instead
+        // (`frames_carried`) — re-encoding and re-parsing it on every deferral
+        // cost ~n²/2d frame round trips per n-frame batch deferring every d.
+        // Bytes remain only when the next iteration is the RESP2 subscriber
+        // loop, which parses bytes; migration spills at its own hand-off.
         if let Some(from) = deferred_tail_from {
-            let mut carry = BytesMut::with_capacity(64 + read_buf.len());
-            for f in &frames[from..num_frames] {
-                crate::protocol::serialize_resp3(f, &mut carry);
+            if conn.subscription_count > 0 && conn.protocol_version < 3 {
+                super::util::spill_frames_to_front(&frames[from..num_frames], &mut read_buf);
+                // moon#1164: bytes were prepended — the resume cursor is void.
+                codec.reset_parse_state();
+            } else {
+                frames.drain(..from);
+                frames_carried = true;
             }
-            carry.extend_from_slice(&read_buf);
-            read_buf = carry;
-            // moon#1164: bytes were prepended — the resume cursor is void.
-            codec.reset_parse_state();
             carried_input = true;
         }
 
@@ -4752,6 +4778,11 @@ pub(crate) async fn handle_connection_sharded_monoio<
         if let Some(target_shard) = conn.migration_target
             && conn.migration_eligible()
         {
+            // moon#1179 item 5: a carried tail rides along as bytes, ahead of
+            // the unparsed remainder, exactly as the pre-carry code sent it.
+            if frames_carried {
+                super::util::spill_frames_to_front(&frames, &mut read_buf);
+            }
             let migrated_state = MigratedConnectionState {
                 selected_db: conn.selected_db,
                 authenticated: conn.authenticated,
@@ -4827,8 +4858,10 @@ pub(crate) async fn handle_connection_sharded_monoio<
 
         responses.clear();
         super::util::shrink_batch_vec(&mut responses);
-        frames.clear();
-        super::util::shrink_batch_vec(&mut frames);
+        if !frames_carried {
+            frames.clear();
+            super::util::shrink_batch_vec(&mut frames);
+        }
     }
 
     // --- Graceful TCP shutdown: send FIN to client to avoid CLOSE_WAIT ---

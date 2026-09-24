@@ -468,6 +468,11 @@ pub(crate) async fn handle_connection_sharded_inner<
     // Batch-end shrink governors with hysteresis (moon#1179 item 4).
     let mut read_shrink = super::util::IoBufShrink::default();
     let mut write_shrink = super::util::IoBufShrink::default();
+    // moon#1179 item 5: a deferred batch tail (#438 / #507) carried as the
+    // parsed frames into the next batch, ahead of anything parsed then —
+    // instead of being re-encoded into `read_buf` and re-parsed. Non-empty
+    // only between a deferral and the next batch's parse.
+    let mut carried_frames: Vec<Frame> = Vec::new();
     loop {
         // Check if CLIENT KILL targeted this connection (lock-free, QW8)
         if client_live.is_killed() {
@@ -500,6 +505,14 @@ pub(crate) async fn handle_connection_sharded_inner<
             // #438: a deferred batch tail from the subscribe break sits in
             // read_buf; run_subscriber_step parses it before awaiting the
             // socket, clearing the flag only when its read arm actually wins.
+            // moon#1179 item 5: that step parses BYTES; a carried tail is
+            // spilled at the deferral when headed here, and this is the belt.
+            if !carried_frames.is_empty() {
+                super::util::spill_frames_to_front(&carried_frames, &mut read_buf);
+                carried_frames.clear();
+                parse_state.reset();
+                carried_input = true;
+            }
             let subscriber_action = pubsub::run_subscriber_step(
                 &mut stream,
                 &mut read_buf,
@@ -531,7 +544,10 @@ pub(crate) async fn handle_connection_sharded_inner<
         // need, so a large upload is read in a geometric series of reads
         // rather than whatever spare capacity happens to be left. The first
         // call skips the config lock whenever there is no hint at all.
-        if !(carried_input && !read_buf.is_empty())
+        // moon#1179 item 5: a carried tail counts as input even when every
+        // remaining byte was already parsed.
+        let have_carry = carried_input && (!read_buf.is_empty() || !carried_frames.is_empty());
+        if !have_carry
             && super::util::hinted_read_len(
                 read_buf.len(),
                 parse_state.pending_len(),
@@ -575,8 +591,10 @@ pub(crate) async fn handle_connection_sharded_inner<
                 // arm BODY below, so a select round lost to the tracking or
                 // shutdown arm keeps the carry armed instead of eating it
                 // (the old take() here could drop carried input on the race).
-                if carried_input && !read_buf.is_empty() {
-                    Ok(read_buf.len())
+                if have_carry {
+                    // Never 0 — that would read as EOF — when the carry is
+                    // only frames (moon#1179 item 5).
+                    Ok(read_buf.len().max(1))
                 } else {
                     stream.read_buf(&mut read_buf).await
                 }
@@ -612,7 +630,13 @@ pub(crate) async fn handle_connection_sharded_inner<
                 }
 
                 // Parse all complete frames from buffer
-                let mut batch: Vec<Frame> = Vec::with_capacity(64);
+                // A carried tail (moon#1179 item 5) runs first; frames parsed
+                // now are appended behind it, in the order the bytes had.
+                let mut batch: Vec<Frame> = if carried_frames.is_empty() {
+                    Vec::with_capacity(64)
+                } else {
+                    std::mem::take(&mut carried_frames)
+                };
                 const MAX_BATCH: usize = 1024;
                 loop {
                     match crate::protocol::parse_resumable(&mut read_buf, &parse_config, &mut parse_state) {
@@ -3193,15 +3217,19 @@ pub(crate) async fn handle_connection_sharded_inner<
                 // resolves every pending remote reply and the epilogue
                 // flushes them. RESP command arrays round-trip losslessly
                 // through serialize_resp3.
+                //
+                // moon#1179 item 5: carried as the parsed frames instead —
+                // bytes only when the next iteration is the RESP2 subscriber
+                // step, which parses bytes (migration spills at its hand-off).
                 if let Some(from) = deferred_tail_from {
-                    let mut carry = BytesMut::with_capacity(64 + read_buf.len());
-                    for f in &batch[from..num_frames] {
-                        crate::protocol::serialize_resp3(f, &mut carry);
+                    if conn.subscription_count > 0 && conn.protocol_version < 3 {
+                        super::util::spill_frames_to_front(&batch[from..num_frames], &mut read_buf);
+                        // moon#1164: bytes were prepended — the resume cursor is void.
+                        parse_state.reset();
+                    } else {
+                        batch.drain(..from);
+                        carried_frames = batch;
                     }
-                    carry.extend_from_slice(&read_buf);
-                    read_buf = carry;
-                    // moon#1164: bytes were prepended — the resume cursor is void.
-                    parse_state.reset();
                     carried_input = true;
                 }
 
@@ -3574,6 +3602,9 @@ pub(crate) async fn handle_connection_sharded_inner<
                 if let Some(target_shard) = conn.migration_target
                     && conn.migration_eligible()
                 {
+                    // moon#1179 item 5: a carried tail rides along as bytes,
+                    // ahead of the unparsed remainder, as it always did.
+                    super::util::spill_frames_to_front(&carried_frames, &mut read_buf);
                     let migrated_state = MigratedConnectionState {
                         selected_db: conn.selected_db,
                         authenticated: conn.authenticated,

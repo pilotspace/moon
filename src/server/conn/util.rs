@@ -164,6 +164,77 @@ pub(crate) fn unpropagate_shard_subscription(
     }
 }
 
+/// Re-encode parsed-but-unexecuted command frames into the FRONT of
+/// `read_buf`, ahead of whatever is still unparsed there.
+///
+/// moon#1179 item 5: a pipeline deferral (#438 / #507) used to do this on
+/// EVERY deferral, re-encoding and re-parsing the whole unconsumed tail each
+/// time — with a deferral every d commands a batch of n frames re-encoded and
+/// re-parsed ~n²/2d frames, each with a fresh `FrameVec`. The handlers now
+/// carry the parsed frames themselves into the next iteration, and fall back
+/// to bytes only for a hand-off whose next consumer parses BYTES: the RESP2
+/// subscriber loop, and the migration / task-park state. Command frames
+/// (arrays of bulk strings) round-trip losslessly through `serialize_resp3`.
+///
+/// The caller must reset its `ParseState`: bytes were prepended.
+pub(crate) fn spill_frames_to_front(frames: &[Frame], read_buf: &mut bytes::BytesMut) {
+    if frames.is_empty() {
+        return;
+    }
+    let mut carry = bytes::BytesMut::with_capacity(64 + read_buf.len());
+    for f in frames {
+        crate::protocol::serialize_resp3(f, &mut carry);
+    }
+    carry.extend_from_slice(read_buf);
+    *read_buf = carry;
+}
+
+#[cfg(test)]
+mod spill_tests {
+    use super::*;
+    use crate::protocol::{ParseConfig, parse};
+    use bytes::BytesMut;
+
+    /// moon#1179 item 5: what a byte hand-off re-parses is exactly the frames
+    /// a carry would have kept, in order, followed by the untouched remainder
+    /// — the equivalence that lets the in-loop deferral keep frames instead.
+    #[test]
+    fn spilled_frames_reparse_identically_ahead_of_the_remainder() {
+        let mut wire = BytesMut::new();
+        for cmd in [
+            &b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n"[..],
+            &b"*1\r\n$4\r\nPING\r\n"[..],
+            &b"ECHO inline-arg\r\n"[..],
+            &b"*2\r\n$3\r\nGET\r\n$0\r\n\r\n"[..],
+            &b"*3\r\n$4\r\nMGET\r\n$1\r\na\r\n$4\r\nb\r\nc\r\n"[..],
+        ] {
+            wire.extend_from_slice(cmd);
+        }
+        let config = ParseConfig::default();
+        let mut frames = Vec::new();
+        while let Ok(Some(f)) = parse(&mut wire, &config) {
+            frames.push(f);
+        }
+        assert_eq!(frames.len(), 5);
+        let mut read_buf = BytesMut::from(&b"*1\r\n$4\r\nPI"[..]); // partial remainder
+        spill_frames_to_front(&frames[1..], &mut read_buf);
+        let mut back = Vec::new();
+        while let Ok(Some(f)) = parse(&mut read_buf, &config) {
+            back.push(f);
+        }
+        assert_eq!(back, frames[1..].to_vec());
+        assert_eq!(
+            &read_buf[..],
+            b"*1\r\n$4\r\nPI",
+            "remainder must follow, untouched"
+        );
+
+        let mut untouched = BytesMut::from(&b"abc"[..]);
+        spill_frames_to_front(&[], &mut untouched);
+        assert_eq!(&untouched[..], b"abc");
+    }
+}
+
 /// Post-batch capacity governor for the per-connection batch scratch vectors
 /// (c10k W1). `responses`/`frames` are cleared and reused across batches; one
 /// deep pipeline grows them to the 1024-frame batch cap (~74 KB each at
