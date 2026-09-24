@@ -753,15 +753,48 @@ pub(crate) struct ColdMarkerSink<'a> {
 }
 
 impl ColdMarkerSink<'_> {
-    fn emit(&mut self, db: usize, file_id: u64, keys: &[bytes::Bytes]) {
+    /// Log the cut record for `keys`, now spilled into `file_id`. Returns
+    /// `false` when it could NOT be logged — the caller must then withdraw
+    /// the publish (moon#1202); `true` when it was logged or no log exists.
+    ///
+    /// A refused marker is never retried later: by then a client write to one
+    /// of the keys may already be in the log, and a marker replayed after it
+    /// cuts that key back to this file's older value (see
+    /// `replay_older_copy_tests::moon1202_a_marker_logged_after_a_later_write_would_lose_it`).
+    ///
+    /// The AOF leg goes first and the WAL leg only once it is in, so the two
+    /// logs never disagree about a withdrawn spill. `budget` bounds how long
+    /// this may block the shard thread on a full AOF channel; it is shared by
+    /// every marker of one completion drain.
+    fn emit(
+        &mut self,
+        db: usize,
+        file_id: u64,
+        keys: &[bytes::Bytes],
+        budget: &mut std::time::Duration,
+    ) -> bool {
         if keys.is_empty() {
-            return;
+            return true;
         }
         let wal_leg = self.wal_kv_log && self.wal_writer.is_some();
         if self.aof_pool.is_none() && !wal_leg {
-            return;
+            return true;
         }
         let data = crate::persistence::cold_records::serialize_spilled(file_id, keys);
+        if let Some(pool) = self.aof_pool
+            && let Err(refusal) =
+                pool.try_send_append_bounded_or_refuse(self.shard_id, 0, db, data.clone(), budget)
+        {
+            tracing::warn!(
+                shard_id = self.shard_id,
+                file_id,
+                keys = keys.len(),
+                ?refusal,
+                "MOON.SPILLED cut record refused by a saturated AOF writer; the spill is \
+                 withdrawn and its keys stay in RAM until the next eviction pass"
+            );
+            return false;
+        }
         if wal_leg && let Some(w) = self.wal_writer.as_deref_mut() {
             // moon#1039: the marker is db-scoped (replay applies it to the
             // selected db's cold index) — carry the db in the header.
@@ -771,21 +804,7 @@ impl ColdMarkerSink<'_> {
                 &data,
             );
         }
-        if let Some(pool) = self.aof_pool {
-            // Same bound as a reason-DEL (#452.4): losing this record does
-            // not lose data (the end-of-replay reconcile keeps the hot copy),
-            // it loses restart-as-cold for these keys — worth a short stall.
-            let mut budget = crate::persistence::aof::AOF_REASON_DEL_BACKPRESSURE_BOUND;
-            if !pool.send_append_bounded_blocking(self.shard_id, 0, db, data, &mut budget) {
-                tracing::error!(
-                    shard_id = self.shard_id,
-                    file_id,
-                    keys = keys.len(),
-                    "MOON.SPILLED cut record LOST under AOF backpressure; these keys \
-                     recover hot (not cold) on the next restart"
-                );
-            }
-        }
+        true
     }
 }
 
@@ -847,6 +866,11 @@ fn apply_completion_vec(
     // fsyncs) per flushed file, measured blocking the loop 1.0-2.1s per 8s
     // window under spill flood, single calls up to 1.0s.
     let mut manifest_dirty = false;
+    // moon#1202: ONE backpressure budget for every `MOON.SPILLED` marker of
+    // this drain, so N completions against a saturated writer stall the
+    // shard thread for at most one bound, not N. Once it is spent, a marker
+    // the channel cannot take right away withdraws its spill instead.
+    let mut marker_budget = crate::persistence::aof::AOF_REASON_DEL_BACKPRESSURE_BOUND;
     for c in completions {
         if !c.success {
             // Deep-review F1: the hot entry was removed at evict time on the
@@ -922,78 +946,126 @@ fn apply_completion_vec(
         let file_id = c.file_entry.file_id;
 
         // RAM-only manifest update; durability handled once per batch below.
-        if let Some(ref mut manifest) = *shard_manifest {
-            if let Err(e) = manifest.add_file(c.file_entry) {
-                // moon#893: the manifest already lists this id (Active, or
-                // Tombstoned inside its retention window), so it does not
-                // describe the file this batch wrote and nothing may point at
-                // it. Unreachable while the file_id seed holds. The hot
-                // entries were removed at enqueue: each key's only copy is its
-                // in-flight payload, so put it back in RAM exactly as the
-                // failed-pwrite branch above does, or it stays readable only
-                // from `spill_inflight` until a restart.
-                crate::storage::tiered::spill_thread::record_spill_completion_id_rejected();
-                tracing::error!(
-                    file_id,
-                    keys = c.entries.len(),
-                    error = %e,
-                    "Spill completion refused: the manifest already lists this file id \
-                     (it was re-issued); re-inserting the batch's keys into the hot table"
-                );
-                for entry in &c.entries {
+        if shard_manifest
+            .as_ref()
+            .is_some_and(|m| m.has_entry(file_id, c.file_entry.file_type))
+        {
+            // moon#893: the manifest already lists this id (Active, or
+            // Tombstoned inside its retention window), so it does not
+            // describe the file this batch wrote and nothing may point at
+            // it. Unreachable while the file_id seed holds. The hot
+            // entries were removed at enqueue: each key's only copy is its
+            // in-flight payload, so put it back in RAM exactly as the
+            // failed-pwrite branch above does, or it stays readable only
+            // from `spill_inflight` until a restart.
+            crate::storage::tiered::spill_thread::record_spill_completion_id_rejected();
+            tracing::error!(
+                file_id,
+                keys = c.entries.len(),
+                "Spill completion refused: the manifest already lists this file id \
+                 (it was re-issued); re-inserting the batch's keys into the hot table"
+            );
+            for entry in &c.entries {
+                rehydrate_unpublished_spill(entry, file_id);
+            }
+            continue;
+        }
+
+        // The keys this completion may publish, grouped per db (a file is
+        // single-db by construction, so this is one group in practice).
+        //
+        // The in-flight record is the completion's AUTHORIZATION to publish,
+        // not just a stale-shadow guard (#459). It is gone when the key was
+        // deleted, overwritten, or read-promoted while the spill was in
+        // flight; publishing anyway resurrects a deleted key — and because
+        // the file reaches the manifest, the resurrection survives restart.
+        // Measured pre-fix: 277 of 400 DELs undone this way. A superseded
+        // key's record belongs to the newer request and is left for it.
+        let mut groups: Vec<(
+            usize,
+            Vec<crate::storage::tiered::spill_thread::SpillCompletionEntry>,
+        )> = Vec::new();
+        for entry in c.entries {
+            let publishable = crate::shard::slice::with_shard_db(entry.db_index, |db| {
+                if !db.spill_inflight_is_newest(&entry.key, entry.req_file_id) {
+                    crate::storage::tiered::spill_thread::record_spill_completion_superseded();
+                    return false;
+                }
+                if db.cold_index.is_none() {
+                    // No cold plane to publish into: retire the record.
+                    db.spill_inflight_clear(&entry.key, entry.req_file_id);
+                    return false;
+                }
+                true
+            });
+            if publishable {
+                match groups.iter_mut().find(|(d, _)| *d == entry.db_index) {
+                    Some((_, entries)) => entries.push(entry),
+                    None => groups.push((entry.db_index, vec![entry])),
+                }
+            }
+        }
+
+        // moon#902 + moon#1202: each group's `MOON.SPILLED` cut record is
+        // logged BEFORE its keys are published, in this same synchronous
+        // section, so no client write to them can be logged in between. If the
+        // AOF writer cannot take it, the group is not published at all: its
+        // keys go back to RAM from their in-flight payloads. Publishing and
+        // then dropping the marker (the pre-#1202 behaviour) left the log with
+        // no cut for keys the cold plane now owns — value-correct on replay
+        // (the log rebuilds them hot) but an acked-append-shaped hole in the
+        // AOF status, and no way to log the cut later without reordering it
+        // after a newer write.
+        let mut published_any = false;
+        let mut withdrawn_any = false;
+        for (db_index, entries) in groups {
+            let keys: Vec<bytes::Bytes> = entries.iter().map(|e| e.key.clone()).collect();
+            if !marker_sink.emit(db_index, file_id, &keys, &mut marker_budget) {
+                withdrawn_any = true;
+                for entry in &entries {
                     rehydrate_unpublished_spill(entry, file_id);
                 }
                 continue;
             }
-            manifest_dirty = true;
-        }
-
-        // Insert one ColdIndex entry per KV within this file. `ttl_ms` rides
-        // along from the `SpillCompletionEntry` so the proactive TTL sweep
-        // (R1, H-2) can judge expiry from the in-RAM index alone.
-        //
-        // moon#902: the keys ACTUALLY published (not superseded) are what the
-        // `MOON.SPILLED` cut record lists — a key whose publish was withdrawn
-        // must not be cut, or a replay would drop the newer hot copy the log
-        // rebuilt for it. Grouped per db because the record is logged in a db
-        // context (the writer injects `SELECT`); a file is single-db by
-        // construction, so this is one group in practice.
-        let mut published: Vec<(usize, Vec<bytes::Bytes>)> = Vec::new();
-        for entry in c.entries {
-            let location = crate::storage::tiered::cold_index::ColdLocation {
-                file_id,
-                page_idx: entry.page_idx,
-                slot_idx: entry.slot_idx,
-                ttl_ms: entry.ttl_ms,
-                value_type: entry.value_type,
-            };
-
-            crate::shard::slice::with_shard_db(entry.db_index, |db| {
-                // The in-flight record is this completion's AUTHORIZATION to
-                // publish, not just a stale-shadow guard (#459). It is gone
-                // when the key was deleted, overwritten, or read-promoted
-                // while the spill was in flight; publishing anyway resurrects
-                // a deleted key — and because this insert reaches the
-                // manifest, the resurrection survives restart. Measured
-                // pre-fix: 277 of 400 DELs undone this way.
-                if !db.spill_inflight_is_newest(&entry.key, entry.req_file_id) {
-                    crate::storage::tiered::spill_thread::record_spill_completion_superseded();
-                    return;
-                }
-                if let Some(ref mut ci) = db.cold_index {
-                    ci.insert(entry.key.clone(), location);
-                    match published.iter_mut().find(|(d, _)| *d == entry.db_index) {
-                        Some((_, keys)) => keys.push(entry.key.clone()),
-                        None => published.push((entry.db_index, vec![entry.key.clone()])),
+            published_any = true;
+            crate::shard::slice::with_shard_db(db_index, |db| {
+                for entry in entries {
+                    // `ttl_ms` rides along from the `SpillCompletionEntry` so
+                    // the proactive TTL sweep (R1, H-2) can judge expiry from
+                    // the in-RAM index alone.
+                    let location = crate::storage::tiered::cold_index::ColdLocation {
+                        file_id,
+                        page_idx: entry.page_idx,
+                        slot_idx: entry.slot_idx,
+                        ttl_ms: entry.ttl_ms,
+                        value_type: entry.value_type,
+                    };
+                    if let Some(ref mut ci) = db.cold_index {
+                        ci.insert(entry.key.clone(), location);
                     }
+                    // Retire this request's record; a newer request's is left
+                    // for its own completion.
+                    db.spill_inflight_clear(&entry.key, entry.req_file_id);
                 }
-                // Retire this request's record; a newer request's is left
-                // for its own completion.
-                db.spill_inflight_clear(&entry.key, entry.req_file_id);
             });
         }
-        for (db_index, keys) in &published {
-            marker_sink.emit(*db_index, file_id, keys);
+        if withdrawn_any {
+            crate::storage::tiered::spill_thread::record_spill_completion_marker_withdrawn();
+            if !published_any {
+                // Nothing points at the file: leave it out of the manifest so
+                // no restart can index it, and the startup orphan sweep
+                // (unmanifested `heap-*.mpf`) reclaims it.
+                continue;
+            }
+        }
+        if let Some(ref mut manifest) = *shard_manifest {
+            // Cannot refuse: `has_entry` was checked above and nothing in
+            // between touches the manifest.
+            if let Err(e) = manifest.add_file(c.file_entry) {
+                tracing::error!(file_id, error = %e, "Spill completion: manifest add_file refused");
+            } else {
+                manifest_dirty = true;
+            }
         }
     }
 
@@ -2961,5 +3033,185 @@ mod tests {
                 panic!("tombstoned={tombstoned}: {msg}")
             });
         }
+    }
+
+    /// moon#1202 harness: run one successful spill completion for `k0..k2`
+    /// (file 5, in-flight payloads `v0..v2`) against an AOF pool whose
+    /// writer channel has `capacity` slots, pre-filled with `prefill`
+    /// records and never drained. Returns what the test asserts on.
+    struct MarkerRun {
+        /// The file id the manifest lists afterwards (5 or nothing).
+        manifest_ids: Vec<u64>,
+        /// Per key: `(published cold, hot value)`.
+        planes: Vec<(bool, Option<Vec<u8>>)>,
+        in_flight_left: bool,
+        /// Whether the pool now reports a dropped acked append.
+        missing_appends: bool,
+        /// Every append the writer would have received, in order.
+        logged: Vec<bytes::Bytes>,
+    }
+
+    fn run_marker_completion(capacity: usize, prefill: usize) -> MarkerRun {
+        use crate::persistence::aof::{AofMessage, AofWriterPool};
+        use crate::persistence::kv_page::ValueType;
+        use crate::persistence::manifest::{FileEntry, FileStatus, StorageTier};
+        use crate::persistence::page::PageType;
+        use crate::shard::slice::{ShardSlice, init_shard, test_support::make_init, with_shard_db};
+        use crate::storage::db::PendingSpill;
+        use crate::storage::tiered::spill_thread::{SpillCompletion, SpillCompletionEntry};
+
+        std::thread::spawn(move || {
+            init_shard(ShardSlice::new(make_init(0, 1)));
+            let tmp = tempfile::tempdir().unwrap();
+            let manifest = ShardManifest::create(&tmp.path().join("shard-0.manifest")).unwrap();
+            let keys: Vec<bytes::Bytes> = (0..3)
+                .map(|i| bytes::Bytes::from(format!("k{i}")))
+                .collect();
+            with_shard_db(0, |db| {
+                db.cold_index = Some(crate::storage::tiered::cold_index::ColdIndex::new());
+                for (i, k) in keys.iter().enumerate() {
+                    db.spill_inflight_mark(
+                        k.clone(),
+                        PendingSpill {
+                            req_id: 100 + i as u64,
+                            value_type: ValueType::String,
+                            value_bytes: bytes::Bytes::from(format!("v{i}")),
+                            ttl_ms: None,
+                        },
+                    );
+                }
+            });
+            let completion = SpillCompletion {
+                file_entry: FileEntry {
+                    file_id: 5,
+                    file_type: PageType::KvLeaf as u8,
+                    status: FileStatus::Active,
+                    tier: StorageTier::Hot,
+                    page_size_log2: 12,
+                    page_count: 1,
+                    byte_size: 4096,
+                    created_lsn: 0,
+                    db_index: 0,
+                    max_key_hash: 0,
+                    last_modified_lsn: 0,
+                },
+                entries: keys
+                    .iter()
+                    .enumerate()
+                    .map(|(i, k)| SpillCompletionEntry {
+                        key: k.clone(),
+                        db_index: 0,
+                        page_idx: 0,
+                        slot_idx: i as u16,
+                        ttl_ms: None,
+                        value_type: ValueType::String,
+                        req_file_id: 100 + i as u64,
+                    })
+                    .collect(),
+                success: true,
+                failed_request: None,
+            };
+
+            let (tx, rx) = crate::runtime::channel::mpsc_bounded::<AofMessage>(capacity);
+            let pool = AofWriterPool::top_level(tx);
+            for _ in 0..prefill {
+                assert!(pool.try_send_append(0, 1, 0, bytes::Bytes::from_static(b"filler")));
+            }
+            let mut sink = ColdMarkerSink {
+                aof_pool: Some(&pool),
+                wal_writer: None,
+                shard_id: 0,
+                wal_kv_log: false,
+            };
+            let mut shard_manifest = Some(manifest);
+            apply_completion_vec(vec![completion], &mut shard_manifest, &mut sink);
+
+            let manifest_ids = shard_manifest
+                .as_ref()
+                .unwrap()
+                .files()
+                .iter()
+                .map(|f| f.file_id)
+                .collect();
+            let (planes, in_flight_left) = with_shard_db(0, |db| {
+                let planes = keys
+                    .iter()
+                    .map(|k| {
+                        let cold = db.cold_index.as_ref().unwrap().lookup(k).is_some();
+                        let hot = db
+                            .data()
+                            .get(k.as_ref())
+                            .and_then(|e| e.value.as_bytes().map(|b| b.to_vec()));
+                        (cold, hot)
+                    })
+                    .collect();
+                (planes, !db.spill_inflight_is_empty())
+            });
+            let mut logged = Vec::new();
+            while let Ok(msg) = rx.try_recv() {
+                if let AofMessage::Append { bytes, .. } = msg {
+                    logged.push(bytes);
+                }
+            }
+            MarkerRun {
+                manifest_ids,
+                planes,
+                in_flight_left,
+                missing_appends: pool.overflow_for(0).is_missing_appends(),
+                logged,
+            }
+        })
+        .join()
+        .unwrap_or_else(|_| panic!("marker completion thread panicked"))
+    }
+
+    /// moon#1202: the writer channel stays full for the whole backpressure
+    /// bound, so the `MOON.SPILLED` marker cannot be logged. It must never be
+    /// dropped with the spill still published (the AOF then no longer cuts
+    /// those keys, and a later retry could only land out of order): the
+    /// publish is withdrawn instead. Every key goes back to the hot table
+    /// from its in-flight payload, nothing is published cold, the manifest
+    /// never names the file (the orphan sweep reclaims it), and the pool
+    /// reports no lost append — nothing that was acknowledged is missing.
+    #[test]
+    fn a_marker_the_writer_cannot_take_withdraws_the_spill_instead_of_dropping() {
+        let run = run_marker_completion(1, 1);
+        assert_eq!(run.logged.len(), 1, "only the filler reached the writer");
+        assert_eq!(
+            run.planes,
+            (0..3)
+                .map(|i| (false, Some(format!("v{i}").into_bytes())))
+                .collect::<Vec<_>>(),
+            "every key must be back in RAM and none published cold"
+        );
+        assert!(!run.in_flight_left, "in-flight records must be retired");
+        assert!(
+            run.manifest_ids.is_empty(),
+            "the manifest must not list a file no marker cuts"
+        );
+        assert!(
+            !run.missing_appends,
+            "a withdrawn marker is not a lost acked append"
+        );
+    }
+
+    /// Control: with room in the channel the marker is logged and the keys
+    /// are published cold, exactly as before.
+    #[test]
+    fn a_marker_the_writer_takes_publishes_the_spill() {
+        let run = run_marker_completion(4, 0);
+        let want = crate::persistence::cold_records::serialize_spilled(
+            5,
+            &[
+                bytes::Bytes::from_static(b"k0"),
+                bytes::Bytes::from_static(b"k1"),
+                bytes::Bytes::from_static(b"k2"),
+            ],
+        );
+        assert_eq!(run.logged, vec![want]);
+        assert_eq!(run.planes, vec![(true, None); 3]);
+        assert!(!run.in_flight_left);
+        assert_eq!(run.manifest_ids, vec![5]);
+        assert!(!run.missing_appends);
     }
 }
