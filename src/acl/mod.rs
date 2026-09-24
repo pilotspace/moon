@@ -13,4 +13,4 @@ pub mod table;
 pub use io::{acl_load, acl_save, acl_table_from_config, user_to_acl_line};
 pub use log::{AclLog, AclLogEntry};
 pub use script::{SCRIPT_ACL_DENIED_PREFIX, ScriptAcl, script_acl_error};
-pub use table::{AclTable, AclUser, CommandPermissions, KeyPattern};
+pub use table::{AclDenial, AclTable, AclUser, CommandPermissions, KeyPattern};

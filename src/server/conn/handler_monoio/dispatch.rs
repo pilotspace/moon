@@ -1520,10 +1520,11 @@ pub(super) fn try_enforce_acl(
     if conn.acl_skip_allowed() {
         return false;
     }
-    let acl_guard = ctx.acl_table.read();
-    if let Some(deny_reason) = acl_guard.check_command_permission(&conn.current_user, cmd, cmd_args)
-    {
-        drop(acl_guard);
+    // moon#1165: a restricted user is checked against the connection's
+    // snapshot of its entry (no table lock, one resolution for the command
+    // AND the key check); see `ConnectionState::acl_denial`.
+    let denial = conn.acl_denial(&ctx.acl_table, cmd, cmd_args);
+    if let Some(crate::acl::AclDenial::Command(deny_reason)) = denial {
         conn.acl_log.push(crate::acl::AclLogEntry {
             reason: "command".to_string(),
             object: crate::acl::subcommand::command_log_object(cmd, cmd_args),
@@ -1540,12 +1541,8 @@ pub(super) fn try_enforce_acl(
         return true;
     }
 
-    // === ACL key pattern check (same lock guard) ===
-    let is_write_for_acl = metadata::is_write(cmd);
-    if let Some(deny_reason) =
-        acl_guard.check_key_permission(&conn.current_user, cmd, cmd_args, is_write_for_acl)
-    {
-        drop(acl_guard);
+    // === ACL key pattern check (resolved together with the command) ===
+    if let Some(crate::acl::AclDenial::Key(deny_reason)) = denial {
         conn.acl_log.push(crate::acl::AclLogEntry {
             reason: "command".to_string(),
             object: String::from_utf8_lossy(cmd).to_ascii_lowercase(),

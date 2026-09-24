@@ -267,6 +267,14 @@ pub(crate) struct ConnectionState {
     /// `replace_with` to preserve the counter's identity.
     pub acl_version_handle: Arc<std::sync::atomic::AtomicU64>,
 
+    /// The table entry `refresh_acl_cache` resolved `current_user` to, at
+    /// `cached_acl_version` (moon#1165). `None` for a user missing from the
+    /// table. Lets a RESTRICTED connection run its per-command check against
+    /// this immutable snapshot instead of taking the process-wide table lock
+    /// and hashing its username twice per command — see
+    /// [`Self::acl_denial`] for when it may be trusted.
+    pub acl_cache_user: Option<Arc<crate::acl::AclUser>>,
+
     // Pub/Sub
     pub subscription_count: usize,
     /// `subscription_count` as of the last time the per-namespace counts were
@@ -452,6 +460,7 @@ impl ConnectionState {
             // to the placeholder and bypass the lock-free staleness check;
             // the first `refresh_acl_cache()` call eliminates that window.
             acl_version_handle: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            acl_cache_user: None,
         }
     }
 
@@ -498,7 +507,11 @@ impl ConnectionState {
     pub fn refresh_acl_cache(&mut self, acl_table: &parking_lot::RwLock<crate::acl::AclTable>) {
         let guard = acl_table.read();
         self.acl_version_handle = guard.version_handle();
-        self.cached_acl_unrestricted = guard.is_user_unrestricted(&self.current_user);
+        self.acl_cache_user = guard.get_user_arc(&self.current_user);
+        self.cached_acl_unrestricted = self
+            .acl_cache_user
+            .as_ref()
+            .is_some_and(|u| u.unrestricted());
         self.cached_acl_version = guard.version();
     }
 
@@ -555,6 +568,40 @@ impl ConnectionState {
     #[inline]
     pub fn acl_skip_allowed(&self) -> bool {
         self.cached_acl_unrestricted && self.acl_cache_fresh()
+    }
+
+    /// This connection's resolved user, when the snapshot may stand in for
+    /// the live table: the table has not changed since it was taken
+    /// (`acl_cache_fresh`) AND it was resolved for the name the connection
+    /// runs as now. The name comparison is a conservative belt: a snapshot is
+    /// never consulted for a name it was not resolved for — the check then
+    /// takes the locked lookup, exactly as it did before snapshots existed.
+    #[inline]
+    pub fn acl_snapshot(&self) -> Option<&crate::acl::AclUser> {
+        let user = self.acl_cache_user.as_deref()?;
+        (self.acl_cache_fresh() && user.username == self.current_user).then_some(user)
+    }
+
+    /// The dispatch-time ACL gate for one command (all three handlers):
+    /// `None` = run it, `Some` = refuse with this reason (moon#1165).
+    ///
+    /// The caller has already taken the `acl_skip_allowed()` fast path for an
+    /// unrestricted user. A restricted user is checked against
+    /// [`Self::acl_snapshot`] — no table lock, no username hashing — and falls
+    /// back to one locked lookup (command + keys under one guard) when the
+    /// snapshot cannot be trusted. Fail-closed either way: the snapshot is an
+    /// immutable copy of the entry as of a version that is re-verified per
+    /// command, and a missing user is denied.
+    pub fn acl_denial(
+        &self,
+        acl_table: &parking_lot::RwLock<crate::acl::AclTable>,
+        cmd: &[u8],
+        args: &[Frame],
+    ) -> Option<crate::acl::AclDenial> {
+        if let Some(user) = self.acl_snapshot() {
+            return user.denial(&self.current_user, cmd, args);
+        }
+        acl_table.read().check_denial(&self.current_user, cmd, args)
     }
 
     /// Check if connection is bound to a workspace.
@@ -726,6 +773,7 @@ pub(crate) enum CoreAction {
 #[cfg(test)]
 mod acl_cache_tests {
     use super::*;
+    use bytes::Bytes;
 
     fn conn() -> ConnectionState {
         ConnectionState::new(1, "127.0.0.1:1".into(), &None, 0, 1, false, 16, None)
@@ -776,6 +824,173 @@ mod acl_cache_tests {
         table.write().apply_setuser("default", &["+get"]);
         c.refresh_acl_cache_if_stale(&table);
         assert!(!c.acl_skip_allowed(), "an unknown user must not skip");
+    }
+
+    fn bulk(words: &[&str]) -> Vec<Frame> {
+        words
+            .iter()
+            .map(|w| Frame::BulkString(Bytes::copy_from_slice(w.as_bytes())))
+            .collect()
+    }
+
+    fn restricted_table() -> parking_lot::RwLock<AclTable> {
+        let t = table();
+        t.write().apply_setuser(
+            "alice",
+            &[
+                "on",
+                "nopass",
+                "~app:*",
+                "+get",
+                "+set",
+                "-config|set",
+                "+config",
+            ],
+        );
+        t.write()
+            .apply_setuser("bob", &["on", "nopass", "~*", "-@all", "+get"]);
+        t
+    }
+
+    /// moon#1165: the snapshot verdict is exactly the locked table verdict —
+    /// command, first-arg rule, key pattern, allowed and denied.
+    #[test]
+    fn snapshot_verdict_matches_the_locked_table() {
+        let table = restricted_table();
+        let mut c = conn();
+        c.current_user = "alice".into();
+        c.refresh_acl_cache(&table);
+        assert!(!c.acl_skip_allowed(), "alice is restricted");
+        assert!(c.acl_snapshot().is_some(), "fresh snapshot for alice");
+        let cases: &[&[&str]] = &[
+            &["GET", "app:1"],
+            &["get", "other"],
+            &["SET", "app:1", "v"],
+            &["SET", "nope", "v"],
+            &["DEL", "app:1"],
+            &["CONFIG", "GET", "maxmemory"],
+            &["CONFIG", "SET", "maxmemory", "1"],
+            &["config", "set", "maxmemory", "1"],
+            &["PING"],
+            &["MGET", "app:1", "other"],
+        ];
+        for argv in cases {
+            let cmd = argv[0].as_bytes();
+            let args = bulk(&argv[1..]);
+            let locked = {
+                let g = table.read();
+                g.check_command_permission("alice", cmd, &args)
+                    .map(crate::acl::AclDenial::Command)
+                    .or_else(|| {
+                        let w = crate::command::metadata::is_write(cmd);
+                        g.check_key_permission("alice", cmd, &args, w)
+                            .map(crate::acl::AclDenial::Key)
+                    })
+            };
+            assert_eq!(c.acl_denial(&table, cmd, &args), locked, "argv {argv:?}");
+        }
+    }
+
+    /// The point of the snapshot: a restricted connection's per-command check
+    /// takes no table lock. The test thread holds the WRITE lock.
+    ///
+    /// Reddening mutation: make `acl_denial` always take the locked path
+    /// (`acl_table.read().check_denial(..)`) — the check then blocks behind
+    /// the held lock and the deadline fires.
+    #[test]
+    fn restricted_check_takes_no_table_lock() {
+        let table = std::sync::Arc::new(restricted_table());
+        let mut c = conn();
+        c.current_user = "alice".into();
+        c.refresh_acl_cache(&table);
+        let held = table.write();
+        let t2 = std::sync::Arc::clone(&table);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let checker = std::thread::spawn(move || {
+            let d1 = c.acl_denial(&t2, b"GET", &bulk(&["app:1"]));
+            let d2 = c.acl_denial(&t2, b"GET", &bulk(&["other"]));
+            let _ = tx.send((d1.is_none(), d2.is_some()));
+        });
+        let got = rx.recv_timeout(std::time::Duration::from_millis(500));
+        drop(held);
+        #[allow(clippy::unwrap_used)] // test thread
+        checker.join().unwrap();
+        assert_eq!(
+            got,
+            Ok((true, true)),
+            "a restricted connection's ACL check took the process-wide table \
+             lock (it blocked behind a held write lock)"
+        );
+    }
+
+    /// Fail-closed: a mutation after the snapshot makes the next check use
+    /// the live table — a revocation bites at once, and so does a deletion.
+    #[test]
+    fn stale_snapshot_is_never_trusted() {
+        let table = restricted_table();
+        let mut c = conn();
+        c.current_user = "alice".into();
+        c.refresh_acl_cache(&table);
+        assert!(c.acl_denial(&table, b"GET", &bulk(&["app:1"])).is_none());
+        table.write().apply_setuser("alice", &["-get"]);
+        assert!(
+            c.acl_snapshot().is_none(),
+            "stale snapshot must not be offered"
+        );
+        assert!(
+            matches!(
+                c.acl_denial(&table, b"GET", &bulk(&["app:1"])),
+                Some(crate::acl::AclDenial::Command(_))
+            ),
+            "revoked GET must be denied before any refresh"
+        );
+        table.write().del_user("alice");
+        c.refresh_acl_cache_if_stale(&table);
+        assert!(
+            matches!(
+                c.acl_denial(&table, b"PING", &[]),
+                Some(crate::acl::AclDenial::Command(_))
+            ),
+            "a deleted user is denied"
+        );
+    }
+
+    /// The snapshot is keyed to the name it was resolved for: a check for any
+    /// other name resolves that name under the lock instead.
+    #[test]
+    fn snapshot_is_bound_to_the_name_it_was_resolved_for() {
+        let table = restricted_table();
+        let mut c = conn();
+        c.current_user = "bob".into();
+        c.refresh_acl_cache(&table);
+        c.current_user = "alice".into();
+        assert!(
+            c.acl_snapshot().is_none(),
+            "bob's snapshot must not serve alice"
+        );
+        // alice may SET app:*; bob (`-@all +get`) may not — alice's verdict wins.
+        assert!(
+            c.acl_denial(&table, b"SET", &bulk(&["app:1", "v"]))
+                .is_none()
+        );
+    }
+
+    /// Copy-on-write: mutating a user never changes a snapshot already held.
+    #[test]
+    fn mutation_does_not_touch_a_held_snapshot() {
+        let table = restricted_table();
+        let snap = table.read().get_user_arc("alice");
+        #[allow(clippy::unwrap_used)] // present by construction
+        let snap = snap.unwrap();
+        table.write().apply_setuser("alice", &["-get"]);
+        if let Some(u) = table.write().get_user_mut("alice") {
+            u.enabled = false;
+        }
+        assert!(snap.enabled, "held snapshot changed under its reader");
+        assert!(
+            snap.command_denial("alice", b"GET", &bulk(&["app:1"]))
+                .is_none()
+        );
     }
 
     /// A fresh cache is left alone (no lock taken): the refresh is a no-op.

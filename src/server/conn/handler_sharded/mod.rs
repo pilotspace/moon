@@ -1054,9 +1054,11 @@ pub(crate) async fn handle_connection_sharded_inner<
                     // with a fresh cache.  Stale caches (after ACL SETUSER /
                     // DELUSER / LOAD) fall through to the full check.
                     if !conn.acl_skip_allowed() {
-                        let acl_guard = ctx.acl_table.read();
-                        if let Some(deny_reason) = acl_guard.check_command_permission(&conn.current_user, cmd, cmd_args) {
-                            drop(acl_guard);
+                        // moon#1165: snapshot check for a restricted user (no
+                        // table lock; command + keys resolved once) — see
+                        // `ConnectionState::acl_denial`.
+                        let denial = conn.acl_denial(&ctx.acl_table, cmd, cmd_args);
+                        if let Some(crate::acl::AclDenial::Command(deny_reason)) = denial {
                             conn.acl_log.push(crate::acl::AclLogEntry {
                                 reason: "command".to_string(),
                                 object: crate::acl::subcommand::command_log_object(cmd, cmd_args),
@@ -1069,9 +1071,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                             responses.push(Frame::Error(Bytes::from(format!("NOPERM {}", deny_reason))));
                             continue;
                         }
-                        let is_write_for_acl = metadata::is_write(cmd);
-                        if let Some(deny_reason) = acl_guard.check_key_permission(&conn.current_user, cmd, cmd_args, is_write_for_acl) {
-                            drop(acl_guard);
+                        if let Some(crate::acl::AclDenial::Key(deny_reason)) = denial {
                             conn.acl_log.push(crate::acl::AclLogEntry {
                                 reason: "command".to_string(),
                                 object: String::from_utf8_lossy(cmd).to_ascii_lowercase(),

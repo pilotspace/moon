@@ -1761,9 +1761,10 @@ pub async fn handle_connection(
                         // whose cache is still fresh.  Stale caches (after ACL
                         // SETUSER / DELUSER / LOAD) fall through to the full check.
                         if !conn.acl_skip_allowed() {
-                            if let Some(deny_reason) = acl_table.read().check_command_permission(
-                                &conn.current_user, cmd, cmd_args,
-                            ) {
+                            // moon#1165: snapshot check for a restricted user —
+                            // see `ConnectionState::acl_denial`.
+                            let denial = conn.acl_denial(&acl_table, cmd, cmd_args);
+                            if let Some(crate::acl::AclDenial::Command(deny_reason)) = denial {
                                 conn.acl_log.push(crate::acl::AclLogEntry {
                                     reason: "command".to_string(),
                                     object: crate::acl::subcommand::command_log_object(cmd, cmd_args),
@@ -1782,11 +1783,8 @@ pub async fn handle_connection(
                                 continue;
                             }
 
-                            // === ACL key pattern check ===
-                            let is_write = metadata::is_write(cmd);
-                            if let Some(deny_reason) = acl_table.read().check_key_permission(
-                                &conn.current_user, cmd, cmd_args, is_write,
-                            ) {
+                            // === ACL key pattern check (resolved with the command) ===
+                            if let Some(crate::acl::AclDenial::Key(deny_reason)) = denial {
                                 conn.acl_log.push(crate::acl::AclLogEntry {
                                     reason: "command".to_string(),
                                     object: String::from_utf8_lossy(cmd).to_ascii_lowercase(),
