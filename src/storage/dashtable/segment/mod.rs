@@ -442,7 +442,15 @@ impl<K, V> Drop for Segment<K, V> {
 
 // SAFETY: Segment is Send if K and V are Send (no interior aliasing).
 unsafe impl<K: Send, V: Send> Send for Segment<K, V> {}
-// SAFETY: Segment is Sync if K and V are Sync (no interior mutability).
+// SAFETY: Segment is Sync if K and V are Sync. Through `&Segment` its own
+// fields (`ctrl`, `count`, `depth`, `has_non_home_keys`, the test-only
+// `probe_count`) are only read — every mutation of them takes `&mut self` —
+// and the slots hand out only `&K` / `&V` for initialized (FULL-control)
+// entries. Any interior mutability therefore lives INSIDE K or V, and the
+// `K: Sync, V: Sync` bounds are what make sharing those references across
+// threads sound: e.g. `CompactEntry` (moon#1161) updates its LRU stamp and
+// LFU counter through `&self` via `AtomicU32`s, which are `Sync`. A V with
+// non-`Sync` interior mutability (`Cell`, `RefCell`) is rejected by the bound.
 unsafe impl<K: Sync, V: Sync> Sync for Segment<K, V> {}
 
 #[cfg(test)]
