@@ -893,8 +893,10 @@ pub async fn aof_writer_task(
                                 }
                                 Err(e) => error!("AOF rewrite failed: {}", e),
                             }
-                            crate::command::persistence::AOF_REWRITE_IN_PROGRESS
-                                .store(false, std::sync::atomic::Ordering::SeqCst);
+                            // The in-progress flag is released only after the
+                            // post-rewrite drain below (moon#1158): a rewrite
+                            // dispatched before then would be consumed by that
+                            // drain and lost, leaving the flag set forever.
 
                             // Reopen file after rewrite (it was replaced)
                             let reopen_result: Result<tokio::fs::File, _> =
@@ -910,6 +912,8 @@ pub async fn aof_writer_task(
                                 Err(e) => {
                                     error!("Failed to reopen AOF file after rewrite: {}", e);
                                     overflow.disarm_dropping();
+                                    crate::command::persistence::AOF_REWRITE_IN_PROGRESS
+                                        .store(false, std::sync::atomic::Ordering::SeqCst);
                                     return;
                                 }
                             }
@@ -931,6 +935,8 @@ pub async fn aof_writer_task(
                                 }
                                 writer = tokio::io::BufWriter::new(tokio::fs::File::from_std(sf));
                             }
+                            crate::command::persistence::AOF_REWRITE_IN_PROGRESS
+                                .store(false, std::sync::atomic::Ordering::SeqCst);
                             // Back-date so the backlog drained right after the
                             // rewrite reaches disk within ~100ms + wake floor,
                             // not a full second later (mirrors the per-shard
@@ -986,8 +992,6 @@ pub async fn aof_writer_task(
                                 matches!(outcome, FoldOutcome::Committed { .. }),
                                 std::sync::atomic::Ordering::SeqCst,
                             );
-                            crate::command::persistence::AOF_REWRITE_IN_PROGRESS
-                                .store(false, std::sync::atomic::Ordering::SeqCst);
                             // #455: from here on, records folded into the
                             // committed base are dropped wherever they surface.
                             fold_floor = outcome.adopt(fold_floor, &overflow);
@@ -998,6 +1002,11 @@ pub async fn aof_writer_task(
                             {
                                 error!("AOF rewrite overflow drain failed: {}", e);
                             }
+                            // Released only after the drain (moon#1158): a
+                            // rewrite dispatched earlier would be consumed by
+                            // it and lost, leaving the flag set forever.
+                            crate::command::persistence::AOF_REWRITE_IN_PROGRESS
+                                .store(false, std::sync::atomic::Ordering::SeqCst);
                             writer = tokio::io::BufWriter::new(tokio::fs::File::from_std(active));
                             // Back-date so the channel backlog that accumulated
                             // during the blocking fold reaches disk within ~100ms

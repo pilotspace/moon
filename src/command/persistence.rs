@@ -283,6 +283,17 @@ pub fn bgrewriteaof_start_sharded(
     pool: &AofWriterPool,
     shard_databases: std::sync::Arc<crate::shard::shared_databases::ShardDatabases>,
 ) -> Frame {
+    bgrewriteaof_start_sharded_with_flag(pool, shard_databases, &AOF_REWRITE_IN_PROGRESS)
+}
+
+/// [`bgrewriteaof_start_sharded`] serialized on `in_progress` instead of the
+/// global [`AOF_REWRITE_IN_PROGRESS`] (test seam, PerShard pools only: a
+/// TopLevel writer always releases the global flag).
+pub(crate) fn bgrewriteaof_start_sharded_with_flag(
+    pool: &AofWriterPool,
+    shard_databases: std::sync::Arc<crate::shard::shared_databases::ShardDatabases>,
+    in_progress: &'static AtomicBool,
+) -> Frame {
     // Refuse the rewrite under the known-unsafe config combo (see the
     // MULTI_SHARD_AOF_REWRITE_UNSAFE doc comment).  This is the
     // single-node v1.0-rc1 gate; the v2.0 multi-part AOF replay fix lifts
@@ -294,7 +305,7 @@ pub fn bgrewriteaof_start_sharded(
     }
     // CAS: only proceed if currently false; prevents a second caller from
     // clearing the flag while the first rewrite is still in progress.
-    if AOF_REWRITE_IN_PROGRESS
+    if in_progress
         .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
         .is_err()
     {
@@ -315,18 +326,20 @@ pub fn bgrewriteaof_start_sharded(
         //
         // try_send_rewrite_per_shard loads the manifest, builds the shared
         // coordinator, and reliably fans out to every writer. The in-progress
-        // flag is cleared by the coordinator's final commit
-        // (PerShardRewriteCoord::shard_done), not here.
-        match pool.try_send_rewrite_per_shard(shard_databases) {
+        // flag is released when the last writer drops the coordinator, after
+        // its post-fold overflow drain (moon#1158), not here.
+        match pool.try_send_rewrite_per_shard_with_flag(shard_databases, in_progress) {
             Ok(()) => {
                 return Frame::SimpleString(Bytes::from_static(
                     b"Background append only file rewriting started",
                 ));
             }
-            Err(e) => {
-                AOF_REWRITE_IN_PROGRESS.store(false, Ordering::SeqCst);
-                return rewrite_pool_error_frame(e);
-            }
+            // The flag is NOT cleared here (moon#1158): a fan-out that fails
+            // part-way has already handed the rewrite to the writers before
+            // the failure, and they still fold/roll back and drain. The pool
+            // released it if no writer got the rewrite; otherwise the last
+            // writer does.
+            Err(e) => return rewrite_pool_error_frame(e),
         }
     }
 
@@ -340,7 +353,7 @@ pub fn bgrewriteaof_start_sharded(
         Err(e) => {
             // Send failed (channel full) or PerShard rejection — rewrite never
             // started, so clear the in-progress flag we just set.
-            AOF_REWRITE_IN_PROGRESS.store(false, Ordering::SeqCst);
+            in_progress.store(false, Ordering::SeqCst);
             rewrite_pool_error_frame(e)
         }
     }
