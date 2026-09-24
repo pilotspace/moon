@@ -10,6 +10,10 @@ mod incr;
 mod kv_ops;
 /// moon#1190: per-database lazy-free queue, drained on the shard tick.
 mod lazy_free;
+/// moon#1221 review F1: the maxmemory / OOM gates reclaim lazily freed
+/// bytes before they evict or refuse. Test-only.
+#[cfg(test)]
+mod lazy_free_pressure_tests;
 /// moon#942: the accessors' DashTable probe budget, asserted with a counter
 /// rather than a clock. Test-only; see the module docs for why.
 #[cfg(test)]

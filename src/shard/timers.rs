@@ -195,6 +195,12 @@ pub(crate) fn run_eviction(
         // actually freed; once it drops to the budget, remaining dbs see an
         // under-budget total and return immediately (no eviction).
         let mut remaining = kv_total.saturating_add(vector_bytes);
+        // moon#1221 review F1: bytes an UNLINK or expiry queued for lazy
+        // free in ANY db are memory already released; reclaim them across
+        // every db before the per-db loop below takes a single victim —
+        // otherwise db 1's queue costs db 0 its live keys.
+        remaining =
+            crate::storage::eviction::reclaim_lazy_free_in_shard(db_count, remaining, &rt, budget);
         // #454 P2.8: ONE shared backpressure bound for this entire sweep
         // (per-key minting could stall the shard bound x victim-count).
         let mut reason_del_budget = crate::persistence::aof::AOF_REASON_DEL_BACKPRESSURE_BOUND;

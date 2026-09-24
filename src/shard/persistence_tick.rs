@@ -1311,6 +1311,19 @@ pub(crate) fn handle_memory_pressure(
                 0 => rt.maxmemory_per_shard(),
                 elastic => elastic.min(rt.maxmemory),
             };
+            // moon#1221 review F1: bytes an UNLINK or expiry queued for lazy
+            // free in ANY db are memory already released; reclaim them
+            // across every db before the per-db loops below take a victim.
+            let total_mem = if total_mem > budget {
+                crate::storage::eviction::reclaim_lazy_free_in_shard(
+                    shard_databases.db_count(),
+                    total_mem,
+                    &rt,
+                    budget,
+                )
+            } else {
+                total_mem
+            };
             if total_mem > budget {
                 let db_count = shard_databases.db_count();
                 // #454 P2.8: ONE shared backpressure bound for this entire sweep

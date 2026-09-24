@@ -887,27 +887,7 @@ pub fn evict_to_budget(
     // Dividing by the ratio means a 19.2 GB maxmemory at 2.3x starts evicting
     // once accounted memory passes ~8.3 GB, holding REAL footprint near the
     // configured limit — which is what the operator asked for.
-    let budget = {
-        // ONE relaxed load. This function is on the write path, so the
-        // correction is READ here and COMPUTED once a second by shard 0's
-        // chore (`admin::footprint::refresh_footprint_correction`). Computing
-        // it here instead — the shape this shipped in originally — cost three
-        // syscalls plus a global-lock read per SET, and measured -57% on SET
-        // at c=8 P=16 against the release before it.
-        //
-        // The denominator inside that computation is the WHOLE instance's
-        // accounted memory, not this shard's slice: the footprint covers the
-        // entire process, so dividing it by one shard's `estimated_memory()`
-        // would inflate the ratio by roughly the shard count and evict N times
-        // too aggressively at `--shards N`.
-        let ratio = crate::admin::metrics_setup::footprint_correction();
-        effective_budget(
-            run.budget_override,
-            config.maxmemory,
-            config.maxmemory_per_shard(),
-            ratio,
-        )
-    };
+    let budget = run_budget(config, run.budget_override);
 
     let mut sink = run.sink;
     let mut noop = |_: &[u8]| {};
@@ -921,6 +901,20 @@ pub fn evict_to_budget(
     // NOTHING observable. See `EVICTION_STALL_LIMIT`.
     let mut stalled = 0usize;
     while current_total > budget {
+        // moon#1221 review F1: bytes an UNLINK or an expiry handed to the
+        // lazy-free queue are still charged (the drain credits them as it
+        // frees) but are no longer the keyspace's. Win them back FIRST —
+        // before a policy is parsed, a victim is picked or `noeviction`
+        // answers OOM — so the write main accepted right after the UNLINK
+        // is accepted here too, and no live key pays for a dead one. Only
+        // over budget, and only the overshoot: one field read otherwise.
+        if db.lazy_free_reclaimable() {
+            let credited = db.reclaim_lazy_free(current_total - budget);
+            current_total = current_total.saturating_sub(credited);
+            if current_total <= budget {
+                break;
+            }
+        }
         let policy = *parsed_policy
             .get_or_insert_with(|| EvictionPolicy::from_str(&config.maxmemory_policy));
         if policy == EvictionPolicy::NoEviction {
@@ -1036,6 +1030,72 @@ pub fn evict_to_budget(
     }
 
     Ok(())
+}
+
+/// The budget an [`evict_to_budget`] run with `budget_override` holds a shard
+/// to: [`effective_budget`] on the published footprint correction.
+///
+/// ONE relaxed load. `evict_to_budget` is on the write path, so the
+/// correction is READ here and COMPUTED once a second by shard 0's chore
+/// (`admin::footprint::refresh_footprint_correction`). Computing it here
+/// instead — the shape this shipped in originally — cost three syscalls plus
+/// a global-lock read per SET, and measured -57% on SET at c=8 P=16 against
+/// the release before it.
+///
+/// The denominator inside that computation is the WHOLE instance's accounted
+/// memory, not this shard's slice: the footprint covers the entire process,
+/// so dividing it by one shard's `estimated_memory()` would inflate the ratio
+/// by roughly the shard count and evict N times too aggressively at
+/// `--shards N`.
+#[inline]
+fn run_budget(config: &RuntimeConfig, budget_override: usize) -> usize {
+    effective_budget(
+        budget_override,
+        config.maxmemory,
+        config.maxmemory_per_shard(),
+        crate::admin::metrics_setup::footprint_correction(),
+    )
+}
+
+/// moon#1221 review F1 for the WHOLE-SHARD gates — the 100 ms eviction tick
+/// (`timers::run_eviction`) and the memory-pressure cascade
+/// (`persistence_tick::handle_memory_pressure`). They measure every
+/// database on the shard as one `total` and then evict database by
+/// database, so the reclaim inside [`evict_to_budget`] only ever sees the
+/// database being evicted: bytes an UNLINK queued in db 1 would still cost
+/// db 0 its live keys. This reclaims queued, still-charged bytes across ALL
+/// of the shard's databases until `total` is back under the budget the run
+/// will enforce (`budget_override` exactly as passed to
+/// [`EvictionRun::budget`]). Returns `total` less what it credited.
+///
+/// Shard thread only (`with_shard_db`). Free when nothing is queued: one
+/// field read per database, and none at all when `total` is under budget.
+pub(crate) fn reclaim_lazy_free_in_shard(
+    db_count: usize,
+    total: usize,
+    config: &RuntimeConfig,
+    budget_override: usize,
+) -> usize {
+    if config.maxmemory == 0 {
+        return total;
+    }
+    let budget = run_budget(config, budget_override);
+    let mut total = total;
+    for i in 0..db_count {
+        if total <= budget {
+            break;
+        }
+        let excess = total - budget;
+        let credited = crate::shard::slice::with_shard_db(i, |db| {
+            if db.lazy_free_reclaimable() {
+                db.reclaim_lazy_free(excess)
+            } else {
+                0
+            }
+        });
+        total = total.saturating_sub(credited);
+    }
+    total
 }
 
 /// Report one plain-dropped victim: to CLIENT TRACKING, then to the caller's

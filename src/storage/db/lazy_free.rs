@@ -31,6 +31,21 @@
 //! the credit synchronously to know when to stop), so only its drop is
 //! deferred.
 //!
+//! ## Memory pressure (moon#1221 review F1)
+//!
+//! Charged-but-queued bytes are memory the keyspace has already released.
+//! A maxmemory / OOM gate that found the ledger over budget used to act on
+//! them as if they were live — evicting live keys (`allkeys-*`), refusing
+//! the write (`noeviction`) or finding no victim (`volatile-*`) right after
+//! an UNLINK or expiry of a large value, where main had credited the value
+//! synchronously and the write fit. Every gate now first calls
+//! [`Database::reclaim_lazy_free`], which drains the queue synchronously, in
+//! bounded batches, until the overshoot is covered or nothing charged is
+//! left — BEFORE it picks a victim or answers OOM. UNLINK stays O(1); the
+//! walk is paid only under memory pressure, and never exceeds what main
+//! paid inside the UNLINK itself. It is the same drain as the tick's, so
+//! each byte is still credited exactly once.
+//!
 //! `Database::clear` and `recalculate_memory` rebuild `used_memory` from the
 //! hot table alone; they first mark every queued item uncharged so the drain
 //! cannot credit bytes the rebuild already dropped from the ledger.
@@ -64,6 +79,10 @@ pub const LAZY_FREE_TICK_BUDGET: Duration = Duration::from_micros(250);
 
 /// Elements freed between two clock reads of the drain.
 const STEP_ELEMENTS: usize = 256;
+
+/// Elements one batch of the memory-pressure drain frees between two checks
+/// of how much it has credited ([`Database::reclaim_lazy_free`]).
+const PRESSURE_BATCH_ELEMENTS: usize = 4_096;
 
 /// Largest value whose credited total is checked against `entry_overhead`
 /// in debug/test builds (the check itself is an O(n) walk).
@@ -146,6 +165,10 @@ fn shell_dropper() -> Option<&'static flume::Sender<Work>> {
 #[derive(Default)]
 pub(crate) struct LazyFreeQueue {
     items: VecDeque<Item>,
+    /// Queued items whose bytes are still counted in `used_memory` — what a
+    /// memory gate can win back by draining (moon#1221 review F1). O(1) to
+    /// ask; an eviction victim (already credited) never counts.
+    charged_items: usize,
 }
 
 impl Drop for LazyFreeQueue {
@@ -396,6 +419,9 @@ impl Database {
                 return;
             }
         };
+        if charged {
+            self.lazy_free.charged_items += 1;
+        }
         self.lazy_free.items.push_back(Item {
             work,
             weight,
@@ -413,6 +439,49 @@ impl Database {
     #[inline]
     pub fn lazy_free_len(&self) -> usize {
         self.lazy_free.items.len()
+    }
+
+    /// `true` when draining the queue would lower `used_memory`: some queued
+    /// value's bytes are still charged. One field read — the memory gates'
+    /// fast bail (moon#1221 review F1).
+    #[inline]
+    pub fn lazy_free_reclaimable(&self) -> bool {
+        self.lazy_free.charged_items != 0
+    }
+
+    /// The memory gates' drain (moon#1221 review F1): free queued values NOW,
+    /// in batches of [`PRESSURE_BATCH_ELEMENTS`], until at least `excess`
+    /// bytes have been credited back to `used_memory` or no queued value is
+    /// still charged. Returns the bytes credited.
+    ///
+    /// Called by every maxmemory / OOM gate that finds the ledger over
+    /// budget, BEFORE it evicts or refuses: the queued bytes are memory the
+    /// keyspace already released. Items ahead of the first charged one (an
+    /// eviction victim, credited when it was evicted) are freed on the way —
+    /// work the tick owed anyway. Stops as soon as the overshoot is covered,
+    /// so a write that is a few bytes over pays a few thousand elements, not
+    /// the whole value; the tick frees the rest. Same drain as the tick's,
+    /// so a byte is never credited twice (debug-asserted per item in
+    /// [`Self::drain_lazy_free_elements`]), and a huge value's emptied shell
+    /// still goes to the `moon-lazyfree` helper.
+    pub fn reclaim_lazy_free(&mut self, excess: usize) -> usize {
+        let start = self.used_memory;
+        while self.lazy_free.charged_items != 0 && start.saturating_sub(self.used_memory) < excess {
+            let queued = self.lazy_free.items.len();
+            if self.drain_lazy_free_elements(PRESSURE_BATCH_ELEMENTS) == 0
+                && self.lazy_free.items.len() == queued
+            {
+                // A batch that freed nothing and finished nothing cannot
+                // happen while an item is queued; never spin on it.
+                break;
+            }
+        }
+        debug_assert_eq!(
+            self.lazy_free.charged_items,
+            self.lazy_free.items.iter().filter(|i| i.charged).count(),
+            "lazy-free charged-item count drifted from the queue"
+        );
+        start.saturating_sub(self.used_memory)
     }
 
     /// Free queued values until `deadline` (checked every [`STEP_ELEMENTS`]
@@ -463,6 +532,9 @@ impl Database {
                 );
             }
             if let Some(done_item) = self.lazy_free.items.pop_front() {
+                if done_item.charged {
+                    self.lazy_free.charged_items = self.lazy_free.charged_items.saturating_sub(1);
+                }
                 release_shell(done_item.work, done_item.weight);
             }
             PENDING_ITEMS.fetch_sub(1, Relaxed);
@@ -476,5 +548,6 @@ impl Database {
         for item in &mut self.lazy_free.items {
             item.charged = false;
         }
+        self.lazy_free.charged_items = 0;
     }
 }

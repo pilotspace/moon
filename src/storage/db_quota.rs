@@ -248,6 +248,17 @@ pub fn check_db_maxmemory(
     let policy = EvictionPolicy::from_str(&config.maxmemory_policy);
     let mut current = db.estimated_memory() as u64;
     while current > budget {
+        // moon#1221 review F1: reclaim what an UNLINK / expiry already
+        // released (queued for lazy free, still charged) before evicting
+        // or refusing — see `evict_to_budget`.
+        if db.lazy_free_reclaimable() {
+            let excess = usize::try_from(current - budget).unwrap_or(usize::MAX);
+            let credited = db.reclaim_lazy_free(excess);
+            current = current.saturating_sub(credited as u64);
+            if current <= budget {
+                break;
+            }
+        }
         if policy == EvictionPolicy::NoEviction {
             return Err(db_quota_error(db_index, budget));
         }
