@@ -758,8 +758,11 @@ pub fn publish_shared(
             .collect();
         (exact, pats)
     };
-    let exact = exact.unwrap_or_else(|| Arc::from(Vec::new()));
-    if exact.is_empty() && pattern_matches.is_empty() {
+    // No exact subscriber is the common case of a pattern-only channel — every
+    // keyspace notification a `PSUBSCRIBE __key*` listener gets arrives here
+    // through `notify_fanout` — so keep the `Option` rather than allocating an
+    // empty list to iterate on every such publish (moon#1227 review m1).
+    if exact.as_ref().is_none_or(|subs| subs.is_empty()) && pattern_matches.is_empty() {
         return 0;
     }
 
@@ -770,7 +773,7 @@ pub fn publish_shared(
     {
         let mut resp2: Option<Bytes> = None;
         let mut resp3: Option<Bytes> = None;
-        for sub in exact.iter() {
+        for sub in exact.as_deref().into_iter().flatten() {
             let data = if sub.is_resp3 {
                 resp3
                     .get_or_insert_with(|| serialize_message_bytes_push(channel, message))
