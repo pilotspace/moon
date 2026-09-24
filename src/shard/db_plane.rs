@@ -251,6 +251,8 @@ impl ShardDbSet {
         if a == b {
             return;
         }
+        // moon#1224: an in-flight snapshot epoch must hear of it first.
+        crate::persistence::snapshot_cow::note_swapdb(a, b);
         self.with_pair(a, b, |da, db| std::mem::swap(da, db));
     }
 

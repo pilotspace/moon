@@ -8,6 +8,39 @@
 //! shard event loop. Keys modified in not-yet-serialized segments have their old
 //! values captured in a per-snapshot overflow buffer (segment-level COW).
 //!
+//! ## Progress is a position in HASH space, not a segment index (moon#1216)
+//!
+//! The DashTable keeps splitting while an epoch serializes: a split moves
+//! about half of a segment's keys into a NEW segment appended at the end of
+//! the segment store. An epoch that walked store indices `0..count` captured
+//! at its start therefore never visited those halves — the moon#1216 repro
+//! lost 1,744 of 2,000 epoch-start keys. Walking by index up to the CURRENT
+//! count instead writes a split-off half of an already-written segment a
+//! second time.
+//!
+//! Extendible hashing gives a structure-independent order instead: a segment
+//! of local depth `d` owns exactly the aligned block of hash space sharing
+//! its top `d` hash bits, and a split only divides a block in two. So the
+//! epoch keeps a per-database `cursor` in hash space and each advance
+//! serializes the segment covering `cursor`, then moves `cursor` to the end
+//! of that segment's block. Every segment lies wholly below the cursor
+//! (written) or wholly at/above it (pending) at every instant — a split
+//! cannot straddle it, because the cursor only ever lands on a block
+//! boundary and splits only add boundaries. "Is this key still pending?" is
+//! `hash(key) >= cursor` in the current database, which no split, directory
+//! doubling or segment-store growth can change. No DashTable hook is needed,
+//! so a table with no snapshot armed pays nothing at all.
+//!
+//! ## Pre-images are point-in-time, including ABSENCE
+//!
+//! A pre-image is the key's state at epoch start: its entry, or `None` when
+//! it did not exist then (a TOMBSTONE). Without tombstones a key CREATED in
+//! a pending range during the epoch was serialized, and the WAL/AOF record
+//! that created it replayed on top (`INCR new` -> 1 in the file, 2 after
+//! replay). Pre-images are kept per database ordered by `(hash, key)`, so
+//! the ones for the range being written are taken in `O(log n)` and a split
+//! moving a key never separates it from its pre-image.
+//!
 //! ## Unwrap Classification
 //!
 //! | Context | Classification | Rationale |
@@ -17,7 +50,7 @@
 //! | `shard_snapshot_load` | **should-recover** (`Result<_, MoonError>`) | Startup load; failure = log + continue empty |
 //! | All `unwrap()` calls (30) | **test-only** | Only appear in `#[cfg(test)]` module |
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
 
@@ -54,6 +87,23 @@ const EOF_MARKER: u8 = 0xFF;
 const SEGMENT_BLOCK_MARKER: u8 = 0xFD;
 const DB_SELECTOR: u8 = 0xFE;
 
+/// Per-tick work budget of [`SnapshotState::advance_budgeted_db`]: stop
+/// after this many entries have been serialized...
+const TICK_ENTRY_BUDGET: u32 = 1024;
+/// ... or after this many segments have been visited, whichever comes first.
+///
+/// Why a budget and not one segment per tick (moon#1216): the hash-space
+/// walk must visit every segment covering a pending range, and a sustained
+/// insert load keeps SPLITTING pending segments. At one segment per 1 ms
+/// tick the walk ran at ~1,000 segments/s while ~370K inserts/s created
+/// ~9,000 new ones per second: the epoch never converged and every insert
+/// into a pending range held a tombstone meanwhile (measured: 11.7 GB RSS
+/// and a 60 s stall, 1M keys, `--shards 1`). The old index walk "finished"
+/// only because it skipped the split-off segments — the data loss itself.
+/// 64 segments / 1,024 entries per tick keeps a tick in the ~100 µs range
+/// and outpaces that growth several times over.
+const TICK_SEGMENT_BUDGET: u32 = 64;
+
 /// Snapshot header metadata, peekable without fully loading the file.
 ///
 /// Used by P3 recovery to pick the snapshot whose `last_lsn <= target_lsn`
@@ -80,14 +130,19 @@ pub struct SnapshotState {
     pub epoch: u64,
     /// Current database index being serialized (0..num_databases).
     current_db: usize,
-    /// Current segment index within the current database.
-    current_segment: usize,
-    /// Total segment count for the current database (captured at epoch start).
-    segments_in_current_db: usize,
+    /// Position in hash space, within `current_db`, of the next key range to
+    /// serialize: every key of `current_db` hashing below it is written
+    /// (moon#1216 — see the module docs).
+    cursor: u64,
     /// Total number of databases to snapshot.
     num_databases: usize,
-    /// Segment counts per database, captured at epoch start.
+    /// Segment counts per database, captured at epoch start. Informational
+    /// only since moon#1216: progress is tracked in hash space.
     segment_counts: Vec<usize>,
+    /// Segment blocks written so far, across every database.
+    segments_written: usize,
+    /// Entries serialized so far, across every database.
+    entries_written: u64,
     /// Output buffer accumulating serialized bytes. With a
     /// [`SnapshotStream`](crate::persistence::snapshot_stream::SnapshotStream)
     /// attached (every event-loop snapshot, moon#1186) it holds only the
@@ -97,25 +152,14 @@ pub struct SnapshotState {
     /// Off-shard-thread writer (moon#1186): receives filled blocks, writes
     /// the temp file with a streaming CRC, and publishes it on finalize.
     stream: Option<crate::persistence::snapshot_stream::SnapshotStream>,
-    /// COW overflow buffer, keyed by `(db_index, segment_storage_idx)`: the
-    /// pre-images of entries modified before their segment was serialized.
-    /// A segment's list is REMOVED (moved, never cloned) when the segment is
-    /// serialized (moon#1186 — it used to be one flat `Vec` rescanned, and
-    /// deep-cloned, on every segment advance).
-    overflow: HashMap<(usize, usize), Vec<(Bytes, Entry)>>,
-    /// Keys already present in `overflow`, so a key written twice inside one
-    /// epoch keeps its FIRST pre-image (moon#517). Without this, the second
-    /// capture appended a second record for the same key and
-    /// `advance_segment_inner` — which writes every overflow record for the
-    /// segment in insertion order — let the LATER one win on load: the
-    /// snapshot then held a value that already includes the first write,
-    /// which the WAL replays on top of. Cheap: `Bytes` clones are refcount
-    /// bumps, and the set strictly shrinks the overflow buffer. A segment's
-    /// keys leave the set when the segment is serialized.
-    overflow_keys: HashSet<(usize, usize, Bytes)>,
-    /// Per-database sets of segment storage indices that have already been serialized.
-    /// Outer index = db_index. Used to determine if a segment is still "pending".
-    serialized_segments: Vec<Vec<bool>>,
+    /// COW overflow, one map per database, keyed by `(hash, key)`: the
+    /// epoch-start state of every key written before its range was
+    /// serialized — its entry, or `None` if it did not exist then. Only
+    /// PENDING keys are ever inserted, so a map holds nothing below its
+    /// database's cursor; an advance splits the written range off the front
+    /// (moved, never cloned). First capture of a key wins (moon#517): it is
+    /// the only one taken before ANY write of this epoch touched the key.
+    overflow: Vec<BTreeMap<(u64, Bytes), PreImage>>,
     /// Shard ID for the snapshot file header.
     shard_id: u16,
     /// Output file path.
@@ -130,6 +174,28 @@ pub struct SnapshotState {
     last_lsn: u64,
     /// Wall-clock at snapshot construction, milliseconds since unix epoch (v0.2).
     created_at_unix_ms: u64,
+    /// Set when a structural change the epoch cannot follow (a SWAPDB)
+    /// happened while it was in flight: the file would not be point-in-time,
+    /// so the snapshot fails loudly instead of publishing it.
+    aborted: Option<&'static str>,
+}
+
+/// A key's state at the start of a snapshot epoch: its entry, or `None` when
+/// the key did not exist then (moon#1216 — see the module docs).
+pub type PreImage = Option<Entry>;
+
+/// The aligned block of hash space owned by a DashTable segment of local
+/// depth `depth` that contains `hash`: `(start, end)`, `end` exclusive and
+/// `None` when the block runs to the top of the hash space.
+#[inline]
+fn segment_block(hash: u64, depth: u32) -> (u64, Option<u64>) {
+    if depth == 0 {
+        return (0, None);
+    }
+    // 1..=64 prefix bits -> 0..=63 bits of span below the prefix.
+    let span_bits = 64 - depth.min(64);
+    let start = (hash >> span_bits) << span_bits;
+    (start, start.checked_add(1u64 << span_bits))
 }
 
 impl SnapshotState {
@@ -153,30 +219,24 @@ impl SnapshotState {
         segment_counts: Vec<usize>,
         file_path: PathBuf,
     ) -> Self {
-        let serialized_segments: Vec<Vec<bool>> = segment_counts
-            .iter()
-            .map(|&count| vec![false; count])
-            .collect();
-        let segments_in_current_db = segment_counts.first().copied().unwrap_or(0);
-
         SnapshotState {
             epoch,
             current_db: 0,
-            current_segment: 0,
-            segments_in_current_db,
+            cursor: 0,
             num_databases,
             segment_counts,
+            segments_written: 0,
+            entries_written: 0,
             output_buf: Vec::with_capacity(4096),
             stream: None,
-            overflow: HashMap::new(),
-            overflow_keys: HashSet::new(),
-            serialized_segments,
+            overflow: (0..num_databases).map(|_| BTreeMap::new()).collect(),
             shard_id,
             file_path,
             header_written: false,
             db_selector_written: vec![false; num_databases],
             last_lsn: 0,
             created_at_unix_ms: current_time_ms() as u64,
+            aborted: None,
         }
     }
 
@@ -213,10 +273,24 @@ impl SnapshotState {
         self.current_db
     }
 
-    /// Segment index (within [`Self::current_db_index`]) serialized next.
+    /// Hash-space position (within [`Self::current_db_index`]) of the next
+    /// key range to serialize (moon#1216): every key of the current database
+    /// hashing below it is already in the file.
     #[inline]
-    pub fn current_segment_index(&self) -> usize {
-        self.current_segment
+    pub fn cursor(&self) -> u64 {
+        self.cursor
+    }
+
+    /// Segment blocks written so far, across every database.
+    #[inline]
+    pub fn segments_written(&self) -> usize {
+        self.segments_written
+    }
+
+    /// Entries serialized so far, across every database.
+    #[inline]
+    pub fn entries_written(&self) -> u64 {
+        self.entries_written
     }
 
     /// Segment counts per database captured at epoch start.
@@ -271,7 +345,16 @@ impl SnapshotState {
     /// succeed, finalize now to report it.
     #[inline]
     pub fn stream_failed(&self) -> bool {
-        self.stream.as_ref().is_some_and(|s| s.failed())
+        self.aborted.is_some() || self.stream.as_ref().is_some_and(|s| s.failed())
+    }
+
+    /// The error a finalize of an aborted snapshot reports.
+    fn aborted_error(&self, why: &str) -> MoonError {
+        SnapshotError::Io {
+            path: self.file_path.clone(),
+            source: std::io::Error::other(format!("snapshot aborted: {why}")),
+        }
+        .into()
     }
 
     /// Start publishing the snapshot OFF the shard thread (moon#1186): the
@@ -279,6 +362,11 @@ impl SnapshotState {
     /// the CRC footer, fsyncs, renames and fsyncs the directory. Poll the
     /// outcome with [`Self::poll_finalize`]. Idempotent.
     pub fn begin_finalize(&mut self) -> Result<(), MoonError> {
+        if let Some(why) = self.aborted {
+            // Never publish: dropping the state abandons the stream, whose
+            // writer removes the temp file.
+            return Err(self.aborted_error(why));
+        }
         if self.stream.as_ref().is_some_and(|s| s.finishing()) {
             return Ok(());
         }
@@ -315,67 +403,116 @@ impl SnapshotState {
         self.stream.as_ref().map_or(0, |s| s.in_flight())
     }
 
-    /// Check if a segment in a given database has NOT yet been serialized.
+    /// Is the epoch-start state of a key hashing to `hash` in `db_index`
+    /// still to be written? A write to such a key must capture its
+    /// pre-image first; a write to any other key needs nothing.
     ///
-    /// Returns true if the snapshot is active for this db and the segment is pending.
+    /// A pure function of `(db_index, hash)` and the cursor — splits,
+    /// directory doublings and segment-store growth cannot change the
+    /// answer (moon#1216).
     #[inline]
-    pub fn is_segment_pending(&self, db_index: usize, segment_storage_idx: usize) -> bool {
-        if db_index > self.current_db {
-            return true;
-        }
-        if db_index < self.current_db {
+    pub fn is_hash_pending(&self, db_index: usize, hash: u64) -> bool {
+        if db_index >= self.num_databases || self.aborted.is_some() {
             return false;
         }
-        // db_index == current_db
-        if segment_storage_idx < self.serialized_segments[db_index].len() {
-            !self.serialized_segments[db_index][segment_storage_idx]
-        } else {
-            false
-        }
+        db_index > self.current_db || (db_index == self.current_db && hash >= self.cursor)
     }
 
-    /// Capture an old entry value before overwrite for COW.
-    ///
-    /// Called when a write targets a segment that hasn't been serialized yet.
+    /// [`Self::is_hash_pending`] for a key.
+    #[inline]
+    pub fn is_key_pending(&self, db_index: usize, key: &[u8]) -> bool {
+        self.is_hash_pending(db_index, crate::storage::dashtable::hash_key(key))
+    }
+
+    /// Record a key's epoch-start state before a write changes it: its old
+    /// entry, or `None` when the key does not exist yet.
     ///
     /// First capture of a key wins (moon#517): it is the only one taken
     /// before ANY write of this epoch touched the key, so it is the only one
-    /// that is the epoch-start value. Repeat captures are dropped.
-    pub fn capture_cow(
-        &mut self,
-        db_index: usize,
-        segment_storage_idx: usize,
-        key: Bytes,
-        old_entry: Entry,
-    ) {
-        if !self
-            .overflow_keys
-            .insert((db_index, segment_storage_idx, key.clone()))
-        {
+    /// that is the epoch-start state. Repeat captures are dropped, and so is
+    /// a capture for a key whose range is already written (the file holds
+    /// its epoch-start bytes; keeping the copy would also break the
+    /// "nothing below the cursor" invariant the range take relies on).
+    pub fn capture_cow(&mut self, db_index: usize, key: Bytes, pre_image: PreImage) {
+        let hash = crate::storage::dashtable::hash_key(&key);
+        if !self.is_hash_pending(db_index, hash) {
             return;
         }
-        self.overflow
-            .entry((db_index, segment_storage_idx))
-            .or_default()
-            .push((key, old_entry));
+        self.overflow[db_index]
+            .entry((hash, key))
+            .or_insert(pre_image);
+    }
+
+    /// Pre-images captured and not yet written, across every database.
+    #[inline]
+    pub fn pending_pre_images(&self) -> usize {
+        self.overflow.iter().map(BTreeMap::len).sum()
+    }
+
+    /// Fail this snapshot instead of publishing a file that is not
+    /// point-in-time (a SWAPDB swapped a database the epoch had not finished
+    /// with). The shard's next tick reports the failure; the previous
+    /// snapshot file stays in place.
+    pub fn abort(&mut self, why: &'static str) {
+        if self.aborted.is_none() {
+            tracing::error!(
+                "Shard {}: snapshot epoch {} aborted: {}",
+                self.shard_id,
+                self.epoch,
+                why
+            );
+            self.aborted = Some(why);
+        }
+        self.overflow.iter_mut().for_each(BTreeMap::clear);
+    }
+
+    /// Why this snapshot was aborted, if it was.
+    #[inline]
+    pub fn aborted(&self) -> Option<&'static str> {
+        self.aborted
     }
 
     /// Advance the snapshot by one segment. Returns true when all segments are done.
     ///
-    /// Serializes the current segment's entries (overflow first, then live data),
-    /// writes per-segment CRC32, and advances to the next segment.
+    /// Serializes the segment covering the cursor (overflow pre-images
+    /// first, then the live entries they do not shadow), writes its CRC32,
+    /// and moves the cursor to the end of that segment's hash block.
     /// Advance using a single database reference (for Arc<ShardDatabases> path).
     pub fn advance_one_segment_db(&mut self, db: &Database) -> bool {
         self.write_header_if_needed();
-        if self.current_db >= self.num_databases {
+        if self.current_db >= self.num_databases || self.aborted.is_some() {
             return true;
         }
         self.advance_segment_inner(db)
     }
 
+    /// The event loop's per-tick advance: serialize segments of the current
+    /// database until [`TICK_ENTRY_BUDGET`] entries are written,
+    /// [`TICK_SEGMENT_BUDGET`] segments are visited, or the database is done
+    /// (the next database needs its own `&Database`, i.e. the next tick).
+    /// Returns true when every database is written.
+    pub fn advance_budgeted_db(&mut self, db: &Database) -> bool {
+        self.write_header_if_needed();
+        let db_index = self.current_db;
+        let mut entries = 0u32;
+        let mut segments = 0u32;
+        while self.current_db == db_index
+            && self.current_db < self.num_databases
+            && self.aborted.is_none()
+            && entries < TICK_ENTRY_BUDGET
+            && segments < TICK_SEGMENT_BUDGET
+        {
+            let before = self.entries_written;
+            self.advance_segment_inner(db);
+            entries += (self.entries_written - before) as u32;
+            segments += 1;
+        }
+        self.current_db >= self.num_databases || self.aborted.is_some()
+    }
+
     pub fn advance_one_segment(&mut self, databases: &[Database]) -> bool {
         self.write_header_if_needed();
-        if self.current_db >= self.num_databases {
+        if self.current_db >= self.num_databases || self.aborted.is_some() {
             return true;
         }
         let db = &databases[self.current_db];
@@ -400,6 +537,20 @@ impl SnapshotState {
         }
     }
 
+    /// Remove and return the current database's pre-images hashing below
+    /// `end` (`None` = to the top of the hash space). The map holds nothing
+    /// below the cursor, so this is exactly the range being written.
+    fn take_pre_images_below(&mut self, end: Option<u64>) -> BTreeMap<(u64, Bytes), PreImage> {
+        let map = &mut self.overflow[self.current_db];
+        match end {
+            None => std::mem::take(map),
+            Some(end) => {
+                let rest = map.split_off(&(end, Bytes::new()));
+                std::mem::replace(map, rest)
+            }
+        }
+    }
+
     fn advance_segment_inner(&mut self, db: &Database) -> bool {
         let now_ms = current_time_ms();
 
@@ -410,25 +561,29 @@ impl SnapshotState {
             self.db_selector_written[self.current_db] = true;
         }
 
-        let seg_idx = self.current_segment;
-        let db_idx = self.current_db;
-        let segment = db.data().segment(seg_idx);
+        // moon#1216: the segment covering the cursor, and the hash block it
+        // owns. Splits never straddle the cursor (it only lands on block
+        // boundaries), so the block normally STARTS at the cursor. It starts
+        // below only if the table was replaced mid-epoch (FLUSHDB/FLUSHALL
+        // install a fresh one): its keys below the cursor were written into
+        // this db after its range was already in the file — skip them.
+        let table = db.data();
+        let start = self.cursor;
+        let seg_idx = table.segment_index_for_hash(start);
+        let segment = table.segment(seg_idx);
+        let (block_start, block_end) = segment_block(start, segment.depth());
+        let skip_below_cursor = block_start < start;
 
-        // This segment's pre-images, MOVED out of the overflow map (moon#1186:
-        // no rescan of every captured pre-image, no deep clone). Their keys
-        // leave the dedupe set too — the segment is final once written.
-        let overflow_entries: Vec<(Bytes, Entry)> =
-            self.overflow.remove(&(db_idx, seg_idx)).unwrap_or_default();
-        for (key, _) in &overflow_entries {
-            self.overflow_keys.remove(&(db_idx, seg_idx, key.clone()));
-        }
-        let overflow_keys: HashSet<&[u8]> =
-            overflow_entries.iter().map(|(k, _)| k.as_ref()).collect();
+        // This range's pre-images, MOVED out of the overflow map (moon#1186:
+        // no rescan of every captured pre-image, no deep clone).
+        let pre_images = self.take_pre_images_below(block_end);
+        let shadowed: HashSet<&[u8]> = pre_images.keys().map(|(_, k)| k.as_ref()).collect();
 
         // Segment block: marker + segment_idx + entry_count + data + CRC32,
         // written straight into the output buffer (moon#1186: no per-segment
         // staging `Vec` copied a second time). `entry_count` is patched in
-        // once the entries are known.
+        // once the entries are known. The index is informational (the
+        // loader only logs it).
         self.output_buf.push(SEGMENT_BLOCK_MARKER);
         self.output_buf
             .extend_from_slice(&(seg_idx as u32).to_le_bytes());
@@ -437,8 +592,11 @@ impl SnapshotState {
         let data_start = self.output_buf.len();
         let mut entry_count: u32 = 0;
 
-        // Write overflow entries first (these represent old values before modification)
-        for (key, entry) in &overflow_entries {
+        // Epoch-start values of keys written since: these win over the live
+        // entries. A tombstone (the key did not exist at epoch start) writes
+        // nothing and hides the live entry below.
+        for ((_, key), pre_image) in &pre_images {
+            let Some(entry) = pre_image else { continue };
             if entry.has_expiry() && entry.is_expired_at(now_ms) {
                 continue;
             }
@@ -452,9 +610,12 @@ impl SnapshotState {
             entry_count += 1;
         }
 
-        // Write live entries, skipping those already in overflow and expired ones
+        // Live entries: skip those shadowed by a pre-image and expired ones.
         for (key, entry) in segment.iter_occupied() {
-            if !overflow_keys.is_empty() && overflow_keys.contains(key.as_bytes()) {
+            if !shadowed.is_empty() && shadowed.contains(key.as_bytes()) {
+                continue;
+            }
+            if skip_below_cursor && crate::storage::dashtable::hash_key(key.as_bytes()) < start {
                 continue;
             }
             if entry.has_expiry() && entry.is_expired_at(now_ms) {
@@ -476,17 +637,16 @@ impl SnapshotState {
         hasher.update(&self.output_buf[data_start..data_end]);
         let crc = hasher.finalize();
         self.output_buf.extend_from_slice(&crc.to_le_bytes());
+        self.segments_written += 1;
+        self.entries_written += u64::from(entry_count);
 
-        // Mark this segment as serialized
-        self.serialized_segments[self.current_db][seg_idx] = true;
-
-        // Advance to next segment
-        self.current_segment += 1;
-        if self.current_segment >= self.segments_in_current_db {
-            self.current_db += 1;
-            self.current_segment = 0;
-            if self.current_db < self.num_databases {
-                self.segments_in_current_db = self.segment_counts[self.current_db];
+        // Move past this block; the last block of a database ends at the top
+        // of the hash space.
+        match block_end {
+            Some(end) => self.cursor = end,
+            None => {
+                self.current_db += 1;
+                self.cursor = 0;
             }
         }
 
@@ -503,6 +663,9 @@ impl SnapshotState {
     /// thread and waits for it; the event loop uses
     /// [`Self::begin_finalize`] + [`Self::poll_finalize`] instead.
     pub fn finalize(&mut self) -> Result<(), MoonError> {
+        if let Some(why) = self.aborted {
+            return Err(self.aborted_error(why));
+        }
         if self.stream.is_some() {
             self.begin_finalize()?;
             let outcome = self.stream.as_ref().map_or(Ok(()), |s| s.wait());
@@ -962,530 +1125,19 @@ pub fn shard_snapshot_load<D: std::borrow::BorrowMut<Database>>(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::storage::compact_value::RedisValueRef;
-    use ordered_float::OrderedFloat;
-    use tempfile::tempdir;
-
-    fn snap_path() -> (tempfile::TempDir, std::path::PathBuf) {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("dump.rrdshard");
-        (dir, path)
-    }
-
-    /// P2 — v2 snapshot header round-trip: stamp last_lsn + created_at,
-    /// reload via the metadata peek API, and verify the fields survive.
-    #[test]
-    fn test_snapshot_v2_header_roundtrip() {
-        let (_dir, path) = snap_path();
-        let dbs = vec![Database::new()];
-
-        // Save with last_lsn = 12345 stamped in.
-        shard_snapshot_save_with_lsn(7, 42, 12345, &dbs, &path).unwrap();
-
-        // Peek metadata only — must report the current write version (V3 since
-        // phase 200 — adds the hash-field TTL trailer; preamble is unchanged
-        // from V2) and the stamped LSN.
-        let meta = read_snapshot_metadata(&path).expect("metadata read");
-        assert_eq!(meta.version, SHARD_RDB_VERSION);
-        assert_eq!(meta.shard_id, 7);
-        assert_eq!(meta.epoch, 42);
-        assert_eq!(meta.last_lsn, 12345);
-        assert!(
-            meta.created_at_unix_ms > 0,
-            "v2 must stamp a non-zero created_at_unix_ms",
-        );
-
-        // Full load must still work.
-        let mut loaded = vec![Database::new()];
-        let _ = shard_snapshot_load(&mut loaded, &path).unwrap();
-    }
-
-    /// P2 — v1 backward compat: hand-build a v1 (24-byte minimum) snapshot
-    /// file and confirm both the loader and metadata-peek API accept it,
-    /// reporting last_lsn = 0 as the lossless fallback.
-    #[test]
-    fn test_v1_snapshot_loads_with_zero_lsn() {
-        use crc32fast::Hasher;
-        let (_dir, path) = snap_path();
-
-        // Build the minimum-valid v1 file: preamble + eof + global_crc.
-        let mut buf = Vec::new();
-        buf.extend_from_slice(SHARD_RDB_MAGIC);
-        buf.push(SHARD_RDB_VERSION_V1);
-        buf.extend_from_slice(&3u16.to_le_bytes()); // shard_id
-        buf.extend_from_slice(&99u64.to_le_bytes()); // epoch
-        buf.push(EOF_MARKER);
-        let mut hasher = Hasher::new();
-        hasher.update(&buf);
-        let crc = hasher.finalize();
-        buf.extend_from_slice(&crc.to_le_bytes());
-        std::fs::write(&path, &buf).unwrap();
-
-        // Metadata peek must succeed and synthesize last_lsn = 0.
-        let meta = read_snapshot_metadata(&path).expect("v1 metadata read");
-        assert_eq!(meta.version, SHARD_RDB_VERSION_V1);
-        assert_eq!(meta.shard_id, 3);
-        assert_eq!(meta.epoch, 99);
-        assert_eq!(
-            meta.last_lsn, 0,
-            "v1 fallback must report last_lsn = 0 (forces full WAL replay)",
-        );
-        assert_eq!(meta.created_at_unix_ms, 0);
-
-        // Full load on a (degenerate) v1 file must also succeed without error.
-        let mut loaded = vec![Database::new()];
-        let count = shard_snapshot_load(&mut loaded, &path).unwrap();
-        assert_eq!(count, 0);
-    }
-
-    /// P2 — `set_last_lsn` must be observable via `last_lsn()` and reflected
-    /// in the on-disk header so P3 recovery can read it back without loading
-    /// the full payload.
-    #[test]
-    fn test_set_last_lsn_persists_in_header() {
-        let (_dir, path) = snap_path();
-        let dbs = vec![Database::new()];
-
-        let mut state = SnapshotState::new(2, 1, &dbs, path.clone());
-        state.set_last_lsn(987_654);
-        assert_eq!(state.last_lsn(), 987_654);
-        while !state.advance_one_segment(&dbs) {}
-        state.finalize().unwrap();
-
-        let meta = read_snapshot_metadata(&path).unwrap();
-        assert_eq!(meta.last_lsn, 987_654);
-    }
-
-    #[test]
-    fn test_snapshot_round_trip_string() {
-        let (_dir, path) = snap_path();
-        let mut dbs = vec![Database::new()];
-        dbs[0].set_string(b"k1", Bytes::from_static(b"v1"));
-        dbs[0].set_string(b"k2", Bytes::from_static(b"v2"));
-        dbs[0].set_string(b"k3", Bytes::from_static(b"v3"));
-
-        shard_snapshot_save(0, 1, &dbs, &path).unwrap();
-
-        let mut loaded = vec![Database::new()];
-        let count = shard_snapshot_load(&mut loaded, &path).unwrap();
-        assert_eq!(count, 3);
-        for key in &[b"k1", b"k2", b"k3"] {
-            let entry = loaded[0].get(*key).unwrap();
-            match entry.value.as_redis_value() {
-                RedisValueRef::String(_) => {}
-                _ => panic!("Expected string for key {:?}", key),
-            }
-        }
-    }
-
-    #[test]
-    fn test_snapshot_round_trip_all_types() {
-        let (_dir, path) = snap_path();
-        let mut dbs = vec![Database::new()];
-
-        // String
-        dbs[0].set_string(b"str", Bytes::from_static(b"val"));
-        // Hash
-        {
-            let map = dbs[0].get_or_create_hash(b"h").unwrap();
-            map.insert(Bytes::from_static(b"f"), Bytes::from_static(b"v"));
-        }
-        // List
-        {
-            let list = dbs[0].get_or_create_list(b"l").unwrap();
-            list.push_back(Bytes::from_static(b"item"));
-        }
-        // Set
-        {
-            let set = dbs[0].get_or_create_set(b"s").unwrap();
-            set.insert(Bytes::from_static(b"m"));
-        }
-        // Sorted set
-        {
-            let (members, tree) = dbs[0].get_or_create_sorted_set(b"z").unwrap();
-            members.insert(Bytes::from_static(b"a"), 1.0);
-            tree.insert(OrderedFloat(1.0), Bytes::from_static(b"a"));
-        }
-
-        shard_snapshot_save(0, 1, &dbs, &path).unwrap();
-
-        let mut loaded = vec![Database::new()];
-        let count = shard_snapshot_load(&mut loaded, &path).unwrap();
-        assert_eq!(count, 5);
-        assert_eq!(loaded[0].get(b"str").unwrap().value.type_name(), "string");
-        assert_eq!(loaded[0].get(b"h").unwrap().value.type_name(), "hash");
-        assert_eq!(loaded[0].get(b"l").unwrap().value.type_name(), "list");
-        assert_eq!(loaded[0].get(b"s").unwrap().value.type_name(), "set");
-        assert_eq!(loaded[0].get(b"z").unwrap().value.type_name(), "zset");
-    }
-
-    #[test]
-    fn test_snapshot_with_ttl() {
-        let (_dir, path) = snap_path();
-        let mut dbs = vec![Database::new()];
-
-        // Key with future TTL
-        let future_ms = current_time_ms() + 3_600_000;
-        dbs[0].set_string_with_expiry(b"live", Bytes::from_static(b"yes"), future_ms);
-        // Key with past TTL (should be skipped)
-        let past_ms = current_time_ms() - 1000;
-        dbs[0].set(
-            b"dead",
-            Entry::new_string_with_expiry(Bytes::from_static(b"no"), past_ms),
-        );
-
-        shard_snapshot_save(0, 1, &dbs, &path).unwrap();
-
-        let mut loaded = vec![Database::new()];
-        let count = shard_snapshot_load(&mut loaded, &path).unwrap();
-        assert_eq!(count, 1);
-        assert!(loaded[0].get(b"live").is_some());
-        assert!(loaded[0].get(b"dead").is_none());
-    }
-
-    #[test]
-    fn test_snapshot_cow_captures_old_value() {
-        let (_dir, path) = snap_path();
-        let mut dbs = vec![Database::new()];
-        // Insert enough entries across at least 2 segments
-        for i in 0..100 {
-            dbs[0].set_string(
-                &Bytes::from(format!("cow_{:04}", i)),
-                Bytes::from(format!("val_{:04}", i)),
-            );
-        }
-
-        let seg_count = dbs[0].data().segment_count();
-        assert!(seg_count > 1, "Need multiple segments for COW test");
-
-        let mut state = SnapshotState::new(0, 1, &dbs, path.to_path_buf());
-
-        // Advance past segment 0
-        let done = state.advance_one_segment(&dbs);
-        assert!(!done, "Should not be done after first segment");
-
-        // Capture a COW entry for segment 1 (which hasn't been serialized yet)
-        // Find a key that lives in segment 1
-        let seg1 = dbs[0].data().segment(1);
-        let (cow_key, cow_old_entry) = seg1.iter_occupied().next().unwrap();
-        let cow_key = cow_key.clone();
-        let cow_old_entry = cow_old_entry.clone();
-
-        assert!(state.is_segment_pending(0, 1));
-        state.capture_cow(0, 1, cow_key.to_bytes(), cow_old_entry);
-
-        // Now overwrite the key in the live database (simulating a write during snapshot)
-        dbs[0].set_string(cow_key.as_ref(), Bytes::from_static(b"NEW_VALUE"));
-
-        // Continue advancing until done
-        while !state.advance_one_segment(&dbs) {}
-        state.finalize().unwrap();
-
-        // Load and verify the COW captured the old value (not the new one)
-        let mut loaded = vec![Database::new()];
-        let _count = shard_snapshot_load(&mut loaded, &path).unwrap();
-        let entry = loaded[0].get(cow_key.as_bytes()).unwrap();
-        match entry.value.as_redis_value() {
-            RedisValueRef::String(s) => {
-                // The snapshot should have the OLD value from COW, not "NEW_VALUE"
-                assert_ne!(
-                    s as &[u8], b"NEW_VALUE",
-                    "COW should have captured old value"
-                );
-            }
-            _ => panic!("Expected string"),
-        }
-    }
-
-    /// moon#517: a key written TWICE inside one snapshot epoch must keep the
-    /// pre-image taken before the FIRST write. `advance_segment_inner` writes
-    /// every overflow record for a segment in insertion order and load takes
-    /// the last one, so an un-deduped second capture silently published a
-    /// value that already contains the first write — which WAL replay then
-    /// applies a second time.
-    ///
-    /// RED before the dedupe in `capture_cow`: the snapshot held "mid".
-    #[test]
-    fn test_snapshot_cow_keeps_the_first_pre_image() {
-        let (_dir, path) = snap_path();
-        let mut dbs = vec![Database::new()];
-        for i in 0..100 {
-            dbs[0].set_string(
-                &Bytes::from(format!("cow_{:04}", i)),
-                Bytes::from(format!("val_{:04}", i)),
-            );
-        }
-        let mut state = SnapshotState::new(0, 1, &dbs, path.to_path_buf());
-
-        let seg1 = dbs[0].data().segment(1);
-        #[allow(clippy::unwrap_used)]
-        let (key, first_entry) = seg1.iter_occupied().next().unwrap();
-        let key = key.to_bytes();
-        let first_entry = first_entry.clone();
-        assert!(state.is_segment_pending(0, 1));
-
-        // Write #1: capture the epoch-start value, then mutate.
-        state.capture_cow(0, 1, key.clone(), first_entry);
-        dbs[0].set_string(&key, Bytes::from_static(b"mid"));
-
-        // Write #2: a second capture of the SAME key, now holding "mid".
-        #[allow(clippy::unwrap_used)]
-        let second_entry = dbs[0].data().get(&key).unwrap().clone();
-        state.capture_cow(0, 1, key.clone(), second_entry);
-        dbs[0].set_string(&key, Bytes::from_static(b"NEW_VALUE"));
-
-        while !state.advance_one_segment(&dbs) {}
-        #[allow(clippy::unwrap_used)]
-        state.finalize().unwrap();
-
-        let mut loaded = vec![Database::new()];
-        #[allow(clippy::unwrap_used)]
-        let _count = shard_snapshot_load(&mut loaded, &path).unwrap();
-        #[allow(clippy::unwrap_used)]
-        let entry = loaded[0].get(&key).unwrap();
-        match entry.value.as_redis_value() {
-            RedisValueRef::String(s) => {
-                assert_ne!(s as &[u8], b"mid", "second capture must not win");
-                assert_ne!(s as &[u8], b"NEW_VALUE", "live value must not win");
-            }
-            _ => panic!("Expected string"),
-        }
-    }
-
-    #[test]
-    fn test_snapshot_per_segment_crc32() {
-        let (_dir, path) = snap_path();
-        let mut dbs = vec![Database::new()];
-        // Use a longer value so we can corrupt a data byte without hitting a tag
-        dbs[0].set_string(b"testkey", Bytes::from_static(b"testvalue_long_enough"));
-
-        shard_snapshot_save(0, 1, &dbs, &path).unwrap();
-
-        let mut data = std::fs::read(&path).unwrap();
-        // Layout: header(19) + DB_SELECTOR(1) + db_idx(1) + SEGMENT_BLOCK_MARKER(1)
-        //       + seg_idx(4) + entry_count(4) + [entry_data...] + seg_crc(4) + EOF(1) + global_crc(4)
-        // Entry data starts at offset 30. The entry:
-        //   type_tag(1) + key_len(4) + "testkey"(7) + ttl(8) + val_len(4) + "testvalue_long_enough"(21) = 45 bytes
-        // Value string bytes start at offset 30+1+4+7+8+4 = 54, end at 75
-        // Corrupt a byte in the value string area (offset 60)
-        let corrupt_offset = 60;
-        assert!(
-            corrupt_offset < data.len() - 8,
-            "File too small for corruption test"
-        );
-        data[corrupt_offset] ^= 0xFF;
-
-        // Recalculate the global CRC to isolate the segment CRC check
-        let payload_len = data.len() - 4;
-        let mut hasher = Hasher::new();
-        hasher.update(&data[..payload_len]);
-        let new_global_crc = hasher.finalize();
-        data[payload_len..].copy_from_slice(&new_global_crc.to_le_bytes());
-        std::fs::write(&path, &data).unwrap();
-
-        let mut loaded = vec![Database::new()];
-        // Per-segment CRC mismatch now uses log+skip recovery:
-        // the corrupted segment is skipped but loading continues successfully.
-        let result = shard_snapshot_load(&mut loaded, &path);
-        assert!(
-            result.is_ok(),
-            "Per-segment CRC mismatch should log+skip, not hard-fail"
-        );
-        let count = result.unwrap();
-        assert_eq!(
-            count, 0,
-            "Corrupted segment should be skipped, yielding 0 keys"
-        );
-    }
-
-    #[test]
-    fn test_snapshot_multi_database() {
-        let (_dir, path) = snap_path();
-        let mut dbs = vec![Database::new(), Database::new()];
-        dbs[0].set_string(b"db0_k", Bytes::from_static(b"v0"));
-        dbs[1].set_string(b"db1_k", Bytes::from_static(b"v1"));
-
-        shard_snapshot_save(0, 1, &dbs, &path).unwrap();
-
-        let mut loaded = vec![Database::new(), Database::new()];
-        let count = shard_snapshot_load(&mut loaded, &path).unwrap();
-        assert_eq!(count, 2);
-        assert!(loaded[0].get(b"db0_k").is_some());
-        assert!(loaded[1].get(b"db1_k").is_some());
-    }
-
-    #[test]
-    fn test_snapshot_empty_database() {
-        let (_dir, path) = snap_path();
-        let dbs = vec![Database::new()];
-
-        shard_snapshot_save(0, 1, &dbs, &path).unwrap();
-
-        let mut loaded = vec![Database::new()];
-        let count = shard_snapshot_load(&mut loaded, &path).unwrap();
-        assert_eq!(count, 0);
-        assert_eq!(loaded[0].len(), 0);
-    }
-
-    #[test]
-    fn test_advance_one_segment_yields_between_segments() {
-        let mut dbs = vec![Database::new()];
-        // Insert enough entries to have multiple segments
-        for i in 0..100 {
-            dbs[0].set_string(
-                &Bytes::from(format!("yield_{:04}", i)),
-                Bytes::from(format!("v_{:04}", i)),
-            );
-        }
-
-        let seg_count = dbs[0].data().segment_count();
-        assert!(seg_count > 1, "Need multiple segments, got {}", seg_count);
-
-        let (_dir, path) = snap_path();
-        let mut state = SnapshotState::new(0, 1, &dbs, path.to_path_buf());
-
-        // First advance should return false (not done -- more segments to process)
-        let done = state.advance_one_segment(&dbs);
-        assert!(
-            !done,
-            "First advance should not complete with {} segments",
-            seg_count
-        );
-
-        // Advance all remaining segments
-        let mut advances = 1;
-        while !state.advance_one_segment(&dbs) {
-            advances += 1;
-        }
-        advances += 1; // count the final true-returning call... actually the last true call is when advance_one_segment returned true
-
-        // Total advances should equal segment count
-        assert_eq!(
-            advances, seg_count,
-            "Should need exactly {} advances, got {}",
-            seg_count, advances
-        );
-
-        assert!(state.is_complete());
-    }
-
-    /// The event loop's finalize (moon#1186): begin, then poll without
-    /// blocking until the writer thread has published a loadable file.
-    #[test]
-    fn test_begin_and_poll_finalize_publishes_a_valid_file() {
-        let (_dir, path) = snap_path();
-        let mut dbs = vec![Database::new()];
-        dbs[0].set_string(b"async_k1", Bytes::from_static(b"async_v1"));
-        dbs[0].set_string(b"async_k2", Bytes::from_static(b"async_v2"));
-
-        let mut state = SnapshotState::new(0, 1, &dbs, path.to_path_buf());
-        while !state.advance_one_segment(&dbs) {}
-        state.begin_finalize().unwrap();
-        assert!(state.finalize_started());
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        let outcome = loop {
-            if let Some(r) = state.poll_finalize() {
-                break r;
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "finalize never completed"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(1));
-        };
-        outcome.unwrap();
-
-        // Verify file was written and is loadable
-        assert!(path.exists(), "Snapshot file should exist after finalize");
-        assert!(
-            !path.with_extension("rrdshard.tmp").exists(),
-            "temp file must be renamed away"
-        );
-        let mut loaded = vec![Database::new()];
-        let count = shard_snapshot_load(&mut loaded, &path).unwrap();
-        assert_eq!(count, 2);
-        assert!(loaded[0].get(b"async_k1").is_some());
-        assert!(loaded[0].get(b"async_k2").is_some());
-    }
-
-    /// Locates the byte offset of the `entry_count` field within the first
-    /// segment block that actually carries entries (skipping empty
-    /// segments, which are still legally written for near-empty
-    /// databases). Mirrors the writer's known layout — see
-    /// `write_header_if_needed` / `advance_segment_inner` above.
-    fn find_entry_count_offset(data: &[u8]) -> usize {
-        let version = data[8];
-        let preamble_len = if version == SHARD_RDB_VERSION_V1 {
-            19
-        } else {
-            35
-        };
-        let mut pos = preamble_len;
-        loop {
-            let tag = data[pos];
-            pos += 1;
-            match tag {
-                EOF_MARKER => panic!("reached EOF before finding a non-empty segment"),
-                DB_SELECTOR => pos += 1, // db_idx byte
-                SEGMENT_BLOCK_MARKER => {
-                    let entry_count =
-                        u32::from_le_bytes(data[pos + 4..pos + 8].try_into().expect("4 bytes"));
-                    if entry_count > 0 {
-                        return pos + 4;
-                    }
-                    // Empty segment: seg_idx(4) + entry_count(4) + data(0) + crc(4).
-                    pos += 12;
-                }
-                other => panic!("unexpected tag byte {other:#x}"),
-            }
-        }
-    }
-
-    /// Security regression (untrusted-input DoS): a crafted/corrupt segment
-    /// block that lies about its `entry_count` (e.g. claims u32::MAX
-    /// entries while the file has only a handful of bytes left) must be
-    /// rejected before `Vec::with_capacity(entry_count as usize)` runs.
-    ///
-    /// Before the fix, this allocation had no bound at all: a hostile or
-    /// corrupt snapshot file on the server-startup / replica-full-sync path
-    /// would drive a multi-gigabyte allocation before a single entry byte
-    /// was read, aborting the process (release builds use `panic =
-    /// "abort"`) or OOM-killing it.
-    #[test]
-    fn test_segment_entry_count_dos_rejected() {
-        let (_dir, path) = snap_path();
-        let mut dbs = vec![Database::new()];
-        dbs[0].set_string(b"k", Bytes::from_static(b"v"));
-        shard_snapshot_save(0, 1, &dbs, &path).unwrap();
-
-        let mut data = std::fs::read(&path).unwrap();
-        let entry_count_off = find_entry_count_offset(&data);
-        data[entry_count_off..entry_count_off + 4].copy_from_slice(&u32::MAX.to_le_bytes());
-
-        // Recompute the global CRC32 so the corruption is caught by the
-        // entry_count bound check, not the outer whole-file checksum gate.
-        let payload_len = data.len() - 4;
-        let mut hasher = Hasher::new();
-        hasher.update(&data[..payload_len]);
-        let new_global_crc = hasher.finalize();
-        data[payload_len..].copy_from_slice(&new_global_crc.to_le_bytes());
-        std::fs::write(&path, &data).unwrap();
-
-        let mut loaded = vec![Database::new()];
-        let result = shard_snapshot_load(&mut loaded, &path);
-        assert!(
-            result.is_err(),
-            "a lying entry_count must be rejected with a clean error, not drive an unbounded allocation"
-        );
-        let err = result.unwrap_err().to_string();
-        assert!(
-            err.contains("segment_entries") && err.contains("exceeds remaining data"),
-            "expected the validate_count bounds-check error, got: {err}"
-        );
-    }
-}
+mod tests;
 
 #[cfg(test)]
 mod stream_tests;
+
+#[cfg(test)]
+mod epoch_harness;
+
+#[cfg(test)]
+mod split_epoch_tests;
+
+#[cfg(test)]
+mod table_swap_tests;
+
+#[cfg(test)]
+mod multi_key_cow_tests;
