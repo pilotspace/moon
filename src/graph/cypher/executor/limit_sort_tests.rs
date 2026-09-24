@@ -125,6 +125,25 @@ const QUERIES: &[&str] = &[
     "MATCH (n:L) RETURN n.y AS y, count(n) AS c ORDER BY c DESC, y LIMIT 3",
     "MATCH (n:L)-[:R]->(m) RETURN n.z, m.x ORDER BY m.x, n.z LIMIT 15",
     "MATCH (n:L) RETURN n.x ORDER BY n.x LIMIT 0",
+    // moon#1220: RETURN … ORDER BY … LIMIT projects only the kept rows — streamed from the
+    // scan through Filter / Unwind / single-hop Expand, or over materialised rows otherwise.
+    "MATCH (n:L) RETURN n.z, n.y, n.x ORDER BY n.x LIMIT 10",
+    "MATCH (n:L) RETURN n.x AS a, n.z ORDER BY a DESC LIMIT 7",
+    "MATCH (n:L) RETURN n.x AS a, n.z ORDER BY n.x LIMIT 7",
+    "MATCH (n:L) RETURN n, n.x ORDER BY n.x DESC, n.z LIMIT 5",
+    "MATCH (n:L) RETURN n.y, n.x, n.y ORDER BY n.y DESC, n.x LIMIT 9",
+    "MATCH (n:L) RETURN n.x, n.z ORDER BY n.x SKIP 5 LIMIT 10",
+    "MATCH (n:L) RETURN n.x, n.z ORDER BY n.x DESC LIMIT $k",
+    "MATCH (n:L) RETURN n.z, n.x ORDER BY n.x LIMIT 100000",
+    "MATCH (n:L) WHERE n.x > 10 RETURN n.z, n.x ORDER BY n.x DESC, n.z LIMIT 9",
+    "MATCH (n:L) WHERE n.z > 100 RETURN n.z, n.y ORDER BY n.y, n.z DESC LIMIT 12",
+    "MATCH (n:L) UNWIND [3, 1, 2] AS k RETURN n.z, k ORDER BY k, n.z DESC LIMIT 8",
+    "MATCH (n:L)-[:R]->(m) RETURN n.z, m.y, m.x ORDER BY m.y DESC, m.x LIMIT 13",
+    "MATCH (n:L)-[:R*1..2]->(m) RETURN m.z, n.z ORDER BY m.z DESC, n.z LIMIT 20",
+    "MATCH (n:L) WITH n, n.x AS x WHERE x > 5 RETURN n.z, x ORDER BY x, n.z LIMIT 11",
+    "MATCH (n) RETURN n.z, n.x ORDER BY n.x DESC LIMIT 6",
+    "MATCH (n:Missing) RETURN n.x ORDER BY n.x LIMIT 5",
+    "MATCH (n:L) RETURN DISTINCT n.y ORDER BY n.y LIMIT 2",
 ];
 
 #[test]
@@ -152,6 +171,84 @@ fn limit_and_order_by_match_full_evaluation_across_tiers() {
         nonempty * 10 >= compared * 7,
         "{nonempty}/{compared} non-empty"
     );
+}
+
+/// moon#1220: the fused RETURN + ORDER BY top-k is TAKEN where it should be (streamed from a
+/// scan through row-local ops, or over materialised rows) and declined where it must be — so the
+/// oracle comparison above covers the new path, not just the old one.
+#[test]
+fn return_order_by_limit_takes_the_fused_top_k() {
+    let store = graph_store(600, 500);
+    let mut params = HashMap::new();
+    params.insert("k".to_owned(), Value::Int(7));
+    // (query, streamed runs, materialised runs)
+    let cases: &[(&str, usize, usize)] = &[
+        (
+            "MATCH (n:L) RETURN n.z, n.y, n.x ORDER BY n.x LIMIT 10",
+            1,
+            0,
+        ),
+        (
+            "MATCH (n:L) WHERE n.x > 10 RETURN n.z, n.x ORDER BY n.x LIMIT 9",
+            1,
+            0,
+        ),
+        (
+            "MATCH (n:L) WHERE n.z > 100 RETURN n.z, n.y ORDER BY n.y LIMIT 12",
+            1,
+            0,
+        ),
+        (
+            "MATCH (n:L) UNWIND [3, 1, 2] AS k RETURN n.z, k ORDER BY k LIMIT 8",
+            1,
+            0,
+        ),
+        (
+            "MATCH (n:L)-[:R]->(m) RETURN n.z, m.x ORDER BY m.x LIMIT 13",
+            1,
+            0,
+        ),
+        (
+            "MATCH (n:L) RETURN n.x, n.z ORDER BY n.x SKIP 5 LIMIT $k",
+            1,
+            0,
+        ),
+        (
+            "MATCH (n:L)-[:R*1..2]->(m) RETURN m.z, n.z ORDER BY m.z LIMIT 20",
+            0,
+            1,
+        ),
+        (
+            "MATCH (n:L) WITH n, n.x AS x RETURN n.z, x ORDER BY x LIMIT 11",
+            0,
+            1,
+        ),
+        // Declined: no LIMIT, LIMIT 0, DISTINCT, aggregation, pre-projection ORDER BY.
+        ("MATCH (n:L) RETURN n.x, n.z ORDER BY n.x", 0, 0),
+        ("MATCH (n:L) RETURN n.x ORDER BY n.x LIMIT 0", 0, 0),
+        ("MATCH (n:L) RETURN DISTINCT n.y ORDER BY n.y LIMIT 2", 0, 0),
+        (
+            "MATCH (n:L) RETURN n.y, count(n) AS c ORDER BY c LIMIT 2",
+            0,
+            0,
+        ),
+        ("MATCH (n:L) WITH n ORDER BY n.x LIMIT 9 RETURN n.z", 0, 0),
+    ];
+    for &(q, streamed, materialised) in cases {
+        let before = fused_counts();
+        let (got, want) = run(&store, q, &params);
+        let after = fused_counts();
+        assert_eq!(render(&got), render(&want), "{q}");
+        assert_eq!(
+            (after.0 - before.0, after.1 - before.1),
+            (streamed, materialised),
+            "{q}: (streamed, materialised) fused runs"
+        );
+        assert!(
+            !want.rows.is_empty() || q.contains("LIMIT 0"),
+            "{q}: empty oracle"
+        );
+    }
 }
 
 /// NaN / ±2^53-int-next-to-float sort keys make `compare_values` intransitive: the fused
@@ -182,6 +279,10 @@ fn order_by_with_nan_and_huge_ints_matches_full_evaluation() {
         "MATCH (n:L) RETURN n.x, n.z ORDER BY n.x LIMIT 10",
         "MATCH (n:L) RETURN n.x, n.z ORDER BY n.x DESC LIMIT 25",
         "MATCH (n:L) WITH n ORDER BY n.x LIMIT 12 RETURN n.z",
+        // moon#1220: the fused RETURN top-k must decline (fall back) on these keys too, both
+        // streamed and over materialised rows.
+        "MATCH (n:L) RETURN n.z, n.x ORDER BY n.x DESC, n.z LIMIT 9",
+        "MATCH (n:L) WITH n, n.z AS z RETURN z, n.x ORDER BY n.x LIMIT 14",
     ] {
         let (got, want) = run(&store, q, &HashMap::new());
         assert_eq!(render(&got), render(&want), "{q}");

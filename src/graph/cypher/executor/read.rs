@@ -4,6 +4,10 @@ use super::*;
 
 #[path = "pipeline.rs"]
 mod pipeline;
+#[path = "topk.rs"]
+mod topk;
+#[cfg(test)]
+pub(crate) use topk::fused_counts;
 
 /// W2-12: if `expr` is a top-level aggregate call, return
 /// `(lowercase name, input expr, distinct)`. `None` input = `count(*)` /
@@ -603,12 +607,22 @@ pub fn execute_with_slots(
     let ops = &plan.operators;
     let demand = pipeline::row_demand(ops, |count| env.count(count));
     let mut first = 0;
-    if let Some(end) = pipeline::streamable_prefix(ops, &demand) {
+    // moon#1220: scan → row-local ops → RETURN … ORDER BY … LIMIT, streamed into a top-k.
+    if let Some(end) = topk::stream_sorted_scan(ops, &demand, &mut st, &env)? {
+        first = end;
+    } else if let Some(end) = pipeline::streamable_prefix(ops, &demand) {
         pipeline::run_streamed_prefix(&ops[..end], demand[end - 1], &mut st, &env)?;
         first = end;
     }
-    for (op, &keep) in ops.iter().zip(&demand).skip(first) {
-        apply_op(op, &mut st, &env, keep)?;
+    let mut i = first;
+    while let Some(op) = ops.get(i) {
+        // moon#1220: RETURN … ORDER BY … LIMIT projects only the rows it keeps.
+        if let Some(fused) = topk::project_sorted_rows(ops, &demand, i, &mut st, &env) {
+            i += fused;
+            continue;
+        }
+        apply_op(op, &mut st, &env, demand[i])?;
+        i += 1;
     }
 
     let pipeline::OpState {
