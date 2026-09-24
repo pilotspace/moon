@@ -387,7 +387,7 @@ impl SegmentHolder {
     /// Resident bytes split into (mutable_bytes, immutable_bytes).
     ///
     /// Mutable = brute-force buffer (TQ codes + raw f32 + entries).
-    /// Immutable = HNSW graph + TQ codes + QJL signs + norms + MVCC, PLUS the
+    /// Immutable = HNSW graph + TQ codes + sub-centroid signs + MVCC, PLUS the
     /// WARM tier (fully-materialized `WarmSearchSegment` heap copies) and COLD
     /// stubs (tiny). WARM is the same-size heap copy of a demoted HOT segment,
     /// so once segments age past `--segment-warm-after` it dominates resident

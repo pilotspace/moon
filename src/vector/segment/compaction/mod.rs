@@ -11,9 +11,10 @@
 //! 8. Construct ImmutableSegment
 
 mod compact_path;
-mod exact_qjl;
 mod graph_build;
 mod merge;
+#[cfg(test)]
+mod qjl_drop_tests;
 mod recall;
 
 pub use compact_path::compact;

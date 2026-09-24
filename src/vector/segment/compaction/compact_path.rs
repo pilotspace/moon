@@ -269,13 +269,10 @@ pub fn compact(
             .copy_from_slice(&tq_buffer_orig[src..src + bytes_per_code]);
     }
 
-    // EXACT: QJL signs + residual norms for the live entries, BFS-ordered,
-    // computed HERE — on the compaction worker — instead of in freeze() on
-    // the shard thread (moon#1192). Empty for LIGHT / SQ8 / raw-less builds
-    // (HEAD stored an all-zero `n * ceil(dim/8)` QJL buffer + `n` zero norms
-    // there, which nothing reads).
-    let exact_qjl =
-        super::exact_qjl::exact_qjl_bfs(collection, frozen, &live_entries, &graph, &tq_bfs);
+    // No QJL signs / residual norms (moon#1213): EXACT used to spend 8 d×d
+    // matvecs per live vector here on data no search path read and no
+    // persist path wrote. EXACT keeps what it is for — the exact-L2 graph
+    // build and sub-centroid signs from the retained raw f32 vectors.
 
     // Compute sub-centroid sign bits from raw f32 vectors (FWHT-rotated).
     // For each coordinate: compare the ACTUAL rotated value against its quantized centroid.
@@ -364,9 +361,6 @@ pub fn compact(
     let segment = ImmutableSegment::new(
         graph,
         AlignedBuffer::from_vec(tq_bfs),
-        exact_qjl.signs,
-        exact_qjl.residual_norms,
-        exact_qjl.bytes_per_vec,
         sub_signs_bfs,
         sub_bpv,
         mvcc,

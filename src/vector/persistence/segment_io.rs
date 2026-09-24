@@ -653,7 +653,6 @@ pub fn read_immutable_segment(
 
     // 6. Construct ImmutableSegment
     let dim = meta.dimension as usize;
-    let qjl_bpv = (dim + 7) / 8;
     let sub_sign_bpv = (meta.padded_dimension as usize + 7) / 8;
 
     // 6b. raw_f16.bin — optional exact-rerank sidecar (HQ-1). Missing file
@@ -698,9 +697,6 @@ pub fn read_immutable_segment(
     let segment = ImmutableSegment::new(
         graph,
         vectors_tq,
-        Vec::new(), // QJL signs — not persisted (never read on a reloaded segment)
-        Vec::new(), // residual norms — not persisted
-        qjl_bpv,
         sub_signs,
         sub_sign_bpv,
         mvcc,
@@ -816,16 +812,12 @@ mod tests {
         let graph = builder.build(bytes_per_code as u32);
 
         let mut tq_buffer_bfs = vec![0u8; n * bytes_per_code];
-        let qjl_bytes_per_vec = (dim + 7) / 8;
-        let qjl_signs_bfs = vec![0u8; n * qjl_bytes_per_vec];
-        let residual_norms_bfs = vec![0.0f32; n];
         for bfs_pos in 0..n {
             let orig_id = graph.to_original(bfs_pos as u32) as usize;
             let src = orig_id * bytes_per_code;
             let dst = bfs_pos * bytes_per_code;
             tq_buffer_bfs[dst..dst + bytes_per_code]
                 .copy_from_slice(&tq_buffer_orig[src..src + bytes_per_code]);
-            // QJL signs and residual norms: use zeros for test
         }
 
         let mvcc: Vec<MvccHeader> = (0..n as u32)
@@ -843,9 +835,6 @@ mod tests {
         let segment = ImmutableSegment::new(
             graph,
             AlignedBuffer::from_vec(tq_buffer_bfs),
-            qjl_signs_bfs,
-            residual_norms_bfs,
-            qjl_bytes_per_vec,
             Vec::new(), // sub-centroid signs — not needed for IO test
             sub_sign_bpv,
             mvcc,

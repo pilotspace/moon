@@ -1853,7 +1853,7 @@ impl VectorStore {
     /// all vector indexes on this shard.
     ///
     /// Mutable = brute-force buffers (TQ codes + raw f32 + entries).
-    /// Immutable = HNSW graphs + TQ codes + QJL + norms + MVCC headers.
+    /// Immutable = HNSW graphs + TQ codes + sub-centroid signs + MVCC headers.
     /// O(index_count * segment_count) -- acceptable for metrics scrape cadence.
     pub fn resident_bytes(&self) -> (usize, usize) {
         let mut total_mutable: usize = 0;
@@ -4137,9 +4137,6 @@ mod tests {
             graph,
             AlignedBuffer::new(0),
             Vec::new(),
-            Vec::new(),
-            16,
-            Vec::new(),
             16,
             Vec::new(),
             collection,
@@ -4221,9 +4218,6 @@ mod tests {
         let imm = Arc::new(ImmutableSegment::new(
             graph,
             AlignedBuffer::new(0),
-            Vec::new(),
-            Vec::new(),
-            16,
             Vec::new(),
             16,
             Vec::new(),
