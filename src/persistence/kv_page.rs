@@ -572,15 +572,21 @@ pub fn build_overflow_chain(data: &[u8], file_id: u64, start_page_id: u64) -> Ve
 /// Reads sequential overflow pages until `next_page == 0`.
 pub fn read_overflow_chain(file_data: &[u8], start_page_idx: usize) -> Option<Vec<u8>> {
     // Bounded traversal: defends against corrupted next_page links forming
-    // cycles or excessively long chains. Matches VecUndoPage::chain_records.
-    const MAX_OVERFLOW_PAGES: usize = 1000;
+    // a cycle. The bound is the file's own page count, NOT a fixed number:
+    // an acyclic chain inside `file_data` visits each page at most once, so
+    // it can never be longer than the file, while a cycle is guaranteed to
+    // exceed it. moon#1201: the old fixed 1000-page cap (~4.03 MB) rejected
+    // every intact chain the spill side wrote for a larger value -- the
+    // writer (`build_overflow_chain`) has no size cap -- so the key stayed
+    // INDEXED but answered IOERR (`OverflowBroken`) on every read.
+    let max_pages = file_data.len() / PAGE_4K;
 
     let mut result = Vec::new();
     let mut page_idx = start_page_idx;
     let mut iterations = 0usize;
 
     loop {
-        if iterations >= MAX_OVERFLOW_PAGES {
+        if iterations >= max_pages {
             return None;
         }
         iterations += 1;
@@ -1062,6 +1068,39 @@ mod tests {
 
         let reassembled = read_overflow_chain(&file_data, 1).expect("should read chain");
         assert_eq!(reassembled, data, "reassembled data must match original");
+    }
+
+    /// moon#1201: an intact chain longer than 1000 pages must read back
+    /// (the old fixed 1000-page guard rejected it as broken).
+    #[test]
+    fn test_overflow_chain_longer_than_1000_pages_reads_back_1201() {
+        let data: Vec<u8> = (0..(OVERFLOW_PAYLOAD_CAP * 1005 + 17))
+            .map(|i| (i % 251) as u8)
+            .collect();
+        let chain = build_overflow_chain(&data, 7, 1);
+        assert_eq!(chain.len(), 1006);
+        let mut file_data = vec![0u8; PAGE_4K];
+        for page in &chain {
+            file_data.extend_from_slice(page.as_bytes());
+        }
+        let reassembled = read_overflow_chain(&file_data, 1).expect("intact long chain");
+        assert_eq!(reassembled, data);
+    }
+
+    /// The cycle guard must survive the #1201 fix: a chain whose last page
+    /// links back to its first never terminates on its own.
+    #[test]
+    fn test_overflow_chain_cycle_is_rejected_1201() {
+        let data = vec![0xABu8; OVERFLOW_PAYLOAD_CAP * 3];
+        let mut chain = build_overflow_chain(&data, 7, 1);
+        let last = chain.len() - 1;
+        chain[last].set_prev_next(last as u32, 1); // 3 -> 1: cycle
+        chain[last].finalize();
+        let mut file_data = vec![0u8; PAGE_4K];
+        for page in &chain {
+            file_data.extend_from_slice(page.as_bytes());
+        }
+        assert!(read_overflow_chain(&file_data, 1).is_none());
     }
 
     #[test]
