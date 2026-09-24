@@ -353,3 +353,7 @@ harness = false
 [[bench]]
 name = "listpack_write_path"
 harness = false
+
+[[bench]]
+name = "text_search"
+harness = false
