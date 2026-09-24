@@ -144,6 +144,15 @@ const QUERIES: &[&str] = &[
     "MATCH (n) RETURN n.z, n.x ORDER BY n.x DESC LIMIT 6",
     "MATCH (n:Missing) RETURN n.x ORDER BY n.x LIMIT 5",
     "MATCH (n:L) RETURN DISTINCT n.y ORDER BY n.y LIMIT 2",
+    // moon#1220: LIMIT-bounded IndexScans stream (and stop) like the label scan — range, eq,
+    // text-predicate and unresolvable-target (label-scan fallback) visitors alike.
+    "MATCH (n:L) WHERE n.z >= 300 RETURN n.z, n.x SKIP 4 LIMIT 9",
+    "MATCH (n:L) WHERE n.z < 50 AND n.x > 3 RETURN n.z LIMIT 7",
+    "MATCH (n:L) WHERE n.z >= $k RETURN n.z, n.y LIMIT 4",
+    "MATCH (n:L {z: 5}) RETURN n.x, n.z LIMIT 3",
+    "MATCH (n:L) WHERE n.y STARTS WITH 's1' RETURN n.z LIMIT 6",
+    "MATCH (n:L {z: $unbound}) RETURN n.x LIMIT 3",
+    "MATCH (n:L) WHERE n.z > 100000 RETURN n.z LIMIT 3",
 ];
 
 #[test]

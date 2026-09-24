@@ -372,41 +372,39 @@ pub(super) fn stream_sorted_scan<'t>(
         }
         Ok::<(), ExecError>(())
     };
+    // Chunk the scan's keys into `feed`, stopping early once the key order is known not to be
+    // total (the plan then runs as usual).
+    let mut chunk: Vec<NodeKey> = Vec::with_capacity(CHUNK);
+    let mut failed: Option<ExecError> = None;
+    let mut on_key = |key: NodeKey| {
+        chunk.push(key);
+        if chunk.len() < CHUNK {
+            return std::ops::ControlFlow::Continue(());
+        }
+        if let Err(e) = feed(&chunk, &mut top) {
+            failed = Some(e);
+            return std::ops::ControlFlow::Break(());
+        }
+        chunk.clear();
+        if top.broken() {
+            std::ops::ControlFlow::Break(())
+        } else {
+            std::ops::ControlFlow::Continue(())
+        }
+    };
     match scan {
         PhysicalOp::NodeScan { label, .. } => {
             let label_id = label.as_ref().map(|l| label_to_id(l.as_bytes()));
             let committed = roaring::RoaringBitmap::new();
             let view = crate::graph::view::MergedNodeView::new(env.memgraph, env.csr_segs);
-            let mut chunk: Vec<NodeKey> = Vec::with_capacity(CHUNK);
-            let mut failed: Option<ExecError> = None;
             let _ = view.try_for_each_visible_node(
                 label_id,
                 env.ctx.snapshot_lsn,
                 env.ctx.my_txn_id,
                 &committed,
                 env.ctx.valid_time_as_of,
-                |key| {
-                    chunk.push(key);
-                    if chunk.len() < CHUNK {
-                        return std::ops::ControlFlow::Continue(());
-                    }
-                    if let Err(e) = feed(&chunk, &mut top) {
-                        failed = Some(e);
-                        return std::ops::ControlFlow::Break(());
-                    }
-                    chunk.clear();
-                    if top.broken() {
-                        return std::ops::ControlFlow::Break(());
-                    }
-                    std::ops::ControlFlow::Continue(())
-                },
+                &mut on_key,
             );
-            if let Some(e) = failed {
-                return Err(e);
-            }
-            if !top.broken() {
-                feed(&chunk, &mut top)?;
-            }
         }
         PhysicalOp::IndexScan {
             label,
@@ -415,7 +413,7 @@ pub(super) fn stream_sorted_scan<'t>(
             text_pred,
             ..
         } => {
-            let keys = index_scan_keys(
+            let _ = index_scan_try_for_each(
                 env.memgraph,
                 env.csr_segs,
                 label.as_ref(),
@@ -424,15 +422,16 @@ pub(super) fn stream_sorted_scan<'t>(
                 text_pred,
                 env.params,
                 env.ctx,
+                &mut on_key,
             );
-            for chunk in keys.chunks(CHUNK) {
-                feed(chunk, &mut top)?;
-                if top.broken() {
-                    break;
-                }
-            }
         }
         _ => return Ok(None),
+    }
+    if let Some(e) = failed {
+        return Err(e);
+    }
+    if !top.broken() {
+        feed(&chunk, &mut top)?;
     }
     let Some(kept) = top.finish() else {
         return Ok(None);

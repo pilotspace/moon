@@ -271,7 +271,11 @@ pub(super) fn run_streamed_prefix<'t>(
             prop_range,
             text_pred,
         } => {
-            let keys = index_scan_keys(
+            // moon#1220: streamed like the label scan — the index scan stops
+            // once the demand is met instead of collecting every key first.
+            let mut chunk: Vec<NodeKey> = Vec::with_capacity(sink.chunk_len());
+            let mut failed: Option<ExecError> = None;
+            let _ = index_scan_try_for_each(
                 env.memgraph,
                 env.csr_segs,
                 label.as_ref(),
@@ -280,14 +284,29 @@ pub(super) fn run_streamed_prefix<'t>(
                 text_pred,
                 env.params,
                 env.ctx,
+                |key| {
+                    chunk.push(key);
+                    if chunk.len() < sink.chunk_len() {
+                        return std::ops::ControlFlow::Continue(());
+                    }
+                    match sink.feed(&chunk, variable, segment, env) {
+                        Ok(false) => {
+                            chunk.clear();
+                            std::ops::ControlFlow::Continue(())
+                        }
+                        Ok(true) => std::ops::ControlFlow::Break(()),
+                        Err(e) => {
+                            failed = Some(e);
+                            std::ops::ControlFlow::Break(())
+                        }
+                    }
+                },
             );
-            let mut rest: &[NodeKey] = &keys;
-            loop {
-                let (chunk, tail) = rest.split_at(rest.len().min(sink.chunk_len()));
-                if sink.feed(chunk, variable, segment, env)? || tail.is_empty() {
-                    break;
-                }
-                rest = tail;
+            if let Some(e) = failed {
+                return Err(e);
+            }
+            if !sink.done() {
+                sink.feed(&chunk, variable, segment, env)?;
             }
         }
         _ => return Ok(()),
