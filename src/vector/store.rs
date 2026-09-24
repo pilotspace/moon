@@ -63,6 +63,11 @@ pub enum FieldType {
         sortable: bool,
         noindex: bool,
     },
+    /// TAG field (moon#1194): declared in the schema, so schema-aware payload
+    /// indexing (`MOON_VECTOR_PAYLOAD_SCHEMA=declared`) indexes it.
+    Tag { field_name: Bytes },
+    /// NUMERIC field (moon#1194), same role as [`FieldType::Tag`].
+    Numeric { field_name: Bytes },
 }
 
 /// Metadata describing a vector index (from FT.CREATE).
