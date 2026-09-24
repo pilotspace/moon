@@ -827,7 +827,10 @@ pub enum ShardMessage {
     /// (moon#1198): duplicated arms drift, which is how moon#1162 happened.
     PipelineBatchSlotted {
         db_index: usize,
-        commands: Vec<std::sync::Arc<Frame>>,
+        /// Owned frames (moon#1177): the sender moves each request in, so the
+        /// `Arc` it used to wrap every frame in (an 88 B allocation freed on
+        /// this thread, for a frame nobody else held) is gone.
+        commands: Vec<Frame>,
         response_slot: ResponseSlotPtr,
     },
     /// Execute a vector search query on this shard's VectorStore.

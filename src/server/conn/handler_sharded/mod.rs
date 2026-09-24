@@ -465,6 +465,13 @@ pub(crate) async fn handle_connection_sharded_inner<
     // none.)
     let mut fanout_state = crate::server::conn::fanout::FanoutState::default();
     let mut fanout_scratch: Vec<(usize, Frame, usize)> = Vec::new(); // grown on first fan-out
+    // moon#1177: the per-batch cross-shard buffer and its reply list, hoisted
+    // like the fan-out pair above (were a per-batch HashMap keyed by shard —
+    // a SipHash, an `Arc` and a ~210 B tuple per remote command — and a
+    // per-batch `Vec`). Allocated on first cross-shard use.
+    use crate::shard::remote_batch::RemoteMeta;
+    let mut remote_groups = crate::shard::remote_batch::RemoteBatch::default();
+    let mut reply_futures: Vec<(Vec<RemoteMeta>, usize)> = Vec::new();
     // Batch-end shrink governors with hysteresis (moon#1179 item 4).
     let mut read_shrink = super::util::IoBufShrink::default();
     let mut write_shrink = super::util::IoBufShrink::default();
@@ -693,7 +700,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                 // moon#513 (A2a): the leading index is a `ReplySink`, not a bare
                 // `responses` index — see the twin in `handler_monoio`.
                 // moon#1179 item 3: no allocation unless the batch crosses a shard.
-                let mut remote_groups: HashMap<usize, Vec<(crate::server::conn::fanout::ReplySink, std::sync::Arc<Frame>, Option<Bytes>, usize, Option<crate::tracking::invalidation::TrackedWriteKeys>, crate::protocol::resp3::Resp3Shape)>> = HashMap::new();
+                remote_groups.clear();
                 // moon#513 (A2a): reset the hoisted fan-out buffers for this
                 // batch, beside the `remote_groups` they are folded against.
                 fanout_state.clear();
@@ -2214,17 +2221,21 @@ pub(crate) async fn handle_connection_sharded_inner<
                                     fanout_state.set_part(part_idx, reply);
                                     local_dispatches = local_dispatches.saturating_add(1);
                                 } else {
-                                    remote_groups.entry(target).or_default().push((
-                                        crate::server::conn::fanout::ReplySink::Part(part_idx),
-                                        std::sync::Arc::new(sub_frame),
-                                        // Reads: no AOF bytes, no tracking
-                                        // invalidation. A2a touches neither the
-                                        // persistence nor the replication path.
-                                        None,
+                                    remote_groups.push(
+                                        ctx.num_shards,
+                                        target,
                                         conn.selected_db,
-                                        None,
-                                        crate::protocol::resp3::Resp3Shape::None,
-                                    ));
+                                        sub_frame,
+                                        RemoteMeta {
+                                            sink: crate::server::conn::fanout::ReplySink::Part(part_idx),
+                                            // Reads: no AOF barrier, no tracking
+                                            // invalidation. A2a touches neither the
+                                            // persistence nor the replication path.
+                                            persisted_write: false,
+                                            track_keys: None,
+                                            shape: crate::protocol::resp3::Resp3Shape::None,
+                                        },
+                                    );
                                     pending_mask |= 1u64 << (target % u64::BITS as usize);
                                     cross_spsc_dispatches = cross_spsc_dispatches.saturating_add(1);
                                 }
@@ -2362,7 +2373,11 @@ pub(crate) async fn handle_connection_sharded_inner<
                     // leg (barrier bookkeeping only; the owner's SPSC arm owns
                     // the append) keep the frame-only form.
                     let is_two_db = cmd.eq_ignore_ascii_case(b"MOVE") || cmd.eq_ignore_ascii_case(b"COPY");
-                    let aof_bytes = if aof_wanted && (!is_local || is_two_db) { Some(aof::serialize_command_for_log(&frame)) } else { None };
+                    // moon#1177: only the LOCAL two-db intercepts append these
+                    // bytes; a remote leg needs only to know it joins the
+                    // owner's barrier (`aof_wanted`) — it used to serialize the
+                    // record here too and throw it away.
+                    let aof_bytes = if aof_wanted && is_local && is_two_db { Some(aof::serialize_command_for_log(&frame)) } else { None };
 
                     if is_local {
                         // LOCAL PATH: split into read/write to avoid exclusive lock on reads.
@@ -3169,7 +3184,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                         let track_keys = if crate::tracking::tracking_active()
                             && metadata::is_write(cmd)
                         {
-                            Some(crate::tracking::invalidation::written_keys(cmd, cmd_args))
+                            Some(Box::new(crate::tracking::invalidation::written_keys(cmd, cmd_args)))
                         } else {
                             None
                         };
@@ -3203,7 +3218,18 @@ pub(crate) async fn handle_connection_sharded_inner<
                         };
                         let resp_idx = responses.len();
                         responses.push(Frame::Null);
-                        remote_groups.entry(target).or_default().push((crate::server::conn::fanout::ReplySink::Direct(resp_idx), std::sync::Arc::new(dispatch_frame), aof_bytes, conn.selected_db, track_keys, resp3_shape));
+                        remote_groups.push(
+                            ctx.num_shards,
+                            target,
+                            conn.selected_db,
+                            dispatch_frame,
+                            RemoteMeta {
+                                sink: crate::server::conn::fanout::ReplySink::Direct(resp_idx),
+                                persisted_write: aof_wanted,
+                                track_keys,
+                                shape: resp3_shape,
+                            },
+                        );
                         pending_mask |= 1u64 << (target % u64::BITS as usize);
                         cross_spsc_dispatches = cross_spsc_dispatches.saturating_add(1);
                     }
@@ -3246,15 +3272,17 @@ pub(crate) async fn handle_connection_sharded_inner<
                 // Phase 2: Dispatch deferred remote commands (zero-allocation via ResponseSlotPool)
                 if !remote_groups.is_empty() {
                     // moon#460: no command name — see the twin in handler_monoio.
-                    type RemoteMeta = (crate::server::conn::fanout::ReplySink, Option<Bytes>, Option<crate::tracking::invalidation::TrackedWriteKeys>, crate::protocol::resp3::Resp3Shape);
-                    let mut reply_futures: Vec<(Vec<RemoteMeta>, usize)> = Vec::with_capacity(remote_groups.len());
-                    for (target, entries) in remote_groups {
+                    reply_futures.clear();
+                    // moon#1177: ascending shard order over the shard-indexed
+                    // buffer; each target's commands MOVE into its message.
+                    for target in 0..remote_groups.slots() {
+                        // The db_index captured with the target's first command
+                        // (all commands in a pipeline batch targeting the same
+                        // shard share it).
+                        let Some((commands, meta, batch_db)) = remote_groups.take(target) else {
+                            continue;
+                        };
                         let slot_arc = response_pool.slot_arc(target);
-                        // Use the db_index captured with the first command (all commands in a
-                        // pipeline batch targeting the same shard share the same db_index).
-                        let batch_db = entries.first().map(|(_, _, _, db, _, _)| *db).unwrap_or(conn.selected_db);
-                        let (meta, commands): (Vec<RemoteMeta>, Vec<std::sync::Arc<Frame>>) =
-                            entries.into_iter().map(|(idx, arc_frame, aof, _db, tk, shape)| ((idx, aof, tk, shape), arc_frame)).unzip();
                         let msg = ShardMessage::PipelineBatchSlotted { db_index: batch_db, commands, response_slot: crate::shard::dispatch::ResponseSlotPtr(slot_arc) };
                         let target_idx = ChannelMesh::target_index(ctx.shard_id, target);
                         // F3: bounded backpressure retry (shared helper). The
@@ -3295,14 +3323,15 @@ pub(crate) async fn handle_connection_sharded_inner<
                                     "Shard {}: cross-shard push to shard {} gave up ({:?}); rejecting batch",
                                     ctx.shard_id, target, outcome
                                 );
-                                for (sink, _, _, _) in &meta {
+                                for m in &meta {
                                     crate::server::conn::fanout::fail_sink(
-                                        *sink,
+                                        m.sink,
                                         &mut responses,
                                         &mut fanout_state,
                                         b"ERR cross-shard dispatch backpressure",
                                     );
                                 }
+                                remote_groups.recycle(target, meta);
                             }
                         }
                     }
@@ -3312,7 +3341,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                     // multi-key fan-out, where a synchronous spin would serialize the reads
                     // and starve pipelined throughput (s4-P16 −27%). See XSHARD_SPIN_MAX_BATCH_REMOTE.
                     let batch_remote_total: usize = reply_futures.iter().map(|(meta, _)| meta.len()).sum();
-                    for (meta, target) in reply_futures {
+                    for (mut meta, target) in reply_futures.drain(..) {
                         // C2 (xshard-read-fastpath): adaptive idle-gated reply-side spin.
                         // When this shard is near-idle (xshard_may_spin) AND this batch holds a
                         // single cross-shard read, busy-poll the response slot for a bounded
@@ -3350,25 +3379,25 @@ pub(crate) async fn handle_connection_sharded_inner<
                                 ctx.shard_id
                             );
                             crate::admin::metrics_setup::record_xshard_reply_timeout("dispatch");
-                            for (sink, _, _, _) in &meta {
+                            for m in &meta {
                                 crate::server::conn::fanout::fail_sink(
-                                    *sink,
+                                    m.sink,
                                     &mut responses,
                                     &mut fanout_state,
                                     b"ERR cross-shard reply timeout",
                                 );
                             }
+                            remote_groups.recycle(target, meta);
                             xshard_reply_fatal = true;
                             // Skip the fsync barrier too: with no reply there
                             // is nothing durable to confirm for these entries.
                             continue;
                         };
 
-                        // H1-BARRIER: collect (resp_idx, had_aof_bytes) pairs so
+                        // H1-BARRIER: collect the resp_idxs of persisted writes so
                         // we can overwrite write responses on fsync failure below.
-                        // aof_bytes is Some for write commands, None for reads.
                         let mut write_resp_idxs: Vec<usize> = Vec::new();
-                        for ((sink, aof_bytes, track_keys, resp3_shape), resp) in meta.into_iter().zip(shard_responses) {
+                        for (RemoteMeta { sink, persisted_write, track_keys, shape: resp3_shape }, resp) in meta.drain(..).zip(shard_responses) {
                             // moon#513 (A2a): a fan-out PART is an intermediate —
                             // stored raw (the RESP3 shape belongs to the FOLDED
                             // reply, moon#460), no AOF barrier and no tracking
@@ -3387,10 +3416,10 @@ pub(crate) async fn handle_connection_sharded_inner<
                             // drain_spsc_shared returns, which means AofFold's
                             // pending_aof_count undercount it → escape to new incr →
                             // double-apply on restart. The SPSC arm now owns the AOF
-                            // write; aof_bytes below is used only for the barrier check.
+                            // write; `persisted_write` is used only for the barrier check.
                             // Shape classified at enqueue, where the args still existed.
                             let converted = crate::protocol::resp3::apply_shape(resp3_shape, resp, proto_ver);
-                            if aof_bytes.is_some() && !matches!(converted, Frame::Error(_)) {
+                            if persisted_write && !matches!(converted, Frame::Error(_)) {
                                 write_resp_idxs.push(resp_idx);
                             }
                             // CLIENT TRACKING: remote write confirmed — invalidate
@@ -3406,6 +3435,8 @@ pub(crate) async fn handle_connection_sharded_inner<
                             }
                             responses[resp_idx] = converted;
                         }
+                        // moon#1177: the drained bookkeeping keeps its capacity.
+                        remote_groups.recycle(target, meta);
 
                         // H1-BARRIER (C4-FOLD-FIX follow-up): under appendfsync=always,
                         // call fsync_barrier once per target shard AFTER responses are

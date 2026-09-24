@@ -966,8 +966,8 @@ pub(crate) fn handle_shard_message_shared(
                             let serialized = aof::serialize_command(&command);
                             let mut aof_budget =
                                 crate::persistence::aof::AOF_SPSC_BACKPRESSURE_BOUND;
-                            if !wal_append_and_fanout(
-                                &serialized,
+                            if !wal_append_and_fanout_bytes(
+                                serialized,
                                 db_idx,
                                 wal_writer,
                                 repl_backlog,
@@ -1080,8 +1080,8 @@ pub(crate) fn handle_shard_message_shared(
                                 let mut aof_budget =
                                     crate::persistence::aof::AOF_SPSC_BACKPRESSURE_BOUND;
                                 for serialized in aof::serialize_effect_for_log(&command, &frame) {
-                                    aof_ok = wal_append_and_fanout(
-                                        &serialized,
+                                    aof_ok = wal_append_and_fanout_bytes(
+                                        serialized,
                                         db_idx,
                                         wal_writer,
                                         repl_backlog,
@@ -1208,8 +1208,8 @@ pub(crate) fn handle_shard_message_shared(
                                 )
                             {
                                 let serialized = aof::serialize_command(cmd_frame);
-                                aof_ok = wal_append_and_fanout(
-                                    &serialized,
+                                aof_ok = wal_append_and_fanout_bytes(
+                                    serialized,
                                     db_idx,
                                     wal_writer,
                                     repl_backlog,
@@ -1316,8 +1316,8 @@ pub(crate) fn handle_shard_message_shared(
                             // do not reproduce themselves on replay. No record means the reply
                             // proves nothing was written, so nothing is appended.
                             for serialized in aof::serialize_effect_for_log(cmd_frame, &frame) {
-                                aof_ok = wal_append_and_fanout(
-                                    &serialized,
+                                aof_ok = wal_append_and_fanout_bytes(
+                                    serialized,
                                     db_idx,
                                     wal_writer,
                                     repl_backlog,
@@ -1441,8 +1441,8 @@ pub(crate) fn handle_shard_message_shared(
                                 )
                             {
                                 let serialized = aof::serialize_command(cmd_frame);
-                                aof_ok = wal_append_and_fanout(
-                                    &serialized,
+                                aof_ok = wal_append_and_fanout_bytes(
+                                    serialized,
                                     db_idx,
                                     wal_writer,
                                     repl_backlog,
@@ -1544,8 +1544,8 @@ pub(crate) fn handle_shard_message_shared(
                             // do not reproduce themselves on replay. No record means the reply
                             // proves nothing was written, so nothing is appended.
                             for serialized in aof::serialize_effect_for_log(cmd_frame, &frame) {
-                                aof_ok = wal_append_and_fanout(
-                                    &serialized,
+                                aof_ok = wal_append_and_fanout_bytes(
+                                    serialized,
                                     db_idx,
                                     wal_writer,
                                     repl_backlog,
@@ -2681,8 +2681,8 @@ pub(crate) fn handle_shard_message_shared(
             // — attribute per entry, not the body's entry db.
             for (entry_db, entry_bytes) in &aof_entries {
                 wrote = true;
-                let ok = wal_append_and_fanout(
-                    entry_bytes,
+                let ok = wal_append_and_fanout_bytes(
+                    entry_bytes.clone(),
                     *entry_db,
                     wal_writer,
                     repl_backlog,
@@ -4006,6 +4006,47 @@ pub(crate) fn wal_append_and_fanout(
     wal_kv_log: bool,
     aof_budget: &mut std::time::Duration,
 ) -> bool {
+    // Borrowed-record entry point (reason-DELs build their own record): one
+    // copy up front, then the owned path. Skipped entirely when nothing
+    // would take the record.
+    if !wal_fanout_has_work(wal_writer, replica_txs, aof_pool, wal_kv_log) {
+        return true;
+    }
+    wal_append_and_fanout_bytes(
+        bytes::Bytes::copy_from_slice(data),
+        db,
+        wal_writer,
+        repl_backlog,
+        replica_txs,
+        repl_state,
+        shard_id,
+        aof_pool,
+        wal_kv_log,
+        aof_budget,
+    )
+}
+
+/// [`wal_append_and_fanout`] for a record the caller already owns — every
+/// SPSC write arm (moon#1177). The record is borrowed for the WAL and the
+/// backlog, shared (refcount) with the replica fan-out when it needs no
+/// `SELECT` prefix, and MOVED into the AOF pool last: the old slice-taking
+/// form paid a malloc + memcpy of every record (`Bytes::copy_from_slice`)
+/// and a cross-thread free on the writer, for bytes the caller already held.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn wal_append_and_fanout_bytes(
+    data: bytes::Bytes,
+    // task #35: db the command executed in — threaded into the AOF pool so
+    // the writer can inject a `SELECT <db>` record on a db-context change.
+    db: usize,
+    wal_writer: &mut Option<WalWriterV3>,
+    repl_backlog: &crate::replication::backlog::SharedBacklog,
+    replica_txs: &mut Vec<crate::shard::dispatch::ReplicaFanout>,
+    repl_state: &Option<crate::replication::state::OffsetHandle>,
+    shard_id: usize,
+    aof_pool: Option<&std::sync::Arc<crate::persistence::aof::AofWriterPool>>,
+    wal_kv_log: bool,
+    aof_budget: &mut std::time::Duration,
+) -> bool {
     // S3.5b (2026-04-27): hot-path bypass when nothing actually has work.
     // See `wal_fanout_has_work` — callers use the same predicate to skip the
     // `aof::serialize_command` alloc entirely when the fanout would no-op.
@@ -4027,7 +4068,7 @@ pub(crate) fn wal_append_and_fanout(
             w.append_in_db(
                 crate::persistence::wal_v3::record::WalRecordType::Command,
                 db,
-                data,
+                &data,
             );
         }
     }
@@ -4048,18 +4089,31 @@ pub(crate) fn wal_append_and_fanout(
     // 2. Replication backlog (in-memory circular buffer for partial resync).
     //
     // The backlog is shared via Arc<Mutex<Option<...>>> with PSYNC handlers.
-    // Cost on the write path:
-    //   - When `None` (no replica ever connected): one branch, no lock acquire.
-    //   - When `Some` (replication active): one uncontended parking_lot::Mutex
-    //     acquire per WAL flush (typically once per 1ms tick batch, NOT per write).
-    let mut guard = repl_backlog.lock();
-    if let Some(backlog) = guard.as_mut() {
-        if let Some(prefix) = &select_prefix {
-            backlog.append(prefix);
+    // Cost on the write path, PER WRITE (moon#1177 — this comment used to
+    // claim "no lock acquire" and "once per 1ms tick", and the code locked on
+    // every write):
+    //   - No replica registered on this shard and none has ever begun
+    //     attaching (`fanout_hint_active()` false — the common case): a length
+    //     check and one relaxed load, no lock.
+    //   - Otherwise: one uncontended parking_lot::Mutex acquire.
+    // Skipping the append while the hint is false is what the local write
+    // path already does (`record_local_write` is gated on the same hint): a
+    // backlog a bare REPLCONF allocated in that window is realigned to the
+    // shard offset at every activation site before any cut is taken
+    // (`ReplicationState::ensure_backlogs_allocated`'s invariant), and the
+    // activation (`RegisterReplica`/`PrepareReplicaSync`) runs on THIS
+    // thread, which sets the hint first — so every later append here sees it.
+    // A registered replica (`replica_txs`) implies the hint; it is checked
+    // too so the append never depends on that implication.
+    if !replica_txs.is_empty() || crate::replication::state::fanout_hint_active() {
+        let mut guard = repl_backlog.lock();
+        if let Some(backlog) = guard.as_mut() {
+            if let Some(prefix) = &select_prefix {
+                backlog.append(prefix);
+            }
+            backlog.append(&data);
         }
-        backlog.append(data);
     }
-    drop(guard);
     // 3. Advance monotonic replication offset (NEVER resets on WAL truncation)
     // QW3 (2026-06 review finding 1.4): `repl_state` is a lock-free
     // OffsetHandle cloned out of `RwLock<ReplicationState>` once at shard
@@ -4095,10 +4149,11 @@ pub(crate) fn wal_append_and_fanout(
             Some(prefix) => {
                 let mut combined = Vec::with_capacity(prefix.len() + data.len());
                 combined.extend_from_slice(prefix);
-                combined.extend_from_slice(data);
+                combined.extend_from_slice(&data);
                 bytes::Bytes::from(combined)
             }
-            None => bytes::Bytes::copy_from_slice(data),
+            // A refcount, not a copy.
+            None => data.clone(),
         };
         crate::shard::self_msg::push(crate::shard::dispatch::ShardMessage::ReplicaLiveFanout {
             bytes,
@@ -4115,14 +4170,10 @@ pub(crate) fn wal_append_and_fanout(
     // (handler_sharded / handler_single). LSN=0 is safe here: per-shard order
     // is preserved by write order; the LSN is only meaningful for cross-shard
     // TXN merge (RFC step 5, not yet wired).
+    // The record moves in (moon#1177): no copy, and the writer frees the
+    // caller's own allocation.
     if let Some(pool) = aof_pool {
-        return pool.send_append_bounded_blocking(
-            shard_id,
-            0,
-            db,
-            bytes::Bytes::copy_from_slice(data),
-            aof_budget,
-        );
+        return pool.send_append_bounded_blocking(shard_id, 0, db, data, aof_budget);
     }
     true
 }
@@ -4664,9 +4715,9 @@ mod drain_cap_tests {
                 prod.try_push(ShardMessage::PipelineBatchSlotted {
                     db_index: 0,
                     commands: vec![
-                        Arc::new(argv(&[b"SET", b"k", b"v"])),
-                        Arc::new(argv(&[b"GET", b"k"])),
-                        Arc::new(argv(&[b"INCR", b"n"])),
+                        argv(&[b"SET", b"k", b"v"]),
+                        argv(&[b"GET", b"k"]),
+                        argv(&[b"INCR", b"n"]),
                     ],
                     response_slot: crate::shard::dispatch::ResponseSlotPtr(Arc::clone(&batch_slot)),
                 })
@@ -4675,7 +4726,7 @@ mod drain_cap_tests {
             assert!(
                 prod.try_push(ShardMessage::PipelineBatchSlotted {
                     db_index: 0,
-                    commands: vec![Arc::new(argv(&[b"GET", b"k"]))],
+                    commands: vec![argv(&[b"GET", b"k"])],
                     response_slot: crate::shard::dispatch::ResponseSlotPtr(Arc::clone(
                         &single_slot
                     )),
@@ -4813,3 +4864,6 @@ mod aof_admission_tests;
 
 #[cfg(test)]
 mod guard_count_tests;
+
+#[cfg(test)]
+mod fanout_record_tests;

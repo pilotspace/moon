@@ -161,7 +161,7 @@ fn slot() -> Arc<ResponseSlot> {
 fn one(command: Frame, slot: &Arc<ResponseSlot>) -> ShardMessage {
     ShardMessage::PipelineBatchSlotted {
         db_index: 0,
-        commands: vec![Arc::new(command)],
+        commands: vec![command],
         response_slot: ResponseSlotPtr(Arc::clone(slot)),
     }
 }
@@ -169,7 +169,7 @@ fn one(command: Frame, slot: &Arc<ResponseSlot>) -> ShardMessage {
 fn batch(commands: Vec<Frame>, slot: &Arc<ResponseSlot>) -> ShardMessage {
     ShardMessage::PipelineBatchSlotted {
         db_index: 0,
-        commands: commands.into_iter().map(Arc::new).collect(),
+        commands,
         response_slot: ResponseSlotPtr(Arc::clone(slot)),
     }
 }

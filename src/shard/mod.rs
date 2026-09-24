@@ -25,6 +25,8 @@ pub(crate) mod mq_exec;
 pub mod numa;
 pub mod persistence_tick;
 pub(crate) mod recovery_rescan;
+/// moon#1177: the connection handlers' per-batch cross-shard command buffer.
+pub(crate) mod remote_batch;
 pub mod remote_subscriber_map;
 #[cfg(feature = "text-index")]
 pub mod scatter_aggregate;

@@ -113,9 +113,9 @@ fn batch_arms_take_one_exclusive_guard_per_command() {
             ShardMessage::PipelineBatchSlotted {
                 db_index: 0,
                 commands: vec![
-                    Arc::new(argv(&[b"SET", b"a", b"1"])),
-                    Arc::new(argv(&[b"GET", b"a"])),
-                    Arc::new(argv(&[b"INCR", b"n"])),
+                    argv(&[b"SET", b"a", b"1"]),
+                    argv(&[b"GET", b"a"]),
+                    argv(&[b"INCR", b"n"]),
                 ],
                 response_slot: ResponseSlotPtr(Arc::clone(&slot)),
             },
