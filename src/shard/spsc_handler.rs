@@ -1155,9 +1155,11 @@ pub(crate) fn handle_shard_message_shared(
             let db_count = shard_databases.db_count();
             let db_idx = db_index.min(db_count.saturating_sub(1));
             crate::shard::slice::with_shard(|s| {
-                s.databases
-                    .write(db_idx)
-                    .refresh_now_from_cache(cached_clock);
+                // moon#1198: the clock is refreshed inside the first command's
+                // own guard (below), not under an extra exclusive acquisition
+                // of its own — each exclusive hold is a window in which a
+                // foreign `try_read` of this db declines into a parked hop.
+                let mut clock_fresh = false;
                 // ONE backpressure budget for the whole batch: under sustained
                 // AOF backpressure the shard thread stalls at most BOUND total,
                 // not BOUND × batch-len (review finding, PR #211).
@@ -1241,6 +1243,12 @@ pub(crate) fn handle_shard_message_shared(
                     }
 
                     let mut guard = s.databases.write(db_idx);
+                    if !clock_fresh {
+                        // One refresh per message, as before — now under the
+                        // guard this command takes anyway.
+                        guard.refresh_now_from_cache(cached_clock);
+                        clock_fresh = true;
+                    }
                     let is_write = metadata::is_write(cmd);
                     if is_write {
                         // M2 fix: same gate as the Execute arm, applied per
@@ -1375,13 +1383,15 @@ pub(crate) fn handle_shard_message_shared(
             let db_idx = db_index.min(db_count.saturating_sub(1));
             // write_db and text_store (HSET auto-index) in one with_shard closure.
             crate::shard::slice::with_shard(|s| {
-                // One-time refresh via a scoped temporary borrow — `guard`
-                // itself moves INSIDE the loop below (Gap A) so the MOVE/
-                // COPY-DB branch can borrow `&mut s.databases` (both src and
-                // dst) for the same command.
-                s.databases
-                    .write(db_idx)
-                    .refresh_now_from_cache(cached_clock);
+                // moon#1198: the clock is refreshed inside the first command's
+                // own guard (below) — it used to take an extra exclusive
+                // acquisition per message just for this, and each exclusive
+                // hold is a window in which a foreign `try_read` of this db
+                // declines into a parked hop. `guard` moves INSIDE the loop
+                // (Gap A) so the MOVE/COPY-DB branch can borrow
+                // `&mut s.databases` (both src and dst) for the same command;
+                // that branch refreshes the two dbs it takes itself.
+                let mut clock_fresh = false;
                 // ONE backpressure budget for the whole batch: under sustained
                 // AOF backpressure the shard thread stalls at most BOUND total,
                 // not BOUND × batch-len (review finding, PR #211).
@@ -1466,6 +1476,12 @@ pub(crate) fn handle_shard_message_shared(
                     }
 
                     let mut guard = s.databases.write(db_idx);
+                    if !clock_fresh {
+                        // One refresh per message, as before — now under the
+                        // guard this command takes anyway.
+                        guard.refresh_now_from_cache(cached_clock);
+                        clock_fresh = true;
+                    }
                     let is_write = metadata::is_write(cmd);
                     if is_write {
                         // M2 fix: same gate as the Execute arm, applied per
@@ -4794,3 +4810,6 @@ mod drain_rotation_tests {
 
 #[cfg(test)]
 mod aof_admission_tests;
+
+#[cfg(test)]
+mod guard_count_tests;
