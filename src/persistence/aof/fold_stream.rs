@@ -1,0 +1,362 @@
+//! Streaming base image for the AOF rewrite fold (moon#1185).
+//!
+//! The fold's cooperative snapshot (`ShardMessage::AofFold`) used to deep-copy
+//! every live entry of the shard — `(key.clone(), entry.clone())`, a malloc
+//! and memcpy per heap key or value and a full clone of every collection — on
+//! the shard thread, hand the copy to the AOF writer, and let the writer
+//! serialize it into ONE growing `Vec` (`rdb::save_snapshot_to_bytes`). Peak
+//! memory was the live data plus the clone plus the doubling image: ~2.5-3x
+//! the shard's data, none of it visible to `used_memory`.
+//!
+//! Now the shard serializes each live entry straight from the keyspace into
+//! the RDB byte stream ([`crate::persistence::rdb::RdbStreamWriter`], CRC
+//! computed as the bytes pass) and ships it to the writer in bounded chunks
+//! ([`FOLD_CHUNK_BYTES`]) as they fill. The writer appends the chunks to the
+//! new base file as they arrive ([`write_fold_image`]). No per-entry copy, no
+//! whole-image buffer: what is in flight is whatever the writer has not yet
+//! written, at most the image.
+//!
+//! The exactly-once contract (#455, C4) is untouched: the image is serialized
+//! inside the same `AofFold` arm, from the same keyspace instant, as the
+//! `pending_aof_count` / `fold_epoch` / cold-watermark cuts the reply carries —
+//! no command runs on the shard in between. Only where the bytes are produced
+//! moved; which state they describe did not.
+
+use std::io::Write;
+use std::time::{Duration, Instant};
+
+use bytes::Bytes;
+use tracing::warn;
+
+use crate::error::{AofError, MoonError};
+use crate::persistence::rdb::RdbStreamWriter;
+use crate::storage::db::Database;
+
+/// Size of one chunk of the base image in flight between the shard and its
+/// AOF writer.
+pub const FOLD_CHUNK_BYTES: usize = 1 << 20;
+
+/// One message of a fold's base-image stream.
+#[derive(Debug)]
+pub enum FoldChunk {
+    /// The next bytes of the base RDB image, in order.
+    Data(Bytes),
+    /// The image is complete: the preceding `Data` chunks end with the EOF
+    /// marker and CRC32 footer.
+    End,
+    /// Serialization failed on the shard; the fold must abort (the old
+    /// generation stays authoritative).
+    Failed(String),
+}
+
+/// Writer-side handle on a fold's base image, carried by
+/// `AofFoldSnapshot::image`.
+#[derive(Debug)]
+pub struct FoldImage {
+    rx: flume::Receiver<FoldChunk>,
+}
+
+/// Shard-side producer of a fold's base image: an `io::Write` that ships
+/// bounded chunks as they fill.
+pub struct FoldImageSink {
+    tx: flume::Sender<FoldChunk>,
+    buf: Vec<u8>,
+    closed: bool,
+}
+
+/// A connected (sink, image) pair.
+pub fn fold_image_channel() -> (FoldImageSink, FoldImage) {
+    // Unbounded on purpose: the shard thread must never block on the
+    // writer's disk. The chunks in flight are bounded by the image itself.
+    let (tx, rx) = flume::unbounded();
+    (
+        FoldImageSink {
+            tx,
+            buf: Vec::new(),
+            closed: false,
+        },
+        FoldImage { rx },
+    )
+}
+
+impl FoldImageSink {
+    fn ship(&mut self) -> std::io::Result<()> {
+        if self.buf.is_empty() {
+            return Ok(());
+        }
+        let chunk = std::mem::take(&mut self.buf);
+        if self.tx.send(FoldChunk::Data(Bytes::from(chunk))).is_err() {
+            // The writer dropped the image (fold aborted): stop producing.
+            self.closed = true;
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "fold image receiver dropped",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Ship the tail and mark the image complete.
+    fn end(mut self) {
+        if self.ship().is_ok() {
+            let _ = self.tx.send(FoldChunk::End);
+        }
+    }
+
+    /// Mark the image failed; the writer aborts the fold.
+    fn fail(self, why: String) {
+        let _ = self.tx.send(FoldChunk::Failed(why));
+    }
+}
+
+impl Write for FoldImageSink {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        if self.closed {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "fold image receiver dropped",
+            ));
+        }
+        if self.buf.capacity() == 0 {
+            self.buf.reserve(FOLD_CHUNK_BYTES.max(data.len()));
+        }
+        self.buf.extend_from_slice(data);
+        if self.buf.len() >= FOLD_CHUNK_BYTES {
+            self.ship()?;
+        }
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.ship()
+    }
+}
+
+/// Serialize the fold's base image straight from the live keyspace into
+/// `sink` — on the shard thread, inside the `AofFold` arm (moon#1185).
+///
+/// `dbs` is every database of the shard, in index order; entries expired at
+/// `now_ms` (the fold instant) are skipped, as the old cloning capture did.
+/// Always terminates the stream: `End` on success, `Failed` on an encode
+/// error (the writer aborts the fold). A writer that already dropped the
+/// image stops the serialization at the next chunk boundary.
+pub fn stream_fold_image(dbs: &[&Database], now_ms: u64, mut sink: FoldImageSink) {
+    let result = (|| -> Result<(), MoonError> {
+        let mut w = RdbStreamWriter::new(&mut sink)?;
+        for (db_idx, db) in dbs.iter().enumerate() {
+            for (key, entry) in db.data().iter() {
+                if entry.is_expired_at(now_ms) {
+                    continue;
+                }
+                w.write_entry(db_idx, key.as_bytes(), entry)?;
+            }
+        }
+        w.finish()?;
+        Ok(())
+    })();
+    match result {
+        Ok(()) => sink.end(),
+        Err(e) => sink.fail(e.to_string()),
+    }
+}
+
+/// How often a writer waiting on a slow image logs that it is still waiting.
+const FOLD_IMAGE_WAIT_WARN: Duration = Duration::from_secs(5);
+
+/// Append a fold's base image to `out` as its chunks arrive; returns the
+/// image length. Blocks until the shard ends the stream (a slow shard is
+/// logged, never abandoned — as the snapshot-reply wait was). `Err` when the
+/// shard reports a serialization failure or drops the stream unfinished,
+/// or on a write error: the caller aborts the fold and the old generation
+/// stays committed.
+pub fn write_fold_image(
+    image: FoldImage,
+    out: &mut impl Write,
+    what: &str,
+) -> Result<u64, MoonError> {
+    let started = Instant::now();
+    let mut written = 0u64;
+    loop {
+        match image.rx.recv_timeout(FOLD_IMAGE_WAIT_WARN) {
+            Ok(FoldChunk::Data(chunk)) => {
+                out.write_all(&chunk)?;
+                written += chunk.len() as u64;
+            }
+            Ok(FoldChunk::End) => return Ok(written),
+            Ok(FoldChunk::Failed(why)) => {
+                return Err(AofError::RewriteFailed {
+                    detail: format!("{what}: base image serialization failed: {why}"),
+                }
+                .into());
+            }
+            Err(flume::RecvTimeoutError::Timeout) => {
+                warn!(
+                    "{what}: still waiting for the fold base image ({} bytes after {:.1}s)",
+                    written,
+                    started.elapsed().as_secs_f64()
+                );
+            }
+            Err(flume::RecvTimeoutError::Disconnected) => {
+                return Err(AofError::RewriteFailed {
+                    detail: format!("{what}: fold base image stream ended unfinished"),
+                }
+                .into());
+            }
+        }
+    }
+}
+
+/// Create `path`, append the fold's base image as it streams in, and fsync
+/// it; returns the image length. On any failure the partial file is removed
+/// and the error returned (the caller aborts the fold).
+pub(crate) fn write_fold_image_file(
+    path: &std::path::Path,
+    image: FoldImage,
+    what: &str,
+) -> Result<u64, MoonError> {
+    let result = (|| -> Result<u64, MoonError> {
+        let mut f = std::fs::File::create(path).map_err(|e| AofError::Io {
+            path: path.to_path_buf(),
+            source: e,
+        })?;
+        let n = write_fold_image(image, &mut f, what)?;
+        f.sync_data().map_err(|e| AofError::Io {
+            path: path.to_path_buf(),
+            source: e,
+        })?;
+        Ok(n)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(path);
+    }
+    result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::compact_key::CompactKey;
+    use crate::storage::entry::Entry;
+
+    fn fixture() -> Vec<Database> {
+        let mut dbs: Vec<Database> = (0..4).map(|_| Database::new()).collect();
+        for i in 0..3000u32 {
+            let key = format!("key:{i:06}");
+            // Values on both sides of the inline/heap boundary, and one
+            // bigger than a chunk to force a chunk-straddling entry.
+            let val = if i == 1500 {
+                vec![b'Q'; FOLD_CHUNK_BYTES + 17]
+            } else {
+                format!("value-{}", "x".repeat((i % 40) as usize)).into_bytes()
+            };
+            dbs[0].set_string(key.as_bytes(), Bytes::from(val));
+        }
+        // db 1 empty; db 2 mixed types; db 3 a single key.
+        dbs[2].set_string(b"s", Bytes::from_static(b"v"));
+        let mut map = std::collections::HashMap::new();
+        map.insert(Bytes::from_static(b"f1"), Bytes::from_static(b"v1"));
+        map.insert(Bytes::from_static(b"f2"), Bytes::from_static(b"v2"));
+        let mut h = Entry::new_hash();
+        if let Some(rv) = h.redis_value_mut() {
+            *rv = crate::storage::entry::RedisValue::Hash(Box::new(map));
+        }
+        dbs[2].set(b"h", h);
+        dbs[3].set_string(b"only", Bytes::from_static(b"one"));
+        dbs
+    }
+
+    fn cloned(dbs: &[Database], now_ms: u64) -> Vec<Vec<(CompactKey, Entry)>> {
+        dbs.iter()
+            .map(|db| {
+                db.data()
+                    .iter()
+                    .filter(|(_, e)| !e.is_expired_at(now_ms))
+                    .map(|(k, e)| (k.clone(), e.clone()))
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// The streamed image is byte-identical to the image HEAD built from the
+    /// deep-cloned snapshot with `save_snapshot_to_bytes` (moon#1185).
+    #[test]
+    fn streamed_image_is_byte_identical_to_the_cloned_snapshot_image() {
+        let dbs = fixture();
+        let now = crate::storage::entry::current_time_ms();
+        let expected = crate::persistence::rdb::save_snapshot_to_bytes(&cloned(&dbs, now))
+            .expect("head image");
+
+        let (sink, image) = fold_image_channel();
+        let refs: Vec<&Database> = dbs.iter().collect();
+        stream_fold_image(&refs, now, sink);
+        let mut out = Vec::new();
+        let n = write_fold_image(image, &mut out, "test").expect("image");
+        assert_eq!(n as usize, out.len());
+        assert_eq!(out, expected);
+
+        // And it loads back to the same dataset.
+        let mut loaded: Vec<Database> = (0..4).map(|_| Database::new()).collect();
+        crate::persistence::rdb::load_from_bytes(&mut loaded, &out).expect("load");
+        for (a, b) in dbs.iter().zip(loaded.iter()) {
+            assert_eq!(a.len(), b.len());
+        }
+    }
+
+    /// Chunks in flight are bounded: every `Data` chunk but the last is at
+    /// least a chunk and at most a chunk plus one entry.
+    #[test]
+    fn image_ships_in_bounded_chunks() {
+        let dbs = fixture();
+        let (sink, image) = fold_image_channel();
+        let refs: Vec<&Database> = dbs.iter().collect();
+        stream_fold_image(&refs, 0, sink);
+        let mut sizes = Vec::new();
+        loop {
+            match image.rx.recv().expect("stream") {
+                FoldChunk::Data(c) => sizes.push(c.len()),
+                FoldChunk::End => break,
+                FoldChunk::Failed(w) => panic!("failed: {w}"),
+            }
+        }
+        assert!(sizes.len() >= 2, "fixture must span several chunks");
+        for s in &sizes[..sizes.len() - 1] {
+            assert!(
+                *s >= FOLD_CHUNK_BYTES && *s <= 2 * FOLD_CHUNK_BYTES + 64,
+                "{s}"
+            );
+        }
+    }
+
+    /// A writer that drops the image stops the shard's serialization
+    /// instead of letting it buffer the rest of the keyspace.
+    #[test]
+    fn dropped_image_stops_serialization() {
+        let dbs = fixture();
+        let (sink, image) = fold_image_channel();
+        drop(image);
+        let refs: Vec<&Database> = dbs.iter().collect();
+        // Must return promptly and not panic.
+        stream_fold_image(&refs, 0, sink);
+    }
+
+    /// A stream that ends without `End` (shard gone) aborts the fold.
+    #[test]
+    fn unfinished_stream_is_an_error() {
+        let (mut sink, image) = fold_image_channel();
+        sink.write_all(b"MOON").unwrap();
+        sink.flush().unwrap();
+        drop(sink);
+        let mut out = Vec::new();
+        assert!(write_fold_image(image, &mut out, "test").is_err());
+    }
+
+    /// A reported serialization failure aborts the fold.
+    #[test]
+    fn failed_stream_is_an_error() {
+        let (sink, image) = fold_image_channel();
+        sink.fail("boom".into());
+        let mut out = Vec::new();
+        let err = write_fold_image(image, &mut out, "test").unwrap_err();
+        assert!(err.to_string().contains("boom"), "{err}");
+    }
+}

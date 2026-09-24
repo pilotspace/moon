@@ -3264,33 +3264,32 @@ pub(crate) fn handle_shard_message_shared(
                 p.overflow_for(shard_id).advance_epoch()
             });
             let now_ms = crate::storage::entry::current_time_ms();
-            let snapshot = crate::shard::slice::with_shard(|s| {
-                // Shared guards on EVERY db for the whole capture: the same
-                // cross-db atomicity the single-threaded loop gave for free,
-                // and read-only exactly as the old `.iter()` was.
-                s.databases.with_all_read(|all| {
-                    let mut dbs = Vec::with_capacity(all.len());
-                    for db in all.iter() {
-                        let mut entries = Vec::new();
-                        for (key, entry) in db.data().iter() {
-                            if !entry.is_expired_at(now_ms) {
-                                entries.push((key.clone(), entry.clone()));
-                            }
-                        }
-                        dbs.push(entries);
-                    }
-                    crate::shard::dispatch::AofFoldSnapshot {
-                        dbs,
-                        pending_aof_count,
-                        // moon#902: same atomic instant as the two cuts above.
-                        cold_file_watermark: spill_file_id.get(),
-                        fold_epoch,
-                    }
-                })
-            });
-            // Ignore send failure: the AOF writer dropped its receiver
-            // (e.g. rewrite aborted) — the snapshot is simply discarded.
-            let _ = reply_tx.send(snapshot);
+            // moon#1185: the base image is serialized straight from the live
+            // keyspace and streamed to the writer in bounded chunks — no
+            // per-entry deep copy, no whole-image buffer. The reply goes out
+            // FIRST so the writer runs its phase-3 drain while this arm
+            // serializes; the image still describes exactly this instant,
+            // because no command runs on the shard until the arm returns.
+            let (sink, image) = crate::persistence::aof::fold_stream::fold_image_channel();
+            let snapshot = crate::shard::dispatch::AofFoldSnapshot {
+                image,
+                pending_aof_count,
+                // moon#902: same atomic instant as the two cuts above.
+                cold_file_watermark: spill_file_id.get(),
+                fold_epoch,
+            };
+            // A send failure means the AOF writer dropped its receiver
+            // (rewrite aborted): nothing will read the image, skip it.
+            if reply_tx.send(snapshot).is_ok() {
+                crate::shard::slice::with_shard(|s| {
+                    // Shared guards on EVERY db for the whole capture: the
+                    // same cross-db atomicity the single-threaded loop gives
+                    // for free, and read-only.
+                    s.databases.with_all_read(|all| {
+                        crate::persistence::aof::fold_stream::stream_fold_image(all, now_ms, sink)
+                    })
+                });
+            }
         }
 
         // ─────────────────────────────────────────────────────────────────────

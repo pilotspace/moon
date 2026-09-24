@@ -203,6 +203,80 @@ pub fn save_snapshot_to_bytes(snapshot: &[Vec<(CompactKey, Entry)>]) -> Result<V
     Ok(buf)
 }
 
+/// Incremental writer of the RDB image [`save_snapshot_to_bytes`] builds in
+/// one `Vec` (moon#1185): header, lazily-emitted DB selectors, entries, EOF
+/// marker and the CRC32 footer are written straight to `out` as they are
+/// produced, with the checksum computed as the bytes stream past — no
+/// whole-image buffer, no second pass.
+///
+/// Byte-identical to `save_snapshot_to_bytes` for the same live entries in
+/// the same order: a database's selector is emitted at its first entry, so
+/// an empty database emits nothing, exactly as the `live.is_empty()` skip
+/// there. Expiry filtering is the caller's (it knows its capture instant).
+pub(crate) struct RdbStreamWriter<W: Write> {
+    out: W,
+    hasher: Hasher,
+    /// Per-entry encode buffer, reused: an entry is encoded fully before
+    /// any of it is written, so an encode error never emits a partial entry.
+    scratch: Vec<u8>,
+    current_db: Option<usize>,
+    written: u64,
+}
+
+impl<W: Write> RdbStreamWriter<W> {
+    /// Start an image: writes the magic and version.
+    pub(crate) fn new(out: W) -> Result<Self, MoonError> {
+        let mut w = Self {
+            out,
+            hasher: Hasher::new(),
+            scratch: Vec::with_capacity(256),
+            current_db: None,
+            written: 0,
+        };
+        w.put(RDB_MAGIC)?;
+        w.put(&[RDB_VERSION])?;
+        Ok(w)
+    }
+
+    #[inline]
+    fn put(&mut self, bytes: &[u8]) -> Result<(), MoonError> {
+        self.hasher.update(bytes);
+        self.out.write_all(bytes)?;
+        self.written += bytes.len() as u64;
+        Ok(())
+    }
+
+    /// Append one live entry of database `db_idx`. Entries of one database
+    /// must be contiguous and databases visited in index order.
+    pub(crate) fn write_entry(
+        &mut self,
+        db_idx: usize,
+        key: &[u8],
+        entry: &Entry,
+    ) -> Result<(), MoonError> {
+        self.scratch.clear();
+        write_entry(&mut self.scratch, key, entry)?;
+        if self.current_db != Some(db_idx) {
+            self.put(&[DB_SELECTOR, db_idx as u8])?;
+            self.current_db = Some(db_idx);
+        }
+        self.hasher.update(&self.scratch);
+        self.out.write_all(&self.scratch)?;
+        self.written += self.scratch.len() as u64;
+        Ok(())
+    }
+
+    /// Write the EOF marker and the CRC32 footer; returns the sink and the
+    /// image's total length.
+    pub(crate) fn finish(mut self) -> Result<(W, u64), MoonError> {
+        self.put(&[EOF_MARKER])?;
+        let crc = self.hasher.clone().finalize();
+        self.out.write_all(&crc.to_le_bytes())?;
+        self.written += 4;
+        Ok((self.out, self.written))
+    }
+}
+
 /// Load an RDB file and populate databases. Returns total keys loaded.
 ///
 /// On any error (missing file, corrupt data, bad checksum), returns Err.

@@ -734,6 +734,8 @@ pub const DEFAULT_AOF_FSYNC_TIMEOUT: Duration = Duration::from_millis(2000);
 pub mod auto_rewrite;
 /// Exactly-sized, allocation-lean record encoding (moon#1187).
 mod encode;
+/// Streamed base image for the rewrite fold (moon#1185).
+pub mod fold_stream;
 /// Group-commit batching seam (coalesce concurrent pending writes into one
 /// fsync under `appendfsync=always`). `pub` so the §4 red suite can pin the pure
 /// seam (collect/commit) against the public API.

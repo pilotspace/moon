@@ -154,29 +154,8 @@ impl AofManifest {
             debug_assert_eq!(shard_id, 0, "TopLevel layout only has shard 0");
             return self.advance(rdb_bytes);
         }
-
-        // Validate shard_id is known in this manifest.
-        let shard_idx = self
-            .shards
-            .iter()
-            .position(|s| s.shard_id == shard_id)
-            .ok_or_else(|| crate::error::AofError::RewriteFailed {
-                detail: format!(
-                    "advance_shard: shard_id {} not in manifest (shards: {})",
-                    shard_id,
-                    self.shards.len()
-                ),
-            })?;
-
-        let shard_dir = self.shard_dir(shard_id);
-        std::fs::create_dir_all(&shard_dir).map_err(|e| crate::error::AofError::Io {
-            path: shard_dir.clone(),
-            source: e,
-        })?;
-
         // 1. Write new base RDB atomically: tmp + fsync + rename.
-        let new_base = self.shard_base_path_seq(shard_id, new_seq);
-        let tmp_base = new_base.with_extension("rdb.tmp");
+        let tmp_base = self.shard_base_staging(shard_id, new_seq)?;
         {
             let mut f =
                 std::fs::File::create(&tmp_base).map_err(|e| crate::error::AofError::Io {
@@ -193,7 +172,83 @@ impl AofManifest {
                 source: e,
             })?;
         }
-        std::fs::rename(&tmp_base, &new_base).map_err(|e| {
+        self.advance_shard_staged(shard_id, new_seq, &tmp_base, rdb_bytes.len() as u64)
+    }
+
+    /// Validate `shard_id`, create its shard directory, and return the temp
+    /// path its new base RDB for `new_seq` is written to before
+    /// [`advance_shard_staged`](Self::advance_shard_staged) publishes it.
+    ///
+    /// moon#1185: the per-shard rewrite streams its base image into this
+    /// file OUTSIDE the coordinator's manifest lock — the lock used to be
+    /// held across the whole base write and fsync, serializing every
+    /// shard's base behind it — and takes the lock only to publish.
+    pub fn shard_base_staging(
+        &self,
+        shard_id: u16,
+        new_seq: u64,
+    ) -> Result<PathBuf, crate::error::MoonError> {
+        if !self.shards.iter().any(|s| s.shard_id == shard_id) {
+            return Err(crate::error::AofError::RewriteFailed {
+                detail: format!(
+                    "advance_shard: shard_id {} not in manifest (shards: {})",
+                    shard_id,
+                    self.shards.len()
+                ),
+            }
+            .into());
+        }
+        let shard_dir = self.shard_dir(shard_id);
+        std::fs::create_dir_all(&shard_dir).map_err(|e| crate::error::AofError::Io {
+            path: shard_dir.clone(),
+            source: e,
+        })?;
+        Ok(self
+            .shard_base_path_seq(shard_id, new_seq)
+            .with_extension("rdb.tmp"))
+    }
+
+    /// Publish a new base RDB that is already written AND fsynced at
+    /// `tmp_base` (from [`shard_base_staging`](Self::shard_base_staging)):
+    /// rename it into place, create the empty new incr, fsync the shard
+    /// directory, and advance the shard's in-memory `max_lsn`. Everything
+    /// [`advance_shard`](Self::advance_shard) documents about deferred
+    /// deletion and the caller's single `write_manifest()` commit applies.
+    pub fn advance_shard_staged(
+        &mut self,
+        shard_id: u16,
+        new_seq: u64,
+        tmp_base: &Path,
+        base_len: u64,
+    ) -> Result<PathBuf, crate::error::MoonError> {
+        if self.layout == AofLayout::TopLevel {
+            // Not reachable from the per-shard fold (it only runs on a
+            // PerShard manifest); kept equivalent to `advance_shard`.
+            debug_assert_eq!(shard_id, 0, "TopLevel layout only has shard 0");
+            let bytes = std::fs::read(tmp_base).map_err(|e| crate::error::AofError::Io {
+                path: tmp_base.to_path_buf(),
+                source: e,
+            })?;
+            let _ = std::fs::remove_file(tmp_base);
+            return self.advance(&bytes);
+        }
+
+        // Validate shard_id is known in this manifest.
+        let shard_idx = self
+            .shards
+            .iter()
+            .position(|s| s.shard_id == shard_id)
+            .ok_or_else(|| crate::error::AofError::RewriteFailed {
+                detail: format!(
+                    "advance_shard: shard_id {} not in manifest (shards: {})",
+                    shard_id,
+                    self.shards.len()
+                ),
+            })?;
+
+        let shard_dir = self.shard_dir(shard_id);
+        let new_base = self.shard_base_path_seq(shard_id, new_seq);
+        std::fs::rename(tmp_base, &new_base).map_err(|e| {
             crate::error::AofError::RewriteFailed {
                 detail: format!(
                     "advance_shard {}: rename base {}: {}",
@@ -233,7 +288,7 @@ impl AofManifest {
             "AOF shard {} advanced to seq {}: base={} bytes, incr={}",
             shard_id,
             new_seq,
-            rdb_bytes.len(),
+            base_len,
             new_incr.display()
         );
 

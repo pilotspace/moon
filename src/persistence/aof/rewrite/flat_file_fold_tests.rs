@@ -35,8 +35,14 @@ fn the_fold_fsyncs_the_directory_after_renaming_the_new_file_into_place() {
     let shard = std::thread::spawn(move || {
         for _ in 0..5000 {
             if let Some(ShardMessage::AofFold { reply_tx }) = cons.try_pop() {
+                let (sink, image) = crate::persistence::aof::fold_stream::fold_image_channel();
+                crate::persistence::aof::fold_stream::stream_fold_image(
+                    &[&Database::new()],
+                    0,
+                    sink,
+                );
                 let _ = reply_tx.send(AofFoldSnapshot {
-                    dbs: vec![Vec::new()],
+                    image,
                     pending_aof_count: 0,
                     cold_file_watermark: 1,
                     fold_epoch: FoldEpoch(1),

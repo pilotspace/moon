@@ -1033,6 +1033,27 @@ impl AofManifest {
         rdb_bytes: &[u8],
         prepare: impl FnOnce(&Path) -> Result<T, crate::error::MoonError>,
     ) -> Result<(PathBuf, T), crate::error::MoonError> {
+        self.advance_with_base(
+            |f| {
+                f.write_all(rdb_bytes)?;
+                Ok(rdb_bytes.len() as u64)
+            },
+            prepare,
+        )
+    }
+
+    /// [`advance_with`](Self::advance_with) with the new base RDB produced
+    /// by `write_base` straight into the base's temp file (moon#1185: the
+    /// rewrite fold streams its image instead of materializing it in one
+    /// `Vec`). `write_base` returns the number of bytes it wrote. Same
+    /// tmp + fsync + rename discipline, same all-or-nothing contract: an
+    /// `Err` from `write_base` leaves the old generation committed and the
+    /// temp file removed.
+    pub fn advance_with_base<T>(
+        &mut self,
+        write_base: impl FnOnce(&mut std::fs::File) -> Result<u64, crate::error::MoonError>,
+        prepare: impl FnOnce(&Path) -> Result<T, crate::error::MoonError>,
+    ) -> Result<(PathBuf, T), crate::error::MoonError> {
         let old_seq = self.seq;
         let new_seq = old_seq + 1;
 
@@ -1048,22 +1069,29 @@ impl AofManifest {
         //    the manifest pointing at an empty/partial base RDB.
         let new_base = self.base_path_seq(new_seq);
         let tmp_base = new_base.with_extension("rdb.tmp");
-        {
+        let base_len = {
             let mut f =
                 std::fs::File::create(&tmp_base).map_err(|e| crate::error::AofError::Io {
                     path: tmp_base.clone(),
                     source: e,
                 })?;
-            f.write_all(rdb_bytes)
-                .map_err(|e| crate::error::AofError::Io {
-                    path: tmp_base.clone(),
-                    source: e,
+            let written = write_base(&mut f).and_then(|n| {
+                f.sync_data().map_err(|e| {
+                    crate::error::MoonError::from(crate::error::AofError::Io {
+                        path: tmp_base.clone(),
+                        source: e,
+                    })
                 })?;
-            f.sync_data().map_err(|e| crate::error::AofError::Io {
-                path: tmp_base.clone(),
-                source: e,
-            })?;
-        }
+                Ok(n)
+            });
+            match written {
+                Ok(n) => n,
+                Err(e) => {
+                    let _ = std::fs::remove_file(&tmp_base);
+                    return Err(e);
+                }
+            }
+        };
         std::fs::rename(&tmp_base, &new_base).map_err(|e| {
             crate::error::AofError::RewriteFailed {
                 detail: format!("rename base: {}", e),
@@ -1173,7 +1201,7 @@ impl AofManifest {
         info!(
             "AOF advanced to seq {}: base={} bytes, incr={}",
             new_seq,
-            rdb_bytes.len(),
+            base_len,
             new_incr.display()
         );
 
