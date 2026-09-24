@@ -353,8 +353,12 @@ enum SetRoute {
 /// the compact encoding (moon#832). A missing, expired or cold-spilled key
 /// answers `Full`, which routes to exactly the code that ran before this
 /// function existed; only the two compact forms take a new path.
+///
+/// A probe, not the command's access (moon#1221 review INTEG-5): every route
+/// ends in a write accessor that records the one access redis's
+/// `lookupKeyWrite` would, so the probe is `LOOKUP_NOTOUCH`.
 fn set_route(db: &Database, key: &[u8]) -> Result<SetRoute, Frame> {
-    match db.get_set_ref_if_alive(key, db.now_ms()) {
+    match db.peek_set_ref_if_alive(key, db.now_ms()) {
         Ok(Some(SetRef::Listpack(_))) => Ok(SetRoute::Listpack),
         Ok(Some(SetRef::Intset(_))) => Ok(SetRoute::Intset),
         Ok(Some(SetRef::Hash(_) | SetRef::Owned(_))) | Ok(None) => Ok(SetRoute::Full),
@@ -431,7 +435,8 @@ fn srem_eager(db: &mut Database, key: &Bytes, args: &[Frame]) -> Frame {
     // latter is `get_promoted`, so the emptiness PROBE itself re-flattened the
     // container this function had just kept compact (moon#832).
     let now_ms = db.now_ms();
-    let empty = matches!(db.get_set_ref_if_alive(key, now_ms), Ok(Some(s)) if s.len() == 0);
+    // A bookkeeping probe, not an access (moon#1221 review INTEG-5).
+    let empty = matches!(db.peek_set_ref_if_alive(key, now_ms), Ok(Some(s)) if s.len() == 0);
     if empty {
         db.remove(key);
     }

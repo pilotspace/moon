@@ -35,6 +35,8 @@
 //! - the WAL append buffer is empty and the local WAL channel is empty,
 //! - no snapshot is in progress or requested, no checkpoint is active,
 //! - `appendfsync != always`, no CDC subscribers,
+//! - no lazy-free work queued on this shard (moon#1221 review F2: the drain
+//!   gets one 250 µs slice per tick, so a 10 ms park ran it at 2.5% duty),
 //! - the loop woke on the timer (an SPSC notify wake resets the streak).
 //!
 //! Escape hatch: `MOON_IDLE_PARK=0` pins the loop to the fixed 1ms period

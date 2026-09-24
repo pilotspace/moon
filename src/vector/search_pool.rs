@@ -71,6 +71,9 @@ pub struct SegmentSearchJob {
     pub segment: GraphSegmentRef,
     /// Owned query copy shared across this query's jobs (one alloc per query).
     pub query: Arc<[f32]>,
+    /// Rotation + ADC LUTs + unit query built ONCE per query and shared by
+    /// every job of it (moon#1196); `None` = each job prepares its own.
+    pub prepared: Option<Arc<crate::vector::hnsw::prepared::PreparedTqQuery>>,
     pub fetch_k: usize,
     pub ef_search: usize,
     /// `Some` = ACORN-filtered traversal (allow-list). Post-filter oversampling
@@ -165,26 +168,25 @@ fn worker_loop(rx: &flume::Receiver<SegmentSearchJob>) {
 
 fn run_job(job: &SegmentSearchJob, scratch: &mut SearchScratch) -> SmallVec<[SearchResult; 32]> {
     let filter = job.filter.as_deref();
+    let prepared = job.prepared.as_deref();
     match &job.segment {
-        GraphSegmentRef::Immutable(seg) => match filter {
-            Some(bm) => seg.search_filtered_with_tuning(
-                &job.query,
-                job.fetch_k,
-                job.ef_search,
-                scratch,
-                Some(bm),
-                job.tuning,
-            ),
-            None => {
-                seg.search_with_tuning(&job.query, job.fetch_k, job.ef_search, scratch, job.tuning)
-            }
-        },
-        GraphSegmentRef::Warm(seg) => match filter {
-            Some(bm) => {
-                seg.search_filtered(&job.query, job.fetch_k, job.ef_search, scratch, Some(bm))
-            }
-            None => seg.search(&job.query, job.fetch_k, job.ef_search, scratch),
-        },
+        GraphSegmentRef::Immutable(seg) => seg.search_prepared(
+            &job.query,
+            prepared,
+            job.fetch_k,
+            job.ef_search,
+            scratch,
+            filter,
+            job.tuning,
+        ),
+        GraphSegmentRef::Warm(seg) => seg.search_prepared(
+            &job.query,
+            prepared,
+            job.fetch_k,
+            job.ef_search,
+            scratch,
+            filter,
+        ),
     }
 }
 

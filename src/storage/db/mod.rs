@@ -3,16 +3,36 @@ use std::collections::HashMap;
 
 mod accessors;
 mod cold_replay_gate;
+/// moon#1221 review INTEG-5: writes to compact collections record one access.
+#[cfg(test)]
+mod compact_write_access_tests;
+/// moon#1189: the whole-key deadline index's element + borrowed lookup.
+mod expiry_index;
 mod hash_ttl;
 mod incr;
 mod kv_ops;
+/// moon#1190: per-database lazy-free queue, drained on the shard tick.
+mod lazy_free;
+/// moon#1221 review F1: the maxmemory / OOM gates reclaim lazily freed
+/// bytes before they evict or refuse. Test-only.
+#[cfg(test)]
+mod lazy_free_pressure_tests;
 /// moon#942: the accessors' DashTable probe budget, asserted with a counter
 /// rather than a clock. Test-only; see the module docs for why.
 #[cfg(test)]
 mod probe_budget;
+/// moon#1221 review F3: read-modify-write string commands record one access.
+#[cfg(test)]
+mod rmw_access_tests;
+/// WS1 (2026-09 perf review) storage-core regression tests: moon#1159,
+/// moon#1161, moon#1190, moon#1189. Test-only.
+#[cfg(test)]
+mod ws1_tests;
 
 pub use cold_replay_gate::{ReplayColdGate, ReplayColdReconcile, close_replay_generation};
 pub(crate) use incr::IncrOutcome;
+pub(crate) use kv_ops::ExpiredRemoval;
+pub use lazy_free::{LAZY_FREE_THRESHOLD, LAZY_FREE_TICK_BUDGET, lazy_free_pending_anywhere};
 
 pub use super::db_read::{HashRef, ListRef, SetRef, SortedSetRef, StreamRef};
 pub use accessors::{EntryView, SetHandle};
@@ -25,7 +45,14 @@ pub use crate::storage::encoding_limits::{EncodingLimits, Shape};
 
 /// Estimate per-entry overhead: key length + value memory + struct overhead.
 fn entry_overhead(key: &[u8], entry: &Entry) -> usize {
-    key.len() + entry.value.estimate_memory() + 128
+    entry_overhead_len(key.len(), entry)
+}
+
+/// [`entry_overhead`] for a caller that has only the key's LENGTH (the
+/// lazy-free queue keeps no key bytes).
+#[inline]
+fn entry_overhead_len(key_len: usize, entry: &Entry) -> usize {
+    key_len + entry.value.estimate_memory() + 128
 }
 
 /// Advance an entry's WATCH version because its value is being mutated
@@ -525,7 +552,7 @@ pub struct Database {
     /// walked hot entries; cold TTLs stay lazy-only. The index's own
     /// memory (~48B/pair) is metadata outside `used_memory`, like every
     /// other side table here.
-    expiry_index: std::collections::BTreeSet<(u64, CompactKey)>,
+    expiry_index: std::collections::BTreeSet<expiry_index::ExpiryPair>,
     /// Deadline-ordered hash-FIELD expiry index (moon#543), the sibling of
     /// [`Self::expiry_index`]: one `(min_expiry_ms, key)` pair per hot
     /// `HashWithTtl` entry whose `ttls` sidecar is non-empty.
@@ -547,6 +574,10 @@ pub struct Database {
     /// LOWER a hash's minimum (`hash_set_field_ttl`) inserts its new pair
     /// unconditionally, so none can exist.
     hash_expiry_index: std::collections::BTreeSet<(u64, CompactKey)>,
+    /// moon#1190: removed large values still being freed, a bounded number
+    /// of elements per shard tick (see `db/lazy_free.rs`). Their bytes stay
+    /// in `used_memory` until the drain releases them.
+    lazy_free: lazy_free::LazyFreeQueue,
 }
 
 /// Maximum `HashWithTtl` keys the hash-field sweep reaps in one tick
@@ -610,6 +641,7 @@ impl Database {
             birth_counter: 0,
             expiry_index: std::collections::BTreeSet::new(),
             hash_expiry_index: std::collections::BTreeSet::new(),
+            lazy_free: lazy_free::LazyFreeQueue::default(),
         }
     }
 
@@ -645,6 +677,7 @@ impl Database {
             birth_counter: 0,
             expiry_index: std::collections::BTreeSet::new(),
             hash_expiry_index: std::collections::BTreeSet::new(),
+            lazy_free: lazy_free::LazyFreeQueue::default(),
         }
     }
 
@@ -854,8 +887,34 @@ impl Database {
     pub fn peek_due_expiry(&self, now_ms: u64) -> Option<(u64, CompactKey)> {
         self.expiry_index
             .first()
-            .filter(|(ts, _)| *ts <= now_ms)
-            .cloned()
+            .filter(|p| p.ts <= now_ms)
+            .map(|p| (p.ts, p.key.clone()))
+    }
+
+    /// `true` iff the earliest indexed deadline is due at `now_ms` — the
+    /// sweep's head-peek gate, without cloning the key (moon#1189).
+    #[inline]
+    pub fn has_due_expiry(&self, now_ms: u64) -> bool {
+        self.expiry_index.first().is_some_and(|p| p.ts <= now_ms)
+    }
+
+    /// Pop the earliest pair if it is due at `now_ms` (moon#1189). O(log n);
+    /// the key MOVES out of the index — no clone, and no second index search
+    /// to retire the pair afterwards.
+    #[inline]
+    pub(crate) fn pop_due_expiry(&mut self, now_ms: u64) -> Option<(u64, CompactKey)> {
+        if !self.has_due_expiry(now_ms) {
+            return None;
+        }
+        self.expiry_index.pop_first().map(|p| (p.ts, p.key))
+    }
+
+    /// Put back a pair [`Self::pop_due_expiry`] handed out that turned out
+    /// to be valid but not yet due (wall clock stepped backwards).
+    #[inline]
+    pub(crate) fn restore_expiry_pair(&mut self, ts: u64, key: CompactKey) {
+        self.expiry_index
+            .insert(expiry_index::ExpiryPair { ts, key });
     }
 
     /// Earliest `(expires_at_ms, key)` pair in the index regardless of
@@ -865,7 +924,7 @@ impl Database {
     /// sampling picker which also only saw hot entries.
     #[inline]
     pub fn peek_nearest_expiry(&self) -> Option<(u64, CompactKey)> {
-        self.expiry_index.first().cloned()
+        self.expiry_index.first().map(|p| (p.ts, p.key.clone()))
     }
 
     /// Drop one specific index pair. The sweep calls this when a popped
@@ -875,7 +934,8 @@ impl Database {
     /// not dropped — see [`Self::peek_due_expiry`].
     #[inline]
     pub fn drop_expiry_index_pair(&mut self, ts: u64, key: &CompactKey) {
-        self.expiry_index.remove(&(ts, key.clone()));
+        self.expiry_index
+            .remove(&expiry_index::lookup(ts, key.as_bytes()) as &dyn expiry_index::ExpiryLookup);
     }
 
     /// Number of indexed (hot, TTL-carrying) keys. Exact — backs
@@ -895,14 +955,22 @@ impl Database {
     /// Insert an index pair. Callers pass `ttl_ms != 0` only.
     #[inline]
     pub(crate) fn expiry_index_insert(&mut self, ttl_ms: u64, key: &[u8]) {
-        self.expiry_index.insert((ttl_ms, CompactKey::from(key)));
+        self.expiry_index.insert(expiry_index::ExpiryPair {
+            ts: ttl_ms,
+            key: CompactKey::from(key),
+        });
     }
 
     /// Remove an index pair. Callers pass the entry's CURRENT `ttl_ms`
     /// (`!= 0`) — the pair the writers inserted for it.
+    ///
+    /// moon#1189: searched through a borrowed `(ts, &[u8])` view — no
+    /// `CompactKey` is built (a heap copy for keys over 23 bytes) just to
+    /// find the pair it is about to drop.
     #[inline]
     pub(crate) fn expiry_index_remove(&mut self, ttl_ms: u64, key: &[u8]) {
-        self.expiry_index.remove(&(ttl_ms, CompactKey::from(key)));
+        self.expiry_index
+            .remove(&expiry_index::lookup(ttl_ms, key) as &dyn expiry_index::ExpiryLookup);
     }
 
     // ── moon#543: deadline-ordered hash-FIELD expiry index ──────────────
@@ -1003,11 +1071,14 @@ impl Database {
     /// API — compiled out of production builds entirely.
     #[cfg(test)]
     pub(crate) fn debug_expiry_index_consistent(&self) -> bool {
-        let scan: std::collections::BTreeSet<(u64, CompactKey)> = self
+        let scan: std::collections::BTreeSet<expiry_index::ExpiryPair> = self
             .data
             .iter()
             .filter(|(_, e)| e.has_expiry())
-            .map(|(k, e)| (e.expires_at_ms(), k.clone()))
+            .map(|(k, e)| expiry_index::ExpiryPair {
+                ts: e.expires_at_ms(),
+                key: k.clone(),
+            })
             .collect();
         // moon#543: the hash-field index's LOWER-BOUND invariant — every
         // reapable hash must have SOME pair at or before its true minimum.

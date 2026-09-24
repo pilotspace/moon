@@ -85,7 +85,7 @@ pub(crate) fn handle_pending_snapshot(
                 shard_id as u16,
                 epoch,
                 db_count,
-                segment_counts,
+                segment_counts.clone(),
                 snap_path,
             );
             // P3c — stamp the WAL LSN so PITR can pick this snapshot as a
@@ -94,9 +94,13 @@ pub(crate) fn handle_pending_snapshot(
             if wal_last_lsn > 0 {
                 state.set_last_lsn(wal_last_lsn);
             }
+            // moon#1186: stream blocks to an off-shard-thread writer instead
+            // of buffering the whole file for a write+fsync on this thread.
+            start_snapshot_streaming(&mut state, shard_id);
             // moon#517: arm off-loop COW capture (Lua script writes) for
             // the life of this snapshot. See `persistence::snapshot_cow`.
-            crate::persistence::snapshot_cow::arm();
+            // moon#1186: with the layout, so written segments are skipped.
+            crate::persistence::snapshot_cow::arm_with_layout(segment_counts);
             *snapshot_state = Some(state);
             *snapshot_reply_tx = Some(reply_tx);
         }
@@ -155,23 +159,71 @@ pub(crate) fn check_auto_save_trigger(
                 shard_id as u16,
                 new_epoch,
                 db_count,
-                segment_counts,
+                segment_counts.clone(),
                 snap_path,
             );
             // P3c — stamp the WAL LSN before the header is written.
             if wal_last_lsn > 0 {
                 state.set_last_lsn(wal_last_lsn);
             }
+            // moon#1186: same streaming writer as the explicit-BGSAVE path.
+            start_snapshot_streaming(&mut state, shard_id);
             // moon#517: same arming as the explicit-BGSAVE path above.
-            crate::persistence::snapshot_cow::arm();
+            crate::persistence::snapshot_cow::arm_with_layout(segment_counts);
             *snapshot_state = Some(state);
+        }
+    }
+}
+
+/// Attach the off-shard-thread writer to a new snapshot (moon#1186). A
+/// thread that cannot be spawned leaves the in-memory path in place; the
+/// finalize still runs off-thread if a thread can be had by then.
+fn start_snapshot_streaming(state: &mut SnapshotState, shard_id: usize) {
+    if let Err(e) = state.start_streaming() {
+        tracing::warn!(
+            "Shard {}: snapshot writer thread unavailable ({}); buffering in memory",
+            shard_id,
+            e
+        );
+    }
+}
+
+/// Drive a complete snapshot's finalize (moon#1186): start it on the writer
+/// thread (the EOF marker, CRC footer, fsync, rename and directory fsync all
+/// run there) and poll its outcome WITHOUT blocking. Returns `Some(true)` /
+/// `Some(false)` once the snapshot published / failed — the success or error
+/// handler has already run — and `None` while the writer is still working.
+pub(crate) fn drive_snapshot_finalize(
+    snapshot_state: &mut Option<SnapshotState>,
+    snapshot_reply_tx: &mut Option<channel::OneshotSender<Result<(), String>>>,
+    shard_id: usize,
+) -> Option<bool> {
+    let snap = snapshot_state.as_mut()?;
+    if !snap.finalize_started() {
+        if let Err(e) = snap.begin_finalize() {
+            finalize_snapshot_error(snapshot_state, snapshot_reply_tx, shard_id, &e.to_string());
+            return Some(false);
+        }
+        // Every segment is written: no pre-image can be needed any more.
+        crate::persistence::snapshot_cow::disarm();
+    }
+    match snapshot_state.as_ref()?.poll_finalize()? {
+        Ok(()) => {
+            finalize_snapshot_success(snapshot_state, snapshot_reply_tx, shard_id);
+            Some(true)
+        }
+        Err(e) => {
+            finalize_snapshot_error(snapshot_state, snapshot_reply_tx, shard_id, &e);
+            Some(false)
         }
     }
 }
 
 /// Advance snapshot one segment and check if done (synchronous part).
 ///
-/// Returns `true` if the snapshot is complete and ready for async finalization.
+/// Returns `true` if the snapshot is complete and ready for finalization
+/// ([`drive_snapshot_finalize`]) — also when its writer thread already
+/// failed, so the failure is reported instead of serializing the rest.
 pub(crate) fn advance_snapshot_segment(
     snapshot_state: &mut Option<SnapshotState>,
     shard_databases: &Arc<ShardDatabases>,
@@ -185,10 +237,26 @@ pub(crate) fn advance_snapshot_segment(
         // first would discard a pre-image that was still needed when it was
         // taken.
         crate::persistence::snapshot_cow::drain_into(snap);
+        if snap.finalize_started() || snap.stream_failed() {
+            return true;
+        }
+        // moon#1186: the writer thread is too far behind the disk — skip
+        // this tick's segment rather than grow the in-flight backlog.
+        if snap.stream_backlogged() {
+            return false;
+        }
         let current_db = snap.current_db_index();
         let db_count = shard_databases.db_count();
         if current_db < db_count {
-            crate::shard::slice::with_shard_db(current_db, |db| snap.advance_one_segment_db(db))
+            let done = crate::shard::slice::with_shard_db(current_db, |db| {
+                snap.advance_one_segment_db(db)
+            });
+            // Captures from here on are filtered against the new cursor.
+            crate::persistence::snapshot_cow::note_progress(
+                snap.current_db_index(),
+                snap.current_segment_index(),
+            );
+            done
         } else {
             // All databases serialized, return true to trigger finalization
             true
@@ -1242,6 +1310,19 @@ pub(crate) fn handle_memory_pressure(
             let budget = match shard_databases.elastic_budget(shard_id) {
                 0 => rt.maxmemory_per_shard(),
                 elastic => elastic.min(rt.maxmemory),
+            };
+            // moon#1221 review F1: bytes an UNLINK or expiry queued for lazy
+            // free in ANY db are memory already released; reclaim them
+            // across every db before the per-db loops below take a victim.
+            let total_mem = if total_mem > budget {
+                crate::storage::eviction::reclaim_lazy_free_in_shard(
+                    shard_databases.db_count(),
+                    total_mem,
+                    &rt,
+                    budget,
+                )
+            } else {
+                total_mem
             };
             if total_mem > budget {
                 let db_count = shard_databases.db_count();

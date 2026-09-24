@@ -265,15 +265,11 @@ pub fn ft_search(
 
         // Session filtering for hybrid path (SESS-01, SESS-02)
         if let (Some(sess_key), Some(db)) = (session_key.as_ref(), db.as_mut()) {
-            let session_members_snapshot: std::collections::HashMap<Bytes, f64> =
-                match db.get_sorted_set(sess_key) {
-                    Ok(Some((members, _tree))) => members.clone(),
-                    Ok(None) => std::collections::HashMap::new(),
-                    Err(_) => std::collections::HashMap::new(),
-                };
+            // moon#1196: probe the live session set in place (was a full
+            // member-map clone per query).
             let sv: SmallVec<[SearchResult; 32]> = fused.drain(..).collect();
             let filtered =
-                session::filter_session_results(&sv, &session_members_snapshot, &key_hash_to_key);
+                session::filter_session_results_in_db(&sv, db, sess_key, &key_hash_to_key);
             fused = filtered.into_vec();
 
             crate::vector::metrics::increment_search();
@@ -334,15 +330,11 @@ pub fn ft_search(
 
         // Session filtering for sparse-only path (SESS-01, SESS-02)
         if let (Some(sess_key), Some(db)) = (session_key.as_ref(), db.as_mut()) {
-            let session_members_snapshot: std::collections::HashMap<Bytes, f64> =
-                match db.get_sorted_set(sess_key) {
-                    Ok(Some((members, _tree))) => members.clone(),
-                    Ok(None) => std::collections::HashMap::new(),
-                    Err(_) => std::collections::HashMap::new(),
-                };
+            // moon#1196: probe the live session set in place (was a full
+            // member-map clone per query).
             let sv: SmallVec<[SearchResult; 32]> = fused.drain(..).collect();
             let filtered =
-                session::filter_session_results(&sv, &session_members_snapshot, &key_hash_to_key);
+                session::filter_session_results_in_db(&sv, db, sess_key, &key_hash_to_key);
             fused = filtered.into_vec();
 
             crate::vector::metrics::increment_search();
@@ -400,20 +392,11 @@ pub fn ft_search(
                 mut results,
                 key_hash_to_key,
             } => {
-                // Read session sorted set for filtering
-                let session_members_snapshot: std::collections::HashMap<Bytes, f64> =
-                    match db.get_sorted_set(sess_key) {
-                        Ok(Some((members, _tree))) => members.clone(),
-                        Ok(None) => std::collections::HashMap::new(),
-                        Err(_) => std::collections::HashMap::new(),
-                    };
-
-                // Filter out previously returned results
-                results = session::filter_session_results(
-                    &results,
-                    &session_members_snapshot,
-                    &key_hash_to_key,
-                );
+                // Filter out previously returned results, probing the live
+                // session set in place (moon#1196: was a full member-map
+                // clone per query).
+                results =
+                    session::filter_session_results_in_db(&results, db, sess_key, &key_hash_to_key);
 
                 // Apply RANGE threshold filter (AGNT-05). Dense KNN distances.
                 if let (Some(threshold), Some(_)) = (range_threshold, range_metric) {
@@ -691,14 +674,19 @@ fn capture_dense_knn_snapshot(
     };
 
     let total_vectors = idx.segments.total_vectors();
-    let filter_bitmap = filter.map(|f| idx.payload_index.evaluate_bitmap(f, total_vectors));
+    // `Arc` once here: the yielding search shares it with pool jobs by
+    // refcount instead of deep-cloning it again (moon#1196).
+    let filter_bitmap =
+        filter.map(|f| std::sync::Arc::new(idx.payload_index.evaluate_bitmap(f, total_vectors)));
     // XC-3: resolve the selectivity-based strategy at capture, mirroring the
     // sync path's `select_strategy` dispatch (holder.rs `search_filtered`). The
     // yield refactor (PR #189) originally hardcoded ACORN-filtered search for
     // every filtered query, losing the >80%-selectivity oversample+post-filter
     // branch.
-    let filter_strategy =
-        crate::vector::filter::selectivity::select_strategy(filter_bitmap.as_ref(), total_vectors);
+    let filter_strategy = crate::vector::filter::selectivity::select_strategy(
+        filter_bitmap.as_deref(),
+        total_vectors,
+    );
 
     // WS3 round 2 + #18: the yielding (worker-pool) search path captures its
     // segment snapshot here, separately from `SegmentHolder::search_filtered`'s

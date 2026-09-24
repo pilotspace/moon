@@ -239,18 +239,17 @@ pub fn prepare_query_prod(
 ) -> TqProdQueryState {
     let dim = query.len();
 
-    // 1. Compute S_m * y for each projection — O(M × d²) total
+    // 1. Compute S_m * y for each projection — O(M × d²) total, each row on
+    //    the SIMD-dispatched `dot_f32` (moon#1192; was a serial scalar loop).
+    let dot = crate::vector::distance::table().dot_f32;
     let s_y_list: Vec<Vec<f32>> = qjl_matrices
         .iter()
         .map(|matrix| {
             let mut s_y = vec![0.0f32; dim];
-            for row in 0..dim {
-                let row_start = row * dim;
-                let mut dot = 0.0f32;
-                for col in 0..dim {
-                    dot += matrix[row_start + col] * query[col];
+            if dim > 0 {
+                for (dst, row) in s_y.iter_mut().zip(matrix.chunks_exact(dim)) {
+                    *dst = dot(row, query);
                 }
-                s_y[row] = dot;
             }
             s_y
         })

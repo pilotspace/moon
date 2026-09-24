@@ -50,6 +50,7 @@ impl<K, V> Segment<K, V> {
             if slot < TOTAL_SLOTS {
                 // SAFETY: ctrl byte matches h2 (a FULL value), so the slot is initialized.
                 let k = unsafe { self.keys[slot].assume_init_ref() };
+                super::note_key_compare();
                 if k.borrow() == key {
                     return Some(slot);
                 }
@@ -86,6 +87,7 @@ impl<K, V> Segment<K, V> {
                 if slot < TOTAL_SLOTS {
                     // SAFETY: ctrl byte matches h2 (a FULL value), so the slot is initialized.
                     let k = unsafe { self.keys[slot].assume_init_ref() };
+                    super::note_key_compare();
                     if k.borrow() == key {
                         return Some(slot);
                     }
@@ -99,6 +101,7 @@ impl<K, V> Segment<K, V> {
             if ctrl == h2 {
                 // SAFETY: ctrl byte matches h2 (a FULL value), so the slot is initialized.
                 let k = unsafe { self.keys[slot].assume_init_ref() };
+                super::note_key_compare();
                 if k.borrow() == key {
                     return Some(slot);
                 }
@@ -136,6 +139,7 @@ impl<K, V> Segment<K, V> {
                 if slot < REGULAR_SLOTS {
                     // SAFETY: ctrl byte matches h2 -> slot is initialized.
                     let k = unsafe { self.keys[slot].assume_init_ref() };
+                    super::note_key_compare();
                     if k.borrow() == key {
                         return Some(slot);
                     }

@@ -9,12 +9,15 @@
 /// - `types` — Field definitions and BM25 configuration
 /// - `analyzer` — Tokenization pipeline (NFKD, stemming, stop words)
 /// - `bm25` — Scoring function and field statistics
+/// - `doc_columns` — Dense doc-id-indexed side tables (keys, lengths, LSNs, TAG/NUMERIC entries)
 /// - `posting` — Inverted index posting lists with RoaringBitmap
+/// - `score` — Single-pass BM25 scoring kernel (cursors + bounded top-k)
 /// - `term_dict` — Mutable term-to-ID dictionary
 /// - `store` — TextStore and TextIndex per-shard registry
 pub mod aggregate;
 pub mod analyzer;
 pub mod bm25;
+pub mod doc_columns;
 pub mod fst_dict;
 pub mod index_persist;
 #[cfg(feature = "text-index")]
@@ -26,6 +29,7 @@ pub mod postings_persist;
 pub mod query;
 #[cfg(feature = "text-index")]
 pub mod recovery;
+pub mod score;
 #[cfg(all(test, feature = "text-index"))]
 mod shared_analysis_tests;
 pub mod store;
@@ -199,7 +203,7 @@ mod tests {
         let posting = store.get_posting(0).expect("posting should exist");
         assert!(posting.doc_ids.contains(1));
         assert!(posting.doc_ids.contains(2));
-        assert_eq!(posting.term_freqs.len(), 2);
+        assert_eq!(posting.tf_values().count(), 2);
     }
 
     #[test]
@@ -210,15 +214,13 @@ mod tests {
 
         assert_eq!(store.doc_freq(0), 1, "upsert should not duplicate doc_id");
         let posting = store.get_posting(0).expect("posting should exist");
+        assert_eq!(posting.tf(1), 2, "term freq should increment on upsert");
+        assert!(posting.has_positions(), "positions should be tracked");
         assert_eq!(
-            posting.term_freqs[0], 2,
-            "term freq should increment on upsert"
+            posting.positions_for(1),
+            Some(&[0u32, 5][..]),
+            "positions should be appended"
         );
-        if let Some(ref positions) = posting.positions {
-            assert_eq!(positions[0], vec![0, 5], "positions should be appended");
-        } else {
-            panic!("positions should be Some");
-        }
     }
 
     #[test]
@@ -229,10 +231,10 @@ mod tests {
 
         let posting = store.get_posting(0).expect("posting should exist");
         assert!(
-            posting.positions.is_none(),
+            !posting.has_positions(),
             "positions should be None when not provided"
         );
-        assert_eq!(posting.term_freqs.len(), 2);
+        assert_eq!(posting.tf_values().count(), 2);
     }
 
     #[test]
@@ -245,7 +247,7 @@ mod tests {
 
         let posting = store.get_posting(0).expect("posting should exist");
         assert!(
-            posting.positions.is_some(),
+            posting.has_positions(),
             "positions should be upgraded to Some"
         );
     }
@@ -372,7 +374,8 @@ mod tests {
                 (Some(pa), Some(pb)) => {
                     assert_eq!(pa.doc_ids, pb.doc_ids, "term {term}: doc_ids identical");
                     assert_eq!(
-                        pa.term_freqs, pb.term_freqs,
+                        pa.tf_values().collect::<Vec<_>>(),
+                        pb.tf_values().collect::<Vec<_>>(),
                         "term {term}: term_freqs identical"
                     );
                 }

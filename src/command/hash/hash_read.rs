@@ -114,13 +114,8 @@ pub fn hexists(db: &mut Database, args: &[Frame]) -> Frame {
     };
     let now_ms = db.now_ms();
     match db.get_hash_ref_if_alive(key, now_ms) {
-        Ok(Some(href)) => {
-            if href.get_field(field).is_some() {
-                Frame::Integer(1)
-            } else {
-                Frame::Integer(0)
-            }
-        }
+        // Presence only: the value is never materialized (moon#1174 §3).
+        Ok(Some(href)) => Frame::Integer(i64::from(href.contains_field(field))),
         Ok(None) => Frame::Integer(0),
         Err(e) => e,
     }
@@ -168,8 +163,9 @@ pub fn hstrlen(db: &mut Database, args: &[Frame]) -> Frame {
     let now_ms = db.now_ms();
     match db.get_hash_ref_if_alive(key, now_ms) {
         // The VALUE's length, not the field name's — the one thing an
-        // implementation can plausibly get backwards.
-        Ok(Some(href)) => Frame::Integer(href.get_field(field).map_or(0, |v| v.len() as i64)),
+        // implementation can plausibly get backwards. Measured in place, never
+        // copied out (moon#1174 §3).
+        Ok(Some(href)) => Frame::Integer(href.field_len(field).map_or(0, |n| n as i64)),
         Ok(None) => Frame::Integer(0),
         Err(e) => e,
     }
@@ -188,12 +184,11 @@ pub fn hkeys(db: &mut Database, args: &[Frame]) -> Frame {
     };
     let now_ms = db.now_ms();
     match db.get_hash_ref_if_alive(key, now_ms) {
+        // Field names only, straight into the reply: no value is materialized
+        // and no intermediate pair vector is built (moon#1174 §3).
         Ok(Some(href)) => {
-            let fields: Vec<Frame> = href
-                .entries()
-                .into_iter()
-                .map(|(k, _)| Frame::BulkString(k))
-                .collect();
+            let mut fields: Vec<Frame> = Vec::with_capacity(href.len_hint());
+            href.for_each_field(|k| fields.push(Frame::BulkString(k)));
             Frame::Array(fields.into())
         }
         Ok(None) => Frame::Array(framevec![]),
@@ -214,12 +209,10 @@ pub fn hvals(db: &mut Database, args: &[Frame]) -> Frame {
     };
     let now_ms = db.now_ms();
     match db.get_hash_ref_if_alive(key, now_ms) {
+        // Values only, straight into the reply (moon#1174 §3).
         Ok(Some(href)) => {
-            let values: Vec<Frame> = href
-                .entries()
-                .into_iter()
-                .map(|(_, v)| Frame::BulkString(v))
-                .collect();
+            let mut values: Vec<Frame> = Vec::with_capacity(href.len_hint());
+            href.for_each_value(|v| values.push(Frame::BulkString(v)));
             Frame::Array(values.into())
         }
         Ok(None) => Frame::Array(framevec![]),
@@ -359,7 +352,7 @@ pub fn hstrlen_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
         None => return err_wrong_args("HSTRLEN"),
     };
     match db.get_hash_ref_if_alive(key, now_ms) {
-        Ok(Some(href)) => Frame::Integer(href.get_field(field).map_or(0, |v| v.len() as i64)),
+        Ok(Some(href)) => Frame::Integer(href.field_len(field).map_or(0, |n| n as i64)),
         Ok(None) => Frame::Integer(0),
         Err(e) => e,
     }
@@ -448,12 +441,11 @@ pub fn hkeys_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
         None => return err_wrong_args("HKEYS"),
     };
     match db.get_hash_ref_if_alive(key, now_ms) {
+        // Field names only, straight into the reply: no value is materialized
+        // and no intermediate pair vector is built (moon#1174 §3).
         Ok(Some(href)) => {
-            let fields: Vec<Frame> = href
-                .entries()
-                .into_iter()
-                .map(|(k, _)| Frame::BulkString(k))
-                .collect();
+            let mut fields: Vec<Frame> = Vec::with_capacity(href.len_hint());
+            href.for_each_field(|k| fields.push(Frame::BulkString(k)));
             Frame::Array(fields.into())
         }
         Ok(None) => Frame::Array(framevec![]),
@@ -471,12 +463,10 @@ pub fn hvals_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
         None => return err_wrong_args("HVALS"),
     };
     match db.get_hash_ref_if_alive(key, now_ms) {
+        // Values only, straight into the reply (moon#1174 §3).
         Ok(Some(href)) => {
-            let values: Vec<Frame> = href
-                .entries()
-                .into_iter()
-                .map(|(_, v)| Frame::BulkString(v))
-                .collect();
+            let mut values: Vec<Frame> = Vec::with_capacity(href.len_hint());
+            href.for_each_value(|v| values.push(Frame::BulkString(v)));
             Frame::Array(values.into())
         }
         Ok(None) => Frame::Array(framevec![]),
@@ -498,13 +488,8 @@ pub fn hexists_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
         None => return err_wrong_args("HEXISTS"),
     };
     match db.get_hash_ref_if_alive(key, now_ms) {
-        Ok(Some(href)) => {
-            if href.get_field(field).is_some() {
-                Frame::Integer(1)
-            } else {
-                Frame::Integer(0)
-            }
-        }
+        // Presence only: the value is never materialized (moon#1174 §3).
+        Ok(Some(href)) => Frame::Integer(i64::from(href.contains_field(field))),
         Ok(None) => Frame::Integer(0),
         Err(e) => e,
     }

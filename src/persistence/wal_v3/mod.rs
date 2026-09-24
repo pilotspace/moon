@@ -5,6 +5,7 @@ pub mod replay;
 pub mod segment;
 pub(crate) mod sync_agent;
 pub mod tail;
+pub(crate) mod watermark;
 
 pub use record::{WalRecord, WalRecordType, read_wal_v3_record, write_wal_v3_record};
 pub use replay::{

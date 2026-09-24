@@ -1212,6 +1212,11 @@ fn main() -> anyhow::Result<()> {
     moon::storage::eviction::publish_maxmemory_policy(
         &runtime_config_shared.read().maxmemory_policy,
     );
+    // moon#1161: the read path records LFU accesses with these parameters.
+    moon::storage::eviction::publish_lfu_params(
+        runtime_config_shared.read().lfu_log_factor,
+        runtime_config_shared.read().lfu_decay_time,
+    );
     // Record what the process costs the OS with no dataset in it. The eviction
     // budget is scaled by how far real footprint exceeds accounted memory, and
     // that comparison is only meaningful on the MARGINAL cost of the data —

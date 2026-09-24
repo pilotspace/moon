@@ -15,9 +15,12 @@
 //!   +-- Segment 1: ...
 //! ```
 //!
-//! Hash routing:
-//! - H1 (full hash): segment index (high bits) + home bucket selection (mid bits)
-//! - H2 (top 7 bits): control byte fingerprint for SIMD matching
+//! Hash routing (one xxh64, three disjoint consumers — moon#1159):
+//! - directory: the TOP `depth` bits pick the segment
+//! - home buckets: `(hash >> 8) % 56` and `(hash >> 16) % 56`
+//! - H2 (bits 32..=38, [`segment::H2_SHIFT`]): control byte fingerprint for
+//!   SIMD matching. It must not overlap the directory bits, or every key in a
+//!   deep segment shares one fingerprint and the SIMD filter matches them all.
 
 pub mod iter;
 pub mod segment;
@@ -26,7 +29,8 @@ pub mod simd;
 use super::compact_key::CompactKey;
 
 use iter::{Iter, IterMut, Keys, Values};
-use segment::{InsertResult, Segment, SegmentInsertOrUpdate, h2, home_buckets};
+pub use segment::RemoveIf;
+use segment::{InsertResult, Segment, UpsertProbe, h2, home_buckets};
 
 /// Outcome of [`DashTable::insert_or_update`].
 pub enum InsertOrUpdate<'a, V> {
@@ -34,6 +38,58 @@ pub enum InsertOrUpdate<'a, V> {
     Inserted(&'a mut V),
     /// Key existed; the user-supplied closure was invoked.
     Updated(&'a mut V),
+}
+
+/// The key an upsert probes with: owned (moved in on a miss) or borrowed
+/// (copied into a `CompactKey` only on a miss).
+enum UpsertKey<'k> {
+    Owned(CompactKey),
+    Borrowed(&'k [u8]),
+}
+
+impl UpsertKey<'_> {
+    #[inline]
+    fn bytes(&self) -> &[u8] {
+        match self {
+            UpsertKey::Owned(k) => k.as_bytes(),
+            UpsertKey::Borrowed(b) => b,
+        }
+    }
+
+    /// The owned key to store. Called on the miss path only.
+    #[inline]
+    fn into_key(self) -> CompactKey {
+        note_upsert_key_build();
+        match self {
+            UpsertKey::Owned(k) => k,
+            UpsertKey::Borrowed(b) => CompactKey::from(b),
+        }
+    }
+}
+
+// Per-thread count of owned keys an upsert STORED (test builds only). An
+// upsert that hits must store nothing — the moon#1159 follow-up that stopped
+// `Database::set` building a `CompactKey` per overwrite. Plain `//`: a doc
+// comment on a macro invocation trips `unused_doc_comments`.
+#[cfg(test)]
+thread_local! {
+    static UPSERT_KEY_BUILDS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+#[inline]
+fn note_upsert_key_build() {
+    UPSERT_KEY_BUILDS.with(|c| c.set(c.get() + 1));
+}
+
+#[cfg(not(test))]
+#[inline(always)]
+fn note_upsert_key_build() {}
+
+/// Read and reset the per-thread upsert key-build counter.
+#[cfg(test)]
+pub(crate) fn take_upsert_key_builds() -> u32 {
+    UPSERT_KEY_BUILDS.with(|c| c.replace(0))
 }
 
 /// Compute the xxh64 hash of a byte slice.
@@ -501,8 +557,11 @@ impl<V> DashTable<CompactKey, V> {
     /// On miss: `make_value()` produces the new value, then it's inserted at the
     /// already-located free slot in the segment that was just probed.
     ///
-    /// On `NeedsSplit`: split the segment, then retry. The segment helper returns
-    /// the unconsumed closures so we can reuse them after the split.
+    /// On a full segment: split, then retry — see [`Self::upsert`].
+    ///
+    /// Takes the key OWNED. A caller that only holds the bytes should use
+    /// [`Self::insert_or_update_slice`], which builds the `CompactKey` only on
+    /// a miss instead of on every call.
     pub fn insert_or_update<F, G>(
         &mut self,
         key: CompactKey,
@@ -513,102 +572,104 @@ impl<V> DashTable<CompactKey, V> {
         F: FnOnce(&mut V),
         G: FnOnce() -> V,
     {
+        self.upsert(UpsertKey::Owned(key), update, make_value)
+    }
+
+    /// [`Self::insert_or_update`] keyed by a borrowed slice (moon#1159
+    /// follow-up): the owned `CompactKey` is built ONLY when the key is new.
+    ///
+    /// `Database::set` used to call `insert_or_update(CompactKey::from(key),
+    /// ..)`, so every SET overwrite of a key longer than 23 bytes allocated a
+    /// heap key block just to drop it again after the probe found the key.
+    pub fn insert_or_update_slice<F, G>(
+        &mut self,
+        key: &[u8],
+        update: F,
+        make_value: G,
+    ) -> InsertOrUpdate<'_, V>
+    where
+        F: FnOnce(&mut V),
+        G: FnOnce() -> V,
+    {
+        self.upsert(UpsertKey::Borrowed(key), update, make_value)
+    }
+
+    /// The one upsert implementation behind both entry points.
+    ///
+    /// Phase 1 (`Segment::probe_for_upsert`) scans the key's home groups once
+    /// and answers with plain slot indexes; phase 2 either updates the found
+    /// value or writes the new pair into the located free slot. Because the
+    /// probe holds no borrow of the key, the owned key moves in only after the
+    /// scan — which is what retired the raw-pointer `from_raw_parts` view of a
+    /// key that was simultaneously being moved into a closure.
+    ///
+    /// A full segment is split and the probe retried until the key's target
+    /// segment has room. A single split does NOT guarantee room: when the
+    /// overflowing segment's keys are skewed on the next directory bit they
+    /// can all land in the same child, which is then still over
+    /// LOAD_THRESHOLD. Each split raises the target's local depth, so the loop
+    /// terminates once the colliding keys separate.
+    fn upsert<F, G>(
+        &mut self,
+        key: UpsertKey<'_>,
+        update: F,
+        make_value: G,
+    ) -> InsertOrUpdate<'_, V>
+    where
+        F: FnOnce(&mut V),
+        G: FnOnce() -> V,
+    {
         note_key_lookup();
-        let hash = hash_key(key.as_ref());
-        let dir_idx = segment_index(hash, self.depth);
-        let seg_idx = self.directory[dir_idx];
+        let hash = hash_key(key.bytes());
+        let mut dir_idx = segment_index(hash, self.depth);
 
         // Prefetch segment data while computing h2/home buckets
-        prefetch_segment(self.segments.get(seg_idx));
+        prefetch_segment(self.segments.get(self.directory[dir_idx]));
 
         let h2_val = h2(hash);
         let (ba, bb) = home_buckets(hash);
 
-        // The key_ref borrow must not overlap with the move into `make`.
-        // We pass key_lookup as &[u8] to the segment helper, and wrap `key`
-        // into the `make` closure so it's only consumed on miss.
-        // key.as_ref() returns &[u8] — we need to hold the borrow before
-        // moving key into the closure. Use a raw pointer to break the overlap.
-        let key_ptr = key.as_ref().as_ptr();
-        let key_len = key.as_ref().len();
-
-        let segment = self.segments.get_mut(seg_idx);
-        // SAFETY: key_ptr/key_len from key.as_ref() are valid for key's lifetime.
-        // key moves into `make` closure which runs AFTER the scan completes.
-        let key_lookup = unsafe { std::slice::from_raw_parts(key_ptr, key_len) };
-
-        let outcome = segment.insert_or_update_at(h2_val, key_lookup, ba, bb, update, move || {
-            (key, make_value())
-        });
-
-        match outcome {
-            SegmentInsertOrUpdate::Inserted { slot } => {
-                self.len += 1;
-                // SAFETY: just-inserted slot has a FULL ctrl byte and an initialized
-                // value (mirrors find at segment.rs:277 — FULL ctrl => values[slot]
-                // initialized).
-                InsertOrUpdate::Inserted(unsafe { self.segments.get_mut(seg_idx).value_mut(slot) })
-            }
-            SegmentInsertOrUpdate::Updated { slot } => {
-                // SAFETY: matched-and-updated slot has a FULL ctrl byte
-                // (mirrors find at segment.rs:277).
-                InsertOrUpdate::Updated(unsafe { self.segments.get_mut(seg_idx).value_mut(slot) })
-            }
-            SegmentInsertOrUpdate::NeedsSplit { update, make } => {
-                // Split and retry until the key's target segment has room,
-                // mirroring `insert`'s recursive retry. A single split does
-                // NOT guarantee room: when the overflowing segment's keys are
-                // skewed on the next directory bit they can all land in the
-                // same child, which is then still over LOAD_THRESHOLD.
-                // Each split raises the target's local depth, so the loop
-                // terminates once the colliding keys separate.
-                let mut update = update;
-                let mut make = make;
-                let mut split_dir_idx = dir_idx;
-                let (final_seg_idx, slot, inserted) = loop {
-                    self.split_segment(split_dir_idx);
-
-                    // This retry re-walks a segment. It reuses `hash`, so it
+        let (seg_idx, probe) = loop {
+            let seg_idx = self.directory[dir_idx];
+            match self
+                .segments
+                .get_mut(seg_idx)
+                .probe_for_upsert(h2_val, key.bytes(), ba, bb)
+            {
+                UpsertProbe::Full => {
+                    self.split_segment(dir_idx);
+                    // The retry re-walks a segment. It reuses `hash`, so it
                     // is cheaper than a fresh lookup — but it is a segment
                     // walk, which is what the counter counts, and leaving it
                     // out would make `Database::set` (fused) and
                     // `DashTable::insert` (recursive, and therefore counted
                     // again) disagree under a split for no reason.
                     note_key_lookup();
-
                     // After split, the directory may have doubled and the key
                     // now routes to a different segment. Recompute.
-                    split_dir_idx = segment_index(hash, self.depth);
-                    let new_seg_idx = self.directory[split_dir_idx];
-                    let new_segment = self.segments.get_mut(new_seg_idx);
-
-                    match new_segment.insert_or_update_at(h2_val, key_lookup, ba, bb, update, make)
-                    {
-                        SegmentInsertOrUpdate::Inserted { slot } => {
-                            break (new_seg_idx, slot, true);
-                        }
-                        SegmentInsertOrUpdate::Updated { slot } => {
-                            break (new_seg_idx, slot, false);
-                        }
-                        SegmentInsertOrUpdate::NeedsSplit { update: u, make: m } => {
-                            update = u;
-                            make = m;
-                        }
-                    }
-                };
-                if inserted {
-                    self.len += 1;
-                    // SAFETY: just-inserted (mirrors find at segment.rs:277).
-                    InsertOrUpdate::Inserted(unsafe {
-                        self.segments.get_mut(final_seg_idx).value_mut(slot)
-                    })
-                } else {
-                    // SAFETY: matched-and-updated (mirrors find at segment.rs:277).
-                    InsertOrUpdate::Updated(unsafe {
-                        self.segments.get_mut(final_seg_idx).value_mut(slot)
-                    })
+                    dir_idx = segment_index(hash, self.depth);
                 }
+                found_or_vacant => break (seg_idx, found_or_vacant),
             }
+        };
+
+        let segment = self.segments.get_mut(seg_idx);
+        match probe {
+            UpsertProbe::Found(slot) => {
+                // SAFETY: `probe_for_upsert` answers `Found` only for a FULL slot
+                // (ctrl byte matched H2, key compared equal), so its value is
+                // initialized; nothing has touched the segment since the probe.
+                let existing = unsafe { segment.value_mut(slot) };
+                update(&mut *existing);
+                InsertOrUpdate::Updated(existing)
+            }
+            UpsertProbe::Vacant(slot) => {
+                let value =
+                    segment.write_vacant(slot, h2_val, key.into_key(), make_value(), ba, bb);
+                self.len += 1;
+                InsertOrUpdate::Inserted(value)
+            }
+            UpsertProbe::Full => unreachable!("the probe loop only exits on Found or Vacant"),
         }
     }
 
@@ -634,6 +695,36 @@ impl<V> DashTable<CompactKey, V> {
                 self.len -= 1;
                 v
             })
+    }
+
+    /// Remove `key` only if `pred(&value)` agrees, in ONE probe (moon#1189:
+    /// the expiry sweep's "remove it if it is still the expired incarnation"
+    /// used to cost a `get` and then a `remove`, i.e. two hashes and two
+    /// segment walks per expired key).
+    pub fn remove_if(&mut self, key: &[u8], pred: impl FnOnce(&V) -> bool) -> RemoveIf<V> {
+        note_key_lookup();
+        let hash = hash_key(key);
+        let dir_idx = segment_index(hash, self.depth);
+        let seg_idx = self.directory[dir_idx];
+
+        // Prefetch segment data while computing home bucket
+        prefetch_segment(self.segments.get(seg_idx));
+
+        let h2_val = h2(hash);
+        let (ba, bb) = home_buckets(hash);
+
+        match self
+            .segments
+            .get_mut(seg_idx)
+            .remove_if(h2_val, key, ba, bb, pred)
+        {
+            RemoveIf::Removed((_k, v)) => {
+                self.len -= 1;
+                RemoveIf::Removed(v)
+            }
+            RemoveIf::Kept => RemoveIf::Kept,
+            RemoveIf::Absent => RemoveIf::Absent,
+        }
     }
 
     /// Remove a key and return both key and value.
@@ -927,6 +1018,91 @@ mod tests {
         );
     }
 
+    /// moon#1159: the H2 fingerprint must carry bits the directory does not.
+    ///
+    /// Every key in a segment of local depth `d` shares its top `d` hash bits
+    /// (that is what routes it there). Keys that share the top 10 bits are
+    /// therefore exactly the population of one depth-10 segment, and their
+    /// fingerprints are what `match_h2` has to tell apart. With H2 taken from
+    /// the top 7 bits they all carried ONE value; from bits 32..=38 they spread
+    /// over (almost) all 128.
+    #[test]
+    fn h2_fingerprint_is_independent_of_the_directory_bits() {
+        const PREFIX_BITS: u32 = 10;
+        const WANT: usize = 300;
+        let target = hash_key(b"h2prefix:0") >> (64 - PREFIX_BITS);
+        let mut fingerprints = std::collections::HashSet::new();
+        let mut matched = 0usize;
+        let mut i = 0u64;
+        while matched < WANT {
+            let k = format!("h2prefix:{i}");
+            let hash = hash_key(k.as_bytes());
+            if hash >> (64 - PREFIX_BITS) == target {
+                fingerprints.insert(segment::h2(hash));
+                matched += 1;
+            }
+            i += 1;
+        }
+        // 300 draws from 128 buckets leave ~116 distinct on average; 90 is a
+        // generous floor that still fails loudly for a top-bit fingerprint
+        // (which yields exactly 1).
+        assert!(
+            fingerprints.len() >= 90,
+            "{WANT} keys sharing the top {PREFIX_BITS} hash bits (one depth-{PREFIX_BITS} \
+             segment's worth) produced only {} distinct H2 fingerprints — H2 overlaps the \
+             directory bits and the SIMD filter cannot separate keys inside a segment \
+             (moon#1159)",
+            fingerprints.len()
+        );
+    }
+
+    /// moon#1159: the deterministic gate for the fingerprint's EFFECT — how
+    /// many full key compares a probe pays.
+    ///
+    /// A 100K-key table sits at directory depth ~12, deep enough that a
+    /// fingerprint drawn from the directory bits is constant within every
+    /// segment. On HEAD `935c555` this measured ~6-8 compares per hit and
+    /// ~20+ per miss; a working 7-bit fingerprint needs ~1 per hit (the key
+    /// itself plus a 1/128 false-positive rate over the ~10 FULL slots ahead
+    /// of it) and ~0.2 per miss.
+    #[test]
+    fn h2_fingerprint_keeps_key_compares_near_one_per_hit() {
+        const N: u32 = 100_000;
+        let mut table: DashTable<CompactKey, u32> = DashTable::new();
+        for i in 0..N {
+            table.insert(CompactKey::from(format!("key:{i:08}")), i);
+        }
+        assert!(
+            table.directory_depth() >= 10,
+            "fixture must be deep enough for a top-bit fingerprint to collapse, got depth {}",
+            table.directory_depth()
+        );
+
+        let _ = segment::take_key_compares();
+        for i in 0..N {
+            assert_eq!(table.get(format!("key:{i:08}").as_bytes()), Some(&i));
+        }
+        let hit_compares = segment::take_key_compares();
+        for i in 0..N {
+            assert!(table.get(format!("miss:{i:08}").as_bytes()).is_none());
+        }
+        let miss_compares = segment::take_key_compares();
+
+        let per_hit = hit_compares as f64 / f64::from(N);
+        let per_miss = miss_compares as f64 / f64::from(N);
+        eprintln!("moon#1159 key compares: per_hit={per_hit:.4} per_miss={per_miss:.4}");
+        assert!(
+            per_hit <= 1.15,
+            "mean key compares per HIT = {per_hit:.3} on a {N}-key table (want ~1.05); \
+             the H2 fingerprint is not filtering (moon#1159)"
+        );
+        assert!(
+            per_miss <= 0.5,
+            "mean key compares per MISS = {per_miss:.3} on a {N}-key table (want ~0.2); \
+             the H2 fingerprint is not filtering (moon#1159)"
+        );
+    }
+
     fn test_value(n: u32) -> String {
         format!("value_{}", n)
     }
@@ -986,6 +1162,69 @@ mod tests {
             128,
             "--initial-keyspace-hint: with_capacity adds a depth level, halving fill"
         );
+    }
+
+    /// moon#1159 follow-up: an upsert keyed by a slice stores an owned key
+    /// ONLY when the key is new. `Database::set` used to build a
+    /// `CompactKey` per call, i.e. a heap block per overwrite of any key
+    /// longer than 23 bytes, dropped again as soon as the probe hit.
+    #[test]
+    fn insert_or_update_slice_builds_the_key_only_on_a_miss() {
+        let long: &[u8] = b"a-key-that-is-definitely-longer-than-23-bytes";
+        let mut t: DashTable<CompactKey, u32> = DashTable::new();
+        let _ = take_upsert_key_builds();
+        match t.insert_or_update_slice(long, |_| panic!("fresh key updated"), || 1) {
+            InsertOrUpdate::Inserted(v) => assert_eq!(*v, 1),
+            InsertOrUpdate::Updated(_) => panic!("fresh key reported Updated"),
+        }
+        assert_eq!(take_upsert_key_builds(), 1, "a miss stores exactly one key");
+        for i in 0..100u32 {
+            match t.insert_or_update_slice(long, |v| *v += 1, || unreachable!("hit ran make")) {
+                InsertOrUpdate::Updated(v) => assert_eq!(*v, i + 2),
+                InsertOrUpdate::Inserted(_) => panic!("existing key reported Inserted"),
+            }
+        }
+        assert_eq!(
+            take_upsert_key_builds(),
+            0,
+            "an overwrite built (and dropped) an owned key"
+        );
+        assert_eq!(t.get(long), Some(&101));
+        assert_eq!(t.len(), 1);
+    }
+
+    /// Both upsert entry points, interleaved, across thousands of splits:
+    /// every key lands once, every overwrite hits, `len` stays exact.
+    #[test]
+    fn upsert_slice_and_owned_agree_across_splits() {
+        let mut t: DashTable<CompactKey, u64> = DashTable::new();
+        for i in 0..20_000u64 {
+            let k = format!("upsert-agree-key-with-some-length-{i}");
+            if i % 2 == 0 {
+                t.insert_or_update_slice(k.as_bytes(), |_| panic!("fresh"), || i);
+            } else {
+                t.insert_or_update(CompactKey::from(k.as_bytes()), |_| panic!("fresh"), || i);
+            }
+        }
+        assert_eq!(t.len(), 20_000);
+        for i in 0..20_000u64 {
+            let k = format!("upsert-agree-key-with-some-length-{i}");
+            let hit = if i % 2 == 1 {
+                t.insert_or_update_slice(k.as_bytes(), |v| *v += 1, || unreachable!())
+            } else {
+                t.insert_or_update(
+                    CompactKey::from(k.as_bytes()),
+                    |v| *v += 1,
+                    || unreachable!(),
+                )
+            };
+            assert!(matches!(hit, InsertOrUpdate::Updated(v) if *v == i + 1));
+        }
+        assert_eq!(t.len(), 20_000);
+        for i in 0..20_000u64 {
+            let k = format!("upsert-agree-key-with-some-length-{i}");
+            assert_eq!(t.get(k.as_bytes()), Some(&(i + 1)));
+        }
     }
 
     #[test]

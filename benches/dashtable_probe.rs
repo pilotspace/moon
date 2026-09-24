@@ -34,14 +34,26 @@ fn shuffled_indices(n: usize) -> Vec<usize> {
     order
 }
 
+/// Key shapes: 14-byte keys stay inline in `CompactKey` (<= 23 B); 40-byte
+/// keys live in a separate heap block, so every key compare a probe pays is a
+/// likely cache miss on top of the slot itself — the case moon#1159's H2
+/// fingerprint fix matters most for.
+fn make_key(shape: &str, prefix: &str, i: usize) -> Bytes {
+    match shape {
+        "k40" => Bytes::from(format!("{prefix}:{i:036}")),
+        _ => Bytes::from(format!("{prefix}:{i:010}")),
+    }
+}
+
 fn bench_probe(c: &mut Criterion) {
-    for &n in &[100_000usize, 1_000_000] {
-        let keys: Vec<Bytes> = (0..n)
-            .map(|i| Bytes::from(format!("key:{i:010}")))
-            .collect();
-        let miss_keys: Vec<Bytes> = (0..n)
-            .map(|i| Bytes::from(format!("nay:{i:010}")))
-            .collect();
+    for &(shape, n) in &[
+        ("k14", 100_000usize),
+        ("k14", 1_000_000),
+        ("k40", 100_000),
+        ("k40", 1_000_000),
+    ] {
+        let keys: Vec<Bytes> = (0..n).map(|i| make_key(shape, "key", i)).collect();
+        let miss_keys: Vec<Bytes> = (0..n).map(|i| make_key(shape, "nay", i)).collect();
 
         let mut table: DashTable<CompactKey, CompactEntry> = DashTable::new();
         for k in &keys {
@@ -57,7 +69,7 @@ fn bench_probe(c: &mut Criterion) {
         group.throughput(Throughput::Elements(1));
 
         let mut idx = 0usize;
-        group.bench_function(BenchmarkId::new("get_hit", n), |b| {
+        group.bench_function(BenchmarkId::new(format!("get_hit/{shape}"), n), |b| {
             b.iter(|| {
                 idx += 1;
                 if idx == n {
@@ -79,7 +91,7 @@ fn bench_probe(c: &mut Criterion) {
         });
 
         let mut midx = 0usize;
-        group.bench_function(BenchmarkId::new("get_miss", n), |b| {
+        group.bench_function(BenchmarkId::new(format!("get_miss/{shape}"), n), |b| {
             b.iter(|| {
                 midx += 1;
                 if midx == n {

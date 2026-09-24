@@ -32,6 +32,7 @@
 //! segment. See `tests/graph_restart_id_aliasing.rs` and
 //! `tests/crash_recovery_graph_durability.rs` for the regression coverage.
 
+use std::ops::ControlFlow;
 use std::sync::Arc;
 
 use roaring::RoaringBitmap;
@@ -159,6 +160,31 @@ impl<'a> MergedNodeView<'a> {
         valid_at: Option<i64>,
         mut f: impl FnMut(NodeKey),
     ) {
+        let _ = self.try_for_each_visible_node(
+            label,
+            snapshot_lsn,
+            my_txn_id,
+            committed,
+            valid_at,
+            |key| -> ControlFlow<()> {
+                f(key);
+                ControlFlow::Continue(())
+            },
+        );
+    }
+
+    /// [`Self::for_each_visible_node`] that stops as soon as `f` breaks —
+    /// same keys, same order, up to the break. Lets a `LIMIT`ed scan stop
+    /// after the rows it needs instead of walking the whole label (moon#1197).
+    pub fn try_for_each_visible_node<B>(
+        &self,
+        label: Option<u16>,
+        snapshot_lsn: u64,
+        my_txn_id: u64,
+        committed: &RoaringBitmap,
+        valid_at: Option<i64>,
+        mut f: impl FnMut(NodeKey) -> ControlFlow<B>,
+    ) -> ControlFlow<B> {
         for (key, node) in self.memgraph.iter_nodes() {
             if let Some(lid) = label {
                 if !node.labels.contains(&lid) {
@@ -168,7 +194,9 @@ impl<'a> MergedNodeView<'a> {
             if !is_node_visible(node, snapshot_lsn, my_txn_id, committed, valid_at) {
                 continue;
             }
-            f(key);
+            if let ControlFlow::Break(b) = f(key) {
+                return ControlFlow::Break(b);
+            }
         }
         // Cross-segment dedup: a copy-up shadow that was later re-frozen
         // leaves the SAME key in two segments (stale row in the old one).
@@ -199,7 +227,9 @@ impl<'a> MergedNodeView<'a> {
                         if !emitted.insert(key) {
                             continue;
                         }
-                        f(key);
+                        if let ControlFlow::Break(b) = f(key) {
+                            return ControlFlow::Break(b);
+                        }
                     }
                 }
                 None => {
@@ -214,11 +244,14 @@ impl<'a> MergedNodeView<'a> {
                         if !emitted.insert(key) {
                             continue;
                         }
-                        f(key);
+                        if let ControlFlow::Break(b) = f(key) {
+                            return ControlFlow::Break(b);
+                        }
                     }
                 }
             }
         }
+        ControlFlow::Continue(())
     }
 }
 

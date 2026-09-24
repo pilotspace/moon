@@ -19,6 +19,57 @@ const GEO_LON_SUFFIX: &[u8] = b"__lon";
 /// heap -- it just loses the zero-allocation fast path.
 const GEO_SUBFIELD_INLINE_CAP: usize = 48;
 
+/// An owned key for `map`: the stored key's allocation when an equal key is
+/// already present (refcount bump), else a fresh exact-size copy — never the
+/// caller's slice, which may be a view into a shared RESP read buffer
+/// (moon#1194, see [`PayloadIndex::insert_tag`]).
+fn owned_key<V>(map: &HashMap<Bytes, V>, key: &Bytes) -> Bytes {
+    match map.get_key_value(key) {
+        Some((stored, _)) => stored.clone(),
+        None => Bytes::copy_from_slice(key),
+    }
+}
+
+/// Whether any TAG filter can ever select a document by this exact stored
+/// value (moon#1194).
+///
+/// The only producer of `FilterExpr::TagEq` is the FT.SEARCH filter parser
+/// (`command::vector_search::ft_search::parse`): a `@field:{...}` value that
+/// contains a space becomes a full-text `TextMatch` instead, and the parsed
+/// value is UTF-8. So a stored value containing `b' '`, or one that is not
+/// valid UTF-8, is unreachable through the tag index — indexing it (one
+/// inverted-map entry keyed by the whole value plus a forward-map entry per
+/// document; ~2 KB+ for a RAG `content` field) only cost memory. Skipping it
+/// changes no query result. Full-text matching of such values is untouched
+/// (it goes through the text index).
+pub fn tag_value_is_matchable(value: &[u8]) -> bool {
+    !value.contains(&b' ') && std::str::from_utf8(value).is_ok()
+}
+
+/// Whether HASH string fields are ALSO indexed into the payload full-text
+/// index that serves `@field:{multi word}` (`TextMatch`) filters in vector
+/// KNN queries (moon#1194). Default on (unchanged behavior). The process-wide
+/// opt-out `MOON_VECTOR_PAYLOAD_TEXT=off` (also `0`/`none`) drops that
+/// index — typically the largest per-document cost of a RAG-shaped vector
+/// index — for deployments that never use `TextMatch` filters in vector
+/// queries (full-text search through FT.SEARCH's BM25 plane is unaffected);
+/// with it off, a `TextMatch` filter matches no document. Read once.
+pub fn payload_text_index_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        payload_text_flag(std::env::var("MOON_VECTOR_PAYLOAD_TEXT").ok().as_deref())
+    })
+}
+
+/// `MOON_VECTOR_PAYLOAD_TEXT` value → enabled? Unset or anything but an
+/// explicit off-switch keeps the HEAD behaviour (enabled).
+fn payload_text_flag(v: Option<&str>) -> bool {
+    !matches!(
+        v.map(str::trim).map(str::to_ascii_lowercase).as_deref(),
+        Some("off") | Some("0") | Some("none") | Some("false") | Some("no")
+    )
+}
+
 /// The values one document wrote to one field.
 ///
 /// `SmallVec<[_; 1]>` because the overwhelmingly common case is a document
@@ -72,13 +123,19 @@ impl PayloadIndex {
     }
 
     /// Insert a tag value for the given internal vector ID.
+    ///
+    /// Field names and values are stored as OWNED copies, interned per
+    /// index (moon#1194): the auto-index path hands in zero-copy slices of
+    /// the connection's RESP read buffer (`parse` → `split_to().freeze()` →
+    /// `slice()`), and storing such a slice — which the forward map did for
+    /// EVERY document — pinned that whole shared read-buffer allocation for
+    /// the document's lifetime. The forward entry now shares the inverted
+    /// map's key allocation instead of holding a second reference.
     pub fn insert_tag(&mut self, field: &Bytes, value: &Bytes, internal_id: u32) {
-        self.tag_indexes
-            .entry(field.clone())
-            .or_default()
-            .entry(value.clone())
-            .or_default()
-            .insert(internal_id);
+        let fk = owned_key(&self.tag_indexes, field);
+        let values = self.tag_indexes.entry(fk.clone()).or_default();
+        let vk = owned_key(values, value);
+        values.entry(vk.clone()).or_default().insert(internal_id);
         // Forward index (moon#614). Deduped: re-inserting the same value for
         // the same document is idempotent in the bitmap, so it must be
         // idempotent here too or the retire list grows without bound.
@@ -86,17 +143,19 @@ impl PayloadIndex {
             .doc_values
             .entry(internal_id)
             .or_default()
-            .entry(field.clone())
+            .entry(fk)
             .or_default();
         if !slot.tags.contains(value) {
-            slot.tags.push(value.clone());
+            slot.tags.push(vk);
         }
     }
 
-    /// Insert a numeric value for the given internal vector ID.
+    /// Insert a numeric value for the given internal vector ID. Field names
+    /// are owned + interned (see [`Self::insert_tag`]).
     pub fn insert_numeric(&mut self, field: &Bytes, value: f64, internal_id: u32) {
+        let fk = owned_key(&self.numeric_indexes, field);
         self.numeric_indexes
-            .entry(field.clone())
+            .entry(fk.clone())
             .or_default()
             .entry(OrderedFloat(value))
             .or_default()
@@ -108,7 +167,7 @@ impl PayloadIndex {
             .doc_values
             .entry(internal_id)
             .or_default()
-            .entry(field.clone())
+            .entry(fk)
             .or_default();
         let v = OrderedFloat(value);
         if !slot.numerics.contains(&v) {
@@ -526,6 +585,124 @@ fn haversine_km(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// moon#1194 red test: the auto-index path passes zero-copy slices of the
+    /// connection's RESP read buffer. HEAD stored `field.clone()` /
+    /// `value.clone()` (for EVERY document in the forward map), pinning the
+    /// whole shared buffer allocation; every stored key must now be an owned
+    /// copy that does not point into the caller's buffer.
+    #[test]
+    fn stored_keys_do_not_pin_the_callers_buffer() {
+        let mut idx = PayloadIndex::new();
+        let buf = Bytes::from(vec![b'x'; 1 << 20]); // stands in for a read buffer
+        let mut frame = Vec::new();
+        frame.extend_from_slice(b"categoryelectronicspricedeep");
+        let frame = {
+            let mut v = buf.to_vec();
+            v[..frame.len()].copy_from_slice(&frame);
+            Bytes::from(v)
+        };
+        let lo = frame.as_ptr() as usize;
+        let hi = lo + frame.len();
+        let inside = |b: &Bytes| (b.as_ptr() as usize) >= lo && (b.as_ptr() as usize) < hi;
+        for id in 0..3u32 {
+            idx.insert_tag(&frame.slice(0..8), &frame.slice(8..19), id);
+            idx.insert_numeric(&frame.slice(19..24), 10.0 + id as f64, id);
+        }
+        for (f, vals) in &idx.tag_indexes {
+            assert!(!inside(f), "tag field key pins the read buffer");
+            for v in vals.keys() {
+                assert!(!inside(v), "tag value key pins the read buffer");
+            }
+        }
+        for f in idx.numeric_indexes.keys() {
+            assert!(!inside(f), "numeric field key pins the read buffer");
+        }
+        for fields in idx.doc_values.values() {
+            for (f, dv) in fields {
+                assert!(!inside(f), "forward-map field key pins the read buffer");
+                for t in &dv.tags {
+                    assert!(!inside(t), "forward-map tag value pins the read buffer");
+                }
+            }
+        }
+        // Interned: the forward map shares the inverted map's allocation.
+        let stored = idx
+            .tag_indexes
+            .values()
+            .next()
+            .unwrap()
+            .keys()
+            .next()
+            .unwrap()
+            .as_ptr();
+        for fields in idx.doc_values.values() {
+            for dv in fields.values() {
+                for t in &dv.tags {
+                    assert_eq!(t.as_ptr(), stored);
+                }
+            }
+        }
+        // Behaviour unchanged.
+        let bm = idx.evaluate_bitmap(
+            &FilterExpr::TagEq {
+                field: Bytes::from_static(b"category"),
+                value: Bytes::from_static(b"electronics"),
+            },
+            3,
+        );
+        assert_eq!(bm.len(), 3);
+        idx.remove_field(&Bytes::from_static(b"category"), 1);
+        assert_eq!(
+            idx.evaluate_bitmap(
+                &FilterExpr::TagEq {
+                    field: Bytes::from_static(b"category"),
+                    value: Bytes::from_static(b"electronics"),
+                },
+                3,
+            )
+            .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn payload_text_flag_defaults_on() {
+        assert!(payload_text_flag(None));
+        assert!(payload_text_flag(Some("on")));
+        assert!(payload_text_flag(Some("")));
+        for off in ["off", "OFF", "0", "none", "false", " no "] {
+            assert!(!payload_text_flag(Some(off)), "{off}");
+        }
+    }
+
+    /// moon#1194: values skipped by `tag_value_is_matchable` are exactly the
+    /// ones the FT.SEARCH filter parser can never turn into a `TagEq` — a
+    /// `{...}` value with a space parses as `TextMatch`. Guards the
+    /// invariant against a future parser change.
+    #[test]
+    fn unmatchable_tag_values_are_unreachable_through_the_parser() {
+        use crate::command::vector_search::ft_search::parse::{FilterParse, parse_inline_filter};
+        assert!(tag_value_is_matchable(b"electronics"));
+        assert!(tag_value_is_matchable(b"https://example.com/a?b=c"));
+        assert!(!tag_value_is_matchable(b"two words"));
+        assert!(!tag_value_is_matchable(&[0xff, 0xfe, b'a']));
+        for q in [
+            &b"@content:{some long prose value}=>[KNN 3 @vec $q]"[..],
+            &b"@content:{a b}=>[KNN 3 @vec $q]"[..],
+        ] {
+            match parse_inline_filter(q) {
+                FilterParse::Parsed(FilterExpr::TextMatch { .. }) => {}
+                other => panic!("space-containing tag query must be TextMatch, got {other:?}"),
+            }
+        }
+        match parse_inline_filter(b"@content:{oneword}=>[KNN 3 @vec $q]") {
+            FilterParse::Parsed(FilterExpr::TagEq { value, .. }) => {
+                assert!(tag_value_is_matchable(&value));
+            }
+            other => panic!("expected TagEq, got {other:?}"),
+        }
+    }
 
     /// Cost of retiring documents, as a field's DISTINCT-VALUE COUNT grows.
     ///

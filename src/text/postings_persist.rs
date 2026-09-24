@@ -57,6 +57,21 @@ const TRAILER_LEN: usize = 8;
 /// Refuse files whose header claims more than this; the decoder never
 /// allocates on the claim, but the read itself should not be unbounded.
 pub const MAX_FILE_LEN: u64 = 16 << 30;
+/// Ids a file may leave unused beyond one per document (see [`doc_ids_dense_enough`]).
+pub const DOC_ID_SLACK: u64 = 65_536;
+
+/// `true` when `next_doc_id` (one past every id in the file) is at most `2 × doc_count +`
+/// [`DOC_ID_SLACK`]. `TextIndex::install_recovered` gives every per-document column one slot per
+/// id up to the highest one, so a sparse file would make a few bytes allocate by a claimed id — a
+/// 107-byte file naming doc 2,000,000 billed 72 MB, one near `u32::MAX` aborts every boot (moon#1221
+/// review). A live index reuses freed ids, so its files stay dense; one that is not (written before
+/// that, or after a mass removal the index never re-filled) is refused and REBUILT, which numbers
+/// the documents densely again. Install is therefore O(file size): ≤ 2 slots per document plus a
+/// fixed 64 Ki-slot allowance.
+#[must_use]
+pub fn doc_ids_dense_enough(next_doc_id: u32, doc_count: usize) -> bool {
+    u64::from(next_doc_id) <= (doc_count as u64).saturating_mul(2) + DOC_ID_SLACK
+}
 
 /// Why a `.tpost` file was refused. Every variant means "rebuild this
 /// index" — the caller logs it and takes the pre-existing rescan path.
@@ -213,8 +228,8 @@ pub fn encode_index(idx: &TextIndex) -> Vec<u8> {
     w.u16(field_count as u16);
 
     // Docs, ascending doc_id.
-    let mut doc_ids: Vec<u32> = idx.doc_id_to_key.keys().copied().collect();
-    doc_ids.sort_unstable();
+    // Ascending by construction (dense column).
+    let doc_ids: Vec<u32> = idx.doc_id_to_key.keys().collect();
     w.u32(doc_ids.len() as u32);
     for &doc_id in &doc_ids {
         w.u32(doc_id);
@@ -232,12 +247,7 @@ pub fn encode_index(idx: &TextIndex) -> Vec<u8> {
         );
         w.u64(idx.doc_id_to_insert_lsn.get(&doc_id).copied().unwrap_or(0));
         for f in 0..field_count {
-            let len = idx
-                .doc_field_lengths
-                .get(&doc_id)
-                .and_then(|l| l.get(f).copied())
-                .unwrap_or(0);
-            w.u32(len);
+            w.u32(idx.doc_field_lengths.get(doc_id, f));
         }
     }
 
@@ -278,21 +288,19 @@ pub fn encode_index(idx: &TextIndex) -> Vec<u8> {
         w.u32(postings.len() as u32);
         for (term_id, list) in postings {
             w.u32(term_id);
-            let has_positions = list.positions.is_some();
-            w.u8(has_positions as u8);
+            w.u8(list.has_positions() as u8);
             w.u32(list.doc_ids.len() as u32);
             for d in &list.doc_ids {
                 w.u32(d);
             }
-            for &tf in &list.term_freqs {
+            for tf in list.tf_values() {
                 w.u32(tf);
             }
-            if let Some(pos) = &list.positions {
-                for p in pos {
-                    w.u32(p.len() as u32);
-                    for &v in p {
-                        w.u32(v);
-                    }
+            // Empty when positions are untracked.
+            for p in list.position_lists() {
+                w.u32(p.len() as u32);
+                for &v in p {
+                    w.u32(v);
                 }
             }
         }
@@ -301,28 +309,30 @@ pub fn encode_index(idx: &TextIndex) -> Vec<u8> {
     // TAG / NUMERIC per-doc entries, ascending doc_id.
     #[cfg(feature = "text-index")]
     {
-        let mut tag_docs: Vec<(&u32, &smallvec::SmallVec<[(Bytes, Bytes); 8]>)> =
-            idx.doc_tag_entries.iter().collect();
-        tag_docs.sort_unstable_by_key(|(d, _)| **d);
-        w.u32(tag_docs.len() as u32);
-        for (doc_id, entries) in tag_docs {
-            w.u32(*doc_id);
+        // Field names are written, not indices, so the format is unchanged
+        // (moon#1194 stores `(field index, value)` in memory).
+        w.u32(idx.doc_tag_entries.len() as u32);
+        for (doc_id, entries) in idx.doc_tag_entries.iter() {
+            w.u32(doc_id);
             w.u16(entries.len() as u16);
-            for (field, value) in entries.iter() {
+            for (fi, value) in entries {
+                let field = idx
+                    .tag_fields
+                    .get(*fi as usize)
+                    .map_or(&[][..], |t| t.field_name.as_ref());
                 w.bytes32(field);
                 w.bytes32(value);
             }
         }
-        let mut num_docs: Vec<(
-            &u32,
-            &smallvec::SmallVec<[(Bytes, ordered_float::OrderedFloat<f64>); 4]>,
-        )> = idx.doc_numeric_entries.iter().collect();
-        num_docs.sort_unstable_by_key(|(d, _)| **d);
-        w.u32(num_docs.len() as u32);
-        for (doc_id, entries) in num_docs {
-            w.u32(*doc_id);
+        w.u32(idx.doc_numeric_entries.len() as u32);
+        for (doc_id, entries) in idx.doc_numeric_entries.iter() {
+            w.u32(doc_id);
             w.u16(entries.len() as u16);
-            for (field, value) in entries.iter() {
+            for (fi, value) in entries {
+                let field = idx
+                    .numeric_fields
+                    .get(*fi as usize)
+                    .map_or(&[][..], |n| n.field_name.as_ref());
                 w.bytes32(field);
                 w.u64(value.0.to_bits());
             }
@@ -483,6 +493,10 @@ pub fn decode(data: &[u8]) -> Result<PersistedTextIndex, PostingsDecodeError> {
             insert_lsn,
             field_lengths,
         });
+    }
+    // Every doc id is below `next_doc_id`, so this bounds the highest one too.
+    if !doc_ids_dense_enough(next_doc_id, doc_count) {
+        return Err(PostingsDecodeError::Invalid("doc ids too sparse"));
     }
 
     // Fields.
@@ -866,6 +880,152 @@ mod tests {
         TextIndex::from_meta(&meta)
     }
 
+    /// moon#1221 review (refs moon#1194): FT.INVALIDATE_RANGE-style hard deletes followed by a
+    /// re-index of the same keys (the Lunaris force-push cycle). Each re-index used to take a FRESH
+    /// doc id while the dense columns kept a slot for every id ever handed out: a ZERO-document
+    /// index grew 278,949 → 4,456,869 B over 12 cycles, and a 1-doc index reloaded from the
+    /// 168-byte `.tpost` billed 2,496,427 B. Freed ids are reused now and an emptied index cuts its
+    /// columns back, so every cycle ends in the same state and the reloaded index is tiny.
+    #[cfg(feature = "text-index")]
+    #[test]
+    fn invalidate_reindex_cycles_keep_columns_bounded_across_restart() {
+        use crate::text::types::TagFieldDef;
+        let mut idx = TextIndex::new_with_schema(
+            Bytes::from_static(b"churn"),
+            vec![Bytes::from_static(b"c:")],
+            vec![TextFieldDef::new(Bytes::from_static(b"body"))],
+            vec![TagFieldDef::new(Bytes::from_static(b"node"))],
+            vec![],
+            BM25Config::default(),
+        );
+        const N: usize = 4_000;
+        let mut billed = Vec::new();
+        let mut peak = 0;
+        for cycle in 0..12u64 {
+            for i in 0..N {
+                let key = format!("c:{i}");
+                let kh = xxhash_rust::xxh64::xxh64(key.as_bytes(), 0);
+                let args = frames(&[("body", "alpha beta"), ("node", "n1")]);
+                idx.index_document_with_lsn(
+                    kh,
+                    key.as_bytes(),
+                    &args,
+                    1 + cycle * N as u64 + i as u64,
+                );
+                idx.tag_index_document(kh, key.as_bytes(), &args);
+                idx.record_content_checksum(kh, &args);
+            }
+            assert_eq!(idx.next_doc_id(), N as u32, "cycle {cycle}: ids reused");
+            peak = peak.max(idx.resident_bytes());
+            let ids: Vec<u32> = idx.doc_id_to_key.keys().collect();
+            for id in ids {
+                idx.remove_doc_by_doc_id(id);
+            }
+            assert_eq!(idx.doc_id_to_key.len(), 0);
+            assert_eq!(idx.next_doc_id(), 0);
+            billed.push(idx.resident_bytes());
+            assert_eq!(
+                idx.doc_id_to_key.footprint() + idx.doc_field_lengths.footprint(),
+                0,
+                "cycle {cycle}: an empty index holds no column slots"
+            );
+        }
+        assert!(
+            billed.iter().all(|&b| b == billed[0]),
+            "a 0-document index must end every cycle in the same state: {billed:?}"
+        );
+        assert!(billed[0] * 50 < peak, "{} vs peak {peak}", billed[0]);
+        let kh = xxhash_rust::xxh64::xxh64(b"c:survivor", 0);
+        let args = frames(&[("body", "alpha"), ("node", "n1")]);
+        idx.index_document_with_lsn(kh, b"c:survivor", &args, 999_999);
+        idx.record_content_checksum(kh, &args);
+        assert_eq!(idx.key_hash_to_doc_id[&kh], 0);
+        let bytes = encode_index(&idx);
+        let mut loaded = empty_like(&idx);
+        loaded
+            .install_recovered(decode(&bytes).expect("decode"))
+            .expect("install");
+        assert_eq!(loaded.next_doc_id(), 1);
+        eprintln!(
+            "moon#1221 churn: {N}-doc peak bills {peak} B; 0 docs after every cycle {} B; \
+             1-doc index reloaded from a {} B .tpost bills {} B",
+            billed[0],
+            bytes.len(),
+            loaded.resident_bytes()
+        );
+        assert!(
+            loaded.resident_bytes() < 2_048,
+            "a 1-doc index reloaded from a {} B .tpost bills {} B",
+            bytes.len(),
+            loaded.resident_bytes()
+        );
+    }
+
+    /// moon#1221 review: a structurally valid, checksummed `.tpost` holding ONE document with a
+    /// large id made `install_recovered` size every per-document column by that id — a 107-byte
+    /// file billed 72,000,099 B, and an id near `u32::MAX` would abort every boot. The density
+    /// guard (`doc_ids_dense_enough`) refuses such a file in `decode` (→ rebuild) and again in
+    /// `install_recovered`, so install allocates O(doc count + 64 Ki slots), never O(a claimed id).
+    #[test]
+    fn sparse_doc_id_tpost_is_refused_before_install_allocates() {
+        let mut live = TextIndex::new(
+            Bytes::from_static(b"h"),
+            vec![Bytes::from_static(b"h:")],
+            vec![TextFieldDef::new(Bytes::from_static(b"body"))],
+            BM25Config::default(),
+        );
+        let kh = xxhash_rust::xxh64::xxh64(b"h:1", 0);
+        live.index_document(kh, b"h:1", &frames(&[("body", "")]));
+        let good = encode_index(&live);
+        let at_next = HEADER_LEN + 4 + live.name.len() + 1;
+        let at_doc = at_next + 4 + 2 + 4;
+        assert_eq!(&good[at_next..at_next + 4], &1u32.to_le_bytes());
+        assert_eq!(&good[at_doc..at_doc + 4], &0u32.to_le_bytes());
+        // The one document at `id`, `next_doc_id = id + 1`, trailer re-stamped.
+        let forge = |id: u32| {
+            let mut bytes = good.clone();
+            bytes[at_next..at_next + 4].copy_from_slice(&id.saturating_add(1).to_le_bytes());
+            bytes[at_doc..at_doc + 4].copy_from_slice(&id.to_le_bytes());
+            restamp(bytes)
+        };
+        // 1 doc: ids up to 2 × 1 + 65,536 − 1 = 65,537 are within the guard.
+        let limit = 2 + DOC_ID_SLACK as u32 - 1;
+        for id in [limit + 1, 2_000_000, u32::MAX - 1] {
+            assert_eq!(
+                decode(&forge(id)).err(),
+                Some(PostingsDecodeError::Invalid("doc ids too sparse")),
+                "doc id {id}"
+            );
+        }
+        // At the limit the file is accepted: the allowance is bounded, and the ids below the
+        // document are free — the next new document takes id 0.
+        let mut loaded = empty_like(&live);
+        loaded
+            .install_recovered(decode(&forge(limit)).expect("within the guard"))
+            .expect("install");
+        let slot = std::mem::size_of::<Option<Bytes>>() + 4;
+        assert!(
+            loaded.resident_bytes() < 2 * (limit as usize + 1) * slot,
+            "{} B",
+            loaded.resident_bytes()
+        );
+        assert_eq!(loaded.next_doc_id(), limit + 1);
+        assert_eq!(loaded.free_doc_ids().len(), u64::from(limit));
+        let kh2 = xxhash_rust::xxh64::xxh64(b"h:2", 0);
+        loaded.index_document(kh2, b"h:2", &frames(&[("body", "x")]));
+        assert_eq!(loaded.key_hash_to_doc_id[&kh2], 0);
+
+        // A hand-built `PersistedTextIndex` that skipped `decode` is refused by install itself,
+        // and leaves the target untouched.
+        let mut p = decode(&good).expect("decode");
+        p.docs[0].doc_id = 2_000_000;
+        p.next_doc_id = 2_000_001;
+        let mut target = empty_like(&live);
+        assert_eq!(target.install_recovered(p), Err("doc ids too sparse"));
+        assert_eq!((target.num_docs(), target.next_doc_id()), (0, 0));
+        assert_eq!(target.resident_bytes(), empty_like(&live).resident_bytes());
+    }
+
     fn hits(idx: &TextIndex, field: usize, terms: &[&str]) -> Vec<(Bytes, f32)> {
         let q: Vec<String> = terms.iter().map(|t| (*t).to_owned()).collect();
         let mut v: Vec<(Bytes, f32)> = idx
@@ -947,6 +1107,91 @@ mod tests {
         // and it re-encodes to the very same bytes
         assert_eq!(encode_index(&loaded), bytes);
     }
+
+    /// moon#1195: postings longer than the flat threshold live in chunked
+    /// columns. Their `.tpost` encoding is the same flat rank-order stream, a
+    /// decode rebuilds the same columns, and the installed index answers — and
+    /// re-encodes — identically, including after upserts of OLD documents
+    /// (mid-posting re-inserts) and deletions.
+    #[cfg(feature = "text-index")]
+    #[test]
+    fn chunked_postings_round_trip_through_tpost() {
+        let mut live = TextIndex::new(
+            Bytes::from_static(b"big"),
+            vec![Bytes::from_static(b"b:")],
+            vec![TextFieldDef::new(Bytes::from_static(b"body"))],
+            BM25Config::default(),
+        );
+        let words = ["alpha", "bravo", "charlie", "delta", "echo", "foxtrot"];
+        let body = |i: usize| {
+            // Distinct, asymmetric tfs: "alpha" i%4+1 times, the rest by stride.
+            let mut s = String::new();
+            for _ in 0..=(i % 4) {
+                s.push_str("alpha ");
+            }
+            for (w, word) in words.iter().enumerate().skip(1) {
+                if i % (w + 1) == 0 {
+                    s.push_str(word);
+                    s.push(' ');
+                }
+            }
+            s
+        };
+        let index = |idx: &mut TextIndex, i: usize, text: &str| {
+            let key = format!("b:{i}");
+            let kh = xxhash_rust::xxh64::xxh64(key.as_bytes(), 0);
+            let args = frames(&[("body", text)]);
+            idx.index_document_with_lsn(kh, key.as_bytes(), &args, 1 + i as u64);
+            idx.record_content_checksum(kh, &args);
+        };
+        for i in 0..3_000 {
+            index(&mut live, i, &body(i));
+        }
+        // Upserts of old docs (rank re-inserts deep inside chunked postings).
+        for i in (0..600).step_by(7) {
+            index(&mut live, i, &body(i + 1));
+        }
+        for d in (5..3_000u32).step_by(11) {
+            live.remove_doc_by_doc_id(d);
+        }
+        assert!(
+            live.field_postings[0]
+                .iter()
+                .any(|(_, p)| p.doc_ids.len() as usize > FLAT_MAX_FOR_TESTS),
+            "the fixture must exercise chunked columns"
+        );
+        let bytes = encode_index(&live);
+        let mut loaded = empty_like(&live);
+        loaded
+            .install_recovered(decode(&bytes).expect("decode"))
+            .expect("install");
+        for terms in [
+            vec!["alpha"],
+            vec!["bravo"],
+            vec!["foxtrot"],
+            vec!["alpha", "charlie"],
+            vec!["delta", "echo"],
+        ] {
+            assert_eq!(
+                hits(&live, 0, &terms),
+                hits(&loaded, 0, &terms),
+                "{terms:?}"
+            );
+        }
+        for (term, p) in live.field_postings[0].iter() {
+            let q = loaded.field_postings[0].get_posting(term).expect("term");
+            assert_eq!(p.doc_ids, q.doc_ids);
+            assert_eq!(
+                p.tf_values().collect::<Vec<_>>(),
+                q.tf_values().collect::<Vec<_>>()
+            );
+            assert!(p.position_lists().eq(q.position_lists()));
+        }
+        assert_eq!(encode_index(&loaded), bytes, "re-encodes byte-identically");
+    }
+
+    /// Mirror of `posting::FLAT_MAX` (private there) for fixture sizing.
+    const FLAT_MAX_FOR_TESTS: usize = 256;
 
     #[cfg(feature = "text-index")]
     #[test]

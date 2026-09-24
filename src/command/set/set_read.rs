@@ -403,7 +403,13 @@ pub fn srandmember_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame
     if count > 0 {
         // O(n) in the COUNT requested, not in the size of the set.
         let n = std::cmp::min(count as usize, len);
-        let chosen: Vec<Frame> = rand::seq::index::sample(&mut rng, len, n)
+        let picks = rand::seq::index::sample(&mut rng, len, n);
+        // moon#1174 §2: `nth` on a listpack walks from the head, once PER
+        // pick; gather them all in one walk, in the order they were drawn.
+        if let crate::storage::db::SetRef::Listpack(lp) = &sref {
+            return Frame::Array(gather_listpack_members(lp, picks.into_iter()).into());
+        }
+        let chosen: Vec<Frame> = picks
             .into_iter()
             .filter_map(|i| sref.nth(i).map(Frame::BulkString))
             .collect();
@@ -416,6 +422,11 @@ pub fn srandmember_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame
         if n > crate::command::RAND_DUP_COUNT_MAX {
             return Frame::Error(Bytes::from_static(crate::command::ERR_RAND_COUNT_RANGE));
         }
+        // moon#1174 §2: same draws, same order, one walk of a listpack.
+        if let crate::storage::db::SetRef::Listpack(lp) = &sref {
+            let draws = (0..n).map(|_| rng.random_range(0..len));
+            return Frame::Array(gather_listpack_members(lp, draws).into());
+        }
         let mut result = Vec::with_capacity(n);
         for _ in 0..n {
             if let Some(m) = sref.nth(rng.random_range(0..len)) {
@@ -424,6 +435,29 @@ pub fn srandmember_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame
         }
         Frame::Array(result.into())
     }
+}
+
+/// The listpack members at `indices`, as bulk strings in the order the
+/// indices were DRAWN, gathered in one forward walk (moon#1174 §2).
+///
+/// `SetRef::nth` is O(idx) on a listpack -- a walk from the head -- so a
+/// SRANDMEMBER of `n` members cost `n` walks. The random draws are unchanged
+/// (and consumed in the same order), so the reply is exactly the one the
+/// per-pick loop produced; only the number of walks changes.
+fn gather_listpack_members(
+    lp: &crate::storage::listpack::Listpack,
+    indices: impl Iterator<Item = usize>,
+) -> Vec<Frame> {
+    let mut picks: Vec<(usize, usize)> = indices.enumerate().map(|(slot, i)| (i, slot)).collect();
+    let mut out: Vec<Frame> = Vec::with_capacity(picks.len());
+    out.resize(picks.len(), Frame::Null);
+    lp.for_each_at(&mut picks, |slot, member| {
+        out[slot] = Frame::BulkString(member.to_bytes())
+    });
+    // Every index was drawn below `len`, so every slot is filled; a hole would
+    // mean the listpack's header and its entries disagree.
+    debug_assert!(!out.iter().any(|f| matches!(f, Frame::Null)));
+    out
 }
 
 /// SSCAN (read-only).
@@ -573,4 +607,72 @@ pub fn sintercard_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame 
     }
 
     Frame::Integer(count as i64)
+}
+
+#[cfg(test)]
+mod srandmember_listpack_walk_1174 {
+    use super::*;
+    use crate::command::set::sadd;
+
+    fn bs(s: &[u8]) -> Frame {
+        Frame::BulkString(Bytes::copy_from_slice(s))
+    }
+
+    /// moon#1174 §2: SRANDMEMBER with a count on a listpack set walks the
+    /// listpack ONCE for all of its picks, positive count or negative.
+    #[test]
+    fn srandmember_count_on_a_listpack_walks_once() {
+        let mut db = Database::new();
+        let mut args = vec![bs(b"s")];
+        let members: Vec<Vec<u8>> = (0..100)
+            .map(|i| format!("member:{i:03}").into_bytes())
+            .collect();
+        args.extend(members.iter().map(|m| bs(m)));
+        sadd(&mut db, &args);
+        let enc = crate::command::key::object(&mut db, &[bs(b"ENCODING"), bs(b"s")]);
+        assert_eq!(
+            enc,
+            Frame::BulkString(Bytes::from_static(b"listpack")),
+            "fixture"
+        );
+        for count in [&b"100"[..], b"37", b"-250"] {
+            let mark = crate::storage::listpack::head_seeks();
+            let got = srandmember(&mut db, &[bs(b"s"), bs(count)]);
+            assert_eq!(
+                crate::storage::listpack::head_seeks() - mark,
+                0,
+                "SRANDMEMBER s {} walked the listpack from the head per pick",
+                String::from_utf8_lossy(count)
+            );
+            let Frame::Array(items) = got else {
+                panic!("expected an array")
+            };
+            let want = if count[0] == b'-' {
+                250
+            } else {
+                std::str::from_utf8(count).unwrap().parse().unwrap()
+            };
+            assert_eq!(items.len(), want);
+            let mut seen: Vec<Vec<u8>> = items
+                .iter()
+                .map(|f| match f {
+                    Frame::BulkString(b) => b.to_vec(),
+                    other => panic!("expected bulk, got {other:?}"),
+                })
+                .collect();
+            assert!(
+                seen.iter().all(|m| members.contains(m)),
+                "a non-member was returned"
+            );
+            if count[0] != b'-' {
+                seen.sort();
+                seen.dedup();
+                assert_eq!(
+                    seen.len(),
+                    want,
+                    "a positive count returns distinct members"
+                );
+            }
+        }
+    }
 }

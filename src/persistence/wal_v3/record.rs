@@ -304,6 +304,38 @@ pub fn read_wal_v3_record(data: &[u8]) -> Option<WalRecord> {
     })
 }
 
+/// The LSN of the record at the start of `data`, accepted exactly when
+/// [`read_wal_v3_record`] would accept it (length, CRC32C, record type, and —
+/// for an LZ4 record — a payload that decompresses), without copying the
+/// payload (moon#1181: a CDC reader skipping to its cursor validates every
+/// record it passes, as the full parse did, but allocates nothing).
+pub fn peek_wal_v3_record_lsn(data: &[u8]) -> Option<u64> {
+    if data.len() < MIN_RECORD_SIZE {
+        return None;
+    }
+    let record_len = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
+    if data.len() < record_len || record_len < MIN_RECORD_SIZE {
+        return None;
+    }
+    let crc_stored = u32::from_le_bytes([
+        data[record_len - 4],
+        data[record_len - 3],
+        data[record_len - 2],
+        data[record_len - 1],
+    ]);
+    if crc_stored != crc32c::crc32c(&data[4..record_len - 4]) {
+        return None;
+    }
+    WalRecordType::from_u8(data[12])?;
+    if data[13] & FLAG_LZ4_COMPRESSED != 0 {
+        // Rare (FPI): let the full parse decide whether it decompresses.
+        return read_wal_v3_record(data).map(|r| r.lsn);
+    }
+    Some(u64::from_le_bytes([
+        data[4], data[5], data[6], data[7], data[8], data[9], data[10], data[11],
+    ]))
+}
+
 /// Encode a TemporalUpsert WAL payload.
 ///
 /// Layout: `[key_len: u32 LE][key: bytes][valid_from: i64 LE][system_from: i64 LE][value_len: u32 LE][value: bytes]`

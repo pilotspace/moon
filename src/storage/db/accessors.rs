@@ -251,9 +251,37 @@ impl Database {
         key: &[u8],
         now_ms: u64,
     ) -> Result<Option<K::Ref<'_>>, Frame> {
+        self.ref_if_alive::<K, true>(key, now_ms)
+    }
+
+    /// [`Self::get_ref_if_alive`] WITHOUT recording an access (redis
+    /// `LOOKUP_NOTOUCH`), for a WRITE command's encoding probe: the write
+    /// accessor it routes to records the command's one access (moon#1221
+    /// review INTEG-5), and counting the probe too made every routed write
+    /// two accesses under LFU.
+    pub fn peek_ref_if_alive<K: ValueKind>(
+        &self,
+        key: &[u8],
+        now_ms: u64,
+    ) -> Result<Option<K::Ref<'_>>, Frame> {
+        self.ref_if_alive::<K, false>(key, now_ms)
+    }
+
+    #[inline]
+    fn ref_if_alive<K: ValueKind, const TOUCH: bool>(
+        &self,
+        key: &[u8],
+        now_ms: u64,
+    ) -> Result<Option<K::Ref<'_>>, Frame> {
         if let Some(entry) = self.data.get(key) {
             if entry.is_expired_at(now_ms) {
                 return Ok(None);
+            }
+            // moon#1161: a typed read (HGET, LRANGE, SMEMBERS, ZRANGE, …) is
+            // an access for the eviction policy — through `&self`, so the
+            // shared-guard read path records it too.
+            if TOUCH {
+                note_read(entry, now_ms);
             }
             return match K::classify_hot(entry.value.as_redis_value(), now_ms) {
                 Ok(r) => Ok(Some(r)),
@@ -277,6 +305,7 @@ impl Database {
     /// upgrades the kind's compact encoding(s) in place.
     pub fn get_or_create<K: OwnedKind>(&mut self, key: &[u8]) -> Result<K::Mut<'_>, Frame> {
         let now_ms = self.cached_now_ms;
+        let now_secs = self.cached_now;
         // moon#942: ONE lookup decides the whole preamble. What used to be a
         // `get` (expiry) + `contains_key` + `get_mut` is now `hot_state` +
         // `get_mut`; the create arm drops a second `contains_key` by reading
@@ -302,6 +331,12 @@ impl Database {
                 b"ERR internal: lookup failed after insert",
             )));
         };
+        // moon#1161: a write to an EXISTING key is an access (redis
+        // `lookupKeyWrite`); a key this call just fabricated is not — redis
+        // creates it with a fresh `LFU_INIT_VAL` counter.
+        if state == HotState::Live {
+            entry.note_access(crate::storage::eviction::access_tracking(), now_secs);
+        }
         // moon#788: a compact→full encoding upgrade changes the entry's real
         // size; charge the difference or the ledger silently desynchronises
         // from the keyspace. Disjoint field borrows: `entry` borrows
@@ -355,6 +390,7 @@ impl Database {
         key: &[u8],
     ) -> Result<Option<K::Mut<'_>>, Frame> {
         let now_ms = self.cached_now_ms;
+        let now_secs = self.cached_now;
         // moon#942: one lookup for the preamble, one to hand the entry out.
         let state = self.hot_state(key, now_ms);
         if state != HotState::Live {
@@ -363,6 +399,8 @@ impl Database {
         let Some(entry) = self.data.get_mut(key) else {
             return Ok(None);
         };
+        // moon#1161: a write (or pop) on a present key is an access.
+        entry.note_access(crate::storage::eviction::access_tracking(), now_secs);
         // moon#788: see `get_or_create` — the upgrade is a no-op on another
         // kind, so it is safe ahead of the type decision.
         let encoding_delta = K::upgrade(entry);
@@ -417,6 +455,7 @@ impl Database {
         key: &[u8],
     ) -> Result<Option<K::Shared<'_>>, Frame> {
         let now_ms = self.cached_now_ms;
+        let now_secs = self.cached_now;
         // moon#942: two lookups, not four. The old shape paid a `get` for
         // expiry, a `contains_key`, a `get_mut` to run the upgrade, and then
         // a FOURTH `get` purely to re-borrow the same entry immutably — the
@@ -428,6 +467,8 @@ impl Database {
         let Some(entry) = self.data.get_mut(key) else {
             return Ok(None);
         };
+        // moon#1161: an access for the eviction policy.
+        entry.note_access(crate::storage::eviction::access_tracking(), now_secs);
         // moon#788: a compact→full encoding upgrade changes the entry's real
         // size; charge the difference or the ledger silently desynchronises
         // from the keyspace. Disjoint field borrows: `entry` borrows
@@ -525,6 +566,7 @@ impl Database {
     #[allow(clippy::unwrap_used)]
     pub fn get_or_create_intset(&mut self, key: &[u8]) -> Result<Option<&mut Intset>, Frame> {
         let now_ms = self.cached_now_ms;
+        let now_secs = self.cached_now;
         // P0 fix: `settle_not_live` promotes a cold-spilled set before this
         // fabricates an empty intset — a promoted value always decodes as
         // `RedisValue::Set` (cold storage never persists the intset compact
@@ -548,6 +590,9 @@ impl Database {
             self.insert_fresh(key, Entry::new_set_intset());
         }
         let entry = self.data.get_mut(key).unwrap();
+        // moon#1221 review INTEG-5: this command's one access, on the arms
+        // that END the lookup — see `note_compact_write`.
+        let live = state == HotState::Live;
         // moon#926 — see `stamp_mutation`.
         // moon#940: a WRONGTYPE is a refused write, not a mutation. Classify
         // first — the reborrow ends with this `match`, so the stamp below is
@@ -557,9 +602,13 @@ impl Database {
             entry.value.as_redis_value_mut(),
             Some(RedisValue::SetIntset(_) | RedisValue::Set(_) | RedisValue::SetListpack(_))
         ) {
+            note_compact_write(entry, live, now_secs);
             return Err(Self::wrongtype_error());
         }
         stamp_mutation(entry);
+        if matches!(entry.value.as_redis_value(), RedisValueRef::SetIntset(_)) {
+            note_compact_write(entry, live, now_secs);
+        }
         match entry.value.as_redis_value_mut() {
             Some(RedisValue::SetIntset(is)) => Ok(Some(is)),
             Some(RedisValue::Set(_)) | Some(RedisValue::SetListpack(_)) => Ok(None),
@@ -608,6 +657,7 @@ impl Database {
         key: &[u8],
     ) -> Result<Option<&mut crate::storage::listpack::Listpack>, Frame> {
         let now_ms = self.cached_now_ms;
+        let now_secs = self.cached_now;
         // P0 fix: `settle_not_live` promotes a cold-spilled hash before this
         // fabricates an empty listpack — a promoted value always decodes as
         // `RedisValue::Hash` (cold storage never persists the listpack
@@ -630,6 +680,8 @@ impl Database {
             self.insert_fresh(key, Entry::new_hash_listpack());
         }
         let entry = self.data.get_mut(key).unwrap();
+        // moon#1221 review INTEG-5 — see `note_compact_write`.
+        let live = state == HotState::Live;
         // moon#926 — see `stamp_mutation`.
         // moon#940: a WRONGTYPE is a refused write, not a mutation. Classify
         // first — the reborrow ends with this `match`, so the stamp below is
@@ -641,9 +693,13 @@ impl Database {
                 RedisValue::HashListpack(_) | RedisValue::Hash(_) | RedisValue::HashWithTtl { .. },
             )
         ) {
+            note_compact_write(entry, live, now_secs);
             return Err(Self::wrongtype_error());
         }
         stamp_mutation(entry);
+        if matches!(entry.value.as_redis_value(), RedisValueRef::HashListpack(_)) {
+            note_compact_write(entry, live, now_secs);
+        }
         match entry.value.as_redis_value_mut() {
             Some(RedisValue::HashListpack(lp)) => Ok(Some(lp)),
             // Plain HashMap or TTL-extended hash: caller falls through to the
@@ -694,6 +750,7 @@ impl Database {
         key: &[u8],
     ) -> Result<Option<&mut crate::storage::listpack::Listpack>, Frame> {
         let now_ms = self.cached_now_ms;
+        let now_secs = self.cached_now;
         // P0 fix: `settle_not_live` promotes a cold-spilled list before this
         // fabricates an empty listpack — a promoted value always decodes as
         // `RedisValue::List` (cold storage never persists the listpack
@@ -716,6 +773,8 @@ impl Database {
             self.insert_fresh(key, Entry::new_list_listpack());
         }
         let entry = self.data.get_mut(key).unwrap();
+        // moon#1221 review INTEG-5 — see `note_compact_write`.
+        let live = state == HotState::Live;
         // moon#926 — see `stamp_mutation`.
         // moon#940: a WRONGTYPE is a refused write, not a mutation. Classify
         // first — the reborrow ends with this `match`, so the stamp below is
@@ -725,9 +784,13 @@ impl Database {
             entry.value.as_redis_value_mut(),
             Some(RedisValue::ListListpack(_) | RedisValue::List(_))
         ) {
+            note_compact_write(entry, live, now_secs);
             return Err(Self::wrongtype_error());
         }
         stamp_mutation(entry);
+        if matches!(entry.value.as_redis_value(), RedisValueRef::ListListpack(_)) {
+            note_compact_write(entry, live, now_secs);
+        }
         match entry.value.as_redis_value_mut() {
             Some(RedisValue::ListListpack(lp)) => Ok(Some(lp)),
             Some(RedisValue::List(_)) => Ok(None),
@@ -827,6 +890,7 @@ impl Database {
         absorb_intset: impl FnOnce(usize, usize) -> bool,
     ) -> Result<SetHandle<'_>, Frame> {
         let now_ms = self.cached_now_ms;
+        let now_secs = self.cached_now;
         // moon#942: ONE lookup decides the preamble. `settle_not_live` still
         // promotes a cold-spilled set before this fabricates an empty
         // listpack, so a promoted value — which cold storage always stores as
@@ -847,6 +911,10 @@ impl Database {
         // `data.get_mut(key)`, which is why this accessor cost one more probe
         // than its four siblings for a key that is not even an intset.
         let entry = self.data.get_mut(key).unwrap();
+        // moon#1221 review INTEG-5: every arm below ends the lookup (the
+        // `Full` handle is handed back, not re-fetched), so a live key's one
+        // access is recorded here — see `note_compact_write`.
+        note_compact_write(entry, state == HotState::Live, now_secs);
         let swing = absorb_intset_into_listpack(entry, absorb_intset);
         // Classify ONCE, on the handle already held, before deciding whether
         // the `SetKind::upgrade` below may run: `upgrade` flattens a
@@ -963,6 +1031,7 @@ impl Database {
         key: &[u8],
     ) -> Result<Option<&mut crate::storage::listpack::Listpack>, Frame> {
         let now_ms = self.cached_now_ms;
+        let now_secs = self.cached_now;
         // moon#942: ONE lookup decides the preamble. `settle_not_live` still
         // promotes a cold-spilled zset before this fabricates an empty
         // listpack, so a promoted value lands in the `Ok(None)` arm below
@@ -978,6 +1047,8 @@ impl Database {
             self.insert_fresh(key, Entry::new_sorted_set_listpack());
         }
         let entry = self.data.get_mut(key).unwrap();
+        // moon#1221 review INTEG-5 — see `note_compact_write`.
+        let live = state == HotState::Live;
         // moon#926 — see `stamp_mutation`.
         // moon#940: a WRONGTYPE is a refused write, not a mutation. Classify
         // first — the reborrow ends with this `match`, so the stamp below is
@@ -991,9 +1062,16 @@ impl Database {
                     | RedisValue::SortedSet { .. },
             )
         ) {
+            note_compact_write(entry, live, now_secs);
             return Err(Self::wrongtype_error());
         }
         stamp_mutation(entry);
+        if matches!(
+            entry.value.as_redis_value(),
+            RedisValueRef::SortedSetListpack(_)
+        ) {
+            note_compact_write(entry, live, now_secs);
+        }
         match entry.value.as_redis_value_mut() {
             Some(RedisValue::SortedSetListpack(lp)) => Ok(Some(lp)),
             Some(RedisValue::SortedSetBPTree { .. }) | Some(RedisValue::SortedSet { .. }) => {
@@ -1060,7 +1138,7 @@ impl Database {
     pub fn keys_with_expiry(&self) -> Vec<CompactKey> {
         // moon#541: read the deadline index (deadline order) instead of
         // scanning the whole data map — O(volatile) instead of O(N).
-        self.expiry_index.iter().map(|(_, k)| k.clone()).collect()
+        self.expiry_index.iter().map(|p| p.key.clone()).collect()
     }
 
     /// Check if a key exists and its expiry is in the past.
@@ -1075,8 +1153,11 @@ impl Database {
     }
 
     // ---- Read-only methods for RwLock read path ----
-    // These take `now_ms` as a parameter and do NOT mutate state:
-    // no expired-key removal, no LRU touch.
+    // These take `now_ms` as a parameter and do NOT mutate keyspace state:
+    // no expired-key removal, no promotion. The `get_*` forms DO record the
+    // access for the eviction policy (moon#1161) — through `&self`, via the
+    // entry's atomic metadata; the `peek_*` forms are redis's
+    // `LOOKUP_NOTOUCH` and record nothing.
 
     /// Read-only get: checks expiry, returns None if expired, but does NOT
     /// remove expired keys or touch LRU. Used with RwLock read path.
@@ -1086,7 +1167,21 @@ impl Database {
     /// from "no such key". Any command that would answer differently for a
     /// tiered key than for a missing one must use
     /// [`Self::get_if_alive_any_plane`] instead (moon#610).
+    ///
+    /// Records the read for the eviction policy (moon#1161); see
+    /// [`Self::peek_if_alive`] for the `LOOKUP_NOTOUCH` form.
+    #[inline]
     pub fn get_if_alive(&self, key: &[u8], now_ms: u64) -> Option<&Entry> {
+        let entry = self.peek_if_alive(key, now_ms)?;
+        note_read(entry, now_ms);
+        Some(entry)
+    }
+
+    /// [`Self::get_if_alive`] WITHOUT recording an access (redis
+    /// `LOOKUP_NOTOUCH`): for `KEYS`/`SCAN` membership checks, metadata
+    /// commands and internal probes, none of which may make a key look hot.
+    #[inline]
+    pub fn peek_if_alive(&self, key: &[u8], now_ms: u64) -> Option<&Entry> {
         let entry = self.data.get(key)?;
         if entry.is_expired_at(now_ms) {
             return None;
@@ -1116,7 +1211,21 @@ impl Database {
     /// WARNING: inherits [`Self::get_cold_value`]'s synchronous disk read on
     /// a cold hit. Callers on the shard event loop must have released any
     /// shard guard first — identical to the existing typed-access path.
+    ///
+    /// Records a hot read for the eviction policy (moon#1161); see
+    /// [`Self::peek_if_alive_any_plane`] for the `LOOKUP_NOTOUCH` form.
     pub fn get_if_alive_any_plane(&self, key: &[u8], now_ms: u64) -> Option<EntryView<'_>> {
+        let view = self.peek_if_alive_any_plane(key, now_ms)?;
+        if let EntryView::Hot(entry) = view {
+            note_read(entry, now_ms);
+        }
+        Some(view)
+    }
+
+    /// [`Self::get_if_alive_any_plane`] WITHOUT recording an access (redis
+    /// `LOOKUP_NOTOUCH`) — `OBJECT`, `TTL`, `TYPE`, `EXPIRETIME`, … read
+    /// metadata and must not refresh the very idle time they report.
+    pub fn peek_if_alive_any_plane(&self, key: &[u8], now_ms: u64) -> Option<EntryView<'_>> {
         if let Some(entry) = self.data.get(key) {
             if entry.is_expired_at(now_ms) {
                 return None;
@@ -1236,6 +1345,22 @@ impl Database {
         }
     }
 
+    /// `TOUCH` on the shared-guard read path (moon#1161): the answer of
+    /// [`Self::exists_if_alive`], plus an access recorded on a live hot
+    /// entry — see [`Self::touch_key`].
+    pub fn touch_key_if_alive(&self, key: &[u8], now_ms: u64) -> bool {
+        match self.data.get(key) {
+            Some(e) if !e.is_expired_at(now_ms) => {
+                e.note_access(
+                    crate::storage::db::kv_ops::touch_tracking(),
+                    secs_of(now_ms),
+                );
+                true
+            }
+            _ => self.cold_contains_alive(key, now_ms),
+        }
+    }
+
     // ---- Enum-based readonly accessors that handle compact encodings ----
 
     /// Read-only hash access via HashRef enum.
@@ -1273,6 +1398,16 @@ impl Database {
         self.get_ref_if_alive::<db_kind::ListKind>(key, now_ms)
     }
 
+    /// [`Self::get_list_ref_if_alive`] without recording an access — a list
+    /// WRITE's encoding probe (see [`Self::peek_ref_if_alive`]).
+    pub fn peek_list_ref_if_alive(
+        &self,
+        key: &[u8],
+        now_ms: u64,
+    ) -> Result<Option<ListRef<'_>>, Frame> {
+        self.peek_ref_if_alive::<db_kind::ListKind>(key, now_ms)
+    }
+
     /// Read-only set access via SetRef enum. Handles HashSet, Listpack, and Intset.
     ///
     /// See [`Self::get_hash_ref_if_alive`] for why this consults the cold
@@ -1284,6 +1419,16 @@ impl Database {
         now_ms: u64,
     ) -> Result<Option<SetRef<'_>>, Frame> {
         self.get_ref_if_alive::<db_kind::SetKind>(key, now_ms)
+    }
+
+    /// [`Self::get_set_ref_if_alive`] without recording an access — a set
+    /// WRITE's encoding probe (see [`Self::peek_ref_if_alive`]).
+    pub fn peek_set_ref_if_alive(
+        &self,
+        key: &[u8],
+        now_ms: u64,
+    ) -> Result<Option<SetRef<'_>>, Frame> {
+        self.peek_ref_if_alive::<db_kind::SetKind>(key, now_ms)
     }
 
     /// Read-only sorted set access via SortedSetRef enum. Handles BPTree, Listpack, and Legacy.
@@ -1499,5 +1644,40 @@ impl Database {
                 }
             }
         }
+    }
+}
+
+/// Epoch seconds of a shard-clock millisecond reading — the domain of
+/// `Entry::last_access`.
+#[inline]
+fn secs_of(now_ms: u64) -> u32 {
+    (now_ms / 1000) as u32
+}
+
+/// Record a compact-encoding WRITE accessor's lookup on `entry` for the
+/// eviction policy — redis `lookupKeyWrite` (moon#1221 review INTEG-5).
+///
+/// `live`: the key was live when the accessor looked (a key the accessor
+/// just fabricated is not an access; redis creates it at `LFU_INIT_VAL`).
+///
+/// Exactly once per command: the five compact accessors call this only on
+/// the arms that END the command's lookup — the compact handle they return,
+/// and a WRONGTYPE refusal (redis records the lookup before `checkType`).
+/// Their `Ok(None)` "already full, fall through" arms do NOT: the caller then
+/// takes `get_or_create` / `get_mut_if_present`, which records it.
+#[inline]
+fn note_compact_write(entry: &Entry, live: bool, now_secs: u32) {
+    if live {
+        entry.note_access(crate::storage::eviction::access_tracking(), now_secs);
+    }
+}
+
+/// Record a READ on `entry` for the eviction policy (moon#1161). One relaxed
+/// load and a branch when the policy tracks nothing.
+#[inline]
+fn note_read(entry: &Entry, now_ms: u64) {
+    let tracking = crate::storage::eviction::access_tracking();
+    if tracking != crate::storage::entry::AccessTracking::Off {
+        entry.note_access(tracking, secs_of(now_ms));
     }
 }

@@ -14,6 +14,7 @@ use crate::vector::segment::compaction::{
     CompactionError, HNSW_EF_CONSTRUCTION, HNSW_M, MERGE_MEMORY_CEILING, MergeMode,
 };
 use crate::vector::segment::immutable::{ImmutableSegment, MvccHeader};
+use crate::vector::segment::sub_signs::SubSignEncoder;
 use crate::vector::turbo_quant::collection::{CollectionMetadata, QuantizationConfig};
 use crate::vector::turbo_quant::sq8::{SQ8_PARAMS_BYTES, decode_sq8, sq8_params};
 
@@ -134,6 +135,23 @@ fn merge_graph_union(
     // sidecar would silently mix exact and ADC distances within one segment).
     let mut all_have_raw = true;
 
+    // moon#1193: every merged entry must carry real sub-centroid signs, or
+    // the merged segment carries none (all-or-nothing, like the sidecar). A
+    // source without signs (a pre-v2 reload, a LIGHT non-TQ4 build) has them
+    // recomputed from its f16 sidecar row instead of zero-filled (a zero row
+    // pins every coordinate to the lower sub-bin and biases its 32-level
+    // score). A quantizer without an encoder (SQ8, TQ1-3) gets NO buffer —
+    // not a zero placeholder that `segment_io` would persist as if real
+    // (moon#1221 review).
+    let mut sign_enc = if is_sq8 {
+        None
+    } else {
+        SubSignEncoder::new(collection).filter(|e| e.bytes_per_vec() == sub_bpv)
+    };
+    let signs_possible = sign_enc.is_some();
+    let mut all_have_signs = signs_possible;
+    let mut recomputed_signs = 0usize;
+
     for seg in segments {
         let tq_buf = seg.vectors_tq().as_slice();
         let headers = seg.mvcc_headers();
@@ -169,18 +187,30 @@ fn merge_graph_union(
                 Vec::new()
             };
 
-            // Sub-centroid sign bytes.
-            let sub_bytes = seg.sub_centroid_bytes_for(bfs_pos, sub_bpv);
-
             // Exact-rerank sidecar slice for this entry (HQ-1).
-            let raw_bytes: Vec<u16> =
-                match seg_raw.and_then(|r| r.get(bfs_pos * dim..(bfs_pos + 1) * dim)) {
-                    Some(slice) => slice.to_vec(),
-                    None => {
-                        all_have_raw = false;
-                        Vec::new()
+            let raw_slice = seg_raw.and_then(|r| r.get(bfs_pos * dim..(bfs_pos + 1) * dim));
+
+            // Sub-centroid sign bytes: the source's own, else recomputed
+            // from the sidecar row (moon#1193), else the merge drops signs.
+            let mut sub_bytes = seg.sub_centroid_bytes_for(bfs_pos, sub_bpv);
+            if all_have_signs && sub_bytes.len() != sub_bpv {
+                match (sign_enc.as_mut(), raw_slice) {
+                    (Some(enc), Some(raw)) if enc.code_len() == code_len => {
+                        sub_bytes = vec![0u8; sub_bpv];
+                        enc.encode_f16(raw, &code_bytes[..code_len], &mut sub_bytes);
+                        recomputed_signs += 1;
                     }
-                };
+                    _ => all_have_signs = false,
+                }
+            }
+
+            let raw_bytes: Vec<u16> = match raw_slice {
+                Some(slice) => slice.to_vec(),
+                None => {
+                    all_have_raw = false;
+                    Vec::new()
+                }
+            };
 
             // Deduplicate: keep highest insert_lsn.
             let entry = by_key_hash.entry(hdr.key_hash).or_insert((
@@ -254,7 +284,11 @@ fn merge_graph_union(
     let mut tq_buffer_orig: Vec<u8> = Vec::with_capacity(n * bytes_per_code);
     let mut qjl_orig: Vec<u8> = Vec::with_capacity(n * qjl_bpv);
     let mut residual_norms: Vec<f32> = Vec::with_capacity(n);
-    let mut sub_orig: Vec<u8> = Vec::with_capacity(n * sub_bpv);
+    let mut sub_orig: Vec<u8> = if all_have_signs {
+        Vec::with_capacity(n * sub_bpv)
+    } else {
+        Vec::new()
+    };
     let mut mvcc_orig: Vec<MvccHeader> = Vec::with_capacity(n);
     let mut raw_orig: Vec<u16> = if all_have_raw {
         Vec::with_capacity(n * dim)
@@ -285,7 +319,8 @@ fn merge_graph_union(
         };
         residual_norms.push(entry_norm);
 
-        if sub_bpv > 0 {
+        // `all_have_signs` ⇒ every surviving `sub` is a full real row.
+        if all_have_signs && sub_bpv > 0 {
             if sub.len() == sub_bpv {
                 sub_orig.extend_from_slice(sub);
             } else {
@@ -406,7 +441,11 @@ fn merge_graph_union(
     // BFS-reorder QJL, residual norms, sub-centroid signs.
     let mut qjl_bfs = vec![0u8; n * qjl_bpv];
     let mut norms_bfs = vec![0.0f32; n];
-    let mut sub_bfs = vec![0u8; n * sub_bpv];
+    let mut sub_bfs = if all_have_signs {
+        vec![0u8; n * sub_bpv]
+    } else {
+        Vec::new()
+    };
     for bfs_pos in 0..n {
         let orig_id = graph.to_original(bfs_pos as u32) as usize;
         if qjl_bpv > 0 {
@@ -419,7 +458,7 @@ fn merge_graph_union(
         if orig_id < residual_norms.len() {
             norms_bfs[bfs_pos] = residual_norms[orig_id];
         }
-        if sub_bpv > 0 {
+        if all_have_signs && sub_bpv > 0 {
             let src = orig_id * sub_bpv;
             let dst = bfs_pos * sub_bpv;
             if src + sub_bpv <= sub_orig.len() {
@@ -469,6 +508,28 @@ fn merge_graph_union(
         });
     }
 
+    // moon#1193: never ship a partially zero-filled sign buffer — nor, for
+    // a quantizer without signs, an all-zero one (moon#1221 review).
+    let sub_bfs = if all_have_signs {
+        sub_bfs
+    } else {
+        if signs_possible {
+            tracing::debug!(
+                sources = segments.len(),
+                "GraphUnion merge: a source row has neither sub-centroid signs nor an \
+                 f16 sidecar to recompute them from — merged segment searches with \
+                 the 16-level LUT"
+            );
+        }
+        Vec::new()
+    };
+    if recomputed_signs > 0 {
+        tracing::debug!(
+            recomputed_signs,
+            "GraphUnion merge recomputed sub-centroid signs from the f16 sidecar"
+        );
+    }
+
     // ── Step 8: Build merged ImmutableSegment ────────────────────────────────
     let merged = ImmutableSegment::new(
         graph,
@@ -495,6 +556,9 @@ fn merge_graph_union(
     if let Some((dir, segment_id)) = persist {
         segment_io::write_immutable_segment_staged(dir, segment_id, &merged, collection)
             .map_err(|e| CompactionError::PersistFailed(format!("{e}")))?;
+        // moon#1194: the sidecar now lives in a sealed file — serve it from
+        // the page cache like a reloaded segment instead of the heap.
+        return Ok(segment_io::map_persisted_raw_f16(merged, dir, segment_id));
     }
 
     Ok(merged)

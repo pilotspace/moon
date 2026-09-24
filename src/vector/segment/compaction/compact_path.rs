@@ -16,6 +16,7 @@ use crate::vector::segment::compaction::graph_build::build_graph_auto;
 use crate::vector::segment::compaction::{HNSW_EF_CONSTRUCTION, HNSW_M};
 use crate::vector::segment::immutable::{ImmutableSegment, MvccHeader};
 use crate::vector::segment::mutable::FrozenSegment;
+use crate::vector::segment::sub_signs::SubSignEncoder;
 use crate::vector::turbo_quant::collection::{CollectionMetadata, QuantizationConfig};
 use crate::vector::turbo_quant::sq8::{decode_sq8, sq8_params};
 
@@ -37,7 +38,6 @@ pub fn compact(
 ) -> Result<ImmutableSegment, CompactionError> {
     let _dim = frozen.dimension as usize;
     let padded = collection.padded_dimension as usize;
-    let signs = collection.fwht_sign_flips.as_slice();
     let bytes_per_code = frozen.bytes_per_code;
 
     // ── Step 1: Filter dead entries ──────────────────────────────────
@@ -269,128 +269,52 @@ pub fn compact(
             .copy_from_slice(&tq_buffer_orig[src..src + bytes_per_code]);
     }
 
-    // BFS reorder QJL signs and residual norms for TurboQuant_prod reranking.
-    let qjl_bpv = frozen.qjl_bytes_per_vec;
-    let mut qjl_signs_bfs = vec![0u8; n * qjl_bpv];
-    let mut residual_norms_bfs = vec![0.0f32; n];
-    for bfs_pos in 0..n {
-        let orig_id = graph.to_original(bfs_pos as u32) as usize;
-        let live_idx = orig_id;
-        // QJL signs
-        let src_qjl = live_idx * qjl_bpv;
-        let dst_qjl = bfs_pos * qjl_bpv;
-        if src_qjl + qjl_bpv <= frozen.qjl_signs.len() {
-            qjl_signs_bfs[dst_qjl..dst_qjl + qjl_bpv]
-                .copy_from_slice(&frozen.qjl_signs[src_qjl..src_qjl + qjl_bpv]);
-        }
-        // Residual norms
-        if live_idx < frozen.residual_norms.len() {
-            residual_norms_bfs[bfs_pos] = frozen.residual_norms[live_idx];
-        }
-    }
+    // EXACT: QJL signs + residual norms for the live entries, BFS-ordered,
+    // computed HERE — on the compaction worker — instead of in freeze() on
+    // the shard thread (moon#1192). Empty for LIGHT / SQ8 / raw-less builds
+    // (HEAD stored an all-zero `n * ceil(dim/8)` QJL buffer + `n` zero norms
+    // there, which nothing reads).
+    let exact_qjl =
+        super::exact_qjl::exact_qjl_bfs(collection, frozen, &live_entries, &graph, &tq_bfs);
 
-    // Compute sub-centroid sign bits from raw f32 vectors (FWHT-rotated).
-    // For each coordinate: compare the ACTUAL rotated value against its quantized centroid.
-    // Sign bit = 1 if original >= centroid (upper sub-bin), 0 if below.
+    // Sub-centroid sign bits, BFS-ordered — REAL signs only (moon#1221
+    // review). For each coordinate: 1 if the actual rotated value lies at or
+    // above its quantized centroid (upper sub-bin), 0 below. Two sources:
+    //  - EXACT (raw f32 retained): computed by the shared encoder, for every
+    //    quantizer that has one (scalar 4-bit TQ and TQ4A2 — not SQ8/TQ1-3);
+    //  - LIGHT scalar TQ4: the insert-time signs, remapped to BFS order.
+    // Anything else gets an EMPTY buffer — never a zero-filled placeholder,
+    // which the beam would read as "every coordinate in the lower sub-bin"
+    // and `segment_io` would persist as if real. Empty = the 16-level LUT,
+    // in memory and after a reload alike.
     let sub_bpv = (padded + 7) / 8;
-    let mut sub_signs_bfs = vec![0u8; n * sub_bpv];
-    // SQ8 has no sub-centroid refinement (no codebook): both inner branches
-    // below `continue` unconditionally, so without this gate the loop spends
-    // O(n · padded log padded) on normalize+FWHT whose results are discarded.
-    // The zero-filled buffer is exactly the SQ8 contract.
-    if has_raw && !is_sq8 {
-        // Use raw f32 → FWHT rotate → compare against centroid per TQ index
-        let mut work = vec![0.0f32; padded];
-        for bfs_pos in 0..n {
-            let orig_id = graph.to_original(bfs_pos as u32) as usize;
-            let live_idx = orig_id;
-            let raw = &frozen.raw_f32[live_entries[live_idx].internal_id as usize * dim
-                ..(live_entries[live_idx].internal_id as usize + 1) * dim];
-
-            // Normalize + pad + FWHT to get actual rotated coordinates
-            let norm_sq: f32 = raw.iter().map(|x| x * x).sum();
-            let norm = norm_sq.sqrt();
-            if norm > 0.0 {
-                let inv = 1.0 / norm;
-                for (dst, &src) in work[..dim].iter_mut().zip(raw.iter()) {
-                    *dst = src * inv;
-                }
-            } else {
-                for v in work[..dim].iter_mut() {
-                    *v = 0.0;
-                }
+    let sub_signs_bfs: Vec<u8> = match SubSignEncoder::new(collection) {
+        Some(mut enc) if has_raw => {
+            debug_assert_eq!(enc.bytes_per_vec(), sub_bpv);
+            let mut out = vec![0u8; n * sub_bpv];
+            for bfs_pos in 0..n {
+                let orig_id = graph.to_original(bfs_pos as u32) as usize;
+                let internal = live_entries[orig_id].internal_id as usize;
+                let raw = &frozen.raw_f32[internal * dim..(internal + 1) * dim];
+                let code_offset = bfs_pos * bytes_per_code;
+                let code_slice = &tq_bfs[code_offset..code_offset + code_len];
+                let sign_offset = bfs_pos * sub_bpv;
+                enc.encode_f32(
+                    raw,
+                    code_slice,
+                    &mut out[sign_offset..sign_offset + sub_bpv],
+                );
             }
-            for v in work[dim..padded].iter_mut() {
-                *v = 0.0;
-            }
-            crate::vector::turbo_quant::fwht::fwht(&mut work[..padded], signs);
-
-            let code_offset = bfs_pos * bytes_per_code;
-            let code_slice = &tq_bfs[code_offset..code_offset + code_len];
-            let sign_offset = bfs_pos * sub_bpv;
-
-            if is_a2 {
-                // A2: each nibble is a pair index, decode via A2Codebook
-                let cb = if let Some(c) = a2_cb.as_ref() {
-                    c
-                } else {
-                    continue;
-                };
-                for j in 0..code_slice.len() {
-                    let byte = code_slice[j];
-                    let qi = j * 4; // each byte = 2 pairs = 4 coordinates
-                    let (x0, y0) = cb.decode_pair(byte & 0x0F);
-                    let (x1, y1) = cb.decode_pair(byte >> 4);
-                    if qi < padded && work[qi] >= x0 {
-                        sub_signs_bfs[sign_offset + qi / 8] |= 1 << (qi % 8);
-                    }
-                    if qi + 1 < padded && work[qi + 1] >= y0 {
-                        sub_signs_bfs[sign_offset + (qi + 1) / 8] |= 1 << ((qi + 1) % 8);
-                    }
-                    if qi + 2 < padded && work[qi + 2] >= x1 {
-                        sub_signs_bfs[sign_offset + (qi + 2) / 8] |= 1 << ((qi + 2) % 8);
-                    }
-                    if qi + 3 < padded && work[qi + 3] >= y1 {
-                        sub_signs_bfs[sign_offset + (qi + 3) / 8] |= 1 << ((qi + 3) % 8);
-                    }
-                }
-            } else {
-                // Scalar TQ: each nibble is a single-coordinate index
-                let codebook = if let Some(c) = codebook_opt {
-                    c
-                } else {
-                    continue;
-                };
-                for j in 0..code_slice.len() {
-                    let byte = code_slice[j];
-                    let qi = j * 2;
-                    if work[qi] >= codebook[(byte & 0x0F) as usize] {
-                        sub_signs_bfs[sign_offset + qi / 8] |= 1 << (qi % 8);
-                    }
-                    if work[qi + 1] >= codebook[(byte >> 4) as usize] {
-                        sub_signs_bfs[sign_offset + (qi + 1) / 8] |= 1 << ((qi + 1) % 8);
-                    }
-                }
-            }
+            out
         }
-    } else if need_cpu_build && !is_sq8 && !frozen.sub_centroid_signs.is_empty() {
-        // Light mode with insert-time sub-centroid signs: remap to BFS order.
-        // graph.to_original(bfs_pos) returns the builder's sequential ID (0..n-1),
-        // which is the index into live_entries. Use it directly, not as internal_id.
-        for bfs_pos in 0..n {
-            let orig_id = graph.to_original(bfs_pos as u32) as usize;
-            if orig_id < live_entries.len() {
-                let src_internal = live_entries[orig_id].internal_id as usize;
-                let src_offset = src_internal * sub_bpv;
-                let dst_offset = bfs_pos * sub_bpv;
-                if src_offset + sub_bpv <= frozen.sub_centroid_signs.len() {
-                    sub_signs_bfs[dst_offset..dst_offset + sub_bpv].copy_from_slice(
-                        &frozen.sub_centroid_signs[src_offset..src_offset + sub_bpv],
-                    );
-                }
-            }
+        // Not gated on `need_cpu_build`: a GPU-built graph maps BFS
+        // positions to the same live-entry indices, and skipping the remap
+        // there left the buffer all-zero.
+        _ if collection.quantization == QuantizationConfig::TurboQuant4 => {
+            remap_insert_time_signs(frozen, &live_entries, &graph, sub_bpv)
         }
-    }
+        _ => Vec::new(),
+    };
 
     // ── Step 5: Create ImmutableSegment ─────────────────────────────
     let mvcc: Vec<MvccHeader> = (0..n)
@@ -432,9 +356,9 @@ pub fn compact(
     let segment = ImmutableSegment::new(
         graph,
         AlignedBuffer::from_vec(tq_bfs),
-        qjl_signs_bfs,
-        residual_norms_bfs,
-        qjl_bpv,
+        exact_qjl.signs,
+        exact_qjl.residual_norms,
+        exact_qjl.bytes_per_vec,
         sub_signs_bfs,
         sub_bpv,
         mvcc,
@@ -458,7 +382,41 @@ pub fn compact(
     if let Some((dir, segment_id)) = persist {
         segment_io::write_immutable_segment_staged(dir, segment_id, &segment, collection)
             .map_err(|e| CompactionError::PersistFailed(format!("{e}")))?;
+        // moon#1194: the sidecar now lives in a sealed file — serve it from
+        // the page cache like a reloaded segment instead of the heap.
+        return Ok(segment_io::map_persisted_raw_f16(segment, dir, segment_id));
     }
 
     Ok(segment)
+}
+
+/// LIGHT scalar TQ4: the frozen segment's insert-time sign rows (indexed by
+/// internal id) in BFS order. All-or-nothing: if any live entry has no row,
+/// the segment carries NO signs rather than a partially zero-filled buffer
+/// (moon#1221 review).
+fn remap_insert_time_signs(
+    frozen: &FrozenSegment,
+    live_entries: &[&crate::vector::segment::mutable::MutableEntry],
+    graph: &crate::vector::hnsw::graph::HnswGraph,
+    sub_bpv: usize,
+) -> Vec<u8> {
+    let n = live_entries.len();
+    if sub_bpv == 0 || frozen.sub_centroid_signs.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::with_capacity(n * sub_bpv);
+    for bfs_pos in 0..n {
+        // graph.to_original(bfs_pos) is the builder's sequential id (0..n),
+        // i.e. the index into live_entries — not the internal id.
+        let orig_id = graph.to_original(bfs_pos as u32) as usize;
+        let row = live_entries.get(orig_id).and_then(|e| {
+            let src = e.internal_id as usize * sub_bpv;
+            frozen.sub_centroid_signs.get(src..src + sub_bpv)
+        });
+        match row {
+            Some(row) => out.extend_from_slice(row),
+            None => return Vec::new(),
+        }
+    }
+    out
 }

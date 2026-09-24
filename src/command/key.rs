@@ -297,7 +297,7 @@ pub fn ttl(db: &mut Database, args: &[Frame]) -> Frame {
         Some(k) => k,
         None => return err_wrong_args("TTL"),
     };
-    match db.get(key) {
+    match db.peek(key) {
         None => Frame::Integer(-2),
         Some(entry) => {
             if !entry.has_expiry() {
@@ -330,7 +330,7 @@ pub fn pttl(db: &mut Database, args: &[Frame]) -> Frame {
         Some(k) => k,
         None => return err_wrong_args("PTTL"),
     };
-    match db.get(key) {
+    match db.peek(key) {
         None => Frame::Integer(-2),
         Some(entry) => {
             if !entry.has_expiry() {
@@ -500,7 +500,7 @@ pub fn expiretime(db: &mut Database, args: &[Frame]) -> Frame {
         Some(k) => k,
         None => return err_wrong_args("EXPIRETIME"),
     };
-    match db.get(key) {
+    match db.peek(key) {
         None => Frame::Integer(-2),
         Some(entry) => {
             if !entry.has_expiry() {
@@ -523,7 +523,7 @@ pub fn pexpiretime(db: &mut Database, args: &[Frame]) -> Frame {
         Some(k) => k,
         None => return err_wrong_args("PEXPIRETIME"),
     };
-    match db.get(key) {
+    match db.peek(key) {
         None => Frame::Integer(-2),
         Some(entry) => {
             if !entry.has_expiry() {
@@ -558,8 +558,9 @@ pub fn touch(db: &mut Database, args: &[Frame]) -> Frame {
             Some(k) => k,
             None => continue,
         };
-        if db.exists(key) {
-            // exists() already does lazy expiry + access tracking
+        // moon#1161: `exists` records nothing; `touch_key` answers the same
+        // question and stamps the access, as redis's `lookupKeyRead` does.
+        if db.touch_key(key) {
             count += 1;
         }
     }
@@ -609,7 +610,7 @@ pub fn type_cmd(db: &mut Database, args: &[Frame]) -> Frame {
         Some(k) => k,
         None => return err_wrong_args("TYPE"),
     };
-    match db.get(key) {
+    match db.peek(key) {
         None => Frame::SimpleString(Bytes::from_static(b"none")),
         Some(entry) => {
             let type_name = entry.value.type_name();
@@ -638,34 +639,11 @@ pub fn object(db: &mut Database, args: &[Frame]) -> Frame {
     if !crate::command::metadata::is_known_subcommand(b"OBJECT", subcommand) {
         return crate::command::helpers::err_unknown_subcommand("OBJECT", subcommand);
     }
-    if subcommand.eq_ignore_ascii_case(b"ENCODING") {
-        if args.len() != 2 {
-            return err_wrong_args("OBJECT");
-        }
-        let key = match extract_key(&args[1]) {
-            Some(k) => k,
-            None => return err_wrong_args("OBJECT"),
-        };
-        match db.get(key) {
-            Some(entry) => {
-                let encoding = entry.value.as_redis_value().encoding_name();
-                Frame::BulkString(Bytes::from(encoding))
-            }
-            None => Frame::Null,
-        }
-    } else if subcommand.eq_ignore_ascii_case(b"FREQ") {
-        if args.len() != 2 {
-            return err_wrong_args("OBJECT");
-        }
-        let key = match extract_key(&args[1]) {
-            Some(k) => k,
-            None => return err_wrong_args("OBJECT"),
-        };
-        match db.get(key) {
-            Some(entry) => Frame::Integer(entry.access_counter() as i64),
-            None => Frame::Error(Bytes::from_static(b"ERR no such key")),
-        }
-    } else if subcommand.eq_ignore_ascii_case(b"IDLETIME") {
+    if subcommand.eq_ignore_ascii_case(b"ENCODING")
+        || subcommand.eq_ignore_ascii_case(b"FREQ")
+        || subcommand.eq_ignore_ascii_case(b"IDLETIME")
+        || subcommand.eq_ignore_ascii_case(b"REFCOUNT")
+    {
         if args.len() != 2 {
             return err_wrong_args("OBJECT");
         }
@@ -674,29 +652,10 @@ pub fn object(db: &mut Database, args: &[Frame]) -> Frame {
             None => return err_wrong_args("OBJECT"),
         };
         let now = db.now();
-        match db.get(key) {
-            Some(entry) => {
-                let last = entry.last_access();
-                // Full u32 epoch-seconds delta; saturate rather than wrap if
-                // the cached clock lags a concurrent touch.
-                let idle = now.saturating_sub(last);
-                Frame::Integer(idle as i64)
-            }
-            None => Frame::Error(Bytes::from_static(b"ERR no such key")),
-        }
-    } else if subcommand.eq_ignore_ascii_case(b"REFCOUNT") {
-        if args.len() != 2 {
-            return err_wrong_args("OBJECT");
-        }
-        let key = match extract_key(&args[1]) {
-            Some(k) => k,
-            None => return err_wrong_args("OBJECT"),
-        };
-        match db.get(key) {
-            // Moon doesn't use reference counting — always return 1
-            Some(_) => Frame::Integer(1),
-            None => Frame::Error(Bytes::from_static(b"ERR no such key")),
-        }
+        // moon#1161: `peek`, not `get` — redis serves OBJECT with
+        // `LOOKUP_NOTOUCH`, and a lookup that recorded an access would reset
+        // the very idle time / bump the very frequency it is asked for.
+        object_key_reply(subcommand, db.peek(key), now)
     } else if subcommand.eq_ignore_ascii_case(b"HELP") {
         object_help()
     } else {
@@ -736,39 +695,50 @@ pub fn object_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
         Some(k) => k,
         None => return err_wrong_args("OBJECT"),
     };
+    let now = db.now();
+    // moon#1161: NOTOUCH, as in the exclusive path above.
+    match db.peek_if_alive_any_plane(key, now_ms) {
+        Some(view) => object_key_reply(subcommand, Some(view.entry()), now),
+        None => object_key_reply(subcommand, None, now),
+    }
+}
+
+/// The per-key OBJECT subcommands' reply, shared by the exclusive and the
+/// read-only path so the two cannot drift (moon#1161).
+///
+/// Redis parity:
+/// - a missing key answers nil for every subcommand (redis
+///   `objectCommandLookupOrReply(.., shared.null)`), not `ERR no such key`;
+/// - `FREQ` is the counter DECAYED to now without recording an access
+///   (redis `LFUDecrAndReturn`) under an LFU policy. Under any other policy
+///   redis refuses with an error; moon keeps answering the raw counter, which
+///   its moon-only HOTKEYS tooling relies on — a documented divergence;
+/// - `IDLETIME` is whole seconds since the last recorded access.
+fn object_key_reply(
+    subcommand: &[u8],
+    entry: Option<&crate::storage::entry::Entry>,
+    now_secs: u32,
+) -> Frame {
+    let Some(entry) = entry else {
+        return Frame::Null;
+    };
     if subcommand.eq_ignore_ascii_case(b"ENCODING") {
-        match db.get_if_alive_any_plane(key, now_ms) {
-            Some(entry) => {
-                let encoding = entry.value.as_redis_value().encoding_name();
-                Frame::BulkString(Bytes::from(encoding))
-            }
-            None => Frame::Null,
-        }
+        Frame::BulkString(Bytes::from(entry.value.as_redis_value().encoding_name()))
     } else if subcommand.eq_ignore_ascii_case(b"FREQ") {
-        match db.get_if_alive_any_plane(key, now_ms) {
-            Some(entry) => Frame::Integer(entry.access_counter() as i64),
-            None => Frame::Error(Bytes::from_static(b"ERR no such key")),
-        }
-    } else if subcommand.eq_ignore_ascii_case(b"IDLETIME") {
-        let now = db.now();
-        match db.get_if_alive_any_plane(key, now_ms) {
-            Some(entry) => {
-                let last = entry.last_access();
-                // Full u32 epoch-seconds delta; saturate rather than wrap if
-                // the cached clock lags a concurrent touch.
-                let idle = now.saturating_sub(last);
-                Frame::Integer(idle as i64)
+        let freq = match crate::storage::eviction::access_tracking() {
+            crate::storage::entry::AccessTracking::Lfu { decay_time, .. } => {
+                entry.lfu_frequency_at(decay_time, now_secs)
             }
-            None => Frame::Error(Bytes::from_static(b"ERR no such key")),
-        }
-    } else if subcommand.eq_ignore_ascii_case(b"REFCOUNT") {
-        match db.get_if_alive_any_plane(key, now_ms) {
-            // Moon doesn't use reference counting — always return 1
-            Some(_) => Frame::Integer(1),
-            None => Frame::Error(Bytes::from_static(b"ERR no such key")),
-        }
+            _ => entry.access_counter(),
+        };
+        Frame::Integer(i64::from(freq))
+    } else if subcommand.eq_ignore_ascii_case(b"IDLETIME") {
+        // Full u32 epoch-seconds delta; saturate rather than wrap if the
+        // cached clock lags a concurrent touch.
+        Frame::Integer(i64::from(now_secs.saturating_sub(entry.last_access())))
     } else {
-        Frame::Error(Bytes::from_static(b"ERR unknown OBJECT subcommand"))
+        // REFCOUNT: moon does not reference-count values.
+        Frame::Integer(1)
     }
 }
 
@@ -931,7 +901,7 @@ pub fn keys(db: &mut Database, args: &[Frame]) -> Frame {
         // hot-aliveness so cold-only keys enter exactly once, via the cold
         // loop (#364 plane partition — see Database::cold_only_keys).
         let _ = db.exists(key.as_bytes());
-        if db.get_if_alive(key.as_bytes(), now_ms).is_some() && glob_match(pattern, key.as_bytes())
+        if db.peek_if_alive(key.as_bytes(), now_ms).is_some() && glob_match(pattern, key.as_bytes())
         {
             result.push(Frame::BulkString(key.to_bytes()));
         }
@@ -1036,27 +1006,6 @@ pub fn renamenx(db: &mut Database, args: &[Frame]) -> Frame {
     Frame::Integer(1)
 }
 
-/// Check if a value is large enough to warrant async drop.
-fn should_async_drop(entry: &crate::storage::entry::Entry) -> bool {
-    use crate::storage::compact_value::RedisValueRef;
-    match entry.value.as_redis_value() {
-        RedisValueRef::Hash(m) => m.len() > 64,
-        RedisValueRef::HashWithTtl { fields, .. } => fields.len() > 64,
-        RedisValueRef::List(l) => l.len() > 64,
-        RedisValueRef::Set(s) => s.len() > 64,
-        RedisValueRef::SortedSet { members, .. } => members.len() > 64,
-        RedisValueRef::SortedSetBPTree { members, .. } => members.len() > 64,
-        RedisValueRef::String(_) => false,
-        RedisValueRef::Stream(s) => s.entries.len() > 64,
-        // Compact encodings are always small, no async drop needed
-        RedisValueRef::HashListpack(_)
-        | RedisValueRef::ListListpack(_)
-        | RedisValueRef::SetListpack(_)
-        | RedisValueRef::SetIntset(_)
-        | RedisValueRef::SortedSetListpack(_) => false,
-    }
-}
-
 /// UNLINK key [key ...]
 ///
 /// Removes the specified keys. Like DEL but reclaims memory asynchronously
@@ -1069,20 +1018,12 @@ pub fn unlink(db: &mut Database, args: &[Frame]) -> Frame {
     for arg in args {
         if let Some(key) = extract_key(arg) {
             // Counting variant: cold-only keys count as removed (D1).
-            let (removed, hot) = db.remove_counting_cold(key);
-            if removed {
+            // moon#1190: a large value is handed to the database's lazy-free
+            // queue — no ledger walk and no drop inside the command, on
+            // either runtime (monoio used to drop inline; tokio's
+            // `spawn_blocking` still walked the value first).
+            if db.unlink(key) {
                 count += 1;
-            }
-            if let Some(entry) = hot {
-                if should_async_drop(&entry) {
-                    // Async drop for large collections: spawn a blocking
-                    // task to avoid holding the event loop.
-                    #[cfg(feature = "runtime-tokio")]
-                    tokio::task::spawn_blocking(move || drop(entry));
-                    #[cfg(feature = "runtime-monoio")]
-                    drop(entry);
-                }
-                // Small values drop normally (entry goes out of scope)
             }
         }
     }
@@ -1282,7 +1223,7 @@ fn scan_core(
             let matches = if *is_cold {
                 cold_type_matches(db, key.as_bytes(), tf)
             } else {
-                db.get_if_alive(key.as_bytes(), now_ms)
+                db.peek_if_alive(key.as_bytes(), now_ms)
                     .is_some_and(|e| tf.eq_ignore_ascii_case(e.value.type_name().as_bytes()))
             };
             if !matches {
@@ -1338,7 +1279,7 @@ pub fn ttl_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
         Some(k) => k,
         None => return err_wrong_args("TTL"),
     };
-    match db.get_if_alive_any_plane(key, now_ms) {
+    match db.peek_if_alive_any_plane(key, now_ms) {
         None => Frame::Integer(-2),
         Some(entry) => {
             if !entry.has_expiry() {
@@ -1365,7 +1306,7 @@ pub fn pttl_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
         Some(k) => k,
         None => return err_wrong_args("PTTL"),
     };
-    match db.get_if_alive_any_plane(key, now_ms) {
+    match db.peek_if_alive_any_plane(key, now_ms) {
         None => Frame::Integer(-2),
         Some(entry) => {
             if !entry.has_expiry() {
@@ -1392,7 +1333,7 @@ pub fn type_cmd_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
         Some(k) => k,
         None => return err_wrong_args("TYPE"),
     };
-    match db.get_if_alive_any_plane(key, now_ms) {
+    match db.peek_if_alive_any_plane(key, now_ms) {
         None => Frame::SimpleString(Bytes::from_static(b"none")),
         Some(entry) => {
             let type_name = entry.value.type_name();
@@ -1415,7 +1356,7 @@ pub fn keys_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
     for key in db.keys() {
         // Strict hot-aliveness: cold-visible keys enter exactly once, via
         // the cold loop below (#364 plane partition).
-        if db.get_if_alive(key.as_bytes(), now_ms).is_some() && glob_match(pattern, key.as_bytes())
+        if db.peek_if_alive(key.as_bytes(), now_ms).is_some() && glob_match(pattern, key.as_bytes())
         {
             result.push(Frame::BulkString(key.to_bytes()));
         }
@@ -1482,7 +1423,7 @@ pub fn expiretime_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame 
         Some(k) => k,
         None => return err_wrong_args("EXPIRETIME"),
     };
-    match db.get_if_alive_any_plane(key, now_ms) {
+    match db.peek_if_alive_any_plane(key, now_ms) {
         None => Frame::Integer(-2),
         Some(entry) => {
             if !entry.has_expiry() {
@@ -1505,7 +1446,7 @@ pub fn pexpiretime_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame
         Some(k) => k,
         None => return err_wrong_args("PEXPIRETIME"),
     };
-    match db.get_if_alive_any_plane(key, now_ms) {
+    match db.peek_if_alive_any_plane(key, now_ms) {
         None => Frame::Integer(-2),
         Some(entry) => {
             if !entry.has_expiry() {
@@ -1530,7 +1471,9 @@ pub fn randomkey_readonly(db: &Database, _args: &[Frame], _now_ms: u64) -> Frame
 
 /// TOUCH key [key …] — read-only twin.
 ///
-/// Counts alive keys. Does NOT update LRU/access metadata (contract M2).
+/// Counts alive keys and records the access on each live hot entry
+/// (moon#1161): the entry's access metadata is atomic, so the shared-guard
+/// path can stamp it — which is TOUCH's whole purpose.
 pub fn touch_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
     if args.is_empty() {
         return err_wrong_args("TOUCH");
@@ -1541,7 +1484,7 @@ pub fn touch_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
             Some(k) => k,
             None => continue,
         };
-        if db.exists_if_alive(key, now_ms) {
+        if db.touch_key_if_alive(key, now_ms) {
             count += 1;
         }
     }

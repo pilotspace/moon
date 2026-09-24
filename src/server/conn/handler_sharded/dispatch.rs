@@ -218,11 +218,12 @@ pub(super) fn try_handle_config(
 /// CDC.READ — polling-based change data capture (C3 v1).
 ///
 /// Dispatches `CDC.READ <wal_dir> <from_lsn> [LIMIT N]` to
-/// `crate::command::cdc::cdc_read`. Stateless / synchronous — no shard
-/// state involved, just reads WAL files from disk and decodes them into
-/// Debezium JSON envelopes. The push-based CDC.SUBSCRIBE variant (C3b)
-/// will live alongside this.
-pub(super) fn try_handle_cdc_read(
+/// `crate::command::cdc::cdc_read_async`. Stateless — no shard state
+/// involved, just reads WAL files from disk (on the CDC read pool, off the
+/// shard thread — moon#1181) and decodes them into Debezium JSON
+/// envelopes. The push-based CDC.SUBSCRIBE variant (C3b) will live
+/// alongside this.
+pub(super) async fn try_handle_cdc_read(
     cmd: &[u8],
     cmd_args: &[Frame],
     responses: &mut crate::server::conn::intercept::InterceptReplies<'_>,
@@ -230,7 +231,9 @@ pub(super) fn try_handle_cdc_read(
     if !cmd.eq_ignore_ascii_case(b"CDC.READ") {
         return false;
     }
-    responses.push(crate::command::cdc::cdc_read(cmd_args));
+    // moon#1181: the WAL read runs on the CDC read pool, off the shard
+    // thread; this connection task awaits it while its siblings run.
+    responses.push(crate::command::cdc::cdc_read_async(cmd_args).await);
     true
 }
 

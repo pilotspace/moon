@@ -1441,6 +1441,10 @@ impl super::Shard {
                 // Periodic 1ms timer for WAL flush, snapshot advance, io_uring poll
                 _ = periodic_interval.0.tick() => {
                     cached_clock.update();
+                    // moon#1190: lazy-free drain (see the monoio tick below).
+                    // Its pending flag feeds only the monoio idle park; this
+                    // loop never stretches its 1 ms period.
+                    let _ = crate::server::expiration::drain_lazy_free_tick(shard_databases.db_count());
 
                     let mut pending_snapshot = None;
                     // No outer with_shard — each arm takes its own flat borrow.
@@ -1570,25 +1574,22 @@ impl super::Shard {
                         &shard_databases,
                         shard_id,
                     ) {
-                        if let Some(snap) = snapshot_state.as_mut() {
-                            if let Err(e) = snap.finalize_async().await {
-                                persistence_tick::finalize_snapshot_error(
-                                    &mut snapshot_state, &mut snapshot_reply_tx, shard_id,
-                                    &e.to_string(),
-                                );
-                                // Decrement the BGSAVE fan-in counter (same as
-                                // the monoio arm below — this was missing here,
-                                // so tokio BGSAVE left rdb_bgsave_in_progress
-                                // stuck at 1 forever). Safe for auto-save
-                                // snapshots too: the counter ignores calls at 0.
-                                crate::command::persistence::bgsave_shard_done(false);
-                            } else {
-                                persistence_tick::finalize_snapshot_success(
-                                    &mut snapshot_state, &mut snapshot_reply_tx, shard_id,
-                                );
+                        // moon#1186: the file is written, fsynced and renamed
+                        // on the snapshot's writer thread; the tick polls.
+                        match persistence_tick::drive_snapshot_finalize(
+                            &mut snapshot_state, &mut snapshot_reply_tx, shard_id,
+                        ) {
+                            // Decrement the BGSAVE fan-in counter (same as
+                            // the monoio arm below — this was missing here,
+                            // so tokio BGSAVE left rdb_bgsave_in_progress
+                            // stuck at 1 forever). Safe for auto-save
+                            // snapshots too: the counter ignores calls at 0.
+                            Some(false) => crate::command::persistence::bgsave_shard_done(false),
+                            Some(true) => {
                                 crate::command::persistence::bgsave_shard_done(true);
                                 bgsave_checkpoint_requested = true;
                             }
+                            None => {}
                         }
                     }
 
@@ -2370,24 +2371,19 @@ impl super::Shard {
                     &shard_databases,
                     shard_id,
                 ) {
-                    if let Some(snap) = snapshot_state.as_mut() {
-                        if let Err(e) = snap.finalize_async().await {
-                            persistence_tick::finalize_snapshot_error(
-                                &mut snapshot_state,
-                                &mut snapshot_reply_tx,
-                                shard_id,
-                                &e.to_string(),
-                            );
-                            crate::command::persistence::bgsave_shard_done(false);
-                        } else {
-                            persistence_tick::finalize_snapshot_success(
-                                &mut snapshot_state,
-                                &mut snapshot_reply_tx,
-                                shard_id,
-                            );
+                    // moon#1186: the file is written, fsynced and renamed on
+                    // the snapshot's writer thread; the tick only polls.
+                    match persistence_tick::drive_snapshot_finalize(
+                        &mut snapshot_state,
+                        &mut snapshot_reply_tx,
+                        shard_id,
+                    ) {
+                        Some(false) => crate::command::persistence::bgsave_shard_done(false),
+                        Some(true) => {
                             crate::command::persistence::bgsave_shard_done(true);
                             bgsave_checkpoint_requested = true;
                         }
+                        None => {}
                     }
                 }
 
@@ -2696,6 +2692,17 @@ impl super::Shard {
                 // counter hits each boundary exactly; entry is additionally
                 // gated on an aligned counter. Any new `% N` dispatch added
                 // here MUST keep N a multiple of IDLE_PARK_MS.
+                //
+                // moon#1190: free lazily-unlinked / expired large values, a
+                // bounded slice per tick (one relaxed load when none queued).
+                // Last in the tick so a value this tick's expiry sweep or
+                // eviction just queued gets its first slice now, and so its
+                // answer — does THIS shard still have work queued? — is exact
+                // for the park decision: moon#1221 review F2, the idle park
+                // must not stretch to 10 ms while the queue drains (one
+                // 250 µs slice per 10 ms held the memory ~10x longer).
+                let lazy_free_pending =
+                    crate::server::expiration::drain_lazy_free_tick(shard_databases.db_count());
                 let quiet = wal_writer
                     .as_ref()
                     .is_none_or(|w| w.buffered_bytes() == 0 && !w.flush_backing_off())
@@ -2706,7 +2713,8 @@ impl super::Shard {
                     && server_config.appendfsync != "always"
                     && cdc_registry.is_empty()
                     && !hit_cap
-                    && !spsc_had_work;
+                    && !spsc_had_work
+                    && !lazy_free_pending;
                 let was_idle = idle_park.is_idle();
                 let now_idle = idle_park.on_timer_tick(
                     crate::admin::metrics_setup::this_thread_commands(),

@@ -2692,7 +2692,9 @@ pub(crate) fn try_inline_dispatch(
         }
         // The lookup itself, `&Database` only. Everything it calls is a
         // shared-guard read — the hot-key sketch is atomics, `get_if_alive`
-        // neither expires nor promotes nor touches LRU, and the cold-index
+        // neither expires nor promotes (the access it records for the
+        // eviction policy, moon#1161, is a relaxed atomic store on the
+        // entry's metadata), and the cold-index
         // probe is a map lookup — so the OWNER takes the SHARED guard for its
         // own GET below, the same guard the batch path's `dispatch_read`
         // takes. Under the exclusive guard this path used to take, every

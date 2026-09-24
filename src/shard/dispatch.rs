@@ -1167,19 +1167,16 @@ pub struct TxnExecReply {
 /// Snapshot payload for [`ShardMessage::AofFold`].
 ///
 /// Produced by the shard thread and consumed by the AOF rewrite writer thread.
-/// Shape mirrors the per-shard snapshot that `do_rewrite_per_shard` phase 4
-/// builds today: live entries per db index. The writer feeds
-/// this directly to `rdb::save_snapshot_to_bytes` unchanged.
+/// The writer appends `image` to the new base file as its chunks arrive
+/// (`persistence::aof::fold_stream`).
 pub struct AofFoldSnapshot {
-    /// One element per db: the live entries.
-    /// Entries are pre-filtered — expired entries (per `is_expired_at`) are
-    /// excluded at snapshot time by the shard thread.
-    pub dbs: Vec<
-        Vec<(
-            crate::storage::compact_key::CompactKey,
-            crate::storage::entry::Entry,
-        )>,
-    >,
+    /// The new base RDB image, serialized by the shard thread straight from
+    /// the live keyspace at the fold instant and streamed in 1 MiB chunks
+    /// over an unbounded channel (moon#1185 — it used to be a deep copy of
+    /// every live entry; the in-flight bytes are bounded only by the image,
+    /// see `fold_stream::fold_image_channel`). Entries expired at the fold
+    /// instant are excluded.
+    pub image: crate::persistence::aof::fold_stream::FoldImage,
     /// Number of messages in the AOF channel at the instant the shard read
     /// this value — BEFORE building the snapshot and BEFORE sending this reply.
     ///

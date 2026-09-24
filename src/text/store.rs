@@ -10,7 +10,10 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::text::analyzer::{AnalysisCache, AnalyzerPipeline};
-use crate::text::bm25::{FieldStats, bm25_score};
+use crate::text::bm25::FieldStats;
+#[cfg(feature = "text-index")]
+use crate::text::doc_columns::DocSlices;
+use crate::text::doc_columns::{DocKeys, DocLengths, DocU64s};
 use crate::text::index_persist::TextIndexMeta;
 use crate::text::posting::PostingStore;
 use crate::text::term_dict::TermDictionary;
@@ -86,6 +89,15 @@ pub struct TextSearchResult {
     pub score: f32,
 }
 
+/// One TAG value indexed for a document: `(index into tag_fields, normalized value)`.
+/// The value `Bytes` shares the `tag_indexes` map key's allocation (moon#1194).
+#[cfg(feature = "text-index")]
+pub type TagEntry = (u32, Bytes);
+
+/// One NUMERIC value indexed for a document: `(index into numeric_fields, value)`.
+#[cfg(feature = "text-index")]
+pub type NumericEntry = (u32, ordered_float::OrderedFloat<f64>);
+
 /// A single full-text search index with per-field BM25 data.
 ///
 /// Created by FT.CREATE, populated by auto_index_hset on HSET commands.
@@ -112,14 +124,22 @@ pub struct TextIndex {
     /// None = no FST built yet (built at FT.COMPACT time). Exact queries unaffected when None (D-13).
     #[cfg(feature = "text-index")]
     pub fst_maps: Vec<Option<fst::Map<Vec<u8>>>>,
-    /// Per-document field lengths: doc_id -> lengths per field index.
-    pub doc_field_lengths: HashMap<u32, Vec<u32>>,
+    /// Per-document field lengths: one `u32` per TEXT field per doc id (moon#1194:
+    /// a dense column, not a `HashMap<u32, Vec<u32>>` entry + heap `Vec` per doc).
+    pub doc_field_lengths: DocLengths,
     /// Key hash -> doc_id mapping (same pattern as VectorIndex).
     pub key_hash_to_doc_id: HashMap<u64, u32>,
-    /// doc_id -> original Redis key bytes.
-    pub doc_id_to_key: HashMap<u32, Bytes>,
-    /// Next doc_id to assign.
+    /// doc_id -> original Redis key bytes, plus the bitmap of ids that have a key
+    /// (moon#1191: "resolvable" is one `&=`). A dense column (moon#1194).
+    pub doc_id_to_key: DocKeys,
+    /// One past the highest live doc_id (`0` when empty) — the id a new document takes when no
+    /// freed id is available.
     next_doc_id: u32,
+    /// Ids below `next_doc_id` that no document holds: exactly `[0, next_doc_id) \ live`. A new
+    /// document takes the smallest ([`Self::alloc_doc_id`]), so the dense columns stay bounded by
+    /// the peak live-document count instead of growing with every id ever handed out (moon#1221
+    /// review: FT.INVALIDATE_RANGE → re-HSET cycles used to leave a hole per cycle, forever).
+    free_doc_ids: roaring::RoaringBitmap,
 
     // ── Bi-temporal MVCC (v0.1.10 G-1, closing HYB-03 deferral) ──────────
     //
@@ -131,7 +151,7 @@ pub struct TextIndex {
     /// `doc_id -> insert LSN` (monotonic LSN from `VectorStore::txn_manager_mut().allocate_lsn()`).
     /// Used by `search_field_as_of` + `search_field_or_as_of` to filter
     /// candidates to those committed at or before the requested AS_OF.
-    pub doc_id_to_insert_lsn: HashMap<u32, u64>,
+    pub doc_id_to_insert_lsn: DocU64s,
     /// `doc_id -> delete LSN`. Reserved for v0.2 logical-delete wiring so
     /// historical AS_OF queries can still see deleted docs. Present today
     /// so the visibility helper is future-proof.
@@ -151,10 +171,13 @@ pub struct TextIndex {
     /// Inner key is the normalized tag value (ASCII-lowercased unless CASESENSITIVE).
     #[cfg(feature = "text-index")]
     pub tag_indexes: HashMap<Bytes, HashMap<Bytes, roaring::RoaringBitmap>>,
-    /// `doc_id -> list of (canonical_field, normalized_value)` entries currently
+    /// `doc_id -> [(tag field index, normalized_value)]` entries currently
     /// indexed for that document. Used to revoke stale entries on per-field upsert.
+    /// moon#1194: a dense column of exact-size slices (16 B slot + 40 B/value);
+    /// the former `HashMap<u32, SmallVec<[(Bytes, Bytes); 8]>>` held 528 B inline
+    /// per tagged doc while billing ~100 B.
     #[cfg(feature = "text-index")]
-    pub doc_tag_entries: HashMap<u32, smallvec::SmallVec<[(Bytes, Bytes); 8]>>,
+    pub doc_tag_entries: DocSlices<TagEntry>,
 
     // ── NUMERIC index (Plan 152-07, Phase 152) ────────────────────────────
     //
@@ -174,11 +197,11 @@ pub struct TextIndex {
         Bytes,
         std::collections::BTreeMap<ordered_float::OrderedFloat<f64>, roaring::RoaringBitmap>,
     >,
-    /// `doc_id -> list of (canonical_field, parsed_value)` entries currently
+    /// `doc_id -> [(numeric field index, parsed_value)]` entries currently
     /// indexed for that document. Used to revoke stale entries on per-field upsert.
+    /// moon#1194: dense column of exact-size slices (16 B slot + 16 B/value).
     #[cfg(feature = "text-index")]
-    pub doc_numeric_entries:
-        HashMap<u32, smallvec::SmallVec<[(Bytes, ordered_float::OrderedFloat<f64>); 4]>>,
+    pub doc_numeric_entries: DocSlices<NumericEntry>,
 
     /// Logical database this index was created in (WS5a db-scoped indexes —
     /// mirrors `IndexMeta::db_index` in `src/vector/store.rs`). Defaults to
@@ -211,7 +234,7 @@ pub struct TextIndex {
     /// fields as they were indexed) — the `.tpost` validity stamp, mirroring
     /// the vector plane's `key_hash_to_vec_checksum`. Absent for docs indexed
     /// by a path that did not record one (treated as "changed" on reconcile).
-    pub doc_id_to_content_checksum: HashMap<u32, u64>,
+    pub doc_id_to_content_checksum: DocU64s,
     /// Bumped by every mutator; `persisted_seq` trails it. Dirty when they
     /// differ. Both start at 0 so a fresh empty index is clean.
     mutation_seq: u64,
@@ -268,28 +291,29 @@ impl TextIndex {
             field_term_dicts,
             #[cfg(feature = "text-index")]
             fst_maps: (0..field_count).map(|_| None).collect(),
-            doc_field_lengths: HashMap::new(),
+            doc_field_lengths: DocLengths::new(field_count),
             key_hash_to_doc_id: HashMap::new(),
-            doc_id_to_key: HashMap::new(),
+            doc_id_to_key: DocKeys::new(),
             next_doc_id: 0,
-            doc_id_to_insert_lsn: HashMap::new(),
+            free_doc_ids: roaring::RoaringBitmap::new(),
+            doc_id_to_insert_lsn: DocU64s::new(),
             doc_id_to_delete_lsn: HashMap::new(),
             #[cfg(feature = "text-index")]
             tag_fields: Vec::new(),
             #[cfg(feature = "text-index")]
             tag_indexes: HashMap::new(),
             #[cfg(feature = "text-index")]
-            doc_tag_entries: HashMap::new(),
+            doc_tag_entries: DocSlices::new(),
             #[cfg(feature = "text-index")]
             numeric_fields: Vec::new(),
             #[cfg(feature = "text-index")]
             numeric_indexes: HashMap::new(),
             #[cfg(feature = "text-index")]
-            doc_numeric_entries: HashMap::new(),
+            doc_numeric_entries: DocSlices::new(),
             db_index: 0,
             resident_bytes_extra: 0,
             recovered_from_sidecar: false,
-            doc_id_to_content_checksum: HashMap::new(),
+            doc_id_to_content_checksum: DocU64s::new(),
             mutation_seq: 0,
             persisted_seq: 0,
             last_encode_at: None,
@@ -379,12 +403,58 @@ impl TextIndex {
         if let Some(&id) = self.key_hash_to_doc_id.get(&key_hash) {
             return id;
         }
-        let id = self.next_doc_id;
-        self.next_doc_id += 1;
+        let id = self.alloc_doc_id();
         self.key_hash_to_doc_id.insert(key_hash, id);
         self.doc_id_to_key.insert(id, Bytes::copy_from_slice(key));
         self.charge_new_doc_key(key.len());
         id
+    }
+
+    /// The id for a genuinely NEW document: the smallest freed id, else `next_doc_id`.
+    ///
+    /// Reuse is safe because `remove_doc_by_doc_id` clears EVERY structure keyed by the id before
+    /// it becomes free — postings (via the doc→terms reverse map), field lengths, key and key-hash
+    /// entry, insert/delete LSNs, content checksum, TAG/NUMERIC entries and bitmaps — so the new
+    /// document starts from exactly the state a never-used id has. Nothing outside the index holds
+    /// a doc_id across commands (results carry keys; DFS carries df/N, not ids). Tie order between
+    /// equal scores is `doc_id ASC`, as before; a reused id simply sorts where its number is.
+    fn alloc_doc_id(&mut self) -> u32 {
+        if let Some(id) = self.free_doc_ids.min() {
+            self.free_doc_ids.remove(id);
+            return id;
+        }
+        let id = self.next_doc_id;
+        self.next_doc_id += 1;
+        id
+    }
+
+    /// Return `doc_id` (already cleared from every structure, key included) to the free set. When
+    /// it was the highest live id, `next_doc_id` drops to one past the new highest one, the free
+    /// ids above it are forgotten, and the dense columns are cut back — so an index emptied by
+    /// `FT.INVALIDATE_RANGE` gives its column memory back.
+    fn release_doc_id(&mut self, doc_id: u32) {
+        if doc_id.saturating_add(1) < self.next_doc_id {
+            self.free_doc_ids.insert(doc_id);
+            return;
+        }
+        let top = self.doc_id_to_key.live().max().map_or(0, |m| m + 1);
+        self.free_doc_ids.remove_range(top..);
+        self.next_doc_id = top;
+        self.doc_id_to_key.truncate(top);
+        self.doc_field_lengths.truncate(top);
+        self.doc_id_to_insert_lsn.truncate(top);
+        self.doc_id_to_content_checksum.truncate(top);
+        #[cfg(feature = "text-index")]
+        {
+            self.doc_tag_entries.truncate(top);
+            self.doc_numeric_entries.truncate(top);
+        }
+    }
+
+    /// Ids below `next_doc_id` that no document holds (`[0, next_doc_id) \ live`).
+    #[must_use]
+    pub fn free_doc_ids(&self) -> &roaring::RoaringBitmap {
+        &self.free_doc_ids
     }
 
     /// K4 (P0 fix): charge the bookkeeping cost of a genuinely NEW document
@@ -408,13 +478,32 @@ impl TextIndex {
             .saturating_sub(Self::doc_key_entry_cost(key_len));
     }
 
+    /// The `key_hash_to_doc_id` entry plus the key's bytes. The key's
+    /// `doc_id_to_key` slot is billed with the column (`columns_footprint`).
     fn doc_key_entry_cost(key_len: usize) -> usize {
         std::mem::size_of::<u64>()
             + std::mem::size_of::<u32>()
             + MAP_ENTRY_OVERHEAD // key_hash_to_doc_id entry
-            + std::mem::size_of::<u32>()
             + key_len
-            + MAP_ENTRY_OVERHEAD // doc_id_to_key entry
+    }
+
+    /// Exact bytes of the dense per-document columns (`capacity × slot size`,
+    /// moon#1194) — O(1), so `resident_bytes()` stays O(1). Per-doc heap
+    /// contents (key bytes, TAG/NUMERIC entry slices) are billed incrementally
+    /// in `resident_bytes_extra`.
+    fn columns_footprint(&self) -> usize {
+        // The free-id bitmap: ≤ 2 B per free id (roaring array containers; a bitmap container is
+        // 1 bit per id). O(1) — the live count is the key-hash map's length.
+        let free_ids =
+            2 * (self.next_doc_id as usize).saturating_sub(self.key_hash_to_doc_id.len());
+        let base = self.doc_id_to_key.footprint()
+            + self.doc_field_lengths.footprint()
+            + self.doc_id_to_insert_lsn.footprint()
+            + self.doc_id_to_content_checksum.footprint()
+            + free_ids;
+        #[cfg(feature = "text-index")]
+        let base = base + self.doc_tag_entries.footprint() + self.doc_numeric_entries.footprint();
+        base
     }
 
     /// Return `true` if a document is visible at the requested `as_of_lsn`
@@ -448,9 +537,6 @@ impl TextIndex {
     // ── `.tpost` persistence support ─────────────────────────────────────
     //
     // Design and contract: `docs/internal/text-postings-persistence.md`.
-
-    const CONTENT_CHECKSUM_ENTRY_COST: usize =
-        std::mem::size_of::<u32>() + std::mem::size_of::<u64>() + MAP_ENTRY_OVERHEAD;
 
     #[inline]
     fn mark_dirty(&mut self) {
@@ -569,13 +655,7 @@ impl TextIndex {
             return;
         };
         let sum = self.content_checksum(args);
-        if self
-            .doc_id_to_content_checksum
-            .insert(doc_id, sum)
-            .is_none()
-        {
-            self.resident_bytes_extra += Self::CONTENT_CHECKSUM_ENTRY_COST;
-        }
+        self.doc_id_to_content_checksum.insert(doc_id, sum);
         self.mark_dirty();
     }
 
@@ -596,11 +676,7 @@ impl TextIndex {
         let docs = self.doc_id_to_key.len() as u32;
         for (f, stats) in self.field_stats.iter_mut().enumerate() {
             stats.num_docs = docs;
-            stats.total_field_length = self
-                .doc_field_lengths
-                .values()
-                .map(|l| l.get(f).copied().unwrap_or(0) as u64)
-                .sum();
+            stats.total_field_length = self.doc_field_lengths.sum_field(f);
         }
     }
 
@@ -681,23 +757,42 @@ impl TextIndex {
             }
         }
 
-        // Validated — assign.
-        self.next_doc_id = p.next_doc_id;
-        let field_count = self.text_fields.len();
+        // The columns below get one slot per id up to the highest loaded one: refuse sparse ids
+        // (`decode` already did; this guards a hand-built `PersistedTextIndex`), so install
+        // allocates O(doc count), never O(a claimed id).
+        let top = p
+            .docs
+            .iter()
+            .map(|d| d.doc_id.saturating_add(1))
+            .max()
+            .unwrap_or(0);
+        if !crate::text::postings_persist::doc_ids_dense_enough(
+            top.max(p.next_doc_id),
+            p.docs.len(),
+        ) {
+            return Err("doc ids too sparse");
+        }
+
+        // Validated — assign. `next_doc_id` is normalised to one past the highest loaded id and
+        // every id below it that no document holds is free (a file written before freed ids were
+        // reused may carry a higher counter and holes).
+        let mut free = roaring::RoaringBitmap::new();
+        free.insert_range(0..top);
+        for d in &p.docs {
+            free.remove(d.doc_id);
+        }
+        self.next_doc_id = top;
+        self.free_doc_ids = free;
         for d in p.docs {
             let key_hash = xxhash_rust::xxh64::xxh64(&d.key, 0);
             self.key_hash_to_doc_id.insert(key_hash, d.doc_id);
             self.charge_new_doc_key(d.key.len());
             self.doc_id_to_key.insert(d.doc_id, d.key);
-            self.doc_field_lengths.insert(d.doc_id, d.field_lengths);
-            self.resident_bytes_extra += std::mem::size_of::<u32>()
-                + field_count * std::mem::size_of::<u32>()
-                + MAP_ENTRY_OVERHEAD;
+            self.doc_field_lengths.set(d.doc_id, &d.field_lengths);
             self.set_doc_insert_lsn(d.doc_id, d.insert_lsn);
             if d.content_checksum != 0 {
                 self.doc_id_to_content_checksum
                     .insert(d.doc_id, d.content_checksum);
-                self.resident_bytes_extra += Self::CONTENT_CHECKSUM_ENTRY_COST;
             }
         }
         self.field_term_dicts = dicts;
@@ -706,26 +801,36 @@ impl TextIndex {
             self.set_fst_map(f, fst);
         }
         for (doc_id, entries) in p.tag_docs {
-            let mut next: smallvec::SmallVec<[(Bytes, Bytes); 8]> = smallvec::SmallVec::new();
+            let mut next: Vec<TagEntry> = Vec::with_capacity(entries.len());
             for (field, value) in entries {
-                self.tag_bitmap_insert(&field, &value, doc_id);
-                next.push((field, value));
+                // Validated above: every field is in the schema.
+                let Some(fi) = self.tag_fields.iter().position(|t| t.field_name == field) else {
+                    continue;
+                };
+                let stored = self.tag_bitmap_insert(&field, &value, doc_id);
+                next.push((fi as u32, stored));
             }
             self.resident_bytes_extra += Self::tag_entries_cost(&next);
-            self.doc_tag_entries.insert(doc_id, next);
+            self.doc_tag_entries.set(doc_id, next);
         }
         for (doc_id, entries) in p.numeric_docs {
-            let mut next: smallvec::SmallVec<[(Bytes, ordered_float::OrderedFloat<f64>); 4]> =
-                smallvec::SmallVec::new();
+            let mut next: Vec<NumericEntry> = Vec::with_capacity(entries.len());
             for (field, value) in entries {
+                let Some(fi) = self
+                    .numeric_fields
+                    .iter()
+                    .position(|n| n.field_name == field)
+                else {
+                    continue;
+                };
                 let of = ordered_float::OrderedFloat(value);
                 if self.numeric_bitmap_insert(&field, of, doc_id) {
-                    next.push((field, of));
+                    next.push((fi as u32, of));
                 }
             }
             if !next.is_empty() {
                 self.resident_bytes_extra += Self::numeric_entries_cost(&next);
-                self.doc_numeric_entries.insert(doc_id, next);
+                self.doc_numeric_entries.set(doc_id, next);
             }
         }
         self.recompute_field_stats();
@@ -771,12 +876,8 @@ impl TextIndex {
     #[inline]
     pub fn set_doc_insert_lsn(&mut self, doc_id: u32, lsn: u64) {
         if lsn != 0 {
-            let is_new = !self.doc_id_to_insert_lsn.contains_key(&doc_id);
+            // Dense column: billed by capacity (`columns_footprint`).
             self.doc_id_to_insert_lsn.insert(doc_id, lsn);
-            if is_new {
-                self.resident_bytes_extra +=
-                    std::mem::size_of::<u32>() + std::mem::size_of::<u64>() + MAP_ENTRY_OVERHEAD;
-            }
         }
     }
 
@@ -858,21 +959,14 @@ impl TextIndex {
                 // Remove old postings for this doc
                 self.field_postings[field_idx].remove_doc(existing_id);
                 // Subtract old field length from stats
-                if let Some(old_lengths) = self.doc_field_lengths.get(&existing_id) {
-                    if field_idx < old_lengths.len() {
-                        let old_len = old_lengths[field_idx] as u64;
-                        self.field_stats[field_idx].total_field_length = self.field_stats
-                            [field_idx]
-                            .total_field_length
-                            .saturating_sub(old_len);
-                    }
-                }
+                let old_len = u64::from(self.doc_field_lengths.get(existing_id, field_idx));
+                self.field_stats[field_idx].total_field_length = self.field_stats[field_idx]
+                    .total_field_length
+                    .saturating_sub(old_len);
             }
             existing_id
         } else {
-            let id = self.next_doc_id;
-            self.next_doc_id += 1;
-            id
+            self.alloc_doc_id()
         };
 
         // Store key mapping. K4 (P0 fix): the bookkeeping charge fires only
@@ -888,7 +982,8 @@ impl TextIndex {
 
         // Initialize field lengths for this document
         let field_count = self.text_fields.len();
-        let mut field_lengths = vec![0u32; field_count];
+        let mut field_lengths: smallvec::SmallVec<[u32; 8]> =
+            smallvec::smallvec![0u32; field_count];
 
         // Index each TEXT field
         for field_idx in 0..field_count {
@@ -941,16 +1036,8 @@ impl TextIndex {
             self.field_stats[field_idx].total_field_length += token_count as u64;
         }
 
-        // K4 (P0 fix): charge only on a genuinely new doc -- on upsert this
-        // `insert` replaces an existing entry with a Vec of the SAME length
-        // (`field_count`, constant for this index), a byte-size-identical
-        // overwrite that must not be re-charged.
-        if !is_upsert {
-            self.resident_bytes_extra += std::mem::size_of::<u32>()
-                + field_count * std::mem::size_of::<u32>()
-                + MAP_ENTRY_OVERHEAD;
-        }
-        self.doc_field_lengths.insert(doc_id, field_lengths);
+        // Dense column: billed by capacity (`columns_footprint`, moon#1194).
+        self.doc_field_lengths.set(doc_id, &field_lengths);
         self.mark_dirty();
     }
 
@@ -963,7 +1050,12 @@ impl TextIndex {
     /// These are injected by the DFS pre-pass coordinator for multi-shard global IDF
     /// accuracy (per D-04). When `None`, local field statistics are used (single-shard path).
     ///
-    /// Returns results sorted descending by BM25 score, truncated to `top_k`.
+    /// Returns results sorted descending by BM25 score (ties: ascending doc_id),
+    /// truncated to `top_k`.
+    ///
+    /// moon#1191: one scoring pass over the candidates (intersected rarest
+    /// posting first) with hoisted IDF and doc-ordered TF cursors, a bounded
+    /// top-k selection, and keys cloned only for the returned results.
     pub fn search_field(
         &self,
         field_idx: usize,
@@ -972,117 +1064,51 @@ impl TextIndex {
         global_n: Option<u32>,
         top_k: usize,
     ) -> Vec<TextSearchResult> {
-        if field_idx >= self.field_postings.len() || query_terms.is_empty() {
-            return Vec::new();
+        self.search_field_where(field_idx, query_terms, global_df, global_n, top_k, |_| true)
+    }
+
+    /// [`Self::search_field`] over the candidates `keep` accepts (AS_OF).
+    fn search_field_where(
+        &self,
+        field_idx: usize,
+        query_terms: &[String],
+        global_df: Option<&HashMap<String, u32>>,
+        global_n: Option<u32>,
+        top_k: usize,
+        keep: impl Fn(u32) -> bool,
+    ) -> Vec<TextSearchResult> {
+        // AND: an out-of-range field or any term missing from the dictionary /
+        // postings matches nothing (RESEARCH Pitfall 1).
+        match crate::text::score::FieldScorer::exact(
+            self,
+            field_idx,
+            query_terms,
+            global_df,
+            global_n,
+        ) {
+            Some(field) => crate::text::score::top_k_for_field(self, field, top_k, keep),
+            None => Vec::new(),
         }
+    }
 
-        // Step 1: build candidate bitmap via RoaringBitmap AND intersection.
-        // Per RESEARCH Pitfall 1: any absent term means no results (AND semantics).
-        use roaring::RoaringBitmap;
+    /// `set` restricted to documents that resolve to a key (`doc_id_to_key`).
+    #[must_use]
+    pub fn restrict_to_live(&self, mut set: roaring::RoaringBitmap) -> roaring::RoaringBitmap {
+        set &= self.doc_id_to_key.live();
+        set
+    }
 
-        // Collect postings for each query term; early-exit if any term is missing.
-        let mut term_postings: Vec<(String, u32)> = Vec::with_capacity(query_terms.len());
-        for term in query_terms {
-            let term_id = match self.field_term_dicts[field_idx].get(term) {
-                Some(id) => id,
-                None => return Vec::new(), // AND: missing term = no results
-            };
-            // Verify posting list exists
-            if self.field_postings[field_idx]
-                .get_posting(term_id)
-                .is_none()
-            {
-                return Vec::new();
-            }
-            term_postings.push((term.clone(), term_id));
-        }
+    /// Every document that resolves to a key — the `*` (match-all) set.
+    #[must_use]
+    pub fn live_docs(&self) -> &roaring::RoaringBitmap {
+        self.doc_id_to_key.live()
+    }
 
-        // Build candidate bitmap: start from first term's doc_ids, AND with rest.
-        let mut candidate_bitmap: RoaringBitmap = {
-            // Defensive (no expect/panic): term_postings is non-empty and each posting was just
-            // verified present, but a missing posting here would mean the AND term has no docs ⇒
-            // no results. Never panic on the BM25 hot path.
-            let Some(first_posting) =
-                self.field_postings[field_idx].get_posting(term_postings[0].1)
-            else {
-                return Vec::new();
-            };
-            first_posting.doc_ids.clone()
-        };
-
-        for (_, term_id) in &term_postings[1..] {
-            // Defensive: an absent AND-term posting ⇒ empty intersection ⇒ no results.
-            let Some(posting) = self.field_postings[field_idx].get_posting(*term_id) else {
-                return Vec::new();
-            };
-            candidate_bitmap &= &posting.doc_ids;
-        }
-
-        if candidate_bitmap.is_empty() {
-            return Vec::new();
-        }
-
-        // Step 2: score each surviving candidate document with BM25.
-        let stats = &self.field_stats[field_idx];
-        let n = global_n.unwrap_or(stats.num_docs);
-        let avgdl = stats.avg_doc_len();
-        let k1 = self.bm25_config.k1;
-        let b = self.bm25_config.b;
-        let weight = self.text_fields[field_idx].weight as f32;
-
-        let mut results: Vec<TextSearchResult> =
-            Vec::with_capacity(candidate_bitmap.len() as usize);
-
-        for doc_id in &candidate_bitmap {
-            let dl = self
-                .doc_field_lengths
-                .get(&doc_id)
-                .and_then(|lens| lens.get(field_idx).copied())
-                .unwrap_or(0);
-
-            let mut doc_score = 0.0f32;
-            for (term, term_id) in &term_postings {
-                // Defensive: skip a term whose posting vanished rather than panic; its BM25
-                // contribution is simply omitted (the doc already matched the AND candidate set).
-                let Some(posting) = self.field_postings[field_idx].get_posting(*term_id) else {
-                    continue;
-                };
-
-                // Rank-aligned TF lookup (fts-posting-rank-tf): sub-linear and correct after
-                // document updates. term_freqs is now kept in sorted-doc_id (rank) order, so the
-                // old linear scan is gone — see PostingList::tf. (Supersedes the former
-                // "RESEARCH Pitfall 1" note, which assumed insertion-order term_freqs.)
-                let tf = posting.tf(doc_id) as f32;
-
-                // Use global_df if provided (DFS path), else local doc frequency.
-                let df = global_df
-                    .and_then(|m| m.get(term.as_str()).copied())
-                    .unwrap_or_else(|| posting.doc_ids.len() as u32);
-
-                doc_score += bm25_score(tf, df, n, dl, avgdl, k1, b) * weight;
-            }
-
-            // Resolve original Redis key for this document.
-            let key = match self.doc_id_to_key.get(&doc_id) {
-                Some(k) => k.clone(),
-                None => continue, // orphaned doc_id — skip
-            };
-
-            results.push(TextSearchResult {
-                doc_id,
-                key,
-                score: doc_score,
-            });
-        }
-
-        // Step 3: sort descending by BM25 score (higher = more relevant per D-07).
-        results.sort_by(|a, b| {
-            b.score
-                .partial_cmp(&a.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        results.truncate(top_k);
-        results
+    /// Token length of `doc_id`'s `field_idx` field (`0` when unknown).
+    #[inline]
+    #[must_use]
+    pub fn doc_field_len(&self, doc_id: u32, field_idx: usize) -> u32 {
+        self.doc_field_lengths.get(doc_id, field_idx)
     }
 
     /// Collect document frequency for each term + total N for the DFS pre-pass.
@@ -1167,103 +1193,41 @@ impl TextIndex {
     /// Expand a single query term into matching term IDs via FST + HashMap fallback.
     ///
     /// Exact terms: direct TermDictionary lookup (unchanged path).
-    /// Fuzzy/Prefix: FST expansion + post-compaction HashMap scan (D-12).
-    /// Returns empty Vec if no FST and term is Fuzzy/Prefix (D-13: not an error).
+    /// Fuzzy/Prefix: FST expansion + post-compaction HashMap scan (D-12), both feeding ONE capped
+    /// selection ([`crate::text::fst_dict::TopTerms`]): the top 50 by (df DESC, term bytes ASC)
+    /// of their union, whichever path holds a term — so the kept terms depend only on the
+    /// matching terms and their document frequencies, never on term-id assignment (moon#1218,
+    /// moon#1221 review). Returned best first. No FST: the whole dictionary is scanned (D-13).
     #[cfg(feature = "text-index")]
     pub fn expand_terms(&self, field_idx: usize, text: &str, modifier: &TermModifier) -> Vec<u32> {
+        use crate::text::fst_dict::{
+            TopTerms, offer_fuzzy_dict, offer_fuzzy_fst, offer_prefix_dict, offer_prefix_fst,
+        };
         const MAX_EXPANDED: usize = 50; // D-09
 
+        let dict = &self.field_term_dicts[field_idx];
+        let postings = &self.field_postings[field_idx];
+        let fst_map = self.fst_maps[field_idx].as_ref();
+        // Terms with id >= hwm were added after the FST was built (D-12); without an FST the
+        // dictionary scan covers everything.
+        let hwm = fst_map.map_or(0, |_| dict.fst_high_water_mark);
         match modifier {
-            TermModifier::Exact => self.field_term_dicts[field_idx]
-                .get(text)
-                .map(|id| vec![id])
-                .unwrap_or_default(),
+            TermModifier::Exact => dict.get(text).map(|id| vec![id]).unwrap_or_default(),
             TermModifier::Fuzzy(dist) => {
-                let hwm = self.field_term_dicts[field_idx].fst_high_water_mark;
-                match &self.fst_maps[field_idx] {
-                    Some(fst_map) => {
-                        let mut ids = crate::text::fst_dict::expand_fuzzy(
-                            fst_map,
-                            text,
-                            *dist,
-                            &self.field_postings[field_idx],
-                            MAX_EXPANDED,
-                        );
-                        // D-12 dual-path: also scan post-compaction HashMap terms.
-                        let mut extra = crate::text::fst_dict::expand_fuzzy_hashmap(
-                            &self.field_term_dicts[field_idx],
-                            text,
-                            *dist,
-                            &self.field_postings[field_idx],
-                            hwm,
-                            MAX_EXPANDED,
-                        );
-                        ids.append(&mut extra);
-                        // Deduplicate and re-cap.
-                        ids.sort_unstable();
-                        ids.dedup();
-                        if ids.len() > MAX_EXPANDED {
-                            let postings = &self.field_postings[field_idx];
-                            ids.sort_unstable_by(|a, b| {
-                                postings.doc_freq(*b).cmp(&postings.doc_freq(*a))
-                            });
-                            ids.truncate(MAX_EXPANDED);
-                        }
-                        ids
-                    }
-                    None => {
-                        // No FST: brute-force scan entire HashMap (no compaction happened yet).
-                        crate::text::fst_dict::expand_fuzzy_hashmap(
-                            &self.field_term_dicts[field_idx],
-                            text,
-                            *dist,
-                            &self.field_postings[field_idx],
-                            0,
-                            MAX_EXPANDED,
-                        )
-                    }
+                let mut top = TopTerms::new(MAX_EXPANDED);
+                if let Some(fst_map) = fst_map {
+                    offer_fuzzy_fst(fst_map, text, *dist, postings, &mut top);
                 }
+                offer_fuzzy_dict(dict, text, *dist, postings, hwm, &mut top);
+                top.into_ids()
             }
             TermModifier::Prefix => {
-                let hwm = self.field_term_dicts[field_idx].fst_high_water_mark;
-                match &self.fst_maps[field_idx] {
-                    Some(fst_map) => {
-                        let mut ids = crate::text::fst_dict::expand_prefix(
-                            fst_map,
-                            text,
-                            &self.field_postings[field_idx],
-                            MAX_EXPANDED,
-                        );
-                        let mut extra = crate::text::fst_dict::expand_prefix_hashmap(
-                            &self.field_term_dicts[field_idx],
-                            text,
-                            &self.field_postings[field_idx],
-                            hwm,
-                            MAX_EXPANDED,
-                        );
-                        ids.append(&mut extra);
-                        ids.sort_unstable();
-                        ids.dedup();
-                        if ids.len() > MAX_EXPANDED {
-                            let postings = &self.field_postings[field_idx];
-                            ids.sort_unstable_by(|a, b| {
-                                postings.doc_freq(*b).cmp(&postings.doc_freq(*a))
-                            });
-                            ids.truncate(MAX_EXPANDED);
-                        }
-                        ids
-                    }
-                    None => {
-                        // No FST: brute-force scan entire HashMap.
-                        crate::text::fst_dict::expand_prefix_hashmap(
-                            &self.field_term_dicts[field_idx],
-                            text,
-                            &self.field_postings[field_idx],
-                            0,
-                            MAX_EXPANDED,
-                        )
-                    }
+                let mut top = TopTerms::new(MAX_EXPANDED);
+                if let Some(fst_map) = fst_map {
+                    offer_prefix_fst(fst_map, text, postings, &mut top);
                 }
+                offer_prefix_dict(dict, text, postings, hwm, &mut top);
+                top.into_ids()
             }
         }
     }
@@ -1275,6 +1239,9 @@ impl TextIndex {
     ///
     /// This is the OR counterpart to `search_field()` which uses AND intersection.
     /// Called for fuzzy/prefix queries after `expand_terms()` produces expanded_term_ids.
+    ///
+    /// `global_df` is accepted for API symmetry but unused: expanded terms always
+    /// score with their LOCAL posting df (`global_n` is honoured).
     #[cfg(feature = "text-index")]
     pub fn search_field_or(
         &self,
@@ -1284,87 +1251,25 @@ impl TextIndex {
         global_n: Option<u32>,
         top_k: usize,
     ) -> Vec<TextSearchResult> {
-        use roaring::RoaringBitmap;
-
-        if field_idx >= self.field_postings.len() || expanded_term_ids.is_empty() {
-            return Vec::new();
-        }
-
-        // OR: union all posting list bitmaps (any expanded term match counts, D-05).
-        let mut candidate_bitmap = RoaringBitmap::new();
-        for &term_id in expanded_term_ids {
-            if let Some(posting) = self.field_postings[field_idx].get_posting(term_id) {
-                candidate_bitmap |= &posting.doc_ids;
-            }
-        }
-        if candidate_bitmap.is_empty() {
-            return Vec::new();
-        }
-
-        // Score each candidate: MAX BM25 across all matching expanded terms (D-05: best, not sum).
-        let stats = &self.field_stats[field_idx];
-        let n = global_n.unwrap_or(stats.num_docs);
-        let avgdl = stats.avg_doc_len();
-        let k1 = self.bm25_config.k1;
-        let b = self.bm25_config.b;
-        let weight = self.text_fields[field_idx].weight as f32;
-
-        let mut results: Vec<TextSearchResult> =
-            Vec::with_capacity(candidate_bitmap.len() as usize);
-
-        // global_df maps term strings -> df, but we have term_ids here (OR-union path).
-        // For fuzzy/prefix expansion, always use local posting list doc_freq.
-        // The global_df parameter is accepted for API symmetry with search_field() but unused.
         let _ = global_df;
+        self.search_field_or_where(field_idx, expanded_term_ids, global_n, top_k, |_| true)
+    }
 
-        for doc_id in &candidate_bitmap {
-            let dl = self
-                .doc_field_lengths
-                .get(&doc_id)
-                .and_then(|lens| lens.get(field_idx).copied())
-                .unwrap_or(0);
-
-            let mut best_score = 0.0f32;
-            for &term_id in expanded_term_ids {
-                let Some(posting) = self.field_postings[field_idx].get_posting(term_id) else {
-                    continue;
-                };
-                if !posting.doc_ids.contains(doc_id) {
-                    continue;
-                }
-
-                // Rank-aligned TF lookup (fts-posting-rank-tf) — same as search_field.
-                let tf = posting.tf(doc_id) as f32;
-
-                // Use local posting list df for expanded term IDs.
-                let df = posting.doc_ids.len() as u32;
-
-                let score = bm25_score(tf, df, n, dl, avgdl, k1, b) * weight;
-                if score > best_score {
-                    best_score = score;
-                }
-            }
-
-            let key = match self.doc_id_to_key.get(&doc_id) {
-                Some(k) => k.clone(),
-                None => continue, // orphaned doc_id — skip
-            };
-
-            results.push(TextSearchResult {
-                doc_id,
-                key,
-                score: best_score,
-            });
+    /// [`Self::search_field_or`] over the candidates `keep` accepts (AS_OF).
+    #[cfg(feature = "text-index")]
+    fn search_field_or_where(
+        &self,
+        field_idx: usize,
+        expanded_term_ids: &[u32],
+        global_n: Option<u32>,
+        top_k: usize,
+        keep: impl Fn(u32) -> bool,
+    ) -> Vec<TextSearchResult> {
+        match crate::text::score::FieldScorer::any_of(self, field_idx, expanded_term_ids, global_n)
+        {
+            Some(field) => crate::text::score::top_k_for_field(self, field, top_k, keep),
+            None => Vec::new(),
         }
-
-        // Sort descending by BM25 score, truncate to top_k.
-        results.sort_by(|a, b| {
-            b.score
-                .partial_cmp(&a.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        results.truncate(top_k);
-        results
     }
 
     // ── TAG indexing (Plan 152-06) ─────────────────────────────────────────
@@ -1418,20 +1323,27 @@ impl TextIndex {
         // actually existed (`doc_tag_entries` never stores an empty Vec --
         // see the `!next.is_empty()` guard below -- so `Some(_)` always
         // means real, previously-charged content).
-        let prior_opt = self.doc_tag_entries.remove(&doc_id);
+        let prior_opt = self.doc_tag_entries.take(doc_id);
         if let Some(prior_entries) = &prior_opt {
             self.resident_bytes_extra = self
                 .resident_bytes_extra
                 .saturating_sub(Self::tag_entries_cost(prior_entries));
         }
-        let prior = prior_opt.unwrap_or_default();
-        let mut next: smallvec::SmallVec<[(Bytes, Bytes); 8]> = smallvec::SmallVec::new();
-        for (field, value) in prior.into_iter() {
+        let prior = prior_opt.map(Vec::from).unwrap_or_default();
+        let mut next: Vec<TagEntry> = Vec::with_capacity(prior.len() + touched.len());
+        for (fi, value) in prior {
+            let Some(field) = self
+                .tag_fields
+                .get(fi as usize)
+                .map(|t| t.field_name.clone())
+            else {
+                continue;
+            };
             let is_touched = touched.iter().any(|f| f == &field);
             if is_touched {
                 self.tag_bitmap_revoke(&field, &value, doc_id);
             } else {
-                next.push((field, value));
+                next.push((fi, value));
             }
         }
 
@@ -1503,28 +1415,36 @@ impl TextIndex {
 
             let canonical_field = tag_def.field_name.clone(); // Arc bump
             for value in seen.into_iter() {
-                self.tag_bitmap_insert(&canonical_field, &value, doc_id);
-                next.push((canonical_field.clone(), value));
+                // The entry shares the map key's allocation; this doc's raw
+                // value copy is freed when the call returns (moon#1194).
+                let stored = self.tag_bitmap_insert(&canonical_field, &value, doc_id);
+                next.push((i as u32, stored));
             }
         }
 
         if !next.is_empty() {
             self.resident_bytes_extra += Self::tag_entries_cost(&next);
-            self.doc_tag_entries.insert(doc_id, next);
+            self.doc_tag_entries.set(doc_id, next);
         }
     }
 
     /// K4 (P0 fix): insert `doc_id` into `tag_indexes[field][value]`,
     /// charging the O(1) fixed-cost delta for any newly-created field/value/
     /// doc-bit. Shared by `tag_index_document`'s insert loop.
+    ///
+    /// Returns the map's own key for `value`, so per-document entries share one
+    /// allocation per distinct value. A NEW value is stored as its own copy:
+    /// `value` may be a slice of the document's whole raw field value, which
+    /// would otherwise stay pinned by the map key.
     #[cfg(feature = "text-index")]
-    fn tag_bitmap_insert(&mut self, field: &Bytes, value: &Bytes, doc_id: u32) {
+    fn tag_bitmap_insert(&mut self, field: &Bytes, value: &Bytes, doc_id: u32) -> Bytes {
         let field_is_new = !self.tag_indexes.contains_key(field);
         let field_map = self.tag_indexes.entry(field.clone()).or_default();
-        let value_is_new = !field_map.contains_key(value);
-        let bm = field_map.entry(value.clone()).or_default();
-        let doc_is_new = !bm.contains(doc_id);
-        bm.insert(doc_id);
+        let existing = field_map.get_key_value(value).map(|(k, _)| k.clone());
+        let value_is_new = existing.is_none();
+        let stored = existing.unwrap_or_else(|| Bytes::copy_from_slice(value));
+        let bm = field_map.entry(stored.clone()).or_default();
+        let doc_is_new = bm.insert(doc_id);
         if doc_is_new {
             self.resident_bytes_extra += ROARING_BIT_APPROX_COST;
         }
@@ -1534,6 +1454,7 @@ impl TextIndex {
         if field_is_new {
             self.resident_bytes_extra += field.len() + MAP_ENTRY_OVERHEAD;
         }
+        stored
     }
 
     /// K4 (P0 fix): revoke `doc_id` from `tag_indexes[field][value]`,
@@ -1563,34 +1484,26 @@ impl TextIndex {
         }
     }
 
-    /// K4 (P0 fix): fixed-cost approximation of one `doc_tag_entries[doc_id]`
-    /// entry (mirrors the removed inline formula from the old
-    /// `resident_bytes()` walk). Pure function of the entries slice so it
-    /// can be called both before insert (to charge) and after remove (to
-    /// uncharge) without borrowing `self`.
+    /// Exact heap bytes of one `doc_tag_entries[doc_id]` slice (moon#1194: its
+    /// allocation request; the slot is billed with the column and the value
+    /// bytes with the shared `tag_indexes` key). Pure function of the entries
+    /// so it charges on insert and uncharges on removal symmetrically.
     #[cfg(feature = "text-index")]
-    fn tag_entries_cost(entries: &[(Bytes, Bytes)]) -> usize {
-        std::mem::size_of::<u32>()
-            + MAP_ENTRY_OVERHEAD
-            + entries
-                .iter()
-                .map(|(a, b)| a.len() + b.len() + 32)
-                .sum::<usize>()
+    fn tag_entries_cost(entries: &[TagEntry]) -> usize {
+        DocSlices::<TagEntry>::entries_bytes(entries)
     }
 
-    /// LSN-aware wrapper around [`Self::search_field`] — post-filters the
-    /// scored result list by MVCC visibility at `as_of_lsn`.
+    /// LSN-aware wrapper around [`Self::search_field`] — only documents visible
+    /// at `as_of_lsn` are ranked.
     ///
     /// Backwards-compatible: `as_of_lsn == 0` is a no-op passthrough and
     /// produces identical output to `search_field`.
     ///
-    /// Implementation note: post-filter (rather than pre-filter the candidate
-    /// bitmap) is a deliberate trade-off — it wastes BM25 scoring work on
-    /// invisible docs in exchange for zero risk of breaking the existing
-    /// scoring path. To avoid recall loss when visible docs rank behind many
-    /// invisible docs, we oversample up to `next_doc_id` (full index) when
-    /// AS_OF is active. For the no-filter path we only oversample by 2×
-    /// because there is no filter-driven recall loss.
+    /// moon#1191: HEAD scored and sorted EVERY candidate (an oversample of
+    /// `next_doc_id`), then post-filtered by visibility and truncated. Filtering
+    /// the candidates before the bounded top-k selection yields exactly that
+    /// list — the oversample always covered every candidate — at the cost of
+    /// the visible candidates only (`g1_as_of_top_k_oversample_rescues_low_ranked_visible_doc`).
     pub fn search_field_as_of(
         &self,
         field_idx: usize,
@@ -1603,21 +1516,9 @@ impl TextIndex {
         if as_of_lsn == 0 {
             return self.search_field(field_idx, query_terms, global_df, global_n, top_k);
         }
-        // Unbounded oversample (bounded by index size) — the adversarial test
-        // `g1_as_of_top_k_oversample_rescues_low_ranked_visible_doc` proved
-        // 2× oversample is insufficient when a visible doc ranks last. We
-        // ask search_field for up to `next_doc_id` results (every doc in the
-        // index) so no visible candidate is truncated before filtering. BM25
-        // still short-circuits on empty postings, so the cost is bounded by
-        // candidate_bitmap size, not index size.
-        let oversample = (self.next_doc_id as usize).max(top_k).max(16);
-        let raw = self.search_field(field_idx, query_terms, global_df, global_n, oversample);
-        let mut filtered: Vec<TextSearchResult> = raw
-            .into_iter()
-            .filter(|r| self.is_doc_visible_at(r.doc_id, as_of_lsn))
-            .collect();
-        filtered.truncate(top_k);
-        filtered
+        self.search_field_where(field_idx, query_terms, global_df, global_n, top_k, |d| {
+            self.is_doc_visible_at(d, as_of_lsn)
+        })
     }
 
     /// LSN-aware counterpart to [`Self::search_field_or`] (fuzzy/prefix OR path).
@@ -1635,20 +1536,10 @@ impl TextIndex {
         if as_of_lsn == 0 {
             return self.search_field_or(field_idx, expanded_term_ids, global_df, global_n, top_k);
         }
-        let oversample = (self.next_doc_id as usize).max(top_k).max(16);
-        let raw = self.search_field_or(
-            field_idx,
-            expanded_term_ids,
-            global_df,
-            global_n,
-            oversample,
-        );
-        let mut filtered: Vec<TextSearchResult> = raw
-            .into_iter()
-            .filter(|r| self.is_doc_visible_at(r.doc_id, as_of_lsn))
-            .collect();
-        filtered.truncate(top_k);
-        filtered
+        let _ = global_df;
+        self.search_field_or_where(field_idx, expanded_term_ids, global_n, top_k, |d| {
+            self.is_doc_visible_at(d, as_of_lsn)
+        })
     }
 
     /// Look up documents tagged with a specific value on a specific field.
@@ -1659,35 +1550,32 @@ impl TextIndex {
     /// same rules used on insert (ASCII-lowercase unless CASESENSITIVE).
     #[cfg(feature = "text-index")]
     pub fn search_tag(&self, field: &Bytes, value: &Bytes) -> Vec<u32> {
-        let (canonical_field, case_sensitive) = match self
-            .tag_fields
-            .iter()
-            .find(|f| f.field_name.eq_ignore_ascii_case(field.as_ref()))
-        {
-            Some(f) => (f.field_name.clone(), f.case_sensitive),
-            None => return Vec::new(),
-        };
-
-        let normalized_value: Bytes = if case_sensitive {
-            value.clone()
-        } else if value.iter().all(|b| !b.is_ascii_uppercase()) {
-            value.clone()
-        } else {
-            let mut v = Vec::with_capacity(value.len());
-            for b in value.iter() {
-                v.push(b.to_ascii_lowercase());
-            }
-            Bytes::from(v)
-        };
-
-        match self
-            .tag_indexes
-            .get(&canonical_field)
-            .and_then(|m| m.get(&normalized_value))
-        {
+        match self.tag_value_bitmap(field, value) {
             Some(bm) => bm.iter().collect(),
             None => Vec::new(),
         }
+    }
+
+    /// The doc-id bitmap behind [`Self::search_tag`] (same field resolution and
+    /// value normalization), borrowed — query membership unions it directly
+    /// instead of materializing a `Vec` (moon#1191).
+    #[cfg(feature = "text-index")]
+    pub fn tag_value_bitmap(
+        &self,
+        field: &Bytes,
+        value: &Bytes,
+    ) -> Option<&roaring::RoaringBitmap> {
+        let (canonical_field, case_sensitive) = self
+            .tag_fields
+            .iter()
+            .find(|f| f.field_name.eq_ignore_ascii_case(field.as_ref()))
+            .map(|f| (&f.field_name, f.case_sensitive))?;
+        let field_map = self.tag_indexes.get(canonical_field)?;
+        if case_sensitive || value.iter().all(|b| !b.is_ascii_uppercase()) {
+            return field_map.get(value);
+        }
+        let lowered: Vec<u8> = value.iter().map(u8::to_ascii_lowercase).collect();
+        field_map.get(lowered.as_slice())
     }
 
     // ── NUMERIC indexing (Plan 152-07) ─────────────────────────────────────
@@ -1746,21 +1634,27 @@ impl TextIndex {
         // actually existed (mirrors the TAG-side reasoning in
         // `tag_index_document` -- `doc_numeric_entries` never stores an
         // empty Vec, see the `!next.is_empty()` guard below).
-        let prior_opt = self.doc_numeric_entries.remove(&doc_id);
+        let prior_opt = self.doc_numeric_entries.take(doc_id);
         if let Some(prior_entries) = &prior_opt {
             self.resident_bytes_extra = self
                 .resident_bytes_extra
                 .saturating_sub(Self::numeric_entries_cost(prior_entries));
         }
-        let prior = prior_opt.unwrap_or_default();
-        let mut next: smallvec::SmallVec<[(Bytes, ordered_float::OrderedFloat<f64>); 4]> =
-            smallvec::SmallVec::new();
-        for (field, value) in prior.into_iter() {
+        let prior = prior_opt.map(Vec::from).unwrap_or_default();
+        let mut next: Vec<NumericEntry> = Vec::with_capacity(prior.len() + touched.len());
+        for (fi, value) in prior {
+            let Some(field) = self
+                .numeric_fields
+                .get(fi as usize)
+                .map(|n| n.field_name.clone())
+            else {
+                continue;
+            };
             let is_touched = touched.iter().any(|f| f == &field);
             if is_touched {
                 self.numeric_bitmap_revoke(&field, &value, doc_id);
             } else {
-                next.push((field, value));
+                next.push((fi, value));
             }
         }
 
@@ -1806,13 +1700,13 @@ impl TextIndex {
             let of = ordered_float::OrderedFloat(parsed);
             let canonical_field = num_def.field_name.clone();
             if self.numeric_bitmap_insert(&canonical_field, of, doc_id) {
-                next.push((canonical_field, of));
+                next.push((i as u32, of));
             }
         }
 
         if !next.is_empty() {
             self.resident_bytes_extra += Self::numeric_entries_cost(&next);
-            self.doc_numeric_entries.insert(doc_id, next);
+            self.doc_numeric_entries.set(doc_id, next);
         }
     }
 
@@ -1884,13 +1778,11 @@ impl TextIndex {
         }
     }
 
-    /// K4 (P0 fix): fixed-cost approximation of one
-    /// `doc_numeric_entries[doc_id]` entry. Mirrors `tag_entries_cost`.
+    /// Exact heap bytes of one `doc_numeric_entries[doc_id]` slice (moon#1194).
+    /// Mirrors `tag_entries_cost`.
     #[cfg(feature = "text-index")]
-    fn numeric_entries_cost(entries: &[(Bytes, ordered_float::OrderedFloat<f64>)]) -> usize {
-        std::mem::size_of::<u32>()
-            + MAP_ENTRY_OVERHEAD
-            + entries.iter().map(|(a, _)| a.len() + 16).sum::<usize>()
+    fn numeric_entries_cost(entries: &[NumericEntry]) -> usize {
+        DocSlices::<NumericEntry>::entries_bytes(entries)
     }
 
     /// Resolve a NUMERIC range filter to sorted doc_ids.
@@ -1916,6 +1808,22 @@ impl TextIndex {
         min_exclusive: bool,
         max_exclusive: bool,
     ) -> Vec<u32> {
+        self.numeric_range_bitmap(field, min, max, min_exclusive, max_exclusive)
+            .iter()
+            .collect()
+    }
+
+    /// The doc-id bitmap behind [`Self::search_numeric_range`] (moon#1191:
+    /// query membership uses it directly instead of a materialized `Vec`).
+    #[cfg(feature = "text-index")]
+    pub fn numeric_range_bitmap(
+        &self,
+        field: &Bytes,
+        min: f64,
+        max: f64,
+        min_exclusive: bool,
+        max_exclusive: bool,
+    ) -> roaring::RoaringBitmap {
         use std::ops::Bound::{Excluded, Included, Unbounded};
 
         // Case-insensitive field resolution (same discipline as search_tag).
@@ -1925,11 +1833,11 @@ impl TextIndex {
             .find(|f| f.field_name.eq_ignore_ascii_case(field.as_ref()))
         {
             Some(f) => &f.field_name,
-            None => return Vec::new(),
+            None => return roaring::RoaringBitmap::new(),
         };
 
         let Some(btree) = self.numeric_indexes.get(canonical_field) else {
-            return Vec::new();
+            return roaring::RoaringBitmap::new();
         };
 
         // `BTreeMap::range` PANICS by contract when start > end, or when start
@@ -1947,7 +1855,7 @@ impl TextIndex {
         let lo_v = ordered_float::OrderedFloat(min);
         let hi_v = ordered_float::OrderedFloat(max);
         if lo_v > hi_v || (lo_v == hi_v && (min_exclusive || max_exclusive)) {
-            return Vec::new();
+            return roaring::RoaringBitmap::new();
         }
 
         let lo = if min == f64::NEG_INFINITY {
@@ -1969,7 +1877,7 @@ impl TextIndex {
         for (_k, bm) in btree.range((lo, hi)) {
             result |= bm;
         }
-        result.iter().collect()
+        result
     }
 
     /// Number of indexed documents.
@@ -2030,7 +1938,7 @@ impl TextIndex {
             .iter()
             .map(TermDictionary::resident_bytes)
             .sum();
-        postings + term_dicts + self.resident_bytes_extra
+        postings + term_dicts + self.resident_bytes_extra + self.columns_footprint()
     }
 
     /// Ground-truth full recompute of `resident_bytes()`, using the exact
@@ -2065,25 +1973,13 @@ impl TextIndex {
         #[cfg(not(feature = "text-index"))]
         let fst: usize = 0;
 
-        let doc_field_lengths: usize = self
-            .doc_field_lengths
-            .values()
-            .map(|v| {
-                std::mem::size_of::<u32>()
-                    + v.len() * std::mem::size_of::<u32>()
-                    + MAP_ENTRY_OVERHEAD
-            })
-            .sum();
+        // Dense columns (moon#1194): exact slot-array bytes, recomputed from
+        // the capacities rather than read from a cache.
+        let columns = self.columns_footprint();
         let key_hash_to_doc_id = self.key_hash_to_doc_id.len()
             * (std::mem::size_of::<u64>() + std::mem::size_of::<u32>() + MAP_ENTRY_OVERHEAD);
-        let doc_id_to_key: usize = self
-            .doc_id_to_key
-            .values()
-            .map(|k| std::mem::size_of::<u32>() + k.len() + MAP_ENTRY_OVERHEAD)
-            .sum();
-        let lsn_maps = (self.doc_id_to_insert_lsn.len()
-            + self.doc_id_to_delete_lsn.len()
-            + self.doc_id_to_content_checksum.len())
+        let doc_id_to_key: usize = self.doc_id_to_key.values().map(Bytes::len).sum();
+        let lsn_maps = self.doc_id_to_delete_lsn.len()
             * (std::mem::size_of::<u32>() + std::mem::size_of::<u64>() + MAP_ENTRY_OVERHEAD);
 
         #[cfg(feature = "text-index")]
@@ -2106,8 +2002,8 @@ impl TextIndex {
             .sum::<usize>()
             + self
                 .doc_tag_entries
-                .values()
-                .map(|entries| Self::tag_entries_cost(entries))
+                .iter()
+                .map(|(_, entries)| Self::tag_entries_cost(entries))
                 .sum::<usize>();
         #[cfg(not(feature = "text-index"))]
         let tag: usize = 0;
@@ -2132,8 +2028,8 @@ impl TextIndex {
             .sum::<usize>()
             + self
                 .doc_numeric_entries
-                .values()
-                .map(|entries| Self::numeric_entries_cost(entries))
+                .iter()
+                .map(|(_, entries)| Self::numeric_entries_cost(entries))
                 .sum::<usize>();
         #[cfg(not(feature = "text-index"))]
         let numeric: usize = 0;
@@ -2141,7 +2037,7 @@ impl TextIndex {
         postings
             + term_dicts
             + fst
-            + doc_field_lengths
+            + columns
             + key_hash_to_doc_id
             + doc_id_to_key
             + lsn_maps
@@ -2175,17 +2071,13 @@ impl TextIndex {
                 continue;
             }
             // Subtract field length from stats before clearing postings.
-            if let Some(lengths) = self.doc_field_lengths.get(&doc_id) {
-                if let Some(&len) = lengths.get(field_idx) {
-                    let len64 = len as u64;
-                    self.field_stats[field_idx].total_field_length = self.field_stats[field_idx]
-                        .total_field_length
-                        .saturating_sub(len64);
-                    if len64 > 0 {
-                        self.field_stats[field_idx].num_docs =
-                            self.field_stats[field_idx].num_docs.saturating_sub(1);
-                    }
-                }
+            let len64 = u64::from(self.doc_field_lengths.get(doc_id, field_idx));
+            self.field_stats[field_idx].total_field_length = self.field_stats[field_idx]
+                .total_field_length
+                .saturating_sub(len64);
+            if len64 > 0 {
+                self.field_stats[field_idx].num_docs =
+                    self.field_stats[field_idx].num_docs.saturating_sub(1);
             }
             self.field_postings[field_idx].remove_doc(doc_id);
         }
@@ -2195,24 +2087,36 @@ impl TextIndex {
         // -- same logic `tag_index_document`'s revoke loop uses -- so the two
         // call sites cannot drift apart.
         #[cfg(feature = "text-index")]
-        if let Some(entries) = self.doc_tag_entries.remove(&doc_id) {
+        if let Some(entries) = self.doc_tag_entries.take(doc_id) {
             self.resident_bytes_extra = self
                 .resident_bytes_extra
                 .saturating_sub(Self::tag_entries_cost(&entries));
-            for (field, value) in entries {
-                self.tag_bitmap_revoke(&field, &value, doc_id);
+            for (fi, value) in entries.iter() {
+                if let Some(field) = self
+                    .tag_fields
+                    .get(*fi as usize)
+                    .map(|t| t.field_name.clone())
+                {
+                    self.tag_bitmap_revoke(&field, value, doc_id);
+                }
             }
         }
 
         // ── NUMERIC field removal ─────────────────────────────────────────────
         // K4 (P0 fix): shared `numeric_bitmap_revoke`/`numeric_entries_cost`.
         #[cfg(feature = "text-index")]
-        if let Some(entries) = self.doc_numeric_entries.remove(&doc_id) {
+        if let Some(entries) = self.doc_numeric_entries.take(doc_id) {
             self.resident_bytes_extra = self
                 .resident_bytes_extra
                 .saturating_sub(Self::numeric_entries_cost(&entries));
-            for (field, value) in entries {
-                self.numeric_bitmap_revoke(&field, &value, doc_id);
+            for (fi, value) in entries.iter() {
+                if let Some(field) = self
+                    .numeric_fields
+                    .get(*fi as usize)
+                    .map(|n| n.field_name.clone())
+                {
+                    self.numeric_bitmap_revoke(&field, value, doc_id);
+                }
             }
         }
 
@@ -2220,29 +2124,23 @@ impl TextIndex {
         // K4 (P0 fix): uncharge using the ACTUAL removed Vec's length --
         // self-correcting even if field_count ever varied per doc (it
         // currently doesn't).
-        if let Some(lengths) = self.doc_field_lengths.remove(&doc_id) {
-            self.resident_bytes_extra = self.resident_bytes_extra.saturating_sub(
-                std::mem::size_of::<u32>()
-                    + lengths.len() * std::mem::size_of::<u32>()
-                    + MAP_ENTRY_OVERHEAD,
-            );
-        }
+        // Dense columns: the slots read as empty until the id is reused (`release_doc_id` below).
+        self.doc_field_lengths.clear(doc_id);
         // Remove from key_hash -> doc_id map (need to find the key_hash).
         if let Some(key) = self.doc_id_to_key.remove(&doc_id) {
             let key_hash = xxhash_rust::xxh64::xxh64(&key, 0);
-            self.key_hash_to_doc_id.remove(&key_hash);
+            if self.key_hash_to_doc_id.get(&key_hash) == Some(&doc_id) {
+                self.key_hash_to_doc_id.remove(&key_hash);
+            } else {
+                // Indexed under a hash other than xxh64(key) (unit tests only — every production
+                // caller hashes the key). The id is about to be reused, so no stale hash may
+                // still reach it.
+                self.key_hash_to_doc_id.retain(|_, d| *d != doc_id);
+            }
             self.uncharge_doc_key(key.len());
         }
-        if self.doc_id_to_insert_lsn.remove(&doc_id).is_some() {
-            self.resident_bytes_extra = self.resident_bytes_extra.saturating_sub(
-                std::mem::size_of::<u32>() + std::mem::size_of::<u64>() + MAP_ENTRY_OVERHEAD,
-            );
-        }
-        if self.doc_id_to_content_checksum.remove(&doc_id).is_some() {
-            self.resident_bytes_extra = self
-                .resident_bytes_extra
-                .saturating_sub(Self::CONTENT_CHECKSUM_ENTRY_COST);
-        }
+        self.doc_id_to_insert_lsn.remove(&doc_id);
+        self.doc_id_to_content_checksum.remove(&doc_id);
         self.mark_dirty();
         // `doc_id_to_delete_lsn` currently has no insertion call site anywhere
         // in the codebase (reserved for future v0.2 logical-delete wiring --
@@ -2254,6 +2152,8 @@ impl TextIndex {
                 std::mem::size_of::<u32>() + std::mem::size_of::<u64>() + MAP_ENTRY_OVERHEAD,
             );
         }
+        // Every structure keyed by `doc_id` is clear: the id may now be reused (moon#1221 review).
+        self.release_doc_id(doc_id);
     }
 }
 
@@ -4011,3 +3911,9 @@ mod tag_tests;
 #[cfg(feature = "text-index")]
 #[path = "store_numeric_tests.rs"]
 mod numeric_tests;
+
+// moon#1221 review: freed doc-id reuse — same sibling-file pattern.
+#[cfg(test)]
+#[cfg(feature = "text-index")]
+#[path = "store_doc_id_tests.rs"]
+mod doc_id_tests;

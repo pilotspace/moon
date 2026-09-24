@@ -907,11 +907,9 @@ pub(crate) fn do_rewrite_per_shard(
         }
     };
     let pending_aof_count = fold_snapshot.pending_aof_count;
-    let snapshot = fold_snapshot.dbs;
     info!(
-        "F6 shard {} snapshot received: {} dbs, {} pre-snapshot pending ({:.1}ms total)",
+        "F6 shard {} snapshot received: image streaming, {} pre-snapshot pending ({:.1}ms total)",
         shard_id,
-        snapshot.len(),
         pending_aof_count,
         _fold_t0.elapsed().as_secs_f64() * 1000.0
     );
@@ -937,18 +935,31 @@ pub(crate) fn do_rewrite_per_shard(
     );
 
     // Phase 6: write new base, advance THIS shard's manifest entry (no seq
-    // commit), reopen to the new incr. The manifest lock is held only for the
-    // brief, await-free advance_shard call.
-    let rdb_bytes = crate::persistence::rdb::save_snapshot_to_bytes(&snapshot)?;
+    // commit), reopen to the new incr. moon#1185: the base image streams in
+    // from the shard (serialized there straight from the keyspace, 1 MiB
+    // chunks) and is appended + fsynced into the staging file OUTSIDE the
+    // manifest lock; the lock is held only for the brief, await-free publish
+    // (rename + new incr + dir fsync). Nothing read it during phase 3, so on
+    // a slow disk the whole image may be queued in memory by now (unbounded
+    // channel — see `fold_stream::fold_image_channel`).
+    let tmp_base = coord
+        .manifest
+        .lock()
+        .shard_base_staging(shard_id, coord.new_seq)?;
+    let base_len = crate::persistence::aof::fold_stream::write_fold_image_file(
+        &tmp_base,
+        fold_snapshot.image,
+        "do_rewrite_per_shard",
+    )?;
     info!(
-        "F6 shard {} rdb serialized: {} bytes ({:.1}ms total)",
+        "F6 shard {} base written: {} bytes ({:.1}ms total)",
         shard_id,
-        rdb_bytes.len(),
+        base_len,
         _fold_t0.elapsed().as_secs_f64() * 1000.0
     );
     let new_incr = {
         let mut m = coord.manifest.lock();
-        m.advance_shard(shard_id, coord.new_seq, &rdb_bytes)?
+        m.advance_shard_staged(shard_id, coord.new_seq, &tmp_base, base_len)?
     };
     // #455: open the new incr NOW, but do not switch to it. Until the
     // coordinator reports the new generation committed, `file` must keep
@@ -1222,10 +1233,8 @@ pub(crate) fn do_rewrite_sharded(
         }
     };
     let pending_aof_count = fold_snapshot.pending_aof_count;
-    let snapshot = fold_snapshot.dbs;
     info!(
-        "TopLevel fold snapshot received: {} dbs, {} pre-snapshot pending ({:.1}ms)",
-        snapshot.len(),
+        "TopLevel fold snapshot received: image streaming, {} pre-snapshot pending ({:.1}ms)",
         pending_aof_count,
         _fold_t0.elapsed().as_secs_f64() * 1000.0
     );
@@ -1253,17 +1262,19 @@ pub(crate) fn do_rewrite_sharded(
     // Phase 4 (= Phase 6 in do_rewrite_per_shard numbering):
     // Write new base RDB, advance the manifest (bumps seq, writes manifest,
     // deletes old files), reopen `file` to the new incr.
-    let rdb_bytes = crate::persistence::rdb::save_snapshot_to_bytes(&snapshot)?;
-    info!(
-        "TopLevel fold rdb serialized: {} bytes ({:.1}ms)",
-        rdb_bytes.len(),
-        _fold_t0.elapsed().as_secs_f64() * 1000.0
-    );
-    let (_new_incr, new_file) = manifest.advance_with(&rdb_bytes, |new_incr| {
-        // #455: opened (with its MOON.COLDCUT head) BEFORE the manifest flips,
-        // so switching `file` below cannot fail — see `FoldOutcome`.
-        open_new_incr(new_incr, false, fold_snapshot.cold_file_watermark)
-    })?;
+    // moon#1185: the base image streams in from the shard (serialized there
+    // straight from the keyspace) and is appended to the base temp file as
+    // it arrives — no cloned snapshot, no whole-image `Vec`.
+    let cold_watermark = fold_snapshot.cold_file_watermark;
+    let image = fold_snapshot.image;
+    let (_new_incr, new_file) = manifest.advance_with_base(
+        |f| crate::persistence::aof::fold_stream::write_fold_image(image, f, "TopLevel fold"),
+        |new_incr| {
+            // #455: opened (with its MOON.COLDCUT head) BEFORE the manifest
+            // flips, so switching `file` below cannot fail — see `FoldOutcome`.
+            open_new_incr(new_incr, false, cold_watermark)
+        },
+    )?;
     *file = new_file;
     // task #35: fresh incr — replay always starts a segment at db 0.
     *last_db = 0;
@@ -1506,10 +1517,9 @@ pub(crate) fn rewrite_aof_sharded_sync(
     let pending_aof_count = fold_snapshot.pending_aof_count;
     let cold_watermark = fold_snapshot.cold_file_watermark;
     let snapshot_epoch = fold_snapshot.fold_epoch;
-    let snapshot = fold_snapshot.dbs;
+    let image = fold_snapshot.image;
     info!(
-        "rewrite_aof_sharded_sync (tokio) snapshot: {} dbs, {} pre-snapshot pending ({:.1}ms)",
-        snapshot.len(),
+        "rewrite_aof_sharded_sync (tokio) snapshot: image streaming, {} pre-snapshot pending ({:.1}ms)",
         pending_aof_count,
         _fold_t0.elapsed().as_secs_f64() * 1000.0
     );
@@ -1612,17 +1622,26 @@ pub(crate) fn rewrite_aof_sharded_sync(
     // rename; when that reopen failed, the new file was already published and
     // the writer had to exit. The handle is positioned at the end of what it
     // wrote, and this writer is the file's only appender.
-    let rdb_bytes = crate::persistence::rdb::save_snapshot_to_bytes(&snapshot)?;
     let tmp_path = aof_path.with_extension("aof.tmp");
     let mut f = std::fs::File::create(&tmp_path).map_err(|e| AofError::Io {
         path: tmp_path.clone(),
         source: e,
     })?;
-    {
-        f.write_all(&rdb_bytes).map_err(|e| AofError::Io {
-            path: tmp_path.clone(),
-            source: e,
-        })?;
+    let base_len = {
+        // moon#1185: the base image streams in from the shard and is
+        // appended as it arrives — no cloned snapshot, no whole-image `Vec`.
+        let base_len = match crate::persistence::aof::fold_stream::write_fold_image(
+            image,
+            &mut f,
+            "rewrite_aof_sharded_sync (tokio)",
+        ) {
+            Ok(n) => n,
+            Err(e) => {
+                drop(f);
+                let _ = std::fs::remove_file(&tmp_path);
+                return Err(e);
+            }
+        };
         // moon#914: the new generation opens with `MOON.COLDCUT` — the first
         // RESP record after the preamble, exactly where the monoio TopLevel
         // fold (`do_rewrite_sharded`) puts it at the head of its new incr.
@@ -1643,7 +1662,8 @@ pub(crate) fn rewrite_aof_sharded_sync(
             path: tmp_path.clone(),
             source: e,
         })?;
-    }
+        base_len
+    };
     std::fs::rename(&tmp_path, aof_path).map_err(|e| AofError::RewriteFailed {
         detail: format!(
             "rename {} -> {}: {}",
@@ -1674,7 +1694,7 @@ pub(crate) fn rewrite_aof_sharded_sync(
 
     info!(
         "rewrite_aof_sharded_sync (tokio) complete: {} bytes ({:.1}ms)",
-        rdb_bytes.len(),
+        base_len,
         _fold_t0.elapsed().as_secs_f64() * 1000.0
     );
     if pre_shutdown_requested || mid_shutdown_requested {

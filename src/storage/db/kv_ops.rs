@@ -9,6 +9,17 @@ use crate::storage::entry::{Entry, RedisValue, current_time_ms};
 
 use crate::storage::db::{Database, entry_overhead};
 
+/// Outcome of [`Database::remove_expired_at`] (moon#1189).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExpiredRemoval {
+    /// The expired entry was removed.
+    Removed,
+    /// The popped pair no longer described the entry; nothing was removed.
+    Stale,
+    /// The pair is valid but not due yet; restore it.
+    NotYetDue,
+}
+
 impl Database {
     /// Get an entry by key, performing lazy expiration.
     ///
@@ -18,8 +29,25 @@ impl Database {
     /// (the cold fallback below mutates `self`, so the first borrow cannot
     /// be returned directly): 2 probes on a live hit, 1 on a miss — down
     /// from 3/2 with the previous expiry-check + `is_some()` + get chain.
-    /// No LRU touch on reads (callers requiring LRU updates use `get_mut()`).
+    ///
+    /// Records the access for the eviction policy (moon#1161) — redis's
+    /// `lookupKeyRead`. Metadata commands that redis serves with
+    /// `LOOKUP_NOTOUCH` (`TTL`, `TYPE`, `OBJECT`, …) use [`Self::peek`].
+    #[inline]
     pub fn get(&mut self, key: &[u8]) -> Option<&Entry> {
+        self.lookup(key, true)
+    }
+
+    /// [`Self::get`] WITHOUT recording an access (redis `LOOKUP_NOTOUCH`):
+    /// same lazy-expiry hiding and cold promotion, but `OBJECT IDLETIME` /
+    /// `OBJECT FREQ` do not see this read. For metadata commands and for
+    /// internal lookups that must not look like client traffic.
+    #[inline]
+    pub fn peek(&mut self, key: &[u8]) -> Option<&Entry> {
+        self.lookup(key, false)
+    }
+
+    fn lookup(&mut self, key: &[u8], touch: bool) -> Option<&Entry> {
         let now_ms = self.cached_now_ms;
         enum KeyState {
             Live,
@@ -33,7 +61,13 @@ impl Database {
         };
         match state {
             // Hot path: single re-probe, borrow returned to caller.
-            KeyState::Live => self.data.get(key),
+            KeyState::Live => {
+                let entry = self.data.get(key);
+                if touch && let Some(e) = entry {
+                    e.note_access(crate::storage::eviction::access_tracking(), self.cached_now);
+                }
+                entry
+            }
             KeyState::Expired => {
                 // moon#542: HIDE, don't remove. Deletion belongs to the
                 // active-expiry drain, which emits the keyspace `expired`
@@ -428,8 +462,12 @@ impl Database {
             self.note_lazy_expired(key);
             return None;
         }
-        // Single get_mut: touch LRU + return
+        // Single get_mut: touch LRU + return. moon#1161: under an LFU policy
+        // a write is an access too (redis `lookupKeyWrite`), so the counter
+        // is decayed + incremented before the unconditional stamp below.
+        let tracking = crate::storage::eviction::access_tracking();
         let entry = self.data.get_mut(key)?;
+        entry.note_access(tracking, now);
         entry.set_last_access(now);
         // moon#926: this hands out a raw `&mut Entry`, the broadest mutable
         // handle there is — stamp the WATCH version with it. A miss returns
@@ -454,12 +492,35 @@ impl Database {
     ///
     /// `key` is BORROWED on purpose. Every use below is by reference —
     /// `spill_inflight_forget`, `entry_overhead`, `hash_expiry_index_note_value`,
-    /// `CompactKey::from` (which copies the bytes either way), `ColdIndex::remove`
+    /// the upsert (which builds a `CompactKey` only on a miss), `ColdIndex::remove`
     /// and both expiry-index writers all take `&[u8]`, and the `Bytes` is never
     /// moved anywhere. Taking `Bytes` forced a `key.clone()` at every write
     /// command's call site: one `shared_v_clone` on the way in and one
     /// `shared_v_drop` on the way out, per command, producing nothing.
+    ///
+    /// An overwrite is an ACCESS for the eviction policy (redis `setKey` =
+    /// `lookupKeyWrite` + `dbOverwrite`). A command that already looked the
+    /// key up with an access-recording read writes through
+    /// [`Self::set_looked_up`] instead, so it is not counted twice.
+    #[inline]
     pub fn set(&mut self, key: &[u8], entry: Entry) {
+        self.set_recording::<true>(key, entry);
+    }
+
+    /// [`Self::set`] for a read-modify-write command that has ALREADY read
+    /// the key with an access-recording lookup ([`Self::get`]) in this same
+    /// command — redis's `lookupKeyWrite` + `dbOverwrite`: the lookup records
+    /// the one access (refused commands included, as in redis), and the
+    /// overwrite only CARRIES the LFU counter over. Writing through
+    /// [`Self::set`] there recorded a second Morris increment per command
+    /// (moon#1221 review F3). Everything else is `set`, byte for byte.
+    pub fn set_looked_up(&mut self, key: &[u8], entry: Entry) {
+        self.set_recording::<false>(key, entry);
+    }
+
+    /// The body of [`Self::set`] / [`Self::set_looked_up`]. `RECORD` is a
+    /// const so the plain `set` monomorph is exactly the code it always was.
+    fn set_recording<const RECORD: bool>(&mut self, key: &[u8], entry: Entry) {
         crate::admin::metrics_setup::record_keyspace_change();
         // An overwrite makes any in-flight spill payload for this key stale.
         // Retiring the record here stops its completion publishing the OLD
@@ -490,21 +551,47 @@ impl Database {
         // the hit path, which is deliberate: the counter is a ticket dispenser,
         // not a count, and a gap costs nothing.
         let birth = self.next_birth_version();
+        // moon#1161: under an LFU policy an overwrite keeps (and bumps) the
+        // key's frequency, as redis's `lookupKeyWrite` + `dbSetValue` do —
+        // otherwise every write reset a hot key to `LFU_INIT_VAL`.
+        let tracking = crate::storage::eviction::access_tracking();
+        // `set_looked_up` (moon#1221 review F3): the caller's `get` was the
+        // access; the overwrite below only carries the counter.
+        let record = if RECORD {
+            tracking
+        } else {
+            crate::storage::entry::AccessTracking::Off
+        };
+        let now_secs = self.cached_now;
 
         // `insert_or_update` invariant: exactly one of the two closures fires
         // exactly once per call, so the `Cell::take()` below cannot observe
         // a None value. Annotated for the hot-path unwrap ratchet.
         #[allow(clippy::expect_used)]
-        let result = self.data.insert_or_update(
-            CompactKey::from(key), // CompactKey copies the bytes either way
+        // moon#1159: keyed by the borrowed slice — the owned `CompactKey` is
+        // built only on a miss. `insert_or_update(CompactKey::from(key), ..)`
+        // allocated (and dropped) a heap key block on every overwrite of a
+        // key longer than 23 bytes.
+        let result = self.data.insert_or_update_slice(
+            key,
             |existing: &mut Entry| {
                 // Hit path: replace existing entry, bump version.
                 let new_entry = entry_cell.take().expect("update closure called once");
                 old_cost = entry_overhead(key, existing);
                 old_ttl = existing.expires_at_ms();
                 let new_version = Entry::bump_version(existing.version());
+                let carried_lfu = match tracking {
+                    crate::storage::entry::AccessTracking::Lfu { .. } => {
+                        existing.note_access(record, now_secs);
+                        Some(existing.access_counter())
+                    }
+                    _ => None,
+                };
                 *existing = new_entry;
                 existing.set_version(new_version);
+                if let Some(counter) = carried_lfu {
+                    existing.set_access_counter(counter);
+                }
             },
             || {
                 // Miss path: stamp the creation ticket. Constructors all start
@@ -581,6 +668,9 @@ impl Database {
     pub fn clear(&mut self) {
         crate::admin::metrics_setup::record_keyspace_change();
         self.data = DashTable::new();
+        // moon#1190: the ledger restarts at 0; values still being freed must
+        // not be credited against it again.
+        self.lazy_free_forget_charges();
         self.used_memory = 0;
         self.maybe_has_expiring_keys = false;
         self.expiry_index.clear();
@@ -637,6 +727,9 @@ impl Database {
 
     /// Recalculate `used_memory` by scanning all entries. Call once after bulk load.
     pub fn recalculate_memory(&mut self) {
+        // moon#1190: rebuilt from the hot table alone — a queued lazy-free
+        // value is no longer in it, so it must not be credited later.
+        self.lazy_free_forget_charges();
         let mut total = 0usize;
         let mut any_expiring = false;
         // moon#541: this post-bulk-load pass is also the index's healer —
@@ -648,7 +741,10 @@ impl Database {
             total += entry_overhead(key.as_bytes(), entry);
             if entry.has_expiry() {
                 any_expiring = true;
-                index.insert((entry.expires_at_ms(), key.clone()));
+                index.insert(super::expiry_index::ExpiryPair {
+                    ts: entry.expires_at_ms(),
+                    key: key.clone(),
+                });
             }
             // moon#543: the same healing property for the hash-field index —
             // a load path that bypassed `insert_for_load` still ends indexed.
@@ -730,6 +826,115 @@ impl Database {
             hot.is_some() || (had_cold && cold_alive) || inflight_alive,
             hot,
         )
+    }
+
+    /// `UNLINK` for one key (moon#1190): [`Self::remove_counting_cold`]'s
+    /// answer, but a large hot value is handed to the lazy-free queue instead
+    /// of being walked for its ledger cost and dropped inside the command.
+    ///
+    /// O(1) for the command however big the value: one table probe, the
+    /// expiry-index unindex, and a queue push. The value's bytes stay charged
+    /// to `used_memory` until the shard tick's drain frees them.
+    pub fn unlink(&mut self, key: &[u8]) -> bool {
+        crate::admin::metrics_setup::record_keyspace_change();
+        let now_ms = self.cached_now_ms;
+        let cold_alive = self
+            .cold_index
+            .as_ref()
+            .and_then(|ci| ci.lookup(key))
+            .is_some_and(|loc| loc.ttl_ms.is_none_or(|ttl| now_ms <= ttl));
+        let inflight_alive = self.spill_inflight_alive(key, now_ms);
+        let had_cold = self.remove_cold_only(key);
+        let hot = self.remove_hot_lazily(key);
+        hot || (had_cold && cold_alive) || inflight_alive
+    }
+
+    /// [`Self::remove`] for a server-initiated deletion (active expiry)
+    /// whose value may be large: hot and cold copies go, and a large hot
+    /// value is freed through the lazy-free queue (moon#1190). Returns
+    /// whether a hot entry was removed.
+    pub(crate) fn remove_lazily(&mut self, key: &[u8]) -> bool {
+        crate::admin::metrics_setup::record_keyspace_change();
+        let _ = self.remove_cold_only(key);
+        self.remove_hot_lazily(key)
+    }
+
+    /// [`Self::remove_hot`] without the O(n) parts for a large value: no
+    /// `entry_overhead` walk (the drain credits as it frees) and the
+    /// hash-field index is unindexed from the value's cached minimum rather
+    /// than a scan of its TTL sidecar (a missed pair is harmless there —
+    /// stale-early pairs self-heal, see `hash_expiry_index`).
+    fn remove_hot_lazily(&mut self, key: &[u8]) -> bool {
+        let Some(entry) = self.data.remove(key) else {
+            return false;
+        };
+        if entry.has_expiry() {
+            self.expiry_index_remove(entry.expires_at_ms(), key);
+        }
+        self.forget_removed_hash_ttl(key, &entry);
+        self.lazy_free_or_drop(key.len(), entry, true);
+        true
+    }
+
+    /// Unindex a just-removed entry from the hash-field index. For a value
+    /// headed to the lazy-free queue the pair is found from the value's
+    /// cached minimum instead of a scan of its TTL sidecar (a missed pair is
+    /// harmless there — stale-early pairs self-heal, see `hash_expiry_index`).
+    fn forget_removed_hash_ttl(&mut self, key: &[u8], entry: &Entry) {
+        if super::lazy_free::lazy_free_weight(entry).is_none() {
+            self.hash_expiry_index_forget(key, entry);
+            return;
+        }
+        if let crate::storage::compact_value::RedisValueRef::HashWithTtl { min_expiry_ms, .. } =
+            entry.value.as_redis_value()
+            && min_expiry_ms != u64::MAX
+            && !self.hash_expiry_index.is_empty()
+        {
+            self.hash_expiry_index
+                .remove(&(min_expiry_ms, CompactKey::from(key)));
+        }
+    }
+
+    /// The active-expiry sweep's removal of an index pair it just POPPED
+    /// (moon#1189): ONE table probe decides and removes.
+    ///
+    /// Replaces `is_key_expired` (a probe) + `remove` (a second probe, plus a
+    /// second index search and a `CompactKey` build to retire the pair the
+    /// sweep had peeked and cloned).
+    ///
+    /// - [`ExpiredRemoval::Removed`]: the entry carried exactly `ts` and is
+    ///   expired at `now_ms`; it is gone with its cold copy, and a large value
+    ///   went to the lazy-free queue (moon#1190). The popped pair WAS its
+    ///   index pair, so there is nothing left to unindex.
+    /// - [`ExpiredRemoval::Stale`]: the entry is gone or carries another
+    ///   deadline — the popped pair was a leftover and is now retired.
+    /// - [`ExpiredRemoval::NotYetDue`]: the pair is valid but the entry is
+    ///   not expired at `now_ms`; the caller must restore the pair.
+    pub(crate) fn remove_expired_at(&mut self, key: &[u8], ts: u64, now_ms: u64) -> ExpiredRemoval {
+        let mut not_yet_due = false;
+        let outcome = self.data.remove_if(key, |e| {
+            if e.expires_at_ms() != ts {
+                return false;
+            }
+            if e.is_expired_at(now_ms) {
+                true
+            } else {
+                not_yet_due = true;
+                false
+            }
+        });
+        match outcome {
+            crate::storage::dashtable::RemoveIf::Removed(entry) => {
+                crate::admin::metrics_setup::record_keyspace_change();
+                let _ = self.remove_cold_only(key);
+                self.forget_removed_hash_ttl(key, &entry);
+                self.lazy_free_or_drop(key.len(), entry, true);
+                ExpiredRemoval::Removed
+            }
+            crate::storage::dashtable::RemoveIf::Kept if not_yet_due => ExpiredRemoval::NotYetDue,
+            crate::storage::dashtable::RemoveIf::Kept
+            | crate::storage::dashtable::RemoveIf::Absent => ExpiredRemoval::Stale,
+        }
     }
 
     /// Drops the cold copy AND any in-flight spill record.
@@ -1219,6 +1424,41 @@ impl Database {
         }
     }
 
+    /// `TOUCH` for one key (moon#1161): answer whether it exists (hot,
+    /// cold-only or mid-spill — the same answer as [`Self::exists`]) and
+    /// record an access on a live hot entry.
+    ///
+    /// Unlike an ordinary read this records even when the policy tracks
+    /// nothing: touching is the command's whole purpose, so `OBJECT
+    /// IDLETIME` restarts from zero as it does on redis. One probe.
+    pub fn touch_key(&mut self, key: &[u8]) -> bool {
+        let now_ms = self.cached_now_ms;
+        match self.data.get(key) {
+            None => self.cold_contains_alive(key, now_ms),
+            Some(entry) if entry.is_expired_at(now_ms) => {
+                // Same as `exists`: hide + defer, never shadow a live cold copy.
+                self.note_lazy_expired(key);
+                self.cold_contains_alive(key, now_ms)
+            }
+            Some(entry) => {
+                entry.note_access(touch_tracking(), self.cached_now);
+                true
+            }
+        }
+    }
+}
+
+/// What `TOUCH` records: the policy's tracking, or a plain LRU stamp when the
+/// policy tracks nothing (TOUCH is an explicit request to be recorded).
+#[inline]
+pub(super) fn touch_tracking() -> crate::storage::entry::AccessTracking {
+    match crate::storage::eviction::access_tracking() {
+        crate::storage::entry::AccessTracking::Off => crate::storage::entry::AccessTracking::Lru,
+        tracking => tracking,
+    }
+}
+
+impl Database {
     /// Touch access time of a key for LRU tracking (for reads).
     pub fn touch_access(&mut self, key: &[u8]) {
         let now = self.cached_now;

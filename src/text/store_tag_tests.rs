@@ -321,3 +321,56 @@ fn pre_parse_field_filter_errors() {
     };
     assert!(pre_parse_field_filter(&long).is_err());
 }
+
+/// moon#1194: the per-document TAG / NUMERIC side tables are a dense column of
+/// exact-size slices — a 16 B slot plus 40 B per TAG value (16 B per NUMERIC
+/// value), billed at exactly that (`tag_entries_cost` is the slice's byte size,
+/// the slot array is billed by capacity). HEAD's per-tagged-doc map value was
+/// 528 B inline (smallvec `union`), before hashbrown slack, and billed ~100 B.
+#[test]
+fn side_table_layout_is_compact_and_billed_exactly() {
+    use std::mem::size_of;
+    assert_eq!(
+        size_of::<(u32, smallvec::SmallVec<[(Bytes, Bytes); 8]>)>(),
+        528,
+        "HEAD's per-tagged-doc entry, for the record"
+    );
+    assert_eq!(size_of::<Option<Box<[TagEntry]>>>(), 16);
+    assert_eq!(size_of::<TagEntry>(), 40);
+    assert_eq!(size_of::<Option<Box<[NumericEntry]>>>(), 16);
+    assert_eq!(size_of::<NumericEntry>(), 16);
+    assert_eq!(size_of::<Option<Bytes>>(), 32);
+
+    let entries: Vec<TagEntry> = vec![
+        (0, Bytes::from_static(b"x")),
+        (1, Bytes::from_static(b"yy")),
+    ];
+    assert_eq!(
+        TextIndex::tag_entries_cost(&entries),
+        2 * size_of::<TagEntry>()
+    );
+
+    // A tagged doc shares the value allocation of the map key: indexing the
+    // same value into many docs adds no per-doc copy of it.
+    let mut idx = tag_only_index(&[b"color"]);
+    for d in 0..64u64 {
+        let key = format!("doc:{d}");
+        idx.tag_index_document(d, key.as_bytes(), &tag_args(&[(b"color", b"Crimson")]));
+    }
+    let stored = idx
+        .tag_indexes
+        .get(&Bytes::from_static(b"color"))
+        .and_then(|m| m.get_key_value(&Bytes::from_static(b"crimson")))
+        .map(|(k, _)| k.as_ptr())
+        .expect("value indexed");
+    for d in 0..64u32 {
+        let entries = idx.doc_tag_entries.get(d).expect("entries");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries[0].1.as_ptr(),
+            stored,
+            "doc {d} shares the key bytes"
+        );
+    }
+    assert_eq!(idx.resident_bytes(), idx.resident_bytes_ground_truth());
+}

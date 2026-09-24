@@ -17,7 +17,7 @@
 //! Module layout:
 //! - `mod.rs` — types, constants, Segment struct + basic accessors, Drop, Send/Sync, tests
 //! - `find.rs` — find / get / get_mut / get_key_value / find_slot_mut
-//! - `insert.rs` — insert / insert_or_update_at + helpers
+//! - `insert.rs` — insert / probe_for_upsert + write_vacant / insert_or_update_at + helpers
 //! - `ops.rs` — remove / split / insert_during_split / home_buckets
 
 use std::mem::MaybeUninit;
@@ -51,12 +51,42 @@ pub(super) const CTRL_BYTES: usize = NUM_GROUPS * 16;
 /// reducing per-key memory overhead by ~8% with minimal impact on probe length.
 pub const LOAD_THRESHOLD: usize = 54;
 
-/// Extract the H2 fingerprint from a hash: top 7 bits, ensuring MSB is 0
-/// so the value (0x00..0x7F) is distinguishable from EMPTY (0xFF) and
-/// DELETED (0x80).
+/// First hash bit the H2 fingerprint reads (bits `H2_SHIFT..H2_SHIFT + 7`).
+///
+/// # Why bits 32..=38 and not the top 7 (moon#1159)
+///
+/// The fingerprint is only a filter if it is independent of everything that
+/// already decided WHICH slots a key can occupy. Three consumers read the
+/// same xxh64 hash before H2 is ever compared:
+///
+/// * **the directory** — `segment_index` routes on the TOP `depth` bits, and
+///   extendible hashing guarantees every key in a segment of local depth `d`
+///   shares its top `d` bits. With H2 = the top 7 bits, every key in a
+///   segment at `d >= 7` (≈128 segments, ≈5K keys per db per shard) carried
+///   the SAME fingerprint: `match_h2` then matched every FULL slot and each
+///   probe fell back to a full key compare per occupied slot — ~6 per hit
+///   and ~22-54 per miss at 1M keys, instead of ~1 and ~0.2. Bits 32..=38
+///   are not reached by the directory until `depth >= 26` (≈2.7B keys in one
+///   table).
+/// * **`home_buckets`** — reads `(hash >> 8) % 56` and `(hash >> 16) % 56`.
+///   `% 56` is `% 8` (bits 8-10 / 16-18) combined with `% 7`, and `% 7` of a
+///   base-8 number is the digit sum of ALL its octal digits, so bits 32..=38
+///   enter the bucket choice only through a 16-term digit sum: no usable
+///   correlation between a key's group and its fingerprint.
+/// * **shard routing** — `xxh64 % num_shards` pins the LOW `log2(N)` bits for
+///   a power-of-two shard count; bits 32..=38 are untouched for any
+///   `N < 2^32`.
+///
+/// Nothing persists control bytes (they are rebuilt on every insert), so
+/// moving the fingerprint is not a format change.
+pub const H2_SHIFT: u32 = 32;
+
+/// Extract the H2 fingerprint from a hash: 7 bits no other consumer of the
+/// hash reads (see [`H2_SHIFT`]), with bit 7 clear so the value
+/// (0x00..0x7F) is distinguishable from EMPTY (0xFF) and DELETED (0x80).
 #[inline]
 pub fn h2(hash: u64) -> u8 {
-    (hash >> 57) as u8 & 0x7F
+    ((hash >> H2_SHIFT) as u8) & 0x7F
 }
 
 /// Result of an insert operation on a segment.
@@ -83,6 +113,33 @@ pub enum SegmentInsertOrUpdate<F, G> {
     /// The unconsumed closures are returned so the caller can retry without
     /// re-constructing them.
     NeedsSplit { update: F, make: G },
+}
+
+/// Where [`Segment::probe_for_upsert`] found a key, or where it would go.
+///
+/// Plain slot indexes: the answer holds no borrow of the probed key, so the
+/// caller can move an owned key in (or build one from the probed slice)
+/// after the scan (moon#1159 follow-up).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpsertProbe {
+    /// The key is stored at this slot (ctrl byte FULL, key compared equal).
+    Found(usize),
+    /// The key is absent; this free slot is where it goes. Valid only for an
+    /// immediate [`Segment::write_vacant`].
+    Vacant(usize),
+    /// The key is absent and the segment is at `LOAD_THRESHOLD`: split first.
+    Full,
+}
+
+/// Outcome of [`Segment::remove_if`] / `DashTable::remove_if` (moon#1189).
+#[derive(Debug, PartialEq, Eq)]
+pub enum RemoveIf<T> {
+    /// The key was present and the predicate agreed: here is what was removed.
+    Removed(T),
+    /// The key is present but the predicate declined; nothing changed.
+    Kept,
+    /// The key is not present.
+    Absent,
 }
 
 /// A segment holding up to 60 key-value pairs with Swiss Table control bytes.
@@ -152,6 +209,43 @@ pub(super) fn note_simd_probe() {}
 #[cfg(test)]
 pub(super) fn take_simd_probes() -> u32 {
     SIMD_PROBES.with(|c| c.replace(0))
+}
+
+// Per-thread count of FULL KEY COMPARES a probe performed (test builds only,
+// moon#1159).
+//
+// Every H2 match that is not the probed key costs one key compare — and for a
+// key longer than 23 bytes a dereference of a separate heap block. The
+// fingerprint exists to make that number ~1 per hit and ~0 per miss; this
+// counter is how a test pins that it still does, deterministically and
+// independently of the host's timing. Counted at each `k.borrow() == key`
+// site in `find` and `insert_or_update_at`, the two probe loops every
+// accessor goes through.
+//
+// Plain `//` comments: a doc comment on a macro invocation trips
+// `unused_doc_comments`, which is denied in CI. Compiles to nothing outside
+// `cfg(test)`.
+#[cfg(test)]
+thread_local! {
+    static KEY_COMPARES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Record one full key compare. No-op outside test builds.
+#[cfg(test)]
+#[inline]
+pub(super) fn note_key_compare() {
+    KEY_COMPARES.with(|c| c.set(c.get() + 1));
+}
+
+/// No-op in non-test builds — zero production cost.
+#[cfg(not(test))]
+#[inline(always)]
+pub(super) fn note_key_compare() {}
+
+/// Read and reset the per-thread key-compare counter (moon#1159).
+#[cfg(test)]
+pub(crate) fn take_key_compares() -> u64 {
+    KEY_COMPARES.with(|c| c.replace(0))
 }
 
 /// Prefetch the key data at the given slot index into L1 cache.
@@ -348,7 +442,15 @@ impl<K, V> Drop for Segment<K, V> {
 
 // SAFETY: Segment is Send if K and V are Send (no interior aliasing).
 unsafe impl<K: Send, V: Send> Send for Segment<K, V> {}
-// SAFETY: Segment is Sync if K and V are Sync (no interior mutability).
+// SAFETY: Segment is Sync if K and V are Sync. Through `&Segment` its own
+// fields (`ctrl`, `count`, `depth`, `has_non_home_keys`, the test-only
+// `probe_count`) are only read — every mutation of them takes `&mut self` —
+// and the slots hand out only `&K` / `&V` for initialized (FULL-control)
+// entries. Any interior mutability therefore lives INSIDE K or V, and the
+// `K: Sync, V: Sync` bounds are what make sharing those references across
+// threads sound: e.g. `CompactEntry` (moon#1161) updates its LRU stamp and
+// LFU counter through `&self` via `AtomicU32`s, which are `Sync`. A V with
+// non-`Sync` interior mutability (`Cell`, `RefCell`) is rejected by the bound.
 unsafe impl<K: Sync, V: Sync> Sync for Segment<K, V> {}
 
 #[cfg(test)]
@@ -564,6 +666,84 @@ mod tests {
             if let Some(v) = in_new {
                 assert_eq!(*v, i as u32);
             }
+        }
+    }
+
+    /// moon#1159 follow-up: `split` moves ONLY the entries whose new
+    /// directory bit is 1. `home_buckets` does not depend on depth, so an
+    /// entry that stays is already in a valid slot; the old collect-and-
+    /// re-insert pass rehashed and re-homed it anyway (through a heap `Vec`),
+    /// ~half of every split's work for nothing. Pinned by slot identity:
+    /// every stayer must be found at exactly the slot it held before.
+    #[test]
+    fn split_moves_only_the_upper_half_and_keeps_stayers_in_place() {
+        // xxh64, not the FNV test hash: FNV-1a leaves the top bit of these
+        // short, similar keys constant, and the fixture needs both halves.
+        let simple_hash = |k: &[u8]| crate::storage::dashtable::hash_key(k);
+        let mut seg: Segment<Vec<u8>, u32> = Segment::new(0);
+        let mut keys = Vec::new();
+        for i in 0..LOAD_THRESHOLD {
+            let k = format!("inplace_{:04}", i).into_bytes();
+            let hash = simple_hash(&k);
+            let (ba, bb) = home_buckets(hash);
+            match seg.insert(h2(hash), k.clone(), i as u32, ba, bb) {
+                InsertResult::Inserted => keys.push((k, i as u32)),
+                InsertResult::Replaced(_) => {}
+                InsertResult::NeedsSplit(_, _) => break,
+            }
+        }
+        // Punch tombstones so the fixture also covers DELETED slots.
+        for (k, _) in keys.iter().step_by(7) {
+            let hash = simple_hash(k);
+            let (ba, bb) = home_buckets(hash);
+            assert!(seg.remove(h2(hash), k.as_slice(), ba, bb).is_some());
+        }
+        let keys: Vec<_> = keys
+            .into_iter()
+            .enumerate()
+            .filter(|(n, _)| n % 7 != 0)
+            .map(|(_, kv)| kv)
+            .collect();
+        let slot_before: Vec<usize> = keys
+            .iter()
+            .map(|(k, _)| {
+                let hash = simple_hash(k);
+                let (ba, bb) = home_buckets(hash);
+                seg.find(h2(hash), k.as_slice(), ba, bb)
+                    .expect("fixture key")
+            })
+            .collect();
+
+        let new_seg = seg.split(&|k: &Vec<u8>| simple_hash(k));
+
+        let (mut stayed, mut moved) = (0, 0);
+        for ((k, v), before) in keys.iter().zip(slot_before) {
+            let hash = simple_hash(k);
+            let (ba, bb) = home_buckets(hash);
+            let in_old = seg.find(h2(hash), k.as_slice(), ba, bb);
+            let in_new = new_seg.get(h2(hash), k.as_slice(), ba, bb);
+            if hash >> 63 == 0 {
+                stayed += 1;
+                assert_eq!(
+                    in_old,
+                    Some(before),
+                    "stayer {:?} was relocated by split",
+                    String::from_utf8_lossy(k)
+                );
+                assert!(in_new.is_none());
+                assert_eq!(seg.get(h2(hash), k.as_slice(), ba, bb), Some(v));
+            } else {
+                moved += 1;
+                assert!(in_old.is_none(), "mover left behind in the old segment");
+                assert_eq!(in_new, Some(v));
+            }
+        }
+        assert!(stayed > 0 && moved > 0, "fixture must exercise both halves");
+        assert_eq!(seg.count() as usize, stayed);
+        assert_eq!(new_seg.count() as usize, moved);
+        // No tombstone survives a split (the old rebuild cleared them too).
+        for slot in 0..TOTAL_SLOTS {
+            assert_ne!(seg.ctrl_byte(slot), DELETED, "tombstone left at {slot}");
         }
     }
 

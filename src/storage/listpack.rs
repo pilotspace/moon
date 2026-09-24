@@ -1,6 +1,14 @@
 use bytes::Bytes;
 use std::collections::{HashMap, VecDeque};
 
+// List-shaped walks and bulk mutations (moon#1173, moon#1174). A child module
+// because this file is already past CLAUDE.md's 1500-line ceiling; it shares
+// this module's private decoder, so no entry width is decided twice.
+mod list_ops;
+// moon#1174 §3 guards: owned-read paths copy each entry once.
+#[cfg(test)]
+mod read_tests;
+
 const LP_HDR_SIZE: usize = 7; // 4 bytes total_bytes + 2 bytes num_elements + 1 byte terminator
 const LP_TERMINATOR: u8 = 0xFF;
 
@@ -43,9 +51,29 @@ impl ListpackEntry {
         }
     }
 
-    /// Convert to Bytes.
+    /// Convert to Bytes, borrowing: ONE allocation, the copy the caller keeps.
+    ///
+    /// This used to be `Bytes::from(self.as_bytes())`, and `as_bytes` CLONES
+    /// the string arm -- on top of the `Vec` the decode had already made, so
+    /// every owned listpack read paid two mallocs, one free and two memcpys
+    /// per element (moon#1174 §3). A caller that owns the entry should prefer
+    /// [`ListpackEntry::into_bytes`], which pays none.
     pub fn to_bytes(&self) -> Bytes {
-        Bytes::from(self.as_bytes())
+        match self {
+            ListpackEntry::Integer(v) => ListpackRef::Integer(*v).to_bytes(),
+            ListpackEntry::String(s) => Bytes::copy_from_slice(s),
+        }
+    }
+
+    /// Convert to Bytes, consuming the entry: the string arm's `Vec` BECOMES
+    /// the `Bytes` (`Bytes::from(Vec)` with `len == capacity`, which is what
+    /// the decoder produces, takes the buffer over without copying or
+    /// allocating). An integer renders through `itoa`, one allocation.
+    pub fn into_bytes(self) -> Bytes {
+        match self {
+            ListpackEntry::Integer(v) => ListpackRef::Integer(v).to_bytes(),
+            ListpackEntry::String(s) => Bytes::from(s),
+        }
     }
 
     /// Interpret this entry as a sorted-set score. See [`ListpackRef::as_score`].
@@ -107,6 +135,35 @@ impl ListpackRef<'_> {
         match self {
             ListpackRef::Integer(v) => Some(*v as f64),
             ListpackRef::Str(s) => crate::storage::zset_score::parse_score(s),
+        }
+    }
+
+    /// The entry as `Bytes`, in exactly ONE allocation: the bytes are copied
+    /// once, straight out of the listpack (a string entry) or out of an `itoa`
+    /// stack buffer (an integer entry, rendered in the canonical spelling it
+    /// was admitted under, so the bytes are the ones the client wrote --
+    /// moon#795). Owned reads go through this rather than through
+    /// [`ListpackEntry`], whose decode already copies once into a `Vec`
+    /// (moon#1174 §3).
+    pub fn to_bytes(&self) -> Bytes {
+        match self {
+            ListpackRef::Str(s) => Bytes::copy_from_slice(s),
+            ListpackRef::Integer(v) => {
+                let mut buf = itoa::Buffer::new();
+                Bytes::copy_from_slice(buf.format(*v).as_bytes())
+            }
+        }
+    }
+
+    /// Byte length of the entry as the client wrote it, without materializing
+    /// it: `HSTRLEN` (moon#1174 §3). An integer's length is that of its
+    /// canonical decimal spelling -- the only spelling that is ever
+    /// integer-encoded (moon#795).
+    #[inline]
+    pub fn byte_len(&self) -> usize {
+        match self {
+            ListpackRef::Str(s) => s.len(),
+            ListpackRef::Integer(v) => itoa::Buffer::new().format(*v).len(),
         }
     }
 
@@ -459,7 +516,7 @@ impl Listpack {
     pub fn take_pair_value(&mut self, field: &[u8]) -> Option<Bytes> {
         let span = self.locate_pair(field)?;
         let value = {
-            let (entry, _) = decode_entry_at(&self.data, span.value_start);
+            let (entry, _) = decode_entry_ref_at(&self.data, span.value_start);
             entry.to_bytes()
         };
         self.data.drain(span.field_start..span.value_end);
@@ -477,19 +534,24 @@ impl Listpack {
         self.iter_pairs()
     }
 
+    // The four whole-container conversions below walk BORROWED entries and
+    // copy each exactly once (moon#1174 §3). Through `iter()` they decoded
+    // every string into a `Vec` and then cloned it again in `to_bytes` -- the
+    // promotion of every list, hash and set out of its compact form, the AOF
+    // rewrite and the RDB writers paid that twice per element.
+
     /// Convert to a Vec of Bytes.
     pub fn to_vec(&self) -> Vec<Bytes> {
-        self.iter().map(|e| e.to_bytes()).collect()
+        let mut out = Vec::with_capacity(self.len());
+        out.extend(self.iter_refs().map(|e| e.to_bytes()));
+        out
     }
 
     /// Convert to a HashMap from alternating field/value entries.
     pub fn to_hash_map(&self) -> HashMap<Bytes, Bytes> {
-        let mut map = HashMap::new();
-        let mut iter = self.iter();
-        while let Some(field) = iter.next() {
-            if let Some(value) = iter.next() {
-                map.insert(field.to_bytes(), value.to_bytes());
-            }
+        let mut map = HashMap::with_capacity(self.len() / 2);
+        for (field, value) in self.iter_pair_refs() {
+            map.insert(field.to_bytes(), value.to_bytes());
         }
         map
     }
@@ -497,12 +559,14 @@ impl Listpack {
     /// Convert to a HashSet.
     /// Promote to the full set representation.
     pub fn to_set_value(&self) -> crate::storage::entry::SetValue {
-        self.iter().map(|e| e.to_bytes()).collect()
+        self.iter_refs().map(|e| e.to_bytes()).collect()
     }
 
     /// Convert to a VecDeque.
     pub fn to_vec_deque(&self) -> VecDeque<Bytes> {
-        self.iter().map(|e| e.to_bytes()).collect()
+        let mut out = VecDeque::with_capacity(self.len());
+        out.extend(self.iter_refs().map(|e| e.to_bytes()));
+        out
     }
 
     /// Estimate memory usage.
@@ -868,10 +932,29 @@ fn decode_backlen(data: &[u8], pos: usize) -> (usize, usize) {
     (val, backlen_size)
 }
 
+// Test-only count of string entries materialized into an owned `Vec` by
+// `decode_entry_at`. A read path that is supposed to borrow until its one
+// terminal copy (moon#1174 §3) must leave this unmoved. Thread-local for the
+// reason `HEAD_SEEKS` is; compiled out of every non-test build.
+#[cfg(test)]
+thread_local! {
+    static OWNED_DECODES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Reads [`OWNED_DECODES`] for the current thread.
+#[cfg(test)]
+pub(crate) fn owned_decodes() -> usize {
+    OWNED_DECODES.with(std::cell::Cell::get)
+}
+
 /// Decode an entry at position `pos` in the data.
 /// Returns (entry, next_entry_position).
 fn decode_entry_at(data: &[u8], pos: usize) -> (ListpackEntry, usize) {
     let b0 = data[pos];
+    #[cfg(test)]
+    if matches!(b0 & 0xC0, 0x80) || matches!(b0 & 0xF0, 0xE0) || b0 == LP_ENCODING_32BIT_STR {
+        OWNED_DECODES.with(|c| c.set(c.get() + 1));
+    }
 
     if b0 & 0x80 == 0 {
         // 7-bit unsigned int: 0xxxxxxx
@@ -1086,7 +1169,7 @@ thread_local! {
 
 /// Reads [`HEAD_SEEKS`] for the current thread.
 #[cfg(test)]
-fn head_seeks() -> usize {
+pub(crate) fn head_seeks() -> usize {
     HEAD_SEEKS.with(std::cell::Cell::get)
 }
 

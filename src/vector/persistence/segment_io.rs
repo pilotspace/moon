@@ -10,7 +10,31 @@
 //!   segment_meta.json   -- JSON metadata with checksum verification
 //!   raw_f16.bin         -- optional HQ-1 exact-rerank sidecar (f16 halves,
 //!                          BFS-ordered); absent when built without raw vectors
+//!   sub_signs.bin       -- optional sub-centroid sign bits (segment format
+//!                          v2, moon#1193): `ceil(padded_dim/8)` bytes per
+//!                          entry, BFS-ordered; absent in v1 directories and
+//!                          for segments built without signs
 //! ```
+//!
+//! ## Segment format versions (`segment_meta.json` `version`)
+//! - **v1**: the four core files + optional `raw_f16.bin`.
+//! - **v2** (moon#1193): v1 + optional `sub_signs.bin`, so a HOT segment
+//!   reloaded after a restart keeps the 32-level sub-centroid LUT instead of
+//!   silently dropping to 16-level ADC. Additive: a v1 reader (older binary)
+//!   ignores the extra file and the version number (it never checked it); a
+//!   v2 reader loads v1 directories exactly as before (no signs, 16-level).
+//!   A present-but-wrong-sized `sub_signs.bin` is ignored with a warning —
+//!   never trusted, because the beam indexes it without per-read checks.
+//!   The file holds REAL signs only (TQ4 insert-time, or encoder-computed):
+//!   never written for SQ8 or for a segment without signs, never an all-zero
+//!   placeholder; the reader skips SQ8 and ignores an all-zero file (the
+//!   placeholder a pre-release v2 build wrote — moon#1221 review).
+//!
+//! A directory whose `version` is NEWER than [`SEGMENT_FORMAT_VERSION`] is
+//! refused with [`SegmentIoError::UnsupportedVersion`] — never interpreted
+//! with this build's rules — and the reader leaves it untouched (moon#1221
+//! review; `version` used to be parsed and ignored). B3 recovery then treats
+//! the segment as not loadable and re-indexes its keys from the keyspace.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -23,6 +47,7 @@ use crate::vector::aligned_buffer::AlignedBuffer;
 use crate::vector::hnsw::graph::HnswGraph;
 use crate::vector::segment::immutable::{ImmutableSegment, MvccHeader};
 use crate::vector::segment::raw_f16_store::RawF16Store;
+use crate::vector::segment::sub_signs;
 use crate::vector::turbo_quant::collection::{CollectionMetadata, QuantizationConfig};
 use crate::vector::types::DistanceMetric;
 
@@ -31,8 +56,18 @@ use crate::vector::types::DistanceMetric;
 pub enum SegmentIoError {
     Io(std::io::Error),
     GraphDeserialize(String),
-    MetadataChecksum { expected: u64, actual: u64 },
+    MetadataChecksum {
+        expected: u64,
+        actual: u64,
+    },
     InvalidMetadata(String),
+    /// `segment_meta.json` names a format NEWER than this build supports
+    /// (a newer moon wrote it). Refused, never misread; nothing on disk is
+    /// touched.
+    UnsupportedVersion {
+        found: u32,
+        supported: u32,
+    },
 }
 
 impl std::fmt::Display for SegmentIoError {
@@ -47,6 +82,12 @@ impl std::fmt::Display for SegmentIoError {
                 )
             }
             Self::InvalidMetadata(msg) => write!(f, "invalid metadata: {msg}"),
+            Self::UnsupportedVersion { found, supported } => write!(
+                f,
+                "segment format version {found} is newer than this build supports \
+                 ({supported}): written by a newer moon — refusing to load it \
+                 (the directory is left untouched)"
+            ),
         }
     }
 }
@@ -55,6 +96,18 @@ impl From<std::io::Error> for SegmentIoError {
     fn from(e: std::io::Error) -> Self {
         Self::Io(e)
     }
+}
+
+/// Current `segment_meta.json` format version written by this build (see
+/// the module docs for the version history).
+pub(crate) const SEGMENT_FORMAT_VERSION: u32 = 2;
+
+/// Only the `version` of a `segment_meta.json`: read before the full
+/// [`SegmentMeta`], so a newer format is recognised as newer even when its
+/// other fields no longer parse with this build's schema.
+#[derive(Deserialize)]
+struct SegmentMetaVersion {
+    version: u32,
 }
 
 /// On-disk JSON metadata for an immutable segment.
@@ -190,6 +243,44 @@ pub fn write_immutable_segment_staged(
     Ok(())
 }
 
+/// Swap a freshly persisted segment's heap-owned f16 exact-rerank sidecar
+/// for a read-only memory map of the `raw_f16.bin` just written under
+/// `{root_dir}/segment-{segment_id}/` (moon#1194).
+///
+/// Compaction and merge used to return the segment still `Owned` — 2·dim
+/// bytes per vector of heap (1.5 KB at 768d vs 516 B of TQ4 codes) — while
+/// the same segment reloaded after a restart maps the file, so the
+/// post-compaction RSS of a persisted index sat far above its post-restart
+/// RSS for identical data. The rerank touches only `mult·k` rows per segment
+/// per query. Called only after [`write_immutable_segment_staged`] returned
+/// `Ok` (the directory is fsynced and renamed into place, so the file is
+/// sealed — the `RawF16Store` mmap contract), while the segment is still
+/// uniquely owned. Any failure (map error, size mismatch) keeps the `Owned`
+/// buffer: search is unaffected either way.
+pub(crate) fn map_persisted_raw_f16(
+    segment: ImmutableSegment,
+    root_dir: &Path,
+    segment_id: u64,
+) -> ImmutableSegment {
+    if segment.raw_f16_is_mapped() {
+        return segment;
+    }
+    let Some(halves) = segment.raw_f16().map(<[u16]>::len) else {
+        return segment;
+    };
+    let path = segment_dir(root_dir, segment_id).join("raw_f16.bin");
+    match RawF16Store::map_file(&path, halves) {
+        Ok(Some(store)) => segment.with_raw_f16_store(Some(store)),
+        Ok(None) | Err(_) => {
+            tracing::warn!(
+                "segment-{segment_id}: could not map the just-written raw_f16.bin — \
+                 keeping the heap copy of the exact-rerank sidecar"
+            );
+            segment
+        }
+    }
+}
+
 /// Shared file-writing body for both [`write_immutable_segment`] (writes
 /// directly to the final name) and [`write_immutable_segment_staged`]
 /// (writes to a staging name first). `seg_dir` is the exact target
@@ -227,6 +318,23 @@ fn write_segment_files(
         fsync_file(&raw_path)?;
     }
 
+    // 3b. sub_signs.bin — sub-centroid sign bits (format v2, moon#1193).
+    // Written only for REAL signs: a complete buffer (one
+    // `sub_sign_bytes_per_vec` row per entry), never for SQ8 (no signs),
+    // never an all-zero placeholder (moon#1221 review). The reader applies
+    // the same conditions.
+    let signs = segment.sub_centroid_signs();
+    let sub_bpv = segment.sub_sign_bytes_per_vec();
+    if collection.quantization != QuantizationConfig::Sq8
+        && sub_bpv > 0
+        && signs.len() == segment.mvcc_headers().len() * sub_bpv
+        && !sub_signs::is_placeholder(signs)
+    {
+        let sub_path = seg_dir.join("sub_signs.bin");
+        fs::write(&sub_path, signs)?;
+        fsync_file(&sub_path)?;
+    }
+
     // 4. mvcc_headers.bin: [version:u8][count:u32 LE][MvccHeader; count]
     // v2 format: 32 bytes/header (internal_id + global_id + key_hash + insert_lsn + delete_lsn)
     let mvcc = segment.mvcc_headers();
@@ -247,7 +355,7 @@ fn write_segment_files(
 
     // 5. segment_meta.json
     let meta = SegmentMeta {
-        version: 1,
+        version: SEGMENT_FORMAT_VERSION,
         segment_id,
         collection_id: collection.collection_id,
         created_at_lsn: collection.created_at_lsn,
@@ -399,6 +507,59 @@ pub fn read_mvcc_headers_only(dir: &Path, segment_id: u64) -> Option<Vec<MvccHea
     parse_mvcc_headers(&mvcc_bytes).ok()
 }
 
+/// Load `sub_signs.bin` if present and exactly `entries * sub_bpv` bytes
+/// (with `entries` agreeing between the graph and the MVCC headers);
+/// otherwise an empty buffer (16-level search). Missing is the silent v1
+/// case; a present file of the wrong size is corruption and warns.
+///
+/// Only REAL signs are loaded (moon#1221 review): SQ8 never reads signs, so
+/// its file is not even opened; an all-zero file is the placeholder a
+/// pre-release v2 build persisted for SQ8 / non-TQ4 LIGHT segments and is
+/// ignored with a warning. Either way the file stays on disk — the loader
+/// never deletes data.
+fn read_sub_signs(
+    seg_dir: &Path,
+    segment_id: u64,
+    quantization: QuantizationConfig,
+    headers: usize,
+    graph_nodes: u32,
+    sub_bpv: usize,
+) -> Vec<u8> {
+    if quantization == QuantizationConfig::Sq8 {
+        return Vec::new();
+    }
+    let path = seg_dir.join("sub_signs.bin");
+    let bytes = match fs::read(&path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+        Err(e) => {
+            tracing::warn!(
+                "segment-{segment_id}: cannot read sub_signs.bin ({e}) — \
+                 searching with the 16-level LUT"
+            );
+            return Vec::new();
+        }
+    };
+    let expected = headers * sub_bpv;
+    if sub_bpv == 0 || headers != graph_nodes as usize || bytes.len() != expected {
+        tracing::warn!(
+            "segment-{segment_id}: sub_signs.bin has {} bytes, expected {expected} \
+             ({headers} headers, {graph_nodes} graph nodes) — ignoring it \
+             (search falls back to the 16-level LUT)",
+            bytes.len()
+        );
+        return Vec::new();
+    }
+    if sub_signs::is_placeholder(&bytes) {
+        tracing::warn!(
+            "segment-{segment_id}: sub_signs.bin is all zero — a placeholder, not \
+             sub-centroid signs; ignoring it (search uses the 16-level LUT)"
+        );
+        return Vec::new();
+    }
+    bytes
+}
+
 /// Read an immutable segment from disk.
 ///
 /// Reads from `{dir}/segment-{id}/` directory.
@@ -411,6 +572,18 @@ pub fn read_immutable_segment(
 
     // 1. Read and parse metadata
     let meta_json = fs::read_to_string(seg_dir.join("segment_meta.json"))?;
+    // Refuse a NEWER format before interpreting anything else (moon#1221
+    // review): its files may mean something this build does not know (a
+    // sign layout, a code layout), and misreading them is worse than not
+    // loading. A read-only check — the directory is never modified here.
+    if let Ok(probe) = serde_json::from_str::<SegmentMetaVersion>(&meta_json)
+        && probe.version > SEGMENT_FORMAT_VERSION
+    {
+        return Err(SegmentIoError::UnsupportedVersion {
+            found: probe.version,
+            supported: SEGMENT_FORMAT_VERSION,
+        });
+    }
     let meta: SegmentMeta = serde_json::from_str(&meta_json)
         .map_err(|e| SegmentIoError::InvalidMetadata(e.to_string()))?;
 
@@ -577,13 +750,26 @@ pub fn read_immutable_segment(
         }
     }
 
+    // 6c. sub_signs.bin — sub-centroid signs (format v2, moon#1193). v1
+    // directories have none (16-level search, exactly as before). The size
+    // must match the graph AND the headers: the beam indexes this buffer by
+    // BFS position, so a short or long file is dropped, never trusted.
+    let sub_signs = read_sub_signs(
+        &seg_dir,
+        segment_id,
+        quantization,
+        mvcc.len(),
+        graph.num_nodes(),
+        sub_sign_bpv,
+    );
+
     let segment = ImmutableSegment::new(
         graph,
         vectors_tq,
-        Vec::new(), // QJL signs — not persisted yet
-        Vec::new(), // residual norms — not persisted yet
+        Vec::new(), // QJL signs — not persisted (never read on a reloaded segment)
+        Vec::new(), // residual norms — not persisted
         qjl_bpv,
-        Vec::new(), // sub-centroid signs — not persisted yet
+        sub_signs,
         sub_sign_bpv,
         mvcc,
         collection.clone(),
@@ -782,6 +968,81 @@ mod tests {
         let (restored, _) = read_immutable_segment(tmp.path(), 1).unwrap();
 
         assert_eq!(restored.suggested_ef(), None);
+    }
+
+    /// moon#1221 review: `version` was parsed but never checked. A directory
+    /// written by a NEWER format must be refused with a clear error — never
+    /// interpreted with this build's rules — and the reader must leave the
+    /// directory exactly as it found it. Current and older versions load.
+    #[test]
+    fn newer_segment_format_is_refused_and_the_directory_left_untouched() {
+        let (segment, collection) = build_test_segment(20, 64);
+        let tmp = tempfile::tempdir().unwrap();
+        write_immutable_segment(tmp.path(), 5, &segment, &collection).unwrap();
+        let dir = tmp.path().join("segment-5");
+        let meta_path = dir.join("segment_meta.json");
+        let meta = fs::read_to_string(&meta_path).unwrap();
+        let current = format!("\"version\": {SEGMENT_FORMAT_VERSION}");
+        assert!(meta.contains(&current), "{meta}");
+        let snapshot = |d: &Path| -> Vec<(std::ffi::OsString, Vec<u8>)> {
+            let mut files: Vec<_> = fs::read_dir(d)
+                .unwrap()
+                .map(|e| {
+                    let e = e.unwrap();
+                    (e.file_name(), fs::read(e.path()).unwrap())
+                })
+                .collect();
+            files.sort();
+            files
+        };
+
+        let newer_metas = [
+            meta.replace(
+                &current,
+                &format!("\"version\": {}", SEGMENT_FORMAT_VERSION + 1),
+            ),
+            meta.replace(&current, &format!("\"version\": {}", u32::MAX)),
+            // A future format whose other fields no longer parse must still
+            // be reported as "newer", not as generic bad metadata.
+            format!(
+                "{{\"version\": {}, \"codebook\": \"moved elsewhere\"}}",
+                SEGMENT_FORMAT_VERSION + 1
+            ),
+        ];
+        for newer in &newer_metas {
+            fs::write(&meta_path, newer).unwrap();
+            let before = snapshot(&dir);
+            let err = match read_immutable_segment(tmp.path(), 5) {
+                Ok(_) => panic!("a newer-format segment was loaded (misread): {newer}"),
+                Err(e) => e,
+            };
+            let msg = err.to_string();
+            assert!(
+                msg.contains("newer") && msg.contains(&SEGMENT_FORMAT_VERSION.to_string()),
+                "unclear error: {msg}"
+            );
+            assert!(
+                matches!(
+                    err,
+                    SegmentIoError::UnsupportedVersion { supported, .. }
+                        if supported == SEGMENT_FORMAT_VERSION
+                ),
+                "{msg}"
+            );
+            assert_eq!(snapshot(&dir), before, "the reader must not touch the dir");
+        }
+
+        for older in 1..=SEGMENT_FORMAT_VERSION {
+            fs::write(
+                &meta_path,
+                meta.replace(&current, &format!("\"version\": {older}")),
+            )
+            .unwrap();
+            assert!(
+                read_immutable_segment(tmp.path(), 5).is_ok(),
+                "version {older} must still load"
+            );
+        }
     }
 
     /// Backward compatibility: a `segment_meta.json` written before the

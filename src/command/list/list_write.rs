@@ -236,8 +236,12 @@ enum ListRoute {
 /// the compact encoding (moon#832). This matters twice over here: the old
 /// shape asked `db.get_list(key)` purely to decide "does the key exist?", so
 /// the MISS CHECK was a flattener before the pop had even started.
+///
+/// A probe, not the command's access (moon#1221 review INTEG-5): every route
+/// it answers ends in a write accessor that records the one access redis's
+/// `lookupKeyWrite` would, so the probe is `LOOKUP_NOTOUCH`.
 fn list_route(db: &Database, key: &[u8]) -> Result<Option<ListRoute>, Frame> {
-    match db.get_list_ref_if_alive(key, db.now_ms()) {
+    match db.peek_list_ref_if_alive(key, db.now_ms()) {
         Ok(None) => Ok(None),
         Ok(Some(ListRef::Listpack(_))) => Ok(Some(ListRoute::Listpack)),
         Ok(Some(ListRef::Deque(_) | ListRef::Owned(_))) => Ok(Some(ListRoute::Full)),
@@ -282,19 +286,13 @@ fn promote_list_listpack(db: &mut Database, key: &[u8], after: usize) {
 /// (moon#795/#903). `itoa` here and `i64::to_string` in `ListpackEntry`
 /// produce the same bytes for every `i64`; `a_listpack_pop_returns_the_exact_bytes_that_were_pushed`
 /// asks both ends for `007`, `+7`, `-0` and both limits.
+///
+/// moon#1174 §2: the BACK used to be reached twice from the head
+/// (`iter_refs().nth(len - 1)` to read it, `remove_at(len - 1)` to seek to it
+/// again). `Listpack::pop_end` steps back over one backlen instead.
 #[inline]
 fn listpack_pop_end(lp: &mut crate::storage::listpack::Listpack, front: bool) -> Option<Bytes> {
-    use crate::storage::listpack::ListpackRef;
-    let idx = if front { 0 } else { lp.len().checked_sub(1)? };
-    let value = match lp.iter_refs().nth(idx)? {
-        ListpackRef::Str(s) => Bytes::copy_from_slice(s),
-        ListpackRef::Integer(v) => {
-            let mut buf = itoa::Buffer::new();
-            Bytes::copy_from_slice(buf.format(v).as_bytes())
-        }
-    };
-    lp.remove_at(idx);
-    Some(value)
+    lp.pop_end(front)
 }
 
 /// The shared body of `LPOP` and `RPOP`.
@@ -623,6 +621,13 @@ fn lset_eager(db: &mut Database, key: &Bytes, index: i64, element: Bytes) -> Fra
 // ---------------------------------------------------------------------------
 
 /// LINSERT key BEFORE|AFTER pivot element
+///
+/// # moon#1174 §1
+///
+/// Gated with `db.get_list` then `get_or_create_list` -- four probes and an
+/// unconditional listpack flatten, so one `LINSERT` permanently turned a small
+/// list into a `linkedlist`. The gate is now the one-probe `&self`
+/// [`list_route`], and a listpack takes the insert in place.
 pub fn linsert(db: &mut Database, args: &[Frame]) -> Frame {
     if args.len() != 4 {
         return err_wrong_args("LINSERT");
@@ -636,11 +641,11 @@ pub fn linsert(db: &mut Database, args: &[Frame]) -> Frame {
         None => return err_wrong_args("LINSERT"),
     };
     let pivot = match extract_bytes(&args[2]) {
-        Some(v) => v.clone(),
+        Some(v) => v.as_ref(),
         None => return err_wrong_args("LINSERT"),
     };
     let element = match extract_bytes(&args[3]) {
-        Some(v) => v.clone(),
+        Some(v) => v,
         None => return err_wrong_args("LINSERT"),
     };
 
@@ -652,26 +657,76 @@ pub fn linsert(db: &mut Database, args: &[Frame]) -> Frame {
         return Frame::Error(Bytes::from_static(b"ERR syntax error"));
     };
 
-    // If key doesn't exist, return 0
-    match db.get_list(key) {
-        Ok(None) => return Frame::Integer(0),
-        Err(e) => return e,
-        Ok(Some(_)) => {}
+    // A missing key answers 0 and is not created.
+    match list_route(db, key) {
+        Err(e) => e,
+        Ok(None) => Frame::Integer(0),
+        Ok(Some(ListRoute::Listpack)) => linsert_listpack(db, key, pivot, element, before),
+        Ok(Some(ListRoute::Full)) => linsert_eager(db, key, pivot, element, before),
     }
+}
 
+/// `LINSERT` against a `ListListpack`: insert in place when the result still
+/// fits the policy, promote and take the eager path when it does not.
+///
+/// A missing pivot is `-1` and changes NOTHING, the encoding included: redis
+/// 7.2+ converts before it searches, but moon's list policy (128 elements /
+/// 64 B) is not redis's 8 KB node budget, so exact encoding parity for an
+/// over-limit element is unreachable either way, and promoting on a no-op is
+/// the one choice that changes state for no reply-visible reason.
+fn linsert_listpack(
+    db: &mut Database,
+    key: &Bytes,
+    pivot: &[u8],
+    element: &Bytes,
+    before: bool,
+) -> Frame {
+    let limits = db.encoding_limits();
+    let lp = match db.get_or_create_list_listpack(key) {
+        Ok(Some(lp)) => lp,
+        Ok(None) => return linsert_eager(db, key, pivot, element, before),
+        Err(e) => return e,
+    };
+    // THE consultation, from the one authority (moon#896): would the list
+    // still fit with one more element of this length in it?
+    if !limits.fits(Shape::List, lp.len() + 1, element.len()) {
+        if lp.find(pivot).is_none() {
+            return Frame::Integer(-1);
+        }
+        let after = lp.estimate_memory();
+        promote_list_listpack(db, key, after);
+        return linsert_eager(db, key, pivot, element, before);
+    }
+    let before_bytes = lp.estimate_memory();
+    if !lp.insert_relative(pivot, element, before) {
+        return Frame::Integer(-1);
+    }
+    let len = lp.len();
+    let after = lp.estimate_memory();
+    // `lp`'s borrow of `db` ends here.
+    db.adjust_memory(before_bytes, after);
+    Frame::Integer(len as i64)
+}
+
+/// `LINSERT` against the full `VecDeque` (or a cold value, which
+/// `get_or_create_list` promotes back).
+fn linsert_eager(
+    db: &mut Database,
+    key: &Bytes,
+    pivot: &[u8],
+    element: &Bytes,
+    before: bool,
+) -> Frame {
     let list = match db.get_or_create_list(key) {
         Ok(l) => l,
         Err(e) => return e,
     };
-
-    // Find pivot
-    let pos = list.iter().position(|v| v == &pivot);
-    match pos {
+    match list.iter().position(|v| v.as_ref() == pivot) {
         None => Frame::Integer(-1),
         Some(idx) => {
             let insert_at = if before { idx } else { idx + 1 };
-            let cost = list_elem_cost(&element);
-            list.insert(insert_at, element);
+            let cost = list_elem_cost(element);
+            list.insert(insert_at, element.clone());
             let len = list.len() as i64;
             // `list`'s borrow of `db` ends above.
             db.charge_memory(cost);
@@ -685,6 +740,22 @@ pub fn linsert(db: &mut Database, args: &[Frame]) -> Frame {
 // ---------------------------------------------------------------------------
 
 /// LREM key count element
+///
+/// # moon#1173
+///
+/// Removed matches one at a time with `VecDeque::remove`, each shifting up to
+/// half the list: O(N*K). `LREM l 0 a` on a 200K-element list with 100K
+/// matches held the shard for 13.1 s where redis takes 0.30 s. Both encodings
+/// are now ONE compaction pass bounded by `count` -- [`lrem_deque`] with read
+/// and write cursors, `Listpack::remove_matches` on the byte buffer.
+///
+/// # moon#1174 §1
+///
+/// The existence/WRONGTYPE gate was `db.get_list` (= `get_promoted`, two
+/// probes and an unconditional listpack flatten) followed by
+/// `get_or_create_list` (two more probes, flatten again): the command
+/// permanently converted every small list it touched. The gate is now the
+/// one-probe `&self` [`list_route`], and a listpack stays a listpack.
 pub fn lrem(db: &mut Database, args: &[Frame]) -> Frame {
     if args.len() != 3 {
         return err_wrong_args("LREM");
@@ -702,65 +773,153 @@ pub fn lrem(db: &mut Database, args: &[Frame]) -> Frame {
         }
     };
     let element = match extract_bytes(&args[2]) {
-        Some(v) => v.clone(),
+        Some(v) => v.as_ref(),
         None => return err_wrong_args("LREM"),
     };
+    // count == 0 removes every match; otherwise |count| of them, from the head
+    // for a positive count and from the tail for a negative one.
+    let max_remove = if count == 0 {
+        usize::MAX
+    } else {
+        usize::try_from(count.unsigned_abs()).unwrap_or(usize::MAX)
+    };
+    let from_tail = count < 0;
 
-    match db.get_list(key) {
-        Ok(None) => return Frame::Integer(0),
-        Err(e) => return e,
-        Ok(Some(_)) => {}
+    match list_route(db, key) {
+        Err(e) => e,
+        Ok(None) => Frame::Integer(0),
+        Ok(Some(ListRoute::Listpack)) => lrem_listpack(db, key, element, from_tail, max_remove),
+        Ok(Some(ListRoute::Full)) => lrem_eager(db, key, element, from_tail, max_remove),
     }
+}
 
+/// `LREM` against a `ListListpack`, in place.
+fn lrem_listpack(
+    db: &mut Database,
+    key: &Bytes,
+    element: &[u8],
+    from_tail: bool,
+    max_remove: usize,
+) -> Frame {
+    let limits = db.encoding_limits();
+    let lp = match db.get_or_create_list_listpack(key) {
+        Ok(Some(lp)) => lp,
+        // The probe said listpack; see `pop_listpack` for why this falls back.
+        Ok(None) => return lrem_eager(db, key, element, from_tail, max_remove),
+        Err(e) => return e,
+    };
+    let before = lp.estimate_memory();
+    let removed = lp.remove_matches(element, from_tail, max_remove);
+    if removed > 0 {
+        lp.shrink_if_sparse();
+    }
+    let after = lp.estimate_memory();
+    let empty = lp.is_empty();
+    // Removal only shrinks, so this is false for every listpack a push could
+    // have produced -- the same post-mutation check the pops run (moon#896).
+    let should_upgrade = !limits.listpack_fits(Shape::List, lp);
+    // `lp`'s borrow of `db` ends here.
+    db.adjust_memory(before, after);
+    if empty {
+        db.remove(key);
+    } else if should_upgrade {
+        promote_list_listpack(db, key, after);
+    }
+    Frame::Integer(removed as i64)
+}
+
+/// `LREM` against the full `VecDeque` (or a cold value, which
+/// `get_or_create_list` promotes back).
+fn lrem_eager(
+    db: &mut Database,
+    key: &Bytes,
+    element: &[u8],
+    from_tail: bool,
+    max_remove: usize,
+) -> Frame {
     let list = match db.get_or_create_list(key) {
         Ok(l) => l,
         Err(e) => return e,
     };
-
-    let mut removed = 0i64;
-    let max_remove = if count == 0 {
-        usize::MAX
-    } else {
-        count.unsigned_abs() as usize
-    };
-
-    if count >= 0 {
-        // Remove from head (or all if count == 0)
-        let mut i = 0;
-        while i < list.len() && (removed as usize) < max_remove {
-            if list[i] == element {
-                list.remove(i);
-                removed += 1;
-            } else {
-                i += 1;
-            }
-        }
-    } else {
-        // Remove from tail
-        let mut i = list.len();
-        while i > 0 && (removed as usize) < max_remove {
-            i -= 1;
-            if list[i] == element {
-                list.remove(i);
-                removed += 1;
-            }
-        }
-    }
-
+    let removed = lrem_deque(list, element, from_tail, max_remove);
     let is_empty = list.is_empty();
     // `list`'s borrow of `db` ends above. Every removed element compared equal
     // to `element` (LREM semantics), so a single per-element cost applies to
     // all of them — O(1), no need to track each removed value individually.
     if removed > 0 {
-        db.credit_memory(removed as usize * list_elem_cost(&element));
+        db.credit_memory(removed * list_elem_cost(element));
     }
-
-    // If list is now empty, remove the key
     if is_empty {
         db.remove(key);
     }
+    Frame::Integer(removed as i64)
+}
 
-    Frame::Integer(removed)
+/// Remove up to `max_remove` elements equal to `element` from `list` in ONE
+/// pass, scanning from the head -- or from the tail when `from_tail` -- and
+/// return how many went (moon#1173).
+///
+/// Read cursor `r`, write cursor `w`: a kept element is swapped down into the
+/// write slot, so the kept elements stay in order on one side of the cursors
+/// and the removed ones collect between them. The scan stops the moment the
+/// `max_remove`-th match is gone -- the unscanned remainder is already in
+/// place -- and one `drain` of the gap closes it, moving whichever side of it
+/// is shorter. O(scanned + min(prefix, suffix)), against `VecDeque::remove`
+/// per match, which is O(len) EACH.
+pub(super) fn lrem_deque(
+    list: &mut std::collections::VecDeque<Bytes>,
+    element: &[u8],
+    from_tail: bool,
+    max_remove: usize,
+) -> usize {
+    let len = list.len();
+    let mut removed = 0usize;
+    if max_remove == 0 {
+        return 0;
+    }
+    if !from_tail {
+        // [0..w) kept, [w..r) removed, [r..len) unscanned.
+        let (mut r, mut w) = (0usize, 0usize);
+        while r < len {
+            if list[r] == element {
+                removed += 1;
+                r += 1;
+                if removed == max_remove {
+                    break;
+                }
+            } else {
+                if w != r {
+                    list.swap(w, r);
+                }
+                w += 1;
+                r += 1;
+            }
+        }
+        if w != r {
+            list.drain(w..r);
+        }
+    } else {
+        // [0..r) unscanned, [r..w) removed, [w..len) kept.
+        let (mut r, mut w) = (len, len);
+        while r > 0 {
+            r -= 1;
+            if list[r] == element {
+                removed += 1;
+                if removed == max_remove {
+                    break;
+                }
+            } else {
+                w -= 1;
+                if w != r {
+                    list.swap(w, r);
+                }
+            }
+        }
+        if w != r {
+            list.drain(r..w);
+        }
+    }
+    removed
 }
 
 // ---------------------------------------------------------------------------
@@ -768,6 +927,16 @@ pub fn lrem(db: &mut Database, args: &[Frame]) -> Frame {
 // ---------------------------------------------------------------------------
 
 /// LTRIM key start stop
+///
+/// # moon#1174 §1
+///
+/// `LPUSH k x; LTRIM k 0 99` -- the capped recent-items list, probably the
+/// most common list idiom there is -- flattened the listpack on its FIRST
+/// trim: the gate was `db.get_list` + `get_or_create_list`, whose
+/// `ListKind::upgrade` is unconditional and one-way, and every later `LPUSH`
+/// then stayed on the `VecDeque` for the key's lifetime (~2x the memory of a
+/// 100 x 20 B listpack). The gate is now the one-probe `&self` [`list_route`]
+/// and a listpack is trimmed in place, in one move of its kept bytes.
 pub fn ltrim(db: &mut Database, args: &[Frame]) -> Frame {
     if args.len() != 3 {
         return err_wrong_args("LTRIM");
@@ -793,47 +962,84 @@ pub fn ltrim(db: &mut Database, args: &[Frame]) -> Frame {
         }
     };
 
-    match db.get_list(key) {
-        Ok(None) => return Frame::SimpleString(Bytes::from_static(b"OK")),
-        Err(e) => return e,
-        Ok(Some(_)) => {}
+    match list_route(db, key) {
+        Err(e) => e,
+        Ok(None) => Frame::SimpleString(Bytes::from_static(b"OK")),
+        Ok(Some(ListRoute::Listpack)) => ltrim_listpack(db, key, start, stop),
+        Ok(Some(ListRoute::Full)) => ltrim_eager(db, key, start, stop),
     }
+}
 
+/// Resolve `LTRIM`'s `start`/`stop` against `len`: the inclusive window to
+/// keep, or `None` when it is empty (the whole list goes).
+fn trim_window(start: i64, stop: i64, len: usize) -> Option<(usize, usize)> {
+    let len = len as i64;
+    let s = if start < 0 { len + start } else { start }.max(0);
+    let e = if stop < 0 { len + stop } else { stop }.min(len - 1);
+    if s > e || s >= len {
+        None
+    } else {
+        Some((s as usize, e as usize))
+    }
+}
+
+/// `LTRIM` against a `ListListpack`, in place.
+fn ltrim_listpack(db: &mut Database, key: &Bytes, start: i64, stop: i64) -> Frame {
+    let limits = db.encoding_limits();
+    let lp = match db.get_or_create_list_listpack(key) {
+        Ok(Some(lp)) => lp,
+        Ok(None) => return ltrim_eager(db, key, start, stop),
+        Err(e) => return e,
+    };
+    let Some((s, e)) = trim_window(start, stop, lp.len()) else {
+        // Everything goes. Whole-key removal credits the entry as it stands,
+        // listpack included, so nothing needs trimming first.
+        db.remove(key);
+        return Frame::SimpleString(Bytes::from_static(b"OK"));
+    };
+    let before = lp.estimate_memory();
+    if s > 0 || e + 1 < lp.len() {
+        lp.retain_range(s, e);
+        lp.shrink_if_sparse();
+    }
+    let after = lp.estimate_memory();
+    // Trimming only shrinks; this is the pops' post-mutation check (moon#896).
+    let should_upgrade = !limits.listpack_fits(Shape::List, lp);
+    // `lp`'s borrow of `db` ends here.
+    db.adjust_memory(before, after);
+    if should_upgrade {
+        promote_list_listpack(db, key, after);
+    }
+    Frame::SimpleString(Bytes::from_static(b"OK"))
+}
+
+/// `LTRIM` against the full `VecDeque` (or a cold value, which
+/// `get_or_create_list` promotes back).
+fn ltrim_eager(db: &mut Database, key: &Bytes, start: i64, stop: i64) -> Frame {
     let list = match db.get_or_create_list(key) {
         Ok(l) => l,
         Err(e) => return e,
     };
 
-    let len = list.len() as i64;
-    let mut s = if start < 0 { len + start } else { start };
-    let mut e = if stop < 0 { len + stop } else { stop };
-
-    if s < 0 {
-        s = 0;
-    }
-    if e >= len {
-        e = len - 1;
-    }
-
     let mut credit: usize = 0;
-    if s > e || s >= len {
-        // Empty range -- clear the list. Credit every dropped element's cost
-        // (proportional to what's removed, same as the drain paths below).
-        credit = list.iter().map(|v| list_elem_cost(v)).sum();
-        list.clear();
-    } else {
-        // Keep only [s..=e]
-        let s = s as usize;
-        let e = e as usize;
-        // Drain from the back first, then from the front
-        if e + 1 < list.len() {
-            credit += list
-                .drain(e + 1..)
-                .map(|v| list_elem_cost(&v))
-                .sum::<usize>();
+    match trim_window(start, stop, list.len()) {
+        None => {
+            // Empty range -- clear the list. Credit every dropped element's
+            // cost (proportional to what's removed, same as the drains below).
+            credit = list.iter().map(|v| list_elem_cost(v)).sum();
+            list.clear();
         }
-        if s > 0 {
-            credit += list.drain(..s).map(|v| list_elem_cost(&v)).sum::<usize>();
+        Some((s, e)) => {
+            // Keep only [s..=e]. Drain from the back first, then the front.
+            if e + 1 < list.len() {
+                credit += list
+                    .drain(e + 1..)
+                    .map(|v| list_elem_cost(&v))
+                    .sum::<usize>();
+            }
+            if s > 0 {
+                credit += list.drain(..s).map(|v| list_elem_cost(&v)).sum::<usize>();
+            }
         }
     }
     let is_empty = list.is_empty();
@@ -930,6 +1136,28 @@ pub fn rpoplpush(db: &mut Database, args: &[Frame]) -> Frame {
 }
 
 /// The shared body of `LMOVE` and `RPOPLPUSH`, after argument parsing.
+///
+/// # moon#1174 §1
+///
+/// The type checks were `db.get_list` on BOTH keys and the move went through
+/// `Database::list_pop_*` / `list_push_*`: about seven probes where redis does
+/// two, and a listpack flatten at every one of the four accessors -- the
+/// reliable-queue pattern (`RPOPLPUSH q processing`) turned both lists into
+/// `linkedlist`s on its first move. Each key is now routed once through the
+/// `&self` [`list_route`], a listpack is popped and pushed in place exactly as
+/// `LPOP`/`LPUSH` do it, and a destination that does not exist yet is born a
+/// listpack when the element fits, as `LPUSH` would make it.
+///
+/// The redis ORDER of refusals is kept: a missing source answers nil before
+/// the destination is looked at; a wrong-typed source, then a wrong-typed
+/// destination, answer WRONGTYPE before anything is popped.
+///
+/// # Rotation (`source == destination`)
+///
+/// Rotates IN PLACE. The old shape popped -- deleting the key when that was
+/// its only element, and with it the key's TTL -- then pushed into a freshly
+/// created key: `RPUSH k a; EXPIRE k 100; LMOVE k k LEFT RIGHT; TTL k`
+/// answered -1 where redis answers 100 (measured against 7.0.15).
 fn lmove_inner(
     db: &mut Database,
     source: Bytes,
@@ -938,39 +1166,132 @@ fn lmove_inner(
     whereto: crate::blocking::Direction,
 ) -> Frame {
     use crate::blocking::Direction;
+    let pop_front = wherefrom == Direction::Left;
+    let push_front = whereto == Direction::Left;
 
-    // Type check: source must be a list or not exist
-    match db.get_list(&source) {
-        Ok(None) => return Frame::Null, // source empty or missing
-        Err(e) => return e,             // WRONGTYPE
-        Ok(Some(_)) => {}
+    let src_route = match list_route(db, &source) {
+        Err(e) => return e,
+        Ok(None) => return Frame::Null,
+        Ok(Some(route)) => route,
+    };
+    if source == destination {
+        return lmove_rotate(db, &source, src_route, pop_front, push_front);
+    }
+    if let Err(e) = list_route(db, &destination) {
+        return e;
     }
 
-    // If destination exists, type check it too (unless same as source)
-    if source != destination {
-        match db.get_list(&destination) {
-            Ok(_) => {}         // exists as list or missing -- both OK
-            Err(e) => return e, // WRONGTYPE
+    let value = match src_route {
+        ListRoute::Listpack => match pop_listpack(db, &source, None, pop_front) {
+            Frame::BulkString(v) => v,
+            Frame::Error(e) => return Frame::Error(e),
+            _ => return Frame::Null,
+        },
+        ListRoute::Full => {
+            let popped = if pop_front {
+                db.list_pop_front(&source)
+            } else {
+                db.list_pop_back(&source)
+            };
+            match popped {
+                Some(v) => v,
+                None => return Frame::Null,
+            }
+        }
+    };
+    push_one(db, &destination, &value, push_front);
+    Frame::BulkString(value)
+}
+
+/// `LMOVE k k …`: pop one end and push the same element onto an end of the
+/// same list, without ever letting the key go empty.
+fn lmove_rotate(
+    db: &mut Database,
+    key: &Bytes,
+    route: ListRoute,
+    pop_front: bool,
+    push_front: bool,
+) -> Frame {
+    if let ListRoute::Listpack = route {
+        match db.get_or_create_list_listpack(key) {
+            Ok(Some(lp)) => {
+                let before = lp.estimate_memory();
+                let Some(value) = listpack_pop_end(lp, pop_front) else {
+                    return Frame::Null;
+                };
+                if push_front {
+                    lp.push_front(&value);
+                } else {
+                    lp.push_back(&value);
+                }
+                let after = lp.estimate_memory();
+                // `lp`'s borrow of `db` ends here. Same element, same count:
+                // the policy verdict cannot move.
+                db.adjust_memory(before, after);
+                return Frame::BulkString(value);
+            }
+            Ok(None) => {}
+            Err(e) => return e,
         }
     }
-
-    // Pop from source
-    let value = match wherefrom {
-        Direction::Left => db.list_pop_front(&source),
-        Direction::Right => db.list_pop_back(&source),
+    let list = match db.get_or_create_list(key) {
+        Ok(l) => l,
+        Err(e) => return e,
     };
-    let value = match value {
-        Some(v) => v,
-        None => return Frame::Null,
+    let popped = if pop_front {
+        list.pop_front()
+    } else {
+        list.pop_back()
     };
-
-    // Push to destination
-    match whereto {
-        Direction::Left => db.list_push_front(&destination, value.clone()),
-        Direction::Right => db.list_push_back(&destination, value.clone()),
+    let Some(value) = popped else {
+        return Frame::Null;
+    };
+    // The element stays in the list, so its ledger charge stays with it.
+    if push_front {
+        list.push_front(value.clone());
+    } else {
+        list.push_back(value.clone());
     }
-
     Frame::BulkString(value)
+}
+
+/// Push one element onto `key` exactly as a one-element `LPUSH`/`RPUSH`
+/// would: onto a listpack in place (creating the key as a listpack when it
+/// is missing and the element fits the policy), promoting past the policy,
+/// and onto the full `VecDeque` otherwise.
+///
+/// The caller has already routed `key` and refused a wrong type, so an error
+/// here is not reachable by type; it is swallowed exactly as the
+/// `Database::list_push_*` accessors this replaced swallowed it.
+fn push_one(db: &mut Database, key: &Bytes, value: &Bytes, front: bool) {
+    let limits = db.encoding_limits();
+    if limits.fits(Shape::List, 1, value.len()) {
+        match db.get_or_create_list_listpack(key) {
+            Ok(Some(lp)) => {
+                let before = lp.estimate_memory();
+                if front {
+                    lp.push_front(value);
+                } else {
+                    lp.push_back(value);
+                }
+                let after = lp.estimate_memory();
+                let should_upgrade = !limits.listpack_fits(Shape::List, lp);
+                // `lp`'s borrow of `db` ends here.
+                db.adjust_memory(before, after);
+                if should_upgrade {
+                    promote_list_listpack(db, key, after);
+                }
+                return;
+            }
+            Ok(None) => {}
+            Err(_) => return,
+        }
+    }
+    if front {
+        db.list_push_front(key, value.clone());
+    } else {
+        db.list_push_back(key, value.clone());
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1142,57 +1463,32 @@ pub fn lmpop(db: &mut Database, args: &[Frame]) -> Frame {
         return Frame::Error(Bytes::from_static(b"ERR syntax error"));
     }
 
+    // moon#1174 §1: each key is routed through the one-probe `&self`
+    // `list_route` and popped by the same two bodies `LPOP key count` uses, so
+    // a listpack stays a listpack. The old loop asked `db.get_list` (a
+    // flattening `get_promoted`) just to read the length, then flattened again
+    // through `get_or_create_list` for the pop.
     for i in 0..numkeys {
         let key = match extract_bytes(&args[1 + i]) {
-            Some(k) => k.clone(),
+            Some(k) => k,
             None => return err_wrong_args("LMPOP"),
         };
-
-        let list_len = match db.get_list(&key) {
-            Ok(Some(l)) => l.len(),
+        let popped = match list_route(db, key) {
+            Err(e) => return e,
             Ok(None) => continue,
-            Err(e) => return e,
+            Ok(Some(ListRoute::Listpack)) => pop_listpack(db, key, Some(count), left),
+            Ok(Some(ListRoute::Full)) => pop_eager(db, key, Some(count), left),
         };
-        if list_len == 0 {
-            continue;
-        }
-
-        let n = count.min(list_len);
-        let list = match db.get_or_create_list(&key) {
-            Ok(l) => l,
-            Err(e) => return e,
-        };
-        let mut elems = Vec::with_capacity(n);
-        let mut credit: usize = 0;
-        for _ in 0..n {
-            let val = if left {
-                list.pop_front()
-            } else {
-                list.pop_back()
-            };
-            match val {
-                Some(v) => {
-                    credit += list_elem_cost(&v);
-                    elems.push(Frame::BulkString(v));
-                }
-                None => break,
+        match popped {
+            Frame::Array(items) if !items.is_empty() => {
+                return Frame::Array(framevec![
+                    Frame::BulkString(key.clone()),
+                    Frame::Array(items),
+                ]);
             }
+            Frame::Error(e) => return Frame::Error(e),
+            _ => continue,
         }
-        let is_empty = list.is_empty();
-        // `list`'s borrow of `db` ends above.
-        db.credit_memory(credit);
-
-        if is_empty {
-            db.remove(&key);
-        }
-
-        if elems.is_empty() {
-            continue;
-        }
-        return Frame::Array(framevec![
-            Frame::BulkString(key),
-            Frame::Array(elems.into()),
-        ]);
     }
 
     // No key held anything: LMPOP's miss is a null ARRAY (moon#482).

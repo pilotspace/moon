@@ -45,7 +45,7 @@
 //! | 8 | `maybe_has_expiring_keys = true` when the entry has a TTL | **reproduced** |
 //! | 9 | `expiry_index` maintenance when `old_ttl != new_ttl` | **N/A** — this path never changes a TTL, so `set`'s own guard would be false |
 //! | 10 | `entry.set_last_access(db.now())` (caller-side) | **reproduced** from the shard-cached clock |
-//! | 11 | LFU counter reset to `LFU_INIT_VAL` (caller-side, a consequence of rebuilding the `Entry`) | **reproduced** verbatim — changing which keys the evictor picks is not this patch's business |
+//! | 11 | LFU counter reset to `LFU_INIT_VAL` (caller-side, a consequence of rebuilding the `Entry`) | **replaced** (moon#1221 review F3): the lookup records one access (`note_access`), as redis `lookupKeyWrite` does — the reset kept every write-hot counter at `LFU_INIT_VAL` |
 //!
 //! Two effects sit outside this table because they are not `Database`'s: the
 //! `incrby` keyspace notification and the AOF/replication record. Both are
@@ -159,6 +159,16 @@ impl Database {
             // would duplicate `note_lazy_expired`'s contract, so refuse.
             return IncrOutcome::NotHot;
         }
+        // moon#1221 review F3 (refs moon#1161): INCR is redis's
+        // `lookupKeyWrite` — ONE access for the eviction policy, recorded by
+        // the lookup and so BEFORE the type and value checks below (a refused
+        // INCR is still a lookup). Under LFU the counter is decayed and
+        // incremented. This path used to reset it to `LFU_INIT_VAL` on every
+        // call instead — a verbatim carry-over of the pre-#942 entry rebuild —
+        // so a write-hot counter never gained frequency (300 INCRs: FREQ 5,
+        // 300 SETs: 11-13) and was `allkeys-lfu`'s first victim. Recording an
+        // access is not a mutation: the WATCH stamp stays below the checks.
+        entry.note_access(crate::storage::eviction::access_tracking(), now_secs);
         let Some(bytes) = entry.value.as_bytes() else {
             return IncrOutcome::WrongType;
         };
@@ -194,12 +204,9 @@ impl Database {
         // that inlines (<= 12 digits).
         entry.value = CompactValue::from_slice(itoa_buf.format(new_val).as_bytes());
         let new_cost = entry.value.estimate_memory();
+        // The unconditional stamp `get_mut` also makes after its
+        // `note_access`: IDLETIME resets on a write under every policy.
         entry.set_last_access(now_secs);
-        // The pre-#942 path rebuilt the entry from scratch every time, which
-        // reset the LFU counter to `LFU_INIT_VAL`. Preserved verbatim: making
-        // INCR *accumulate* LFU credit would change which keys the evictor
-        // picks, which is a behaviour change and not this patch's business.
-        entry.set_access_counter(LFU_INIT_VAL);
         // moon#926: this IS the WATCH bump, and it is placed after every
         // early return above so an error reply cannot move it.
         stamp_mutation(entry);
@@ -708,20 +715,32 @@ mod incr_in_place_942 {
     }
 
     #[test]
-    fn the_lfu_counter_is_reset_the_way_the_set_path_resets_it() {
+    fn the_lfu_counter_is_kept_and_bumped_the_way_the_set_path_does() {
         // `differential` cannot see this one either: a freshly `set` entry is
-        // already at `LFU_INIT_VAL`, so dropping the reset is invisible there.
-        // Drive the counter somewhere else first.
+        // already at `LFU_INIT_VAL`. Drive the counter somewhere else first.
+        // moon#1221 review F3: this pinned the pre-#942 reset (200 -> 5) as
+        // "preserved verbatim"; redis's INCR is `lookupKeyWrite`, which
+        // records one access, so the counter must be kept and incremented.
+        use crate::storage::entry::AccessTracking;
         let mut db = Database::new();
         db.set(b"ctr", Entry::new_string(Bytes::from_static(b"1")));
         db.data.get_mut(b"ctr").unwrap().set_access_counter(200);
-        assert!(matches!(db.incr_string(b"ctr", 1), IncrOutcome::Applied(2)));
+        {
+            // Under a non-LFU policy the counter is left alone.
+            assert!(matches!(db.incr_string(b"ctr", 1), IncrOutcome::Applied(2)));
+            assert_eq!(db.data.get(b"ctr").unwrap().access_counter(), 200);
+        }
+        // Under LFU (`log_factor` 0 makes the Morris increment certain, no
+        // decay) one INCR is exactly one increment.
+        let _lfu = crate::storage::eviction::force_access_tracking(AccessTracking::Lfu {
+            log_factor: 0,
+            decay_time: 0,
+        });
+        assert!(matches!(db.incr_string(b"ctr", 1), IncrOutcome::Applied(3)));
         assert_eq!(
             db.data.get(b"ctr").unwrap().access_counter(),
-            5,
-            "the pre-#942 path rebuilt the entry, which reset the LFU counter \
-             to LFU_INIT_VAL on every INCR. Preserving that verbatim is what \
-             keeps the evictor picking the same victims."
+            201,
+            "one INCR must record exactly one access and keep the frequency"
         );
     }
 

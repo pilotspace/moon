@@ -45,6 +45,42 @@ pub fn filter_session_results(
     filtered
 }
 
+/// Filter search results against the session sorted set stored under
+/// `session_key` in `db`, borrowing it in place (moon#1196).
+///
+/// FT.SEARCH … SESSION used to `clone()` the session's whole member map
+/// (`HashMap<Bytes, f64>`) on every query just to probe `k` keys against it;
+/// `record_session_results` grows that set by up to `k` members per query,
+/// so the per-query cost grew linearly with the session's age. This probes
+/// the live set through the read-only accessor (no clone, no encoding
+/// promotion) and returns an owned `SmallVec` that holds no borrow of `db`,
+/// so the caller can take `&mut db` for recording afterwards.
+///
+/// A missing, expired or wrong-typed session key filters nothing — the same
+/// outcome as the old snapshot path (whose `Err`/`None` arms produced an
+/// empty map).
+pub fn filter_session_results_in_db(
+    results: &SmallVec<[SearchResult; 32]>,
+    db: &Database,
+    session_key: &[u8],
+    key_hash_to_key: &BucketedKeyMap<Bytes>,
+) -> SmallVec<[SearchResult; 32]> {
+    let set = match db.get_sorted_set_ref_if_alive(session_key, db.now_ms()) {
+        Ok(Some(set)) => set,
+        _ => return results.clone(),
+    };
+    let mut filtered = SmallVec::with_capacity(results.len());
+    for r in results {
+        if let Some(redis_key) = key_hash_to_key.get(&r.key_hash) {
+            if set.score(redis_key).is_some() {
+                continue; // already returned in this session
+            }
+        }
+        filtered.push(*r);
+    }
+    filtered
+}
+
 /// Record newly returned results into the session sorted set.
 ///
 /// For each result, resolves key_hash to Redis key and inserts into the session

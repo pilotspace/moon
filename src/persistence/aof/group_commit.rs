@@ -206,6 +206,83 @@ pub(crate) fn ack_batch(batch: &mut GroupCommitBatch, verdict: BatchAck) -> Comm
     }
 }
 
+/// Retained capacity a writer's [`BatchBuf`] shrinks back to after a burst.
+pub(crate) const BATCH_BUF_RETAIN_FLOOR: usize = 64 * 1024;
+
+/// Consecutive small batches (each using at most a quarter of the retained
+/// capacity) before a [`BatchBuf`] gives its burst capacity back.
+pub(crate) const BATCH_BUF_SHRINK_AFTER: u32 = 64;
+
+/// A writer's reusable batch-coalescing buffer, with shrink hysteresis
+/// (moon#1187).
+///
+/// The monoio writers coalesce each group-commit batch into one contiguous
+/// `write_all`. The buffer used to be either allocated fresh per batch
+/// (`Vec::with_capacity(total)`, up to [`AOF_GROUP_COMMIT_MAX_BYTES`]) or
+/// dropped whenever it exceeded 1 MiB — so under a steady stream of large
+/// batches every batch paid a multi-megabyte allocation, its page faults and
+/// its free. `BatchBuf` keeps its capacity across batches and gives a burst's
+/// capacity back only after [`BATCH_BUF_SHRINK_AFTER`] consecutive small
+/// batches: a steady load of any size settles to zero allocations per batch,
+/// and a one-off burst does not pin megabytes on the writer thread forever.
+pub(crate) struct BatchBuf {
+    buf: Vec<u8>,
+    small_streak: u32,
+}
+
+impl Default for BatchBuf {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl BatchBuf {
+    pub(crate) const fn new() -> Self {
+        Self {
+            buf: Vec::new(),
+            small_streak: 0,
+        }
+    }
+
+    /// Start a batch of `total` bytes: an empty buffer with room for all of
+    /// it, so the batch is coalesced with at most one (re)allocation — none
+    /// once the retained capacity covers the load.
+    pub(crate) fn begin(&mut self, total: usize) -> &mut Vec<u8> {
+        self.buf.clear();
+        self.buf.reserve(total);
+        &mut self.buf
+    }
+
+    /// The bytes of the batch being coalesced.
+    #[inline]
+    pub(crate) fn as_slice(&self) -> &[u8] {
+        &self.buf
+    }
+
+    /// Retained capacity (tests).
+    #[cfg(test)]
+    pub(crate) fn capacity(&self) -> usize {
+        self.buf.capacity()
+    }
+
+    /// End a batch: shrink the retained capacity only after a sustained run
+    /// of small batches (hysteresis), never per batch.
+    pub(crate) fn finish(&mut self) {
+        let cap = self.buf.capacity();
+        if cap > BATCH_BUF_RETAIN_FLOOR && self.buf.len() <= cap / 4 {
+            self.small_streak += 1;
+            if self.small_streak >= BATCH_BUF_SHRINK_AFTER {
+                self.buf.clear();
+                self.buf.shrink_to(BATCH_BUF_RETAIN_FLOOR);
+                self.small_streak = 0;
+            }
+        } else {
+            self.small_streak = 0;
+        }
+        self.buf.clear();
+    }
+}
+
 /// Commit one batch through a [`GroupCommitSink`] — the durability invariant:
 ///
 ///   1. `write_all` every data message's bytes IN ORDER;
@@ -230,6 +307,18 @@ pub fn commit_group_commit_batch<S: GroupCommitSink + ?Sized>(
     batch: &mut GroupCommitBatch,
     do_fsync: bool,
 ) -> CommitOutcome {
+    commit_group_commit_batch_with(sink, batch, do_fsync, &mut BatchBuf::new())
+}
+
+/// [`commit_group_commit_batch`] coalescing multi-message batches into the
+/// writer's persistent `scratch` buffer instead of a fresh allocation per
+/// batch (moon#1187). Same three-step durability invariant, same acks.
+pub(crate) fn commit_group_commit_batch_with<S: GroupCommitSink + ?Sized>(
+    sink: &mut S,
+    batch: &mut GroupCommitBatch,
+    do_fsync: bool,
+    scratch: &mut BatchBuf,
+) -> CommitOutcome {
     // Step 1 — write the batch's bytes in channel order. Multi-message
     // batches are coalesced into ONE contiguous `write_all` (the sink is a
     // raw unbuffered File on the monoio paths, so per-message writes meant
@@ -246,11 +335,13 @@ pub fn commit_group_commit_batch<S: GroupCommitSink + ?Sized>(
         }
         _ => {
             let total: usize = batch.data.iter().map(|m| msg_body(m).len()).sum();
-            let mut buf = Vec::with_capacity(total);
+            let buf = scratch.begin(total);
             for msg in &batch.data {
                 buf.extend_from_slice(msg_body(msg));
             }
-            if sink.write_all(&buf).is_err() {
+            let written = sink.write_all(scratch.as_slice());
+            scratch.finish();
+            if written.is_err() {
                 return ack_batch(batch, BatchAck::WriteFailed);
             }
         }
@@ -261,4 +352,64 @@ pub fn commit_group_commit_batch<S: GroupCommitSink + ?Sized>(
     }
     // Step 3 — ack every AppendSync (only now, after the fsync has returned).
     ack_batch(batch, BatchAck::Synced)
+}
+
+#[cfg(test)]
+mod batch_buf_tests {
+    use super::*;
+
+    fn fill(b: &mut BatchBuf, n: usize) -> *const u8 {
+        let buf = b.begin(n);
+        buf.resize(n, 0xAB);
+        let p = b.as_slice().as_ptr();
+        b.finish();
+        p
+    }
+
+    /// A steady stream of large batches reuses one allocation: the buffer
+    /// never moves once it has grown to the load (moon#1187). HEAD dropped
+    /// any buffer over 1 MiB after every batch, so each 2 MiB batch paid a
+    /// fresh 2 MiB allocation.
+    #[test]
+    fn steady_large_batches_reuse_one_allocation() {
+        let mut b = BatchBuf::new();
+        let first = fill(&mut b, 2 << 20);
+        for _ in 0..200 {
+            assert_eq!(fill(&mut b, 2 << 20), first, "buffer reallocated");
+        }
+        assert!(b.capacity() >= 2 << 20);
+    }
+
+    /// Mixed batch sizes inside the retained capacity never reallocate.
+    #[test]
+    fn mixed_sizes_within_capacity_do_not_reallocate() {
+        let mut b = BatchBuf::new();
+        let first = fill(&mut b, 1 << 20);
+        for i in 0..500 {
+            // Alternate big and small: the big ones keep resetting the streak.
+            let n = if i % 8 == 0 { 1 << 20 } else { 4096 };
+            assert_eq!(fill(&mut b, n), first);
+        }
+    }
+
+    /// A one-off burst gives its capacity back after a sustained run of
+    /// small batches — not after one.
+    #[test]
+    fn burst_capacity_is_released_after_sustained_small_batches() {
+        let mut b = BatchBuf::new();
+        fill(&mut b, AOF_GROUP_COMMIT_MAX_BYTES);
+        for _ in 0..BATCH_BUF_SHRINK_AFTER - 1 {
+            fill(&mut b, 100);
+        }
+        assert!(
+            b.capacity() >= AOF_GROUP_COMMIT_MAX_BYTES,
+            "shrank before the streak completed"
+        );
+        fill(&mut b, 100);
+        assert!(
+            b.capacity() <= BATCH_BUF_RETAIN_FLOOR,
+            "burst capacity retained: {}",
+            b.capacity()
+        );
+    }
 }

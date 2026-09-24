@@ -6,7 +6,7 @@
 //! Control byte encoding:
 //! - `EMPTY`   = 0xFF  -- slot is unused
 //! - `DELETED` = 0x80  -- tombstone
-//! - `FULL`    = 0x00..0x7F -- H2 fingerprint (top 7 bits of hash)
+//! - `FULL`    = 0x00..0x7F -- H2 fingerprint (hash bits 32..=38, see `segment::H2_SHIFT`)
 
 /// Marker for an empty (unused) slot.
 pub const EMPTY: u8 = 0xFF;

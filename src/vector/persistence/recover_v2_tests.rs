@@ -686,6 +686,81 @@ fn persist_docs(root: &std::path::Path, dim: usize, n: usize) -> (IndexMeta, Vec
     (meta, store)
 }
 
+/// moon#1221 review: `segment_meta.json` `version` was parsed but never
+/// checked, so a segment written by a NEWER format was interpreted with this
+/// build's rules. It is now refused, never misread: recovery re-indexes its
+/// keys from the keyspace (vector segments are derived data), and startup
+/// recovery — including `finish`'s orphan sweep — leaves the directory on
+/// disk, byte for byte. Red on the PR head: the segment loaded and every key
+/// was "verified unchanged" against it.
+#[test]
+fn recover_refuses_a_newer_format_segment_and_keeps_its_directory() {
+    use crate::protocol::Frame;
+    use crate::vector::persistence::segment_io::SEGMENT_FORMAT_VERSION;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let (dim, n) = (8usize, 20usize);
+    let (meta, _live) = persist_docs(tmp.path(), dim, n);
+    let idx_dir = manifest::index_persist_dir(tmp.path(), b"idx");
+    let m = manifest::read_manifest_tolerant(&idx_dir).expect("manifest");
+    assert_eq!(m.segment_ids.len(), 1);
+    let seg_dir = idx_dir.join(format!("segment-{}", m.segment_ids[0]));
+    let meta_path = seg_dir.join("segment_meta.json");
+    let json = std::fs::read_to_string(&meta_path).unwrap();
+    let newer = json.replace(
+        &format!("\"version\": {SEGMENT_FORMAT_VERSION}"),
+        &format!("\"version\": {}", SEGMENT_FORMAT_VERSION + 1),
+    );
+    assert_ne!(json, newer, "fixture must bump the version");
+    std::fs::write(&meta_path, &newer).unwrap();
+    let snapshot = |dir: &std::path::Path| -> Vec<(std::ffi::OsString, Vec<u8>)> {
+        let mut files: Vec<_> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| {
+                let e = e.unwrap();
+                (e.file_name(), std::fs::read(e.path()).unwrap())
+            })
+            .collect();
+        files.sort();
+        files
+    };
+    let before = snapshot(&seg_dir);
+
+    let mut fresh = VectorStore::new();
+    fresh.set_persist_dir(tmp.path().to_path_buf());
+    let mut state = RecoveryState::new();
+    state.create_index(&mut fresh, tmp.path(), &meta);
+    for i in 0..n {
+        let key = format!("doc:{i}");
+        let args = vec![
+            Frame::BulkString(Bytes::from(key.clone())),
+            Frame::BulkString(Bytes::from_static(b"vec")),
+            Frame::BulkString(f32_blob(dim, i as u32 + 1)),
+        ];
+        state.reconcile_key(&mut fresh, &mut TextStore::new(), key.as_bytes(), &args, 0);
+    }
+    let c = state
+        .counters
+        .get(&Bytes::from_static(b"idx"))
+        .copied()
+        .unwrap_or_default();
+    assert_eq!(c.loaded_segments, 0, "a newer-format segment must not load");
+    assert_eq!(
+        c.verified_unchanged, 0,
+        "nothing may be verified against it"
+    );
+    assert_eq!(c.re_indexed, n, "its keys are re-indexed from the keyspace");
+
+    state.finish(&mut fresh, tmp.path());
+    assert!(seg_dir.is_dir(), "the refused directory must be kept");
+    assert_eq!(snapshot(&seg_dir), before, "…and left untouched");
+    assert_eq!(
+        fresh.get_index(b"idx").unwrap().key_hash_to_global_id.len(),
+        n,
+        "every key is indexed after recovery"
+    );
+}
+
 /// moon#1073: the keymap names each key's current copy by global_id. A loaded
 /// row survives only if it IS that copy, and only once; every other live row
 /// is tombstoned in its own segment (an old copy of a re-written key, a

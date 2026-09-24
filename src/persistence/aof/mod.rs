@@ -773,6 +773,10 @@ pub const DEFAULT_AOF_FSYNC_TIMEOUT: Duration = Duration::from_millis(2000);
 /// #433 — automatic AOF rewrite monitor (Redis `auto-aof-rewrite-*` parity)
 /// plus the INFO-persistence size/enabled statics (#432).
 pub mod auto_rewrite;
+/// Exactly-sized, allocation-lean record encoding (moon#1187).
+mod encode;
+/// Streamed base image for the rewrite fold (moon#1185).
+pub mod fold_stream;
 /// Group-commit batching seam (coalesce concurrent pending writes into one
 /// fsync under `appendfsync=always`). `pub` so the §4 red suite can pin the pure
 /// seam (collect/commit) against the public API.
@@ -794,10 +798,12 @@ pub use writer_task::{aof_writer_task, per_shard_aof_writer_task};
 pub(crate) use writer_task::TEST_FAIL_WRITE_AT;
 
 /// Serialize a Frame into RESP wire format bytes.
+///
+/// One allocation, sized from the frame's exact RESP length (moon#1187) —
+/// see [`encode`].
+#[inline]
 pub fn serialize_command(frame: &Frame) -> Bytes {
-    let mut buf = BytesMut::with_capacity(64);
-    serialize::serialize(frame, &mut buf);
-    buf.freeze()
+    encode::serialize_command(frame)
 }
 
 /// Serialize a write command for the durable log **and** the replication
@@ -818,8 +824,11 @@ pub fn serialize_command_for_log(frame: &Frame) -> Bytes {
 }
 
 fn serialize_command_for_log_at(frame: &Frame, now_ms: u64) -> Bytes {
-    match crate::replication::expire_rewrite::rewrite_expire_for_propagation(frame, now_ms) {
-        Some(rewritten) => serialize_command(&rewritten),
+    // moon#1187: decide the rewrite without allocating, then serialize the
+    // absolute form straight from the borrowed arguments — one exactly-sized
+    // buffer per record whether or not the command was rewritten.
+    match crate::replication::expire_rewrite::plan_expire_rewrite(frame, now_ms) {
+        Some(plan) => encode::serialize_expire_rewrite(&plan),
         None => serialize_command(frame),
     }
 }
@@ -920,6 +929,21 @@ pub(crate) fn inject_select_records(
     floor: FoldEpoch,
     last_db: &mut usize,
 ) -> Vec<AofMessage> {
+    // moon#1187 fast path: a batch in which every record executed in the
+    // writer's current db and none is already folded — every batch of a
+    // single-db workload between rewrites — needs no SELECT and no drop, so
+    // it is returned as is instead of being copied into a fresh `Vec`.
+    // `last_db` does not move: no record switches the db.
+    let current = *last_db;
+    let untouched = data.iter().all(|msg| match msg {
+        AofMessage::Append { db, bytes, .. } | AofMessage::AppendSync { db, bytes, .. } => {
+            bytes.is_empty() || (*db == current && !is_folded(msg, floor))
+        }
+        _ => true,
+    });
+    if untouched {
+        return data;
+    }
     let mut out = Vec::with_capacity(data.len());
     for msg in data {
         // #455: a record already folded into the committed base is dropped
@@ -1913,5 +1937,53 @@ mod fold_floor_tests {
         let mut last_db = 0usize;
         let out = inject_select_records(batch, FoldEpoch::INITIAL, &mut last_db);
         assert_eq!(out.len(), 1);
+    }
+
+    /// moon#1187: a batch that needs neither a SELECT nor a fold drop is
+    /// handed back as is — same allocation, same order — instead of being
+    /// copied into a fresh `Vec` every batch.
+    #[test]
+    fn a_batch_needing_no_select_and_no_drop_is_returned_in_place() {
+        let batch = vec![
+            append(b"a", 2, FoldEpoch(4)),
+            append(b"", 7, FoldEpoch::INITIAL), // barrier: never switches
+            append(b"b", 2, FoldEpoch(5)),
+        ];
+        let ptr = batch.as_ptr();
+        let mut last_db = 2usize;
+        let out = inject_select_records(batch, FoldEpoch(4), &mut last_db);
+        assert_eq!(out.as_ptr(), ptr, "fast path must not reallocate");
+        assert_eq!(
+            payloads(&out),
+            vec![b"a".to_vec(), b"".to_vec(), b"b".to_vec()]
+        );
+        assert_eq!(last_db, 2);
+    }
+
+    /// The fast path hands over exactly what the full path would produce:
+    /// any db switch or folded record still takes the full path.
+    #[test]
+    fn fast_path_agrees_with_the_full_path() {
+        let mk = || {
+            vec![
+                append(b"a", 0, FoldEpoch(4)),
+                append(b"b", 3, FoldEpoch(4)),
+                append(b"c", 3, FoldEpoch(3)), // folded
+                append(b"d", 0, FoldEpoch(9)),
+            ]
+        };
+        let mut last_db = 0usize;
+        let out = inject_select_records(mk(), FoldEpoch(4), &mut last_db);
+        assert_eq!(
+            payloads(&out),
+            vec![
+                b"a".to_vec(),
+                serialize_select_record(3).to_vec(),
+                b"b".to_vec(),
+                serialize_select_record(0).to_vec(),
+                b"d".to_vec(),
+            ]
+        );
+        assert_eq!(last_db, 0);
     }
 }

@@ -62,9 +62,26 @@ any structural violation (duplicate doc_id/key, `doc_id >= next_doc_id`,
 `term_id >= next_id` or duplicate, posting for an unknown term or doc,
 non-increasing doc_ids, `tf == 0`, length mismatches, `positions` count
 mismatch, non-finite numeric, field count ≠ schema) · count that does not fit
-in the remaining bytes (no pre-allocation on a hostile count) · `.tfst`
+in the remaining bytes (no pre-allocation on a hostile count) · **sparse doc
+ids**: `next_doc_id > 2 × doc_count + 65,536` (`doc_ids_dense_enough`) · `.tfst`
 seeding then runs as before. A loaded index is all-or-nothing: the decoder
 returns a plain struct and nothing is installed until it validated in full.
+
+### Doc ids are dense, so install is O(file size)
+
+The per-document side tables are dense columns indexed by doc id
+(`src/text/doc_columns.rs`), so install allocates one slot per id up to the
+highest one. The live index keeps ids dense: a new document takes the
+**smallest freed id** (`TextIndex::alloc_doc_id`), `next_doc_id` is one past
+the highest live id, and removing the highest ids cuts the columns back. A
+file is therefore never much sparser than its document count; one that is (a
+hostile or buggy writer, a file written before freed ids were reused, or an
+index that lost most of its documents and was never re-filled) is refused and
+rebuilt, which numbers the documents densely again. Without the guard a
+107-byte file naming doc 2,000,000 billed 72 MB, and an id near `u32::MAX`
+would abort every boot (moon#1221 review). On install `next_doc_id` is
+normalised to one past the highest loaded id and the ids below it that no
+document holds become the free set.
 
 ## Write path — never on the shard thread's I/O budget
 
