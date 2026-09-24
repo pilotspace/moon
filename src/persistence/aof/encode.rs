@@ -417,7 +417,7 @@ mod tests {
             Frame::Boolean(true),
             Frame::BigNumber(Bytes::from_static(b"123456789012345678901234567890")),
             Frame::VerbatimString {
-                encoding: Bytes::from_static(b"txt"),
+                encoding: *b"txt",
                 data: Bytes::from_static(b"hello"),
             },
             Frame::Map(vec![(b(b"a"), Frame::Integer(i64::MIN))]),
