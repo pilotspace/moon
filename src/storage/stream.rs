@@ -8,6 +8,7 @@ use bytes::Bytes;
 use std::collections::{BTreeMap, HashMap};
 
 use super::entry::current_time_ms;
+use super::owned_bytes::detach;
 
 /// Stream entry ID: <milliseconds>-<sequence>.
 /// Ordered by (ms, seq) for BTreeMap keying.
@@ -163,7 +164,15 @@ impl Stream {
     }
 
     /// Add an entry. Returns the assigned ID. Caller must ensure id > last_id.
-    pub fn add(&mut self, id: StreamId, fields: Vec<(Bytes, Bytes)>) -> StreamId {
+    ///
+    /// moon#1160: every field and value is stored as an exact-size copy —
+    /// the callers (`XADD`, the MQ paths) hand in `Bytes` sliced from the
+    /// request buffer, and storing those kept the whole buffer alive.
+    pub fn add(&mut self, id: StreamId, mut fields: Vec<(Bytes, Bytes)>) -> StreamId {
+        for (f, v) in &mut fields {
+            *f = detach(f);
+            *v = detach(v);
+        }
         self.entries.insert(id, fields);
         self.length += 1;
         self.last_id = id;
@@ -269,7 +278,8 @@ impl Stream {
             return Err("BUSYGROUP Consumer Group name already exists");
         }
         self.groups.insert(
-            name,
+            // moon#1160: never store the request's slice.
+            detach(&name),
             ConsumerGroup {
                 last_delivered_id,
                 pel: BTreeMap::new(),
@@ -308,14 +318,7 @@ impl Stream {
         if group.consumers.contains_key(&consumer_name) {
             Ok(false)
         } else {
-            group.consumers.insert(
-                consumer_name.clone(),
-                Consumer {
-                    name: consumer_name,
-                    pending: BTreeMap::new(),
-                    seen_time: current_time_ms(),
-                },
-            );
+            Self::insert_consumer(group, &consumer_name);
             Ok(true)
         }
     }
@@ -343,19 +346,32 @@ impl Stream {
         }
     }
 
-    /// Ensure a consumer exists in a group, auto-creating if needed.
-    fn ensure_consumer(group: &mut ConsumerGroup, consumer_name: &Bytes) {
+    /// Insert a NEW consumer, its name stored as ONE exact-size copy that the
+    /// map key and `Consumer::name` share (moon#1160: `consumer_name` is the
+    /// request's slice). Returns the stored name.
+    fn insert_consumer(group: &mut ConsumerGroup, consumer_name: &[u8]) -> Bytes {
+        let name = detach(consumer_name);
+        group.consumers.insert(
+            name.clone(),
+            Consumer {
+                name: name.clone(),
+                pending: BTreeMap::new(),
+                seen_time: current_time_ms(),
+            },
+        );
+        name
+    }
+
+    /// Ensure a consumer exists in a group, auto-creating if needed, and
+    /// return its STORED name — the handle a PEL entry must keep (moon#1160:
+    /// a clone of the caller's `consumer_name` pinned the request buffer once
+    /// per delivered entry).
+    fn ensure_consumer(group: &mut ConsumerGroup, consumer_name: &Bytes) -> Bytes {
         if let Some(consumer) = group.consumers.get_mut(consumer_name) {
             consumer.seen_time = current_time_ms();
+            consumer.name.clone()
         } else {
-            group.consumers.insert(
-                consumer_name.clone(),
-                Consumer {
-                    name: consumer_name.clone(),
-                    pending: BTreeMap::new(),
-                    seen_time: current_time_ms(),
-                },
-            );
+            Self::insert_consumer(group, consumer_name)
         }
     }
 
@@ -388,7 +404,7 @@ impl Stream {
             .groups
             .get_mut(group_name.as_ref())
             .ok_or("NOGROUP No such consumer group for key name")?;
-        Self::ensure_consumer(group, consumer_name);
+        let stored_name = Self::ensure_consumer(group, consumer_name);
 
         let start = StreamId {
             ms: group.last_delivered_id.ms,
@@ -428,7 +444,7 @@ impl Stream {
                 group.pel.insert(
                     id,
                     PendingEntry {
-                        consumer: consumer_name.clone(),
+                        consumer: stored_name.clone(),
                         delivery_time: now,
                         delivery_count: 1,
                     },
@@ -601,7 +617,7 @@ impl Stream {
             Some(t) if t >= 0 && (t as u64) <= now => t as u64,
             _ => now,
         };
-        Self::ensure_consumer(group, consumer_name);
+        let stored_name = Self::ensure_consumer(group, consumer_name);
 
         let mut claimed = Vec::with_capacity(ids.len());
         for &id in ids {
@@ -619,7 +635,7 @@ impl Stream {
                 group.pel.insert(
                     id,
                     PendingEntry {
-                        consumer: consumer_name.clone(),
+                        consumer: stored_name.clone(),
                         delivery_time: now,
                         delivery_count: 1,
                     },
@@ -639,7 +655,7 @@ impl Stream {
                 if !forced && let Some(c) = group.consumers.get_mut(&pe.consumer) {
                     c.pending.remove(&id);
                 }
-                pe.consumer = consumer_name.clone();
+                pe.consumer = stored_name.clone();
                 if let Some(c) = group.consumers.get_mut(consumer_name) {
                     c.pending.insert(id, ());
                 }
@@ -676,7 +692,7 @@ impl Stream {
             .groups
             .get_mut(group_name.as_ref())
             .ok_or("NOGROUP No such consumer group for key name")?;
-        Self::ensure_consumer(group, consumer_name);
+        let stored_name = Self::ensure_consumer(group, consumer_name);
 
         let now = current_time_ms();
         let mut claimed = Vec::new();
@@ -710,7 +726,7 @@ impl Stream {
 
                 // Update PEL entry
                 if let Some(pe) = group.pel.get_mut(id) {
-                    pe.consumer = consumer_name.clone();
+                    pe.consumer = stored_name.clone();
                     pe.delivery_time = now;
                     pe.delivery_count += 1;
                 }

@@ -22,6 +22,9 @@ use crate::protocol::Frame;
 use crate::storage::Database;
 use crate::storage::db::HashTtlCond;
 
+/// The bounded streaming reader the RESP log replays use (moon#1160).
+pub(crate) mod chunks;
+
 /// Parse a Frame as an unsigned integer (BulkString or Integer).
 #[inline]
 fn frame_as_u64(f: &Frame) -> Option<u64> {

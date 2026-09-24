@@ -4,6 +4,7 @@ use crate::framevec;
 use crate::protocol::Frame;
 use crate::storage::Database;
 use crate::storage::db::{ListRef, Shape, list_elem_cost};
+use crate::storage::owned_bytes::detach;
 
 use super::list_compact::lrem_deque;
 use super::{parse_i64, resolve_index};
@@ -87,8 +88,9 @@ pub fn lpush(db: &mut Database, args: &[Frame]) -> Frame {
     };
     let mut mem_delta: usize = 0;
     for arg in &args[1..] {
+        // moon#1160: an exact-size copy, never a slice of the request buffer.
         let val = match extract_bytes(arg) {
-            Some(v) => v.clone(),
+            Some(v) => detach(v),
             None => return err_wrong_args("LPUSH"),
         };
         mem_delta += list_elem_cost(&val);
@@ -174,8 +176,9 @@ pub fn rpush(db: &mut Database, args: &[Frame]) -> Frame {
     };
     let mut mem_delta: usize = 0;
     for arg in &args[1..] {
+        // moon#1160: an exact-size copy, never a slice of the request buffer.
         let val = match extract_bytes(arg) {
-            Some(v) => v.clone(),
+            Some(v) => detach(v),
             None => return err_wrong_args("RPUSH"),
         };
         mem_delta += list_elem_cost(&val);
@@ -604,7 +607,8 @@ fn lset_eager(db: &mut Database, key: &Bytes, index: i64, element: Bytes) -> Fra
         Some(i) => {
             let old_cost = list_elem_cost(&list[i]) as i64;
             let new_cost = list_elem_cost(&element) as i64;
-            list[i] = element;
+            // moon#1160: stored as an exact-size copy of the request's bytes.
+            list[i] = detach(&element);
             // `list`'s borrow of `db` ends above.
             let delta = new_cost - old_cost;
             if delta >= 0 {
@@ -728,7 +732,8 @@ fn linsert_eager(
         Some(idx) => {
             let insert_at = if before { idx } else { idx + 1 };
             let cost = list_elem_cost(element);
-            list.insert(insert_at, element.clone());
+            // moon#1160: an exact-size copy, never a slice of the request buffer.
+            list.insert(insert_at, detach(element));
             let len = list.len() as i64;
             // `list`'s borrow of `db` ends above.
             db.charge_memory(cost);
@@ -1284,8 +1289,9 @@ pub fn lpushx(db: &mut Database, args: &[Frame]) -> Frame {
     };
     let mut mem_delta: usize = 0;
     for arg in &args[1..] {
+        // moon#1160: an exact-size copy, never a slice of the request buffer.
         let val = match extract_bytes(arg) {
-            Some(v) => v.clone(),
+            Some(v) => detach(v),
             None => return err_wrong_args("LPUSHX"),
         };
         mem_delta += list_elem_cost(&val);
@@ -1335,8 +1341,9 @@ pub fn rpushx(db: &mut Database, args: &[Frame]) -> Frame {
     };
     let mut mem_delta: usize = 0;
     for arg in &args[1..] {
+        // moon#1160: an exact-size copy, never a slice of the request buffer.
         let val = match extract_bytes(arg) {
-            Some(v) => v.clone(),
+            Some(v) => detach(v),
             None => return err_wrong_args("RPUSHX"),
         };
         mem_delta += list_elem_cost(&val);

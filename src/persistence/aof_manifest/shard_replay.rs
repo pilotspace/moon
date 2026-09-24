@@ -100,13 +100,15 @@ pub fn replay_multi_part(
         );
     }
 
-    // Replay incremental RESP
+    // Replay incremental RESP — streamed through a bounded buffer (moon#1160):
+    // the whole-file read plus `BytesMut::from(&data[..])` held the incr file
+    // twice, and every replayed element sliced that one buffer.
     let incr_path = manifest.incr_path();
     if incr_path.exists() {
-        let data = std::fs::read(&incr_path)?;
-        if !data.is_empty() {
-            // Pure RESP — use replay_aof_resp (no RDB preamble detection needed)
-            let count = replay_incr_resp(databases, &data, engine)?;
+        let file = std::fs::File::open(&incr_path)?;
+        if file.metadata()?.len() > 0 {
+            // Pure RESP — no RDB preamble detection needed.
+            let count = replay_incr_resp_from(databases, file, engine)?;
             info!(
                 "AOF incr replayed: {} commands from {}",
                 count,
@@ -128,26 +130,32 @@ pub fn replay_multi_part(
 /// Truncated tails (parser returns `Ok(None)` with bytes remaining) are
 /// logged and treated as the legitimate end of the incremental log, matching
 /// `replay_aof` semantics for crash-time tail truncation.
+#[cfg(test)]
 fn replay_incr_resp(
     databases: &mut [crate::storage::Database],
     data: &[u8],
     engine: &dyn crate::persistence::replay::CommandReplayEngine,
 ) -> Result<usize, crate::error::MoonError> {
-    use crate::protocol::{Frame, ParseConfig, parse};
-    use bytes::BytesMut;
+    replay_incr_resp_from(databases, data, engine)
+}
 
-    let total_len = data.len();
-    let mut buf = BytesMut::from(data);
-    let config = ParseConfig::default();
+/// [`replay_incr_resp`] over any reader, through the bounded
+/// [`ReplayChunks`](crate::persistence::replay::chunks::ReplayChunks) buffer.
+fn replay_incr_resp_from(
+    databases: &mut [crate::storage::Database],
+    src: impl std::io::Read,
+    engine: &dyn crate::persistence::replay::CommandReplayEngine,
+) -> Result<usize, crate::error::MoonError> {
+    use crate::persistence::replay::chunks::{ReplayChunks, ReplayNext};
+    use crate::protocol::Frame;
+
+    let mut chunks = ReplayChunks::new(src, 0);
     let mut selected_db: usize = 0;
     let mut count: usize = 0;
 
     loop {
-        if buf.is_empty() {
-            break;
-        }
-        match parse::parse(&mut buf, &config) {
-            Ok(Some(frame)) => {
+        match chunks.next_frame()? {
+            ReplayNext::Frame(frame) => {
                 let (cmd, cmd_args) = match &frame {
                     Frame::Array(arr) if !arr.is_empty() => {
                         let name = match &arr[0] {
@@ -158,7 +166,7 @@ fn replay_incr_resp(
                                     crate::error::AofError::RewriteFailed {
                                         detail: format!(
                                             "AOF incr command at offset {} has non-string name frame: {:?}",
-                                            total_len - buf.len(),
+                                            chunks.offset(),
                                             std::mem::discriminant(other)
                                         ),
                                     },
@@ -172,7 +180,7 @@ fn replay_incr_resp(
                             crate::error::AofError::RewriteFailed {
                                 detail: format!(
                                     "AOF incr non-array frame at offset {}: {:?}",
-                                    total_len - buf.len(),
+                                    chunks.offset(),
                                     std::mem::discriminant(other)
                                 ),
                             },
@@ -182,22 +190,18 @@ fn replay_incr_resp(
                 engine.replay_command(databases, cmd, cmd_args, &mut selected_db);
                 count += 1;
             }
-            Ok(None) => {
-                if !buf.is_empty() {
-                    let offset = total_len - buf.len();
-                    warn!(
-                        "AOF incr truncated tail: {} bytes at offset {} (treating as crash-time EOF)",
-                        buf.len(),
-                        offset
-                    );
-                }
+            ReplayNext::End => break,
+            ReplayNext::Truncated { offset, len } => {
+                warn!(
+                    "AOF incr truncated tail: {} bytes at offset {} (treating as crash-time EOF)",
+                    len, offset
+                );
                 break;
             }
-            Err(e) => {
-                let offset = total_len - buf.len();
+            ReplayNext::Corrupt { offset, err } => {
                 return Err(crate::error::MoonError::from(
                     crate::error::AofError::RewriteFailed {
-                        detail: format!("AOF incr parse error at offset {}: {:?}", offset, e),
+                        detail: format!("AOF incr parse error at offset {}: {:?}", offset, err),
                     },
                 ));
             }
