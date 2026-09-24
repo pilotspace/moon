@@ -251,6 +251,25 @@ fn write_filler(port: u16) {
         stream.write_all(&buf).expect("filler tail write");
     }
     stream.flush().ok();
+    // Read every reply before the socket is dropped. Closing a socket with
+    // unread replies in its receive queue sends an RST, and on Linux the
+    // server then discards the pipelined commands it had not read yet:
+    // measured on the ae21476 binary, 8,289 of 16,000 SETs landed and
+    // nothing spilled, so every case failed its "no heap-*.mpf" precondition
+    // before it tested anything (the suite was written on macOS, where the
+    // close did not cost the tail). Each SET reply is one line.
+    use std::io::Read;
+    stream.set_read_timeout(Some(Duration::from_secs(60))).ok();
+    let mut replies = 0usize;
+    let mut chunk = [0u8; 64 * 1024];
+    while replies < FILLER_COUNT {
+        let n = stream.read(&mut chunk).expect("filler replies");
+        assert!(
+            n > 0,
+            "server closed the filler connection after {replies} replies"
+        );
+        replies += chunk[..n].iter().filter(|&&b| b == b'\n').count();
+    }
 }
 
 fn count_heap_files(dir: &std::path::Path) -> usize {
