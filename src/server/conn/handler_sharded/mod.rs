@@ -1585,7 +1585,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                     }
 
                     // --- CDC.READ ---
-                    if dispatch::try_handle_cdc_read(cmd, cmd_args, shaped!()) {
+                    if dispatch::try_handle_cdc_read(cmd, cmd_args, shaped!()).await {
                         continue;
                     }
 
