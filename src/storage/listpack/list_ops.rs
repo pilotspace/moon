@@ -3,8 +3,25 @@
 //! These live in a child module only because `listpack.rs` is already past
 //! CLAUDE.md's 1500-line ceiling. As a descendant this module sees the parent's
 //! private buffer and helpers, so nothing here re-derives an entry width: every
-//! walk goes through `decode_entry_ref_at` (forward) or `decode_backlen`
-//! (backward), the same two functions every other scan in the parent uses.
+//! walk goes through `decode_entry_ref_at`, the function every other scan in
+//! the parent uses.
+//!
+//! # Every walk here goes FORWARD
+//!
+//! Stepping backwards over an entry means decoding its backlen from the tail,
+//! and moon's backlen is not decodable from the tail once it is wider than one
+//! byte: `encode_backlen_into` writes the 7-bit groups low group first
+//! (`[low | 0x80, high]`, pinned by `byte_exactness_tests`), while
+//! `decode_backlen` -- like Redis's `lpDecodeBacklen` -- reads them the other
+//! way (`[high, low | 0x80]`). The two agree only for entries shorter than 128
+//! bytes. Today's policy keeps every listpack element at or under 64 bytes, so
+//! no live listpack has a wider entry, but nothing in this module may depend on
+//! that staying true: a policy change (the Redis 8 KB list budget the
+//! authority reserves a field for) would turn a tail walk into silent
+//! corruption. A forward walk only ever needs an entry's WIDTH, which
+//! `backlen_size` derives from the head, so it is correct for every entry.
+//! Listpacks are bounded by the policy (128 entries by default), so the cost of
+//! reaching the tail from the head is a bounded, allocation-free width walk.
 //!
 //! The shape of every operation below is Redis's: work on the flat byte buffer
 //! in place, move each kept byte at most once, and never decode an entry into an
@@ -13,73 +30,17 @@
 use bytes::Bytes;
 
 use super::{
-    LP_TERMINATOR, Listpack, ListpackRef, ListpackRefIter, decode_backlen, decode_entry_ref_at,
-    encode_entry, seek_to,
+    LP_TERMINATOR, Listpack, ListpackRef, ListpackRefIter, decode_entry_ref_at, encode_entry,
+    seek_to,
 };
 
 /// Byte offset of the first entry: `total_bytes: u32` + `num_elements: u16`.
 const LP_FIRST_ENTRY: usize = 6;
 
-// Test-only count of walks that started at the TAIL -- the backward half of
-// [`Listpack::offset_of`]. Paired with the parent's `HEAD_SEEKS`, it pins "one
-// seek per operation" whichever end the seek started from. Thread-local for the
-// same reason `HEAD_SEEKS` is: unit tests run in parallel in one process.
-#[cfg(test)]
-thread_local! {
-    static TAIL_SEEKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
-
-/// Walks from either end so far on this thread: `HEAD_SEEKS + TAIL_SEEKS`.
-#[cfg(test)]
-pub(crate) fn seeks_from_either_end() -> usize {
-    super::head_seeks() + TAIL_SEEKS.with(std::cell::Cell::get)
-}
-
-/// Reverse iterator yielding BORROWED entries, tail first — the borrowed twin of
-/// [`super::ListpackRevIter`].
-///
-/// Steps backwards over each entry through its backlen, so reaching the `k`-th
-/// entry from the tail decodes `k` backlens and nothing else.
-pub struct ListpackRevRefIter<'a> {
-    data: &'a [u8],
-    /// One past the last byte of the next entry to yield (its backlen's end):
-    /// the terminator position before the first `next`.
-    pos: usize,
-    remaining: usize,
-}
-
-impl<'a> Iterator for ListpackRevRefIter<'a> {
-    type Item = ListpackRef<'a>;
-
-    fn next(&mut self) -> Option<ListpackRef<'a>> {
-        if self.remaining == 0 || self.pos <= LP_FIRST_ENTRY {
-            return None;
-        }
-        let (entry_len, backlen_size) = decode_backlen(self.data, self.pos);
-        let start = self.pos - backlen_size - entry_len;
-        let (entry, _) = decode_entry_ref_at(self.data, start);
-        self.pos = start;
-        self.remaining -= 1;
-        Some(entry)
-    }
-}
-
 impl Listpack {
-    /// Reverse iterator yielding BORROWED entries -- no allocation per entry.
-    ///
-    /// `LPOS` with a negative `RANK` scans from the tail; before moon#1173 it
-    /// got there by cloning the whole list into a `Vec` first.
-    pub fn iter_rev_refs(&self) -> ListpackRevRefIter<'_> {
-        ListpackRevRefIter {
-            data: &self.data,
-            pos: self.data.len() - 1,
-            remaining: self.len(),
-        }
-    }
-
-    /// Remove up to `max` entries equal to `value` in ONE pass over the buffer,
-    /// scanning from the head, or from the tail when `from_tail` is set.
-    /// Returns how many were removed.
+    /// Remove up to `max` entries equal to `value`, the FIRST `max` of them --
+    /// or the LAST `max` when `from_tail` is set -- in one compaction pass over
+    /// the buffer. Returns how many were removed.
     ///
     /// This is `LREM` on the compact encoding (moon#1173 / moon#1174 §1). Kept
     /// entries are moved at most once each, as raw bytes -- nothing is decoded
@@ -88,15 +49,21 @@ impl Listpack {
     /// `copy_within`. Equality is [`ListpackRef::eq_bytes`], the canonical-
     /// integer rule every other lookup uses, so a stored `7` answers to `b"7"`
     /// and never to `b"07"` (moon#795).
+    ///
+    /// The tail form does not walk backwards (see the module docs): a borrowed
+    /// counting pass finds how many matches there are, and the compaction then
+    /// keeps the first `total - max` of them and removes the rest.
     pub fn remove_matches(&mut self, value: &[u8], from_tail: bool, max: usize) -> usize {
         if max == 0 || self.is_empty() {
             return 0;
         }
-        let removed = if from_tail {
-            self.remove_matches_from_tail(value, max)
+        let keep_first = if from_tail {
+            let total = self.iter_refs().filter(|e| e.eq_bytes(value)).count();
+            total.saturating_sub(max)
         } else {
-            self.remove_matches_from_head(value, max)
+            0
         };
+        let removed = self.remove_matches_compacting(value, keep_first, max);
         if removed > 0 {
             // `removed <= len()`, and `len()` is the header's own u16.
             let removed = u16::try_from(removed).unwrap_or(u16::MAX);
@@ -106,8 +73,14 @@ impl Listpack {
     }
 
     /// Head-first compaction: `[FIRST..w)` holds the kept entries in order,
-    /// `[w..r)` is the gap left by the removed ones.
-    fn remove_matches_from_head(&mut self, value: &[u8], max: usize) -> usize {
+    /// `[w..r)` is the gap left by the removed ones. The first `keep_first`
+    /// matches are kept like any other entry; the next `max` are removed.
+    fn remove_matches_compacting(
+        &mut self,
+        value: &[u8],
+        mut keep_first: usize,
+        max: usize,
+    ) -> usize {
         let mut remaining = self.len();
         let mut r = LP_FIRST_ENTRY;
         let mut w = LP_FIRST_ENTRY;
@@ -118,7 +91,11 @@ impl Listpack {
                 (entry.eq_bytes(value), next)
             };
             remaining -= 1;
-            if hit {
+            let drop = hit && keep_first == 0;
+            if hit && keep_first > 0 {
+                keep_first -= 1;
+            }
+            if drop {
                 removed += 1;
                 r = next;
                 if removed == max {
@@ -142,51 +119,10 @@ impl Listpack {
         removed
     }
 
-    /// Tail-first compaction, the mirror image: kept entries are packed
-    /// against the terminator, `[w..terminator)`, the gap is `[r..w)`, and the
-    /// untouched prefix `[FIRST..r)` stays where it is. Closing the gap is one
-    /// `drain`, i.e. one move of the kept suffix.
-    fn remove_matches_from_tail(&mut self, value: &[u8], max: usize) -> usize {
-        let mut remaining = self.len();
-        let mut r = self.data.len() - 1; // the terminator: one past the last entry
-        let mut w = r;
-        let mut removed = 0usize;
-        while remaining > 0 && r > LP_FIRST_ENTRY {
-            let (entry_len, backlen_size) = decode_backlen(&self.data, r);
-            let start = r - backlen_size - entry_len;
-            let hit = {
-                let (entry, _) = decode_entry_ref_at(&self.data, start);
-                entry.eq_bytes(value)
-            };
-            remaining -= 1;
-            if hit {
-                removed += 1;
-                r = start;
-                if removed == max {
-                    break;
-                }
-            } else {
-                let width = r - start;
-                if w != r {
-                    self.data.copy_within(start..r, w - width);
-                }
-                w -= width;
-                r = start;
-            }
-        }
-        if w != r {
-            self.data.drain(r..w);
-        }
-        removed
-    }
-
-    /// Byte offset of entry `index` -- `index == len()` names the terminator --
-    /// walking from whichever END of the buffer is nearer.
-    ///
-    /// From the head this is [`seek_to`], counted by `HEAD_SEEKS`; from the tail
-    /// it steps back over `len() - index` entries by their backlens alone, never
-    /// decoding a payload. `LTRIM k 0 99` on a 101-entry list therefore walks
-    /// ONE entry, not a hundred.
+    /// Byte offset of entry `index` -- `index == len()` names the terminator,
+    /// which needs no walk. One borrowed [`seek_to`] from the head (counted by
+    /// `HEAD_SEEKS`), stepping over entries by their width alone; never a walk
+    /// backwards (see the module docs).
     pub(super) fn offset_of(&self, index: usize) -> Option<usize> {
         let len = self.len();
         if index > len {
@@ -195,24 +131,12 @@ impl Listpack {
         if index == len {
             return Some(self.data.len() - 1);
         }
-        if index <= len - index {
-            return seek_to(&self.data, index).map(|(pos, _)| pos);
-        }
-        #[cfg(test)]
-        TAIL_SEEKS.with(|c| c.set(c.get() + 1));
-        let mut pos = self.data.len() - 1;
-        for _ in 0..len - index {
-            let (entry_len, backlen_size) = decode_backlen(&self.data, pos);
-            pos -= backlen_size + entry_len;
-        }
-        Some(pos)
+        seek_to(&self.data, index).map(|(pos, _)| pos)
     }
 
-    /// The entry at `index`, borrowed, reached from the NEARER end.
-    ///
-    /// `LINDEX l -1` on a listpack used to walk the whole list from the head
-    /// (`get_at` -> `seek_to`) and then decode the entry it landed on into an
-    /// owned `Vec`; this steps back over one backlen and borrows.
+    /// The entry at `index`, borrowed: one seek, and nothing materialized
+    /// until the caller copies what it keeps. `LINDEX` on a listpack used to
+    /// decode the entry it landed on into an owned `Vec` and then clone it.
     pub fn get_ref(&self, index: usize) -> Option<ListpackRef<'_>> {
         if index >= self.len() {
             return None;
@@ -222,7 +146,7 @@ impl Listpack {
     }
 
     /// Borrowed forward iterator over the `count` entries starting at `start`:
-    /// ONE seek, from the nearer end, then a plain walk (moon#1174 §2).
+    /// ONE seek, then a plain walk (moon#1174 §2).
     ///
     /// `ListRef::range` -- `LRANGE` -- used to call `get_at(i)` for every `i`
     /// in the window, and every `get_at` walks from the HEAD: `LRANGE 0 -1` on
@@ -245,8 +169,8 @@ impl Listpack {
     ///
     /// `LPOP`/`RPOP`/`LMOVE` on a listpack. The back used to be reached TWICE
     /// from the head -- `iter_refs().nth(len - 1)` to read it, then
-    /// `remove_at(len - 1)` to seek to it again -- where one backlen from the
-    /// terminator names it. The one allocation is the reply's own copy
+    /// `remove_at(len - 1)` to seek to it again; one seek finds both the entry
+    /// and its extent. The one allocation is the reply's own copy
     /// (`tests/list_pop_alloc_942.rs` pins that floor): it must own its bytes,
     /// because the buffer is mutated out from under them on the next line.
     pub fn pop_end(&mut self, front: bool) -> Option<Bytes> {
@@ -303,9 +227,8 @@ impl Listpack {
     /// Keep only the entries `start..=end`, dropping everything outside that
     /// range in ONE move of the kept bytes (`LTRIM`, moon#1174 §1).
     ///
-    /// Both edges are found by [`Listpack::offset_of`], each from its nearer
-    /// end, so the common `LTRIM k 0 N` on a list one entry past `N` steps over
-    /// a single backlen. An empty or out-of-range window (`start > end`, or
+    /// Both edges come out of ONE borrowed walk from the head, which stops at
+    /// the end edge. An empty or out-of-range window (`start > end`, or
     /// `start >= len()`) empties the listpack; `end` past the tail is clamped.
     pub fn retain_range(&mut self, start: usize, end: usize) {
         let len = self.len();
@@ -316,9 +239,14 @@ impl Listpack {
             return;
         }
         let end = end.min(len - 1);
-        let (Some(from), Some(to)) = (self.offset_of(start), self.offset_of(end + 1)) else {
+        let Some(from) = self.offset_of(start) else {
             return;
         };
+        // Continue from `start` to one past `end` -- the same walk, resumed.
+        let mut to = from;
+        for _ in start..=end {
+            to = decode_entry_ref_at(&self.data, to).1;
+        }
         let kept = to - from;
         if from != LP_FIRST_ENTRY {
             self.data.copy_within(from..to, LP_FIRST_ENTRY);
@@ -449,6 +377,7 @@ mod tests {
             b"9223372036854775807".to_vec(),
             b"".to_vec(),
             vec![b'z'; 70],
+            vec![b'w'; 150], // entry_len >= 128: a two-byte backlen
         ]
     }
 
@@ -488,18 +417,6 @@ mod tests {
                 "round {round}: byte layout differs from a fresh build"
             );
         }
-    }
-
-    /// The reverse iterator must be the forward one, reversed, on every
-    /// encoding width.
-    #[test]
-    fn iter_rev_refs_mirrors_iter_refs() {
-        let lp = build(&alphabet());
-        let mut fwd: Vec<Vec<u8>> = lp.iter_refs().map(|e| e.to_vec()).collect();
-        fwd.reverse();
-        let rev: Vec<Vec<u8>> = lp.iter_rev_refs().map(|e| e.to_vec()).collect();
-        assert_eq!(rev, fwd);
-        assert_eq!(Listpack::new().iter_rev_refs().count(), 0);
     }
 
     #[test]
@@ -549,29 +466,62 @@ mod tests {
         assert_eq!(contents(&lp), values[..3].to_vec());
     }
 
-    /// `offset_of` must land on the same byte the head walk lands on, from
-    /// either end, for every index including the terminator -- and it must
-    /// take the NEARER end.
+    /// `offset_of` lands on the byte the owned walk lands on, for every index
+    /// including the terminator, in exactly one seek.
     #[test]
-    fn offset_of_agrees_with_seek_to_from_either_end() {
+    fn offset_of_agrees_with_seek_to() {
         let lp = build(&alphabet());
         let len = lp.len();
         for i in 0..len {
             let (want, _) = seek_to(&lp.data, i).expect("in range");
-            let mark = seeks_from_either_end();
+            let mark = super::super::head_seeks();
             assert_eq!(lp.offset_of(i), Some(want), "index {i}");
-            assert_eq!(seeks_from_either_end() - mark, 1, "index {i}: one seek");
+            assert_eq!(super::super::head_seeks() - mark, 1, "index {i}: one seek");
         }
         assert_eq!(lp.offset_of(len), Some(lp.data.len() - 1), "terminator");
         assert_eq!(lp.offset_of(len + 1), None);
-        // The last entry is reached from the tail, not the head.
-        let head = super::super::head_seeks();
-        lp.offset_of(len - 1);
-        assert_eq!(
-            super::super::head_seeks(),
-            head,
-            "tail index walked from the head"
-        );
+    }
+
+    /// moon's multi-byte backlen is written low group first, which the
+    /// tail-side decoder cannot read (module docs). Every operation in this
+    /// module must therefore stay correct on WIDE entries -- the ones a looser
+    /// policy would admit -- at every position, tail included.
+    #[test]
+    fn every_operation_is_correct_on_wide_entries() {
+        let values: Vec<Vec<u8>> = vec![
+            vec![b'a'; 200],
+            b"x".to_vec(),
+            vec![b'b'; 4096],
+            b"x".to_vec(),
+            vec![b'c'; 130],
+        ];
+        let lp = build(&values);
+        for (i, v) in values.iter().enumerate() {
+            assert_eq!(
+                lp.get_ref(i).map(|e| e.to_vec()).as_ref(),
+                Some(v),
+                "get_ref({i})"
+            );
+        }
+        let got: Vec<Vec<u8>> = lp.range_refs(3, 10).map(|e| e.to_vec()).collect();
+        assert_eq!(got, values[3..].to_vec());
+
+        let mut tail = build(&values);
+        assert_eq!(tail.pop_end(false).as_deref(), Some(values[4].as_slice()));
+        assert_eq!(tail.pop_end(false).as_deref(), Some(values[3].as_slice()));
+        assert_eq!(contents(&tail), values[..3].to_vec());
+
+        let mut rem = build(&values);
+        assert_eq!(rem.remove_matches(b"x", true, 1), 1);
+        let mut want = values.clone();
+        want.remove(3);
+        assert_eq!(contents(&rem), want);
+        assert_eq!(rem.data, build(&want).data);
+
+        let mut trim = build(&values);
+        trim.retain_range(2, 4);
+        assert_eq!(contents(&trim), values[2..].to_vec());
+        assert_eq!(trim.data, build(&values[2..]).data);
     }
 
     /// `retain_range` against slicing, on every window of a list that spans
@@ -595,21 +545,22 @@ mod tests {
         }
     }
 
-    /// The capped-list shape: `LTRIM 0 99` on 101 entries walks ONE backlen.
+    /// The capped-list shape: `LTRIM 0 99` on 101 entries is ONE walk.
     #[test]
-    fn retain_range_on_a_capped_list_seeks_once_from_the_tail() {
+    fn retain_range_on_a_capped_list_is_one_walk() {
         let values: Vec<Vec<u8>> = (0..101)
             .map(|i| format!("item:{i:06}").into_bytes())
             .collect();
         let mut lp = build(&values);
         let head = super::super::head_seeks();
-        let both = seeks_from_either_end();
         lp.retain_range(0, 99);
         assert_eq!(contents(&lp), values[..100].to_vec());
-        assert_eq!(seeks_from_either_end() - both, 2, "one seek per edge");
-        // The start edge is index 0 (a zero-length head seek); the end edge
-        // must come from the tail.
-        assert_eq!(super::super::head_seeks() - head, 1);
+        assert_eq!(
+            super::super::head_seeks() - head,
+            1,
+            "one walk for both edges"
+        );
+        assert_eq!(lp.data, build(&values[..100]).data);
     }
 
     /// `insert_relative` against `Vec::insert` at the first pivot, both sides,
@@ -653,9 +604,9 @@ mod tests {
         let lp = build(&values);
         for start in [0usize, 1, 63, 64, 100, 127, 128, 200] {
             for count in [0usize, 1, 5, 64, 128, 500] {
-                let mark = seeks_from_either_end();
+                let mark = super::super::head_seeks();
                 let got: Vec<Vec<u8>> = lp.range_refs(start, count).map(|e| e.to_vec()).collect();
-                let seeks = seeks_from_either_end() - mark;
+                let seeks = super::super::head_seeks() - mark;
                 let want: Vec<Vec<u8>> = values.iter().skip(start).take(count).cloned().collect();
                 assert_eq!(got, want, "range_refs({start}, {count})");
                 assert!(
@@ -675,7 +626,7 @@ mod tests {
     }
 
     #[test]
-    fn get_ref_and_pop_end_reach_the_nearer_end() {
+    fn get_ref_and_pop_end_take_one_seek() {
         let values = alphabet();
         let lp = build(&values);
         for (i, v) in values.iter().enumerate() {
@@ -691,11 +642,7 @@ mod tests {
         let head = super::super::head_seeks();
         let back = lp.pop_end(false).expect("non-empty");
         assert_eq!(back.as_ref(), values.last().unwrap().as_slice());
-        assert_eq!(
-            super::super::head_seeks(),
-            head,
-            "RPOP walked from the head"
-        );
+        assert_eq!(super::super::head_seeks() - head, 1, "one seek per pop");
         let front = lp.pop_end(true).expect("non-empty");
         assert_eq!(front.as_ref(), values[0].as_slice());
         assert_eq!(contents(&lp), values[1..values.len() - 1].to_vec());
@@ -714,10 +661,10 @@ mod tests {
         let mut picks: Vec<(usize, usize)> =
             draws.iter().enumerate().map(|(s, &i)| (i, s)).collect();
         let mut out: Vec<Option<Vec<u8>>> = vec![None; draws.len()];
-        let mark = seeks_from_either_end();
+        let mark = super::super::head_seeks();
         lp.for_each_at(&mut picks, |slot, e| out[slot] = Some(e.to_vec()));
         assert_eq!(
-            seeks_from_either_end(),
+            super::super::head_seeks(),
             mark,
             "no seek at all: one plain walk"
         );

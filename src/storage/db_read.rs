@@ -282,8 +282,20 @@ impl<'a> ListRef<'a> {
             ListRef::Owned(d) => d,
             ListRef::Listpack(lp) => {
                 if from_tail {
-                    for (k, e) in lp.iter_rev_refs().take(limit).enumerate() {
-                        if e.eq_bytes(element) && !on_match(len - 1 - k) {
+                    // The window is the last `limit` entries. A listpack is
+                    // never walked backwards (`listpack::list_ops` docs), so
+                    // the window's matches are gathered in one forward walk
+                    // and handed out tail first. Bounded by the policy's entry
+                    // count; the buffer spills to the heap only past 32 hits.
+                    let first = len - limit.min(len);
+                    let mut hits: smallvec::SmallVec<[usize; 32]> = smallvec::SmallVec::new();
+                    for (k, e) in lp.range_refs(first, len - first).enumerate() {
+                        if e.eq_bytes(element) {
+                            hits.push(first + k);
+                        }
+                    }
+                    for &i in hits.iter().rev() {
+                        if !on_match(i) {
                             return;
                         }
                     }

@@ -5,9 +5,6 @@ use std::collections::{HashMap, VecDeque};
 // because this file is already past CLAUDE.md's 1500-line ceiling; it shares
 // this module's private decoder, so no entry width is decided twice.
 mod list_ops;
-pub use list_ops::ListpackRevRefIter;
-#[cfg(test)]
-pub(crate) use list_ops::seeks_from_either_end;
 
 const LP_HDR_SIZE: usize = 7; // 4 bytes total_bytes + 2 bytes num_elements + 1 byte terminator
 const LP_TERMINATOR: u8 = 0xFF;

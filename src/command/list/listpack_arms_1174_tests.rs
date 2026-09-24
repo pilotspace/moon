@@ -472,10 +472,10 @@ fn refusals_create_nothing_and_pop_nothing() {
 
 /// moon#1174 §2: LRANGE on a listpack is ONE seek, whatever the window --
 /// HEAD walked from the head once PER returned element (`LRANGE 0 -1` on 128
-/// entries decoded 8,256). LINDEX near the tail is reached from the tail.
+/// entries decoded 8,256). LINDEX is one seek too.
 #[test]
 fn lrange_and_lindex_on_a_listpack_seek_once() {
-    use crate::storage::listpack::{head_seeks, seeks_from_either_end};
+    use crate::storage::listpack::head_seeks;
     let values: Vec<Vec<u8>> = (0..128)
         .map(|i| format!("element:{i:05}").into_bytes())
         .collect();
@@ -497,7 +497,7 @@ fn lrange_and_lindex_on_a_listpack_seek_once() {
         (5, 2),
         (-500, 500),
     ] {
-        let mark = seeks_from_either_end();
+        let mark = head_seeks();
         let got = lrange_readonly(
             &db,
             &[
@@ -507,7 +507,7 @@ fn lrange_and_lindex_on_a_listpack_seek_once() {
             ],
             0,
         );
-        let seeks = seeks_from_either_end() - mark;
+        let seeks = head_seeks() - mark;
         assert!(seeks <= 1, "LRANGE {start} {stop} took {seeks} seeks");
         let s = if start < 0 {
             (len + start).max(0)
@@ -534,5 +534,5 @@ fn lrange_and_lindex_on_a_listpack_seek_once() {
         super::lindex_readonly(&db, &[bs(b"l"), bs(b"-1")], 0),
         bs(values.last().unwrap())
     );
-    assert_eq!(head_seeks(), head, "LINDEX -1 walked from the head");
+    assert_eq!(head_seeks() - head, 1, "LINDEX is one seek");
 }
