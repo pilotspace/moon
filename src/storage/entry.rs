@@ -425,7 +425,11 @@ impl RedisValue {
                         .map(|(member, _)| crate::storage::db::zset_member_cost(member))
                         .sum::<usize>()
             }
-            RedisValue::Stream(s) => s.estimate_memory(),
+            // moon#1163: the LEDGER's figure for the stream — what it was
+            // charged, kept in lockstep with `used_memory` — so the credit on
+            // removal always equals the charges (see `Stream::billed_memory`).
+            // `Stream::estimate_memory` is the true size, by scan.
+            RedisValue::Stream(s) => s.billed_memory(),
         }
     }
 }

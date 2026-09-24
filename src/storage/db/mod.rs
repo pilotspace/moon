@@ -24,6 +24,8 @@ mod probe_budget;
 /// moon#1221 review F3: read-modify-write string commands record one access.
 #[cfg(test)]
 mod rmw_access_tests;
+#[cfg(test)]
+mod stream_accounting_tests;
 pub(crate) mod string_mut;
 /// WS1 (2026-09 perf review) storage-core regression tests: moon#1159,
 /// moon#1161, moon#1190, moon#1189. Test-only.
@@ -47,6 +49,19 @@ pub use crate::storage::encoding_limits::{EncodingLimits, Shape};
 /// Estimate per-entry overhead: key length + value memory + struct overhead.
 fn entry_overhead(key: &[u8], entry: &Entry) -> usize {
     entry_overhead_len(key.len(), entry)
+}
+
+/// moon#1163: measure a stream that enters the keyspace WHOLE (a loader,
+/// RESTORE, the cold tier, a replica, a moved entry) before `entry_overhead`
+/// bills it — a stream is billed at `Stream::billed_memory`, O(1), and a
+/// value built field by field has not been measured yet. Once per stream:
+/// a settled one (a RENAME) is not rescanned. One tag check for any other
+/// value kind.
+#[inline]
+pub(crate) fn settle_stream_billing(entry: &mut Entry) {
+    if let Some(crate::storage::entry::RedisValue::Stream(s)) = entry.value.as_redis_value_mut() {
+        s.settle_billing();
+    }
 }
 
 /// [`entry_overhead`] for a caller that has only the key's LENGTH (the

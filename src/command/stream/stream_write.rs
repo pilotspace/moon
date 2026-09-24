@@ -10,6 +10,20 @@ use crate::storage::stream::StreamId;
 use super::format_entry;
 use crate::command::helpers::{err_wrong_args, extract_bytes};
 
+/// moon#1163: apply the byte delta a stream drained with
+/// `Stream::take_unbilled` to `used_memory` — the other half of the lockstep
+/// that keeps a stream's billed size equal to what the ledger carries. Called
+/// once per mutating command, after the stream's borrow ends. Also picks up
+/// any mutation made since the last drain by a caller outside these commands.
+#[inline]
+fn bill(db: &mut Database, delta: isize) {
+    if delta >= 0 {
+        db.charge_memory(delta.unsigned_abs());
+    } else {
+        db.credit_memory(delta.unsigned_abs());
+    }
+}
+
 /// XADD key [NOMKSTREAM] [MAXLEN|MINID [=|~] threshold] id field value [field value ...]
 pub fn xadd(db: &mut Database, args: &[Frame]) -> Frame {
     if args.len() < 4 {
@@ -196,6 +210,8 @@ pub fn xadd(db: &mut Database, args: &[Frame]) -> Frame {
             }
         }
     }
+    let delta = stream.take_unbilled();
+    bill(db, delta);
 
     Frame::BulkString(result_id.to_bytes())
 }
@@ -270,6 +286,8 @@ pub fn xtrim(db: &mut Database, args: &[Frame]) -> Frame {
             b"ERR syntax error, XTRIM requires MAXLEN or MINID",
         ));
     };
+    let delta = stream.take_unbilled();
+    bill(db, delta);
 
     Frame::Integer(removed as i64)
 }
@@ -303,6 +321,8 @@ pub fn xdel(db: &mut Database, args: &[Frame]) -> Frame {
     };
 
     let deleted = stream.delete(&ids);
+    let delta = stream.take_unbilled();
+    bill(db, delta);
     Frame::Integer(deleted as i64)
 }
 
@@ -388,10 +408,13 @@ pub fn xgroup(db: &mut Database, args: &[Frame]) -> Frame {
             Err(e) => return e,
         };
 
-        match stream.create_group(group_name, last_delivered_id) {
+        let reply = match stream.create_group(group_name, last_delivered_id) {
             Ok(()) => Frame::SimpleString(Bytes::from_static(b"OK")),
             Err(e) => Frame::Error(Bytes::from(e)),
-        }
+        };
+        let delta = stream.take_unbilled();
+        bill(db, delta);
+        reply
     } else if subcmd.eq_ignore_ascii_case(b"DESTROY") {
         if args.len() < 3 {
             return err_wrong_args("XGROUP DESTROY");
@@ -409,11 +432,10 @@ pub fn xgroup(db: &mut Database, args: &[Frame]) -> Frame {
             Ok(None) => return Frame::Integer(0),
             Err(e) => return e,
         };
-        if stream.destroy_group(group_name) {
-            Frame::Integer(1)
-        } else {
-            Frame::Integer(0)
-        }
+        let destroyed = stream.destroy_group(group_name);
+        let delta = stream.take_unbilled();
+        bill(db, delta);
+        Frame::Integer(i64::from(destroyed))
     } else if subcmd.eq_ignore_ascii_case(b"SETID") {
         if args.len() < 4 {
             return err_wrong_args("XGROUP SETID");
@@ -482,11 +504,14 @@ pub fn xgroup(db: &mut Database, args: &[Frame]) -> Frame {
             }
             Err(e) => return e,
         };
-        match stream.create_consumer(group_name, consumer_name) {
+        let reply = match stream.create_consumer(group_name, consumer_name) {
             Ok(true) => Frame::Integer(1),
             Ok(false) => Frame::Integer(0),
             Err(e) => Frame::Error(Bytes::from(e)),
-        }
+        };
+        let delta = stream.take_unbilled();
+        bill(db, delta);
+        reply
     } else if subcmd.eq_ignore_ascii_case(b"DELCONSUMER") {
         if args.len() < 4 {
             return err_wrong_args("XGROUP DELCONSUMER");
@@ -512,10 +537,13 @@ pub fn xgroup(db: &mut Database, args: &[Frame]) -> Frame {
             }
             Err(e) => return e,
         };
-        match stream.delete_consumer(group_name, consumer_name) {
+        let reply = match stream.delete_consumer(group_name, consumer_name) {
             Ok(count) => Frame::Integer(count as i64),
             Err(e) => Frame::Error(Bytes::from(e)),
-        }
+        };
+        let delta = stream.take_unbilled();
+        bill(db, delta);
+        reply
     } else {
         Frame::Error(Bytes::from_static(
             b"ERR 'XGROUP' command 'UNKNOWN' not recognized",
@@ -691,6 +719,9 @@ pub fn xreadgroup(db: &mut Database, args: &[Frame]) -> Frame {
                 Err(e) => return Frame::Error(Bytes::from(e)),
             }
         };
+        // The consumer it may have created and the PEL entries it added.
+        let delta = stream.take_unbilled();
+        bill(db, delta);
 
         // `>` with nothing new is not served at all; history always is.
         if is_new && entries.is_empty() {
@@ -756,10 +787,13 @@ pub fn xack(db: &mut Database, args: &[Frame]) -> Frame {
 
     // Convert group Bytes to owned for the borrow
     let group_owned = group.clone();
-    match stream.xack(&group_owned, &ids) {
+    let reply = match stream.xack(&group_owned, &ids) {
         Ok(count) => Frame::Integer(count as i64),
         Err(e) => Frame::Error(Bytes::from(e)),
-    }
+    };
+    let delta = stream.take_unbilled();
+    bill(db, delta);
+    reply
 }
 
 /// XCLAIM key group consumer min-idle-time id [id ...] [IDLE ms] [TIME ms]
@@ -888,6 +922,8 @@ pub fn xclaim(db: &mut Database, args: &[Frame]) -> Frame {
             .filter_map(|id| stream.entries.get(&id).map(|f| format_entry(id, f)))
             .collect()
     };
+    let delta = stream.take_unbilled();
+    bill(db, delta);
     Frame::Array(frames.into())
 }
 
@@ -1009,7 +1045,7 @@ pub fn xautoclaim(db: &mut Database, args: &[Frame]) -> Frame {
         Err(e) => return e,
     };
 
-    match stream.xautoclaim(&group, &consumer, min_idle, start, count) {
+    let reply = match stream.xautoclaim(&group, &consumer, min_idle, start, count) {
         Ok((next_id, claimed, deleted)) => {
             let claimed_frames: Vec<Frame> = claimed
                 .iter()
@@ -1026,7 +1062,10 @@ pub fn xautoclaim(db: &mut Database, args: &[Frame]) -> Frame {
             ])
         }
         Err(e) => Frame::Error(Bytes::from(e)),
-    }
+    };
+    let delta = stream.take_unbilled();
+    bill(db, delta);
+    reply
 }
 
 /// XSETID key last-id [ENTRIESADDED entries-added]
