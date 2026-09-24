@@ -1441,6 +1441,8 @@ impl super::Shard {
                 // Periodic 1ms timer for WAL flush, snapshot advance, io_uring poll
                 _ = periodic_interval.0.tick() => {
                     cached_clock.update();
+                    // moon#1190: lazy-free drain (see the monoio tick below).
+                    crate::server::expiration::drain_lazy_free_tick(shard_databases.db_count());
 
                     let mut pending_snapshot = None;
                     // No outer with_shard — each arm takes its own flat borrow.
@@ -2347,6 +2349,9 @@ impl super::Shard {
                 // 10 idle) so the counter keeps counting nominal milliseconds.
                 monoio_tick_counter = monoio_tick_counter.wrapping_add(idle_park.counter_step());
                 cached_clock.update();
+                // moon#1190: free lazily-unlinked / expired large values, a
+                // bounded slice per tick (one relaxed load when none queued).
+                crate::server::expiration::drain_lazy_free_tick(shard_databases.db_count());
 
                 persistence_tick::check_auto_save_trigger(
                     &snapshot_trigger_rx,
