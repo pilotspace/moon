@@ -376,6 +376,10 @@ pub(crate) async fn handle_connection_sharded_inner<
     // crossing a migration stalled indefinitely).
     let mut carried_input = !read_buf.is_empty();
     let parse_config = crate::protocol::ParseConfig::default();
+    // moon#1164: resume cursor for the incomplete frame at the front of
+    // `read_buf`, so a large upload is scanned once, not once per read. Every
+    // other consumer of `read_buf`'s front resets it (see `ParseState`).
+    let mut parse_state = crate::protocol::ParseState::new();
     let mut conn = super::core::ConnectionState::new(
         client_id,
         peer_addr.clone(),
@@ -493,7 +497,7 @@ pub(crate) async fn handle_connection_sharded_inner<
             // #438: a deferred batch tail from the subscribe break sits in
             // read_buf; run_subscriber_step parses it before awaiting the
             // socket, clearing the flag only when its read arm actually wins.
-            match pubsub::run_subscriber_step(
+            let subscriber_action = pubsub::run_subscriber_step(
                 &mut stream,
                 &mut read_buf,
                 &mut write_buf,
@@ -504,8 +508,11 @@ pub(crate) async fn handle_connection_sharded_inner<
                 &shutdown,
                 &mut carried_input,
             )
-            .await
-            {
+            .await;
+            // moon#1164: the subscriber step parses (and consumes) `read_buf`
+            // with the stateless parser, so the resume cursor is void.
+            parse_state.reset();
+            match subscriber_action {
                 pubsub::SubscriberAction::Continue => {
                     continue;
                 }
@@ -515,6 +522,37 @@ pub(crate) async fn handle_connection_sharded_inner<
                 pubsub::SubscriberAction::EarlyReturn => {
                     return (HandlerResult::Done, None);
                 }
+            }
+        }
+        // moon#1164: make room for what the incomplete front frame is known to
+        // need, so a large upload is read in a geometric series of reads
+        // rather than whatever spare capacity happens to be left. The first
+        // call skips the config lock whenever there is no hint at all.
+        if !(carried_input && !read_buf.is_empty())
+            && super::util::hinted_read_len(
+                read_buf.len(),
+                parse_state.pending_len(),
+                conn.authenticated,
+                0,
+                0,
+            )
+            .is_some()
+        {
+            let (limit, preauth) = {
+                let rt = ctx.runtime_config.read();
+                (
+                    rt.client_query_buffer_limit,
+                    rt.client_query_buffer_limit_preauth,
+                )
+            };
+            if let Some(want) = super::util::hinted_read_len(
+                read_buf.len(),
+                parse_state.pending_len(),
+                conn.authenticated,
+                limit,
+                preauth,
+            ) {
+                read_buf.reserve(want);
             }
         }
         tokio::select! {
@@ -572,7 +610,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                 let mut batch: Vec<Frame> = Vec::with_capacity(64);
                 const MAX_BATCH: usize = 1024;
                 loop {
-                    match crate::protocol::parse(&mut read_buf, &parse_config) {
+                    match crate::protocol::parse_resumable(&mut read_buf, &parse_config, &mut parse_state) {
                         Ok(Some(frame)) => {
                             batch.push(frame);
                             if batch.len() >= MAX_BATCH { break; }
@@ -3156,6 +3194,8 @@ pub(crate) async fn handle_connection_sharded_inner<
                     }
                     carry.extend_from_slice(&read_buf);
                     read_buf = carry;
+                    // moon#1164: bytes were prepended — the resume cursor is void.
+                    parse_state.reset();
                     carried_input = true;
                 }
 

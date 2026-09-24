@@ -313,6 +313,52 @@ pub(crate) fn query_buf_exceeded(
     resolved != 0 && len > resolved
 }
 
+/// Smallest read the parse hint may ask for. Below this a frame's remainder
+/// fits in an ordinary read and sizing it buys nothing.
+#[cfg(any(feature = "runtime-tokio", test))]
+pub(crate) const READ_HINT_MIN: usize = 32 * 1024;
+/// Largest single read the parse hint may ask for. Bounds the capacity one
+/// read reserves ahead of the bytes actually arriving: a `$536870911` header
+/// must not reserve half a gigabyte on the strength of a claim.
+#[cfg(any(feature = "runtime-tokio", test))]
+pub(crate) const READ_HINT_MAX: usize = 1024 * 1024;
+
+/// How many bytes the next read should make room for, given the incomplete
+/// frame at the front of the read buffer (moon#1164).
+///
+/// `pending_total` is `ParseState::pending_len()`: the buffer length the front
+/// frame is known to need, or one byte past what is buffered when only "more"
+/// is known. The answer is the larger of that remainder and what is already
+/// buffered — so an unbounded tail (a million small elements) grows reads
+/// geometrically and a known bulk remainder is read in one go — clamped to
+/// [`READ_HINT_MIN`, `READ_HINT_MAX`] and to the query-buffer ceiling.
+///
+/// `None` means "no hint, use the ordinary read size": nothing incomplete, a
+/// remainder small enough for an ordinary read, or an UNAUTHENTICATED
+/// connection — pre-auth clients stay on the small fixed read; the growth a
+/// hint allows is for clients the server has already let in.
+#[inline]
+#[cfg(any(feature = "runtime-tokio", test))]
+pub(crate) fn hinted_read_len(
+    buffered: usize,
+    pending_total: usize,
+    authenticated: bool,
+    limit: usize,
+    preauth_limit: usize,
+) -> Option<usize> {
+    if !authenticated || pending_total <= buffered {
+        return None;
+    }
+    let mut want = (pending_total - buffered).max(buffered).min(READ_HINT_MAX);
+    // Never make room past the ceiling: one byte beyond it is all the check
+    // after the read needs to see.
+    let resolved = query_buf_limit(authenticated, limit, preauth_limit);
+    if resolved != 0 {
+        want = want.min(resolved.saturating_sub(buffered).saturating_add(1));
+    }
+    (want >= READ_HINT_MIN).then_some(want)
+}
+
 /// The error moon sends before closing a connection that blew its query
 /// buffer. Redis closes silently (and logs); we say why first, then close —
 /// a silent close on a large pipeline is very hard to tell from a crash.
@@ -352,6 +398,41 @@ mod query_buf_limit_tests {
         // still binds before that.
         assert_eq!(query_buf_limit(true, 0, 64 * 1024), 0);
         assert_eq!(query_buf_limit(false, 0, 64 * 1024), 64 * 1024);
+    }
+
+    /// moon#1164: reads are sized from what the incomplete front frame needs.
+    #[test]
+    fn hinted_read_len_grows_geometrically_and_respects_the_ceilings() {
+        const G: usize = 1 << 30;
+        const P: usize = 64 * 1024;
+        // Nothing pending, or pending already buffered: no hint.
+        assert_eq!(hinted_read_len(100, 0, true, G, P), None);
+        assert_eq!(hinted_read_len(100, 100, true, G, P), None);
+        // A small remainder fits an ordinary read.
+        assert_eq!(hinted_read_len(100, 200, true, G, P), None);
+        // A known bulk remainder is read in one go (up to the max).
+        assert_eq!(
+            hinted_read_len(8192, 8192 + 500_000, true, G, P),
+            Some(500_000)
+        );
+        assert_eq!(
+            hinted_read_len(8192, 50 << 20, true, G, P),
+            Some(READ_HINT_MAX)
+        );
+        // An unbounded tail ("one more byte") doubles what is buffered.
+        assert_eq!(
+            hinted_read_len(64 * 1024, 64 * 1024 + 1, true, G, P),
+            Some(64 * 1024)
+        );
+        assert_eq!(hinted_read_len(16 * 1024, 16 * 1024 + 1, true, G, P), None);
+        // Pre-auth clients never get a hint, whatever they claim.
+        assert_eq!(hinted_read_len(8192, 50 << 20, false, G, P), None);
+        // The query-buffer ceiling bounds the room made.
+        assert_eq!(
+            hinted_read_len(900_000, 5 << 20, true, 1_000_000, P),
+            Some(100_001)
+        );
+        assert_eq!(hinted_read_len(990_000, 5 << 20, true, 1_000_000, P), None);
     }
 
     #[test]

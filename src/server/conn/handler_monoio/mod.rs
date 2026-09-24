@@ -1681,6 +1681,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                     .as_ref()
                     .map_or(b"" as &[u8], |n| n.as_ref()),
             );
+            let len_before_inline = read_buf.len();
             let inlined = try_inline_dispatch_loop(
                 &mut read_buf,
                 &mut write_buf,
@@ -1708,6 +1709,14 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 &mut probe,
             );
             drop(probe);
+            // moon#1164: the inline path consumes from the front of `read_buf`
+            // behind the codec's back, so the codec's resume cursor no longer
+            // describes those bytes. (It can never describe a frame the inline
+            // path consumes — cursors are only kept for `*4`+ frames — but the
+            // reset is what the `ParseState` contract asks of every consumer.)
+            if read_buf.len() != len_before_inline {
+                codec.reset_parse_state();
+            }
             crate::admin::metrics_setup::record_dispatch_local_inline(inlined as u64);
             if inlined > 0 && read_buf.is_empty() {
                 // All commands were inlined -- flush write_buf and continue
@@ -4263,6 +4272,8 @@ pub(crate) async fn handle_connection_sharded_monoio<
             }
             carry.extend_from_slice(&read_buf);
             read_buf = carry;
+            // moon#1164: bytes were prepended — the resume cursor is void.
+            codec.reset_parse_state();
             carried_input = true;
         }
 

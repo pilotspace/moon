@@ -2,7 +2,7 @@ use bytes::BytesMut;
 #[cfg(feature = "runtime-tokio")]
 use tokio_util::codec::{Decoder, Encoder};
 
-use crate::protocol::{self, Frame, ParseConfig, ParseError};
+use crate::protocol::{self, Frame, ParseConfig, ParseError, ParseState};
 
 /// RESP2/RESP3 codec wrapping the parser and dual serializers.
 ///
@@ -33,6 +33,12 @@ pub struct RespCodec {
     /// `Decoder` trait's `io::Error` cannot carry it, and a bare close leaves
     /// the client unable to tell a bad encoder from a dropped network.
     last_fault: Option<crate::protocol::ProtoFault>,
+    /// moon#1164: how far into the (incomplete) frame at the front of the
+    /// read buffer the last decode got, so the next one resumes there instead
+    /// of re-scanning from byte 0. The codec is the only thing that consumes
+    /// its buffer, EXCEPT where a handler says otherwise via
+    /// [`RespCodec::reset_parse_state`].
+    parse_state: ParseState,
 }
 
 impl RespCodec {
@@ -42,6 +48,7 @@ impl RespCodec {
             protocol_version: 2,
             max_query_buf: 0,
             last_fault: None,
+            parse_state: ParseState::new(),
         }
     }
 
@@ -70,7 +77,7 @@ impl RespCodec {
                 "query buffer limit reached",
             ));
         }
-        match protocol::parse(src, &self.config) {
+        match protocol::parse_resumable(src, &self.config, &mut self.parse_state) {
             Ok(frame) => Ok(frame),
             Err(ParseError::Incomplete) => Ok(None),
             Err(e) => {
@@ -85,6 +92,21 @@ impl RespCodec {
                 Err(std::io::Error::new(std::io::ErrorKind::InvalidData, e))
             }
         }
+    }
+
+    /// Forget the resume cursor. Call after anything other than
+    /// [`Self::decode_frame`] consumes, prepends to, or replaces the front of
+    /// the buffer this codec decodes (see [`ParseState`]).
+    #[inline]
+    pub fn reset_parse_state(&mut self) {
+        self.parse_state.reset();
+    }
+
+    /// The parse progress, for sizing the next read from what the incomplete
+    /// front frame is known to need.
+    #[inline]
+    pub fn parse_state(&self) -> &ParseState {
+        &self.parse_state
     }
 
     /// The fault from the most recent failed [`Self::decode_frame`], taken.
@@ -147,6 +169,42 @@ mod tests {
         let frame = codec.decode_frame(&mut buf).unwrap().unwrap();
         assert_eq!(frame, Frame::SimpleString(Bytes::from_static(b"OK")));
         assert!(buf.is_empty());
+    }
+
+    /// moon#1164: the codec keeps its resume cursor across reads of one large
+    /// frame, drops it once the frame is out, and `reset_parse_state` drops it
+    /// on demand (what the handlers call after a foreign consumer).
+    #[test]
+    fn decode_frame_resumes_a_large_frame_across_reads() {
+        let mut frame = format!("*{}\r\n$5\r\nRPUSH\r\n$1\r\nk\r\n", 10_002).into_bytes();
+        for _ in 0..10_000 {
+            frame.extend_from_slice(b"$1\r\nx\r\n");
+        }
+        let mut codec = RespCodec::default();
+        let mut buf = BytesMut::new();
+        let mut resumed = false;
+        let mut done = false;
+        for chunk in frame.chunks(8192) {
+            buf.extend_from_slice(chunk);
+            match codec.decode_frame(&mut buf).unwrap() {
+                Some(Frame::Array(items)) => {
+                    assert_eq!(items.len(), 10_002);
+                    assert!(buf.is_empty());
+                    assert!(!codec.parse_state().is_resuming());
+                    done = true;
+                }
+                Some(other) => panic!("expected Array, got {other:?}"),
+                None => resumed |= codec.parse_state().is_resuming(),
+            }
+        }
+        assert!(done && resumed, "done={done} resumed={resumed}");
+
+        let mut buf = BytesMut::from(&frame[..frame.len() - 1]);
+        assert!(codec.decode_frame(&mut buf).unwrap().is_none());
+        assert!(codec.parse_state().is_resuming());
+        codec.reset_parse_state();
+        assert!(!codec.parse_state().is_resuming());
+        assert_eq!(codec.parse_state().pending_len(), 0);
     }
 
     #[test]

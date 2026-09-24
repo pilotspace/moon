@@ -310,8 +310,35 @@ fn bench_parse_hset_6arg(c: &mut Criterion) {
     });
 }
 
+/// moon#1164: one large command arriving in 8 KiB reads, decoded the way the
+/// read loops do (append a read, decode until "need more"). Linear in the
+/// element count with the resumable parser; it was quadratic before (15.3 s
+/// for 1M elements end to end). 100K elements keeps one iteration short.
+fn bench_parse_incremental_rpush(c: &mut Criterion) {
+    let n = 100_000usize;
+    let mut input = format!("*{}\r\n$5\r\nRPUSH\r\n$4\r\nbigl\r\n", n + 2).into_bytes();
+    for _ in 0..n {
+        input.extend_from_slice(b"$1\r\nx\r\n");
+    }
+    c.bench_function("parse_incremental_rpush_100k", |b| {
+        b.iter(|| {
+            let mut codec = moon::server::codec::RespCodec::default();
+            let mut buf = BytesMut::with_capacity(8192);
+            let mut out = None;
+            for piece in black_box(&input[..]).chunks(8192) {
+                buf.extend_from_slice(piece);
+                if let Some(frame) = codec.decode_frame(&mut buf).unwrap() {
+                    out = Some(frame);
+                }
+            }
+            black_box(out);
+        })
+    });
+}
+
 criterion_group!(
     benches,
+    bench_parse_incremental_rpush,
     bench_parse_simple_string,
     bench_parse_bulk_string,
     bench_parse_integer,
