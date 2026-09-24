@@ -45,17 +45,33 @@ impl Epoch {
         }
     }
 
-    /// One persistence tick: drain the off-loop captures, serialize one
-    /// segment, publish the cursor. Returns true once every db is written.
+    /// One persistence tick exactly as `advance_snapshot_segment` runs it:
+    /// drain the off-loop captures, serialize one tick's budget of the
+    /// current database, publish the cursor. True once every db is written.
     pub(super) fn tick(&mut self, dbs: &[Database]) -> bool {
+        self.step(dbs, true)
+    }
+
+    /// [`Self::tick`] that serializes exactly ONE segment, for tests that
+    /// need to stop the walk at a precise point.
+    pub(super) fn tick_one(&mut self, dbs: &[Database]) -> bool {
+        self.step(dbs, false)
+    }
+
+    fn step(&mut self, dbs: &[Database], budgeted: bool) -> bool {
         let Some(state) = self.state.as_mut() else {
             return true;
         };
         snapshot_cow::drain_pending_for_test(state);
-        if state.is_complete() {
+        if state.is_complete() || state.aborted().is_some() {
             return true;
         }
-        let done = state.advance_one_segment(dbs);
+        let done = if budgeted {
+            let db = state.current_db_index();
+            state.advance_budgeted_db(&dbs[db])
+        } else {
+            state.advance_one_segment(dbs)
+        };
         snapshot_cow::note_progress(state.current_db_index(), state.cursor());
         done
     }

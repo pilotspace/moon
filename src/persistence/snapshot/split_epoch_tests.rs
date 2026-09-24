@@ -76,7 +76,7 @@ fn split_of_already_serialized_segments_writes_no_key_twice() {
     let mut epoch = Epoch::begin(&dbs);
     let half = dbs[0].data().segment_count() / 2;
     for _ in 0..half {
-        assert!(!epoch.tick(&dbs));
+        assert!(!epoch.tick_one(&dbs));
     }
     // Structural churn only (raw inserts, no capture): every segment,
     // written or pending, splits at least once.
@@ -104,14 +104,14 @@ fn drained_pre_image_follows_its_key_into_a_split_off_segment() {
     preload(&mut dbs[0], "pre", 3000);
     let expected = string_keyspace(&dbs);
     let mut epoch = Epoch::begin(&dbs);
-    assert!(!epoch.tick(&dbs));
+    assert!(!epoch.tick_one(&dbs));
     // Overwrite every epoch-start key (capture -> queue).
     for i in 0..3000u32 {
         run(&mut dbs, 0, &[b"INCR", format!("pre:{i:06}").as_bytes()]);
     }
     // Next tick drains every pre-image into the state (and writes one more
     // segment).
-    assert!(!epoch.tick(&dbs));
+    assert!(!epoch.tick_one(&dbs));
     // Now split every remaining segment: moved keys take their pre-images'
     // segment with them.
     for i in 0..30_000u32 {
@@ -134,7 +134,7 @@ fn queued_pre_image_survives_a_split_before_its_drain() {
     preload(&mut dbs[0], "pre", 3000);
     let expected = string_keyspace(&dbs);
     let mut epoch = Epoch::begin(&dbs);
-    assert!(!epoch.tick(&dbs));
+    assert!(!epoch.tick_one(&dbs));
     for i in 0..3000u32 {
         run(&mut dbs, 0, &[b"INCR", format!("pre:{i:06}").as_bytes()]);
     }
@@ -160,7 +160,7 @@ fn keys_created_during_the_epoch_are_absent_from_the_snapshot() {
     preload(&mut dbs[0], "pre", 2000);
     let expected = string_keyspace(&dbs);
     let mut epoch = Epoch::begin(&dbs);
-    assert!(!epoch.tick(&dbs));
+    assert!(!epoch.tick_one(&dbs));
     for i in 0..2000u32 {
         run(&mut dbs, 0, &[b"INCR", format!("new:{i:06}").as_bytes()]);
     }
@@ -255,7 +255,13 @@ fn run_randomized_epoch(seed: u64, cov: &mut Coverage) -> super::epoch_harness::
                             cov.captured_writes =
                                 cov.captured_writes.max(state.pending_pre_images());
                         }
-                        done = epoch.tick(&dbs);
+                        // The production tick (a budget of segments) or a
+                        // single segment, so the walk stops everywhere.
+                        done = if rng.below(3) == 0 {
+                            epoch.tick(&dbs)
+                        } else {
+                            epoch.tick_one(&dbs)
+                        };
                     }
                 }
                 continue;
@@ -315,4 +321,89 @@ fn harness_reads_back_an_untouched_epoch_exactly() {
     let path = dir.path().join("x.rrdshard");
     shard_snapshot_save(0, 1, &dbs, &path).unwrap();
     assert_eq!(read_records(&path).len(), 1510);
+}
+
+/// One production tick serializes a BOUNDED batch: at most
+/// `TICK_SEGMENT_BUDGET` segments, and it stops once `TICK_ENTRY_BUDGET`
+/// entries are written (so at most one segment's worth past it).
+#[test]
+fn a_tick_writes_a_bounded_batch() {
+    let mut dbs = vec![Database::new()];
+    preload(&mut dbs[0], "a", 40_000);
+    let segs = dbs[0].data().segment_count();
+    let mut epoch = Epoch::begin(&dbs);
+    let mut ticks = 0usize;
+    loop {
+        let (s0, e0) = {
+            let st = epoch.state.as_ref().unwrap();
+            (st.segments_written(), st.entries_written())
+        };
+        let done = epoch.tick(&dbs);
+        ticks += 1;
+        let st = epoch.state.as_ref().unwrap();
+        let (ds, de) = (st.segments_written() - s0, st.entries_written() - e0);
+        assert!(
+            ds as u32 <= TICK_SEGMENT_BUDGET,
+            "{ds} segments in one tick"
+        );
+        assert!(
+            de <= u64::from(TICK_ENTRY_BUDGET) + 64,
+            "{de} entries in one tick"
+        );
+        if done {
+            break;
+        }
+    }
+    assert!(
+        ticks * 8 < segs,
+        "{ticks} ticks for {segs} segments: the budget must batch segments"
+    );
+    let records = epoch.finish(&dbs);
+    assert_eq!(records.len(), 40_000);
+}
+
+/// A sustained insert flood keeps SPLITTING the pending segments. The walk
+/// must still converge: the production tick outpaces the table's growth.
+/// One segment per tick does not — that pacing never finished under the
+/// moon#1216 evidence load (11.7 GB, 60 s stall) once the walk had to visit
+/// the split-off halves it used to skip.
+#[test]
+fn the_walk_converges_under_a_sustained_insert_flood() {
+    let run = |budgeted: bool| -> Option<usize> {
+        let mut dbs = vec![Database::new()];
+        preload(&mut dbs[0], "a", 20_000);
+        let mut epoch = Epoch::begin(&dbs);
+        let mut fresh = 0u32;
+        for tick in 0..1_000usize {
+            // ~300 inserts per 1 ms tick (300K/s): ~7 new segments a tick.
+            for _ in 0..300 {
+                fresh += 1;
+                let k = format!("n:{fresh:08}");
+                run(&mut dbs, 0, &[b"SET", k.as_bytes(), b"n"]);
+            }
+            let done = if budgeted {
+                epoch.tick(&dbs)
+            } else {
+                epoch.tick_one(&dbs)
+            };
+            if done {
+                let records = epoch.finish(&dbs);
+                assert_eq!(records.len(), 20_000, "exactly the epoch-start keys");
+                return Some(tick + 1);
+            }
+        }
+        crate::persistence::snapshot_cow::disarm();
+        None
+    };
+    let budgeted = run(true);
+    assert!(
+        budgeted.is_some_and(|t| t < 200),
+        "the production tick must converge, took {budgeted:?} ticks"
+    );
+    assert_eq!(
+        run(false),
+        None,
+        "control: one segment per tick falls behind the splits (if this ever \
+         converges, the flood is too small to mean anything)"
+    );
 }

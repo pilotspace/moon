@@ -87,6 +87,23 @@ const EOF_MARKER: u8 = 0xFF;
 const SEGMENT_BLOCK_MARKER: u8 = 0xFD;
 const DB_SELECTOR: u8 = 0xFE;
 
+/// Per-tick work budget of [`SnapshotState::advance_budgeted_db`]: stop
+/// after this many entries have been serialized...
+const TICK_ENTRY_BUDGET: u32 = 1024;
+/// ... or after this many segments have been visited, whichever comes first.
+///
+/// Why a budget and not one segment per tick (moon#1216): the hash-space
+/// walk must visit every segment covering a pending range, and a sustained
+/// insert load keeps SPLITTING pending segments. At one segment per 1 ms
+/// tick the walk ran at ~1,000 segments/s while ~370K inserts/s created
+/// ~9,000 new ones per second: the epoch never converged and every insert
+/// into a pending range held a tombstone meanwhile (measured: 11.7 GB RSS
+/// and a 60 s stall, 1M keys, `--shards 1`). The old index walk "finished"
+/// only because it skipped the split-off segments — the data loss itself.
+/// 64 segments / 1,024 entries per tick keeps a tick in the ~100 µs range
+/// and outpaces that growth several times over.
+const TICK_SEGMENT_BUDGET: u32 = 64;
+
 /// Snapshot header metadata, peekable without fully loading the file.
 ///
 /// Used by P3 recovery to pick the snapshot whose `last_lsn <= target_lsn`
@@ -124,6 +141,8 @@ pub struct SnapshotState {
     segment_counts: Vec<usize>,
     /// Segment blocks written so far, across every database.
     segments_written: usize,
+    /// Entries serialized so far, across every database.
+    entries_written: u64,
     /// Output buffer accumulating serialized bytes. With a
     /// [`SnapshotStream`](crate::persistence::snapshot_stream::SnapshotStream)
     /// attached (every event-loop snapshot, moon#1186) it holds only the
@@ -207,6 +226,7 @@ impl SnapshotState {
             num_databases,
             segment_counts,
             segments_written: 0,
+            entries_written: 0,
             output_buf: Vec::with_capacity(4096),
             stream: None,
             overflow: (0..num_databases).map(|_| BTreeMap::new()).collect(),
@@ -265,6 +285,12 @@ impl SnapshotState {
     #[inline]
     pub fn segments_written(&self) -> usize {
         self.segments_written
+    }
+
+    /// Entries serialized so far, across every database.
+    #[inline]
+    pub fn entries_written(&self) -> u64 {
+        self.entries_written
     }
 
     /// Segment counts per database captured at epoch start.
@@ -460,6 +486,30 @@ impl SnapshotState {
         self.advance_segment_inner(db)
     }
 
+    /// The event loop's per-tick advance: serialize segments of the current
+    /// database until [`TICK_ENTRY_BUDGET`] entries are written,
+    /// [`TICK_SEGMENT_BUDGET`] segments are visited, or the database is done
+    /// (the next database needs its own `&Database`, i.e. the next tick).
+    /// Returns true when every database is written.
+    pub fn advance_budgeted_db(&mut self, db: &Database) -> bool {
+        self.write_header_if_needed();
+        let db_index = self.current_db;
+        let mut entries = 0u32;
+        let mut segments = 0u32;
+        while self.current_db == db_index
+            && self.current_db < self.num_databases
+            && self.aborted.is_none()
+            && entries < TICK_ENTRY_BUDGET
+            && segments < TICK_SEGMENT_BUDGET
+        {
+            let before = self.entries_written;
+            self.advance_segment_inner(db);
+            entries += (self.entries_written - before) as u32;
+            segments += 1;
+        }
+        self.current_db >= self.num_databases || self.aborted.is_some()
+    }
+
     pub fn advance_one_segment(&mut self, databases: &[Database]) -> bool {
         self.write_header_if_needed();
         if self.current_db >= self.num_databases || self.aborted.is_some() {
@@ -588,6 +638,7 @@ impl SnapshotState {
         let crc = hasher.finalize();
         self.output_buf.extend_from_slice(&crc.to_le_bytes());
         self.segments_written += 1;
+        self.entries_written += u64::from(entry_count);
 
         // Move past this block; the last block of a database ends at the top
         // of the hash space.

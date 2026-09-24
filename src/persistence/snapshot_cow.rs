@@ -443,8 +443,18 @@ fn capture_key(db: &Database, db_index: usize, key: &Bytes) {
     // tombstone the serializer would write the entry this write is about to
     // create. The key is copied so the capture never pins the connection's
     // read buffer (`key` is usually a slice of it) for the rest of the epoch.
-    let pre_image: PreImage = db.data().get(key).cloned();
     let owned = Bytes::copy_from_slice(key);
+    let Some(entry) = db.data().get(key) else {
+        // Absent: a tombstone, NOT entered in the epoch dedupe set. Under an
+        // insert flood that set was the larger half of a tombstone's cost,
+        // and exactness does not need it: the queue is FIFO and
+        // `SnapshotState::capture_cow` keeps the FIRST capture of a key, so a
+        // later write of the now-present key (which does enter the set, once)
+        // can only queue a copy the drain discards.
+        PENDING.with(|p| p.borrow_mut().push((db_index, owned, None)));
+        return;
+    };
+    let pre_image: PreImage = Some(entry.clone());
     PENDING_KEYS.with(|k| k.borrow_mut().insert((db_index, owned.clone())));
     PENDING.with(|p| p.borrow_mut().push((db_index, owned, pre_image)));
 }
@@ -538,21 +548,50 @@ mod tests {
     }
 
     /// moon#1216: a write that CREATES a key captures its epoch-start state
-    /// too — "absent" — so the serializer does not write the new entry.
-    /// A second write of the same key (now present) must not replace it.
+    /// too — "absent" — so the serializer does not write the new entry. The
+    /// tombstone stays out of the epoch dedupe set (memory under an insert
+    /// flood), so a second write queues ONE copy of the now-present value,
+    /// behind the tombstone: the drain keeps the tombstone (first capture
+    /// wins) and the file does not contain the key. Later writes queue
+    /// nothing.
     #[test]
     fn capture_records_absence_for_a_key_created_during_the_epoch() {
         armed_guard();
-        let mut db = Database::new();
+        let mut dbs = vec![Database::new()];
+        for i in 0..200 {
+            dbs[0].set_string(format!("k{i}").as_bytes(), Bytes::from_static(b"1"));
+        }
         let mut selected = 0usize;
         let args = [Frame::BulkString(Bytes::from_static(b"fresh"))];
-        let _ = crate::command::dispatch(&mut db, b"INCR", &args, &mut selected, 16);
-        let _ = crate::command::dispatch(&mut db, b"INCR", &args, &mut selected, 16);
-        let tombstones = pending_tombstones_for_test();
-        let entries = pending_for_test();
+        for _ in 0..3 {
+            let _ = crate::command::dispatch(&mut dbs[0], b"INCR", &args, &mut selected, 16);
+        }
+        let queued = PENDING.with(|p| p.borrow().clone());
+        let order: Vec<bool> = queued.iter().map(|(_, _, e)| e.is_some()).collect();
+        assert_eq!(
+            order,
+            vec![false, true],
+            "tombstone first, one copy, then nothing"
+        );
+        assert_eq!(
+            pending_tombstones_for_test(),
+            vec![(0, Bytes::from_static(b"fresh"))]
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.rrdshard");
+        let mut state = SnapshotState::new(0, 1, &dbs, path.clone());
+        drain_pending_for_test(&mut state);
         disarm();
-        assert_eq!(tombstones, vec![(0, Bytes::from_static(b"fresh"))]);
-        assert!(entries.is_empty(), "the second write must not re-capture");
+        while !state.advance_one_segment(&dbs) {}
+        state.finalize().unwrap();
+        let mut loaded = vec![Database::new()];
+        shard_snapshot_load(&mut loaded, &path).unwrap();
+        assert!(
+            loaded[0].get(b"fresh").is_none(),
+            "created during the epoch"
+        );
+        assert_eq!(loaded[0].len(), 200);
     }
 
     /// End-to-end drain semantics: a pre-image captured off-loop must land

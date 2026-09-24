@@ -126,7 +126,7 @@ fn assert_aborts(n_dbs: usize, after_ticks: usize, cmd: &[&[u8]]) {
     let previous = std::fs::read(epoch.path()).unwrap();
     let mut epoch = epoch;
     for _ in 0..after_ticks {
-        assert!(!epoch.tick(&dbs));
+        assert!(!epoch.tick_one(&dbs));
     }
     let mut tail = Tail::new();
     live(&mut dbs, &mut tail, 0, cmd);
@@ -162,7 +162,7 @@ fn flushdb_of_a_pending_non_empty_database_aborts_the_snapshot() {
     preload(&mut dbs[0], "a", 1500);
     preload(&mut dbs[1], "b", 10);
     let mut epoch = Epoch::begin(&dbs);
-    assert!(!epoch.tick(&dbs));
+    assert!(!epoch.tick_one(&dbs));
     run(&mut dbs, 1, &[b"FLUSHDB"]);
     let err = epoch
         .try_finish(&dbs)
@@ -220,7 +220,7 @@ fn flush_of_a_finished_database_keeps_the_file_point_in_time() {
     let expected = string_keyspace(&dbs);
     let mut epoch = Epoch::begin(&dbs);
     while epoch.state.as_ref().unwrap().current_db_index() == 0 {
-        assert!(!epoch.tick(&dbs));
+        assert!(!epoch.tick_one(&dbs));
     }
     let mut tail = Tail::new();
     live(&mut dbs, &mut tail, 0, &[b"FLUSHDB"]);
@@ -247,7 +247,7 @@ fn flushdb_of_an_empty_pending_database_is_harmless() {
     preload(&mut dbs[0], "a", 1500);
     let expected = string_keyspace(&dbs);
     let mut epoch = Epoch::begin(&dbs);
-    assert!(!epoch.tick(&dbs));
+    assert!(!epoch.tick_one(&dbs));
     let mut tail = Tail::new();
     live(&mut dbs, &mut tail, 2, &[b"FLUSHDB"]);
     live(&mut dbs, &mut tail, 2, &[b"SET", b"c:1", b"x"]);
@@ -267,7 +267,7 @@ fn swapdb_of_two_finished_databases_is_harmless() {
     let expected = string_keyspace(&dbs);
     let mut epoch = Epoch::begin(&dbs);
     while epoch.state.as_ref().unwrap().current_db_index() < 2 {
-        assert!(!epoch.tick(&dbs));
+        assert!(!epoch.tick_one(&dbs));
     }
     let mut tail = Tail::new();
     live(&mut dbs, &mut tail, 0, &[b"SWAPDB", b"0", b"1"]);
@@ -285,7 +285,7 @@ fn a_refused_flush_does_not_abort() {
     preload(&mut dbs[0], "a", 1500);
     let expected = string_keyspace(&dbs);
     let mut epoch = Epoch::begin(&dbs);
-    assert!(!epoch.tick(&dbs));
+    assert!(!epoch.tick_one(&dbs));
     let reply = run(&mut dbs, 0, &[b"FLUSHDB", b"BOGUS"]);
     assert!(
         matches!(reply, Frame::Error(_)),
