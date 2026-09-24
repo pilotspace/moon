@@ -148,7 +148,10 @@ fn limit_and_order_by_match_full_evaluation_across_tiers() {
     }
     assert_eq!(compared, 3 * QUERIES.len());
     // A differential that only compares empty results proves nothing (CONVENTIONS).
-    assert!(nonempty * 10 >= compared * 7, "{nonempty}/{compared} non-empty");
+    assert!(
+        nonempty * 10 >= compared * 7,
+        "{nonempty}/{compared} non-empty"
+    );
 }
 
 /// NaN / ±2^53-int-next-to-float sort keys make `compare_values` intransitive: the fused
