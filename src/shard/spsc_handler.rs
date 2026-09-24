@@ -4556,44 +4556,39 @@ fn parse_geo_value(s: &str) -> Option<(f64, f64)> {
     Some((lon, lat))
 }
 
-/// COW intercept: capture old value for a key being written if its segment is pending.
+/// COW intercept: capture the epoch-start state of the key a routed write is
+/// about to change, while a snapshot is in flight on this shard.
 ///
-/// Called before cmd_dispatch to preserve snapshot consistency. Only clones the old entry
-/// if the key's segment is actually pending serialization (fast bool check in hot path).
-///
-/// Scope (moon#558): this covers ONLY the routed/queued arms in this file —
-/// the ones that run on the shard event loop's own stack, where
-/// `&mut Option<SnapshotState>` is in scope. Ordinary LOCAL writes (the
-/// monoio inline fast path, the monoio/tokio local dispatch arms, MULTI/EXEC,
-/// the coordinator's scatter arms) execute from a connection task and can
-/// never reach here. Those capture through
+/// Scope (moon#558): this covers the routed/queued arms in this file — the
+/// ones that run on the shard event loop's own stack. Ordinary LOCAL writes
+/// (the monoio inline fast path, the monoio/tokio local dispatch arms,
+/// MULTI/EXEC, the coordinator's scatter arms) capture through
 /// `persistence::snapshot_cow::capture_dispatch_pre_image` (wired into
-/// `command::dispatch`) and `capture_key_pre_image` (the inline SET path)
-/// instead, which queue into a per-shard thread-local that the persistence
-/// tick drains into this same `SnapshotState`. Double capture on the routed
-/// arms is harmless: `SnapshotState::capture_cow` is first-wins deduped.
+/// `command::dispatch`) and `capture_key_pre_image` (the inline SET path).
+///
+/// moon#1216: this goes through that SAME per-shard queue instead of
+/// writing into `SnapshotState` directly. Two capture paths with two dedupe
+/// sets let a later write's value win: a local `INCR k` queued the
+/// epoch-start value, then a routed write to `k` before the next drain found
+/// `k` absent from the state's overflow and captured the post-`INCR` value
+/// there, and the drain's first-wins then discarded the true pre-image. One
+/// queue keeps every capture of an epoch in the order the writes ran.
 pub(crate) fn cow_intercept(
     snapshot: &mut Option<SnapshotState>,
     db: &Database,
     db_index: usize,
     command: &crate::protocol::Frame,
 ) {
-    let Some(snap) = snapshot else { return };
-    // Extract the primary key from the command (args[1] for Array commands)
-    let key = match command {
-        crate::protocol::Frame::Array(args) if args.len() >= 2 => match &args[1] {
-            crate::protocol::Frame::BulkString(k) => k,
-            _ => return,
-        },
-        _ => return,
-    };
-    let hash = crate::storage::dashtable::hash_key(key);
-    let seg_idx = db.data().segment_index_for_hash(hash);
-    if snap.is_segment_pending(db_index, seg_idx) {
-        if let Some(old_entry) = db.data().get(key) {
-            snap.capture_cow(db_index, seg_idx, key.clone(), old_entry.clone());
-        }
+    if snapshot.is_none() {
+        return;
     }
+    let crate::protocol::Frame::Array(argv) = command else {
+        return;
+    };
+    let Some(crate::protocol::Frame::BulkString(cmd)) = argv.first() else {
+        return;
+    };
+    crate::persistence::snapshot_cow::capture_dispatch_pre_image(db, db_index, cmd, &argv[1..]);
 }
 
 /// Append WAL bytes, update the replication backlog, advance the monotonic shard offset,

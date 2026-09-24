@@ -252,10 +252,7 @@ pub(crate) fn advance_snapshot_segment(
                 snap.advance_one_segment_db(db)
             });
             // Captures from here on are filtered against the new cursor.
-            crate::persistence::snapshot_cow::note_progress(
-                snap.current_db_index(),
-                snap.current_segment_index(),
-            );
+            crate::persistence::snapshot_cow::note_progress(snap.current_db_index(), snap.cursor());
             done
         } else {
             // All databases serialized, return true to trigger finalization

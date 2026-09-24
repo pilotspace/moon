@@ -88,7 +88,7 @@ fn segment_block_bytes_match_head() {
     let mut state = SnapshotState::new(0, 1, &dbs, dir.path().join("s.rrdshard"));
     let victim = key_in_segment(&dbs[0], 0);
     let pre = dbs[0].data().get(&victim).unwrap().clone();
-    state.capture_cow(0, 0, victim.clone(), pre.clone());
+    state.capture_cow(0, victim.clone(), Some(pre.clone()));
     state.advance_one_segment(&dbs);
     // header (35) + db selector (2) precede the first block.
     let block = &state.output_buf[37..];
@@ -115,8 +115,8 @@ fn streamed_snapshot_is_byte_identical_to_in_memory_snapshot() {
     for seg in [1usize, count / 2, count - 1] {
         let k = key_in_segment(&dbs[0], seg);
         let e = dbs[0].data().get(&k).unwrap().clone();
-        mem.capture_cow(0, seg, k.clone(), e.clone());
-        streamed.capture_cow(0, seg, k, e);
+        mem.capture_cow(0, k.clone(), Some(e.clone()));
+        streamed.capture_cow(0, k, Some(e));
     }
 
     while !mem.advance_one_segment(&dbs) {}
@@ -168,21 +168,23 @@ fn overflow_is_moved_out_per_segment() {
     for seg in 0..seg_count {
         let k = key_in_segment(&dbs[0], seg);
         let e = dbs[0].data().get(&k).unwrap().clone();
-        state.capture_cow(0, seg, k.clone(), e);
+        state.capture_cow(0, k.clone(), Some(e));
         victims.push(k);
     }
-    assert_eq!(state.overflow.len(), seg_count);
+    assert_eq!(state.pending_pre_images(), seg_count);
     for k in &victims {
         dbs[0].set_string(k, Bytes::from_static(b"OVERWRITTEN"));
     }
     for done in 0..seg_count {
         state.advance_one_segment(&dbs);
-        assert!(
-            !state.overflow.contains_key(&(0, done)),
-            "segment {done} not moved out"
+        // One victim per segment: each advance moves exactly the written
+        // segment's pre-image out (moon#1216 walks segments in hash order,
+        // not store order, so which one is irrelevant).
+        assert_eq!(
+            state.pending_pre_images(),
+            seg_count - done - 1,
+            "advance {done} did not move its pre-image out"
         );
-        assert_eq!(state.overflow.len(), seg_count - done - 1);
-        assert_eq!(state.overflow_keys.len(), seg_count - done - 1);
     }
     while !state.advance_one_segment(&dbs) {}
     state.finalize().unwrap();
