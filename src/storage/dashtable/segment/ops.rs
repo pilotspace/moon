@@ -1,10 +1,8 @@
 //! Remove / split operations on `Segment`, plus the free function `home_buckets`.
 
 use std::borrow::Borrow;
-use std::ptr;
 
-use super::{EMPTY, NUM_GROUPS, REGULAR_SLOTS, Segment, TOTAL_SLOTS, h2};
-use crate::storage::dashtable::simd::Group;
+use super::{DELETED, EMPTY, REGULAR_SLOTS, Segment, TOTAL_SLOTS, h2};
 
 impl<K, V> Segment<K, V> {
     /// Remove a key from the segment.
@@ -33,7 +31,7 @@ impl<K, V> Segment<K, V> {
         if slot >= REGULAR_SLOTS {
             self.set_ctrl_byte(slot, EMPTY);
         } else {
-            self.set_ctrl_byte(slot, super::DELETED);
+            self.set_ctrl_byte(slot, DELETED);
         }
 
         self.count -= 1;
@@ -46,54 +44,67 @@ impl<K, V> Segment<K, V> {
     /// Entries whose hash bit at position `self.depth` (from the top) is 1 move
     /// to the new segment; entries with bit 0 stay in self.
     ///
-    /// Uses collect-and-redistribute strategy: all entries are temporarily extracted,
-    /// then re-inserted into the appropriate segment with fresh slot assignments.
+    /// **In place** (moon#1159 follow-up): only the movers are touched.
+    /// [`home_buckets`] and [`h2`] do not depend on depth, so a stayer's slot
+    /// and control byte are exactly as valid after the split as before — the
+    /// old collect-and-redistribute pass extracted EVERY entry into a heap
+    /// `Vec` and re-inserted the ~half that stay put, for nothing (#797
+    /// measured `split_segment` at 5.1% of cycles on a fresh 1M fill). Each
+    /// entry is still hashed once, to read its routing bit.
+    ///
+    /// Tombstones are cleared as the pass walks the control bytes, so a split
+    /// segment still carries no DELETED slots (the old rebuild reset every
+    /// group to EMPTY). `has_non_home_keys` is recomputed exactly from the
+    /// stayers' positions: a stayer the "any free slot" fallback once placed
+    /// outside its home groups keeps the fallback scan enabled; if none
+    /// remains, `find` goes back to skipping it.
     pub fn split(&mut self, hasher: &impl Fn(&K) -> u64) -> Segment<K, V> {
         let new_depth = self.depth + 1;
         let mut new_seg = Segment::new(new_depth);
-
-        // Collect all entries from current segment
-        let mut entries: Vec<(K, V, u64)> = Vec::with_capacity(self.count as usize);
-        for slot in 0..TOTAL_SLOTS {
-            if Self::is_full_ctrl(self.ctrl_byte(slot)) {
-                // SAFETY: ctrl byte is FULL, so key and value are initialized. We immediately
-                // mark the slot EMPTY after reading, preventing double-read or double-drop.
-                let k = unsafe { ptr::read(self.keys[slot].as_ptr()) };
-                let hash = hasher(&k);
-                // SAFETY: Same as above — slot is FULL, so value is initialized.
-                let v = unsafe { ptr::read(self.values[slot].as_ptr()) };
-                entries.push((k, v, hash));
-                // Mark slot as EMPTY (we've moved the data out)
-                self.set_ctrl_byte(slot, EMPTY);
-            }
-        }
-        self.count = 0;
-        // Reset non-home-keys flag; insert_during_split will set it if needed.
-        self.has_non_home_keys = false;
-
-        // Reset all control bytes to EMPTY for clean re-insertion
-        for g in 0..NUM_GROUPS {
-            self.ctrl[g] = Group::new_empty();
-        }
-
-        // Update depth BEFORE re-inserting (so home_buckets use correct depth)
-        self.depth = new_depth;
-
-        // Re-insert entries into appropriate segment
         let bit_pos = new_depth - 1; // 0-indexed from the top
-        for (key, value, hash) in entries {
-            let h2_val = h2(hash);
+        let mut stayer_off_home = false;
+
+        for slot in 0..TOTAL_SLOTS {
+            let ctrl = self.ctrl_byte(slot);
+            if !Self::is_full_ctrl(ctrl) {
+                if ctrl == DELETED {
+                    self.set_ctrl_byte(slot, EMPTY);
+                }
+                continue;
+            }
+            // SAFETY: the ctrl byte is FULL, so `keys[slot]` is initialized;
+            // this only borrows it to compute the routing hash.
+            let hash = hasher(unsafe { self.keys[slot].assume_init_ref() });
             let (bucket_a, bucket_b) = home_buckets(hash);
 
-            if (hash >> (63 - bit_pos)) & 1 == 1 {
-                // Move to new segment
-                new_seg.insert_during_split(h2_val, key, value, bucket_a, bucket_b);
-            } else {
-                // Stay in old segment
-                self.insert_during_split(h2_val, key, value, bucket_a, bucket_b);
+            if (hash >> (63 - bit_pos)) & 1 == 0 {
+                // Stays exactly where it is (ctrl byte == h2(hash) already).
+                if slot < REGULAR_SLOTS {
+                    let group = slot / 16;
+                    if group != bucket_a / 16 && group != bucket_b / 16 {
+                        stayer_off_home = true;
+                    }
+                }
+                continue;
             }
+
+            // SAFETY: the ctrl byte is FULL, so key and value are initialized.
+            // The slot is marked EMPTY immediately below, before anything else
+            // can observe it, so the moved-out pair is never read or dropped
+            // through this segment again.
+            let (key, value) = unsafe {
+                (
+                    self.keys[slot].assume_init_read(),
+                    self.values[slot].assume_init_read(),
+                )
+            };
+            self.set_ctrl_byte(slot, EMPTY);
+            self.count -= 1;
+            new_seg.insert_during_split(h2(hash), key, value, bucket_a, bucket_b);
         }
 
+        self.has_non_home_keys = stayer_off_home;
+        self.depth = new_depth;
         new_seg
     }
 

@@ -634,6 +634,84 @@ mod tests {
         }
     }
 
+    /// moon#1159 follow-up: `split` moves ONLY the entries whose new
+    /// directory bit is 1. `home_buckets` does not depend on depth, so an
+    /// entry that stays is already in a valid slot; the old collect-and-
+    /// re-insert pass rehashed and re-homed it anyway (through a heap `Vec`),
+    /// ~half of every split's work for nothing. Pinned by slot identity:
+    /// every stayer must be found at exactly the slot it held before.
+    #[test]
+    fn split_moves_only_the_upper_half_and_keeps_stayers_in_place() {
+        // xxh64, not the FNV test hash: FNV-1a leaves the top bit of these
+        // short, similar keys constant, and the fixture needs both halves.
+        let simple_hash = |k: &[u8]| crate::storage::dashtable::hash_key(k);
+        let mut seg: Segment<Vec<u8>, u32> = Segment::new(0);
+        let mut keys = Vec::new();
+        for i in 0..LOAD_THRESHOLD {
+            let k = format!("inplace_{:04}", i).into_bytes();
+            let hash = simple_hash(&k);
+            let (ba, bb) = home_buckets(hash);
+            match seg.insert(h2(hash), k.clone(), i as u32, ba, bb) {
+                InsertResult::Inserted => keys.push((k, i as u32)),
+                InsertResult::Replaced(_) => {}
+                InsertResult::NeedsSplit(_, _) => break,
+            }
+        }
+        // Punch tombstones so the fixture also covers DELETED slots.
+        for (k, _) in keys.iter().step_by(7) {
+            let hash = simple_hash(k);
+            let (ba, bb) = home_buckets(hash);
+            assert!(seg.remove(h2(hash), k.as_slice(), ba, bb).is_some());
+        }
+        let keys: Vec<_> = keys
+            .into_iter()
+            .enumerate()
+            .filter(|(n, _)| n % 7 != 0)
+            .map(|(_, kv)| kv)
+            .collect();
+        let slot_before: Vec<usize> = keys
+            .iter()
+            .map(|(k, _)| {
+                let hash = simple_hash(k);
+                let (ba, bb) = home_buckets(hash);
+                seg.find(h2(hash), k.as_slice(), ba, bb)
+                    .expect("fixture key")
+            })
+            .collect();
+
+        let new_seg = seg.split(&|k: &Vec<u8>| simple_hash(k));
+
+        let (mut stayed, mut moved) = (0, 0);
+        for ((k, v), before) in keys.iter().zip(slot_before) {
+            let hash = simple_hash(k);
+            let (ba, bb) = home_buckets(hash);
+            let in_old = seg.find(h2(hash), k.as_slice(), ba, bb);
+            let in_new = new_seg.get(h2(hash), k.as_slice(), ba, bb);
+            if hash >> 63 == 0 {
+                stayed += 1;
+                assert_eq!(
+                    in_old,
+                    Some(before),
+                    "stayer {:?} was relocated by split",
+                    String::from_utf8_lossy(k)
+                );
+                assert!(in_new.is_none());
+                assert_eq!(seg.get(h2(hash), k.as_slice(), ba, bb), Some(v));
+            } else {
+                moved += 1;
+                assert!(in_old.is_none(), "mover left behind in the old segment");
+                assert_eq!(in_new, Some(v));
+            }
+        }
+        assert!(stayed > 0 && moved > 0, "fixture must exercise both halves");
+        assert_eq!(seg.count() as usize, stayed);
+        assert_eq!(new_seg.count() as usize, moved);
+        // No tombstone survives a split (the old rebuild cleared them too).
+        for slot in 0..TOTAL_SLOTS {
+            assert_ne!(seg.ctrl_byte(slot), DELETED, "tombstone left at {slot}");
+        }
+    }
+
     #[test]
     fn test_segment_drop_safety() {
         // Insert entries with heap-allocating types to verify Drop doesn't leak.
