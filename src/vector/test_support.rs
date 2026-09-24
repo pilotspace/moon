@@ -103,7 +103,7 @@ impl EmbeddingLike {
             .min(self.topics.len() - 1)
     }
 
-    fn from_latent(&mut self, latent: &[f32]) -> Vec<f32> {
+    fn embed_latent(&mut self, latent: &[f32]) -> Vec<f32> {
         let mut v: Vec<f32> = self.mean.iter().map(|m| m * 0.55).collect();
         for (coef, b) in latent.iter().zip(&self.basis) {
             for (x, bj) in v.iter_mut().zip(b) {
@@ -123,7 +123,7 @@ impl EmbeddingLike {
         let latent: Vec<f32> = (0..self.sqrt_lambda.len())
             .map(|j| self.topics[t][j] + 0.45 * self.rng.next() * self.sqrt_lambda[j])
             .collect();
-        self.from_latent(&latent)
+        self.embed_latent(&latent)
     }
 
     pub(crate) fn docs(&mut self, n: usize) -> Vec<Vec<f32>> {
@@ -144,23 +144,6 @@ impl EmbeddingLike {
         normalize(&mut v);
         v
     }
-}
-
-/// Exact top-k by cosine distance (`1 - cos`) over unit vectors.
-pub(crate) fn exact_topk(data: &[Vec<f32>], q: &[f32], k: usize) -> Vec<usize> {
-    let mut d: Vec<(f32, usize)> = data
-        .iter()
-        .enumerate()
-        .map(|(i, v)| (1.0 - v.iter().zip(q).map(|(a, b)| a * b).sum::<f32>(), i))
-        .collect();
-    d.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
-    d.into_iter().take(k).map(|(_, i)| i).collect()
-}
-
-/// Recall@k of `got` against `truth` (both top-k index lists).
-pub(crate) fn recall(got: &[usize], truth: &[usize]) -> f32 {
-    let hit = got.iter().filter(|g| truth.contains(g)).count();
-    hit as f32 / truth.len().max(1) as f32
 }
 
 #[cfg(test)]

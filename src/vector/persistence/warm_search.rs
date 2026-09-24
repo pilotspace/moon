@@ -174,12 +174,12 @@ fn extract_payloads(mmap: &memmap2::Mmap, page_size: usize, sub_hdr_size: usize)
 /// (`codes ++ signs`, see `warm_segment::write_codes_mpf_with_sub_signs`).
 ///
 /// Unflagged (every file written before moon#1213) or SQ8 (never reads
-/// signs): no signs. Flagged: the stream must be exactly `n * (bytes_per_code
-/// + sub_bpv)` bytes — the beam reads signs by BFS position without bounds
-/// checks per read — and the signs must not be all zero (a placeholder, not
-/// signs: the same rule `segment_io` applies to `sub_signs.bin`); otherwise
-/// they are dropped with a warning (16-level search). The codes are always
-/// kept.
+/// signs): no signs. Flagged: the stream must be exactly
+/// `n * (bytes_per_code + sub_bpv)` bytes (the beam reads signs by BFS
+/// position without per-read bounds checks), and the signs must not be all
+/// zero (a placeholder, not signs: the rule `segment_io` applies to
+/// `sub_signs.bin`). Otherwise they are dropped with a warning and search
+/// uses the 16-level LUT; the codes are always kept.
 fn split_sub_signs(
     segment_id: u64,
     codes_data: &mut Vec<u8>,
