@@ -320,8 +320,15 @@ fn poll_cost_is_independent_of_retained_history() {
     let last_long = write_wal(&long, seg, 60_000);
 
     // Fresh consumer at the tail (no hint): header seek + at most one segment.
-    let fresh_short = poll_wall(&short, last_short, 100);
-    let fresh_long = poll_wall(&long, last_long, 100);
+    // A poll leaves its hint at the NEXT cursor (`last + 1`), so repeating
+    // the poll at `last` stays fresh. The minimum of several interleaved
+    // runs, like the caught-up check below: one sample of each is a coin
+    // flip on a shared, loaded box (moon#1221 review R9).
+    let (mut fresh_short, mut fresh_long) = (std::time::Duration::MAX, std::time::Duration::MAX);
+    for _ in 0..7 {
+        fresh_short = fresh_short.min(poll_wall(&short, last_short, 100));
+        fresh_long = fresh_long.min(poll_wall(&long, last_long, 100));
+    }
     // Caught-up consumer (hint left by the previous poll).
     let _ = execute(&req(&long, last_long + 1, 100), TS);
     let caught_up_long = (0..20)
