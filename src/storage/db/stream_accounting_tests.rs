@@ -238,3 +238,30 @@ fn a_stream_arriving_whole_is_billed_at_its_measured_size() {
     run(&mut db, &["DEL", "bulk"]);
     assert_eq!(db.estimated_memory(), base);
 }
+
+/// `MEMORY USAGE` of a stream reflects its size (it answered a constant 114
+/// for a 200K-entry stream), on both dispatch paths.
+#[test]
+fn memory_usage_of_a_stream_reflects_its_size() {
+    let mut db = Database::new();
+    for _ in 0..1000 {
+        run(
+            &mut db,
+            &["XADD", "st", "*", "f", "0123456789abcdef0123456789abcdef"],
+        );
+    }
+    let (_, measured) = sizes(&mut db, "st");
+    let Frame::Integer(usage) = run(&mut db, &["MEMORY", "USAGE", "st"]) else {
+        panic!("MEMORY USAGE must answer an integer");
+    };
+    assert!(
+        usage as usize >= measured && usage >= 1000 * 100,
+        "MEMORY USAGE answered {usage} for a stream measured at {measured} B (moon#1163)"
+    );
+    let args = [
+        Frame::BulkString(Bytes::from_static(b"USAGE")),
+        Frame::BulkString(Bytes::from_static(b"st")),
+    ];
+    let read = crate::command::server_admin::memory_readonly(&db, &args, db.now_ms());
+    assert_eq!(read, Frame::Integer(usage), "the shared-read path agrees");
+}

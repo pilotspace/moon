@@ -112,6 +112,15 @@ fn stream_growth_is_charged_and_del_returns_to_baseline() {
         grown >= (ENTRIES * 100) as u64,
         "{ENTRIES} XADDs grew used_memory by {grown} B — streams are not charged (moon#1163)"
     );
+    let usage: u64 = usage_raw
+        .trim_end()
+        .strip_prefix(':')
+        .and_then(|v| v.parse().ok())
+        .unwrap_or_else(|| panic!("MEMORY USAGE answered {usage_raw:?}"));
+    assert!(
+        usage >= (ENTRIES * 100) as u64,
+        "MEMORY USAGE of a {ENTRIES}-entry stream answered {usage} (moon#1163)"
+    );
     assert_eq!(c.send(&["DEL", "st"]), ":1\r\n");
     assert_eq!(
         used_memory(&mut c),
