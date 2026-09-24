@@ -113,12 +113,17 @@ pub fn handle_eval(
         }
     }
 
-    // Cache the script (idempotent -- duplicates are no-ops)
-    cache.borrow_mut().load(script.clone());
+    // moon#1167: cache the source (idempotent) AND get-or-compile the function,
+    // computing the sha exactly once. A compile error surfaces here with the
+    // same frame `run_script` produced on HEAD.
+    let func = match ensure_compiled_eval(lua, cache, &script) {
+        Ok(func) => func,
+        Err(frame) => return frame,
+    };
 
-    run_script(
+    run_compiled(
         lua,
-        script.as_ref(),
+        &func,
         keys,
         argv,
         db,
@@ -151,32 +156,44 @@ pub fn handle_evalsha(
         return eval_arity_error(true, read_only);
     }
 
-    // Extract SHA1 hex from first argument
-    let sha1_hex = match &args[0] {
-        Frame::BulkString(b) => String::from_utf8_lossy(b).to_lowercase(),
+    // Extract the SHA1 first argument, lowercased into a stack `[u8; 40]` — no
+    // per-call `String` allocation (moon#1167).
+    let sha_arg = match &args[0] {
+        Frame::BulkString(b) => b,
         _ => {
             return Frame::Error(Bytes::from_static(b"ERR invalid SHA1 hex string"));
         }
     };
+    // A sha that is not 40 hex chars can never match a cached body (every key
+    // is a 40-char lowercase hex digest), so it is `NOSCRIPT` exactly as the
+    // old `to_lowercase()` + map lookup produced.
+    let mut key = [0u8; 40];
+    let matched = sha_arg.len() == 40 && {
+        for (dst, &c) in key.iter_mut().zip(sha_arg.iter()) {
+            *dst = c.to_ascii_lowercase();
+        }
+        true
+    };
 
-    // Look up script in cache
-    let script = {
-        let cache_ref = cache.borrow();
-        match cache_ref.get(&sha1_hex) {
-            Some(s) => s.clone(),
-            None => {
-                return Frame::Error(Bytes::from_static(
-                    b"NOSCRIPT No matching script. Please use EVAL.",
-                ));
-            }
+    // Look up the cached SOURCE (drives NOSCRIPT, unchanged) via a zero-copy
+    // `&str` view of the stack buffer — non-ASCII lowercased bytes cannot be a
+    // hex sha, so they fall through to NOSCRIPT.
+    let script = match matched
+        .then(|| std::str::from_utf8(&key).ok())
+        .flatten()
+        .and_then(|s| cache.borrow().get(s).cloned())
+    {
+        Some(s) => s,
+        None => {
+            return Frame::Error(Bytes::from_static(
+                b"NOSCRIPT No matching script. Please use EVAL.",
+            ));
         }
     };
 
-    // Parse remaining args (construct synthetic eval args with script in place of sha)
-    let mut eval_args = vec![Frame::BulkString(script.clone())];
-    eval_args.extend_from_slice(&args[1..]);
-
-    let (_script_bytes, _numkeys, keys, argv) = match parse_eval_args(&eval_args) {
+    // Parse numkeys/keys/argv straight from the tail — no synthetic `eval_args`
+    // Vec, no clone of the body into arg position (moon#1167).
+    let (_numkeys, keys, argv) = match parse_numkeys_keys_argv(&args[1..]) {
         Ok(parsed) => parsed,
         Err(e) => return e,
     };
@@ -188,9 +205,26 @@ pub fn handle_evalsha(
         }
     }
 
-    run_script(
+    // Get-or-compile the cached function (moon#1167). The body came from a
+    // successful EVAL/SCRIPT LOAD so it normally compiles; a compile error is
+    // still surfaced with the same frame HEAD produced.
+    let func = {
+        let cached = cache.borrow_mut().get_compiled(&key);
+        match cached {
+            Some(func) => func,
+            None => match compile_user_script(lua, &script) {
+                Ok(func) => {
+                    cache.borrow_mut().store_compiled(key, func.clone());
+                    func
+                }
+                Err(e) => return script_error_to_frame(e),
+            },
+        }
+    };
+
+    run_compiled(
         lua,
-        script.as_ref(),
+        &func,
         keys,
         argv,
         db,
@@ -415,7 +449,24 @@ pub fn parse_eval_args(args: &[Frame]) -> Result<(Bytes, usize, Vec<Bytes>, Vec<
         Frame::BulkString(b) => b.clone(),
         _ => return Err(Frame::Error(Bytes::from_static(b"ERR invalid script"))),
     };
-    let numkeys: usize = match &args[1] {
+    let (numkeys, keys, argv) = parse_numkeys_keys_argv(&args[1..])?;
+    Ok((script, numkeys, keys, argv))
+}
+
+/// Parse the tail of an EVAL/EVALSHA — everything AFTER the script/sha — into
+/// (numkeys, keys, argv).
+///
+/// Split out (moon#1167) so `EVALSHA` can parse straight from `args[1..]`
+/// instead of building a synthetic `[script, args[1..]]` `Vec` per call. The
+/// error texts are command-agnostic (they never name `eval` vs `evalsha`), so
+/// both callers stay byte-identical to the pre-split behaviour.
+fn parse_numkeys_keys_argv(after: &[Frame]) -> Result<(usize, Vec<Bytes>, Vec<Bytes>), Frame> {
+    let Some(numkeys_frame) = after.first() else {
+        return Err(Frame::Error(Bytes::from_static(
+            b"ERR wrong number of arguments for 'eval' command",
+        )));
+    };
+    let numkeys: usize = match numkeys_frame {
         Frame::BulkString(b) => std::str::from_utf8(b)
             .ok()
             .and_then(|s| s.parse().ok())
@@ -438,36 +489,140 @@ pub fn parse_eval_args(args: &[Frame]) -> Result<(Bytes, usize, Vec<Bytes>, Vec<
             )));
         }
     };
-    if args.len() < 2 + numkeys {
+    if after.len() < 1 + numkeys {
         return Err(Frame::Error(Bytes::from_static(
             b"ERR Number of keys can't be greater than number of args",
         )));
     }
-    let keys: Vec<Bytes> = args[2..2 + numkeys]
+    let keys: Vec<Bytes> = after[1..1 + numkeys]
         .iter()
         .filter_map(|f| match f {
             Frame::BulkString(b) => Some(b.clone()),
             _ => None,
         })
         .collect();
-    let argv: Vec<Bytes> = args[2 + numkeys..]
+    let argv: Vec<Bytes> = after[1 + numkeys..]
         .iter()
         .filter_map(|f| match f {
             Frame::BulkString(b) => Some(b.clone()),
             _ => None,
         })
         .collect();
-    Ok((script, numkeys, keys, argv))
+    Ok((numkeys, keys, argv))
 }
 
-/// Execute a Lua script with the given keys/argv, returning a Frame result.
+/// The 40 lowercase-hex characters of a sha, as a stack `[u8; 40]` (moon#1167).
 ///
-/// Sets up the thread-local DB pointer, installs timeout hook, populates
-/// KEYS and ARGV globals (1-indexed), executes the script, and cleans up.
+/// Lets the EVAL path reuse a single computed digest as the compiled-cache key
+/// without re-hashing or re-allocating.
+fn sha_str_to_key(sha: &str) -> [u8; 40] {
+    let mut key = [0u8; 40];
+    let bytes = sha.as_bytes();
+    let n = bytes.len().min(40);
+    key[..n].copy_from_slice(&bytes[..n]);
+    key
+}
+
+/// Compile a user script into a callable `Function`, cached per shard
+/// (moon#1167).
+///
+/// Replicates `mlua::Chunk::eval`'s mode choice EXACTLY so a cached function is
+/// byte-for-byte equivalent to what `.eval()` produced on HEAD: try the source
+/// as an EXPRESSION first (`"return " + src`), and only if that fails to
+/// compile fall back to loading it as a STATEMENT. `eval()` makes this decision
+/// at compile time (never from runtime results), so making it once and caching
+/// the resulting `Function` changes no observable behaviour — including the
+/// cases where HEAD is more lenient than redis (e.g. `EVAL "1+1" 0` -> 2).
+///
+/// The chunk is named `@user_script` on both attempts, so a Lua-level error and
+/// its traceback quote `user_script`, never a moon source path (moon#672).
+fn compile_user_script(lua: &Lua, src: &[u8]) -> mlua::Result<LuaFunction> {
+    let mut expr = Vec::with_capacity(b"return ".len() + src.len());
+    expr.extend_from_slice(b"return ");
+    expr.extend_from_slice(src);
+    if let Ok(func) = lua.load(&expr).set_name("@user_script").into_function() {
+        return Ok(func);
+    }
+    lua.load(src).set_name("@user_script").into_function()
+}
+
+/// Ensure the EVAL body is cached (source + compiled) and return the compiled
+/// function, computing the sha exactly ONCE (moon#1167).
+///
+/// On a compile error the source is still cached — HEAD's `handle_eval` cached
+/// the body before `run_script` ran, so `SCRIPT EXISTS` of an invalid body is
+/// `1` on HEAD; that is preserved here rather than tightened.
+fn ensure_compiled_eval(
+    lua: &Lua,
+    cache: &Rc<RefCell<ScriptCache>>,
+    script: &Bytes,
+) -> Result<LuaFunction, Frame> {
+    let sha = sha1_smol::Sha1::from(&script[..]).hexdigest();
+    let key = sha_str_to_key(&sha);
+    {
+        let mut c = cache.borrow_mut();
+        c.load_precomputed(sha, script.clone());
+        if let Some(func) = c.get_compiled(&key) {
+            return Ok(func);
+        }
+    }
+    match compile_user_script(lua, script) {
+        Ok(func) => {
+            cache.borrow_mut().store_compiled(key, func.clone());
+            Ok(func)
+        }
+        Err(e) => Err(script_error_to_frame(e)),
+    }
+}
+
+/// Execute a Lua script SOURCE with the given keys/argv, returning a Frame
+/// result.
+///
+/// Compiles the body (uncached — used by unit tests and any caller that has no
+/// per-shard cache) and runs it. Production EVAL/EVALSHA go through the cached
+/// path (`ensure_compiled_eval` / [`run_compiled`]); the compile here uses the
+/// SAME [`compile_user_script`] so behaviour is identical.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn run_script(
     lua: &Lua,
     script: &[u8],
+    keys: Vec<Bytes>,
+    argv: Vec<Bytes>,
+    db: &mut Database,
+    selected_db: usize,
+    db_count: usize,
+    acl: &crate::acl::ScriptAcl,
+    read_only: bool,
+) -> Frame {
+    match compile_user_script(lua, script) {
+        Ok(func) => run_compiled(
+            lua,
+            &func,
+            keys,
+            argv,
+            db,
+            selected_db,
+            db_count,
+            acl,
+            read_only,
+        ),
+        Err(e) => script_error_to_frame(e),
+    }
+}
+
+/// Execute an ALREADY-COMPILED Lua function with the given keys/argv, returning
+/// a Frame result (moon#1167).
+///
+/// Sets up the thread-local DB pointer, installs the timeout hook, populates
+/// KEYS and ARGV globals (1-indexed) FRESH per call, calls the function, and
+/// cleans up. Calling a cached `Function` gives a fresh activation record every
+/// time — its locals are re-initialised per call and never leak between calls
+/// or between scripts.
+#[allow(clippy::too_many_arguments)]
+fn run_compiled(
+    lua: &Lua,
+    func: &LuaFunction,
     keys: Vec<Bytes>,
     argv: Vec<Bytes>,
     db: &mut Database,
@@ -513,12 +668,13 @@ fn run_script(
         }
         lua.globals().set("ARGV", argv_table)?;
 
-        // Load and execute. The chunk is NAMED: without it mlua defaults the
-        // chunk name to this Rust file and line, so every Lua-level error and
-        // traceback quoted a moon source path back at the client (moon#672).
-        // `user_script` is the name redis uses, so error text that mentions it
-        // reads the same to a client either way.
-        let val: LuaValue = lua.load(script).set_name("@user_script").eval()?;
+        // Call the compiled chunk. A Lua chunk is a function over the shared
+        // globals, so calling the cached function is identical to loading and
+        // running the source — only the lexer/parser/codegen are skipped
+        // (moon#1167). The chunk was named `@user_script` at compile time, so
+        // errors and tracebacks still quote `user_script`, not a moon source
+        // path (moon#672).
+        let val: LuaValue = func.call(())?;
         types::lua_value_to_frame(lua, &val)
     })();
 
@@ -1525,5 +1681,207 @@ mod tests {
             false,
         );
         assert!(matches!(result, Frame::Integer(99)));
+    }
+
+    // ── moon#1167: compiled-function cache ─────────────────────────────────
+
+    fn eval(
+        lua: &Rc<Lua>,
+        cache: &Rc<RefCell<ScriptCache>>,
+        db: &mut Database,
+        argv: &[&[u8]],
+    ) -> Frame {
+        let args: Vec<Frame> = argv
+            .iter()
+            .map(|a| Frame::BulkString(Bytes::copy_from_slice(a)))
+            .collect();
+        handle_eval(
+            lua,
+            cache,
+            &args,
+            db,
+            0,
+            1,
+            0,
+            1,
+            &crate::acl::ScriptAcl::trusted(),
+            false,
+        )
+    }
+
+    fn evalsha(
+        lua: &Rc<Lua>,
+        cache: &Rc<RefCell<ScriptCache>>,
+        db: &mut Database,
+        argv: &[&[u8]],
+    ) -> Frame {
+        let args: Vec<Frame> = argv
+            .iter()
+            .map(|a| Frame::BulkString(Bytes::copy_from_slice(a)))
+            .collect();
+        handle_evalsha(
+            lua,
+            cache,
+            &args,
+            db,
+            0,
+            1,
+            0,
+            1,
+            &crate::acl::ScriptAcl::trusted(),
+            false,
+        )
+    }
+
+    /// The whole point of moon#1167: an EVAL then many EVALSHA of the same body
+    /// compile the chunk ONCE and reuse a single cached function — the compiled
+    /// map holds exactly one entry no matter how many times it runs, and the
+    /// results are correct every time.
+    #[test]
+    fn evalsha_reuses_one_compiled_function() {
+        let lua = setup_lua_vm(bridge::LuaEvictionCtx::disabled()).unwrap();
+        let cache = Rc::new(RefCell::new(ScriptCache::new()));
+        let mut db = Database::new();
+
+        let body = b"return 1 + 1";
+        assert!(matches!(
+            eval(&lua, &cache, &mut db, &[body, b"0"]),
+            Frame::Integer(2)
+        ));
+        assert_eq!(cache.borrow().compiled_len(), 1);
+
+        let sha = sha1_smol::Sha1::from(body).hexdigest();
+        for _ in 0..200 {
+            assert!(matches!(
+                evalsha(&lua, &cache, &mut db, &[sha.as_bytes(), b"0"]),
+                Frame::Integer(2)
+            ));
+        }
+        // Reused, not recompiled into new entries.
+        assert_eq!(cache.borrow().compiled_len(), 1);
+
+        // A mixed-case sha resolves to the same single cached function.
+        assert!(matches!(
+            evalsha(
+                &lua,
+                &cache,
+                &mut db,
+                &[sha.to_uppercase().as_bytes(), b"0"]
+            ),
+            Frame::Integer(2)
+        ));
+        assert_eq!(cache.borrow().compiled_len(), 1);
+    }
+
+    /// SCRIPT FLUSH must drop compiled functions too — after a flush the sha is
+    /// gone from BOTH maps and EVALSHA answers NOSCRIPT.
+    #[test]
+    fn script_flush_clears_compiled_functions() {
+        let lua = setup_lua_vm(bridge::LuaEvictionCtx::disabled()).unwrap();
+        let cache = Rc::new(RefCell::new(ScriptCache::new()));
+        let mut db = Database::new();
+
+        let body = b"return 7";
+        let _ = eval(&lua, &cache, &mut db, &[body, b"0"]);
+        let sha = sha1_smol::Sha1::from(body).hexdigest();
+        assert_eq!(cache.borrow().compiled_len(), 1);
+
+        let (_resp, _fanout) =
+            handle_script_subcommand(&cache, &[Frame::BulkString(Bytes::from_static(b"FLUSH"))]);
+        assert_eq!(cache.borrow().compiled_len(), 0);
+        assert_eq!(cache.borrow().len(), 0);
+
+        let after = evalsha(&lua, &cache, &mut db, &[sha.as_bytes(), b"0"]);
+        assert!(
+            matches!(&after, Frame::Error(e) if e.starts_with(b"NOSCRIPT")),
+            "flushed sha must be NOSCRIPT: {after:?}"
+        );
+    }
+
+    /// The compiled map is LRU-bounded so a storm of unique EVAL bodies cannot
+    /// grow the Lua heap without limit. The SOURCE map stays unbounded (Redis
+    /// parity — SCRIPT EXISTS must keep reporting every loaded sha).
+    #[test]
+    fn compiled_cache_is_lru_bounded_but_source_is_not() {
+        let lua = setup_lua_vm(bridge::LuaEvictionCtx::disabled()).unwrap();
+        let cache = Rc::new(RefCell::new(ScriptCache::new()));
+        let mut db = Database::new();
+
+        let unique = super::cache::compiled_cache_cap_for_test() + 500;
+        for i in 0..unique {
+            let body = format!("return {i}");
+            let _ = eval(&lua, &cache, &mut db, &[body.as_bytes(), b"0"]);
+        }
+        assert!(
+            cache.borrow().compiled_len() <= super::cache::compiled_cache_cap_for_test(),
+            "compiled map exceeded its cap: {}",
+            cache.borrow().compiled_len()
+        );
+        // Source map is unbounded.
+        assert_eq!(cache.borrow().len(), unique);
+    }
+
+    /// A cached function called repeatedly gets FRESH locals and FRESH
+    /// KEYS/ARGV every call — no state accumulates across calls, and one call's
+    /// keys never bleed into the next.
+    #[test]
+    fn cached_function_has_fresh_locals_and_keys_argv_per_call() {
+        let lua = setup_lua_vm(bridge::LuaEvictionCtx::disabled()).unwrap();
+        let cache = Rc::new(RefCell::new(ScriptCache::new()));
+        let mut db = Database::new();
+
+        // A fresh local table every call: #t is 1 each time, never 1,2,3…
+        let body = b"local t = {} t[#t + 1] = 1 return #t";
+        let sha = sha1_smol::Sha1::from(&body[..]).hexdigest();
+        let _ = eval(&lua, &cache, &mut db, &[body, b"0"]);
+        for _ in 0..5 {
+            assert!(matches!(
+                evalsha(&lua, &cache, &mut db, &[sha.as_bytes(), b"0"]),
+                Frame::Integer(1)
+            ));
+        }
+
+        // KEYS/ARGV are per-call: the same cached function returns whatever the
+        // current call passed, not the first call's values.
+        let kbody = b"return {KEYS[1], ARGV[1]}";
+        let ksha = sha1_smol::Sha1::from(&kbody[..]).hexdigest();
+        let _ = eval(&lua, &cache, &mut db, &[kbody, b"1", b"k1", b"a1"]);
+        let r = evalsha(
+            &lua,
+            &cache,
+            &mut db,
+            &[ksha.as_bytes(), b"1", b"k2", b"a2"],
+        );
+        match r {
+            Frame::Array(items) => {
+                assert!(matches!(&items[0], Frame::BulkString(b) if b.as_ref() == b"k2"));
+                assert!(matches!(&items[1], Frame::BulkString(b) if b.as_ref() == b"a2"));
+            }
+            other => panic!("expected array, got {other:?}"),
+        }
+    }
+
+    /// The cached EVAL path still authorizes every inner `redis.call` against
+    /// the caller's ACL — caching the chunk changes nothing about the
+    /// thread-local ACL gate, and a denial is returned on every call.
+    #[test]
+    fn cached_eval_path_still_enforces_acl() {
+        let lua = setup_lua_vm(bridge::LuaEvictionCtx::disabled()).unwrap();
+        let cache = Rc::new(RefCell::new(ScriptCache::new()));
+        let mut db = Database::new();
+        let acl = restricted_acl();
+
+        let args: Vec<Frame> = [&b"return redis.call('GET', 'secret:x')"[..], b"0"]
+            .iter()
+            .map(|a| Frame::BulkString(Bytes::copy_from_slice(a)))
+            .collect();
+        // Twice: a cache hit on the second call must be denied identically.
+        for _ in 0..2 {
+            let r = handle_eval(&lua, &cache, &args, &mut db, 0, 1, 0, 1, &acl, false);
+            assert!(
+                matches!(&r, Frame::Error(e) if e.starts_with(b"NOPERM")),
+                "cached script bypassed ACL: {r:?}"
+            );
+        }
     }
 }
