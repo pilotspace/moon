@@ -10,6 +10,7 @@
 /// - `analyzer` — Tokenization pipeline (NFKD, stemming, stop words)
 /// - `bm25` — Scoring function and field statistics
 /// - `posting` — Inverted index posting lists with RoaringBitmap
+/// - `score` — Single-pass BM25 scoring kernel (cursors + bounded top-k)
 /// - `term_dict` — Mutable term-to-ID dictionary
 /// - `store` — TextStore and TextIndex per-shard registry
 pub mod aggregate;
@@ -26,6 +27,7 @@ pub mod postings_persist;
 pub mod query;
 #[cfg(feature = "text-index")]
 pub mod recovery;
+pub mod score;
 #[cfg(all(test, feature = "text-index"))]
 mod shared_analysis_tests;
 pub mod store;

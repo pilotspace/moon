@@ -3,20 +3,27 @@
 //! from `fts-query-combinators` §3, FROZEN @ v1).
 //!
 //! Two layers:
-//!   * [`eval_set`] — the authoritative MEMBERSHIP. `And` = ∩, `Or` = ∪, `Empty` = ∅; leaves reuse
-//!     the index's own search machinery (`search_field` / `search_field_or` / `search_tag` /
-//!     `search_numeric_range`) and collect their doc-ids into a [`RoaringBitmap`]. Pure — set
-//!     membership is document-frequency-independent, so DFS weights do not enter here.
-//!     `eval_set(root).len()` is the "total matched" cardinality (the FROZEN boundary that
-//!     `fts-search-count-semantics` consumes) — kept `pub` for that task.
+//!   * [`eval_set`] — the authoritative MEMBERSHIP. `And` = ∩, `Or` = ∪, `Empty` = ∅; leaves are
+//!     posting / TAG / NUMERIC bitmaps combined directly (moon#1191 — HEAD ran the full BM25
+//!     scorer per TEXT leaf just to collect doc ids). Pure — set membership is
+//!     document-frequency-independent, so DFS weights do not enter here.
+//!     `eval_set(root)` restricted to resolvable documents is the "total matched" cardinality (the
+//!     FROZEN boundary that `fts-search-count-semantics` consumes) — kept `pub` for that task.
 //!   * [`eval_query`] — `eval_set` + best-effort scoring. TEXT leaves contribute BM25, summed
 //!     across OR branches and across leaves; docs matched only by TAG/NUMERIC score `0.0`. The
-//!     final order is score DESC, doc_id ASC (stable, deterministic).
+//!     final order is score DESC, doc_id ASC (deterministic).
 //!
 //! **Why per-leaf score summation is regression-safe.** BM25 is additive across query terms, and
 //! `search_field` computes exactly Σ-over-terms. So for a single-field query the sum of per-leaf
 //! BM25 contributions equals the old combined `search_field(&[t1, t2, …])` score — byte-identical
 //! to the pre-2b path. Across multiple fields the sum is the RediSearch-correct cross-field score.
+//!
+//! **One scoring pass (moon#1191).** The matched set is walked once in ascending doc-id order;
+//! every TEXT leaf is a [`LeafScorer`] whose doc-ordered posting cursors supply term frequencies,
+//! with IDF hoisted per term. Scores are bit-identical to the former two-pass evaluation (same f32
+//! operation order — see `crate::text::score`), a bounded top-k keeps the page, and keys are
+//! cloned for the page only. `total` is the matched set's cardinality after restricting it to
+//! documents that resolve to a key.
 //!
 //! Tokens in the AST are RAW (un-analyzed); analysis happens here so the parser stays pure. Analysis
 //! reuses the index's per-field [`AnalyzerPipeline`] (the same one indexing used), so query and
@@ -24,46 +31,92 @@
 
 #![cfg(feature = "text-index")]
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 
 use bytes::Bytes;
 use roaring::RoaringBitmap;
 
 use super::ast::QueryNode;
+use crate::text::score::{FieldScorer, LeafScorer, QueryScorer, TopK};
 use crate::text::store::{TermModifier, TextIndex, TextSearchResult};
 
 /// Fold the AST to the matched doc-id set (frozen §3 set-semantics).
 ///
-/// `And(xs)` intersects children (fold `&=`), `Or(xs)` unions them (fold `|=`), `Empty` is `∅`.
-/// Leaves reuse the index's search machinery and collect doc-ids into the shared id space
-/// (`ensure_doc_id`), so the set operations compose directly.
+/// `And(xs)` intersects children, `Or(xs)` unions them, `Empty` is `∅`. Leaves are the index's own
+/// posting / TAG / NUMERIC bitmaps in the shared id space (`ensure_doc_id`), so the set operations
+/// compose directly. Ids that do not resolve to a key are dropped by `eval_query_counted`
+/// (`TextIndex::restrict_to_live`); in a consistent index there are none.
 pub fn eval_set(node: &QueryNode, idx: &TextIndex) -> RoaringBitmap {
+    let leaves = LeafTable::build(node, idx, None, None);
+    eval_set_cow(node, idx, &leaves).into_owned()
+}
+
+/// Every TEXT term leaf of one query, resolved ONCE (analysis, dictionary lookups, fuzzy/prefix
+/// expansion, cursors, IDF) and shared by the membership fold and the scoring pass — HEAD analysed
+/// and expanded each leaf twice. Keyed by node address (compared, never dereferenced); in AST DFS
+/// order, which is the order leaf scores are summed in.
+struct LeafTable<'a> {
+    leaves: Vec<(*const QueryNode, LeafScorer<'a>)>,
+}
+
+impl<'a> LeafTable<'a> {
+    fn build(
+        node: &QueryNode,
+        idx: &'a TextIndex,
+        global_df: Option<&HashMap<String, u32>>,
+        global_n: Option<u32>,
+    ) -> Self {
+        let mut leaves = Vec::new();
+        collect_leaf_scorers(node, idx, global_df, global_n, &mut leaves);
+        Self { leaves }
+    }
+
+    fn get(&self, node: &QueryNode) -> Option<&LeafScorer<'a>> {
+        let key: *const QueryNode = node;
+        self.leaves
+            .iter()
+            .find(|(n, _)| std::ptr::eq(*n, key))
+            .map(|(_, leaf)| leaf)
+    }
+
+    fn into_scorer(self) -> QueryScorer<'a> {
+        QueryScorer::new(self.leaves.into_iter().map(|(_, leaf)| leaf).collect())
+    }
+}
+
+/// [`eval_set`] that borrows a single leaf's bitmap instead of cloning it, so `alpha beta` never
+/// copies either (possibly very broad) posting — only the intersection is allocated.
+fn eval_set_cow<'a>(
+    node: &QueryNode,
+    idx: &'a TextIndex,
+    leaves: &LeafTable<'_>,
+) -> Cow<'a, RoaringBitmap> {
     match node {
-        QueryNode::Empty => RoaringBitmap::new(),
+        QueryNode::Empty => Cow::Owned(RoaringBitmap::new()),
 
         // moon#693: membership comes from the document registry, not a posting list — so
         // `*` also returns documents no term query can reach (one whose text analyzed to
-        // nothing is still in the index). `doc_id_to_key` is the same registry
-        // `eval_query_counted` resolves results through, so every id here is returnable.
-        QueryNode::MatchAll => idx.doc_id_to_key.keys().copied().collect(),
+        // nothing is still in the index). `live_docs` is exactly the key set of `doc_id_to_key`,
+        // the registry `eval_query_counted` resolves results through.
+        QueryNode::MatchAll => Cow::Borrowed(idx.live_docs()),
 
-        QueryNode::Term {
-            field,
-            token,
-            modifier,
-        } => term_results(idx, *field, token, modifier, None, None, usize::MAX)
-            .into_iter()
-            .map(|r| r.doc_id)
-            .collect(),
+        QueryNode::Term { .. } => Cow::Owned(
+            leaves
+                .get(node)
+                .map_or_else(RoaringBitmap::new, LeafScorer::candidates),
+        ),
 
         QueryNode::Tag { field, values } => {
-            let mut bm = RoaringBitmap::new();
-            for value in values {
-                for doc_id in idx.search_tag(field, value) {
-                    bm.insert(doc_id);
-                }
+            let mut hits = values.iter().filter_map(|v| idx.tag_value_bitmap(field, v));
+            let Some(first) = hits.next() else {
+                return Cow::Owned(RoaringBitmap::new());
+            };
+            let mut acc = Cow::Borrowed(first);
+            for bm in hits {
+                *acc.to_mut() |= bm;
             }
-            bm
+            acc
         }
 
         QueryNode::Numeric {
@@ -72,39 +125,47 @@ pub fn eval_set(node: &QueryNode, idx: &TextIndex) -> RoaringBitmap {
             max,
             min_excl,
             max_excl,
-        } => {
-            let mut bm = RoaringBitmap::new();
-            for doc_id in idx.search_numeric_range(field, *min, *max, *min_excl, *max_excl) {
-                bm.insert(doc_id);
-            }
-            bm
-        }
+        } => Cow::Owned(idx.numeric_range_bitmap(field, *min, *max, *min_excl, *max_excl)),
 
         QueryNode::And(children) => {
             // moon#690: a stop-word leaf is REMOVED from the conjunction, not intersected as
             // ∅ — `alpha the` means `alpha`, which is what RediSearch does. Intersecting it
             // zeroed every conjunction that happened to contain a stop word.
-            let mut iter = children.iter().filter(|c| !is_stop_word_only(c, idx));
-            // Every child was a stop word: nothing is being asked for, so nothing matches.
-            let Some(first) = iter.next() else {
-                return RoaringBitmap::new();
-            };
-            let mut acc = eval_set(first, idx);
-            for child in iter {
-                if acc.is_empty() {
-                    break; // ∩ with anything stays empty — short-circuit.
+            let mut sets: Vec<Cow<'a, RoaringBitmap>> = Vec::with_capacity(children.len());
+            for child in children.iter().filter(|c| !is_stop_word_only(c, idx)) {
+                let set = eval_set_cow(child, idx, leaves);
+                if set.is_empty() {
+                    // ∩ with ∅ stays empty — short-circuit the remaining children.
+                    return Cow::Owned(RoaringBitmap::new());
                 }
-                acc &= &eval_set(child, idx);
+                sets.push(set);
             }
-            acc
+            // Every child was a stop word: nothing is being asked for, so nothing matches.
+            // Otherwise intersect smallest-first (moon#1191: HEAD folded in query order).
+            sets.sort_by_key(|s| s.len());
+            let mut iter = sets.into_iter();
+            let Some(first) = iter.next() else {
+                return Cow::Owned(RoaringBitmap::new());
+            };
+            let Some(second) = iter.next() else {
+                return first;
+            };
+            let mut acc = &*first & &*second;
+            for set in iter {
+                if acc.is_empty() {
+                    break;
+                }
+                acc &= &*set;
+            }
+            Cow::Owned(acc)
         }
 
         QueryNode::Or(children) => {
             let mut acc = RoaringBitmap::new();
             for child in children {
-                acc |= &eval_set(child, idx);
+                acc |= &*eval_set_cow(child, idx, leaves);
             }
-            acc
+            Cow::Owned(acc)
         }
     }
 }
@@ -112,8 +173,8 @@ pub fn eval_set(node: &QueryNode, idx: &TextIndex) -> RoaringBitmap {
 /// Evaluate the AST to a best-effort BM25-scored, ordered result list.
 ///
 /// Membership is `eval_set` (authoritative); scoring sums TEXT-leaf BM25 per doc (filters score
-/// `0.0`). Order: score DESC, doc_id ASC (stable). `global_df`/`global_n` forward the DFS global
-/// IDF weights to the text leaves (multi-shard path, E5). Truncated to `top_k`.
+/// `0.0`). Order: score DESC, doc_id ASC. `global_df`/`global_n` forward the DFS global IDF weights
+/// to the text leaves (multi-shard path, E5). Truncated to `top_k`.
 ///
 /// Thin wrapper over [`eval_query_counted`] — the `.0` projection, kept for the frozen
 /// fts-query-eval-dispatch §3 contract (`eval_query(..) -> Vec<TextSearchResult>`). Callers that also
@@ -132,10 +193,9 @@ pub fn eval_query(
 /// — the FT.SEARCH integer reply (`reply[0]`, RediSearch semantics), counted BEFORE the `top_k`
 /// truncation (fts-search-count-semantics C1). `eval_set` is evaluated EXACTLY ONCE.
 ///
-/// The total is the length of the assembled (resolvable) `results` vector *before* truncation, NOT
-/// `set.len()`: a `doc_id` present in the match set but absent from `doc_id_to_key` is unreturnable
-/// and is already dropped by the assembly `filter_map`, so it is excluded from both the page and the
-/// total (`unresolvable_doc_uncounted`). In a consistent index the two coincide.
+/// The total is the cardinality of the match set restricted to documents present in
+/// `doc_id_to_key`: a `doc_id` without a key is unreturnable, so it is excluded from both the page
+/// and the total (`unresolvable_doc_uncounted`). In a consistent index the two coincide.
 pub fn eval_query_counted(
     idx: &TextIndex,
     node: &QueryNode,
@@ -143,54 +203,44 @@ pub fn eval_query_counted(
     global_n: Option<u32>,
     top_k: usize,
 ) -> (Vec<TextSearchResult>, usize) {
-    // 1. Authoritative membership (complete — no truncation).
-    let set = eval_set(node, idx);
-    if set.is_empty() {
+    // 1. Authoritative membership (complete — no truncation), resolvable docs only.
+    let leaves = LeafTable::build(node, idx, global_df, global_n);
+    let set = idx.restrict_to_live(eval_set_cow(node, idx, &leaves).into_owned());
+    let total_matched = set.len() as usize;
+    if total_matched == 0 {
         return (Vec::new(), 0);
     }
 
-    // 2. Best-effort scores from TEXT leaves only. usize::MAX so every matched doc gets its true
-    //    BM25 (search_field caps capacity by candidate count, not top_k — see store.rs), avoiding
-    //    truncation-induced 0.0 scores for docs that are in the set but below a small top_k.
-    let mut scores: HashMap<u32, f32> = HashMap::new();
-    accumulate_text_scores(node, idx, global_df, global_n, &mut scores);
+    // 2. One scoring pass: every TEXT leaf (AST order) scores the docs it matches.
+    let mut scorer = leaves.into_scorer();
 
-    // 3. Assemble results for docs in the set; pure-filter docs score 0.0.
-    let mut results: Vec<TextSearchResult> = set
-        .iter()
-        .filter_map(|doc_id| {
-            idx.doc_id_to_key.get(&doc_id).map(|key| TextSearchResult {
-                doc_id,
-                key: key.clone(),
-                score: scores.get(&doc_id).copied().unwrap_or(0.0),
-            })
-        })
-        .collect();
+    let mut top = TopK::new(top_k, total_matched);
+    if scorer.is_constant_zero() {
+        // Pure TAG / NUMERIC / `*`: every doc scores 0.0, so the order is doc_id ASC and the page
+        // is the first `top_k` ids — no pass over the whole set.
+        for doc in set.iter().take(top_k) {
+            top.push(doc, 0.0);
+        }
+    } else {
+        for doc in &set {
+            top.push(doc, scorer.score(idx, doc));
+        }
+    }
 
-    // True total-matched: matched AND key-resolvable, captured BEFORE truncation (C1).
-    let total_matched = results.len();
-
-    // 4. Order: score DESC, doc_id ASC (stable, deterministic tie-break).
-    results.sort_by(|a, b| {
-        b.score
-            .partial_cmp(&a.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then(a.doc_id.cmp(&b.doc_id))
-    });
-    results.truncate(top_k);
-    (results, total_matched)
+    // 3. Keys resolved (and cloned) for the returned page only.
+    (top.into_results(idx), total_matched)
 }
 
-/// Walk the AST, accumulating each TEXT leaf's BM25 contribution per doc into `scores`. TAG /
-/// NUMERIC / Empty leaves contribute nothing (they score `0.0` by absence). Scores sum across OR
-/// branches and across leaves — the additive-BM25 property keeps single-field queries identical to
-/// the pre-2b combined score.
-fn accumulate_text_scores(
+/// Walk the AST, collecting one [`LeafScorer`] per TEXT leaf in DFS order (the order HEAD's
+/// `accumulate_text_scores` summed them in). TAG / NUMERIC / `*` / Empty leaves contribute nothing
+/// (they score `0.0` by absence); OR and AND children alike are visited, so a doc matched through
+/// any branch collects every TEXT leaf it satisfies.
+fn collect_leaf_scorers<'a>(
     node: &QueryNode,
-    idx: &TextIndex,
+    idx: &'a TextIndex,
     global_df: Option<&HashMap<String, u32>>,
     global_n: Option<u32>,
-    scores: &mut HashMap<u32, f32>,
+    out: &mut Vec<(*const QueryNode, LeafScorer<'a>)>,
 ) {
     match node {
         // MatchAll scores 0.0 by absence, like the other non-TEXT leaves (moon#693).
@@ -204,105 +254,67 @@ fn accumulate_text_scores(
             token,
             modifier,
         } => {
-            for r in term_results(
-                idx,
-                *field,
-                token,
-                modifier,
-                global_df,
-                global_n,
-                usize::MAX,
-            ) {
-                *scores.entry(r.doc_id).or_insert(0.0) += r.score;
-            }
+            let fields = leaf_field_scorers(idx, *field, token, modifier, global_df, global_n);
+            let key: *const QueryNode = node;
+            out.push((key, LeafScorer::new(fields, field.is_none())));
         }
 
         QueryNode::And(children) | QueryNode::Or(children) => {
             for child in children {
-                accumulate_text_scores(child, idx, global_df, global_n, scores);
+                collect_leaf_scorers(child, idx, global_df, global_n, out);
             }
         }
     }
 }
 
-/// Evaluate a single TEXT term leaf to scored results, reusing the index's search machinery.
+/// The per-field scorers of a single TEXT term leaf.
 ///
-/// `field = Some(idx)` restricts to one text field; `None` searches all non-NOINDEX text fields
-/// and sums per-doc scores across them (cross-field union — matches the pre-2b
-/// `accumulate_cross_field` behaviour). Invalid UTF-8 in the raw token yields no matches (the
-/// analyzer operates on `&str`); this never panics.
-fn term_results(
-    idx: &TextIndex,
+/// `field = Some(idx)` restricts to one text field; `None` covers all non-NOINDEX text fields
+/// (cross-field union, per-doc sum — matches the pre-2b `accumulate_cross_field` behaviour).
+/// Exact terms run the field's full analyzer (lowercase + NFKD + stem + stop-words) and AND-match;
+/// fuzzy/prefix terms are lowercased + NFKD only (no stemming, per D-06/D-07), expanded via
+/// `expand_terms`, then OR-matched. A field that can match nothing yields no scorer. Invalid UTF-8
+/// in the raw token yields no matches (the analyzer operates on `&str`); this never panics.
+fn leaf_field_scorers<'a>(
+    idx: &'a TextIndex,
     field: Option<usize>,
     raw: &Bytes,
     modifier: &TermModifier,
     global_df: Option<&HashMap<String, u32>>,
     global_n: Option<u32>,
-    top_k: usize,
-) -> Vec<TextSearchResult> {
+) -> Vec<FieldScorer<'a>> {
     let Ok(raw_str) = std::str::from_utf8(raw) else {
         return Vec::new();
     };
-
-    match field {
-        Some(fidx) => {
-            term_results_in_field(idx, fidx, raw_str, modifier, global_df, global_n, top_k)
-        }
-        None => {
-            // Cross-field: union over non-NOINDEX text fields, summing per-doc scores.
-            let mut acc: HashMap<u32, (f32, Bytes)> = HashMap::new();
-            for fidx in 0..idx.text_fields.len() {
-                if idx.text_fields[fidx].noindex {
-                    continue;
-                }
-                for r in
-                    term_results_in_field(idx, fidx, raw_str, modifier, global_df, global_n, top_k)
-                {
-                    let entry = acc.entry(r.doc_id).or_insert((0.0, r.key.clone()));
-                    entry.0 += r.score;
-                }
-            }
-            acc.into_iter()
-                .map(|(doc_id, (score, key))| TextSearchResult { doc_id, key, score })
-                .collect()
-        }
-    }
+    leaf_fields(idx, field)
+        .into_iter()
+        .filter_map(|fidx| field_scorer(idx, fidx, raw_str, modifier, global_df, global_n))
+        .collect()
 }
 
-/// Evaluate a term leaf within a single text field. Exact terms run the field's full analyzer
-/// (lowercase + NFKD + stem + stop-words) and AND-match via `search_field`; fuzzy/prefix terms are
-/// lowercased + NFKD only (no stemming, per D-06/D-07), expanded via `expand_terms`, then OR-matched
-/// via `search_field_or`.
-fn term_results_in_field(
-    idx: &TextIndex,
+fn field_scorer<'a>(
+    idx: &'a TextIndex,
     fidx: usize,
     raw_str: &str,
     modifier: &TermModifier,
     global_df: Option<&HashMap<String, u32>>,
     global_n: Option<u32>,
-    top_k: usize,
-) -> Vec<TextSearchResult> {
+) -> Option<FieldScorer<'a>> {
     match modifier {
         TermModifier::Exact => {
-            // A single raw token may analyze to 0 terms (stop word) or >1 (rare); search_field
+            // A single raw token may analyze to 0 terms (stop word) or >1 (rare); the field-leaf
             // AND-matches them, consistent with the pre-2b exact path.
             let terms = analyze_raw(idx, fidx, raw_str, modifier);
-            if terms.is_empty() {
-                return Vec::new();
-            }
-            idx.search_field(fidx, &terms, global_df, global_n, top_k)
+            FieldScorer::exact(idx, fidx, &terms, global_df, global_n)
         }
-
         TermModifier::Fuzzy(_) | TermModifier::Prefix => {
-            let normalized = analyze_raw(idx, fidx, raw_str, modifier);
-            let Some(normalized) = normalized.first() else {
-                return Vec::new();
-            };
-            let ids = idx.expand_terms(fidx, normalized, modifier);
-            if ids.is_empty() {
-                return Vec::new();
+            if fidx >= idx.field_postings.len() {
+                return None;
             }
-            idx.search_field_or(fidx, &ids, global_df, global_n, top_k)
+            let normalized = analyze_raw(idx, fidx, raw_str, modifier);
+            let normalized = normalized.first()?;
+            let ids = idx.expand_terms(fidx, normalized, modifier);
+            FieldScorer::any_of(idx, fidx, &ids, global_n)
         }
     }
 }
@@ -513,3 +525,7 @@ fn collect_df_terms_inner(node: &QueryNode, idx: &TextIndex, acc: &mut DfAcc) {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "eval_oracle_tests.rs"]
+mod oracle_tests;

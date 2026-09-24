@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::text::analyzer::{AnalysisCache, AnalyzerPipeline};
-use crate::text::bm25::{FieldStats, bm25_score};
+use crate::text::bm25::FieldStats;
 use crate::text::index_persist::TextIndexMeta;
 use crate::text::posting::PostingStore;
 use crate::text::term_dict::TermDictionary;
@@ -118,6 +118,11 @@ pub struct TextIndex {
     pub key_hash_to_doc_id: HashMap<u64, u32>,
     /// doc_id -> original Redis key bytes.
     pub doc_id_to_key: HashMap<u32, Bytes>,
+    /// Exactly the key set of `doc_id_to_key`, as a bitmap (moon#1191): query
+    /// membership is pure bitmap algebra, and "resolvable" (has a key) is one
+    /// `&=` instead of a hash probe per matched document. Maintained at every
+    /// `doc_id_to_key` insert/remove site in this file.
+    live_docs: roaring::RoaringBitmap,
     /// Next doc_id to assign.
     next_doc_id: u32,
 
@@ -271,6 +276,7 @@ impl TextIndex {
             doc_field_lengths: HashMap::new(),
             key_hash_to_doc_id: HashMap::new(),
             doc_id_to_key: HashMap::new(),
+            live_docs: roaring::RoaringBitmap::new(),
             next_doc_id: 0,
             doc_id_to_insert_lsn: HashMap::new(),
             doc_id_to_delete_lsn: HashMap::new(),
@@ -383,6 +389,7 @@ impl TextIndex {
         self.next_doc_id += 1;
         self.key_hash_to_doc_id.insert(key_hash, id);
         self.doc_id_to_key.insert(id, Bytes::copy_from_slice(key));
+        self.live_docs.insert(id);
         self.charge_new_doc_key(key.len());
         id
     }
@@ -689,6 +696,7 @@ impl TextIndex {
             self.key_hash_to_doc_id.insert(key_hash, d.doc_id);
             self.charge_new_doc_key(d.key.len());
             self.doc_id_to_key.insert(d.doc_id, d.key);
+            self.live_docs.insert(d.doc_id);
             self.doc_field_lengths.insert(d.doc_id, d.field_lengths);
             self.resident_bytes_extra += std::mem::size_of::<u32>()
                 + field_count * std::mem::size_of::<u32>()
@@ -882,6 +890,7 @@ impl TextIndex {
         self.key_hash_to_doc_id.insert(key_hash, doc_id);
         self.doc_id_to_key
             .insert(doc_id, Bytes::copy_from_slice(key));
+        self.live_docs.insert(doc_id);
         if !is_upsert {
             self.charge_new_doc_key(key.len());
         }
@@ -963,7 +972,12 @@ impl TextIndex {
     /// These are injected by the DFS pre-pass coordinator for multi-shard global IDF
     /// accuracy (per D-04). When `None`, local field statistics are used (single-shard path).
     ///
-    /// Returns results sorted descending by BM25 score, truncated to `top_k`.
+    /// Returns results sorted descending by BM25 score (ties: ascending doc_id),
+    /// truncated to `top_k`.
+    ///
+    /// moon#1191: one scoring pass over the candidates (intersected rarest
+    /// posting first) with hoisted IDF and doc-ordered TF cursors, a bounded
+    /// top-k selection, and keys cloned only for the returned results.
     pub fn search_field(
         &self,
         field_idx: usize,
@@ -972,117 +986,54 @@ impl TextIndex {
         global_n: Option<u32>,
         top_k: usize,
     ) -> Vec<TextSearchResult> {
-        if field_idx >= self.field_postings.len() || query_terms.is_empty() {
-            return Vec::new();
+        self.search_field_where(field_idx, query_terms, global_df, global_n, top_k, |_| true)
+    }
+
+    /// [`Self::search_field`] over the candidates `keep` accepts (AS_OF).
+    fn search_field_where(
+        &self,
+        field_idx: usize,
+        query_terms: &[String],
+        global_df: Option<&HashMap<String, u32>>,
+        global_n: Option<u32>,
+        top_k: usize,
+        keep: impl Fn(u32) -> bool,
+    ) -> Vec<TextSearchResult> {
+        // AND: an out-of-range field or any term missing from the dictionary /
+        // postings matches nothing (RESEARCH Pitfall 1).
+        match crate::text::score::FieldScorer::exact(
+            self,
+            field_idx,
+            query_terms,
+            global_df,
+            global_n,
+        ) {
+            Some(field) => crate::text::score::top_k_for_field(self, field, top_k, keep),
+            None => Vec::new(),
         }
+    }
 
-        // Step 1: build candidate bitmap via RoaringBitmap AND intersection.
-        // Per RESEARCH Pitfall 1: any absent term means no results (AND semantics).
-        use roaring::RoaringBitmap;
+    /// `set` restricted to documents that resolve to a key (`doc_id_to_key`).
+    #[must_use]
+    pub fn restrict_to_live(&self, mut set: roaring::RoaringBitmap) -> roaring::RoaringBitmap {
+        set &= &self.live_docs;
+        set
+    }
 
-        // Collect postings for each query term; early-exit if any term is missing.
-        let mut term_postings: Vec<(String, u32)> = Vec::with_capacity(query_terms.len());
-        for term in query_terms {
-            let term_id = match self.field_term_dicts[field_idx].get(term) {
-                Some(id) => id,
-                None => return Vec::new(), // AND: missing term = no results
-            };
-            // Verify posting list exists
-            if self.field_postings[field_idx]
-                .get_posting(term_id)
-                .is_none()
-            {
-                return Vec::new();
-            }
-            term_postings.push((term.clone(), term_id));
-        }
+    /// Every document that resolves to a key — the `*` (match-all) set.
+    #[must_use]
+    pub fn live_docs(&self) -> &roaring::RoaringBitmap {
+        &self.live_docs
+    }
 
-        // Build candidate bitmap: start from first term's doc_ids, AND with rest.
-        let mut candidate_bitmap: RoaringBitmap = {
-            // Defensive (no expect/panic): term_postings is non-empty and each posting was just
-            // verified present, but a missing posting here would mean the AND term has no docs ⇒
-            // no results. Never panic on the BM25 hot path.
-            let Some(first_posting) =
-                self.field_postings[field_idx].get_posting(term_postings[0].1)
-            else {
-                return Vec::new();
-            };
-            first_posting.doc_ids.clone()
-        };
-
-        for (_, term_id) in &term_postings[1..] {
-            // Defensive: an absent AND-term posting ⇒ empty intersection ⇒ no results.
-            let Some(posting) = self.field_postings[field_idx].get_posting(*term_id) else {
-                return Vec::new();
-            };
-            candidate_bitmap &= &posting.doc_ids;
-        }
-
-        if candidate_bitmap.is_empty() {
-            return Vec::new();
-        }
-
-        // Step 2: score each surviving candidate document with BM25.
-        let stats = &self.field_stats[field_idx];
-        let n = global_n.unwrap_or(stats.num_docs);
-        let avgdl = stats.avg_doc_len();
-        let k1 = self.bm25_config.k1;
-        let b = self.bm25_config.b;
-        let weight = self.text_fields[field_idx].weight as f32;
-
-        let mut results: Vec<TextSearchResult> =
-            Vec::with_capacity(candidate_bitmap.len() as usize);
-
-        for doc_id in &candidate_bitmap {
-            let dl = self
-                .doc_field_lengths
-                .get(&doc_id)
-                .and_then(|lens| lens.get(field_idx).copied())
-                .unwrap_or(0);
-
-            let mut doc_score = 0.0f32;
-            for (term, term_id) in &term_postings {
-                // Defensive: skip a term whose posting vanished rather than panic; its BM25
-                // contribution is simply omitted (the doc already matched the AND candidate set).
-                let Some(posting) = self.field_postings[field_idx].get_posting(*term_id) else {
-                    continue;
-                };
-
-                // Rank-aligned TF lookup (fts-posting-rank-tf): sub-linear and correct after
-                // document updates. term_freqs is now kept in sorted-doc_id (rank) order, so the
-                // old linear scan is gone — see PostingList::tf. (Supersedes the former
-                // "RESEARCH Pitfall 1" note, which assumed insertion-order term_freqs.)
-                let tf = posting.tf(doc_id) as f32;
-
-                // Use global_df if provided (DFS path), else local doc frequency.
-                let df = global_df
-                    .and_then(|m| m.get(term.as_str()).copied())
-                    .unwrap_or_else(|| posting.doc_ids.len() as u32);
-
-                doc_score += bm25_score(tf, df, n, dl, avgdl, k1, b) * weight;
-            }
-
-            // Resolve original Redis key for this document.
-            let key = match self.doc_id_to_key.get(&doc_id) {
-                Some(k) => k.clone(),
-                None => continue, // orphaned doc_id — skip
-            };
-
-            results.push(TextSearchResult {
-                doc_id,
-                key,
-                score: doc_score,
-            });
-        }
-
-        // Step 3: sort descending by BM25 score (higher = more relevant per D-07).
-        results.sort_by(|a, b| {
-            b.score
-                .partial_cmp(&a.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        results.truncate(top_k);
-        results
+    /// Token length of `doc_id`'s `field_idx` field (`0` when unknown).
+    #[inline]
+    #[must_use]
+    pub fn doc_field_len(&self, doc_id: u32, field_idx: usize) -> u32 {
+        self.doc_field_lengths
+            .get(&doc_id)
+            .and_then(|lens| lens.get(field_idx).copied())
+            .unwrap_or(0)
     }
 
     /// Collect document frequency for each term + total N for the DFS pre-pass.
@@ -1275,6 +1226,9 @@ impl TextIndex {
     ///
     /// This is the OR counterpart to `search_field()` which uses AND intersection.
     /// Called for fuzzy/prefix queries after `expand_terms()` produces expanded_term_ids.
+    ///
+    /// `global_df` is accepted for API symmetry but unused: expanded terms always
+    /// score with their LOCAL posting df (`global_n` is honoured).
     #[cfg(feature = "text-index")]
     pub fn search_field_or(
         &self,
@@ -1284,87 +1238,25 @@ impl TextIndex {
         global_n: Option<u32>,
         top_k: usize,
     ) -> Vec<TextSearchResult> {
-        use roaring::RoaringBitmap;
-
-        if field_idx >= self.field_postings.len() || expanded_term_ids.is_empty() {
-            return Vec::new();
-        }
-
-        // OR: union all posting list bitmaps (any expanded term match counts, D-05).
-        let mut candidate_bitmap = RoaringBitmap::new();
-        for &term_id in expanded_term_ids {
-            if let Some(posting) = self.field_postings[field_idx].get_posting(term_id) {
-                candidate_bitmap |= &posting.doc_ids;
-            }
-        }
-        if candidate_bitmap.is_empty() {
-            return Vec::new();
-        }
-
-        // Score each candidate: MAX BM25 across all matching expanded terms (D-05: best, not sum).
-        let stats = &self.field_stats[field_idx];
-        let n = global_n.unwrap_or(stats.num_docs);
-        let avgdl = stats.avg_doc_len();
-        let k1 = self.bm25_config.k1;
-        let b = self.bm25_config.b;
-        let weight = self.text_fields[field_idx].weight as f32;
-
-        let mut results: Vec<TextSearchResult> =
-            Vec::with_capacity(candidate_bitmap.len() as usize);
-
-        // global_df maps term strings -> df, but we have term_ids here (OR-union path).
-        // For fuzzy/prefix expansion, always use local posting list doc_freq.
-        // The global_df parameter is accepted for API symmetry with search_field() but unused.
         let _ = global_df;
+        self.search_field_or_where(field_idx, expanded_term_ids, global_n, top_k, |_| true)
+    }
 
-        for doc_id in &candidate_bitmap {
-            let dl = self
-                .doc_field_lengths
-                .get(&doc_id)
-                .and_then(|lens| lens.get(field_idx).copied())
-                .unwrap_or(0);
-
-            let mut best_score = 0.0f32;
-            for &term_id in expanded_term_ids {
-                let Some(posting) = self.field_postings[field_idx].get_posting(term_id) else {
-                    continue;
-                };
-                if !posting.doc_ids.contains(doc_id) {
-                    continue;
-                }
-
-                // Rank-aligned TF lookup (fts-posting-rank-tf) — same as search_field.
-                let tf = posting.tf(doc_id) as f32;
-
-                // Use local posting list df for expanded term IDs.
-                let df = posting.doc_ids.len() as u32;
-
-                let score = bm25_score(tf, df, n, dl, avgdl, k1, b) * weight;
-                if score > best_score {
-                    best_score = score;
-                }
-            }
-
-            let key = match self.doc_id_to_key.get(&doc_id) {
-                Some(k) => k.clone(),
-                None => continue, // orphaned doc_id — skip
-            };
-
-            results.push(TextSearchResult {
-                doc_id,
-                key,
-                score: best_score,
-            });
+    /// [`Self::search_field_or`] over the candidates `keep` accepts (AS_OF).
+    #[cfg(feature = "text-index")]
+    fn search_field_or_where(
+        &self,
+        field_idx: usize,
+        expanded_term_ids: &[u32],
+        global_n: Option<u32>,
+        top_k: usize,
+        keep: impl Fn(u32) -> bool,
+    ) -> Vec<TextSearchResult> {
+        match crate::text::score::FieldScorer::any_of(self, field_idx, expanded_term_ids, global_n)
+        {
+            Some(field) => crate::text::score::top_k_for_field(self, field, top_k, keep),
+            None => Vec::new(),
         }
-
-        // Sort descending by BM25 score, truncate to top_k.
-        results.sort_by(|a, b| {
-            b.score
-                .partial_cmp(&a.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        results.truncate(top_k);
-        results
     }
 
     // ── TAG indexing (Plan 152-06) ─────────────────────────────────────────
@@ -1578,19 +1470,17 @@ impl TextIndex {
                 .sum::<usize>()
     }
 
-    /// LSN-aware wrapper around [`Self::search_field`] — post-filters the
-    /// scored result list by MVCC visibility at `as_of_lsn`.
+    /// LSN-aware wrapper around [`Self::search_field`] — only documents visible
+    /// at `as_of_lsn` are ranked.
     ///
     /// Backwards-compatible: `as_of_lsn == 0` is a no-op passthrough and
     /// produces identical output to `search_field`.
     ///
-    /// Implementation note: post-filter (rather than pre-filter the candidate
-    /// bitmap) is a deliberate trade-off — it wastes BM25 scoring work on
-    /// invisible docs in exchange for zero risk of breaking the existing
-    /// scoring path. To avoid recall loss when visible docs rank behind many
-    /// invisible docs, we oversample up to `next_doc_id` (full index) when
-    /// AS_OF is active. For the no-filter path we only oversample by 2×
-    /// because there is no filter-driven recall loss.
+    /// moon#1191: HEAD scored and sorted EVERY candidate (an oversample of
+    /// `next_doc_id`), then post-filtered by visibility and truncated. Filtering
+    /// the candidates before the bounded top-k selection yields exactly that
+    /// list — the oversample always covered every candidate — at the cost of
+    /// the visible candidates only (`g1_as_of_top_k_oversample_rescues_low_ranked_visible_doc`).
     pub fn search_field_as_of(
         &self,
         field_idx: usize,
@@ -1603,21 +1493,9 @@ impl TextIndex {
         if as_of_lsn == 0 {
             return self.search_field(field_idx, query_terms, global_df, global_n, top_k);
         }
-        // Unbounded oversample (bounded by index size) — the adversarial test
-        // `g1_as_of_top_k_oversample_rescues_low_ranked_visible_doc` proved
-        // 2× oversample is insufficient when a visible doc ranks last. We
-        // ask search_field for up to `next_doc_id` results (every doc in the
-        // index) so no visible candidate is truncated before filtering. BM25
-        // still short-circuits on empty postings, so the cost is bounded by
-        // candidate_bitmap size, not index size.
-        let oversample = (self.next_doc_id as usize).max(top_k).max(16);
-        let raw = self.search_field(field_idx, query_terms, global_df, global_n, oversample);
-        let mut filtered: Vec<TextSearchResult> = raw
-            .into_iter()
-            .filter(|r| self.is_doc_visible_at(r.doc_id, as_of_lsn))
-            .collect();
-        filtered.truncate(top_k);
-        filtered
+        self.search_field_where(field_idx, query_terms, global_df, global_n, top_k, |d| {
+            self.is_doc_visible_at(d, as_of_lsn)
+        })
     }
 
     /// LSN-aware counterpart to [`Self::search_field_or`] (fuzzy/prefix OR path).
@@ -1635,20 +1513,10 @@ impl TextIndex {
         if as_of_lsn == 0 {
             return self.search_field_or(field_idx, expanded_term_ids, global_df, global_n, top_k);
         }
-        let oversample = (self.next_doc_id as usize).max(top_k).max(16);
-        let raw = self.search_field_or(
-            field_idx,
-            expanded_term_ids,
-            global_df,
-            global_n,
-            oversample,
-        );
-        let mut filtered: Vec<TextSearchResult> = raw
-            .into_iter()
-            .filter(|r| self.is_doc_visible_at(r.doc_id, as_of_lsn))
-            .collect();
-        filtered.truncate(top_k);
-        filtered
+        let _ = global_df;
+        self.search_field_or_where(field_idx, expanded_term_ids, global_n, top_k, |d| {
+            self.is_doc_visible_at(d, as_of_lsn)
+        })
     }
 
     /// Look up documents tagged with a specific value on a specific field.
@@ -1659,35 +1527,32 @@ impl TextIndex {
     /// same rules used on insert (ASCII-lowercase unless CASESENSITIVE).
     #[cfg(feature = "text-index")]
     pub fn search_tag(&self, field: &Bytes, value: &Bytes) -> Vec<u32> {
-        let (canonical_field, case_sensitive) = match self
-            .tag_fields
-            .iter()
-            .find(|f| f.field_name.eq_ignore_ascii_case(field.as_ref()))
-        {
-            Some(f) => (f.field_name.clone(), f.case_sensitive),
-            None => return Vec::new(),
-        };
-
-        let normalized_value: Bytes = if case_sensitive {
-            value.clone()
-        } else if value.iter().all(|b| !b.is_ascii_uppercase()) {
-            value.clone()
-        } else {
-            let mut v = Vec::with_capacity(value.len());
-            for b in value.iter() {
-                v.push(b.to_ascii_lowercase());
-            }
-            Bytes::from(v)
-        };
-
-        match self
-            .tag_indexes
-            .get(&canonical_field)
-            .and_then(|m| m.get(&normalized_value))
-        {
+        match self.tag_value_bitmap(field, value) {
             Some(bm) => bm.iter().collect(),
             None => Vec::new(),
         }
+    }
+
+    /// The doc-id bitmap behind [`Self::search_tag`] (same field resolution and
+    /// value normalization), borrowed — query membership unions it directly
+    /// instead of materializing a `Vec` (moon#1191).
+    #[cfg(feature = "text-index")]
+    pub fn tag_value_bitmap(
+        &self,
+        field: &Bytes,
+        value: &Bytes,
+    ) -> Option<&roaring::RoaringBitmap> {
+        let (canonical_field, case_sensitive) = self
+            .tag_fields
+            .iter()
+            .find(|f| f.field_name.eq_ignore_ascii_case(field.as_ref()))
+            .map(|f| (&f.field_name, f.case_sensitive))?;
+        let field_map = self.tag_indexes.get(canonical_field)?;
+        if case_sensitive || value.iter().all(|b| !b.is_ascii_uppercase()) {
+            return field_map.get(value);
+        }
+        let lowered: Vec<u8> = value.iter().map(u8::to_ascii_lowercase).collect();
+        field_map.get(lowered.as_slice())
     }
 
     // ── NUMERIC indexing (Plan 152-07) ─────────────────────────────────────
@@ -1916,6 +1781,22 @@ impl TextIndex {
         min_exclusive: bool,
         max_exclusive: bool,
     ) -> Vec<u32> {
+        self.numeric_range_bitmap(field, min, max, min_exclusive, max_exclusive)
+            .iter()
+            .collect()
+    }
+
+    /// The doc-id bitmap behind [`Self::search_numeric_range`] (moon#1191:
+    /// query membership uses it directly instead of a materialized `Vec`).
+    #[cfg(feature = "text-index")]
+    pub fn numeric_range_bitmap(
+        &self,
+        field: &Bytes,
+        min: f64,
+        max: f64,
+        min_exclusive: bool,
+        max_exclusive: bool,
+    ) -> roaring::RoaringBitmap {
         use std::ops::Bound::{Excluded, Included, Unbounded};
 
         // Case-insensitive field resolution (same discipline as search_tag).
@@ -1925,11 +1806,11 @@ impl TextIndex {
             .find(|f| f.field_name.eq_ignore_ascii_case(field.as_ref()))
         {
             Some(f) => &f.field_name,
-            None => return Vec::new(),
+            None => return roaring::RoaringBitmap::new(),
         };
 
         let Some(btree) = self.numeric_indexes.get(canonical_field) else {
-            return Vec::new();
+            return roaring::RoaringBitmap::new();
         };
 
         // `BTreeMap::range` PANICS by contract when start > end, or when start
@@ -1947,7 +1828,7 @@ impl TextIndex {
         let lo_v = ordered_float::OrderedFloat(min);
         let hi_v = ordered_float::OrderedFloat(max);
         if lo_v > hi_v || (lo_v == hi_v && (min_exclusive || max_exclusive)) {
-            return Vec::new();
+            return roaring::RoaringBitmap::new();
         }
 
         let lo = if min == f64::NEG_INFINITY {
@@ -1969,7 +1850,7 @@ impl TextIndex {
         for (_k, bm) in btree.range((lo, hi)) {
             result |= bm;
         }
-        result.iter().collect()
+        result
     }
 
     /// Number of indexed documents.
@@ -2228,6 +2109,7 @@ impl TextIndex {
             );
         }
         // Remove from key_hash -> doc_id map (need to find the key_hash).
+        self.live_docs.remove(doc_id);
         if let Some(key) = self.doc_id_to_key.remove(&doc_id) {
             let key_hash = xxhash_rust::xxh64::xxh64(&key, 0);
             self.key_hash_to_doc_id.remove(&key_hash);

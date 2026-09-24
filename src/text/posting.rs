@@ -117,6 +117,88 @@ impl PostingList {
             .and_then(|p| p.get(idx))
             .map(Vec::as_slice)
     }
+
+    /// Term frequency at a rank index (`0` when out of range — never panics).
+    #[inline]
+    fn tf_at(&self, idx: usize) -> u32 {
+        self.term_freqs.get(idx).copied().unwrap_or(0)
+    }
+
+    /// A doc-ordered TF cursor over this posting (moon#1191).
+    ///
+    /// Scoring walks candidates in ascending doc-id order; the cursor walks the
+    /// posting alongside them, so the rank index of the current posting entry is
+    /// known without a per-document `rank()` (a bitmap-container `rank` popcounts
+    /// up to 1024 words). Long gaps between consecutive candidates are crossed
+    /// with a container-aware `advance_to` plus ONE `rank`, so sparse candidate
+    /// sets do not pay a linear walk of a long posting either.
+    #[must_use]
+    pub fn cursor(&self) -> PostingCursor<'_> {
+        let mut iter = self.doc_ids.iter();
+        let cur = iter.next();
+        let len = self.doc_ids.len();
+        // Expected posting entries per doc-id of gap: decides linear step vs jump.
+        let span = self.doc_ids.max().map_or(1u64, |m| u64::from(m) + 1);
+        PostingCursor {
+            list: self,
+            iter,
+            cur,
+            idx: 0,
+            density: len as f64 / span as f64,
+        }
+    }
+}
+
+/// Crossing a gap that is expected to hold more than this many posting entries
+/// uses `advance_to` + `rank` instead of stepping entry by entry. Stepping costs
+/// a few ns per entry; a bitmap-container `rank` costs up to ~1024 popcounts.
+const CURSOR_JUMP_ENTRIES: f64 = 64.0;
+
+/// Forward-only TF cursor produced by [`PostingList::cursor`].
+///
+/// `seek(doc)` must be called with non-decreasing `doc` values; it returns the
+/// document's term frequency when `doc` is in the posting and `None` otherwise.
+/// Results are identical to [`PostingList::tf`] (`None` ⇔ `tf == 0`).
+pub struct PostingCursor<'a> {
+    list: &'a PostingList,
+    iter: roaring::bitmap::Iter<'a>,
+    /// Posting entry the cursor rests on (`None` once exhausted).
+    cur: Option<u32>,
+    /// Rank index of `cur` in the rank-aligned arrays.
+    idx: usize,
+    density: f64,
+}
+
+impl PostingCursor<'_> {
+    /// Advance to `doc` (non-decreasing across calls) and return its tf, or
+    /// `None` when the posting does not contain it.
+    #[inline]
+    pub fn seek(&mut self, doc: u32) -> Option<u32> {
+        let c = self.cur?;
+        if c < doc {
+            let expected_entries = f64::from(doc - c) * self.density;
+            if expected_entries > CURSOR_JUMP_ENTRIES {
+                self.iter.advance_to(doc);
+                self.cur = self.iter.next();
+                if let Some(n) = self.cur {
+                    self.idx = self.list.rank_index(n);
+                }
+            } else {
+                while let Some(c) = self.cur {
+                    if c >= doc {
+                        break;
+                    }
+                    self.cur = self.iter.next();
+                    self.idx += 1;
+                }
+            }
+        }
+        if self.cur == Some(doc) {
+            Some(self.list.tf_at(self.idx))
+        } else {
+            None
+        }
+    }
 }
 
 /// Fixed per-term overhead charged exactly once, when a term's `PostingList`
