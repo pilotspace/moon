@@ -169,6 +169,83 @@ pub fn notifications_enabled() -> bool {
     published_flags().is_enabled()
 }
 
+// ── moon#1214 item 2: gate event construction on a live `__key*` listener ───
+//
+// With `notify-keyspace-events` enabled but NOBODY subscribed to a
+// `__keyspace@*`/`__keyevent@*` channel or pattern, HEAD still paid a key copy
+// and ~3 allocations per mutating command. This process-global count, kept in
+// step by (P)SUBSCRIBE/(P)UNSUBSCRIBE/disconnect (see `pubsub`), makes that case
+// free: `notify_keyspace_event` returns before allocating when the count is 0.
+//
+// The count tracks the number of DISTINCT keyspace-relevant channel/pattern
+// entries with at least one subscriber, summed across shard registries — a
+// present↔absent transition per entry, so increments and decrements balance and
+// it never leaks. Decrement is saturating as belt-and-braces (moon#1214: "counts
+// never go negative across disconnects"). It is a HINT that only gates a pure
+// optimisation: a late (P)SUBSCRIBE that raises it from 0 makes every SUBSEQUENT
+// event flow, which is exactly Redis's own guarantee (a subscription established
+// after a write does not receive that write's event).
+
+static KEYSPACE_LISTENERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Record that a keyspace-relevant channel/pattern gained its first subscriber.
+#[inline]
+pub fn keyspace_listener_added() {
+    KEYSPACE_LISTENERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Record that a keyspace-relevant channel/pattern lost its last subscriber.
+/// Saturating at 0.
+#[inline]
+pub fn keyspace_listener_removed() {
+    let _ = KEYSPACE_LISTENERS.fetch_update(
+        std::sync::atomic::Ordering::Relaxed,
+        std::sync::atomic::Ordering::Relaxed,
+        |v| Some(v.saturating_sub(1)),
+    );
+}
+
+/// `true` when at least one client is subscribed to a `__keyspace@*`/
+/// `__keyevent@*` channel or pattern anywhere in the process.
+#[inline]
+pub fn has_keyspace_listener() -> bool {
+    KEYSPACE_LISTENERS.load(std::sync::atomic::Ordering::Relaxed) > 0
+}
+
+/// The live keyspace-listener count (tests only).
+#[cfg(test)]
+pub fn keyspace_listener_count() -> usize {
+    KEYSPACE_LISTENERS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Whether a SUBSCRIBE channel or PSUBSCRIBE pattern could deliver keyspace
+/// notifications — i.e. could match a `__keyspace@<db>__:…` or
+/// `__keyevent@<db>__:…` channel.
+///
+/// Conservative by construction: it compares the pattern's LITERAL prefix (the
+/// bytes before the first glob metacharacter) against the two families' shared
+/// `__key…` prefix, so it NEVER undercounts a real listener (an undercount
+/// would silently drop that listener's notifications). An overcount only costs
+/// the optimisation, never correctness. An exact channel is a pattern with no
+/// metacharacters, so the same test serves both.
+pub fn subscription_targets_keyspace(name: &[u8]) -> bool {
+    let lit_end = name
+        .iter()
+        .position(|&b| b == b'*' || b == b'?' || b == b'[')
+        .unwrap_or(name.len());
+    let lit = &name[..lit_end];
+    prefix_consistent(lit, b"__keyspace@") || prefix_consistent(lit, b"__keyevent@")
+}
+
+/// `true` when `a` and `b` agree on their shared-length prefix — so a literal
+/// shorter than `__keyspace@` (e.g. `__key`) is still treated as a potential
+/// match.
+#[inline]
+fn prefix_consistent(a: &[u8], b: &[u8]) -> bool {
+    let n = a.len().min(b.len());
+    a[..n] == b[..n]
+}
+
 /// One event waiting to be published, produced by command code and consumed
 /// by whichever layer owns this shard's cross-shard mesh.
 #[derive(Debug, Clone)]
@@ -209,6 +286,14 @@ thread_local! {
 pub fn notify_keyspace_event(class: NotifyFlags, event: &'static str, key: &[u8], db: usize) {
     let flags = published_flags();
     if !flags.is_enabled() || !flags.intersects(class) {
+        return;
+    }
+    // moon#1214 item 2: with the class enabled but no `__keyspace@*`/
+    // `__keyevent@*` subscriber anywhere, the event would be built, queued and
+    // fanned out only to be dropped. Skip the key copy + allocations entirely —
+    // one extra Relaxed load on the write path. A late (P)SUBSCRIBE flips this
+    // and every subsequent event flows.
+    if !has_keyspace_listener() {
         return;
     }
     let pending = PendingNotification {
@@ -353,6 +438,70 @@ pub fn flags_to_string(flags: NotifyFlags) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// moon#1214 item 2: the listener classifier must flag every channel /
+    /// pattern that COULD receive keyspace notifications (never undercount — an
+    /// undercount silently drops a real listener's events), while leaving
+    /// unrelated channels free.
+    #[test]
+    fn keyspace_subscription_classifier_never_undercounts() {
+        // Real keyspace/keyevent targets — exact and pattern forms.
+        for name in [
+            &b"__keyspace@0__:foo"[..],
+            b"__keyevent@0__:expired",
+            b"__keyspace@*__:*",
+            b"__keyevent@0__:*",
+            b"__key*",      // matches both families
+            b"__keyspace@", // degenerate but consistent -> conservative yes
+            b"*",           // matches everything
+            b"__*",         // prefix consistent with __key...
+        ] {
+            assert!(
+                subscription_targets_keyspace(name),
+                "must be treated as a keyspace listener: {:?}",
+                String::from_utf8_lossy(name)
+            );
+        }
+        // Unrelated channels — free to skip.
+        for name in [
+            &b"news.tech"[..],
+            b"chat:*",
+            b"__keyspac", // diverges before the '@' but shares "__keyspac"... still consistent
+            b"foobar",
+            b"_keyspace@0__:x", // missing leading underscore
+        ] {
+            // Only the genuinely-inconsistent ones must be false; the deliberately
+            // tricky `__keyspac` shares a prefix so it is allowed to be true.
+            if name.starts_with(b"__key") {
+                continue;
+            }
+            assert!(
+                !subscription_targets_keyspace(name),
+                "must NOT be treated as a keyspace listener: {:?}",
+                String::from_utf8_lossy(name)
+            );
+        }
+    }
+
+    /// The listener count is a saturating counter: balanced add/remove returns
+    /// to zero, and an extra remove can never drive it negative (moon#1214:
+    /// "counts never go negative across disconnects").
+    #[test]
+    fn listener_count_is_balanced_and_saturating() {
+        let start = keyspace_listener_count();
+        keyspace_listener_added();
+        keyspace_listener_added();
+        assert_eq!(keyspace_listener_count(), start + 2);
+        keyspace_listener_removed();
+        keyspace_listener_removed();
+        assert_eq!(keyspace_listener_count(), start);
+        // Underflow guard: an unpaired remove saturates at 0, never wraps.
+        // (Only meaningful when the process count is already 0.)
+        if start == 0 {
+            keyspace_listener_removed();
+            assert_eq!(keyspace_listener_count(), 0);
+        }
+    }
 
     /// Every pair here was captured from a running redis-server 8.6.1, not
     /// derived from the letters. `Km -> Km` and `mn -> nm` are the two that

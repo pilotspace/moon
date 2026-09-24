@@ -67,6 +67,26 @@ fn cow_remove_id(subs: &mut Arc<[Subscriber]>, sub_id: u64) -> bool {
     true
 }
 
+/// A keyspace-relevant exact channel / pattern gained its first subscriber
+/// (moon#1214 item 2). Called when a channel/pattern entry is CREATED.
+#[inline]
+fn note_keyspace_added(name: &[u8]) {
+    if crate::notify::subscription_targets_keyspace(name) {
+        crate::notify::keyspace_listener_added();
+    }
+}
+
+/// A keyspace-relevant exact channel / pattern lost its last subscriber
+/// (moon#1214 item 2). Called when a channel/pattern entry is REMOVED. Paired
+/// 1:1 with [`note_keyspace_added`] via the map's present↔absent transitions,
+/// so the global count never leaks and (saturating) never goes negative.
+#[inline]
+fn note_keyspace_removed(name: &[u8]) {
+    if crate::notify::subscription_targets_keyspace(name) {
+        crate::notify::keyspace_listener_removed();
+    }
+}
+
 /// Allocate a globally unique subscriber ID.
 pub fn next_subscriber_id() -> u64 {
     NEXT_SUBSCRIBER_ID.fetch_add(1, Ordering::Relaxed)
@@ -132,6 +152,8 @@ impl PubSubRegistry {
         match self.channels.get_mut(&channel) {
             Some(subs) => cow_push(subs, sub),
             None => {
+                // First subscriber for this channel: a present transition.
+                note_keyspace_added(&channel);
                 self.channels.insert(channel, Arc::from(vec![sub]));
             }
         }
@@ -146,6 +168,7 @@ impl PubSubRegistry {
             cow_remove_id(subs, sub_id);
             if subs.is_empty() {
                 self.channels.remove(channel);
+                note_keyspace_removed(channel);
             }
         }
     }
@@ -174,6 +197,10 @@ impl PubSubRegistry {
         channels: &mut HashMap<Bytes, Arc<[Subscriber]>>,
         joined: Option<std::collections::HashSet<Bytes>>,
         sub_id: u64,
+        // moon#1214 item 2: exact channels feed keyspace notifications; sharded
+        // channels never do, so `sunsubscribe_all` passes `false` and does not
+        // touch the listener count.
+        count_keyspace: bool,
     ) -> Vec<Bytes> {
         let Some(joined) = joined else {
             return Vec::new();
@@ -188,6 +215,9 @@ impl PubSubRegistry {
             }
             if subs.is_empty() {
                 channels.remove(&channel);
+                if count_keyspace {
+                    note_keyspace_removed(&channel);
+                }
             }
             removed.push(channel);
         }
@@ -202,6 +232,8 @@ impl PubSubRegistry {
                 return;
             }
         }
+        // New pattern entry: a present transition.
+        note_keyspace_added(&pattern);
         self.patterns.push((pattern, Arc::from(vec![sub])));
     }
 
@@ -210,7 +242,11 @@ impl PubSubRegistry {
         self.patterns.retain_mut(|(p, subs)| {
             if p.as_ref() == pattern {
                 cow_remove_id(subs, sub_id);
-                !subs.is_empty()
+                let keep = !subs.is_empty();
+                if !keep {
+                    note_keyspace_removed(p);
+                }
+                keep
             } else {
                 true
             }
@@ -223,6 +259,7 @@ impl PubSubRegistry {
             &mut self.channels,
             self.sub_channels.remove(&sub_id),
             sub_id,
+            true,
         )
     }
 
@@ -233,7 +270,11 @@ impl PubSubRegistry {
             if cow_remove_id(subs, sub_id) {
                 removed.push(pattern.clone());
             }
-            !subs.is_empty()
+            let keep = !subs.is_empty();
+            if !keep {
+                note_keyspace_removed(pattern);
+            }
+            keep
         });
         removed
     }
@@ -282,6 +323,7 @@ impl PubSubRegistry {
                     .collect();
                 if v.is_empty() {
                     self.channels.remove(channel);
+                    note_keyspace_removed(channel);
                 } else {
                     *subs = Arc::from(v);
                 }
@@ -330,7 +372,13 @@ impl PubSubRegistry {
             }
             // Only clean up if we actually removed subscribers
             if had_removals {
-                self.patterns.retain(|(_, subs)| !subs.is_empty());
+                self.patterns.retain(|(pattern, subs)| {
+                    let keep = !subs.is_empty();
+                    if !keep {
+                        note_keyspace_removed(pattern);
+                    }
+                    keep
+                });
             }
         }
 
@@ -358,6 +406,7 @@ impl PubSubRegistry {
                         .collect();
                     if v.is_empty() {
                         self.channels.remove(channel);
+                        note_keyspace_removed(channel);
                     } else {
                         *subs = Arc::from(v);
                     }
@@ -383,7 +432,11 @@ impl PubSubRegistry {
                         .collect();
                     *subs = Arc::from(v);
                 }
-                !subs.is_empty()
+                let keep = !subs.is_empty();
+                if !keep {
+                    note_keyspace_removed(p);
+                }
+                keep
             });
         }
     }
@@ -494,10 +547,13 @@ impl PubSubRegistry {
 
     /// Remove a subscriber from every sharded channel. Returns those channels.
     pub fn sunsubscribe_all(&mut self, sub_id: u64) -> Vec<Bytes> {
+        // Sharded channels never carry keyspace notifications, so the listener
+        // count is left untouched (moon#1214 item 2).
         Self::retire_subscriber(
             &mut self.shard_channels,
             self.sub_shard_channels.remove(&sub_id),
             sub_id,
+            false,
         )
     }
 
