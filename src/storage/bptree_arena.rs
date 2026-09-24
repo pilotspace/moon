@@ -142,14 +142,23 @@ impl<T, const SHIFT: u32> Arena<T, SHIFT> {
 impl<T: Clone, const SHIFT: u32> Clone for Arena<T, SHIFT> {
     /// Chunk-shape preserving: every full chunk of the clone is allocated at
     /// exactly `1 << SHIFT` slots like the original, so `bytes()` stays exact
-    /// and later pushes into the last chunk never reallocate it.
+    /// and later pushes into the last chunk never reallocate it. The first
+    /// chunk takes the original's CAPACITY (never above `1 << SHIFT`), not its
+    /// length: sized at a small tree's length, it grew by doubling from there
+    /// (5 -> 10 of an 8-slot chunk) past the chunk size, breaking the layout
+    /// `capacity()` and the chunk index rely on (moon#1227 review N2).
     fn clone(&self) -> Self {
         let chunks = self
             .chunks
             .iter()
             .enumerate()
             .map(|(k, c)| {
-                let mut v = Vec::with_capacity(if k == 0 { c.len() } else { Self::CHUNK });
+                let cap = if k == 0 {
+                    c.capacity().min(Self::CHUNK)
+                } else {
+                    Self::CHUNK
+                };
+                let mut v = Vec::with_capacity(cap);
                 v.extend(c.iter().cloned());
                 v
             })
@@ -211,5 +220,34 @@ mod tests {
         a.clear();
         assert_eq!(a.len(), 0);
         assert_eq!(a.push(7), 0);
+    }
+
+    /// moon#1227 review N2: a clone of a SMALL arena (one partly used first
+    /// chunk) must keep the first chunk growing by doubling up to exactly
+    /// `1 << SHIFT` slots. Sizing it at `len` (5 of 8) made it grow 5 -> 10,
+    /// past the chunk size, so the chunk layout — and `capacity()` — broke.
+    #[test]
+    fn a_cloned_small_arena_keeps_the_chunk_layout() {
+        let mut a: Arena<u64, 3> = Arena::new();
+        for i in 0..5u64 {
+            a.push(i);
+        }
+        let mut b = a.clone();
+        assert_eq!(b.chunks[0].capacity(), a.chunks[0].capacity());
+        for i in 5..40u64 {
+            b.push(i);
+            assert!(
+                b.chunks[0].capacity() <= 8,
+                "first chunk grew to {} slots, past the 8-slot chunk",
+                b.chunks[0].capacity()
+            );
+        }
+        assert_eq!(b.capacity(), 40, "5 chunks of exactly 8 slots");
+        for i in 0..40usize {
+            assert_eq!(*b.get(i), i as u64);
+        }
+        // An empty arena clones to an empty one.
+        let e: Arena<u64, 3> = Arena::new();
+        assert_eq!(e.clone().capacity(), 0);
     }
 }
