@@ -1563,7 +1563,7 @@ async fn coordinate_mset(
     my_shard: usize,
     num_shards: usize,
     db_index: usize,
-    _shard_databases: &Arc<ShardDatabases>,
+    shard_databases: &Arc<ShardDatabases>,
     dispatch_tx: &Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
     spsc_notifiers: &[Arc<channel::Notify>],
     cached_clock: &CachedClock,
@@ -1601,12 +1601,17 @@ async fn coordinate_mset(
         groups.entry(shard).or_default().push((key, value));
     }
 
-    // Fast path: all keys on local shard
+    // Fast path: all keys on local shard.
+    //
+    // moon#1228: through `run_local` (`cmd_dispatch`), never the command body
+    // directly — `cmd_dispatch` is where an armed BGSAVE epoch captures the
+    // pre-image of every key a write overwrites. Calling `string::mset` here
+    // put the post-MSET value of a not-yet-serialized key into the snapshot.
     if groups.len() == 1 && groups.contains_key(&my_shard) {
-        let resp = crate::shard::slice::with_shard_db(db_index, |db| {
-            db.refresh_now_from_cache(cached_clock);
-            crate::command::string::mset(db, args)
-        });
+        let resp = run_local(shard_databases, db_index, cached_clock, b"MSET", args);
+        if matches!(resp, Frame::Error(_)) {
+            return resp;
+        }
         // Local leg (review Finding 1): persist the whole MSET — every key is
         // owned by my_shard — matching the local single-key write contract.
         if let Some(pairs) = groups.get(&my_shard) {
@@ -1637,12 +1642,20 @@ async fn coordinate_mset(
 
     for (shard_id, kv_pairs) in &groups {
         if *shard_id == my_shard {
-            crate::shard::slice::with_shard_db(db_index, |db| {
-                db.refresh_now_from_cache(cached_clock);
-                for (key, value) in kv_pairs {
-                    db.set_string(key, value.clone());
-                }
-            });
+            // moon#1228: an `MSET` over this shard's pairs through `run_local`,
+            // so the BGSAVE capture hook in `cmd_dispatch` sees every key it
+            // overwrites (a bare `set_string` loop captured nothing).
+            let local_args: Vec<Frame> = kv_pairs
+                .iter()
+                .flat_map(|(k, v)| [bulk(k), bulk(v)])
+                .collect();
+            let _ = run_local(
+                shard_databases,
+                db_index,
+                cached_clock,
+                b"MSET",
+                &local_args,
+            );
             // Local leg (review Finding 1): persist a synthesized MSET over
             // ONLY the local keys. The remote slices persist themselves on
             // their owner shards via MultiExecute -> wal_append_and_fanout;
@@ -4443,3 +4456,6 @@ mod swapdb_fold_tests;
 
 #[cfg(test)]
 mod refused_leg_tests;
+
+#[cfg(test)]
+mod multikey_leg_tests;
