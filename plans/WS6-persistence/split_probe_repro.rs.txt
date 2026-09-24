@@ -1,0 +1,32 @@
+//! TEMPORARY probe (not committed): does a DashTable split of a pending
+//! segment during a snapshot epoch lose keys from the snapshot?
+use super::*;
+
+#[test]
+fn probe_split_of_pending_segment_during_epoch() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("p.rrdshard");
+    let mut dbs = vec![Database::new()];
+    for i in 0..2000u32 {
+        dbs[0].set_string(format!("pre:{i:06}").as_bytes(), Bytes::from_static(b"v"));
+    }
+    let mut state = SnapshotState::new(0, 1, &dbs, path.clone());
+    let count0 = dbs[0].data().segment_count();
+    // Serialize the first segment only, then insert many NEW keys: splits.
+    state.advance_one_segment(&dbs);
+    for i in 0..20000u32 {
+        dbs[0].set_string(format!("new:{i:06}").as_bytes(), Bytes::from_static(b"n"));
+    }
+    let count1 = dbs[0].data().segment_count();
+    while !state.advance_one_segment(&dbs) {}
+    state.finalize().unwrap();
+    let mut loaded = vec![Database::new()];
+    shard_snapshot_load(&mut loaded, &path).unwrap();
+    let mut missing = 0;
+    for i in 0..2000u32 {
+        if loaded[0].get(format!("pre:{i:06}").as_bytes()).is_none() {
+            missing += 1;
+        }
+    }
+    eprintln!("SPLIT PROBE: segments {count0} -> {count1}; pre-epoch keys missing from snapshot: {missing} / 2000");
+}
