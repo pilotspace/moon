@@ -322,3 +322,29 @@ fn flagged_codes_file_of_the_wrong_size_keeps_codes_and_drops_signs() {
     assert_eq!(warm.sub_centroid_signs(), &signs[..]);
     assert_eq!(warm.codes_data(), imm.vectors_tq().as_slice());
 }
+
+#[test]
+fn flagged_all_zero_signs_are_a_placeholder_not_signs() {
+    // Same rule as `segment_io`'s sub_signs.bin (PR #1221 review): an
+    // all-zero buffer would pin every coordinate to the lower sub-bin.
+    distance::init();
+    crate::vector::turbo_quant::fwht::init_fwht();
+    let dim = 64;
+    let col = Arc::new(CollectionMetadata::new(
+        6,
+        dim as u32,
+        DistanceMetric::L2,
+        QuantizationConfig::TurboQuant4,
+        6,
+    ));
+    let imm = segment(&col, &clustered(200, dim, 12));
+    let zeros = vec![0u8; imm.sub_centroid_signs().len()];
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("warm");
+    warm_dir(&dir, &imm, |p, codes| {
+        write_codes_mpf_with_sub_signs(p, 7, codes, &zeros).unwrap()
+    });
+    let warm = open_warm(&dir, &col);
+    assert!(warm.sub_centroid_signs().is_empty());
+    assert_eq!(warm.codes_data(), imm.vectors_tq().as_slice());
+}

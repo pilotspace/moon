@@ -173,11 +173,13 @@ fn extract_payloads(mmap: &memmap2::Mmap, page_size: usize, sub_hdr_size: usize)
 /// Split the sub-centroid signs off the codes.mpf payload stream
 /// (`codes ++ signs`, see `warm_segment::write_codes_mpf_with_sub_signs`).
 ///
-/// Unflagged (every file written before moon#1213): no signs, codes
-/// untouched. Flagged: the stream must be exactly `n * (bytes_per_code +
-/// sub_bpv)` bytes — the beam reads signs by BFS position without bounds
-/// checks per read — otherwise the signs are dropped with a warning (16-level
-/// search) and the codes are kept.
+/// Unflagged (every file written before moon#1213) or SQ8 (never reads
+/// signs): no signs. Flagged: the stream must be exactly `n * (bytes_per_code
+/// + sub_bpv)` bytes — the beam reads signs by BFS position without bounds
+/// checks per read — and the signs must not be all zero (a placeholder, not
+/// signs: the same rule `segment_io` applies to `sub_signs.bin`); otherwise
+/// they are dropped with a warning (16-level search). The codes are always
+/// kept.
 fn split_sub_signs(
     segment_id: u64,
     codes_data: &mut Vec<u8>,
@@ -191,7 +193,16 @@ fn split_sub_signs(
     }
     let codes_len = n * bytes_per_code;
     let signs = if n > 0 && sub_bpv > 0 && codes_data.len() == codes_len + n * sub_bpv {
-        codes_data[codes_len..].to_vec()
+        let tail = &codes_data[codes_len..];
+        if tail.iter().all(|&b| b == 0) {
+            tracing::warn!(
+                "warm segment {segment_id}: codes.mpf carries all-zero sub-centroid \
+                 signs — a placeholder, not signs; ignoring them (16-level LUT)"
+            );
+            Vec::new()
+        } else {
+            tail.to_vec()
+        }
     } else {
         tracing::warn!(
             "warm segment {segment_id}: codes.mpf declares sub-centroid signs but holds {} \
@@ -455,7 +466,9 @@ impl WarmSearchSegment {
         let sub_signs = split_sub_signs(
             segment_id,
             &mut codes_data,
-            codes_flagged,
+            codes_flagged
+                && collection_meta.quantization
+                    != crate::vector::turbo_quant::collection::QuantizationConfig::Sq8,
             total_count as usize,
             graph.bytes_per_code() as usize,
             sub_sign_bpv,
