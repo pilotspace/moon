@@ -362,6 +362,73 @@ fn a_tick_writes_a_bounded_batch() {
     assert_eq!(records.len(), 40_000);
 }
 
+/// moon#1227 review F3: a tick is bounded in BYTES too. With 64 KiB values
+/// the entry budget alone let 1,024 of them through in one tick — 65 MiB, a
+/// 212 ms tick in a debug build — and a tick could overshoot the stream's
+/// in-flight cap by as much. A tick now stops once it has produced
+/// `TICK_BYTE_BUDGET`, or as soon as the writer is backlogged. A segment is
+/// the walk's unit of progress (the cursor moves past a whole block), so a
+/// tick ends at most ONE segment past the budget: every slot of it holding a
+/// 64 KiB value. The walk still makes progress every tick the writer can
+/// take more, and finishes.
+#[test]
+fn a_tick_is_bounded_in_bytes_when_values_are_large() {
+    const VALUE: usize = 64 * 1024;
+    const KEYS: u64 = 1_100;
+    let mut dbs = vec![Database::new()];
+    let value = Bytes::from(vec![b'v'; VALUE]);
+    for i in 0..KEYS {
+        dbs[0].set_string(format!("big:{i:06}").as_bytes(), value.clone());
+    }
+    // A record: type tag, key and value lengths, TTL, the key — far below
+    // 256 bytes on top of the value.
+    let one_segment = (crate::storage::dashtable::segment::TOTAL_SLOTS * (VALUE + 256)) as u64;
+    let bound = TICK_BYTE_BUDGET + one_segment;
+    let mut epoch = Epoch::begin(&dbs);
+    // Streamed, as every event-loop snapshot is: the file goes to the writer
+    // thread instead of piling up in memory, and the backlog check is live.
+    let state = epoch.state.as_mut().expect("epoch");
+    state.start_streaming().expect("writer thread");
+    let cap = (crate::persistence::snapshot_stream::SNAPSHOT_STREAM_MAX_IN_FLIGHT as u64) + bound;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    let mut max_tick = 0u64;
+    loop {
+        let before = epoch.state.as_ref().map_or(0, |s| s.bytes_serialized());
+        let done = epoch.tick(&dbs);
+        let st = epoch.state.as_ref().expect("epoch");
+        let tick_bytes = st.bytes_serialized() - before;
+        max_tick = max_tick.max(tick_bytes);
+        assert!(
+            tick_bytes <= bound,
+            "{tick_bytes} bytes in one tick; the bound is {bound} \
+             (budget {TICK_BYTE_BUDGET} + one full segment)"
+        );
+        assert!(
+            (st.stream_in_flight() as u64) <= cap,
+            "{} bytes in flight after a tick; the cap is {cap}",
+            st.stream_in_flight()
+        );
+        if done {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the walk never finished"
+        );
+    }
+    let st = epoch.state.as_ref().expect("epoch");
+    assert_eq!(
+        st.entries_written(),
+        KEYS,
+        "every entry written exactly once"
+    );
+    assert!(max_tick > 0);
+    eprintln!("largest tick: {max_tick} bytes (bound {bound})");
+    // Dropping the epoch abandons the stream: its writer is joined and its
+    // temp file removed (moon#1227 review F1).
+    crate::persistence::snapshot_cow::disarm();
+}
+
 /// A sustained insert flood keeps SPLITTING the pending segments. The walk
 /// must still converge: the production tick outpaces the table's growth.
 /// One segment per tick does not — that pacing never finished under the

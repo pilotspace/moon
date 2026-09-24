@@ -103,6 +103,13 @@ const TICK_ENTRY_BUDGET: u32 = 1024;
 /// 64 segments / 1,024 entries per tick keeps a tick in the ~100 µs range
 /// and outpaces that growth several times over.
 const TICK_SEGMENT_BUDGET: u32 = 64;
+/// ... or once the tick has serialized this many bytes (moon#1227 review
+/// F3): four stream chunks. Entry and segment counts say nothing about
+/// size — with 64 KiB values the entry budget let 65 MiB through in one tick
+/// (212 ms in a debug build), and overshot the stream's in-flight cap by as
+/// much. A segment is the walk's unit of progress (the cursor moves past a
+/// whole hash block), so a tick can still end one segment past this.
+const TICK_BYTE_BUDGET: u64 = 4 * crate::persistence::snapshot_stream::SNAPSHOT_STREAM_CHUNK as u64;
 
 /// Snapshot header metadata, peekable without fully loading the file.
 ///
@@ -143,6 +150,9 @@ pub struct SnapshotState {
     segments_written: usize,
     /// Entries serialized so far, across every database.
     entries_written: u64,
+    /// Bytes of segment blocks (and database selectors) serialized so far,
+    /// shipped to the writer or not — what the per-tick byte budget counts.
+    bytes_serialized: u64,
     /// Output buffer accumulating serialized bytes. With a
     /// [`SnapshotStream`](crate::persistence::snapshot_stream::SnapshotStream)
     /// attached (every event-loop snapshot, moon#1186) it holds only the
@@ -227,6 +237,7 @@ impl SnapshotState {
             segment_counts,
             segments_written: 0,
             entries_written: 0,
+            bytes_serialized: 0,
             output_buf: Vec::with_capacity(4096),
             stream: None,
             overflow: (0..num_databases).map(|_| BTreeMap::new()).collect(),
@@ -291,6 +302,12 @@ impl SnapshotState {
     #[inline]
     pub fn entries_written(&self) -> u64 {
         self.entries_written
+    }
+
+    /// Bytes of segment blocks serialized so far, across every database.
+    #[inline]
+    pub fn bytes_serialized(&self) -> u64 {
+        self.bytes_serialized
     }
 
     /// Segment counts per database captured at epoch start.
@@ -487,20 +504,27 @@ impl SnapshotState {
     }
 
     /// The event loop's per-tick advance: serialize segments of the current
-    /// database until [`TICK_ENTRY_BUDGET`] entries are written,
-    /// [`TICK_SEGMENT_BUDGET`] segments are visited, or the database is done
-    /// (the next database needs its own `&Database`, i.e. the next tick).
-    /// Returns true when every database is written.
+    /// database until [`TICK_ENTRY_BUDGET`] entries or [`TICK_BYTE_BUDGET`]
+    /// bytes are written, [`TICK_SEGMENT_BUDGET`] segments are visited, the
+    /// writer thread falls behind
+    /// ([`stream_backlogged`](Self::stream_backlogged), moon#1227 review F3),
+    /// or the database is done (the next database
+    /// needs its own `&Database`, i.e. the next tick). Every budget is checked
+    /// BEFORE a segment, so a tick ends at most one segment past it. Returns
+    /// true when every database is written.
     pub fn advance_budgeted_db(&mut self, db: &Database) -> bool {
         self.write_header_if_needed();
         let db_index = self.current_db;
         let mut entries = 0u32;
         let mut segments = 0u32;
+        let bytes_at_start = self.bytes_serialized;
         while self.current_db == db_index
             && self.current_db < self.num_databases
             && self.aborted.is_none()
             && entries < TICK_ENTRY_BUDGET
             && segments < TICK_SEGMENT_BUDGET
+            && self.bytes_serialized - bytes_at_start < TICK_BYTE_BUDGET
+            && !self.stream_backlogged()
         {
             let before = self.entries_written;
             self.advance_segment_inner(db);
@@ -553,6 +577,7 @@ impl SnapshotState {
 
     fn advance_segment_inner(&mut self, db: &Database) -> bool {
         let now_ms = current_time_ms();
+        let bytes_before = self.output_buf.len();
 
         // Write DB selector if this is the first segment of a new database
         if !self.db_selector_written[self.current_db] {
@@ -649,6 +674,9 @@ impl SnapshotState {
                 self.cursor = 0;
             }
         }
+
+        // Counted before the hand-off below empties the buffer.
+        self.bytes_serialized += (self.output_buf.len() - bytes_before) as u64;
 
         // moon#1186: hand full blocks to the writer thread as they fill.
         self.ship_if_ready();
