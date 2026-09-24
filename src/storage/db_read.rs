@@ -236,6 +236,62 @@ impl<'a> ListRef<'a> {
         }
     }
 
+    /// Visit the indices of the elements equal to `element`, among the first
+    /// `limit` elements scanned from the head -- or from the tail when
+    /// `from_tail` is set. `on_match(index)` returns `false` to stop.
+    ///
+    /// `LPOS` is this call (moon#1173). It used to be `iter_bytes()` -- a clone
+    /// of EVERY element into a fresh `Vec`, two allocations each on a listpack
+    /// -- before it looked at `MAXLEN`, `RANK` or `COUNT`, so `LPOS l x MAXLEN
+    /// 10` on a million-element list copied a million elements to compare ten.
+    /// This borrows: the scan stops at `limit` or when the caller says so, and
+    /// nothing is copied. Listpack equality is [`ListpackRef::eq_bytes`], the
+    /// canonical-integer rule every other listpack lookup uses (moon#795).
+    ///
+    /// [`ListpackRef::eq_bytes`]: super::listpack::ListpackRef::eq_bytes
+    pub fn for_each_match(
+        &self,
+        element: &[u8],
+        from_tail: bool,
+        limit: usize,
+        mut on_match: impl FnMut(usize) -> bool,
+    ) {
+        let len = self.len();
+        let deque = match self {
+            ListRef::Deque(d) => *d,
+            ListRef::Owned(d) => d,
+            ListRef::Listpack(lp) => {
+                if from_tail {
+                    for (k, e) in lp.iter_rev_refs().take(limit).enumerate() {
+                        if e.eq_bytes(element) && !on_match(len - 1 - k) {
+                            return;
+                        }
+                    }
+                } else {
+                    for (i, e) in lp.iter_refs().take(limit).enumerate() {
+                        if e.eq_bytes(element) && !on_match(i) {
+                            return;
+                        }
+                    }
+                }
+                return;
+            }
+        };
+        if from_tail {
+            for (k, v) in deque.iter().rev().take(limit).enumerate() {
+                if v.as_ref() == element && !on_match(len - 1 - k) {
+                    return;
+                }
+            }
+        } else {
+            for (i, v) in deque.iter().take(limit).enumerate() {
+                if v.as_ref() == element && !on_match(i) {
+                    return;
+                }
+            }
+        }
+    }
+
     /// Iterate all elements (for LPOS).
     pub fn iter_bytes(&self) -> Vec<Bytes> {
         match self {

@@ -1,6 +1,12 @@
 use bytes::Bytes;
 use std::collections::{HashMap, VecDeque};
 
+// List-shaped walks and bulk mutations (moon#1173, moon#1174). A child module
+// because this file is already past CLAUDE.md's 1500-line ceiling; it shares
+// this module's private decoder, so no entry width is decided twice.
+mod list_ops;
+pub use list_ops::ListpackRevRefIter;
+
 const LP_HDR_SIZE: usize = 7; // 4 bytes total_bytes + 2 bytes num_elements + 1 byte terminator
 const LP_TERMINATOR: u8 = 0xFF;
 

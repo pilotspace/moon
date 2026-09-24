@@ -1,6 +1,11 @@
 mod list_read;
 mod list_write;
 
+// moon#1173 guards. Out of line because this file is past the 1500-line
+// ceiling; they need `list_write`'s `pub(super)` compaction helper.
+#[cfg(test)]
+mod lrem_lpos_1173_tests;
+
 use crate::protocol::Frame;
 
 use super::helpers::extract_bytes;

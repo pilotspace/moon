@@ -685,6 +685,22 @@ pub fn linsert(db: &mut Database, args: &[Frame]) -> Frame {
 // ---------------------------------------------------------------------------
 
 /// LREM key count element
+///
+/// # moon#1173
+///
+/// Removed matches one at a time with `VecDeque::remove`, each shifting up to
+/// half the list: O(N*K). `LREM l 0 a` on a 200K-element list with 100K
+/// matches held the shard for 13.1 s where redis takes 0.30 s. Both encodings
+/// are now ONE compaction pass bounded by `count` -- [`lrem_deque`] with read
+/// and write cursors, `Listpack::remove_matches` on the byte buffer.
+///
+/// # moon#1174 §1
+///
+/// The existence/WRONGTYPE gate was `db.get_list` (= `get_promoted`, two
+/// probes and an unconditional listpack flatten) followed by
+/// `get_or_create_list` (two more probes, flatten again): the command
+/// permanently converted every small list it touched. The gate is now the
+/// one-probe `&self` [`list_route`], and a listpack stays a listpack.
 pub fn lrem(db: &mut Database, args: &[Frame]) -> Frame {
     if args.len() != 3 {
         return err_wrong_args("LREM");
@@ -702,65 +718,153 @@ pub fn lrem(db: &mut Database, args: &[Frame]) -> Frame {
         }
     };
     let element = match extract_bytes(&args[2]) {
-        Some(v) => v.clone(),
+        Some(v) => v.as_ref(),
         None => return err_wrong_args("LREM"),
     };
+    // count == 0 removes every match; otherwise |count| of them, from the head
+    // for a positive count and from the tail for a negative one.
+    let max_remove = if count == 0 {
+        usize::MAX
+    } else {
+        usize::try_from(count.unsigned_abs()).unwrap_or(usize::MAX)
+    };
+    let from_tail = count < 0;
 
-    match db.get_list(key) {
-        Ok(None) => return Frame::Integer(0),
-        Err(e) => return e,
-        Ok(Some(_)) => {}
+    match list_route(db, key) {
+        Err(e) => e,
+        Ok(None) => Frame::Integer(0),
+        Ok(Some(ListRoute::Listpack)) => lrem_listpack(db, key, element, from_tail, max_remove),
+        Ok(Some(ListRoute::Full)) => lrem_eager(db, key, element, from_tail, max_remove),
     }
+}
 
+/// `LREM` against a `ListListpack`, in place.
+fn lrem_listpack(
+    db: &mut Database,
+    key: &Bytes,
+    element: &[u8],
+    from_tail: bool,
+    max_remove: usize,
+) -> Frame {
+    let limits = db.encoding_limits();
+    let lp = match db.get_or_create_list_listpack(key) {
+        Ok(Some(lp)) => lp,
+        // The probe said listpack; see `pop_listpack` for why this falls back.
+        Ok(None) => return lrem_eager(db, key, element, from_tail, max_remove),
+        Err(e) => return e,
+    };
+    let before = lp.estimate_memory();
+    let removed = lp.remove_matches(element, from_tail, max_remove);
+    if removed > 0 {
+        lp.shrink_if_sparse();
+    }
+    let after = lp.estimate_memory();
+    let empty = lp.is_empty();
+    // Removal only shrinks, so this is false for every listpack a push could
+    // have produced -- the same post-mutation check the pops run (moon#896).
+    let should_upgrade = !limits.listpack_fits(Shape::List, lp);
+    // `lp`'s borrow of `db` ends here.
+    db.adjust_memory(before, after);
+    if empty {
+        db.remove(key);
+    } else if should_upgrade {
+        promote_list_listpack(db, key, after);
+    }
+    Frame::Integer(removed as i64)
+}
+
+/// `LREM` against the full `VecDeque` (or a cold value, which
+/// `get_or_create_list` promotes back).
+fn lrem_eager(
+    db: &mut Database,
+    key: &Bytes,
+    element: &[u8],
+    from_tail: bool,
+    max_remove: usize,
+) -> Frame {
     let list = match db.get_or_create_list(key) {
         Ok(l) => l,
         Err(e) => return e,
     };
-
-    let mut removed = 0i64;
-    let max_remove = if count == 0 {
-        usize::MAX
-    } else {
-        count.unsigned_abs() as usize
-    };
-
-    if count >= 0 {
-        // Remove from head (or all if count == 0)
-        let mut i = 0;
-        while i < list.len() && (removed as usize) < max_remove {
-            if list[i] == element {
-                list.remove(i);
-                removed += 1;
-            } else {
-                i += 1;
-            }
-        }
-    } else {
-        // Remove from tail
-        let mut i = list.len();
-        while i > 0 && (removed as usize) < max_remove {
-            i -= 1;
-            if list[i] == element {
-                list.remove(i);
-                removed += 1;
-            }
-        }
-    }
-
+    let removed = lrem_deque(list, element, from_tail, max_remove);
     let is_empty = list.is_empty();
     // `list`'s borrow of `db` ends above. Every removed element compared equal
     // to `element` (LREM semantics), so a single per-element cost applies to
     // all of them — O(1), no need to track each removed value individually.
     if removed > 0 {
-        db.credit_memory(removed as usize * list_elem_cost(&element));
+        db.credit_memory(removed * list_elem_cost(element));
     }
-
-    // If list is now empty, remove the key
     if is_empty {
         db.remove(key);
     }
+    Frame::Integer(removed as i64)
+}
 
-    Frame::Integer(removed)
+/// Remove up to `max_remove` elements equal to `element` from `list` in ONE
+/// pass, scanning from the head -- or from the tail when `from_tail` -- and
+/// return how many went (moon#1173).
+///
+/// Read cursor `r`, write cursor `w`: a kept element is swapped down into the
+/// write slot, so the kept elements stay in order on one side of the cursors
+/// and the removed ones collect between them. The scan stops the moment the
+/// `max_remove`-th match is gone -- the unscanned remainder is already in
+/// place -- and one `drain` of the gap closes it, moving whichever side of it
+/// is shorter. O(scanned + min(prefix, suffix)), against `VecDeque::remove`
+/// per match, which is O(len) EACH.
+pub(super) fn lrem_deque(
+    list: &mut std::collections::VecDeque<Bytes>,
+    element: &[u8],
+    from_tail: bool,
+    max_remove: usize,
+) -> usize {
+    let len = list.len();
+    let mut removed = 0usize;
+    if max_remove == 0 {
+        return 0;
+    }
+    if !from_tail {
+        // [0..w) kept, [w..r) removed, [r..len) unscanned.
+        let (mut r, mut w) = (0usize, 0usize);
+        while r < len {
+            if list[r] == element {
+                removed += 1;
+                r += 1;
+                if removed == max_remove {
+                    break;
+                }
+            } else {
+                if w != r {
+                    list.swap(w, r);
+                }
+                w += 1;
+                r += 1;
+            }
+        }
+        if w != r {
+            list.drain(w..r);
+        }
+    } else {
+        // [0..r) unscanned, [r..w) removed, [w..len) kept.
+        let (mut r, mut w) = (len, len);
+        while r > 0 {
+            r -= 1;
+            if list[r] == element {
+                removed += 1;
+                if removed == max_remove {
+                    break;
+                }
+            } else {
+                w -= 1;
+                if w != r {
+                    list.swap(w, r);
+                }
+            }
+        }
+        if w != r {
+            list.drain(r..w);
+        }
+    }
+    removed
 }
 
 // ---------------------------------------------------------------------------

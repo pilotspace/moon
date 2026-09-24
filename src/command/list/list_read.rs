@@ -188,7 +188,33 @@ pub fn lindex_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
     }
 }
 
+/// `LPOS`'s `RANK 0` refusal, byte-for-byte what redis answers.
+const ERR_LPOS_RANK_ZERO: &[u8] = b"ERR RANK can't be zero: use 1 to start from the first match, \
+2 from the second ... or use negative to start from the end of the list";
+
 /// LPOS (read-only).
+///
+/// # moon#1173
+///
+/// This used to clone the WHOLE list into a `Vec` (`ListRef::iter_bytes`) --
+/// two allocations per element on a listpack -- before it looked at `MAXLEN`,
+/// `RANK` or `COUNT`: `LPOS l a MAXLEN 10` on a million-element list took
+/// 38.9 ms against redis's 78 us. It now scans the list IN PLACE through
+/// [`ListRef::for_each_match`], forward, or backward for a negative `RANK`,
+/// and stops at `MAXLEN` or once `COUNT` matches are in hand. Nothing is
+/// copied; the only allocation is the reply.
+///
+/// # Option parsing (redis parity)
+///
+/// Redis decides the OPTION first and only then parses its value, so an
+/// unknown option is `ERR syntax error` whatever follows it, and `COUNT` /
+/// `MAXLEN` answer their own message for a non-integer as well as a negative
+/// value (`getPositiveLongFromObjectOrReply` with a message). moon used to
+/// parse the value first and answered `ERR value is not an integer or out of
+/// range` for both, and spelled the `RANK 0` refusal differently. Measured
+/// against redis 7.0.15.
+///
+/// [`ListRef::for_each_match`]: crate::storage::db::ListRef::for_each_match
 pub fn lpos_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
     if args.len() < 2 {
         return err_wrong_args("LPOS");
@@ -198,7 +224,7 @@ pub fn lpos_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
         None => return err_wrong_args("LPOS"),
     };
     let element = match extract_bytes(&args[1]) {
-        Some(v) => v.clone(),
+        Some(v) => v.as_ref(),
         None => return err_wrong_args("LPOS"),
     };
     let mut rank: i64 = 1;
@@ -210,36 +236,30 @@ pub fn lpos_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
             Some(o) => o.as_ref(),
             None => return err_wrong_args("LPOS"),
         };
-        i += 1;
-        if i >= args.len() {
+        let Some(value) = args.get(i + 1) else {
             return Frame::Error(Bytes::from_static(b"ERR syntax error"));
-        }
-        let val = match parse_i64(&args[i]) {
-            Some(v) => v,
-            None => {
-                return Frame::Error(Bytes::from_static(
-                    b"ERR value is not an integer or out of range",
-                ));
-            }
         };
-        i += 1;
+        i += 2;
         if opt.eq_ignore_ascii_case(b"RANK") {
-            if val == 0 {
-                return Frame::Error(Bytes::from_static(
-                    b"ERR RANK can't be zero: use 1 to start from the first match, 2 from the second ... or use negative values meaning from the end of the list",
-                ));
-            }
-            rank = val;
+            rank = match parse_i64(value) {
+                Some(0) => return Frame::Error(Bytes::from_static(ERR_LPOS_RANK_ZERO)),
+                Some(v) => v,
+                None => {
+                    return Frame::Error(Bytes::from_static(
+                        b"ERR value is not an integer or out of range",
+                    ));
+                }
+            };
         } else if opt.eq_ignore_ascii_case(b"COUNT") {
-            if val < 0 {
-                return Frame::Error(Bytes::from_static(b"ERR COUNT can't be negative"));
-            }
-            count = Some(val as usize);
+            count = match parse_i64(value) {
+                Some(v) if v >= 0 => Some(usize::try_from(v).unwrap_or(usize::MAX)),
+                _ => return Frame::Error(Bytes::from_static(b"ERR COUNT can't be negative")),
+            };
         } else if opt.eq_ignore_ascii_case(b"MAXLEN") {
-            if val < 0 {
-                return Frame::Error(Bytes::from_static(b"ERR MAXLEN can't be negative"));
-            }
-            maxlen = val as usize;
+            maxlen = match parse_i64(value) {
+                Some(v) if v >= 0 => usize::try_from(v).unwrap_or(usize::MAX),
+                _ => return Frame::Error(Bytes::from_static(b"ERR MAXLEN can't be negative")),
+            };
         } else {
             return Frame::Error(Bytes::from_static(b"ERR syntax error"));
         }
@@ -255,60 +275,35 @@ pub fn lpos_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
         }
         Err(e) => return e,
     };
-    let all_elements = lref.iter_bytes();
-    let len = all_elements.len();
+    let len = lref.len();
+    let scan_limit = if maxlen > 0 { maxlen.min(len) } else { len };
     let max_count = match count {
         Some(0) => usize::MAX,
         Some(c) => c,
         None => 1,
     };
-    let mut matches: Vec<i64> = Vec::new();
-    let mut match_count = 0usize;
-    if rank > 0 {
-        let mut skip = rank as usize - 1;
-        let scan_limit = if maxlen > 0 { maxlen.min(len) } else { len };
-        for idx in 0..scan_limit {
-            if all_elements[idx] == element {
-                if skip > 0 {
-                    skip -= 1;
-                } else {
-                    matches.push(idx as i64);
-                    match_count += 1;
-                    if match_count >= max_count {
-                        break;
-                    }
-                }
-            }
+    // `unsigned_abs`, not `-rank`: `RANK -9223372036854775808` must not
+    // overflow. It asks for a match no list can hold, so it finds none.
+    let mut skip = usize::try_from(rank.unsigned_abs() - 1).unwrap_or(usize::MAX);
+    let mut first: Option<i64> = None;
+    let mut matches: Vec<Frame> = Vec::new();
+    let mut found = 0usize;
+    lref.for_each_match(element, rank < 0, scan_limit, |idx| {
+        if skip > 0 {
+            skip -= 1;
+            return true;
         }
-    } else {
-        let mut skip = (-rank) as usize - 1;
-        let scan_limit = if maxlen > 0 { maxlen.min(len) } else { len };
-        let mut scanned = 0;
-        for idx in (0..len).rev() {
-            if scanned >= scan_limit {
-                break;
-            }
-            scanned += 1;
-            if all_elements[idx] == element {
-                if skip > 0 {
-                    skip -= 1;
-                } else {
-                    matches.push(idx as i64);
-                    match_count += 1;
-                    if match_count >= max_count {
-                        break;
-                    }
-                }
-            }
+        found += 1;
+        if count.is_some() {
+            matches.push(Frame::Integer(idx as i64));
+        } else {
+            first = Some(idx as i64);
         }
-    }
+        found < max_count
+    });
     if count.is_some() {
-        Frame::Array(matches.into_iter().map(Frame::Integer).collect())
+        Frame::Array(matches.into())
     } else {
-        matches
-            .first()
-            .copied()
-            .map(Frame::Integer)
-            .unwrap_or(Frame::Null)
+        first.map(Frame::Integer).unwrap_or(Frame::Null)
     }
 }
