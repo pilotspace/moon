@@ -1,12 +1,11 @@
 use bytes::Bytes;
 use rand::RngExt;
-use std::collections::HashSet;
 
 use crate::framevec;
 use crate::protocol::Frame;
 use crate::storage::Database;
 
-use super::{glob_match, parse_int};
+use super::{glob_match, parse_int, set_algebra};
 use crate::command::helpers::{err_wrong_args, extract_bytes};
 
 // ---------------------------------------------------------------------------
@@ -158,23 +157,6 @@ pub fn sscan(db: &mut Database, args: &[Frame]) -> Frame {
 // Read-only variants for RwLock read path
 // ---------------------------------------------------------------------------
 
-/// Collect sets read-only (no mutation, no expiry removal).
-fn collect_sets_readonly(
-    db: &Database,
-    keys: &[&Bytes],
-    now_ms: u64,
-) -> Result<Vec<Option<HashSet<Bytes>>>, Frame> {
-    let mut sets = Vec::with_capacity(keys.len());
-    for key in keys {
-        match db.get_set_ref_if_alive(key, now_ms) {
-            Ok(Some(sref)) => sets.push(Some(sref.to_hash_set())),
-            Ok(None) => sets.push(None),
-            Err(e) => return Err(e),
-        }
-    }
-    Ok(sets)
-}
-
 /// SMEMBERS (read-only).
 pub fn smembers_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
     if args.len() != 1 {
@@ -269,84 +251,87 @@ pub fn smismember_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame 
     }
 }
 
+/// The keys of a `key [key ...]` command, borrowed. `None` when an argument
+/// is not a bulk string (the arity-error shape these commands answer with).
+fn key_args(args: &[Frame]) -> Option<Vec<&[u8]>> {
+    args.iter()
+        .map(|a| extract_bytes(a).map(|b| b.as_ref()))
+        .collect()
+}
+
 /// SINTER (read-only).
+///
+/// moon#1169: walk the smallest set, probe the others — O(|smallest| x K).
+/// Every input used to be copied into a fresh `HashSet` first (205.7 ms for
+/// `SINTER small(10) big(1M)`, 2,479x redis). See `set_algebra`.
 pub fn sinter_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
     if args.is_empty() {
         return err_wrong_args("SINTER");
     }
-    let keys: Vec<&Bytes> = args.iter().filter_map(extract_bytes).collect();
-    if keys.len() != args.len() {
+    let Some(keys) = key_args(args) else {
         return err_wrong_args("SINTER");
-    }
-    let sets = match collect_sets_readonly(db, &keys, now_ms) {
+    };
+    let sets = match set_algebra::lookup_all(db, keys, now_ms) {
         Ok(s) => s,
         Err(e) => return e,
     };
-    let mut concrete: Vec<HashSet<Bytes>> = Vec::new();
-    for s in sets {
-        match s {
-            Some(set) => concrete.push(set),
-            None => return Frame::Array(framevec![]),
-        }
-    }
-    if concrete.is_empty() {
+    // A missing key is an empty set: the intersection is empty — decided
+    // only after every key was type-checked, as redis does.
+    let Some(present) = sets.into_iter().collect::<Option<Vec<_>>>() else {
         return Frame::Array(framevec![]);
-    }
-    concrete.sort_by_key(|s| s.len());
-    let mut result = concrete[0].clone();
-    for other in &concrete[1..] {
-        result.retain(|m| other.contains(m));
-    }
-    let members: Vec<Frame> = result.into_iter().map(Frame::BulkString).collect();
+    };
+    let mut members = Vec::new();
+    set_algebra::intersect(&present, |m| {
+        members.push(Frame::BulkString(m.to_bytes()));
+        true
+    });
     Frame::Array(members.into())
 }
 
-/// SUNION (read-only).
+/// SUNION (read-only). Streams every present set into one result set; a
+/// member already collected is recognised without allocating (moon#1169).
 pub fn sunion_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
     if args.is_empty() {
         return err_wrong_args("SUNION");
     }
-    let keys: Vec<&Bytes> = args.iter().filter_map(extract_bytes).collect();
-    if keys.len() != args.len() {
+    let Some(keys) = key_args(args) else {
         return err_wrong_args("SUNION");
-    }
-    let sets = match collect_sets_readonly(db, &keys, now_ms) {
+    };
+    let sets = match set_algebra::lookup_all(db, keys, now_ms) {
         Ok(s) => s,
         Err(e) => return e,
     };
-    let mut result = HashSet::new();
-    for s in sets {
-        if let Some(set) = s {
-            result.extend(set);
-        }
-    }
-    let members: Vec<Frame> = result.into_iter().map(Frame::BulkString).collect();
+    let members: Vec<Frame> = set_algebra::union(&sets)
+        .into_iter()
+        .map(Frame::BulkString)
+        .collect();
     Frame::Array(members.into())
 }
 
 /// SDIFF (read-only).
+///
+/// moon#1169: walk the FIRST set and probe the rest (redis's algorithm 1),
+/// instead of copying every input into a `HashSet` (208.8 ms for
+/// `SDIFF small(10) big(1M)`, 3,215x redis).
 pub fn sdiff_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
     if args.is_empty() {
         return err_wrong_args("SDIFF");
     }
-    let keys: Vec<&Bytes> = args.iter().filter_map(extract_bytes).collect();
-    if keys.len() != args.len() {
+    let Some(keys) = key_args(args) else {
         return err_wrong_args("SDIFF");
-    }
-    let sets = match collect_sets_readonly(db, &keys, now_ms) {
+    };
+    let sets = match set_algebra::lookup_all(db, keys, now_ms) {
         Ok(s) => s,
         Err(e) => return e,
     };
-    let mut result = match &sets[0] {
-        Some(set) => set.clone(),
-        None => return Frame::Array(framevec![]),
+    let Some((Some(first), others)) = sets.split_first() else {
+        return Frame::Array(framevec![]);
     };
-    for s in &sets[1..] {
-        if let Some(set) = s {
-            result.retain(|m| !set.contains(m));
-        }
-    }
-    let members: Vec<Frame> = result.into_iter().map(Frame::BulkString).collect();
+    let mut members = Vec::new();
+    set_algebra::difference(first, others, |m| {
+        members.push(Frame::BulkString(m.to_bytes()));
+        true
+    });
     Frame::Array(members.into())
 }
 
@@ -544,33 +529,23 @@ pub fn sintercard_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame 
         return err_wrong_args("SINTERCARD");
     }
 
-    // Use readonly path to get sets
-    let mut concrete: Vec<HashSet<Bytes>> = Vec::new();
-    for key in &keys {
-        match db.get_set_ref_if_alive(key, now_ms) {
-            Ok(Some(sref)) => concrete.push(sref.members().into_iter().collect()),
-            Ok(None) => return Frame::Integer(0),
-            Err(e) => return e,
-        }
-    }
-
-    if concrete.is_empty() {
+    // moon#1169: probe from the smallest set on borrowed refs, so LIMIT
+    // stops the walk — every input used to be collected into a HashSet
+    // first, which LIMIT could not short-circuit.
+    let key_slices: Vec<&[u8]> = keys.iter().map(|k| k.as_ref()).collect();
+    let sets = match set_algebra::lookup_all(db, key_slices, now_ms) {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
+    let Some(present) = sets.into_iter().collect::<Option<Vec<_>>>() else {
         return Frame::Integer(0);
-    }
-
-    concrete.sort_by_key(|s| s.len());
-    let smallest = &concrete[0];
-    let rest = &concrete[1..];
+    };
 
     let mut count: usize = 0;
-    for member in smallest {
-        if rest.iter().all(|s| s.contains(member)) {
-            count += 1;
-            if limit > 0 && count >= limit {
-                break;
-            }
-        }
-    }
+    set_algebra::intersect(&present, |_| {
+        count += 1;
+        limit == 0 || count < limit
+    });
 
     Frame::Integer(count as i64)
 }

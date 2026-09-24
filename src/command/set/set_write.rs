@@ -1,6 +1,5 @@
 use bytes::Bytes;
 use rand::RngExt;
-use std::collections::HashSet;
 
 use crate::framevec;
 use crate::protocol::Frame;
@@ -9,7 +8,7 @@ use crate::storage::db::{SetHandle, SetRef, Shape, set_member_cost, set_table_by
 use crate::storage::entry::{Entry, SetValue, boxed_payload_block};
 use crate::storage::listpack::Listpack;
 
-use super::{collect_sets, parse_int};
+use super::{parse_int, set_algebra};
 use crate::command::helpers::{err_wrong_args, extract_bytes};
 
 // ---------------------------------------------------------------------------
@@ -665,82 +664,98 @@ pub fn spop(db: &mut Database, args: &[Frame]) -> Frame {
 }
 
 // ---------------------------------------------------------------------------
-// Raw set algebra returning HashSet (for *STORE variants)
+// *STORE: set algebra over borrowed SOURCES (moon#1169)
+//
+// The sources used to be read through `collect_sets` -> `db.get_set(key)`,
+// whose `get_promoted` core converts an intset/listpack to a hashtable
+// unconditionally and never back (moon#832): `SINTERSTORE d small small`
+// PERMANENTLY flattened `small` — 3.45x `used_memory` for that class — and
+// copied every source into a `HashSet` besides. Now the sources are read
+// through the shared-borrow accessor (a `&Database` cannot reach
+// `SetKind::upgrade`) with the same walk-and-probe core as the read
+// commands, and the result is built directly as the stored `IndexSet`.
 // ---------------------------------------------------------------------------
 
-fn sinter_raw(db: &mut Database, args: &[Frame]) -> Result<HashSet<Bytes>, Frame> {
-    if args.is_empty() {
-        return Err(err_wrong_args("SINTERSTORE"));
-    }
-    let keys: Vec<&Bytes> = args.iter().filter_map(extract_bytes).collect();
-    if keys.len() != args.len() {
-        return Err(err_wrong_args("SINTERSTORE"));
-    }
-
-    let sets = collect_sets(db, &keys)?;
-
-    let mut concrete: Vec<HashSet<Bytes>> = Vec::new();
-    for s in sets {
-        match s {
-            Some(set) => concrete.push(set),
-            None => return Ok(HashSet::new()),
-        }
-    }
-
-    if concrete.is_empty() {
-        return Ok(HashSet::new());
-    }
-
-    concrete.sort_by_key(|s| s.len());
-    let mut result = concrete[0].clone();
-    for other in &concrete[1..] {
-        result.retain(|m| other.contains(m));
-    }
-    Ok(result)
+/// Which algebra a `*STORE` runs.
+#[derive(Clone, Copy)]
+enum StoreOp {
+    Inter,
+    Union,
+    Diff,
 }
 
-fn sunion_raw(db: &mut Database, args: &[Frame]) -> Result<HashSet<Bytes>, Frame> {
+/// Compute `op` over the source keys `args` into an owned `SetValue`,
+/// without re-encoding any source. `cmd` names the arity error.
+fn store_result(
+    db: &Database,
+    args: &[Frame],
+    op: StoreOp,
+    cmd: &'static str,
+) -> Result<SetValue, Frame> {
     if args.is_empty() {
-        return Err(err_wrong_args("SUNIONSTORE"));
+        return Err(err_wrong_args(cmd));
     }
-    let keys: Vec<&Bytes> = args.iter().filter_map(extract_bytes).collect();
-    if keys.len() != args.len() {
-        return Err(err_wrong_args("SUNIONSTORE"));
-    }
-
-    let sets = collect_sets(db, &keys)?;
-
-    let mut result = HashSet::new();
-    for s in sets {
-        if let Some(set) = s {
-            result.extend(set);
+    let keys: Option<Vec<&[u8]>> = args
+        .iter()
+        .map(|a| extract_bytes(a).map(|b| b.as_ref()))
+        .collect();
+    let Some(keys) = keys else {
+        return Err(err_wrong_args(cmd));
+    };
+    let sets = set_algebra::lookup_all(db, keys, db.now_ms())?;
+    let mut out = SetValue::new();
+    match op {
+        StoreOp::Inter => {
+            if let Some(present) = sets.into_iter().collect::<Option<Vec<_>>>() {
+                set_algebra::intersect(&present, |m| {
+                    out.insert(m.to_bytes());
+                    true
+                });
+            }
+        }
+        StoreOp::Union => {
+            out.extend(set_algebra::union(&sets));
+        }
+        StoreOp::Diff => {
+            if let Some((Some(first), others)) = sets.split_first() {
+                set_algebra::difference(first, others, |m| {
+                    out.insert(m.to_bytes());
+                    true
+                });
+            }
         }
     }
-    Ok(result)
+    Ok(out)
 }
 
-fn sdiff_raw(db: &mut Database, args: &[Frame]) -> Result<HashSet<Bytes>, Frame> {
-    if args.is_empty() {
-        return Err(err_wrong_args("SDIFFSTORE"));
+/// The shared tail of SINTERSTORE / SUNIONSTORE / SDIFFSTORE: compute from
+/// `args[1..]`, then replace `args[0]` (or delete it on an empty result).
+fn set_store(db: &mut Database, args: &[Frame], op: StoreOp, cmd: &'static str) -> Frame {
+    if args.len() < 2 {
+        return err_wrong_args(cmd);
     }
-    let keys: Vec<&Bytes> = args.iter().filter_map(extract_bytes).collect();
-    if keys.len() != args.len() {
-        return Err(err_wrong_args("SDIFFSTORE"));
-    }
-
-    let sets = collect_sets(db, &keys)?;
-
-    let mut result = match &sets[0] {
-        Some(set) => set.clone(),
-        None => return Ok(HashSet::new()),
+    let dest = match extract_bytes(&args[0]) {
+        Some(k) => k,
+        None => return err_wrong_args(cmd),
+    };
+    // The whole computation borrows `db` shared; the result is owned, so the
+    // write below is free to take `&mut db` even when `dest` is a source.
+    let result = match store_result(db, &args[1..], op, cmd) {
+        Ok(set) => set,
+        Err(e) => return e,
     };
 
-    for s in &sets[1..] {
-        if let Some(set) = s {
-            result.retain(|m| !set.contains(m));
+    let count = result.len() as i64;
+    if result.is_empty() {
+        db.remove(dest);
+    } else {
+        let mut entry = Entry::new_set();
+        if let Some(crate::storage::entry::RedisValue::Set(s)) = entry.value.as_redis_value_mut() {
+            **s = result;
         }
+        db.set(dest, entry);
     }
-    Ok(result)
+    Frame::Integer(count)
 }
 
 // ---------------------------------------------------------------------------
@@ -749,34 +764,7 @@ fn sdiff_raw(db: &mut Database, args: &[Frame]) -> Result<HashSet<Bytes>, Frame>
 
 /// SINTERSTORE command handler: compute SINTER and store in destination.
 pub fn sinterstore(db: &mut Database, args: &[Frame]) -> Frame {
-    if args.len() < 2 {
-        return err_wrong_args("SINTERSTORE");
-    }
-    let dest = match extract_bytes(&args[0]) {
-        Some(k) => k,
-        None => return err_wrong_args("SINTERSTORE"),
-    };
-
-    // Compute intersection using source keys (args[1..])
-    let result = sinter_raw(db, &args[1..]);
-    let result = match result {
-        Ok(set) => set,
-        Err(e) => return e,
-    };
-
-    let count = result.len() as i64;
-    if result.is_empty() {
-        db.remove(dest);
-    } else {
-        let mut entry = Entry::new_set();
-        if let Some(crate::storage::entry::RedisValue::Set(s)) = entry.value.as_redis_value_mut() {
-            // Set algebra computes in a `HashSet`; the stored representation is
-            // an `IndexSet` so SPOP/SRANDMEMBER can address a member by index.
-            **s = result.into_iter().collect();
-        }
-        db.set(dest, entry);
-    }
-    Frame::Integer(count)
+    set_store(db, args, StoreOp::Inter, "SINTERSTORE")
 }
 
 // ---------------------------------------------------------------------------
@@ -785,33 +773,7 @@ pub fn sinterstore(db: &mut Database, args: &[Frame]) -> Frame {
 
 /// SUNIONSTORE command handler: compute SUNION and store in destination.
 pub fn sunionstore(db: &mut Database, args: &[Frame]) -> Frame {
-    if args.len() < 2 {
-        return err_wrong_args("SUNIONSTORE");
-    }
-    let dest = match extract_bytes(&args[0]) {
-        Some(k) => k,
-        None => return err_wrong_args("SUNIONSTORE"),
-    };
-
-    let result = sunion_raw(db, &args[1..]);
-    let result = match result {
-        Ok(set) => set,
-        Err(e) => return e,
-    };
-
-    let count = result.len() as i64;
-    if result.is_empty() {
-        db.remove(dest);
-    } else {
-        let mut entry = Entry::new_set();
-        if let Some(crate::storage::entry::RedisValue::Set(s)) = entry.value.as_redis_value_mut() {
-            // Set algebra computes in a `HashSet`; the stored representation is
-            // an `IndexSet` so SPOP/SRANDMEMBER can address a member by index.
-            **s = result.into_iter().collect();
-        }
-        db.set(dest, entry);
-    }
-    Frame::Integer(count)
+    set_store(db, args, StoreOp::Union, "SUNIONSTORE")
 }
 
 // ---------------------------------------------------------------------------
@@ -820,33 +782,7 @@ pub fn sunionstore(db: &mut Database, args: &[Frame]) -> Frame {
 
 /// SDIFFSTORE command handler: compute SDIFF and store in destination.
 pub fn sdiffstore(db: &mut Database, args: &[Frame]) -> Frame {
-    if args.len() < 2 {
-        return err_wrong_args("SDIFFSTORE");
-    }
-    let dest = match extract_bytes(&args[0]) {
-        Some(k) => k,
-        None => return err_wrong_args("SDIFFSTORE"),
-    };
-
-    let result = sdiff_raw(db, &args[1..]);
-    let result = match result {
-        Ok(set) => set,
-        Err(e) => return e,
-    };
-
-    let count = result.len() as i64;
-    if result.is_empty() {
-        db.remove(dest);
-    } else {
-        let mut entry = Entry::new_set();
-        if let Some(crate::storage::entry::RedisValue::Set(s)) = entry.value.as_redis_value_mut() {
-            // Set algebra computes in a `HashSet`; the stored representation is
-            // an `IndexSet` so SPOP/SRANDMEMBER can address a member by index.
-            **s = result.into_iter().collect();
-        }
-        db.set(dest, entry);
-    }
-    Frame::Integer(count)
+    set_store(db, args, StoreOp::Diff, "SDIFFSTORE")
 }
 
 // ---------------------------------------------------------------------------
