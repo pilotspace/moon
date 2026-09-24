@@ -585,7 +585,7 @@ pub fn execute_with_slots(
 
     // Build a SegmentMergeReader for cross-segment neighbor queries.
     let segments_guard = graph.segments.load();
-    let env = OpEnv {
+    let env = pipeline::OpEnv {
         memgraph: &graph.write_buf,
         csr_segs: &segments_guard.immutable,
         params,
@@ -593,7 +593,7 @@ pub fn execute_with_slots(
         slot_table,
         empty_row: &empty_row,
     };
-    let mut st = OpState {
+    let mut st = pipeline::OpState {
         rows: vec![Row::seed(slot_table)],
         projected_rows: None,
         columns: Vec::new(),
@@ -604,14 +604,14 @@ pub fn execute_with_slots(
     let demand = pipeline::row_demand(ops, |count| env.count(count));
     let mut first = 0;
     if let Some(end) = pipeline::streamable_prefix(ops, &demand) {
-        run_streamed_prefix(&ops[..end], demand[end - 1], &mut st, &env)?;
+        pipeline::run_streamed_prefix(&ops[..end], demand[end - 1], &mut st, &env)?;
         first = end;
     }
     for (op, &keep) in ops.iter().zip(&demand).skip(first) {
         apply_op(op, &mut st, &env, keep)?;
     }
 
-    let OpState {
+    let pipeline::OpState {
         rows,
         projected_rows,
         mut columns,
@@ -649,226 +649,12 @@ pub fn execute_with_slots(
     })
 }
 
-/// Read-only inputs every operator evaluates against.
-struct OpEnv<'a, 't> {
-    memgraph: &'a crate::graph::memgraph::MemGraph,
-    csr_segs: &'a [std::sync::Arc<crate::graph::csr::CsrStorage>],
-    params: &'a HashMap<String, Value>,
-    ctx: &'a ExecutionContext,
-    slot_table: &'t SlotTable,
-    empty_row: &'a Row<'a>,
-}
-
-impl OpEnv<'_, '_> {
-    /// A SKIP / LIMIT count, evaluated exactly as those operators do.
-    fn count(&self, count: &Expr) -> usize {
-        match eval_expr(
-            count,
-            self.empty_row,
-            self.memgraph,
-            self.params,
-            self.csr_segs,
-            self.ctx.snapshot_lsn,
-            self.ctx.decay,
-        ) {
-            Value::Int(n) if n >= 0 => n as usize,
-            _ => 0,
-        }
-    }
-}
-
-/// The row stream between operators.
-struct OpState<'t> {
-    rows: Vec<Row<'t>>,
-    /// After a non-rebinding Project, rows are positional value arrays.
-    projected_rows: Option<Vec<Vec<Value>>>,
-    columns: Vec<String>,
-    nodes_scanned: u64,
-}
-
-/// Run the leading streamable run `prefix` (`prefix[0]` is the scan) in
-/// chunks of scan keys, stopping once `need` output rows exist (moon#1197).
-/// Every op after the scan is row-local and order-preserving, so the rows
-/// produced are exactly the first rows full evaluation would produce; the
-/// downstream SKIP/LIMIT then cut them identically.
-fn run_streamed_prefix<'t>(
-    prefix: &[PhysicalOp],
-    need: usize,
-    st: &mut OpState<'t>,
-    env: &OpEnv<'_, 't>,
-) -> Result<(), ExecError> {
-    let Some((scan, segment)) = prefix.split_first() else {
-        return Ok(());
-    };
-    let mut sink = StreamSink::new(need);
-    match scan {
-        PhysicalOp::NodeScan { variable, label } => {
-            let label_id = label.as_ref().map(|l| label_to_id(l.as_bytes()));
-            let committed = roaring::RoaringBitmap::new();
-            let view = crate::graph::view::MergedNodeView::new(env.memgraph, env.csr_segs);
-            let mut chunk: Vec<NodeKey> = Vec::with_capacity(sink.chunk_len());
-            let mut failed: Option<ExecError> = None;
-            let _ = view.try_for_each_visible_node(
-                label_id,
-                env.ctx.snapshot_lsn,
-                env.ctx.my_txn_id,
-                &committed,
-                env.ctx.valid_time_as_of,
-                |key| {
-                    chunk.push(key);
-                    if chunk.len() < sink.chunk_len() {
-                        return std::ops::ControlFlow::Continue(());
-                    }
-                    match sink.feed(&chunk, variable, segment, env) {
-                        Ok(false) => {
-                            chunk.clear();
-                            std::ops::ControlFlow::Continue(())
-                        }
-                        Ok(true) => std::ops::ControlFlow::Break(()),
-                        Err(e) => {
-                            failed = Some(e);
-                            std::ops::ControlFlow::Break(())
-                        }
-                    }
-                },
-            );
-            if let Some(e) = failed {
-                return Err(e);
-            }
-            if !sink.done() {
-                sink.feed(&chunk, variable, segment, env)?;
-            }
-        }
-        PhysicalOp::IndexScan {
-            variable,
-            label,
-            prop_eq,
-            prop_range,
-            text_pred,
-        } => {
-            let keys = index_scan_keys(
-                env.memgraph,
-                env.csr_segs,
-                label.as_ref(),
-                prop_eq,
-                prop_range,
-                text_pred,
-                env.params,
-                env.ctx,
-            );
-            let mut rest: &[NodeKey] = &keys;
-            loop {
-                let (chunk, tail) = rest.split_at(rest.len().min(sink.chunk_len()));
-                if sink.feed(chunk, variable, segment, env)? || tail.is_empty() {
-                    break;
-                }
-                rest = tail;
-            }
-        }
-        _ => return Ok(()),
-    }
-    sink.finish(st, segment, env)
-}
-
-/// Accumulates the streamed prefix's output chunk by chunk.
-struct StreamSink<'t> {
-    need: usize,
-    chunk_len: usize,
-    scanned: u64,
-    fed_any: bool,
-    rows: Vec<Row<'t>>,
-    projected: Option<Vec<Vec<Value>>>,
-    columns: Vec<String>,
-}
-
-impl<'t> StreamSink<'t> {
-    fn new(need: usize) -> Self {
-        Self {
-            need,
-            // Start near the demand; double per chunk so a selective filter
-            // costs O(log) chunk rounds, not O(n / demand).
-            chunk_len: need.clamp(16, 1024),
-            scanned: 0,
-            fed_any: false,
-            rows: Vec::new(),
-            projected: None,
-            columns: Vec::new(),
-        }
-    }
-
-    fn chunk_len(&self) -> usize {
-        self.chunk_len
-    }
-
-    fn produced(&self) -> usize {
-        self.projected.as_ref().map_or(self.rows.len(), Vec::len)
-    }
-
-    fn done(&self) -> bool {
-        self.fed_any && self.produced() >= self.need
-    }
-
-    /// Run `keys` through the scan binding and `segment`; `true` once the
-    /// demand is met.
-    fn feed(
-        &mut self,
-        keys: &[NodeKey],
-        variable: &str,
-        segment: &[PhysicalOp],
-        env: &OpEnv<'_, 't>,
-    ) -> Result<bool, ExecError> {
-        self.scanned += keys.len() as u64;
-        let mut part = OpState {
-            rows: keys
-                .iter()
-                .map(|&key| {
-                    let mut row = Row::seed(env.slot_table);
-                    row.insert(variable, Value::Node(key));
-                    row
-                })
-                .collect(),
-            projected_rows: None,
-            columns: Vec::new(),
-            nodes_scanned: 0,
-        };
-        for op in segment {
-            apply_op(op, &mut part, env, usize::MAX)?;
-        }
-        match part.projected_rows {
-            Some(p) => self.projected.get_or_insert_with(Vec::new).extend(p),
-            None => self.rows.extend(part.rows),
-        }
-        self.columns = part.columns;
-        self.fed_any = true;
-        self.chunk_len = (self.chunk_len * 2).min(8192);
-        Ok(self.done())
-    }
-
-    fn finish(
-        mut self,
-        st: &mut OpState<'t>,
-        segment: &[PhysicalOp],
-        env: &OpEnv<'_, 't>,
-    ) -> Result<(), ExecError> {
-        if !self.fed_any {
-            // Nothing scanned (or LIMIT 0): still run the segment once so a
-            // projection names its columns exactly as full evaluation does.
-            self.feed(&[], "", segment, env)?;
-        }
-        st.nodes_scanned += self.scanned;
-        st.rows = self.rows;
-        st.projected_rows = self.projected;
-        st.columns = self.columns;
-        Ok(())
-    }
-}
-
 /// Apply one operator to the row stream. `keep` bounds how many of its output
 /// rows the rest of the plan can use (only `Sort` exploits it).
 fn apply_op<'t>(
     op: &PhysicalOp,
-    st: &mut OpState<'t>,
-    env: &OpEnv<'_, 't>,
+    st: &mut pipeline::OpState<'t>,
+    env: &pipeline::OpEnv<'_, 't>,
     keep: usize,
 ) -> Result<(), ExecError> {
     let memgraph = env.memgraph;
