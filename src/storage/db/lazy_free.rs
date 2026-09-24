@@ -151,7 +151,7 @@ enum Work {
     /// each pop also retires the member's `members` slot (and credits it).
     BpZset {
         tree: Box<BPTree>,
-        members: Box<HashMap<Bytes, f64>>,
+        members: HashMap<Bytes, f64>,
     },
     Stream {
         entries: std::collections::btree_map::IntoIter<StreamId, Vec<(Bytes, Bytes)>>,
@@ -205,7 +205,13 @@ impl Work {
             ),
             RedisValue::SortedSetBPTree { tree, members } => {
                 let table = zset_table_bytes(&members, &tree);
-                (Work::BpZset { tree, members }, boxed + table)
+                (
+                    Work::BpZset {
+                        tree,
+                        members: *members,
+                    },
+                    boxed + table,
+                )
             }
             RedisValue::Stream(mut s) => {
                 let entries: BTreeMap<StreamId, Vec<(Bytes, Bytes)>> =
@@ -285,7 +291,7 @@ impl Work {
                 }
                 if n < budget {
                     // Tree empty: any member it did not index is still billed.
-                    let rest = std::mem::take(&mut **members);
+                    let rest = std::mem::take(members);
                     for (m, _) in rest {
                         credit += zset_member_cost(&m);
                     }
