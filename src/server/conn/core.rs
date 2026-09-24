@@ -60,6 +60,12 @@ pub(crate) struct ConnectionContext {
     /// dispatch by `try_enforce_readonly` to avoid the per-command RwLock CAS.
     /// `None` when replication is disabled entirely.
     pub is_replica_mirror: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// Lock-free write-path handle to this shard's replication state
+    /// (moon#1176): LSN issue, the fan-out probe and backlog recording, none
+    /// of which may take `repl_state`'s process-wide `RwLock` per write.
+    /// Built once in `new()`, like `is_replica_mirror`. `None` when
+    /// replication is disabled entirely.
+    pub repl_write: Option<crate::replication::state::ReplWriteHandle>,
     pub cluster_state: Option<Arc<parking_lot::RwLock<crate::cluster::ClusterState>>>,
     pub lua: Rc<mlua::Lua>,
     pub script_cache: Rc<RefCell<crate::scripting::ScriptCache>>,
@@ -130,9 +136,16 @@ impl ConnectionContext {
         // try_enforce_readonly can avoid taking the RwLock per command.
         // The Arc is cloned out under the read-lock once at connection setup;
         // ReplicationState::set_role() updates the same AtomicBool thereafter.
-        let is_replica_mirror = repl_state
-            .as_ref()
-            .map(|rs| rs.read().is_replica_mirror.clone());
+        let (is_replica_mirror, repl_write) = match repl_state.as_ref() {
+            Some(rs) => {
+                let g = rs.read();
+                (
+                    Some(g.is_replica_mirror.clone()),
+                    Some(g.write_handle(rs, shard_id)),
+                )
+            }
+            None => (None, None),
+        };
         Self {
             shard_databases,
             shard_id,
@@ -144,6 +157,7 @@ impl ConnectionContext {
             tracking_table,
             repl_state,
             is_replica_mirror,
+            repl_write,
             cluster_state,
             lua,
             script_cache,
@@ -163,6 +177,14 @@ impl ConnectionContext {
             spill_file_id,
             disk_offload_dir,
         }
+    }
+
+    /// Issue the AOF LSN for a `delta`-byte record written on this shard —
+    /// `AofWriterPool::issue_append_lsn` through the lock-free handle
+    /// (moon#1176). 0 when replication is disabled (the same sentinel).
+    #[inline]
+    pub fn issue_append_lsn(&self, delta: usize) -> u64 {
+        self.repl_write.as_ref().map_or(0, |h| h.issue_lsn(delta))
     }
 
     /// Build the eviction context for FCALL-internal `redis.call` writes

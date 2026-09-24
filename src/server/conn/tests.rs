@@ -95,6 +95,7 @@ fn inline_get_and_set_are_observed_by_the_probe() {
             0,
             &aof_pool,
             &None,
+            None,
             0,
             1,
             reads,
@@ -162,6 +163,7 @@ fn test_inline_get_hit() {
         0,
         &aof_pool,
         &None,
+        None,
         0,
         1,
         true,  // can_inline_reads
@@ -221,6 +223,7 @@ fn test_inline_get_does_not_wait_behind_a_shared_reader() {
         0,
         &aof_pool,
         &None,
+        None,
         0,
         1,
         true,  // can_inline_reads
@@ -277,6 +280,7 @@ fn test_inline_get_answers_a_mid_spill_key() {
         0,
         &aof_pool,
         &None,
+        None,
         0,
         1,
         true,  // can_inline_reads
@@ -325,6 +329,7 @@ fn test_inline_get_hit_byte_parity_sizes() {
             0,
             &aof_pool,
             &None,
+            None,
             0,
             1,
             true,  // can_inline_reads
@@ -375,6 +380,7 @@ fn test_inline_get_miss() {
         0,
         &aof_pool,
         &None,
+        None,
         0,
         1,
         true,  // can_inline_reads
@@ -416,6 +422,7 @@ fn test_inline_get_miss_null_spelling_follows_protocol() {
             0,
             &aof_pool,
             &None,
+            None,
             0,
             1,
             true,  // can_inline_reads
@@ -463,6 +470,7 @@ fn test_inline_get_hit_is_protocol_independent() {
             0,
             &aof_pool,
             &None,
+            None,
             0,
             1,
             true,  // can_inline_reads
@@ -501,6 +509,7 @@ fn test_inline_set_falls_through_when_writes_disabled() {
         0,
         &aof_pool,
         &None,
+        None,
         0,
         1,
         true,  // can_inline_reads
@@ -534,6 +543,7 @@ fn test_inline_set_executes_when_writes_enabled() {
         0,
         &aof_pool,
         &None,
+        None,
         0,
         1,
         true,  // can_inline_reads
@@ -596,6 +606,7 @@ fn test_inline_set_stands_down_when_aof_writer_is_full() {
         0,
         &aof_pool,
         &None,
+        None,
         0,
         1,
         true,  // can_inline_reads
@@ -644,6 +655,7 @@ fn test_inline_set_stands_down_when_aof_writer_is_full() {
         0,
         &aof_pool,
         &None,
+        None,
         0,
         1,
         true,
@@ -701,6 +713,7 @@ fn test_inline_set_captures_snapshot_pre_image() {
         0,
         &aof_pool,
         &None,
+        None,
         0,
         1,
         true,  // can_inline_reads
@@ -752,6 +765,7 @@ fn test_inline_get_captures_nothing_under_snapshot() {
         0,
         &aof_pool,
         &None,
+        None,
         0,
         1,
         true,
@@ -787,6 +801,7 @@ fn test_inline_set_with_options_falls_through() {
         0,
         &aof_pool,
         &None,
+        None,
         0,
         1,
         true,  // can_inline_reads
@@ -819,6 +834,7 @@ fn test_inline_fallthrough() {
         0,
         &aof_pool,
         &None,
+        None,
         0,
         1,
         true,  // can_inline_reads
@@ -857,6 +873,7 @@ fn test_inline_mixed_batch() {
         0,
         &aof_pool,
         &None,
+        None,
         0,
         1,
         true,  // can_inline_reads: unrestricted, non-tracking connection
@@ -899,6 +916,7 @@ fn test_inline_get_refused_when_reads_not_inlinable() {
         0,
         &aof_pool,
         &None,
+        None,
         0,
         1,
         false, // can_inline_reads: restricted ACL or CLIENT TRACKING conn
@@ -941,6 +959,7 @@ fn test_inline_case_insensitive() {
         0,
         &aof_pool,
         &None,
+        None,
         0,
         1,
         true,  // can_inline_reads
@@ -974,6 +993,7 @@ fn test_inline_partial() {
         0,
         &aof_pool,
         &None,
+        None,
         0,
         1,
         true,  // can_inline_reads
@@ -1012,6 +1032,7 @@ fn test_inline_set_with_aof_falls_through_when_writes_disabled() {
         0,
         &aof_pool,
         &None,
+        None,
         0,
         1,
         true,  // can_inline_reads
@@ -1052,6 +1073,7 @@ fn test_inline_multiple_gets() {
         0,
         &aof_pool,
         &None,
+        None,
         0,
         1,
         true,  // can_inline_reads: unrestricted, non-tracking connection
@@ -1090,6 +1112,7 @@ fn test_inline_loop_disabled_in_cluster_mode() {
         0,
         &aof_pool,
         &None,
+        None,
         0,
         1,
         true,  // even with reads inlinable...
@@ -1175,6 +1198,7 @@ fn test_inline_get_declines_for_cold_key_instead_of_blocking() {
         0,
         &aof_pool,
         &None,
+        None,
         0,
         1,
         true,  // can_inline_reads
@@ -1231,6 +1255,7 @@ fn test_inline_get_genuine_miss_still_answers_inline() {
         0,
         &aof_pool,
         &None,
+        None,
         0,
         1,
         true,  // can_inline_reads
@@ -1381,6 +1406,7 @@ fn test_inline_set_stands_down_under_client_pause() {
         0,
         &aof_pool,
         &None,
+        None,
         0,
         1,
         true,
@@ -1405,6 +1431,7 @@ fn test_inline_set_stands_down_under_client_pause() {
         0,
         &aof_pool,
         &None,
+        None,
         0,
         1,
         true,
@@ -1481,6 +1508,7 @@ fn test_inline_set_bails_only_when_a_spill_sender_is_live() {
             0,
             &aof_pool,
             &None,
+            None,
             0,
             1,
             true,
@@ -1551,6 +1579,7 @@ fn test_inline_set_stands_down_while_loading() {
         0,
         &aof_pool,
         &None,
+        None,
         0,
         1,
         true,
@@ -1574,6 +1603,7 @@ fn test_inline_set_stands_down_while_loading() {
         0,
         &aof_pool,
         &None,
+        None,
         0,
         1,
         true,

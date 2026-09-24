@@ -40,20 +40,14 @@ fn is_replicated_ft_def_mutation(cmd: &[u8], cmd_args: &[Frame]) -> bool {
 /// outlive this function (task #70 — never hold a lock across `.await`).
 /// Only the WRITE itself — `record_local_write_db`'s own internal chain,
 /// entirely synchronous — collapses to one shared guard; see there.
+///
+/// moon#1176: answered by the connection's lock-free `ReplWriteHandle` — the
+/// hint, then one Acquire load once the plane is live. It used to take
+/// `repl_state.read()` AND shard 0's backlog mutex on every write of every
+/// shard (see `ReplWriteHandle::fanout_active` for why the answer is the same).
 #[inline]
 pub(super) fn replication_fanout_active(ctx: &ConnectionContext) -> bool {
-    // Cheap first gate: one Relaxed load; false until the first replica ever
-    // begins attaching (REPLCONF/PSYNC → ensure_backlogs_allocated).
-    if !crate::replication::state::fanout_hint_active() {
-        return false;
-    }
-    ctx.repl_state.as_ref().is_some_and(|rs| {
-        let g = rs.read();
-        !g.replicas.is_empty()
-            || g.per_shard_backlogs
-                .first()
-                .is_some_and(|slot| slot.lock().is_some())
-    })
+    ctx.repl_write.as_ref().is_some_and(|h| h.fanout_active())
 }
 
 /// Record one successfully-executed local write in the replication plane.
@@ -120,20 +114,19 @@ pub(super) fn record_local_write(
 /// previously up to 3 separate acquisitions (plus the caller's own
 /// `replication_fanout_active` gate check) down to 1 here. `None` (no
 /// `repl_state` configured) is a silent no-op, matching the prior behavior.
+///
+/// moon#1176: through the connection's `ReplWriteHandle` — no
+/// `repl_state.read()` per write. Same body (`record_db_core`) as
+/// `record_local_write_db_on`, the implementation the coordinator's local
+/// legs use (moon#815), over the same `Arc`'d state.
 #[inline]
 pub(super) fn record_local_write_db(ctx: &ConnectionContext, db: usize, bytes: Bytes) {
-    let Some(rs) = ctx.repl_state.as_ref() else {
-        return;
-    };
-    let g = rs.read();
     // R2 (task #20): multi-shard masters merge N shard streams onto one
     // replica wire, so every db-scoped record carries its own fused
     // `SELECT <db>` prefix; single-shard masters emit `SELECT` on change.
-    // Both branches live in `record_local_write_db_on` — the ONE
-    // implementation the coordinator's local legs also use (moon#815).
-    // `ReplicationState::num_shards()` is `ctx.num_shards` (both come from
-    // the boot-time shard count), so the topology decision is unchanged.
-    crate::replication::state::record_local_write_db_on(&g, ctx.shard_id, db, bytes);
+    if let Some(h) = ctx.repl_write.as_ref() {
+        h.record_local_write_db(db, bytes);
+    }
 }
 
 /// Handle FT.* commands. Returns `true` if the command was consumed.

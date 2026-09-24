@@ -1825,6 +1825,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 conn.selected_db,
                 &ctx.aof_pool,
                 &ctx.repl_state,
+                ctx.repl_write.as_ref(),
                 ctx.cached_clock.ms(),
                 ctx.num_shards,
                 can_inline_reads,
@@ -3408,11 +3409,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                                 );
                                 0
                             } else {
-                                aof::AofWriterPool::issue_append_lsn(
-                                    &ctx.repl_state,
-                                    ctx.shard_id,
-                                    serialized.len(),
-                                )
+                                ctx.issue_append_lsn(serialized.len())
                             };
                             if let Some(ref pool) = ctx.aof_pool {
                                 // No await since `move_core`: the fold epoch
@@ -3522,11 +3519,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                                     );
                                     0
                                 } else {
-                                    aof::AofWriterPool::issue_append_lsn(
-                                        &ctx.repl_state,
-                                        ctx.shard_id,
-                                        serialized.len(),
-                                    )
+                                    ctx.issue_append_lsn(serialized.len())
                                 };
                                 if let Some(ref pool) = ctx.aof_pool {
                                     // No await since `copy_core` (see MOVE).
@@ -3924,11 +3917,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                             let lsn = if repl_active {
                                 0
                             } else {
-                                aof::AofWriterPool::issue_append_lsn(
-                                    &ctx.repl_state,
-                                    ctx.shard_id,
-                                    serialized.len(),
-                                )
+                                ctx.issue_append_lsn(serialized.len())
                             };
                             if let Some(ref pool) = ctx.aof_pool {
                                 match pool

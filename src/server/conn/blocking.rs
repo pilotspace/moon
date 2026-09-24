@@ -2551,6 +2551,9 @@ pub(crate) fn try_inline_dispatch(
     repl_state: &Option<
         std::sync::Arc<parking_lot::RwLock<crate::replication::state::ReplicationState>>,
     >,
+    // moon#1176: the connection's lock-free replication write handle; the
+    // inline SET issues its AOF LSN through it (no `repl_state.read()`).
+    repl_write: Option<&crate::replication::state::ReplWriteHandle>,
     now_ms: u64,
     num_shards: usize,
     can_inline_reads: bool,
@@ -3194,17 +3197,14 @@ pub(crate) fn try_inline_dispatch(
     // AOF: reuse the frozen RESP bytes directly (Arc clone, zero-copy).
     // This path is monoio inline GET/SET — the writer for the local shard
     // (shard_id) owns the AOF record; under PerShard layout that routes
-    // to shard_id's writer. LSN must be sourced from `repl_state` so the
+    // to shard_id's writer. LSN must come from the replication offsets so the
     // inline path's writes share an LSN namespace with the non-inline path
     // — otherwise per-shard replay merge in RFC step 5 would see two
-    // disjoint LSN streams per shard. Cost: one extra read-lock acquire
-    // (uncontended) + one atomic fetch_add per inline SET.
+    // disjoint LSN streams per shard. moon#1176: issued through the
+    // connection's lock-free handle (the same atomics); this used to take the
+    // process-wide `ReplicationState` read lock on every inline SET.
     if let Some(pool) = aof_pool {
-        let lsn = crate::persistence::aof::AofWriterPool::issue_append_lsn(
-            repl_state,
-            shard_id,
-            frozen.len(),
-        );
+        let lsn = repl_write.map_or(0, |h| h.issue_lsn(frozen.len()));
         // Bounded backpressure (not fire-and-forget): this path writes `+OK`
         // below, so a silent drop here is a client-acked write that never
         // reached the durability machinery. Fast path is the same try_send;
@@ -3246,6 +3246,9 @@ pub(crate) fn try_inline_dispatch_loop(
     repl_state: &Option<
         std::sync::Arc<parking_lot::RwLock<crate::replication::state::ReplicationState>>,
     >,
+    // moon#1176: the connection's lock-free replication write handle; the
+    // inline SET issues its AOF LSN through it (no `repl_state.read()`).
+    repl_write: Option<&crate::replication::state::ReplWriteHandle>,
     now_ms: u64,
     num_shards: usize,
     can_inline_reads: bool,
@@ -3273,6 +3276,7 @@ pub(crate) fn try_inline_dispatch_loop(
             selected_db,
             aof_pool,
             repl_state,
+            repl_write,
             now_ms,
             num_shards,
             can_inline_reads,

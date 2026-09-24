@@ -980,11 +980,7 @@ pub(crate) async fn persist_txn_aof(
         let lsn = if repl_recorded {
             0
         } else {
-            crate::persistence::aof::AofWriterPool::issue_append_lsn(
-                &ctx.repl_state,
-                ctx.shard_id,
-                bytes.len(),
-            )
+            ctx.issue_append_lsn(bytes.len())
         };
         match pool
             .send_append_group(ctx.shard_id, lsn, db, bytes, fold_stamp)

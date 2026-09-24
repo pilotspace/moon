@@ -2373,7 +2373,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                             if matches!(response, Frame::Integer(1)) {
                                 if let Some(ref bytes) = aof_bytes {
                                     if let Some(ref pool) = ctx.aof_pool {
-                                        let lsn = aof::AofWriterPool::issue_append_lsn(&ctx.repl_state, ctx.shard_id, bytes.len());
+                                        let lsn = ctx.issue_append_lsn(bytes.len());
                                         match pool
                                             .send_append_group(
                                                 ctx.shard_id,
@@ -2472,7 +2472,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                                 if matches!(response, Frame::Integer(1)) {
                                     if let Some(ref bytes) = aof_bytes {
                                         if let Some(ref pool) = ctx.aof_pool {
-                                            let lsn = aof::AofWriterPool::issue_append_lsn(&ctx.repl_state, ctx.shard_id, bytes.len());
+                                            let lsn = ctx.issue_append_lsn(bytes.len());
                                             match pool
                                                 .send_append_group(
                                                     ctx.shard_id,
@@ -2896,7 +2896,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                             };
                             if let Some(ref pool) = ctx.aof_pool {
                                 for bytes in aof_records {
-                                    let lsn = aof::AofWriterPool::issue_append_lsn(&ctx.repl_state, ctx.shard_id, bytes.len());
+                                    let lsn = ctx.issue_append_lsn(bytes.len());
                                     match pool
                                         .send_append_group(
                                             ctx.shard_id,

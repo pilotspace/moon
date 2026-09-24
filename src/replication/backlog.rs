@@ -45,7 +45,10 @@ impl ReplicationBacklog {
     /// Append bytes to the backlog. Evicts oldest bytes when at capacity.
     ///
     /// Bulk-copy implementation (QW5, 2026-06 review finding 1.5): one drain
-    /// plus one extend instead of a per-byte eviction loop. State machine is
+    /// plus one extend instead of a per-byte eviction loop. The extends take
+    /// `data.iter()` (`&u8`), which hits VecDeque's slice specialisation and
+    /// lowers to `memcpy`; `iter().copied()` lowered to a 32-byte SSE loop on
+    /// rustc 1.94 (moon#1176, checked in the emitted assembly). State machine is
     /// identical to the per-byte version — the live window is always the last
     /// `capacity` bytes ever appended, and `start_offset` maintains the
     /// invariant `start_offset = end_offset - buf.len()`.
@@ -54,14 +57,13 @@ impl ReplicationBacklog {
         if data.len() >= self.capacity {
             // The live window comes entirely from the tail of `data`.
             self.buf.clear();
-            self.buf
-                .extend(data[data.len() - self.capacity..].iter().copied());
+            self.buf.extend(data[data.len() - self.capacity..].iter());
         } else {
             let overflow = (self.buf.len() + data.len()).saturating_sub(self.capacity);
             if overflow > 0 {
                 self.buf.drain(..overflow);
             }
-            self.buf.extend(data.iter().copied());
+            self.buf.extend(data.iter());
         }
         self.start_offset = self.end_offset - self.buf.len() as u64;
     }
