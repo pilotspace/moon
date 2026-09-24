@@ -63,3 +63,16 @@ redis-cli parity spot-checked for EVAL/EVALSHA/SCRIPT and error texts against re
 Completeness 0.92 · Clarity 0.93 · Practicality 0.95 · Optimization 0.90 · Edge cases 0.93 ·
 Self-evaluation 0.92 — #1180's wall-clock win is not measurable above this box's noise and is
 reported as such; mechanism and semantics are proven.
+
+## PR #1227 review fixes (orchestrator-committed from the fix agent's report)
+Cherry-picked as `e5bc536` (M1), `a7e8d18` (M2), `d49bcdc` (m1).
+- **M1** — `\` now ends the literal prefix in `subscription_targets_keyspace`: an escaped `PSUBSCRIBE`
+  pattern (e.g. `__keyspace\@0__:*`) is counted as a keyspace listener, so its events are no longer
+  lost. `every_pattern_that_matches_a_keyspace_channel_is_counted` (4 review patterns + a 20,000-pattern
+  property check against `glob_match`) red → green.
+- **M2** — subscriber lists are `Arc<Vec<Subscriber>>` mutated in place with `Arc::make_mut`, so SUBSCRIBE
+  is amortised O(1) again while PUBLISH still snapshots with one `Arc::clone`. Handle clones to fill 1K
+  subscribers 1,498,500 → 0; debug fill 1K → 8K 0.16–0.20 → 3.50–3.71 s before, 0.10–0.19 → 0.91–1.07 s after.
+- **m1** — no empty-list allocation per PUBLISH to a channel without an exact subscriber.
+- Correction: the `pubsub::` unit tests are gated on `runtime-tokio`, so "green on both runtimes" above
+  holds for the integration suites; the unit tests run on the tokio leg only.

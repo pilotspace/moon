@@ -145,3 +145,14 @@ Self-evaluation 0.92.
   members, WRONGTYPE ordering, expired/cold/cold-fault keys (string_mut), 512 MB limits, both
   dispatch paths, listpack vs B+tree vs Owned vs intset encodings — each with a test; verified
   byte-exact against a live redis on 21,898 random cases.
+
+## PR #1227 review fixes (orchestrator-committed from the fix agent's report)
+Cherry-picked as `b6e7926` (geo argument validation + bounded step estimator), `48b13c5` (decoded positions
+clamped like redis; saturating cell successor), `1021483` (ZRANDMEMBER / HRANDFIELD count parsed before the key
+like redis), `c5979ed` (a cloned arena keeps its first chunk within the chunk size), `af02033` (doc).
+- GEO: `geosearch_core` parses per command form exactly like redis 7.0.15's `georadiusGeneric`, with redis's
+  error texts (verified live); `estimate_steps_by_radius` is total and capped. `command::geo::validation_tests`
+  (20 forms × 13 bad radii, both handler twins) and `tests/geo_input_validation.rs` (4 shards, MULTI/EXEC, Lua)
+  red on fea9469, green after. 44 new rows in both consistency scripts match redis byte-for-byte.
+- Residual: hex floats (`0x10`) are accepted by redis's `strtod` but not by moon (pre-existing everywhere); no
+  fuzz target for the rewritten geo parser yet.

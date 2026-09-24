@@ -46,7 +46,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   answers WRONGTYPE even when an earlier key is missing; BITFIELD grows the string under
   `OVERFLOW FAIL`; ZRANDMEMBER with count ≥ size answers highest score first; GEOSEARCH keeps
   redis's unsorted order, honours `ANY` and uses redis's error texts; APPEND / SETRANGE / SETBIT /
-  BITFIELD keep the key's LFU counter and record one access.
+  BITFIELD keep the key's LFU counter and record one access. GEOSEARCH / GEORADIUS* parse like redis's
+  `georadiusGeneric`: a negative or non-numeric radius, width or height is an error with redis's text,
+  clauses may come in any order, a missing key still validates every option, FROMMEMBER of an absent
+  member is an error, and positions decoded from out-of-range scores are clamped to WGS84.
+  ZRANDMEMBER / HRANDFIELD parse the count before the key with redis's strict integer rules (`+1`,
+  `01`, `-0` and an extra argument are errors).
 - **Vector: WARM segments rank like their HOT source** (moon#1213) — they carry real sub-centroid
   signs and use the 32-level LUT. New opt-in `MOON_VECTOR_PAYLOAD_SCHEMA=declared` indexes only
   declared TAG/NUMERIC payload fields and routes KNN TEXT filters to the BM25 plane (filters on
