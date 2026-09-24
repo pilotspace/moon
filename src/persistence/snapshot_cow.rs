@@ -17,9 +17,10 @@
 //! the shard event loop's own stack. A **Lua script** runs on a connection
 //! task (or inside the routed `ShardMessage::Execute` arm) and issues its
 //! writes from `scripting::bridge`, which has no access to that state.
-//! Worse, `cow_intercept` keys off `command[1]` — for `EVAL <script> <n> k`
-//! that argument is the SCRIPT BODY, not a key, so even wrapping the
-//! `handle_eval` call sites in it would capture the wrong thing.
+//! Worse, `EVAL <script> <n> k` names its keys by position only — which of
+//! them the script WRITES is known only per `redis.call` — so wrapping the
+//! `handle_eval` call sites in `cow_intercept` could not capture the right
+//! keys (it used to key off `command[1]`, the script body).
 //!
 //! # Design: capture eagerly, filter at the drain
 //!
@@ -276,14 +277,13 @@ fn flush_args_accepted(args: &[Frame]) -> bool {
     }
 }
 
-/// Capture the pre-image of the key a `cmd + args` write is about to touch.
+/// Capture the pre-images of the keys a script's `redis.call(cmd, args..)`
+/// is about to write.
 ///
-/// `cmd_and_args[0]` is the command name and `cmd_and_args[1]` its first
-/// argument — the same "primary key = `command[1]`" contract
-/// `spsc_handler::cow_intercept` uses for ordinary commands, so a script's
-/// writes get exactly the fidelity the generic path has (multi-key writes
-/// capture their first key; extending that is one shared follow-up for both
-/// paths, not a script-specific gap).
+/// `cmd_and_args[0]` is the command name. Every WRITTEN key position is
+/// captured (moon#1217), through the same walker as
+/// [`capture_dispatch_pre_image`] — a script's writes get exactly the
+/// fidelity the generic path has.
 ///
 /// Costs one thread-local `bool` load when no snapshot is in flight.
 #[inline]
@@ -291,10 +291,13 @@ pub(crate) fn capture_command_pre_image(db: &Database, db_index: usize, cmd_and_
     if !is_armed() {
         return;
     }
-    let Some(Frame::BulkString(key)) = cmd_and_args.get(1) else {
+    let Some((Frame::BulkString(cmd), args)) = cmd_and_args.split_first() else {
         return;
     };
-    capture_key(db, db_index, key);
+    if !crate::command::metadata::is_write(cmd) {
+        return;
+    }
+    capture_written_keys(db, db_index, cmd, args);
 }
 
 /// Capture the pre-image for a generic command about to run against `db`
@@ -322,12 +325,11 @@ pub(crate) fn capture_command_pre_image(db: &Database, db_index: usize, cmd_and_
 /// which is not wired into the shipped server and runs no shard event loop,
 /// so it can never be armed.
 ///
-/// Fidelity note: multi-key writes capture their PRIMARY key only, the same
-/// contract `cow_intercept` has always had. Every non-idempotent single-key
-/// write (`INCR`, `APPEND`, `SETRANGE`, `HINCRBY`, `LPUSH`, `ZINCRBY`, …) is
-/// therefore covered; a destination-key write like `LMOVE src dst` still
-/// captures only `src`. Widening that is one shared follow-up for both
-/// paths, not a local-path gap.
+/// Every key position the command may WRITE is captured (moon#1217) — the
+/// destination of `LMOVE`/`SMOVE`/`RENAME`/`COPY`/`SORT ... STORE`,
+/// `k2..kN` of `MSET`/`DEL`, the non-first keys of `LMPOP`/`ZMPOP` —
+/// not just `command[1]`: otherwise the file mixes pre- and post-epoch
+/// states of the keys one atomic command touched.
 #[inline]
 pub(crate) fn capture_dispatch_pre_image(
     db: &Database,
@@ -349,10 +351,39 @@ pub(crate) fn capture_dispatch_pre_image(
     if !crate::command::metadata::is_write(cmd) {
         return;
     }
-    let Some(key) = crate::server::conn::shared::extract_primary_key(cmd, args) else {
-        return;
-    };
-    capture_key(db, db_index, key);
+    capture_written_keys(db, db_index, cmd, args);
+}
+
+/// Capture every key position `cmd args..` may WRITE (moon#1217).
+///
+/// The positions come from the one key walker every consumer shares
+/// (`acl::keyspec::command_key_positions`, which also drives blocking
+/// wake-ups and client-tracking invalidation): its `Write` role is
+/// deliberately over-inclusive where the argv cannot say (`LMPOP 2 a b`
+/// writes whichever is non-empty, so both are `Write`) — for a snapshot that
+/// costs at most a clone, while a missed key would be a post-epoch value in
+/// the file. An argv the walker cannot enumerate falls back to the primary
+/// key, the pre-moon#1217 contract.
+fn capture_written_keys(db: &Database, db_index: usize, cmd: &[u8], args: &[Frame]) {
+    use crate::acl::keyspec::{KeyPositions, KeyRole, command_key_positions};
+    match command_key_positions(cmd, args) {
+        KeyPositions::At(positions) | KeyPositions::AtPlusComputed(positions) => {
+            for at in positions.iter().filter(|at| at.role == KeyRole::Write) {
+                if let Some(key) = args
+                    .get(at.idx)
+                    .and_then(crate::command::helpers::extract_bytes)
+                {
+                    capture_key(db, db_index, key);
+                }
+            }
+        }
+        KeyPositions::None => {}
+        KeyPositions::Unknown => {
+            if let Some(key) = crate::server::conn::shared::extract_primary_key(cmd, args) {
+                capture_key(db, db_index, key);
+            }
+        }
+    }
 }
 
 /// Capture the pre-image for a write whose key is already parsed — the

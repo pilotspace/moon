@@ -1087,3 +1087,6 @@ mod split_epoch_tests;
 
 #[cfg(test)]
 mod table_swap_tests;
+
+#[cfg(test)]
+mod multi_key_cow_tests;

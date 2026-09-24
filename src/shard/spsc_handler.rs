@@ -4573,6 +4573,9 @@ fn parse_geo_value(s: &str) -> Option<(f64, f64)> {
 /// `k` absent from the state's overflow and captured the post-`INCR` value
 /// there, and the drain's first-wins then discarded the true pre-image. One
 /// queue keeps every capture of an epoch in the order the writes ran.
+///
+/// moon#1217: every key position the command may WRITE is captured (the
+/// shared keyspec walker), not only `command[1]`.
 pub(crate) fn cow_intercept(
     snapshot: &mut Option<SnapshotState>,
     db: &Database,

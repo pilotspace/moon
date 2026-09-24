@@ -174,6 +174,15 @@ fn keys_created_during_the_epoch_are_absent_from_the_snapshot() {
 /// dispatch, most through dispatch alone — against segment advances and
 /// drains, across three databases. The file must equal the epoch-start
 /// keyspace exactly.
+/// A key: mostly an epoch-start one, sometimes a post-epoch one.
+fn pick(rng: &mut Rng, names: &[Vec<u8>], fresh: u64, db: usize) -> Vec<u8> {
+    if !names.is_empty() && rng.below(4) != 0 {
+        names[rng.below(names.len() as u64) as usize].clone()
+    } else {
+        format!("n{db}:{:06}", rng.below(fresh + 1)).into_bytes()
+    }
+}
+
 /// What one randomized epoch did, so the test can prove it exercised the
 /// structural change it claims to (a green run over a fixture that never
 /// split would be vacuous).
@@ -205,17 +214,22 @@ fn run_randomized_epoch(seed: u64, cov: &mut Coverage) -> super::epoch_harness::
     for _ in 0..6000 {
         let db = rng.below(3) as usize;
         let op = rng.below(100);
-        // A key: mostly an epoch-start one, sometimes a post-epoch one.
-        let key: Vec<u8> = if !names[db].is_empty() && rng.below(4) != 0 {
-            names[db][rng.below(names[db].len() as u64) as usize].clone()
-        } else {
-            format!("n{db}:{:06}", rng.below(fresh + 1)).into_bytes()
-        };
+        let key = pick(&mut rng, &names[db], fresh, db);
         let parts: Vec<Vec<u8>> = match op {
             0..=24 => vec![b"INCR".to_vec(), key],
             25..=39 => vec![b"SET".to_vec(), key, b"x".to_vec()],
             40..=54 => vec![b"DEL".to_vec(), key],
-            55..=64 => vec![b"APPEND".to_vec(), key, b"+".to_vec()],
+            55..=60 => vec![b"APPEND".to_vec(), key, b"+".to_vec()],
+            // moon#1217: multi-key writes, the second key usually elsewhere
+            // in hash space (and often in another segment's range).
+            61..=64 => {
+                let other = pick(&mut rng, &names[db], fresh, db);
+                match rng.below(3) {
+                    0 => vec![b"MSET".to_vec(), key, b"m".to_vec(), other, b"m".to_vec()],
+                    1 => vec![b"DEL".to_vec(), key, other],
+                    _ => vec![b"RENAME".to_vec(), key, other],
+                }
+            }
             65..=74 => {
                 // An insert burst: splits whatever segments these land in.
                 let n = 1 + rng.below(400);
