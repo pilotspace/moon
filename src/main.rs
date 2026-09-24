@@ -605,19 +605,20 @@ fn main() -> anyhow::Result<()> {
     )
     .map_err(|e| anyhow::anyhow!(e))?;
     moon::shard::db_plane::set_cross_shard_fast_path(fast_path_on);
-    // The dispatch site lives in `handler_monoio`. On the tokio leg
-    // `handler_sharded` still routes every cross-shard read through SPSC, so an
-    // explicit `on` there is accepted and does nothing at all -- exactly the
-    // moon#776 failure this feature was written to fix. Say so rather than let
-    // an operator tune against a no-op. `auto` cannot reach this: it resolves
-    // to `false` without the monoio handler.
+    // The read dispatch site lives in `handler_monoio`. On the tokio leg
+    // `handler_sharded` still routes every cross-shard READ through SPSC, so an
+    // explicit `on` there only affects WATCH's version snapshot (moon#1183,
+    // `coordinator::snapshot_versions`, which is runtime-neutral) -- plain
+    // reads keep the hop, the moon#776 failure this feature was written to fix.
+    // Say so rather than let an operator tune reads against a no-op. `auto`
+    // cannot reach this: it resolves to `false` without the monoio handler.
     #[cfg(feature = "runtime-tokio")]
     if fast_path_on {
         tracing::warn!(
-            "--cross-shard-fast-path is enabled but has NO EFFECT on the tokio \
-             runtime: the fast path is implemented only in the monoio connection \
-             handler. Cross-shard reads will take the SPSC hop and \
-             total_dispatch_cross_read_fast will stay at 0."
+            "--cross-shard-fast-path on the tokio runtime only affects WATCH \
+             version reads: the cross-shard READ fast path is implemented only in \
+             the monoio connection handler. Cross-shard reads will take the SPSC \
+             hop and total_dispatch_cross_read_fast will stay at 0."
         );
     }
 
