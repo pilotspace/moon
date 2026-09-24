@@ -261,15 +261,52 @@ fn write_mpf_pages(
 ///
 /// Each page holds up to 65440 bytes of data (65536 - 64 header - 32 sub-header).
 /// The 32-byte VecCodes sub-header is written with default values (zeroed
-/// collection/dimension fields). Callers can use `write_codes_mpf_with_meta`
-/// for populated sub-headers once collection metadata is available at write time.
+/// collection/dimension fields) and `has_sub_signs = 0`.
 pub fn write_codes_mpf(path: &Path, file_id: u64, codes_data: &[u8]) -> std::io::Result<()> {
-    let sub_fn = |buf: &mut [u8], _page_idx: usize, data_len: usize| {
-        // Default sub-header: vector_count derived from data, rest zeroed
-        // quantization=4 (TQ4 default), bytes_per_code=0
-        write_vec_codes_sub_header(buf, 0, 0, 0, 0, 4, 0, data_len as u16, false);
+    write_codes_mpf_with_sub_signs(path, file_id, codes_data, &[])
+}
+
+/// Byte offset of `has_sub_signs` inside the VecCodes sub-header.
+pub const VEC_CODES_HAS_SUB_SIGNS_OFFSET: usize = 25;
+
+/// [`write_codes_mpf`] carrying the segment's sub-centroid sign bits
+/// (moon#1213): the page payload stream is `codes ++ sub_signs` (BFS order,
+/// `ceil(padded_dim / 8)` sign bytes per vector after all `n` codes) and
+/// every page's sub-header sets `has_sub_signs = 1`. Empty `sub_signs` writes
+/// exactly what [`write_codes_mpf`] always wrote (`has_sub_signs = 0`).
+///
+/// Compatibility: a reader that predates the flag slices codes by
+/// `bfs_pos * bytes_per_code` from the start of the stream, so the trailing
+/// signs are invisible to it (16-level search, as before); a flag-aware
+/// reader ([`codes_mpf_has_sub_signs`]) splits them off and searches with
+/// the 32-level LUT, like the HOT segment the file was written from.
+pub fn write_codes_mpf_with_sub_signs(
+    path: &Path,
+    file_id: u64,
+    codes_data: &[u8],
+    sub_signs: &[u8],
+) -> std::io::Result<()> {
+    let has_sub_signs = !sub_signs.is_empty();
+    let joined: Vec<u8>;
+    let data: &[u8] = if has_sub_signs {
+        joined = [codes_data, sub_signs].concat();
+        &joined
+    } else {
+        codes_data
     };
-    write_mpf_pages(path, file_id, PageType::VecCodes, codes_data, Some(&sub_fn))
+    let sub_fn = move |buf: &mut [u8], _page_idx: usize, data_len: usize| {
+        // vector_count derived from data, rest zeroed; quantization=4 (TQ4
+        // default), bytes_per_code=0.
+        write_vec_codes_sub_header(buf, 0, 0, 0, 0, 4, 0, data_len as u16, has_sub_signs);
+    };
+    write_mpf_pages(path, file_id, PageType::VecCodes, data, Some(&sub_fn))
+}
+
+/// Whether a `codes.mpf` file image declares trailing sub-centroid signs
+/// (`has_sub_signs` in the first page's VecCodes sub-header; zero — the
+/// reserved value — in every file written before moon#1213).
+pub fn codes_mpf_has_sub_signs(file: &[u8]) -> bool {
+    file.get(MOONPAGE_HEADER_SIZE + VEC_CODES_HAS_SUB_SIGNS_OFFSET) == Some(&1)
 }
 
 /// Write HNSW graph adjacency data to a .mpf file with 4KB VecGraph pages.

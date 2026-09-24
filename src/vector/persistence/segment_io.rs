@@ -632,25 +632,10 @@ pub fn read_immutable_segment(
         }
     };
 
-    // Reconstruct dense Gaussian QJL matrices from deterministic seeds.
-    // Only generated in Exact mode — Light mode uses sub-centroid reranking instead.
-    const QJL_NUM_PROJECTIONS: usize = 8;
-    let (qjl_matrices, qjl_num_projections) = if build_mode
-        == crate::vector::turbo_quant::collection::BuildMode::Exact
-        && quantization.is_turbo_quant()
-    {
-        let matrices: Vec<Vec<f32>> = (0..QJL_NUM_PROJECTIONS)
-            .map(|m| {
-                crate::vector::turbo_quant::qjl::generate_qjl_matrix(
-                    meta.dimension as usize,
-                    meta.collection_id.wrapping_add(1 + m as u64),
-                )
-            })
-            .collect();
-        (matrices, QJL_NUM_PROJECTIONS)
-    } else {
-        (Vec::new(), 0)
-    };
+    // QJL matrices are seeded by the collection id and only hashed into the
+    // checksum (never materialized, moon#1213).
+    let qjl_num_projections =
+        crate::vector::turbo_quant::collection::qjl_projections_for(build_mode, quantization);
 
     let sub_centroid_table = if quantization.is_turbo_quant() {
         Some(
@@ -678,7 +663,7 @@ pub fn read_immutable_segment(
         codebook: codebook.clone(),
         codebook_boundaries: boundaries.clone(),
         metadata_checksum: meta.metadata_checksum,
-        qjl_matrices,
+        qjl_seed: meta.collection_id,
         qjl_num_projections,
         build_mode,
         sub_centroid_table,
@@ -720,7 +705,6 @@ pub fn read_immutable_segment(
 
     // 6. Construct ImmutableSegment
     let dim = meta.dimension as usize;
-    let qjl_bpv = (dim + 7) / 8;
     let sub_sign_bpv = (meta.padded_dimension as usize + 7) / 8;
 
     // 6b. raw_f16.bin — optional exact-rerank sidecar (HQ-1). Missing file
@@ -766,9 +750,6 @@ pub fn read_immutable_segment(
     let segment = ImmutableSegment::new(
         graph,
         vectors_tq,
-        Vec::new(), // QJL signs — not persisted (never read on a reloaded segment)
-        Vec::new(), // residual norms — not persisted
-        qjl_bpv,
         sub_signs,
         sub_sign_bpv,
         mvcc,
@@ -884,16 +865,12 @@ mod tests {
         let graph = builder.build(bytes_per_code as u32);
 
         let mut tq_buffer_bfs = vec![0u8; n * bytes_per_code];
-        let qjl_bytes_per_vec = (dim + 7) / 8;
-        let qjl_signs_bfs = vec![0u8; n * qjl_bytes_per_vec];
-        let residual_norms_bfs = vec![0.0f32; n];
         for bfs_pos in 0..n {
             let orig_id = graph.to_original(bfs_pos as u32) as usize;
             let src = orig_id * bytes_per_code;
             let dst = bfs_pos * bytes_per_code;
             tq_buffer_bfs[dst..dst + bytes_per_code]
                 .copy_from_slice(&tq_buffer_orig[src..src + bytes_per_code]);
-            // QJL signs and residual norms: use zeros for test
         }
 
         let mvcc: Vec<MvccHeader> = (0..n as u32)
@@ -911,9 +888,6 @@ mod tests {
         let segment = ImmutableSegment::new(
             graph,
             AlignedBuffer::from_vec(tq_buffer_bfs),
-            qjl_signs_bfs,
-            residual_norms_bfs,
-            qjl_bytes_per_vec,
             Vec::new(), // sub-centroid signs — not needed for IO test
             sub_sign_bpv,
             mvcc,

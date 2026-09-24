@@ -13,6 +13,20 @@ pub const DEFAULT_M: u8 = 16;
 /// Default layer-0 connectivity (2 * M).
 pub const DEFAULT_M0: u8 = 32;
 
+/// Code-row cache lines [`HnswGraph::prefetch_node`] hints at most (1 KiB:
+/// a whole 1536d TQ4 row is 17 lines — the hardware streamer takes the tail).
+pub const PREFETCH_MAX_CODE_LINES: usize = 16;
+/// Total lines per [`HnswGraph::prefetch_node`] call (code + sign rows).
+const PREFETCH_MAX_LINES: usize = 20;
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only A/B switch: `true` makes `prefetch_node` issue HEAD's
+    /// pattern (2 own-neighbour lines + 3 code lines) for the in-binary
+    /// interleaved measurement in `hnsw::prefetch_ab_tests`.
+    pub(crate) static PREFETCH_LEGACY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// Immutable HNSW graph with BFS-reordered layer 0 for cache-friendly traversal.
 ///
 /// Layer 0 neighbors are stored in a flat `AlignedBuffer<u32>` indexed by BFS position.
@@ -247,65 +261,103 @@ impl HnswGraph {
         self.bfs_inverse[bfs_pos as usize]
     }
 
-    /// Dual prefetch: neighbor list + vector data for a BFS-positioned node.
-    /// Prefetches 2 cache lines of neighbors (128 bytes = 32 u32s at M0=32)
-    /// and 3 cache lines of TQ code data (~192 bytes covers 512-byte TQ code start).
+    /// Prefetch what scoring a beam candidate at `bfs_pos` reads next: its
+    /// whole TQ code row (all `ceil(bytes_per_code / 64)` cache lines, capped
+    /// at [`PREFETCH_MAX_CODE_LINES`]) and, when the beam scores with the
+    /// 32-level LUT, its sub-centroid sign row (moon#1213).
+    ///
+    /// HEAD prefetched 2 lines of the candidate's OWN neighbour list plus the
+    /// first 3 code lines: the whole code at 128d, but 3 of 9 lines at 768d,
+    /// no sign lines, and a neighbour list that is read only if (much later)
+    /// the candidate is popped from the heap — most never are. Pass an empty
+    /// `sub_signs` for the 16-level LUT.
     #[inline(always)]
-    pub fn prefetch_node(&self, bfs_pos: u32, _vectors_tq: &[u8]) {
-        let neighbor_offset = bfs_pos as usize * self.m0 as usize;
-        let vector_offset = bfs_pos as usize * self.bytes_per_code as usize;
+    pub fn prefetch_node(
+        &self,
+        bfs_pos: u32,
+        vectors_tq: &[u8],
+        sub_signs: &[u8],
+        sub_sign_bpv: usize,
+    ) {
+        // Addresses are formed with `wrapping_add` (safe): prefetching one is
+        // a hint only, so they never need to be in bounds.
+        let mut addrs = [core::ptr::null::<u8>(); PREFETCH_MAX_LINES];
+        let mut n = 0usize;
+        let bpc = self.bytes_per_code as usize;
+        let code = vectors_tq.as_ptr().wrapping_add(bfs_pos as usize * bpc);
+
+        #[cfg(test)]
+        let legacy = PREFETCH_LEGACY.with(std::cell::Cell::get);
+        #[cfg(not(test))]
+        let legacy = false;
+
+        if legacy {
+            // HEAD's pattern, kept for the in-binary A/B (test builds only).
+            let nb = self
+                .layer0_neighbors
+                .as_ptr()
+                .cast::<u8>()
+                .wrapping_add(bfs_pos as usize * self.m0 as usize * 4);
+            for p in [nb, nb.wrapping_add(64)] {
+                addrs[n] = p;
+                n += 1;
+            }
+            for line in 0..3 {
+                addrs[n] = code.wrapping_add(line * 64);
+                n += 1;
+            }
+        } else {
+            for line in 0..bpc.div_ceil(64).min(PREFETCH_MAX_CODE_LINES) {
+                addrs[n] = code.wrapping_add(line * 64);
+                n += 1;
+            }
+            if sub_sign_bpv > 0 && !sub_signs.is_empty() {
+                let signs = sub_signs
+                    .as_ptr()
+                    .wrapping_add(bfs_pos as usize * sub_sign_bpv);
+                for line in 0..sub_sign_bpv.div_ceil(64).min(PREFETCH_MAX_LINES - n) {
+                    addrs[n] = signs.wrapping_add(line * 64);
+                    n += 1;
+                }
+            }
+        }
 
         #[cfg(target_arch = "x86_64")]
         {
             use core::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
-            let nptr = self.layer0_neighbors.as_ptr();
-            let vptr = _vectors_tq.as_ptr();
             // SAFETY: prefetch is an architectural hint on x86_64. Out-of-bounds
             // prefetch addresses do not fault -- the CPU silently ignores them.
             // No memory is read or written; only the cache hierarchy is hinted.
             unsafe {
-                _mm_prefetch(nptr.add(neighbor_offset) as *const i8, _MM_HINT_T0);
-                _mm_prefetch(nptr.add(neighbor_offset + 16) as *const i8, _MM_HINT_T0);
-                _mm_prefetch(vptr.add(vector_offset) as *const i8, _MM_HINT_T0);
-                _mm_prefetch(vptr.add(vector_offset + 64) as *const i8, _MM_HINT_T0);
-                _mm_prefetch(vptr.add(vector_offset + 128) as *const i8, _MM_HINT_T0);
+                for &p in &addrs[..n] {
+                    _mm_prefetch(p.cast::<i8>(), _MM_HINT_T0);
+                }
             }
         }
 
         #[cfg(target_arch = "aarch64")]
         {
             // Stable-Rust PRFM via inline asm (the stdarch `_prefetch` intrinsic
-            // is nightly-only, but `asm!` is stable). Mirrors the x86_64 hint
-            // pattern above: 2 neighbor cache lines + 3 TQ-code cache lines.
-            let nptr = self.layer0_neighbors.as_ptr();
-            let vptr = _vectors_tq.as_ptr();
-            // Addresses are formed with `wrapping_add` so `pointer::add`'s
-            // in-bounds contract is never invoked; the asm only materializes
+            // is nightly-only, but `asm!` is stable); the asm only materializes
             // each address in a register.
             // SAFETY: PRFM PLDL1KEEP is an architectural hint — it never
             // faults, never architecturally reads or writes memory, and
             // silently ignores invalid/out-of-bounds addresses.
             unsafe {
                 use core::arch::asm;
-                asm!(
-                    "prfm pldl1keep, [{n0}]",
-                    "prfm pldl1keep, [{n1}]",
-                    "prfm pldl1keep, [{v0}]",
-                    "prfm pldl1keep, [{v1}]",
-                    "prfm pldl1keep, [{v2}]",
-                    n0 = in(reg) nptr.wrapping_add(neighbor_offset),
-                    n1 = in(reg) nptr.wrapping_add(neighbor_offset + 16),
-                    v0 = in(reg) vptr.wrapping_add(vector_offset),
-                    v1 = in(reg) vptr.wrapping_add(vector_offset + 64),
-                    v2 = in(reg) vptr.wrapping_add(vector_offset + 128),
-                    options(nostack, preserves_flags, readonly)
-                );
+                for &p in &addrs[..n] {
+                    asm!(
+                        "prfm pldl1keep, [{a}]",
+                        a = in(reg) p,
+                        options(nostack, preserves_flags, readonly)
+                    );
+                }
             }
         }
 
         #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
         {
-            let _ = (neighbor_offset, vector_offset);
+            let _ = (addrs, n);
         }
     }
 
@@ -713,7 +765,8 @@ mod tests {
         );
 
         // Should compile and not panic
-        graph.prefetch_node(0, &vectors_tq);
+        graph.prefetch_node(0, &vectors_tq, &[], 0);
+        graph.prefetch_node(0, &vectors_tq, &[0u8; 4], 4);
     }
 
     #[test]

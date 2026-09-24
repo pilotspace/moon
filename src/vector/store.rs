@@ -63,6 +63,11 @@ pub enum FieldType {
         sortable: bool,
         noindex: bool,
     },
+    /// TAG field (moon#1194): declared in the schema, so schema-aware payload
+    /// indexing (`MOON_VECTOR_PAYLOAD_SCHEMA=declared`) indexes it.
+    Tag { field_name: Bytes },
+    /// NUMERIC field (moon#1194), same role as [`FieldType::Tag`].
+    Numeric { field_name: Bytes },
 }
 
 /// Metadata describing a vector index (from FT.CREATE).
@@ -1520,12 +1525,29 @@ impl VectorIndex {
                 .raw_f16()
                 .filter(|halves| !halves.is_empty())
                 .map(crate::vector::segment::raw_f16_store::RawF16Store::le_bytes);
+            // moon#1213: carry the sub-centroid signs too, so the WARM beam
+            // keeps the HOT segment's 32-level LUT. Only a complete buffer
+            // (one row per entry) of REAL signs: SQ8's buffer is never read,
+            // and an all-zero buffer is an insert-time placeholder (LIGHT
+            // A2/SQ8) that would pin every coordinate to the lower sub-bin —
+            // the 16-level LUT is the unbiased fallback for those.
+            let sub_signs = imm.sub_centroid_signs();
+            let sub_signs: &[u8] = if self.collection.quantization != QuantizationConfig::Sq8
+                && !sub_signs.is_empty()
+                && sub_signs.len() == imm.mvcc_headers().len() * imm.sub_sign_bytes_per_vec()
+                && sub_signs.iter().any(|&b| b != 0)
+            {
+                sub_signs
+            } else {
+                &[]
+            };
 
-            match crate::storage::tiered::warm_tier::transition_to_warm(
+            match crate::storage::tiered::warm_tier::transition_to_warm_with_sub_signs(
                 shard_dir,
                 file_id, // segment_id == file_id
                 file_id,
                 codes_data,
+                sub_signs,
                 &graph_bytes,
                 raw_f16_bytes.as_deref(),
                 &mvcc_data,
@@ -1853,7 +1875,7 @@ impl VectorStore {
     /// all vector indexes on this shard.
     ///
     /// Mutable = brute-force buffers (TQ codes + raw f32 + entries).
-    /// Immutable = HNSW graphs + TQ codes + QJL + norms + MVCC headers.
+    /// Immutable = HNSW graphs + TQ codes + sub-centroid signs + MVCC headers.
     /// O(index_count * segment_count) -- acceptable for metrics scrape cadence.
     pub fn resident_bytes(&self) -> (usize, usize) {
         let mut total_mutable: usize = 0;
@@ -1963,6 +1985,8 @@ impl VectorStore {
         }
 
         let name = meta.name.clone();
+        let payload_schema =
+            crate::vector::filter::payload_schema::schema_for_index(&meta.schema_fields);
 
         // B2 (durability): defensive id-space floor. If this index's
         // `idx-<hex>` dir already has a manifest — e.g. FLUSHALL/DROP just
@@ -1991,7 +2015,9 @@ impl VectorStore {
                 segments,
                 scratch,
                 collection,
-                payload_index: PayloadIndex::new(),
+                // moon#1194: opt-in schema-aware payload indexing
+                // (`MOON_VECTOR_PAYLOAD_SCHEMA=declared`); `None` otherwise.
+                payload_index: PayloadIndex::with_schema(payload_schema),
                 key_hash_to_key: BucketedKeyMap::new(),
                 key_hash_to_global_id: BucketedKeyMap::new(),
                 key_hash_to_vec_checksum: BucketedKeyMap::new(),
@@ -2115,6 +2141,8 @@ impl VectorStore {
         }
 
         let name = meta.name.clone();
+        let payload_schema =
+            crate::vector::filter::payload_schema::schema_for_index(&meta.schema_fields);
 
         self.indexes.insert(
             name.clone(),
@@ -2123,7 +2151,9 @@ impl VectorStore {
                 segments,
                 scratch,
                 collection,
-                payload_index: PayloadIndex::new(),
+                // moon#1194: opt-in schema-aware payload indexing
+                // (`MOON_VECTOR_PAYLOAD_SCHEMA=declared`); `None` otherwise.
+                payload_index: PayloadIndex::with_schema(payload_schema),
                 key_hash_to_key: BucketedKeyMap::new(),
                 key_hash_to_global_id: BucketedKeyMap::new(),
                 key_hash_to_vec_checksum: BucketedKeyMap::new(),
@@ -4137,9 +4167,6 @@ mod tests {
             graph,
             AlignedBuffer::new(0),
             Vec::new(),
-            Vec::new(),
-            16,
-            Vec::new(),
             16,
             Vec::new(),
             collection,
@@ -4221,9 +4248,6 @@ mod tests {
         let imm = Arc::new(ImmutableSegment::new(
             graph,
             AlignedBuffer::new(0),
-            Vec::new(),
-            Vec::new(),
-            16,
             Vec::new(),
             16,
             Vec::new(),

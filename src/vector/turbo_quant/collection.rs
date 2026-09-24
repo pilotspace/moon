@@ -13,14 +13,17 @@ use super::sub_centroid::SubCentroidTable;
 use crate::vector::aligned_buffer::AlignedBuffer;
 use crate::vector::types::DistanceMetric;
 
-/// HNSW build mode: controls whether raw f32 and QJL are retained.
+/// HNSW build mode: controls whether raw f32 vectors are retained.
 ///
-/// - **Light** (default): No raw f32 retention, no QJL matrices. Build HNSW with
-///   TQ-decoded centroid pairwise distance. Mutable brute-force uses TQ-ADC.
-///   Memory: ~372 B/vec mutable, ~452 B/vec immutable. Compaction: ~1.6s/10K.
+/// - **Light** (default): No raw f32 retention. Build HNSW from the f16
+///   sidecar (TQ-decoded centroids when there is none). Mutable brute-force
+///   uses TQ-ADC.
 ///
-/// - **Exact**: Retain raw f32 for exact L2 pairwise HNSW build + QJL signs.
-///   Higher recall (+2-3%) at cost of 5× more mutable memory and 5× slower compaction.
+/// - **Exact**: Retain raw f32 in the mutable segment for the exact-L2
+///   pairwise HNSW build and sub-centroid signs from the raw vectors. No QJL
+///   data is computed or kept anywhere (moon#1192, moon#1213); the build mode
+///   still selects the seed of the (never materialized) QJL matrices hashed
+///   into `metadata_checksum`, so persisted segments keep verifying.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum BuildMode {
@@ -119,17 +122,19 @@ pub struct CollectionMetadata {
     /// XXHash64 of all fields above. Verified at load and search init.
     pub metadata_checksum: u64,
 
-    /// QJL dense Gaussian projection matrices for unbiased inner product estimation.
+    /// Base seed of the QJL dense Gaussian projection matrices: matrix `m`
+    /// (of `qjl_num_projections`) is `qjl::generate_qjl_matrix(dimension,
+    /// qjl_seed + 1 + m)` — see [`Self::qjl_matrices`].
     ///
-    /// The QJL unbiasedness proof requires rows sᵢ ~ N(0, I) so that
-    /// (sᵢᵀx, sᵢᵀy) is jointly Gaussian. SRHT violates this assumption
-    /// and introduces bias. Dense Gaussian is mathematically correct.
-    ///
-    /// M independent d×d matrices. Memory: M × d² × 4 bytes.
-    /// M=4 at 768d = 9 MB shared. M=8 for 95%+ recall = 18 MB.
-    pub qjl_matrices: Vec<Vec<f32>>,
-    /// Number of QJL projections (M). Higher M = lower variance = better recall.
-    /// M=4: ~91% recall. M=8: ~95% recall.
+    /// The matrices are NOT held (moon#1213). Since immutable segments
+    /// dropped their QJL data nothing reads them, and holding them cost
+    /// `M·d²·4` B per collection: 18.9 MB at 768d, per index, per shard —
+    /// and again per reloaded EXACT segment, which each rebuild their own
+    /// collection. They stay part of `metadata_checksum` (streamed, see
+    /// `compute_checksum`) so every persisted checksum still verifies.
+    pub qjl_seed: u64,
+    /// Number of QJL projections (M): 8 for EXACT scalar-TQ collections,
+    /// 0 otherwise.
     pub qjl_num_projections: usize,
 
     /// HNSW build mode: Light (no raw f32/QJL) or Exact (retain raw f32 for build).
@@ -155,6 +160,20 @@ impl std::fmt::Display for CollectionMetadataError {
                 "metadata checksum mismatch: expected {expected:#x}, got {actual:#x}"
             ),
         }
+    }
+}
+
+/// QJL projections a collection is checksummed with: 8 for EXACT
+/// TurboQuant collections, 0 otherwise.
+pub(crate) fn qjl_projections_for(
+    build_mode: BuildMode,
+    quantization: QuantizationConfig,
+) -> usize {
+    const QJL_NUM_PROJECTIONS: usize = 8;
+    if build_mode == BuildMode::Exact && quantization.is_turbo_quant() {
+        QJL_NUM_PROJECTIONS
+    } else {
+        0
     }
 }
 
@@ -205,23 +224,9 @@ impl CollectionMetadata {
             *val = if (rng_state >> 63) == 0 { 1.0 } else { -1.0 };
         }
 
-        // QJL matrices: only generated in Exact mode.
-        // Light mode skips QJL entirely (sub-centroid handles reranking).
-        const QJL_NUM_PROJECTIONS: usize = 8;
-        let (qjl_matrices, qjl_num_projections) =
-            if build_mode == BuildMode::Exact && quantization.is_turbo_quant() {
-                let matrices: Vec<Vec<f32>> = (0..QJL_NUM_PROJECTIONS)
-                    .map(|m| {
-                        super::qjl::generate_qjl_matrix(
-                            dimension as usize,
-                            seed.wrapping_add(1 + m as u64),
-                        )
-                    })
-                    .collect();
-                (matrices, QJL_NUM_PROJECTIONS)
-            } else {
-                (Vec::new(), 0)
-            };
+        // QJL matrices: Exact mode only, and only as a checksum input (never
+        // materialized — see `qjl_seed`).
+        let qjl_num_projections = qjl_projections_for(build_mode, quantization);
 
         // Build sub-centroid table for sign-bit refinement (doubles effective resolution).
         let sub_centroid_table = if quantization.is_turbo_quant() {
@@ -255,7 +260,7 @@ impl CollectionMetadata {
                 Vec::new()
             },
             metadata_checksum: 0, // computed below
-            qjl_matrices,
+            qjl_seed: seed,
             qjl_num_projections,
             build_mode,
             sub_centroid_table,
@@ -264,9 +269,27 @@ impl CollectionMetadata {
         meta
     }
 
+    /// The QJL projection matrices, generated on demand (`M·d²·4` bytes,
+    /// `O(M·d²)` time — never call this on a query path). Empty unless
+    /// `qjl_num_projections > 0`.
+    pub fn qjl_matrices(&self) -> Vec<Vec<f32>> {
+        (0..self.qjl_num_projections)
+            .map(|m| {
+                super::qjl::generate_qjl_matrix(
+                    self.dimension as usize,
+                    self.qjl_seed.wrapping_add(1 + m as u64),
+                )
+            })
+            .collect()
+    }
+
     /// Compute XXHash64 over all fields except metadata_checksum itself.
+    ///
+    /// Byte-identical to the historical formula (one-shot `xxh64` over the
+    /// concatenation, QJL matrices included), but streamed: the matrices are
+    /// generated chunk by chunk into the hasher instead of being held in
+    /// the struct and copied into an `M·d²·4`-byte buffer (moon#1213).
     pub(crate) fn compute_checksum(&self) -> u64 {
-        use xxhash_rust::xxh64::xxh64;
         let mut data = Vec::with_capacity(256);
         data.extend_from_slice(&self.collection_id.to_le_bytes());
         data.extend_from_slice(&self.created_at_lsn.to_le_bytes());
@@ -287,13 +310,23 @@ impl CollectionMetadata {
         }
         // Include build_mode discriminant
         data.push(self.build_mode as u8);
-        // Include QJL matrices (not reconstructable from other fields)
-        for matrix in &self.qjl_matrices {
-            for &val in matrix {
-                data.extend_from_slice(&val.to_le_bytes());
-            }
+        let mut hasher = xxhash_rust::xxh64::Xxh64::new(0);
+        hasher.update(&data);
+        // Include the QJL matrices, streamed (same bytes, same order).
+        let mut bytes = [0u8; super::qjl::QJL_STREAM_CHUNK * 4];
+        for m in 0..self.qjl_num_projections {
+            super::qjl::for_each_qjl_chunk(
+                self.dimension as usize,
+                self.qjl_seed.wrapping_add(1 + m as u64),
+                |chunk| {
+                    for (dst, &val) in bytes.chunks_exact_mut(4).zip(chunk) {
+                        dst.copy_from_slice(&val.to_le_bytes());
+                    }
+                    hasher.update(&bytes[..chunk.len() * 4]);
+                },
+            );
         }
-        xxh64(&data, 0)
+        hasher.digest()
     }
 
     /// Packed code size in bytes per vector for this collection's quantization.
@@ -855,5 +888,95 @@ mod tests {
         assert_eq!(meta_tq4.codebook.len(), 16);
         assert_eq!(meta_tq4.codebook_boundaries.len(), 15);
         assert!(meta_tq4.verify_checksum().is_ok());
+    }
+
+    /// moon#1213: the matrices are streamed into the checksum instead of
+    /// held — the digest must be the one every persisted segment recorded.
+    /// Golden values were computed by the pre-change formula (materialized
+    /// `qjl_matrices` concatenated into the one-shot `xxh64` input) at
+    /// f32546c; a mismatch here means every EXACT segment on disk would fail
+    /// `verify_checksum` on reload and be re-indexed from the AOF.
+    #[test]
+    fn metadata_checksum_matches_the_pre_streaming_formula() {
+        use crate::vector::types::DistanceMetric as M;
+        use QuantizationConfig as Q;
+        for (cid, dim, metric, q, mode, golden) in [
+            (
+                9u64,
+                100u32,
+                M::L2,
+                Q::TurboQuant4,
+                BuildMode::Exact,
+                0x534c_318a_7ea1_4cb2u64,
+            ),
+            (
+                3,
+                768,
+                M::Cosine,
+                Q::TurboQuant4,
+                BuildMode::Exact,
+                0xf9fe_bc07_cc03_dd65,
+            ),
+            (
+                1,
+                384,
+                M::L2,
+                Q::TurboQuant4A2,
+                BuildMode::Exact,
+                0x4482_560a_5425_98b7,
+            ),
+            (
+                2,
+                64,
+                M::L2,
+                Q::TurboQuant4,
+                BuildMode::Light,
+                0x6710_350e_a9d9_52e8,
+            ),
+            (
+                5,
+                33,
+                M::InnerProduct,
+                Q::Sq8,
+                BuildMode::Exact,
+                0x2b31_853f_6436_0926,
+            ),
+        ] {
+            let meta = CollectionMetadata::with_build_mode(cid, dim, metric, q, cid, mode);
+            assert_eq!(
+                meta.metadata_checksum, golden,
+                "{cid} {dim} {q:?} {mode:?}: checksum drifted from the persisted formula"
+            );
+            assert!(meta.verify_checksum().is_ok());
+        }
+    }
+
+    #[test]
+    fn collection_holds_no_qjl_matrix_but_regenerates_the_same_ones() {
+        let meta = CollectionMetadata::with_build_mode(
+            4,
+            50,
+            DistanceMetric::L2,
+            QuantizationConfig::TurboQuant4,
+            4,
+            BuildMode::Exact,
+        );
+        assert_eq!(meta.qjl_num_projections, 8);
+        let ms = meta.qjl_matrices();
+        assert_eq!(ms.len(), 8);
+        for (m, mat) in ms.iter().enumerate() {
+            assert_eq!(
+                *mat,
+                crate::vector::turbo_quant::qjl::generate_qjl_matrix(50, 5 + m as u64)
+            );
+        }
+        let light = CollectionMetadata::new(
+            4,
+            50,
+            DistanceMetric::L2,
+            QuantizationConfig::TurboQuant4,
+            4,
+        );
+        assert!(light.qjl_matrices().is_empty());
     }
 }

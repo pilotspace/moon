@@ -158,8 +158,6 @@ pub struct FrozenSegment {
     pub sub_sign_bytes_per_vec: usize,
     /// Bytes per TQ code (padded_dim/2 + 4 for norm).
     pub bytes_per_code: usize,
-    /// Bytes per QJL sign vector (ceil(dim/8)).
-    pub qjl_bytes_per_vec: usize,
     /// Base offset for computing global vector IDs: global_id = base + internal_id.
     pub global_id_base: u32,
     pub dimension: u32,
@@ -199,7 +197,6 @@ struct MutableSegmentInner {
     dimension: u32,
     padded_dimension: u32,
     bytes_per_code: usize,
-    qjl_bytes_per_vec: usize,
     byte_size: usize,
 }
 
@@ -346,8 +343,6 @@ impl MutableSegment {
         } else {
             collection.code_bytes_per_vector() + 4 // packed codes + 4 bytes norm
         };
-        let m = collection.qjl_num_projections.max(1);
-        let qjl_bytes_per_vec = m * ((dimension as usize + 7) / 8);
         let sub_sign_bytes_per_vec = (padded as usize + 7) / 8;
         Self {
             inner: RwLock::new(MutableSegmentInner {
@@ -362,18 +357,17 @@ impl MutableSegment {
                 dimension,
                 padded_dimension: padded,
                 bytes_per_code,
-                qjl_bytes_per_vec,
                 byte_size: 0,
             }),
             collection,
         }
     }
 
-    /// Append a vector. TQ-encodes at insert time; QJL deferred to freeze().
+    /// Append a vector. TQ-encodes at insert time.
     ///
-    /// Fast path: only FWHT + quantize + nibble pack (O(d log d)).
-    /// QJL encoding (O(M×d²)) is deferred to freeze() when the segment compacts.
-    /// Mutable brute-force search uses TQ-MSE-only distance (no QJL correction).
+    /// Fast path: only FWHT + quantize + nibble pack (O(d log d)). No QJL
+    /// work anywhere in the lifecycle (moon#1192, moon#1213): the mutable
+    /// scan is TQ-ADC + FastScan, and compaction attaches none.
     pub fn append(&self, key_hash: u64, vector_f32: &[f32], insert_lsn: u64) -> u32 {
         let mut inner = self.inner.write();
         let internal_id = inner.entries.len() as u32;
@@ -468,8 +462,8 @@ impl MutableSegment {
             inner.sub_centroid_signs.extend_from_slice(&signs);
         }
 
-        // Exact mode: retain raw f32 + zero-fill QJL (recomputed at freeze).
-        // Light mode: skip both — saves 1,536 B/vec + avoids O(M×d²) at freeze.
+        // Exact mode: retain raw f32 (exact-L2 graph build + sub-centroid
+        // signs at compaction). Light mode skips it — saves 4·dim B/vec.
         let is_exact =
             self.collection.build_mode == crate::vector::turbo_quant::collection::BuildMode::Exact;
         crate::vector::f16::encode_f16_slice(vector_f32, &mut inner.raw_f16);
@@ -1484,8 +1478,7 @@ impl MutableSegment {
         // to recompute QJL signs + residual norms for the WHOLE mutable
         // buffer here (8 scalar d×d matvecs per vector: ~1 s per 1K vectors
         // at 384d, synchronously, at every background-compaction submit).
-        // The compaction worker now does it for the frozen live entries only
-        // (`compaction::exact_qjl`).
+        // QJL data is no longer computed at all (moon#1213).
         FrozenSegment {
             entries: inner.entries[..n]
                 .iter()
@@ -1521,7 +1514,6 @@ impl MutableSegment {
                 .unwrap_or_default(),
             sub_sign_bytes_per_vec: inner.sub_sign_bytes_per_vec,
             bytes_per_code: inner.bytes_per_code,
-            qjl_bytes_per_vec: inner.qjl_bytes_per_vec,
             global_id_base: inner.global_id_base,
             dimension: inner.dimension,
         }
@@ -1555,7 +1547,6 @@ impl MutableSegment {
 
         let bpc = inner.bytes_per_code;
         let sub_bpv = inner.sub_sign_bytes_per_vec;
-        let qjl_bpv = inner.qjl_bytes_per_vec;
         let dim = inner.dimension as usize;
 
         // ── TQ codes ────────────────────────────────────────────────────────
@@ -1637,7 +1628,6 @@ impl MutableSegment {
             dimension: inner.dimension,
             padded_dimension: inner.padded_dimension,
             bytes_per_code: bpc,
-            qjl_bytes_per_vec: qjl_bpv,
             byte_size,
         };
 
@@ -1696,7 +1686,7 @@ mod tests {
     ) -> crate::vector::turbo_quant::inner_product::TqProdQueryState {
         crate::vector::turbo_quant::inner_product::prepare_query_prod(
             query,
-            &col.qjl_matrices,
+            &col.qjl_matrices(),
             col.fwht_sign_flips.as_slice(),
             col.padded_dimension as usize,
         )

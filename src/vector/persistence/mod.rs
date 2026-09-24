@@ -14,3 +14,5 @@ mod segment_sub_signs_tests;
 pub mod unloaded_segment;
 pub mod warm_search;
 pub mod warm_segment;
+#[cfg(test)]
+mod warm_sub_signs_tests;

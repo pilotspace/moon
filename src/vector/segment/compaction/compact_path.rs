@@ -20,6 +20,13 @@ use crate::vector::segment::sub_signs::SubSignEncoder;
 use crate::vector::turbo_quant::collection::{CollectionMetadata, QuantizationConfig};
 use crate::vector::turbo_quant::sq8::{decode_sq8, sq8_params};
 
+#[cfg(test)]
+thread_local! {
+    /// Test-only: vectors decoded into the graph-build oracle by `compact`
+    /// on this thread (mechanism proxy for the EXACT no-decode fix).
+    pub(super) static DECODED_BUILD_ROWS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Convert a frozen mutable segment into an optimized immutable segment.
 ///
 /// Steps: filter dead -> encode TQ -> build HNSW -> verify recall -> BFS reorder ->
@@ -154,8 +161,15 @@ pub fn compact(
         Vec::new()
     };
 
-    // Also decode TQ → centroid for sub-centroid sign computation (needed later).
-    let all_rotated: Vec<Vec<f32>> = if need_cpu_build {
+    // Decoded TQ/SQ8 vectors: the graph-build oracle when no raw f32 is
+    // retained (LIGHT, or a rebuild from reloaded codes). EXACT builds from
+    // `live_f32` and used to decode these anyway — nothing read them (sub-
+    // centroid signs come from the raw vectors): n·(4·padded + 24) bytes of
+    // transient heap, 78.6 MB at 20K × 768d, plus the decode work
+    // (moon#1213).
+    let all_rotated: Vec<Vec<f32>> = if need_cpu_build && !has_raw {
+        #[cfg(test)]
+        DECODED_BUILD_ROWS.with(|c| c.set(c.get() + n));
         let mut rotated: Vec<Vec<f32>> = Vec::with_capacity(n);
         if is_sq8 {
             // SQ8: decode `dim` u8 codes via per-vector (min, scale) into an f32
@@ -269,13 +283,10 @@ pub fn compact(
             .copy_from_slice(&tq_buffer_orig[src..src + bytes_per_code]);
     }
 
-    // EXACT: QJL signs + residual norms for the live entries, BFS-ordered,
-    // computed HERE — on the compaction worker — instead of in freeze() on
-    // the shard thread (moon#1192). Empty for LIGHT / SQ8 / raw-less builds
-    // (HEAD stored an all-zero `n * ceil(dim/8)` QJL buffer + `n` zero norms
-    // there, which nothing reads).
-    let exact_qjl =
-        super::exact_qjl::exact_qjl_bfs(collection, frozen, &live_entries, &graph, &tq_bfs);
+    // No QJL signs / residual norms (moon#1213): EXACT used to spend 8 d×d
+    // matvecs per live vector here on data no search path read and no
+    // persist path wrote. EXACT keeps what it is for — the exact-L2 graph
+    // build and sub-centroid signs from the retained raw f32 vectors.
 
     // Sub-centroid sign bits, BFS-ordered — REAL signs only (moon#1221
     // review). For each coordinate: 1 if the actual rotated value lies at or
@@ -356,9 +367,6 @@ pub fn compact(
     let segment = ImmutableSegment::new(
         graph,
         AlignedBuffer::from_vec(tq_bfs),
-        exact_qjl.signs,
-        exact_qjl.residual_norms,
-        exact_qjl.bytes_per_vec,
         sub_signs_bfs,
         sub_bpv,
         mvcc,

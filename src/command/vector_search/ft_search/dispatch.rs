@@ -22,7 +22,7 @@ use crate::vector::types::SearchResult;
 
 use super::execute::{
     ScoreOrder, SearchRawResult, apply_range_filter, parse_sparse_query_blob,
-    search_local_filtered, search_local_raw,
+    search_local_filtered_with_text, search_local_raw,
 };
 use super::parse::{
     extract_param_blob, parse_as_of_clause, parse_filter_clause, parse_inline_filter,
@@ -229,6 +229,7 @@ pub fn ft_search(
             field_name.as_ref(),
             as_of_lsn,
             db_index,
+            text_store,
         );
         let (dense_results, key_hash_to_key) = match dense_raw {
             SearchRawResult::Ok {
@@ -384,6 +385,7 @@ pub fn ft_search(
             field_name.as_ref(),
             as_of_lsn,
             db_index,
+            text_store,
         );
         crate::vector::metrics::increment_search();
         return match result {
@@ -438,6 +440,7 @@ pub fn ft_search(
             field_name.as_ref(),
             as_of_lsn,
             db_index,
+            text_store,
         );
         crate::vector::metrics::increment_search();
         match raw {
@@ -451,7 +454,7 @@ pub fn ft_search(
             }
         }
     } else {
-        let result = search_local_filtered(
+        let result = search_local_filtered_with_text(
             store,
             &index_name,
             &blob,
@@ -462,6 +465,7 @@ pub fn ft_search(
             field_name.as_ref(),
             as_of_lsn,
             db_index,
+            text_store,
         );
         crate::vector::metrics::increment_search();
         result
@@ -581,6 +585,7 @@ pub fn ft_search_capture(
         filter_expr.as_ref(),
         as_of_lsn,
         db_index,
+        text_store,
     ) {
         Some(snapshot) => {
             crate::vector::metrics::increment_search();
@@ -608,6 +613,7 @@ fn capture_dense_knn_snapshot(
     filter: Option<&crate::vector::filter::FilterExpr>,
     as_of_lsn: u64,
     db_index: u8,
+    text_store: Option<&TextStore>,
 ) -> Option<crate::vector::segment::holder::SearchSnapshot> {
     use crate::vector::segment::holder::SearchSnapshot;
     use crate::vector::turbo_quant::encoder::padded_dimension;
@@ -676,8 +682,15 @@ fn capture_dense_knn_snapshot(
     let total_vectors = idx.segments.total_vectors();
     // `Arc` once here: the yielding search shares it with pool jobs by
     // refcount instead of deep-cloning it again (moon#1196).
-    let filter_bitmap =
-        filter.map(|f| std::sync::Arc::new(idx.payload_index.evaluate_bitmap(f, total_vectors)));
+    let filter_bitmap = filter.map(|f| {
+        std::sync::Arc::new(super::payload_filter::evaluate_filter(
+            idx,
+            f,
+            total_vectors,
+            text_store,
+            db_index,
+        ))
+    });
     // XC-3: resolve the selectivity-based strategy at capture, mirroring the
     // sync path's `select_strategy` dispatch (holder.rs `search_filtered`). The
     // yield refactor (PR #189) originally hardcoded ACORN-filtered search for

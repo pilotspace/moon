@@ -55,7 +55,7 @@
 //!   [db_index: u8]   ← NEW in v4
 //! ```
 //!
-//! ## Format v5 (current — search-tuning knobs)
+//! ## Format v5 (search-tuning knobs)
 //!
 //! Extends v4 with the FT.CONFIG search-tuning knobs appended after
 //! `db_index`. v1-v4 sidecars are read with the defaults (mult 4, beam off).
@@ -65,13 +65,30 @@
 //!   ... (same as v4 fields) ...
 //!   [rerank_mult: u32 LE] [exact_beam: u8] [reserved: 3B]   ← NEW in v5
 //! ```
+//!
+//! ## Format v6 (current — payload schema, moon#1194)
+//!
+//! Extends v5 with the non-vector schema fields FT.CREATE declared (TEXT /
+//! TAG / NUMERIC), which schema-aware payload indexing needs across a
+//! restart. v1-v5 sidecars are read with an empty `schema_fields` — exactly
+//! how every version before this one came back (legacy: every HASH field is
+//! payload-indexed).
+//!
+//! ```text
+//! Per index:
+//!   ... (same as v5 fields) ...
+//!   [payload_field_count: u16]                                ← NEW in v6
+//!   Per field:
+//!     [kind: u8 (1 TEXT, 2 TAG, 3 NUMERIC)] [name_len: u16] [name]
+//!     TEXT only: [weight: f64 LE] [flags: u8 (1 nostem, 2 sortable, 4 noindex)]
+//! ```
 
 use std::io::{self, Read};
 use std::path::Path;
 
 use bytes::Bytes;
 
-use crate::vector::store::{IndexMeta, VectorFieldMeta};
+use crate::vector::store::{FieldType, IndexMeta, VectorFieldMeta};
 use crate::vector::turbo_quant::collection::{BuildMode, QuantizationConfig};
 use crate::vector::types::DistanceMetric;
 
@@ -83,6 +100,13 @@ const VERSION_V4: u8 = 4;
 /// v5 appends per-index search-tuning knobs (rerank_mult u32 LE,
 /// exact_beam u8, 3 reserved bytes) after the v4 db_index byte.
 const VERSION_V5: u8 = 5;
+
+/// v6 (moon#1194): v5 + the declared TEXT/TAG/NUMERIC payload schema.
+const VERSION_V6: u8 = 6;
+
+const PAYLOAD_KIND_TEXT: u8 = 1;
+const PAYLOAD_KIND_TAG: u8 = 2;
+const PAYLOAD_KIND_NUMERIC: u8 = 3;
 
 /// Default compaction weight used when reading v1/v2 sidecars without a stored weight.
 const DEFAULT_WEIGHT_ON_LOAD: f32 = 1.0;
@@ -114,10 +138,10 @@ fn serialize_index_metas_v1(metas: &[&IndexMeta]) -> Vec<u8> {
 /// from `vector_fields[0]` for backward compatibility), then appends the full
 /// `vector_fields` array.
 pub fn serialize_index_metas(metas: &[&IndexMeta]) -> Vec<u8> {
-    // Wrap with default weight=1.0 and delegate to the current (v5) serializer.
+    // Wrap with default weight=1.0 and delegate to the current (v6) serializer.
     let pairs: Vec<(&IndexMeta, f32)> =
         metas.iter().map(|&m| (m, DEFAULT_WEIGHT_ON_LOAD)).collect();
-    serialize_index_metas_v5(&pairs)
+    serialize_index_metas_v6(&pairs)
 }
 
 /// Serialize `(IndexMeta, compaction_weight)` pairs to bytes using v3 format (W3-deep).
@@ -143,6 +167,12 @@ pub fn serialize_index_metas_v4(pairs: &[(&IndexMeta, f32)]) -> Vec<u8> {
 /// (`rerank_mult` u32 LE, `exact_beam` u8, 3 reserved bytes).
 pub fn serialize_index_metas_v5(pairs: &[(&IndexMeta, f32)]) -> Vec<u8> {
     serialize_index_metas_versioned(pairs, VERSION_V5)
+}
+
+/// Serialize `(IndexMeta, compaction_weight)` pairs to bytes using the
+/// current v6 format: v5 plus the declared payload schema (moon#1194).
+pub fn serialize_index_metas_v6(pairs: &[(&IndexMeta, f32)]) -> Vec<u8> {
+    serialize_index_metas_versioned(pairs, VERSION_V6)
 }
 
 /// Shared v3/v4/v5 serializer — `version` selects which trailing extensions
@@ -185,9 +215,79 @@ fn serialize_index_metas_versioned(pairs: &[(&IndexMeta, f32)], version: u8) -> 
             buf.push(m.exact_beam as u8);
             buf.extend_from_slice(&[0u8; 3]); // reserved
         }
+
+        // v6 extension: declared payload schema (TEXT/TAG/NUMERIC).
+        if version >= VERSION_V6 {
+            write_payload_schema(&mut buf, &m.schema_fields);
+        }
     }
 
     buf
+}
+
+/// v6: the non-vector `schema_fields`, in declaration order.
+fn write_payload_schema(buf: &mut Vec<u8>, schema: &[FieldType]) {
+    let payload: Vec<&FieldType> = schema
+        .iter()
+        .filter(|f| !matches!(f, FieldType::Vector(_)))
+        .collect();
+    buf.extend_from_slice(&(payload.len() as u16).to_le_bytes());
+    for f in payload {
+        let (kind, name) = match f {
+            FieldType::Text { field_name, .. } => (PAYLOAD_KIND_TEXT, field_name),
+            FieldType::Tag { field_name } => (PAYLOAD_KIND_TAG, field_name),
+            FieldType::Numeric { field_name } => (PAYLOAD_KIND_NUMERIC, field_name),
+            FieldType::Vector(_) => continue,
+        };
+        buf.push(kind);
+        buf.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        buf.extend_from_slice(name);
+        if let FieldType::Text {
+            weight,
+            nostem,
+            sortable,
+            noindex,
+            ..
+        } = f
+        {
+            buf.extend_from_slice(&weight.to_le_bytes());
+            buf.push(u8::from(*nostem) | u8::from(*sortable) << 1 | u8::from(*noindex) << 2);
+        }
+    }
+}
+
+/// v6: read what [`write_payload_schema`] wrote.
+fn read_payload_schema(data: &[u8], cursor: &mut usize) -> io::Result<Vec<FieldType>> {
+    let count = read_u16(data, cursor)? as usize;
+    let mut fields = Vec::with_capacity(count);
+    for _ in 0..count {
+        let kind = read_u8(data, cursor)?;
+        let len = read_u16(data, cursor)? as usize;
+        let field_name = Bytes::copy_from_slice(read_bytes(data, cursor, len)?);
+        fields.push(match kind {
+            PAYLOAD_KIND_TEXT => {
+                let w = read_bytes(data, cursor, 8)?;
+                let weight = f64::from_le_bytes([w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]]);
+                let flags = read_u8(data, cursor)?;
+                FieldType::Text {
+                    field_name,
+                    weight,
+                    nostem: flags & 1 != 0,
+                    sortable: flags & 2 != 0,
+                    noindex: flags & 4 != 0,
+                }
+            }
+            PAYLOAD_KIND_TAG => FieldType::Tag { field_name },
+            PAYLOAD_KIND_NUMERIC => FieldType::Numeric { field_name },
+            other => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("unknown payload field kind {other}"),
+                ));
+            }
+        });
+    }
+    Ok(fields)
 }
 
 /// Write the v1 per-index fields (shared between v1, v2, and v3 serializers).
@@ -219,7 +319,7 @@ fn write_v1_per_index(buf: &mut Vec<u8>, m: &IndexMeta) {
     }
 }
 
-/// Deserialize IndexMeta list from bytes. Handles v1 through v5 formats.
+/// Deserialize IndexMeta list from bytes. Handles v1 through v6 formats.
 ///
 /// Older data is auto-migrated:
 /// - v1: single source_field wrapped into 1-element `vector_fields`.
@@ -227,6 +327,7 @@ fn write_v1_per_index(buf: &mut Vec<u8>, m: &IndexMeta) {
 /// - v3: full field array + explicit `compaction_weight` per index.
 /// - v4: v3 + `db_index` per index (pre-v4 defaults to 0).
 /// - v5: v4 + `rerank_mult`/`exact_beam` (pre-v5 defaults to 4 / OFF).
+/// - v6: v5 + the declared payload schema (pre-v6: empty `schema_fields`).
 ///
 /// Returns `(IndexMeta, compaction_weight)` pairs.
 pub fn deserialize_index_metas_with_weights(data: &[u8]) -> io::Result<Vec<(IndexMeta, f32)>> {
@@ -237,7 +338,7 @@ pub fn deserialize_index_metas_with_weights(data: &[u8]) -> io::Result<Vec<(Inde
         return Err(io::Error::new(io::ErrorKind::InvalidData, "bad magic"));
     }
     let version = data[4];
-    if !(VERSION_V1..=VERSION_V5).contains(&version) {
+    if !(VERSION_V1..=VERSION_V6).contains(&version) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("unsupported version {version}"),
@@ -328,6 +429,21 @@ pub fn deserialize_index_metas_with_weights(data: &[u8]) -> io::Result<Vec<(Inde
             (4, false)
         };
 
+        // v6: declared payload schema. Rebuilt in FT.CREATE's shape (vector
+        // fields first). Older sidecars come back with no schema, exactly as
+        // before (every HASH field payload-indexed).
+        let schema_fields = if version >= VERSION_V6 {
+            let payload = read_payload_schema(data, &mut cursor)?;
+            vector_fields
+                .iter()
+                .cloned()
+                .map(FieldType::Vector)
+                .chain(payload)
+                .collect()
+        } else {
+            Vec::new()
+        };
+
         let meta = IndexMeta {
             name: meta_base.0,
             dimension,
@@ -342,7 +458,7 @@ pub fn deserialize_index_metas_with_weights(data: &[u8]) -> io::Result<Vec<(Inde
             quantization,
             build_mode,
             vector_fields,
-            schema_fields: Vec::new(),
+            schema_fields,
             merge_mode: crate::vector::segment::compaction::MergeMode::GraphUnion,
             keep_raw: false,
             db_index,
@@ -474,7 +590,10 @@ pub fn save_index_metadata(shard_dir: &Path, metas: &[&IndexMeta]) -> io::Result
 /// (`.planning/reviews/kernel-m2-brief-2026-07-12.md`).
 pub fn save_index_metadata_v3(shard_dir: &Path, pairs: &[(&IndexMeta, f32)]) -> io::Result<()> {
     let path = shard_dir.join("vector-indexes.meta");
-    let data = serialize_index_metas_v4(pairs);
+    // The CURRENT format. This wrote v4 until moon#1194's v6 bump, so the
+    // v5 FT.CONFIG knobs (RERANK_MULT / EXACT_BEAM) never reached the
+    // sidecar and reset to their defaults on every restart.
+    let data = serialize_index_metas_v6(pairs);
     crate::persistence::atomic::atomic_write_durable(&path, &data)?;
     Ok(())
 }
@@ -645,8 +764,8 @@ mod tests {
         let m1 = make_meta_for_db("idx1", 128, "doc:", "vec", 0);
         let m2 = make_meta_for_db("idx2", 128, "doc:", "vec", 7);
         let data = serialize_index_metas(&[&m1, &m2]);
-        // v5 is the current on-disk version.
-        assert_eq!(data[4], VERSION_V5);
+        // v6 is the current on-disk version (moon#1194).
+        assert_eq!(data[4], VERSION_V6);
         let result = deserialize_index_metas(&data).unwrap();
         assert_eq!(result[0].db_index, 0);
         assert_eq!(result[1].db_index, 7);
@@ -667,15 +786,15 @@ mod tests {
         let mut meta = make_meta("idx_v5", 128, "doc:", "vec");
         meta.rerank_mult = 16;
         meta.exact_beam = true;
-        let data = serialize_index_metas(&[&meta]);
+        let data = serialize_index_metas_v5(&[(&meta, 1.0)]);
         assert_eq!(data[4], VERSION_V5);
         let result = deserialize_index_metas(&data).unwrap();
         assert_eq!(result[0].rerank_mult, 16);
         assert!(result[0].exact_beam);
 
-        // The v5 knob block is the last 8 bytes of the buffer:
+        // The v5 knob block is the last 8 bytes of a v5 buffer:
         // [rerank_mult: u32 LE][exact_beam: u8][reserved: 3B].
-        let mut data = serialize_index_metas(&[&meta]);
+        let mut data = serialize_index_metas_v5(&[(&meta, 1.0)]);
         let n = data.len();
         data[n - 8..n - 4].copy_from_slice(&999u32.to_le_bytes());
         let result = deserialize_index_metas(&data).unwrap();
@@ -703,6 +822,109 @@ mod tests {
         let result = deserialize_index_metas(&v3_data).unwrap();
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].db_index, 0);
+    }
+
+    fn payload_schema_meta() -> IndexMeta {
+        let mut meta = make_meta("rag", 384, "doc:", "emb");
+        meta.schema_fields = meta
+            .vector_fields
+            .iter()
+            .cloned()
+            .map(FieldType::Vector)
+            .chain([
+                FieldType::Text {
+                    field_name: Bytes::from_static(b"content"),
+                    weight: 2.5,
+                    nostem: true,
+                    sortable: false,
+                    noindex: true,
+                },
+                FieldType::Tag {
+                    field_name: Bytes::from_static(b"lang"),
+                },
+                FieldType::Numeric {
+                    field_name: Bytes::from_static(b"year"),
+                },
+            ])
+            .collect();
+        meta
+    }
+
+    /// Declared TEXT/TAG/NUMERIC fields in FT.CREATE's shape.
+    fn describe(schema: &[FieldType]) -> Vec<String> {
+        schema
+            .iter()
+            .map(|f| match f {
+                FieldType::Vector(v) => format!("vector {:?}", v.field_name),
+                FieldType::Text {
+                    field_name,
+                    weight,
+                    nostem,
+                    sortable,
+                    noindex,
+                } => format!("text {field_name:?} {weight} {nostem} {sortable} {noindex}"),
+                FieldType::Tag { field_name } => format!("tag {field_name:?}"),
+                FieldType::Numeric { field_name } => format!("numeric {field_name:?}"),
+            })
+            .collect()
+    }
+
+    /// moon#1194: v6 persists the declared payload schema. Red before the
+    /// bump: every sidecar reloaded with an empty `schema_fields`, so
+    /// schema-aware payload indexing could not survive a restart.
+    #[test]
+    fn v6_roundtrips_the_declared_payload_schema() {
+        let meta = payload_schema_meta();
+        let data = serialize_index_metas(&[&meta]);
+        assert_eq!(data[4], VERSION_V6);
+        let back = deserialize_index_metas(&data).unwrap();
+        assert_eq!(
+            describe(&back[0].schema_fields),
+            describe(&meta.schema_fields)
+        );
+        // Truncating inside the schema block is an error, never a guess.
+        for cut in [1usize, 3, 9] {
+            assert!(
+                deserialize_index_metas(&data[..data.len() - cut]).is_err(),
+                "cut {cut}"
+            );
+        }
+    }
+
+    /// Backward compatibility: v1-v5 sidecars carry no payload schema and
+    /// load with an empty `schema_fields`, exactly as before.
+    #[test]
+    fn pre_v6_sidecars_load_without_a_payload_schema() {
+        let meta = payload_schema_meta();
+        for data in [
+            serialize_index_metas_v1(&[&meta]),
+            serialize_index_metas_v3(&[(&meta, 1.0)]),
+            serialize_index_metas_v4(&[(&meta, 1.0)]),
+            serialize_index_metas_v5(&[(&meta, 1.0)]),
+        ] {
+            let back = deserialize_index_metas(&data).unwrap();
+            assert!(back[0].schema_fields.is_empty(), "v{}", data[4]);
+            assert_eq!(back[0].name, meta.name);
+        }
+    }
+
+    /// The sidecar file keeps the FT.CONFIG search knobs. Red before the v6
+    /// bump: `save_index_metadata_v3` wrote a v4 sidecar, so RERANK_MULT /
+    /// EXACT_BEAM silently reset to 4 / OFF on every restart.
+    #[test]
+    fn sidecar_file_keeps_search_tuning_knobs_and_schema() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut meta = payload_schema_meta();
+        meta.rerank_mult = 12;
+        meta.exact_beam = true;
+        save_index_metadata_v3(tmp.path(), &[(&meta, 1.0)]).unwrap();
+        let loaded = load_index_metadata(tmp.path()).unwrap();
+        assert_eq!(loaded[0].rerank_mult, 12);
+        assert!(loaded[0].exact_beam);
+        assert_eq!(
+            describe(&loaded[0].schema_fields),
+            describe(&meta.schema_fields)
+        );
     }
 
     #[test]
@@ -777,8 +999,8 @@ mod tests {
     fn test_serialize_deserialize_v2_single_field() {
         let meta = make_meta("idx", 128, "doc:", "vec");
         let data = serialize_index_metas(&[&meta]);
-        // Now writes v5 (serialize_index_metas delegates to v5 -- tuning knobs)
-        assert_eq!(data[4], VERSION_V5);
+        // Now writes v6 (serialize_index_metas delegates to the current writer)
+        assert_eq!(data[4], VERSION_V6);
         let result = deserialize_index_metas(&data).unwrap();
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].vector_fields.len(), 1);

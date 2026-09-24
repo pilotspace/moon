@@ -104,30 +104,15 @@ fn merge_graph_union(
     let code_len = if is_sq8 { dim } else { bytes_per_code - 4 };
 
     // ── Step 1: Collect live entries, deduplicate by key_hash ────────────────
-    // Map key_hash → (insert_lsn, global_id, tq_code_bytes, qjl_bytes, residual_norm,
-    //                  sub_centroid_bytes, raw_f16_bytes)
+    // Map key_hash → (insert_lsn, global_id, tq_code_bytes, sub_centroid_bytes,
+    //                  raw_f16_bytes). No QJL data (moon#1213): immutable
+    // segments carry none.
     #[allow(clippy::type_complexity)]
     let mut by_key_hash: std::collections::HashMap<
         u64,
-        (u64, u32, Vec<u8>, Vec<u8>, f32, Vec<u8>, Vec<u16>),
+        (u64, u32, Vec<u8>, Vec<u8>, Vec<u16>),
     > = std::collections::HashMap::new();
 
-    let qjl_bpv = {
-        // QJL bytes per vector: derived from first segment or computed from padded_dim.
-        // All segments in the same index use the same qjl layout.
-        let first = &segments[0];
-        let headers = first.mvcc_headers();
-        if headers.is_empty() {
-            0usize
-        } else {
-            let total_qjl = first.qjl_bytes();
-            if total_qjl > 0 && first.total_count() > 0 {
-                total_qjl / first.total_count() as usize
-            } else {
-                0
-            }
-        }
-    };
     let sub_bpv = (padded + 7) / 8;
 
     // HQ-1: the merged segment keeps the exact-rerank sidecar only when every
@@ -171,21 +156,6 @@ fn merge_graph_union(
                 continue; // defensive: skip out-of-bounds
             }
             let code_bytes = tq_buf[code_offset..code_offset + bytes_per_code].to_vec();
-            // SQ8 has no residual-norm trailer: its (min, scale) live inside the
-            // slot and are read directly during search, so residual_norms is unused.
-            let norm = if is_sq8 {
-                0.0
-            } else {
-                let norm_bytes = &code_bytes[code_len..];
-                f32::from_le_bytes([norm_bytes[0], norm_bytes[1], norm_bytes[2], norm_bytes[3]])
-            };
-
-            // QJL bytes for this entry.
-            let qjl_bytes = if qjl_bpv > 0 {
-                seg.qjl_bytes_for(bfs_pos, qjl_bpv)
-            } else {
-                Vec::new()
-            };
 
             // Exact-rerank sidecar slice for this entry (HQ-1).
             let raw_slice = seg_raw.and_then(|r| r.get(bfs_pos * dim..(bfs_pos + 1) * dim));
@@ -218,8 +188,6 @@ fn merge_graph_union(
                 0,
                 Vec::new(),
                 Vec::new(),
-                0.0,
-                Vec::new(),
                 Vec::new(),
             ));
             if hdr.insert_lsn >= entry.0 {
@@ -227,8 +195,6 @@ fn merge_graph_union(
                     hdr.insert_lsn,
                     hdr.global_id,
                     code_bytes,
-                    qjl_bytes,
-                    norm,
                     sub_bytes,
                     raw_bytes,
                 );
@@ -243,7 +209,7 @@ fn merge_graph_union(
 
     // ── Memory ceiling check ─────────────────────────────────────────────────
     // Estimate: TQ codes + HNSW layer-0 (M0=32 nodes * 4 bytes * n) + overhead.
-    let estimated_bytes = n * bytes_per_code + n * 32 * 4 + n * sub_bpv + n * qjl_bpv;
+    let estimated_bytes = n * bytes_per_code + n * 32 * 4 + n * sub_bpv;
     if estimated_bytes > MERGE_MEMORY_CEILING {
         return Err(CompactionError::PersistFailed(format!(
             "merge union would require ~{estimated_bytes} bytes > {MERGE_MEMORY_CEILING} ceiling; \
@@ -254,13 +220,11 @@ fn merge_graph_union(
     // ── Step 2: Lay out entries in deterministic order ───────────────────────
     // Sort by (insert_lsn asc, key_hash asc) for determinism.
     #[allow(clippy::type_complexity)]
-    let mut entries: Vec<(u64, u32, Vec<u8>, Vec<u8>, f32, Vec<u8>, u64, Vec<u16>)> = by_key_hash
+    let mut entries: Vec<(u64, u32, Vec<u8>, Vec<u8>, u64, Vec<u16>)> = by_key_hash
         .into_iter()
-        .map(|(kh, (lsn, gid, code, qjl, norm, sub, raw))| {
-            (lsn, gid, code, qjl, norm, sub, kh, raw)
-        })
+        .map(|(kh, (lsn, gid, code, sub, raw))| (lsn, gid, code, sub, kh, raw))
         .collect();
-    entries.sort_by(|a, b| a.0.cmp(&b.0).then(a.6.cmp(&b.6)));
+    entries.sort_by(|a, b| a.0.cmp(&b.0).then(a.4.cmp(&b.4)));
 
     // R5 (persistence review): a dropped sidecar must be LOUD. The merged
     // segment loses exact rerank for ALL entries when any source lacks the
@@ -282,8 +246,6 @@ fn merge_graph_union(
 
     // ── Step 3: Build TQ buffer (verbatim codes, no re-encode) ───────────────
     let mut tq_buffer_orig: Vec<u8> = Vec::with_capacity(n * bytes_per_code);
-    let mut qjl_orig: Vec<u8> = Vec::with_capacity(n * qjl_bpv);
-    let mut residual_norms: Vec<f32> = Vec::with_capacity(n);
     let mut sub_orig: Vec<u8> = if all_have_signs {
         Vec::with_capacity(n * sub_bpv)
     } else {
@@ -296,29 +258,11 @@ fn merge_graph_union(
         Vec::new()
     };
 
-    for (i, (lsn, gid, code, qjl, _norm, sub, kh, raw)) in entries.iter().enumerate() {
+    for (i, (lsn, gid, code, sub, kh, raw)) in entries.iter().enumerate() {
         tq_buffer_orig.extend_from_slice(code);
         if all_have_raw {
             raw_orig.extend_from_slice(raw);
         }
-        if qjl_bpv > 0 {
-            if qjl.len() == qjl_bpv {
-                qjl_orig.extend_from_slice(qjl);
-            } else {
-                // Pad with zeros if QJL not available for this segment.
-                qjl_orig.extend(std::iter::repeat_n(0u8, qjl_bpv));
-            }
-        }
-        // Residual norm from the norm bytes in the TQ code (unused for SQ8).
-        let entry_norm = if is_sq8 {
-            0.0
-        } else {
-            let code_slice = &code[..];
-            let norm_b = &code_slice[code_len..];
-            f32::from_le_bytes([norm_b[0], norm_b[1], norm_b[2], norm_b[3]])
-        };
-        residual_norms.push(entry_norm);
-
         // `all_have_signs` ⇒ every surviving `sub` is a full real row.
         if all_have_signs && sub_bpv > 0 {
             if sub.len() == sub_bpv {
@@ -438,9 +382,7 @@ fn merge_graph_union(
             .copy_from_slice(&tq_buffer_orig[src..src + bytes_per_code]);
     }
 
-    // BFS-reorder QJL, residual norms, sub-centroid signs.
-    let mut qjl_bfs = vec![0u8; n * qjl_bpv];
-    let mut norms_bfs = vec![0.0f32; n];
+    // BFS-reorder sub-centroid signs.
     let mut sub_bfs = if all_have_signs {
         vec![0u8; n * sub_bpv]
     } else {
@@ -448,16 +390,6 @@ fn merge_graph_union(
     };
     for bfs_pos in 0..n {
         let orig_id = graph.to_original(bfs_pos as u32) as usize;
-        if qjl_bpv > 0 {
-            let src = orig_id * qjl_bpv;
-            let dst = bfs_pos * qjl_bpv;
-            if src + qjl_bpv <= qjl_orig.len() {
-                qjl_bfs[dst..dst + qjl_bpv].copy_from_slice(&qjl_orig[src..src + qjl_bpv]);
-            }
-        }
-        if orig_id < residual_norms.len() {
-            norms_bfs[bfs_pos] = residual_norms[orig_id];
-        }
         if all_have_signs && sub_bpv > 0 {
             let src = orig_id * sub_bpv;
             let dst = bfs_pos * sub_bpv;
@@ -534,9 +466,6 @@ fn merge_graph_union(
     let merged = ImmutableSegment::new(
         graph,
         AlignedBuffer::from_vec(tq_bfs),
-        qjl_bfs,
-        norms_bfs,
-        qjl_bpv,
         sub_bfs,
         sub_bpv,
         mvcc_bfs,
