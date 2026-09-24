@@ -26,9 +26,14 @@ Out: the RESET/ACL privilege-retention finding (security — handled privately p
 | 1 | WS5b-text-graph | performance-engineer | #1191 #1195 #1194(text part) #1197 |
 | 1 | WS6-persistence | storage-durability-engineer · performance-engineer | #1185 #1186 #1187 #1188 #1181 |
 | 2 | WS7-conn-hotpath | performance-engineer · acl-security-gatekeeper | #1175 #1165 #1176 #1178 #1166 |
-| 2 | WS8-shard-coordination | routing-dispatch-engineer · performance-engineer | #1162 #1177 #1182 #1183 #1184 |
-| 2 | WS9-scripting-pubsub | acl-security-gatekeeper · performance-engineer | #1167 #1180 |
-| 2 | WS10-memory-ownership | storage-durability-engineer · performance-engineer | #1160 #1163 #1198 |
+| 2 | WS8-shard-coordination | routing-dispatch-engineer · performance-engineer | #1162 #1177 #1182 #1183 #1184 #1214(1) |
+| 2 | WS9-scripting-pubsub | acl-security-gatekeeper · performance-engineer | #1167 #1180 #1214(2) |
+| 2 | WS10-memory-ownership | storage-durability-engineer · performance-engineer | #1160 #1163 #1198 #1206 #1212 #1214(3) |
+| 2 | WS11-vector-followups | performance-engineer · storage-durability-engineer | #1213 |
+
+## Found during the fix wave (filed 2026-09-24)
+- Bugs: moon#1205 (B+tree corruption — fixed in WS2), #1206 (listpack backlen order — WS10), #1207 (TQ4A2 FT.SEARCH panic — fixed in WS5a), #1208 (EXACT QJL misalignment — fixed in WS5a), #1209 (LPOS/LMOVE parity — fixed in WS3), #1211 (inert LFU params / NOTOUCH introspection — fixed in WS1).
+- Follow-ups: #1212 (listpack residuals — WS10), #1213 (vector follow-ups — WS11), #1214 (needs-profile items — WS8/WS9/WS10).
 
 ## Exit criteria
 - [ ] every workstream has a SUMMARY.md with a per-issue verdict (FIXED / PARTIAL / DEFERRED + reason) and evidence

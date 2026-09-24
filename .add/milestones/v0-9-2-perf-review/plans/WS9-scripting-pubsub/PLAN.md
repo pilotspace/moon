@@ -13,6 +13,8 @@ Review measurement (--shards 1, -P 16 -c 50): GET 1.47M rps (1.59× redis) but E
    - Must: subscribers per channel/pattern stored as `Arc<[Subscriber]>` rebuilt copy-on-write on (un)subscribe / remove_slow; publish snapshot = one Arc clone per channel + per matching pattern; delivery order and slow-subscriber eviction semantics unchanged (pubsub suites by name, incl. RESP3 push, sharded pubsub, keyspace notifications).
    - Evidence: criterion bench or release-fast timing of `publish_shared` at 1/100/1K/10K subscribers before/after.
 
+3. **moon#1214 item 2** keyspace notifications allocate even when nobody subscribes to `__keyspace@*`/`__keyevent@*`: a lock-free global keyspace-listener count maintained by (P)SUBSCRIBE/(P)UNSUBSCRIBE/disconnect gates the event construction; notification delivery unchanged when a listener exists (pubsub/notify suites by name; a test that a late PSUBSCRIBE still receives events).
+
 ## Owned files
 `src/scripting/**`, `src/pubsub/**`, `src/notify*.rs` (only if the pubsub API change requires it), tests `tests/perf_ws9_*.rs`, benches for publish if added.
 Cross-ownership (own commit + note): `parse_eval_args` call sites in `src/server/conn/shared.rs` / handler dispatch.

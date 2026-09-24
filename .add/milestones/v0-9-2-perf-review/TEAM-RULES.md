@@ -11,7 +11,13 @@ does not OOM, fill the disk, or corrupt each other's work.
   The orchestrator integrates your branch.
 
 ## 2. Building (shared target dir — builds serialize on cargo's lock; that is intended)
-- ALWAYS: `export CARGO_TARGET_DIR=/home/user/wt/target` (dependencies are pre-built there).
+- ALWAYS: `export CARGO_TARGET_DIR=/home/user/wt/target CARGO_INCREMENTAL=0` (dependencies are pre-built there;
+  incremental caches are OFF — wave 1 grew them 7 GB in 40 min across worktrees).
+- ARTIFACT ALIASING: cargo's metadata hash is workspace-relative, so every worktree's moon artifacts have the
+  SAME file names in the shared target and another agent's build can overwrite them at any moment. Run tests
+  ONLY via `cargo test …` (build+run in one invocation) — never execute a test binary by path afterwards; for
+  release builds use `cargo build --profile release-fast --bin moon && cp <target>/release-fast/moon /home/user/wt/bin/<ws>-<label>`
+  in ONE command line and measure only the copied binary.
 - Iterate with `cargo check --lib` (fast). Unit tests: `cargo test --lib <filter>`.
   Integration tests: ONLY by name, `cargo test --test <name> [filter]` — NEVER a bare
   `cargo test` (272 test binaries ≈ 10 GB + an hour of CPU).
@@ -70,3 +76,5 @@ does not OOM, fill the disk, or corrupt each other's work.
 ## Self-evaluation (0–1): Completeness · Clarity · Practicality · Optimization · Edge cases · Self-evaluation
 ```
 If any self-score < 0.9, refine the work (or say precisely why it cannot reach 0.9 here) before finishing.
+If the harness refuses a subagent Write of SUMMARY.md, do not work around it: put the full SUMMARY.md content in your
+final report and the orchestrator commits it.
