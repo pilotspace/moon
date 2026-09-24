@@ -672,6 +672,10 @@ pub(crate) async fn handle_connection_sharded_inner<
                 if let Some(remaining) = crate::client_pause::batch_pause_remaining() {
                     tokio::time::sleep(remaining).await;
                 }
+                // moon#1165: re-resolve a stale ACL cache once per batch (after
+                // any pause, so the batch runs against the table as it is now).
+                // Fail-closed: see `ConnectionState::refresh_acl_cache_if_stale`.
+                conn.refresh_acl_cache_if_stale(&ctx.acl_table);
 
                 let mut responses: Vec<Frame> = Vec::with_capacity(batch.len());
                 // v3-5 group commit: response indexes of coordinator LOCAL-leg

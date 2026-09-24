@@ -492,9 +492,10 @@ impl ConnectionState {
     /// `acl_version_handle` pointing at the table's real counter, so this
     /// function always refreshes the handle (cheap Arc clone).  Reading
     /// the handle and the user data in the same critical section ensures
-    /// the snapshot stays consistent: any mutator bumps the version only
-    /// after releasing the write lock via Drop, so we cannot observe a
-    /// post-mutation version with pre-mutation user data.
+    /// the snapshot stays consistent: every mutator bumps the version inside
+    /// its write-locked `&mut AclTable` method (`set_user`, `del_user`,
+    /// `try_apply_setuser`, `replace_with`), so a reader holding the read
+    /// guard sees data and version from the same side of every mutation.
     #[inline]
     pub fn refresh_acl_cache(&mut self, acl_table: &StdRwLock<crate::acl::AclTable>) {
         // std RwLock: poison = prior panic = unrecoverable. Same convention
@@ -504,6 +505,32 @@ impl ConnectionState {
         self.acl_version_handle = guard.version_handle();
         self.cached_acl_unrestricted = guard.is_user_unrestricted(&self.current_user);
         self.cached_acl_version = guard.version();
+    }
+
+    /// Batch-top ACL cache maintenance (moon#1165): re-resolve the cache once
+    /// the table has moved on, so ONE `ACL SETUSER`/`DELUSER`/`LOAD` —
+    /// for any user, including one nobody is connected as — no longer leaves
+    /// every existing connection on the locked per-command check (and off the
+    /// inline GET/SET path) for the rest of its life.
+    ///
+    /// Fail-closed by construction, whatever the interleaving:
+    /// - this only changes what the cache SAYS; every command still gates on
+    ///   [`Self::acl_skip_allowed`], which re-checks freshness per command, so a
+    ///   mutation landing after this refresh (mid-batch) sends the very next
+    ///   command back to the full check against the live table;
+    /// - the refresh reads the unrestricted verdict and the version under ONE
+    ///   read guard, and mutators bump the version while holding the write
+    ///   guard, so the pair is consistent (never "new version, old verdict");
+    /// - a user that became restricted, was deleted, or was disabled caches
+    ///   `false` — the full check then answers NOPERM exactly as before.
+    ///
+    /// It never changes `current_user` (identity changes stay with
+    /// AUTH/HELLO/RESET). Cost when nothing changed: one Acquire load.
+    #[inline]
+    pub fn refresh_acl_cache_if_stale(&mut self, acl_table: &StdRwLock<crate::acl::AclTable>) {
+        if !self.acl_cache_fresh() {
+            self.refresh_acl_cache(acl_table);
+        }
     }
 
     /// Lock-free check: is the cached unrestricted flag still valid?
@@ -696,4 +723,80 @@ pub(crate) enum CoreAction {
     Close,
     /// Migrate connection to a different shard.
     Migrate { target_shard: usize },
+}
+
+#[cfg(test)]
+mod acl_cache_tests {
+    use super::*;
+
+    fn conn() -> ConnectionState {
+        ConnectionState::new(1, "127.0.0.1:1".into(), &None, 0, 1, false, 16, None)
+    }
+
+    fn table() -> StdRwLock<AclTable> {
+        let mut t = AclTable::new();
+        t.ensure_default_user(None);
+        StdRwLock::new(t)
+    }
+
+    /// moon#1165: an unrelated mutation stales the cache; the batch-top
+    /// refresh brings an unrestricted connection back to the skip path.
+    #[test]
+    fn stale_cache_is_refreshed_back_to_skip_for_an_unrestricted_user() {
+        let table = table();
+        let mut c = conn();
+        c.refresh_acl_cache(&table);
+        assert!(c.acl_skip_allowed());
+
+        #[allow(clippy::unwrap_used)]
+        table
+            .write()
+            .unwrap()
+            .apply_setuser("probe", &["on", "nopass", "+ping"]);
+        assert!(!c.acl_skip_allowed(), "a mutation must stale the cache");
+        c.refresh_acl_cache_if_stale(&table);
+        assert!(
+            c.acl_skip_allowed(),
+            "after the refresh the unrestricted default user skips again"
+        );
+    }
+
+    /// Fail-closed: when the mutation restricts THIS connection's user, the
+    /// refresh caches `false` — the full check keeps running.
+    #[test]
+    fn refresh_after_revocation_caches_restricted() {
+        let table = table();
+        let mut c = conn();
+        c.refresh_acl_cache(&table);
+        #[allow(clippy::unwrap_used)]
+        table.write().unwrap().apply_setuser("default", &["-get"]);
+        c.refresh_acl_cache_if_stale(&table);
+        assert!(
+            !c.acl_skip_allowed(),
+            "revoked user must not skip the check"
+        );
+
+        // A deleted user never caches unrestricted either.
+        c.current_user = "ghost".into();
+        #[allow(clippy::unwrap_used)]
+        table.write().unwrap().apply_setuser("default", &["+get"]);
+        c.refresh_acl_cache_if_stale(&table);
+        assert!(!c.acl_skip_allowed(), "an unknown user must not skip");
+    }
+
+    /// A fresh cache is left alone (no lock taken): the refresh is a no-op.
+    #[test]
+    fn fresh_cache_is_not_re_resolved() {
+        let table = table();
+        let mut c = conn();
+        c.refresh_acl_cache(&table);
+        // Poison the cached verdict without touching the version: a refresh
+        // that re-resolved would overwrite it.
+        c.cached_acl_unrestricted = false;
+        c.refresh_acl_cache_if_stale(&table);
+        assert!(
+            !c.cached_acl_unrestricted,
+            "a fresh cache must not re-resolve"
+        );
+    }
 }

@@ -1564,6 +1564,14 @@ pub(crate) async fn handle_connection_sharded_monoio<
             }
         }
 
+        // moon#1165: re-resolve a stale ACL cache before this batch's gates
+        // read it. Without this one ACL mutation — for ANY user — left every
+        // existing connection off the inline path and on the locked
+        // per-command check until it reconnected. Fail-closed: see
+        // `ConnectionState::refresh_acl_cache_if_stale`. One Acquire load
+        // when nothing changed.
+        conn.refresh_acl_cache_if_stale(&ctx.acl_table);
+
         // Inline dispatch: GET/SET directly from raw bytes, skipping Frame construction.
         // Skip when unauthenticated or workspace-bound (prefix injection in normal path only).
         if !frames_carried && conn.authenticated && conn.workspace_id.is_none() {

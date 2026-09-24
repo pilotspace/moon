@@ -523,6 +523,11 @@ pub async fn handle_connection(
                 // the binary never reaches it. Its own retro-encode behaviour is
                 // unchanged and recorded as a spec delta.
                 conn.proto_switches.clear();
+                // moon#1165: re-resolve a stale ACL cache once per batch, so an
+                // ACL mutation does not pin this connection on the locked check
+                // for life. Fail-closed: see
+                // `ConnectionState::refresh_acl_cache_if_stale`.
+                conn.refresh_acl_cache_if_stale(&acl_table);
                 // moon#1099: every write's record is enqueued in the stretch
                 // that applies it, while its db guard is held, so log order is
                 // apply order across connections. The log keeps each record's
