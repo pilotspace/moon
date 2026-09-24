@@ -1049,6 +1049,12 @@ fn apply_completion_vec(
             usize,
             Vec<crate::storage::tiered::spill_thread::SpillCompletionEntry>,
         )> = Vec::new();
+        // moon#1215: keys this file holds a slot for but that will NOT be
+        // indexed from it (superseded, or withdrawn with the marker). If the
+        // file is published for its other keys, those slots are on disk in a
+        // listed file and a rebuild would index them: the cold index's
+        // dead-slot ledger must know, so an AOF rewrite can keep them dead.
+        let mut ghosts: Vec<(usize, bytes::Bytes)> = Vec::new();
         for entry in c.entries {
             let publishable = crate::shard::slice::with_shard_db(entry.db_index, |db| {
                 if !db.spill_inflight_is_newest(&entry.key, entry.req_file_id) {
@@ -1067,6 +1073,8 @@ fn apply_completion_vec(
                     Some((_, entries)) => entries.push(entry),
                     None => groups.push((entry.db_index, vec![entry])),
                 }
+            } else {
+                ghosts.push((entry.db_index, entry.key));
             }
         }
 
@@ -1089,6 +1097,7 @@ fn apply_completion_vec(
                 for entry in &entries {
                     rehydrate_unpublished_spill(entry, file_id);
                 }
+                ghosts.extend(keys.into_iter().map(|k| (db_index, k)));
                 continue;
             }
             published_any = true;
@@ -1129,6 +1138,13 @@ fn apply_completion_vec(
                 tracing::error!(file_id, error = %e, "Spill completion: manifest add_file refused");
             } else {
                 manifest_dirty = true;
+                for (db_index, key) in ghosts {
+                    crate::shard::slice::with_shard_db(db_index, |db| {
+                        if let Some(ci) = db.cold_index.as_mut() {
+                            ci.note_dead_slot(file_id, key);
+                        }
+                    });
+                }
             }
         }
     }
@@ -2245,6 +2261,9 @@ mod checkpoint_tick_tests;
 
 #[cfg(test)]
 mod fold_inflight_tests;
+
+#[cfg(test)]
+mod ghost_slot_tests;
 
 #[cfg(test)]
 mod tests {
