@@ -463,6 +463,9 @@ async fn stream_commands_read_loop(
     cfg: &ReplicaTaskConfig,
 ) -> anyhow::Result<()> {
     let mut buf = BytesMut::with_capacity(65536);
+    // moon#1164: resume cursor for a large frame split across reads. `buf` is
+    // only appended to here and consumed by the drain, as it requires.
+    let mut parse_state = crate::protocol::ParseState::new();
     // Seeded from the task-level slot (NOT 0): a +CONTINUE resume must keep
     // the db context the stream was in when the link dropped — see
     // `ReplicaTaskConfig::stream_db`.
@@ -482,8 +485,11 @@ async fn stream_commands_read_loop(
         // Parse every complete RESP command in the buffer and apply it to the
         // local shard. The replication offset advances by CONSUMED bytes (whole
         // frames), never the raw socket read count — a read may split a frame.
-        let outcome =
-            crate::replication::apply::drain_replicated_commands(&mut buf, &mut selected_db);
+        let outcome = crate::replication::apply::drain_replicated_commands_resumable(
+            &mut buf,
+            &mut selected_db,
+            &mut parse_state,
+        );
         for rc in &outcome.commands {
             use crate::replication::apply::ApplyOutcome;
             match crate::replication::apply::apply_local(
@@ -869,6 +875,9 @@ async fn stream_commands_read_loop(
     use monoio::io::AsyncReadRent;
 
     let mut buf = BytesMut::with_capacity(65536);
+    // moon#1164: resume cursor for a large frame split across reads. `buf` is
+    // only appended to here and consumed by the drain, as it requires.
+    let mut parse_state = crate::protocol::ParseState::new();
     // Seeded from the task-level slot (NOT 0): a +CONTINUE resume must keep
     // the db context the stream was in when the link dropped — see
     // `ReplicaTaskConfig::stream_db`.
@@ -892,8 +901,11 @@ async fn stream_commands_read_loop(
         // Parse every complete RESP command in the buffer and apply it to the
         // local shard. Offset advances by CONSUMED bytes (whole frames), never
         // the raw read count — a read may split a frame across boundaries.
-        let outcome =
-            crate::replication::apply::drain_replicated_commands(&mut buf, &mut selected_db);
+        let outcome = crate::replication::apply::drain_replicated_commands_resumable(
+            &mut buf,
+            &mut selected_db,
+            &mut parse_state,
+        );
         for rc in &outcome.commands {
             use crate::replication::apply::ApplyOutcome;
             match crate::replication::apply::apply_local(

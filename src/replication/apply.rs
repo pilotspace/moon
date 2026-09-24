@@ -140,6 +140,10 @@ pub(crate) struct DrainResult {
 /// `SELECT n` updates `selected_db` and is NOT emitted (carries no data).
 /// Replication chatter (`PING`, `REPLCONF`) is skipped. Every other command is
 /// emitted bound to the `selected_db` in effect when it was parsed.
+///
+/// Stateless form, for tests and one-shot buffers; the replica read loops use
+/// [`drain_replicated_commands_resumable`].
+#[cfg(test)]
 pub(crate) fn drain_replicated_commands(
     buf: &mut BytesMut,
     selected_db: &mut usize,
