@@ -357,3 +357,4 @@ harness = false
 [[bench]]
 name = "text_search"
 harness = false
+required-features = ["text-index"]
