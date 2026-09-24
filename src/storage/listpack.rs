@@ -8,6 +8,9 @@ mod list_ops;
 // moon#1174 §3 guards: owned-read paths copy each entry once.
 #[cfg(test)]
 mod read_tests;
+// moon#1206 guards: redis's backlen order, backward walks on wide entries.
+#[cfg(test)]
+mod backlen_tests;
 
 const LP_HDR_SIZE: usize = 7; // 4 bytes total_bytes + 2 bytes num_elements + 1 byte terminator
 const LP_TERMINATOR: u8 = 0xFF;
@@ -842,49 +845,63 @@ fn encode_string_head(len: usize, head: &mut [u8; LP_MAX_ENTRY_HEAD]) -> usize {
 /// Write the backlen for an entry of `entry_len` bytes into `out`; returns
 /// how many bytes it used.
 ///
-/// The non-allocating twin of [`encode_backlen`], which survives as the test
-/// oracle both this and [`backlen_size`] are pinned against.
+/// Redis's byte order (`lpEncodeBacklen`, moon#1206): the MOST significant
+/// 7-bit group first, WITHOUT the continuation bit, then every lower group
+/// with `0x80` set -- so [`decode_backlen`], reading from the entry's tail,
+/// meets the lowest group first and stops at the one byte without `0x80`.
+/// moon used to write the groups low-first (`129` as `81 01` where redis
+/// writes `01 81`): the decoder read that as the wrong length and every
+/// backward walk over an entry of 128 B or more landed inside its payload.
+///
+/// No persisted artifact carries these bytes: every RDB, AOF-rewrite base,
+/// DUMP payload and cold-tier record stores a listpack value as its ELEMENTS
+/// and rebuilds the listpack through `push_*` on load, and `Listpack` has no
+/// constructor from raw bytes. So flipping the order changes no on-disk
+/// format and needs no normalize pass; `persisted_forms_rebuild_through_the_encoder`
+/// pins that property.
 #[inline]
 fn encode_backlen_into(entry_len: usize, out: &mut [u8; LP_MAX_BACKLEN]) -> usize {
-    let mut len = entry_len;
-    if len <= 127 {
-        out[0] = len as u8;
-        return 1;
-    }
-    let mut n = 0;
-    while len > 0 {
-        let mut byte = (len & 0x7F) as u8;
-        len >>= 7;
-        if len > 0 {
-            byte |= 0x80;
-        }
-        out[n] = byte;
-        n += 1;
+    let n = backlen_size(entry_len);
+    // The top group: at most 7 bits by `backlen_size`'s choice of `n`.
+    out[0] = ((entry_len >> (7 * (n - 1))) & 0x7F) as u8;
+    for (k, byte) in out.iter_mut().enumerate().take(n).skip(1) {
+        *byte = ((entry_len >> (7 * (n - 1 - k))) & 0x7F) as u8 | 0x80;
     }
     n
 }
 
-/// Encode backlen as variable-length bytes (7 bits + continuation bit).
-///
-/// The allocating original, kept as the oracle [`encode_backlen_into`] and
-/// [`backlen_size`] are checked against. No production path calls it.
+/// Encode a backlen exactly as redis 7's `lpEncodeBacklen` does, transcribed
+/// case by case -- the oracle [`encode_backlen_into`] and [`backlen_size`]
+/// are pinned against. Covers every `entry_len` a listpack can hold (its
+/// `total_bytes` is a `u32`). No production path calls it.
 #[cfg(test)]
-fn encode_backlen(entry_len: usize) -> Vec<u8> {
-    let mut buf = Vec::new();
-    let mut len = entry_len;
-    if len <= 127 {
-        buf.push(len as u8);
+fn encode_backlen(l: usize) -> Vec<u8> {
+    if l <= 127 {
+        vec![l as u8]
+    } else if l < 16383 {
+        vec![(l >> 7) as u8, (l & 127) as u8 | 128]
+    } else if l < 2097151 {
+        vec![
+            (l >> 14) as u8,
+            ((l >> 7) & 127) as u8 | 128,
+            (l & 127) as u8 | 128,
+        ]
+    } else if l < 268435455 {
+        vec![
+            (l >> 21) as u8,
+            ((l >> 14) & 127) as u8 | 128,
+            ((l >> 7) & 127) as u8 | 128,
+            (l & 127) as u8 | 128,
+        ]
     } else {
-        while len > 0 {
-            let mut byte = (len & 0x7F) as u8;
-            len >>= 7;
-            if len > 0 {
-                byte |= 0x80;
-            }
-            buf.push(byte);
-        }
+        vec![
+            (l >> 28) as u8,
+            ((l >> 21) & 127) as u8 | 128,
+            ((l >> 14) & 127) as u8 | 128,
+            ((l >> 7) & 127) as u8 | 128,
+            (l & 127) as u8 | 128,
+        ]
     }
-    buf
 }
 
 /// Byte width of the backlen field for an entry of `entry_len` bytes.
@@ -893,19 +910,21 @@ fn encode_backlen(entry_len: usize) -> Vec<u8> {
 /// only ever needs the WIDTH -- it walks forward and must know where the next
 /// entry starts -- so allocating the encoded bytes just to call `.len()` on
 /// them put one malloc/free on every entry decoded, on every scan.
+///
+/// Redis's boundaries (moon#1206): `n` bytes hold `entry_len < 2^(7n) - 1`,
+/// so 16383 takes THREE bytes (`00 ff ff`), not two. A forward walk that
+/// disagreed with redis on the width would mis-step on an entry of exactly
+/// that length.
 #[inline]
 fn backlen_size(entry_len: usize) -> usize {
     if entry_len <= 127 {
-        1
-    } else {
-        let mut len = entry_len;
-        let mut n = 0;
-        while len > 0 {
-            len >>= 7;
-            n += 1;
-        }
-        n
+        return 1;
     }
+    let mut n = 2;
+    while 7 * n < usize::BITS as usize && entry_len >= (1usize << (7 * n)) - 1 {
+        n += 1;
+    }
+    n
 }
 
 /// Decode backlen reading backward from the byte at `pos - 1`.
@@ -1804,14 +1823,15 @@ mod byte_exactness_tests {
 
     /// A listpack is a byte-exact format, not merely a container.
     ///
-    /// It is what `DUMP`/`RESTORE` hand across the wire and what the RDB
-    /// writes to disk (`persistence::redis_rdb` emits the `*_LISTPACK` object
-    /// types verbatim), so an encoder change that still "reads back
-    /// correctly" inside this process can still be a wire-format break. The
-    /// bar is identical BYTES, and these goldens are that bar: they were
-    /// captured from the `Vec`-building encoder and committed BEFORE the
-    /// moon#942 stack-buffer rewrite, so they are an oracle for that rewrite
-    /// rather than a restatement of it.
+    /// moon persists listpack VALUES as their elements (the RDB writers emit
+    /// the plain `HASH`/`LIST`/`SET`/`ZSET_2` types and rebuild the listpack
+    /// on load), but the in-memory layout is redis's: a listpack reader for
+    /// redis's `*_LISTPACK` payloads, and every backward walk, depend on it.
+    /// The bar is identical BYTES, and these goldens are that bar: the
+    /// narrow ones were captured from the `Vec`-building encoder and committed
+    /// BEFORE the moon#942 stack-buffer rewrite; every multi-byte backlen was
+    /// re-captured from redis-server 7.0.15 `DUMP` output for moon#1206, which
+    /// flipped moon's low-group-first order to redis's.
     ///
     /// `007`, `000000012345`, `00`, `0000`, `+5`, `+0` and `-0` are in here
     /// deliberately: storing `000000012345` as the integer `12345` and
@@ -1898,11 +1918,12 @@ mod byte_exactness_tests {
         let all: Vec<u8> = (0u8..=255).collect();
         let got = encoded_hex(&all);
         // total = 7 + (2 + 256) + 2 = 267; head = 0xE1 0x00;
-        // backlen(258) = [0x82, 0x02].
+        // backlen(258) = [258 >> 7, (258 & 0x7F) | 0x80] = [0x02, 0x82]
+        // (redis 7.0.15 writes `02 82`).
         assert_eq!(&got[..12], "0b0100000100", "header changed");
         assert_eq!(&got[12..16], "e100", "12-bit string head changed");
         assert_eq!(&got[16..16 + 512], &hex(&all), "payload changed");
-        assert_eq!(&got[16 + 512..], "8202ff", "backlen/terminator changed");
+        assert_eq!(&got[16 + 512..], "0282ff", "backlen/terminator changed");
     }
 
     /// The seams where the head width or the backlen width moves.
@@ -1915,10 +1936,10 @@ mod byte_exactness_tests {
         assert_eq!(&encoded_hex(&[b'z'; 65])[12..16], "e041");
 
         // 127 bytes of payload makes entry_len 129: the first two-byte
-        // backlen.
+        // backlen, `01 81` in redis's order (moon#1206; it was `81 01`).
         let seam = encoded_hex(&[b'p'; 127]);
         assert_eq!(&seam[..16], "8a0000000100e07f");
-        assert_eq!(&seam[seam.len() - 6..], "8101ff");
+        assert_eq!(&seam[seam.len() - 6..], "0181ff");
     }
 
     /// The two widest encodings, checked against a head/backlen derivation
@@ -1930,7 +1951,7 @@ mod byte_exactness_tests {
         // 4095 bytes: the top of the 12-bit string encoding.
         //   head    = 0xE0 | (4095 >> 8) = 0xEF, then 4095 & 0xFF = 0xFF
         //   entry   = 2 + 4095 = 4097
-        //   backlen = [(4097 & 0x7F) | 0x80, 4097 >> 7] = [0x81, 0x20]
+        //   backlen = [4097 >> 7, (4097 & 0x7F) | 0x80] = [0x20, 0x81]
         //   total   = 7 + 4097 + 2 = 4106
         let mut lp = Listpack::new();
         lp.push_back(&vec![b'q'; 4095]);
@@ -1939,12 +1960,12 @@ mod byte_exactness_tests {
         want.extend_from_slice(&1u16.to_le_bytes());
         want.extend_from_slice(&[0xEF, 0xFF]);
         want.extend(std::iter::repeat_n(b'q', 4095));
-        want.extend_from_slice(&[0x81, 0x20, LP_TERMINATOR]);
+        want.extend_from_slice(&[0x20, 0x81, LP_TERMINATOR]);
         assert_eq!(lp.data, want, "12-bit string encoding changed at its top");
 
         // 4096 bytes: the first 32-bit string encoding.
         //   head    = 0xF0, then 4096u32 LE
-        //   entry   = 5 + 4096 = 4101 -> backlen [0x85, 0x20]
+        //   entry   = 5 + 4096 = 4101 -> backlen [0x20, 0x85]
         //   total   = 7 + 4101 + 2 = 4110
         let mut lp = Listpack::new();
         lp.push_back(&vec![b'r'; 4096]);
@@ -1954,7 +1975,7 @@ mod byte_exactness_tests {
         want.push(LP_ENCODING_32BIT_STR);
         want.extend_from_slice(&4096u32.to_le_bytes());
         want.extend(std::iter::repeat_n(b'r', 4096));
-        want.extend_from_slice(&[0x85, 0x20, LP_TERMINATOR]);
+        want.extend_from_slice(&[0x20, 0x85, LP_TERMINATOR]);
         assert_eq!(lp.data, want, "32-bit string encoding changed");
     }
 
@@ -2071,12 +2092,20 @@ mod byte_exactness_tests {
             127,
             128,
             129,
+            16382,
             16383,
             16384,
             16385,
+            2097150,
             2097151,
             2097152,
-            usize::MAX,
+            268435454,
+            268435455,
+            268435456,
+            // The oracle is redis's own five cases, which cover every length a
+            // `u32`-sized listpack can hold; wider ones are decoder-checked in
+            // `backlen_tests`.
+            u32::MAX as usize,
         ] {
             let mut buf = [0u8; LP_MAX_BACKLEN];
             let written = encode_backlen_into(n, &mut buf);
