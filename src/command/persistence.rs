@@ -623,6 +623,37 @@ mod tests {
         assert!(!SAVE_IN_PROGRESS.load(Ordering::SeqCst));
     }
 
+    /// A sharded auto-save starts as a COUNTED save (moon#1230): it arms the
+    /// per-shard fan-in, so its completions publish its status and advance
+    /// LASTSAVE, and it holds SAVE_IN_PROGRESS against a concurrent BGSAVE.
+    #[test]
+    fn a_sharded_auto_save_is_a_counted_save() {
+        let _guard = BGSAVE_TEST_LOCK.lock();
+        SAVE_IN_PROGRESS.store(false, Ordering::SeqCst);
+        BGSAVE_SHARDS_REMAINING.store(0, Ordering::SeqCst);
+        LAST_SAVE_TIME.store(3, Ordering::SeqCst);
+        let (tx, rx) = crate::runtime::channel::watch(0u64);
+        let before = rx.borrow();
+        assert!(crate::persistence::auto_save::start_counted_auto_save(&tx));
+        assert!(rx.borrow() > before, "the shards are told to snapshot");
+        assert!(SAVE_IN_PROGRESS.load(Ordering::SeqCst));
+        let shards = crate::command::connection::shard_count() as u64;
+        assert_eq!(BGSAVE_SHARDS_REMAINING.load(Ordering::SeqCst), shards);
+        assert!(
+            !crate::persistence::auto_save::start_counted_auto_save(&tx),
+            "a second save while one runs is refused"
+        );
+        for _ in 0..shards {
+            bgsave_shard_done(true);
+        }
+        assert!(!SAVE_IN_PROGRESS.load(Ordering::SeqCst));
+        assert!(BGSAVE_LAST_STATUS.load(Ordering::SeqCst));
+        assert!(
+            LAST_SAVE_TIME.load(Ordering::SeqCst) > 3,
+            "LASTSAVE advanced"
+        );
+    }
+
     #[test]
     fn test_bgsave_last_status_initial() {
         // BGSAVE_LAST_STATUS starts as true (no failure has occurred)

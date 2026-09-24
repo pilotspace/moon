@@ -108,7 +108,9 @@ pub async fn run_auto_save(
 
 /// Start a sharded auto-save through the same entry point BGSAVE uses
 /// ([`bgsave_start_sharded`]). `false` when a save is already running.
-fn start_counted_auto_save(snapshot_trigger: &crate::runtime::channel::WatchSender<u64>) -> bool {
+pub(crate) fn start_counted_auto_save(
+    snapshot_trigger: &crate::runtime::channel::WatchSender<u64>,
+) -> bool {
     matches!(
         bgsave_start_sharded(snapshot_trigger, crate::command::connection::shard_count()),
         crate::protocol::Frame::SimpleString(_)

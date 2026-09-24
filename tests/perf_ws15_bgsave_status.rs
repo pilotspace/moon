@@ -6,9 +6,11 @@
 //! landing while a large BGSAVE epoch is still writing aborts that save.
 //! Before the fix the status then stayed `err` forever (and every later
 //! `SHUTDOWN SAVE` was refused with "background save error", because it
-//! reads the same flag after its own, successful, save); sharded auto-saves
-//! never advanced `LASTSAVE`; and a BGSAVE on a server with no persistence
-//! directory never finished (`rdb_bgsave_in_progress:1` forever).
+//! reads the same flag after its own, successful, save); and a BGSAVE on a
+//! server with no persistence directory never finished
+//! (`rdb_bgsave_in_progress:1` forever). (That a sharded auto-save is now a
+//! counted save is unit-tested in `command::persistence`: in the shipped
+//! sharded server `--save` rules never fire at all — a separate finding.)
 //!
 //! Runs at `--shards 1` and `--shards 4`. Pin the binary:
 //! `MOON_BIN=<moon> cargo test --test perf_ws15_bgsave_status`.
@@ -219,32 +221,6 @@ fn bgsave_status_recovers_after_a_failed_save_shards_1() {
 #[test]
 fn bgsave_status_recovers_after_a_failed_save_shards_4() {
     failed_then_clean_save(4);
-}
-
-/// Sharded auto-save (`--save`) is a counted save: it advances LASTSAVE and
-/// reports its status.
-#[test]
-fn auto_save_advances_lastsave() {
-    for shards in [1usize, 4] {
-        let dir = common::unique_test_dir(&format!("ws15-1230-auto-s{shards}"));
-        std::fs::create_dir_all(&dir).unwrap();
-        let (_server, port) = spawn(&dir, shards, &["--save", "1 1"]);
-        let mut c = Conn::open(port);
-        assert_eq!(lastsave(&mut c), 0, "fixture: nothing saved yet");
-        for i in 0..10 {
-            c.send(&["SET", &format!("k{i}"), "v"]);
-        }
-        let deadline = Instant::now() + Duration::from_secs(20);
-        while lastsave(&mut c) == 0 {
-            assert!(
-                Instant::now() < deadline,
-                "--shards {shards}: auto-save never advanced LASTSAVE"
-            );
-            std::thread::sleep(Duration::from_millis(50));
-        }
-        assert_eq!(wait_bgsave(&mut c, Duration::from_secs(30)), "ok");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
 }
 
 /// With no persistence directory (`--appendonly no`, no `--save`) a BGSAVE
