@@ -96,254 +96,264 @@ pub(crate) fn handle_uring_event(
                 .or_insert_with(|| bytes::BytesMut::with_capacity(4096));
             parse_buf.extend_from_slice(&data);
 
-            // Phase A: Parse all frames into a batch (up to 1024, matching Tokio path MAX_BATCH).
+            // moon#1227 review: one recv can complete more frames than one
+            // batch takes. Each batch is parsed, dispatched and answered in
+            // turn until the buffer holds fewer; stopping at the first would
+            // leave the rest unanswered until the client happened to send
+            // more, and it is waiting for these replies instead.
             let parse_config = crate::protocol::ParseConfig::default();
-            let mut batch: Vec<crate::protocol::Frame> = Vec::with_capacity(16);
-            let mut parse_error = false;
             loop {
-                match crate::protocol::parse(parse_buf, &parse_config) {
-                    Ok(Some(frame)) => {
-                        batch.push(frame);
-                        if batch.len() >= 1024 {
+                // Phase A: Parse the frames into a batch, at most
+                // `MAX_BATCH_FRAMES` (the connection handlers' cap).
+                let mut batch: Vec<crate::protocol::Frame> = Vec::with_capacity(16);
+                let mut parse_error = false;
+                while batch.len() < crate::server::conn::util::MAX_BATCH_FRAMES {
+                    match crate::protocol::parse(parse_buf, &parse_config) {
+                        Ok(Some(frame)) => batch.push(frame),
+                        Ok(None) => break,
+                        Err(crate::protocol::ParseError::Incomplete) => break,
+                        Err(_) => {
+                            parse_error = true;
                             break;
                         }
                     }
-                    Ok(None) => break,
-                    Err(crate::protocol::ParseError::Incomplete) => break,
-                    Err(_) => {
-                        parse_error = true;
-                        break;
-                    }
                 }
-            }
 
-            if parse_error {
-                // Protocol error: close connection, reclaim pooled buffers
-                if let Some(sends) = inflight_sends.remove(&conn_id) {
-                    for send in sends {
-                        if let InFlightSend::Fixed(idx) = send {
-                            driver.reclaim_send_buf(idx);
+                if parse_error {
+                    // Protocol error: close connection, reclaim pooled buffers
+                    if let Some(sends) = inflight_sends.remove(&conn_id) {
+                        for send in sends {
+                            if let InFlightSend::Fixed(idx) = send {
+                                driver.reclaim_send_buf(idx);
+                            }
                         }
                     }
+                    let _ = driver.close_connection(conn_id);
+                    parse_bufs.remove(&conn_id);
+                    return;
                 }
-                let _ = driver.close_connection(conn_id);
-                parse_bufs.remove(&conn_id);
-                return;
-            }
 
-            if batch.is_empty() {
-                return;
-            }
+                if batch.is_empty() {
+                    return;
+                }
+                // Stopped at the cap with input left: go round again once
+                // this batch is answered.
+                let more = batch.len() >= crate::server::conn::util::MAX_BATCH_FRAMES
+                    && !parse_buf.is_empty();
 
-            // Phase B: Dispatch all commands inside a single ShardSlice borrow.
-            // This handler runs synchronously ON the shard thread, so the
-            // thread-local slice borrow replaces the old per-batch write lock
-            // (shardslice-migration C6). The workspace-registry Mutex and
-            // wal_append channel sends inside the closure are independent of
-            // the slice borrow — no re-entrancy, no await.
-            let db_count = shard_databases.db_count();
-            let responses: Vec<crate::protocol::Frame> = crate::shard::slice::with_shard_db(
-                0,
-                |db| {
-                    db.refresh_now_from_cache(cached_clock);
-                    let mut selected = 0usize;
-                    batch
-                        .iter()
-                        .map(|frame| {
-                        let (cmd, args) = match extract_command_static(frame) {
-                            Some(pair) => pair,
-                            None => {
+                // Phase B: Dispatch all commands inside a single ShardSlice borrow.
+                // This handler runs synchronously ON the shard thread, so the
+                // thread-local slice borrow replaces the old per-batch write lock
+                // (shardslice-migration C6). The workspace-registry Mutex and
+                // wal_append channel sends inside the closure are independent of
+                // the slice borrow — no re-entrancy, no await.
+                let db_count = shard_databases.db_count();
+                let responses: Vec<crate::protocol::Frame> = crate::shard::slice::with_shard_db(
+                    0,
+                    |db| {
+                        db.refresh_now_from_cache(cached_clock);
+                        let mut selected = 0usize;
+                        batch
+                            .iter()
+                            .map(|frame| {
+                            let (cmd, args) = match extract_command_static(frame) {
+                                Some(pair) => pair,
+                                None => {
+                                    return crate::protocol::Frame::Error(bytes::Bytes::from_static(
+                                        b"ERR invalid command",
+                                    ));
+                                }
+                            };
+                            // WS.* command intercept (Phase 159) — workspace commands
+                            // are handled at the handler level, not in cmd_dispatch.
+                            if crate::workspace::is_ws_command(cmd) {
+                                let sub = args.first().and_then(|f| {
+                                    if let crate::protocol::Frame::BulkString(b) = f { Some(b.as_ref()) } else { None }
+                                });
+                                let mut reg_guard = shard_databases.workspace_registry();
+                                let registry = reg_guard.get_or_insert_with(|| Box::new(crate::workspace::registry::WorkspaceRegistry::new()));
+                                match sub {
+                                    Some(s) if s.eq_ignore_ascii_case(b"CREATE") => {
+                                        let ws_id = crate::workspace::WorkspaceId::new_v7();
+                                        let name = args.get(1).and_then(|f| {
+                                            if let crate::protocol::Frame::BulkString(b) = f { Some(b.clone()) } else { None }
+                                        }).unwrap_or_else(|| bytes::Bytes::from_static(b""));
+                                        let created_at = std::time::SystemTime::now()
+                                            .duration_since(std::time::UNIX_EPOCH)
+                                            .unwrap_or_default()
+                                            .as_millis() as i64;
+                                        registry.insert(ws_id, crate::workspace::registry::WorkspaceMetadata {
+                                            id: ws_id,
+                                            name: name.clone(),
+                                            created_at,
+                                        });
+                                        // WAL: WorkspaceCreate to shard 0 (unframed,
+                                        // real type — K1a) — the global registry's
+                                        // single stream (mirrors the conn handlers;
+                                        // without it, workspaces created via this
+                                        // batch path were lost on restart). K1b: the
+                                        // payload carries `created_at` too.
+                                        let payload = crate::workspace::wal::encode_workspace_create(ws_id.as_bytes(), &name, created_at);
+                                        shard_databases.wal_append(
+                                            0,
+                                            crate::persistence::wal_v3::record::WalRecordType::WorkspaceCreate,
+                                            bytes::Bytes::from(payload),
+                                        );
+                                        return crate::protocol::Frame::BulkString(bytes::Bytes::from(ws_id.as_hex()));
+                                    }
+                                    Some(s) if s.eq_ignore_ascii_case(b"DROP") => {
+                                        let ws_hex = args.get(1).and_then(|f| {
+                                            if let crate::protocol::Frame::BulkString(b) = f { Some(b.as_ref()) } else { None }
+                                        });
+                                        if let Some(hex) = ws_hex {
+                                            if let Some(ws_id) = crate::workspace::WorkspaceId::from_hex(hex) {
+                                                // WAL only a real removal; the OK-even-if-absent
+                                                // reply is pre-existing batch-path behavior.
+                                                if registry.remove(&ws_id).is_some() {
+                                                    let payload = crate::workspace::wal::encode_workspace_drop(ws_id.as_bytes());
+                                                    shard_databases.wal_append(
+                                                        0,
+                                                        crate::persistence::wal_v3::record::WalRecordType::WorkspaceDrop,
+                                                        bytes::Bytes::from(payload),
+                                                    );
+                                                }
+                                                return crate::protocol::Frame::SimpleString(bytes::Bytes::from_static(b"OK"));
+                                            }
+                                        }
+                                        return crate::protocol::Frame::Error(bytes::Bytes::from_static(b"ERR invalid workspace id"));
+                                    }
+                                    Some(s) if s.eq_ignore_ascii_case(b"LIST") => {
+                                        let list: Vec<crate::protocol::Frame> = registry.iter().map(|(id, _)| {
+                                            crate::protocol::Frame::BulkString(bytes::Bytes::from(id.as_hex()))
+                                        }).collect();
+                                        return crate::protocol::Frame::Array(list.into());
+                                    }
+                                    Some(s) if s.eq_ignore_ascii_case(b"INFO") => {
+                                        let ws_hex = args.get(1).and_then(|f| {
+                                            if let crate::protocol::Frame::BulkString(b) = f { Some(b.as_ref()) } else { None }
+                                        });
+                                        if let Some(hex) = ws_hex {
+                                            if let Some(ws_id) = crate::workspace::WorkspaceId::from_hex(hex) {
+                                                if let Some(meta) = registry.get(&ws_id) {
+                                                    let info = vec![
+                                                        crate::protocol::Frame::BulkString(bytes::Bytes::from_static(b"id")),
+                                                        crate::protocol::Frame::BulkString(bytes::Bytes::from(ws_id.as_hex())),
+                                                        crate::protocol::Frame::BulkString(bytes::Bytes::from_static(b"name")),
+                                                        crate::protocol::Frame::BulkString(meta.name.clone()),
+                                                    ];
+                                                    return crate::protocol::Frame::Array(info.into());
+                                                }
+                                            }
+                                        }
+                                        return crate::protocol::Frame::Error(bytes::Bytes::from_static(b"ERR workspace not found"));
+                                    }
+                                    // WS.AUTH not supported in uring_handler (no per-connection
+                                    // state). CREATE/DROP above DO mutate the global registry,
+                                    // so a workspace created here is AUTH-able from any
+                                    // standard connection handler.
+                                    Some(s) if s.eq_ignore_ascii_case(b"AUTH") => {
+                                        return crate::protocol::Frame::Error(bytes::Bytes::from_static(
+                                            b"ERR WS.AUTH not available in io_uring batch mode; use standard connection handler",
+                                        ));
+                                    }
+                                    _ => {
+                                        return crate::protocol::Frame::Error(bytes::Bytes::from_static(
+                                            b"ERR unknown WS subcommand; supported: CREATE, DROP, LIST, INFO, AUTH",
+                                        ));
+                                    }
+                                }
+                            }
+
+                            // TXN.* not supported in uring batch mode (no per-connection state)
+                            if crate::command::transaction::is_txn_begin(cmd, args)
+                                || crate::command::transaction::is_txn_commit(cmd, args)
+                                || crate::command::transaction::is_txn_abort(cmd, args)
+                            {
                                 return crate::protocol::Frame::Error(bytes::Bytes::from_static(
-                                    b"ERR invalid command",
+                                    b"ERR TXN commands not supported in io_uring batch mode; use standard connection handler",
                                 ));
                             }
-                        };
-                        // WS.* command intercept (Phase 159) — workspace commands
-                        // are handled at the handler level, not in cmd_dispatch.
-                        if crate::workspace::is_ws_command(cmd) {
-                            let sub = args.first().and_then(|f| {
-                                if let crate::protocol::Frame::BulkString(b) = f { Some(b.as_ref()) } else { None }
-                            });
-                            let mut reg_guard = shard_databases.workspace_registry();
-                            let registry = reg_guard.get_or_insert_with(|| Box::new(crate::workspace::registry::WorkspaceRegistry::new()));
-                            match sub {
-                                Some(s) if s.eq_ignore_ascii_case(b"CREATE") => {
-                                    let ws_id = crate::workspace::WorkspaceId::new_v7();
-                                    let name = args.get(1).and_then(|f| {
-                                        if let crate::protocol::Frame::BulkString(b) = f { Some(b.clone()) } else { None }
-                                    }).unwrap_or_else(|| bytes::Bytes::from_static(b""));
-                                    let created_at = std::time::SystemTime::now()
-                                        .duration_since(std::time::UNIX_EPOCH)
-                                        .unwrap_or_default()
-                                        .as_millis() as i64;
-                                    registry.insert(ws_id, crate::workspace::registry::WorkspaceMetadata {
-                                        id: ws_id,
-                                        name: name.clone(),
-                                        created_at,
-                                    });
-                                    // WAL: WorkspaceCreate to shard 0 (unframed,
-                                    // real type — K1a) — the global registry's
-                                    // single stream (mirrors the conn handlers;
-                                    // without it, workspaces created via this
-                                    // batch path were lost on restart). K1b: the
-                                    // payload carries `created_at` too.
-                                    let payload = crate::workspace::wal::encode_workspace_create(ws_id.as_bytes(), &name, created_at);
-                                    shard_databases.wal_append(
-                                        0,
-                                        crate::persistence::wal_v3::record::WalRecordType::WorkspaceCreate,
-                                        bytes::Bytes::from(payload),
+
+                            // TEMPORAL.* not supported in uring batch mode (no per-connection state)
+                            if crate::command::temporal::is_temporal_snapshot_at(cmd)
+                                || crate::command::temporal::is_temporal_invalidate(cmd)
+                            {
+                                return crate::protocol::Frame::Error(bytes::Bytes::from_static(
+                                    b"ERR TEMPORAL commands not supported in io_uring batch mode; use standard connection handler",
+                                ));
+                            }
+
+                            // MQ.* not supported in uring batch mode (no per-connection state for durable ACK)
+                            if crate::mq::is_mq_command(cmd) {
+                                return crate::protocol::Frame::Error(bytes::Bytes::from_static(
+                                    b"ERR MQ commands not supported in io_uring batch mode; use standard connection handler",
+                                ));
+                            }
+
+                                let result = cmd_dispatch(db, cmd, args, &mut selected, db_count);
+                                match result {
+                                    DispatchResult::Response(f) => f,
+                                    DispatchResult::Quit(f) => f,
+                                }
+                            })
+                            .collect()
+                    },
+                );
+
+                // Phase C: Serialize and send all responses (outside borrow).
+                for response in responses {
+                    match response {
+                        crate::protocol::Frame::BulkString(ref value) if !value.is_empty() => {
+                            // Zero-copy path: scatter-gather via writev
+                            match driver.submit_writev_bulkstring(conn_id, value.clone()) {
+                                Ok(guard) => {
+                                    inflight_sends
+                                        .entry(conn_id)
+                                        .or_default()
+                                        .push_back(InFlightSend::Writev(guard));
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        "writev failed for conn {}: {}, falling back to send",
+                                        conn_id,
+                                        e
                                     );
-                                    return crate::protocol::Frame::BulkString(bytes::Bytes::from(ws_id.as_hex()));
-                                }
-                                Some(s) if s.eq_ignore_ascii_case(b"DROP") => {
-                                    let ws_hex = args.get(1).and_then(|f| {
-                                        if let crate::protocol::Frame::BulkString(b) = f { Some(b.as_ref()) } else { None }
-                                    });
-                                    if let Some(hex) = ws_hex {
-                                        if let Some(ws_id) = crate::workspace::WorkspaceId::from_hex(hex) {
-                                            // WAL only a real removal; the OK-even-if-absent
-                                            // reply is pre-existing batch-path behavior.
-                                            if registry.remove(&ws_id).is_some() {
-                                                let payload = crate::workspace::wal::encode_workspace_drop(ws_id.as_bytes());
-                                                shard_databases.wal_append(
-                                                    0,
-                                                    crate::persistence::wal_v3::record::WalRecordType::WorkspaceDrop,
-                                                    bytes::Bytes::from(payload),
-                                                );
-                                            }
-                                            return crate::protocol::Frame::SimpleString(bytes::Bytes::from_static(b"OK"));
-                                        }
-                                    }
-                                    return crate::protocol::Frame::Error(bytes::Bytes::from_static(b"ERR invalid workspace id"));
-                                }
-                                Some(s) if s.eq_ignore_ascii_case(b"LIST") => {
-                                    let list: Vec<crate::protocol::Frame> = registry.iter().map(|(id, _)| {
-                                        crate::protocol::Frame::BulkString(bytes::Bytes::from(id.as_hex()))
-                                    }).collect();
-                                    return crate::protocol::Frame::Array(list.into());
-                                }
-                                Some(s) if s.eq_ignore_ascii_case(b"INFO") => {
-                                    let ws_hex = args.get(1).and_then(|f| {
-                                        if let crate::protocol::Frame::BulkString(b) = f { Some(b.as_ref()) } else { None }
-                                    });
-                                    if let Some(hex) = ws_hex {
-                                        if let Some(ws_id) = crate::workspace::WorkspaceId::from_hex(hex) {
-                                            if let Some(meta) = registry.get(&ws_id) {
-                                                let info = vec![
-                                                    crate::protocol::Frame::BulkString(bytes::Bytes::from_static(b"id")),
-                                                    crate::protocol::Frame::BulkString(bytes::Bytes::from(ws_id.as_hex())),
-                                                    crate::protocol::Frame::BulkString(bytes::Bytes::from_static(b"name")),
-                                                    crate::protocol::Frame::BulkString(meta.name.clone()),
-                                                ];
-                                                return crate::protocol::Frame::Array(info.into());
-                                            }
-                                        }
-                                    }
-                                    return crate::protocol::Frame::Error(bytes::Bytes::from_static(b"ERR workspace not found"));
-                                }
-                                // WS.AUTH not supported in uring_handler (no per-connection
-                                // state). CREATE/DROP above DO mutate the global registry,
-                                // so a workspace created here is AUTH-able from any
-                                // standard connection handler.
-                                Some(s) if s.eq_ignore_ascii_case(b"AUTH") => {
-                                    return crate::protocol::Frame::Error(bytes::Bytes::from_static(
-                                        b"ERR WS.AUTH not available in io_uring batch mode; use standard connection handler",
-                                    ));
-                                }
-                                _ => {
-                                    return crate::protocol::Frame::Error(bytes::Bytes::from_static(
-                                        b"ERR unknown WS subcommand; supported: CREATE, DROP, LIST, INFO, AUTH",
-                                    ));
+                                    let mut resp_buf = bytes::BytesMut::new();
+                                    crate::protocol::serialize(&response, &mut resp_buf);
+                                    send_serialized(driver, conn_id, resp_buf, inflight_sends);
                                 }
                             }
                         }
-
-                        // TXN.* not supported in uring batch mode (no per-connection state)
-                        if crate::command::transaction::is_txn_begin(cmd, args)
-                            || crate::command::transaction::is_txn_commit(cmd, args)
-                            || crate::command::transaction::is_txn_abort(cmd, args)
-                        {
-                            return crate::protocol::Frame::Error(bytes::Bytes::from_static(
-                                b"ERR TXN commands not supported in io_uring batch mode; use standard connection handler",
-                            ));
-                        }
-
-                        // TEMPORAL.* not supported in uring batch mode (no per-connection state)
-                        if crate::command::temporal::is_temporal_snapshot_at(cmd)
-                            || crate::command::temporal::is_temporal_invalidate(cmd)
-                        {
-                            return crate::protocol::Frame::Error(bytes::Bytes::from_static(
-                                b"ERR TEMPORAL commands not supported in io_uring batch mode; use standard connection handler",
-                            ));
-                        }
-
-                        // MQ.* not supported in uring batch mode (no per-connection state for durable ACK)
-                        if crate::mq::is_mq_command(cmd) {
-                            return crate::protocol::Frame::Error(bytes::Bytes::from_static(
-                                b"ERR MQ commands not supported in io_uring batch mode; use standard connection handler",
-                            ));
-                        }
-
-                            let result = cmd_dispatch(db, cmd, args, &mut selected, db_count);
-                            match result {
-                                DispatchResult::Response(f) => f,
-                                DispatchResult::Quit(f) => f,
+                        crate::protocol::Frame::PreSerialized(ref data) if !data.is_empty() => {
+                            // Zero-copy path for PreSerialized: already RESP wire format
+                            match driver.submit_send_preserialized(conn_id, data.clone()) {
+                                Ok(guard) => {
+                                    inflight_sends
+                                        .entry(conn_id)
+                                        .or_default()
+                                        .push_back(InFlightSend::Writev(guard));
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        "writev preserialized failed for conn {}: {}, falling back",
+                                        conn_id,
+                                        e
+                                    );
+                                    let mut resp_buf = bytes::BytesMut::new();
+                                    crate::protocol::serialize(&response, &mut resp_buf);
+                                    send_serialized(driver, conn_id, resp_buf, inflight_sends);
+                                }
                             }
-                        })
-                        .collect()
-                },
-            );
-
-            // Phase C: Serialize and send all responses (outside borrow).
-            for response in responses {
-                match response {
-                    crate::protocol::Frame::BulkString(ref value) if !value.is_empty() => {
-                        // Zero-copy path: scatter-gather via writev
-                        match driver.submit_writev_bulkstring(conn_id, value.clone()) {
-                            Ok(guard) => {
-                                inflight_sends
-                                    .entry(conn_id)
-                                    .or_default()
-                                    .push_back(InFlightSend::Writev(guard));
-                            }
-                            Err(e) => {
-                                tracing::warn!(
-                                    "writev failed for conn {}: {}, falling back to send",
-                                    conn_id,
-                                    e
-                                );
-                                let mut resp_buf = bytes::BytesMut::new();
-                                crate::protocol::serialize(&response, &mut resp_buf);
-                                send_serialized(driver, conn_id, resp_buf, inflight_sends);
-                            }
+                        }
+                        _ => {
+                            let mut resp_buf = bytes::BytesMut::new();
+                            crate::protocol::serialize(&response, &mut resp_buf);
+                            send_serialized(driver, conn_id, resp_buf, inflight_sends);
                         }
                     }
-                    crate::protocol::Frame::PreSerialized(ref data) if !data.is_empty() => {
-                        // Zero-copy path for PreSerialized: already RESP wire format
-                        match driver.submit_send_preserialized(conn_id, data.clone()) {
-                            Ok(guard) => {
-                                inflight_sends
-                                    .entry(conn_id)
-                                    .or_default()
-                                    .push_back(InFlightSend::Writev(guard));
-                            }
-                            Err(e) => {
-                                tracing::warn!(
-                                    "writev preserialized failed for conn {}: {}, falling back",
-                                    conn_id,
-                                    e
-                                );
-                                let mut resp_buf = bytes::BytesMut::new();
-                                crate::protocol::serialize(&response, &mut resp_buf);
-                                send_serialized(driver, conn_id, resp_buf, inflight_sends);
-                            }
-                        }
-                    }
-                    _ => {
-                        let mut resp_buf = bytes::BytesMut::new();
-                        crate::protocol::serialize(&response, &mut resp_buf);
-                        send_serialized(driver, conn_id, resp_buf, inflight_sends);
-                    }
+                }
+                if !more {
+                    break;
                 }
             }
         }

@@ -235,6 +235,16 @@ mod spill_tests {
     }
 }
 
+/// Most frames one batch parses before it runs (both connection handlers and
+/// the tokio io_uring path).
+///
+/// A read can hold more (moon#1227 review): direct reads fill all of the read
+/// buffer's spare capacity, and 1100 inline `PING`s fit in one 8 KiB read. What
+/// the cap leaves in the buffer has already been SENT — the client is waiting
+/// for its replies, not writing — so a handler that stops here must parse the
+/// rest before it waits on the socket again.
+pub(crate) const MAX_BATCH_FRAMES: usize = 1024;
+
 /// Post-batch capacity governor for the per-connection batch scratch vectors
 /// (c10k W1). `responses`/`frames` are cleared and reused across batches; one
 /// deep pipeline grows them to the 1024-frame batch cap (~74 KB each at

@@ -1872,20 +1872,16 @@ pub(crate) async fn handle_connection_sharded_monoio<
             // for remaining commands. Inlined responses are already in write_buf.
         }
 
-        // Parse all complete frames from the read buffer (reuse pre-allocated Vec, cap at 1024).
-        // A carried tail (moon#1179 item 5) stays at the front: new frames
-        // are appended BEHIND it, which is exactly the order the bytes had.
+        // Parse the complete frames in the read buffer, at most
+        // `MAX_BATCH_FRAMES` per batch (reused Vec). A carried tail (moon#1179
+        // item 5) stays at the front: new frames are appended BEHIND it, which
+        // is exactly the order the bytes had.
         if !std::mem::take(&mut frames_carried) {
             frames.clear();
         }
-        loop {
+        while frames.len() < super::util::MAX_BATCH_FRAMES {
             match codec.decode_frame(&mut read_buf) {
-                Ok(Some(frame)) => {
-                    frames.push(frame);
-                    if frames.len() >= 1024 {
-                        break;
-                    }
-                }
+                Ok(Some(frame)) => frames.push(frame),
                 Ok(None) => break,
                 Err(_) => {
                     // A protocol fault kills the connection, but not before
@@ -1897,6 +1893,14 @@ pub(crate) async fn handle_connection_sharded_monoio<
                     break;
                 }
             }
+        }
+        // moon#1227 review: stopped at the cap with input left over. The client
+        // has already sent it and is waiting for its replies, so the next
+        // iteration must parse it BEFORE reading — a read would wait for bytes
+        // that are never coming. (If only a partial frame is left, that parse
+        // finds nothing and the iteration after it reads, as for any A1 carry.)
+        if frames.len() >= super::util::MAX_BATCH_FRAMES && !read_buf.is_empty() {
+            carried_input = true;
         }
 
         if frames.is_empty() {

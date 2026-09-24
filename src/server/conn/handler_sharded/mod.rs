@@ -637,13 +637,9 @@ pub(crate) async fn handle_connection_sharded_inner<
                 } else {
                     std::mem::take(&mut carried_frames)
                 };
-                const MAX_BATCH: usize = 1024;
-                loop {
+                while batch.len() < super::util::MAX_BATCH_FRAMES {
                     match crate::protocol::parse_resumable(&mut read_buf, &parse_config, &mut parse_state) {
-                        Ok(Some(frame)) => {
-                            batch.push(frame);
-                            if batch.len() >= MAX_BATCH { break; }
-                        }
+                        Ok(Some(frame)) => batch.push(frame),
                         Ok(None) => break,
                         Err(crate::protocol::ParseError::Incomplete) => break,
                         // A protocol fault is fatal to the connection, but it
@@ -664,6 +660,13 @@ pub(crate) async fn handle_connection_sharded_inner<
                     }
                 }
                 if break_outer { break; }
+                // moon#1227 review: stopped at the cap with input left over.
+                // The client already sent it and waits for its replies, so the
+                // next select must parse it before reading — a read would wait
+                // for bytes that are never coming.
+                if batch.len() >= super::util::MAX_BATCH_FRAMES && !read_buf.is_empty() {
+                    carried_input = true;
+                }
                 if batch.is_empty() {
                     // Nothing valid preceded the fault — report it directly.
                     if let Some(kind) = proto_fault.take() {
