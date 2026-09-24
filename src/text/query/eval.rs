@@ -222,6 +222,7 @@ pub fn eval_query_counted(
             top.push(doc, 0.0);
         }
     } else {
+        scorer.prepare(idx, &set);
         for doc in &set {
             top.push(doc, scorer.score(idx, doc));
         }
