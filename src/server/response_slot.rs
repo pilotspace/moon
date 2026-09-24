@@ -567,7 +567,7 @@ mod tests {
         );
         let a = pool.slot_arc(5);
         assert_eq!(pool.created_slots(), 1);
-        let _ = pool.future_for(9);
+        drop(pool.future_for(9)); // creating the future is what allocates the slot
         let _ = pool.slot_for(5);
         assert_eq!(pool.created_slots(), 2);
         assert!(
