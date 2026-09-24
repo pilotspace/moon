@@ -203,6 +203,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Performance
 
+2026-09 performance review fix wave, part 3a (index moon#1199; evidence in
+`.add/milestones/v0-9-2-perf-review/plans/{WS8,WS15}-*/SUMMARY.md`). Relative A/Bs on a shared
+4-vCPU Linux container. No throughput change is claimed; only the deterministic counts below are.
+
+- **Spanning `MSET`/`DEL`/`UNLINK` send one sub-command per owner shard** (moon#1184) and log one AOF
+  record per owner. A `DEL`/`UNLINK` that removes nothing is no longer logged: DEL of 10 absent keys
+  went from 51.7 MB of AOF to about 0.3 KB, and MSET of 10 pairs is 23% smaller.
+- **Cross-shard writes do less redundant work** (moon#1177): request frames are moved instead of
+  deep-cloned, AOF records are passed on without a copy, and the replication backlog lock is skipped
+  when there are no replicas.
+- **`WATCH` over remote keys** (moon#1183) reads versions through the foreign-read fast path and asks
+  every remaining owner at once, under shared guards. Owner-loop wakes for 200 WATCHes of 3 remote
+  owners went from 603 to 3.
+- **Multi-shard `FT.SEARCH`** (moon#1182) sends its remote legs before searching locally, and every KNN
+  leg runs on the cooperative yielding path.
+- **SPSC batch arms take one exclusive db guard per command** (moon#1198). Three shard message
+  variants that nothing produced are removed, along with about 690 lines of their handler arms.
+- moon#1214 item 1 (the SPSC Notify lock) was profiled and **deferred**. The removable share is at most
+  0.83%, which is below the noise floor on this host; re-profile at `--shards 8` on the GCE rig.
+
 2026-09 performance review fix wave, part 2 (index moon#1199; evidence in
 `.add/milestones/v0-9-2-perf-review/plans/{WS2,WS4,WS9,WS11,WS12,WS13}-*/SUMMARY.md`). Relative
 A/Bs on a shared 4-vCPU Linux container — re-measure on the GCE rig before quoting.
@@ -289,6 +309,29 @@ shared 4-vCPU Linux container against HEAD `935c555` — re-measure on the GCE r
 
 ### Fixed
 
+- **P0: a deleted cold-tier key came back after an AOF rewrite and any restart** (moon#1215, pre-existing
+  in v0.8.9, default config). The cold index now remembers every dead slot still on disk, and every
+  rewrite opens its new generation with plain `DEL` records for the keys that are dead at the fold
+  instant. The real-server crash suite went from 44–157 resurrected keys per case to 8/8 cases passing
+  at `--shards 1` and `--shards 4` on both runtimes. Every moon version replays `DEL`, so a downgrade
+  keeps the deletes. Cost: about 54 B of RAM per dead slot until its spill file is reclaimed, plus a
+  fold pass over those slots.
+- **P1: a key whose spill was in flight when a BGREWRITEAOF fold cut its base could be lost** (moon#1223)
+  if the spill then did not publish (the marker was refused under AOF backpressure, the pwrite failed,
+  or the file id was re-issued). The fold base image now includes in-flight spill payloads. On
+  `ae21476`, a kill -9 run lost 1,067 of 63,049 acknowledged keys.
+- **`rdb_last_bgsave_status` now reports the last save** (moon#1230). Before, one failed sharded BGSAVE
+  latched `err` forever and every later `SHUTDOWN SAVE` was refused. `LASTSAVE`/`rdb_last_save_time`
+  and `rdb_changes_since_last_save` now move only on a successful save. A shard that cannot write a
+  snapshot (no persistence dir, lost data dir) now fails the save instead of leaving
+  `rdb_bgsave_in_progress:1` forever, and sharded auto-saves start as counted saves.
+- **A spanning `DEL`/`UNLINK`, a fanned-out `FLUSHDB`/`FLUSHALL`, or an `HSET`/`HDEL` executed on
+  another shard now updates vector and text indexes and drops durable queues on every owner shard**
+  (moon#1162). Before, all 20 deleted docs were still returned by FT.SEARCH at `--shards 4`.
+- **`SCRIPT FLUSH` now empties every shard's script cache before replying** (moon#1229). Before, EVALSHA
+  still ran for up to 36 of 48 keys at `--shards 4`. An invalid mode now returns redis's error.
+- **The MSET coordinator's local leg now captures BGSAVE pre-images** (moon#1228, MSET item), so a
+  snapshot taken during a spanning MSET stays point-in-time.
 - **P0: BGSAVE lost pre-snapshot keys when a DashTable segment split during the save**
   (moon#1216): 1,744 of 2,000 keys in the repro, 698K–726K of 1M under an insert flood. The epoch
   now walks hash space, so a split cannot move keys out of the walk. Copy-on-write also captures
