@@ -55,6 +55,34 @@ const DEFAULT_WAL_BUF_CAPACITY: usize = 8192;
 /// otherwise pin peak-sized memory for the lifetime of the writer.
 const WAL_BUF_SHRINK_THRESHOLD: usize = DEFAULT_WAL_BUF_CAPACITY * 4;
 
+/// Bytes a writer may buffer in memory while a segment rotation waits for
+/// the old segment's off-loop fsync (moon#1188). Past this the rotation is
+/// completed with an inline fsync — memory stays bounded when the disk is
+/// the bottleneck, and the old-before-new ordering is kept either way.
+const PENDING_ROTATION_MAX_BUFFER: usize = 4 * 1024 * 1024;
+
+/// A segment rotation whose old-segment fsync runs on the sync agent
+/// (moon#1188).
+///
+/// The mid-chain tear policy (`replay::replay_wal_v3_dir_until_with_salvage`)
+/// treats a torn record as a benign crash tail only in the FINAL segment,
+/// which holds because a segment is durable before the next one exists. The
+/// rotation used to guarantee that with an inline `sync_data()` on the shard
+/// thread — up to a whole segment of dirty data. It now hands a dup of the old
+/// segment's fd to the agent and keeps buffering appends in memory; the next
+/// segment is created only once the agent's watermark covers every record the
+/// old segment holds. Nothing past `upto_lsn` is written to any file until
+/// then, so the ordering is unchanged, only who waits for the disk.
+#[derive(Debug, Clone, Copy)]
+struct PendingRotation {
+    /// Every record `<= upto_lsn` is in the old segment, and no other is.
+    upto_lsn: u64,
+    /// A `request_sync` arrived while the rotation was pending. The buffered
+    /// records it asked for belong to the next segment, which does not exist
+    /// yet; the request is re-issued the moment the rotation completes.
+    sync_requested: bool,
+}
+
 /// Represents a single WAL v3 segment file.
 #[derive(Debug, Clone)]
 pub struct WalSegment {
@@ -460,6 +488,14 @@ pub struct WalWriterV3 {
     /// Read by `overflow_recycle_backoff_multiplier`; reset by any
     /// recycler that deletes at least one segment.
     overflow_noop_streak: u32,
+    /// A rotation waiting for the agent to make the old segment durable
+    /// (moon#1188). While set, `current_file` is still the OLD segment and
+    /// every append since stays in `buf`.
+    pending_rotation: Option<PendingRotation>,
+    /// Rotations whose old-segment fsync ran on the agent / inline on the
+    /// caller's thread (instrumentation, moon#1188).
+    rotations_offloaded: u64,
+    rotations_inline: u64,
 }
 
 /// Cap on the #870 overflow backoff: the lag guard doubles per no-op pass
@@ -522,6 +558,9 @@ impl WalWriterV3 {
             plane_scan_bytes: 0,
             plane_scan_memo: std::collections::HashMap::new(),
             overflow_noop_streak: 0,
+            pending_rotation: None,
+            rotations_offloaded: 0,
+            rotations_inline: 0,
         };
 
         writer.open_new_segment()?;
@@ -571,12 +610,22 @@ impl WalWriterV3 {
     /// Data reaches the kernel but is NOT guaranteed durable until
     /// `sync_data()` is called (typically on the 1s timer or shutdown).
     fn flush_write(&mut self) -> std::io::Result<()> {
+        // moon#1188: while a rotation waits for the old segment's off-loop
+        // fsync, appends stay buffered — the next segment may not exist yet.
+        if self.pending_rotation.is_some() && !self.poll_pending_rotation()? {
+            return Ok(());
+        }
         if self.buf.is_empty() {
             return Ok(());
         }
 
         if self.write_offset + self.buf.len() as u64 > self.segment_size {
             self.rotate_segment()?;
+            if self.pending_rotation.is_some() {
+                // The buffer went into the old segment; the next one opens
+                // once the agent reports the old one durable.
+                return Ok(());
+            }
         }
 
         if let Some(ref mut file) = self.current_file {
@@ -600,7 +649,16 @@ impl WalWriterV3 {
     ///
     /// After this returns, all appended records are durable on stable storage.
     pub fn flush_sync(&mut self) -> std::io::Result<()> {
+        // An inline flush makes everything durable now: a pending rotation
+        // is completed inline first (moon#1188), so the buffered records
+        // reach the NEW segment only after the old one is on disk.
+        self.complete_pending_rotation(true)?;
         self.flush_write()?;
+        if self.pending_rotation.is_some() {
+            // `flush_write` itself rotated (async): finish that one inline too.
+            self.complete_pending_rotation(true)?;
+            self.flush_write()?;
+        }
         if let Some(ref mut file) = self.current_file {
             file.sync_data()?;
         }
@@ -640,6 +698,25 @@ impl WalWriterV3 {
     /// promised on this WAL; fail loud, never silently degrade).
     pub fn request_sync(&mut self) -> std::io::Result<()> {
         self.flush_write()?;
+        if let Some(pending) = self.pending_rotation.as_mut() {
+            // moon#1188: the old segment's fsync is already with the agent;
+            // the records past it are still buffered for a segment that may
+            // not exist yet. Remember the request — completing the rotation
+            // re-issues it for the new segment.
+            pending.sync_requested = true;
+            return match &self.sync_agent {
+                Some(agent) if agent.is_poisoned() => Err(std::io::Error::other(
+                    "WAL v3 sync agent poisoned by a prior fsync failure",
+                )),
+                _ => Ok(()),
+            };
+        }
+        self.request_sync_current()
+    }
+
+    /// The body of [`Self::request_sync`] once no rotation is pending: hand
+    /// an fd-dup of the CURRENT segment to the agent (inline fallback).
+    fn request_sync_current(&mut self) -> std::io::Result<()> {
         let upto_lsn = self.next_lsn.saturating_sub(1);
         self.spawn_agent_if_needed();
 
@@ -688,9 +765,19 @@ impl WalWriterV3 {
                 return Ok(());
             }
         }
+        // moon#1188: records past a pending rotation are not in any file
+        // yet. Wait (bounded) for the old segment, open the next one, and
+        // only then request the sync that covers `lsn`.
+        self.finish_pending_rotation_blocking(timeout)?;
         // Make sure a sync covering `lsn` is in flight (or completed
         // inline, which publishes the watermark itself).
         self.request_sync()?;
+        if self.pending_rotation.is_some() {
+            // The flush inside `request_sync` rotated again (one more
+            // segment's worth was buffered): same bounded wait.
+            self.finish_pending_rotation_blocking(timeout)?;
+            self.request_sync()?;
+        }
         match &self.sync_agent {
             Some(agent) => agent.wait_watermark(lsn, timeout),
             // No agent: request_sync went through the inline flush_sync
@@ -704,7 +791,9 @@ impl WalWriterV3 {
     /// Matches WAL v2 pattern: frequent writes to OS page cache,
     /// durable sync deferred to the 1s timer (`sync_data`).
     pub fn flush_if_needed(&mut self) -> std::io::Result<()> {
-        if self.buf.len() >= 4096 {
+        // A pending rotation is polled every tick (moon#1188), so the next
+        // segment opens within one tick of the old one becoming durable.
+        if self.buf.len() >= 4096 || self.pending_rotation.is_some() {
             self.flush_write()
         } else {
             Ok(())
@@ -739,10 +828,33 @@ impl WalWriterV3 {
     /// Fsync without writing — call after `flush_write` / `flush_if_needed`
     /// to make all previously written records durable.
     pub fn sync_data(&mut self) -> std::io::Result<()> {
+        // Buffered records past a pending rotation were never "written";
+        // what was written is the old segment, which this makes durable.
         if let Some(ref mut file) = self.current_file {
             file.sync_data()?;
         }
         Ok(())
+    }
+
+    /// Install a sync agent with an injected fsync backend (tests gate or
+    /// fail it to force every interleaving of a pending rotation).
+    #[cfg(test)]
+    pub(crate) fn install_sync_agent_for_test(&mut self, agent: super::sync_agent::WalSyncAgent) {
+        self.sync_agent = Some(agent);
+    }
+
+    /// True while a rotation waits for the old segment's off-loop fsync
+    /// (moon#1188). Instrumentation / tests.
+    pub fn rotation_pending(&self) -> bool {
+        self.pending_rotation.is_some()
+    }
+
+    /// `(offloaded, inline)` rotation counts (moon#1188 instrument): how many
+    /// rotations handed the old segment's fsync to the agent, and how many
+    /// ran it on the caller's thread (no agent / queue full / poisoned /
+    /// memory bound / an inline `flush_sync` or bounded-wait timeout).
+    pub fn rotation_counts(&self) -> (u64, u64) {
+        (self.rotations_offloaded, self.rotations_inline)
     }
 
     /// Return the current (next-to-be-assigned) LSN.
@@ -1052,7 +1164,16 @@ impl WalWriterV3 {
         })
     }
 
-    /// Rotate to a new segment: flush + fsync current, open next.
+    /// Rotate to a new segment: flush the buffer into the current one, make
+    /// it durable, open the next.
+    ///
+    /// moon#1188: the old segment's fsync is handed to the off-loop sync
+    /// agent when one is running; the next segment is then opened by
+    /// [`Self::poll_pending_rotation`] once the agent's watermark covers the
+    /// old segment. The inline fsync remains the fallback — no agent, a full
+    /// agent queue, a failed fd dup, a poisoned agent — so a rotation is
+    /// never dropped and the old segment is always durable before the next
+    /// exists.
     #[tracing::instrument(skip_all, level = "debug")]
     fn rotate_segment(&mut self) -> std::io::Result<()> {
         // Flush remaining buffer to current segment
@@ -1065,19 +1186,144 @@ impl WalWriterV3 {
                     self.buf.shrink_to(DEFAULT_WAL_BUF_CAPACITY);
                 }
             }
-            file.sync_data()?;
         }
-        // The old segment (holding every record < next_lsn) is now durable;
-        // the off-loop watermark can reflect that. This inline fsync at
-        // rotation is also what makes the agent's fd-dup scheme safe: a
-        // sync request only ever needs to cover the CURRENT segment.
-        if let Some(agent) = &self.sync_agent {
-            agent.shared.publish(self.next_lsn.saturating_sub(1));
+        let upto_lsn = self.next_lsn.saturating_sub(1);
+        if self.begin_offloaded_rotation(upto_lsn) {
+            return Ok(());
         }
+        self.pending_rotation = Some(PendingRotation {
+            upto_lsn,
+            sync_requested: false,
+        });
+        self.complete_pending_rotation(true)
+    }
 
+    /// Hand the old segment's fsync to the agent. `false` = the caller must
+    /// fsync inline (no agent, poisoned, dup failed, queue full).
+    fn begin_offloaded_rotation(&mut self, upto_lsn: u64) -> bool {
+        self.spawn_agent_if_needed();
+        let (Some(agent), Some(file)) = (&self.sync_agent, &self.current_file) else {
+            return false;
+        };
+        if agent.is_poisoned() {
+            return false;
+        }
+        let Ok(dup) = file.try_clone() else {
+            return false;
+        };
+        if agent
+            .try_send(super::sync_agent::SyncRequest {
+                file: dup,
+                upto_lsn,
+            })
+            .is_err()
+        {
+            return false;
+        }
+        self.pending_rotation = Some(PendingRotation {
+            upto_lsn,
+            sync_requested: false,
+        });
+        self.rotations_offloaded += 1;
+        true
+    }
+
+    /// Non-blocking progress check on a pending rotation: `Ok(true)` when no
+    /// rotation is pending any more (completed now or earlier).
+    ///
+    /// Completes it when the agent's watermark covers the old segment, and
+    /// falls back to an inline fsync when the agent is poisoned or gone, or
+    /// when the in-memory buffer outgrows [`PENDING_ROTATION_MAX_BUFFER`].
+    fn poll_pending_rotation(&mut self) -> std::io::Result<bool> {
+        let Some(pending) = self.pending_rotation else {
+            return Ok(true);
+        };
+        let durable = match &self.sync_agent {
+            Some(agent) if !agent.is_poisoned() => agent.durable_lsn() >= pending.upto_lsn,
+            // Poisoned or no agent: the agent will never publish this
+            // watermark — the inline fsync is the pre-moon#1188 behaviour.
+            _ => return self.complete_pending_rotation(true).map(|()| true),
+        };
+        if durable {
+            self.complete_pending_rotation(false)?;
+            return Ok(true);
+        }
+        if self.buf.len() > PENDING_ROTATION_MAX_BUFFER {
+            self.complete_pending_rotation(true)?;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    /// Block (bounded by `timeout`) until a pending rotation completes. A
+    /// timeout falls back to the inline fsync — never a silent skip; a
+    /// poisoned agent is an error, exactly as `wait_durable` reports it.
+    fn finish_pending_rotation_blocking(
+        &mut self,
+        timeout: std::time::Duration,
+    ) -> std::io::Result<()> {
+        let Some(pending) = self.pending_rotation else {
+            return Ok(());
+        };
+        let Some(agent) = &self.sync_agent else {
+            return self.complete_pending_rotation(true);
+        };
+        match agent.wait_watermark(pending.upto_lsn, timeout) {
+            Ok(()) => self.complete_pending_rotation(false),
+            Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
+                self.complete_pending_rotation(true)
+            }
+            // Poisoned: durability can no longer be promised — the same
+            // error `wait_durable` reports without a pending rotation.
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Finish a pending rotation: optionally fsync the old segment inline
+    /// (`inline_sync`; otherwise the agent already did), then open the next
+    /// segment and re-issue a sync request that arrived meanwhile.
+    ///
+    /// On an inline fsync failure the rotation stays pending and nothing
+    /// new is created — the next segment never exists before the old one is
+    /// durable.
+    fn complete_pending_rotation(&mut self, inline_sync: bool) -> std::io::Result<()> {
+        let Some(pending) = self.pending_rotation else {
+            return Ok(());
+        };
+        if inline_sync {
+            if let Some(ref mut file) = self.current_file {
+                file.sync_data()?;
+            }
+            self.rotations_inline += 1;
+            // Only the old segment's records are durable — NOT what is still
+            // buffered for the next segment.
+            if let Some(agent) = &self.sync_agent {
+                agent.shared.publish(pending.upto_lsn);
+            }
+        }
+        // The old segment (every record <= upto_lsn) is durable: the next
+        // segment may exist now. The sequence moves only once it does, so a
+        // failed open never leaves a gap in the chain.
         self.current_sequence += 1;
+        if let Err(e) = self.open_new_segment() {
+            self.current_sequence -= 1;
+            // The old segment stays current and durable; appends keep going
+            // into it (the pre-moon#1188 recovery from a failed open).
+            self.pending_rotation = None;
+            return Err(e);
+        }
+        self.pending_rotation = None;
         crate::admin::metrics_setup::record_wal_rotation();
-        self.open_new_segment()
+        if pending.sync_requested {
+            // The records buffered past the rotation are the ones the
+            // deferred request was for: write them into the new segment and
+            // hand its sync to the agent now.
+            self.flush_write()?;
+            if self.pending_rotation.is_none() {
+                self.request_sync_current()?;
+            }
+        }
+        Ok(())
     }
 
     /// Open a new segment file and write its 64-byte header.
@@ -1395,6 +1641,19 @@ mod tests {
         writer
             .flush_write()
             .expect("rotation must recreate the missing wal dir, not fail ENOENT");
+        // moon#1188: the old segment's fsync runs on the sync agent; the next
+        // segment is opened (and the dir re-created) once it is durable.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while writer.rotation_pending() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "rotation never completed"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            writer
+                .flush_if_needed()
+                .expect("rotation must recreate the missing wal dir, not fail ENOENT");
+        }
 
         assert!(wal_dir.exists(), "wal dir must have been re-created");
         assert!(
@@ -2479,3 +2738,6 @@ mod tests {
         assert_eq!(writer.overflow_recycle_backoff_multiplier(), 2);
     }
 }
+
+#[cfg(test)]
+mod rotation_tests;

@@ -22,8 +22,11 @@
 //! fd-dup correctness: the dup'd fd shares the file description, and the
 //! shard thread's `write_all` happens-before the `try_clone()` on the same
 //! thread — the agent's fsync therefore covers every byte written before
-//! the request. Rotation is safe because `rotate_segment` fsyncs the old
-//! segment inline before switching files.
+//! the request. Rotation is safe because the next segment is never created
+//! before the old one is durable: `rotate_segment` hands the old segment's
+//! fsync to this agent and `poll_pending_rotation` opens the next segment
+//! only once the watermark covers it (moon#1188), with the inline fsync as
+//! the fallback when the agent is absent, full or poisoned.
 //!
 //! Failure policy: an fsync error POISONS the agent permanently (POSIX
 //! leaves post-error fsync semantics undefined — fail loud, PR #211
