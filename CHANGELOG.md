@@ -223,7 +223,9 @@ shared 4-vCPU Linux container against HEAD `935c555` — re-measure on the GCE r
   to a writer thread and finalizes (fsync/rename) off the shard (max stall on 1.5M keys 1.3 s →
   12 ms, peak RSS growth +257 → +2 MiB); AOF rewrite streams its base image instead of deep-copying
   the keyspace (peak RSS growth +567 → +6 MiB; the fold is still O(dataset) on the shard — moon#1185
-  stays open);
+  stays open — and the image travels in 1 MiB chunks over an unbounded channel the AOF writer reads
+  only after its phase-3 drain and fsync, so on a slow disk up to one serialized image per shard can
+  wait in memory `used_memory` does not count; the +6 MiB was measured where fsync is nearly free);
   WAL segment-rotation fsync goes through the sync agent (while it is in flight new WAL records wait
   in process memory — at most 4 MiB or 1 s, then the rotation completes inline — so a SIGKILL there
   can lose up to that much of the WAL-only planes, workspace / MQ / temporal, still within

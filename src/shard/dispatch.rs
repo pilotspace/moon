@@ -1171,9 +1171,11 @@ pub struct TxnExecReply {
 /// (`persistence::aof::fold_stream`).
 pub struct AofFoldSnapshot {
     /// The new base RDB image, serialized by the shard thread straight from
-    /// the live keyspace at the fold instant and streamed in bounded chunks
-    /// (moon#1185 — it used to be a deep copy of every live entry). Entries
-    /// expired at the fold instant are excluded.
+    /// the live keyspace at the fold instant and streamed in 1 MiB chunks
+    /// over an unbounded channel (moon#1185 — it used to be a deep copy of
+    /// every live entry; the in-flight bytes are bounded only by the image,
+    /// see `fold_stream::fold_image_channel`). Entries expired at the fold
+    /// instant are excluded.
     pub image: crate::persistence::aof::fold_stream::FoldImage,
     /// Number of messages in the AOF channel at the instant the shard read
     /// this value — BEFORE building the snapshot and BEFORE sending this reply.

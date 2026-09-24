@@ -3265,8 +3265,10 @@ pub(crate) fn handle_shard_message_shared(
             });
             let now_ms = crate::storage::entry::current_time_ms();
             // moon#1185: the base image is serialized straight from the live
-            // keyspace and streamed to the writer in bounded chunks — no
-            // per-entry deep copy, no whole-image buffer. The reply goes out
+            // keyspace and streamed to the writer in 1 MiB chunks — no
+            // per-entry deep copy. The channel is unbounded (the writer reads
+            // it only after its phase-3 fsync; a slow disk can queue the whole
+            // image — see `fold_stream::fold_image_channel`). The reply goes out
             // FIRST so the writer runs its phase-3 drain while this arm
             // serializes; the image still describes exactly this instant,
             // because no command runs on the shard until the arm returns.

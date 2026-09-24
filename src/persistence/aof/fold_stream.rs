@@ -10,11 +10,17 @@
 //!
 //! Now the shard serializes each live entry straight from the keyspace into
 //! the RDB byte stream ([`crate::persistence::rdb::RdbStreamWriter`], CRC
-//! computed as the bytes pass) and ships it to the writer in bounded chunks
-//! ([`FOLD_CHUNK_BYTES`]) as they fill. The writer appends the chunks to the
-//! new base file as they arrive ([`write_fold_image`]). No per-entry copy, no
-//! whole-image buffer: what is in flight is whatever the writer has not yet
-//! written, at most the image.
+//! computed as the bytes pass) and ships it to the writer in chunks of
+//! [`FOLD_CHUNK_BYTES`] as they fill. The writer appends the chunks to the
+//! new base file as they arrive ([`write_fold_image`]). No per-entry copy and
+//! no doubling `Vec`, but the image in flight is NOT bounded (moon#1221 review
+//! R4): the channel is unbounded, the shard serializes the whole image inside
+//! the `AofFold` arm with no backpressure, and every writer path starts
+//! reading only after its phase-3 drain and fsync (and, per shard, the
+//! manifest's staging lock). The chunk SIZE is bounded; how many chunks queue
+//! is whatever the writer has not yet written — on a slow disk up to one
+//! whole serialized image per shard, held in memory `used_memory` does not
+//! count. See [`fold_image_channel`] for why the channel is not bounded.
 //!
 //! The exactly-once contract (#455, C4) is untouched: the image is serialized
 //! inside the same `AofFold` arm, from the same keyspace instant, as the
@@ -57,7 +63,7 @@ pub struct FoldImage {
 }
 
 /// Shard-side producer of a fold's base image: an `io::Write` that ships
-/// bounded chunks as they fill.
+/// [`FOLD_CHUNK_BYTES`] chunks as they fill.
 pub struct FoldImageSink {
     tx: flume::Sender<FoldChunk>,
     buf: Vec<u8>,
@@ -65,9 +71,20 @@ pub struct FoldImageSink {
 }
 
 /// A connected (sink, image) pair.
+///
+/// The channel is unbounded on purpose — and so is the memory in flight, up
+/// to one serialized image (moon#1221 review R4). A bounded channel would
+/// make [`FoldImageSink::write`] block the shard's event loop inside the
+/// `AofFold` arm until the writer drains it, and the writer drains only
+/// after its phase-3 drain + fsync (and, per shard, the coordinator's
+/// manifest lock): the shard stall would grow from the serialization's CPU
+/// time to the writer's disk time, and the arm cannot yield instead — the
+/// image must describe one instant, with no command run in between (#455).
+///
+/// TODO(moon#1185 follow-up: incremental COW fold): bound the in-flight
+/// image by serializing segment by segment across ticks, with the COW
+/// pre-image capture BGSAVE uses; that needs moon#1216 / moon#1217 first.
 pub fn fold_image_channel() -> (FoldImageSink, FoldImage) {
-    // Unbounded on purpose: the shard thread must never block on the
-    // writer's disk. The chunks in flight are bounded by the image itself.
     let (tx, rx) = flume::unbounded();
     (
         FoldImageSink {
@@ -302,8 +319,9 @@ mod tests {
         }
     }
 
-    /// Chunks in flight are bounded: every `Data` chunk but the last is at
-    /// least a chunk and at most a chunk plus one entry.
+    /// Each chunk is bounded in size: every `Data` chunk but the last is at
+    /// least a chunk and at most a chunk plus one entry. (How MANY chunks can
+    /// be in flight is not bounded — see `fold_image_channel`.)
     #[test]
     fn image_ships_in_bounded_chunks() {
         let dbs = fixture();

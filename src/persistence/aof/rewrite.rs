@@ -936,10 +936,12 @@ pub(crate) fn do_rewrite_per_shard(
 
     // Phase 6: write new base, advance THIS shard's manifest entry (no seq
     // commit), reopen to the new incr. moon#1185: the base image streams in
-    // from the shard (serialized there straight from the keyspace, bounded
+    // from the shard (serialized there straight from the keyspace, 1 MiB
     // chunks) and is appended + fsynced into the staging file OUTSIDE the
     // manifest lock; the lock is held only for the brief, await-free publish
-    // (rename + new incr + dir fsync).
+    // (rename + new incr + dir fsync). Nothing read it during phase 3, so on
+    // a slow disk the whole image may be queued in memory by now (unbounded
+    // channel — see `fold_stream::fold_image_channel`).
     let tmp_base = coord
         .manifest
         .lock()
