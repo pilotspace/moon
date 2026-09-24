@@ -5,7 +5,8 @@
 //! connection, and still commits when nothing changed.
 //!
 //! The hop count is read from `INFO stats` `spsc_notify_wakes` (a shard loop
-//! woken by a cross-shard push). Red on `ae21476`
+//! woken by a cross-shard push). The server runs with
+//! `--cross-shard-fast-path on`, the default (`auto`) on a monoio build. Red on `ae21476`
 //! (`MOON_BIN=/home/user/wt/bin/baseline-ae21476`): every WATCH of three
 //! remote owners wakes three owner loops.
 //!
@@ -42,6 +43,12 @@ fn spawn(dir: &std::path::Path) -> (ServerGuard, u16) {
                 "0",
                 "--disk-free-min-pct",
                 "0",
+                // Explicit, not `auto`: `auto` enables the foreign-read fast
+                // path only on the monoio build (the tokio handler's reads do
+                // not use it). WATCH's version read does on either runtime
+                // once the switch is on, and this test is about that read.
+                "--cross-shard-fast-path",
+                "on",
             ])
             .stdout(common::server_stderr(dir))
             .stderr(common::server_stderr(dir))
