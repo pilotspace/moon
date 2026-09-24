@@ -66,13 +66,20 @@
 //!   [rerank_mult: u32 LE] [exact_beam: u8] [reserved: 3B]   ← NEW in v5
 //! ```
 //!
-//! ## Format v6 (current — payload schema, moon#1194)
+//! ## Format v6 (payload schema, moon#1194 — written only in declared mode)
 //!
 //! Extends v5 with the non-vector schema fields FT.CREATE declared (TEXT /
 //! TAG / NUMERIC), which schema-aware payload indexing needs across a
 //! restart. v1-v5 sidecars are read with an empty `schema_fields` — exactly
 //! how every version before this one came back (legacy: every HASH field is
 //! payload-indexed).
+//!
+//! The writer emits v6 ONLY when `MOON_VECTOR_PAYLOAD_SCHEMA=declared` is on
+//! and some index actually declared a payload field — the one thing only v6
+//! can carry (moon#1227 review F5). Otherwise it writes v5, which the
+//! previous release reads: an unconditional v6 made a rollback start with no
+//! vector indexes after any FT.CREATE / FT.DROPINDEX / FT.CONFIG. v5 already
+//! carries the RERANK_MULT / EXACT_BEAM knobs.
 //!
 //! ```text
 //! Per index:
@@ -138,10 +145,38 @@ fn serialize_index_metas_v1(metas: &[&IndexMeta]) -> Vec<u8> {
 /// from `vector_fields[0]` for backward compatibility), then appends the full
 /// `vector_fields` array.
 pub fn serialize_index_metas(metas: &[&IndexMeta]) -> Vec<u8> {
-    // Wrap with default weight=1.0 and delegate to the current (v6) serializer.
+    // Wrap with default weight=1.0 and delegate to the current writer.
     let pairs: Vec<(&IndexMeta, f32)> =
         metas.iter().map(|&m| (m, DEFAULT_WEIGHT_ON_LOAD)).collect();
-    serialize_index_metas_v6(&pairs)
+    serialize_index_metas_for_mode(
+        &pairs,
+        crate::vector::filter::payload_schema::payload_schema_declared_mode(),
+    )
+}
+
+/// The version the sidecar writer emits (moon#1227 review F5): v6 only when
+/// schema-aware payload indexing is on (`declared_mode`) AND some index
+/// declared a TEXT / TAG / NUMERIC field — the one thing v5 cannot carry.
+/// Everything else is v5, which the previous release reads, so a rollback
+/// keeps its vector indexes.
+fn sidecar_write_version(pairs: &[(&IndexMeta, f32)], declared_mode: bool) -> u8 {
+    let declares_payload = |m: &IndexMeta| {
+        m.schema_fields
+            .iter()
+            .any(|f| !matches!(f, FieldType::Vector(_)))
+    };
+    if declared_mode && pairs.iter().any(|(m, _)| declares_payload(m)) {
+        VERSION_V6
+    } else {
+        VERSION_V5
+    }
+}
+
+/// Serialize with the version [`sidecar_write_version`] picks for
+/// `declared_mode` (the process's `MOON_VECTOR_PAYLOAD_SCHEMA` in
+/// production; explicit so both modes are testable in one process).
+pub fn serialize_index_metas_for_mode(pairs: &[(&IndexMeta, f32)], declared_mode: bool) -> Vec<u8> {
+    serialize_index_metas_versioned(pairs, sidecar_write_version(pairs, declared_mode))
 }
 
 /// Serialize `(IndexMeta, compaction_weight)` pairs to bytes using v3 format (W3-deep).
@@ -162,15 +197,17 @@ pub fn serialize_index_metas_v4(pairs: &[(&IndexMeta, f32)]) -> Vec<u8> {
     serialize_index_metas_versioned(pairs, VERSION_V4)
 }
 
-/// Serialize `(IndexMeta, compaction_weight)` pairs to bytes using the
-/// current v5 format: v4 plus the per-index search-tuning knobs
-/// (`rerank_mult` u32 LE, `exact_beam` u8, 3 reserved bytes).
+/// Serialize `(IndexMeta, compaction_weight)` pairs to bytes using the v5
+/// format: v4 plus the per-index search-tuning knobs (`rerank_mult` u32 LE,
+/// `exact_beam` u8, 3 reserved bytes). The default sidecar format, and what
+/// replicas receive.
 pub fn serialize_index_metas_v5(pairs: &[(&IndexMeta, f32)]) -> Vec<u8> {
     serialize_index_metas_versioned(pairs, VERSION_V5)
 }
 
-/// Serialize `(IndexMeta, compaction_weight)` pairs to bytes using the
-/// current v6 format: v5 plus the declared payload schema (moon#1194).
+/// Serialize `(IndexMeta, compaction_weight)` pairs to bytes using the v6
+/// format: v5 plus the declared payload schema (moon#1194). Written only in
+/// declared mode — see [`sidecar_write_version`].
 pub fn serialize_index_metas_v6(pairs: &[(&IndexMeta, f32)]) -> Vec<u8> {
     serialize_index_metas_versioned(pairs, VERSION_V6)
 }
@@ -579,8 +616,8 @@ pub fn save_index_metadata(shard_dir: &Path, metas: &[&IndexMeta]) -> io::Result
 }
 
 /// Write all active index metadata **with compaction weights** to the sidecar file
-/// (current on-disk format: v4, WS5a db_index; name kept as `_v3` for API stability
-/// across the many existing call sites — see module docs for the v4 wire format).
+/// (v5, or v6 in declared mode — see [`sidecar_write_version`]; name kept as `_v3`
+/// for API stability across the many existing call sites).
 ///
 /// Called after FT.CREATE / FT.DROPINDEX / FT.CONFIG SET COMPACTION_WEIGHT.
 /// Atomically replaces the file via `atomic_write_durable` (K3: temp +
@@ -589,11 +626,25 @@ pub fn save_index_metadata(shard_dir: &Path, metas: &[&IndexMeta]) -> io::Result
 /// found by the same K3 grep sweep
 /// (`.planning/reviews/kernel-m2-brief-2026-07-12.md`).
 pub fn save_index_metadata_v3(shard_dir: &Path, pairs: &[(&IndexMeta, f32)]) -> io::Result<()> {
+    save_index_metadata_for_mode(
+        shard_dir,
+        pairs,
+        crate::vector::filter::payload_schema::payload_schema_declared_mode(),
+    )
+}
+
+/// [`save_index_metadata_v3`] for an explicit payload-schema mode.
+fn save_index_metadata_for_mode(
+    shard_dir: &Path,
+    pairs: &[(&IndexMeta, f32)],
+    declared_mode: bool,
+) -> io::Result<()> {
     let path = shard_dir.join("vector-indexes.meta");
-    // The CURRENT format. This wrote v4 until moon#1194's v6 bump, so the
-    // v5 FT.CONFIG knobs (RERANK_MULT / EXACT_BEAM) never reached the
-    // sidecar and reset to their defaults on every restart.
-    let data = serialize_index_metas_v6(pairs);
+    // At least v5: this wrote v4 until moon#1194, so the v5 FT.CONFIG knobs
+    // (RERANK_MULT / EXACT_BEAM) never reached the sidecar and reset to their
+    // defaults on every restart. v6 only in declared mode (moon#1227 review
+    // F5): an unconditional v6 cost a rollback every vector index.
+    let data = serialize_index_metas_for_mode(pairs, declared_mode);
     crate::persistence::atomic::atomic_write_durable(&path, &data)?;
     Ok(())
 }
@@ -764,8 +815,8 @@ mod tests {
         let m1 = make_meta_for_db("idx1", 128, "doc:", "vec", 0);
         let m2 = make_meta_for_db("idx2", 128, "doc:", "vec", 7);
         let data = serialize_index_metas(&[&m1, &m2]);
-        // v6 is the current on-disk version (moon#1194).
-        assert_eq!(data[4], VERSION_V6);
+        // No payload schema declared: v5 in either mode (moon#1227 review F5).
+        assert_eq!(data[4], VERSION_V5);
         let result = deserialize_index_metas(&data).unwrap();
         assert_eq!(result[0].db_index, 0);
         assert_eq!(result[1].db_index, 7);
@@ -875,7 +926,7 @@ mod tests {
     #[test]
     fn v6_roundtrips_the_declared_payload_schema() {
         let meta = payload_schema_meta();
-        let data = serialize_index_metas(&[&meta]);
+        let data = serialize_index_metas_for_mode(&[(&meta, 1.0)], true);
         assert_eq!(data[4], VERSION_V6);
         let back = deserialize_index_metas(&data).unwrap();
         assert_eq!(
@@ -910,14 +961,17 @@ mod tests {
 
     /// The sidecar file keeps the FT.CONFIG search knobs. Red before the v6
     /// bump: `save_index_metadata_v3` wrote a v4 sidecar, so RERANK_MULT /
-    /// EXACT_BEAM silently reset to 4 / OFF on every restart.
+    /// EXACT_BEAM silently reset to 4 / OFF on every restart. In declared
+    /// mode it keeps the payload schema too.
     #[test]
     fn sidecar_file_keeps_search_tuning_knobs_and_schema() {
         let tmp = tempfile::tempdir().unwrap();
         let mut meta = payload_schema_meta();
         meta.rerank_mult = 12;
         meta.exact_beam = true;
-        save_index_metadata_v3(tmp.path(), &[(&meta, 1.0)]).unwrap();
+        save_index_metadata_for_mode(tmp.path(), &[(&meta, 1.0)], true).unwrap();
+        let bytes = std::fs::read(tmp.path().join("vector-indexes.meta")).unwrap();
+        assert_eq!(bytes[4], VERSION_V6);
         let loaded = load_index_metadata(tmp.path()).unwrap();
         assert_eq!(loaded[0].rerank_mult, 12);
         assert!(loaded[0].exact_beam);
@@ -925,6 +979,65 @@ mod tests {
             describe(&loaded[0].schema_fields),
             describe(&meta.schema_fields)
         );
+    }
+
+    /// moon#1227 review F5: the sidecar the default mode writes must be one
+    /// the PREVIOUS binary (which reads <= v5) can load. Writing v6 after any
+    /// FT.CREATE / FT.DROPINDEX / FT.CONFIG made a rollback start with no
+    /// vector indexes at all. v5 already carries RERANK_MULT / EXACT_BEAM, so
+    /// the knobs still survive a restart; only the payload schema — which
+    /// nothing reads unless `MOON_VECTOR_PAYLOAD_SCHEMA=declared` — is v6-only.
+    #[test]
+    fn default_mode_sidecar_is_v5_and_keeps_the_search_knobs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut meta = payload_schema_meta();
+        meta.rerank_mult = 12;
+        meta.exact_beam = true;
+        save_index_metadata_v3(tmp.path(), &[(&meta, 1.0)]).unwrap();
+        let bytes = std::fs::read(tmp.path().join("vector-indexes.meta")).unwrap();
+        let declared = crate::vector::filter::payload_schema::payload_schema_declared_mode();
+        assert_eq!(
+            bytes[4],
+            if declared { VERSION_V6 } else { VERSION_V5 },
+            "declared mode {declared}: the sidecar version a rollback must read"
+        );
+        let loaded = load_index_metadata(tmp.path()).unwrap();
+        assert_eq!(loaded[0].rerank_mult, 12);
+        assert!(loaded[0].exact_beam);
+    }
+
+    /// moon#1227 review F5: v6 is written only when it carries something —
+    /// declared mode AND a declared payload field; otherwise the default
+    /// writer's bytes are EXACTLY a v5 sidecar, which is what the previous
+    /// release wrote and reads.
+    #[test]
+    fn v6_is_written_only_for_a_declared_payload_schema() {
+        let plain = make_meta("plain", 128, "doc:", "vec");
+        let rag = payload_schema_meta();
+        for (declared, pairs, want) in [
+            (false, vec![(&plain, 1.0f32)], VERSION_V5),
+            (false, vec![(&plain, 1.0), (&rag, 1.0)], VERSION_V5),
+            (true, vec![(&plain, 1.0)], VERSION_V5),
+            (true, vec![(&plain, 1.0), (&rag, 1.0)], VERSION_V6),
+        ] {
+            let data = serialize_index_metas_for_mode(&pairs, declared);
+            assert_eq!(
+                data[4],
+                want,
+                "declared {declared}, {} indexes",
+                pairs.len()
+            );
+            if want == VERSION_V5 {
+                assert_eq!(
+                    data,
+                    serialize_index_metas_v5(&pairs),
+                    "the default writer must emit a plain v5 sidecar"
+                );
+            }
+            // The current reader loads either.
+            let back = deserialize_index_metas_with_weights(&data).unwrap();
+            assert_eq!(back.len(), pairs.len());
+        }
     }
 
     #[test]
@@ -999,8 +1112,8 @@ mod tests {
     fn test_serialize_deserialize_v2_single_field() {
         let meta = make_meta("idx", 128, "doc:", "vec");
         let data = serialize_index_metas(&[&meta]);
-        // Now writes v6 (serialize_index_metas delegates to the current writer)
-        assert_eq!(data[4], VERSION_V6);
+        // No payload schema: the current writer emits v5 (moon#1227 review F5).
+        assert_eq!(data[4], VERSION_V5);
         let result = deserialize_index_metas(&data).unwrap();
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].vector_fields.len(), 1);
