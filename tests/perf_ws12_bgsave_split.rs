@@ -129,12 +129,12 @@ fn start_inserter(
         let mut j = 0u64;
         while !stop.load(Ordering::Relaxed) {
             let mut batch = Vec::new();
-            for _ in 0..500 {
+            for _ in 0..100 {
                 batch.extend_from_slice(&encode(&["SET", &format!("new:{j:010}"), "n"]));
                 j += 1;
             }
             c.sock.write_all(&batch).unwrap();
-            c.read_replies(500);
+            c.read_replies(100);
             counter.store(j, Ordering::Relaxed);
         }
     });
@@ -144,7 +144,9 @@ fn start_inserter(
 fn split_during_bgsave_keeps_every_pre_epoch_key(shards: usize) {
     let dir = common::unique_test_dir("ws12-split");
     std::fs::create_dir_all(&dir).unwrap();
-    let n = 300_000u64;
+    // Per-shard size fixed, so every shard's epoch lasts ~the same number of
+    // ticks (a budgeted tick writes ~1,024 entries) whatever the shard count.
+    let n = 200_000u64 * shards as u64;
     let (mut server, port) = spawn(&dir, shards);
     let mut c = Conn::open(port);
     preload(&mut c, n);
@@ -162,9 +164,13 @@ fn split_during_bgsave_keeps_every_pre_epoch_key(shards: usize) {
     stop.store(true, Ordering::Relaxed);
     inserter.join().unwrap();
     assert_eq!(status, "ok", "BGSAVE failed");
+    // Overlap guard, not a volume target: a release-fast server takes 10^5+
+    // inserts per epoch here; an unoptimized one sharing 4 vCPUs with two
+    // sibling servers can take under 1,000. The split cases themselves are
+    // pinned deterministically by `persistence::snapshot::split_epoch_tests`.
     assert!(
-        during >= 1_000,
-        "only {during} inserts landed during the BGSAVE — the epoch saw no split load"
+        during >= 200,
+        "only {during} inserts landed during the BGSAVE — the epoch saw no insert load"
     );
 
     // Crash, restart from the snapshot alone.
