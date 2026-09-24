@@ -38,6 +38,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **BEHAVIOUR CHANGE — a BGSAVE crossed by FLUSHDB / FLUSHALL / SWAPDB on a database it has not
+  finished now fails** (moon#1224) — error log, `rdb_last_bgsave_status:err`, the previous snapshot
+  file kept — instead of panicking the shard (FLUSH*) or writing a mixed file (SWAPDB). Snapshot
+  segment blocks are now written in hash order (the loader ignores the segment index field).
+- **BEHAVIOUR CHANGE — data-type edge cases now match redis 7** (moon#1168–#1172): SINTERCARD
+  answers WRONGTYPE even when an earlier key is missing; BITFIELD grows the string under
+  `OVERFLOW FAIL`; ZRANDMEMBER with count ≥ size answers highest score first; GEOSEARCH keeps
+  redis's unsorted order, honours `ANY` and uses redis's error texts; APPEND / SETRANGE / SETBIT /
+  BITFIELD keep the key's LFU counter and record one access.
+- **Vector: WARM segments rank like their HOT source** (moon#1213) — they carry real sub-centroid
+  signs and use the 32-level LUT. New opt-in `MOON_VECTOR_PAYLOAD_SCHEMA=declared` indexes only
+  declared TAG/NUMERIC payload fields and routes KNN TEXT filters to the BM25 plane (filters on
+  undeclared fields then match nothing). `index_persist` sidecars are v6 (older binaries refuse a
+  v6 sidecar, as with every bump; replicas still receive v5 definitions).
+
 - **BEHAVIOUR CHANGE — a command the user's ACL denies inside `MULTI` now
   aborts the whole transaction** (moon#1035). `EXEC` answers
   `-EXECABORT Transaction discarded because of previous errors.` and applies
@@ -177,6 +192,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Performance
 
+2026-09 performance review fix wave, part 2 (index moon#1199; evidence in
+`.add/milestones/v0-9-2-perf-review/plans/{WS2,WS4,WS9,WS11,WS12,WS13}-*/SUMMARY.md`). Relative
+A/Bs on a shared 4-vCPU Linux container — re-measure on the GCE rig before quoting.
+
+- **Large multibulk uploads parse in O(n)** (moon#1164): a resumable tri-state scan keeps a
+  per-connection parse state across reads — one RPUSH of 1M elements in 64 KiB writes 15.7–22.7 s →
+  121–126 ms (redis 112–126 ms). **Wire path** (moon#1179): `Frame` 72 → 40 bytes, direct reads into
+  the read buffer sized from the parse hint, lazy batch scratch and response slots — 64 KiB SET +60%,
+  `SET … EX` P16 +8%, server CPU per request −6 to −11%.
+- **Sorted sets, sets, strings, geo** (moon#1168–#1172, #1174 §4, #1189 B+tree): ZRANGEBYSCORE LIMIT
+  48.7 ms → 118 µs and ZCOUNT 32.4 ms → 55 µs via order statistics; ZRANDMEMBER 20.3 ms → 56 µs;
+  SINTER small ∩ big 232 ms → 85 µs; SETBIT on 12.5 MB 8.75 ms → 59 µs and APPEND 40K × 100 B
+  12.0 s → 0.2 s (in place); GEOSEARCH over 200K points 22.4 ms → 84 µs; a 1M rising zset's
+  B+tree 363 → 180 MB.
+- **EVAL/EVALSHA reuse compiled functions** (moon#1167): EVALSHA 2.28× (1-line) and 5.02× (1.4 KB
+  script). **PUBLISH** snapshots subscribers with one `Arc` clone (moon#1180). **Keyspace events**
+  with no `__key*` subscriber allocate nothing (moon#1214): SET with `notify-keyspace-events KEA`
+  1.53×.
+- **BGSAVE converges under an insert flood** (moon#1216): a per-tick budget over the hash-space walk
+  — 1M keys: 35 s → 1.5 s, max PING 40–420 ms → 1–3 ms, peak RSS 950 → 200 MiB.
+- **Vector** (moon#1213): immutable segments drop never-read QJL data and collections no longer hold
+  QJL matrices (4 shards × 2 EXACT 768d indexes +145.5 → +1.4 MB RSS); EXACT compaction at 768d
+  12.3 → 2.5 s; HNSW prefetch widened (−4 to −9% per query, identical results).
+- **Text / graph** (moon#1220): wide prefix/fuzzy expansions scored term-at-a-time (`ka*` over 200K
+  matches 4.5×); posting positions stored contiguously per run (RSS −37% at 200K docs); Cypher
+  `RETURN … ORDER BY … LIMIT` projects only the kept rows (2.1–3.0×) and range IndexScans stream
+  (9.4×).
+
 2026-09 performance review fix wave, part 1 (index moon#1199; per-workstream evidence in
 `.add/milestones/v0-9-2-perf-review/plans/*/SUMMARY.md`). Numbers are relative A/Bs on a
 shared 4-vCPU Linux container against HEAD `935c555` — re-measure on the GCE rig before quoting.
@@ -233,6 +276,21 @@ shared 4-vCPU Linux container against HEAD `935c555` — re-measure on the GCE r
   and reads in chunks on a CDC read pool (a poll at a ~1M-record tail 5.8 s → 0.17 ms).
 
 ### Fixed
+
+- **P0: BGSAVE lost pre-snapshot keys when a DashTable segment split during the save**
+  (moon#1216): 1,744 of 2,000 keys in the repro, 698K–726K of 1M under an insert flood. The epoch
+  now walks hash space, so a split cannot move keys out of the walk. Copy-on-write also captures
+  every key a multi-key write modifies, not only the first (moon#1217; MOVE / COPY … DB n remain),
+  including a woken BLMOVE's keys.
+- **FLUSHDB / FLUSHALL / SWAPDB during a BGSAVE no longer panics the shard** (moon#1224; see Changed).
+- **Sorted-set B+tree corruption** (moon#1205): an internal split lost a separator and a subtree and
+  a right-borrow lost a subtree count, so ZRANK answered nil for existing members and ZREM'd members
+  came back in ZRANGE for any zset over 128 members built from non-monotone scores. Restart after
+  upgrading: persisted zsets rebuild a correct tree.
+- **Vector index sidecars lost RERANK_MULT and EXACT_BEAM on every restart** (moon#1194): the writer
+  wrote v4.
+- **Cross-shard TAG/NUMERIC consistency suites run again** (moon#1219) — on shards 1 and 4 against an
+  in-test oracle, no longer `#[ignore]`d.
 
 - **A failed WAL v3 fsync is never followed by a durability claim** (moon#1221
   review, refs moon#1188). Once the off-loop sync agent's fsync of a segment
