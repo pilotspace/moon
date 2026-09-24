@@ -961,6 +961,71 @@ mod tests {
         );
     }
 
+    /// moon#1221 review: a structurally valid, checksummed `.tpost` holding ONE document with a
+    /// large id made `install_recovered` size every per-document column by that id — a 107-byte
+    /// file billed 72,000,099 B, and an id near `u32::MAX` would abort every boot. The density
+    /// guard (`doc_ids_dense_enough`) refuses such a file in `decode` (→ rebuild) and again in
+    /// `install_recovered`, so install allocates O(doc count + 64 Ki slots), never O(a claimed id).
+    #[test]
+    fn sparse_doc_id_tpost_is_refused_before_install_allocates() {
+        let mut live = TextIndex::new(
+            Bytes::from_static(b"h"),
+            vec![Bytes::from_static(b"h:")],
+            vec![TextFieldDef::new(Bytes::from_static(b"body"))],
+            BM25Config::default(),
+        );
+        let kh = xxhash_rust::xxh64::xxh64(b"h:1", 0);
+        live.index_document(kh, b"h:1", &frames(&[("body", "")]));
+        let good = encode_index(&live);
+        let at_next = HEADER_LEN + 4 + live.name.len() + 1;
+        let at_doc = at_next + 4 + 2 + 4;
+        assert_eq!(&good[at_next..at_next + 4], &1u32.to_le_bytes());
+        assert_eq!(&good[at_doc..at_doc + 4], &0u32.to_le_bytes());
+        // The one document at `id`, `next_doc_id = id + 1`, trailer re-stamped.
+        let forge = |id: u32| {
+            let mut bytes = good.clone();
+            bytes[at_next..at_next + 4].copy_from_slice(&id.saturating_add(1).to_le_bytes());
+            bytes[at_doc..at_doc + 4].copy_from_slice(&id.to_le_bytes());
+            restamp(bytes)
+        };
+        // 1 doc: ids up to 2 × 1 + 65,536 − 1 = 65,537 are within the guard.
+        let limit = 2 + DOC_ID_SLACK as u32 - 1;
+        for id in [limit + 1, 2_000_000, u32::MAX - 1] {
+            assert_eq!(
+                decode(&forge(id)).err(),
+                Some(PostingsDecodeError::Invalid("doc ids too sparse")),
+                "doc id {id}"
+            );
+        }
+        // At the limit the file is accepted: the allowance is bounded, and the ids below the
+        // document are free — the next new document takes id 0.
+        let mut loaded = empty_like(&live);
+        loaded
+            .install_recovered(decode(&forge(limit)).expect("within the guard"))
+            .expect("install");
+        let slot = std::mem::size_of::<Option<Bytes>>() + 4;
+        assert!(
+            loaded.resident_bytes() < 2 * (limit as usize + 1) * slot,
+            "{} B",
+            loaded.resident_bytes()
+        );
+        assert_eq!(loaded.next_doc_id(), limit + 1);
+        assert_eq!(loaded.free_doc_ids().len(), u64::from(limit));
+        let kh2 = xxhash_rust::xxh64::xxh64(b"h:2", 0);
+        loaded.index_document(kh2, b"h:2", &frames(&[("body", "x")]));
+        assert_eq!(loaded.key_hash_to_doc_id[&kh2], 0);
+
+        // A hand-built `PersistedTextIndex` that skipped `decode` is refused by install itself,
+        // and leaves the target untouched.
+        let mut p = decode(&good).expect("decode");
+        p.docs[0].doc_id = 2_000_000;
+        p.next_doc_id = 2_000_001;
+        let mut target = empty_like(&live);
+        assert_eq!(target.install_recovered(p), Err("doc ids too sparse"));
+        assert_eq!((target.num_docs(), target.next_doc_id()), (0, 0));
+        assert_eq!(target.resident_bytes(), empty_like(&live).resident_bytes());
+    }
+
     fn hits(idx: &TextIndex, field: usize, terms: &[&str]) -> Vec<(Bytes, f32)> {
         let q: Vec<String> = terms.iter().map(|t| (*t).to_owned()).collect();
         let mut v: Vec<(Bytes, f32)> = idx
