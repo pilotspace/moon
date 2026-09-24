@@ -29,7 +29,8 @@
 //! A marker is best-effort, and moon#1140 is what that costs: the manifest
 //! entry of a spill file is committed by the manifest-sync thread while its
 //! marker is still in the AOF writer's channel or user-space buffer, and a
-//! `SIGKILL` (or a marker dropped under AOF backpressure) leaves the file
+//! `SIGKILL` (or, in logs written before moon#1202, a marker dropped under
+//! AOF backpressure) leaves the file
 //! named by the manifest with no record of it in the log. The rebuilt index
 //! then points the key at that file — newest wins — and the copy BELOW the
 //! cut, the one the generation's records are written against, is shadowed.
@@ -193,8 +194,8 @@ impl Database {
     /// visible one. A file below the cut is a valid base for every record of
     /// the generation, and a newer file whose marker is missing must not hide
     /// it: that marker is best-effort (lost when the process dies before the
-    /// writer flushed it, or dropped under backpressure) while the file's
-    /// manifest entry is committed on its own. Treating the key as absent
+    /// writer flushed it, or — before moon#1202 — dropped under backpressure)
+    /// while the file's manifest entry is committed on its own. Treating the key as absent
     /// replayed each post-rewrite write onto an empty value, and the
     /// end-of-replay resolution then kept that truncated hot copy. The older
     /// copy is exactly what the newest-wins index would have held had the
@@ -271,11 +272,10 @@ impl Database {
     ///   data. Enumerating how a key can be hot AND cold here shows hot-wins
     ///   is value-correct in every case: it was written after its marker (the
     ///   hot copy is newest), or its cold entry is stale in a file the
-    ///   manifest still lists (likewise), or its own marker was lost under
-    ///   AOF backpressure — in which case both planes hold the SAME value and
-    ///   hot-wins costs only restart-as-cold for that one key, which the
-    ///   marker's emit site already documents as the accepted price of losing
-    ///   it. Read visibility is untouched: no gate is installed, so every
+    ///   manifest still lists (likewise), or its own marker was lost in the
+    ///   crash tail (or, in a log written before moon#1202, dropped under AOF
+    ///   backpressure) — in which case both planes hold the SAME value and
+    ///   hot-wins costs only restart-as-cold for that one key. Read visibility is untouched: no gate is installed, so every
     ///   cold file stays readable during replay exactly as before.
     /// * Pre-#902 generation (no cut, no markers — an AOF written by an older
     ///   build): the task #56 behaviour,

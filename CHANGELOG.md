@@ -226,6 +226,48 @@ shared 4-vCPU Linux container against HEAD `935c555` — re-measure on the GCE r
 
 ### Fixed
 
+- **A spill's `MOON.SPILLED` cut record is never dropped under AOF
+  backpressure** (moon#1202). When the AOF writer's channel stayed full past
+  the 500 ms bound, the record was dropped while its keys stayed published to
+  the cold tier. Recovery was still value-correct, because the log rebuilt
+  those keys in RAM, but the drop was reported as a lost acknowledged append
+  (`aof_last_append_status:err`) and the keys came back in RAM instead of cold.
+  A later retry was not an option: a record logged after a newer write to the
+  key makes replay lose that write. The record is now logged before the keys
+  are published. If the writer cannot take it, the spill is withdrawn: the
+  keys go back to RAM, the file stays out of the manifest (the startup orphan
+  sweep removes it), and the next eviction pass spills them again. New
+  `INFO persistence` field: `spill_completion_marker_withdrawn`. One
+  backpressure budget now covers every record in a completion drain, so a
+  saturated writer blocks the shard thread for at most 500 ms per drain
+  instead of 500 ms per spill file.
+- **A spilled value larger than ~4 MB is readable again** (moon#1201). The
+  cold-tier overflow-chain reader capped a chain at a fixed 1000 pages
+  (~4.03 MB), while the spill writer has no size cap, so every larger value —
+  in practice a consumer-group stream whose PEL grows without `XACK` — was
+  written intact but refused on read as `OverflowBroken`: the key stayed
+  indexed and answered `IOERR` to `XADD`, `XREADGROUP`, `GET` and every other
+  reader until overwritten (in v0.8.9 and earlier the same read was a silent
+  miss, so `XADD` started a fresh stream and the old one was lost). The cycle
+  guard is now the file's own page count, which no acyclic chain can exceed.
+  No on-disk format change; files written by any earlier version read back.
+
+- **An AOF rewrite that is started while the previous one is still draining
+  is no longer lost** (moon#1158). A per-shard rewrite released the
+  in-progress flag when its manifest committed, before every writer had
+  written out the appends that spilled during the fold. On a real disk under
+  sustained writes that drain takes seconds, so the auto-rewrite monitor
+  could start the next rewrite during it. The drain then consumed and dropped
+  the new rewrite request. Its countdown never finished, the flag stayed set,
+  and no rewrite ran again: the incr AOF grew until appends were dropped and
+  the disk filled. The flag is now released when the last writer finishes
+  its drain. The same ordering is fixed on the `--shards 1` tokio writer,
+  and a per-shard rewrite whose fan-out fails part-way no longer clears the
+  flag while the writers that received it are still working. A rewrite
+  request that reaches a drain anyway aborts loudly instead of disappearing,
+  and the monitor logs an error when a rewrite has been running for more
+  than 5 minutes.
+
 - **Reads never refreshed LRU/LFU metadata, so `allkeys-lru`/`allkeys-lfu` evicted the most-read
   keys first** (moon#1161): hot-key retention in the review scenario 0.6% → 99.5% (LRU) / 100%
   (LFU). `OBJECT IDLETIME` resets on read, `OBJECT FREQ` grows under LFU, `TOUCH` touches, `OBJECT`
@@ -238,7 +280,6 @@ shared 4-vCPU Linux container against HEAD `935c555` — re-measure on the GCE r
   EXACT compaction gave rows after a deleted vector their neighbour's QJL signs (moon#1208).
 - **FT.SEARCH prefix/fuzzy results differed between processes** (moon#1218): the 50-term expansion
   cap broke document-frequency ties in HashMap order; ties now break by term id.
-
 
 - **The boot crash-orphan sweep no longer lets a cold file id be issued twice
   in one AOF generation** (moon#1114). A spill's `MOON.SPILLED <N>` marker

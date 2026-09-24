@@ -17,6 +17,23 @@ enum AppendNow {
     Refused(AofAck),
 }
 
+/// Why a bounded blocking append was not enqueued
+/// ([`AofWriterPool::try_send_append_bounded_or_refuse`]). In every case the
+/// record is NOT in the writer's channel or overflow buffer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BoundedRefusal {
+    /// A rewrite fold's overflow buffer is at its cap with older records in
+    /// it; sending to the channel instead would reorder the log.
+    OverflowCap,
+    /// The writer is gone.
+    Disconnected,
+    /// The channel was full and the caller's budget was already spent.
+    BudgetExhausted,
+    /// The channel stayed full (or the writer went away) for the whole
+    /// remaining budget, `spent`.
+    StillBlocked { spent: Duration, disconnected: bool },
+}
+
 #[derive(Clone)]
 pub struct AofWriterPool {
     senders: Vec<channel::MpscSender<AofMessage>>,
@@ -857,6 +874,89 @@ impl AofWriterPool {
         bytes: Bytes,
         budget: &mut Duration,
     ) -> bool {
+        let refusal = match self.send_bounded_or_refuse(shard_id, lsn, db, bytes, budget) {
+            Ok(()) => return true,
+            Err(refusal) => refusal,
+        };
+        match refusal {
+            BoundedRefusal::OverflowCap => {
+                super::record_append_dropped(self.overflow_for(shard_id), 1);
+                tracing::error!(
+                    "AOF append LOST for shard {} (lsn {}): rewrite overflow cap reached",
+                    shard_id,
+                    lsn
+                );
+            }
+            BoundedRefusal::Disconnected => {
+                super::record_append_dropped(self.overflow_for(shard_id), 1);
+                warn!(
+                    "AOF append dropped for shard {} (lsn {}): channel disconnected",
+                    shard_id, lsn
+                );
+            }
+            BoundedRefusal::BudgetExhausted => {
+                super::record_append_dropped(self.overflow_for(shard_id), 1);
+                tracing::error!(
+                    "AOF append LOST for shard {} (lsn {}): batch backpressure budget exhausted; \
+                     backpressure_dropped={}",
+                    shard_id,
+                    lsn,
+                    AOF_BACKPRESSURE_DROPPED.load(std::sync::atomic::Ordering::Relaxed),
+                );
+            }
+            BoundedRefusal::StillBlocked {
+                spent,
+                disconnected,
+            } => {
+                if !disconnected {
+                    super::record_append_dropped(self.overflow_for(shard_id), 1);
+                }
+                tracing::error!(
+                    "AOF append LOST for shard {} (lsn {}): writer still {} after {:?} \
+                     backpressure bound; backpressure_dropped={}",
+                    shard_id,
+                    lsn,
+                    if disconnected { "disconnected" } else { "full" },
+                    spent,
+                    AOF_BACKPRESSURE_DROPPED.load(std::sync::atomic::Ordering::Relaxed),
+                );
+            }
+        }
+        false
+    }
+
+    /// [`Self::send_append_bounded_blocking`] for a record the CALLER can
+    /// still take back (moon#1202): the same fast path, spill gate and
+    /// `budget`-bounded block, but a refusal is returned instead of being
+    /// counted as a dropped acked append. Nothing was enqueued when this
+    /// returns `Err`, so the caller must undo whatever the record would have
+    /// described — there is no hole in the log to report.
+    ///
+    /// For the `MOON.SPILLED` cut record: its publish is withdrawn instead
+    /// (`shard::persistence_tick::apply_completion_vec`). A record whose
+    /// effect is already visible to clients must use
+    /// [`Self::send_append_bounded_blocking`], which accounts the loss.
+    pub fn try_send_append_bounded_or_refuse(
+        &self,
+        shard_id: usize,
+        lsn: u64,
+        db: usize,
+        bytes: Bytes,
+        budget: &mut Duration,
+    ) -> Result<(), BoundedRefusal> {
+        self.send_bounded_or_refuse(shard_id, lsn, db, bytes, budget)
+    }
+
+    /// Shared body of the two bounded senders above; performs no loss
+    /// accounting and no logging.
+    fn send_bounded_or_refuse(
+        &self,
+        shard_id: usize,
+        lsn: u64,
+        db: usize,
+        bytes: Bytes,
+        budget: &mut Duration,
+    ) -> Result<(), BoundedRefusal> {
         use super::rewrite_overflow::SpillReject;
         // #455: synchronous — the stamp is the caller's mutation epoch, and
         // a block below holds the whole thread, so no fold can interleave.
@@ -875,56 +975,25 @@ impl AofWriterPool {
         let ovf = self.overflow_for(shard_id);
         if ovf.spill_first() {
             match ovf.try_spill(msg) {
-                Ok(()) => return true,
+                Ok(()) => return Ok(()),
                 Err(SpillReject::Disarmed(returned)) => msg = returned,
-                Err(SpillReject::CapExceeded) => {
-                    super::record_append_dropped(self.overflow_for(shard_id), 1);
-                    tracing::error!(
-                        "AOF append LOST for shard {} (lsn {}): rewrite overflow cap reached",
-                        shard_id,
-                        lsn
-                    );
-                    return false;
-                }
+                Err(SpillReject::CapExceeded) => return Err(BoundedRefusal::OverflowCap),
             }
         }
         match self.sender(shard_id).try_send(msg) {
-            Ok(()) => return true,
-            Err(flume::TrySendError::Disconnected(_)) => {
-                super::record_append_dropped(self.overflow_for(shard_id), 1);
-                warn!(
-                    "AOF append dropped for shard {} (lsn {}): channel disconnected",
-                    shard_id, lsn
-                );
-                return false;
-            }
+            Ok(()) => return Ok(()),
+            Err(flume::TrySendError::Disconnected(_)) => return Err(BoundedRefusal::Disconnected),
             Err(flume::TrySendError::Full(returned)) => msg = returned,
         }
         // #452.1: channel saturated — spill instead of blocking/dropping when
         // a rewrite fold is holding the writer out of its recv loop.
         match ovf.try_spill(msg) {
-            Ok(()) => return true,
+            Ok(()) => return Ok(()),
             Err(SpillReject::Disarmed(returned)) => msg = returned,
-            Err(SpillReject::CapExceeded) => {
-                super::record_append_dropped(self.overflow_for(shard_id), 1);
-                tracing::error!(
-                    "AOF append LOST for shard {} (lsn {}): rewrite overflow cap reached",
-                    shard_id,
-                    lsn
-                );
-                return false;
-            }
+            Err(SpillReject::CapExceeded) => return Err(BoundedRefusal::OverflowCap),
         }
         if budget.is_zero() {
-            super::record_append_dropped(self.overflow_for(shard_id), 1);
-            tracing::error!(
-                "AOF append LOST for shard {} (lsn {}): batch backpressure budget exhausted; \
-                 backpressure_dropped={}",
-                shard_id,
-                lsn,
-                AOF_BACKPRESSURE_DROPPED.load(std::sync::atomic::Ordering::Relaxed),
-            );
-            return false;
+            return Err(BoundedRefusal::BudgetExhausted);
         }
         // Slow path only (channel full, about to block for up to `budget` —
         // milliseconds): two `Instant::now()` calls are noise here, and the
@@ -934,25 +1003,11 @@ impl AofWriterPool {
         let spent = *budget;
         *budget = budget.saturating_sub(blocked_at.elapsed());
         match result {
-            Ok(()) => true,
-            Err(e) => {
-                if matches!(e, flume::SendTimeoutError::Timeout(_)) {
-                    super::record_append_dropped(self.overflow_for(shard_id), 1);
-                }
-                tracing::error!(
-                    "AOF append LOST for shard {} (lsn {}): writer still {} after {:?} \
-                     backpressure bound; backpressure_dropped={}",
-                    shard_id,
-                    lsn,
-                    match e {
-                        flume::SendTimeoutError::Timeout(_) => "full",
-                        flume::SendTimeoutError::Disconnected(_) => "disconnected",
-                    },
-                    spent,
-                    AOF_BACKPRESSURE_DROPPED.load(std::sync::atomic::Ordering::Relaxed),
-                );
-                false
-            }
+            Ok(()) => Ok(()),
+            Err(e) => Err(BoundedRefusal::StillBlocked {
+                spent,
+                disconnected: matches!(e, flume::SendTimeoutError::Disconnected(_)),
+            }),
         }
     }
 
@@ -1301,6 +1356,11 @@ impl AofWriterPool {
     /// draining continuously, so `send` blocks only until a channel slot frees
     /// (sub-millisecond), which is acceptable for a rare admin command.
     ///
+    /// The caller must already hold the BGREWRITEAOF in-progress flag and
+    /// must NOT touch it after this returns, `Ok` or `Err` (moon#1158): it is
+    /// released here when no writer received the rewrite, otherwise by the
+    /// last writer to let go of it — after its post-fold drain.
+    ///
     /// Returns `SendFailed` if `base_dir` is unset, the manifest can't be
     /// loaded, or a writer thread is gone (disconnected channel). On the last
     /// case the rewrite aborts WITHOUT committing — the old generation stays
@@ -1310,13 +1370,37 @@ impl AofWriterPool {
         &self,
         shard_dbs: Arc<crate::shard::shared_databases::ShardDatabases>,
     ) -> Result<(), AofPoolSendError> {
+        self.try_send_rewrite_per_shard_with_flag(
+            shard_dbs,
+            &crate::command::persistence::AOF_REWRITE_IN_PROGRESS,
+        )
+    }
+
+    /// [`try_send_rewrite_per_shard`](Self::try_send_rewrite_per_shard) for a
+    /// rewrite holding `in_progress` instead of the global BGREWRITEAOF flag
+    /// (test seam: parallel unit tests must not share the global flag).
+    pub(crate) fn try_send_rewrite_per_shard_with_flag(
+        &self,
+        shard_dbs: Arc<crate::shard::shared_databases::ShardDatabases>,
+        in_progress: &'static std::sync::atomic::AtomicBool,
+    ) -> Result<(), AofPoolSendError> {
         use crate::persistence::aof_manifest::{AofLayout, AofManifest};
+        // Flag ownership (moon#1158): the caller hands the held flag to this
+        // call. Until a coordinator exists nothing else can release it, so
+        // every early return below releases it here; from the coordinator's
+        // construction on, it is released when the last holder of the
+        // coordinator drops it (see `PerShardRewriteCoord`'s `Drop`).
+        let release = || in_progress.store(false, std::sync::atomic::Ordering::SeqCst);
         if self.layout != AofLayout::PerShard {
             // A TopLevel pool rewrites via try_send_rewrite; this entry point
             // is PerShard-only.
+            release();
             return Err(AofPoolSendError::RewriteUnsupportedInPerShard);
         }
-        let base_dir = self.base_dir.as_ref().ok_or(AofPoolSendError::SendFailed)?;
+        let Some(base_dir) = self.base_dir.as_ref() else {
+            release();
+            return Err(AofPoolSendError::SendFailed);
+        };
         let manifest = match AofManifest::load(base_dir) {
             Ok(Some(m)) if m.layout == AofLayout::PerShard => m,
             Ok(_) => {
@@ -1324,6 +1408,7 @@ impl AofWriterPool {
                     "F6 per-shard rewrite: manifest at {} missing or not PerShard; aborting",
                     base_dir.display()
                 );
+                release();
                 return Err(AofPoolSendError::SendFailed);
             }
             Err(e) => {
@@ -1332,13 +1417,19 @@ impl AofWriterPool {
                     base_dir.display(),
                     e
                 );
+                release();
                 return Err(AofPoolSendError::SendFailed);
             }
         };
         let current_seq = manifest.seq;
         let n_shards = self.senders.len();
         let shared_manifest = Arc::new(parking_lot::Mutex::new(manifest));
-        let coord = PerShardRewriteCoord::new(shared_manifest, current_seq, n_shards);
+        let coord = PerShardRewriteCoord::with_in_progress_flag(
+            shared_manifest,
+            current_seq,
+            n_shards,
+            in_progress,
+        );
         // C4 deadlock guard: fold channels MUST be wired before a per-shard
         // rewrite is attempted. If they are absent the AofFold push would
         // succeed into a 1-slot ring whose consumer was dropped at construction
@@ -1453,8 +1544,9 @@ mod pool_tests {
     /// leaving the old generation authoritative.
     #[test]
     fn rewrite_fan_out_partial_failure_clears_in_progress_flag() {
-        use crate::command::persistence::AOF_REWRITE_IN_PROGRESS;
-        use std::sync::atomic::Ordering;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        // Test-local flag: the global one is shared by parallel tests.
+        static AOF_REWRITE_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 
         let tmp = tempfile::tempdir().unwrap();
         // PerShard manifest on disk so the rewrite reaches the fan-out loop.
@@ -1479,7 +1571,7 @@ mod pool_tests {
 
         // The command handler sets this before dispatching the rewrite.
         AOF_REWRITE_IN_PROGRESS.store(true, Ordering::SeqCst);
-        let res = pool.try_send_rewrite_per_shard(shard_dbs);
+        let res = pool.try_send_rewrite_per_shard_with_flag(shard_dbs, &AOF_REWRITE_IN_PROGRESS);
         assert!(res.is_err(), "disconnected writer must fail the fan-out");
         assert!(
             !AOF_REWRITE_IN_PROGRESS.load(Ordering::SeqCst),
@@ -1497,9 +1589,10 @@ mod pool_tests {
     /// post-abort appends land in the COMMITTED old-gen incr.
     #[test]
     fn rewrite_abort_reopens_writer_onto_committed_old_generation() {
-        use crate::command::persistence::AOF_REWRITE_IN_PROGRESS;
         use std::io::Write;
-        use std::sync::atomic::Ordering;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        // Test-local flag: the global one is shared by parallel tests.
+        static AOF_REWRITE_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 
         let tmp = tempfile::tempdir().unwrap();
         // 2-shard manifest at seq=1 on disk; share it through the coord's Arc.
@@ -1510,7 +1603,12 @@ mod pool_tests {
         assert!(old_incr_s0.exists(), "old-gen incr must exist pre-rewrite");
         let manifest = std::sync::Arc::new(parking_lot::Mutex::new(manifest));
 
-        let coord = PerShardRewriteCoord::new(manifest.clone(), old_seq, 2);
+        let coord = PerShardRewriteCoord::with_in_progress_flag(
+            manifest.clone(),
+            old_seq,
+            2,
+            &AOF_REWRITE_IN_PROGRESS,
+        );
         let new_seq = coord.new_seq();
         assert_ne!(new_seq, old_seq);
 
@@ -1609,7 +1707,9 @@ mod pool_tests {
             crate::persistence::aof_manifest::AofManifest::initialize_multi(tmp.path(), 2).unwrap();
         let old_seq = manifest.seq;
         let manifest = std::sync::Arc::new(parking_lot::Mutex::new(manifest));
-        let coord = PerShardRewriteCoord::new(manifest, old_seq, 2);
+        static IN_PROGRESS: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
+        let coord = PerShardRewriteCoord::with_in_progress_flag(manifest, old_seq, 2, &IN_PROGRESS);
 
         // Shard A: decrement (countdown 2 -> 1, non-terminal) then block.
         let c_a = coord.clone();
@@ -1646,7 +1746,9 @@ mod pool_tests {
             crate::persistence::aof_manifest::AofManifest::initialize_multi(tmp.path(), 2).unwrap();
         let old_seq = manifest.seq;
         let manifest = std::sync::Arc::new(parking_lot::Mutex::new(manifest));
-        let coord = PerShardRewriteCoord::new(manifest, old_seq, 2);
+        static IN_PROGRESS: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
+        let coord = PerShardRewriteCoord::with_in_progress_flag(manifest, old_seq, 2, &IN_PROGRESS);
 
         // Shard A folds, decrements, then blocks on the barrier in a thread.
         let c_a = coord.clone();
