@@ -759,3 +759,120 @@ mod lazy_free_1190 {
         assert_eq!(db.estimated_memory(), 0);
     }
 }
+
+// ── moon#1189 (expiry-index part) ───────────────────────────────────────
+
+mod expiry_index_1189 {
+    use bytes::Bytes;
+
+    use crate::server::expiration::expire_cycle_direct;
+    use crate::storage::dashtable::take_key_lookups;
+    use crate::storage::db::Database;
+    use crate::storage::entry::{Entry, current_time_ms};
+
+    fn volatile(value: &'static [u8], at_ms: u64) -> Entry {
+        Entry::new_string_with_expiry(Bytes::from_static(value), at_ms)
+    }
+
+    /// Long keys (> 23 bytes) so a `CompactKey` clone or build would be a
+    /// heap allocation — the case the borrowed index lookup is for.
+    fn key(i: usize) -> String {
+        format!("volatile-key-long-enough-for-the-heap:{i:06}")
+    }
+
+    /// The sweep pays ONE table probe per expired key: pop the pair (the key
+    /// moves out of the index), then `remove_expired_at` decides and removes
+    /// in the same probe. HEAD `935c555` paid two (`is_key_expired` +
+    /// `remove`), plus a peek clone and a second index search per key.
+    #[test]
+    fn sweep_costs_one_table_probe_per_expired_key() {
+        let mut db = Database::new();
+        let now = current_time_ms();
+        const EXPIRED: usize = 1_000;
+        for i in 0..EXPIRED {
+            db.set(key(i).as_bytes(), volatile(b"v", now - 10_000 + i as u64));
+        }
+        for i in 0..50 {
+            db.set(
+                format!("future-key-long-enough-for-heap:{i}").as_bytes(),
+                volatile(b"v", now + 3_600_000),
+            );
+        }
+        assert!(db.debug_expiry_index_consistent());
+
+        let _ = take_key_lookups();
+        let mut removed = Vec::new();
+        let mut cycles = 0;
+        while db.len() > 50 {
+            expire_cycle_direct(&mut db, &mut |k| removed.push(k.to_vec()));
+            cycles += 1;
+            assert!(cycles < 10_000, "sweep made no progress");
+        }
+        let lookups = take_key_lookups();
+        assert_eq!(removed.len(), EXPIRED, "every expired key reported once");
+        assert_eq!(
+            lookups as usize, EXPIRED,
+            "the sweep probed the table {lookups} times for {EXPIRED} expired keys \
+             (want exactly one probe per key; HEAD paid two)"
+        );
+        // Deadline order, and the survivors are exactly the future keys.
+        let expect: Vec<Vec<u8>> = (0..EXPIRED).map(|i| key(i).into_bytes()).collect();
+        assert_eq!(removed, expect, "removed out of deadline order");
+        assert_eq!(db.expiry_index_len(), 50);
+        assert!(db.debug_expiry_index_consistent());
+    }
+
+    /// A pair the entry no longer carries (a writer that failed to retire
+    /// it) is retired by the pop itself and removes nothing.
+    #[test]
+    fn a_stale_pair_is_retired_without_touching_the_live_entry() {
+        let mut db = Database::new();
+        let now = current_time_ms();
+        let k = key(1);
+        db.set(k.as_bytes(), volatile(b"live", now + 3_600_000));
+        // Leak a due pair for the same key and one for a missing key.
+        db.expiry_index_insert(now - 5_000, k.as_bytes());
+        db.expiry_index_insert(now - 4_000, key(2).as_bytes());
+        assert_eq!(db.expiry_index_len(), 3);
+
+        let mut removed = Vec::new();
+        expire_cycle_direct(&mut db, &mut |k| removed.push(k.to_vec()));
+        assert!(
+            removed.is_empty(),
+            "a stale pair must not delete the live key"
+        );
+        assert!(db.get(k.as_bytes()).is_some());
+        assert_eq!(db.expiry_index_len(), 1, "both stale pairs retired");
+        assert!(db.debug_expiry_index_consistent());
+    }
+
+    /// Every TTL transition on a heap-sized key keeps the index exact —
+    /// the unindex side now searches by a borrowed `(ts, &[u8])`.
+    #[test]
+    fn ttl_transitions_on_long_keys_keep_the_index_exact() {
+        let mut db = Database::new();
+        let now = current_time_ms();
+        for i in 0..200 {
+            let k = key(i);
+            db.set(k.as_bytes(), volatile(b"v", now + 1_000_000 + i as u64));
+            assert!(db.set_expiry(k.as_bytes(), now + 2_000_000 + i as u64));
+            if i % 3 == 0 {
+                assert!(db.set_expiry(k.as_bytes(), 0));
+            }
+            if i % 5 == 0 {
+                db.set(
+                    k.as_bytes(),
+                    Entry::new_string(Bytes::from_static(b"plain")),
+                );
+            }
+            if i % 7 == 0 {
+                db.remove(k.as_bytes());
+            }
+        }
+        assert!(db.debug_expiry_index_consistent());
+        let volatile_left = (0..200)
+            .filter(|i| i % 3 != 0 && i % 5 != 0 && i % 7 != 0)
+            .count();
+        assert_eq!(db.expiry_index_len(), volatile_left);
+    }
+}

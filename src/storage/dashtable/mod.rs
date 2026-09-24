@@ -29,6 +29,7 @@ pub mod simd;
 use super::compact_key::CompactKey;
 
 use iter::{Iter, IterMut, Keys, Values};
+pub use segment::RemoveIf;
 use segment::{InsertResult, Segment, UpsertProbe, h2, home_buckets};
 
 /// Outcome of [`DashTable::insert_or_update`].
@@ -694,6 +695,36 @@ impl<V> DashTable<CompactKey, V> {
                 self.len -= 1;
                 v
             })
+    }
+
+    /// Remove `key` only if `pred(&value)` agrees, in ONE probe (moon#1189:
+    /// the expiry sweep's "remove it if it is still the expired incarnation"
+    /// used to cost a `get` and then a `remove`, i.e. two hashes and two
+    /// segment walks per expired key).
+    pub fn remove_if(&mut self, key: &[u8], pred: impl FnOnce(&V) -> bool) -> RemoveIf<V> {
+        note_key_lookup();
+        let hash = hash_key(key);
+        let dir_idx = segment_index(hash, self.depth);
+        let seg_idx = self.directory[dir_idx];
+
+        // Prefetch segment data while computing home bucket
+        prefetch_segment(self.segments.get(seg_idx));
+
+        let h2_val = h2(hash);
+        let (ba, bb) = home_buckets(hash);
+
+        match self
+            .segments
+            .get_mut(seg_idx)
+            .remove_if(h2_val, key, ba, bb, pred)
+        {
+            RemoveIf::Removed((_k, v)) => {
+                self.len -= 1;
+                RemoveIf::Removed(v)
+            }
+            RemoveIf::Kept => RemoveIf::Kept,
+            RemoveIf::Absent => RemoveIf::Absent,
+        }
     }
 
     /// Remove a key and return both key and value.

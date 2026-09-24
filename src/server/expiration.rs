@@ -8,7 +8,9 @@ use crate::runtime::cancel::CancellationToken;
 use tracing::info;
 
 use crate::storage::Database;
-use crate::storage::db::{HASH_SWEEP_MAX_FIELDS_PER_KEY, HASH_SWEEP_MAX_KEYS_PER_TICK};
+use crate::storage::db::{
+    ExpiredRemoval, HASH_SWEEP_MAX_FIELDS_PER_KEY, HASH_SWEEP_MAX_KEYS_PER_TICK,
+};
 use crate::storage::db_hash_ttl::ReapOutcome;
 use crate::storage::entry::current_time_ms;
 
@@ -162,8 +164,7 @@ pub fn expire_cycle_direct(db: &mut Database, on_removed: &mut dyn FnMut(&[u8]))
 /// so the gate can never skip work a sweep would have done.
 #[inline]
 fn nothing_due(db: &Database) -> bool {
-    db.peek_due_expiry(current_time_ms()).is_none()
-        && db.peek_due_hash_expiry(db.now_ms()).is_none()
+    !db.has_due_expiry(current_time_ms()) && db.peek_due_hash_expiry(db.now_ms()).is_none()
 }
 
 /// Delete-and-emit the lazily-discovered expired keys (moon#542).
@@ -234,37 +235,36 @@ fn expire_cycle(db: &mut Database, on_removed: &mut dyn FnMut(&[u8])) {
     let budget = Duration::from_millis(1);
 
     // ── Sweep 1: deadline-ordered whole-key expiry (moon#541) ───────────────
+    //
+    // moon#1189: per due key, ONE index pop (the key moves out — no clone)
+    // and ONE table probe (`remove_expired_at` decides and removes). It used
+    // to be a peek + key clone, an `is_key_expired` probe, a `remove` probe,
+    // and a second index search (building a `CompactKey`) to retire the pair.
     let now_ms = current_time_ms();
     let mut popped = 0u32;
-    while let Some((ts, key)) = db.peek_due_expiry(now_ms) {
-        if db.is_key_expired(key.as_bytes()) {
-            // `remove_lazily` unindexes the entry's CURRENT pair and hands a
-            // large value to the lazy-free drain (moon#1190): expiring
-            // 100 × 100K-element hashes no longer walks and frees 10M
-            // elements inside this 1 ms-budgeted sweep.
-            db.remove_lazily(key.as_bytes());
-            on_removed(key.as_bytes());
-            // moon#1013: tell CLIENT TRACKING caches the key is gone. One
-            // relaxed load per key when nobody tracks.
-            crate::tracking::invalidation::invalidate_server_removed(key.as_bytes());
-        } else if db
-            .data()
-            .get(key.as_bytes())
-            .is_none_or(|e| e.expires_at_ms() != ts)
-        {
-            // The pair is PROVABLY stale: the entry is gone or its TTL was
-            // retargeted since this pair was written — a pair a writer
-            // failed to retire (writer-coverage bug; the
+    while let Some((ts, key)) = db.pop_due_expiry(now_ms) {
+        match db.remove_expired_at(key.as_bytes(), ts, now_ms) {
+            ExpiredRemoval::Removed => {
+                on_removed(key.as_bytes());
+                // moon#1013: tell CLIENT TRACKING caches the key is gone. One
+                // relaxed load per key when nobody tracks.
+                crate::tracking::invalidation::invalidate_server_removed(key.as_bytes());
+            }
+            // The popped pair was PROVABLY stale: the entry is gone or its
+            // TTL was retargeted since this pair was written — a pair a
+            // writer failed to retire (writer-coverage bug; the
             // debug_expiry_index_consistent oracle exists to catch those in
-            // tests). Drop it or this loop would peek it forever.
-            db.drop_expiry_index_pair(ts, &key);
-        } else {
-            // The pair matches the entry exactly, yet the fresh clock says
-            // "not expired" — the wall clock stepped backwards between the
-            // cycle-start peek and this re-verification. The pair is VALID,
-            // just not due; keep it for a later tick. The index is ordered,
-            // so nothing after the head is due either.
-            break;
+            // tests). Popping it already retired it.
+            ExpiredRemoval::Stale => {}
+            // The pair matches the entry exactly, yet it is not expired at
+            // `now_ms`. Cannot happen with one clock for pop and check (a
+            // due pair is expired by definition) — kept so a future clock
+            // split cannot lose a pair: put it back and stop, nothing after
+            // the head is due either.
+            ExpiredRemoval::NotYetDue => {
+                db.restore_expiry_pair(ts, key);
+                break;
+            }
         }
         // Budget check every 64 pops, not per key: `Instant::elapsed` is a
         // clock read, and the common tick pops far fewer than 64. At least

@@ -131,6 +131,17 @@ pub enum UpsertProbe {
     Full,
 }
 
+/// Outcome of [`Segment::remove_if`] / `DashTable::remove_if` (moon#1189).
+#[derive(Debug, PartialEq, Eq)]
+pub enum RemoveIf<T> {
+    /// The key was present and the predicate agreed: here is what was removed.
+    Removed(T),
+    /// The key is present but the predicate declined; nothing changed.
+    Kept,
+    /// The key is not present.
+    Absent,
+}
+
 /// A segment holding up to 60 key-value pairs with Swiss Table control bytes.
 ///
 /// Memory layout (cache-line optimized):

@@ -9,6 +9,17 @@ use crate::storage::entry::{Entry, RedisValue, current_time_ms};
 
 use crate::storage::db::{Database, entry_overhead};
 
+/// Outcome of [`Database::remove_expired_at`] (moon#1189).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExpiredRemoval {
+    /// The expired entry was removed.
+    Removed,
+    /// The popped pair no longer described the entry; nothing was removed.
+    Stale,
+    /// The pair is valid but not due yet; restore it.
+    NotYetDue,
+}
+
 impl Database {
     /// Get an entry by key, performing lazy expiration.
     ///
@@ -700,7 +711,10 @@ impl Database {
             total += entry_overhead(key.as_bytes(), entry);
             if entry.has_expiry() {
                 any_expiring = true;
-                index.insert((entry.expires_at_ms(), key.clone()));
+                index.insert(super::expiry_index::ExpiryPair {
+                    ts: entry.expires_at_ms(),
+                    key: key.clone(),
+                });
             }
             // moon#543: the same healing property for the hash-field index —
             // a load path that bypassed `insert_for_load` still ends indexed.
@@ -827,22 +841,70 @@ impl Database {
         if entry.has_expiry() {
             self.expiry_index_remove(entry.expires_at_ms(), key);
         }
-        if super::lazy_free::lazy_free_weight(&entry).is_some() {
-            if let crate::storage::compact_value::RedisValueRef::HashWithTtl {
-                min_expiry_ms, ..
-            } = entry.value.as_redis_value()
-                && min_expiry_ms != u64::MAX
-                && !self.hash_expiry_index.is_empty()
-            {
-                self.hash_expiry_index
-                    .remove(&(min_expiry_ms, CompactKey::from(key)));
-            }
-            self.lazy_free_or_drop(key.len(), entry, true);
-        } else {
-            self.used_memory = self.used_memory.saturating_sub(entry_overhead(key, &entry));
-            self.hash_expiry_index_forget(key, &entry);
-        }
+        self.forget_removed_hash_ttl(key, &entry);
+        self.lazy_free_or_drop(key.len(), entry, true);
         true
+    }
+
+    /// Unindex a just-removed entry from the hash-field index. For a value
+    /// headed to the lazy-free queue the pair is found from the value's
+    /// cached minimum instead of a scan of its TTL sidecar (a missed pair is
+    /// harmless there — stale-early pairs self-heal, see `hash_expiry_index`).
+    fn forget_removed_hash_ttl(&mut self, key: &[u8], entry: &Entry) {
+        if super::lazy_free::lazy_free_weight(entry).is_none() {
+            self.hash_expiry_index_forget(key, entry);
+            return;
+        }
+        if let crate::storage::compact_value::RedisValueRef::HashWithTtl { min_expiry_ms, .. } =
+            entry.value.as_redis_value()
+            && min_expiry_ms != u64::MAX
+            && !self.hash_expiry_index.is_empty()
+        {
+            self.hash_expiry_index
+                .remove(&(min_expiry_ms, CompactKey::from(key)));
+        }
+    }
+
+    /// The active-expiry sweep's removal of an index pair it just POPPED
+    /// (moon#1189): ONE table probe decides and removes.
+    ///
+    /// Replaces `is_key_expired` (a probe) + `remove` (a second probe, plus a
+    /// second index search and a `CompactKey` build to retire the pair the
+    /// sweep had peeked and cloned).
+    ///
+    /// - [`ExpiredRemoval::Removed`]: the entry carried exactly `ts` and is
+    ///   expired at `now_ms`; it is gone with its cold copy, and a large value
+    ///   went to the lazy-free queue (moon#1190). The popped pair WAS its
+    ///   index pair, so there is nothing left to unindex.
+    /// - [`ExpiredRemoval::Stale`]: the entry is gone or carries another
+    ///   deadline — the popped pair was a leftover and is now retired.
+    /// - [`ExpiredRemoval::NotYetDue`]: the pair is valid but the entry is
+    ///   not expired at `now_ms`; the caller must restore the pair.
+    pub(crate) fn remove_expired_at(&mut self, key: &[u8], ts: u64, now_ms: u64) -> ExpiredRemoval {
+        let mut not_yet_due = false;
+        let outcome = self.data.remove_if(key, |e| {
+            if e.expires_at_ms() != ts {
+                return false;
+            }
+            if e.is_expired_at(now_ms) {
+                true
+            } else {
+                not_yet_due = true;
+                false
+            }
+        });
+        match outcome {
+            crate::storage::dashtable::RemoveIf::Removed(entry) => {
+                crate::admin::metrics_setup::record_keyspace_change();
+                let _ = self.remove_cold_only(key);
+                self.forget_removed_hash_ttl(key, &entry);
+                self.lazy_free_or_drop(key.len(), entry, true);
+                ExpiredRemoval::Removed
+            }
+            crate::storage::dashtable::RemoveIf::Kept if not_yet_due => ExpiredRemoval::NotYetDue,
+            crate::storage::dashtable::RemoveIf::Kept
+            | crate::storage::dashtable::RemoveIf::Absent => ExpiredRemoval::Stale,
+        }
     }
 
     /// Drops the cold copy AND any in-flight spill record.

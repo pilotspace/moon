@@ -1,8 +1,9 @@
 //! Remove / split operations on `Segment`, plus the free function `home_buckets`.
 
 use std::borrow::Borrow;
+use std::mem::MaybeUninit;
 
-use super::{DELETED, EMPTY, REGULAR_SLOTS, Segment, TOTAL_SLOTS, h2};
+use super::{DELETED, EMPTY, REGULAR_SLOTS, RemoveIf, Segment, TOTAL_SLOTS, h2};
 
 impl<K, V> Segment<K, V> {
     /// Remove a key from the segment.
@@ -20,11 +21,47 @@ impl<K, V> Segment<K, V> {
         K: Borrow<Q>,
         Q: Eq,
     {
-        let slot = self.find(h2, key, bucket_a, bucket_b)?;
+        match self.remove_if(h2, key, bucket_a, bucket_b, |_| true) {
+            RemoveIf::Removed(kv) => Some(kv),
+            RemoveIf::Kept | RemoveIf::Absent => None,
+        }
+    }
 
-        // SAFETY: find guarantees the slot is FULL (initialized).
-        let k = unsafe { self.keys[slot].assume_init_read() };
-        let v = unsafe { self.values[slot].assume_init_read() };
+    /// Remove a key only if `pred(&value)` agrees — ONE `find` for the probe,
+    /// the predicate and the removal (moon#1189: the active-expiry sweep's
+    /// "remove if it still carries this deadline and is expired", which was a
+    /// `get` probe followed by a separate `remove` probe).
+    ///
+    /// The pair is moved out and its slot freed BEFORE the predicate runs,
+    /// and moved back (same slot, same ctrl byte, same count) if the
+    /// predicate declines. A panicking predicate therefore drops the pair
+    /// exactly once — its slot is already free — and the predicate borrows
+    /// an owned value rather than a reference into the slot.
+    pub fn remove_if<Q: ?Sized>(
+        &mut self,
+        h2: u8,
+        key: &Q,
+        bucket_a: usize,
+        bucket_b: usize,
+        pred: impl FnOnce(&V) -> bool,
+    ) -> RemoveIf<(K, V)>
+    where
+        K: Borrow<Q>,
+        Q: Eq,
+    {
+        let Some(slot) = self.find(h2, key, bucket_a, bucket_b) else {
+            return RemoveIf::Absent;
+        };
+        let ctrl = self.ctrl_byte(slot);
+
+        // SAFETY: find guarantees the slot is FULL (initialized); it is
+        // marked free immediately below, before anything can observe it.
+        let (k, v) = unsafe {
+            (
+                self.keys[slot].assume_init_read(),
+                self.values[slot].assume_init_read(),
+            )
+        };
 
         // Use DELETED for regular slots (maintains probe chains),
         // EMPTY for stash slots (no probe chain dependency).
@@ -33,9 +70,17 @@ impl<K, V> Segment<K, V> {
         } else {
             self.set_ctrl_byte(slot, DELETED);
         }
-
         self.count -= 1;
-        Some((k, v))
+
+        if pred(&v) {
+            return RemoveIf::Removed((k, v));
+        }
+        // Declined: restore the pair exactly as it was.
+        self.keys[slot] = MaybeUninit::new(k);
+        self.values[slot] = MaybeUninit::new(v);
+        self.set_ctrl_byte(slot, ctrl);
+        self.count += 1;
+        RemoveIf::Kept
     }
 
     /// Split this segment, distributing entries between self and a new segment.
