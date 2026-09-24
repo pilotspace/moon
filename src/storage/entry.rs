@@ -341,7 +341,7 @@ impl RedisValue {
     /// field type: swapping `HashSet` for `IndexSet` (72 B, class 80) or
     /// growing `BPTree` re-prices the bill with no edit here.
     #[inline]
-    fn boxed_payload_bytes(&self) -> usize {
+    pub(crate) fn boxed_payload_bytes(&self) -> usize {
         match self {
             RedisValue::Hash(map) => boxed_payload_block(&**map),
             RedisValue::HashWithTtl { fields, ttls, .. } => {

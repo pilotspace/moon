@@ -1006,27 +1006,6 @@ pub fn renamenx(db: &mut Database, args: &[Frame]) -> Frame {
     Frame::Integer(1)
 }
 
-/// Check if a value is large enough to warrant async drop.
-fn should_async_drop(entry: &crate::storage::entry::Entry) -> bool {
-    use crate::storage::compact_value::RedisValueRef;
-    match entry.value.as_redis_value() {
-        RedisValueRef::Hash(m) => m.len() > 64,
-        RedisValueRef::HashWithTtl { fields, .. } => fields.len() > 64,
-        RedisValueRef::List(l) => l.len() > 64,
-        RedisValueRef::Set(s) => s.len() > 64,
-        RedisValueRef::SortedSet { members, .. } => members.len() > 64,
-        RedisValueRef::SortedSetBPTree { members, .. } => members.len() > 64,
-        RedisValueRef::String(_) => false,
-        RedisValueRef::Stream(s) => s.entries.len() > 64,
-        // Compact encodings are always small, no async drop needed
-        RedisValueRef::HashListpack(_)
-        | RedisValueRef::ListListpack(_)
-        | RedisValueRef::SetListpack(_)
-        | RedisValueRef::SetIntset(_)
-        | RedisValueRef::SortedSetListpack(_) => false,
-    }
-}
-
 /// UNLINK key [key ...]
 ///
 /// Removes the specified keys. Like DEL but reclaims memory asynchronously
@@ -1039,20 +1018,12 @@ pub fn unlink(db: &mut Database, args: &[Frame]) -> Frame {
     for arg in args {
         if let Some(key) = extract_key(arg) {
             // Counting variant: cold-only keys count as removed (D1).
-            let (removed, hot) = db.remove_counting_cold(key);
-            if removed {
+            // moon#1190: a large value is handed to the database's lazy-free
+            // queue — no ledger walk and no drop inside the command, on
+            // either runtime (monoio used to drop inline; tokio's
+            // `spawn_blocking` still walked the value first).
+            if db.unlink(key) {
                 count += 1;
-            }
-            if let Some(entry) = hot {
-                if should_async_drop(&entry) {
-                    // Async drop for large collections: spawn a blocking
-                    // task to avoid holding the event loop.
-                    #[cfg(feature = "runtime-tokio")]
-                    tokio::task::spawn_blocking(move || drop(entry));
-                    #[cfg(feature = "runtime-monoio")]
-                    drop(entry);
-                }
-                // Small values drop normally (entry goes out of scope)
             }
         }
     }

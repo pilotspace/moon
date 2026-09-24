@@ -53,12 +53,46 @@ pub async fn run_active_expiration(
                     // moon#542: route through `_direct` so the lazy-expiry
                     // pending queue physically drains under tokio too.
                     expire_cycle_direct(&mut guard, &mut |_| {});
+                    // moon#1190: this non-sharded mode has no 1 ms shard tick;
+                    // free queued large values here, a slice per 100 ms.
+                    if guard.lazy_free_len() != 0 {
+                        guard.drain_lazy_free(Instant::now() + LAZY_FREE_LEGACY_BUDGET);
+                    }
                 }
             }
             _ = shutdown.cancelled() => {
                 info!("Active expiration task shutting down");
                 break;
             }
+        }
+    }
+}
+
+/// Lazy-free slice for the non-sharded tokio driver above, which runs every
+/// 100 ms rather than every 1 ms (moon#1190).
+#[cfg(feature = "runtime-tokio")]
+const LAZY_FREE_LEGACY_BUDGET: Duration = Duration::from_millis(2);
+
+/// The shard tick's lazy-free drain (moon#1190): free queued large values
+/// across this shard's databases for at most
+/// [`crate::storage::db::LAZY_FREE_TICK_BUDGET`].
+///
+/// Called from BOTH runtimes' 1 ms periodic tick. One relaxed load when no
+/// database in the process has anything queued — the common case.
+pub fn drain_lazy_free_tick(db_count: usize) {
+    if !crate::storage::db::lazy_free_pending_anywhere() {
+        return;
+    }
+    let deadline = Instant::now() + crate::storage::db::LAZY_FREE_TICK_BUDGET;
+    for i in 0..db_count {
+        let in_budget = crate::shard::slice::with_shard_db(i, |db| {
+            if db.lazy_free_len() != 0 {
+                db.drain_lazy_free(deadline);
+            }
+            Instant::now() < deadline
+        });
+        if !in_budget {
+            break;
         }
     }
 }
@@ -147,7 +181,9 @@ fn drain_lazy_expired(db: &mut Database, on_removed: &mut dyn FnMut(&[u8])) {
     }
     for key in db.take_pending_lazy_expired() {
         if db.is_key_expired(key.as_bytes()) {
-            db.remove(key.as_bytes());
+            // moon#1190: a large expired value is freed by the lazy-free
+            // drain, not inside this tick.
+            db.remove_lazily(key.as_bytes());
             on_removed(key.as_bytes());
             // moon#1013: a lazily-expired key is as gone as a swept one.
             crate::tracking::invalidation::invalidate_server_removed(key.as_bytes());
@@ -202,8 +238,11 @@ fn expire_cycle(db: &mut Database, on_removed: &mut dyn FnMut(&[u8])) {
     let mut popped = 0u32;
     while let Some((ts, key)) = db.peek_due_expiry(now_ms) {
         if db.is_key_expired(key.as_bytes()) {
-            // `remove` unindexes the entry's CURRENT pair via `remove_hot`.
-            db.remove(key.as_bytes());
+            // `remove_lazily` unindexes the entry's CURRENT pair and hands a
+            // large value to the lazy-free drain (moon#1190): expiring
+            // 100 × 100K-element hashes no longer walks and frees 10M
+            // elements inside this 1 ms-budgeted sweep.
+            db.remove_lazily(key.as_bytes());
             on_removed(key.as_bytes());
             // moon#1013: tell CLIENT TRACKING caches the key is gone. One
             // relaxed load per key when nobody tracks.

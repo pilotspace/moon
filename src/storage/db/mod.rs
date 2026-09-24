@@ -6,6 +6,8 @@ mod cold_replay_gate;
 mod hash_ttl;
 mod incr;
 mod kv_ops;
+/// moon#1190: per-database lazy-free queue, drained on the shard tick.
+mod lazy_free;
 /// moon#942: the accessors' DashTable probe budget, asserted with a counter
 /// rather than a clock. Test-only; see the module docs for why.
 #[cfg(test)]
@@ -17,6 +19,7 @@ mod ws1_tests;
 
 pub use cold_replay_gate::{ReplayColdGate, ReplayColdReconcile, close_replay_generation};
 pub(crate) use incr::IncrOutcome;
+pub use lazy_free::{LAZY_FREE_THRESHOLD, LAZY_FREE_TICK_BUDGET, lazy_free_pending_anywhere};
 
 pub use super::db_read::{HashRef, ListRef, SetRef, SortedSetRef, StreamRef};
 pub use accessors::{EntryView, SetHandle};
@@ -29,7 +32,14 @@ pub use crate::storage::encoding_limits::{EncodingLimits, Shape};
 
 /// Estimate per-entry overhead: key length + value memory + struct overhead.
 fn entry_overhead(key: &[u8], entry: &Entry) -> usize {
-    key.len() + entry.value.estimate_memory() + 128
+    entry_overhead_len(key.len(), entry)
+}
+
+/// [`entry_overhead`] for a caller that has only the key's LENGTH (the
+/// lazy-free queue keeps no key bytes).
+#[inline]
+fn entry_overhead_len(key_len: usize, entry: &Entry) -> usize {
+    key_len + entry.value.estimate_memory() + 128
 }
 
 /// Advance an entry's WATCH version because its value is being mutated
@@ -551,6 +561,10 @@ pub struct Database {
     /// LOWER a hash's minimum (`hash_set_field_ttl`) inserts its new pair
     /// unconditionally, so none can exist.
     hash_expiry_index: std::collections::BTreeSet<(u64, CompactKey)>,
+    /// moon#1190: removed large values still being freed, a bounded number
+    /// of elements per shard tick (see `db/lazy_free.rs`). Their bytes stay
+    /// in `used_memory` until the drain releases them.
+    lazy_free: lazy_free::LazyFreeQueue,
 }
 
 /// Maximum `HashWithTtl` keys the hash-field sweep reaps in one tick
@@ -614,6 +628,7 @@ impl Database {
             birth_counter: 0,
             expiry_index: std::collections::BTreeSet::new(),
             hash_expiry_index: std::collections::BTreeSet::new(),
+            lazy_free: lazy_free::LazyFreeQueue::default(),
         }
     }
 
@@ -649,6 +664,7 @@ impl Database {
             birth_counter: 0,
             expiry_index: std::collections::BTreeSet::new(),
             hash_expiry_index: std::collections::BTreeSet::new(),
+            lazy_free: lazy_free::LazyFreeQueue::default(),
         }
     }
 

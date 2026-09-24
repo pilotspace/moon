@@ -466,3 +466,296 @@ mod hit_ratio_1161 {
         );
     }
 }
+
+// ── moon#1190 ────────────────────────────────────────────────────────────
+
+mod lazy_free_1190 {
+    use std::collections::{BTreeMap, HashMap, VecDeque};
+
+    use bytes::Bytes;
+    use ordered_float::OrderedFloat;
+
+    use crate::config::RuntimeConfig;
+    use crate::storage::bptree::BPTree;
+    use crate::storage::compact_value::CompactValue;
+    use crate::storage::db::{Database, LAZY_FREE_THRESHOLD};
+    use crate::storage::entry::{Entry, RedisValue, SetValue, current_time_ms};
+    use crate::storage::eviction::{EvictionRun, evict_to_budget};
+    use crate::storage::stream::{Stream, StreamId};
+
+    const N: usize = 5_000;
+
+    /// A distinct heap-backed payload whose uniqueness tells whether the
+    /// stored copy has been dropped yet.
+    fn probe() -> Bytes {
+        Bytes::from(b"probe-payload-held-by-the-test".to_vec())
+    }
+
+    fn b(s: String) -> Bytes {
+        Bytes::from(s.into_bytes())
+    }
+
+    fn entry_of(value: RedisValue) -> Entry {
+        let mut e = Entry::new_string(Bytes::new());
+        e.value = CompactValue::from_redis_value(value);
+        e
+    }
+
+    /// One large value of every lazily-freed kind, each holding `probe`.
+    fn large_values(probe: &Bytes) -> Vec<(&'static str, RedisValue)> {
+        let mut hash = HashMap::new();
+        let mut ttls = HashMap::new();
+        let mut list = VecDeque::new();
+        let mut set = SetValue::default();
+        let mut zmembers = HashMap::new();
+        let mut zscores = BTreeMap::new();
+        let mut tree = BPTree::new();
+        let mut bmembers = HashMap::new();
+        let mut stream = Stream::new();
+        for i in 0..N {
+            let f = b(format!("field-{i:06}"));
+            hash.insert(f.clone(), b(format!("value-{i}")));
+            if i % 3 == 0 {
+                ttls.insert(f.clone(), 4_000_000_000_000 + i as u64);
+            }
+            list.push_back(b(format!("element-{i}")));
+            set.insert(b(format!("member-{i}")));
+            zmembers.insert(f.clone(), i as f64);
+            zscores.insert((OrderedFloat(i as f64), f.clone()), ());
+            tree.insert(OrderedFloat(i as f64), f.clone());
+            bmembers.insert(f.clone(), i as f64);
+            stream.entries.insert(
+                StreamId {
+                    ms: 1 + i as u64,
+                    seq: 0,
+                },
+                vec![(b(format!("f{i}")), b(format!("v{i}")))],
+            );
+        }
+        hash.insert(Bytes::from_static(b"probe"), probe.clone());
+        let mut hash_ttl_fields = hash.clone();
+        hash_ttl_fields.insert(Bytes::from_static(b"probe2"), probe.clone());
+        let min_expiry_ms = ttls.values().copied().min().unwrap_or(u64::MAX);
+        list.push_back(probe.clone());
+        set.insert(probe.clone());
+        zmembers.insert(probe.clone(), -1.0);
+        zscores.insert((OrderedFloat(-1.0), probe.clone()), ());
+        tree.insert(OrderedFloat(-1.0), probe.clone());
+        bmembers.insert(probe.clone(), -1.0);
+        stream.entries.insert(
+            StreamId { ms: 0, seq: 0 },
+            vec![(Bytes::from_static(b"p"), probe.clone())],
+        );
+        vec![
+            ("hash", RedisValue::Hash(Box::new(hash))),
+            (
+                "hash-ttl",
+                RedisValue::HashWithTtl {
+                    fields: Box::new(hash_ttl_fields),
+                    ttls: Box::new(ttls),
+                    min_expiry_ms,
+                },
+            ),
+            ("list", RedisValue::List(list)),
+            ("set", RedisValue::Set(Box::new(set))),
+            (
+                "zset-legacy",
+                RedisValue::SortedSet {
+                    members: Box::new(zmembers),
+                    scores: Box::new(zscores),
+                },
+            ),
+            (
+                "zset-bptree",
+                RedisValue::SortedSetBPTree {
+                    tree: Box::new(tree),
+                    members: Box::new(bmembers),
+                },
+            ),
+            ("stream", RedisValue::Stream(Box::new(stream))),
+        ]
+    }
+
+    fn drain_all(db: &mut Database) -> usize {
+        let mut steps = 0;
+        while db.lazy_free_len() != 0 {
+            db.drain_lazy_free_elements(1_000);
+            steps += 1;
+            assert!(steps < 10_000, "lazy-free drain made no progress");
+        }
+        steps
+    }
+
+    /// UNLINK of a large value of EVERY kind: the command drops nothing and
+    /// walks nothing (the value's bytes stay charged), the key is gone at
+    /// once, and draining credits EXACTLY what `SET` charged — the equality
+    /// between the per-element decomposition and `estimate_memory` that
+    /// `entry_overhead` relies on (also `debug_assert`ed inside the drain).
+    #[test]
+    fn unlink_hands_every_large_kind_to_the_queue_and_the_drain_credits_exactly() {
+        let probe = probe();
+        let kinds = large_values(&probe).len();
+        for idx in 0..kinds {
+            // Build afresh and keep ONLY this kind alive: the other values
+            // hold clones of `probe` too.
+            let (kind, value) = large_values(&probe).swap_remove(idx);
+            let mut db = Database::new();
+            let base = db.estimated_memory();
+            db.set(b"big", entry_of(value));
+            let charged = db.estimated_memory();
+            assert!(charged > base, "{kind}: fixture charged nothing");
+            assert!(!probe.is_unique());
+
+            assert!(db.unlink(b"big"), "{kind}: UNLINK must count the key");
+            assert!(db.get(b"big").is_none(), "{kind}: key must be gone at once");
+            assert!(
+                !probe.is_unique(),
+                "{kind}: UNLINK dropped the value inside the command"
+            );
+            assert_eq!(db.lazy_free_len(), 1, "{kind}");
+            assert_eq!(
+                db.estimated_memory(),
+                charged,
+                "{kind}: bytes still resident must stay charged until freed"
+            );
+
+            // One bounded slice frees part of it, and credits that part.
+            assert_eq!(db.drain_lazy_free_elements(100), 100, "{kind}");
+            let mid = db.estimated_memory();
+            assert!(mid < charged && mid > base, "{kind}: partial credit {mid}");
+
+            let steps = drain_all(&mut db);
+            assert!(steps >= 2, "{kind}: a {N}-element value must span slices");
+            assert!(probe.is_unique(), "{kind}: drain did not free the value");
+            assert_eq!(
+                db.estimated_memory(),
+                base,
+                "{kind}: drain credited a different amount than SET charged"
+            );
+        }
+    }
+
+    #[test]
+    fn small_values_are_unlinked_inline() {
+        let probe = probe();
+        let mut db = Database::new();
+        let mut hash = HashMap::new();
+        for i in 0..LAZY_FREE_THRESHOLD - 1 {
+            hash.insert(b(format!("f{i}")), b(format!("v{i}")));
+        }
+        hash.insert(Bytes::from_static(b"probe"), probe.clone());
+        db.set(b"small", entry_of(RedisValue::Hash(Box::new(hash))));
+        assert!(db.unlink(b"small"));
+        assert_eq!(db.lazy_free_len(), 0);
+        assert!(probe.is_unique(), "a small value is freed inline");
+        assert_eq!(db.estimated_memory(), 0);
+        assert!(!db.unlink(b"small"), "a missing key is not counted");
+    }
+
+    /// `clear` rebuilds the ledger at 0; a value still queued must not be
+    /// credited against it again (which would under-report — saturating at
+    /// 0 here, hiding real memory in general).
+    #[test]
+    fn clear_and_recalculate_forget_queued_charges() {
+        let probe = probe();
+        let mut db = Database::new();
+        let mut values = large_values(&probe);
+        let (_, v1) = values.remove(0);
+        let (_, v2) = values.remove(0);
+        drop(values);
+        db.set(b"a", entry_of(v1));
+        assert!(db.unlink(b"a"));
+        db.clear();
+        db.set(b"b", entry_of(v2));
+        let after_set = db.estimated_memory();
+        drain_all(&mut db);
+        assert_eq!(db.estimated_memory(), after_set, "clear left a live charge");
+
+        assert!(db.unlink(b"b"));
+        db.recalculate_memory();
+        assert_eq!(db.estimated_memory(), 0);
+        drain_all(&mut db);
+        assert_eq!(db.estimated_memory(), 0, "recalculate left a live charge");
+        assert!(probe.is_unique());
+    }
+
+    /// Active expiry of a large value goes through the same queue: the sweep
+    /// (1 ms budget) no longer walks and frees it inline.
+    #[test]
+    fn active_expiry_of_a_large_value_is_freed_lazily() {
+        let probe = probe();
+        let mut db = Database::new();
+        let (_, value) = large_values(&probe).swap_remove(0);
+        let mut e = entry_of(value);
+        e.set_expires_at_ms(current_time_ms() - 1_000);
+        db.set(b"exp", e);
+        let charged = db.estimated_memory();
+        let mut removed = Vec::new();
+        crate::server::expiration::expire_cycle_direct(&mut db, &mut |k| removed.push(k.to_vec()));
+        assert_eq!(
+            removed,
+            vec![b"exp".to_vec()],
+            "the sweep must delete and report it"
+        );
+        assert_eq!(db.len(), 0);
+        assert!(!probe.is_unique(), "the sweep freed a large value inline");
+        assert_eq!(db.estimated_memory(), charged);
+        drain_all(&mut db);
+        assert!(probe.is_unique());
+        assert_eq!(db.estimated_memory(), 0);
+        assert!(db.debug_expiry_index_consistent());
+    }
+
+    /// Eviction keeps its synchronous credit (the loop needs it to stop) but
+    /// no longer drops a large victim inside the write that triggered it.
+    #[test]
+    fn eviction_credits_now_and_frees_a_large_victim_later() {
+        let probe = probe();
+        let mut db = Database::new();
+        let (_, value) = large_values(&probe).swap_remove(0);
+        db.set(b"victim", entry_of(value));
+        let cfg = RuntimeConfig {
+            maxmemory: 1,
+            maxmemory_policy: "allkeys-random".to_string(),
+            ..RuntimeConfig::default()
+        };
+        evict_to_budget(&mut db, &cfg, EvictionRun::plain()).expect("evictable");
+        assert_eq!(db.len(), 0);
+        assert_eq!(
+            db.estimated_memory(),
+            0,
+            "eviction must credit synchronously"
+        );
+        assert!(!probe.is_unique(), "eviction dropped a large victim inline");
+        assert_eq!(db.lazy_free_len(), 1);
+        drain_all(&mut db);
+        assert!(probe.is_unique());
+        assert_eq!(
+            db.estimated_memory(),
+            0,
+            "an uncharged item must credit nothing"
+        );
+    }
+
+    /// The time-budgeted drain stops at its deadline and reports work left.
+    #[test]
+    fn budgeted_drain_yields_at_the_deadline() {
+        let probe = probe();
+        let mut db = Database::new();
+        for (i, (_, value)) in large_values(&probe).into_iter().enumerate() {
+            db.set(format!("k{i}").as_bytes(), entry_of(value));
+            assert!(db.unlink(format!("k{i}").as_bytes()));
+        }
+        assert!(crate::storage::db::lazy_free_pending_anywhere());
+        let more = db.drain_lazy_free(std::time::Instant::now());
+        assert!(more, "an already-passed deadline must leave work queued");
+        assert!(
+            db.lazy_free_len() >= 6,
+            "one step at most per call past the deadline"
+        );
+        while db.drain_lazy_free(std::time::Instant::now() + std::time::Duration::from_secs(5)) {}
+        assert_eq!(db.lazy_free_len(), 0);
+        assert!(probe.is_unique());
+        assert_eq!(db.estimated_memory(), 0);
+    }
+}

@@ -1689,7 +1689,18 @@ pub(crate) fn evict_one_with_spill(
     // `evicted_keys` grow without `DBSIZE` shrinking, which is exactly the
     // divergence this issue is about. Same gate on `on_plain_drop`: no
     // dual-plane DEL record for a key this call did not delete.
-    let removed = db.remove(key.as_bytes()).is_some();
+    //
+    // moon#1190: the ledger credit stays synchronous (`remove` walks the
+    // value — this loop needs it to know when to stop), but a large victim's
+    // DROP goes to the lazy-free drain instead of stalling the write that
+    // triggered the eviction.
+    let removed = match db.remove(key.as_bytes()) {
+        Some(entry) => {
+            db.lazy_free_or_drop(key.len(), entry, false);
+            true
+        }
+        None => false,
+    };
     if removed {
         crate::admin::metrics_setup::record_eviction();
         report_plain_drop(on_plain_drop, key.as_bytes());

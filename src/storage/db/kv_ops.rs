@@ -627,6 +627,9 @@ impl Database {
     pub fn clear(&mut self) {
         crate::admin::metrics_setup::record_keyspace_change();
         self.data = DashTable::new();
+        // moon#1190: the ledger restarts at 0; values still being freed must
+        // not be credited against it again.
+        self.lazy_free_forget_charges();
         self.used_memory = 0;
         self.maybe_has_expiring_keys = false;
         self.expiry_index.clear();
@@ -683,6 +686,9 @@ impl Database {
 
     /// Recalculate `used_memory` by scanning all entries. Call once after bulk load.
     pub fn recalculate_memory(&mut self) {
+        // moon#1190: rebuilt from the hot table alone — a queued lazy-free
+        // value is no longer in it, so it must not be credited later.
+        self.lazy_free_forget_charges();
         let mut total = 0usize;
         let mut any_expiring = false;
         // moon#541: this post-bulk-load pass is also the index's healer —
@@ -776,6 +782,67 @@ impl Database {
             hot.is_some() || (had_cold && cold_alive) || inflight_alive,
             hot,
         )
+    }
+
+    /// `UNLINK` for one key (moon#1190): [`Self::remove_counting_cold`]'s
+    /// answer, but a large hot value is handed to the lazy-free queue instead
+    /// of being walked for its ledger cost and dropped inside the command.
+    ///
+    /// O(1) for the command however big the value: one table probe, the
+    /// expiry-index unindex, and a queue push. The value's bytes stay charged
+    /// to `used_memory` until the shard tick's drain frees them.
+    pub fn unlink(&mut self, key: &[u8]) -> bool {
+        crate::admin::metrics_setup::record_keyspace_change();
+        let now_ms = self.cached_now_ms;
+        let cold_alive = self
+            .cold_index
+            .as_ref()
+            .and_then(|ci| ci.lookup(key))
+            .is_some_and(|loc| loc.ttl_ms.is_none_or(|ttl| now_ms <= ttl));
+        let inflight_alive = self.spill_inflight_alive(key, now_ms);
+        let had_cold = self.remove_cold_only(key);
+        let hot = self.remove_hot_lazily(key);
+        hot || (had_cold && cold_alive) || inflight_alive
+    }
+
+    /// [`Self::remove`] for a server-initiated deletion (active expiry)
+    /// whose value may be large: hot and cold copies go, and a large hot
+    /// value is freed through the lazy-free queue (moon#1190). Returns
+    /// whether a hot entry was removed.
+    pub(crate) fn remove_lazily(&mut self, key: &[u8]) -> bool {
+        crate::admin::metrics_setup::record_keyspace_change();
+        let _ = self.remove_cold_only(key);
+        self.remove_hot_lazily(key)
+    }
+
+    /// [`Self::remove_hot`] without the O(n) parts for a large value: no
+    /// `entry_overhead` walk (the drain credits as it frees) and the
+    /// hash-field index is unindexed from the value's cached minimum rather
+    /// than a scan of its TTL sidecar (a missed pair is harmless there —
+    /// stale-early pairs self-heal, see `hash_expiry_index`).
+    fn remove_hot_lazily(&mut self, key: &[u8]) -> bool {
+        let Some(entry) = self.data.remove(key) else {
+            return false;
+        };
+        if entry.has_expiry() {
+            self.expiry_index_remove(entry.expires_at_ms(), key);
+        }
+        if super::lazy_free::lazy_free_weight(&entry).is_some() {
+            if let crate::storage::compact_value::RedisValueRef::HashWithTtl {
+                min_expiry_ms, ..
+            } = entry.value.as_redis_value()
+                && min_expiry_ms != u64::MAX
+                && !self.hash_expiry_index.is_empty()
+            {
+                self.hash_expiry_index
+                    .remove(&(min_expiry_ms, CompactKey::from(key)));
+            }
+            self.lazy_free_or_drop(key.len(), entry, true);
+        } else {
+            self.used_memory = self.used_memory.saturating_sub(entry_overhead(key, &entry));
+            self.hash_expiry_index_forget(key, &entry);
+        }
+        true
     }
 
     /// Drops the cold copy AND any in-flight spill record.
