@@ -228,10 +228,19 @@ pub fn keyspace_listener_count() -> usize {
 /// would silently drop that listener's notifications). An overcount only costs
 /// the optimisation, never correctness. An exact channel is a pattern with no
 /// metacharacters, so the same test serves both.
+///
+/// The metacharacters are EVERY byte `glob_match` treats specially: `*`, `?`,
+/// `[` and the `\` escape. A pattern can spell a keyspace channel's bytes
+/// through escapes (`__keyspace\@0__:*`, `\_\_keyevent@0__:set`); stopping the
+/// prefix only at `*?[` read the backslash as a literal, found the prefix
+/// inconsistent, and dropped a real sole listener's events (moon#1227 review
+/// M1). Treating `\` as a metacharacter errs toward counting: an escaped
+/// pattern that could never match (`\x_keyspace@*`) is counted too, which costs
+/// only the optimisation.
 pub fn subscription_targets_keyspace(name: &[u8]) -> bool {
     let lit_end = name
         .iter()
-        .position(|&b| b == b'*' || b == b'?' || b == b'[')
+        .position(|&b| matches!(b, b'*' | b'?' | b'[' | b'\\'))
         .unwrap_or(name.len());
     let lit = &name[..lit_end];
     prefix_consistent(lit, b"__keyspace@") || prefix_consistent(lit, b"__keyevent@")
@@ -479,6 +488,108 @@ mod tests {
                 !subscription_targets_keyspace(name),
                 "must NOT be treated as a keyspace listener: {:?}",
                 String::from_utf8_lossy(name)
+            );
+        }
+    }
+
+    /// moon#1227 review M1: `glob_match` honours `\x` escapes, so a pattern
+    /// can spell a keyspace channel's literal bytes with backslashes
+    /// (`__keyspace\@0__:*`). Every pattern that matches ANY keyspace or
+    /// keyevent channel must be counted, or a sole such listener's events are
+    /// dropped before they are built. Property-tested against the real
+    /// matcher on patterns derived from sample channels (escapes, `?`,
+    /// classes, negated classes, ranges, `*`), plus the review's patterns.
+    #[test]
+    fn every_pattern_that_matches_a_keyspace_channel_is_counted() {
+        use crate::command::key::glob_match;
+
+        let channels: [&[u8]; 7] = [
+            b"__keyspace@0__:foo",
+            b"__keyevent@0__:set",
+            b"__keyspace@12__:user:1",
+            b"__keyevent@3__:expired",
+            b"__keyspace@0__:",
+            b"__keyspace@0__:a*b?[c]\\d",
+            b"__keyevent@0__:hset",
+        ];
+        let matches_any = |pat: &[u8]| channels.iter().any(|c| glob_match(pat, c));
+
+        // The review's patterns: each really matches, so each must count.
+        for pat in [
+            &br"__keyspace\@0__:*"[..],
+            br"\_\_keyspace@0__:*",
+            br"__key\space@*",
+            br"\__keyevent@0__:set",
+        ] {
+            assert!(
+                matches_any(pat),
+                "{:?} must match a channel",
+                String::from_utf8_lossy(pat)
+            );
+            assert!(
+                subscription_targets_keyspace(pat),
+                "undercounted {:?}",
+                String::from_utf8_lossy(pat)
+            );
+        }
+
+        // Derived patterns: rewrite each byte of a channel into a construct
+        // that still matches it — or, now and then, into one that does not,
+        // so the property is also exercised on non-matching shapes.
+        let mut state = 0x1227_u64;
+        let mut next = move || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state >> 33) as usize
+        };
+        let mut matched = 0usize;
+        for _ in 0..20_000 {
+            let ch = channels[next() % channels.len()];
+            let mut pat = Vec::with_capacity(ch.len() * 3);
+            // Keep a random-length prefix, then optionally close with `*`.
+            let keep = next() % (ch.len() + 1);
+            for &b in &ch[..keep] {
+                match next() % 10 {
+                    0 | 1 => pat.extend_from_slice(&[b'\\', b]),
+                    2 => pat.push(b'?'),
+                    3 => pat.extend_from_slice(&[b'[', b, b'q', b']']),
+                    4 => pat.extend_from_slice(if b == b'z' { b"[^y]" } else { b"[^z]" }),
+                    5 => pat.extend_from_slice(&[
+                        b'[',
+                        b.saturating_sub(1),
+                        b'-',
+                        b.saturating_add(1),
+                        b']',
+                    ]),
+                    6 if next() % 4 == 0 => pat.push(b'*'),
+                    7 if next() % 16 == 0 => pat.push(b'x'), // a mismatch
+                    _ => pat.push(b),
+                }
+            }
+            if keep < ch.len() || next() % 2 == 0 {
+                pat.push(b'*');
+            }
+            if matches_any(&pat) {
+                matched += 1;
+                assert!(
+                    subscription_targets_keyspace(&pat),
+                    "{:?} matches a keyspace channel but is not counted",
+                    String::from_utf8_lossy(&pat)
+                );
+            }
+        }
+        assert!(
+            matched > 10_000,
+            "the generator must mostly produce matching patterns ({matched})"
+        );
+
+        // Precision is kept where escapes cannot reach a keyspace channel.
+        for pat in [&br"chat\:*"[..], br"news.\*", br"x\_keyspace@*"] {
+            assert!(
+                !subscription_targets_keyspace(pat),
+                "{:?} can never match a keyspace channel",
+                String::from_utf8_lossy(pat)
             );
         }
     }
