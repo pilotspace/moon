@@ -480,3 +480,106 @@ fn step_estimate_bound_matches_redis_for_every_positive_radius() {
         range *= 1.37;
     }
 }
+
+// ---------------------------------------------------------------------------
+// N3: decoding a score clamps like redis's `geohashDecodeAreaToLongLat`
+// ---------------------------------------------------------------------------
+
+/// A score above the 52-bit geohash range (any zset member can hold one)
+/// decodes to a cell centre outside WGS84; redis clamps it to the range.
+/// `(member, score, GEOPOS as redis-server 7.0.15 prints it with %.17Lf)`.
+const OUT_OF_RANGE_SCORES: &[(&str, f64, &str, &str)] = &[
+    (
+        "m",
+        1152921504606846976.0, // 2^60
+        "-179.99999731779098511",
+        "85.0511287799999991",
+    ),
+    (
+        "top",
+        4503599627370495.0, // 2^52 - 1, the last in-range score
+        "179.99999731779098511",
+        "85.05112751263942528",
+    ),
+    (
+        "over",
+        4503599627370496.0, // 2^52
+        "-179.99999731779098511",
+        "85.0511287799999991",
+    ),
+    (
+        "big2",
+        9007199254740992.0, // 2^53
+        "180",
+        "-85.05112751263942528",
+    ),
+];
+
+fn parse_coord(s: &str) -> f64 {
+    s.parse().expect("a redis coordinate")
+}
+
+#[test]
+fn decode_clamps_to_wgs84_like_redis() {
+    for (name, score, lon, lat) in OUT_OF_RANGE_SCORES {
+        assert_eq!(
+            geohash_decode(*score),
+            (parse_coord(lon), parse_coord(lat)),
+            "{name} ({score})"
+        );
+    }
+}
+
+/// The commands that decode a member agree with redis on such a set:
+/// GEOPOS, GEODIST, GEOHASH, and a GEOSEARCH centred on one of them.
+#[test]
+fn out_of_range_scores_answer_like_redis() {
+    let mut db = Database::new();
+    for (name, score, _, _) in OUT_OF_RANGE_SCORES {
+        let s = format!("{score}");
+        crate::command::sorted_set::zadd(&mut db, &frames(&["big", &s, name]));
+    }
+    let Frame::Array(positions) = geopos(&mut db, &frames(&["big", "m", "big2"])) else {
+        panic!("GEOPOS answers an array");
+    };
+    let coords: Vec<Vec<f64>> = positions
+        .iter()
+        .map(|p| match p {
+            Frame::Array(xy) => xy
+                .iter()
+                .map(|c| match c {
+                    Frame::BulkString(b) => {
+                        parse_coord(std::str::from_utf8(b).expect("utf-8 coordinate"))
+                    }
+                    other => panic!("{other:?}"),
+                })
+                .collect(),
+            other => panic!("{other:?}"),
+        })
+        .collect();
+    assert_eq!(
+        coords,
+        vec![
+            vec![
+                parse_coord("-179.99999731779098511"),
+                parse_coord("85.0511287799999991")
+            ],
+            vec![180.0, parse_coord("-85.05112751263942528")],
+        ]
+    );
+    assert_eq!(
+        geodist(&mut db, &frames(&["big", "m", "top"])),
+        Frame::BulkString(Bytes::from_static(b"0.1501"))
+    );
+    assert_eq!(
+        geohash(&mut db, &frames(&["big", "m", "top", "over", "big2"])),
+        array(&["bp05b5048p0", "zzpgzgpfxz0", "bp05b5048p0", "00bh0hbj200"])
+    );
+    assert_eq!(
+        geosearch(
+            &mut db,
+            &frames(&["big", "FROMMEMBER", "m", "BYRADIUS", "100", "km"])
+        ),
+        array(&["over", "top"])
+    );
+}

@@ -85,6 +85,13 @@ pub(crate) fn geohash_encode(lon: f64, lat: f64) -> f64 {
 /// Decode a 52-bit geohash score to the cell-center (longitude, latitude),
 /// using Redis's direct min/max arithmetic (geohashDecode + center) so the
 /// resulting f64s are bit-identical to Redis's GEOPOS output.
+///
+/// The centre is clamped to the WGS84 range exactly as redis's
+/// `geohashDecodeAreaToLongLat` clamps it. Any zset member can hold a score
+/// above the 52-bit range (ZADD takes any double), and its decoded centre
+/// then lies past the edge: redis reports the edge for GEOPOS / GEODIST /
+/// GEOHASH, and a FROMMEMBER / GEORADIUSBYMEMBER centre must be encodable
+/// for the cell search (moon#1227 review, refs moon#1172).
 pub(crate) fn geohash_decode(score: f64) -> (f64, f64) {
     let hash = score as u64;
     let ilato = deinterleave_even(hash) as f64;
@@ -96,7 +103,10 @@ pub(crate) fn geohash_decode(score: f64) -> (f64, f64) {
     let lon_min = GEO_LON_MIN + (ilono / scale) * (GEO_LON_MAX - GEO_LON_MIN);
     let lon_max = GEO_LON_MIN + ((ilono + 1.0) / scale) * (GEO_LON_MAX - GEO_LON_MIN);
 
-    ((lon_min + lon_max) / 2.0, (lat_min + lat_max) / 2.0)
+    (
+        ((lon_min + lon_max) / 2.0).clamp(GEO_LON_MIN, GEO_LON_MAX),
+        ((lat_min + lat_max) / 2.0).clamp(GEO_LAT_MIN, GEO_LAT_MAX),
+    )
 }
 
 /// The 11-character base32 geohash string, Redis-exact: decode the score

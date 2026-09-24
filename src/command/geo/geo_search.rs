@@ -472,8 +472,11 @@ fn members_of_all_neighbors(
             break;
         }
         let min = align52(*cell) as f64;
+        // Cell bits are at most 53 bits wide (a centre on the upper latitude
+        // edge encodes one row past the last, as in redis), so the successor
+        // cannot overflow; saturating keeps that true for any input.
         let max = align52(HashBits {
-            bits: cell.bits + 1,
+            bits: cell.bits.saturating_add(1),
             step: cell.step,
         }) as f64;
         index.walk_range(min, max, |member, score| {
