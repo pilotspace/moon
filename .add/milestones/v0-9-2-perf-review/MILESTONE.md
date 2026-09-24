@@ -1,0 +1,37 @@
+# MILESTONE: 2026-09 performance & code-quality review — fix wave
+
+goal: land fixes for the 40 findings of the 2026-09 whole-codebase review (moon#1159–#1198, index moon#1199) — each measured or test-proven, each committed individually, without regressing wire parity, durability, or the shared-nothing invariants
+rationale: the review verified every finding against HEAD `935c555` and measured 13 of them against redis-server 7.0.15 (up to 3,215× gaps, 553 MB of hidden RSS, 15 s shard stalls, a data-integrity bug). Fixes are grouped into workstreams by FILE OWNERSHIP so parallel agents do not collide.
+stage: production · status: active · created: 2026-09-24 · base: `935c555`
+
+## Scope
+In: every issue in moon#1199's tiers 1–5, executed as the 11 workstreams below.
+Out: the RESET/ACL privilege-retention finding (security — handled privately per SECURITY.md, never in this branch) · any wire-visible behaviour change that makes moon diverge further from redis · on-disk format changes without a version bump + backward-compat read path.
+
+## Shared decisions (every workstream must honor)
+- **One issue ⇒ at least one commit**, message `perf(<area>): <what> (moon#NNNN)` or `fix(<area>): … (moon#NNNN)`; a commit may close at most one issue; partial progress says `refs moon#NNNN` not `fixes`.
+- **Behaviour parity is frozen**: replies stay byte-identical to redis (and to HEAD where HEAD already matched redis). Every change ships a test that would have caught the old cost or bug (wall-time / op-count / allocation-count / RSS assertion, per CONVENTIONS "behavioral wall-time red test").
+- **Hot-path rules** (CLAUDE.md): no new alloc/lock on dispatch/parse/event loop/io; parking_lot only; no new `unsafe` (a fix that needs one is DESCRIBED in SUMMARY.md, not written); dual-runtime compiles.
+- **Shared orchestrator artifacts are read-only for workstream agents**: `CHANGELOG.md`, `.add/state.json`, this `MILESTONE.md`, `TEAM-RULES.md`, `.add/PROJECT.md`, `.add/CONVENTIONS.md`, `CLAUDE.md`, `README.md`, other workstreams' plan directories. The orchestrator writes CHANGELOG + milestone status after each wave from the SUMMARY.md files.
+- Build / test / measurement rules for this box: `TEAM-RULES.md`.
+
+## Workstreams (file ownership decides the wave)
+| wave | ws | persona(s) | issues |
+|---|---|---|---|
+| 1 | WS1-storage-core | performance-engineer · storage-durability-engineer | #1159 #1161 #1190 #1189(expiry-index part) |
+| 1 | WS2-datatype-commands | routing-dispatch-engineer · performance-engineer | #1168 #1169 #1170 #1171 #1172 #1189(B+tree part) #1174(§4 listpack zset) |
+| 1 | WS3-lists-listpack | routing-dispatch-engineer · performance-engineer | #1173 #1174(§1–3) |
+| 1 | WS4-protocol-wire | performance-engineer · acl-security-gatekeeper (untrusted input) | #1164 #1179 |
+| 1 | WS5a-vector-engine | performance-engineer | #1192 #1193 #1194(vector parts) #1196 |
+| 1 | WS5b-text-graph | performance-engineer | #1191 #1195 #1194(text part) #1197 |
+| 1 | WS6-persistence | storage-durability-engineer · performance-engineer | #1185 #1186 #1187 #1188 #1181 |
+| 2 | WS7-conn-hotpath | performance-engineer · acl-security-gatekeeper | #1175 #1165 #1176 #1178 #1166 |
+| 2 | WS8-shard-coordination | routing-dispatch-engineer · performance-engineer | #1162 #1177 #1182 #1183 #1184 |
+| 2 | WS9-scripting-pubsub | acl-security-gatekeeper · performance-engineer | #1167 #1180 |
+| 2 | WS10-memory-ownership | storage-durability-engineer · performance-engineer | #1160 #1163 #1198 |
+
+## Exit criteria
+- [ ] every workstream has a SUMMARY.md with a per-issue verdict (FIXED / PARTIAL / DEFERRED + reason) and evidence
+- [ ] `cargo fmt --check`, `cargo clippy --lib -- -D warnings` on both feature sets, `cargo test --lib` on both runtimes green on the merged branch
+- [ ] the measured findings re-measured on the merged binary against redis-server (same harness as the review)
+- [ ] CHANGELOG entries written by the orchestrator
