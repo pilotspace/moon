@@ -191,7 +191,7 @@ deliberately aggressive but each release has a **single headline** and hard exit
 | **v0.7.1** | ✅ **shipped 2026-07-15** | SQ8 CPU-storm fix + deterministic replica TTL | Patch |
 | **v0.8.0** | ✅ **shipped 2026-07-16** | **One Storage Kernel: kill-9-lossless on every plane + 10× RAM datasets** | Close-out + verification of the already-built kernel (owner decision 2026-07-15) |
 | **v0.8.1** | ✅ **shipped 2026-07-19** | Deploy-safe busy-poll (O3 governor) + single-shard tuning preset; CPU-cache digest closed | Patch — folds the post-v0.8.0 perf/correctness train (#361–#392) + `conf/moon-standalone.conf` |
-| **v0.8.2 – v0.8.10** | ✅ **shipped 2026-07-20 → 2026-09-23** | Patch train: storage unification, c1M connection plane, durability + wire-parity waves | Nine patches — one line each in the block below |
+| **v0.8.2 – v0.8.10** | ✅ **shipped 2026-07-20 → 2026-09-24** | Patch train: storage unification, c1M connection plane, durability + wire-parity waves | Nine patches — one line each in the block below |
 | **v0.9.0** | 2026-10 | **Horizontal scale: cluster GA-hardened on monoio + multi-shard replicas** | Re-slotted from v0.8; adds the replica-side shard gap |
 | **v0.10.0** | 2026-12 | **Enterprise foundation** | Encryption at rest, audit, ecosystem (re-slotted from v0.9) |
 | **v1.0.0** | 2027-Q1 | **GA / production contract fulfilled** | Stability promise, LTS |
@@ -242,7 +242,7 @@ hygiene (recall canaries → nightly job, PR #354). Disclosed follow-ups: task #
 (read-vs-spill fairness), issue #355 (`DBSIZE` resident-only under offload), AOF-rewrite
 cadence bounds restart time.
 
-### v0.8.1–v0.8.10 — SHIPPED (2026-07-19 → 2026-09-23)
+### v0.8.1–v0.8.10 — SHIPPED (2026-07-19 → 2026-09-24)
 
 Patch releases on the v0.8 line; full evidence per entry in `RELEASES.md` and `CHANGELOG.md`.
 

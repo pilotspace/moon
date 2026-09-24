@@ -17,6 +17,23 @@ enum AppendNow {
     Refused(AofAck),
 }
 
+/// Why a bounded blocking append was not enqueued
+/// ([`AofWriterPool::try_send_append_bounded_or_refuse`]). In every case the
+/// record is NOT in the writer's channel or overflow buffer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BoundedRefusal {
+    /// A rewrite fold's overflow buffer is at its cap with older records in
+    /// it; sending to the channel instead would reorder the log.
+    OverflowCap,
+    /// The writer is gone.
+    Disconnected,
+    /// The channel was full and the caller's budget was already spent.
+    BudgetExhausted,
+    /// The channel stayed full (or the writer went away) for the whole
+    /// remaining budget, `spent`.
+    StillBlocked { spent: Duration, disconnected: bool },
+}
+
 #[derive(Clone)]
 pub struct AofWriterPool {
     senders: Vec<channel::MpscSender<AofMessage>>,
@@ -857,6 +874,89 @@ impl AofWriterPool {
         bytes: Bytes,
         budget: &mut Duration,
     ) -> bool {
+        let refusal = match self.send_bounded_or_refuse(shard_id, lsn, db, bytes, budget) {
+            Ok(()) => return true,
+            Err(refusal) => refusal,
+        };
+        match refusal {
+            BoundedRefusal::OverflowCap => {
+                super::record_append_dropped(self.overflow_for(shard_id), 1);
+                tracing::error!(
+                    "AOF append LOST for shard {} (lsn {}): rewrite overflow cap reached",
+                    shard_id,
+                    lsn
+                );
+            }
+            BoundedRefusal::Disconnected => {
+                super::record_append_dropped(self.overflow_for(shard_id), 1);
+                warn!(
+                    "AOF append dropped for shard {} (lsn {}): channel disconnected",
+                    shard_id, lsn
+                );
+            }
+            BoundedRefusal::BudgetExhausted => {
+                super::record_append_dropped(self.overflow_for(shard_id), 1);
+                tracing::error!(
+                    "AOF append LOST for shard {} (lsn {}): batch backpressure budget exhausted; \
+                     backpressure_dropped={}",
+                    shard_id,
+                    lsn,
+                    AOF_BACKPRESSURE_DROPPED.load(std::sync::atomic::Ordering::Relaxed),
+                );
+            }
+            BoundedRefusal::StillBlocked {
+                spent,
+                disconnected,
+            } => {
+                if !disconnected {
+                    super::record_append_dropped(self.overflow_for(shard_id), 1);
+                }
+                tracing::error!(
+                    "AOF append LOST for shard {} (lsn {}): writer still {} after {:?} \
+                     backpressure bound; backpressure_dropped={}",
+                    shard_id,
+                    lsn,
+                    if disconnected { "disconnected" } else { "full" },
+                    spent,
+                    AOF_BACKPRESSURE_DROPPED.load(std::sync::atomic::Ordering::Relaxed),
+                );
+            }
+        }
+        false
+    }
+
+    /// [`Self::send_append_bounded_blocking`] for a record the CALLER can
+    /// still take back (moon#1202): the same fast path, spill gate and
+    /// `budget`-bounded block, but a refusal is returned instead of being
+    /// counted as a dropped acked append. Nothing was enqueued when this
+    /// returns `Err`, so the caller must undo whatever the record would have
+    /// described — there is no hole in the log to report.
+    ///
+    /// For the `MOON.SPILLED` cut record: its publish is withdrawn instead
+    /// (`shard::persistence_tick::apply_completion_vec`). A record whose
+    /// effect is already visible to clients must use
+    /// [`Self::send_append_bounded_blocking`], which accounts the loss.
+    pub fn try_send_append_bounded_or_refuse(
+        &self,
+        shard_id: usize,
+        lsn: u64,
+        db: usize,
+        bytes: Bytes,
+        budget: &mut Duration,
+    ) -> Result<(), BoundedRefusal> {
+        self.send_bounded_or_refuse(shard_id, lsn, db, bytes, budget)
+    }
+
+    /// Shared body of the two bounded senders above; performs no loss
+    /// accounting and no logging.
+    fn send_bounded_or_refuse(
+        &self,
+        shard_id: usize,
+        lsn: u64,
+        db: usize,
+        bytes: Bytes,
+        budget: &mut Duration,
+    ) -> Result<(), BoundedRefusal> {
         use super::rewrite_overflow::SpillReject;
         // #455: synchronous — the stamp is the caller's mutation epoch, and
         // a block below holds the whole thread, so no fold can interleave.
@@ -875,56 +975,25 @@ impl AofWriterPool {
         let ovf = self.overflow_for(shard_id);
         if ovf.spill_first() {
             match ovf.try_spill(msg) {
-                Ok(()) => return true,
+                Ok(()) => return Ok(()),
                 Err(SpillReject::Disarmed(returned)) => msg = returned,
-                Err(SpillReject::CapExceeded) => {
-                    super::record_append_dropped(self.overflow_for(shard_id), 1);
-                    tracing::error!(
-                        "AOF append LOST for shard {} (lsn {}): rewrite overflow cap reached",
-                        shard_id,
-                        lsn
-                    );
-                    return false;
-                }
+                Err(SpillReject::CapExceeded) => return Err(BoundedRefusal::OverflowCap),
             }
         }
         match self.sender(shard_id).try_send(msg) {
-            Ok(()) => return true,
-            Err(flume::TrySendError::Disconnected(_)) => {
-                super::record_append_dropped(self.overflow_for(shard_id), 1);
-                warn!(
-                    "AOF append dropped for shard {} (lsn {}): channel disconnected",
-                    shard_id, lsn
-                );
-                return false;
-            }
+            Ok(()) => return Ok(()),
+            Err(flume::TrySendError::Disconnected(_)) => return Err(BoundedRefusal::Disconnected),
             Err(flume::TrySendError::Full(returned)) => msg = returned,
         }
         // #452.1: channel saturated — spill instead of blocking/dropping when
         // a rewrite fold is holding the writer out of its recv loop.
         match ovf.try_spill(msg) {
-            Ok(()) => return true,
+            Ok(()) => return Ok(()),
             Err(SpillReject::Disarmed(returned)) => msg = returned,
-            Err(SpillReject::CapExceeded) => {
-                super::record_append_dropped(self.overflow_for(shard_id), 1);
-                tracing::error!(
-                    "AOF append LOST for shard {} (lsn {}): rewrite overflow cap reached",
-                    shard_id,
-                    lsn
-                );
-                return false;
-            }
+            Err(SpillReject::CapExceeded) => return Err(BoundedRefusal::OverflowCap),
         }
         if budget.is_zero() {
-            super::record_append_dropped(self.overflow_for(shard_id), 1);
-            tracing::error!(
-                "AOF append LOST for shard {} (lsn {}): batch backpressure budget exhausted; \
-                 backpressure_dropped={}",
-                shard_id,
-                lsn,
-                AOF_BACKPRESSURE_DROPPED.load(std::sync::atomic::Ordering::Relaxed),
-            );
-            return false;
+            return Err(BoundedRefusal::BudgetExhausted);
         }
         // Slow path only (channel full, about to block for up to `budget` —
         // milliseconds): two `Instant::now()` calls are noise here, and the
@@ -934,25 +1003,11 @@ impl AofWriterPool {
         let spent = *budget;
         *budget = budget.saturating_sub(blocked_at.elapsed());
         match result {
-            Ok(()) => true,
-            Err(e) => {
-                if matches!(e, flume::SendTimeoutError::Timeout(_)) {
-                    super::record_append_dropped(self.overflow_for(shard_id), 1);
-                }
-                tracing::error!(
-                    "AOF append LOST for shard {} (lsn {}): writer still {} after {:?} \
-                     backpressure bound; backpressure_dropped={}",
-                    shard_id,
-                    lsn,
-                    match e {
-                        flume::SendTimeoutError::Timeout(_) => "full",
-                        flume::SendTimeoutError::Disconnected(_) => "disconnected",
-                    },
-                    spent,
-                    AOF_BACKPRESSURE_DROPPED.load(std::sync::atomic::Ordering::Relaxed),
-                );
-                false
-            }
+            Ok(()) => Ok(()),
+            Err(e) => Err(BoundedRefusal::StillBlocked {
+                spent,
+                disconnected: matches!(e, flume::SendTimeoutError::Disconnected(_)),
+            }),
         }
     }
 

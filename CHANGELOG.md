@@ -6,7 +6,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.8.10] — 2026-09-23
+## [0.8.10] — 2026-09-24
 
 ### Added
 
@@ -178,6 +178,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   drift apart. An admin script that retried until `+OK` will now see the error.
 
 ### Fixed
+
+- **A spill's `MOON.SPILLED` cut record is never dropped under AOF
+  backpressure** (moon#1202). When the AOF writer's channel stayed full past
+  the 500 ms bound, the record was dropped while its keys stayed published to
+  the cold tier. Recovery was still value-correct, because the log rebuilt
+  those keys in RAM, but the drop was reported as a lost acknowledged append
+  (`aof_last_append_status:err`) and the keys came back in RAM instead of cold.
+  A later retry was not an option: a record logged after a newer write to the
+  key makes replay lose that write. The record is now logged before the keys
+  are published. If the writer cannot take it, the spill is withdrawn: the
+  keys go back to RAM, the file stays out of the manifest (the startup orphan
+  sweep removes it), and the next eviction pass spills them again. New
+  `INFO persistence` field: `spill_completion_marker_withdrawn`. One
+  backpressure budget now covers every record in a completion drain, so a
+  saturated writer blocks the shard thread for at most 500 ms per drain
+  instead of 500 ms per spill file.
+- **A spilled value larger than ~4 MB is readable again** (moon#1201). The
+  cold-tier overflow-chain reader capped a chain at a fixed 1000 pages
+  (~4.03 MB), while the spill writer has no size cap, so every larger value —
+  in practice a consumer-group stream whose PEL grows without `XACK` — was
+  written intact but refused on read as `OverflowBroken`: the key stayed
+  indexed and answered `IOERR` to `XADD`, `XREADGROUP`, `GET` and every other
+  reader until overwritten (in v0.8.9 and earlier the same read was a silent
+  miss, so `XADD` started a fresh stream and the old one was lost). The cycle
+  guard is now the file's own page count, which no acyclic chain can exceed.
+  No on-disk format change; files written by any earlier version read back.
 
 - **An AOF rewrite that is started while the previous one is still draining
   is no longer lost** (moon#1158). A per-shard rewrite released the
