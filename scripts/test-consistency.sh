@@ -1485,6 +1485,25 @@ assert_both "GEORADIUS STORE rejects WITHDIST" GEORADIUS "{eg}:src" 15 37 200 km
 assert_both "GEOSEARCHSTORE rejects WITHCOORD" GEOSEARCHSTORE "{eg}:d1" "{eg}:src" FROMLONLAT 15 37 BYRADIUS 200 km WITHCOORD
 assert_both "GEORADIUS STORE without a destination" GEORADIUS "{eg}:src" 15 37 200 km STORE
 assert_both "GEORADIUS_RO still refuses STORE" GEORADIUS_RO "{eg}:src" 15 37 200 km STORE "{eg}:d1"
+# WS2 (moon#1169 / #1168 / #1171 / #1172) behaviour edges, each verified on
+# redis-server 7.0.15. `{ws2}` co-locates the multi-key rows at every shard
+# count. SINTERCARD used to answer 0 at the FIRST missing key, before it
+# type-checked the rest; BITFIELD grew a string only per applied write;
+# ZRANDMEMBER count>=size was a random permutation (redis walks from the top);
+# GEOSEARCH ignored ANY, sorted when asked not to, and searched from an
+# unencodable centre.
+both SET "{ws2}:str" x
+assert_both "SINTERCARD: WRONGTYPE beats a missing key" SINTERCARD 2 "{ws2}:missing" "{ws2}:str"
+assert_both "SINTER: WRONGTYPE beats a missing key" SINTER "{ws2}:missing" "{ws2}:str"
+assert_both "BITFIELD OVERFLOW FAIL still grows the key" BITFIELD "{ws2}:bf" OVERFLOW FAIL INCRBY u2 0 5
+assert_both "BITFIELD OVERFLOW FAIL still grows (STRLEN)" STRLEN "{ws2}:bf"
+both ZADD "{ws2}:z" 1 a 2 b 3 c 3 d
+assert_both "ZRANDMEMBER count>=size is highest-first" ZRANDMEMBER "{ws2}:z" 10 WITHSCORES
+assert_both "GEOSEARCH ANY without COUNT" GEOSEARCH edge:geo FROMLONLAT 15 37 BYRADIUS 200 km ANY
+assert_both "GEOSEARCH COUNT 0" GEOSEARCH edge:geo FROMLONLAT 15 37 BYRADIUS 200 km COUNT 0
+assert_both "GEOSEARCH FROMLONLAT out of range" GEOSEARCH edge:geo FROMLONLAT 200 37 BYRADIUS 200 km
+assert_both "GEOSEARCH unsorted keeps the cell-walk order" GEOSEARCH edge:geo FROMLONLAT 15 37 BYRADIUS 2000 km
+assert_both "GEOSEARCH COUNT 1 ANY" GEOSEARCH edge:geo FROMLONLAT 15 37 BYRADIUS 2000 km COUNT 1 ANY
 
 # EXPIREAT / PEXPIREAT / EXPIRETIME / PEXPIRETIME
 both SET edge:eat "val"
