@@ -682,13 +682,6 @@ pub enum ShardMessage {
         commands: Vec<(Bytes, Frame)>, // (key, command) pairs for this shard
         reply_tx: channel::OneshotSender<Vec<Frame>>,
     },
-    /// Execute a batch of pipelined commands on this shard.
-    /// Each command is independent (not transactional). Returns one response per command.
-    PipelineBatch {
-        db_index: usize,
-        commands: Vec<std::sync::Arc<Frame>>,
-        reply_tx: channel::OneshotSender<Vec<Frame>>,
-    },
     /// Begin a cooperative snapshot at the given epoch.
     /// Shard creates SnapshotState and advances one segment per tick.
     /// Sends reply when snapshot is complete.
@@ -781,6 +774,14 @@ pub enum ShardMessage {
         add_slots: Vec<u16>,
         remove_slots: Vec<u16>,
     },
+    /// Fan-out of `SCRIPT FLUSH` to every other shard (moon#1229): each shard
+    /// owns its own script cache, so a flush that reached only the
+    /// connection's shard left `EVALSHA` working for keys routed anywhere
+    /// else. `ack` follows [`Self::ScriptLoad`]'s contract: the sender replies
+    /// to its client only once every shard has flushed.
+    ScriptFlush {
+        ack: Option<channel::OneshotSender<bool>>,
+    },
     /// Fan-out a loaded script to all shards so EVALSHA works regardless of which shard receives it.
     /// Sent by the connection handler on SCRIPT LOAD; received by all other shards' SPSC drain loops.
     ///
@@ -819,25 +820,17 @@ pub enum ShardMessage {
     ///
     /// Boxed (Phase 177) — `MigratedConnectionState` exceeds 120 B.
     MigrateConnection(Box<MigrateConnectionPayload>),
-    /// Execute a single command with pre-allocated response slot (zero allocation).
-    /// Used instead of Execute for cross-shard write dispatch.
-    ExecuteSlotted {
-        db_index: usize,
-        command: std::sync::Arc<Frame>,
-        response_slot: ResponseSlotPtr,
-    },
-    /// Execute multi-key sub-operation with pre-allocated response slot.
-    /// Used instead of MultiExecute for cross-shard multi-key dispatch.
-    MultiExecuteSlotted {
-        db_index: usize,
-        commands: Vec<(Bytes, Frame)>,
-        response_slot: ResponseSlotPtr,
-    },
-    /// Execute pipelined batch with pre-allocated response slot.
-    /// Used instead of PipelineBatch for cross-shard pipeline dispatch.
+    /// Execute pipelined batch with pre-allocated response slot — the
+    /// connection handlers' one routed-command message (a single remote
+    /// command is a batch of one). `ExecuteSlotted`, `MultiExecuteSlotted`
+    /// and the oneshot `PipelineBatch` had no producer and were removed
+    /// (moon#1198): duplicated arms drift, which is how moon#1162 happened.
     PipelineBatchSlotted {
         db_index: usize,
-        commands: Vec<std::sync::Arc<Frame>>,
+        /// Owned frames (moon#1177): the sender moves each request in, so the
+        /// `Arc` it used to wrap every frame in (an 88 B allocation freed on
+        /// this thread, for a frame nobody else held) is gone.
+        commands: Vec<Frame>,
         response_slot: ResponseSlotPtr,
     },
     /// Execute a vector search query on this shard's VectorStore.

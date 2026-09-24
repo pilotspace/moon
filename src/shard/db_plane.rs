@@ -78,6 +78,8 @@ impl ShardDbSet {
     pub fn write(&self, idx: usize) -> DbWriteGuard<'_> {
         let cell = self.slot(idx);
         let _depth = guard_depth::acquire(idx);
+        #[cfg(test)]
+        exclusive_count::bump();
         DbWriteGuard {
             inner: cell.write(),
             _depth,
@@ -352,6 +354,29 @@ impl std::ops::Deref for DbReadGuard<'_> {
 ///
 /// Only owner acquisitions register: foreign `try_read` cannot deadlock, so it
 /// pays nothing here.
+/// Test-only count of the owner's EXCLUSIVE acquisitions ([`ShardDbSet::write`])
+/// on this thread. Each one is a window in which a foreign `try_read` of that
+/// database declines into a parked SPSC hop (cost model §8.3), so an arm that
+/// takes more of them than it has commands is measurable (moon#1198).
+#[cfg(test)]
+pub(crate) mod exclusive_count {
+    use std::cell::Cell;
+
+    thread_local! {
+        static COUNT: Cell<u64> = const { Cell::new(0) };
+    }
+
+    #[inline]
+    pub(super) fn bump() {
+        COUNT.with(|c| c.set(c.get() + 1));
+    }
+
+    /// Exclusive acquisitions on this thread so far.
+    pub(crate) fn get() -> u64 {
+        COUNT.with(Cell::get)
+    }
+}
+
 mod guard_depth {
     use std::cell::Cell;
 

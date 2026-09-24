@@ -150,7 +150,6 @@ use crate::runtime::cancel::CancellationToken;
 use bytes::{Bytes, BytesMut};
 use ringbuf::traits::Producer;
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::rc::Rc;
 
 use crate::command::metadata;
@@ -571,22 +570,11 @@ pub(crate) async fn handle_connection_sharded_monoio<
     // `responses` index — a fanned-out command's parts land in the batch's
     // fan-out buffer and are folded into ONE client reply afterwards, so the
     // destination is no longer 1:1 with a client slot.
-    type RemoteMeta = (
-        crate::server::conn::fanout::ReplySink,
-        Option<Bytes>,
-        Option<crate::tracking::invalidation::TrackedWriteKeys>,
-        crate::protocol::resp3::Resp3Shape,
-    );
-    let mut remote_groups: HashMap<
-        usize,
-        Vec<(
-            crate::server::conn::fanout::ReplySink,
-            std::sync::Arc<Frame>,
-            Option<Bytes>,
-            Option<crate::tracking::invalidation::TrackedWriteKeys>,
-            crate::protocol::resp3::Resp3Shape,
-        )>,
-    > = HashMap::new(); // moon#1179: allocated on first cross-shard use
+    // moon#1177: a shard-indexed buffer kept for the connection's life (was a
+    // HashMap keyed by shard: a SipHash, an `Arc` and a ~210 B tuple per
+    // remote command). Allocated on first cross-shard use (moon#1179).
+    use crate::shard::remote_batch::RemoteMeta;
+    let mut remote_groups = crate::shard::remote_batch::RemoteBatch::default();
     // moon#513 (A2a): batch-scoped fan-out buffers, allocated once per
     // connection and cleared beside `remote_groups` — the batch loop is a hot
     // path and must not allocate a plan per command.
@@ -3095,16 +3083,21 @@ pub(crate) async fn handle_connection_sharded_monoio<
                             fanout_state.set_part(part_idx, reply);
                             local_dispatches = local_dispatches.saturating_add(1);
                         } else {
-                            remote_groups.entry(target).or_default().push((
-                                crate::server::conn::fanout::ReplySink::Part(part_idx),
-                                std::sync::Arc::new(sub_frame),
-                                // Reads: no AOF bytes, no tracking
-                                // invalidation. A2a touches neither the
-                                // persistence nor the replication path.
-                                None,
-                                None,
-                                crate::protocol::resp3::Resp3Shape::None,
-                            ));
+                            remote_groups.push(
+                                ctx.num_shards,
+                                target,
+                                conn.selected_db,
+                                sub_frame,
+                                RemoteMeta {
+                                    sink: crate::server::conn::fanout::ReplySink::Part(part_idx),
+                                    // Reads: no AOF barrier, no tracking
+                                    // invalidation. A2a touches neither the
+                                    // persistence nor the replication path.
+                                    persisted_write: false,
+                                    track_keys: None,
+                                    shape: crate::protocol::resp3::Resp3Shape::None,
+                                },
+                            );
                             pending_mask |= 1u64 << (target % u64::BITS as usize);
                             cross_spsc_dispatches = cross_spsc_dispatches.saturating_add(1);
                         }
@@ -4329,30 +4322,21 @@ pub(crate) async fn handle_connection_sharded_monoio<
                     }
                 }
                 // Cross-shard write: deferred SPSC dispatch.
-                // When workspace rewriting occurred, rebuild the frame with
-                // prefixed args so the target shard stores the correct key.
-                let dispatch_frame = if rewritten.is_some() {
-                    let mut parts = Vec::with_capacity(1 + cmd_args.len());
-                    parts.push(Frame::BulkString(Bytes::copy_from_slice(cmd)));
-                    parts.extend_from_slice(cmd_args);
-                    Frame::Array(parts.into())
-                } else {
-                    frame.clone()
-                };
                 let resp_idx = responses.len();
                 responses.push(Frame::Null); // placeholder, filled after batch dispatch
-                // Pre-compute AOF bytes before moving frame into Arc
+                // moon#1177: the owner derives the AOF record from its own
+                // reply (moon#825) and appends it; this side only needs to
+                // know the reply joins that owner's `always` barrier. It used
+                // to serialize the record here too and throw it away.
                 // `is_persisted_write`: never AOF/replicate a literal client
                 // SELECT (task #35 — poisons the stream db context).
-                let aof_bytes = if ctx.aof_pool.is_some() && metadata::is_persisted_write(cmd) {
-                    Some(aof::serialize_command_for_log(&dispatch_frame))
-                } else {
-                    None
-                };
+                let persisted_write = ctx.aof_pool.is_some() && metadata::is_persisted_write(cmd);
                 // CLIENT TRACKING: capture the write's key set at enqueue time
                 // (gated); invalidation fires when the remote reply confirms.
                 let track_keys = if crate::tracking::tracking_active() && metadata::is_write(cmd) {
-                    Some(crate::tracking::invalidation::written_keys(cmd, cmd_args))
+                    Some(Box::new(crate::tracking::invalidation::written_keys(
+                        cmd, cmd_args,
+                    )))
                 } else {
                     None
                 };
@@ -4375,13 +4359,32 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 } else {
                     crate::protocol::resp3::Resp3Shape::None
                 };
-                remote_groups.entry(target).or_default().push((
-                    crate::server::conn::fanout::ReplySink::Direct(resp_idx),
-                    std::sync::Arc::new(dispatch_frame),
-                    aof_bytes,
-                    track_keys,
-                    resp3_shape,
-                ));
+                // When workspace rewriting occurred, rebuild the frame with
+                // prefixed args so the target shard stores the correct key.
+                // Otherwise the request itself MOVES into the message
+                // (moon#1177: it was deep-cloned — a new FrameVec plus a
+                // refcount per argument — only to satisfy the borrow of `cmd`,
+                // whose last use is above).
+                let dispatch_frame = if rewritten.is_some() {
+                    let mut parts = Vec::with_capacity(1 + cmd_args.len());
+                    parts.push(Frame::BulkString(Bytes::copy_from_slice(cmd)));
+                    parts.extend_from_slice(cmd_args);
+                    Frame::Array(parts.into())
+                } else {
+                    frame
+                };
+                remote_groups.push(
+                    ctx.num_shards,
+                    target,
+                    conn.selected_db,
+                    dispatch_frame,
+                    RemoteMeta {
+                        sink: crate::server::conn::fanout::ReplySink::Direct(resp_idx),
+                        persisted_write,
+                        track_keys,
+                        shape: resp3_shape,
+                    },
+                );
                 pending_mask |= 1u64 << (target % u64::BITS as usize);
                 cross_spsc_dispatches = cross_spsc_dispatches.saturating_add(1);
             }
@@ -4546,15 +4549,15 @@ pub(crate) async fn handle_connection_sharded_monoio<
             // flume oneshot alloc). `target` is captured per batch so the H1
             // fsync barrier at the bottom of the loop can route to the owning
             // shard's pool (not ctx.shard_id — mirrors handler_sharded).
-            for (target, entries) in remote_groups.drain() {
+            // moon#1177: ascending shard order over the shard-indexed buffer;
+            // each target's commands MOVE into its message.
+            for target in 0..remote_groups.slots() {
+                let Some((commands, meta, batch_db)) = remote_groups.take(target) else {
+                    continue;
+                };
                 let slot_arc = response_pool.slot_arc(target);
-                let (meta, commands): (Vec<RemoteMeta>, Vec<std::sync::Arc<Frame>>) = entries
-                    .into_iter()
-                    .map(|(idx, arc_frame, aof, tk, shape)| ((idx, aof, tk, shape), arc_frame))
-                    .unzip();
-
                 let msg = ShardMessage::PipelineBatchSlotted {
-                    db_index: conn.selected_db,
+                    db_index: batch_db,
                     commands,
                     response_slot: crate::shard::dispatch::ResponseSlotPtr(slot_arc),
                 };
@@ -4607,14 +4610,15 @@ pub(crate) async fn handle_connection_sharded_monoio<
                             target,
                             outcome
                         );
-                        for (sink, _, _, _) in &meta {
+                        for m in &meta {
                             crate::server::conn::fanout::fail_sink(
-                                *sink,
+                                m.sink,
                                 &mut responses,
                                 &mut fanout_state,
                                 b"ERR cross-shard dispatch backpressure",
                             );
                         }
+                        remote_groups.recycle(target, meta);
                     }
                 }
             }
@@ -4643,7 +4647,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
             // foreign read; >1 means a pipeline / multi-key fan-out where a synchronous
             // spin would serialize the reads and starve pipelined throughput (s4-P16 −27%).
             let batch_remote_total: usize = reply_futures.iter().map(|(meta, _)| meta.len()).sum();
-            for (meta, target) in reply_futures.drain(..) {
+            for (mut meta, target) in reply_futures.drain(..) {
                 // C2 (xshard-read-fastpath): adaptive idle-gated reply-side spin.
                 // When this shard is near-idle (xshard_may_spin) AND this batch holds
                 // a single cross-shard read, busy-poll the response slot for a bounded
@@ -4683,14 +4687,15 @@ pub(crate) async fn handle_connection_sharded_monoio<
                         ctx.shard_id
                     );
                     crate::admin::metrics_setup::record_xshard_reply_timeout("dispatch");
-                    for (sink, _, _, _) in &meta {
+                    for m in &meta {
                         crate::server::conn::fanout::fail_sink(
-                            *sink,
+                            m.sink,
                             &mut responses,
                             &mut fanout_state,
                             b"ERR cross-shard reply timeout",
                         );
                     }
+                    remote_groups.recycle(target, meta);
                     xshard_reply_fatal = true;
                     // Skip the fsync barrier too: with no reply there is
                     // nothing durable to confirm for these entries.
@@ -4699,8 +4704,15 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 // H1-BARRIER: collect write resp_idxs before consuming meta
                 // so we can overwrite them if the fsync barrier fails.
                 let mut write_resp_idxs: Vec<usize> = Vec::new();
-                for ((sink, aof_bytes, track_keys, resp3_shape), resp) in
-                    meta.into_iter().zip(shard_responses)
+                for (
+                    RemoteMeta {
+                        sink,
+                        persisted_write,
+                        track_keys,
+                        shape: resp3_shape,
+                    },
+                    resp,
+                ) in meta.drain(..).zip(shard_responses)
                 {
                     // moon#513 (A2a): a fan-out PART is an intermediate. It is
                     // stored raw — no RESP3 shape (the shape belongs to the
@@ -4719,14 +4731,14 @@ pub(crate) async fn handle_connection_sharded_monoio<
                     // defers the append until after drain_spsc_shared returns, which
                     // makes AofFold's pending_aof_count undercount it → escape to
                     // new incr → double-apply on restart. The SPSC arm now owns the
-                    // AOF write; aof_bytes below is used only for the barrier check.
+                    // AOF write; `persisted_write` is used only for the barrier check.
                     // Shape was classified at enqueue, where the args still existed.
                     let resp = crate::protocol::resp3::apply_shape(
                         resp3_shape,
                         resp,
                         conn.protocol_version,
                     );
-                    if aof_bytes.is_some() && !matches!(resp, Frame::Error(_)) {
+                    if persisted_write && !matches!(resp, Frame::Error(_)) {
                         write_resp_idxs.push(resp_idx);
                     }
                     // CLIENT TRACKING: remote write confirmed — invalidate the
@@ -4742,6 +4754,8 @@ pub(crate) async fn handle_connection_sharded_monoio<
                     }
                     responses[resp_idx] = resp;
                 }
+                // moon#1177: the drained bookkeeping keeps its capacity.
+                remote_groups.recycle(target, meta);
 
                 // H1-BARRIER (C4-FOLD-FIX follow-up): under appendfsync=always,
                 // call fsync_barrier once per target shard AFTER responses are

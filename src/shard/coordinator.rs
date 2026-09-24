@@ -159,6 +159,12 @@ pub async fn coordinate_multi_key(
 
 /// Run one full command on the LOCAL shard through the real dispatcher
 /// (identical semantics to a remote MultiExecute leg, minus the hop).
+///
+/// "Identical" includes the index/queue hooks the `MultiExecute` arm runs
+/// after dispatch (moon#1162): a local leg of a spanning `DEL` tombstones its
+/// documents exactly like the remote legs do. `cmd_dispatch` also captures the
+/// BGSAVE pre-images of every key it writes (moon#558/#1217), which is why
+/// local legs go through here rather than calling a command body directly.
 fn run_local(
     shard_databases: &Arc<ShardDatabases>,
     db_index: usize,
@@ -174,7 +180,14 @@ fn run_local(
             DispatchResult::Response(f) | DispatchResult::Quit(f) => f,
         }
     };
-    crate::shard::slice::with_shard_db(db_index, run)
+    let reply = crate::shard::slice::with_shard_db(db_index, run);
+    // The guard above is released: the MQ drop takes the whole slice.
+    if crate::shard::write_hooks::hook_kind(cmd) != crate::shard::write_hooks::HookKind::None {
+        crate::shard::slice::with_shard(|s| {
+            crate::shard::write_hooks::run_post_write_hooks(s, cmd, args, db_index, &reply);
+        });
+    }
+    reply
 }
 
 /// Maximum time to wait for a cross-shard reply after the request was
@@ -348,8 +361,24 @@ pub(crate) async fn execute_txn_on_owner(
 ///
 /// Returns versions positionally aligned with `keys`; `0` means absent, which
 /// is a real token (watching a key that does not exist and seeing it created
-/// IS a conflict). Local keys are read inline; remote keys are grouped per
-/// owner so a WATCH of N keys costs at most one hop per shard, not per key.
+/// IS a conflict).
+///
+/// moon#1183 — three changes, each removing a park or a hold:
+/// - **Local group**: read under the SHARED guard (`get_version` is `&self`);
+///   the exclusive one it took was a window in which foreign `try_read`s of
+///   this db declined into parked hops (cost model §8.3).
+/// - **Remote owners, fast path first**: `try_foreign_db_read` serves the
+///   read on this thread with one CAS and no park, exactly as the GET fast
+///   path does, gated on the same `--cross-shard-fast-path` switch. The GET
+///   path's other gate — this connection's `pending_mask` — holds trivially
+///   here: `WATCH` is a connection-level intercept, which the ordering guard
+///   (`must_wait_for_pending_remote`) defers whenever the batch has ANY
+///   pending remote work, so no write of this connection is in flight when
+///   this runs and the read cannot overtake one. No `is_hot` gate either:
+///   the owner arm calls the very same `get_version`, which never consults
+///   the cold tier, so both paths answer identically for a spilled key.
+/// - **Declined owners**: every `ReadVersions` is sent before any reply is
+///   awaited, so m owners cost one round trip of latency, not m in series.
 ///
 /// A dead owner yields `0` for its keys, which is fail-SAFE in the only
 /// direction that matters: `0` almost never matches a live key's version, so
@@ -363,40 +392,52 @@ pub(crate) async fn snapshot_versions(
     spsc_notifiers: &[Arc<channel::Notify>],
 ) -> Vec<u32> {
     let mut out = vec![0u32; keys.len()];
-    // owner -> (original indices, keys)
-    let mut groups: std::collections::HashMap<usize, (Vec<usize>, Vec<Bytes>)> =
-        std::collections::HashMap::new();
+    // Owner -> positions in `keys`, indexed by shard (ascending = VLL order).
+    let mut groups: Vec<smallvec::SmallVec<[usize; 4]>> = (0..num_shards.max(1))
+        .map(|_| smallvec::SmallVec::new())
+        .collect();
     for (i, k) in keys.iter().enumerate() {
-        let owner = key_to_shard(k, num_shards);
-        let e = groups.entry(owner).or_default();
-        e.0.push(i);
-        e.1.push(k.clone());
+        groups[key_to_shard(k, num_shards)].push(i);
     }
 
-    for (owner, (idxs, group_keys)) in groups {
-        if owner == my_shard {
-            let versions = crate::shard::slice::with_shard_db(db_index, |db| {
-                group_keys
-                    .iter()
-                    .map(|k| db.get_version(k))
-                    .collect::<Vec<u32>>()
-            });
-            for (slot, v) in idxs.iter().zip(versions) {
-                out[*slot] = v;
+    if !groups[my_shard].is_empty() {
+        crate::shard::slice::with_shard_db_read(db_index, |db| {
+            for &i in &groups[my_shard] {
+                out[i] = db.get_version(&keys[i]);
             }
+        });
+    }
+
+    let fast_path = crate::shard::db_plane::cross_shard_fast_path_enabled();
+    let mut pending = Vec::new();
+    for (owner, idxs) in groups.iter().enumerate() {
+        if owner == my_shard || idxs.is_empty() {
+            continue;
+        }
+        if fast_path
+            && crate::shard::slice::try_foreign_db_read(owner, db_index, |db| {
+                for &i in idxs {
+                    out[i] = db.get_version(&keys[i]);
+                }
+            })
+            .is_some()
+        {
             continue;
         }
         let (reply_tx, reply_rx) = channel::oneshot();
         let payload = crate::shard::dispatch::ReadVersionsPayload {
             db_index,
-            keys: group_keys,
+            keys: idxs.iter().map(|&i| keys[i].clone()).collect(),
             reply_tx,
         };
         let msg = ShardMessage::ReadVersions(Box::new(payload));
         let _ = spsc_send(dispatch_tx, my_shard, owner, msg, spsc_notifiers).await;
+        pending.push((owner, reply_rx));
+    }
+    for (owner, reply_rx) in pending {
         if let Ok(versions) = recv_reply_bounded(reply_rx).await {
-            for (slot, v) in idxs.iter().zip(versions) {
-                out[*slot] = v;
+            for (&i, v) in groups[owner].iter().zip(versions) {
+                out[i] = v;
             }
         }
     }
@@ -686,19 +727,6 @@ fn local_fold_stamp(
     aof_pool.map_or(crate::persistence::aof::FoldEpoch::INITIAL, |pool| {
         pool.fold_stamp(my_shard)
     })
-}
-
-/// Serialize an `MSET k v ...` command over `pairs` for AOF logging of a local
-/// MSET leg. Used for both the fast path (all keys local) and a scattered MSET's
-/// local slice (only the local keys) — never the full scattered command.
-fn serialize_local_mset(pairs: &[(Bytes, Bytes)]) -> Bytes {
-    let mut parts: Vec<Frame> = Vec::with_capacity(pairs.len() * 2 + 1);
-    parts.push(Frame::BulkString(Bytes::from_static(b"MSET")));
-    for (k, v) in pairs {
-        parts.push(Frame::BulkString(k.clone()));
-        parts.push(Frame::BulkString(v.clone()));
-    }
-    crate::persistence::aof::serialize_command(&Frame::Array(parts.into()))
 }
 
 fn bulk(b: &Bytes) -> Frame {
@@ -1160,7 +1188,7 @@ fn extract_key(frame: &Frame) -> Option<Bytes> {
 /// backoff — and (b) could block graceful shutdown forever on a wedged target.
 ///
 /// **Give-up semantics:** on `Backpressure` the message (`pending`) is dropped.
-/// For a reply-carrying message (`MultiExecute`/`MultiExecuteSlotted`/…) this
+/// For a reply-carrying message (`MultiExecute`/`Execute`/…) this
 /// drops the embedded reply sender, so the awaiting caller's `reply_rx.recv()`
 /// resolves to `Err` and it synthesizes a per-shard error for that slice of the
 /// response — the same closed-channel path callers already handle. Fire-and-
@@ -1491,7 +1519,7 @@ async fn coordinate_mget(
                 }
             });
         } else {
-            // Remote dispatch: batch of GET commands via MultiExecuteSlotted
+            // Remote dispatch: batch of GET commands via MultiExecute
             let (reply_tx, reply_rx) = channel::oneshot();
             let commands: Vec<(Bytes, Frame)> = indexed_keys
                 .iter()
@@ -1543,14 +1571,18 @@ async fn coordinate_mget(
 
 /// Coordinate MSET across shards using VLL pattern.
 ///
-/// Groups key-value pairs by shard in ascending order, dispatches SET
-/// sub-commands per shard. Returns OK when all complete.
+/// Groups the pairs by owner shard in ascending order and sends each remote
+/// owner ONE `MSET k v …` over its pairs (moon#1184 — it used to be one `SET`
+/// per pair, so an owner took its lock, serialized an AOF record and appended
+/// a replication record per KEY). The local slice runs in-process through
+/// [`run_local`]. Returns OK when every leg confirmed.
+#[allow(clippy::too_many_arguments)]
 async fn coordinate_mset(
     args: &[Frame],
     my_shard: usize,
     num_shards: usize,
     db_index: usize,
-    _shard_databases: &Arc<ShardDatabases>,
+    shard_databases: &Arc<ShardDatabases>,
     dispatch_tx: &Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
     spsc_notifiers: &[Arc<channel::Notify>],
     cached_clock: &CachedClock,
@@ -1559,120 +1591,86 @@ async fn coordinate_mset(
     local_barrier_pending: &mut bool,
     _response_pool: &(), // placeholder — coordinator uses oneshot internally
 ) -> Frame {
-    if args.is_empty() || !args.len().is_multiple_of(2) {
+    if args.is_empty()
+        || !args.len().is_multiple_of(2)
+        || args.iter().any(|a| arg_bytes(a).is_none())
+    {
         return Frame::Error(Bytes::from_static(
             b"ERR wrong number of arguments for 'mset' command",
         ));
     }
 
-    // Group key-value pairs by shard in ascending order (BTreeMap = VLL)
-    let mut groups: BTreeMap<usize, Vec<(Bytes, Bytes)>> = BTreeMap::new();
-    for pair in args.chunks(2) {
-        let key = match extract_key(&pair[0]) {
-            Some(k) => k,
-            None => {
-                return Frame::Error(Bytes::from_static(
-                    b"ERR wrong number of arguments for 'mset' command",
-                ));
-            }
-        };
-        let value = match extract_key(&pair[1]) {
-            Some(v) => v,
-            None => {
-                return Frame::Error(Bytes::from_static(
-                    b"ERR wrong number of arguments for 'mset' command",
-                ));
-            }
-        };
-        let shard = key_to_shard(&key, num_shards);
-        groups.entry(shard).or_default().push((key, value));
-    }
+    // One `MSET k v …` per owner, ascending shard order (VLL). Each group is
+    // the whole sub-command, name first, so it serves as the remote leg's
+    // frame, the local leg's argv (`[1..]`) and the local AOF record alike.
+    let groups = group_by_owner(b"MSET", args, 2, num_shards);
+    let owners = groups.iter().filter(|g| !g.is_empty()).count();
 
-    // Fast path: all keys on local shard
-    if groups.len() == 1 && groups.contains_key(&my_shard) {
-        let resp = crate::shard::slice::with_shard_db(db_index, |db| {
-            db.refresh_now_from_cache(cached_clock);
-            crate::command::string::mset(db, args)
-        });
+    // Fast path: all keys on local shard.
+    //
+    // moon#1228: through `run_local` (`cmd_dispatch`), never the command body
+    // directly — `cmd_dispatch` is where an armed BGSAVE epoch captures the
+    // pre-image of every key a write overwrites. Calling `string::mset` here
+    // put the post-MSET value of a not-yet-serialized key into the snapshot.
+    if owners == 1 && !groups[my_shard].is_empty() {
+        let resp = run_local(shard_databases, db_index, cached_clock, b"MSET", args);
+        if matches!(resp, Frame::Error(_)) {
+            return resp;
+        }
         // Local leg (review Finding 1): persist the whole MSET — every key is
         // owned by my_shard — matching the local single-key write contract.
-        if let Some(pairs) = groups.get(&my_shard) {
-            let serialized = serialize_local_mset(pairs);
-            match persist_local_leg(
-                aof_pool,
-                repl_state,
-                my_shard,
-                db_index,
-                serialized,
-                local_fold_stamp(aof_pool, my_shard),
-            )
-            .await
-            {
-                Ok(needs_barrier) => *local_barrier_pending |= needs_barrier,
-                Err(()) => {
-                    return Frame::Error(Bytes::from_static(
-                        crate::persistence::aof::AOF_FSYNC_ERR,
-                    ));
-                }
+        return match persist_local_group(
+            aof_pool,
+            repl_state,
+            my_shard,
+            db_index,
+            &groups[my_shard],
+        )
+        .await
+        {
+            Ok(needs_barrier) => {
+                *local_barrier_pending |= needs_barrier;
+                resp
             }
-        }
-        return resp;
+            Err(()) => Frame::Error(Bytes::from_static(crate::persistence::aof::AOF_FSYNC_ERR)),
+        };
     }
 
-    let mut pending_shards: Vec<channel::OneshotReceiver<Vec<Frame>>> = Vec::new();
-    let mut local_append_failed = false;
+    // Every remote leg is sent BEFORE the local slice runs, so the owners
+    // apply theirs while this shard applies its own.
+    let mut groups = groups;
+    let local_group = std::mem::take(&mut groups[my_shard]);
+    let pending_shards =
+        send_owner_legs(groups, my_shard, db_index, dispatch_tx, spsc_notifiers).await;
 
-    for (shard_id, kv_pairs) in &groups {
-        if *shard_id == my_shard {
-            crate::shard::slice::with_shard_db(db_index, |db| {
-                db.refresh_now_from_cache(cached_clock);
-                for (key, value) in kv_pairs {
-                    db.set_string(key, value.clone());
-                }
-            });
-            // Local leg (review Finding 1): persist a synthesized MSET over
-            // ONLY the local keys. The remote slices persist themselves on
-            // their owner shards via MultiExecute -> wal_append_and_fanout;
-            // my_shard must not log their keys (replay re-dispatches raw
-            // commands, so a full-command log here would try to write keys
-            // this shard doesn't own).
-            //
-            // moon#1084: logged HERE, right after the apply and before the
-            // remote legs are awaited. Logged after them, a write another
-            // client made to one of these keys during the wait reached the
-            // log first although it was applied second, and replay put this
-            // slice back on top of it. A failed append is reported once every
-            // leg has been dispatched and drained, as before.
-            let serialized = serialize_local_mset(kv_pairs);
-            // Stamped here, in the same synchronous stretch as the apply
-            // above: the append below may park before it enqueues (#455).
-            let stamp = local_fold_stamp(aof_pool, my_shard);
-            match persist_local_leg(aof_pool, repl_state, my_shard, db_index, serialized, stamp)
-                .await
-            {
-                Ok(needs_barrier) => *local_barrier_pending |= needs_barrier,
-                Err(()) => local_append_failed = true,
-            }
-        } else {
-            let (reply_tx, reply_rx) = channel::oneshot();
-            let commands: Vec<(Bytes, Frame)> = kv_pairs
-                .iter()
-                .map(|(k, v)| {
-                    let cmd = Frame::Array(framevec![
-                        Frame::BulkString(Bytes::from_static(b"SET")),
-                        Frame::BulkString(k.clone()),
-                        Frame::BulkString(v.clone()),
-                    ]);
-                    (k.clone(), cmd)
-                })
-                .collect();
-            let msg = ShardMessage::MultiExecute {
-                db_index,
-                commands,
-                reply_tx,
-            };
-            let _ = spsc_send(dispatch_tx, my_shard, *shard_id, msg, spsc_notifiers).await;
-            pending_shards.push(reply_rx);
+    let mut local_append_failed = false;
+    if !local_group.is_empty() {
+        // moon#1228: an `MSET` over this shard's pairs through `run_local`,
+        // so the BGSAVE capture hook in `cmd_dispatch` sees every key it
+        // overwrites (a bare `set_string` loop captured nothing).
+        let _ = run_local(
+            shard_databases,
+            db_index,
+            cached_clock,
+            b"MSET",
+            &local_group[1..],
+        );
+        // Local leg (review Finding 1): persist a synthesized MSET over
+        // ONLY the local keys. The remote slices persist themselves on
+        // their owner shards via MultiExecute -> wal_append_and_fanout;
+        // my_shard must not log their keys (replay re-dispatches raw
+        // commands, so a full-command log here would try to write keys
+        // this shard doesn't own).
+        //
+        // moon#1084: logged HERE, right after the apply and before the
+        // remote legs are awaited. Logged after them, a write another
+        // client made to one of these keys during the wait reached the
+        // log first although it was applied second, and replay put this
+        // slice back on top of it. A failed append is reported once every
+        // leg has been dispatched and drained, as before.
+        match persist_local_group(aof_pool, repl_state, my_shard, db_index, &local_group).await {
+            Ok(needs_barrier) => *local_barrier_pending |= needs_barrier,
+            Err(()) => local_append_failed = true,
         }
     }
 
@@ -1682,7 +1680,7 @@ async fn coordinate_mset(
     let mut leg_err: Option<Frame> = None;
     // Whether any part of the MSET ran: the local slice, or a remote leg
     // that answered without an error.
-    let mut applied_parts = usize::from(groups.contains_key(&my_shard));
+    let mut applied_parts = usize::from(!local_group.is_empty());
     for reply_rx in pending_shards {
         match recv_reply_bounded(reply_rx).await {
             Ok(frames) => match frames.into_iter().find(|f| matches!(f, Frame::Error(_))) {
@@ -1710,6 +1708,122 @@ async fn coordinate_mset(
         return refused_leg_error(err, applied_parts > 0);
     }
     Frame::SimpleString(Bytes::from_static(b"OK"))
+}
+
+/// The bytes of a key/value argument: a bulk or simple string, else `None`
+/// (the argument shape every multi-key coordinator accepts).
+#[inline]
+fn arg_bytes(frame: &Frame) -> Option<&Bytes> {
+    match frame {
+        Frame::BulkString(b) | Frame::SimpleString(b) => Some(b),
+        _ => None,
+    }
+}
+
+/// Split `args` into one sub-command per owner shard (moon#1184).
+///
+/// `args` is a run of `stride`-sized items whose first element is the key
+/// (`stride` 2 for `k v` pairs, 1 for bare keys); every argument must already
+/// have passed [`arg_bytes`]. Returns `num_shards` groups indexed by shard
+/// id: empty for a shard that owns none of the keys, otherwise
+/// `[name, item, item, …]` in argument order — so the owner applies its items
+/// in the order the client sent them, and duplicates stay together on the
+/// one shard that owns them (`EXISTS k k` still counts 2, `DEL k k` 1).
+fn group_by_owner(
+    name: &'static [u8],
+    args: &[Frame],
+    stride: usize,
+    num_shards: usize,
+) -> Vec<Vec<Frame>> {
+    let mut groups: Vec<Vec<Frame>> = (0..num_shards).map(|_| Vec::new()).collect();
+    for item in args.chunks(stride) {
+        let Some(key) = item.first().and_then(arg_bytes) else {
+            continue;
+        };
+        let group = &mut groups[key_to_shard(key, num_shards)];
+        if group.is_empty() {
+            group.reserve(1 + args.len() / num_shards.max(1));
+            group.push(bulk_static(name));
+        }
+        group.extend_from_slice(item);
+    }
+    groups
+}
+
+/// Send each non-empty `groups[shard]` (never `my_shard`'s — the caller
+/// takes that one out first) to its owner as ONE `MultiExecute`
+/// sub-command, in ascending shard order. Returns the reply receivers.
+async fn send_owner_legs(
+    groups: Vec<Vec<Frame>>,
+    my_shard: usize,
+    db_index: usize,
+    dispatch_tx: &Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
+    spsc_notifiers: &[Arc<channel::Notify>],
+) -> Vec<channel::OneshotReceiver<Vec<Frame>>> {
+    let mut pending = Vec::with_capacity(groups.iter().filter(|g| !g.is_empty()).count());
+    for (shard_id, group) in groups.into_iter().enumerate() {
+        if group.is_empty() {
+            continue;
+        }
+        debug_assert_ne!(shard_id, my_shard, "the local group is run in-process");
+        // The routing key is informational on this arm; the first key names
+        // the leg in logs and admission accounting.
+        let routing_key = group
+            .get(1)
+            .and_then(arg_bytes)
+            .cloned()
+            .unwrap_or_default();
+        let (reply_tx, reply_rx) = channel::oneshot();
+        let msg = ShardMessage::MultiExecute {
+            db_index,
+            commands: vec![(routing_key, Frame::Array(group.into()))],
+            reply_tx,
+        };
+        let _ = spsc_send(dispatch_tx, my_shard, shard_id, msg, spsc_notifiers).await;
+        pending.push(reply_rx);
+    }
+    pending
+}
+
+/// Persist a coordinator LOCAL leg whose whole sub-command is `group`
+/// (`[name, args…]`, every key owned by `my_shard`) — see
+/// [`persist_local_leg`]. Skips the serialization when nothing would take
+/// the record (no AOF pool and no live replica).
+async fn persist_local_group(
+    aof_pool: Option<&Arc<crate::persistence::aof::AofWriterPool>>,
+    repl_state: ReplStateRef<'_>,
+    my_shard: usize,
+    db_index: usize,
+    group: &[Frame],
+) -> Result<bool, ()> {
+    if aof_pool.is_none() && !crate::replication::state::fanout_active_for(repl_state) {
+        return Ok(false);
+    }
+    let serialized = serialize_command_parts(group);
+    // Stamped before the append, in the same synchronous stretch as the
+    // caller's apply: the append below may park before it enqueues (#455).
+    let stamp = local_fold_stamp(aof_pool, my_shard);
+    persist_local_leg(aof_pool, repl_state, my_shard, db_index, serialized, stamp).await
+}
+
+/// RESP-serialize a command given as its parts — the bytes
+/// `aof::serialize_command(&Frame::Array(parts))` produces, without first
+/// copying the argv into an owned `Frame::Array`.
+fn serialize_command_parts(parts: &[Frame]) -> Bytes {
+    // A size hint, not an exact length: bulk payloads plus their headers.
+    let hint = 16
+        + parts
+            .iter()
+            .map(|p| arg_bytes(p).map_or(16, |b| b.len() + 16))
+            .sum::<usize>();
+    let mut buf = bytes::BytesMut::with_capacity(hint);
+    buf.extend_from_slice(b"*");
+    buf.extend_from_slice(itoa::Buffer::new().format(parts.len()).as_bytes());
+    buf.extend_from_slice(b"\r\n");
+    for part in parts {
+        crate::protocol::serialize::serialize(part, &mut buf);
+    }
+    buf.freeze()
 }
 
 /// Coordinate MSETNX across shards.
@@ -1814,10 +1928,23 @@ async fn coordinate_msetnx(
     }
 }
 
-/// Coordinate DEL/UNLINK/EXISTS with multiple keys across shards using VLL pattern.
+/// The canonical, static spelling of a command this coordinator sums over
+/// (`DEL`, `UNLINK`, `EXISTS`, `TOUCH`), matched case-insensitively. Replaces
+/// a per-call `to_ascii_uppercase` allocation (moon#1184).
+fn summed_command_name(cmd: &[u8]) -> Option<&'static [u8]> {
+    [&b"DEL"[..], b"UNLINK", b"EXISTS", b"TOUCH"]
+        .into_iter()
+        .find(|name| cmd.eq_ignore_ascii_case(name))
+}
+
+/// Coordinate DEL/UNLINK/EXISTS/TOUCH with multiple keys across shards
+/// using VLL pattern.
 ///
-/// Groups keys by shard in ascending order (BTreeMap), dispatches sub-commands
-/// per shard via MultiExecute, sums integer results.
+/// Groups keys by owner shard in ascending order and sends each remote owner
+/// ONE `<CMD> k1 k2 …` (moon#1184 — it used to be one sub-command per key:
+/// per key, a lock acquire, an AOF record and a replication record on the
+/// owner), runs the local slice in-process, and sums the integer replies.
+#[allow(clippy::too_many_arguments)]
 async fn coordinate_multi_del_or_exists(
     cmd: &[u8],
     args: &[Frame],
@@ -1833,53 +1960,31 @@ async fn coordinate_multi_del_or_exists(
     local_barrier_pending: &mut bool,
     _response_pool: &(), // placeholder — coordinator uses oneshot internally
 ) -> Frame {
-    let cmd_upper = cmd.to_ascii_uppercase();
+    let Some(name) = summed_command_name(cmd) else {
+        return Frame::Error(Bytes::from_static(
+            b"ERR multi-key coordinator: unsupported command",
+        ));
+    };
     // DEL/UNLINK mutate and must persist their in-process legs; EXISTS/TOUCH
     // read (TOUCH updates access time only — never AOF-logged, like Redis).
-    let is_delete = cmd_upper == b"DEL" || cmd_upper == b"UNLINK";
+    let is_delete = name == b"DEL" || name == b"UNLINK";
 
-    // Group keys by shard in ascending order (BTreeMap = VLL)
-    let mut groups: BTreeMap<usize, Vec<Frame>> = BTreeMap::new();
-    for arg in args {
-        if let Some(key) = extract_key(arg) {
-            let shard = key_to_shard(&key, num_shards);
-            groups.entry(shard).or_default().push(arg.clone());
-        }
-    }
+    // One `<CMD> k …` per owner, ascending shard order (VLL); name first.
+    let mut groups = group_by_owner(name, args, 1, num_shards);
+    let owners = groups.iter().filter(|g| !g.is_empty()).count();
 
-    // db_count() lives on ShardDatabases — read once, share across both branches.
-    let db_count = shard_databases.db_count();
-
-    // Fast path: all keys on local shard
-    if groups.len() == 1 && groups.contains_key(&my_shard) {
-        let mut selected = db_index;
-        let result = crate::shard::slice::with_shard_db(db_index, |db| {
-            db.refresh_now_from_cache(cached_clock);
-            cmd_dispatch(db, cmd, args, &mut selected, db_count)
-        });
-        let resp = match result {
-            DispatchResult::Response(f) => f,
-            DispatchResult::Quit(f) => f,
-        };
+    // Fast path: all keys on local shard. `run_local` also runs the
+    // index/queue hooks (moon#1162) — `cmd_dispatch` alone left the deleted
+    // documents in every vector index.
+    if owners == 1 && !groups[my_shard].is_empty() {
+        let resp = run_local(shard_databases, db_index, cached_clock, cmd, args);
         // v3-5 carried gap: the in-process DEL/UNLINK never reached the AOF —
         // deleted keys RESURRECTED from the seed writes on restart. Persist
         // only when something was actually removed (n=0 replays identically
         // without a record).
         if is_delete && matches!(resp, Frame::Integer(n) if n > 0) {
-            let mut parts: Vec<Frame> = Vec::with_capacity(args.len() + 1);
-            parts.push(Frame::BulkString(Bytes::from(cmd_upper.clone())));
-            parts.extend_from_slice(args);
-            let serialized =
-                crate::persistence::aof::serialize_command(&Frame::Array(parts.into()));
-            match persist_local_leg(
-                aof_pool,
-                repl_state,
-                my_shard,
-                db_index,
-                serialized,
-                local_fold_stamp(aof_pool, my_shard),
-            )
-            .await
+            match persist_local_group(aof_pool, repl_state, my_shard, db_index, &groups[my_shard])
+                .await
             {
                 Ok(needs_barrier) => *local_barrier_pending |= needs_barrier,
                 Err(()) => {
@@ -1892,73 +1997,51 @@ async fn coordinate_multi_del_or_exists(
         return resp;
     }
 
-    let mut total_count: i64 = 0;
-    let mut pending_shards: Vec<channel::OneshotReceiver<Vec<Frame>>> = Vec::new();
+    // Every remote leg is sent BEFORE the local slice runs.
+    let local_group = std::mem::take(&mut groups[my_shard]);
+    let pending_shards =
+        send_owner_legs(groups, my_shard, db_index, dispatch_tx, spsc_notifiers).await;
 
-    for (shard_id, key_args) in &groups {
-        if *shard_id == my_shard {
-            let mut selected = db_index;
-            let result = crate::shard::slice::with_shard_db(db_index, |db| {
-                db.refresh_now_from_cache(cached_clock);
-                cmd_dispatch(db, cmd, key_args, &mut selected, db_count)
-            });
-            if let DispatchResult::Response(Frame::Integer(n)) = result {
-                total_count += n;
-                // v3-5 carried gap: persist the local slice (synthesized over
-                // ONLY the keys this shard owns — remote slices persist on
-                // their owners via MultiExecute). Skip when nothing removed.
-                if is_delete && n > 0 {
-                    let mut parts: Vec<Frame> = Vec::with_capacity(key_args.len() + 1);
-                    parts.push(Frame::BulkString(Bytes::from(cmd_upper.clone())));
-                    parts.extend_from_slice(key_args);
-                    let serialized =
-                        crate::persistence::aof::serialize_command(&Frame::Array(parts.into()));
-                    match persist_local_leg(
-                        aof_pool,
-                        repl_state,
-                        my_shard,
-                        db_index,
-                        serialized,
-                        local_fold_stamp(aof_pool, my_shard),
-                    )
+    let mut total_count: i64 = 0;
+    if !local_group.is_empty() {
+        // moon#1162: through `run_local`, so this slice's deleted
+        // documents are tombstoned like the remote slices' are.
+        let result = run_local(
+            shard_databases,
+            db_index,
+            cached_clock,
+            name,
+            &local_group[1..],
+        );
+        if let Frame::Integer(n) = result {
+            total_count += n;
+            // v3-5 carried gap: persist the local slice (synthesized over
+            // ONLY the keys this shard owns — remote slices persist on
+            // their owners via MultiExecute). Skip when nothing removed.
+            if is_delete && n > 0 {
+                match persist_local_group(aof_pool, repl_state, my_shard, db_index, &local_group)
                     .await
-                    {
-                        Ok(needs_barrier) => *local_barrier_pending |= needs_barrier,
-                        Err(()) => {
-                            return Frame::Error(Bytes::from_static(
-                                crate::persistence::aof::AOF_FSYNC_ERR,
-                            ));
+                {
+                    Ok(needs_barrier) => *local_barrier_pending |= needs_barrier,
+                    Err(()) => {
+                        // Drain the dispatched legs first: their owners apply
+                        // them whether or not this shard answers.
+                        for reply_rx in pending_shards {
+                            let _ = recv_reply_bounded(reply_rx).await;
                         }
+                        return Frame::Error(Bytes::from_static(
+                            crate::persistence::aof::AOF_FSYNC_ERR,
+                        ));
                     }
                 }
             }
-        } else {
-            let (reply_tx, reply_rx) = channel::oneshot();
-            let commands: Vec<(Bytes, Frame)> = key_args
-                .iter()
-                .map(|arg| {
-                    let key = extract_key(arg).unwrap_or_default();
-                    let cmd_frame = Frame::Array(framevec![
-                        Frame::BulkString(Bytes::from(cmd_upper.clone())),
-                        arg.clone(),
-                    ]);
-                    (key, cmd_frame)
-                })
-                .collect();
-            let msg = ShardMessage::MultiExecute {
-                db_index,
-                commands,
-                reply_tx,
-            };
-            let _ = spsc_send(dispatch_tx, my_shard, *shard_id, msg, spsc_notifiers).await;
-            pending_shards.push(reply_rx);
         }
     }
 
     // Every leg is drained even after an error, so the reply can say
     // whether any part of the command ran.
     let mut leg_err: Option<Frame> = None;
-    let mut applied_parts = usize::from(groups.contains_key(&my_shard));
+    let mut applied_parts = usize::from(!local_group.is_empty());
     for reply_rx in pending_shards {
         match recv_reply_bounded(reply_rx).await {
             Ok(frames) => {
@@ -2123,9 +2206,35 @@ pub async fn coordinate_keys(
 
     let mut all_keys: Vec<Frame> = Vec::new();
     let mut pending_shards: Vec<channel::OneshotReceiver<crate::shard::dispatch::ExecReply>> =
-        Vec::new();
+        Vec::with_capacity(num_shards.saturating_sub(1));
 
-    // Execute locally on this shard
+    // moon#1182: every remote shard gets its KEYS BEFORE the local scan runs —
+    // a full keyspace scan here used to finish before any other shard started
+    // its own. One request frame, shared (refcount) by every leg.
+    let cmd_frame = {
+        let mut parts = Vec::with_capacity(args.len() + 1);
+        parts.push(Frame::BulkString(Bytes::from_static(b"KEYS")));
+        parts.extend_from_slice(args);
+        std::sync::Arc::new(Frame::Array(parts.into()))
+    };
+    for target in 0..num_shards {
+        if target == my_shard {
+            continue;
+        }
+        let (reply_tx, reply_rx) = channel::oneshot();
+        let msg = ShardMessage::Execute {
+            db_index,
+            command: std::sync::Arc::clone(&cmd_frame),
+            // Never a script: this fan-out builds its own keyspace command.
+            // Fail-closed anyway (moon#569).
+            script_acl: crate::acl::ScriptAcl::deny(),
+            reply_tx,
+        };
+        let _ = spsc_send(dispatch_tx, my_shard, target, msg, spsc_notifiers).await;
+        pending_shards.push(reply_rx);
+    }
+
+    // Execute locally on this shard (its keys lead the reply, as before).
     {
         let db_count = shard_databases.db_count();
         let mut selected = db_index;
@@ -2136,31 +2245,6 @@ pub async fn coordinate_keys(
         if let DispatchResult::Response(Frame::Array(keys)) = result {
             all_keys.extend(keys);
         }
-    }
-
-    // Dispatch to all remote shards
-    for target in 0..num_shards {
-        if target == my_shard {
-            continue;
-        }
-        let (reply_tx, reply_rx) = channel::oneshot();
-        let cmd_frame = {
-            let mut parts = vec![Frame::BulkString(Bytes::from_static(b"KEYS"))];
-            for a in args {
-                parts.push(a.clone());
-            }
-            Frame::Array(parts.into())
-        };
-        let msg = ShardMessage::Execute {
-            db_index,
-            command: std::sync::Arc::new(cmd_frame),
-            // Never a script: this fan-out builds its own keyspace command.
-            // Fail-closed anyway (moon#569).
-            script_acl: crate::acl::ScriptAcl::deny(),
-            reply_tx,
-        };
-        let _ = spsc_send(dispatch_tx, my_shard, target, msg, spsc_notifiers).await;
-        pending_shards.push(reply_rx);
     }
 
     // Collect remote results
@@ -2695,91 +2779,14 @@ pub async fn coordinate_hotkeys(
     Frame::Array(out.into())
 }
 
-/// Scatter a vector search query to all shards, collect per-shard results,
-/// and merge into a global top-K response.
+/// Scatter a KNN FT.SEARCH to every shard and merge the per-shard top-K.
 ///
-/// Used when the connection handler receives FT.SEARCH and num_shards > 1.
-/// Each shard runs a local search and returns its local top-K. The coordinator
-/// merges all per-shard results and returns the globally correct top-K.
-///
-/// For single-shard deployments, FT.SEARCH executes directly without scatter.
-pub async fn scatter_vector_search(
-    index_name: Bytes,
-    query_blob: Bytes,
-    k: usize,
-    as_of_lsn: u64,
-    my_shard: usize,
-    num_shards: usize,
-    dispatch_tx: &Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
-    spsc_notifiers: &[Arc<channel::Notify>],
-    vector_store: &mut crate::vector::store::VectorStore,
-    db_index: u8,
-) -> Frame {
-    let mut receivers = Vec::with_capacity(num_shards);
-    let mut local_result: Option<Frame> = None;
-
-    for shard_id in 0..num_shards {
-        if shard_id == my_shard {
-            // Execute locally -- avoid SPSC overhead for local shard.
-            // Phase 171 SCAT-01: thread as_of_lsn through the local branch so
-            // the coordinator honors temporal filtering on its own shard too.
-            // WS5a: db_index scopes index visibility on this shard too.
-            local_result = Some(crate::command::vector_search::search_local_filtered(
-                vector_store,
-                &index_name,
-                &query_blob,
-                k,
-                None,
-                0,
-                usize::MAX,
-                None,
-                as_of_lsn,
-                db_index,
-            ));
-        } else {
-            let (reply_tx, reply_rx) = channel::oneshot();
-            let msg =
-                ShardMessage::VectorSearch(Box::new(crate::shard::dispatch::VectorSearchPayload {
-                    index_name: index_name.clone(),
-                    query_blob: query_blob.clone(),
-                    k,
-                    as_of_lsn,
-                    reply_tx,
-                    db_index,
-                }));
-            let _ = spsc_send(dispatch_tx, my_shard, shard_id, msg, spsc_notifiers).await;
-            receivers.push(reply_rx);
-        }
-    }
-
-    let mut shard_responses = Vec::with_capacity(num_shards);
-    if let Some(local) = local_result {
-        shard_responses.push(local);
-    }
-    for rx in receivers {
-        match rx.recv().await {
-            Ok(frame) => shard_responses.push(frame),
-            Err(_) => {
-                return Frame::Error(bytes::Bytes::from_static(
-                    b"ERR shard reply channel closed during vector search scatter-gather",
-                ));
-            }
-        }
-    }
-
-    crate::command::vector_search::merge_search_results(&shard_responses, k, 0, usize::MAX)
-}
-
-/// Scatter FT.SEARCH to all shards via SPSC (no local vector_store needed).
-///
-/// Used by connection handlers that don't have direct vector_store access.
-/// Sends VectorSearch to every shard (including local) via SPSC, collects
-/// results, and merges into a global top-K response.
-/// Scatter FT.SEARCH to all shards (local + remote), merge top-K results.
-///
-/// Local shard: direct VectorStore access via shard_databases (no SPSC self-send).
-/// Remote shards: SPSC dispatch with VectorSearch message.
-/// Single-shard (num_shards == 1): local-only, no SPSC needed.
+/// moon#1182: every remote shard gets its request BEFORE the local leg runs,
+/// and every leg — this one here, the others in their `VectorSearch` arms —
+/// searches on the cooperative path (`shard::vector_scatter`), so neither the
+/// coordinator's connection task nor a remote shard's event loop is held for
+/// the length of a search. Merge input order is unchanged: local first, then
+/// the remote shards in ascending order.
 pub async fn scatter_vector_search_remote(
     index_name: Bytes,
     query_blob: Bytes,
@@ -2793,27 +2800,9 @@ pub async fn scatter_vector_search_remote(
     db_index: u8,
 ) -> Frame {
     let _ = shard_databases; // E2 removes
-    // LOCAL: direct vector store access (avoids SPSC self-send).
-    // Phase 171 SCAT-01: honor AS_OF on the coordinator's own shard by
-    // routing through `search_local_filtered` with the resolved LSN rather
-    // than the AS_OF-unaware `search_local` helper. WS5a: db_index scopes
-    // index visibility here too.
-    let local_result = crate::shard::slice::with_shard(|s| {
-        crate::command::vector_search::search_local_filtered(
-            &mut s.vector_store,
-            &index_name,
-            &query_blob,
-            k,
-            None,
-            0,
-            usize::MAX,
-            None,
-            as_of_lsn,
-            db_index,
-        )
-    });
-
-    // REMOTE: SPSC to all other shards
+    // moon#1182: REMOTE legs first. The local search used to run before any
+    // other shard received its request, so end-to-end latency was local
+    // search + hop + slowest remote search instead of hop + slowest search.
     let mut receivers = Vec::with_capacity(num_shards.saturating_sub(1));
     for shard_id in 0..num_shards {
         if shard_id == my_shard {
@@ -2832,6 +2821,41 @@ pub async fn scatter_vector_search_remote(
         let _ = spsc_send(dispatch_tx, my_shard, shard_id, msg, spsc_notifiers).await;
         receivers.push(reply_rx);
     }
+
+    // LOCAL: this shard's leg on the cooperative search path (moon#1182 —
+    // the C5 `search_mvcc_yielding` path was `--shards 1` only), yielding to
+    // the event loop between chunks instead of searching in one stretch.
+    // Phase 171 SCAT-01: AS_OF honoured; WS5a: db-scoped. Shapes the snapshot
+    // does not cover (unknown index, dimension mismatch) take the synchronous
+    // search, whose error frames they need.
+    let snapshot = crate::shard::slice::with_shard(|s| {
+        crate::shard::vector_scatter::capture_knn(
+            &mut s.vector_store,
+            &s.text_store,
+            &index_name,
+            &query_blob,
+            k,
+            as_of_lsn,
+            db_index,
+        )
+    });
+    let local_result = match snapshot {
+        Some(snapshot) => crate::shard::vector_scatter::run_knn(snapshot).await,
+        None => crate::shard::slice::with_shard(|s| {
+            crate::command::vector_search::search_local_filtered(
+                &mut s.vector_store,
+                &index_name,
+                &query_blob,
+                k,
+                None,
+                0,
+                usize::MAX,
+                None,
+                as_of_lsn,
+                db_index,
+            )
+        }),
+    };
 
     let mut shard_responses = Vec::with_capacity(num_shards);
     shard_responses.push(local_result);
@@ -3367,44 +3391,43 @@ pub async fn scatter_text_search(
     // field_queries comes from collect_df_field_terms (above); shape unchanged.
     let mut doc_freq_receivers: Vec<crate::runtime::channel::OneshotReceiver<Frame>> =
         Vec::with_capacity(num_shards.saturating_sub(1));
-    let mut local_doc_freq: Option<Frame> = None;
 
+    // moon#1182: every remote request goes out BEFORE the local leg runs.
     for shard_id in 0..num_shards {
         if shard_id == my_shard {
-            // Local: extract df/N directly — no SPSC overhead.
-            // Shard slice released before any .await.
-            let response = crate::shard::slice::with_shard(|s| {
-                match s.text_store.get_index_for_db(&index_name, db_index) {
-                    Some(text_index) => {
-                        let mut items: Vec<Frame> = Vec::new();
-                        for (field_idx_opt, terms) in &field_queries {
-                            let fidx = field_idx_opt.unwrap_or(0);
-                            let (term_dfs, n) = text_index.doc_freq_for_terms(fidx, terms);
-                            for (term, df) in term_dfs {
-                                items.push(Frame::BulkString(Bytes::from(term)));
-                                items.push(Frame::Integer(i64::from(df)));
-                            }
-                            items.push(Frame::BulkString(Bytes::from_static(b"N")));
-                            items.push(Frame::Integer(i64::from(n)));
-                        }
-                        Frame::Array(items.into())
-                    }
-                    None => Frame::Error(Bytes::from_static(b"ERR unknown index")),
-                }
-            });
-            local_doc_freq = Some(response);
-        } else {
-            let (reply_tx, reply_rx) = channel::oneshot();
-            let msg = ShardMessage::DocFreq(Box::new(crate::shard::dispatch::DocFreqPayload {
-                index_name: index_name.clone(),
-                field_queries: field_queries.clone(),
-                reply_tx,
-                db_index,
-            }));
-            let _ = spsc_send(dispatch_tx, my_shard, shard_id, msg, spsc_notifiers).await;
-            doc_freq_receivers.push(reply_rx);
+            continue;
         }
+        let (reply_tx, reply_rx) = channel::oneshot();
+        let msg = ShardMessage::DocFreq(Box::new(crate::shard::dispatch::DocFreqPayload {
+            index_name: index_name.clone(),
+            field_queries: field_queries.clone(),
+            reply_tx,
+            db_index,
+        }));
+        let _ = spsc_send(dispatch_tx, my_shard, shard_id, msg, spsc_notifiers).await;
+        doc_freq_receivers.push(reply_rx);
     }
+    // Local: extract df/N directly — no SPSC overhead.
+    // Shard slice released before any .await.
+    let local_doc_freq: Option<Frame> = Some(crate::shard::slice::with_shard(|s| {
+        match s.text_store.get_index_for_db(&index_name, db_index) {
+            Some(text_index) => {
+                let mut items: Vec<Frame> = Vec::new();
+                for (field_idx_opt, terms) in &field_queries {
+                    let fidx = field_idx_opt.unwrap_or(0);
+                    let (term_dfs, n) = text_index.doc_freq_for_terms(fidx, terms);
+                    for (term, df) in term_dfs {
+                        items.push(Frame::BulkString(Bytes::from(term)));
+                        items.push(Frame::Integer(i64::from(df)));
+                    }
+                    items.push(Frame::BulkString(Bytes::from_static(b"N")));
+                    items.push(Frame::Integer(i64::from(n)));
+                }
+                Frame::Array(items.into())
+            }
+            None => Frame::Error(Bytes::from_static(b"ERR unknown index")),
+        }
+    }));
 
     // Collect Phase 1 responses and aggregate.
     let mut doc_freq_responses = Vec::with_capacity(num_shards);
@@ -3427,73 +3450,74 @@ pub async fn scatter_text_search(
     // ── Phase 2: scatter TextSearch with global IDF to all shards ─────────────
     let mut search_receivers: Vec<crate::runtime::channel::OneshotReceiver<Frame>> =
         Vec::with_capacity(num_shards.saturating_sub(1));
-    let mut local_search: Option<Frame> = None;
 
+    // moon#1182: every remote search goes out BEFORE the local one runs —
+    // the local search used to finish before any other shard started.
     for shard_id in 0..num_shards {
         if shard_id == my_shard {
-            // Local: execute with global IDF via run_text_query_on_index.
-            // text_store + databases[0] folded into a single `with_shard` to
-            // avoid reentrant `with_shard*` panic. Slice released before .await.
-            let response = crate::shard::slice::with_shard(|s| {
-                match s.text_store.get_index_for_db(&index_name, db_index) {
-                    Some(text_index) => {
-                        #[cfg(feature = "text-index")]
-                        {
-                            let mut r = crate::command::vector_search::ft_text_search::run_text_query_on_index(
+            continue;
+        }
+        let (reply_tx, reply_rx) = channel::oneshot();
+        let msg = ShardMessage::TextSearch(Box::new(crate::shard::dispatch::TextSearchPayload {
+            index_name: index_name.clone(),
+            // Send raw query bytes; each remote shard re-parses with the full AST.
+            query: query.clone(),
+            global_df: global_df.clone(),
+            global_n,
+            top_k,
+            offset: 0, // each shard returns top_k; coordinator applies final offset+count
+            count: top_k,
+            // Pass opts to each remote shard — each applies post-processing locally.
+            highlight_opts: highlight_opts.clone(),
+            summarize_opts: summarize_opts.clone(),
+            reply_tx,
+            db_index,
+        }));
+        let _ = spsc_send(dispatch_tx, my_shard, shard_id, msg, spsc_notifiers).await;
+        search_receivers.push(reply_rx);
+    }
+    // Local: execute with global IDF via run_text_query_on_index.
+    // text_store + databases[0] folded into a single `with_shard` to
+    // avoid reentrant `with_shard*` panic. Slice released before .await.
+    let response = crate::shard::slice::with_shard(|s| {
+        match s.text_store.get_index_for_db(&index_name, db_index) {
+            Some(text_index) => {
+                #[cfg(feature = "text-index")]
+                {
+                    let mut r =
+                        crate::command::vector_search::ft_text_search::run_text_query_on_index(
+                            text_index,
+                            &query,
+                            Some(&global_df),
+                            Some(global_n),
+                            top_k,
+                            0, // each shard returns top_k; coordinator applies final offset
+                            top_k,
+                        );
+                    if highlight_opts.is_some() || summarize_opts.is_some() {
+                        if let Some(db) = s.databases.try_write(db_index as usize) {
+                            crate::command::vector_search::ft_text_search::apply_post_processing(
+                                &mut r,
+                                &term_strings,
                                 text_index,
-                                &query,
-                                Some(&global_df),
-                                Some(global_n),
-                                top_k,
-                                0,      // each shard returns top_k; coordinator applies final offset
-                                top_k,
+                                &db,
+                                highlight_opts.as_ref(),
+                                summarize_opts.as_ref(),
                             );
-                            if highlight_opts.is_some() || summarize_opts.is_some() {
-                                if let Some(db) = s.databases.try_write(db_index as usize) {
-                                    crate::command::vector_search::ft_text_search::apply_post_processing(
-                                        &mut r,
-                                        &term_strings,
-                                        text_index,
-                                        &db,
-                                        highlight_opts.as_ref(),
-                                        summarize_opts.as_ref(),
-                                    );
-                                }
-                            }
-                            r
-                        }
-                        #[cfg(not(feature = "text-index"))]
-                        {
-                            let _ = text_index;
-                            Frame::Error(Bytes::from_static(b"ERR text-index feature not enabled"))
                         }
                     }
-                    None => Frame::Error(Bytes::from_static(b"ERR unknown index")),
+                    r
                 }
-            });
-            local_search = Some(response);
-        } else {
-            let (reply_tx, reply_rx) = channel::oneshot();
-            let msg =
-                ShardMessage::TextSearch(Box::new(crate::shard::dispatch::TextSearchPayload {
-                    index_name: index_name.clone(),
-                    // Send raw query bytes; each remote shard re-parses with the full AST.
-                    query: query.clone(),
-                    global_df: global_df.clone(),
-                    global_n,
-                    top_k,
-                    offset: 0, // each shard returns top_k; coordinator applies final offset+count
-                    count: top_k,
-                    // Pass opts to each remote shard — each applies post-processing locally.
-                    highlight_opts: highlight_opts.clone(),
-                    summarize_opts: summarize_opts.clone(),
-                    reply_tx,
-                    db_index,
-                }));
-            let _ = spsc_send(dispatch_tx, my_shard, shard_id, msg, spsc_notifiers).await;
-            search_receivers.push(reply_rx);
+                #[cfg(not(feature = "text-index"))]
+                {
+                    let _ = text_index;
+                    Frame::Error(Bytes::from_static(b"ERR text-index feature not enabled"))
+                }
+            }
+            None => Frame::Error(Bytes::from_static(b"ERR unknown index")),
         }
-    }
+    });
+    let local_search: Option<Frame> = Some(response);
 
     // Collect Phase 2 responses.
     let mut search_responses = Vec::with_capacity(num_shards);
@@ -4441,3 +4465,9 @@ mod swapdb_fold_tests;
 
 #[cfg(test)]
 mod refused_leg_tests;
+
+#[cfg(test)]
+mod multikey_leg_tests;
+
+#[cfg(test)]
+mod watch_versions_tests;
