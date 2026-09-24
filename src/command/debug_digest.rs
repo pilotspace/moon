@@ -325,14 +325,16 @@ pub fn db_partial(db: &crate::storage::Database, now_ms: u64) -> Option<Digest> 
     let mut any = false;
 
     for k in db.keys() {
-        if let Some(entry) = db.get_if_alive(k.as_bytes(), now_ms) {
+        // moon#1161: a whole-keyspace walk must not record an access on every
+        // key (redis iterates the dict directly) — `peek`, not `get`.
+        if let Some(entry) = db.peek_if_alive(k.as_bytes(), now_ms) {
             accumulate_key(&mut acc, k.as_bytes(), entry);
             any = true;
         }
     }
 
     for key in db.cold_only_keys(now_ms) {
-        if let Some(view) = db.get_if_alive_any_plane(key, now_ms) {
+        if let Some(view) = db.peek_if_alive_any_plane(key, now_ms) {
             accumulate_key(&mut acc, key, &view);
             any = true;
         }

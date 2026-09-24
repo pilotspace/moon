@@ -235,7 +235,11 @@ pub fn config_set(runtime_config: &mut RuntimeConfig, args: &[Frame]) -> Frame {
                 }
             },
             "lfu-log-factor" => match value_str.parse::<u8>() {
-                Ok(v) => runtime_config.lfu_log_factor = v,
+                Ok(v) => {
+                    // moon#1161: the read path's LFU increment reads this.
+                    crate::storage::eviction::publish_lfu_params(v, runtime_config.lfu_decay_time);
+                    runtime_config.lfu_log_factor = v;
+                }
                 Err(_) => {
                     return Frame::Error(Bytes::from(format!(
                         "ERR Invalid argument '{}' for CONFIG SET 'lfu-log-factor'",
@@ -244,7 +248,11 @@ pub fn config_set(runtime_config: &mut RuntimeConfig, args: &[Frame]) -> Frame {
                 }
             },
             "lfu-decay-time" => match value_str.parse::<u64>() {
-                Ok(v) => runtime_config.lfu_decay_time = v,
+                Ok(v) => {
+                    // moon#1161: the read path's LFU decay reads this.
+                    crate::storage::eviction::publish_lfu_params(runtime_config.lfu_log_factor, v);
+                    runtime_config.lfu_decay_time = v;
+                }
                 Err(_) => {
                     return Frame::Error(Bytes::from(format!(
                         "ERR Invalid argument '{}' for CONFIG SET 'lfu-decay-time'",
