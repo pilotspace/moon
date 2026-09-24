@@ -1,11 +1,8 @@
+mod set_algebra;
 mod set_read;
 mod set_write;
 
-use bytes::Bytes;
-use std::collections::HashSet;
-
 use crate::protocol::Frame;
-use crate::storage::Database;
 
 use super::helpers::extract_bytes;
 
@@ -66,23 +63,6 @@ pub(crate) fn glob_match(pattern: &[u8], string: &[u8]) -> bool {
     pi == pattern.len()
 }
 
-/// Collect sets from database as cloned HashSets to avoid borrow conflicts.
-/// Returns Err(WRONGTYPE) if any key is the wrong type.
-pub(crate) fn collect_sets(
-    db: &mut Database,
-    keys: &[&Bytes],
-) -> Result<Vec<Option<HashSet<Bytes>>>, Frame> {
-    let mut sets = Vec::with_capacity(keys.len());
-    for key in keys {
-        match db.get_set(key) {
-            Ok(Some(set)) => sets.push(Some(set.iter().cloned().collect())),
-            Ok(None) => sets.push(None),
-            Err(e) => return Err(e),
-        }
-    }
-    Ok(sets)
-}
-
 // ---------------------------------------------------------------------------
 // Re-exports: read operations
 // ---------------------------------------------------------------------------
@@ -123,10 +103,15 @@ pub use set_write::sunionstore;
 // ===========================================================================
 
 #[cfg(test)]
+mod algebra_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::framevec;
     use crate::storage::Database;
+    use bytes::Bytes;
+    use std::collections::HashSet;
 
     fn bs(s: &[u8]) -> Frame {
         Frame::BulkString(Bytes::copy_from_slice(s))
@@ -1902,6 +1887,7 @@ mod tests {
 mod sadd_listpack_batch_tests {
     use super::*;
     use crate::storage::Database;
+    use bytes::Bytes;
 
     fn bs(s: &[u8]) -> Frame {
         Frame::BulkString(Bytes::copy_from_slice(s))

@@ -572,6 +572,83 @@ impl CompactValue {
         }
     }
 
+    /// Mutable bytes of a STRING value — inline or heap — without changing
+    /// its length. `None` for a collection. The in-place counterpart of
+    /// [`Self::as_bytes`] for SETBIT / SETRANGE / BITFIELD (moon#1168);
+    /// [`Self::as_bytes_mut`] only reaches heap strings.
+    pub(crate) fn string_bytes_mut(&mut self) -> Option<&mut [u8]> {
+        if self.is_inline() {
+            let len = self.inline_len();
+            Some(&mut self.payload[..len])
+        } else if self.is_heap_string() {
+            Some(self.heap_str_mut())
+        } else {
+            None
+        }
+    }
+
+    /// Grow a string value to `new_len` bytes, zero-filling the new tail.
+    /// A no-op when `new_len` does not exceed the current length; `false`
+    /// for a collection.
+    pub(crate) fn string_grow_zeroed(&mut self, new_len: usize) -> bool {
+        let Some(len) = self.as_bytes().map(<[u8]>::len) else {
+            return false;
+        };
+        if new_len > len {
+            self.string_grow_with(new_len - len, |v| v.resize(new_len, 0));
+        }
+        true
+    }
+
+    /// Append `data` to a string value. `false` for a collection.
+    pub(crate) fn string_append(&mut self, data: &[u8]) -> bool {
+        if self.as_bytes().is_none() {
+            return false;
+        }
+        if !data.is_empty() {
+            self.string_grow_with(data.len(), |v| v.extend_from_slice(data));
+        }
+        true
+    }
+
+    /// The one growth path for strings (moon#1168).
+    ///
+    /// A heap string's `Box<[u8]>` is taken back as a `Vec` WITHOUT copying
+    /// (`into_vec` adopts the allocation), grown by EXACTLY `extra` bytes with
+    /// `reserve_exact` — a `realloc` — filled, and stored back; `capacity ==
+    /// len` again, so `into_boxed_slice` is a no-op and the value keeps its
+    /// one-allocation, no-spare-capacity layout (the 16-byte value has no
+    /// room to record a capacity, and the ledger bills `size_class(len)`).
+    ///
+    /// # Why this is amortized O(1) per appended byte without an sds-style
+    /// spare capacity
+    ///
+    /// `realloc` to a size in the SAME allocator size class returns the same
+    /// block untouched (jemalloc's `rallocx` and glibc both do), and size
+    /// classes are geometric — four per doubling in jemalloc, from 16 B up —
+    /// so between two copies the string grows by at least ~19% of its size.
+    /// Copies therefore sum to a constant multiple of the final length (a
+    /// geometric series), exactly the argument that makes a doubling `Vec`
+    /// amortized O(1); large blocks may additionally grow in place. The old
+    /// path copied the WHOLE string twice on every APPEND — quadratic: 11.2 s
+    /// for 40K x 100 B. `tests`: `append_growth_is_amortized_linear`.
+    ///
+    /// An inline (<= 12 byte) value is copied out into a fresh `Vec` — at most
+    /// 12 bytes — and a result that still fits inline goes back inline.
+    fn string_grow_with(&mut self, extra: usize, fill: impl FnOnce(&mut Vec<u8>)) {
+        debug_assert!(!self.is_collection());
+        let mut v: Vec<u8> = if self.is_heap_string() {
+            // Leaves `self` an empty inline string: nothing left to free.
+            self.take_heap_string().into_vec()
+        } else {
+            self.payload[..self.inline_len()].to_vec()
+        };
+        v.reserve_exact(extra);
+        fill(&mut v);
+        // Dropping the (now inline, empty) old value frees nothing.
+        *self = Self::heap_string_vec_direct(v);
+    }
+
     /// Consuming conversion: returns the owned RedisValue.
     /// For inline strings, allocates a new Bytes.
     /// For heap strings, adopts the buffer into `Bytes` (no copy).
