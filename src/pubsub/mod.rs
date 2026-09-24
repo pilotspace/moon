@@ -25,6 +25,7 @@
 pub mod subscriber;
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::{Bytes, BytesMut};
@@ -35,6 +36,56 @@ use crate::protocol::Frame;
 use self::subscriber::Subscriber;
 use crate::framevec;
 static NEXT_SUBSCRIBER_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Append a subscriber to an `Arc<[Subscriber]>` list, copy-on-write
+/// (moon#1180).
+///
+/// Subscribe is rare and already O(N); rebuilding the shared slice here is what
+/// makes PUBLISH's snapshot a single `Arc::clone` instead of a per-subscriber
+/// flume `Sender` clone + drop.
+#[inline]
+fn cow_push(subs: &mut Arc<[Subscriber]>, sub: Subscriber) {
+    let mut v: Vec<Subscriber> = Vec::with_capacity(subs.len() + 1);
+    v.extend(subs.iter().cloned());
+    v.push(sub);
+    *subs = Arc::from(v);
+}
+
+/// Rebuild an `Arc<[Subscriber]>` without `sub_id`, copy-on-write (moon#1180).
+///
+/// Returns `true` when the id was present and the slice was rebuilt, `false`
+/// when it was absent (no allocation, the `Arc` is left untouched) — so callers
+/// only pay the COW when a removal actually happens and can report the true
+/// "was removed" set the remote-subscriber maps rely on.
+#[inline]
+fn cow_remove_id(subs: &mut Arc<[Subscriber]>, sub_id: u64) -> bool {
+    if !subs.iter().any(|s| s.id == sub_id) {
+        return false;
+    }
+    let v: Vec<Subscriber> = subs.iter().filter(|s| s.id != sub_id).cloned().collect();
+    *subs = Arc::from(v);
+    true
+}
+
+/// A keyspace-relevant exact channel / pattern gained its first subscriber
+/// (moon#1214 item 2). Called when a channel/pattern entry is CREATED.
+#[inline]
+fn note_keyspace_added(name: &[u8]) {
+    if crate::notify::subscription_targets_keyspace(name) {
+        crate::notify::keyspace_listener_added();
+    }
+}
+
+/// A keyspace-relevant exact channel / pattern lost its last subscriber
+/// (moon#1214 item 2). Called when a channel/pattern entry is REMOVED. Paired
+/// 1:1 with [`note_keyspace_added`] via the map's present↔absent transitions,
+/// so the global count never leaks and (saturating) never goes negative.
+#[inline]
+fn note_keyspace_removed(name: &[u8]) {
+    if crate::notify::subscription_targets_keyspace(name) {
+        crate::notify::keyspace_listener_removed();
+    }
+}
 
 /// Allocate a globally unique subscriber ID.
 pub fn next_subscriber_id() -> u64 {
@@ -48,11 +99,17 @@ pub fn next_subscriber_id() -> u64 {
 /// subscribers whose channels are full are automatically removed.
 #[derive(Default)]
 pub struct PubSubRegistry {
-    channels: HashMap<Bytes, Vec<Subscriber>>,
-    patterns: Vec<(Bytes, Vec<Subscriber>)>,
+    /// Each channel's subscribers as a copy-on-write `Arc<[Subscriber]>`
+    /// (moon#1180): PUBLISH snapshots the list with one `Arc::clone` instead of
+    /// cloning every subscriber's flume `Sender` (two atomic RMWs each on clone,
+    /// two on drop) into a fresh vector per message. The list is rebuilt COW on
+    /// subscribe / unsubscribe / slow-drop — all rare, all already O(N) under
+    /// the write lock.
+    channels: HashMap<Bytes, Arc<[Subscriber]>>,
+    patterns: Vec<(Bytes, Arc<[Subscriber]>)>,
     /// Sharded (`SSUBSCRIBE`) channels — a separate namespace from `channels`,
     /// so `SPUBLISH ch` structurally cannot reach a `SUBSCRIBE ch`.
-    shard_channels: HashMap<Bytes, Vec<Subscriber>>,
+    shard_channels: HashMap<Bytes, Arc<[Subscriber]>>,
     /// REVERSE index of `channels`: subscriber id -> the channels it joined.
     ///
     /// Teardown used to `retain` over the whole channel map (moon#651) — under
@@ -92,10 +149,14 @@ impl PubSubRegistry {
             .entry(sub.id)
             .or_default()
             .insert(channel.clone());
-        self.channels
-            .entry(channel)
-            .or_insert_with(Vec::new)
-            .push(sub);
+        match self.channels.get_mut(&channel) {
+            Some(subs) => cow_push(subs, sub),
+            None => {
+                // First subscriber for this channel: a present transition.
+                note_keyspace_added(&channel);
+                self.channels.insert(channel, Arc::from(vec![sub]));
+            }
+        }
     }
 
     /// Unsubscribe from an exact channel by subscriber ID.
@@ -104,9 +165,10 @@ impl PubSubRegistry {
         // cycling through distinct channels would grow it without bound.
         Self::forget_sub_channel(&mut self.sub_channels, sub_id, channel);
         if let Some(subs) = self.channels.get_mut(channel) {
-            subs.retain(|s| s.id != sub_id);
+            cow_remove_id(subs, sub_id);
             if subs.is_empty() {
                 self.channels.remove(channel);
+                note_keyspace_removed(channel);
             }
         }
     }
@@ -132,9 +194,13 @@ impl PubSubRegistry {
     /// unpropagate remote subscription maps, so a stale candidate must not
     /// appear in it.
     fn retire_subscriber(
-        channels: &mut HashMap<Bytes, Vec<Subscriber>>,
+        channels: &mut HashMap<Bytes, Arc<[Subscriber]>>,
         joined: Option<std::collections::HashSet<Bytes>>,
         sub_id: u64,
+        // moon#1214 item 2: exact channels feed keyspace notifications; sharded
+        // channels never do, so `sunsubscribe_all` passes `false` and does not
+        // touch the listener count.
+        count_keyspace: bool,
     ) -> Vec<Bytes> {
         let Some(joined) = joined else {
             return Vec::new();
@@ -144,13 +210,14 @@ impl PubSubRegistry {
             let Some(subs) = channels.get_mut(&channel) else {
                 continue; // channel already gone (last subscriber slow-dropped)
             };
-            let before = subs.len();
-            subs.retain(|s| s.id != sub_id);
-            if subs.len() == before {
+            if !cow_remove_id(subs, sub_id) {
                 continue; // stale candidate: already slow-dropped from here
             }
             if subs.is_empty() {
                 channels.remove(&channel);
+                if count_keyspace {
+                    note_keyspace_removed(&channel);
+                }
             }
             removed.push(channel);
         }
@@ -161,19 +228,25 @@ impl PubSubRegistry {
     pub fn psubscribe(&mut self, pattern: Bytes, sub: Subscriber) {
         for (existing_pattern, subs) in &mut self.patterns {
             if existing_pattern.as_ref() == pattern.as_ref() {
-                subs.push(sub);
+                cow_push(subs, sub);
                 return;
             }
         }
-        self.patterns.push((pattern, vec![sub]));
+        // New pattern entry: a present transition.
+        note_keyspace_added(&pattern);
+        self.patterns.push((pattern, Arc::from(vec![sub])));
     }
 
     /// Unsubscribe from a glob pattern by subscriber ID.
     pub fn punsubscribe(&mut self, pattern: &[u8], sub_id: u64) {
         self.patterns.retain_mut(|(p, subs)| {
             if p.as_ref() == pattern {
-                subs.retain(|s| s.id != sub_id);
-                !subs.is_empty()
+                cow_remove_id(subs, sub_id);
+                let keep = !subs.is_empty();
+                if !keep {
+                    note_keyspace_removed(p);
+                }
+                keep
             } else {
                 true
             }
@@ -186,6 +259,7 @@ impl PubSubRegistry {
             &mut self.channels,
             self.sub_channels.remove(&sub_id),
             sub_id,
+            true,
         )
     }
 
@@ -193,12 +267,14 @@ impl PubSubRegistry {
     pub fn punsubscribe_all(&mut self, sub_id: u64) -> Vec<Bytes> {
         let mut removed = Vec::new();
         self.patterns.retain_mut(|(pattern, subs)| {
-            let before = subs.len();
-            subs.retain(|s| s.id != sub_id);
-            if subs.len() < before {
+            if cow_remove_id(subs, sub_id) {
                 removed.push(pattern.clone());
             }
-            !subs.is_empty()
+            let keep = !subs.is_empty();
+            if !keep {
+                note_keyspace_removed(pattern);
+            }
+            keep
         });
         removed
     }
@@ -214,12 +290,15 @@ impl PubSubRegistry {
         let mut count: i64 = 0;
         let mut slow_drops: i64 = 0;
 
-        // Exact channel subscribers — lazy pre-serialize RESP2/RESP3 variants at most once each
+        // Exact channel subscribers. The subscriber list is an
+        // `Arc<[Subscriber]>` (moon#1180): iterate it and, only if a slow
+        // subscriber was hit, rebuild the list copy-on-write without them —
+        // preserving delivery order and the slow-drop eviction semantics.
         if let Some(subs) = self.channels.get_mut(channel) {
             let mut resp2_bytes: Option<Bytes> = None;
             let mut resp3_bytes: Option<Bytes> = None;
-            let before = subs.len();
-            subs.retain(|sub| {
+            let mut slow: smallvec::SmallVec<[u64; 4]> = smallvec::SmallVec::new();
+            for sub in subs.iter() {
                 let data = if sub.is_resp3 {
                     resp3_bytes
                         .get_or_insert_with(|| serialize_message_bytes_push(channel, message))
@@ -231,14 +310,23 @@ impl PubSubRegistry {
                 };
                 if sub.try_send(data) {
                     count += 1;
-                    true
                 } else {
-                    false // slow subscriber, remove
+                    slow.push(sub.id);
                 }
-            });
-            slow_drops += (before - subs.len()) as i64;
-            if subs.is_empty() {
-                self.channels.remove(channel);
+            }
+            if !slow.is_empty() {
+                slow_drops += slow.len() as i64;
+                let v: Vec<Subscriber> = subs
+                    .iter()
+                    .filter(|s| !slow.contains(&s.id))
+                    .cloned()
+                    .collect();
+                if v.is_empty() {
+                    self.channels.remove(channel);
+                    note_keyspace_removed(channel);
+                } else {
+                    *subs = Arc::from(v);
+                }
             }
         }
 
@@ -249,8 +337,8 @@ impl PubSubRegistry {
                 if glob_match(pattern, channel) {
                     let mut resp2_bytes: Option<Bytes> = None;
                     let mut resp3_bytes: Option<Bytes> = None;
-                    let before = subs.len();
-                    subs.retain(|sub| {
+                    let mut slow: smallvec::SmallVec<[u64; 4]> = smallvec::SmallVec::new();
+                    for sub in subs.iter() {
                         let data = if sub.is_resp3 {
                             resp3_bytes
                                 .get_or_insert_with(|| {
@@ -266,20 +354,31 @@ impl PubSubRegistry {
                         };
                         if sub.try_send(data) {
                             count += 1;
-                            true
                         } else {
-                            false
+                            slow.push(sub.id);
                         }
-                    });
-                    if subs.len() < before {
-                        slow_drops += (before - subs.len()) as i64;
+                    }
+                    if !slow.is_empty() {
+                        slow_drops += slow.len() as i64;
+                        let v: Vec<Subscriber> = subs
+                            .iter()
+                            .filter(|s| !slow.contains(&s.id))
+                            .cloned()
+                            .collect();
+                        *subs = Arc::from(v);
                         had_removals = true;
                     }
                 }
             }
             // Only clean up if we actually removed subscribers
             if had_removals {
-                self.patterns.retain(|(_, subs)| !subs.is_empty());
+                self.patterns.retain(|(pattern, subs)| {
+                    let keep = !subs.is_empty();
+                    if !keep {
+                        note_keyspace_removed(pattern);
+                    }
+                    keep
+                });
             }
         }
 
@@ -299,20 +398,45 @@ impl PubSubRegistry {
     fn remove_slow(&mut self, channel: &Bytes, slow_exact: &[u64], slow_patterns: &[(Bytes, u64)]) {
         if !slow_exact.is_empty() {
             if let Some(subs) = self.channels.get_mut(channel) {
-                subs.retain(|s| !slow_exact.contains(&s.id));
-                if subs.is_empty() {
-                    self.channels.remove(channel);
+                if subs.iter().any(|s| slow_exact.contains(&s.id)) {
+                    let v: Vec<Subscriber> = subs
+                        .iter()
+                        .filter(|s| !slow_exact.contains(&s.id))
+                        .cloned()
+                        .collect();
+                    if v.is_empty() {
+                        self.channels.remove(channel);
+                        note_keyspace_removed(channel);
+                    } else {
+                        *subs = Arc::from(v);
+                    }
                 }
             }
         }
         if !slow_patterns.is_empty() {
             self.patterns.retain_mut(|(p, subs)| {
-                subs.retain(|s| {
-                    !slow_patterns
+                let hit = subs.iter().any(|s| {
+                    slow_patterns
                         .iter()
-                        .any(|(sp, sid)| *sid == s.id && sp.as_ref() == p.as_ref())
+                        .any(|(sp, sid)| *sid == s.id && sp == p)
                 });
-                !subs.is_empty()
+                if hit {
+                    let v: Vec<Subscriber> = subs
+                        .iter()
+                        .filter(|s| {
+                            !slow_patterns
+                                .iter()
+                                .any(|(sp, sid)| *sid == s.id && sp.as_ref() == p.as_ref())
+                        })
+                        .cloned()
+                        .collect();
+                    *subs = Arc::from(v);
+                }
+                let keep = !subs.is_empty();
+                if !keep {
+                    note_keyspace_removed(p);
+                }
+                keep
             });
         }
     }
@@ -402,14 +526,19 @@ impl PubSubRegistry {
             .entry(sub.id)
             .or_default()
             .insert(channel.clone());
-        self.shard_channels.entry(channel).or_default().push(sub);
+        match self.shard_channels.get_mut(&channel) {
+            Some(subs) => cow_push(subs, sub),
+            None => {
+                self.shard_channels.insert(channel, Arc::from(vec![sub]));
+            }
+        }
     }
 
     /// Unsubscribe from a sharded channel by subscriber ID.
     pub fn sunsubscribe(&mut self, channel: &[u8], sub_id: u64) {
         Self::forget_sub_channel(&mut self.sub_shard_channels, sub_id, channel);
         if let Some(subs) = self.shard_channels.get_mut(channel) {
-            subs.retain(|s| s.id != sub_id);
+            cow_remove_id(subs, sub_id);
             if subs.is_empty() {
                 self.shard_channels.remove(channel);
             }
@@ -418,10 +547,13 @@ impl PubSubRegistry {
 
     /// Remove a subscriber from every sharded channel. Returns those channels.
     pub fn sunsubscribe_all(&mut self, sub_id: u64) -> Vec<Bytes> {
+        // Sharded channels never carry keyspace notifications, so the listener
+        // count is left untouched (moon#1214 item 2).
         Self::retire_subscriber(
             &mut self.shard_channels,
             self.sub_shard_channels.remove(&sub_id),
             sub_id,
+            false,
         )
     }
 
@@ -470,8 +602,8 @@ impl PubSubRegistry {
         if let Some(subs) = self.shard_channels.get_mut(channel) {
             let mut resp2_bytes: Option<Bytes> = None;
             let mut resp3_bytes: Option<Bytes> = None;
-            let before = subs.len();
-            subs.retain(|sub| {
+            let mut slow: smallvec::SmallVec<[u64; 4]> = smallvec::SmallVec::new();
+            for sub in subs.iter() {
                 let data = if sub.is_resp3 {
                     resp3_bytes
                         .get_or_insert_with(|| serialize_smessage_bytes(channel, message, true))
@@ -483,14 +615,22 @@ impl PubSubRegistry {
                 };
                 if sub.try_send(data) {
                     count += 1;
-                    true
                 } else {
-                    false // slow subscriber, remove
+                    slow.push(sub.id);
                 }
-            });
-            slow_drops += (before - subs.len()) as i64;
-            if subs.is_empty() {
-                self.shard_channels.remove(channel);
+            }
+            if !slow.is_empty() {
+                slow_drops += slow.len() as i64;
+                let v: Vec<Subscriber> = subs
+                    .iter()
+                    .filter(|s| !slow.contains(&s.id))
+                    .cloned()
+                    .collect();
+                if v.is_empty() {
+                    self.shard_channels.remove(channel);
+                } else {
+                    *subs = Arc::from(v);
+                }
             }
         }
         if count > 0 {
@@ -516,13 +656,14 @@ pub fn spublish_shared(
 ) -> i64 {
     use smallvec::SmallVec;
 
-    // Phase 1: snapshot under the read lock.
-    let subs: SmallVec<[Subscriber; 8]> = {
+    // Phase 1: snapshot under the read lock — ONE `Arc::clone` of the whole
+    // subscriber list, not a per-subscriber flume `Sender` clone (moon#1180).
+    let subs: Arc<[Subscriber]> = {
         let reg = lock.read();
-        reg.shard_channels
-            .get(channel)
-            .map(|s| s.iter().cloned().collect())
-            .unwrap_or_default()
+        match reg.shard_channels.get(channel) {
+            Some(s) => Arc::clone(s),
+            None => return 0,
+        }
     };
     if subs.is_empty() {
         return 0;
@@ -534,7 +675,7 @@ pub fn spublish_shared(
     {
         let mut resp2: Option<Bytes> = None;
         let mut resp3: Option<Bytes> = None;
-        for sub in &subs {
+        for sub in subs.iter() {
             let data = if sub.is_resp3 {
                 resp3
                     .get_or_insert_with(|| serialize_smessage_bytes(channel, message, true))
@@ -552,13 +693,21 @@ pub fn spublish_shared(
         }
     }
 
-    // Phase 3: reconcile slow subscribers under the write lock.
+    // Phase 3: reconcile slow subscribers under the write lock (copy-on-write).
     if !slow.is_empty() {
         let mut reg = lock.write();
         if let Some(entry) = reg.shard_channels.get_mut(channel) {
-            entry.retain(|s| !slow.contains(&s.id));
-            if entry.is_empty() {
-                reg.shard_channels.remove(channel);
+            if entry.iter().any(|s| slow.contains(&s.id)) {
+                let v: Vec<Subscriber> = entry
+                    .iter()
+                    .filter(|s| !slow.contains(&s.id))
+                    .cloned()
+                    .collect();
+                if v.is_empty() {
+                    reg.shard_channels.remove(channel);
+                } else {
+                    *entry = Arc::from(v);
+                }
             }
         }
         for _ in 0..slow.len() {
@@ -618,25 +767,24 @@ pub fn publish_shared(
 ) -> i64 {
     use smallvec::SmallVec;
 
-    // Phase 1: snapshot under read lock.
+    // Phase 1: snapshot under read lock — ONE `Arc::clone` for the exact channel
+    // and one per MATCHING pattern, regardless of how many subscribers each
+    // holds (moon#1180). No per-subscriber flume `Sender` clone/drop.
     let (exact, pattern_matches): (
-        SmallVec<[Subscriber; 8]>,
-        SmallVec<[(Bytes, SmallVec<[Subscriber; 8]>); 2]>,
+        Option<Arc<[Subscriber]>>,
+        SmallVec<[(Bytes, Arc<[Subscriber]>); 2]>,
     ) = {
         let reg = lock.read();
-        let exact = reg
-            .channels
-            .get(channel)
-            .map(|subs| subs.iter().cloned().collect())
-            .unwrap_or_default();
+        let exact = reg.channels.get(channel).map(Arc::clone);
         let pats = reg
             .patterns
             .iter()
             .filter(|(p, _)| glob_match(p, channel))
-            .map(|(p, subs)| (p.clone(), subs.iter().cloned().collect()))
+            .map(|(p, subs)| (p.clone(), Arc::clone(subs)))
             .collect();
         (exact, pats)
     };
+    let exact = exact.unwrap_or_else(|| Arc::from(Vec::new()));
     if exact.is_empty() && pattern_matches.is_empty() {
         return 0;
     }
@@ -648,7 +796,7 @@ pub fn publish_shared(
     {
         let mut resp2: Option<Bytes> = None;
         let mut resp3: Option<Bytes> = None;
-        for sub in &exact {
+        for sub in exact.iter() {
             let data = if sub.is_resp3 {
                 resp3
                     .get_or_insert_with(|| serialize_message_bytes_push(channel, message))
@@ -668,7 +816,7 @@ pub fn publish_shared(
     for (pattern, subs) in &pattern_matches {
         let mut resp2: Option<Bytes> = None;
         let mut resp3: Option<Bytes> = None;
-        for sub in subs {
+        for sub in subs.iter() {
             let data = if sub.is_resp3 {
                 resp3
                     .get_or_insert_with(|| serialize_pmessage_bytes_push(pattern, channel, message))
@@ -907,7 +1055,7 @@ mod tests {
                 !subs.is_empty(),
                 "empty subscriber list left on {channel:?}"
             );
-            for sub in subs {
+            for sub in subs.iter() {
                 assert!(
                     reg.sub_channels
                         .get(&sub.id)
@@ -922,7 +1070,7 @@ mod tests {
                 !subs.is_empty(),
                 "empty subscriber list left on {channel:?}"
             );
-            for sub in subs {
+            for sub in subs.iter() {
                 assert!(
                     reg.sub_shard_channels
                         .get(&sub.id)
