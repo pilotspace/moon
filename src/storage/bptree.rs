@@ -588,37 +588,23 @@ impl BPTree {
         new_child: NodeId,
         is_new: bool,
     ) -> InsertResult {
-        // Gather all keys and children including the new one
+        // Gather all keys and children including the new one: the separator
+        // goes in at `child_idx` among the keys and the new child directly
+        // right of the child that split. The previous hand-rolled merge loop
+        // pushed the separator INSTEAD of `keys[child_idx]` and so also lost
+        // the right-most child pointer whenever `child_idx < old_n` — every
+        // non-append insert into a full internal node (see
+        // `bptree_invariants.rs`).
         let old_n = self.internal(node_id).key_count();
-
         let mut all_keys: Vec<Key> = Vec::with_capacity(old_n + 1);
         let mut all_children: Vec<NodeId> = Vec::with_capacity(old_n + 2);
-
         {
             let node = self.internal(node_id);
-            for i in 0..old_n {
-                if i == child_idx {
-                    all_keys.push(separator.clone());
-                    all_children.push(node.children[i]);
-                    all_children.push(new_child);
-                } else {
-                    all_keys.push(node.keys[i].clone());
-                    if i < child_idx {
-                        all_children.push(node.children[i]);
-                    } else {
-                        // i > child_idx
-                        all_children.push(node.children[i]);
-                    }
-                }
-            }
-            if child_idx == old_n {
-                all_keys.push(separator.clone());
-                all_children.push(node.children[old_n]);
-                all_children.push(new_child);
-            } else {
-                all_children.push(node.children[old_n]);
-            }
+            all_keys.extend(node.keys[..old_n].iter().cloned());
+            all_children.extend_from_slice(&node.children[..=old_n]);
         }
+        all_keys.insert(child_idx, separator);
+        all_children.insert(child_idx + 1, new_child);
 
         let total_keys = all_keys.len(); // old_n + 1
         let mid = total_keys / 2;
@@ -924,7 +910,7 @@ impl BPTree {
         let parent_sep = self.internal(parent_id).keys[child_idx].clone();
         let borrowed_key = self.internal(right_id).keys[0].clone();
         let borrowed_child = self.internal(right_id).children[0];
-        let _borrowed_count = self.internal(right_id).counts[0];
+        let borrowed_count = self.internal(right_id).counts[0];
 
         // Remove from right (shift left)
         let right_n = self.internal(right_id).key_count();
@@ -946,6 +932,9 @@ impl BPTree {
         let child = self.internal_mut(child_id);
         child.keys[child_n] = parent_sep;
         child.children[child_n + 1] = borrowed_child;
+        // The moved subtree's size moves with it. Leaving the slot's stale
+        // value (0 after the last shrink) made every ancestor count wrong.
+        child.counts[child_n + 1] = borrowed_count;
         child.len += 1;
 
         // Update parent separator
@@ -1065,6 +1054,10 @@ enum InsertResult {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+#[path = "bptree_invariants.rs"]
+mod invariants;
 
 #[cfg(test)]
 mod tests {
