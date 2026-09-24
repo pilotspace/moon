@@ -7,7 +7,7 @@ use std::time::Instant;
 use crate::runtime::cancel::CancellationToken;
 use tracing::info;
 
-use crate::command::persistence::{SAVE_IN_PROGRESS, SNAPSHOT_EPOCH, bgsave_start};
+use crate::command::persistence::{SAVE_IN_PROGRESS, bgsave_start, bgsave_start_sharded};
 use crate::storage::Database;
 
 /// Type alias for the per-database RwLock container.
@@ -106,12 +106,27 @@ pub async fn run_auto_save(
     }
 }
 
+/// Start a sharded auto-save through the same entry point BGSAVE uses
+/// ([`bgsave_start_sharded`]). `false` when a save is already running.
+fn start_counted_auto_save(snapshot_trigger: &crate::runtime::channel::WatchSender<u64>) -> bool {
+    matches!(
+        bgsave_start_sharded(snapshot_trigger, crate::command::connection::shard_count()),
+        crate::protocol::Frame::SimpleString(_)
+    )
+}
+
 /// Background auto-save task for sharded mode.
 ///
-/// Instead of calling `bgsave_start` (which clones data under locks), this bumps
-/// the snapshot epoch via a `tokio::sync::watch::Sender<u64>`. Each shard's event
-/// loop subscribes to the watch channel and initiates a cooperative snapshot when
-/// the epoch changes.
+/// Instead of calling `bgsave_start` (which clones data under locks), this
+/// starts the same cooperative per-shard save BGSAVE does: each shard's event
+/// loop picks the epoch up from the watch channel and snapshots. Going
+/// through that entry point (moon#1230) is what makes an auto-save a COUNTED
+/// save: before, it bumped the epoch itself without arming the per-shard
+/// fan-in, so its completions arrived at a zero counter and were dropped —
+/// `LASTSAVE` / `rdb_last_save_time` never moved under auto-save, and one
+/// failed auto-save latched `rdb_last_bgsave_status:err` for good. It also
+/// sets `SAVE_IN_PROGRESS`, so a BGSAVE issued while an auto-save runs is
+/// refused, as in redis.
 pub async fn run_auto_save_sharded(
     rules: Vec<(u64, u64)>,
     change_counter: Arc<AtomicU64>,
@@ -133,10 +148,11 @@ pub async fn run_auto_save_sharded(
                     elapsed >= secs && changes >= threshold
                 });
 
-                if should_save && !SAVE_IN_PROGRESS.load(Ordering::SeqCst) {
-                    let epoch = SNAPSHOT_EPOCH.fetch_add(1, Ordering::SeqCst) + 1;
-                    info!("Auto-save triggered: {} changes in {}s, epoch {}", changes, elapsed, epoch);
-                    let _ = snapshot_trigger.send(epoch);
+                if should_save
+                    && !SAVE_IN_PROGRESS.load(Ordering::SeqCst)
+                    && start_counted_auto_save(&snapshot_trigger)
+                {
+                    info!("Auto-save triggered: {} changes in {}s", changes, elapsed);
                     change_counter.store(0, Ordering::Relaxed);
                     last_save = Instant::now();
                 }
@@ -157,13 +173,11 @@ pub async fn run_auto_save_sharded(
             let should_save = rules
                 .iter()
                 .any(|&(secs, threshold)| elapsed >= secs && changes >= threshold);
-            if should_save && !SAVE_IN_PROGRESS.load(Ordering::SeqCst) {
-                let epoch = SNAPSHOT_EPOCH.fetch_add(1, Ordering::SeqCst) + 1;
-                info!(
-                    "Auto-save triggered: {} changes in {}s, epoch {}",
-                    changes, elapsed, epoch
-                );
-                let _ = snapshot_trigger.send(epoch);
+            if should_save
+                && !SAVE_IN_PROGRESS.load(Ordering::SeqCst)
+                && start_counted_auto_save(&snapshot_trigger)
+            {
+                info!("Auto-save triggered: {} changes in {}s", changes, elapsed);
                 change_counter.store(0, Ordering::Relaxed);
                 last_save = Instant::now();
             }

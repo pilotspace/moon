@@ -132,46 +132,62 @@ pub(crate) fn check_auto_save_trigger(
                 shard_id,
                 new_epoch
             );
+            // moon#1230: this shard's part of the save is over, and it
+            // failed. Unreported, the fan-in counter never reached zero:
+            // `rdb_bgsave_in_progress:1` forever, every later BGSAVE
+            // refused as "already in progress".
+            crate::command::persistence::bgsave_shard_done(false);
             return;
         }
-        if let Some(dir) = persistence_dir {
-            // When disk-offload is enabled, write snapshot to the offload shard directory
-            // so v3 recovery can find it alongside WAL v3 segments and manifest.
-            let snap_path = if let Some(offload) = disk_offload_dir {
-                let shard_dir = offload.join(format!("shard-{}", shard_id));
-                let _ = std::fs::create_dir_all(&shard_dir);
-                shard_dir.join(format!("shard-{}.rrdshard", shard_id))
-            } else {
-                std::path::PathBuf::from(dir).join(format!("shard-{}.rrdshard", shard_id))
-            };
-            let segment_counts = crate::shard::slice::with_shard(|s| {
-                // One consistent snapshot of every db's segment layout: the
-                // counts must all describe the same instant, or the bitmap
-                // sized here would not match the keyspace the capture walks.
-                s.databases.with_all_read(|dbs| {
-                    dbs.iter()
-                        .map(|db| db.data().segment_count())
-                        .collect::<Vec<_>>()
-                })
-            });
-            let db_count = shard_databases.db_count();
-            let mut state = SnapshotState::new_from_metadata(
-                shard_id as u16,
-                new_epoch,
-                db_count,
-                segment_counts.clone(),
-                snap_path,
+        let Some(dir) = persistence_dir else {
+            // No persistence directory (`--appendonly no` without `--save`):
+            // nowhere to write. Report the failure instead of leaving the
+            // save in progress forever (moon#1230).
+            tracing::warn!(
+                "Shard {}: snapshot epoch {} not written — no persistence directory \
+                 (--appendonly no and no --save); the save is reported failed",
+                shard_id,
+                new_epoch
             );
-            // P3c — stamp the WAL LSN before the header is written.
-            if wal_last_lsn > 0 {
-                state.set_last_lsn(wal_last_lsn);
-            }
-            // moon#1186: same streaming writer as the explicit-BGSAVE path.
-            start_snapshot_streaming(&mut state, shard_id);
-            // moon#517: same arming as the explicit-BGSAVE path above.
-            crate::persistence::snapshot_cow::arm_with_layout(segment_counts);
-            *snapshot_state = Some(state);
+            crate::command::persistence::bgsave_shard_done(false);
+            return;
+        };
+        // When disk-offload is enabled, write snapshot to the offload shard directory
+        // so v3 recovery can find it alongside WAL v3 segments and manifest.
+        let snap_path = if let Some(offload) = disk_offload_dir {
+            let shard_dir = offload.join(format!("shard-{}", shard_id));
+            let _ = std::fs::create_dir_all(&shard_dir);
+            shard_dir.join(format!("shard-{}.rrdshard", shard_id))
+        } else {
+            std::path::PathBuf::from(dir).join(format!("shard-{}.rrdshard", shard_id))
+        };
+        let segment_counts = crate::shard::slice::with_shard(|s| {
+            // One consistent snapshot of every db's segment layout: the
+            // counts must all describe the same instant, or the bitmap
+            // sized here would not match the keyspace the capture walks.
+            s.databases.with_all_read(|dbs| {
+                dbs.iter()
+                    .map(|db| db.data().segment_count())
+                    .collect::<Vec<_>>()
+            })
+        });
+        let db_count = shard_databases.db_count();
+        let mut state = SnapshotState::new_from_metadata(
+            shard_id as u16,
+            new_epoch,
+            db_count,
+            segment_counts.clone(),
+            snap_path,
+        );
+        // P3c — stamp the WAL LSN before the header is written.
+        if wal_last_lsn > 0 {
+            state.set_last_lsn(wal_last_lsn);
         }
+        // moon#1186: same streaming writer as the explicit-BGSAVE path.
+        start_snapshot_streaming(&mut state, shard_id);
+        // moon#517: same arming as the explicit-BGSAVE path above.
+        crate::persistence::snapshot_cow::arm_with_layout(segment_counts);
+        *snapshot_state = Some(state);
     }
 }
 

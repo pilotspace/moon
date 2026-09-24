@@ -31,6 +31,13 @@ pub static BGSAVE_SHARDS_REMAINING: AtomicU64 = AtomicU64::new(0);
 /// Whether the last BGSAVE completed successfully.
 pub static BGSAVE_LAST_STATUS: AtomicBool = AtomicBool::new(true);
 
+/// Whether any shard of the sharded save in progress has failed (moon#1230).
+/// Cleared when a sharded save starts; the last shard to finish publishes it
+/// into [`BGSAVE_LAST_STATUS`]. A per-save latch, because the status must
+/// describe THAT save: `ok` when every shard succeeded, `err` when one did
+/// not — and back to `ok` on the next save that succeeds, as redis does.
+static BGSAVE_CURRENT_FAILED: AtomicBool = AtomicBool::new(false);
+
 /// Process-wide gate set at startup when the configuration combination
 /// `--shards >= 2 + --appendonly yes` is selected (see `Config::per_shard_aof_active`).
 ///
@@ -169,6 +176,7 @@ pub fn bgsave_start_sharded(
         ));
     }
 
+    BGSAVE_CURRENT_FAILED.store(false, Ordering::SeqCst);
     let epoch = SNAPSHOT_EPOCH.fetch_add(1, Ordering::SeqCst) + 1;
     BGSAVE_SHARDS_REMAINING.store(num_shards as u64, Ordering::SeqCst);
 
@@ -183,13 +191,19 @@ pub fn bgsave_start_sharded(
     Frame::SimpleString(Bytes::from_static(b"Background saving started"))
 }
 
-/// Called by each shard after its snapshot completes (monoio runtime).
+/// Called by each shard after its part of a sharded save ends (both
+/// runtimes' event loops, and a shard that had to skip the save).
 ///
-/// Decrements the shared counter. When the last shard finishes,
-/// clears SAVE_IN_PROGRESS and updates LAST_SAVE_TIME.
+/// Decrements the shared counter. The last shard to finish publishes the
+/// save's outcome (moon#1230): `rdb_last_bgsave_status` is `ok` iff no shard
+/// of THIS save failed, and only a successful save advances
+/// `rdb_last_save_time` / `LASTSAVE` and resets `rdb_changes_since_last_save`
+/// (redis: `lastsave` and the dirty counter move on success only). It then
+/// clears `SAVE_IN_PROGRESS` — last, so a poller that sees the save finished
+/// (SHUTDOWN SAVE) reads this save's status, not the previous one's.
 pub fn bgsave_shard_done(success: bool) {
     if !success {
-        BGSAVE_LAST_STATUS.store(false, Ordering::Relaxed);
+        BGSAVE_CURRENT_FAILED.store(true, Ordering::SeqCst);
     }
     // Use compare-exchange loop to prevent underflow below zero.
     // If the counter is already 0 (spurious call), do nothing.
@@ -197,6 +211,11 @@ pub fn bgsave_shard_done(success: bool) {
         let current = BGSAVE_SHARDS_REMAINING.load(Ordering::SeqCst);
         if current == 0 {
             tracing::warn!("BGSAVE shard done called with counter already at 0 -- ignoring");
+            // No counted save to attach it to; a failure still shows (the
+            // next save that succeeds clears it).
+            if !success {
+                BGSAVE_LAST_STATUS.store(false, Ordering::SeqCst);
+            }
             return;
         }
         match BGSAVE_SHARDS_REMAINING.compare_exchange(
@@ -207,18 +226,26 @@ pub fn bgsave_shard_done(success: bool) {
         ) {
             Ok(prev) => {
                 if prev == 1 {
-                    // Last shard to finish
+                    // Last shard to finish: publish THIS save's outcome.
+                    let ok = !BGSAVE_CURRENT_FAILED.swap(false, Ordering::SeqCst);
+                    if ok {
+                        // A completed save is the reset point for
+                        // `rdb_changes_since_last_save`; a failed one is not
+                        // (the dataset is still unpersisted).
+                        crate::admin::metrics_setup::mark_save_completed();
+                        LAST_SAVE_TIME.store(
+                            std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_secs(),
+                            Ordering::SeqCst,
+                        );
+                        info!("BGSAVE complete: all shards finished");
+                    } else {
+                        error!("BGSAVE failed: at least one shard's snapshot failed (see above)");
+                    }
+                    BGSAVE_LAST_STATUS.store(ok, Ordering::SeqCst);
                     SAVE_IN_PROGRESS.store(false, Ordering::SeqCst);
-                    // A completed save is the reset point for `rdb_changes_since_last_save`.
-                    crate::admin::metrics_setup::mark_save_completed();
-                    LAST_SAVE_TIME.store(
-                        std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_secs(),
-                        Ordering::Relaxed,
-                    );
-                    info!("BGSAVE complete: all shards finished");
                 }
                 return;
             }
@@ -489,8 +516,12 @@ pub fn handle_lastsave() -> Frame {
 mod tests {
     use super::*;
 
+    /// Serializes every test that drives the process-wide BGSAVE statics.
+    static BGSAVE_TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
     #[test]
     fn test_save_in_progress_flag() {
+        let _guard = BGSAVE_TEST_LOCK.lock();
         // Reset flag
         SAVE_IN_PROGRESS.store(false, Ordering::SeqCst);
         assert!(!SAVE_IN_PROGRESS.load(Ordering::SeqCst));
@@ -509,6 +540,87 @@ mod tests {
         // Note: other tests may have modified this, so just verify the static exists
         // and is an AtomicU64 that can be loaded.
         let _ = LAST_SAVE_TIME.load(Ordering::Relaxed);
+    }
+
+    /// Run one sharded save over `shards` shards whose outcomes are
+    /// `results`, as the event loops report them.
+    fn sharded_save(results: &[bool]) {
+        let (tx, _rx) = crate::runtime::channel::watch(0u64);
+        let reply = bgsave_start_sharded(&tx, results.len());
+        assert!(
+            matches!(reply, Frame::SimpleString(_)),
+            "the save must start: {reply:?}"
+        );
+        for &ok in results {
+            assert!(SAVE_IN_PROGRESS.load(Ordering::SeqCst), "still running");
+            bgsave_shard_done(ok);
+        }
+        assert!(
+            !SAVE_IN_PROGRESS.load(Ordering::SeqCst),
+            "the last shard ends the save"
+        );
+    }
+
+    /// moon#1230: the status describes the LAST save — `err` after a save a
+    /// shard failed, `ok` again after one where every shard succeeded — and
+    /// only a successful save advances `LASTSAVE`.
+    #[test]
+    fn bgsave_status_is_per_save_and_lastsave_moves_only_on_success() {
+        let _guard = BGSAVE_TEST_LOCK.lock();
+        SAVE_IN_PROGRESS.store(false, Ordering::SeqCst);
+        BGSAVE_SHARDS_REMAINING.store(0, Ordering::SeqCst);
+        LAST_SAVE_TIME.store(7, Ordering::SeqCst);
+
+        // One shard of four fails — first, in the middle, and last.
+        for failing in [0usize, 2, 3] {
+            let mut results = [true; 4];
+            results[failing] = false;
+            sharded_save(&results);
+            assert!(
+                !BGSAVE_LAST_STATUS.load(Ordering::SeqCst),
+                "shard {failing} failed: the save failed"
+            );
+            assert_eq!(
+                LAST_SAVE_TIME.load(Ordering::SeqCst),
+                7,
+                "a failed save must not advance LASTSAVE"
+            );
+        }
+
+        sharded_save(&[true; 4]);
+        assert!(
+            BGSAVE_LAST_STATUS.load(Ordering::SeqCst),
+            "every shard succeeded: the status must return to ok"
+        );
+        assert!(
+            LAST_SAVE_TIME.load(Ordering::SeqCst) > 7,
+            "a successful save advances LASTSAVE"
+        );
+
+        // The single-shard path is the same function with one shard.
+        sharded_save(&[false]);
+        assert!(!BGSAVE_LAST_STATUS.load(Ordering::SeqCst));
+        sharded_save(&[true]);
+        assert!(BGSAVE_LAST_STATUS.load(Ordering::SeqCst));
+    }
+
+    /// A second BGSAVE while one runs is refused and does not reset the
+    /// running save's failure latch.
+    #[test]
+    fn a_refused_second_bgsave_does_not_clear_the_running_saves_failure() {
+        let _guard = BGSAVE_TEST_LOCK.lock();
+        SAVE_IN_PROGRESS.store(false, Ordering::SeqCst);
+        BGSAVE_SHARDS_REMAINING.store(0, Ordering::SeqCst);
+        let (tx, _rx) = crate::runtime::channel::watch(0u64);
+        assert!(matches!(
+            bgsave_start_sharded(&tx, 2),
+            Frame::SimpleString(_)
+        ));
+        bgsave_shard_done(false);
+        assert!(matches!(bgsave_start_sharded(&tx, 2), Frame::Error(_)));
+        bgsave_shard_done(true);
+        assert!(!BGSAVE_LAST_STATUS.load(Ordering::SeqCst));
+        assert!(!SAVE_IN_PROGRESS.load(Ordering::SeqCst));
     }
 
     #[test]
