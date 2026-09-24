@@ -39,7 +39,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use crate::persistence::aof_manifest::{AofLayout, AofManifest};
 
@@ -65,6 +65,10 @@ static AOF_DIR: parking_lot::RwLock<Option<PathBuf>> = parking_lot::RwLock::new(
 /// Cooldown after a failed auto-rewrite dispatch. One minute mirrors the
 /// "don't hot-retry a deterministic failure" backoff floor used elsewhere.
 const FAILED_DISPATCH_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// How long the monitor waits for a rewrite it dispatched before reporting
+/// it as not progressing (moon#1158).
+const REWRITE_WAIT_BOUND: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// Monitor sampling cadence.
 const TICK: std::time::Duration = std::time::Duration::from_secs(1);
@@ -343,11 +347,24 @@ fn monitor_loop(
                 // is deterministic even when the whole rewrite fits inside
                 // one tick; the transition/shrink detection above is the
                 // fallback for manual rewrites.
-                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
+                let deadline = std::time::Instant::now() + REWRITE_WAIT_BOUND;
                 while AOF_REWRITE_IN_PROGRESS.load(Ordering::SeqCst)
                     && std::time::Instant::now() < deadline
                 {
                     std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+                if AOF_REWRITE_IN_PROGRESS.load(Ordering::SeqCst) {
+                    // Fail loud (moon#1158): no new rewrite can start while
+                    // this one holds the flag, so the incr AOF grows until it
+                    // finishes. A rewrite cannot be cancelled safely from
+                    // here — its writers may be mid-commit — so report it.
+                    error!(
+                        "aof-auto-rewrite: the rewrite dispatched {:?} ago has not finished; \
+                         no further rewrite can start until it does and the AOF keeps \
+                         growing (current={} bytes). Check the AOF writer threads.",
+                        REWRITE_WAIT_BOUND,
+                        refresh_current_size()
+                    );
                 }
                 record_base_size();
                 saw_in_progress = false;

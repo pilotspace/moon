@@ -100,6 +100,12 @@ pub struct RewriteOverflow {
     /// and moving [`AOF_WRITERS_MISSING_APPENDS`]. Taken only on a drop or a
     /// committed fold.
     missing_since: parking_lot::Mutex<u64>,
+    /// Test-only probe (moon#1158): the BGREWRITEAOF in-progress flag as the
+    /// post-fold drain found it on entry. The drain must run while the
+    /// rewrite still holds the flag — otherwise the next rewrite can be
+    /// dispatched into the channel being drained.
+    #[cfg(test)]
+    in_progress_at_finish: parking_lot::Mutex<Option<bool>>,
 }
 
 /// Why [`RewriteOverflow::try_spill`] refused a message — the two reasons
@@ -133,7 +139,16 @@ impl RewriteOverflow {
             max_bytes,
             epoch: std::sync::atomic::AtomicU64::new(FoldEpoch::INITIAL.0),
             missing_since: parking_lot::Mutex::new(0),
+            #[cfg(test)]
+            in_progress_at_finish: parking_lot::Mutex::new(None),
         }
+    }
+
+    /// Test-only: the in-progress flag as the last `finish_*` saw it on
+    /// entry (`None` if no drain ran yet). See the field doc.
+    #[cfg(test)]
+    pub(crate) fn in_progress_at_finish_for_test(&self) -> Option<bool> {
+        *self.in_progress_at_finish.lock()
     }
 
     /// Record that an acked append for this writer was dropped (moon#1094).
@@ -312,6 +327,13 @@ impl RewriteOverflow {
         floor: FoldEpoch,
     ) -> Result<(), MoonError> {
         use std::io::Write;
+        #[cfg(test)]
+        {
+            *self.in_progress_at_finish.lock() = Some(
+                crate::command::persistence::AOF_REWRITE_IN_PROGRESS
+                    .load(std::sync::atomic::Ordering::SeqCst),
+            );
+        }
         // Two-phase drain (deep-review P2): the buffer lock is held only for
         // each SWAP, never across the disk writes — a shard thread deciding
         // spill-vs-send must not park behind a multi-second file drain.
