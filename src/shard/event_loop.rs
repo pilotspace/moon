@@ -1442,7 +1442,9 @@ impl super::Shard {
                 _ = periodic_interval.0.tick() => {
                     cached_clock.update();
                     // moon#1190: lazy-free drain (see the monoio tick below).
-                    crate::server::expiration::drain_lazy_free_tick(shard_databases.db_count());
+                    // Its pending flag feeds only the monoio idle park; this
+                    // loop never stretches its 1 ms period.
+                    let _ = crate::server::expiration::drain_lazy_free_tick(shard_databases.db_count());
 
                     let mut pending_snapshot = None;
                     // No outer with_shard — each arm takes its own flat borrow.
@@ -2349,9 +2351,6 @@ impl super::Shard {
                 // 10 idle) so the counter keeps counting nominal milliseconds.
                 monoio_tick_counter = monoio_tick_counter.wrapping_add(idle_park.counter_step());
                 cached_clock.update();
-                // moon#1190: free lazily-unlinked / expired large values, a
-                // bounded slice per tick (one relaxed load when none queued).
-                crate::server::expiration::drain_lazy_free_tick(shard_databases.db_count());
 
                 persistence_tick::check_auto_save_trigger(
                     &snapshot_trigger_rx,
@@ -2693,6 +2692,17 @@ impl super::Shard {
                 // counter hits each boundary exactly; entry is additionally
                 // gated on an aligned counter. Any new `% N` dispatch added
                 // here MUST keep N a multiple of IDLE_PARK_MS.
+                //
+                // moon#1190: free lazily-unlinked / expired large values, a
+                // bounded slice per tick (one relaxed load when none queued).
+                // Last in the tick so a value this tick's expiry sweep or
+                // eviction just queued gets its first slice now, and so its
+                // answer — does THIS shard still have work queued? — is exact
+                // for the park decision: moon#1221 review F2, the idle park
+                // must not stretch to 10 ms while the queue drains (one
+                // 250 µs slice per 10 ms held the memory ~10x longer).
+                let lazy_free_pending =
+                    crate::server::expiration::drain_lazy_free_tick(shard_databases.db_count());
                 let quiet = wal_writer
                     .as_ref()
                     .is_none_or(|w| w.buffered_bytes() == 0 && !w.flush_backing_off())
@@ -2703,7 +2713,8 @@ impl super::Shard {
                     && server_config.appendfsync != "always"
                     && cdc_registry.is_empty()
                     && !hit_cap
-                    && !spsc_had_work;
+                    && !spsc_had_work
+                    && !lazy_free_pending;
                 let was_idle = idle_park.is_idle();
                 let now_idle = idle_park.on_timer_tick(
                     crate::admin::metrics_setup::this_thread_commands(),

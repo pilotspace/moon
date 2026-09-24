@@ -30,7 +30,8 @@ pub async fn run_active_expiration(
     // `stream_commands` apply path), and a replica must NOT run its own expiry
     // deletion sweep — it waits for the master's authoritative expire/DEL
     // record so both sides remove a key at the same point in the stream. When
-    // this is `Some(true)` the tick becomes a no-op; logical expiry on reads
+    // this is `Some(true)` the tick skips its expiry sweep (it still frees
+    // lazily unlinked values, moon#1221 review NIT-6); logical expiry on reads
     // still applies. `None` (no replication configured) always sweeps.
     is_replica_mirror: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 ) {
@@ -42,21 +43,27 @@ pub async fn run_active_expiration(
                 let is_replica = is_replica_mirror
                     .as_ref()
                     .is_some_and(|m| m.load(std::sync::atomic::Ordering::Acquire));
-                if is_replica {
+                if is_replica && !crate::storage::db::lazy_free_pending_anywhere() {
                     continue;
                 }
                 for lock in db.iter() {
                     let mut guard = lock.write();
-                    // task #34 (Wave A): tokio's active-expiry sweep does not
-                    // emit `record_reason_del` — master-side PSYNC is
-                    // monoio-only (CLAUDE.md), so a tokio-runtime process is
-                    // never a replication master; a no-op sink preserves
-                    // today's behavior exactly.
-                    // moon#542: route through `_direct` so the lazy-expiry
-                    // pending queue physically drains under tokio too.
-                    expire_cycle_direct(&mut guard, &mut |_| {});
+                    if !is_replica {
+                        // task #34 (Wave A): tokio's active-expiry sweep does not
+                        // emit `record_reason_del` — master-side PSYNC is
+                        // monoio-only (CLAUDE.md), so a tokio-runtime process is
+                        // never a replication master; a no-op sink preserves
+                        // today's behavior exactly.
+                        // moon#542: route through `_direct` so the lazy-expiry
+                        // pending queue physically drains under tokio too.
+                        expire_cycle_direct(&mut guard, &mut |_| {});
+                    }
                     // moon#1190: this non-sharded mode has no 1 ms shard tick;
-                    // free queued large values here, a slice per 100 ms.
+                    // free queued large values here, a slice per 100 ms. On a
+                    // replica too (moon#1221 review NIT-6): it skips only the
+                    // expiry sweep above, but it queues values like any node —
+                    // every UNLINK / DEL its master replicates — and bailing
+                    // out of the whole tick left them resident and charged.
                     if guard.lazy_free_len() != 0 {
                         guard.drain_lazy_free(Instant::now() + LAZY_FREE_LEGACY_BUDGET);
                     }
@@ -81,22 +88,26 @@ const LAZY_FREE_LEGACY_BUDGET: Duration = Duration::from_millis(2);
 ///
 /// Called from BOTH runtimes' 1 ms periodic tick. One relaxed load when no
 /// database in the process has anything queued — the common case.
-pub fn drain_lazy_free_tick(db_count: usize) {
+///
+/// Returns whether THIS shard still has work queued after the slice
+/// (moon#1221 review F2): the monoio loop must not stretch its park to the
+/// 10 ms idle period while it does — at one 250 µs slice per 10 ms the drain
+/// ran at 2.5% duty and held the memory ~10x longer. Per shard, not the
+/// process-wide [`crate::storage::db::lazy_free_pending_anywhere`]: an idle
+/// shard must not be kept awake by another shard's queue. Databases past the
+/// deadline are only asked, not drained.
+pub fn drain_lazy_free_tick(db_count: usize) -> bool {
     if !crate::storage::db::lazy_free_pending_anywhere() {
-        return;
+        return false;
     }
     let deadline = Instant::now() + crate::storage::db::LAZY_FREE_TICK_BUDGET;
+    let mut pending = false;
     for i in 0..db_count {
-        let in_budget = crate::shard::slice::with_shard_db(i, |db| {
-            if db.lazy_free_len() != 0 {
-                db.drain_lazy_free(deadline);
-            }
-            Instant::now() < deadline
+        pending |= crate::shard::slice::with_shard_db(i, |db| {
+            db.lazy_free_len() != 0 && (Instant::now() >= deadline || db.drain_lazy_free(deadline))
         });
-        if !in_budget {
-            break;
-        }
     }
+    pending
 }
 
 /// Public entry point for per-shard active expiry.
@@ -1154,5 +1165,143 @@ mod tests {
                 "queue must not grow past the cap"
             );
         }
+    }
+}
+
+/// moon#1221 review NIT-6 (refs moon#1190): the non-sharded tokio driver's
+/// 100 ms tick skipped its whole body on a replica — including the lazy-free
+/// drain, although a replica queues large values too (every UNLINK and DEL
+/// the master replicates). They then stayed resident, and charged, forever.
+#[cfg(all(test, feature = "runtime-tokio"))]
+mod lazy_free_tokio_tests {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+
+    use bytes::Bytes;
+
+    use super::*;
+    use crate::storage::compact_value::CompactValue;
+    use crate::storage::entry::{Entry, RedisValue};
+
+    #[test]
+    fn a_replica_still_drains_its_lazy_free_queue() {
+        let dbs: SharedDatabases = Arc::new(vec![parking_lot::RwLock::new(Database::new())]);
+        {
+            let mut db = dbs[0].write();
+            let mut h = HashMap::new();
+            for i in 0..5_000 {
+                h.insert(
+                    Bytes::from(format!("field-{i:06}").into_bytes()),
+                    Bytes::from_static(b"v"),
+                );
+            }
+            let mut e = Entry::new_string(Bytes::new());
+            e.value = CompactValue::from_redis_value(RedisValue::Hash(Box::new(h)));
+            db.set(b"big", e);
+            assert!(db.unlink(b"big"));
+            assert_eq!(db.lazy_free_len(), 1, "fixture: the value must be queued");
+        }
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("runtime");
+        let token = CancellationToken::new();
+        let replica = Some(Arc::new(AtomicBool::new(true)));
+        rt.block_on(async {
+            let canceller = token.clone();
+            let stop = async move {
+                // The interval's first tick is immediate; 350 ms covers three
+                // more, and one 2 ms slice frees 5,000 fields many times over.
+                tokio::time::sleep(Duration::from_millis(350)).await;
+                canceller.cancel();
+            };
+            tokio::join!(
+                run_active_expiration(dbs.clone(), token.clone(), replica),
+                stop
+            );
+        });
+        assert_eq!(
+            dbs[0].read().lazy_free_len(),
+            0,
+            "a replica's expiry tick must still free its queued values"
+        );
+    }
+}
+
+/// moon#1221 review F2: the shard tick's drain reports whether THIS shard
+/// still has lazy-free work queued — the monoio loop's idle park keys on it,
+/// so the flag must be exact per shard (the process-wide pending counter
+/// would keep an idle shard awake for another shard's queue).
+#[cfg(test)]
+mod lazy_free_tick_tests {
+    use std::collections::HashMap;
+    use std::sync::mpsc;
+
+    use bytes::Bytes;
+
+    use super::drain_lazy_free_tick;
+    use crate::shard::slice::{ShardSlice, init_shard, test_support::make_init, with_shard_db};
+    use crate::storage::compact_value::CompactValue;
+    use crate::storage::entry::{Entry, RedisValue};
+
+    fn huge_hash(fields: usize) -> Entry {
+        let mut h = HashMap::new();
+        for i in 0..fields {
+            h.insert(
+                Bytes::from(format!("field-{i:07}").into_bytes()),
+                Bytes::from_static(b"v"),
+            );
+        }
+        let mut e = Entry::new_string(Bytes::new());
+        e.value = CompactValue::from_redis_value(RedisValue::Hash(Box::new(h)));
+        e
+    }
+
+    #[test]
+    fn the_tick_reports_work_left_on_this_shard_only() {
+        let (queued_tx, queued_rx) = mpsc::channel::<()>();
+        let (go_tx, go_rx) = mpsc::channel::<()>();
+        // Shard A: db 1 holds a value no single 250 µs slice can free.
+        let a = std::thread::spawn(move || {
+            init_shard(ShardSlice::new(make_init(0, 2)));
+            with_shard_db(1, |db| {
+                db.set(b"big", huge_hash(200_000));
+                assert!(db.unlink(b"big"));
+            });
+            queued_tx.send(()).expect("signal");
+            go_rx.recv().expect("wait");
+            let first = drain_lazy_free_tick(2);
+            let mut ticks = 1u32;
+            while drain_lazy_free_tick(2) {
+                ticks += 1;
+                assert!(ticks < 1_000_000, "the drain made no progress");
+            }
+            (first, with_shard_db(1, |db| db.lazy_free_len()))
+        });
+        queued_rx.recv().expect("shard A queued its value");
+        // Shard B: nothing queued, while shard A's queue is not empty.
+        let b = std::thread::spawn(|| {
+            init_shard(ShardSlice::new(make_init(1, 2)));
+            (
+                crate::storage::db::lazy_free_pending_anywhere(),
+                drain_lazy_free_tick(2),
+            )
+        })
+        .join()
+        .expect("shard B");
+        go_tx.send(()).expect("release shard A");
+        let (first, left) = a.join().expect("shard A");
+        assert!(b.0, "fixture: shard A's queue must be pending process-wide");
+        assert!(
+            !b.1,
+            "a shard with nothing queued must report no lazy-free work, whatever \
+             other shards hold"
+        );
+        assert!(first, "a slice that cannot finish must report work left");
+        assert_eq!(
+            left, 0,
+            "the tick must report pending until the queue is empty"
+        );
     }
 }
