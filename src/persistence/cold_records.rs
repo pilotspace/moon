@@ -46,6 +46,90 @@ pub fn serialize_spilled(file_id: u64, keys: &[Bytes]) -> Bytes {
     serialize_command(&Frame::Array(parts))
 }
 
+/// Keys a new AOF generation must delete right after its `MOON.COLDCUT`
+/// (moon#1215), per database, as computed at the fold instant by
+/// `aof::fold_stream`: each has a slot on disk in a listed spill file (so a
+/// rebuild would index it and the cut would authorize it) and is not alive at
+/// the fold instant (not in the base, not cold, not in flight).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ColdDeletes {
+    /// `(db index, keys)`, db ascending. A key may appear more than once
+    /// (once per dead slot); [`generation_head`] writes it once.
+    pub per_db: Vec<(usize, Vec<Bytes>)>,
+}
+
+impl ColdDeletes {
+    /// Total listed keys across every database (duplicates included).
+    pub fn len(&self) -> usize {
+        self.per_db.iter().map(|(_, k)| k.len()).sum()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.per_db.iter().all(|(_, k)| k.is_empty())
+    }
+}
+
+/// Keys per `DEL` record in a generation head: bounds one record's size
+/// (one RESP array per 512 keys) without a record per key.
+const HEAD_DEL_BATCH: usize = 512;
+
+/// The head of a new AOF generation: `MOON.COLDCUT <watermark>`, then for
+/// every database with dead cold slots `SELECT <db>` + `DEL key…` (moon#1215),
+/// ending selected on db 0 — the writer and every replay reader start an
+/// incr's records at db 0, so a head that left another db selected would
+/// replay the generation's first db-0 records into it.
+///
+/// Only records every moon binary already replays: `SELECT` and `DEL` (which
+/// tombstones the cold plane through the replay gate, moon#257), so an older
+/// binary reading this generation keeps the deletes too. `framed` selects
+/// the per-shard `[lsn=0][len][RESP]` encoding for every record.
+pub fn generation_head(watermark: u64, deletes: &ColdDeletes, framed: bool) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut push = |resp: &[u8]| {
+        if framed {
+            out.extend_from_slice(&frame_unoffset(resp));
+        } else {
+            out.extend_from_slice(resp);
+        }
+    };
+    push(&serialize_cold_cut(watermark));
+    let mut selected = 0usize;
+    for (db, keys) in &deletes.per_db {
+        if keys.is_empty() {
+            continue;
+        }
+        if *db != selected {
+            push(&serialize_select(*db));
+            selected = *db;
+        }
+        // The fold lists a key once per dead slot (it does not dedupe on the
+        // shard thread); one DEL argument per key is enough.
+        let mut keys: Vec<&Bytes> = keys.iter().collect();
+        keys.sort_unstable();
+        keys.dedup();
+        for batch in keys.chunks(HEAD_DEL_BATCH) {
+            let mut parts = crate::protocol::FrameVec::with_capacity(batch.len() + 1);
+            parts.push(Frame::BulkString(Bytes::from_static(b"DEL")));
+            for key in batch {
+                parts.push(Frame::BulkString((*key).clone()));
+            }
+            push(&serialize_command(&Frame::Array(parts)));
+        }
+    }
+    if selected != 0 {
+        push(&serialize_select(0));
+    }
+    out
+}
+
+fn serialize_select(db: usize) -> Bytes {
+    let mut n = itoa::Buffer::new();
+    serialize_command(&Frame::Array(crate::framevec![
+        Frame::BulkString(Bytes::from_static(b"SELECT")),
+        Frame::BulkString(Bytes::copy_from_slice(n.format(db).as_bytes())),
+    ]))
+}
+
 /// Per-shard framed incr encoding (`[u64 lsn LE][u32 len LE][RESP]`) of a
 /// record that carries no replication offset — the same `lsn = 0` the
 /// writer's own `SELECT` injection uses.
@@ -283,6 +367,52 @@ mod tests {
         std::fs::write(&legacy, &set).unwrap();
         assert!(!seed_cold_cut_if_fresh(&legacy, 3).unwrap());
         assert_eq!(std::fs::read(&legacy).unwrap(), set.as_ref());
+    }
+
+    /// moon#1215: the head lists each dead key once (the fold may list it
+    /// once per dead slot), batches its DELs, and hands the generation back on
+    /// db 0; the framed form carries the same records.
+    #[test]
+    fn generation_head_dedupes_batches_and_ends_on_db_0() {
+        let key = |i: usize| Bytes::from(format!("k{i:04}"));
+        let mut db2: Vec<Bytes> = (0..HEAD_DEL_BATCH + 3).map(key).collect();
+        db2.push(key(0));
+        let deletes = ColdDeletes {
+            per_db: vec![
+                (0, vec![Bytes::from_static(b"z"), Bytes::from_static(b"z")]),
+                (2, db2),
+            ],
+        };
+        assert_eq!(deletes.len(), HEAD_DEL_BATCH + 6, "duplicates are counted");
+        let head = generation_head(9, &deletes, false);
+        let mut want = serialize_cold_cut(9).to_vec();
+        let del = |keys: &[Bytes]| {
+            let mut parts = crate::protocol::FrameVec::new();
+            parts.push(Frame::BulkString(Bytes::from_static(b"DEL")));
+            for k in keys {
+                parts.push(Frame::BulkString(k.clone()));
+            }
+            serialize_command(&Frame::Array(parts)).to_vec()
+        };
+        want.extend(del(&[Bytes::from_static(b"z")]));
+        want.extend_from_slice(&serialize_select(2));
+        let all: Vec<Bytes> = (0..HEAD_DEL_BATCH + 3).map(key).collect();
+        want.extend(del(&all[..HEAD_DEL_BATCH]));
+        want.extend(del(&all[HEAD_DEL_BATCH..]));
+        want.extend_from_slice(&serialize_select(0));
+        assert_eq!(head, want);
+
+        let framed = generation_head(9, &deletes, true);
+        let mut records = 0usize;
+        let mut at = 0usize;
+        while at < framed.len() {
+            assert_eq!(&framed[at..at + 8], &0u64.to_le_bytes(), "lsn 0");
+            let len = u32::from_le_bytes(framed[at + 8..at + 12].try_into().unwrap()) as usize;
+            at += 12 + len;
+            records += 1;
+        }
+        assert_eq!(at, framed.len());
+        assert_eq!(records, 6, "COLDCUT, DEL z, SELECT 2, DEL x2, SELECT 0");
     }
 
     #[test]

@@ -1,8 +1,13 @@
+#[cfg(test)]
+mod cold_del_rewrite_tests;
 pub mod cold_index;
 #[cfg(test)]
 mod cold_index_rebuild_tests;
 pub mod cold_read;
 pub mod cold_read_pool;
+#[cfg(test)]
+mod dead_slot_ledger_tests;
+pub mod dead_slots;
 pub mod file_id_seed;
 pub mod kv_serde;
 pub mod kv_spill;
