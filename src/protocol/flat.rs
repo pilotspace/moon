@@ -97,10 +97,39 @@ enum Header {
     Malformed,
 }
 
-/// Parse the decimal header starting at `start`, exactly as `validate_frame`'s
-/// `read_decimal` does: first CRLF, then a strict signed decimal.
+/// Parse the decimal header starting at `start`, with exactly the answers of
+/// `validate_frame`'s `read_decimal`: first CRLF, then a strict signed decimal.
+///
+/// moon#1179 item 6: the common header — 1 to 18 ASCII digits immediately
+/// followed by CRLF — is read in ONE fused loop instead of a `memchr` for the
+/// CRLF and then a second walk in `strict_atoi`. It is the same answer by
+/// construction: with only digits before it, the first `\r\n` is the one
+/// right after them, and 18 digits cannot overflow an i64. Anything else — a
+/// sign, no digits, a 19th digit, a bare `\r`, any other byte, or the buffer
+/// ending mid-header — declines to the original two-step path.
 #[inline]
 fn header(buf: &[u8], start: usize) -> Header {
+    const FAST_DIGITS: usize = 18;
+    let limit = buf.len().min(start.saturating_add(FAST_DIGITS));
+    let mut i = start;
+    let mut value: i64 = 0;
+    while i < limit {
+        let d = buf[i].wrapping_sub(b'0');
+        if d > 9 {
+            break;
+        }
+        value = value * 10 + d as i64;
+        i += 1;
+    }
+    if i > start && buf.get(i) == Some(&b'\r') && buf.get(i + 1) == Some(&b'\n') {
+        return Header::Value(value, i + 2);
+    }
+    header_slow(buf, start)
+}
+
+/// The original header parse: find the CRLF, then parse strictly.
+#[inline(never)]
+fn header_slow(buf: &[u8], start: usize) -> Header {
     let Some(crlf) = find_crlf(buf, start) else {
         return Header::Incomplete;
     };
@@ -722,6 +751,59 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// moon#1179 item 6: the fused digit loop answers exactly what the
+    /// original find-CRLF-then-strict-atoi path answers, on the shapes it
+    /// takes and on every shape it must decline — at every truncation.
+    #[test]
+    fn fused_header_parse_matches_the_two_step_parse() {
+        let cases: &[&[u8]] = &[
+            b"0\r\n",
+            b"7\r\n",
+            b"007\r\n",
+            b"123456789012345678\r\n",   // 18 digits: fast path
+            b"1234567890123456789\r\n",  // 19 digits: slow path, fits i64
+            b"9223372036854775807\r\n",  // i64::MAX
+            b"9223372036854775808\r\n",  // overflow: malformed
+            b"99999999999999999999\r\n", // 20 digits
+            b"-1\r\n",
+            b"-0\r\n",
+            b"+5\r\n",
+            b"-\r\n",
+            b"+\r\n",
+            b"\r\n", // empty: strict_atoi reads it as 0
+            b"12\rx3\r\n",
+            b"12\n\r\n",
+            b"1 2\r\n",
+            b" 12\r\n",
+            b"12x\r\n",
+            b"12\r",
+            b"12",
+        ];
+        fn same(a: &Header, b: &Header) -> bool {
+            match (a, b) {
+                (Header::Value(x, p), Header::Value(y, q)) => x == y && p == q,
+                (Header::Incomplete, Header::Incomplete) => true,
+                (Header::Malformed, Header::Malformed) => true,
+                _ => false,
+            }
+        }
+        for case in cases {
+            for cut in 0..=case.len() {
+                let mut buf = b"$".to_vec();
+                buf.extend_from_slice(&case[..cut]);
+                let fused = header(&buf, 1);
+                let slow = header_slow(&buf, 1);
+                assert!(
+                    same(&fused, &slow),
+                    "header parse diverged on {:?}",
+                    String::from_utf8_lossy(&buf)
+                );
+            }
+        }
+        // and the common shape parses to its value and end offset
+        assert!(matches!(header(b"$1234\r\n", 1), Header::Value(1234, 7)));
     }
 
     /// A cursor left over from different bytes (a missed `reset`) must never

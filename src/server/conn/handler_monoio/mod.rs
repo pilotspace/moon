@@ -87,6 +87,65 @@ macro_rules! write_all_bounded {
     }};
 }
 
+/// [`write_all_bounded!`] for the connection's own `write_buf`, written BY
+/// OWNERSHIP and handed back cleared (moon#1179 item 6).
+///
+/// The batch flushes used to write `write_buf.split().freeze()`: a refcount
+/// fetch_add + fetch_sub per batch and a `Shared` promotion of the buffer,
+/// for a `Bytes` that is dropped as soon as the write returns. `BytesMut` is
+/// itself a monoio `IoBuf`, so the buffer goes to `write_all` and comes back
+/// with its capacity intact. Same limit, watchdog and `CLIENT LIST`
+/// accounting as `write_all_bounded!` (see there for the rationale); a write
+/// the watchdog abandons drops the buffer with it, and the connection closes.
+macro_rules! flush_write_buf_bounded {
+    ($stream:expr, $buf:ident, $wt:expr, $cap:expr, $live:expr, $client_id:expr) => {{
+        let pending = $buf.len();
+        if $cap != 0 && pending > $cap {
+            tracing::warn!(
+                "Connection {} reply of {} bytes exceeds the output buffer limit of {} — closing",
+                $client_id,
+                pending,
+                $cap,
+            );
+            false
+        } else {
+            $live.begin_write(pending);
+            let data = std::mem::take(&mut $buf);
+            let ok = match super::util::arm_write_timeout(pending, $wt) {
+                None => {
+                    let (r, back): (std::io::Result<usize>, BytesMut) =
+                        $stream.write_all(data).await;
+                    $buf = back;
+                    $buf.clear();
+                    r.is_ok()
+                }
+                Some(dur) => {
+                    let mut ok = false;
+                    monoio::select! {
+                        res = $stream.write_all(data) => {
+                            let (r, back): (std::io::Result<usize>, BytesMut) = res;
+                            $buf = back;
+                            $buf.clear();
+                            ok = r.is_ok();
+                        }
+                        _ = monoio::time::sleep(dur) => {
+                            tracing::warn!(
+                                "Connection {} reply write made no progress for {}ms — closing ({} bytes held, client is not reading)",
+                                $client_id,
+                                dur.as_millis(),
+                                pending,
+                            );
+                        }
+                    }
+                    ok
+                }
+            };
+            $live.end_write(pending, ok);
+            ok
+        }
+    }};
+}
+
 use crate::runtime::cancel::CancellationToken;
 use bytes::{Bytes, BytesMut};
 use ringbuf::traits::Producer;
@@ -1793,18 +1852,17 @@ pub(crate) async fn handle_connection_sharded_monoio<
             crate::admin::metrics_setup::record_dispatch_local_inline(inlined as u64);
             if inlined > 0 && read_buf.is_empty() {
                 // All commands were inlined -- flush write_buf and continue
-                if !write_buf.is_empty() {
-                    let data = write_buf.split().freeze();
-                    if !write_all_bounded!(
+                if !write_buf.is_empty()
+                    && !flush_write_buf_bounded!(
                         stream,
-                        data,
+                        write_buf,
                         write_timeout,
                         out_cap_normal,
                         client_live,
                         client_id
-                    ) {
-                        break;
-                    }
+                    )
+                {
+                    break;
                 }
                 continue;
             }
@@ -4734,18 +4792,17 @@ pub(crate) async fn handle_connection_sharded_monoio<
 
         // Write all responses in one batch using ownership I/O
         let write_high_water = write_buf.len();
-        if !write_buf.is_empty() {
-            let data = write_buf.split().freeze();
-            if !write_all_bounded!(
+        if !write_buf.is_empty()
+            && !flush_write_buf_bounded!(
                 stream,
-                data,
+                write_buf,
                 write_timeout,
                 out_cap_normal,
                 client_live,
                 client_id
-            ) {
-                break;
-            }
+            )
+        {
+            break;
         }
 
         // E4: a timed-out cross-shard reply slot must never be reused — the
