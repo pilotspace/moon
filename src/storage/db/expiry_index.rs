@@ -89,7 +89,7 @@ impl Ord for dyn ExpiryLookup + '_ {
 
 /// Look `(ts, key)` up in an index without building a key.
 #[inline]
-pub(crate) fn lookup<'a>(ts: u64, key: &'a [u8]) -> (u64, &'a [u8]) {
+pub(crate) fn lookup(ts: u64, key: &[u8]) -> (u64, &[u8]) {
     (ts, key)
 }
 
