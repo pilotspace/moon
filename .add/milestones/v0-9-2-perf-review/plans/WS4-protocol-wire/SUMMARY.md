@@ -55,3 +55,16 @@ migration_batch_tail, perf_ws4_multibulk_linear.
 Completeness 0.92 · Clarity 0.90 · Practicality 0.92 · Optimization 0.91 · Edge cases 0.92 ·
 Self-evaluation 0.93. Short of 1.0: fuzzers not executed, uring path not resumable,
 small-command wins judged by CPU/request on a noisy box.
+
+## PR #1227 review fixes (orchestrator-committed from the fix agent's report)
+Cherry-picked as `fae8250` (B1), `2a98501` (B2), `a0d6cda` (m1), `bda2eba` (m2), `901e16c` (n1).
+- **B1 — a pipeline past the 1024-frame parse cap was stranded** (direct reads from 3d96c78 fill all
+  of read_buf's spare capacity). The loop now marks the leftover input carried so the next pass parses
+  before reading (monoio, tokio, and the uring bridge runs batch after batch). `tests/perf_ws4_pipeline_cap.rs`
+  (6 cases) red at fea9469 — 2194/2250, 1024/1100 ×3, 1024/1025 on monoio; 1024/1100 ×2 on tokio — green on both.
+- **B2 — TLS reads zero only the range they can fill** (≤ 32 KiB per read): bytes zeroed per byte read
+  159× → 2.0× for a 4 MiB upload (`tls_reads_zero_only_what_they_can_fill`); 4 MiB TLS SET 0.06–0.10 s → 0.03 s.
+- **m1** — an I/O buffer past 1 MiB is shrunk at the batch end that grew it (tokio has no idle downshift):
+  4 idle tokio connections after 32 MiB values 336–344 MiB → 33–161 MiB RSS.
+- **m2** — inline-protocol arguments are copied again (risk 4 above no longer applies); RESP stays zero-copy.
+- Residual: the opt-in `MOON_URING=1` bridge drops replies past ~254 per recv event before and after (pre-existing).
