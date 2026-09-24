@@ -60,15 +60,74 @@ thread_local! {
     static ARMED: Cell<bool> = const { Cell::new(false) };
     /// Pre-images captured since the last drain: `(db_index, key, old_entry)`.
     static PENDING: RefCell<Vec<(usize, Bytes, Entry)>> = const { RefCell::new(Vec::new()) };
-    /// First-wins dedupe set for `PENDING`, same lifetime.
+    /// First-wins dedupe set: every key whose pre-image was captured this
+    /// EPOCH. Held for the whole snapshot (moon#1186) — it used to be
+    /// cleared on every drain, so a hot key was deep-cloned again on every
+    /// tick only for `SnapshotState::capture_cow` to discard the copy.
     static PENDING_KEYS: RefCell<HashSet<(usize, Bytes)>> =
         RefCell::new(HashSet::new());
+    /// Serialization progress of the armed snapshot (moon#1186): lets
+    /// `capture_key` skip keys whose segment is already written, whose
+    /// pre-image the drain would drop anyway. `None` = unknown (capture
+    /// everything, the pre-moon#1186 behaviour).
+    static PROGRESS: RefCell<Option<Progress>> = const { RefCell::new(None) };
+}
+
+/// Mirror of `SnapshotState`'s serialization cursor, so a capture can
+/// answer `is_segment_pending` without the state in scope.
+struct Progress {
+    current_db: usize,
+    current_segment: usize,
+    /// Segment counts per db captured at epoch start.
+    segment_counts: Vec<usize>,
+}
+
+impl Progress {
+    /// Exactly `SnapshotState::is_segment_pending`: segments are written in
+    /// order, so within the current db the written ones are those below
+    /// `current_segment`; a segment created after epoch start (index past
+    /// the captured count) is never written and never pending.
+    fn is_pending(&self, db_index: usize, seg_idx: usize) -> bool {
+        if db_index > self.current_db {
+            return true;
+        }
+        if db_index < self.current_db {
+            return false;
+        }
+        let count = self.segment_counts.get(db_index).copied().unwrap_or(0);
+        seg_idx < count && seg_idx >= self.current_segment
+    }
 }
 
 /// Arm capture for a snapshot that just began on this shard.
 pub(crate) fn arm() {
     clear();
     ARMED.with(|a| a.set(true));
+}
+
+/// [`arm`] with the snapshot's epoch-start segment layout, so captures for
+/// already-written segments are skipped at the source (moon#1186).
+pub(crate) fn arm_with_layout(segment_counts: Vec<usize>) {
+    arm();
+    PROGRESS.with(|p| {
+        *p.borrow_mut() = Some(Progress {
+            current_db: 0,
+            current_segment: 0,
+            segment_counts,
+        })
+    });
+}
+
+/// Publish the snapshot's cursor after a segment advance (moon#1186). Must
+/// be called AFTER the tick's [`drain_into`] and advance, never between
+/// them: a pre-image is filtered against the cursor it was captured under.
+pub(crate) fn note_progress(current_db: usize, current_segment: usize) {
+    PROGRESS.with(|p| {
+        if let Some(progress) = p.borrow_mut().as_mut() {
+            progress.current_db = current_db;
+            progress.current_segment = current_segment;
+        }
+    });
 }
 
 /// Disarm and drop anything still queued (the snapshot finished or failed —
@@ -95,6 +154,7 @@ pub(crate) fn pending_for_test() -> Vec<(usize, Bytes, Entry)> {
 fn clear() {
     PENDING.with(|p| p.borrow_mut().clear());
     PENDING_KEYS.with(|k| k.borrow_mut().clear());
+    PROGRESS.with(|p| *p.borrow_mut() = None);
 }
 
 /// Capture the pre-image of the key a `cmd + args` write is about to touch.
@@ -191,14 +251,26 @@ pub(crate) fn capture_key_pre_image(db: &Database, db_index: usize, key: &Bytes)
 
 /// Out-of-line slow path: look up and stash the old entry, first write wins.
 fn capture_key(db: &Database, db_index: usize, key: &Bytes) {
-    let fresh = PENDING_KEYS.with(|k| k.borrow_mut().insert((db_index, key.clone())));
-    if !fresh {
+    // moon#1186: a key whose segment is already written needs no pre-image —
+    // the file holds its epoch-start bytes and the drain would drop the copy.
+    // Skip it BEFORE the deep clone.
+    let written = PROGRESS.with(|p| {
+        p.borrow().as_ref().is_some_and(|progress| {
+            let hash = crate::storage::dashtable::hash_key(key);
+            !progress.is_pending(db_index, db.data().segment_index_for_hash(hash))
+        })
+    });
+    if written {
+        return;
+    }
+    if PENDING_KEYS.with(|k| k.borrow().contains(&(db_index, key.clone()))) {
         // Already captured this epoch — the FIRST pre-image is the
         // epoch-start value; a later one would be a value the snapshot must
         // not contain.
         return;
     }
     if let Some(old_entry) = db.data().get(key) {
+        PENDING_KEYS.with(|k| k.borrow_mut().insert((db_index, key.clone())));
         PENDING.with(|p| {
             p.borrow_mut()
                 .push((db_index, key.clone(), old_entry.clone()))
@@ -206,7 +278,9 @@ fn capture_key(db: &Database, db_index: usize, key: &Bytes) {
     }
     // A key that does not exist yet needs no pre-image: the snapshot's
     // correct content for it is "absent", which is what serializing the
-    // segment without an overflow record produces.
+    // segment without an overflow record produces. It is not marked either:
+    // its first write that finds it present captures it — the same value
+    // the per-drain reset used to capture on the next tick.
 }
 
 /// Fold everything captured since the last drain into `snap`, dropping
@@ -221,7 +295,8 @@ pub(crate) fn drain_into(snap: &mut SnapshotState) {
     }
     let captured: Vec<(usize, Bytes, Entry)> =
         PENDING.with(|p| std::mem::take(&mut *p.borrow_mut()));
-    PENDING_KEYS.with(|k| k.borrow_mut().clear());
+    // PENDING_KEYS is NOT reset here (moon#1186): first-wins holds for the
+    // whole epoch, so a hot key is cloned once, not once per tick.
     crate::shard::slice::with_shard(|s| {
         // Read guards only: the drain inspects each db's segment layout, it
         // never mutates one. Held across every captured pre-image so the
@@ -614,5 +689,99 @@ mod tests {
             ),
             _ => panic!("expected a string entry"),
         }
+    }
+
+    /// moon#1186: first-wins holds for the whole EPOCH. A hot key written on
+    /// every tick used to be deep-cloned again after each drain (the dedupe
+    /// set was cleared per drain) only for `capture_cow` to drop the copy.
+    #[test]
+    fn hot_key_is_cloned_once_per_epoch_not_once_per_tick() {
+        let mut dbs = vec![Database::new()];
+        for i in 0..100 {
+            dbs[0].set_string(format!("hot_{i:03}").as_bytes(), Bytes::from_static(b"0"));
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = SnapshotState::new(0, 1, &dbs, dir.path().join("s.rrdshard"));
+        disarm();
+        arm_with_layout(state.segment_counts().to_vec());
+        let hot = Bytes::from_static(b"hot_050");
+        let args = [Frame::BulkString(hot.clone())];
+        for tick in 0..5 {
+            let mut selected = 0usize;
+            let _ = crate::command::dispatch(&mut dbs[0], b"INCR", &args, &mut selected, 16);
+            let captured = PENDING.with(|p| std::mem::take(&mut *p.borrow_mut()));
+            if tick == 0 {
+                assert_eq!(
+                    captured.len(),
+                    1,
+                    "first write captures the epoch-start value"
+                );
+            } else {
+                assert!(
+                    captured.is_empty(),
+                    "tick {tick}: a key already captured this epoch was cloned again"
+                );
+            }
+            drain_into_with_dbs(&mut state, &dbs, captured);
+        }
+        disarm();
+    }
+
+    /// moon#1186: a write to a key whose segment is already written needs no
+    /// pre-image — it is skipped BEFORE the deep clone, not dropped by the
+    /// drain after it.
+    #[test]
+    fn capture_skips_keys_in_already_written_segments() {
+        let mut dbs = vec![Database::new()];
+        for i in 0..200 {
+            dbs[0].set_string(format!("w_{i:04}").as_bytes(), Bytes::from_static(b"1"));
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = SnapshotState::new(0, 1, &dbs, dir.path().join("s.rrdshard"));
+        assert!(dbs[0].data().segment_count() > 2, "fixture needs segments");
+        disarm();
+        arm_with_layout(state.segment_counts().to_vec());
+        assert!(!state.advance_one_segment(&dbs));
+        note_progress(state.current_db_index(), state.current_segment_index());
+
+        let written = key_in(&dbs[0], 0);
+        let pending = key_in(&dbs[0], 1);
+        let mut selected = 0usize;
+        let _ = crate::command::dispatch(
+            &mut dbs[0],
+            b"INCR",
+            &[Frame::BulkString(written)],
+            &mut selected,
+            16,
+        );
+        assert!(
+            pending_for_test().is_empty(),
+            "a written segment's key must not be cloned"
+        );
+        let _ = crate::command::dispatch(
+            &mut dbs[0],
+            b"INCR",
+            &[Frame::BulkString(pending.clone())],
+            &mut selected,
+            16,
+        );
+        let captured = pending_for_test();
+        disarm();
+        assert_eq!(
+            captured.len(),
+            1,
+            "a pending segment's key is still captured"
+        );
+        assert_eq!(captured[0].1, pending);
+    }
+
+    fn key_in(db: &Database, seg: usize) -> Bytes {
+        db.data()
+            .segment(seg)
+            .iter_occupied()
+            .next()
+            .unwrap()
+            .0
+            .to_bytes()
     }
 }

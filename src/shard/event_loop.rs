@@ -1570,25 +1570,22 @@ impl super::Shard {
                         &shard_databases,
                         shard_id,
                     ) {
-                        if let Some(snap) = snapshot_state.as_mut() {
-                            if let Err(e) = snap.finalize_async().await {
-                                persistence_tick::finalize_snapshot_error(
-                                    &mut snapshot_state, &mut snapshot_reply_tx, shard_id,
-                                    &e.to_string(),
-                                );
-                                // Decrement the BGSAVE fan-in counter (same as
-                                // the monoio arm below — this was missing here,
-                                // so tokio BGSAVE left rdb_bgsave_in_progress
-                                // stuck at 1 forever). Safe for auto-save
-                                // snapshots too: the counter ignores calls at 0.
-                                crate::command::persistence::bgsave_shard_done(false);
-                            } else {
-                                persistence_tick::finalize_snapshot_success(
-                                    &mut snapshot_state, &mut snapshot_reply_tx, shard_id,
-                                );
+                        // moon#1186: the file is written, fsynced and renamed
+                        // on the snapshot's writer thread; the tick polls.
+                        match persistence_tick::drive_snapshot_finalize(
+                            &mut snapshot_state, &mut snapshot_reply_tx, shard_id,
+                        ) {
+                            // Decrement the BGSAVE fan-in counter (same as
+                            // the monoio arm below — this was missing here,
+                            // so tokio BGSAVE left rdb_bgsave_in_progress
+                            // stuck at 1 forever). Safe for auto-save
+                            // snapshots too: the counter ignores calls at 0.
+                            Some(false) => crate::command::persistence::bgsave_shard_done(false),
+                            Some(true) => {
                                 crate::command::persistence::bgsave_shard_done(true);
                                 bgsave_checkpoint_requested = true;
                             }
+                            None => {}
                         }
                     }
 
@@ -2370,24 +2367,19 @@ impl super::Shard {
                     &shard_databases,
                     shard_id,
                 ) {
-                    if let Some(snap) = snapshot_state.as_mut() {
-                        if let Err(e) = snap.finalize_async().await {
-                            persistence_tick::finalize_snapshot_error(
-                                &mut snapshot_state,
-                                &mut snapshot_reply_tx,
-                                shard_id,
-                                &e.to_string(),
-                            );
-                            crate::command::persistence::bgsave_shard_done(false);
-                        } else {
-                            persistence_tick::finalize_snapshot_success(
-                                &mut snapshot_state,
-                                &mut snapshot_reply_tx,
-                                shard_id,
-                            );
+                    // moon#1186: the file is written, fsynced and renamed on
+                    // the snapshot's writer thread; the tick only polls.
+                    match persistence_tick::drive_snapshot_finalize(
+                        &mut snapshot_state,
+                        &mut snapshot_reply_tx,
+                        shard_id,
+                    ) {
+                        Some(false) => crate::command::persistence::bgsave_shard_done(false),
+                        Some(true) => {
                             crate::command::persistence::bgsave_shard_done(true);
                             bgsave_checkpoint_requested = true;
                         }
+                        None => {}
                     }
                 }
 

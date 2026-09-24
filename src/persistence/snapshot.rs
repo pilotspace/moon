@@ -12,12 +12,12 @@
 //!
 //! | Context | Classification | Rationale |
 //! |---------|---------------|-----------|
-//! | `finalize`, `finalize_async` | **should-recover** (`Result<_, MoonError>`) | Snapshot save failure should not crash server |
+//! | `finalize`, `begin_finalize`/`poll_finalize` | **should-recover** (`Result<_, MoonError>`) | Snapshot save failure should not crash server |
 //! | `shard_snapshot_save` | **should-recover** (`Result<_, MoonError>`) | Calls finalize; same recovery semantics |
 //! | `shard_snapshot_load` | **should-recover** (`Result<_, MoonError>`) | Startup load; failure = log + continue empty |
 //! | All `unwrap()` calls (30) | **test-only** | Only appear in `#[cfg(test)]` module |
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
 
@@ -88,11 +88,21 @@ pub struct SnapshotState {
     num_databases: usize,
     /// Segment counts per database, captured at epoch start.
     segment_counts: Vec<usize>,
-    /// Output buffer accumulating serialized bytes.
+    /// Output buffer accumulating serialized bytes. With a
+    /// [`SnapshotStream`](crate::persistence::snapshot_stream::SnapshotStream)
+    /// attached (every event-loop snapshot, moon#1186) it holds only the
+    /// block not yet handed to the writer thread; without one (synchronous
+    /// `finalize` callers) it holds the whole file.
     output_buf: Vec<u8>,
-    /// COW overflow buffer: (db_index, segment_storage_idx, key, entry) for entries
-    /// modified before their segment was serialized.
-    overflow: Vec<(usize, usize, Bytes, Entry)>,
+    /// Off-shard-thread writer (moon#1186): receives filled blocks, writes
+    /// the temp file with a streaming CRC, and publishes it on finalize.
+    stream: Option<crate::persistence::snapshot_stream::SnapshotStream>,
+    /// COW overflow buffer, keyed by `(db_index, segment_storage_idx)`: the
+    /// pre-images of entries modified before their segment was serialized.
+    /// A segment's list is REMOVED (moved, never cloned) when the segment is
+    /// serialized (moon#1186 — it used to be one flat `Vec` rescanned, and
+    /// deep-cloned, on every segment advance).
+    overflow: HashMap<(usize, usize), Vec<(Bytes, Entry)>>,
     /// Keys already present in `overflow`, so a key written twice inside one
     /// epoch keeps its FIRST pre-image (moon#517). Without this, the second
     /// capture appended a second record for the same key and
@@ -100,7 +110,8 @@ pub struct SnapshotState {
     /// segment in insertion order — let the LATER one win on load: the
     /// snapshot then held a value that already includes the first write,
     /// which the WAL replays on top of. Cheap: `Bytes` clones are refcount
-    /// bumps, and the set strictly shrinks the overflow buffer.
+    /// bumps, and the set strictly shrinks the overflow buffer. A segment's
+    /// keys leave the set when the segment is serialized.
     overflow_keys: HashSet<(usize, usize, Bytes)>,
     /// Per-database sets of segment storage indices that have already been serialized.
     /// Outer index = db_index. Used to determine if a segment is still "pending".
@@ -156,7 +167,8 @@ impl SnapshotState {
             num_databases,
             segment_counts,
             output_buf: Vec::with_capacity(4096),
-            overflow: Vec::new(),
+            stream: None,
+            overflow: HashMap::new(),
             overflow_keys: HashSet::new(),
             serialized_segments,
             shard_id,
@@ -201,6 +213,108 @@ impl SnapshotState {
         self.current_db
     }
 
+    /// Segment index (within [`Self::current_db_index`]) serialized next.
+    #[inline]
+    pub fn current_segment_index(&self) -> usize {
+        self.current_segment
+    }
+
+    /// Segment counts per database captured at epoch start.
+    #[inline]
+    pub fn segment_counts(&self) -> &[usize] {
+        &self.segment_counts
+    }
+
+    /// Stream serialized blocks to an off-shard-thread writer (moon#1186)
+    /// instead of buffering the whole file. Call right after construction;
+    /// on `Err` (no thread) the state keeps the in-memory path.
+    pub fn start_streaming(&mut self) -> Result<(), MoonError> {
+        if self.stream.is_some() {
+            return Ok(());
+        }
+        let stream = crate::persistence::snapshot_stream::SnapshotStream::spawn(
+            self.shard_id,
+            self.file_path.clone(),
+        )
+        .map_err(|e| SnapshotError::Io {
+            path: self.file_path.clone(),
+            source: e,
+        })?;
+        self.stream = Some(stream);
+        self.ship_if_ready();
+        Ok(())
+    }
+
+    /// Hand the output block to the writer thread once it is big enough.
+    fn ship_if_ready(&mut self) {
+        use crate::persistence::snapshot_stream::SNAPSHOT_STREAM_CHUNK;
+        if let Some(stream) = &self.stream
+            && self.output_buf.len() >= SNAPSHOT_STREAM_CHUNK
+        {
+            let block = std::mem::replace(
+                &mut self.output_buf,
+                Vec::with_capacity(SNAPSHOT_STREAM_CHUNK + SNAPSHOT_STREAM_CHUNK / 4),
+            );
+            stream.send(block);
+        }
+    }
+
+    /// The writer thread is more than
+    /// [`SNAPSHOT_STREAM_MAX_IN_FLIGHT`](crate::persistence::snapshot_stream::SNAPSHOT_STREAM_MAX_IN_FLIGHT)
+    /// bytes behind: the tick should not serialize another segment yet.
+    #[inline]
+    pub fn stream_backlogged(&self) -> bool {
+        self.stream.as_ref().is_some_and(|s| s.backlogged())
+    }
+
+    /// A write on the writer thread already failed: the snapshot cannot
+    /// succeed, finalize now to report it.
+    #[inline]
+    pub fn stream_failed(&self) -> bool {
+        self.stream.as_ref().is_some_and(|s| s.failed())
+    }
+
+    /// Start publishing the snapshot OFF the shard thread (moon#1186): the
+    /// last block and the EOF marker go to the writer thread, which appends
+    /// the CRC footer, fsyncs, renames and fsyncs the directory. Poll the
+    /// outcome with [`Self::poll_finalize`]. Idempotent.
+    pub fn begin_finalize(&mut self) -> Result<(), MoonError> {
+        if self.stream.as_ref().is_some_and(|s| s.finishing()) {
+            return Ok(());
+        }
+        if self.stream.is_none() {
+            // In-memory state: the whole buffer goes to a writer thread now.
+            self.start_streaming()?;
+        }
+        self.output_buf.push(EOF_MARKER);
+        let block = std::mem::take(&mut self.output_buf);
+        if let Some(stream) = self.stream.as_mut() {
+            stream.send(block);
+            stream.finish();
+        }
+        Ok(())
+    }
+
+    /// True once [`Self::begin_finalize`] ran.
+    #[inline]
+    pub fn finalize_started(&self) -> bool {
+        self.stream.as_ref().is_some_and(|s| s.finishing())
+    }
+
+    /// Non-blocking: `Some(outcome)` once the writer thread has published
+    /// (or failed to publish) the file; `None` while it is still working.
+    pub fn poll_finalize(&self) -> Option<Result<(), String>> {
+        match &self.stream {
+            Some(s) if s.finishing() => s.poll(),
+            _ => None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn stream_in_flight(&self) -> usize {
+        self.stream.as_ref().map_or(0, |s| s.in_flight())
+    }
+
     /// Check if a segment in a given database has NOT yet been serialized.
     ///
     /// Returns true if the snapshot is active for this db and the segment is pending.
@@ -241,7 +355,9 @@ impl SnapshotState {
             return;
         }
         self.overflow
-            .push((db_index, segment_storage_idx, key, old_entry));
+            .entry((db_index, segment_storage_idx))
+            .or_default()
+            .push((key, old_entry));
     }
 
     /// Advance the snapshot by one segment. Returns true when all segments are done.
@@ -295,24 +411,30 @@ impl SnapshotState {
         }
 
         let seg_idx = self.current_segment;
+        let db_idx = self.current_db;
         let segment = db.data().segment(seg_idx);
 
-        // Collect overflow entries for this segment
-        let overflow_entries: Vec<(Bytes, Entry)> = self
-            .overflow
-            .iter()
-            .filter(|(db_idx, s_idx, _, _)| *db_idx == self.current_db && *s_idx == seg_idx)
-            .map(|(_, _, k, e)| (k.clone(), e.clone()))
-            .collect();
+        // This segment's pre-images, MOVED out of the overflow map (moon#1186:
+        // no rescan of every captured pre-image, no deep clone). Their keys
+        // leave the dedupe set too — the segment is final once written.
+        let overflow_entries: Vec<(Bytes, Entry)> =
+            self.overflow.remove(&(db_idx, seg_idx)).unwrap_or_default();
+        for (key, _) in &overflow_entries {
+            self.overflow_keys.remove(&(db_idx, seg_idx, key.clone()));
+        }
         let overflow_keys: HashSet<&[u8]> =
             overflow_entries.iter().map(|(k, _)| k.as_ref()).collect();
 
-        // Remove consumed overflow entries
-        self.overflow
-            .retain(|(db_idx, s_idx, _, _)| !(*db_idx == self.current_db && *s_idx == seg_idx));
-
-        // Collect all entries for this segment: overflow + live (non-overlap, non-expired)
-        let mut segment_entries: Vec<u8> = Vec::new();
+        // Segment block: marker + segment_idx + entry_count + data + CRC32,
+        // written straight into the output buffer (moon#1186: no per-segment
+        // staging `Vec` copied a second time). `entry_count` is patched in
+        // once the entries are known.
+        self.output_buf.push(SEGMENT_BLOCK_MARKER);
+        self.output_buf
+            .extend_from_slice(&(seg_idx as u32).to_le_bytes());
+        let count_pos = self.output_buf.len();
+        self.output_buf.extend_from_slice(&0u32.to_le_bytes());
+        let data_start = self.output_buf.len();
         let mut entry_count: u32 = 0;
 
         // Write overflow entries first (these represent old values before modification)
@@ -320,7 +442,10 @@ impl SnapshotState {
             if entry.has_expiry() && entry.is_expired_at(now_ms) {
                 continue;
             }
-            if let Err(e) = rdb::write_entry(&mut segment_entries, key, entry) {
+            let mark = self.output_buf.len();
+            if let Err(e) = rdb::write_entry(&mut self.output_buf, key, entry) {
+                // Drop the partial entry: the block must stay parseable.
+                self.output_buf.truncate(mark);
                 tracing::warn!("Snapshot: skipping entry serialization error: {}", e);
                 continue;
             }
@@ -329,32 +454,27 @@ impl SnapshotState {
 
         // Write live entries, skipping those already in overflow and expired ones
         for (key, entry) in segment.iter_occupied() {
-            if overflow_keys.contains(key.as_bytes()) {
+            if !overflow_keys.is_empty() && overflow_keys.contains(key.as_bytes()) {
                 continue;
             }
             if entry.has_expiry() && entry.is_expired_at(now_ms) {
                 continue;
             }
-            if let Err(e) = rdb::write_entry(&mut segment_entries, key.as_bytes(), entry) {
+            let mark = self.output_buf.len();
+            if let Err(e) = rdb::write_entry(&mut self.output_buf, key.as_bytes(), entry) {
+                self.output_buf.truncate(mark);
                 tracing::warn!("Snapshot: skipping entry serialization error: {}", e);
                 continue;
             }
             entry_count += 1;
         }
 
-        // Write segment block: marker + segment_idx + entry_count + data + CRC32
-        self.output_buf.push(SEGMENT_BLOCK_MARKER);
-        self.output_buf
-            .extend_from_slice(&(seg_idx as u32).to_le_bytes());
-        self.output_buf
-            .extend_from_slice(&entry_count.to_le_bytes());
-
         // Per-segment CRC32 covers the entry data
+        let data_end = self.output_buf.len();
+        self.output_buf[count_pos..count_pos + 4].copy_from_slice(&entry_count.to_le_bytes());
         let mut hasher = Hasher::new();
-        hasher.update(&segment_entries);
+        hasher.update(&self.output_buf[data_start..data_end]);
         let crc = hasher.finalize();
-
-        self.output_buf.extend_from_slice(&segment_entries);
         self.output_buf.extend_from_slice(&crc.to_le_bytes());
 
         // Mark this segment as serialized
@@ -370,11 +490,30 @@ impl SnapshotState {
             }
         }
 
+        // moon#1186: hand full blocks to the writer thread as they fill.
+        self.ship_if_ready();
+
         self.current_db >= self.num_databases
     }
 
     /// Finalize the snapshot: write EOF marker, global CRC32, and atomically write to disk.
+    ///
+    /// Synchronous — for callers off the shard event loop (`SAVE`-style
+    /// helpers, tests). With a stream attached it hands off to the writer
+    /// thread and waits for it; the event loop uses
+    /// [`Self::begin_finalize`] + [`Self::poll_finalize`] instead.
     pub fn finalize(&mut self) -> Result<(), MoonError> {
+        if self.stream.is_some() {
+            self.begin_finalize()?;
+            let outcome = self.stream.as_ref().map_or(Ok(()), |s| s.wait());
+            return outcome.map_err(|detail| {
+                SnapshotError::Io {
+                    path: self.file_path.clone(),
+                    source: std::io::Error::other(detail),
+                }
+                .into()
+            });
+        }
         // Write EOF marker
         self.output_buf.push(EOF_MARKER);
 
@@ -403,82 +542,6 @@ impl SnapshotState {
                 path: parent.to_path_buf(),
                 source: e,
             })?;
-        }
-
-        Ok(())
-    }
-
-    /// Async variant of finalize: uses tokio::fs for non-blocking I/O.
-    ///
-    /// Under Monoio, falls back to synchronous write (thread-per-core model,
-    /// rare operation, acceptable blocking).
-    pub async fn finalize_async(&mut self) -> Result<(), MoonError> {
-        // Write EOF marker
-        self.output_buf.push(EOF_MARKER);
-
-        // Global CRC32 of entire output_buf
-        let mut hasher = Hasher::new();
-        hasher.update(&self.output_buf);
-        let global_crc = hasher.finalize();
-        self.output_buf.extend_from_slice(&global_crc.to_le_bytes());
-
-        // Atomic write: write to .tmp, then rename
-        let tmp_path = self.file_path.with_extension("rrdshard.tmp");
-
-        // Take ownership of buffer to avoid borrow across await
-        let buf = std::mem::take(&mut self.output_buf);
-        let file_path = self.file_path.clone();
-
-        #[cfg(feature = "runtime-tokio")]
-        {
-            tokio::fs::write(&tmp_path, &buf)
-                .await
-                .map_err(|e| SnapshotError::Io {
-                    path: tmp_path.clone(),
-                    source: e,
-                })?;
-            crate::persistence::fsync::fsync_file(&tmp_path).map_err(|e| SnapshotError::Io {
-                path: tmp_path.clone(),
-                source: e,
-            })?;
-            tokio::fs::rename(&tmp_path, &file_path)
-                .await
-                .map_err(|e| SnapshotError::Io {
-                    path: file_path.clone(),
-                    source: e,
-                })?;
-            if let Some(parent) = file_path.parent() {
-                crate::persistence::fsync::fsync_directory(parent).map_err(|e| {
-                    SnapshotError::Io {
-                        path: parent.to_path_buf(),
-                        source: e,
-                    }
-                })?;
-            }
-        }
-
-        #[cfg(feature = "runtime-monoio")]
-        {
-            std::fs::write(&tmp_path, &buf).map_err(|e| SnapshotError::Io {
-                path: tmp_path.clone(),
-                source: e,
-            })?;
-            crate::persistence::fsync::fsync_file(&tmp_path).map_err(|e| SnapshotError::Io {
-                path: tmp_path.clone(),
-                source: e,
-            })?;
-            std::fs::rename(&tmp_path, &file_path).map_err(|e| SnapshotError::Io {
-                path: file_path.clone(),
-                source: e,
-            })?;
-            if let Some(parent) = file_path.parent() {
-                crate::persistence::fsync::fsync_directory(parent).map_err(|e| {
-                    SnapshotError::Io {
-                        path: parent.to_path_buf(),
-                        source: e,
-                    }
-                })?;
-            }
         }
 
         Ok(())
@@ -1308,9 +1371,10 @@ mod tests {
         assert!(state.is_complete());
     }
 
-    #[cfg(feature = "runtime-tokio")]
-    #[tokio::test]
-    async fn test_finalize_async_writes_valid_file() {
+    /// The event loop's finalize (moon#1186): begin, then poll without
+    /// blocking until the writer thread has published a loadable file.
+    #[test]
+    fn test_begin_and_poll_finalize_publishes_a_valid_file() {
         let (_dir, path) = snap_path();
         let mut dbs = vec![Database::new()];
         dbs[0].set_string(b"async_k1", Bytes::from_static(b"async_v1"));
@@ -1318,12 +1382,26 @@ mod tests {
 
         let mut state = SnapshotState::new(0, 1, &dbs, path.to_path_buf());
         while !state.advance_one_segment(&dbs) {}
-        state.finalize_async().await.unwrap();
+        state.begin_finalize().unwrap();
+        assert!(state.finalize_started());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let outcome = loop {
+            if let Some(r) = state.poll_finalize() {
+                break r;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "finalize never completed"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        };
+        outcome.unwrap();
 
         // Verify file was written and is loadable
+        assert!(path.exists(), "Snapshot file should exist after finalize");
         assert!(
-            path.exists(),
-            "Snapshot file should exist after finalize_async"
+            !path.with_extension("rrdshard.tmp").exists(),
+            "temp file must be renamed away"
         );
         let mut loaded = vec![Database::new()];
         let count = shard_snapshot_load(&mut loaded, &path).unwrap();
@@ -1408,3 +1486,6 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod stream_tests;
