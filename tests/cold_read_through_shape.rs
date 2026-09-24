@@ -18,6 +18,11 @@
 //! the call site is on the allowlist below, with a reason. Adding a hot-only
 //! read to a command now fails a test that names the file and the line.
 //!
+//! moon#1161 added `peek_if_alive`, the `LOOKUP_NOTOUCH` twin that does not
+//! record an access for the eviction policy. It is exactly as hot-only, so it
+//! is denied on the same terms: otherwise switching a call to the NOTOUCH form
+//! would silently take it out from under this pin.
+//!
 //! Source-grep in the style of `tests/xshard_cleanup_shape.rs` — reads `.rs`
 //! files at runtime, no server, no feature flags.
 //!
@@ -75,6 +80,15 @@ fn collect_rs(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
+/// The hot-plane-only accessors, in call form. `get_if_alive_any_plane(` and
+/// `peek_if_alive_any_plane(` contain neither, so the read-through twins never
+/// match: the open paren must follow the bare name.
+const HOT_ONLY_CALLS: &[&str] = &["get_if_alive(", "peek_if_alive("];
+
+fn calls_hot_only(line: &str) -> bool {
+    HOT_ONLY_CALLS.iter().any(|c| line.contains(c))
+}
+
 fn repo_relative(path: &Path) -> String {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     path.strip_prefix(root)
@@ -105,7 +119,7 @@ fn command_handlers_do_not_read_the_hot_plane_alone() {
             // `get_if_alive_any_plane` also contains `get_if_alive`, so match
             // the call form exactly: the hot-only accessor is always followed
             // by its open paren.
-            if line.contains("get_if_alive(") {
+            if calls_hot_only(line) {
                 violations.push(format!("{}:{}: {}", rel, idx + 1, line.trim()));
             }
         }
@@ -114,11 +128,13 @@ fn command_handlers_do_not_read_the_hot_plane_alone() {
     assert!(
         violations.is_empty(),
         "command handlers must read through every plane (moon#610).\n\
-         `Database::get_if_alive` is HOT-PLANE ONLY: it answers None for a key \
-         that has been spilled to the cold tier, so the command reports the key \
-         as absent while EXISTS reports it present.\n\
-         Use `Database::get_if_alive_any_plane` instead, or add the call site to \
-         ALLOWED in this file with the reason it is genuinely hot-only.\n\n\
+         `Database::get_if_alive` and its NOTOUCH twin `peek_if_alive` are \
+         HOT-PLANE ONLY: they answer None for a key that has been spilled to the \
+         cold tier, so the command reports the key as absent while EXISTS \
+         reports it present.\n\
+         Use `Database::get_if_alive_any_plane` / `peek_if_alive_any_plane` \
+         instead, or add the call site to ALLOWED in this file with the reason \
+         it is genuinely hot-only.\n\n\
          Offending call sites:\n  {}",
         violations.join("\n  ")
     );
@@ -133,11 +149,17 @@ fn the_allowlist_has_no_stale_entries() {
         let path = root.join(file);
         let text = std::fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("allowlisted file {file} is unreadable: {e}"));
+        // Code lines only: a comment that merely NAMES the accessor must not
+        // keep an entry alive after its last call site is gone.
+        let calls = text
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .any(calls_hot_only);
         assert!(
-            text.contains("get_if_alive("),
+            calls,
             "{file} is on the hot-only allowlist ({reason}) but no longer calls \
-             `get_if_alive(` — drop the entry so the next hot-only read in this \
-             file is caught."
+             `get_if_alive(` or `peek_if_alive(` — drop the entry so the next \
+             hot-only read in this file is caught."
         );
     }
 }
