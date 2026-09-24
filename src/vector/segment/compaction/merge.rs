@@ -137,16 +137,19 @@ fn merge_graph_union(
 
     // moon#1193: every merged entry must carry real sub-centroid signs, or
     // the merged segment carries none (all-or-nothing, like the sidecar). A
-    // source reloaded from a pre-v2 segment directory has no signs; they are
+    // source without signs (a pre-v2 reload, a LIGHT non-TQ4 build) has them
     // recomputed from its f16 sidecar row instead of zero-filled (a zero row
     // pins every coordinate to the lower sub-bin and biases its 32-level
-    // score). SQ8 keeps its zero-filled buffer — the search never reads it.
+    // score). A quantizer without an encoder (SQ8, TQ1-3) gets NO buffer —
+    // not a zero placeholder that `segment_io` would persist as if real
+    // (moon#1221 review).
     let mut sign_enc = if is_sq8 {
         None
     } else {
         SubSignEncoder::new(collection).filter(|e| e.bytes_per_vec() == sub_bpv)
     };
-    let mut all_have_signs = sign_enc.is_some();
+    let signs_possible = sign_enc.is_some();
+    let mut all_have_signs = signs_possible;
     let mut recomputed_signs = 0usize;
 
     for seg in segments {
@@ -281,7 +284,11 @@ fn merge_graph_union(
     let mut tq_buffer_orig: Vec<u8> = Vec::with_capacity(n * bytes_per_code);
     let mut qjl_orig: Vec<u8> = Vec::with_capacity(n * qjl_bpv);
     let mut residual_norms: Vec<f32> = Vec::with_capacity(n);
-    let mut sub_orig: Vec<u8> = Vec::with_capacity(n * sub_bpv);
+    let mut sub_orig: Vec<u8> = if all_have_signs {
+        Vec::with_capacity(n * sub_bpv)
+    } else {
+        Vec::new()
+    };
     let mut mvcc_orig: Vec<MvccHeader> = Vec::with_capacity(n);
     let mut raw_orig: Vec<u16> = if all_have_raw {
         Vec::with_capacity(n * dim)
@@ -312,7 +319,8 @@ fn merge_graph_union(
         };
         residual_norms.push(entry_norm);
 
-        if sub_bpv > 0 {
+        // `all_have_signs` ⇒ every surviving `sub` is a full real row.
+        if all_have_signs && sub_bpv > 0 {
             if sub.len() == sub_bpv {
                 sub_orig.extend_from_slice(sub);
             } else {
@@ -433,7 +441,11 @@ fn merge_graph_union(
     // BFS-reorder QJL, residual norms, sub-centroid signs.
     let mut qjl_bfs = vec![0u8; n * qjl_bpv];
     let mut norms_bfs = vec![0.0f32; n];
-    let mut sub_bfs = vec![0u8; n * sub_bpv];
+    let mut sub_bfs = if all_have_signs {
+        vec![0u8; n * sub_bpv]
+    } else {
+        Vec::new()
+    };
     for bfs_pos in 0..n {
         let orig_id = graph.to_original(bfs_pos as u32) as usize;
         if qjl_bpv > 0 {
@@ -446,7 +458,7 @@ fn merge_graph_union(
         if orig_id < residual_norms.len() {
             norms_bfs[bfs_pos] = residual_norms[orig_id];
         }
-        if sub_bpv > 0 {
+        if all_have_signs && sub_bpv > 0 {
             let src = orig_id * sub_bpv;
             let dst = bfs_pos * sub_bpv;
             if src + sub_bpv <= sub_orig.len() {
@@ -496,16 +508,19 @@ fn merge_graph_union(
         });
     }
 
-    // moon#1193: never ship a partially zero-filled sign buffer.
-    let sub_bfs = if is_sq8 || all_have_signs {
+    // moon#1193: never ship a partially zero-filled sign buffer — nor, for
+    // a quantizer without signs, an all-zero one (moon#1221 review).
+    let sub_bfs = if all_have_signs {
         sub_bfs
     } else {
-        tracing::debug!(
-            sources = segments.len(),
-            "GraphUnion merge: a source row has neither sub-centroid signs nor an \
-             f16 sidecar to recompute them from — merged segment searches with \
-             the 16-level LUT"
-        );
+        if signs_possible {
+            tracing::debug!(
+                sources = segments.len(),
+                "GraphUnion merge: a source row has neither sub-centroid signs nor an \
+                 f16 sidecar to recompute them from — merged segment searches with \
+                 the 16-level LUT"
+            );
+        }
         Vec::new()
     };
     if recomputed_signs > 0 {

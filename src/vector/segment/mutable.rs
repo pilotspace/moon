@@ -389,11 +389,9 @@ impl MutableSegment {
             let (codes, raw_norm) = encode_sq8_slot(vector_f32, self.collection.metric, dim);
             inner.tq_codes.extend_from_slice(&codes);
 
-            // Keep the sub-centroid sign buffer offset-consistent (unused for SQ8).
-            let sub_bpv = inner.sub_sign_bytes_per_vec;
-            inner
-                .sub_centroid_signs
-                .extend(std::iter::repeat_n(0u8, sub_bpv));
+            // No sub-centroid sign row: SQ8 has no signs, and a zero-filled
+            // placeholder row was persisted as if real (moon#1221 review).
+            // The buffer stays EMPTY for every non-TQ4 quantizer.
 
             let is_exact = self.collection.build_mode
                 == crate::vector::turbo_quant::collection::BuildMode::Exact;
@@ -461,15 +459,13 @@ impl MutableSegment {
         let is_a2 = self.collection.quantization == QuantizationConfig::TurboQuant4A2;
         inner.maintain_fastscan_shadow(internal_id, &code.codes, is_a2);
 
-        // Append sub-centroid signs (Light mode TQ4 only)
+        // Append sub-centroid signs — scalar TQ4 only, the one quantizer
+        // with an insert-time sign encoder. Every other path (A2, TQ1-3,
+        // Prod4, SQ8) leaves the buffer EMPTY: the zero-filled placeholder
+        // rows it used to get were searched with the 32-level LUT and
+        // persisted as if real (moon#1221 review). Empty = 16-level LUT.
         if let Some(signs) = sub_signs {
             inner.sub_centroid_signs.extend_from_slice(&signs);
-        } else {
-            // Zero-fill for non-TQ4 paths (A2, multi-bit)
-            let sub_bpv = inner.sub_sign_bytes_per_vec;
-            inner
-                .sub_centroid_signs
-                .extend(std::iter::repeat_n(0u8, sub_bpv));
         }
 
         // Exact mode: retain raw f32 + zero-fill QJL (recomputed at freeze).
@@ -1194,11 +1190,7 @@ impl MutableSegment {
             let (codes, raw_norm) = encode_sq8_slot(vector_f32, self.collection.metric, dim);
             inner.tq_codes.extend_from_slice(&codes);
 
-            // Keep the sub-centroid sign buffer offset-consistent (unused for SQ8).
-            let sub_bpv = inner.sub_sign_bytes_per_vec;
-            inner
-                .sub_centroid_signs
-                .extend(std::iter::repeat_n(0u8, sub_bpv));
+            // No sub-centroid sign row for SQ8 (see `append`).
 
             let is_exact = self.collection.build_mode
                 == crate::vector::turbo_quant::collection::BuildMode::Exact;
@@ -1224,18 +1216,42 @@ impl MutableSegment {
 
         let signs = self.collection.fwht_sign_flips.as_slice();
         let mut work_buf = vec![0.0f32; padded];
-        let code = if self.collection.quantization == QuantizationConfig::TurboQuant4A2 {
+        // Same encoders as `append`, INCLUDING scalar TQ4's insert-time
+        // sub-centroid signs: this path used to push no sign row, so a TQ4
+        // segment mixing both append paths froze misaligned rows (entry k
+        // read entry k-1's signs) or panicked slicing `[..n·bpv]` at freeze
+        // (moon#1221 review).
+        let (code, sub_signs) = if self.collection.quantization == QuantizationConfig::TurboQuant4A2
+        {
             let a2_cb = crate::vector::turbo_quant::a2_lattice::A2Codebook::new(
                 self.collection.padded_dimension,
             );
-            encode_tq_mse_a2(vector_f32, signs, &a2_cb, &mut work_buf)
+            (
+                encode_tq_mse_a2(vector_f32, signs, &a2_cb, &mut work_buf),
+                None,
+            )
+        } else if self.collection.quantization == QuantizationConfig::TurboQuant4 {
+            let with_signs = encode_tq_mse_scaled_with_signs(
+                vector_f32,
+                signs,
+                self.collection.codebook_boundaries_15(),
+                self.collection.codebook_16(),
+                &mut work_buf,
+            );
+            (with_signs.code, Some(with_signs.signs))
         } else {
             let boundaries = self.collection.codebook_boundaries_15();
-            encode_tq_mse_scaled(vector_f32, signs, boundaries, &mut work_buf)
+            (
+                encode_tq_mse_scaled(vector_f32, signs, boundaries, &mut work_buf),
+                None,
+            )
         };
 
         inner.tq_codes.extend_from_slice(&code.codes);
         inner.tq_codes.extend_from_slice(&code.norm.to_le_bytes());
+        if let Some(signs) = sub_signs {
+            inner.sub_centroid_signs.extend_from_slice(&signs);
+        }
 
         // FastScan shadow: scalar-codebook TQ4 only (shared gate with append()).
         let is_a2 = self.collection.quantization == QuantizationConfig::TurboQuant4A2;
@@ -1495,11 +1511,14 @@ impl MutableSegment {
             } else {
                 inner.raw_f16[..n * dim].to_vec()
             },
-            sub_centroid_signs: if inner.sub_centroid_signs.is_empty() {
-                Vec::new()
-            } else {
-                inner.sub_centroid_signs[..n * inner.sub_sign_bytes_per_vec].to_vec()
-            },
+            // Empty (no signs: every non-TQ4 quantizer) or one row per
+            // entry. A buffer that cannot cover the prefix freezes as NO
+            // signs (16-level LUT) instead of panicking on the slice.
+            sub_centroid_signs: inner
+                .sub_centroid_signs
+                .get(..n * inner.sub_sign_bytes_per_vec)
+                .map(<[u8]>::to_vec)
+                .unwrap_or_default(),
             sub_sign_bytes_per_vec: inner.sub_sign_bytes_per_vec,
             bytes_per_code: inner.bytes_per_code,
             qjl_bytes_per_vec: inner.qjl_bytes_per_vec,
@@ -1543,9 +1562,13 @@ impl MutableSegment {
         let tq_start = start * bpc;
         let tq_codes = inner.tq_codes[tq_start..].to_vec();
 
-        // ── Sub-centroid signs (always present, even if zero-filled) ─────────
-        let sub_start = start * sub_bpv;
-        let sub_centroid_signs = inner.sub_centroid_signs[sub_start..].to_vec();
+        // ── Sub-centroid signs: scalar TQ4 only, EMPTY otherwise ─────────────
+        // (`get`: an empty buffer with `start > 0` must not panic.)
+        let sub_centroid_signs = inner
+            .sub_centroid_signs
+            .get(start * sub_bpv..)
+            .map(<[u8]>::to_vec)
+            .unwrap_or_default();
 
         // ── Exact-mode optional fields ───────────────────────────────────────
         let raw_f32 = if inner.raw_f32.is_empty() {
@@ -1590,7 +1613,7 @@ impl MutableSegment {
 
         let byte_size = count * (bpc + std::mem::size_of::<MutableEntry>())
             + fs_blocks.len()
-            + count * sub_bpv
+            + sub_centroid_signs.len()
             + (if !raw_f32.is_empty() {
                 count * dim * 4
             } else {

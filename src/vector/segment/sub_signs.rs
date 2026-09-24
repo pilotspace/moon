@@ -26,6 +26,20 @@ pub(crate) fn sub_sign_bytes_per_vec(padded_dim: usize) -> usize {
     padded_dim.div_ceil(8)
 }
 
+/// Whether a segment's sign buffer carries no information: empty, or
+/// all-zero — the placeholder the insert path used to zero-fill for every
+/// quantizer without an insert-time encoder (moon#1221 review). A
+/// placeholder must never be persisted or loaded: the beam would read it as
+/// "every coordinate in the lower sub-bin" on the 32-level LUT.
+///
+/// Real signs are all-zero only if every coordinate of every vector sits
+/// below its centroid (e.g. a segment of only zero vectors); treating such a
+/// buffer as a placeholder merely selects the always-valid 16-level LUT.
+#[inline]
+pub(crate) fn is_placeholder(signs: &[u8]) -> bool {
+    signs.iter().all(|&b| b == 0)
+}
+
 /// Stateful encoder: owns the rotation work buffer so a whole segment is
 /// encoded with one allocation.
 pub(crate) struct SubSignEncoder<'a> {
@@ -40,7 +54,7 @@ pub(crate) struct SubSignEncoder<'a> {
 
 impl<'a> SubSignEncoder<'a> {
     /// `None` for SQ8 (no codebook, no sub-centroid refinement — its segments
-    /// carry a zero-filled buffer the search never reads).
+    /// carry no sign buffer at all).
     pub(crate) fn new(collection: &'a CollectionMetadata) -> Option<Self> {
         let dim = collection.dimension as usize;
         let padded = collection.padded_dimension as usize;

@@ -277,20 +277,21 @@ pub fn compact(
     let exact_qjl =
         super::exact_qjl::exact_qjl_bfs(collection, frozen, &live_entries, &graph, &tq_bfs);
 
-    // Compute sub-centroid sign bits from raw f32 vectors (FWHT-rotated).
-    // For each coordinate: compare the ACTUAL rotated value against its quantized centroid.
-    // Sign bit = 1 if original >= centroid (upper sub-bin), 0 if below.
+    // Sub-centroid sign bits, BFS-ordered — REAL signs only (moon#1221
+    // review). For each coordinate: 1 if the actual rotated value lies at or
+    // above its quantized centroid (upper sub-bin), 0 below. Two sources:
+    //  - EXACT (raw f32 retained): computed by the shared encoder, for every
+    //    quantizer that has one (scalar 4-bit TQ and TQ4A2 — not SQ8/TQ1-3);
+    //  - LIGHT scalar TQ4: the insert-time signs, remapped to BFS order.
+    // Anything else gets an EMPTY buffer — never a zero-filled placeholder,
+    // which the beam would read as "every coordinate in the lower sub-bin"
+    // and `segment_io` would persist as if real. Empty = the 16-level LUT,
+    // in memory and after a reload alike.
     let sub_bpv = (padded + 7) / 8;
-    let mut sub_signs_bfs = vec![0u8; n * sub_bpv];
-    // SQ8 has no sub-centroid refinement (no codebook): both inner branches
-    // below `continue` unconditionally, so without this gate the loop spends
-    // O(n · padded log padded) on normalize+FWHT whose results are discarded.
-    // The zero-filled buffer is exactly the SQ8 contract.
-    if has_raw && !is_sq8 {
-        // Use raw f32 → FWHT rotate → compare against centroid per TQ index
-        // (shared encoder: the same routine merge uses on f16 sidecar rows).
-        if let Some(mut enc) = SubSignEncoder::new(collection) {
+    let sub_signs_bfs: Vec<u8> = match SubSignEncoder::new(collection) {
+        Some(mut enc) if has_raw => {
             debug_assert_eq!(enc.bytes_per_vec(), sub_bpv);
+            let mut out = vec![0u8; n * sub_bpv];
             for bfs_pos in 0..n {
                 let orig_id = graph.to_original(bfs_pos as u32) as usize;
                 let internal = live_entries[orig_id].internal_id as usize;
@@ -301,28 +302,19 @@ pub fn compact(
                 enc.encode_f32(
                     raw,
                     code_slice,
-                    &mut sub_signs_bfs[sign_offset..sign_offset + sub_bpv],
+                    &mut out[sign_offset..sign_offset + sub_bpv],
                 );
             }
+            out
         }
-    } else if need_cpu_build && !is_sq8 && !frozen.sub_centroid_signs.is_empty() {
-        // Light mode with insert-time sub-centroid signs: remap to BFS order.
-        // graph.to_original(bfs_pos) returns the builder's sequential ID (0..n-1),
-        // which is the index into live_entries. Use it directly, not as internal_id.
-        for bfs_pos in 0..n {
-            let orig_id = graph.to_original(bfs_pos as u32) as usize;
-            if orig_id < live_entries.len() {
-                let src_internal = live_entries[orig_id].internal_id as usize;
-                let src_offset = src_internal * sub_bpv;
-                let dst_offset = bfs_pos * sub_bpv;
-                if src_offset + sub_bpv <= frozen.sub_centroid_signs.len() {
-                    sub_signs_bfs[dst_offset..dst_offset + sub_bpv].copy_from_slice(
-                        &frozen.sub_centroid_signs[src_offset..src_offset + sub_bpv],
-                    );
-                }
-            }
+        // Not gated on `need_cpu_build`: a GPU-built graph maps BFS
+        // positions to the same live-entry indices, and skipping the remap
+        // there left the buffer all-zero.
+        _ if collection.quantization == QuantizationConfig::TurboQuant4 => {
+            remap_insert_time_signs(frozen, &live_entries, &graph, sub_bpv)
         }
-    }
+        _ => Vec::new(),
+    };
 
     // ── Step 5: Create ImmutableSegment ─────────────────────────────
     let mvcc: Vec<MvccHeader> = (0..n)
@@ -396,4 +388,35 @@ pub fn compact(
     }
 
     Ok(segment)
+}
+
+/// LIGHT scalar TQ4: the frozen segment's insert-time sign rows (indexed by
+/// internal id) in BFS order. All-or-nothing: if any live entry has no row,
+/// the segment carries NO signs rather than a partially zero-filled buffer
+/// (moon#1221 review).
+fn remap_insert_time_signs(
+    frozen: &FrozenSegment,
+    live_entries: &[&crate::vector::segment::mutable::MutableEntry],
+    graph: &crate::vector::hnsw::graph::HnswGraph,
+    sub_bpv: usize,
+) -> Vec<u8> {
+    let n = live_entries.len();
+    if sub_bpv == 0 || frozen.sub_centroid_signs.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::with_capacity(n * sub_bpv);
+    for bfs_pos in 0..n {
+        // graph.to_original(bfs_pos) is the builder's sequential id (0..n),
+        // i.e. the index into live_entries — not the internal id.
+        let orig_id = graph.to_original(bfs_pos as u32) as usize;
+        let row = live_entries.get(orig_id).and_then(|e| {
+            let src = e.internal_id as usize * sub_bpv;
+            frozen.sub_centroid_signs.get(src..src + sub_bpv)
+        });
+        match row {
+            Some(row) => out.extend_from_slice(row),
+            None => return Vec::new(),
+        }
+    }
+    out
 }

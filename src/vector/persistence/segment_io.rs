@@ -25,6 +25,10 @@
 //!   v2 reader loads v1 directories exactly as before (no signs, 16-level).
 //!   A present-but-wrong-sized `sub_signs.bin` is ignored with a warning —
 //!   never trusted, because the beam indexes it without per-read checks.
+//!   The file holds REAL signs only (TQ4 insert-time, or encoder-computed):
+//!   never written for SQ8 or for a segment without signs, never an all-zero
+//!   placeholder; the reader skips SQ8 and ignores an all-zero file (the
+//!   placeholder a pre-release v2 build wrote — moon#1221 review).
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -37,6 +41,7 @@ use crate::vector::aligned_buffer::AlignedBuffer;
 use crate::vector::hnsw::graph::HnswGraph;
 use crate::vector::segment::immutable::{ImmutableSegment, MvccHeader};
 use crate::vector::segment::raw_f16_store::RawF16Store;
+use crate::vector::segment::sub_signs;
 use crate::vector::turbo_quant::collection::{CollectionMetadata, QuantizationConfig};
 use crate::vector::types::DistanceMetric;
 
@@ -284,16 +289,19 @@ fn write_segment_files(
     }
 
     // 3b. sub_signs.bin — sub-centroid sign bits (format v2, moon#1193).
-    // Written only when the segment carries a complete buffer (one
-    // `sub_sign_bytes_per_vec` row per entry); readers validate the size.
-    let sub_signs = segment.sub_centroid_signs();
+    // Written only for REAL signs: a complete buffer (one
+    // `sub_sign_bytes_per_vec` row per entry), never for SQ8 (no signs),
+    // never an all-zero placeholder (moon#1221 review). The reader applies
+    // the same conditions.
+    let signs = segment.sub_centroid_signs();
     let sub_bpv = segment.sub_sign_bytes_per_vec();
-    if !sub_signs.is_empty()
+    if collection.quantization != QuantizationConfig::Sq8
         && sub_bpv > 0
-        && sub_signs.len() == segment.mvcc_headers().len() * sub_bpv
+        && signs.len() == segment.mvcc_headers().len() * sub_bpv
+        && !sub_signs::is_placeholder(signs)
     {
         let sub_path = seg_dir.join("sub_signs.bin");
-        fs::write(&sub_path, sub_signs)?;
+        fs::write(&sub_path, signs)?;
         fsync_file(&sub_path)?;
     }
 
@@ -473,13 +481,23 @@ pub fn read_mvcc_headers_only(dir: &Path, segment_id: u64) -> Option<Vec<MvccHea
 /// (with `entries` agreeing between the graph and the MVCC headers);
 /// otherwise an empty buffer (16-level search). Missing is the silent v1
 /// case; a present file of the wrong size is corruption and warns.
+///
+/// Only REAL signs are loaded (moon#1221 review): SQ8 never reads signs, so
+/// its file is not even opened; an all-zero file is the placeholder a
+/// pre-release v2 build persisted for SQ8 / non-TQ4 LIGHT segments and is
+/// ignored with a warning. Either way the file stays on disk — the loader
+/// never deletes data.
 fn read_sub_signs(
     seg_dir: &Path,
     segment_id: u64,
+    quantization: QuantizationConfig,
     headers: usize,
     graph_nodes: u32,
     sub_bpv: usize,
 ) -> Vec<u8> {
+    if quantization == QuantizationConfig::Sq8 {
+        return Vec::new();
+    }
     let path = seg_dir.join("sub_signs.bin");
     let bytes = match fs::read(&path) {
         Ok(b) => b,
@@ -499,6 +517,13 @@ fn read_sub_signs(
              ({headers} headers, {graph_nodes} graph nodes) — ignoring it \
              (search falls back to the 16-level LUT)",
             bytes.len()
+        );
+        return Vec::new();
+    }
+    if sub_signs::is_placeholder(&bytes) {
+        tracing::warn!(
+            "segment-{segment_id}: sub_signs.bin is all zero — a placeholder, not \
+             sub-centroid signs; ignoring it (search uses the 16-level LUT)"
         );
         return Vec::new();
     }
@@ -690,6 +715,7 @@ pub fn read_immutable_segment(
     let sub_signs = read_sub_signs(
         &seg_dir,
         segment_id,
+        quantization,
         mvcc.len(),
         graph.num_nodes(),
         sub_sign_bpv,

@@ -16,7 +16,7 @@ use crate::vector::persistence::segment_io::{
 use crate::vector::segment::compaction::{MergeMode, compact, merge_immutable};
 use crate::vector::segment::immutable::ImmutableSegment;
 use crate::vector::segment::mutable::MutableSegment;
-use crate::vector::turbo_quant::collection::{CollectionMetadata, QuantizationConfig};
+use crate::vector::turbo_quant::collection::{BuildMode, CollectionMetadata, QuantizationConfig};
 use crate::vector::types::DistanceMetric;
 
 fn vecs(n: usize, dim: usize, seed: u64) -> Vec<Vec<f32>> {
@@ -270,4 +270,270 @@ fn persisted_compaction_serves_the_f16_sidecar_from_the_mapped_file() {
     assert_eq!(persisted.raw_f16(), heap.raw_f16());
     let qs: Vec<Vec<f32>> = data.iter().step_by(29).cloned().collect();
     assert_eq!(search_all(&persisted, &qs), search_all(&heap, &qs));
+}
+
+// ── moon#1221 review: only REAL signs are ever built, persisted or loaded ──
+//
+// The PR head persisted every sign buffer of the right length, so all-zero
+// PLACEHOLDER buffers became `sub_signs.bin` as if real: SQ8 (never reads
+// signs; reloaded n·padded/8 dead heap bytes where HEAD reloaded none) and
+// every non-TQ4 LIGHT build (zero-filled at insert, then searched with the
+// 32-level LUT and all-zero signs — the bias moon#1193 itself calls a bug —
+// where HEAD's reload used the 16-level LUT). An EMPTY buffer is the one
+// representation of "no signs": it selects the 16-level LUT in memory and
+// after a reload alike.
+
+fn collection_of(dim: usize, q: QuantizationConfig, mode: BuildMode) -> Arc<CollectionMetadata> {
+    distance::init();
+    crate::vector::turbo_quant::fwht::init_fwht();
+    // seed == collection_id, as `VectorStore` creates collections: EXACT
+    // reloads regenerate the QJL matrices from the id and the checksum
+    // covers them.
+    Arc::new(CollectionMetadata::with_build_mode(
+        31,
+        dim as u32,
+        DistanceMetric::L2,
+        q,
+        31,
+        mode,
+    ))
+}
+
+/// Insert `data` into a mutable segment and compact it with persistence.
+/// Returns the built segment, the bytes of `sub_signs.bin` (None when the
+/// file was not written) and the segment reloaded from disk.
+fn compact_persist_reload(
+    col: &Arc<CollectionMetadata>,
+    data: &[Vec<f32>],
+    root: &std::path::Path,
+    segment_id: u64,
+) -> (ImmutableSegment, Option<Vec<u8>>, ImmutableSegment) {
+    let seg = MutableSegment::new(col.dimension, col.clone());
+    for (i, v) in data.iter().enumerate() {
+        seg.append(i as u64 + 1, v, i as u64 + 1);
+    }
+    let built = compact(&seg.freeze(), col, 4242, Some((root, segment_id))).expect("compact");
+    let file = fs::read(root.join(format!("segment-{segment_id}/sub_signs.bin"))).ok();
+    let (reloaded, _) = read_immutable_segment(root, segment_id).expect("reload");
+    (built, file, reloaded)
+}
+
+#[test]
+fn sq8_segments_build_persist_and_reload_no_sub_signs() {
+    // Red on the PR head: n·padded/8 zero bytes built, written to
+    // sub_signs.bin and reloaded onto the heap for a quantizer that never
+    // reads them (HEAD reloaded an empty buffer).
+    for mode in [BuildMode::Light, BuildMode::Exact] {
+        let col = collection_of(96, QuantizationConfig::Sq8, mode);
+        let data = vecs(200, 96, 21);
+        let tmp = tempfile::tempdir().unwrap();
+        let (built, file, reloaded) = compact_persist_reload(&col, &data, tmp.path(), 1);
+        assert!(built.sub_centroid_signs().is_empty(), "{mode:?}: built");
+        assert_eq!(
+            file.map(|f| f.len()),
+            None,
+            "{mode:?}: sub_signs.bin written"
+        );
+        assert!(
+            reloaded.sub_centroid_signs().is_empty(),
+            "{mode:?}: reloaded"
+        );
+        let mut scratch = SearchScratch::new(0, col.padded_dimension);
+        assert_eq!(
+            reloaded
+                .search(&data[7], 1, 32, &mut scratch)
+                .first()
+                .map(|r| r.id.0),
+            Some(7)
+        );
+    }
+}
+
+#[test]
+fn non_tq4_light_segments_carry_no_placeholder_signs() {
+    // TQ4A2 and TurboQuantProd4 have no insert-time sign encoder: the PR head
+    // zero-filled their rows at insert, compacted the zeros, searched them
+    // with the 32-level LUT and persisted them. Now: no signs anywhere, the
+    // 16-level LUT before AND after a restart, identical results. The A2
+    // dims include padded 8 and 32, whose HOT segments now take the budgeted
+    // 16-level kernel fixed in the previous commit.
+    for (q, dim) in [
+        (QuantizationConfig::TurboQuant4A2, 6usize),
+        (QuantizationConfig::TurboQuant4A2, 20),
+        (QuantizationConfig::TurboQuant4A2, 96),
+        (QuantizationConfig::TurboQuantProd4, 96),
+    ] {
+        let col = collection_of(dim, q, BuildMode::Light);
+        let data = vecs(240, dim, 22);
+        let tmp = tempfile::tempdir().unwrap();
+        let (built, file, reloaded) = compact_persist_reload(&col, &data, tmp.path(), 2);
+        assert!(built.sub_centroid_signs().is_empty(), "{q:?}/{dim}: built");
+        assert_eq!(file.map(|f| f.len()), None, "{q:?}/{dim}: file written");
+        assert!(reloaded.sub_centroid_signs().is_empty(), "{q:?}/{dim}");
+        let qs: Vec<Vec<f32>> = data.iter().step_by(31).cloned().collect();
+        let before = search_all(&built, &qs);
+        assert!(before.iter().all(|r| !r.is_empty()));
+        assert_eq!(search_all(&reloaded, &qs), before, "{q:?}/{dim}");
+    }
+}
+
+#[test]
+fn real_signs_persist_byte_identical() {
+    // Real signs — TQ4 insert-time (LIGHT) and encoder-computed from raw f32
+    // (EXACT, TQ4 and TQ4A2) — are written and reloaded byte for byte.
+    for (q, mode) in [
+        (QuantizationConfig::TurboQuant4, BuildMode::Light),
+        (QuantizationConfig::TurboQuant4, BuildMode::Exact),
+        (QuantizationConfig::TurboQuant4A2, BuildMode::Exact),
+    ] {
+        let col = collection_of(64, q, mode);
+        let data = vecs(200, 64, 23);
+        let tmp = tempfile::tempdir().unwrap();
+        let (built, file, reloaded) = compact_persist_reload(&col, &data, tmp.path(), 3);
+        let signs = built.sub_centroid_signs();
+        assert_eq!(
+            signs.len(),
+            200 * built.sub_sign_bytes_per_vec(),
+            "{q:?}/{mode:?}"
+        );
+        assert!(signs.iter().any(|&b| b != 0), "{q:?}/{mode:?}: placeholder");
+        assert_eq!(file.as_deref(), Some(signs), "{q:?}/{mode:?}: file");
+        assert_eq!(reloaded.sub_centroid_signs(), signs, "{q:?}/{mode:?}");
+    }
+}
+
+#[test]
+fn placeholder_sub_signs_files_are_ignored_at_load() {
+    // A v2 directory written by the PR head before this fix can hold a
+    // right-sized all-zero sub_signs.bin (SQ8, non-TQ4 LIGHT). Loading it
+    // would put a zero placeholder on the 32-level path; it is ignored.
+    // Red on the PR head: both reloads returned the zeros.
+    let tmp = tempfile::tempdir().unwrap();
+    for (id, q) in [
+        (4u64, QuantizationConfig::Sq8),
+        (5, QuantizationConfig::TurboQuant4),
+        (6, QuantizationConfig::TurboQuant4A2),
+    ] {
+        let col = collection_of(64, q, BuildMode::Light);
+        let data = vecs(120, 64, 24);
+        let (built, _, _) = compact_persist_reload(&col, &data, tmp.path(), id);
+        let bpv = built.sub_sign_bytes_per_vec();
+        let path = tmp.path().join(format!("segment-{id}/sub_signs.bin"));
+        fs::write(&path, vec![0u8; 120 * bpv]).unwrap();
+        let (reloaded, _) = read_immutable_segment(tmp.path(), id).unwrap();
+        assert!(reloaded.sub_centroid_signs().is_empty(), "{q:?}");
+        assert!(path.exists(), "the reader never deletes data");
+    }
+}
+
+/// Interleave `append` and `append_transactional` (every third row).
+fn mixed_appends(col: &Arc<CollectionMetadata>, data: &[Vec<f32>]) -> MutableSegment {
+    let seg = MutableSegment::new(col.dimension, col.clone());
+    for (i, v) in data.iter().enumerate() {
+        if i % 3 == 1 {
+            seg.append_transactional(i as u64, v, i as u64 + 1, 9);
+        } else {
+            seg.append(i as u64, v, i as u64 + 1);
+        }
+    }
+    seg
+}
+
+#[test]
+fn mutable_segments_hold_no_sign_placeholder_for_non_tq4() {
+    // Red on the PR head: SQ8 / TQ4A2 inserts zero-filled a sign row each,
+    // and freeze handed the zeros to compaction.
+    let dim = 64;
+    let data = vecs(40, dim, 25);
+    for q in [QuantizationConfig::Sq8, QuantizationConfig::TurboQuant4A2] {
+        let col = collection_of(dim, q, BuildMode::Light);
+        let seg = mixed_appends(&col, &data);
+        assert!(seg.freeze().sub_centroid_signs.is_empty(), "{q:?}");
+        // An empty buffer with `start > 0` must not panic the install path.
+        let tail = seg.clone_suffix(7);
+        assert_eq!(tail.len(), 33);
+        assert!(tail.freeze().sub_centroid_signs.is_empty(), "{q:?}");
+    }
+}
+
+#[test]
+fn tq4_sign_rows_stay_aligned_across_both_append_paths() {
+    // Red on the PR head: `append_transactional` pushed no sign row, so a
+    // TQ4 segment mixing both paths held fewer rows than entries and
+    // `freeze` panicked slicing `[..n·bpv]` (or, with the rows present,
+    // entry k would have read another entry's signs).
+    use crate::vector::turbo_quant::encoder::encode_tq_mse_scaled_with_signs;
+    let dim = 64;
+    let data = vecs(40, dim, 25);
+    let col = collection_of(dim, QuantizationConfig::TurboQuant4, BuildMode::Light);
+    let seg = mixed_appends(&col, &data);
+    let mut work = vec![0.0f32; col.padded_dimension as usize];
+    let expected: Vec<Vec<u8>> = data
+        .iter()
+        .map(|v| {
+            encode_tq_mse_scaled_with_signs(
+                v,
+                col.fwht_sign_flips.as_slice(),
+                col.codebook_boundaries_15(),
+                col.codebook_16(),
+                &mut work,
+            )
+            .signs
+        })
+        .collect();
+    let frozen = seg.freeze();
+    let bpv = frozen.sub_sign_bytes_per_vec;
+    assert_eq!(frozen.sub_centroid_signs.len(), data.len() * bpv);
+    for (i, row) in frozen.sub_centroid_signs.chunks_exact(bpv).enumerate() {
+        assert_eq!(row, expected[i].as_slice(), "row {i} misaligned");
+    }
+    let tail = seg.clone_suffix(7).freeze();
+    assert_eq!(
+        tail.sub_centroid_signs.as_slice(),
+        &frozen.sub_centroid_signs[7 * bpv..]
+    );
+}
+
+#[test]
+fn incomplete_insert_signs_are_dropped_at_compaction_not_zero_filled() {
+    // A LIGHT TQ4 frozen segment whose sign buffer misses a row must not
+    // ship a partially zero-filled buffer (red on the PR head: the missing
+    // row stayed zero and the rest were used on the 32-level path).
+    let dim = 64;
+    let col = collection(dim);
+    let seg = MutableSegment::new(col.dimension, col.clone());
+    for (i, v) in vecs(120, dim, 26).iter().enumerate() {
+        seg.append(i as u64, v, i as u64 + 1);
+    }
+    let mut frozen = seg.freeze();
+    let bpv = frozen.sub_sign_bytes_per_vec;
+    let full = frozen.sub_centroid_signs.len();
+    frozen.sub_centroid_signs.truncate(full - bpv);
+    let built = compact(&frozen, &col, 4242, None).expect("compact");
+    assert!(built.sub_centroid_signs().is_empty());
+}
+
+#[test]
+fn sq8_merge_carries_no_sign_buffer() {
+    // Red on the PR head: `is_sq8 || all_have_signs` kept SQ8's zero buffer.
+    let dim = 64;
+    let col = collection_of(dim, QuantizationConfig::Sq8, BuildMode::Light);
+    let build = |seed: u64, base: u64| {
+        let seg = MutableSegment::new(col.dimension, col.clone());
+        for (i, v) in vecs(120, dim, seed).iter().enumerate() {
+            seg.append(base + i as u64, v, base + i as u64 + 1);
+        }
+        Arc::new(compact(&seg.freeze(), &col, 4242, None).expect("compact"))
+    };
+    let merged = merge_immutable(
+        &[build(27, 0), build(28, 10_000)],
+        &col,
+        97,
+        MergeMode::GraphUnion,
+        0.0,
+        None,
+    )
+    .expect("merge");
+    assert_eq!(merged.mvcc_headers().len(), 240);
+    assert!(merged.sub_centroid_signs().is_empty());
 }
