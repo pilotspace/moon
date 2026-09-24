@@ -1193,103 +1193,41 @@ impl TextIndex {
     /// Expand a single query term into matching term IDs via FST + HashMap fallback.
     ///
     /// Exact terms: direct TermDictionary lookup (unchanged path).
-    /// Fuzzy/Prefix: FST expansion + post-compaction HashMap scan (D-12).
-    /// Returns empty Vec if no FST and term is Fuzzy/Prefix (D-13: not an error).
+    /// Fuzzy/Prefix: FST expansion + post-compaction HashMap scan (D-12), both feeding ONE capped
+    /// selection ([`crate::text::fst_dict::TopTerms`]): the top 50 by (df DESC, term bytes ASC)
+    /// of their union, whichever path holds a term — so the kept terms depend only on the
+    /// matching terms and their document frequencies, never on term-id assignment (moon#1218,
+    /// moon#1221 review). Returned best first. No FST: the whole dictionary is scanned (D-13).
     #[cfg(feature = "text-index")]
     pub fn expand_terms(&self, field_idx: usize, text: &str, modifier: &TermModifier) -> Vec<u32> {
+        use crate::text::fst_dict::{
+            TopTerms, offer_fuzzy_dict, offer_fuzzy_fst, offer_prefix_dict, offer_prefix_fst,
+        };
         const MAX_EXPANDED: usize = 50; // D-09
 
+        let dict = &self.field_term_dicts[field_idx];
+        let postings = &self.field_postings[field_idx];
+        let fst_map = self.fst_maps[field_idx].as_ref();
+        // Terms with id >= hwm were added after the FST was built (D-12); without an FST the
+        // dictionary scan covers everything.
+        let hwm = fst_map.map_or(0, |_| dict.fst_high_water_mark);
         match modifier {
-            TermModifier::Exact => self.field_term_dicts[field_idx]
-                .get(text)
-                .map(|id| vec![id])
-                .unwrap_or_default(),
+            TermModifier::Exact => dict.get(text).map(|id| vec![id]).unwrap_or_default(),
             TermModifier::Fuzzy(dist) => {
-                let hwm = self.field_term_dicts[field_idx].fst_high_water_mark;
-                match &self.fst_maps[field_idx] {
-                    Some(fst_map) => {
-                        let mut ids = crate::text::fst_dict::expand_fuzzy(
-                            fst_map,
-                            text,
-                            *dist,
-                            &self.field_postings[field_idx],
-                            MAX_EXPANDED,
-                        );
-                        // D-12 dual-path: also scan post-compaction HashMap terms.
-                        let mut extra = crate::text::fst_dict::expand_fuzzy_hashmap(
-                            &self.field_term_dicts[field_idx],
-                            text,
-                            *dist,
-                            &self.field_postings[field_idx],
-                            hwm,
-                            MAX_EXPANDED,
-                        );
-                        ids.append(&mut extra);
-                        // Deduplicate and re-cap.
-                        ids.sort_unstable();
-                        ids.dedup();
-                        if ids.len() > MAX_EXPANDED {
-                            let postings = &self.field_postings[field_idx];
-                            ids.sort_unstable_by(|a, b| {
-                                postings.doc_freq(*b).cmp(&postings.doc_freq(*a))
-                            });
-                            ids.truncate(MAX_EXPANDED);
-                        }
-                        ids
-                    }
-                    None => {
-                        // No FST: brute-force scan entire HashMap (no compaction happened yet).
-                        crate::text::fst_dict::expand_fuzzy_hashmap(
-                            &self.field_term_dicts[field_idx],
-                            text,
-                            *dist,
-                            &self.field_postings[field_idx],
-                            0,
-                            MAX_EXPANDED,
-                        )
-                    }
+                let mut top = TopTerms::new(MAX_EXPANDED);
+                if let Some(fst_map) = fst_map {
+                    offer_fuzzy_fst(fst_map, text, *dist, postings, &mut top);
                 }
+                offer_fuzzy_dict(dict, text, *dist, postings, hwm, &mut top);
+                top.into_ids()
             }
             TermModifier::Prefix => {
-                let hwm = self.field_term_dicts[field_idx].fst_high_water_mark;
-                match &self.fst_maps[field_idx] {
-                    Some(fst_map) => {
-                        let mut ids = crate::text::fst_dict::expand_prefix(
-                            fst_map,
-                            text,
-                            &self.field_postings[field_idx],
-                            MAX_EXPANDED,
-                        );
-                        let mut extra = crate::text::fst_dict::expand_prefix_hashmap(
-                            &self.field_term_dicts[field_idx],
-                            text,
-                            &self.field_postings[field_idx],
-                            hwm,
-                            MAX_EXPANDED,
-                        );
-                        ids.append(&mut extra);
-                        ids.sort_unstable();
-                        ids.dedup();
-                        if ids.len() > MAX_EXPANDED {
-                            let postings = &self.field_postings[field_idx];
-                            ids.sort_unstable_by(|a, b| {
-                                postings.doc_freq(*b).cmp(&postings.doc_freq(*a))
-                            });
-                            ids.truncate(MAX_EXPANDED);
-                        }
-                        ids
-                    }
-                    None => {
-                        // No FST: brute-force scan entire HashMap.
-                        crate::text::fst_dict::expand_prefix_hashmap(
-                            &self.field_term_dicts[field_idx],
-                            text,
-                            &self.field_postings[field_idx],
-                            0,
-                            MAX_EXPANDED,
-                        )
-                    }
+                let mut top = TopTerms::new(MAX_EXPANDED);
+                if let Some(fst_map) = fst_map {
+                    offer_prefix_fst(fst_map, text, postings, &mut top);
                 }
+                offer_prefix_dict(dict, text, postings, hwm, &mut top);
+                top.into_ids()
             }
         }
     }

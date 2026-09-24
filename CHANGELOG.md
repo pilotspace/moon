@@ -279,7 +279,11 @@ shared 4-vCPU Linux container against HEAD `935c555` — re-measure on the GCE r
 - **FT.SEARCH panicked on a LIGHT TQ4A2 index** over a non-empty mutable segment (moon#1207), and
   EXACT compaction gave rows after a deleted vector their neighbour's QJL signs (moon#1208).
 - **FT.SEARCH prefix/fuzzy results differed between processes** (moon#1218): the 50-term expansion
-  cap broke document-frequency ties in HashMap order; ties now break by term id.
+  cap broke document-frequency ties in HashMap order (and, with an FST plus newer terms, by an
+  unstable re-sort). One capped selection now spans the FST and the newer terms and keeps the top
+  50 by document frequency, ties by term bytes — a function of the matching terms and their
+  frequencies only, so it no longer depends on term-id assignment (which a rebuild or a replica
+  makes differently).
 
 - **The boot crash-orphan sweep no longer lets a cold file id be issued twice
   in one AOF generation** (moon#1114). A spill's `MOON.SPILLED <N>` marker
