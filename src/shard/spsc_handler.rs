@@ -4506,28 +4506,38 @@ fn index_payload_field(
     global_id: u32,
     analysis: &mut crate::text::analyzer::AnalysisCache,
 ) {
+    // moon#1194: a value no TAG filter can ever select (contains a space, or
+    // is not UTF-8 — see `tag_value_is_matchable`) is not tag-indexed; it
+    // only cost memory (a 2 KB `content` field was a 2 KB inverted-map key
+    // plus a forward entry per document). Non-UTF-8 values were
+    // tag-indexed as binary tags; no UTF-8 query can match them.
+    use crate::vector::filter::payload_index::{
+        payload_text_index_enabled, tag_value_is_matchable,
+    };
     if let Ok(val_str) = std::str::from_utf8(value) {
         // Geo detection: "lon,lat" pattern (two floats separated by comma)
         if let Some((lon, lat)) = parse_geo_value(val_str) {
             payload_index.insert_geo(field, lat, lon, global_id);
             // Also store raw value as tag for display
-            payload_index.insert_tag(field, value, global_id);
+            if tag_value_is_matchable(value) {
+                payload_index.insert_tag(field, value, global_id);
+            }
         } else if let Ok(num) = val_str.parse::<f64>() {
             // Numeric value
             payload_index.insert_numeric(field, num, global_id);
-        } else {
+        } else if tag_value_is_matchable(value) {
             // Tag value (includes "true"/"false" for BoolEq)
             payload_index.insert_tag(field, value, global_id);
         }
-    } else {
-        // Non-UTF8 binary: store as tag
-        payload_index.insert_tag(field, value, global_id);
     }
     // Also index into full-text TextIndex (if text-index feature enabled).
     // All payload string fields are indexed; only fields queried via TextMatch
     // will actually be searched at query time. The analysis is shared with
-    // the BM25 text plane for this HSET (moon#885).
-    payload_index.insert_text_shared(field, value, global_id, analysis);
+    // the BM25 text plane for this HSET (moon#885). moon#1194: process-wide
+    // opt-out `MOON_VECTOR_PAYLOAD_TEXT=off` (default on).
+    if payload_text_index_enabled() {
+        payload_index.insert_text_shared(field, value, global_id, analysis);
+    }
 }
 
 /// Parse a "lon,lat" geo value string. Returns `Some((lon, lat))` if the value
