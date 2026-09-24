@@ -49,6 +49,17 @@ for mod in src/protocol src/command src/shard src/storage src/persistence src/se
                     continue 2
                 fi
             done
+            # ... or a sibling includes it under a cfg(test) attribute via
+            # `#[path = "<basename>"]` (a 2018-style `foo.rs` naming its child
+            # module file `foo_tests.rs` in the same directory).
+            if awk -v base="$basename" '
+                /^[[:space:]]*#\[cfg\(.*test.*\)\]/ { cfg_test = 1; next }
+                cfg_test && index($0, "#[path = \"" base "\"]") { found = 1; exit }
+                { cfg_test = 0 }
+                END { exit(found ? 0 : 1) }
+            ' "$dir"/*.rs; then
+                continue
+            fi
         fi
 
         # Check if we're inside a #[cfg(test)] module
