@@ -441,12 +441,21 @@ pub(crate) async fn handle_connection_sharded_monoio<
     let func_registry: Rc<RefCell<Option<crate::scripting::FunctionRegistry>>> =
         crate::scripting::shard_function_registry();
 
-    // Pre-allocate read buffer outside the loop to avoid per-read heap allocation.
-    // Monoio's ownership I/O takes ownership and returns the buffer, so we reassign.
-    // D3: same lazy sizing as read_buf/write_buf — the first read of a
-    // rehydrated conn is usually a probe-sized frame (keepalive PING); the
-    // shrink logic at the loop tail governs the steady state either way.
-    let mut tmp_buf = vec![0u8; init_cap];
+    // moon#1179 item 4: ordinary reads land directly in `read_buf`'s spare
+    // capacity (`idle_park::spare_read_target`) — no rent buffer, no copy of
+    // every input byte, no 8 KiB cap per read. `tmp_buf` survives only as the
+    // rent buffer of the `select!` read arms (RESP2/RESP3 subscriber, MONITOR,
+    // tracking), whose losing read future DROPS its buffer, so it must never
+    // be `read_buf`. Allocated on first use by one of those arms.
+    let mut tmp_buf: Vec<u8> = Vec::new();
+    // D3: the size of an ordinary read — the reserve made in `read_buf`
+    // before it. A rehydrated conn starts at its 512 B probe size (its first
+    // read is usually a keepalive PING) and moves to the full size the moment
+    // a read fills it; a fresh conn starts at full size.
+    let mut read_base = init_cap;
+    // Batch-end shrink governors with hysteresis (moon#1179 item 4).
+    let mut read_shrink = super::util::IoBufShrink::default();
+    let mut write_shrink = super::util::IoBufShrink::default();
 
     // c10k W11: two-stage idle park (see idle_park.rs). Cancel-capable
     // streams register for the shard chore's ≥1s sweep; `downshifted` tracks
@@ -1013,18 +1022,45 @@ pub(crate) async fn handle_connection_sharded_monoio<
             continue;
         }
 
-        // Read data from stream using monoio ownership I/O.
-        // Reuse pre-allocated buffer; restore length for the read. While
-        // downshifted (c10k W11) the park size is the probe buffer; the
-        // resize below re-inflates lazily on the first post-idle iteration.
+        // Read data from stream using monoio ownership I/O. While downshifted
+        // (c10k W11) a read is probe-sized; real data re-inflates it.
+        //
+        // `park_len` sizes the rent buffer of the `select!` arms below;
+        // `read_want` the reserve an ordinary read makes in `read_buf` —
+        // larger when the incomplete front frame is known to need more
+        // (moon#1164: a known bulk remainder in one read, or geometric growth
+        // for a long tail; never for an unauthenticated client). The first
+        // `hinted_read_len` call takes no lock; only a real hint reads the
+        // query-buffer limits.
         let park_len = if downshifted {
             idle_park::IDLE_PROBE_BUF
         } else {
             idle_park::PARK_BUF_FULL
         };
-        if tmp_buf.len() != park_len {
-            tmp_buf.resize(park_len, 0);
-        }
+        let read_want = if downshifted {
+            idle_park::IDLE_PROBE_BUF
+        } else {
+            let pending = codec.parse_state().pending_len();
+            let hinted =
+                super::util::hinted_read_len(read_buf.len(), pending, conn.authenticated, 0, 0)
+                    .and_then(|_| {
+                        let (limit, preauth) = {
+                            let rt = ctx.runtime_config.read();
+                            (
+                                rt.client_query_buffer_limit,
+                                rt.client_query_buffer_limit_preauth,
+                            )
+                        };
+                        super::util::hinted_read_len(
+                            read_buf.len(),
+                            pending,
+                            conn.authenticated,
+                            limit,
+                            preauth,
+                        )
+                    });
+            hinted.unwrap_or(read_base)
+        };
         // c10k A1: a blocking command's peer watch may have pulled bytes the
         // client pipelined behind it out of the kernel and into `read_buf`.
         // Pre-A1 those bytes stayed in the socket, so the read below returned
@@ -1058,6 +1094,9 @@ pub(crate) async fn handle_connection_sharded_monoio<
             // this loop only reaches here when no reply is mid-flight.
             #[allow(clippy::unwrap_used)] // guarded by subscription_count > 0
             let rx = conn.pubsub_rx.as_ref().unwrap();
+            if tmp_buf.len() != park_len {
+                tmp_buf.resize(park_len, 0);
+            }
             let sub_buf = std::mem::take(&mut tmp_buf);
             let mut delivery: Option<bytes::Bytes> = None;
             monoio::select! {
@@ -1125,6 +1164,9 @@ pub(crate) async fn handle_connection_sharded_monoio<
             // MONITOR gets `>2 invalidate` for a key it read). Its queue must
             // be drained here too, or it fills to the output-buffer limit and
             // the monitor is disconnected for pushes it never saw.
+            if tmp_buf.len() != park_len {
+                tmp_buf.resize(park_len, 0);
+            }
             let mon_buf = std::mem::take(&mut tmp_buf);
             let mut line: Option<bytes::Bytes> = None;
             let mut push_frame: Option<Frame> = None;
@@ -1193,6 +1235,9 @@ pub(crate) async fn handle_connection_sharded_monoio<
             // in read(). Only tracking connections take this select — the
             // hot path below is untouched for everyone else. Losing-future
             // buffer semantics mirror the other parked reads in this loop.
+            if tmp_buf.len() != park_len {
+                tmp_buf.resize(park_len, 0);
+            }
             let track_buf = std::mem::take(&mut tmp_buf);
             let mut push_frame: Option<Frame> = None;
             monoio::select! {
@@ -1296,13 +1341,13 @@ pub(crate) async fn handle_connection_sharded_monoio<
             if let (true, Some(reg)) = (parkable, idle_reg.as_ref()) {
                 let handle = reg.slot.handle();
                 reg.slot.mark_parked_stage2(ctx.cached_clock.ms());
-                let (result, returned_buf) = stream.idle_park_read(tmp_buf, handle).await;
+                let target = idle_park::spare_read_target::<S>(&mut read_buf, read_want);
+                let (result, returned_buf) = stream.idle_park_read(target, handle).await;
                 reg.slot.mark_unparked();
-                tmp_buf = returned_buf;
+                read_buf = returned_buf.into_inner();
                 match result {
                     Ok(0) => break,
-                    Ok(n) => {
-                        read_buf.extend_from_slice(&tmp_buf[..n]);
+                    Ok(_) => {
                         downshifted = false;
                     }
                     // Real socket/TLS error (EOF without close_notify,
@@ -1346,12 +1391,12 @@ pub(crate) async fn handle_connection_sharded_monoio<
                     }
                 }
             } else {
-                let (result, returned_buf) = stream.read(tmp_buf).await;
-                tmp_buf = returned_buf;
+                let target = idle_park::spare_read_target::<S>(&mut read_buf, read_want);
+                let (result, returned_buf) = stream.read(target).await;
+                read_buf = returned_buf.into_inner();
                 match result {
                     Ok(0) => break,
-                    Ok(n) => {
-                        read_buf.extend_from_slice(&tmp_buf[..n]);
+                    Ok(_) => {
                         downshifted = false;
                     }
                     Err(_) => break,
@@ -1363,14 +1408,13 @@ pub(crate) async fn handle_connection_sharded_monoio<
             // completion that raced the cancel still delivers its bytes.
             let handle = reg.slot.handle();
             reg.slot.mark_parked(ctx.cached_clock.ms());
-            let (result, returned_buf) = stream.idle_park_read(tmp_buf, handle).await;
+            let target = idle_park::spare_read_target::<S>(&mut read_buf, read_want);
+            let (result, returned_buf) = stream.idle_park_read(target, handle).await;
             reg.slot.mark_unparked();
-            tmp_buf = returned_buf;
+            read_buf = returned_buf.into_inner();
             match result {
                 Ok(0) => break,
-                Ok(n) => {
-                    read_buf.extend_from_slice(&tmp_buf[..n]);
-                }
+                Ok(_) => {}
                 // Real socket/TLS error: terminate now. (Pre-P1 this arm
                 // could lump errors in with the cancel because stage 2
                 // always performed a read that re-surfaced them; the
@@ -1398,25 +1442,27 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 }
             }
         } else {
-            let (result, returned_buf) = stream.read(tmp_buf).await;
-            tmp_buf = returned_buf;
+            let target = idle_park::spare_read_target::<S>(&mut read_buf, read_want);
+            let (result, returned_buf) = stream.read(target).await;
+            read_buf = returned_buf.into_inner();
             match result {
                 Ok(0) => break,
-                Ok(n) => {
-                    read_buf.extend_from_slice(&tmp_buf[..n]);
-                }
+                Ok(_) => {}
                 Err(_) => break,
             }
         }
 
-        // D3: a rehydrated conn starts with a small (512 B) owned read buffer;
-        // the moment a read saturates it (real traffic, not a keepalive-sized
+        // D3: a rehydrated conn starts with a small (512 B) read size; the
+        // moment a read saturates it (real traffic, not a keepalive-sized
         // probe), restore the full 8 KiB so bulk transfers aren't capped at
         // 512 B per syscall. Sited with the C2 check below: after every read
         // arm, once per iteration.
-        if tmp_buf.len() < 8192 && read_buf.len() >= tmp_buf.len() {
-            tmp_buf = vec![0u8; 8192];
+        if read_base < idle_park::PARK_BUF_FULL && read_buf.len() >= read_base {
+            read_base = idle_park::PARK_BUF_FULL;
         }
+        // Most bytes buffered this iteration — what the batch-end shrink
+        // governor judges the read buffer's use by.
+        let read_high_water = read_buf.len();
 
         // c10k C2: query-buffer ceiling. One check per read iteration, sited
         // after every read arm and ahead of both parse paths — an incomplete
@@ -4661,6 +4707,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
         crate::server::conn::shared::encode_response_batch(&mut conn, &responses, &mut write_buf);
 
         // Write all responses in one batch using ownership I/O
+        let write_high_water = write_buf.len();
         if !write_buf.is_empty() {
             let data = write_buf.split().freeze();
             if !write_all_bounded!(
@@ -4746,18 +4793,23 @@ pub(crate) async fn handle_connection_sharded_monoio<
         // Shrink buffers if they grew too large (c10k W1: floor lowered
         // 64 KiB → 16 KiB — the old floor let 16–64 KiB high-waters ratchet
         // until disconnect; see tmp/C10K-REVIEW.md).
-        if read_buf.capacity() > super::util::IO_BUF_SHRINK_TRIGGER {
+        //
+        // moon#1179 item 4: with hysteresis — only after a streak of batches
+        // that left the big buffer mostly unused, so a client sending large
+        // values every batch no longer regrows (and re-copies) its buffer
+        // 8 -> 16 -> ... -> 128 KiB on every request.
+        if read_shrink.should_shrink(read_buf.capacity(), read_high_water.max(read_buf.len())) {
             let remaining = read_buf.split();
             read_buf = BytesMut::with_capacity(8192);
             if !remaining.is_empty() {
                 read_buf.extend_from_slice(&remaining);
             }
         }
-        if write_buf.capacity() > super::util::IO_BUF_SHRINK_TRIGGER {
+        if write_shrink.should_shrink(write_buf.capacity(), write_high_water) {
             write_buf = BytesMut::with_capacity(8192);
         }
         if tmp_buf.capacity() > super::util::IO_BUF_SHRINK_TRIGGER {
-            tmp_buf = vec![0u8; 8192];
+            tmp_buf = Vec::new(); // select-arm rent buffer: re-sized on use
         }
         // c10k W1: drop the batch scratch capacity BEFORE parking in read().
         // Both vecs are dead scratch here (responses fully serialized to

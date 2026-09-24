@@ -465,6 +465,9 @@ pub(crate) async fn handle_connection_sharded_inner<
     // none.)
     let mut fanout_state = crate::server::conn::fanout::FanoutState::default();
     let mut fanout_scratch: Vec<(usize, Frame, usize)> = Vec::new(); // grown on first fan-out
+    // Batch-end shrink governors with hysteresis (moon#1179 item 4).
+    let mut read_shrink = super::util::IoBufShrink::default();
+    let mut write_shrink = super::util::IoBufShrink::default();
     loop {
         // Check if CLIENT KILL targeted this connection (lock-free, QW8)
         if client_live.is_killed() {
@@ -585,6 +588,8 @@ pub(crate) async fn handle_connection_sharded_inner<
                     Ok(_) => {}
                     Err(_) => break,
                 }
+                // Most bytes buffered this iteration, for the shrink governor.
+                let read_high_water = read_buf.len();
 
                 // c10k C2: query-buffer ceiling. Sited after the read and
                 // ahead of the parse, because an incomplete frame is exactly
@@ -3588,11 +3593,13 @@ pub(crate) async fn handle_connection_sharded_inner<
                 }
 
                 // c10k W1: shrink floor lowered 64 KiB → 16 KiB (see
-                // super::util::IO_BUF_SHRINK_TRIGGER).
-                if write_buf.capacity() > super::util::IO_BUF_SHRINK_TRIGGER {
+                // super::util::IO_BUF_SHRINK_TRIGGER). moon#1179 item 4: with
+                // hysteresis, so large values every batch do not regrow and
+                // re-copy the buffers on every request.
+                if write_shrink.should_shrink(write_buf.capacity(), write_buf.len()) {
                     write_buf = BytesMut::with_capacity(8192);
                 }
-                if read_buf.capacity() > super::util::IO_BUF_SHRINK_TRIGGER {
+                if read_shrink.should_shrink(read_buf.capacity(), read_high_water.max(read_buf.len())) {
                     let remaining = read_buf.split();
                     read_buf = BytesMut::with_capacity(8192);
                     if !remaining.is_empty() { read_buf.extend_from_slice(&remaining); }

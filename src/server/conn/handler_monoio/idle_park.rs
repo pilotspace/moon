@@ -35,6 +35,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 
+use monoio::buf::{IoBufMut, SliceMut};
 use monoio::io::{AsyncReadRent, CancelHandle, Canceller};
 
 /// Park duration after which the sweep cancels a stage-1 read (ms).
@@ -250,6 +251,35 @@ pub(super) fn downshift_idle_buffers(
     }
 }
 
+/// moon#1179 item 4: hand the connection's read buffer to a monoio read as a
+/// view of its SPARE capacity, so the bytes land in place.
+///
+/// This replaces the 8 KiB rent buffer + `extend_from_slice` of every byte
+/// read: one memcpy of all client input, a hard 8 KiB cap per read, and a
+/// second buffer per connection. The caller must put the buffer back with
+/// `SliceMut::into_inner` when the read returns — the plain and idle-park
+/// read arms always get it back (a cancelled idle-park read is
+/// cancel-and-await, loss-free); a `select!` arm, whose losing future DROPS
+/// its buffer, must keep using a separate rent buffer instead.
+///
+/// `want` is reserved first (so one read can take at least that much); the
+/// read may fill all spare capacity beyond it. For streams that are not
+/// [`IdleParkRead::READ_INTO_UNINIT`] the spare is zeroed first.
+pub(super) fn spare_read_target<S: IdleParkRead>(
+    read_buf: &mut bytes::BytesMut,
+    want: usize,
+) -> SliceMut<bytes::BytesMut> {
+    read_buf.reserve(want);
+    let len = read_buf.len();
+    if !S::READ_INTO_UNINIT {
+        let cap = read_buf.capacity();
+        read_buf.resize(cap, 0);
+        read_buf.truncate(len);
+    }
+    let cap = read_buf.capacity();
+    std::mem::take(read_buf).slice_mut(len..cap)
+}
+
 /// The sweep's cancelled-op error, as monoio constructs it on BOTH drivers:
 /// io_uring surfaces the kernel's `-ECANCELED` (125) and the legacy driver
 /// hardcodes `from_raw_os_error(125)` in its cancel path — including on
@@ -290,11 +320,22 @@ pub(crate) trait IdleParkRead: AsyncReadRent {
         true
     }
 
-    fn idle_park_read(
+    /// moon#1179 item 4: may a read target the UNINITIALIZED spare capacity
+    /// of the connection's read buffer directly?
+    ///
+    /// True only where the read hands the memory to the kernel as a raw
+    /// pointer (plain TCP: io_uring or `read(2)`) and nothing ever forms a
+    /// `&mut [u8]` over it. The vendored TLS stream builds a `&mut [u8]` over
+    /// the whole target for rustls to write into, so for it (and any stream
+    /// not audited) [`spare_read_target`] zeroes the spare first — a memset,
+    /// still cheaper than the decrypt, and never a reference to uninit bytes.
+    const READ_INTO_UNINIT: bool = false;
+
+    fn idle_park_read<T: IoBufMut>(
         &mut self,
-        buf: Vec<u8>,
+        buf: T,
         _c: CancelHandle,
-    ) -> impl std::future::Future<Output = monoio::BufResult<usize, Vec<u8>>> {
+    ) -> impl std::future::Future<Output = monoio::BufResult<usize, T>> {
         self.read(buf)
     }
 
@@ -328,12 +369,15 @@ pub(crate) trait IdleParkRead: AsyncReadRent {
 impl IdleParkRead for monoio::net::TcpStream {
     const SUPPORTS_IDLE_PARK: bool = true;
     const SUPPORTS_TASK_PARK: bool = true;
+    /// Both drivers pass `write_ptr()`/`bytes_total()` straight to the kernel
+    /// (io_uring `Read` op / `read(2)`) and only then `set_init(n)`.
+    const READ_INTO_UNINIT: bool = true;
 
-    fn idle_park_read(
+    fn idle_park_read<T: IoBufMut>(
         &mut self,
-        buf: Vec<u8>,
+        buf: T,
         c: CancelHandle,
-    ) -> impl std::future::Future<Output = monoio::BufResult<usize, Vec<u8>>> {
+    ) -> impl std::future::Future<Output = monoio::BufResult<usize, T>> {
         monoio::io::CancelableAsyncReadRent::cancelable_read(self, buf, c)
     }
 
@@ -363,11 +407,11 @@ impl IdleParkRead for monoio_rustls::ServerTlsStream<monoio::net::TcpStream> {
         monoio_rustls::ServerTlsStream::task_park_safe(self)
     }
 
-    fn idle_park_read(
+    fn idle_park_read<T: IoBufMut>(
         &mut self,
-        buf: Vec<u8>,
+        buf: T,
         c: CancelHandle,
-    ) -> impl std::future::Future<Output = monoio::BufResult<usize, Vec<u8>>> {
+    ) -> impl std::future::Future<Output = monoio::BufResult<usize, T>> {
         monoio::io::CancelableAsyncReadRent::cancelable_read(self, buf, c)
     }
 
@@ -490,6 +534,44 @@ mod idle_park_tests {
             0,
             "dropped registration must leave the registry"
         );
+    }
+
+    /// moon#1179 item 4: the read target is exactly `read_buf`'s spare
+    /// capacity (at least `want`), the buffered bytes come back untouched, and
+    /// a stream not audited for uninit targets gets a zeroed spare.
+    #[test]
+    fn spare_read_target_covers_the_spare_capacity() {
+        use monoio::buf::IoBuf;
+        let mut rb = bytes::BytesMut::with_capacity(16);
+        rb.extend_from_slice(b"*1\r\n$4\r\nPI");
+        let target = spare_read_target::<monoio::net::TcpStream>(&mut rb, 4096);
+        assert!(
+            rb.is_empty() && rb.capacity() == 0,
+            "the buffer moved into the read"
+        );
+        assert_eq!(target.begin(), 10, "reads append after the buffered bytes");
+        assert!(
+            target.end() - target.begin() >= 4096,
+            "at least `want` of room"
+        );
+        assert_eq!(
+            target.bytes_init(),
+            0,
+            "nothing past the buffered bytes is readable"
+        );
+        let back = target.into_inner();
+        assert_eq!(&back[..], b"*1\r\n$4\r\nPI");
+
+        // The zeroing path (TLS): same view, spare zero-filled, data intact.
+        let mut rb = back;
+        let target = spare_read_target::<monoio_rustls::ServerTlsStream<monoio::net::TcpStream>>(
+            &mut rb, 64,
+        );
+        let (begin, end) = (target.begin(), target.end());
+        let back = target.into_inner();
+        assert_eq!(&back[..], b"*1\r\n$4\r\nPI");
+        assert_eq!(begin, 10);
+        assert!(end - begin >= 64);
     }
 
     #[test]

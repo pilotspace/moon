@@ -197,6 +197,48 @@ pub(crate) fn shrink_batch_vec<T>(v: &mut Vec<T>) {
 /// growth for genuinely large frames in flight.
 pub(crate) const IO_BUF_SHRINK_TRIGGER: usize = 16384;
 
+/// Consecutive batches that must leave an oversized I/O buffer mostly unused
+/// before [`IoBufShrink`] gives its capacity back.
+pub(crate) const IO_BUF_SHRINK_AFTER_BATCHES: u32 = 8;
+
+/// Batch-end shrink governor for a connection's read or write buffer, with
+/// hysteresis (moon#1179 item 4).
+///
+/// The old rule shrank on EVERY batch end whose buffer capacity exceeded
+/// [`IO_BUF_SHRINK_TRIGGER`]. A client sending one 64 KiB `SET` per batch
+/// therefore regrew its read buffer 8 -> 16 -> 32 -> 64 -> 128 KiB (copying
+/// each time) on every request, only to have it dropped again at the batch
+/// end: ~4x the payload in memcpy per request. The W1 goal — a connection that
+/// once carried a large value must not keep that high-water forever — only
+/// needs the shrink to happen once the buffer has STOPPED being used, so:
+/// a batch that used more than half the trigger resets the streak, and the
+/// buffer is shrunk after [`IO_BUF_SHRINK_AFTER_BATCHES`] consecutive batches
+/// that did not. An idle connection is covered separately and sooner by the
+/// idle downshift, which releases empty buffers outright.
+#[derive(Debug, Default)]
+pub(crate) struct IoBufShrink {
+    small_batches: u32,
+}
+
+impl IoBufShrink {
+    /// Record one batch end. `capacity` is the buffer's capacity now; `used`
+    /// the most bytes it held during the batch (or still holds). True means
+    /// "shrink it now".
+    #[inline]
+    pub(crate) fn should_shrink(&mut self, capacity: usize, used: usize) -> bool {
+        if capacity <= IO_BUF_SHRINK_TRIGGER || used > IO_BUF_SHRINK_TRIGGER / 2 {
+            self.small_batches = 0;
+            return false;
+        }
+        self.small_batches += 1;
+        if self.small_batches >= IO_BUF_SHRINK_AFTER_BATCHES {
+            self.small_batches = 0;
+            return true;
+        }
+        false
+    }
+}
+
 /// Reply size at or above which a write arms the `--client-write-timeout-ms`
 /// watchdog (c10k C1).
 ///
@@ -234,6 +276,37 @@ pub(crate) fn arm_write_timeout(
 #[cfg(test)]
 mod shrink_tests {
     use super::*;
+
+    /// moon#1179 item 4: a connection that keeps sending large values keeps
+    /// its buffer (no per-batch shrink/regrow thrash); one that went back to
+    /// small commands gives the capacity back after the streak.
+    #[test]
+    fn io_buf_shrink_has_hysteresis() {
+        let big = 128 * 1024;
+        let mut g = IoBufShrink::default();
+        // Every batch uses the big buffer: never shrink.
+        for _ in 0..100 {
+            assert!(!g.should_shrink(big, 70 * 1024));
+        }
+        // Small batches: shrink exactly on the Nth consecutive one.
+        for i in 1..IO_BUF_SHRINK_AFTER_BATCHES {
+            assert!(!g.should_shrink(big, 100), "shrank early at batch {i}");
+        }
+        assert!(g.should_shrink(big, 100));
+        // A big batch in the middle of a streak restarts it.
+        for _ in 1..IO_BUF_SHRINK_AFTER_BATCHES {
+            assert!(!g.should_shrink(big, 100));
+        }
+        assert!(!g.should_shrink(big, IO_BUF_SHRINK_TRIGGER));
+        for _ in 1..IO_BUF_SHRINK_AFTER_BATCHES {
+            assert!(!g.should_shrink(big, 100));
+        }
+        assert!(g.should_shrink(big, 100));
+        // A buffer at or under the trigger is never shrunk.
+        for _ in 0..100 {
+            assert!(!g.should_shrink(IO_BUF_SHRINK_TRIGGER, 0));
+        }
+    }
 
     #[test]
     fn oversized_batch_vec_shrinks_to_steady_cap() {
@@ -315,12 +388,10 @@ pub(crate) fn query_buf_exceeded(
 
 /// Smallest read the parse hint may ask for. Below this a frame's remainder
 /// fits in an ordinary read and sizing it buys nothing.
-#[cfg(any(feature = "runtime-tokio", test))]
 pub(crate) const READ_HINT_MIN: usize = 32 * 1024;
 /// Largest single read the parse hint may ask for. Bounds the capacity one
 /// read reserves ahead of the bytes actually arriving: a `$536870911` header
 /// must not reserve half a gigabyte on the strength of a claim.
-#[cfg(any(feature = "runtime-tokio", test))]
 pub(crate) const READ_HINT_MAX: usize = 1024 * 1024;
 
 /// How many bytes the next read should make room for, given the incomplete
@@ -338,7 +409,6 @@ pub(crate) const READ_HINT_MAX: usize = 1024 * 1024;
 /// connection — pre-auth clients stay on the small fixed read; the growth a
 /// hint allows is for clients the server has already let in.
 #[inline]
-#[cfg(any(feature = "runtime-tokio", test))]
 pub(crate) fn hinted_read_len(
     buffered: usize,
     pending_total: usize,
