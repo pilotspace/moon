@@ -140,9 +140,27 @@ pub(crate) struct DrainResult {
 /// `SELECT n` updates `selected_db` and is NOT emitted (carries no data).
 /// Replication chatter (`PING`, `REPLCONF`) is skipped. Every other command is
 /// emitted bound to the `selected_db` in effect when it was parsed.
+///
+/// Stateless form, for tests and one-shot buffers; the replica read loops use
+/// [`drain_replicated_commands_resumable`].
+#[cfg(test)]
 pub(crate) fn drain_replicated_commands(
     buf: &mut BytesMut,
     selected_db: &mut usize,
+) -> DrainResult {
+    drain_replicated_commands_resumable(buf, selected_db, &mut parse::ParseState::new())
+}
+
+/// [`drain_replicated_commands`] for a read loop that feeds ONE buffer across
+/// socket reads: `state` resumes the scan of a large frame at the front of
+/// `buf` where the previous call stopped, so a big command in the feed (a
+/// million-element `RPUSH`) costs O(n) to parse on the replica instead of
+/// O(n²) (moon#1164). `buf` must only be appended to between calls — this
+/// function is its only consumer, which is what the replica loops guarantee.
+pub(crate) fn drain_replicated_commands_resumable(
+    buf: &mut BytesMut,
+    selected_db: &mut usize,
+    state: &mut parse::ParseState,
 ) -> DrainResult {
     let config = ParseConfig::default();
     let mut commands = Vec::new();
@@ -154,7 +172,7 @@ pub(crate) fn drain_replicated_commands(
             break;
         }
         let before = buf.len();
-        match parse::parse(buf, &config) {
+        match parse::parse_resumable(buf, &config, state) {
             Ok(Some(frame)) => {
                 consumed += before - buf.len();
                 classify(frame, selected_db, &mut commands);
@@ -1563,6 +1581,57 @@ mod tests {
         assert_eq!(r.consumed, complete_len);
         assert!(!r.fatal);
         assert_eq!(&buf[..], b"*3\r\n$3\r\nSET\r\n$3\r\nfo");
+    }
+
+    /// moon#1164: the replica feed parser resumes a large frame across reads
+    /// (it keeps a cursor instead of re-scanning from byte 0) and still
+    /// reports whole-frame `consumed` accounting for the replication offset.
+    #[test]
+    fn large_frame_across_reads_resumes_and_accounts_whole_frames() {
+        let mut args: Vec<Vec<u8>> = vec![b"RPUSH".to_vec(), b"bigl".to_vec()];
+        args.extend((0..20_000).map(|i| format!("{i}").into_bytes()));
+        let refs: Vec<&[u8]> = args.iter().map(|a| a.as_slice()).collect();
+        let mut feed = resp_cmd(&[b"SELECT", b"3"]);
+        let select_len = feed.len();
+        let big = resp_cmd(&refs);
+        feed.extend_from_slice(&big);
+        feed.extend_from_slice(&resp_cmd(&[b"SET", b"after", b"1"]));
+
+        let mut buf = BytesMut::new();
+        let mut db = 0usize;
+        let mut state = crate::protocol::ParseState::new();
+        let mut emitted = Vec::new();
+        let mut consumed = 0usize;
+        let mut resumed_midway = false;
+        for chunk in feed.chunks(64 * 1024) {
+            buf.extend_from_slice(chunk);
+            let r = drain_replicated_commands_resumable(&mut buf, &mut db, &mut state);
+            assert!(!r.fatal);
+            consumed += r.consumed;
+            resumed_midway |= state.is_resuming();
+            emitted.extend(r.commands);
+            // Offsets advance by WHOLE frames only.
+            assert!(
+                consumed == select_len
+                    || consumed == select_len + big.len()
+                    || consumed == feed.len()
+                    || consumed == 0
+            );
+        }
+        assert!(
+            resumed_midway,
+            "a 20K-element frame in 64 KiB reads must hold a resume cursor"
+        );
+        assert_eq!(consumed, feed.len());
+        assert!(buf.is_empty());
+        assert_eq!(emitted.len(), 2);
+        assert_eq!(cmd_name(&emitted[0]), b"RPUSH");
+        assert_eq!(emitted[0].db_index, 3);
+        match &*emitted[0].command {
+            Frame::Array(items) => assert_eq!(items.len(), 20_002),
+            other => panic!("expected Array, got {other:?}"),
+        }
+        assert_eq!(cmd_name(&emitted[1]), b"SET");
     }
 
     #[test]

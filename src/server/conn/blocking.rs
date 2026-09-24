@@ -2768,7 +2768,11 @@ pub(crate) fn try_inline_dispatch(
         );
         match outcome {
             GetOutcome::Handled => {
-                let _ = read_buf.split_to(consumed);
+                // moon#1179 item 6: `advance`, not `split_to` — the consumed
+                // prefix is discarded, so there is nothing to split off and no
+                // reason to promote the buffer to shared (a refcount
+                // fetch_add + fetch_sub for nothing).
+                bytes::Buf::advance(read_buf, consumed);
                 return 1;
             }
             GetOutcome::Miss => {
@@ -2821,7 +2825,7 @@ pub(crate) fn try_inline_dispatch(
                 }
             }
         }
-        let _ = read_buf.split_to(consumed);
+        bytes::Buf::advance(read_buf, consumed); // moon#1179 item 6, as above
         return 1;
     }
 

@@ -80,12 +80,25 @@ pub fn parse_inline(
         return Ok(Some(Frame::Array(args)));
     }
 
+    // Empty/whitespace-only lines produce no frame: consume them without
+    // freezing anything.
+    if line.iter().all(|&c| is_inline_separator(c)) {
+        buf.advance(consumed);
+        return Ok(None);
+    }
+
     // Split on the separator set using SIMD, filtering empty slices.
     //
     // `\r` belongs here and used to be missing: Redis breaks unquoted tokens on
     // {space, \n, \r, \t}, so `RPUSH k a\rb` is two elements there and was one
     // in Moon (measured). `\n` cannot appear — it is the terminator — so the
     // three bytes below are the whole set this path can ever see.
+    //
+    // moon#1179 item 6: the line is frozen ONCE and every argument is a
+    // zero-copy slice of it — the same thing the RESP path does for a frame —
+    // instead of one `Bytes::copy_from_slice` allocation per argument.
+    let frozen = buf.split_to(consumed).freeze();
+    let line = &frozen[..line_len];
     let mut args = FrameVec::new();
     let mut start = 0;
     while start < line.len() {
@@ -99,24 +112,14 @@ pub fn parse_inline(
         // Find next separator using SIMD
         match memchr3(b' ', b'\t', b'\r', &line[start..]) {
             Some(pos) => {
-                args.push(Frame::BulkString(Bytes::copy_from_slice(
-                    &line[start..start + pos],
-                )));
+                args.push(Frame::BulkString(frozen.slice(start..start + pos)));
                 start += pos + 1;
             }
             None => {
-                args.push(Frame::BulkString(Bytes::copy_from_slice(&line[start..])));
+                args.push(Frame::BulkString(frozen.slice(start..line_len)));
                 break;
             }
         }
-    }
-
-    // Advance buffer past line + terminator
-    buf.advance(consumed);
-
-    // Empty/whitespace-only lines produce no frame
-    if args.is_empty() {
-        return Ok(None);
     }
 
     Ok(Some(Frame::Array(args)))
@@ -370,6 +373,41 @@ mod tests {
     fn parse_inline_bytes(input: &[u8]) -> Result<Option<Frame>, ParseError> {
         let mut buf = BytesMut::from(input);
         parse_inline(&mut buf, TEST_MAX_INLINE)
+    }
+
+    /// moon#1179 item 6: unquoted inline arguments are zero-copy slices of
+    /// ONE frozen line — each sits exactly where it sat in the line — rather
+    /// than one fresh allocation per argument; the remainder of the buffer is
+    /// untouched and a blank line is consumed without producing a frame.
+    #[test]
+    fn inline_args_alias_one_frozen_line() {
+        let mut buf = BytesMut::from(&b"SET  foo\tbar\r\nPING\r\n"[..]);
+        let frame = parse_inline(&mut buf, TEST_MAX_INLINE).unwrap().unwrap();
+        let Frame::Array(args) = frame else {
+            panic!("expected Array")
+        };
+        let ptrs: Vec<usize> = args
+            .iter()
+            .map(|a| match a {
+                Frame::BulkString(b) => b.as_ptr() as usize,
+                other => panic!("expected BulkString, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            ptrs[1] - ptrs[0],
+            5,
+            "`foo` must alias the line, 5 bytes after `SET`"
+        );
+        assert_eq!(
+            ptrs[2] - ptrs[0],
+            9,
+            "`bar` must alias the line, 9 bytes after `SET`"
+        );
+        assert_eq!(&buf[..], b"PING\r\n");
+
+        let mut blank = BytesMut::from(&b" \t \r\nPING\r\n"[..]);
+        assert!(parse_inline(&mut blank, TEST_MAX_INLINE).unwrap().is_none());
+        assert_eq!(&blank[..], b"PING\r\n");
     }
 
     #[test]

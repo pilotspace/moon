@@ -53,6 +53,7 @@ jobs:
           - resp_parse_differential
           - listpack_decoder_differential
           - resp_parse_fused
+          - resp_parse_resumable
           - inline_parse
           - wal_v3_record
           - gossip_deser
@@ -140,6 +141,7 @@ jobs:
           - resp_parse_differential
           - listpack_decoder_differential
           - resp_parse_fused
+          - resp_parse_resumable
           - inline_parse
           - wal_v3_record
           - gossip_deser
