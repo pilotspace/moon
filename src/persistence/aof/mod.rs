@@ -782,7 +782,7 @@ pub mod rewrite;
 pub mod rewrite_overflow;
 mod writer_task;
 
-pub use pool::AofWriterPool;
+pub use pool::{AofWriterPool, BoundedRefusal};
 pub use rewrite::generate_rewrite_commands;
 // `rewrite_aof` is defined only under the tokio runtime; gate its re-export to match.
 #[cfg(feature = "runtime-tokio")]

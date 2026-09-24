@@ -177,6 +177,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A spill's `MOON.SPILLED` cut record is never dropped under AOF
+  backpressure** (moon#1202). When the AOF writer's channel stayed full past
+  the 500 ms bound, the record was dropped while its keys stayed published to
+  the cold tier. Recovery was still value-correct, because the log rebuilt
+  those keys in RAM, but the drop was reported as a lost acknowledged append
+  (`aof_last_append_status:err`) and the keys came back in RAM instead of cold.
+  A later retry was not an option: a record logged after a newer write to the
+  key makes replay lose that write. The record is now logged before the keys
+  are published. If the writer cannot take it, the spill is withdrawn: the
+  keys go back to RAM, the file stays out of the manifest (the startup orphan
+  sweep removes it), and the next eviction pass spills them again. New
+  `INFO persistence` field: `spill_completion_marker_withdrawn`. One
+  backpressure budget now covers every record in a completion drain, so a
+  saturated writer blocks the shard thread for at most 500 ms per drain
+  instead of 500 ms per spill file.
+
 - **An AOF rewrite that is started while the previous one is still draining
   is no longer lost** (moon#1158). A per-shard rewrite released the
   in-progress flag when its manifest committed, before every writer had

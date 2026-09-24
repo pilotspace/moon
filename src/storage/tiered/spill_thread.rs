@@ -215,6 +215,26 @@ pub fn record_spill_completion_id_rejected() {
     SPILL_COMPLETION_ID_REJECTED.fetch_add(1, Ordering::Relaxed);
 }
 
+/// Spill completions withdrawn because the AOF writer would not take their
+/// `MOON.SPILLED` cut record within the backpressure bound (moon#1202). The
+/// keys went back to the hot table from their in-flight payloads and the file
+/// was left out of the manifest, so the next eviction pass spills them again.
+/// A nonzero value means the AOF writer is saturated. Exposed as
+/// `spill_completion_marker_withdrawn` in INFO.
+static SPILL_COMPLETION_MARKER_WITHDRAWN: AtomicU64 = AtomicU64::new(0);
+
+/// Cumulative spill completions withdrawn for an unloggable marker.
+#[inline]
+pub fn spill_completion_marker_withdrawn_total() -> u64 {
+    SPILL_COMPLETION_MARKER_WITHDRAWN.load(Ordering::Relaxed)
+}
+
+/// Record one spill completion withdrawn for an unloggable marker.
+#[inline]
+pub fn record_spill_completion_marker_withdrawn() {
+    SPILL_COMPLETION_MARKER_WITHDRAWN.fetch_add(1, Ordering::Relaxed);
+}
+
 use bytes::Bytes;
 use tracing::warn;
 

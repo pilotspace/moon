@@ -259,3 +259,158 @@ fn a_file_holding_only_a_superseded_copy_is_not_unlinked_during_replay() {
         "file 7 still backs `solo` and file 12 still backs `k`"
     );
 }
+
+// ---------------------------------------------------------------------------
+// moon#1202: what a `MOON.SPILLED` marker that never reached the AOF costs,
+// in every ordering the issue asks about. The crash image is the one a marker
+// dropped under AOF backpressure leaves: the spill file is in the manifest,
+// the keys were published cold live (their hot copies gone), and the log
+// holds every record that built them but no cut. Each test replays through
+// the production recovery path above.
+// ---------------------------------------------------------------------------
+
+/// The value of `key` and whether recovery left it hot (vs cold).
+fn value_and_plane(db: &mut Database, key: &[u8]) -> (Option<Vec<u8>>, bool) {
+    let hot = db.is_hot(key);
+    (string_value(db, key), hot)
+}
+
+/// (a) No later write: the key recovers HOT with the value the log built.
+/// The file's entry is dropped at the end-of-replay resolution, so nothing
+/// points at the unauthorized copy afterwards.
+#[test]
+fn moon1202_a_dropped_marker_with_no_later_write_recovers_hot() {
+    let mut aof = crate::persistence::cold_records::serialize_cold_cut(1).to_vec();
+    aof.extend_from_slice(&resp(&[b"APPEND", b"k", b"hello"]));
+    let (_dir, mut db) = recover(&[(5, &[("k", "hello")])], &aof);
+    assert!(
+        db.cold_index
+            .as_ref()
+            .is_some_and(|ci| ci.lookup(b"k").is_none()),
+        "hot-wins: the unauthorized cold entry is dropped"
+    );
+    assert_eq!(
+        value_and_plane(&mut db, b"k"),
+        (Some(b"hello".to_vec()), true),
+        "the key recovers hot with exactly the logged value"
+    );
+}
+
+/// Control for (a): with the marker the same key recovers cold.
+#[test]
+fn moon1202_a_control_the_marker_recovers_cold() {
+    let mut aof = crate::persistence::cold_records::serialize_cold_cut(1).to_vec();
+    aof.extend_from_slice(&resp(&[b"APPEND", b"k", b"hello"]));
+    aof.extend_from_slice(&resp(&[b"MOON.SPILLED", b"5", b"k"]));
+    let (_dir, mut db) = recover(&[(5, &[("k", "hello")])], &aof);
+    assert_eq!(
+        value_and_plane(&mut db, b"k"),
+        (Some(b"hello".to_vec()), false)
+    );
+}
+
+/// (b) A later non-idempotent write: live, it promoted the cold copy
+/// (`hello`) and appended. Replay lands it on the hot copy the log rebuilt —
+/// neither lost nor applied twice.
+#[test]
+fn moon1202_b_a_later_append_is_neither_lost_nor_doubled() {
+    let mut aof = crate::persistence::cold_records::serialize_cold_cut(1).to_vec();
+    aof.extend_from_slice(&resp(&[b"APPEND", b"k", b"hello"]));
+    aof.extend_from_slice(&resp(&[b"APPEND", b"k", b"!"]));
+    let (_dir, mut db) = recover(&[(5, &[("k", "hello")])], &aof);
+    assert_eq!(
+        value_and_plane(&mut db, b"k"),
+        (Some(b"hello!".to_vec()), true)
+    );
+}
+
+/// (b) A later SET and a later DEL.
+#[test]
+fn moon1202_b_a_later_set_or_del_wins() {
+    for (tail, want) in [
+        (resp(&[b"SET", b"k", b"new"]), Some(b"new".to_vec())),
+        (resp(&[b"DEL", b"k"]), None),
+    ] {
+        let mut aof = crate::persistence::cold_records::serialize_cold_cut(1).to_vec();
+        aof.extend_from_slice(&resp(&[b"APPEND", b"k", b"hello"]));
+        aof.extend_from_slice(&tail);
+        let (_dir, mut db) = recover(&[(5, &[("k", "hello")])], &aof);
+        assert_eq!(string_value(&mut db, b"k"), want);
+    }
+}
+
+/// (b) A later write, then a re-spill whose marker DID land. The second
+/// replayed write retires the stale shadow (`Database::set`'s `Updated` arm),
+/// so the key recovers hot rather than cut over — either way with the
+/// current value.
+#[test]
+fn moon1202_b_a_later_respill_with_its_marker_recovers_the_current_value() {
+    let mut aof = crate::persistence::cold_records::serialize_cold_cut(1).to_vec();
+    aof.extend_from_slice(&resp(&[b"SET", b"k", b"hello"]));
+    aof.extend_from_slice(&resp(&[b"SET", b"k", b"hello!"]));
+    aof.extend_from_slice(&resp(&[b"MOON.SPILLED", b"9", b"k"]));
+    let files: &[(u64, &[(&str, &str)])] = &[(5, &[("k", "hello")]), (9, &[("k", "hello!")])];
+    let (_dir, mut db) = recover(files, &aof);
+    assert_eq!(string_value(&mut db, b"k").as_deref(), Some(&b"hello!"[..]));
+}
+
+/// (b) The key's pre-spill history is NOT in this generation: it was cold
+/// below the cut (file 3), read-promoted (unlogged), re-spilled into file 5
+/// with the marker dropped, then written. Live, the write promoted file 5's
+/// copy. Replay: file 5 is hidden, its older copy in file 3 (same value) is
+/// visible, so the write lands exactly once.
+#[test]
+fn moon1202_b_a_write_after_a_dropped_respill_of_a_pre_cut_key() {
+    let mut aof = crate::persistence::cold_records::serialize_cold_cut(4).to_vec();
+    aof.extend_from_slice(&resp(&[b"APPEND", b"k", b"!"]));
+    let files: &[(u64, &[(&str, &str)])] = &[(3, &[("k", "v0")]), (5, &[("k", "v0")])];
+    let (_dir, mut db) = recover(files, &aof);
+    assert_eq!(string_value(&mut db, b"k").as_deref(), Some(&b"v0!"[..]));
+}
+
+/// (c) A rewrite committing after the drop: the base is hot-only, so the key
+/// is in it not at all; the new generation's `MOON.COLDCUT` is above the
+/// file, which authorizes it. The key recovers cold, and a post-rewrite write
+/// replays onto that copy exactly once.
+#[test]
+fn moon1202_c_a_rewrite_after_the_drop_heals_it() {
+    let head = crate::persistence::cold_records::serialize_cold_cut(9).to_vec();
+    let (_dir, mut db) = recover(&[(5, &[("k", "hello")])], &head);
+    assert_eq!(
+        value_and_plane(&mut db, b"k"),
+        (Some(b"hello".to_vec()), false),
+        "no record in the new generation: served cold from the file below the cut"
+    );
+
+    let mut aof = head;
+    aof.extend_from_slice(&resp(&[b"APPEND", b"k", b"!"]));
+    let (_dir, mut db) = recover(&[(5, &[("k", "hello")])], &aof);
+    assert_eq!(string_value(&mut db, b"k").as_deref(), Some(&b"hello!"[..]));
+}
+
+/// Why a dropped marker must never be RETRIED later. Same history as the
+/// test above, but the key's post-spill write is a SET — its first replayed
+/// write, so `set`'s `Inserted` arm leaves file 5's shadow standing — and a
+/// retried marker for file 5 lands AFTER it. Replay then cuts the key back to
+/// file 5's older value: the acknowledged SET is lost. The fix never logs a
+/// marker anywhere but at its publish instant (fail-closed instead).
+#[test]
+fn moon1202_a_marker_logged_after_a_later_write_would_lose_it() {
+    let mut aof = crate::persistence::cold_records::serialize_cold_cut(4).to_vec();
+    aof.extend_from_slice(&resp(&[b"SET", b"k", b"acked"]));
+    let files: &[(u64, &[(&str, &str)])] = &[(3, &[("k", "v0")]), (5, &[("k", "v0")])];
+    let (_dir, mut db) = recover(files, &aof);
+    assert_eq!(
+        string_value(&mut db, b"k").as_deref(),
+        Some(&b"acked"[..]),
+        "control: no marker, the SET survives"
+    );
+
+    aof.extend_from_slice(&resp(&[b"MOON.SPILLED", b"5", b"k"]));
+    let (_dir, mut db) = recover(files, &aof);
+    assert_eq!(
+        string_value(&mut db, b"k").as_deref(),
+        Some(&b"v0"[..]),
+        "a late marker drops the acknowledged SET — the hazard a retry would create"
+    );
+}
