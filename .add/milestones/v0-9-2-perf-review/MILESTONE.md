@@ -33,14 +33,15 @@ Out: the RESET/ACL privilege-retention finding (security — handled privately p
 | 2 | WS12-snapshot-integrity | storage-durability-engineer · performance-engineer | #1216(P0) #1217 #1185(incremental fold) |
 | 2 | WS13-text-graph-followups | performance-engineer · ci-test-integrity-engineer | #1219 #1220 |
 | 2 | WS15-durability-followups | storage-durability-engineer · ci-test-integrity-engineer | #1215(P0) #1223(P1) #1230 |
-| 2 | WS16-snapshot-capture (queued after WS7+WS8 land) | storage-durability-engineer · ci-test-integrity-engineer | #1228(capture gaps, epoch liveness, vector items) #1222 #1185(incremental fold) |
+| 2 | WS16-snapshot-capture (queued after WS7+WS8+WS10 land) | storage-durability-engineer · ci-test-integrity-engineer | #1228(capture gaps, epoch liveness) #1185(incremental fold) #1231 #1232 |
+| 2 | WS17-vector-text-residuals | performance-engineer · ci-test-integrity-engineer | #1226(vector/text/graph items, file splits, root-test skip) #1228(vector items) #1220(item 3) #1222 |
 | 3 | WS14-ci-verification | ci-test-integrity-engineer | merged-tree gates, test-consistency.sh / test-commands.sh vs redis, re-measure the review's 📏 numbers |
 
 ## Found during the fix wave (filed 2026-09-24)
 - Bugs: moon#1205 (B+tree corruption — fixed in WS2), #1206 (listpack backlen order — WS10), #1207 (TQ4A2 FT.SEARCH panic — fixed in WS5a), #1208 (EXACT QJL misalignment — fixed in WS5a), #1209 (LPOS/LMOVE parity — fixed in WS3), #1211 (inert LFU params / NOTOUCH introspection — fixed in WS1).
 - More bugs (from WS6): #1216 **P0** BGSAVE loses keys on a mid-epoch DashTable split (WS12), #1217 COW captures only the first key of multi-key writes (WS12).
 - From WS5b: #1218 FT prefix/fuzzy expansion nondeterministic across processes (fixed in WS5b), #1219 ignored cross-shard FT consistency suites broken at their seed (WS13).
-- From the PR #1221/#1227 reviews: #1223 (P1 spill withdraw after fold — WS15), #1225 (list cold-fault element loss — WS10), #1228 (snapshot capture gaps — WS16/WS8), #1229 (SCRIPT FLUSH one shard — WS8), #1230 (bgsave status sticky — WS15); #1215 P0 cold DEL resurrects after rewrite (WS15); #1222 flaky test (WS16), #1226 review nits.
+- From the PR #1221/#1227 reviews: #1223 (P1 spill withdraw after fold — WS15), #1225 (list cold-fault element loss — WS10), #1228 (snapshot capture gaps — WS16/WS8), #1229 (SCRIPT FLUSH one shard — WS8), #1230 (bgsave status sticky — WS15); #1215 P0 cold DEL resurrects after rewrite (WS15); #1222 flaky test (WS17), #1226 review nits (vector/text/graph part — WS17). From WS15: #1231 (promote-then-sweep loss — WS16), #1232 (sharded --save never fires — WS16).
 - Part 4 queue (after part 3): residual perf partials #1190 (O(1) entry_overhead, lazy free), #1189 (structural expiry index), #1171 (O(1) HRANDFIELD), #1220 item 3, #1194 key_hash merge (after WS8), #1226 nits. Hardware-blocked items (aarch64 A/B, Linux perf host, ≥8-core load generator, MiniLM recall) are recorded, not faked.
 - Follow-ups: #1220 (text/graph residuals — WS13), #1212 (listpack residuals — WS10), #1213 (vector follow-ups — WS11), #1214 (needs-profile items — WS8/WS9/WS10).
 

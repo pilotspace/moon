@@ -8,7 +8,7 @@ does not OOM, fill the disk, or corrupt each other's work.
 - Base is main **`ae21476`** (PR #1221 + PR #1227 merged). Wherever this file says `935c555`, read `ae21476`:
   regression tests must FAIL on `ae21476` and pass after; the HEAD baseline binary is `/home/user/wt/bin/baseline-ae21476`.
 - Four agents build concurrently in the shared target: expect lock waits; the rules in §2 are what keep that safe.
-- WS15 port range: 7320–7339.
+- WS15 port range: 7320–7339. WS16: 7360–7379. WS17: 7340–7359.
 - Known environment-only failure, NOT yours: `storage::tiered::cold_index_rebuild_tests::unreadable_file_is_counted_and_skipped_never_queued_for_unlink`
   fails because the container runs as root (chmod 000 is still readable). Do not "fix" it.
 - CHANGELOG entries are written by the orchestrator from your SUMMARY.md — put a ready-to-paste CHANGELOG bullet per issue in SUMMARY.
