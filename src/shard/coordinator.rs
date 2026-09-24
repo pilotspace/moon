@@ -159,6 +159,12 @@ pub async fn coordinate_multi_key(
 
 /// Run one full command on the LOCAL shard through the real dispatcher
 /// (identical semantics to a remote MultiExecute leg, minus the hop).
+///
+/// "Identical" includes the index/queue hooks the `MultiExecute` arm runs
+/// after dispatch (moon#1162): a local leg of a spanning `DEL` tombstones its
+/// documents exactly like the remote legs do. `cmd_dispatch` also captures the
+/// BGSAVE pre-images of every key it writes (moon#558/#1217), which is why
+/// local legs go through here rather than calling a command body directly.
 fn run_local(
     shard_databases: &Arc<ShardDatabases>,
     db_index: usize,
@@ -174,7 +180,14 @@ fn run_local(
             DispatchResult::Response(f) | DispatchResult::Quit(f) => f,
         }
     };
-    crate::shard::slice::with_shard_db(db_index, run)
+    let reply = crate::shard::slice::with_shard_db(db_index, run);
+    // The guard above is released: the MQ drop takes the whole slice.
+    if crate::shard::write_hooks::hook_kind(cmd) != crate::shard::write_hooks::HookKind::None {
+        crate::shard::slice::with_shard(|s| {
+            crate::shard::write_hooks::run_post_write_hooks(s, cmd, args, db_index, &reply);
+        });
+    }
+    reply
 }
 
 /// Maximum time to wait for a cross-shard reply after the request was
@@ -1847,20 +1860,11 @@ async fn coordinate_multi_del_or_exists(
         }
     }
 
-    // db_count() lives on ShardDatabases — read once, share across both branches.
-    let db_count = shard_databases.db_count();
-
-    // Fast path: all keys on local shard
+    // Fast path: all keys on local shard. `run_local` also runs the
+    // index/queue hooks (moon#1162) — `cmd_dispatch` alone left the deleted
+    // documents in every vector index.
     if groups.len() == 1 && groups.contains_key(&my_shard) {
-        let mut selected = db_index;
-        let result = crate::shard::slice::with_shard_db(db_index, |db| {
-            db.refresh_now_from_cache(cached_clock);
-            cmd_dispatch(db, cmd, args, &mut selected, db_count)
-        });
-        let resp = match result {
-            DispatchResult::Response(f) => f,
-            DispatchResult::Quit(f) => f,
-        };
+        let resp = run_local(shard_databases, db_index, cached_clock, cmd, args);
         // v3-5 carried gap: the in-process DEL/UNLINK never reached the AOF —
         // deleted keys RESURRECTED from the seed writes on restart. Persist
         // only when something was actually removed (n=0 replays identically
@@ -1897,12 +1901,10 @@ async fn coordinate_multi_del_or_exists(
 
     for (shard_id, key_args) in &groups {
         if *shard_id == my_shard {
-            let mut selected = db_index;
-            let result = crate::shard::slice::with_shard_db(db_index, |db| {
-                db.refresh_now_from_cache(cached_clock);
-                cmd_dispatch(db, cmd, key_args, &mut selected, db_count)
-            });
-            if let DispatchResult::Response(Frame::Integer(n)) = result {
+            // moon#1162: through `run_local`, so this slice's deleted
+            // documents are tombstoned like the remote slices' are.
+            let result = run_local(shard_databases, db_index, cached_clock, cmd, key_args);
+            if let Frame::Integer(n) = result {
                 total_count += n;
                 // v3-5 carried gap: persist the local slice (synthesized over
                 // ONLY the keys this shard owns — remote slices persist on

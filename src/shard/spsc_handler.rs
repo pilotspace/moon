@@ -1121,29 +1121,15 @@ pub(crate) fn handle_shard_message_shared(
                             drop(db);
                             flush_every_database_on_flushall(&s.databases, cmd, db_idx, &frame);
 
-                            // Auto-index: if HSET succeeded and key matches a vector index prefix,
-                            // extract the vector field and append to mutable segment.
-                            // vector_store and text_store accessed here (same with_shard closure).
-                            if cmd.eq_ignore_ascii_case(b"HSET")
-                                && !matches!(frame, crate::protocol::Frame::Error(_))
-                            {
-                                if let Some(crate::protocol::Frame::BulkString(key_bytes)) =
-                                    args.first()
-                                {
-                                    // Plan 166-01: return value (index_name, key_hash)
-                                    // tuples will be consumed by Plan 166-02 to record
-                                    // VectorIntents on the active CrossStoreTxn. Discarded
-                                    // here because this path is not txn-aware yet.
-                                    let _ = auto_index_hset(
-                                        &mut s.vector_store,
-                                        &mut s.text_store,
-                                        key_bytes,
-                                        args,
-                                        0,
-                                        db_idx as u8,
-                                    );
-                                }
-                            }
+                            // moon#1162: the index/queue hooks (HSET auto-index,
+                            // DEL/UNLINK tombstones + MQ drops, HDEL, FLUSH index
+                            // clears) — one list shared with every other arm, run
+                            // on the dispatch reply (the mutation happened even if
+                            // the AOF append below turns the client reply into an
+                            // error).
+                            crate::shard::write_hooks::run_post_write_hooks(
+                                s, cmd, args, db_idx, &frame,
+                            );
 
                             // Fail-loud: the mutation is applied (wake/auto-index above
                             // ran on real state), but the client must not see success
@@ -1158,21 +1144,6 @@ pub(crate) fn handle_shard_message_shared(
                         })
                     }
                 };
-
-                // Auto-delete is a vector_store-only operation; runs outside the gate.
-                // Each arm uses its own flat with_shard borrow — no outer borrow is active.
-                if (cmd.eq_ignore_ascii_case(b"DEL") || cmd.eq_ignore_ascii_case(b"UNLINK"))
-                    && !matches!(frame, crate::protocol::Frame::Error(_))
-                {
-                    crate::shard::slice::with_shard(|s| {
-                        for arg in args.iter() {
-                            if let crate::protocol::Frame::BulkString(key_bytes) = arg {
-                                s.vector_store
-                                    .mark_deleted_for_key_for_db(key_bytes.as_ref(), db_idx as u8);
-                            }
-                        }
-                    });
-                }
 
                 frame
             };
@@ -1374,6 +1345,13 @@ pub(crate) fn handle_shard_message_shared(
                     // guard first (the old code ended its borrow of db_idx here too).
                     drop(guard);
                     flush_every_database_on_flushall(&s.databases, cmd, db_idx, &frame);
+
+                    // moon#1162: this arm carries the coordinator's spanning
+                    // DEL/UNLINK legs and every FLUSHALL/FLUSHDB broadcast leg,
+                    // and ran none of the index/queue hooks — deleted documents
+                    // kept matching FT.SEARCH, and a FLUSHALL cleared the index
+                    // contents of one shard in N.
+                    crate::shard::write_hooks::run_post_write_hooks(s, cmd, args, db_idx, &frame);
 
                     results.push(if aof_ok {
                         frame
@@ -2272,54 +2250,6 @@ pub(crate) fn handle_shard_message_shared(
                         }
                     }
 
-                    // Auto-index: if HSET succeeded, check for vector index match.
-                    // vector_store and text_store in same with_shard closure.
-                    if cmd.eq_ignore_ascii_case(b"HSET")
-                        && !matches!(frame, crate::protocol::Frame::Error(_))
-                    {
-                        if let Some(crate::protocol::Frame::BulkString(key_bytes)) = args.first() {
-                            // Plan 166-01: Vec<(idx, key_hash)> return discarded
-                            // here; Plan 166-02 threads it into CrossStoreTxn.
-                            let _ = auto_index_hset(
-                                &mut s.vector_store,
-                                &mut s.text_store,
-                                key_bytes,
-                                args,
-                                0,
-                                db_idx as u8,
-                            );
-                        }
-                    }
-
-                    // Auto-delete vectors on DEL/UNLINK (parity with the HSET
-                    // hook above and the Execute arm's auto-delete).
-                    if !matches!(frame, crate::protocol::Frame::Error(_))
-                        && (cmd.eq_ignore_ascii_case(b"DEL") || cmd.eq_ignore_ascii_case(b"UNLINK"))
-                    {
-                        auto_delete_vectors(&mut s.vector_store, args, db_idx as u8);
-                    }
-
-                    // R4: HDEL of an indexed vector field tombstones the vector.
-                    if !matches!(frame, crate::protocol::Frame::Error(_))
-                        && cmd.eq_ignore_ascii_case(b"HDEL")
-                    {
-                        auto_hdel_vectors(&mut s.vector_store, args, db_idx as u8);
-                    }
-
-                    // R3: FLUSHALL/FLUSHDB clears index contents (definitions kept).
-                    // WS5a: FLUSHDB scopes to `db_idx`; FLUSHALL clears every db.
-                    if !matches!(frame, crate::protocol::Frame::Error(_))
-                        && (cmd.eq_ignore_ascii_case(b"FLUSHDB")
-                            || cmd.eq_ignore_ascii_case(b"FLUSHALL"))
-                    {
-                        auto_flush_indexes(
-                            &mut s.vector_store,
-                            &mut s.text_store,
-                            cmd.eq_ignore_ascii_case(b"FLUSHDB"),
-                            db_idx as u8,
-                        );
-                    }
-
                     if !matches!(frame, crate::protocol::Frame::Error(_)) {
                         crate::blocking::wakeup::wake_written_keys(
                             blocking_registry,
@@ -2337,6 +2267,11 @@ pub(crate) fn handle_shard_message_shared(
                     // guard first (the old code ended its borrow of db_idx here too).
                     drop(guard);
                     flush_every_database_on_flushall(&s.databases, cmd, db_idx, &frame);
+
+                    // Index/queue hooks (HSET auto-index, DEL/UNLINK tombstones
+                    // + MQ drops, HDEL, FLUSH index clears) — moon#1162's one
+                    // list. After the guard: the MQ drop takes the whole slice.
+                    crate::shard::write_hooks::run_post_write_hooks(s, cmd, args, db_idx, &frame);
 
                     results.push(if aof_ok {
                         frame
