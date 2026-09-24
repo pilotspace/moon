@@ -132,13 +132,13 @@ thread_local! {
 }
 
 /// Term-at-a-time folds run on this thread so far.
-#[cfg(test)]
+#[cfg(all(test, feature = "text-index"))]
 pub(crate) fn taat_folds() -> usize {
     TAAT_FOLDS.with(std::cell::Cell::get)
 }
 
 /// Run `f` with the term-at-a-time choice forced (`None` = the cost model).
-#[cfg(test)]
+#[cfg(all(test, feature = "text-index"))]
 pub(crate) fn with_forced_taat<R>(force: Option<bool>, f: impl FnOnce() -> R) -> R {
     let prev = FORCE_TAAT.with(|c| c.replace(force));
     let out = f();
