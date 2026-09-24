@@ -6,6 +6,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.10] — 2026-09-24
+
 ### Added
 
 - **`CLIENT TRACKINGINFO` and `CLIENT GETREDIR`** (refs moon#632), matching
