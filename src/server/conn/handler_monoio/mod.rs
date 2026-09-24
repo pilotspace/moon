@@ -539,7 +539,14 @@ pub(crate) async fn handle_connection_sharded_monoio<
     // c10k C1: reply-write ceiling. 0 = wait forever (pre-C1 behaviour).
     // Read once, like the idle timeout above — this must not touch the lock on
     // the hot path.
-    let (write_timeout, out_cap_normal) = {
+    //
+    // moon#1175: the query-buffer ceilings join the same snapshot. They were
+    // read under the process-global `RuntimeConfig` lock on EVERY read
+    // iteration (and on every hinted read), a lock word every shard thread
+    // bounces. `CONFIG SET` has no arm for either, so they cannot change
+    // after startup and one read per connection is exact. If an arm is ever
+    // added it reaches connections accepted after it, like `write_timeout`.
+    let (write_timeout, out_cap_normal, qbuf_limit, qbuf_preauth) = {
         let rt = ctx.runtime_config.read();
         (
             match rt.client_write_timeout_ms {
@@ -547,6 +554,8 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 ms => Some(std::time::Duration::from_millis(ms)),
             },
             rt.client_output_buffer_limit_normal,
+            rt.client_query_buffer_limit,
+            rt.client_query_buffer_limit_preauth,
         )
     };
 
@@ -1104,9 +1113,8 @@ pub(crate) async fn handle_connection_sharded_monoio<
         // `read_want` the reserve an ordinary read makes in `read_buf` —
         // larger when the incomplete front frame is known to need more
         // (moon#1164: a known bulk remainder in one read, or geometric growth
-        // for a long tail; never for an unauthenticated client). The first
-        // `hinted_read_len` call takes no lock; only a real hint reads the
-        // query-buffer limits.
+        // for a long tail; never for an unauthenticated client). The limits
+        // are the per-connection snapshot (moon#1175): no lock here.
         let park_len = if downshifted {
             idle_park::IDLE_PROBE_BUF
         } else {
@@ -1117,24 +1125,13 @@ pub(crate) async fn handle_connection_sharded_monoio<
             idle_park::IDLE_PROBE_BUF
         } else {
             let pending = codec.parse_state().pending_len();
-            let hinted =
-                super::util::hinted_read_len(read_buf.len(), pending, conn.authenticated, 0, 0)
-                    .and_then(|_| {
-                        let (limit, preauth) = {
-                            let rt = ctx.runtime_config.read();
-                            (
-                                rt.client_query_buffer_limit,
-                                rt.client_query_buffer_limit_preauth,
-                            )
-                        };
-                        super::util::hinted_read_len(
-                            read_buf.len(),
-                            pending,
-                            conn.authenticated,
-                            limit,
-                            preauth,
-                        )
-                    });
+            let hinted = super::util::hinted_read_len(
+                read_buf.len(),
+                pending,
+                conn.authenticated,
+                qbuf_limit,
+                qbuf_preauth,
+            );
             read_grow = hinted.is_some();
             hinted.unwrap_or(read_base)
         };
@@ -1551,14 +1548,13 @@ pub(crate) async fn handle_connection_sharded_monoio<
         // no credentials. Unauthenticated connections get the much smaller
         // pre-auth ceiling; see `util::query_buf_limit`.
         {
-            let (limit, preauth) = {
-                let rt = ctx.runtime_config.read();
-                (
-                    rt.client_query_buffer_limit,
-                    rt.client_query_buffer_limit_preauth,
-                )
-            };
-            if super::util::query_buf_exceeded(read_buf.len(), conn.authenticated, limit, preauth) {
+            // moon#1175: per-connection snapshot, no config lock per read.
+            if super::util::query_buf_exceeded(
+                read_buf.len(),
+                conn.authenticated,
+                qbuf_limit,
+                qbuf_preauth,
+            ) {
                 let (_r, _b): (std::io::Result<usize>, bytes::Bytes) = stream
                     .write_all(bytes::Bytes::from_static(
                         super::util::QUERY_BUF_LIMIT_ERROR,
@@ -1914,9 +1910,11 @@ pub(crate) async fn handle_connection_sharded_monoio<
             continue;
         }
 
-        // CLIENT PAUSE: delay processing if server is paused
-        crate::client_pause::expire_if_needed();
-        if let Some(remaining) = crate::client_pause::check_pause(true) {
+        // CLIENT PAUSE: delay processing if server is paused. moon#1175: the
+        // gate is one Relaxed load unless a pause may be in force — the old
+        // unconditional `expire_if_needed()` took the process-global PAUSE
+        // WRITE lock on every batch of every shard.
+        if let Some(remaining) = crate::client_pause::batch_pause_remaining() {
             monoio::time::sleep(remaining).await;
         }
 

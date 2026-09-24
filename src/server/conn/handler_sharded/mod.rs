@@ -441,7 +441,12 @@ pub(crate) async fn handle_connection_sharded_inner<
 
     // c10k C1: reply-write ceiling. 0 = wait forever (pre-C1 behaviour).
     // Read once at connection setup — never on the hot path.
-    let (write_timeout, out_cap_normal) = {
+    //
+    // moon#1175: the query-buffer ceilings join the snapshot (they were read
+    // under the global `RuntimeConfig` lock on every read). `CONFIG SET` has
+    // no arm for either, so one read per connection is exact — see the
+    // monoio twin.
+    let (write_timeout, out_cap_normal, qbuf_limit, qbuf_preauth) = {
         let rt = ctx.runtime_config.read();
         (
             match rt.client_write_timeout_ms {
@@ -449,6 +454,8 @@ pub(crate) async fn handle_connection_sharded_inner<
                 ms => Some(std::time::Duration::from_millis(ms)),
             },
             rt.client_output_buffer_limit_normal,
+            rt.client_query_buffer_limit,
+            rt.client_query_buffer_limit_preauth,
         )
     };
 
@@ -542,34 +549,18 @@ pub(crate) async fn handle_connection_sharded_inner<
         }
         // moon#1164: make room for what the incomplete front frame is known to
         // need, so a large upload is read in a geometric series of reads
-        // rather than whatever spare capacity happens to be left. The first
-        // call skips the config lock whenever there is no hint at all.
+        // rather than whatever spare capacity happens to be left. The limits
+        // are the per-connection snapshot (moon#1175), so no lock either way.
         // moon#1179 item 5: a carried tail counts as input even when every
         // remaining byte was already parsed.
         let have_carry = carried_input && (!read_buf.is_empty() || !carried_frames.is_empty());
-        if !have_carry
-            && super::util::hinted_read_len(
-                read_buf.len(),
-                parse_state.pending_len(),
-                conn.authenticated,
-                0,
-                0,
-            )
-            .is_some()
-        {
-            let (limit, preauth) = {
-                let rt = ctx.runtime_config.read();
-                (
-                    rt.client_query_buffer_limit,
-                    rt.client_query_buffer_limit_preauth,
-                )
-            };
+        if !have_carry {
             if let Some(want) = super::util::hinted_read_len(
                 read_buf.len(),
                 parse_state.pending_len(),
                 conn.authenticated,
-                limit,
-                preauth,
+                qbuf_limit,
+                qbuf_preauth,
             ) {
                 read_buf.reserve(want);
             }
@@ -618,11 +609,8 @@ pub(crate) async fn handle_connection_sharded_inner<
                 // runs after parsing so it costs no credentials. See
                 // `util::query_buf_limit` for the pre-auth ceiling.
                 {
-                    let (limit, preauth) = {
-                        let rt = ctx.runtime_config.read();
-                        (rt.client_query_buffer_limit, rt.client_query_buffer_limit_preauth)
-                    };
-                    if super::util::query_buf_exceeded(read_buf.len(), conn.authenticated, limit, preauth) {
+                    // moon#1175: per-connection snapshot, no config lock per read.
+                    if super::util::query_buf_exceeded(read_buf.len(), conn.authenticated, qbuf_limit, qbuf_preauth) {
                         use tokio::io::AsyncWriteExt;
                         let _ = stream.write_all(super::util::QUERY_BUF_LIMIT_ERROR).await;
                         break;
@@ -680,8 +668,8 @@ pub(crate) async fn handle_connection_sharded_inner<
 
                 // CLIENT PAUSE: delay processing if server is paused
                 // Check with is_write=true (conservative — pauses all batches in ALL mode)
-                crate::client_pause::expire_if_needed();
-                if let Some(remaining) = crate::client_pause::check_pause(true) {
+                // moon#1175: lock-free unless a pause may be in force.
+                if let Some(remaining) = crate::client_pause::batch_pause_remaining() {
                     tokio::time::sleep(remaining).await;
                 }
 
@@ -1450,48 +1438,12 @@ pub(crate) async fn handle_connection_sharded_inner<
                         continue;
                     }
 
-                    // === CLIENT PAUSE check ===
-                    // Extract pause info with short lock hold, then sleep outside lock scope
-                    let pause_wait_ms = {
-                        let rt = ctx.runtime_config.read();
-                        let deadline = rt.client_pause_deadline_ms;
-                        if deadline > 0 {
-                            let now = crate::storage::entry::current_time_ms();
-                            if now < deadline {
-                                let should_pause = if rt.client_pause_write_only {
-                                    crate::command::metadata::is_write(cmd)
-                                } else {
-                                    true
-                                };
-                                if should_pause { deadline.saturating_sub(now) } else { 0 }
-                            } else { 0 }
-                        } else { 0 }
-                    };
-                    if pause_wait_ms > 0 {
-                        // Poll in 50ms intervals so CLIENT UNPAUSE takes effect quickly
-                        let mut remaining = pause_wait_ms;
-                        while remaining > 0 {
-                            let chunk = remaining.min(50);
-                            #[cfg(feature = "runtime-tokio")]
-                            {
-                                tokio::time::sleep(std::time::Duration::from_millis(chunk)).await;
-                            }
-                            #[cfg(feature = "runtime-monoio")]
-                            {
-                                monoio::time::sleep(std::time::Duration::from_millis(chunk)).await;
-                            }
-                            remaining = remaining.saturating_sub(chunk);
-                            // Re-check if UNPAUSE was called
-                            let still_paused = {
-                                let rt = ctx.runtime_config.read();
-                                rt.client_pause_deadline_ms > 0
-                                    && crate::storage::entry::current_time_ms() < rt.client_pause_deadline_ms
-                            };
-                            if !still_paused {
-                                break;
-                            }
-                        }
-                    }
+                    // moon#1175: the per-command `client_pause_deadline_ms` read
+                    // (a `RuntimeConfig` read lock per command) is gone. Only
+                    // `handler_single` writes that field; this handler's CLIENT
+                    // PAUSE goes through `client_pause::pause`, enforced by the
+                    // batch-top `batch_pause_remaining()` gate, so here it always
+                    // read 0.
 
 
                     // --- Functions API: FUNCTION/FCALL/FCALL_RO ---
