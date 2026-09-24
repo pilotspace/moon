@@ -80,13 +80,6 @@ pub fn parse_inline(
         return Ok(Some(Frame::Array(args)));
     }
 
-    // Empty/whitespace-only lines produce no frame: consume them without
-    // freezing anything.
-    if line.iter().all(|&c| is_inline_separator(c)) {
-        buf.advance(consumed);
-        return Ok(None);
-    }
-
     // Split on the separator set using SIMD, filtering empty slices.
     //
     // `\r` belongs here and used to be missing: Redis breaks unquoted tokens on
@@ -94,11 +87,12 @@ pub fn parse_inline(
     // in Moon (measured). `\n` cannot appear — it is the terminator — so the
     // three bytes below are the whole set this path can ever see.
     //
-    // moon#1179 item 6: the line is frozen ONCE and every argument is a
-    // zero-copy slice of it — the same thing the RESP path does for a frame —
-    // instead of one `Bytes::copy_from_slice` allocation per argument.
-    let frozen = buf.split_to(consumed).freeze();
-    let line = &frozen[..line_len];
+    // Each argument is COPIED out of the read buffer (moon#1227 review). A
+    // zero-copy slice would keep the connection's whole read-buffer
+    // allocation alive for as long as any value stored from it lives — the
+    // pinning moon#1160 tracks for RESP frames — and on this path that bought
+    // one small allocation per argument of telnet / redis-cli / script
+    // traffic. RESP arguments stay zero-copy.
     let mut args = FrameVec::new();
     let mut start = 0;
     while start < line.len() {
@@ -112,14 +106,24 @@ pub fn parse_inline(
         // Find next separator using SIMD
         match memchr3(b' ', b'\t', b'\r', &line[start..]) {
             Some(pos) => {
-                args.push(Frame::BulkString(frozen.slice(start..start + pos)));
+                args.push(Frame::BulkString(Bytes::copy_from_slice(
+                    &line[start..start + pos],
+                )));
                 start += pos + 1;
             }
             None => {
-                args.push(Frame::BulkString(frozen.slice(start..line_len)));
+                args.push(Frame::BulkString(Bytes::copy_from_slice(&line[start..])));
                 break;
             }
         }
+    }
+
+    // Advance buffer past line + terminator
+    buf.advance(consumed);
+
+    // Empty/whitespace-only lines produce no frame
+    if args.is_empty() {
+        return Ok(None);
     }
 
     Ok(Some(Frame::Array(args)))
@@ -375,34 +379,33 @@ mod tests {
         parse_inline(&mut buf, TEST_MAX_INLINE)
     }
 
-    /// moon#1179 item 6: unquoted inline arguments are zero-copy slices of
-    /// ONE frozen line — each sits exactly where it sat in the line — rather
-    /// than one fresh allocation per argument; the remainder of the buffer is
-    /// untouched and a blank line is consumed without producing a frame.
+    /// moon#1227 review: unquoted inline arguments are COPIES — none of them
+    /// points into the read buffer's allocation, so a value stored from one
+    /// cannot keep the connection's read buffer alive (moon#1160). The
+    /// remainder of the buffer is untouched and a blank line is consumed
+    /// without producing a frame.
     #[test]
-    fn inline_args_alias_one_frozen_line() {
+    fn inline_args_do_not_alias_the_read_buffer() {
         let mut buf = BytesMut::from(&b"SET  foo\tbar\r\nPING\r\n"[..]);
+        let alloc = buf.as_ptr() as usize..buf.as_ptr() as usize + buf.capacity();
         let frame = parse_inline(&mut buf, TEST_MAX_INLINE).unwrap().unwrap();
         let Frame::Array(args) = frame else {
             panic!("expected Array")
         };
-        let ptrs: Vec<usize> = args
-            .iter()
-            .map(|a| match a {
-                Frame::BulkString(b) => b.as_ptr() as usize,
-                other => panic!("expected BulkString, got {other:?}"),
-            })
-            .collect();
-        assert_eq!(
-            ptrs[1] - ptrs[0],
-            5,
-            "`foo` must alias the line, 5 bytes after `SET`"
-        );
-        assert_eq!(
-            ptrs[2] - ptrs[0],
-            9,
-            "`bar` must alias the line, 9 bytes after `SET`"
-        );
+        let want: [&[u8]; 3] = [b"SET", b"foo", b"bar"];
+        assert_eq!(args.len(), want.len());
+        for (arg, want) in args.iter().zip(want) {
+            let Frame::BulkString(b) = arg else {
+                panic!("expected BulkString, got {arg:?}")
+            };
+            assert_eq!(&b[..], want);
+            let p = b.as_ptr() as usize;
+            assert!(
+                !alloc.contains(&p),
+                "{:?} aliases the read buffer",
+                String::from_utf8_lossy(want)
+            );
+        }
         assert_eq!(&buf[..], b"PING\r\n");
 
         let mut blank = BytesMut::from(&b" \t \r\nPING\r\n"[..]);
