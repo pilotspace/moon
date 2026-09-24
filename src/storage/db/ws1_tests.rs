@@ -737,6 +737,36 @@ mod lazy_free_1190 {
         );
     }
 
+    /// A value at or above the shell-offload size: elements are still freed
+    /// and credited by the drain, and the emptied container (one huge
+    /// allocation) is released on the `moon-lazyfree` helper thread instead
+    /// of the shard thread.
+    #[test]
+    fn a_huge_value_s_empty_shell_is_released_off_the_shard_thread() {
+        let probe = probe();
+        let mut db = Database::new();
+        let mut hash = HashMap::new();
+        for i in 0..70_000 {
+            hash.insert(b(format!("field-{i:06}")), b(format!("v{i}")));
+        }
+        hash.insert(Bytes::from_static(b"probe"), probe.clone());
+        db.set(b"huge", entry_of(RedisValue::Hash(Box::new(hash))));
+        assert!(db.unlink(b"huge"));
+        assert!(!probe.is_unique());
+        drain_all(&mut db);
+        assert!(probe.is_unique(), "elements are freed by the drain itself");
+        assert_eq!(db.estimated_memory(), 0);
+        #[cfg(target_os = "linux")]
+        {
+            let helper = std::fs::read_dir("/proc/self/task")
+                .expect("procfs")
+                .filter_map(Result::ok)
+                .filter_map(|t| std::fs::read_to_string(t.path().join("comm")).ok())
+                .any(|name| name.trim() == "moon-lazyfree");
+            assert!(helper, "the shell-dropping helper thread was never started");
+        }
+    }
+
     /// The time-budgeted drain stops at its deadline and reports work left.
     #[test]
     fn budgeted_drain_yields_at_the_deadline() {

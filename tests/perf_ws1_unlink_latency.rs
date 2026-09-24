@@ -4,8 +4,10 @@
 //! Before the fix, `UNLINK` of a 1M-field hash on monoio walked the value for
 //! its ledger cost and then dropped it inline — ~2M frees on the shard
 //! thread, with every other connection on the shard waiting behind it, i.e.
-//! exactly what `DEL` does. Now the command only unlinks the key and the
-//! shard tick frees the value in bounded slices.
+//! exactly what `DEL` does. Now the command only unlinks the key, the
+//! shard tick frees the elements in bounded slices, and the emptied table
+//! (one ~160 MB allocation whose `madvise` alone took 29 ms) is released on
+//! the `moon-lazyfree` helper thread.
 //!
 //! Measured the way the issue asks: PING round-trip latency on the SAME shard
 //! (`--shards 1`) while a 1M-field hash is removed, once with `DEL` (the
@@ -146,8 +148,10 @@ fn unlink_of_a_million_field_hash_does_not_stall_the_shard() {
     fill_hash(&mut c, "big:del");
     fill_hash(&mut c, "big:unlink");
 
-    let (del_ms, del_ping) = remove_under_ping_load(moon.port, "DEL", "big:del");
+    // UNLINK first, so its window is not sharing the allocator's clean-up of
+    // the ~200 MB the synchronous DEL control frees.
     let (unlink_ms, unlink_ping) = remove_under_ping_load(moon.port, "UNLINK", "big:unlink");
+    let (del_ms, del_ping) = remove_under_ping_load(moon.port, "DEL", "big:del");
     eprintln!(
         "moon#1190: DEL {del_ms:?} (worst PING {del_ping:?}) vs UNLINK {unlink_ms:?} \
          (worst PING {unlink_ping:?}) on a {FIELDS}-field hash"

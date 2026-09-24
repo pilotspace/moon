@@ -100,6 +100,48 @@ pub(crate) fn lazy_free_weight(entry: &Entry) -> Option<usize> {
     (n > LAZY_FREE_THRESHOLD).then_some(n)
 }
 
+/// A value this large leaves behind a container SHELL — the emptied hash
+/// table, deque buffer, index vector or B+tree arena — whose single backing
+/// allocation is itself huge (~160 MB for a 1M-field hash table). Freeing it
+/// is one `madvise(MADV_DONTNEED)` of the whole extent: measured at 29 ms on
+/// the shard thread (strace, release build), the one remaining stall of a
+/// lazily freed 1M-field UNLINK. Shells of values at least this large are
+/// released on the helper thread below instead.
+const OFFLOAD_SHELL_ELEMENTS: usize = 65_536;
+
+/// Free an emptied container shell: inline when small, on the
+/// `moon-lazyfree` helper thread when large (or inline if that thread could
+/// not be started). Its bytes were already credited by the drain.
+fn release_shell(work: Work, weight: usize) {
+    if weight >= OFFLOAD_SHELL_ELEMENTS
+        && let Some(tx) = shell_dropper()
+    {
+        // A send only fails if the helper is gone; the shell then comes back
+        // in the error and is dropped here.
+        let _ = tx.send(work);
+    }
+}
+
+/// The lazily started helper that drops large shells, off every shard
+/// thread. One per process, idle (parked in `recv`) when unused.
+fn shell_dropper() -> Option<&'static flume::Sender<Work>> {
+    static DROPPER: std::sync::OnceLock<Option<flume::Sender<Work>>> = std::sync::OnceLock::new();
+    DROPPER
+        .get_or_init(|| {
+            let (tx, rx) = flume::unbounded::<Work>();
+            std::thread::Builder::new()
+                .name("moon-lazyfree".to_string())
+                .spawn(move || {
+                    while let Ok(shell) = rx.recv() {
+                        drop(shell);
+                    }
+                })
+                .ok()
+                .map(|_| tx)
+        })
+        .as_ref()
+}
+
 /// The per-database queue.
 #[derive(Default)]
 pub(crate) struct LazyFreeQueue {
@@ -118,6 +160,8 @@ impl Drop for LazyFreeQueue {
 
 struct Item {
     work: Work,
+    /// Element count at enqueue — decides where the emptied shell is freed.
+    weight: usize,
     /// Credited once the last element is gone: the key, the entry, the
     /// boxes, and the tables charged from capacity — everything the ledger
     /// bills that is not per element.
@@ -337,6 +381,7 @@ impl Database {
         let expected = lazy_free_weight(&entry)
             .is_some_and(|n| n <= DEBUG_VERIFY_MAX_ELEMENTS)
             .then(|| super::entry_overhead_len(key_len, &entry));
+        let weight = lazy_free_weight(&entry).unwrap_or(0);
         let entry_fixed = key_len + ENTRY_SLOT_OVERHEAD + BOXED_REDIS_VALUE_BYTES;
         let (work, fixed) = match Work::from_value(entry.value.into_redis_value()) {
             Ok(w) => w,
@@ -353,6 +398,7 @@ impl Database {
         };
         self.lazy_free.items.push_back(Item {
             work,
+            weight,
             tail_credit: entry_fixed + fixed,
             charged,
             #[cfg(debug_assertions)]
@@ -416,7 +462,9 @@ impl Database {
                     item.credited, expected
                 );
             }
-            self.lazy_free.items.pop_front();
+            if let Some(done_item) = self.lazy_free.items.pop_front() {
+                release_shell(done_item.work, done_item.weight);
+            }
             PENDING_ITEMS.fetch_sub(1, Relaxed);
         }
         freed
