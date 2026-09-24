@@ -1084,3 +1084,6 @@ mod epoch_harness;
 
 #[cfg(test)]
 mod split_epoch_tests;
+
+#[cfg(test)]
+mod table_swap_tests;

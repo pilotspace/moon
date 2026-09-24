@@ -63,11 +63,23 @@ impl Epoch {
     /// Run the epoch to completion, publish the file, disarm, and return its
     /// raw records.
     pub(super) fn finish(mut self, dbs: &[Database]) -> Vec<Record> {
+        self.try_finish(dbs).expect("finalize")
+    }
+
+    /// [`Self::finish`], reporting a failed (e.g. aborted) snapshot instead
+    /// of panicking. The file is read back only if it was published.
+    /// The epoch's directory lives as long as `self`.
+    pub(super) fn try_finish(&mut self, dbs: &[Database]) -> Result<Vec<Record>, String> {
         while !self.tick(dbs) {}
         let mut state = self.state.take().expect("epoch already finished");
-        state.finalize().expect("finalize");
+        let outcome = state.finalize().map_err(|e| e.to_string());
         snapshot_cow::disarm();
-        read_records(&self.path)
+        outcome.map(|()| read_records(&self.path))
+    }
+
+    /// Where this epoch publishes its file.
+    pub(super) fn path(&self) -> &Path {
+        &self.path
     }
 }
 

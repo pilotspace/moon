@@ -74,6 +74,10 @@ thread_local! {
     /// pre-image the drain would drop anyway. `None` = unknown (capture
     /// everything, the pre-moon#1186 behaviour).
     static PROGRESS: RefCell<Option<Progress>> = const { RefCell::new(None) };
+    /// A whole-table change the armed epoch cannot follow (moon#1224): a
+    /// FLUSHDB / FLUSHALL / SWAPDB that hit a database the epoch has not
+    /// finished. The next drain fails the snapshot with this reason.
+    static ABORT: Cell<Option<&'static str>> = const { Cell::new(None) };
 }
 
 /// Mirror of `SnapshotState`'s serialization cursor, so a capture can
@@ -92,6 +96,11 @@ impl Progress {
     fn is_pending(&self, db_index: usize, hash: u64) -> bool {
         db_index < self.num_databases
             && (db_index > self.current_db || (db_index == self.current_db && hash >= self.cursor))
+    }
+
+    /// Is any of `db_index`'s epoch-start contents still to be written?
+    fn is_unfinished(&self, db_index: usize) -> bool {
+        db_index < self.num_databases && db_index >= self.current_db
     }
 }
 
@@ -172,14 +181,99 @@ pub(crate) fn pending_tombstones_for_test() -> Vec<(usize, Bytes)> {
 /// tick does before every advance.
 #[cfg(test)]
 pub(crate) fn drain_pending_for_test(snap: &mut SnapshotState) {
+    apply_queued_abort(snap);
     let captured = PENDING.with(|p| std::mem::take(&mut *p.borrow_mut()));
     drain_captured(snap, captured);
+}
+
+/// Test-only: the abort a structural change queued for the next drain.
+#[cfg(test)]
+pub(crate) fn abort_pending_for_test() -> Option<&'static str> {
+    ABORT.with(Cell::get)
 }
 
 fn clear() {
     PENDING.with(|p| p.borrow_mut().clear());
     PENDING_KEYS.with(|k| k.borrow_mut().clear());
     PROGRESS.with(|p| *p.borrow_mut() = None);
+    ABORT.with(|a| a.set(None));
+}
+
+/// Would the armed epoch still write any of `db_index`? `None` = every
+/// database. Without a published layout the answer is a conservative yes.
+fn epoch_unfinished(db_index: Option<usize>) -> bool {
+    PROGRESS.with(|p| match p.borrow().as_ref() {
+        None => true,
+        Some(progress) => match db_index {
+            Some(db) => progress.is_unfinished(db),
+            None => progress.current_db < progress.num_databases,
+        },
+    })
+}
+
+/// Queue the failure of the armed epoch (moon#1224): the next drain aborts
+/// it, before another segment is written.
+fn abort_epoch(why: &'static str) {
+    ABORT.with(|a| {
+        if a.get().is_none() {
+            a.set(Some(why));
+        }
+    });
+}
+
+/// `SWAPDB a b` is about to exchange two databases' tables on this shard
+/// (moon#1224). Called from `ShardDbSet::swap`, the one place every SWAPDB
+/// path — the coordinator's local leg, the SPSC arm, replica apply —
+/// exchanges them.
+///
+/// An epoch that had not finished with `a` or `b` would write the rest of
+/// one database's contents under the other's index (and lose the other's
+/// entirely), so it is aborted: the BGSAVE fails loudly and the previous
+/// snapshot file stays. A swap of two databases the epoch already wrote is
+/// harmless — the file holds their epoch-start contents and the logged
+/// SWAPDB replays on top. One thread-local `bool` load when nothing is
+/// armed.
+pub(crate) fn note_swapdb(a: usize, b: usize) {
+    if !is_armed() || a == b {
+        return;
+    }
+    if epoch_unfinished(Some(a)) || epoch_unfinished(Some(b)) {
+        abort_epoch("SWAPDB exchanged a database the snapshot had not finished writing");
+    }
+}
+
+/// A FLUSHDB / FLUSHALL is about to run against `db` (`databases[db_index]`)
+/// while an epoch is armed (moon#1224). `Database::clear` replaces the whole
+/// table, so the epoch-start contents of an unfinished database are gone
+/// before the epoch wrote them: the snapshot is aborted — redis's own answer
+/// to `FLUSHALL` during a `BGSAVE` is to kill the child. Nothing happens
+/// when the flushed databases are already written (the logged FLUSH replays
+/// on top of their epoch-start contents), when a FLUSHDB empties an already
+/// EMPTY table (the file's contents for it are its pre-images, untouched),
+/// or when the command will refuse its arguments and flush nothing.
+fn note_flush(db: &Database, db_index: usize, all: bool, args: &[Frame]) {
+    if !flush_args_accepted(args) {
+        return;
+    }
+    if all {
+        if epoch_unfinished(None) {
+            abort_epoch("FLUSHALL cleared databases the snapshot had not finished writing");
+        }
+    } else if epoch_unfinished(Some(db_index)) && !db.data().is_empty() {
+        abort_epoch("FLUSHDB cleared a database the snapshot had not finished writing");
+    }
+}
+
+/// Exactly `command::server_admin`'s FLUSHDB/FLUSHALL argument check: no
+/// argument, or one of `ASYNC` / `SYNC`. Anything else is refused before
+/// `Database::clear` runs (pinned by `table_swap_tests::a_refused_flush_does_not_abort`).
+fn flush_args_accepted(args: &[Frame]) -> bool {
+    match args {
+        [] => true,
+        [only] => crate::command::helpers::extract_bytes(only)
+            .is_some_and(|s| s.eq_ignore_ascii_case(b"ASYNC") || s.eq_ignore_ascii_case(b"SYNC")),
+        _ => false,
+    }
 }
 
 /// Capture the pre-image of the key a `cmd + args` write is about to touch.
@@ -244,6 +338,14 @@ pub(crate) fn capture_dispatch_pre_image(
     if !is_armed() {
         return;
     }
+    // moon#1224: the whole-table writes. Every FLUSHDB / FLUSHALL on a shard
+    // — client, MULTI/EXEC, script, routed, replicated — runs through
+    // `dispatch`; FLUSHALL's other databases are cleared right after by
+    // `flush_every_database`, on the same shard.
+    if cmd.eq_ignore_ascii_case(b"FLUSHDB") || cmd.eq_ignore_ascii_case(b"FLUSHALL") {
+        note_flush(db, db_index, cmd.len() == 8, args);
+        return;
+    }
     if !crate::command::metadata::is_write(cmd) {
         return;
     }
@@ -306,6 +408,7 @@ fn capture_key(db: &Database, db_index: usize, key: &Bytes) {
 /// captured while its range was still pending would be filtered out by a
 /// cursor that moved past it in the meantime.
 pub(crate) fn drain_into(snap: &mut SnapshotState) {
+    apply_queued_abort(snap);
     if PENDING.with(|p| p.borrow().is_empty()) {
         return;
     }
@@ -314,6 +417,14 @@ pub(crate) fn drain_into(snap: &mut SnapshotState) {
     // PENDING_KEYS is NOT reset here (moon#1186): first-wins holds for the
     // whole epoch, so a hot key is cloned once, not once per tick.
     drain_captured(snap, captured);
+}
+
+/// Fail the snapshot if a structural change queued an abort (moon#1224).
+/// Runs first in every drain, so no segment is written after the change.
+fn apply_queued_abort(snap: &mut SnapshotState) {
+    if let Some(why) = ABORT.with(|a| a.take()) {
+        snap.abort(why);
+    }
 }
 
 /// Core of [`drain_into`]. Needs no database: whether a key's range is still
