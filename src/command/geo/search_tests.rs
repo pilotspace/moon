@@ -133,7 +133,7 @@ fn cell_search_matches_brute_force() {
         let want = oracle(&points, lon, lat, shape);
         let desc = round % 2 == 1;
         args.push(if desc { b"DESC" } else { b"ASC" });
-        let count = (round % 4 == 0).then(|| 3usize);
+        let count = (round % 4 == 0).then_some(3usize);
         if count.is_some() {
             args.extend([&b"COUNT"[..], b"3"]);
         }
