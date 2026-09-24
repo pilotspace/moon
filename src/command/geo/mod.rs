@@ -1,8 +1,7 @@
 mod geo_cmd;
+mod geo_search;
 
 pub use geo_cmd::*;
-
-use std::f64::consts::PI;
 
 // ---------------------------------------------------------------------------
 // Geohash encoding/decoding (52-bit integer, Redis-compatible)
@@ -23,7 +22,7 @@ const GEO_STEP_MAX: u8 = 26; // 52-bit precision
 /// Interleave the low 26 bits of `xlo` (even positions) and `ylo` (odd
 /// positions) — Redis's interleave64 (Morton code). `xlo` = latitude cells,
 /// `ylo` = longitude cells, so longitude owns the MSB (bit 51).
-fn interleave64(xlo: u32, ylo: u32) -> u64 {
+pub(super) fn interleave64(xlo: u32, ylo: u32) -> u64 {
     const B: [u64; 5] = [
         0x5555555555555555,
         0x3333333333333333,
@@ -50,7 +49,7 @@ fn interleave64(xlo: u32, ylo: u32) -> u64 {
 /// Inverse of interleave64: extract the even bits — Redis's deinterleave64
 /// helper (call once on `bits` for latitude, once on `bits >> 1` for
 /// longitude).
-fn deinterleave_even(mut x: u64) -> u32 {
+pub(super) fn deinterleave_even(mut x: u64) -> u32 {
     const B: [u64; 6] = [
         0x5555555555555555,
         0x3333333333333333,
@@ -134,25 +133,13 @@ pub(crate) fn fmt_geo_coord(v: f64) -> String {
 // Haversine distance
 // ---------------------------------------------------------------------------
 
-const EARTH_RADIUS_M: f64 = 6372797.560856;
-
-/// Haversine distance in meters between two (lon, lat) pairs.
-///
-/// Operation order matches Redis's geohashGetDistance exactly (radians first,
-/// then differences; u/v half-angle sines; single asin) so the resulting f64
-/// is bit-identical and GEODIST's %.4f output matches byte-for-byte.
+/// Haversine distance in meters between two (lon, lat) pairs — redis's
+/// `geohashGetDistance`, operation for operation (`geo_search::geo_distance`:
+/// `deg * (PI / 180)` as ONE constant, and the same-longitude shortcut to
+/// the latitude distance), so GEODIST, GEOSEARCH WITHDIST and the search's
+/// radius test all agree with redis to the bit (moon#1172).
 pub(crate) fn haversine_distance(lon1: f64, lat1: f64, lon2: f64, lat2: f64) -> f64 {
-    let lat1r = lat1 * PI / 180.0;
-    let lon1r = lon1 * PI / 180.0;
-    let lat2r = lat2 * PI / 180.0;
-    let lon2r = lon2 * PI / 180.0;
-    let u = ((lat2r - lat1r) / 2.0).sin();
-    let v = ((lon2r - lon1r) / 2.0).sin();
-    if u == 0.0 && v == 0.0 {
-        return 0.0;
-    }
-    let a = u * u + lat1r.cos() * lat2r.cos() * v * v;
-    2.0 * EARTH_RADIUS_M * a.sqrt().asin()
+    geo_search::geo_distance(lon1, lat1, lon2, lat2)
 }
 
 /// Convert meters to the specified unit.
@@ -182,6 +169,9 @@ pub(crate) fn parse_unit(unit: &[u8]) -> Option<f64> {
         None
     }
 }
+
+#[cfg(test)]
+mod search_tests;
 
 #[cfg(test)]
 mod tests {
