@@ -406,6 +406,9 @@ pub struct ExecutionContext {
 use slotmap::Key;
 
 #[cfg(test)]
+mod limit_sort_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::graph::store::GraphStore;

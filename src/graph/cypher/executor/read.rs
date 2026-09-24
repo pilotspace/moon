@@ -2,6 +2,9 @@ use std::collections::HashMap;
 
 use super::*;
 
+#[path = "pipeline.rs"]
+mod pipeline;
+
 /// W2-12: if `expr` is a top-level aggregate call, return
 /// `(lowercase name, input expr, distinct)`. `None` input = `count(*)` /
 /// bare `count()` (counts rows, not values). Aggregates nested inside a
@@ -558,6 +561,12 @@ pub fn execute(
 /// inserted into the cache, and reused verbatim on every subsequent cache
 /// hit -- a `SlotTable` depends only on the plan's bound variables, which
 /// never change for a given `PhysicalPlan`.
+///
+/// moon#1197: operators still run one at a time over the whole row vector,
+/// but (a) a leading `scan → row-local ops → [1:1 projection]` run whose
+/// output a `LIMIT` bounds is fed in chunks and stops once enough rows exist,
+/// and (b) `ORDER BY` precomputes its keys and keeps only the rows the plan
+/// can use. Results — rows, order, ties — are identical to full evaluation.
 pub fn execute_with_slots(
     graph: &NamedGraph,
     plan: &PhysicalPlan,
@@ -570,541 +579,44 @@ pub fn execute_with_slots(
     // Seed row: one empty row to bootstrap the pipeline.
     let empty_table = SlotTable::default();
     let empty_row = Row::seed(&empty_table);
-    let mut rows: Vec<Row> = vec![Row::seed(slot_table)];
-    let mut columns = Vec::new();
-    // After Project, rows are converted to positional arrays.
-    let mut projected_rows: Option<Vec<Vec<Value>>> = None;
     let nodes_created: u64 = 0;
-    let mut nodes_scanned: u64 = 0;
     let nodes_deleted: u64 = 0;
     let properties_set: u64 = 0;
 
-    let memgraph = &graph.write_buf;
-
     // Build a SegmentMergeReader for cross-segment neighbor queries.
     let segments_guard = graph.segments.load();
-    let csr_segs = &segments_guard.immutable;
+    let env = OpEnv {
+        memgraph: &graph.write_buf,
+        csr_segs: &segments_guard.immutable,
+        params,
+        ctx,
+        slot_table,
+        empty_row: &empty_row,
+    };
+    let mut st = OpState {
+        rows: vec![Row::seed(slot_table)],
+        projected_rows: None,
+        columns: Vec::new(),
+        nodes_scanned: 0,
+    };
 
-    for op in &plan.operators {
-        match op {
-            PhysicalOp::NodeScan { variable, label } => {
-                let label_id = label.as_ref().map(|l| label_to_id(l.as_bytes()));
-                let committed = roaring::RoaringBitmap::new();
-                // Scan BOTH tiers: the mutable write buffer and frozen CSR
-                // segments (freeze DRAINS nodes — a memgraph-only scan loses
-                // every frozen node).
-                let view = crate::graph::view::MergedNodeView::new(memgraph, csr_segs);
-                let mut keys = Vec::new();
-                view.for_each_visible_node(
-                    label_id,
-                    ctx.snapshot_lsn,
-                    ctx.my_txn_id,
-                    &committed,
-                    ctx.valid_time_as_of,
-                    |k| keys.push(k),
-                );
-                nodes_scanned += keys.len() as u64;
-                let mut new_rows = Vec::with_capacity(rows.len() * keys.len());
-                for row in &rows {
-                    for &key in &keys {
-                        let mut new_row = row.clone();
-                        new_row.insert(variable, Value::Node(key));
-                        new_rows.push(new_row);
-                    }
-                }
-                rows = new_rows;
-            }
-
-            PhysicalOp::IndexScan {
-                variable,
-                label,
-                prop_eq,
-                prop_range,
-                text_pred,
-            } => {
-                let keys = index_scan_keys(
-                    memgraph,
-                    csr_segs,
-                    label.as_ref(),
-                    prop_eq,
-                    prop_range,
-                    text_pred,
-                    params,
-                    ctx,
-                );
-                nodes_scanned += keys.len() as u64;
-                let mut new_rows = Vec::with_capacity(rows.len() * keys.len());
-                for row in &rows {
-                    for &key in &keys {
-                        let mut new_row = row.clone();
-                        new_row.insert(variable, Value::Node(key));
-                        new_rows.push(new_row);
-                    }
-                }
-                rows = new_rows;
-            }
-
-            PhysicalOp::Expand {
-                source,
-                target,
-                edge_variable,
-                edge_types,
-                direction,
-                min_hops,
-                max_hops,
-                optional,
-            } => {
-                let type_ids: Vec<u16> = edge_types
-                    .iter()
-                    .map(|t| label_to_id(t.as_bytes()))
-                    .collect();
-
-                let dir = match direction {
-                    EdgeDirection::Right => Direction::Outgoing,
-                    EdgeDirection::Left => Direction::Incoming,
-                    EdgeDirection::Both => Direction::Both,
-                };
-
-                // Build a per-expand SegmentMergeReader with the correct
-                // direction and edge type filter for this operator.
-                let edge_type_filter = if type_ids.len() == 1 {
-                    Some(type_ids[0])
-                } else {
-                    None
-                };
-                let reader = SegmentMergeReader::new(
-                    Some(memgraph),
-                    csr_segs,
-                    dir,
-                    u64::MAX,
-                    edge_type_filter,
-                );
-
-                let committed = roaring::RoaringBitmap::new();
-                let view = crate::graph::view::MergedNodeView::new(memgraph, csr_segs);
-                // Scratch reused across every neighbor lookup in this Expand
-                // (the allocating `neighbors()` built a HashSet+Vec per call).
-                let mut nb_seen = crate::graph::fasthash::FxHashSet::default();
-                let mut nb_buf: Vec<crate::graph::traversal::MergedNeighbor> = Vec::new();
-                let mut new_rows = Vec::new();
-                for row in &rows {
-                    let src_key = match row.get(source) {
-                        Some(Value::Node(k)) => *k,
-                        _ => {
-                            // W2-13: a Null/unbound source under OPTIONAL
-                            // MATCH survives null-padded instead of dropping.
-                            if *optional {
-                                push_null_padded(row, target, edge_variable, &mut new_rows);
-                            }
-                            continue;
-                        }
-                    };
-                    let row_start = new_rows.len();
-
-                    if *max_hops <= 1 {
-                        // Single-hop expansion via SegmentMergeReader.
-                        reader.neighbors_into(src_key, &mut nb_seen, &mut nb_buf);
-                        for merged in &nb_buf {
-                            // Multi-type filter (SegmentMergeReader handles
-                            // single-type; we need extra check for multi-type).
-                            if type_ids.len() > 1 && !type_ids.contains(&merged.edge_type) {
-                                continue;
-                            }
-                            // Bi-temporal visibility check on target node
-                            // (merged view — frozen targets get the CSR
-                            // NodeMeta check instead of a free pass).
-                            if !view.is_visible(
-                                merged.node,
-                                ctx.snapshot_lsn,
-                                ctx.my_txn_id,
-                                &committed,
-                                ctx.valid_time_as_of,
-                            ) {
-                                continue;
-                            }
-                            let mut new_row = row.clone();
-                            new_row.insert(target, Value::Node(merged.node));
-                            // v0.1.9 CYP-06: bind edge variable for single-hop
-                            // expansion so WHERE r.valid_to >= $asof works.
-                            if let Some(evar) = edge_variable {
-                                new_row.insert(evar, Value::Edge(merged.edge));
-                            }
-                            new_rows.push(new_row);
-                        }
-                    } else {
-                        // Variable-length expansion via BFS using SegmentMergeReader.
-                        // Enforce limits to prevent DoS via exponential row growth.
-                        const MAX_HOPS_LIMIT: u32 = 20;
-                        const MAX_RESULT_ROWS: usize = 100_000;
-                        let capped_max_hops = (*max_hops).min(MAX_HOPS_LIMIT);
-
-                        let mut frontier = vec![src_key];
-                        let mut visited = crate::graph::fasthash::FxHashSet::default();
-                        visited.insert(src_key);
-
-                        for hop in 1..=capped_max_hops {
-                            guard_check(ctx)?;
-                            let mut next_frontier = Vec::new();
-                            for &current in &frontier {
-                                reader.neighbors_into(current, &mut nb_seen, &mut nb_buf);
-                                for merged in &nb_buf {
-                                    if visited.contains(&merged.node) {
-                                        continue;
-                                    }
-                                    if type_ids.len() > 1 && !type_ids.contains(&merged.edge_type) {
-                                        continue;
-                                    }
-                                    visited.insert(merged.node);
-                                    next_frontier.push(merged.node);
-
-                                    if hop >= *min_hops {
-                                        let mut new_row = row.clone();
-                                        new_row.insert(target, Value::Node(merged.node));
-                                        new_rows.push(new_row);
-                                        if new_rows.len() >= MAX_RESULT_ROWS {
-                                            break;
-                                        }
-                                    }
-                                }
-                                if new_rows.len() >= MAX_RESULT_ROWS {
-                                    break;
-                                }
-                            }
-                            frontier = next_frontier;
-                            if frontier.is_empty() || new_rows.len() >= MAX_RESULT_ROWS {
-                                break;
-                            }
-                        }
-                    }
-
-                    // W2-13: zero matches under OPTIONAL MATCH → the source
-                    // row survives with target/edge bound to Null.
-                    if *optional && new_rows.len() == row_start {
-                        push_null_padded(row, target, edge_variable, &mut new_rows);
-                    }
-                }
-                rows = new_rows;
-            }
-
-            PhysicalOp::Filter { expr } => {
-                rows.retain(|row| {
-                    matches!(
-                        eval_expr(
-                            expr,
-                            row,
-                            memgraph,
-                            params,
-                            csr_segs,
-                            ctx.snapshot_lsn,
-                            ctx.decay
-                        ),
-                        Value::Bool(true)
-                    )
-                });
-            }
-
-            PhysicalOp::Project {
-                items,
-                distinct,
-                rebind,
-            } => {
-                columns = items
-                    .iter()
-                    .map(|item| {
-                        if let Some(alias) = &item.alias {
-                            alias.clone()
-                        } else {
-                            expr_to_string(&item.expr)
-                        }
-                    })
-                    .collect();
-
-                // W2-12: aggregate items (count/sum/avg/min/max/collect)
-                // switch the projection into grouped-aggregation mode.
-                let aggregated = try_project_aggregate(items, rows.len(), |e, ri| {
-                    eval_expr(
-                        e,
-                        &rows[ri],
-                        memgraph,
-                        params,
-                        csr_segs,
-                        ctx.snapshot_lsn,
-                        ctx.decay,
-                    )
-                });
-
-                let mut projected: Vec<Vec<Value>> = match aggregated {
-                    Some(agg_rows) => agg_rows,
-                    None => rows
-                        .iter()
-                        .map(|row| {
-                            items
-                                .iter()
-                                .map(|item| {
-                                    if matches!(item.expr, Expr::Star) {
-                                        let entries: Vec<(String, Value)> = row
-                                            .iter()
-                                            .map(|(k, v)| (k.to_owned(), v.clone()))
-                                            .collect();
-                                        Value::Map(entries)
-                                    } else {
-                                        eval_expr(
-                                            &item.expr,
-                                            row,
-                                            memgraph,
-                                            params,
-                                            csr_segs,
-                                            ctx.snapshot_lsn,
-                                            ctx.decay,
-                                        )
-                                    }
-                                })
-                                .collect()
-                        })
-                        .collect(),
-                };
-
-                if *distinct {
-                    dedup_rows(&mut projected);
-                }
-
-                if *rebind {
-                    // W2-13 WITH: re-seed the variable-binding row stream
-                    // with the projection outputs so later clauses (WHERE /
-                    // ORDER BY / MATCH / RETURN) keep executing. `columns`
-                    // stays set but the final RETURN overwrites it.
-                    let mut new_rows = Vec::with_capacity(projected.len());
-                    for vals in projected {
-                        let mut new_row = Row::seed(slot_table);
-                        for (name, val) in columns.iter().zip(vals) {
-                            new_row.insert(name, val);
-                        }
-                        new_rows.push(new_row);
-                    }
-                    rows = new_rows;
-                    projected_rows = None;
-                } else {
-                    projected_rows = Some(projected);
-                    rows.clear();
-                }
-            }
-
-            PhysicalOp::Sort { items } => {
-                if let Some(ref mut pr) = projected_rows {
-                    // After projection, sort by evaluating expressions on
-                    // positional columns. Build a temporary index mapping.
-                    let col_indices: Vec<Option<usize>> = items
-                        .iter()
-                        .map(|(expr, _)| {
-                            let name = expr_to_string(expr);
-                            columns.iter().position(|c| *c == name)
-                        })
-                        .collect();
-
-                    pr.sort_by(|a, b| {
-                        for (i, (_, ascending)) in items.iter().enumerate() {
-                            let va = col_indices[i]
-                                .and_then(|idx| a.get(idx))
-                                .cloned()
-                                .unwrap_or(Value::Null);
-                            let vb = col_indices[i]
-                                .and_then(|idx| b.get(idx))
-                                .cloned()
-                                .unwrap_or(Value::Null);
-                            let ord = compare_values(&va, &vb);
-                            let ord = if *ascending { ord } else { ord.reverse() };
-                            if ord != std::cmp::Ordering::Equal {
-                                return ord;
-                            }
-                        }
-                        std::cmp::Ordering::Equal
-                    });
-                } else {
-                    rows.sort_by(|a, b| {
-                        for (expr, ascending) in items {
-                            let va = eval_expr(
-                                expr,
-                                a,
-                                memgraph,
-                                params,
-                                csr_segs,
-                                ctx.snapshot_lsn,
-                                ctx.decay,
-                            );
-                            let vb = eval_expr(
-                                expr,
-                                b,
-                                memgraph,
-                                params,
-                                csr_segs,
-                                ctx.snapshot_lsn,
-                                ctx.decay,
-                            );
-                            let ord = compare_values(&va, &vb);
-                            let ord = if *ascending { ord } else { ord.reverse() };
-                            if ord != std::cmp::Ordering::Equal {
-                                return ord;
-                            }
-                        }
-                        std::cmp::Ordering::Equal
-                    });
-                }
-            }
-
-            PhysicalOp::Limit { count } => {
-                let n = match eval_expr(
-                    count,
-                    &empty_row,
-                    memgraph,
-                    params,
-                    csr_segs,
-                    ctx.snapshot_lsn,
-                    ctx.decay,
-                ) {
-                    Value::Int(n) if n >= 0 => n as usize,
-                    _ => 0,
-                };
-                if let Some(ref mut pr) = projected_rows {
-                    pr.truncate(n);
-                } else {
-                    rows.truncate(n);
-                }
-            }
-
-            PhysicalOp::Skip { count } => {
-                let n = match eval_expr(
-                    count,
-                    &empty_row,
-                    memgraph,
-                    params,
-                    csr_segs,
-                    ctx.snapshot_lsn,
-                    ctx.decay,
-                ) {
-                    Value::Int(n) if n >= 0 => n as usize,
-                    _ => 0,
-                };
-                if let Some(ref mut pr) = projected_rows {
-                    if n < pr.len() {
-                        *pr = pr.split_off(n);
-                    } else {
-                        pr.clear();
-                    }
-                } else if n < rows.len() {
-                    rows = rows.split_off(n);
-                } else {
-                    rows.clear();
-                }
-            }
-
-            PhysicalOp::Unwind { expr, alias } => {
-                let mut new_rows = Vec::new();
-                for row in &rows {
-                    let val = eval_expr(
-                        expr,
-                        row,
-                        memgraph,
-                        params,
-                        csr_segs,
-                        ctx.snapshot_lsn,
-                        ctx.decay,
-                    );
-                    if let Value::List(items) = val {
-                        for item in items {
-                            let mut new_row = row.clone();
-                            new_row.insert(alias, item);
-                            new_rows.push(new_row);
-                        }
-                    }
-                }
-                rows = new_rows;
-            }
-
-            PhysicalOp::CreatePattern { .. } => {
-                return Err(ExecError {
-                    kind: ExecErrorKind::Unsupported(
-                        "write operations require GRAPH.QUERY with write lock".into(),
-                    ),
-                    partial_mutations: Vec::new(),
-                });
-            }
-
-            PhysicalOp::DeleteEntities { .. } => {
-                return Err(ExecError {
-                    kind: ExecErrorKind::Unsupported(
-                        "write operations require GRAPH.QUERY with write lock".into(),
-                    ),
-                    partial_mutations: Vec::new(),
-                });
-            }
-
-            PhysicalOp::SetProperties { .. } => {
-                return Err(ExecError {
-                    kind: ExecErrorKind::Unsupported(
-                        "write operations require GRAPH.QUERY with write lock".into(),
-                    ),
-                    partial_mutations: Vec::new(),
-                });
-            }
-
-            PhysicalOp::ProcedureCall { .. } => {
-                return Err(ExecError {
-                    kind: ExecErrorKind::Unsupported(
-                        "procedure calls not yet implemented in executor".into(),
-                    ),
-                    partial_mutations: Vec::new(),
-                });
-            }
-
-            PhysicalOp::Merge { .. } => {
-                return Err(ExecError {
-                    kind: ExecErrorKind::Unsupported(
-                        "write operations require GRAPH.QUERY with write lock".into(),
-                    ),
-                    partial_mutations: Vec::new(),
-                });
-            }
-
-            PhysicalOp::ShortestPath {
-                path_var,
-                source,
-                target,
-                max_hops,
-                edge_types,
-                direction,
-            } => {
-                // Phase 174 FIX-04: delegates to shared run_shortest_path helper.
-                let mut new_rows = Vec::new();
-                for row in &rows {
-                    let src_key = match row.get(source) {
-                        Some(Value::Node(k)) => *k,
-                        _ => continue,
-                    };
-                    let dst_key = match row.get(target) {
-                        Some(Value::Node(k)) => *k,
-                        _ => continue,
-                    };
-                    guard_check(ctx)?;
-                    if let Some(path) = super::shortest_path::run_shortest_path(
-                        memgraph,
-                        csr_segs,
-                        ctx.snapshot_lsn,
-                        ctx.decay,
-                        src_key,
-                        dst_key,
-                        edge_types,
-                        *direction,
-                        *max_hops,
-                    ) {
-                        let mut new_row = row.clone();
-                        new_row.insert(path_var, Value::Path(path));
-                        new_rows.push(new_row);
-                    }
-                }
-                rows = new_rows;
-            }
-        }
+    let ops = &plan.operators;
+    let demand = pipeline::row_demand(ops, |count| env.count(count));
+    let mut first = 0;
+    if let Some(end) = pipeline::streamable_prefix(ops, &demand) {
+        run_streamed_prefix(&ops[..end], demand[end - 1], &mut st, &env)?;
+        first = end;
     }
+    for (op, &keep) in ops.iter().zip(&demand).skip(first) {
+        apply_op(op, &mut st, &env, keep)?;
+    }
+
+    let OpState {
+        rows,
+        projected_rows,
+        mut columns,
+        nodes_scanned,
+    } = st;
 
     let final_rows = if let Some(pr) = projected_rows {
         pr
@@ -1135,6 +647,754 @@ pub fn execute_with_slots(
         execution_time_us: elapsed,
         mutations: Vec::new(),
     })
+}
+
+/// Read-only inputs every operator evaluates against.
+struct OpEnv<'a, 't> {
+    memgraph: &'a crate::graph::memgraph::MemGraph,
+    csr_segs: &'a [std::sync::Arc<crate::graph::csr::CsrStorage>],
+    params: &'a HashMap<String, Value>,
+    ctx: &'a ExecutionContext,
+    slot_table: &'t SlotTable,
+    empty_row: &'a Row<'a>,
+}
+
+impl OpEnv<'_, '_> {
+    /// A SKIP / LIMIT count, evaluated exactly as those operators do.
+    fn count(&self, count: &Expr) -> usize {
+        match eval_expr(
+            count,
+            self.empty_row,
+            self.memgraph,
+            self.params,
+            self.csr_segs,
+            self.ctx.snapshot_lsn,
+            self.ctx.decay,
+        ) {
+            Value::Int(n) if n >= 0 => n as usize,
+            _ => 0,
+        }
+    }
+}
+
+/// The row stream between operators.
+struct OpState<'t> {
+    rows: Vec<Row<'t>>,
+    /// After a non-rebinding Project, rows are positional value arrays.
+    projected_rows: Option<Vec<Vec<Value>>>,
+    columns: Vec<String>,
+    nodes_scanned: u64,
+}
+
+/// Run the leading streamable run `prefix` (`prefix[0]` is the scan) in
+/// chunks of scan keys, stopping once `need` output rows exist (moon#1197).
+/// Every op after the scan is row-local and order-preserving, so the rows
+/// produced are exactly the first rows full evaluation would produce; the
+/// downstream SKIP/LIMIT then cut them identically.
+fn run_streamed_prefix<'t>(
+    prefix: &[PhysicalOp],
+    need: usize,
+    st: &mut OpState<'t>,
+    env: &OpEnv<'_, 't>,
+) -> Result<(), ExecError> {
+    let Some((scan, segment)) = prefix.split_first() else {
+        return Ok(());
+    };
+    let mut sink = StreamSink::new(need);
+    match scan {
+        PhysicalOp::NodeScan { variable, label } => {
+            let label_id = label.as_ref().map(|l| label_to_id(l.as_bytes()));
+            let committed = roaring::RoaringBitmap::new();
+            let view = crate::graph::view::MergedNodeView::new(env.memgraph, env.csr_segs);
+            let mut chunk: Vec<NodeKey> = Vec::with_capacity(sink.chunk_len());
+            let mut failed: Option<ExecError> = None;
+            let _ = view.try_for_each_visible_node(
+                label_id,
+                env.ctx.snapshot_lsn,
+                env.ctx.my_txn_id,
+                &committed,
+                env.ctx.valid_time_as_of,
+                |key| {
+                    chunk.push(key);
+                    if chunk.len() < sink.chunk_len() {
+                        return std::ops::ControlFlow::Continue(());
+                    }
+                    match sink.feed(&chunk, variable, segment, env) {
+                        Ok(false) => {
+                            chunk.clear();
+                            std::ops::ControlFlow::Continue(())
+                        }
+                        Ok(true) => std::ops::ControlFlow::Break(()),
+                        Err(e) => {
+                            failed = Some(e);
+                            std::ops::ControlFlow::Break(())
+                        }
+                    }
+                },
+            );
+            if let Some(e) = failed {
+                return Err(e);
+            }
+            if !sink.done() {
+                sink.feed(&chunk, variable, segment, env)?;
+            }
+        }
+        PhysicalOp::IndexScan {
+            variable,
+            label,
+            prop_eq,
+            prop_range,
+            text_pred,
+        } => {
+            let keys = index_scan_keys(
+                env.memgraph,
+                env.csr_segs,
+                label.as_ref(),
+                prop_eq,
+                prop_range,
+                text_pred,
+                env.params,
+                env.ctx,
+            );
+            let mut rest: &[NodeKey] = &keys;
+            loop {
+                let (chunk, tail) = rest.split_at(rest.len().min(sink.chunk_len()));
+                if sink.feed(chunk, variable, segment, env)? || tail.is_empty() {
+                    break;
+                }
+                rest = tail;
+            }
+        }
+        _ => return Ok(()),
+    }
+    sink.finish(st, segment, env)
+}
+
+/// Accumulates the streamed prefix's output chunk by chunk.
+struct StreamSink<'t> {
+    need: usize,
+    chunk_len: usize,
+    scanned: u64,
+    fed_any: bool,
+    rows: Vec<Row<'t>>,
+    projected: Option<Vec<Vec<Value>>>,
+    columns: Vec<String>,
+}
+
+impl<'t> StreamSink<'t> {
+    fn new(need: usize) -> Self {
+        Self {
+            need,
+            // Start near the demand; double per chunk so a selective filter
+            // costs O(log) chunk rounds, not O(n / demand).
+            chunk_len: need.clamp(16, 1024),
+            scanned: 0,
+            fed_any: false,
+            rows: Vec::new(),
+            projected: None,
+            columns: Vec::new(),
+        }
+    }
+
+    fn chunk_len(&self) -> usize {
+        self.chunk_len
+    }
+
+    fn produced(&self) -> usize {
+        self.projected.as_ref().map_or(self.rows.len(), Vec::len)
+    }
+
+    fn done(&self) -> bool {
+        self.fed_any && self.produced() >= self.need
+    }
+
+    /// Run `keys` through the scan binding and `segment`; `true` once the
+    /// demand is met.
+    fn feed(
+        &mut self,
+        keys: &[NodeKey],
+        variable: &str,
+        segment: &[PhysicalOp],
+        env: &OpEnv<'_, 't>,
+    ) -> Result<bool, ExecError> {
+        self.scanned += keys.len() as u64;
+        let mut part = OpState {
+            rows: keys
+                .iter()
+                .map(|&key| {
+                    let mut row = Row::seed(env.slot_table);
+                    row.insert(variable, Value::Node(key));
+                    row
+                })
+                .collect(),
+            projected_rows: None,
+            columns: Vec::new(),
+            nodes_scanned: 0,
+        };
+        for op in segment {
+            apply_op(op, &mut part, env, usize::MAX)?;
+        }
+        match part.projected_rows {
+            Some(p) => self.projected.get_or_insert_with(Vec::new).extend(p),
+            None => self.rows.extend(part.rows),
+        }
+        self.columns = part.columns;
+        self.fed_any = true;
+        self.chunk_len = (self.chunk_len * 2).min(8192);
+        Ok(self.done())
+    }
+
+    fn finish(
+        mut self,
+        st: &mut OpState<'t>,
+        segment: &[PhysicalOp],
+        env: &OpEnv<'_, 't>,
+    ) -> Result<(), ExecError> {
+        if !self.fed_any {
+            // Nothing scanned (or LIMIT 0): still run the segment once so a
+            // projection names its columns exactly as full evaluation does.
+            self.feed(&[], "", segment, env)?;
+        }
+        st.nodes_scanned += self.scanned;
+        st.rows = self.rows;
+        st.projected_rows = self.projected;
+        st.columns = self.columns;
+        Ok(())
+    }
+}
+
+/// Apply one operator to the row stream. `keep` bounds how many of its output
+/// rows the rest of the plan can use (only `Sort` exploits it).
+fn apply_op<'t>(
+    op: &PhysicalOp,
+    st: &mut OpState<'t>,
+    env: &OpEnv<'_, 't>,
+    keep: usize,
+) -> Result<(), ExecError> {
+    let memgraph = env.memgraph;
+    let csr_segs = env.csr_segs;
+    let params = env.params;
+    let ctx = env.ctx;
+    let slot_table = env.slot_table;
+    let empty_row = env.empty_row;
+    match op {
+        PhysicalOp::NodeScan { variable, label } => {
+            let label_id = label.as_ref().map(|l| label_to_id(l.as_bytes()));
+            let committed = roaring::RoaringBitmap::new();
+            // Scan BOTH tiers: the mutable write buffer and frozen CSR
+            // segments (freeze DRAINS nodes — a memgraph-only scan loses
+            // every frozen node).
+            let view = crate::graph::view::MergedNodeView::new(memgraph, csr_segs);
+            let mut keys = Vec::new();
+            view.for_each_visible_node(
+                label_id,
+                ctx.snapshot_lsn,
+                ctx.my_txn_id,
+                &committed,
+                ctx.valid_time_as_of,
+                |k| keys.push(k),
+            );
+            st.nodes_scanned += keys.len() as u64;
+            let mut new_rows = Vec::with_capacity(st.rows.len() * keys.len());
+            for row in &st.rows {
+                for &key in &keys {
+                    let mut new_row = row.clone();
+                    new_row.insert(variable, Value::Node(key));
+                    new_rows.push(new_row);
+                }
+            }
+            st.rows = new_rows;
+        }
+
+        PhysicalOp::IndexScan {
+            variable,
+            label,
+            prop_eq,
+            prop_range,
+            text_pred,
+        } => {
+            let keys = index_scan_keys(
+                memgraph,
+                csr_segs,
+                label.as_ref(),
+                prop_eq,
+                prop_range,
+                text_pred,
+                params,
+                ctx,
+            );
+            st.nodes_scanned += keys.len() as u64;
+            let mut new_rows = Vec::with_capacity(st.rows.len() * keys.len());
+            for row in &st.rows {
+                for &key in &keys {
+                    let mut new_row = row.clone();
+                    new_row.insert(variable, Value::Node(key));
+                    new_rows.push(new_row);
+                }
+            }
+            st.rows = new_rows;
+        }
+
+        PhysicalOp::Expand {
+            source,
+            target,
+            edge_variable,
+            edge_types,
+            direction,
+            min_hops,
+            max_hops,
+            optional,
+        } => {
+            let type_ids: Vec<u16> = edge_types
+                .iter()
+                .map(|t| label_to_id(t.as_bytes()))
+                .collect();
+
+            let dir = match direction {
+                EdgeDirection::Right => Direction::Outgoing,
+                EdgeDirection::Left => Direction::Incoming,
+                EdgeDirection::Both => Direction::Both,
+            };
+
+            // Build a per-expand SegmentMergeReader with the correct
+            // direction and edge type filter for this operator.
+            let edge_type_filter = if type_ids.len() == 1 {
+                Some(type_ids[0])
+            } else {
+                None
+            };
+            let reader =
+                SegmentMergeReader::new(Some(memgraph), csr_segs, dir, u64::MAX, edge_type_filter);
+
+            let committed = roaring::RoaringBitmap::new();
+            let view = crate::graph::view::MergedNodeView::new(memgraph, csr_segs);
+            // Scratch reused across every neighbor lookup in this Expand
+            // (the allocating `neighbors()` built a HashSet+Vec per call).
+            let mut nb_seen = crate::graph::fasthash::FxHashSet::default();
+            let mut nb_buf: Vec<crate::graph::traversal::MergedNeighbor> = Vec::new();
+            let mut new_rows = Vec::new();
+            for row in &st.rows {
+                let src_key = match row.get(source) {
+                    Some(Value::Node(k)) => *k,
+                    _ => {
+                        // W2-13: a Null/unbound source under OPTIONAL
+                        // MATCH survives null-padded instead of dropping.
+                        if *optional {
+                            push_null_padded(row, target, edge_variable, &mut new_rows);
+                        }
+                        continue;
+                    }
+                };
+                let row_start = new_rows.len();
+
+                if *max_hops <= 1 {
+                    // Single-hop expansion via SegmentMergeReader.
+                    reader.neighbors_into(src_key, &mut nb_seen, &mut nb_buf);
+                    for merged in &nb_buf {
+                        // Multi-type filter (SegmentMergeReader handles
+                        // single-type; we need extra check for multi-type).
+                        if type_ids.len() > 1 && !type_ids.contains(&merged.edge_type) {
+                            continue;
+                        }
+                        // Bi-temporal visibility check on target node
+                        // (merged view — frozen targets get the CSR
+                        // NodeMeta check instead of a free pass).
+                        if !view.is_visible(
+                            merged.node,
+                            ctx.snapshot_lsn,
+                            ctx.my_txn_id,
+                            &committed,
+                            ctx.valid_time_as_of,
+                        ) {
+                            continue;
+                        }
+                        let mut new_row = row.clone();
+                        new_row.insert(target, Value::Node(merged.node));
+                        // v0.1.9 CYP-06: bind edge variable for single-hop
+                        // expansion so WHERE r.valid_to >= $asof works.
+                        if let Some(evar) = edge_variable {
+                            new_row.insert(evar, Value::Edge(merged.edge));
+                        }
+                        new_rows.push(new_row);
+                    }
+                } else {
+                    // Variable-length expansion via BFS using SegmentMergeReader.
+                    // Enforce limits to prevent DoS via exponential row growth.
+                    const MAX_HOPS_LIMIT: u32 = 20;
+                    const MAX_RESULT_ROWS: usize = 100_000;
+                    let capped_max_hops = (*max_hops).min(MAX_HOPS_LIMIT);
+
+                    let mut frontier = vec![src_key];
+                    let mut visited = crate::graph::fasthash::FxHashSet::default();
+                    visited.insert(src_key);
+
+                    for hop in 1..=capped_max_hops {
+                        guard_check(ctx)?;
+                        let mut next_frontier = Vec::new();
+                        for &current in &frontier {
+                            reader.neighbors_into(current, &mut nb_seen, &mut nb_buf);
+                            for merged in &nb_buf {
+                                if visited.contains(&merged.node) {
+                                    continue;
+                                }
+                                if type_ids.len() > 1 && !type_ids.contains(&merged.edge_type) {
+                                    continue;
+                                }
+                                visited.insert(merged.node);
+                                next_frontier.push(merged.node);
+
+                                if hop >= *min_hops {
+                                    let mut new_row = row.clone();
+                                    new_row.insert(target, Value::Node(merged.node));
+                                    new_rows.push(new_row);
+                                    if new_rows.len() >= MAX_RESULT_ROWS {
+                                        break;
+                                    }
+                                }
+                            }
+                            if new_rows.len() >= MAX_RESULT_ROWS {
+                                break;
+                            }
+                        }
+                        frontier = next_frontier;
+                        if frontier.is_empty() || new_rows.len() >= MAX_RESULT_ROWS {
+                            break;
+                        }
+                    }
+                }
+
+                // W2-13: zero matches under OPTIONAL MATCH → the source
+                // row survives with target/edge bound to Null.
+                if *optional && new_rows.len() == row_start {
+                    push_null_padded(row, target, edge_variable, &mut new_rows);
+                }
+            }
+            st.rows = new_rows;
+        }
+
+        PhysicalOp::Filter { expr } => {
+            st.rows.retain(|row| {
+                matches!(
+                    eval_expr(
+                        expr,
+                        row,
+                        memgraph,
+                        params,
+                        csr_segs,
+                        ctx.snapshot_lsn,
+                        ctx.decay
+                    ),
+                    Value::Bool(true)
+                )
+            });
+        }
+
+        PhysicalOp::Project {
+            items,
+            distinct,
+            rebind,
+        } => {
+            st.columns = items
+                .iter()
+                .map(|item| {
+                    if let Some(alias) = &item.alias {
+                        alias.clone()
+                    } else {
+                        expr_to_string(&item.expr)
+                    }
+                })
+                .collect();
+
+            // W2-12: aggregate items (count/sum/avg/min/max/collect)
+            // switch the projection into grouped-aggregation mode.
+            let aggregated = try_project_aggregate(items, st.rows.len(), |e, ri| {
+                eval_expr(
+                    e,
+                    &st.rows[ri],
+                    memgraph,
+                    params,
+                    csr_segs,
+                    ctx.snapshot_lsn,
+                    ctx.decay,
+                )
+            });
+
+            let mut projected: Vec<Vec<Value>> = match aggregated {
+                Some(agg_rows) => agg_rows,
+                None => st
+                    .rows
+                    .iter()
+                    .map(|row| {
+                        items
+                            .iter()
+                            .map(|item| {
+                                if matches!(item.expr, Expr::Star) {
+                                    let entries: Vec<(String, Value)> = row
+                                        .iter()
+                                        .map(|(k, v)| (k.to_owned(), v.clone()))
+                                        .collect();
+                                    Value::Map(entries)
+                                } else {
+                                    eval_expr(
+                                        &item.expr,
+                                        row,
+                                        memgraph,
+                                        params,
+                                        csr_segs,
+                                        ctx.snapshot_lsn,
+                                        ctx.decay,
+                                    )
+                                }
+                            })
+                            .collect()
+                    })
+                    .collect(),
+            };
+
+            if *distinct {
+                dedup_rows(&mut projected);
+            }
+
+            if *rebind {
+                // W2-13 WITH: re-seed the variable-binding row stream
+                // with the projection outputs so later clauses (WHERE /
+                // ORDER BY / MATCH / RETURN) keep executing. `st.columns`
+                // stays set but the final RETURN overwrites it.
+                let mut new_rows = Vec::with_capacity(projected.len());
+                for vals in projected {
+                    let mut new_row = Row::seed(slot_table);
+                    for (name, val) in st.columns.iter().zip(vals) {
+                        new_row.insert(name, val);
+                    }
+                    new_rows.push(new_row);
+                }
+                st.rows = new_rows;
+                st.projected_rows = None;
+            } else {
+                st.projected_rows = Some(projected);
+                st.rows.clear();
+            }
+        }
+
+        PhysicalOp::Sort { items } => {
+            // moon#1197: sort keys computed ONCE per row and compared by
+            // reference (HEAD cloned both values — or evaluated both
+            // expressions — inside every comparison), and only the rows the
+            // rest of the plan can use (`keep`: ORDER BY … [SKIP s] LIMIT n)
+            // are selected + sorted. `stable_order` reproduces HEAD's stable
+            // `sort_by` + truncation exactly.
+            let ascending: SmallVec<[bool; 4]> = items.iter().map(|(_, asc)| *asc).collect();
+            if let Some(pr) = st.projected_rows.take() {
+                // After projection, sort keys are positional columns.
+                let col_indices: SmallVec<[Option<usize>; 4]> = items
+                    .iter()
+                    .map(|(expr, _)| {
+                        let name = expr_to_string(expr);
+                        st.columns.iter().position(|c| *c == name)
+                    })
+                    .collect();
+                let null = Value::Null;
+                let total = pipeline::totally_ordered(pr.iter().flat_map(|row| {
+                    col_indices
+                        .iter()
+                        .map(|&c| pipeline::column_key(row, c, &null))
+                }));
+                let order = pipeline::stable_order(pr.len(), keep, total, |a, b| {
+                    pipeline::cmp_keys(
+                        col_indices
+                            .iter()
+                            .map(|&c| pipeline::column_key(&pr[a], c, &null)),
+                        col_indices
+                            .iter()
+                            .map(|&c| pipeline::column_key(&pr[b], c, &null)),
+                        &ascending,
+                    )
+                });
+                st.projected_rows = Some(pipeline::permute(pr, &order));
+            } else {
+                let keys: Vec<SmallVec<[Value; 2]>> = st
+                    .rows
+                    .iter()
+                    .map(|row| {
+                        items
+                            .iter()
+                            .map(|(expr, _)| {
+                                eval_expr(
+                                    expr,
+                                    row,
+                                    memgraph,
+                                    params,
+                                    csr_segs,
+                                    ctx.snapshot_lsn,
+                                    ctx.decay,
+                                )
+                            })
+                            .collect()
+                    })
+                    .collect();
+                let total = pipeline::totally_ordered(keys.iter().flatten());
+                let order = pipeline::stable_order(keys.len(), keep, total, |a, b| {
+                    pipeline::cmp_keys(keys[a].iter(), keys[b].iter(), &ascending)
+                });
+                let rows = std::mem::take(&mut st.rows);
+                st.rows = pipeline::permute(rows, &order);
+            }
+        }
+
+        PhysicalOp::Limit { count } => {
+            let n = match eval_expr(
+                count,
+                &empty_row,
+                memgraph,
+                params,
+                csr_segs,
+                ctx.snapshot_lsn,
+                ctx.decay,
+            ) {
+                Value::Int(n) if n >= 0 => n as usize,
+                _ => 0,
+            };
+            if let Some(ref mut pr) = st.projected_rows {
+                pr.truncate(n);
+            } else {
+                st.rows.truncate(n);
+            }
+        }
+
+        PhysicalOp::Skip { count } => {
+            let n = match eval_expr(
+                count,
+                &empty_row,
+                memgraph,
+                params,
+                csr_segs,
+                ctx.snapshot_lsn,
+                ctx.decay,
+            ) {
+                Value::Int(n) if n >= 0 => n as usize,
+                _ => 0,
+            };
+            if let Some(ref mut pr) = st.projected_rows {
+                if n < pr.len() {
+                    *pr = pr.split_off(n);
+                } else {
+                    pr.clear();
+                }
+            } else if n < st.rows.len() {
+                st.rows = st.rows.split_off(n);
+            } else {
+                st.rows.clear();
+            }
+        }
+
+        PhysicalOp::Unwind { expr, alias } => {
+            let mut new_rows = Vec::new();
+            for row in &st.rows {
+                let val = eval_expr(
+                    expr,
+                    row,
+                    memgraph,
+                    params,
+                    csr_segs,
+                    ctx.snapshot_lsn,
+                    ctx.decay,
+                );
+                if let Value::List(items) = val {
+                    for item in items {
+                        let mut new_row = row.clone();
+                        new_row.insert(alias, item);
+                        new_rows.push(new_row);
+                    }
+                }
+            }
+            st.rows = new_rows;
+        }
+
+        PhysicalOp::CreatePattern { .. } => {
+            return Err(ExecError {
+                kind: ExecErrorKind::Unsupported(
+                    "write operations require GRAPH.QUERY with write lock".into(),
+                ),
+                partial_mutations: Vec::new(),
+            });
+        }
+
+        PhysicalOp::DeleteEntities { .. } => {
+            return Err(ExecError {
+                kind: ExecErrorKind::Unsupported(
+                    "write operations require GRAPH.QUERY with write lock".into(),
+                ),
+                partial_mutations: Vec::new(),
+            });
+        }
+
+        PhysicalOp::SetProperties { .. } => {
+            return Err(ExecError {
+                kind: ExecErrorKind::Unsupported(
+                    "write operations require GRAPH.QUERY with write lock".into(),
+                ),
+                partial_mutations: Vec::new(),
+            });
+        }
+
+        PhysicalOp::ProcedureCall { .. } => {
+            return Err(ExecError {
+                kind: ExecErrorKind::Unsupported(
+                    "procedure calls not yet implemented in executor".into(),
+                ),
+                partial_mutations: Vec::new(),
+            });
+        }
+
+        PhysicalOp::Merge { .. } => {
+            return Err(ExecError {
+                kind: ExecErrorKind::Unsupported(
+                    "write operations require GRAPH.QUERY with write lock".into(),
+                ),
+                partial_mutations: Vec::new(),
+            });
+        }
+
+        PhysicalOp::ShortestPath {
+            path_var,
+            source,
+            target,
+            max_hops,
+            edge_types,
+            direction,
+        } => {
+            // Phase 174 FIX-04: delegates to shared run_shortest_path helper.
+            let mut new_rows = Vec::new();
+            for row in &st.rows {
+                let src_key = match row.get(source) {
+                    Some(Value::Node(k)) => *k,
+                    _ => continue,
+                };
+                let dst_key = match row.get(target) {
+                    Some(Value::Node(k)) => *k,
+                    _ => continue,
+                };
+                guard_check(ctx)?;
+                if let Some(path) = super::shortest_path::run_shortest_path(
+                    memgraph,
+                    csr_segs,
+                    ctx.snapshot_lsn,
+                    ctx.decay,
+                    src_key,
+                    dst_key,
+                    edge_types,
+                    *direction,
+                    *max_hops,
+                ) {
+                    let mut new_row = row.clone();
+                    new_row.insert(path_var, Value::Path(path));
+                    new_rows.push(new_row);
+                }
+            }
+            st.rows = new_rows;
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
