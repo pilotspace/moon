@@ -155,27 +155,55 @@ pub fn stall_refusal(cmd: &[u8], sources: StallSources) -> Option<&'static [u8]>
     None
 }
 
-/// Update the segment-stall atomic based on the current immutable segment count.
+thread_local! {
+    /// Whether THIS shard thread currently counts itself in
+    /// `RECL_SEGMENT_STALL_ACTIVE` (moon#1198).
+    static THIS_SHARD_STALLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Update the calling shard's contribution to the segment-stall gauge from its
+/// current immutable segment count.
 ///
-/// Called from the 1s MVCC sweep tick (`timers::run_mvcc_sweep`).
-/// Sets `RECL_SEGMENT_STALL_ACTIVE` to 1 when `count > threshold`, 0 otherwise.
-/// No-ops when `threshold == 0` (guard disabled).
+/// Called from each shard's 1s MVCC sweep tick (`timers::run_mvcc_sweep`).
+/// This shard is stalled when `count > threshold`; `threshold == 0` disables
+/// the guard (the shard counts itself out).
+///
+/// moon#1198: `RECL_SEGMENT_STALL_ACTIVE` is the NUMBER of stalled shards,
+/// moved by one on each shard's own transition. It used to be a 0/1 that
+/// every shard OVERWROTE with its own verdict each second, so a shard with no
+/// backlog cleared another shard's stall — which then refused writes or not
+/// depending on which shard ticked last. Every reader asks `!= 0`, so "any
+/// shard is stalled" keeps its meaning; nothing can lose another shard's bit.
 #[inline]
 pub fn update_segment_stall(count: usize, threshold: u64) {
-    if threshold == 0 {
-        RECL_SEGMENT_STALL_ACTIVE.store(0, Ordering::Relaxed);
-        return;
-    }
-    let stalled = if count as u64 > threshold { 1 } else { 0 };
-    RECL_SEGMENT_STALL_ACTIVE.store(stalled, Ordering::Relaxed);
+    let stalled = threshold != 0 && count as u64 > threshold;
+    THIS_SHARD_STALLED.with(|was| {
+        if was.replace(stalled) != stalled {
+            if stalled {
+                RECL_SEGMENT_STALL_ACTIVE.fetch_add(1, Ordering::Relaxed);
+            } else {
+                // Saturating: a test (or tool) may have stored the gauge
+                // directly; never wrap it to u64::MAX (= stalled forever).
+                let _ = RECL_SEGMENT_STALL_ACTIVE.fetch_update(
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                    |n| Some(n.saturating_sub(1)),
+                );
+            }
+        }
+    });
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// The gauge is process-global; the tests that move it run one at a time.
+    static GAUGE: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
     #[test]
     fn test_update_segment_stall_sets_active_above_threshold() {
+        let _g = GAUGE.lock();
         update_segment_stall(21, 20);
         assert!(is_segment_stall_active());
         // Restore
@@ -184,14 +212,16 @@ mod tests {
 
     #[test]
     fn test_update_segment_stall_clears_below_threshold() {
-        RECL_SEGMENT_STALL_ACTIVE.store(1, Ordering::Relaxed);
+        let _g = GAUGE.lock();
+        update_segment_stall(21, 20);
         update_segment_stall(19, 20);
         assert!(!is_segment_stall_active());
     }
 
     #[test]
     fn test_update_segment_stall_disabled_when_threshold_zero() {
-        RECL_SEGMENT_STALL_ACTIVE.store(1, Ordering::Relaxed);
+        let _g = GAUGE.lock();
+        update_segment_stall(21, 20);
         update_segment_stall(9999, 0);
         // threshold == 0 means guard is off — stall cleared
         assert!(!is_segment_stall_active());
@@ -199,6 +229,7 @@ mod tests {
 
     #[test]
     fn test_update_segment_stall_at_exact_threshold_is_not_stalled() {
+        let _g = GAUGE.lock();
         update_segment_stall(20, 20);
         // Strictly greater than threshold triggers stall
         assert!(
@@ -206,6 +237,39 @@ mod tests {
             "count == threshold must NOT stall"
         );
         update_segment_stall(0, 20);
+    }
+
+    /// moon#1198: one shard's clean tick must not clear another shard's
+    /// stall. Each thread is one shard's sweep tick; pre-fix the second
+    /// thread's `store(0)` wiped the first thread's `store(1)`.
+    #[test]
+    fn a_clean_shard_does_not_clear_another_shards_stall() {
+        let _g = GAUGE.lock();
+        let tick = |count: usize| {
+            std::thread::spawn(move || update_segment_stall(count, 20))
+                .join()
+                .is_ok()
+        };
+        let (recover, recover_rx) = std::sync::mpsc::channel::<()>();
+        let stalled_shard = std::thread::spawn(move || {
+            update_segment_stall(25, 20);
+            // Stay alive (still stalled) while the other shard ticks, then
+            // recover, as a real shard thread would on a later tick.
+            let _ = recover_rx.recv();
+            update_segment_stall(0, 20);
+        });
+        // Let the stalled shard's tick land first.
+        while !is_segment_stall_active() {
+            std::thread::yield_now();
+        }
+        assert!(tick(3), "the clean shard's tick");
+        assert!(
+            is_segment_stall_active(),
+            "a shard with no backlog cleared another shard's stall (moon#1198)"
+        );
+        assert!(recover.send(()).is_ok());
+        assert!(stalled_shard.join().is_ok());
+        assert!(!is_segment_stall_active(), "the stalled shard recovered");
     }
 
     use super::{StallSources, stall_refusal};
