@@ -188,6 +188,7 @@ impl<K, V> Segment<K, V> {
                 // SAFETY: ctrl byte matches h2 (a FULL value), so the slot is initialized.
                 // Mirrors find at segment/find.rs.
                 let k = unsafe { self.keys[slot].assume_init_ref() };
+                super::note_key_compare();
                 if k.borrow() == key_lookup {
                     // SAFETY: ctrl byte matches h2 and key compares equal (mirrors find),
                     // so values[slot] is initialized.
@@ -242,6 +243,7 @@ impl<K, V> Segment<K, V> {
                 if slot < TOTAL_SLOTS {
                     // SAFETY: ctrl byte matches h2 (mirrors find).
                     let k = unsafe { self.keys[slot].assume_init_ref() };
+                    super::note_key_compare();
                     if k.borrow() == key_lookup {
                         // SAFETY: key match confirmed (mirrors find).
                         let v = unsafe { self.values[slot].assume_init_mut() };
@@ -275,6 +277,7 @@ impl<K, V> Segment<K, V> {
             if ctrl == h2 {
                 // SAFETY: ctrl byte matches h2 (mirrors find).
                 let k = unsafe { self.keys[slot].assume_init_ref() };
+                super::note_key_compare();
                 if k.borrow() == key_lookup {
                     // SAFETY: key match confirmed (mirrors find).
                     let v = unsafe { self.values[slot].assume_init_mut() };
@@ -314,6 +317,7 @@ impl<K, V> Segment<K, V> {
                         // SAFETY: ctrl byte matches h2 -> slot is initialized
                         // (mirrors find).
                         let k = unsafe { self.keys[slot].assume_init_ref() };
+                        super::note_key_compare();
                         if k.borrow() == key_lookup {
                             // SAFETY: key match confirmed (mirrors find).
                             let v = unsafe { self.values[slot].assume_init_mut() };

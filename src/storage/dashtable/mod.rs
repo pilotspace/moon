@@ -15,9 +15,12 @@
 //!   +-- Segment 1: ...
 //! ```
 //!
-//! Hash routing:
-//! - H1 (full hash): segment index (high bits) + home bucket selection (mid bits)
-//! - H2 (top 7 bits): control byte fingerprint for SIMD matching
+//! Hash routing (one xxh64, three disjoint consumers — moon#1159):
+//! - directory: the TOP `depth` bits pick the segment
+//! - home buckets: `(hash >> 8) % 56` and `(hash >> 16) % 56`
+//! - H2 (bits 32..=38, [`segment::H2_SHIFT`]): control byte fingerprint for
+//!   SIMD matching. It must not overlap the directory bits, or every key in a
+//!   deep segment shares one fingerprint and the SIMD filter matches them all.
 
 pub mod iter;
 pub mod segment;
@@ -924,6 +927,91 @@ mod tests {
              miss; get_mut + insert scanned {legacy_probes}. The fused path must scan \
              strictly fewer — that is the whole of PERF-08. Equal or greater means the \
              single-probe fusion has regressed (moon#789)."
+        );
+    }
+
+    /// moon#1159: the H2 fingerprint must carry bits the directory does not.
+    ///
+    /// Every key in a segment of local depth `d` shares its top `d` hash bits
+    /// (that is what routes it there). Keys that share the top 10 bits are
+    /// therefore exactly the population of one depth-10 segment, and their
+    /// fingerprints are what `match_h2` has to tell apart. With H2 taken from
+    /// the top 7 bits they all carried ONE value; from bits 32..=38 they spread
+    /// over (almost) all 128.
+    #[test]
+    fn h2_fingerprint_is_independent_of_the_directory_bits() {
+        const PREFIX_BITS: u32 = 10;
+        const WANT: usize = 300;
+        let target = hash_key(b"h2prefix:0") >> (64 - PREFIX_BITS);
+        let mut fingerprints = std::collections::HashSet::new();
+        let mut matched = 0usize;
+        let mut i = 0u64;
+        while matched < WANT {
+            let k = format!("h2prefix:{i}");
+            let hash = hash_key(k.as_bytes());
+            if hash >> (64 - PREFIX_BITS) == target {
+                fingerprints.insert(segment::h2(hash));
+                matched += 1;
+            }
+            i += 1;
+        }
+        // 300 draws from 128 buckets leave ~116 distinct on average; 90 is a
+        // generous floor that still fails loudly for a top-bit fingerprint
+        // (which yields exactly 1).
+        assert!(
+            fingerprints.len() >= 90,
+            "{WANT} keys sharing the top {PREFIX_BITS} hash bits (one depth-{PREFIX_BITS} \
+             segment's worth) produced only {} distinct H2 fingerprints — H2 overlaps the \
+             directory bits and the SIMD filter cannot separate keys inside a segment \
+             (moon#1159)",
+            fingerprints.len()
+        );
+    }
+
+    /// moon#1159: the deterministic gate for the fingerprint's EFFECT — how
+    /// many full key compares a probe pays.
+    ///
+    /// A 100K-key table sits at directory depth ~12, deep enough that a
+    /// fingerprint drawn from the directory bits is constant within every
+    /// segment. On HEAD `935c555` this measured ~6-8 compares per hit and
+    /// ~20+ per miss; a working 7-bit fingerprint needs ~1 per hit (the key
+    /// itself plus a 1/128 false-positive rate over the ~10 FULL slots ahead
+    /// of it) and ~0.2 per miss.
+    #[test]
+    fn h2_fingerprint_keeps_key_compares_near_one_per_hit() {
+        const N: u32 = 100_000;
+        let mut table: DashTable<CompactKey, u32> = DashTable::new();
+        for i in 0..N {
+            table.insert(CompactKey::from(format!("key:{i:08}")), i);
+        }
+        assert!(
+            table.directory_depth() >= 10,
+            "fixture must be deep enough for a top-bit fingerprint to collapse, got depth {}",
+            table.directory_depth()
+        );
+
+        let _ = segment::take_key_compares();
+        for i in 0..N {
+            assert_eq!(table.get(format!("key:{i:08}").as_bytes()), Some(&i));
+        }
+        let hit_compares = segment::take_key_compares();
+        for i in 0..N {
+            assert!(table.get(format!("miss:{i:08}").as_bytes()).is_none());
+        }
+        let miss_compares = segment::take_key_compares();
+
+        let per_hit = hit_compares as f64 / f64::from(N);
+        let per_miss = miss_compares as f64 / f64::from(N);
+        eprintln!("moon#1159 key compares: per_hit={per_hit:.4} per_miss={per_miss:.4}");
+        assert!(
+            per_hit <= 1.15,
+            "mean key compares per HIT = {per_hit:.3} on a {N}-key table (want ~1.05); \
+             the H2 fingerprint is not filtering (moon#1159)"
+        );
+        assert!(
+            per_miss <= 0.5,
+            "mean key compares per MISS = {per_miss:.3} on a {N}-key table (want ~0.2); \
+             the H2 fingerprint is not filtering (moon#1159)"
         );
     }
 

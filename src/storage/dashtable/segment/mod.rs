@@ -51,12 +51,42 @@ pub(super) const CTRL_BYTES: usize = NUM_GROUPS * 16;
 /// reducing per-key memory overhead by ~8% with minimal impact on probe length.
 pub const LOAD_THRESHOLD: usize = 54;
 
-/// Extract the H2 fingerprint from a hash: top 7 bits, ensuring MSB is 0
-/// so the value (0x00..0x7F) is distinguishable from EMPTY (0xFF) and
-/// DELETED (0x80).
+/// First hash bit the H2 fingerprint reads (bits `H2_SHIFT..H2_SHIFT + 7`).
+///
+/// # Why bits 32..=38 and not the top 7 (moon#1159)
+///
+/// The fingerprint is only a filter if it is independent of everything that
+/// already decided WHICH slots a key can occupy. Three consumers read the
+/// same xxh64 hash before H2 is ever compared:
+///
+/// * **the directory** — `segment_index` routes on the TOP `depth` bits, and
+///   extendible hashing guarantees every key in a segment of local depth `d`
+///   shares its top `d` bits. With H2 = the top 7 bits, every key in a
+///   segment at `d >= 7` (≈128 segments, ≈5K keys per db per shard) carried
+///   the SAME fingerprint: `match_h2` then matched every FULL slot and each
+///   probe fell back to a full key compare per occupied slot — ~6 per hit
+///   and ~22-54 per miss at 1M keys, instead of ~1 and ~0.2. Bits 32..=38
+///   are not reached by the directory until `depth >= 26` (≈2.7B keys in one
+///   table).
+/// * **`home_buckets`** — reads `(hash >> 8) % 56` and `(hash >> 16) % 56`.
+///   `% 56` is `% 8` (bits 8-10 / 16-18) combined with `% 7`, and `% 7` of a
+///   base-8 number is the digit sum of ALL its octal digits, so bits 32..=38
+///   enter the bucket choice only through a 16-term digit sum: no usable
+///   correlation between a key's group and its fingerprint.
+/// * **shard routing** — `xxh64 % num_shards` pins the LOW `log2(N)` bits for
+///   a power-of-two shard count; bits 32..=38 are untouched for any
+///   `N < 2^32`.
+///
+/// Nothing persists control bytes (they are rebuilt on every insert), so
+/// moving the fingerprint is not a format change.
+pub const H2_SHIFT: u32 = 32;
+
+/// Extract the H2 fingerprint from a hash: 7 bits no other consumer of the
+/// hash reads (see [`H2_SHIFT`]), with bit 7 clear so the value
+/// (0x00..0x7F) is distinguishable from EMPTY (0xFF) and DELETED (0x80).
 #[inline]
 pub fn h2(hash: u64) -> u8 {
-    (hash >> 57) as u8 & 0x7F
+    ((hash >> H2_SHIFT) as u8) & 0x7F
 }
 
 /// Result of an insert operation on a segment.
@@ -152,6 +182,43 @@ pub(super) fn note_simd_probe() {}
 #[cfg(test)]
 pub(super) fn take_simd_probes() -> u32 {
     SIMD_PROBES.with(|c| c.replace(0))
+}
+
+// Per-thread count of FULL KEY COMPARES a probe performed (test builds only,
+// moon#1159).
+//
+// Every H2 match that is not the probed key costs one key compare — and for a
+// key longer than 23 bytes a dereference of a separate heap block. The
+// fingerprint exists to make that number ~1 per hit and ~0 per miss; this
+// counter is how a test pins that it still does, deterministically and
+// independently of the host's timing. Counted at each `k.borrow() == key`
+// site in `find` and `insert_or_update_at`, the two probe loops every
+// accessor goes through.
+//
+// Plain `//` comments: a doc comment on a macro invocation trips
+// `unused_doc_comments`, which is denied in CI. Compiles to nothing outside
+// `cfg(test)`.
+#[cfg(test)]
+thread_local! {
+    static KEY_COMPARES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Record one full key compare. No-op outside test builds.
+#[cfg(test)]
+#[inline]
+pub(super) fn note_key_compare() {
+    KEY_COMPARES.with(|c| c.set(c.get() + 1));
+}
+
+/// No-op in non-test builds — zero production cost.
+#[cfg(not(test))]
+#[inline(always)]
+pub(super) fn note_key_compare() {}
+
+/// Read and reset the per-thread key-compare counter (moon#1159).
+#[cfg(test)]
+pub(crate) fn take_key_compares() -> u64 {
+    KEY_COMPARES.with(|c| c.replace(0))
 }
 
 /// Prefetch the key data at the given slot index into L1 cache.
