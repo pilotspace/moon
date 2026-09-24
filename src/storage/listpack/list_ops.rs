@@ -10,10 +10,28 @@
 //! in place, move each kept byte at most once, and never decode an entry into an
 //! owned `Vec` just to look at it or step over it.
 
-use super::{LP_TERMINATOR, Listpack, ListpackRef, decode_backlen, decode_entry_ref_at};
+use super::{
+    LP_TERMINATOR, Listpack, ListpackRef, decode_backlen, decode_entry_ref_at, encode_entry,
+    seek_to,
+};
 
 /// Byte offset of the first entry: `total_bytes: u32` + `num_elements: u16`.
 const LP_FIRST_ENTRY: usize = 6;
+
+// Test-only count of walks that started at the TAIL -- the backward half of
+// [`Listpack::offset_of`]. Paired with the parent's `HEAD_SEEKS`, it pins "one
+// seek per operation" whichever end the seek started from. Thread-local for the
+// same reason `HEAD_SEEKS` is: unit tests run in parallel in one process.
+#[cfg(test)]
+thread_local! {
+    static TAIL_SEEKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Walks from either end so far on this thread: `HEAD_SEEKS + TAIL_SEEKS`.
+#[cfg(test)]
+pub(crate) fn seeks_from_either_end() -> usize {
+    super::head_seeks() + TAIL_SEEKS.with(std::cell::Cell::get)
+}
 
 /// Reverse iterator yielding BORROWED entries, tail first — the borrowed twin of
 /// [`super::ListpackRevIter`].
@@ -158,6 +176,100 @@ impl Listpack {
             self.data.drain(r..w);
         }
         removed
+    }
+
+    /// Byte offset of entry `index` -- `index == len()` names the terminator --
+    /// walking from whichever END of the buffer is nearer.
+    ///
+    /// From the head this is [`seek_to`], counted by `HEAD_SEEKS`; from the tail
+    /// it steps back over `len() - index` entries by their backlens alone, never
+    /// decoding a payload. `LTRIM k 0 99` on a 101-entry list therefore walks
+    /// ONE entry, not a hundred.
+    pub(super) fn offset_of(&self, index: usize) -> Option<usize> {
+        let len = self.len();
+        if index > len {
+            return None;
+        }
+        if index == len {
+            return Some(self.data.len() - 1);
+        }
+        if index <= len - index {
+            return seek_to(&self.data, index).map(|(pos, _)| pos);
+        }
+        #[cfg(test)]
+        TAIL_SEEKS.with(|c| c.set(c.get() + 1));
+        let mut pos = self.data.len() - 1;
+        for _ in 0..len - index {
+            let (entry_len, backlen_size) = decode_backlen(&self.data, pos);
+            pos -= backlen_size + entry_len;
+        }
+        Some(pos)
+    }
+
+    /// Stamp both header fields: `total_bytes` from the buffer, the element
+    /// count from the caller.
+    fn stamp_header(&mut self, count: usize) {
+        let total = u32::try_from(self.data.len()).unwrap_or(u32::MAX);
+        self.data[0..4].copy_from_slice(&total.to_le_bytes());
+        let count = u16::try_from(count).unwrap_or(u16::MAX);
+        self.data[4..6].copy_from_slice(&count.to_le_bytes());
+    }
+
+    /// Keep only the entries `start..=end`, dropping everything outside that
+    /// range in ONE move of the kept bytes (`LTRIM`, moon#1174 §1).
+    ///
+    /// Both edges are found by [`Listpack::offset_of`], each from its nearer
+    /// end, so the common `LTRIM k 0 N` on a list one entry past `N` steps over
+    /// a single backlen. An empty or out-of-range window (`start > end`, or
+    /// `start >= len()`) empties the listpack; `end` past the tail is clamped.
+    pub fn retain_range(&mut self, start: usize, end: usize) {
+        let len = self.len();
+        if start > end || start >= len {
+            self.data.truncate(LP_FIRST_ENTRY);
+            self.data.push(LP_TERMINATOR);
+            self.stamp_header(0);
+            return;
+        }
+        let end = end.min(len - 1);
+        let (Some(from), Some(to)) = (self.offset_of(start), self.offset_of(end + 1)) else {
+            return;
+        };
+        let kept = to - from;
+        if from != LP_FIRST_ENTRY {
+            self.data.copy_within(from..to, LP_FIRST_ENTRY);
+        }
+        let terminator = LP_FIRST_ENTRY + kept;
+        self.data[terminator] = LP_TERMINATOR;
+        self.data.truncate(terminator + 1);
+        self.stamp_header(end - start + 1);
+    }
+
+    /// Insert `value` immediately before -- or, with `before == false`, after
+    /// -- the FIRST entry equal to `pivot`, found in one borrowed walk
+    /// (`LINSERT`, moon#1174 §1). Returns `false`, touching nothing, when no
+    /// entry equals `pivot`.
+    ///
+    /// The pivot match is [`ListpackRef::eq_bytes`] and the new entry goes
+    /// through the same canonical-integer encoder `push_back` uses, so bytes go
+    /// in and come back out exactly (moon#795).
+    pub fn insert_relative(&mut self, pivot: &[u8], value: &[u8], before: bool) -> bool {
+        let mut pos = LP_FIRST_ENTRY;
+        let mut remaining = self.len();
+        let at = loop {
+            if remaining == 0 || pos >= self.data.len() - 1 || self.data[pos] == LP_TERMINATOR {
+                return false;
+            }
+            let (entry, next) = decode_entry_ref_at(&self.data, pos);
+            if entry.eq_bytes(pivot) {
+                break if before { pos } else { next };
+            }
+            pos = next;
+            remaining -= 1;
+        };
+        let encoded = encode_entry(value);
+        self.write_entry(at..at, &encoded);
+        self.update_header();
+        true
     }
 
     /// Give back buffer capacity after a BULK removal, when the buffer has
@@ -350,5 +462,99 @@ mod tests {
             lp.data.len()
         );
         assert_eq!(contents(&lp), values[..3].to_vec());
+    }
+
+    /// `offset_of` must land on the same byte the head walk lands on, from
+    /// either end, for every index including the terminator -- and it must
+    /// take the NEARER end.
+    #[test]
+    fn offset_of_agrees_with_seek_to_from_either_end() {
+        let lp = build(&alphabet());
+        let len = lp.len();
+        for i in 0..len {
+            let (want, _) = seek_to(&lp.data, i).expect("in range");
+            let mark = seeks_from_either_end();
+            assert_eq!(lp.offset_of(i), Some(want), "index {i}");
+            assert_eq!(seeks_from_either_end() - mark, 1, "index {i}: one seek");
+        }
+        assert_eq!(lp.offset_of(len), Some(lp.data.len() - 1), "terminator");
+        assert_eq!(lp.offset_of(len + 1), None);
+        // The last entry is reached from the tail, not the head.
+        let head = super::super::head_seeks();
+        lp.offset_of(len - 1);
+        assert_eq!(
+            super::super::head_seeks(),
+            head,
+            "tail index walked from the head"
+        );
+    }
+
+    /// `retain_range` against slicing, on every window of a list that spans
+    /// every encoding width, and the byte layout of a fresh build.
+    #[test]
+    fn retain_range_agrees_with_slicing() {
+        let values = alphabet();
+        let n = values.len();
+        for start in 0..n + 2 {
+            for end in 0..n + 2 {
+                let mut lp = build(&values);
+                lp.retain_range(start, end);
+                let want: Vec<Vec<u8>> = if start > end || start >= n {
+                    Vec::new()
+                } else {
+                    values[start..=end.min(n - 1)].to_vec()
+                };
+                assert_eq!(contents(&lp), want, "window {start}..={end}");
+                assert_eq!(lp.data, build(&want).data, "bytes, window {start}..={end}");
+            }
+        }
+    }
+
+    /// The capped-list shape: `LTRIM 0 99` on 101 entries walks ONE backlen.
+    #[test]
+    fn retain_range_on_a_capped_list_seeks_once_from_the_tail() {
+        let values: Vec<Vec<u8>> = (0..101)
+            .map(|i| format!("item:{i:06}").into_bytes())
+            .collect();
+        let mut lp = build(&values);
+        let head = super::super::head_seeks();
+        let both = seeks_from_either_end();
+        lp.retain_range(0, 99);
+        assert_eq!(contents(&lp), values[..100].to_vec());
+        assert_eq!(seeks_from_either_end() - both, 2, "one seek per edge");
+        // The start edge is index 0 (a zero-length head seek); the end edge
+        // must come from the tail.
+        assert_eq!(super::super::head_seeks() - head, 1);
+    }
+
+    /// `insert_relative` against `Vec::insert` at the first pivot, both sides,
+    /// including a pivot that is integer-encoded and one that is absent.
+    #[test]
+    fn insert_relative_agrees_with_vec_insert() {
+        let values = alphabet();
+        let mut probes = values.clone();
+        probes.push(b"absent".to_vec());
+        probes.push(b"0007".to_vec());
+        for pivot in &probes {
+            for before in [true, false] {
+                for new in [&b"new"[..], b"12", b"+12", &[b'w'; 90][..]] {
+                    let mut lp = build(&values);
+                    let found = lp.insert_relative(pivot, new, before);
+                    let mut want = values.clone();
+                    match values.iter().position(|v| v == pivot) {
+                        Some(i) => {
+                            assert!(found);
+                            want.insert(if before { i } else { i + 1 }, new.to_vec());
+                        }
+                        None => assert!(!found),
+                    }
+                    assert_eq!(contents(&lp), want);
+                    assert_eq!(lp.data, build(&want).data);
+                }
+            }
+        }
+        let mut empty = Listpack::new();
+        assert!(!empty.insert_relative(b"x", b"y", true));
+        assert_eq!(empty.data, Listpack::new().data);
     }
 }
