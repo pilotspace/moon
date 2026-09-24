@@ -27,12 +27,14 @@ use std::collections::HashMap;
 /// Columns stay one flat run up to this many entries: an insert/remove then
 /// memmoves at most `FLAT_MAX × (4 + 24)` bytes (~7 KiB).
 ///
-/// Sizing (measured, moon#1195): re-indexing a document costs one memmove of
-/// its run per touched term (O(RUN_MAX), position-dependent) plus one `u32`
-/// shift per later run (O(len / RUN_MAX), cheap). With 1024-entry runs the
-/// oldest document of a 200K corpus still re-indexed ~2x slower than the
-/// newest (28 KiB memmoves); 256-entry runs bring the two within noise while
-/// the run-start shift stays a few µs even for million-entry postings.
+/// Sizing (measured on release-fast, moon#1195): re-indexing a document costs
+/// one memmove of its run per touched term (O(RUN_MAX), position-dependent)
+/// plus one `u32` shift per later run (O(len / RUN_MAX), vectorised). HSET of
+/// a 30-token body, 300 interleaved reps: baseline oldest/newest doc
+/// 3.58 ms/0.26 ms at 50K docs and 15.5 ms/0.30 ms at 200K; with 256-entry
+/// runs 0.34/0.26 ms and 0.42/0.25 ms (1024-entry runs: ~2x at 200K). The
+/// remaining gap is the per-run memmove, dominated by the 24-byte
+/// `Vec<u32>` header of each position list.
 const FLAT_MAX: usize = 256;
 /// A chunked posting converts back to one flat run below this many entries
 /// (hysteresis against `FLAT_MAX`, so a posting hovering at the boundary does
