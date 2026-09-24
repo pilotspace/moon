@@ -167,6 +167,7 @@ impl PayloadIndex {
     }
 
     /// Payload full-text indexing allowed for `field` under the policy.
+    #[cfg(feature = "text-index")]
     #[inline]
     fn indexes_text(&self, field: &[u8]) -> bool {
         self.schema.as_ref().is_none_or(|s| s.indexes_text(field))
