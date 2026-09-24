@@ -24,11 +24,11 @@ mod probe_budget;
 /// moon#1221 review F3: read-modify-write string commands record one access.
 #[cfg(test)]
 mod rmw_access_tests;
+pub(crate) mod string_mut;
 /// WS1 (2026-09 perf review) storage-core regression tests: moon#1159,
 /// moon#1161, moon#1190, moon#1189. Test-only.
 #[cfg(test)]
 mod ws1_tests;
-pub(crate) mod string_mut;
 
 pub use cold_replay_gate::{ReplayColdGate, ReplayColdReconcile, close_replay_generation};
 pub(crate) use incr::IncrOutcome;
