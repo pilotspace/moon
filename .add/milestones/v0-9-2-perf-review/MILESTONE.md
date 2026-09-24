@@ -5,7 +5,7 @@ rationale: the review verified every finding against HEAD `935c555` and measured
 stage: production · status: active · created: 2026-09-24 · base: `935c555`
 
 ## Scope
-In: every issue in moon#1199's tiers 1–5, executed as the 11 workstreams below.
+In: every issue in moon#1199's tiers 1–5, executed as the workstreams below (the original 11, WS1–WS10 incl. WS5a/WS5b, plus WS11–WS17 added for the follow-up issues the fix waves filed).
 Out: the RESET/ACL privilege-retention finding (security — handled privately per SECURITY.md, never in this branch) · any wire-visible behaviour change that makes moon diverge further from redis · on-disk format changes without a version bump + backward-compat read path.
 
 ## Shared decisions (every workstream must honor)

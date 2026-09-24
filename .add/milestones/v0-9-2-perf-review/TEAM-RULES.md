@@ -10,7 +10,8 @@ does not OOM, fill the disk, or corrupt each other's work.
 - Four agents build concurrently in the shared target: expect lock waits; the rules in §2 are what keep that safe.
 - WS15 port range: 7320–7339. WS16: 7360–7379. WS17: 7340–7359.
 - Known environment-only failure, NOT yours: `storage::tiered::cold_index_rebuild_tests::unreadable_file_is_counted_and_skipped_never_queued_for_unlink`
-  fails because the container runs as root (chmod 000 is still readable). Do not "fix" it.
+  fails because the container runs as root (chmod 000 is still readable). Do not "fix" it — unless your PLAN.md assigns
+  it (WS17 item 7: a test-only skip when euid is 0, with a note; no production change).
 - CHANGELOG entries are written by the orchestrator from your SUMMARY.md — put a ready-to-paste CHANGELOG bullet per issue in SUMMARY.
 
 ## 1. Where you work
