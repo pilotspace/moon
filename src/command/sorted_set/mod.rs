@@ -905,6 +905,9 @@ pub(super) fn zrange_from_entries(
 mod range_rank_tests;
 
 #[cfg(test)]
+mod rand_member_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::storage::Database;

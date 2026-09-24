@@ -1388,9 +1388,33 @@ pub fn zintercard_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame 
     Frame::Integer(count)
 }
 
+/// Where ZRANDMEMBER draws from: the B+tree's order statistics (O(log N) per
+/// pick), or a listpack decoded once, unsorted (bounded by
+/// `zset-max-listpack-entries`).
+enum RandPool<'z> {
+    Tree(&'z crate::storage::bptree::BPTree),
+    Flat(Vec<(Bytes, f64)>),
+}
+
+impl RandPool<'_> {
+    fn get(&self, i: usize) -> Option<(&Bytes, f64)> {
+        match self {
+            RandPool::Tree(t) => t.get_by_rank(i).map(|(s, m)| (m, s.0)),
+            RandPool::Flat(v) => v.get(i).map(|(m, s)| (m, *s)),
+        }
+    }
+}
+
 /// ZRANDMEMBER key [count [WITHSCORES]] — read-only twin.
+///
+/// moon#1171: picks by POSITION. A B+tree zset resolves each position with
+/// one `get_by_rank` descent through the subtree counts — O(log N) per
+/// member where the old code collected all N `(member, score)` pairs into a
+/// Vec first (17 ms for one member of a 1M zset, 264x redis). A listpack is
+/// decoded once without the sort `entries_sorted` does. Distribution is
+/// unchanged: a uniform position is a uniform member.
 pub fn zrandmember_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
-    use rand::seq::IndexedRandom;
+    use rand::RngExt;
     if args.is_empty() || args.len() > 3 {
         return err_wrong_args("ZRANDMEMBER");
     }
@@ -1411,28 +1435,23 @@ pub fn zrandmember_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame
         }
         Err(e) => return e,
     };
-    // Borrow the map when one exists; materialize only for small listpacks.
-    let entries_owned: Vec<(Bytes, f64)>;
-    let entries: Vec<(&Bytes, f64)> = match zref.members_map() {
-        Some(m) => m.iter().map(|(m, s)| (m, *s)).collect(),
-        None => {
-            entries_owned = zref.entries_sorted();
-            entries_owned.iter().map(|(m, s)| (m, *s)).collect()
-        }
-    };
-    if entries.is_empty() {
+    let len = zref.len();
+    if len == 0 {
         return if args.len() == 1 {
             Frame::Null
         } else {
             Frame::Array(framevec![])
         };
     }
+    let pool = match zref.any_tree() {
+        Some(t) => RandPool::Tree(t),
+        None => RandPool::Flat(zref.entries_unordered()),
+    };
     let mut rng = rand::rng();
     if args.len() == 1 {
-        return if let Some(chosen) = entries.choose(&mut rng) {
-            Frame::BulkString(chosen.0.clone())
-        } else {
-            Frame::Null
+        return match pool.get(rng.random_range(0..len)) {
+            Some((member, _)) => Frame::BulkString(member.clone()),
+            None => Frame::Null,
         };
     }
     let count_bytes = match extract_bytes(&args[1]) {
@@ -1462,15 +1481,37 @@ pub fn zrandmember_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame
     if count == 0 {
         return Frame::Array(framevec![]);
     }
+    let push = |result: &mut Vec<Frame>, member: &Bytes, score: f64| {
+        result.push(Frame::BulkString(member.clone()));
+        if withscores {
+            result.push(Frame::BulkString(format_score_bytes(score)));
+        }
+    };
     if count > 0 {
-        let n = std::cmp::min(count as usize, entries.len());
-        let chosen: Vec<&(&Bytes, f64)> = entries.sample(&mut rng, n).collect();
-        let cap = if withscores { n * 2 } else { n };
-        let mut result = Vec::with_capacity(cap);
-        for (member, score) in chosen {
-            result.push(Frame::BulkString((*member).clone()));
-            if withscores {
-                result.push(Frame::BulkString(format_score_bytes(*score)));
+        let n = std::cmp::min(count as usize, len);
+        let mut result = Vec::with_capacity(if withscores { n * 2 } else { n });
+        if n == len {
+            // The whole zset, in score order — Redis's CASE 2 ("count >=
+            // size: return the whole zset", walked with its own iterator) —
+            // with no sampling at all.
+            match &pool {
+                RandPool::Tree(t) => {
+                    for (score, member) in t.iter() {
+                        push(&mut result, member, score.0);
+                    }
+                }
+                RandPool::Flat(_) => {
+                    for (member, score) in zref.entries_sorted() {
+                        push(&mut result, &member, score);
+                    }
+                }
+            }
+            return Frame::Array(result.into());
+        }
+        // n distinct positions in O(n), in random order.
+        for i in rand::seq::index::sample(&mut rng, len, n) {
+            if let Some((member, score)) = pool.get(i) {
+                push(&mut result, member, score);
             }
         }
         Frame::Array(result.into())
@@ -1482,14 +1523,10 @@ pub fn zrandmember_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame
         if n > crate::command::RAND_DUP_COUNT_MAX {
             return Frame::Error(Bytes::from_static(crate::command::ERR_RAND_COUNT_RANGE));
         }
-        let cap = if withscores { n * 2 } else { n };
-        let mut result = Vec::with_capacity(cap);
+        let mut result = Vec::with_capacity(if withscores { n * 2 } else { n });
         for _ in 0..n {
-            if let Some(chosen) = entries.choose(&mut rng) {
-                result.push(Frame::BulkString(chosen.0.clone()));
-                if withscores {
-                    result.push(Frame::BulkString(format_score_bytes(chosen.1)));
-                }
+            if let Some((member, score)) = pool.get(rng.random_range(0..len)) {
+                push(&mut result, member, score);
             }
         }
         Frame::Array(result.into())

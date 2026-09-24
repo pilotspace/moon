@@ -437,6 +437,43 @@ impl<'a> SortedSetRef<'a> {
             _ => None,
         }
     }
+
+    /// The B+tree behind this view, borrowed from the view itself — so,
+    /// unlike [`Self::bptree`], it also reaches the tree an `Owned` cold-tier
+    /// decode carries. For readers that only need the tree's order
+    /// statistics and never outlive the view (moon#1171).
+    pub fn any_tree(&self) -> Option<&BPTree> {
+        match self {
+            SortedSetRef::BPTree { tree, .. } => Some(tree),
+            SortedSetRef::Owned { tree, .. } => Some(tree),
+            SortedSetRef::Listpack(_) | SortedSetRef::Legacy { .. } => None,
+        }
+    }
+
+    /// Every `(member, score)` pair in STORAGE order, unsorted: insertion
+    /// order for a listpack (whose length `zset-max-listpack-entries`
+    /// bounds), `(score, member)` order for the tree forms. For callers that
+    /// pick entries by position and never need a rank — ZRANDMEMBER — so a
+    /// listpack is decoded once with no sort (moon#1171). Scores decode with
+    /// the same `as_score` rule `score()` uses.
+    pub fn entries_unordered(&self) -> Vec<(Bytes, f64)> {
+        match self {
+            SortedSetRef::Listpack(lp) => lp
+                .iter_pair_refs()
+                .map(|(m, s)| {
+                    let member = match m {
+                        super::listpack::ListpackRef::Str(b) => Bytes::copy_from_slice(b),
+                        super::listpack::ListpackRef::Integer(v) => {
+                            let mut buf = itoa::Buffer::new();
+                            Bytes::copy_from_slice(buf.format(v).as_bytes())
+                        }
+                    };
+                    (member, s.as_score().unwrap_or(0.0))
+                })
+                .collect(),
+            _ => self.entries_sorted(),
+        }
+    }
 }
 
 /// Read-only reference to a stream: either borrowed from a hot `Entry`, or
