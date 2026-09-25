@@ -10,10 +10,11 @@ use std::sync::Arc;
 use crate::persistence::aof::AofWriterPool;
 use crate::persistence::manifest::ShardManifest;
 
-/// Files compacted per shard tick at most — bounds the tick's stall.
-const FILES_PER_TICK: usize = 8;
+/// Files compacted per shard tick at most — bounds the tick's stall (each
+/// compaction is one read of a spill batch plus a small durable write).
+const FILES_PER_TICK: usize = 16;
 /// Spill-file bytes read per shard tick at most.
-const READ_BYTES_PER_TICK: u64 = 8 << 20;
+const READ_BYTES_PER_TICK: u64 = 16 << 20;
 /// Compactions one database may have waiting for a fold. Their outputs are
 /// unlisted files on disk until adoption; this bounds them.
 const MAX_PENDING_PER_DB: usize = 256;
