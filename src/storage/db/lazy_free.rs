@@ -48,7 +48,12 @@
 //!
 //! `Database::clear` and `recalculate_memory` rebuild `used_memory` from the
 //! hot table alone; they first mark every queued item uncharged so the drain
-//! cannot credit bytes the rebuild already dropped from the ledger.
+//! cannot credit bytes the rebuild already dropped from the ledger. When a
+//! FLUSHDB hands its table to a BGSAVE epoch (moon#1228), the ledger's bytes
+//! — the queued values' remaining charges included — become that frozen
+//! table's bill, so `clear` REDIRECTS the queued charges there instead
+//! ([`Charge::Frozen`]): the drain credits the frozen bill as it frees, one
+//! O(1) add per credit, and nothing is freed inside the FLUSHDB (review 7).
 
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
@@ -224,9 +229,10 @@ fn spawn_shell_dropper(name: &str) -> Option<flume::Sender<Work>> {
 #[derive(Default)]
 pub(crate) struct LazyFreeQueue {
     items: VecDeque<Item>,
-    /// Queued items whose bytes are still counted in `used_memory` — what a
-    /// memory gate can win back by draining (moon#1221 review F1). O(1) to
-    /// ask; an eviction victim (already credited) never counts.
+    /// Queued items whose bytes are still counted in `used_memory`
+    /// ([`Charge::Ledger`]) — what a memory gate can win back by draining
+    /// (moon#1221 review F1). O(1) to ask; an eviction victim (already
+    /// credited) and a frozen table's value never count.
     charged_items: usize,
 }
 
@@ -241,6 +247,20 @@ impl Drop for LazyFreeQueue {
     }
 }
 
+/// Where a queued value's credits go as the drain frees it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Charge {
+    /// Still counted in `used_memory`: credited there.
+    Ledger,
+    /// Counted in the bill of a table a FLUSHDB froze into a BGSAVE epoch
+    /// (moon#1228 review 7): credited to it, through
+    /// `snapshot_cow::credit_frozen`.
+    Frozen(crate::persistence::snapshot_cow::FrozenCharge),
+    /// Already credited (an eviction victim) or forgotten (the ledger was
+    /// rebuilt without it): nothing to credit.
+    Credited,
+}
+
 struct Item {
     work: Work,
     /// Element count at enqueue — decides where the emptied shell is freed.
@@ -249,8 +269,8 @@ struct Item {
     /// boxes, and the tables charged from capacity — everything the ledger
     /// bills that is not per element.
     tail_credit: usize,
-    /// Whether these bytes are still counted in `used_memory`.
-    charged: bool,
+    /// Where these bytes are still counted, if anywhere.
+    charge: Charge,
     /// `entry_overhead` computed the slow way at enqueue (debug/test only,
     /// and only for values up to [`DEBUG_VERIFY_MAX_ELEMENTS`]).
     #[cfg(debug_assertions)]
@@ -492,7 +512,11 @@ impl Database {
             work,
             weight,
             tail_credit: entry_fixed + fixed,
-            charged,
+            charge: if charged {
+                Charge::Ledger
+            } else {
+                Charge::Credited
+            },
             #[cfg(debug_assertions)]
             expected,
             #[cfg(debug_assertions)]
@@ -545,7 +569,11 @@ impl Database {
         }
         debug_assert_eq!(
             self.lazy_free.charged_items,
-            self.lazy_free.items.iter().filter(|i| i.charged).count(),
+            self.lazy_free
+                .items
+                .iter()
+                .filter(|i| i.charge == Charge::Ledger)
+                .count(),
             "lazy-free charged-item count drifted from the queue"
         );
         start.saturating_sub(self.used_memory)
@@ -577,18 +605,29 @@ impl Database {
             if done {
                 credit += item.tail_credit;
             }
-            if item.charged {
-                self.used_memory = self.used_memory.saturating_sub(credit);
-                #[cfg(debug_assertions)]
-                {
-                    item.credited += credit;
+            match item.charge {
+                Charge::Ledger => {
+                    self.used_memory = self.used_memory.saturating_sub(credit);
                 }
+                // moon#1228 review 7: the bytes moved to a frozen table's
+                // bill with the FLUSHDB; one thread-local add.
+                Charge::Frozen(frozen) => {
+                    crate::persistence::snapshot_cow::credit_frozen(frozen, credit as u64);
+                }
+                Charge::Credited => {}
+            }
+            #[cfg(debug_assertions)]
+            if item.charge != Charge::Credited {
+                item.credited += credit;
             }
             if !done {
                 break;
             }
+            // Exact for a frozen table's value too: its credits before the
+            // FLUSHDB went to the ledger, the rest to the frozen bill, and
+            // together they are the value's `entry_overhead`.
             #[cfg(debug_assertions)]
-            if item.charged
+            if item.charge != Charge::Credited
                 && let Some(expected) = item.expected
             {
                 debug_assert_eq!(
@@ -600,7 +639,7 @@ impl Database {
                 );
             }
             if let Some(done_item) = self.lazy_free.items.pop_front() {
-                if done_item.charged {
+                if done_item.charge == Charge::Ledger {
                     self.lazy_free.charged_items = self.lazy_free.charged_items.saturating_sub(1);
                 }
                 release_shell(done_item.work, done_item.weight);
@@ -612,10 +651,30 @@ impl Database {
     }
 
     /// The ledger is about to be rebuilt from the hot table alone (`clear`,
-    /// `recalculate_memory`): nothing still queued may be credited again.
+    /// `recalculate_memory`): nothing still queued may be credited to it
+    /// again. A value already credited to a frozen table keeps crediting
+    /// that table — its bytes were never in this ledger since.
     pub(super) fn lazy_free_forget_charges(&mut self) {
         for item in &mut self.lazy_free.items {
-            item.charged = false;
+            if item.charge == Charge::Ledger {
+                item.charge = Charge::Credited;
+            }
+        }
+        self.lazy_free.charged_items = 0;
+    }
+
+    /// A FLUSHDB just froze this database's table into a BGSAVE epoch with
+    /// the ledger as its bill (moon#1228 review 7): the queued values'
+    /// remaining charges are in that bill now, so the drain credits them
+    /// there. O(queued items); nothing is freed.
+    pub(super) fn lazy_free_redirect_charges(
+        &mut self,
+        frozen: crate::persistence::snapshot_cow::FrozenCharge,
+    ) {
+        for item in &mut self.lazy_free.items {
+            if item.charge == Charge::Ledger {
+                item.charge = Charge::Frozen(frozen);
+            }
         }
         self.lazy_free.charged_items = 0;
     }

@@ -769,3 +769,58 @@ Notes:
   - perf_ws16_bgsave_capture 7/7, perf_ws16_bgsave_prop 2/2, perf_ws16_mq_billing 6/6 + 4
     ignored (they need a replica);
   - mq_integration 17/17, workspace_integration 13/13 + 1 ignored.
+
+## Review 7 (MERGE-AFTER-FIXES) — what changed
+
+The PR head (82e3064e) was merged first (fa9a5dc1). One commit per item:
+
+| item | commit | red → green |
+|---|---|---|
+| 1 FLUSHDB freed queued lazy-free values inline (review 6's N1 reclaim) | (item 1) | see below |
+
+### Item 1 — the lazy-free charge follows the table into the epoch
+
+Review 6's N1 fix called `reclaim_lazy_free(usize::MAX)` in `Database::clear` while a save
+was armed. That freed every charged queued value inside the FLUSHDB, and FLUSHALL's per-db
+clears and a replica resync took the same path.
+
+**Chosen: the reviewer's full design, not the stopgap.** The stopgap (drop the reclaim and
+document the over-report) would bill the frozen table for values that are no longer in it
+until the save ends. With the S2 rule weighing untrimmed excess, that over-report could fail
+a later save. The redirect costs O(1) per credit, frees nothing inside FLUSHDB, and leaves
+the bill exact once the lazy free finishes.
+
+- `lazy_free::Item.charged: bool` became `charge: Charge { Ledger, Frozen(FrozenCharge),
+  Credited }`.
+- `note_cleared_table` returns the frozen slot, a `FrozenCharge { serial, db }`, when it
+  queues the freeze. `clear` then calls `lazy_free_redirect_charges`, which moves every
+  `Ledger` item to `Frozen`.
+- The drain credits `Frozen` items through `snapshot_cow::credit_frozen`, a thread-local
+  push. `drain_into` applies the credits to `frozen.bill` (saturating) after the table
+  events and before `trim_frozen`.
+- Each arm takes a new serial. A credit for a disarmed or later epoch is dropped, and disarm
+  clears the queue.
+- The debug exactness assertion now covers `Frozen` items too.
+
+Red → green:
+- Lib, `a_lazy_free_charge_is_credited_to_the_frozen_table_not_freed_inline`: with the
+  reclaim, `lazy_free_len()` is 0 right after the FLUSHDB (red: "left: 0"). With the
+  redirect it is 1, and after the drain `bill == rows <= start_bill`.
+- Lib, `a_value_freed_after_its_save_ended_credits_no_later_save`: without the serial check
+  a second epoch's bill is credited 39,790 B it never took (red: "left: 0, right: 39790").
+  With the check it is green.
+- Server, `flushdb_during_a_save_does_not_free_an_unlinked_hash_inline` (the reviewer's
+  proof, adopted). Setup: a 2M-field hash is UNLINKed, then a held BGSAVE runs, then FLUSHDB;
+  the budget is 50 ms. The test uses `spawn_listening` ports, and the UNLINK comes before
+  the save, as in the reviewer's proof.
+
+  | binary | FLUSHDB |
+  |---|---|
+  | REVIEW7-head-rf | 117.2 ms (red) |
+  | REVIEW7-main-rf | 317 µs |
+  | this fix, debug | 723 µs (green) |
+
+  On main the test goes on to fail its "save completes" assertion: main aborts the save on
+  FLUSHDB.
+- An UNLINK *during* the save deep-clones the value's pre-image. That cost is pre-existing
+  (the reviewer is filing it) and this test does not measure it.

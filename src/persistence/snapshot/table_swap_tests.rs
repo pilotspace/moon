@@ -722,15 +722,17 @@ fn a_grown_flush_while_another_grown_table_is_trimming_fails_the_save() {
     }
 }
 
-/// Review 6 (N1, the reviewer's proof): an UNLINKed large collection stays
-/// CHARGED to `used_memory` until the lazy-free drain frees it (moon#1190).
-/// A FLUSHDB before that drain handed the epoch `table_bytes` = the ledger
-/// WITH that charge while the table no longer held the row, and the trim then
-/// restored the pre-image and added its bytes a second time: the frozen bill
-/// (INFO `current_cow_size`) over-reported by the lazily-freed value for the
-/// rest of the save, above the database's epoch-start bill.
+/// Review 6 (N1) and review 7: an UNLINKed large collection stays CHARGED to
+/// `used_memory` until the lazy-free drain frees it (moon#1190), and a
+/// FLUSHDB hands the epoch that ledger as the frozen table's bill. Review 5
+/// billed the charge on top of the pre-image the trim restores, for the
+/// whole save (bill 551,044 B vs rows 278,817 B). Review 6 freed the value
+/// INSIDE the FLUSHDB to drop the charge — the very stall moon#1190 exists to
+/// avoid (231-244 ms for a 5M-field hash, release). Now the FLUSHDB leaves
+/// the value queued, the queue credits the frozen bill as it frees it, and
+/// once it is done the bill is exactly what the table's rows hold.
 #[test]
-fn a_lazy_free_charge_is_not_billed_to_the_frozen_table() {
+fn a_lazy_free_charge_is_credited_to_the_frozen_table_not_freed_inline() {
     let mut dbs = vec![Database::new(), Database::new()];
     for i in 0..50 {
         let k = format!("k{i}");
@@ -748,17 +750,67 @@ fn a_lazy_free_charge_is_not_billed_to_the_frozen_table() {
         "setup: the UNLINKed hash waits in the lazy-free queue, still charged"
     );
     let _ = run(&mut dbs, 1, &[b"FLUSHDB"]);
+    assert_eq!(
+        dbs[1].lazy_free_len(),
+        1,
+        "the FLUSHDB freed the UNLINKed hash inline (review 6's reclaim)"
+    );
     epoch.drain_until_trimmed(1);
+    // The shard tick's lazy-free drain frees it; the next drain credits the
+    // frozen bill with what it freed.
+    let _ = dbs[1].drain_lazy_free_elements(usize::MAX);
+    assert_eq!(dbs[1].lazy_free_len(), 0);
+    epoch.drain();
     let state = epoch.state.as_ref().expect("epoch");
     let (bill, rows) = state.frozen_bill_and_rows_for_test(1).expect("frozen");
     let _ = epoch.try_finish(&dbs);
     assert_eq!(
         bill, rows,
-        "the frozen bill must be what its rows hold (epoch-start bill {start_bill} B)"
+        "once the lazy free is done the frozen bill is what its rows hold (epoch-start bill \
+         {start_bill} B)"
     );
     assert!(
         bill <= start_bill,
         "{bill} B frozen, epoch-start {start_bill} B"
+    );
+}
+
+/// Review 7: a value whose charge moved to a frozen table's bill may still
+/// be draining when that save ends. Its credits belong to that save's table
+/// alone: a later save, which may freeze the same database again, must not
+/// take them off its own bill (each arming has its own serial).
+#[test]
+fn a_value_freed_after_its_save_ended_credits_no_later_save() {
+    let mut dbs = vec![Database::new(), Database::new()];
+    for f in 0..2000 {
+        let f = format!("field-{f:06}");
+        let _ = run(&mut dbs, 1, &[b"HSET", b"big", f.as_bytes(), b"some-value"]);
+    }
+    let mut first = Epoch::begin(&dbs);
+    let _ = run(&mut dbs, 1, &[b"UNLINK", b"big"]);
+    let _ = run(&mut dbs, 1, &[b"FLUSHDB"]);
+    first.try_finish(&dbs).expect("the first save completes");
+    assert_eq!(dbs[1].lazy_free_len(), 1, "setup: still draining");
+
+    for i in 0..300 {
+        let k = format!("k{i}");
+        let _ = run(&mut dbs, 1, &[b"SET", k.as_bytes(), b"v"]);
+    }
+    let mut second = Epoch::begin(&dbs);
+    let _ = run(&mut dbs, 1, &[b"FLUSHDB"]);
+    second.drain_until_trimmed(1);
+    let _ = dbs[1].drain_lazy_free_elements(usize::MAX);
+    second.drain();
+    let (bill, rows) = second
+        .state
+        .as_ref()
+        .expect("epoch")
+        .frozen_bill_and_rows_for_test(1)
+        .expect("frozen");
+    let _ = second.try_finish(&dbs);
+    assert_eq!(
+        bill, rows,
+        "the first save's credits reached the second save's bill"
     );
 }
 

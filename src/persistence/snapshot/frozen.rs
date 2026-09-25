@@ -198,6 +198,16 @@ fn charge(key: &[u8], entry: &Entry) -> u64 {
 }
 
 impl SnapshotState {
+    /// The lazy-free drain freed `bytes` of a value whose remaining charge
+    /// was in epoch database `db`'s ledger when a FLUSHDB froze its table
+    /// (review 7): the bill took that ledger, so it drops by them. A table
+    /// already released (or an aborted epoch) has no bill left to credit.
+    pub(crate) fn credit_frozen(&mut self, db: usize, bytes: u64) {
+        if let Some(Source::Frozen(frozen)) = self.sources.get_mut(db) {
+            frozen.bill = frozen.bill.saturating_sub(bytes);
+        }
+    }
+
     /// Post-epoch bytes the frozen tables still hold, summed (review 6, S2):
     /// what `snapshot_cow::note_cleared_table` weighs a further grown flush
     /// against. Published after every drain.

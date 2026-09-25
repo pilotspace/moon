@@ -106,6 +106,12 @@ thread_local! {
     /// a grown table holds its post-epoch rows for ceil(work / budget)
     /// drains, not one).
     static UNTRIMMED_EXCESS: Cell<u64> = const { Cell::new(0) };
+    /// Bumped by every [`arm`]: a lazily freed value crediting an earlier
+    /// epoch's frozen table cannot credit this one's (review 7).
+    static ARM_SERIAL: Cell<u64> = const { Cell::new(0) };
+    /// `(epoch database, bytes)` the lazy-free drain owes frozen tables'
+    /// bills (review 7), applied by the next [`drain_into`].
+    static FROZEN_CREDITS: RefCell<Vec<(usize, u64)>> = const { RefCell::new(Vec::new()) };
     /// Approximate bytes of `PENDING_KEYS` (moon#1228, INFO
     /// `current_cow_size`).
     static DEDUPE_BYTES: Cell<u64> = const { Cell::new(0) };
@@ -202,7 +208,31 @@ impl Progress {
 /// Arm capture for a snapshot that just began on this shard.
 pub(crate) fn arm() {
     clear();
+    ARM_SERIAL.with(|s| s.set(s.get().wrapping_add(1)));
     ARMED.with(|a| a.set(true));
+}
+
+/// Where a lazily freed value's credits go once a FLUSHDB froze its table
+/// (review 7): that table's bill, which took the ledger as its own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct FrozenCharge {
+    serial: u64,
+    db: usize,
+}
+
+/// The lazy-free drain freed `bytes` charged to a frozen table's bill:
+/// credited at the next drain. Dropped once its epoch is not armed.
+pub(crate) fn credit_frozen(frozen: FrozenCharge, bytes: u64) {
+    if !is_armed() || ARM_SERIAL.with(Cell::get) != frozen.serial {
+        return;
+    }
+    FROZEN_CREDITS.with(|c| {
+        let mut credits = c.borrow_mut();
+        match credits.last_mut() {
+            Some((db, sum)) if *db == frozen.db => *sum = sum.saturating_add(bytes),
+            _ => credits.push((frozen.db, bytes)),
+        }
+    });
 }
 
 /// [`arm`] with the snapshot's epoch-start layout, so captures for keys
@@ -367,6 +397,7 @@ fn clear() {
     EVENTS.with(|e| e.borrow_mut().clear());
     WAITING_EXCESS.with(|w| w.set(0));
     UNTRIMMED_EXCESS.with(|u| u.set(0));
+    FROZEN_CREDITS.with(|c| c.borrow_mut().clear());
 }
 
 /// Would the armed epoch still write anything? Without a published layout
@@ -483,17 +514,27 @@ pub(crate) fn note_swapdb(a: usize, b: usize) {
 /// The trim clears ~512 rows a tick, faster than a client refills a database
 /// (8 x 40 MB of SETs + FLUSHDB completes in a release build).
 ///
+/// Returns the frozen table's charge when the table was queued to freeze:
+/// `table_bytes` includes the remaining charges of values the database's
+/// lazy-free queue has not finished freeing (moon#1190), so `clear` points
+/// those values' credits at the frozen bill (review 7) instead of freeing
+/// them inside the FLUSHDB. `None` otherwise.
+///
 /// A slot that cannot be identified (an epoch armed on a thread with no
 /// shard slice) keeps the old answer: an unfinished epoch is aborted. One
 /// thread-local `bool` load when nothing is armed.
-pub(crate) fn note_cleared_table(db: &Database, table: Table, table_bytes: u64) {
+pub(crate) fn note_cleared_table(
+    db: &Database,
+    table: Table,
+    table_bytes: u64,
+) -> Option<FrozenCharge> {
     if !is_armed() {
-        return;
+        return None;
     }
     if ABORT.with(|a| a.get().is_some()) {
         // The epoch is being failed: nothing will be written from this
         // table. `table` drops here.
-        return;
+        return None;
     }
     enum Outcome {
         /// The epoch database, and its epoch-start bill.
@@ -537,7 +578,7 @@ pub(crate) fn note_cleared_table(db: &Database, table: Table, table_bytes: u64) 
                     "FLUSHDB detached databases that grew during the save faster than the \
                      snapshot could trim them",
                 );
-                return;
+                return None;
             }
             WAITING_EXCESS.with(|w| w.set(w.get().saturating_add(excess)));
             EVENTS.with(|e| {
@@ -548,12 +589,17 @@ pub(crate) fn note_cleared_table(db: &Database, table: Table, table_bytes: u64) 
                     start_bill,
                 ))
             });
+            Some(FrozenCharge {
+                serial: ARM_SERIAL.with(Cell::get),
+                db: logical,
+            })
         }
-        Outcome::Drop => {}
+        Outcome::Drop => None,
         Outcome::Unknown => {
             if epoch_unfinished() && !table.is_empty() {
                 abort_epoch("a flush cleared a database the snapshot could not identify");
             }
+            None
         }
     }
 }
@@ -894,6 +940,14 @@ pub(crate) fn drain_into(snap: &mut SnapshotState) {
     // database and pending-ness do not depend on the table events, so the
     // order is free otherwise.
     apply_table_events(snap);
+    // Review 7: what the lazy-free drain freed of values whose charge moved
+    // to a frozen table's bill with the FLUSHDB — after the freezes (a
+    // credit may follow its table's flush within the tick), before the trim.
+    FROZEN_CREDITS.with(|c| {
+        for (db, bytes) in c.borrow_mut().drain(..) {
+            snap.credit_frozen(db, bytes);
+        }
+    });
     // Review 6: the frozen tables' trims advance by a bounded amount per
     // drain (`snapshot::frozen::TRIM_BUDGET`), not whole in one.
     snap.trim_frozen(crate::persistence::snapshot::frozen::trim_budget());
