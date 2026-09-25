@@ -27,6 +27,8 @@ use super::simd::{DELETED, EMPTY, Group};
 mod find;
 mod insert;
 mod ops;
+#[cfg(test)]
+mod split_tests;
 
 pub use ops::home_buckets;
 
