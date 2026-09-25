@@ -854,7 +854,7 @@ impl AofWriterPool {
     /// at `error!`.
     ///
     /// `budget` is decremented by the time actually spent blocking so that
-    /// batched callers (MultiExecute / PipelineBatch drain arms) share ONE
+    /// batched callers (MultiExecute / PipelineBatchSlotted drain arms) share ONE
     /// bound across the whole batch — without this, an N-command batch under
     /// sustained backpressure could hold the shard thread for N×bound.
     /// Single-command callers pass a fresh
