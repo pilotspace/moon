@@ -82,6 +82,24 @@ fn info_field(c: &mut Conn, field: &str) -> Option<String> {
         .map(|v| v.trim().to_string())
 }
 
+/// Wait until shard 0 has ARMED the BGSAVE epoch just requested, so a
+/// command sent next lands inside it. The shard spawns the writer that
+/// creates `shard-0.rrdshard.tmp` in the same synchronous stretch that arms
+/// the epoch (part 3b's wait; `perf_ws8_mset_bgsave_capture` relies on the
+/// same). A fixed sleep instead let a loaded runner's tick arm the epoch
+/// only after the command. `dir` must hold no temp file from an earlier save.
+fn wait_epoch_armed(dir: &std::path::Path) {
+    let tmp = dir.join("shard-0.rrdshard.tmp");
+    let armed_by = Instant::now() + Duration::from_secs(30);
+    while !tmp.exists() {
+        assert!(
+            Instant::now() < armed_by,
+            "the BGSAVE never armed its epoch"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
 /// Wait for the in-flight BGSAVE to finish; returns `rdb_last_bgsave_status`.
 fn wait_bgsave(c: &mut Conn, budget: Duration) -> String {
     let deadline = Instant::now() + budget;
@@ -229,9 +247,9 @@ fn table_swaps_during_bgsave_keep_the_save_point_in_time() {
         let mut c = Conn::open(port);
         preload(&mut c, N);
         assert!(c.send(&["BGSAVE"]).contains("Background saving started"));
-        // Let the shard pick the epoch up (1 ms tick). At ~1,024 entries per
-        // tick, 600K keys keep the epoch open for ~0.6 s after this.
-        std::thread::sleep(Duration::from_millis(30));
+        // At ~1,024 entries per 1 ms tick, 600K keys keep the epoch open for
+        // ~0.6 s after it is armed.
+        wait_epoch_armed(&dir);
         let reply = c.pipeline(&[cmd, &["INFO", "persistence"]]);
         assert!(reply.starts_with('+'), "{cmd:?} refused: {reply:.200}");
         assert!(
@@ -360,7 +378,8 @@ fn an_aborted_bgsave_cannot_corrupt_the_next_one() {
         preload(&mut c, 800_000 << (attempt - 1));
         let aborted_before = aborted_saves(&dir);
         assert!(c.send(&["BGSAVE"]).contains("Background saving started"));
-        std::thread::sleep(Duration::from_millis(10));
+        // A missed attempt's save completed, so its temp file is renamed away.
+        wait_epoch_armed(&dir);
         // The master is empty: after the resync this node holds nothing.
         assert!(
             c.send(&["REPLICAOF", "127.0.0.1", &mport.to_string()])
