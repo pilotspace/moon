@@ -24,8 +24,15 @@
 //!
 //! `spill_completion_marker_withdrawn` is reported, not required: a key the
 //! fold caught in flight is lost on the unfixed server whether its spill is
-//! withdrawn or simply unpublished at the stop. The deterministic red/green
-//! guard is in-process (`shard::persistence_tick::fold_inflight_tests`).
+//! withdrawn or simply unpublished at the stop.
+//!
+//! **This is a smoke test, not a regression guard.** The loss needs the fold
+//! to catch a flood key in flight AND that key's spill to end unpublished,
+//! and this test only makes that likely: in the PR #1233 review it passed on
+//! the unfixed `ae21476` in 4 of 5 runs. A pass here proves nothing about
+//! moon#1223. The deterministic regression guard is in-process —
+//! `shard::persistence_tick::fold_inflight_tests`, which forces each
+//! rehydrate path and was red on `ae21476` in 4 of 4 runs.
 //!
 //! Runs at `--shards 1` (TopLevel fold on monoio, the legacy flat-file fold
 //! on tokio) and `--shards 4` (per-shard fold). Pin the binary:
