@@ -39,8 +39,8 @@ thread_local! {
 
 /// Subscriber handles cloned on this thread so far (tests only; per thread so
 /// concurrently running tests cannot disturb each other's counts). Read by
-/// the registry tests, which run on the tokio leg.
-#[cfg(all(test, feature = "runtime-tokio"))]
+/// the registry tests, which run on both runtimes (moon#1226).
+#[cfg(test)]
 pub(crate) fn clones_on_this_thread() -> u64 {
     CLONES.with(|c| c.get())
 }

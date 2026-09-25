@@ -1,5 +1,11 @@
-//! `PubSubRegistry` unit tests, moved verbatim out of `mod.rs` (moon#1226:
-//! the module was 1,716 lines, over the 1,500-line rule). No test changed.
+//! `PubSubRegistry` unit tests (moved out of `mod.rs` for the 1,500-line
+//! rule, moon#1226).
+//!
+//! Runtime-neutral, so they run in the default (monoio) lib run too: they
+//! were gated on `runtime-tokio` only because a dozen of them were
+//! `#[tokio::test]`s awaiting `recv_async`. `publish` delivers with a
+//! non-blocking `try_send`, so the message is already in the channel when it
+//! returns and `try_recv` reads it without a runtime (moon#1226).
 
 use super::*;
 use crate::protocol::ParseConfig;
@@ -297,8 +303,8 @@ fn parse_resp(data: &[u8]) -> Frame {
         .expect("complete frame")
 }
 
-#[tokio::test]
-async fn test_subscribe_and_publish() {
+#[test]
+fn test_subscribe_and_publish() {
     let mut registry = PubSubRegistry::new();
     let (tx, rx) = channel::mpsc_bounded::<Bytes>(16);
     let sub = Subscriber::new(tx, 1);
@@ -309,7 +315,7 @@ async fn test_subscribe_and_publish() {
     let count = registry.publish(&channel, &Bytes::from_static(b"hello"));
     assert_eq!(count, 1);
 
-    let msg = rx.recv_async().await.unwrap();
+    let msg = rx.try_recv().expect("publish delivers synchronously");
     let parsed = parse_resp(&msg);
     assert_eq!(
         parsed,
@@ -321,8 +327,8 @@ async fn test_subscribe_and_publish() {
     );
 }
 
-#[tokio::test]
-async fn test_psubscribe_glob() {
+#[test]
+fn test_psubscribe_glob() {
     let mut registry = PubSubRegistry::new();
     let (tx, rx) = channel::mpsc_bounded::<Bytes>(16);
     let sub = Subscriber::new(tx, 1);
@@ -334,7 +340,7 @@ async fn test_psubscribe_glob() {
     let count = registry.publish(&channel, &Bytes::from_static(b"goal!"));
     assert_eq!(count, 1);
 
-    let msg = rx.recv_async().await.unwrap();
+    let msg = rx.try_recv().expect("publish delivers synchronously");
     let parsed = parse_resp(&msg);
     assert_eq!(
         parsed,
@@ -347,8 +353,8 @@ async fn test_psubscribe_glob() {
     );
 }
 
-#[tokio::test]
-async fn test_unsubscribe() {
+#[test]
+fn test_unsubscribe() {
     let mut registry = PubSubRegistry::new();
     let (tx, _rx) = channel::mpsc_bounded::<Bytes>(16);
     let sub = Subscriber::new(tx, 1);
@@ -361,8 +367,8 @@ async fn test_unsubscribe() {
     assert_eq!(count, 0);
 }
 
-#[tokio::test]
-async fn test_slow_subscriber_disconnected() {
+#[test]
+fn test_slow_subscriber_disconnected() {
     let mut registry = PubSubRegistry::new();
     // capacity-1 channel: immediately full after one message
     let (tx, _rx) = channel::mpsc_bounded::<Bytes>(1);
@@ -383,8 +389,8 @@ async fn test_slow_subscriber_disconnected() {
     assert_eq!(registry.channel_subscription_count(1), 0);
 }
 
-#[tokio::test]
-async fn test_publish_returns_count() {
+#[test]
+fn test_publish_returns_count() {
     let mut registry = PubSubRegistry::new();
     let (tx1, _rx1) = channel::mpsc_bounded::<Bytes>(16);
     let (tx2, _rx2) = channel::mpsc_bounded::<Bytes>(16);
@@ -496,8 +502,8 @@ fn test_punsubscribe_all() {
     assert_eq!(registry.pattern_subscription_count(1), 0);
 }
 
-#[tokio::test]
-async fn test_publish_shared_delivers_and_counts() {
+#[test]
+fn test_publish_shared_delivers_and_counts() {
     let lock = parking_lot::RwLock::new(PubSubRegistry::new());
     let (tx1, rx1) = channel::mpsc_bounded::<Bytes>(16);
     let (tx2, _rx2) = channel::mpsc_bounded::<Bytes>(16);
@@ -511,7 +517,7 @@ async fn test_publish_shared_delivers_and_counts() {
     let count = publish_shared(&lock, &channel, &Bytes::from_static(b"hello"));
     assert_eq!(count, 2);
 
-    let msg = rx1.recv_async().await.unwrap();
+    let msg = rx1.try_recv().expect("publish delivers synchronously");
     let parsed = parse_resp(&msg);
     assert_eq!(
         parsed,
@@ -523,8 +529,8 @@ async fn test_publish_shared_delivers_and_counts() {
     );
 }
 
-#[tokio::test]
-async fn test_publish_shared_pattern_delivery() {
+#[test]
+fn test_publish_shared_pattern_delivery() {
     let lock = parking_lot::RwLock::new(PubSubRegistry::new());
     let (tx, rx) = channel::mpsc_bounded::<Bytes>(16);
     lock.write()
@@ -534,7 +540,7 @@ async fn test_publish_shared_pattern_delivery() {
     let count = publish_shared(&lock, &channel, &Bytes::from_static(b"goal!"));
     assert_eq!(count, 1);
 
-    let msg = rx.recv_async().await.unwrap();
+    let msg = rx.try_recv().expect("publish delivers synchronously");
     let parsed = parse_resp(&msg);
     assert_eq!(
         parsed,
@@ -547,8 +553,8 @@ async fn test_publish_shared_pattern_delivery() {
     );
 }
 
-#[tokio::test]
-async fn test_publish_shared_removes_slow_subscriber() {
+#[test]
+fn test_publish_shared_removes_slow_subscriber() {
     // Parity with test_slow_subscriber_disconnected on the locked path.
     let lock = parking_lot::RwLock::new(PubSubRegistry::new());
     let (tx, _rx) = channel::mpsc_bounded::<Bytes>(1);
@@ -569,8 +575,8 @@ async fn test_publish_shared_removes_slow_subscriber() {
     assert_eq!(lock.read().channel_subscription_count(1), 0);
 }
 
-#[tokio::test]
-async fn test_sharded_namespace_is_isolated_from_plain() {
+#[test]
+fn test_sharded_namespace_is_isolated_from_plain() {
     // The invariant the whole sharded design rests on. `SPUBLISH ch` and
     // `SUBSCRIBE ch` name the SAME channel and must still be different
     // destinations — which is why the registry keeps two maps rather than
@@ -588,7 +594,7 @@ async fn test_sharded_namespace_is_isolated_from_plain() {
     assert_eq!(registry.spublish(&ch, &Bytes::from_static(b"s")), 1);
     assert_eq!(registry.publish(&ch, &Bytes::from_static(b"p")), 1);
 
-    let got_shard = rx_shard.recv_async().await.unwrap();
+    let got_shard = rx_shard.try_recv().expect("publish delivers synchronously");
     assert_eq!(
         parse_resp(&got_shard),
         Frame::Array(framevec![
@@ -603,7 +609,7 @@ async fn test_sharded_namespace_is_isolated_from_plain() {
         "the plain PUBLISH must not have leaked into the sharded namespace"
     );
 
-    let got_plain = rx_plain.recv_async().await.unwrap();
+    let got_plain = rx_plain.try_recv().expect("publish delivers synchronously");
     assert_eq!(
         parse_resp(&got_plain),
         Frame::Array(framevec![
@@ -618,8 +624,8 @@ async fn test_sharded_namespace_is_isolated_from_plain() {
     );
 }
 
-#[tokio::test]
-async fn test_spublish_shared_removes_slow_subscriber() {
+#[test]
+fn test_spublish_shared_removes_slow_subscriber() {
     // Parity with test_publish_shared_removes_slow_subscriber: the sharded
     // fan-out reconciles a subscriber that cannot keep up, rather than
     // blocking the publisher on it.
@@ -637,8 +643,8 @@ async fn test_spublish_shared_removes_slow_subscriber() {
     );
 }
 
-#[tokio::test]
-async fn test_sunsubscribe_all_returns_channels_for_unpropagation() {
+#[test]
+fn test_sunsubscribe_all_returns_channels_for_unpropagation() {
     // Teardown depends on this return value: RESET and disconnect feed it
     // to `unpropagate_shard_subscription`. A version that cleaned the
     // registry but returned nothing would leave every other shard fanning
@@ -658,8 +664,8 @@ async fn test_sunsubscribe_all_returns_channels_for_unpropagation() {
     assert_eq!(registry.shard_subscription_count(7), 0);
 }
 
-#[tokio::test]
-async fn test_publish_shared_removes_slow_pattern_subscriber() {
+#[test]
+fn test_publish_shared_removes_slow_pattern_subscriber() {
     let lock = parking_lot::RwLock::new(PubSubRegistry::new());
     let (tx, _rx) = channel::mpsc_bounded::<Bytes>(1);
     lock.write()

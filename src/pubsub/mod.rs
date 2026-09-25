@@ -1021,5 +1021,5 @@ pub fn instance_pubsub_counts(
     (channels.len(), patterns.len())
 }
 
-#[cfg(all(test, feature = "runtime-tokio"))]
+#[cfg(test)]
 mod tests;
