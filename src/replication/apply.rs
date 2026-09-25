@@ -940,6 +940,10 @@ fn apply_swapdb(
     ) {
         (Some(a), Some(b)) if a != b && a < db_count && b < db_count => {
             databases.swap(a, b);
+            // moon#1232 (REVIEW7 R1): one keyspace change, as redis 7.0.15
+            // counts a replicated SWAPDB — counted like the funnels a
+            // replicated SET goes through.
+            crate::admin::metrics_setup::record_keyspace_change();
             Some((a, b))
         }
         (Some(a), Some(b)) if a == b => None, // same-index: no-op, matches Redis
@@ -1825,6 +1829,22 @@ mod tests {
         assert!(set_has_marker(&dbs, 2, 0), "db2 must now hold db0's data");
         assert!(set_has_marker(&dbs, 1, 1), "db1 untouched");
         assert!(set_has_marker(&dbs, 3, 3), "db3 untouched");
+    }
+
+    /// moon#1232 (REVIEW7 R1): a replicated SWAPDB is one keyspace change on
+    /// the replica, as in redis 7.0.15 (measured: replica count 1 -> 2 across
+    /// the master's SET then SWAPDB); a replicated SET already counted.
+    #[test]
+    fn apply_swapdb_counts_one_change() {
+        use crate::admin::metrics_setup::keyspace_changes_on_this_thread as mine;
+        let dbs = db_set_with_markers(2);
+        let args = [
+            Frame::BulkString(Bytes::from_static(b"0")),
+            Frame::BulkString(Bytes::from_static(b"1")),
+        ];
+        let before = mine();
+        assert_eq!(apply_swapdb(b"SWAPDB", &args, &dbs), Some((0, 1)));
+        assert_eq!(mine() - before, 1);
     }
 
     #[test]

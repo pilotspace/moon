@@ -1215,3 +1215,78 @@ fn an_aof_boot_counts_its_replayed_tail_like_redis() {
         "changes right after an AOF boot (redis 7.0.15: 5)"
     );
 }
+
+/// REVIEW7 R1: a SWAPDB replayed from the AOF at boot counts one change, as
+/// redis 7.0.15 counts it (measured: SET, SWAPDB 0 1, SET, restart ->
+/// `rdb_changes_since_last_save:3`).
+#[test]
+fn an_aof_boot_counts_a_replayed_swapdb() {
+    let dir = common::unique_test_dir("ws19-r7-aofswap");
+    std::fs::create_dir_all(&dir).unwrap();
+    // `always`, so the kill -9 below loses no acknowledged write.
+    let args = ["--appendonly", "yes", "--appendfsync", "always"];
+    let (mut first, port) = spawn_with(&dir, 1, &args);
+    let mut c = Conn::open(port);
+    assert!(c.send(&["SET", "a", "1"]).starts_with("+OK"));
+    assert_eq!(c.send(&["SWAPDB", "0", "1"]), "+OK\r\n");
+    assert!(c.send(&["SET", "b", "1"]).starts_with("+OK"));
+    first.kill_now();
+    drop(first);
+    let (mut again, port) = spawn_with(&dir, 1, &args);
+    let mut c = Conn::open(port);
+    let in_db1 = c.send(&["EXISTS", "a"]);
+    let after_boot = changes(&mut c);
+    again.kill_now();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(
+        in_db1, ":0\r\n",
+        "fixture: the swap was replayed ('a' left db 0)"
+    );
+    assert_eq!(
+        after_boot, 3,
+        "changes after replaying SET, SWAPDB, SET (redis 7.0.15: 3)"
+    );
+}
+
+/// REVIEW7 R1: a replicated SWAPDB is one change on the replica, as in redis
+/// 7.0.15 (measured: the replica's count goes 0 -> 1 -> 2 across the
+/// master's SET and SWAPDB 0 1).
+///
+/// monoio only: a master answers PSYNC only under runtime-monoio.
+#[test]
+#[cfg_attr(
+    not(feature = "runtime-monoio"),
+    ignore = "needs a replica full sync, which needs a runtime-monoio master"
+)]
+fn a_replicated_swapdb_counts_one_change_on_the_replica() {
+    let (dm, dr) = (
+        common::unique_test_dir("ws19-r7-swap-master"),
+        common::unique_test_dir("ws19-r7-swap-replica"),
+    );
+    std::fs::create_dir_all(&dm).unwrap();
+    std::fs::create_dir_all(&dr).unwrap();
+    let (mut master, mport) = spawn_with(&dm, 1, &["--appendonly", "no"]);
+    let (mut replica, rport) = spawn_with(&dr, 1, &["--appendonly", "no"]);
+    let mut m = Conn::open(mport);
+    let mut r = Conn::open(rport);
+    m.send(&["SET", "seed", "1"]);
+    let replicaof = r.send(&["REPLICAOF", "127.0.0.1", &mport.to_string()]);
+    wait_until("the full sync lands", || r.send(&["DBSIZE"]) == ":1\r\n");
+    let before = changes(&mut r);
+    m.send(&["SET", "x", "1"]);
+    wait_until("the SET lands", || r.send(&["EXISTS", "x"]) == ":1\r\n");
+    let after_set = changes(&mut r);
+    assert_eq!(m.send(&["SWAPDB", "0", "1"]), "+OK\r\n");
+    wait_until("the SWAPDB lands", || r.send(&["EXISTS", "x"]) == ":0\r\n");
+    let after_swap = changes(&mut r);
+    replica.kill_now();
+    master.kill_now();
+    let _ = std::fs::remove_dir_all(&dm);
+    let _ = std::fs::remove_dir_all(&dr);
+    assert_eq!(replicaof, "+OK\r\n");
+    assert_eq!(
+        (after_set - before, after_swap - after_set),
+        (1, 1),
+        "replica changes for the replicated (SET, SWAPDB)"
+    );
+}
