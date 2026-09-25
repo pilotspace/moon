@@ -25,33 +25,47 @@ use std::time::{Duration, Instant};
 use common::{Conn, ServerGuard, encode};
 
 fn spawn(dir: &std::path::Path, shards: usize) -> (ServerGuard, u16) {
+    spawn_with_hold(dir, shards, None)
+}
+
+/// [`spawn`], with `MOON_TEST_SNAPSHOT_HOLD_FILE` (test-only, part 3b) set to
+/// `hold`: while that file exists, a running save's epoch stays armed but
+/// its walk does not advance.
+fn spawn_with_hold(
+    dir: &std::path::Path,
+    shards: usize,
+    hold: Option<&std::path::Path>,
+) -> (ServerGuard, u16) {
     let bin = common::find_moon_binary();
     let (child, port) = common::spawn_listening(|port| {
-        std::process::Command::new(&bin)
-            .args([
-                "--port",
-                &port.to_string(),
-                "--dir",
-                &dir.to_string_lossy(),
-                "--shards",
-                &shards.to_string(),
-                "--appendonly",
-                "no",
-                "--save",
-                "",
-                "--disk-offload",
-                "disable",
-                "--maxmemory",
-                "0",
-                "--disk-free-min-pct",
-                "0",
-            ])
-            // The server logs to stdout; keep it with stderr in the test's
-            // own directory, so a test can see what the server said.
-            .stdout(common::server_stderr(dir))
-            .stderr(common::server_stderr(dir))
-            .spawn()
-            .expect("spawn moon")
+        let mut cmd = std::process::Command::new(&bin);
+        if let Some(hold) = hold {
+            cmd.env("MOON_TEST_SNAPSHOT_HOLD_FILE", hold);
+        }
+        cmd.args([
+            "--port",
+            &port.to_string(),
+            "--dir",
+            &dir.to_string_lossy(),
+            "--shards",
+            &shards.to_string(),
+            "--appendonly",
+            "no",
+            "--save",
+            "",
+            "--disk-offload",
+            "disable",
+            "--maxmemory",
+            "0",
+            "--disk-free-min-pct",
+            "0",
+        ])
+        // The server logs to stdout; keep it with stderr in the test's
+        // own directory, so a test can see what the server said.
+        .stdout(common::server_stderr(dir))
+        .stderr(common::server_stderr(dir))
+        .spawn()
+        .expect("spawn moon")
     });
     (ServerGuard::new(child), port)
 }
@@ -343,14 +357,15 @@ fn preload_big(c: &mut Conn, n: u32) {
 /// and was renaming into place: the second save completed ("BGSAVE OK"), and
 /// the file it published held tens to hundreds of MiB of the aborted save's
 /// blocks behind its own ~300 bytes, failing its checksum at restart (the
-/// canary written between the saves gone). Or the straggler unlinked the new temp file and
-/// the second save failed.
+/// canary written between the saves gone). Or the straggler unlinked the new
+/// temp file and the second save failed.
 ///
 /// Since moon#1230 `rdb_last_bgsave_status` describes the LAST save, so it
 /// judges the second save directly; the log shows the first was aborted, and
 /// the restart proves the published file is sound.
 fn aborted_bgsave_then_resave(dir: &std::path::Path, abort: Abort) {
-    let (mut server, port) = spawn(dir, 1);
+    let hold = dir.join("snapshot.hold");
+    let (mut server, port) = spawn_with_hold(dir, 1, Some(&hold));
     let mut c = Conn::open(port);
     let logged = match abort {
         Abort::FlushAll => "aborted: FLUSHALL",
@@ -371,13 +386,14 @@ fn aborted_bgsave_then_resave(dir: &std::path::Path, abort: Abort) {
             // FLUSHALL lands.
             Abort::FlushAll => preload_big(&mut c, 6_000),
             // The resync (connect, PSYNC, load) must land while the epoch is
-            // still WRITING. Behind a values-heavy save it came up only after
-            // the walk ended — measured: link up 0.7-1.7 s into a 375 MiB
-            // save vs ~40 ms idle, most likely its durable
-            // `replication.state` write queueing behind the save's dirty
-            // pages. Small keys keep the walk going (~1,024 entries per 1 ms
-            // tick) with few bytes to flush.
-            Abort::Resync { .. } => preload(&mut c, 800_000 << (attempt - 1).min(2)),
+            // still WRITING: the walk is held (`MOON_TEST_SNAPSHOT_HOLD_FILE`)
+            // until the resync is in, so any dataset will do. Racing the walk
+            // instead needed up to 3.2M keys and still missed the window:
+            // link up took 0.7-1.7 s during a save vs ~40 ms idle.
+            Abort::Resync { .. } => {
+                preload(&mut c, 10_000);
+                std::fs::write(&hold, b"").expect("create the hold file");
+            }
         }
         let aborted_before = aborted_saves();
         assert!(c.send(&["BGSAVE"]).contains("Background saving started"));
@@ -388,9 +404,7 @@ fn aborted_bgsave_then_resave(dir: &std::path::Path, abort: Abort) {
                 // Mid-walk, not at its first tick: once the writer has
                 // written 128 MiB the shard's hand-over (up to 1 MiB per
                 // tick) has run ahead of it and the backlog is deep; at the
-                // first tick it can be almost empty, and a straggler with
-                // little left drains it while the FLUSHALL runs (tens of ms
-                // in a debug build). ~250 MiB of walk remain.
+                // first tick it can be almost empty.
                 let tmp = dir.join("shard-0.rrdshard.tmp");
                 let grown_by = Instant::now() + Duration::from_secs(60);
                 while std::fs::metadata(&tmp).map_or(0, |m| m.len()) < 128 << 20 {
@@ -400,7 +414,14 @@ fn aborted_bgsave_then_resave(dir: &std::path::Path, abort: Abort) {
                     );
                     std::thread::sleep(Duration::from_millis(1));
                 }
+                // Then hold the walk, so the FLUSHALL lands inside the epoch
+                // however loaded the box is: beside this file's other tests
+                // a busy shard dispatched it only after the walk ended, in 4
+                // attempts of 4. The writer keeps draining its backlog; the
+                // hold only stops new blocks.
+                std::fs::write(&hold, b"").expect("create the hold file");
                 assert!(c.send(&["FLUSHALL"]).starts_with('+'));
+                std::fs::remove_file(&hold).expect("release the hold");
             }
             Abort::Resync { master_port } => {
                 // The master is empty: after the resync this node holds
@@ -417,6 +438,10 @@ fn aborted_bgsave_then_resave(dir: &std::path::Path, abort: Abort) {
                     assert!(Instant::now() < deadline, "the replica link never came up");
                     std::thread::sleep(Duration::from_millis(1));
                 }
+                // The resync queued the abort; the next tick applies it
+                // (before the hold check). Release the hold so the NEXT save
+                // runs.
+                std::fs::remove_file(&hold).expect("release the hold");
                 assert!(c.send(&["REPLICAOF", "NO", "ONE"]).starts_with('+'));
             }
         }
@@ -470,12 +495,17 @@ fn aborted_bgsave_then_resave(dir: &std::path::Path, abort: Abort) {
 /// [`aborted_bgsave_then_resave`], aborted by FLUSHALL: the epoch is 64 KiB
 /// values only, so its writer holds a deep backlog (up to
 /// `SNAPSHOT_STREAM_MAX_IN_FLIGHT`) when the FLUSHALL lands, and the next
-/// BGSAVE follows within a millisecond of its reply. RED on a debug binary
-/// without the writer-cancel fix (`snapshot_stream`): the second save fails
-/// (the straggler unlinked its temp file) or publishes a file of hundreds of
-/// MiB that does not restore — 3 of 3 runs alone, 4 of 5 beside the resync
-/// variant. Green runs there were ones where the FLUSHALL itself took long
-/// enough for the straggler to drain: a race, as F1 is.
+/// BGSAVE follows within a millisecond of its reply.
+///
+/// RED on a debug binary without the writer-cancel fix (`snapshot_stream`)
+/// when the box is quiet: the second save publishes a ~168 MB file that does
+/// not restore, 3 of 3 runs. Beside this file's other tests (CPU-bound debug
+/// servers on 4 vCPUs) it stayed green 3 of 3 there: the FLUSHALL, which
+/// frees ~375 MiB, then takes long enough for the straggler to drain first.
+/// F1 is a race; its deterministic guards are
+/// `persistence::snapshot::stream_tests::an_aborted_snapshot_cannot_*`, which
+/// run on both runtimes. This test is the end-to-end one, green with the fix
+/// on a loaded box too (the walk is held while the FLUSHALL lands).
 #[test]
 fn an_aborted_bgsave_cannot_corrupt_the_next_one() {
     let dir = common::unique_test_dir("ws12-abort-resave");
@@ -486,14 +516,14 @@ fn an_aborted_bgsave_cannot_corrupt_the_next_one() {
 
 /// [`aborted_bgsave_then_resave`], aborted by a replica full resync — the
 /// abort path (`snapshot_cow::note_table_replace`) no other real-server
-/// test reaches: the resync lands mid-save, fails it, and the next save
-/// publishes a sound file.
+/// test reaches: the resync lands in a save held open by the test hook,
+/// fails it, and the next save publishes a sound file.
 ///
-/// NOT a regression test for the writer-cancel fix: the small keys that let
-/// the resync land inside the walk leave the writer no backlog, and it
-/// passes on a binary without that fix. A writer-bound (values-only) epoch
-/// does reproduce F1 with a resync, but its resync then lands after the
-/// walk in most attempts. The FLUSHALL variant is the F1 regression.
+/// NOT a regression test for the writer-cancel fix: a held walk leaves the
+/// writer no backlog, and it passes on a binary without that fix. A
+/// writer-bound (values-only) epoch does reproduce F1 with a resync, but
+/// its resync then lands after the walk in most attempts. The FLUSHALL
+/// variant is the F1 regression.
 ///
 /// monoio only: a master answers PSYNC only under runtime-monoio ("-ERR PSYNC
 /// requires runtime-monoio on the master"), so a tokio build has no resync
