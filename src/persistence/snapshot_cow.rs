@@ -45,7 +45,9 @@
 //! 3. The next tick [`drain_into`]s the queue into the live `SnapshotState`
 //!    **before** advancing, dropping pre-images whose range was already
 //!    written (the file already holds their epoch-start bytes), and first
-//!    applying any abort a FLUSH*/SWAPDB queued (moon#1224).
+//!    applying the table changes queued since (moon#1228: a SWAPDB re-points
+//!    the epoch's databases, a flush freezes the detached table into it) and
+//!    any abort a replica full resync queued (moon#1224).
 //!
 //! One shard per OS thread, and every producer/consumer here runs on that
 //! shard's thread, so a `thread_local!` IS the per-shard queue — same
@@ -58,7 +60,7 @@ use std::collections::HashSet;
 
 use bytes::Bytes;
 
-use crate::persistence::snapshot::{PreImage, SnapshotState};
+use crate::persistence::snapshot::{PreImage, SnapshotState, Table};
 use crate::protocol::Frame;
 use crate::storage::db::Database;
 #[cfg(test)]
@@ -85,9 +87,22 @@ thread_local! {
     /// everything, the pre-moon#1186 behaviour).
     static PROGRESS: RefCell<Option<Progress>> = const { RefCell::new(None) };
     /// A whole-table change the armed epoch cannot follow (moon#1224): a
-    /// FLUSHDB / FLUSHALL / SWAPDB that hit a database the epoch has not
-    /// finished. The next drain fails the snapshot with this reason.
+    /// replica full resync over databases the epoch has not finished (a FLUSH
+    /// or SWAPDB no longer aborts, moon#1228). The next drain fails the
+    /// snapshot with this reason.
     static ABORT: Cell<Option<&'static str>> = const { Cell::new(None) };
+    /// Table changes the epoch follows (moon#1228), in the order they
+    /// happened, applied to the `SnapshotState` by the next drain.
+    static EVENTS: RefCell<Vec<TableEvent>> = const { RefCell::new(Vec::new()) };
+}
+
+/// A whole-table change the armed epoch follows instead of aborting
+/// (moon#1228).
+enum TableEvent {
+    /// `SWAPDB a b` exchanged shard slots `a` and `b`.
+    Swap(usize, usize),
+    /// A flush detached this epoch database's table before it was written.
+    Freeze(usize, Box<Table>),
 }
 
 /// Mirror of `SnapshotState`'s serialization cursor, so a capture can
@@ -97,9 +112,25 @@ struct Progress {
     /// Hash-space position within `current_db` (moon#1216).
     cursor: u64,
     num_databases: usize,
+    /// Which database of the epoch each shard slot's CURRENT table belongs
+    /// to (moon#1228): the identity at arm, exchanged by a SWAPDB, and
+    /// `None` once a flush detached the slot's epoch table (the slot's new
+    /// contents are post-epoch — nothing written to it needs a pre-image).
+    logical_of_slot: Vec<Option<usize>>,
+    /// Each shard slot's `Database` address, recorded at arm: how
+    /// [`note_cleared_table`] tells which slot `Database::clear` ran on (a
+    /// slot's database lives at a fixed address in the shard's `ShardDbSet`;
+    /// a SWAPDB exchanges contents, not addresses). Empty when the arming
+    /// thread has no shard slice.
+    slot_addrs: Vec<usize>,
 }
 
 impl Progress {
+    /// The database of the epoch whose epoch-start table is in `slot`.
+    fn logical_of(&self, slot: usize) -> Option<usize> {
+        self.logical_of_slot.get(slot).copied().flatten()
+    }
+
     /// Exactly `SnapshotState::is_hash_pending`. A mirror that lags the
     /// state (a cursor published late) only answers "pending" for more keys,
     /// which costs a clone the drain then drops — never a missed pre-image.
@@ -124,15 +155,45 @@ pub(crate) fn arm() {
 /// whose range is already written are skipped at the source (moon#1186).
 /// Only the number of databases matters since moon#1216: progress is a
 /// position in hash space that starts at database 0, hash 0.
+///
+/// Also records each shard slot's `Database` address from this thread's
+/// shard slice (moon#1228, see [`note_cleared_table`]). Must be called
+/// outside any `with_shard` borrow — both arming sites in
+/// `shard::persistence_tick` are.
 pub(crate) fn arm_with_layout(segment_counts: Vec<usize>) {
+    let slot_addrs = crate::shard::slice::try_with_shard(|s| {
+        s.databases
+            .with_all_read(|dbs| dbs.iter().map(|db| db_addr(db)).collect::<Vec<_>>())
+    })
+    .unwrap_or_default();
+    arm_with_slots(segment_counts.len(), slot_addrs);
+}
+
+/// [`arm_with_layout`] over an explicit database slice (`dbs[i]` is shard
+/// slot `i`), for harnesses that drive a `SnapshotState` over a plain
+/// `Vec<Database>` instead of a shard slice.
+#[cfg(test)]
+pub(crate) fn arm_with_databases(dbs: &[Database]) {
+    arm_with_slots(dbs.len(), dbs.iter().map(db_addr).collect());
+}
+
+fn arm_with_slots(num_databases: usize, slot_addrs: Vec<usize>) {
     arm();
     PROGRESS.with(|p| {
         *p.borrow_mut() = Some(Progress {
             current_db: 0,
             cursor: 0,
-            num_databases: segment_counts.len(),
+            num_databases,
+            logical_of_slot: (0..num_databases).map(Some).collect(),
+            slot_addrs,
         })
     });
+}
+
+/// A database's identity as a shard slot: its address.
+#[inline]
+fn db_addr(db: &Database) -> usize {
+    db as *const Database as usize
 }
 
 /// Publish the snapshot's cursor after a segment advance (moon#1186). Must
@@ -191,9 +252,18 @@ pub(crate) fn pending_tombstones_for_test() -> Vec<(usize, Bytes)> {
 /// tick does before every advance.
 #[cfg(test)]
 pub(crate) fn drain_pending_for_test(snap: &mut SnapshotState) {
-    apply_queued_abort(snap);
-    let captured = PENDING.with(|p| std::mem::take(&mut *p.borrow_mut()));
-    drain_captured(snap, captured);
+    drain_into(snap);
+}
+
+/// Test-only: the epoch database each shard slot maps to (moon#1228).
+#[cfg(test)]
+pub(crate) fn logical_of_slot_for_test() -> Vec<Option<usize>> {
+    PROGRESS.with(|p| {
+        p.borrow()
+            .as_ref()
+            .map(|p| p.logical_of_slot.clone())
+            .unwrap_or_default()
+    })
 }
 
 /// Test-only: the abort a structural change queued for the next drain.
@@ -207,17 +277,15 @@ fn clear() {
     PENDING_KEYS.with(|k| k.borrow_mut().clear());
     PROGRESS.with(|p| *p.borrow_mut() = None);
     ABORT.with(|a| a.set(None));
+    EVENTS.with(|e| e.borrow_mut().clear());
 }
 
-/// Would the armed epoch still write any of `db_index`? `None` = every
-/// database. Without a published layout the answer is a conservative yes.
-fn epoch_unfinished(db_index: Option<usize>) -> bool {
+/// Would the armed epoch still write anything? Without a published layout
+/// the answer is a conservative yes.
+fn epoch_unfinished() -> bool {
     PROGRESS.with(|p| match p.borrow().as_ref() {
         None => true,
-        Some(progress) => match db_index {
-            Some(db) => progress.is_unfinished(db),
-            None => progress.current_db < progress.num_databases,
-        },
+        Some(progress) => progress.current_db < progress.num_databases,
     })
 }
 
@@ -231,73 +299,114 @@ fn abort_epoch(why: &'static str) {
     });
 }
 
-/// `SWAPDB a b` is about to exchange two databases' tables on this shard
-/// (moon#1224). Called from `ShardDbSet::swap`, the one place every SWAPDB
-/// path — the coordinator's local leg, the SPSC arm, replica apply —
-/// exchanges them.
+/// `SWAPDB a b` is about to exchange the tables of shard slots `a` and `b`
+/// (moon#1224, moon#1228). Called from `ShardDbSet::swap`, the one place
+/// every SWAPDB path — the coordinator's local leg, the SPSC arm, replica
+/// apply — exchanges them.
 ///
-/// An epoch that had not finished with `a` or `b` would write the rest of
-/// one database's contents under the other's index (and lose the other's
-/// entirely), so it is aborted: the BGSAVE fails loudly and the previous
-/// snapshot file stays. A swap of two databases the epoch already wrote is
-/// harmless — the file holds their epoch-start contents and the logged
-/// SWAPDB replays on top. One thread-local `bool` load when nothing is
+/// The epoch follows the tables instead of aborting (it used to fail the
+/// BGSAVE whenever `a` or `b` was unfinished): from now on a write to slot
+/// `a` is a write to the epoch database whose table moved there, and the
+/// serializer reads that database from slot `a` (applied to the state at the
+/// next drain, before another segment is written). The logged SWAPDB
+/// replays on top of the file. One thread-local `bool` load when nothing is
 /// armed.
 pub(crate) fn note_swapdb(a: usize, b: usize) {
     if !is_armed() || a == b {
         return;
     }
-    if epoch_unfinished(Some(a)) || epoch_unfinished(Some(b)) {
+    let followed = PROGRESS.with(|p| {
+        let mut p = p.borrow_mut();
+        let Some(progress) = p.as_mut() else {
+            return false;
+        };
+        let n = progress.logical_of_slot.len();
+        if a >= n || b >= n {
+            return false;
+        }
+        progress.logical_of_slot.swap(a, b);
+        true
+    });
+    if followed {
+        EVENTS.with(|e| e.borrow_mut().push(TableEvent::Swap(a, b)));
+    } else if epoch_unfinished() {
+        // No slot map (an epoch armed without a layout): the pre-moon#1228
+        // answer.
         abort_epoch("SWAPDB exchanged a database the snapshot had not finished writing");
+    }
+}
+
+/// `Database::clear` just detached `db`'s table (moon#1228): FLUSHDB,
+/// FLUSHALL (the selected database through `dispatch`, every other one
+/// through `server_admin::flush_every_database`), a script's deferred flush,
+/// a replica full resync. `table` is the old table, which `clear` used to
+/// drop.
+///
+/// If the table is the epoch-start table of a database the armed epoch has
+/// not finished writing, it is FROZEN into the epoch (moved, never cloned):
+/// with the pre-images captured before the flush it is exactly that
+/// database's epoch-start contents, so the BGSAVE completes with the
+/// pre-flush image — redis's fork does the same — where it used to abort. The
+/// slot's new contents are post-epoch, so writes to it capture nothing from
+/// here on. Otherwise the table is dropped here, where `clear` dropped it.
+///
+/// A slot that cannot be identified (an epoch armed on a thread with no
+/// shard slice) keeps the old answer: an unfinished epoch is aborted. One
+/// thread-local `bool` load when nothing is armed.
+pub(crate) fn note_cleared_table(db: &Database, table: Table) {
+    if !is_armed() {
+        return;
+    }
+    enum Outcome {
+        Freeze(usize),
+        Drop,
+        Unknown,
+    }
+    let addr = db_addr(db);
+    let outcome = PROGRESS.with(|p| {
+        let mut p = p.borrow_mut();
+        let Some(progress) = p.as_mut() else {
+            return Outcome::Unknown;
+        };
+        let Some(slot) = progress.slot_addrs.iter().position(|a| *a == addr) else {
+            return Outcome::Unknown;
+        };
+        match progress.logical_of(slot) {
+            Some(logical) if progress.is_unfinished(logical) => {
+                progress.logical_of_slot[slot] = None;
+                Outcome::Freeze(logical)
+            }
+            _ => Outcome::Drop,
+        }
+    });
+    match outcome {
+        Outcome::Freeze(logical) => {
+            EVENTS.with(|e| {
+                e.borrow_mut()
+                    .push(TableEvent::Freeze(logical, Box::new(table)))
+            });
+        }
+        Outcome::Drop => {}
+        Outcome::Unknown => {
+            if epoch_unfinished() && !table.is_empty() {
+                abort_epoch("a flush cleared a database the snapshot could not identify");
+            }
+        }
     }
 }
 
 /// Every database of this shard is about to be REPLACED wholesale outside
 /// `command::dispatch` (moon#1227 review F6): a replica full resync
 /// (`replication::apply::load_snapshot`) clears each table and loads the
-/// master's RDB in its place. Neither the FLUSH hook in
-/// [`capture_dispatch_pre_image`] nor [`note_swapdb`] sees that, and an
-/// epoch still writing would publish a file mixing this node's epoch-start
-/// data with the master's. Same answer as FLUSHALL: an unfinished epoch is
-/// aborted — the BGSAVE fails loudly and the previous file stays. One
-/// thread-local `bool` load when nothing is armed.
+/// master's RDB in its place. Unlike a FLUSH (moon#1228), the resync is not
+/// a record of this node's own log: a pre-resync image with the post-resync
+/// tail replayed on top would mix this node's data with the master's. So an
+/// unfinished epoch is aborted — the BGSAVE fails loudly and the previous
+/// file stays; the tables the resync's `clear` calls hand over are dropped
+/// with it. One thread-local `bool` load when nothing is armed.
 pub(crate) fn note_table_replace(why: &'static str) {
-    if is_armed() && epoch_unfinished(None) {
+    if is_armed() && epoch_unfinished() {
         abort_epoch(why);
-    }
-}
-
-/// A FLUSHDB / FLUSHALL is about to run against `db` (`databases[db_index]`)
-/// while an epoch is armed (moon#1224). `Database::clear` replaces the whole
-/// table, so the epoch-start contents of an unfinished database are gone
-/// before the epoch wrote them: the snapshot is aborted — redis's own answer
-/// to `FLUSHALL` during a `BGSAVE` is to kill the child. Nothing happens
-/// when the flushed databases are already written (the logged FLUSH replays
-/// on top of their epoch-start contents), when a FLUSHDB empties an already
-/// EMPTY table (the file's contents for it are its pre-images, untouched),
-/// or when the command will refuse its arguments and flush nothing.
-fn note_flush(db: &Database, db_index: usize, all: bool, args: &[Frame]) {
-    if !flush_args_accepted(args) {
-        return;
-    }
-    if all {
-        if epoch_unfinished(None) {
-            abort_epoch("FLUSHALL cleared databases the snapshot had not finished writing");
-        }
-    } else if epoch_unfinished(Some(db_index)) && !db.data().is_empty() {
-        abort_epoch("FLUSHDB cleared a database the snapshot had not finished writing");
-    }
-}
-
-/// Exactly `command::server_admin`'s FLUSHDB/FLUSHALL argument check: no
-/// argument, or one of `ASYNC` / `SYNC`. Anything else is refused before
-/// `Database::clear` runs (pinned by `table_swap_tests::a_refused_flush_does_not_abort`).
-fn flush_args_accepted(args: &[Frame]) -> bool {
-    match args {
-        [] => true,
-        [only] => crate::command::helpers::extract_bytes(only)
-            .is_some_and(|s| s.eq_ignore_ascii_case(b"ASYNC") || s.eq_ignore_ascii_case(b"SYNC")),
-        _ => false,
     }
 }
 
@@ -364,12 +473,9 @@ pub(crate) fn capture_dispatch_pre_image(
     if !is_armed() {
         return;
     }
-    // moon#1224: the whole-table writes. Every FLUSHDB / FLUSHALL on a shard
-    // — client, MULTI/EXEC, script, routed, replicated — runs through
-    // `dispatch`; FLUSHALL's other databases are cleared right after by
-    // `flush_every_database`, on the same shard.
+    // The whole-table writes have no key to capture: `Database::clear`
+    // hands the epoch the table itself (`note_cleared_table`, moon#1228).
     if cmd.eq_ignore_ascii_case(b"FLUSHDB") || cmd.eq_ignore_ascii_case(b"FLUSHALL") {
-        note_flush(db, db_index, cmd.len() == 8, args);
         return;
     }
     if !crate::command::metadata::is_write(cmd) {
@@ -496,18 +602,28 @@ pub(crate) fn capture_two_db(
 }
 
 /// Out-of-line slow path: record the key's current state, first write wins.
-fn capture_key(db: &Database, db_index: usize, key: &[u8]) {
+///
+/// `slot` is the shard slot the write runs in (`databases[slot]`); the
+/// pre-image is filed under the database of the EPOCH whose table is in that
+/// slot now (moon#1228 — a SWAPDB moves tables between slots, a flush
+/// detaches one).
+fn capture_key(db: &Database, slot: usize, key: &[u8]) {
     // moon#1186: a key whose range is already written needs no pre-image —
     // the file holds its epoch-start bytes and the drain would drop the copy.
-    // Skip it BEFORE the deep clone.
-    let written = PROGRESS.with(|p| {
-        p.borrow().as_ref().is_some_and(|progress| {
-            !progress.is_pending(db_index, crate::storage::dashtable::hash_key(key))
-        })
+    // Skip it BEFORE the deep clone. moon#1228: nor does a write to a slot
+    // whose epoch table a flush detached (its contents are post-epoch).
+    let target = PROGRESS.with(|p| match p.borrow().as_ref() {
+        None => Some(slot),
+        Some(progress) => {
+            let logical = progress.logical_of(slot)?;
+            progress
+                .is_pending(logical, crate::storage::dashtable::hash_key(key))
+                .then_some(logical)
+        }
     });
-    if written {
+    let Some(db_index) = target else {
         return;
-    }
+    };
     if PENDING_KEYS.with(|k| {
         k.borrow()
             .get(db_index)
@@ -553,14 +669,14 @@ fn capture_key(db: &Database, db_index: usize, key: &[u8]) {
 /// cursor that moved past it in the meantime.
 pub(crate) fn drain_into(snap: &mut SnapshotState) {
     apply_queued_abort(snap);
-    if PENDING.with(|p| p.borrow().is_empty()) {
-        return;
+    apply_table_events(snap);
+    if !PENDING.with(|p| p.borrow().is_empty()) {
+        let captured: Vec<(usize, Bytes, PreImage)> =
+            PENDING.with(|p| std::mem::take(&mut *p.borrow_mut()));
+        // PENDING_KEYS is NOT reset here (moon#1186): first-wins holds for
+        // the whole epoch, so a hot key is cloned once, not once per tick.
+        drain_captured(snap, captured);
     }
-    let captured: Vec<(usize, Bytes, PreImage)> =
-        PENDING.with(|p| std::mem::take(&mut *p.borrow_mut()));
-    // PENDING_KEYS is NOT reset here (moon#1186): first-wins holds for the
-    // whole epoch, so a hot key is cloned once, not once per tick.
-    drain_captured(snap, captured);
 }
 
 /// Fail the snapshot if a structural change queued an abort (moon#1224).
@@ -568,6 +684,19 @@ pub(crate) fn drain_into(snap: &mut SnapshotState) {
 fn apply_queued_abort(snap: &mut SnapshotState) {
     if let Some(why) = ABORT.with(|a| a.take()) {
         snap.abort(why);
+    }
+}
+
+/// Hand the state the table changes it follows (moon#1228), in the order
+/// they happened: SWAPDBs re-point its sources, flushes freeze detached
+/// tables into it. Runs before any further segment is written.
+fn apply_table_events(snap: &mut SnapshotState) {
+    let events = EVENTS.with(|e| std::mem::take(&mut *e.borrow_mut()));
+    for event in events {
+        match event {
+            TableEvent::Swap(a, b) => snap.swap_slots(a, b),
+            TableEvent::Freeze(db, table) => snap.freeze(db, table),
+        }
     }
 }
 

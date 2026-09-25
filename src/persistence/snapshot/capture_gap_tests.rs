@@ -101,7 +101,7 @@ fn move_mid_epoch_keeps_both_databases_point_in_time() {
     preload(&mut dbs[0], "a", 1500);
     preload(&mut dbs[1], "b", 400);
     let expected = string_keyspace(&dbs);
-    let mut epoch = epoch_partway(&dbs);
+    let epoch = epoch_partway(&dbs);
     let (written, pending) = split_by_pending(&epoch, 0, "a", 1500);
     assert!(
         written.len() >= 20 && pending.len() >= 20,
@@ -166,7 +166,7 @@ fn copy_into_another_database_mid_epoch_keeps_the_destination_point_in_time() {
     preload(&mut dbs[0], "a", 1500);
     preload(&mut dbs[1], "b", 400);
     let expected = string_keyspace(&dbs);
-    let mut epoch = epoch_partway(&dbs);
+    let epoch = epoch_partway(&dbs);
     let (written, pending) = split_by_pending(&epoch, 0, "a", 1500);
 
     let mut tail = Tail::new();
@@ -273,7 +273,7 @@ fn workspace_drop_sweep_mid_epoch_keeps_the_file_point_in_time() {
     preload(&mut dbs[1], &format!("{prefix}x"), 200);
     preload(&mut dbs[2], "c", 100);
     let expected = string_keyspace(&dbs);
-    let mut epoch = epoch_partway(&dbs);
+    let epoch = epoch_partway(&dbs);
     let (written, pending) = split_by_pending(&epoch, 0, &format!("{prefix}w"), 300);
     assert!(
         !written.is_empty() && !pending.is_empty(),
