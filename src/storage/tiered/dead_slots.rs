@@ -46,7 +46,7 @@
 //! would come back the moment the key dies again.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use bytes::Bytes;
 
@@ -150,6 +150,14 @@ pub struct DeadSlots {
     /// Smallest TTL among the entries (`u64::MAX` = none carries one), so
     /// [`Self::prune_expired`] is O(1) when nothing can have expired.
     earliest_ttl: u64,
+    /// Bytes an AOF fold took out of this ledger and is carrying to its
+    /// writer (`FoldChunk::ColdDeletes` chunks: key handles, plus copies of
+    /// expired shadows' keys), charged while they exist (PR #1233 review).
+    /// Added by the fold on the shard thread through a SHARED guard — hence
+    /// an atomic — and released by the shard's tick once no rewrite is in
+    /// progress ([`Self::clear_in_transit`]), i.e. after the writer wrote or
+    /// dropped every chunk. Same thread both ways; the atomic is for `&self`.
+    in_transit: AtomicUsize,
 }
 
 impl Default for DeadSlots {
@@ -159,6 +167,7 @@ impl Default for DeadSlots {
             resident_bytes: 0,
             len: 0,
             earliest_ttl: u64::MAX,
+            in_transit: AtomicUsize::new(0),
         }
     }
 }
@@ -236,6 +245,7 @@ impl DeadSlots {
         self.len += std::mem::take(&mut other.len);
         self.resident_bytes += std::mem::take(&mut other.resident_bytes);
         self.earliest_ttl = self.earliest_ttl.min(other.earliest_ttl);
+        *self.in_transit.get_mut() += std::mem::take(other.in_transit.get_mut());
     }
 
     /// Every key with at least one dead slot. A key dead in several files is
@@ -268,10 +278,24 @@ impl DeadSlots {
         self.len == 0
     }
 
-    /// Approximate RAM this ledger holds.
+    /// Approximate RAM this ledger holds, a fold's in-flight chunks
+    /// included. O(1): a field and a relaxed load — it is read by the write
+    /// admission gate (`eviction::cold_ledger_bytes`).
     #[inline]
     pub fn resident_bytes(&self) -> usize {
-        self.resident_bytes
+        self.resident_bytes + self.in_transit.load(Ordering::Relaxed)
+    }
+
+    /// Charge `bytes` a fold is carrying out of this ledger (see the
+    /// `in_transit` field). `&self`: the fold holds a shared guard.
+    pub fn charge_in_transit(&self, bytes: usize) {
+        self.in_transit.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    /// Release the fold-transit charge (the shard's tick, once no rewrite is
+    /// in progress). Returns what was released.
+    pub fn clear_in_transit(&self) -> usize {
+        self.in_transit.swap(0, Ordering::Relaxed)
     }
 
     /// Whether `file_id` has any dead slot recorded (tests, diagnostics).
@@ -364,6 +388,23 @@ mod tests {
         assert_eq!(at(10), vec![&b"gone"[..], b"kept"]);
         assert_eq!(at(11), vec![&b"kept"[..]]);
         assert!(at(21).is_empty());
+    }
+
+    /// A fold's in-flight chunks are part of the ledger's bytes until
+    /// released, and survive a merge.
+    #[test]
+    fn the_fold_transit_charge_counts_until_released() {
+        let mut d = DeadSlots::default();
+        d.note(1, Bytes::from_static(b"k"), None);
+        let base = d.resident_bytes();
+        d.charge_in_transit(64);
+        assert_eq!(d.resident_bytes(), base + 64);
+        let mut e = DeadSlots::default();
+        e.charge_in_transit(8);
+        d.merge(e);
+        assert_eq!(d.resident_bytes(), base + 72);
+        assert_eq!(d.clear_in_transit(), 72);
+        assert_eq!(d.resident_bytes(), base);
     }
 
     /// Dropped: with no AOF fold to consume them, nothing is recorded.

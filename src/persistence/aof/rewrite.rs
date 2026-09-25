@@ -254,23 +254,29 @@ pub(crate) fn write_generation_head(
     file: &mut std::fs::File,
     framed: bool,
     watermark: u64,
-    cold_deletes: &crate::persistence::cold_records::ColdDeletes,
+    cold_deletes: crate::persistence::cold_records::ColdDeletes,
     path: &Path,
 ) -> Result<(), MoonError> {
-    use std::io::Write;
-    let head = crate::persistence::cold_records::generation_head(watermark, cold_deletes, framed);
     let io = |e: std::io::Error| AofError::Io {
         path: path.to_path_buf(),
         source: e,
     };
-    file.write_all(&head).map_err(io)?;
+    // Streamed chunk by chunk: the head never exists as one buffer (PR #1233
+    // review).
+    let written = crate::persistence::cold_records::write_generation_head_to(
+        file,
+        watermark,
+        cold_deletes,
+        framed,
+    )
+    .map_err(io)?;
     file.sync_data().map_err(io)?;
-    if !cold_deletes.is_empty() {
+    if written > 0 {
         info!(
             "AOF rewrite: new generation {} opens with DELs of {} key(s) whose cold slots \
              outlive them (moon#1215)",
             path.display(),
-            cold_deletes.len()
+            written
         );
     }
     Ok(())
@@ -329,7 +335,7 @@ pub(crate) fn open_new_incr(
     path: &Path,
     framed: bool,
     cold_watermark: u64,
-    cold_deletes: &crate::persistence::cold_records::ColdDeletes,
+    cold_deletes: crate::persistence::cold_records::ColdDeletes,
 ) -> Result<std::fs::File, MoonError> {
     #[cfg(test)]
     if test_fault::fail_new_incr_open() {
@@ -979,7 +985,7 @@ pub(crate) fn do_rewrite_per_shard(
         &new_incr,
         true,
         fold_snapshot.cold_file_watermark,
-        &cold_deletes,
+        cold_deletes,
     )?;
 
     info!(
@@ -1134,7 +1140,7 @@ pub(crate) fn do_rewrite_single(
     // switch of `file` below cannot fail (#455, see `FoldOutcome`).
     let rdb_bytes = crate::persistence::rdb::save_snapshot_to_bytes(&snapshot)?;
     let (_new_incr, new_file) = manifest.advance_with(&rdb_bytes, |new_incr| {
-        open_new_incr(new_incr, false, cold_watermark, &cold_deletes)
+        open_new_incr(new_incr, false, cold_watermark, cold_deletes)
     })?;
     *file = new_file;
     // task #35: fresh incr — replay always starts a segment at db 0.
@@ -1319,7 +1325,7 @@ pub(crate) fn do_rewrite_sharded(
                 new_incr,
                 false,
                 cold_watermark,
-                &cold_deletes.take().unwrap_or_default(),
+                cold_deletes.take().unwrap_or_default(),
             )
         },
     )?;
@@ -1700,7 +1706,7 @@ pub(crate) fn rewrite_aof_sharded_sync(
         // Written into the tmp file BEFORE the rename, so the file this
         // rewrite publishes can never exist without its head — moon#1215's
         // DELs of dead cold slots included.
-        write_generation_head(&mut f, false, cold_watermark, &cold_deletes, &tmp_path)?;
+        write_generation_head(&mut f, false, cold_watermark, cold_deletes, &tmp_path)?;
         base_len
     };
     std::fs::rename(&tmp_path, aof_path).map_err(|e| AofError::RewriteFailed {

@@ -646,10 +646,20 @@ pub(crate) fn run_eviction_tick(
         // is resident RAM, so `used_memory` and the elastic budget count it.
         // The pressure cascade does not (`ledger_bytes`, PR #1233 review): no
         // step of the cascade can free a ledger byte.
+        //
+        // A rewrite's in-flight head chunks are charged to their ledger
+        // (`DeadSlots::charge_in_transit`) until the rewrite is over; with
+        // none in progress every chunk has been written or dropped, so the
+        // charge is released here first.
+        let rewriting = crate::command::persistence::AOF_REWRITE_IN_PROGRESS
+            .load(std::sync::atomic::Ordering::SeqCst);
         let (used, ledger) = crate::shard::slice::with_shard(|s| {
             s.databases.with_all_read(|dbs| {
                 dbs.iter().fold((0usize, 0usize), |(used, ledger), db| {
                     let ci = db.cold_index.as_ref();
+                    if !rewriting && let Some(ci) = ci {
+                        ci.dead_slots().clear_in_transit();
+                    }
                     (
                         used + db.estimated_memory() + ci.map_or(0, |ci| ci.resident_bytes()),
                         ledger + ci.map_or(0, |ci| ci.dead_slot_bytes()),

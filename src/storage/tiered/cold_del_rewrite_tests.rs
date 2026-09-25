@@ -310,9 +310,12 @@ fn a_key_with_two_dead_slots_stays_deleted() {
 /// the generation back on db 0.
 #[test]
 fn the_head_deletes_in_the_right_database_and_ends_on_db_0() {
-    use crate::persistence::cold_records::ColdDeletes;
+    use crate::persistence::cold_records::{ColdDeleteChunk, ColdDeletes};
     let deletes = ColdDeletes {
-        per_db: vec![(3, vec![Bytes::from_static(b"x")])],
+        chunks: vec![ColdDeleteChunk {
+            db: 3,
+            keys: vec![Bytes::from_static(b"x")],
+        }],
     };
     let head = generation_head(9, &deletes, false);
     let mut want = serialize_cold_cut(9).to_vec();

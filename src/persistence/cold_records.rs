@@ -46,79 +46,118 @@ pub fn serialize_spilled(file_id: u64, keys: &[Bytes]) -> Bytes {
     serialize_command(&Frame::Array(parts))
 }
 
-/// Keys a new AOF generation must delete right after its `MOON.COLDCUT`
-/// (moon#1215), per database, as computed at the fold instant by
-/// `aof::fold_stream`: each has a slot on disk in a listed spill file (so a
-/// rebuild would index it and the cut would authorize it) and is not alive at
-/// the fold instant (not in the base, not cold, not in flight).
+/// Keys per `DEL` record in a generation head, and the size of one
+/// [`ColdDeleteChunk`]: bounds one record's size (one RESP array per 512
+/// keys) without a record per key.
+pub const HEAD_DEL_BATCH: usize = 512;
+
+/// One batch of keys a new AOF generation must delete right after its
+/// `MOON.COLDCUT` (moon#1215), all in database `db`: at most
+/// [`HEAD_DEL_BATCH`] keys, written as ONE `DEL` record. The fold ships its
+/// deletes as a stream of these (`FoldChunk::ColdDeletes`), never as one
+/// list, and the writer writes each as it goes (PR #1233 review).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ColdDeleteChunk {
+    pub db: usize,
+    pub keys: Vec<Bytes>,
+}
+
+/// The cold deletes of one fold, as computed at the fold instant by
+/// `aof::fold_stream`: each key has a slot on disk in a listed spill file
+/// (so a rebuild would index it and the cut would authorize it) and is not
+/// alive at the fold instant (not in the base, not cold, not in flight).
+///
+/// Chunks come in database order. A key may be listed more than once when it
+/// is dead in several files; duplicates inside one chunk are written once,
+/// across chunks they are harmless (`DEL` of an absent key is a no-op).
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ColdDeletes {
-    /// `(db index, keys)`, db ascending. A key may appear more than once
-    /// (once per dead slot); [`generation_head`] writes it once.
-    pub per_db: Vec<(usize, Vec<Bytes>)>,
+    pub chunks: Vec<ColdDeleteChunk>,
 }
 
 impl ColdDeletes {
-    /// Total listed keys across every database (duplicates included).
+    /// Total listed keys across every chunk (duplicates included).
     pub fn len(&self) -> usize {
-        self.per_db.iter().map(|(_, k)| k.len()).sum()
+        self.chunks.iter().map(|c| c.keys.len()).sum()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.per_db.iter().all(|(_, k)| k.is_empty())
+        self.chunks.iter().all(|c| c.keys.is_empty())
+    }
+
+    /// Every listed key with its database, in chunk order.
+    pub fn keys(&self) -> impl Iterator<Item = (usize, &Bytes)> {
+        self.chunks
+            .iter()
+            .flat_map(|c| c.keys.iter().map(move |k| (c.db, k)))
     }
 }
 
-/// Keys per `DEL` record in a generation head: bounds one record's size
-/// (one RESP array per 512 keys) without a record per key.
-const HEAD_DEL_BATCH: usize = 512;
-
-/// The head of a new AOF generation: `MOON.COLDCUT <watermark>`, then for
-/// every database with dead cold slots `SELECT <db>` + `DEL key…` (moon#1215),
-/// ending selected on db 0 — the writer and every replay reader start an
-/// incr's records at db 0, so a head that left another db selected would
-/// replay the generation's first db-0 records into it.
+/// Stream the head of a new AOF generation into `out`: `MOON.COLDCUT
+/// <watermark>`, then for every chunk of `deletes` a `SELECT <db>` when the
+/// database changes and ONE `DEL key…` record, ending selected on db 0 — the
+/// writer and every replay reader start an incr's records at db 0, so a head
+/// that left another db selected would replay the generation's first db-0
+/// records into it. Returns how many `DEL` arguments it wrote.
+///
+/// Each chunk is serialized on its own and dropped once written, so the
+/// head never exists in memory as one buffer (PR #1233 review: a large
+/// ledger used to build a multi-megabyte `Vec` here).
 ///
 /// Only records every moon binary already replays: `SELECT` and `DEL` (which
 /// tombstones the cold plane through the replay gate, moon#257), so an older
 /// binary reading this generation keeps the deletes too. `framed` selects
 /// the per-shard `[lsn=0][len][RESP]` encoding for every record.
-pub fn generation_head(watermark: u64, deletes: &ColdDeletes, framed: bool) -> Vec<u8> {
-    let mut out = Vec::new();
-    let mut push = |resp: &[u8]| {
+pub fn write_generation_head_to(
+    out: &mut impl std::io::Write,
+    watermark: u64,
+    deletes: ColdDeletes,
+    framed: bool,
+) -> std::io::Result<usize> {
+    let mut put = |resp: &[u8]| -> std::io::Result<()> {
         if framed {
-            out.extend_from_slice(&frame_unoffset(resp));
+            out.write_all(&frame_unoffset(resp))
         } else {
-            out.extend_from_slice(resp);
+            out.write_all(resp)
         }
     };
-    push(&serialize_cold_cut(watermark));
+    put(&serialize_cold_cut(watermark))?;
     let mut selected = 0usize;
-    for (db, keys) in &deletes.per_db {
+    let mut written = 0usize;
+    for chunk in deletes.chunks {
+        let ColdDeleteChunk { db, mut keys } = chunk;
         if keys.is_empty() {
             continue;
         }
-        if *db != selected {
-            push(&serialize_select(*db));
-            selected = *db;
+        if db != selected {
+            put(&serialize_select(db))?;
+            selected = db;
         }
-        // The fold lists a key once per dead slot (it does not dedupe on the
-        // shard thread); one DEL argument per key is enough.
-        let mut keys: Vec<&Bytes> = keys.iter().collect();
         keys.sort_unstable();
         keys.dedup();
         for batch in keys.chunks(HEAD_DEL_BATCH) {
             let mut parts = crate::protocol::FrameVec::with_capacity(batch.len() + 1);
             parts.push(Frame::BulkString(Bytes::from_static(b"DEL")));
             for key in batch {
-                parts.push(Frame::BulkString((*key).clone()));
+                parts.push(Frame::BulkString(key.clone()));
             }
-            push(&serialize_command(&Frame::Array(parts)));
+            put(&serialize_command(&Frame::Array(parts)))?;
+            written += batch.len();
         }
     }
     if selected != 0 {
-        push(&serialize_select(0));
+        put(&serialize_select(0))?;
     }
+    Ok(written)
+}
+
+/// [`write_generation_head_to`] into a buffer — tests only; production
+/// streams straight into the incr.
+#[cfg(test)]
+pub fn generation_head(watermark: u64, deletes: &ColdDeletes, framed: bool) -> Vec<u8> {
+    let mut out = Vec::new();
+    #[allow(clippy::unwrap_used)] // writing into a Vec cannot fail
+    write_generation_head_to(&mut out, watermark, deletes.clone(), framed).unwrap();
     out
 }
 
@@ -369,18 +408,25 @@ mod tests {
         assert_eq!(std::fs::read(&legacy).unwrap(), set.as_ref());
     }
 
-    /// moon#1215: the head lists each dead key once (the fold may list it
-    /// once per dead slot), batches its DELs, and hands the generation back on
-    /// db 0; the framed form carries the same records.
+    /// moon#1215: the head writes each chunk as one DEL (duplicates inside a
+    /// chunk once), SELECTs a database only when it changes, and hands the
+    /// generation back on db 0; the framed form carries the same records.
     #[test]
     fn generation_head_dedupes_batches_and_ends_on_db_0() {
         let key = |i: usize| Bytes::from(format!("k{i:04}"));
-        let mut db2: Vec<Bytes> = (0..HEAD_DEL_BATCH + 3).map(key).collect();
-        db2.push(key(0));
+        let mut first: Vec<Bytes> = (0..HEAD_DEL_BATCH).map(key).collect();
+        first.push(key(0));
         let deletes = ColdDeletes {
-            per_db: vec![
-                (0, vec![Bytes::from_static(b"z"), Bytes::from_static(b"z")]),
-                (2, db2),
+            chunks: vec![
+                ColdDeleteChunk {
+                    db: 0,
+                    keys: vec![Bytes::from_static(b"z"), Bytes::from_static(b"z")],
+                },
+                ColdDeleteChunk { db: 2, keys: first },
+                ColdDeleteChunk {
+                    db: 2,
+                    keys: (HEAD_DEL_BATCH..HEAD_DEL_BATCH + 3).map(key).collect(),
+                },
             ],
         };
         assert_eq!(deletes.len(), HEAD_DEL_BATCH + 6, "duplicates are counted");
