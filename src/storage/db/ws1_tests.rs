@@ -328,19 +328,27 @@ mod access_tracking_1161 {
         }
     }
 
+    /// The counter is a Morris counter: each GET increments it with
+    /// probability `1 / ((c - 5) * log_factor + 1)`. After 200 GETs it is
+    /// below 8 with probability 1.3e-4 (exact, over the Markov chain); the
+    /// hosted Windows leg drew a 7 once at `c111e6b`. After 1000 GETs that
+    /// probability is 1.4e-21, and HEAD's constant 5 still fails.
     #[test]
     fn object_freq_reports_the_decayed_counter_under_lfu() {
         let _lfu = force_access_tracking(lfu());
         let mut db = Database::new();
         let _p = at(&mut db, T0);
         db.set(b"k", Entry::new_string(Bytes::from_static(b"v")));
-        for _ in 0..200 {
+        for _ in 0..1000 {
             let _ = db.get(b"k");
         }
         let Frame::Integer(f) = object(&mut db, b"FREQ", b"k") else {
             panic!("FREQ not an integer");
         };
-        assert!(f >= 8, "OBJECT FREQ after 200 GETs = {f} (HEAD answered 5)");
+        assert!(
+            f >= 8,
+            "OBJECT FREQ after 1000 GETs = {f} (HEAD answered 5)"
+        );
         // 5 idle minutes decay it by 5 without recording an access.
         let _p = at(&mut db, T0 + 300);
         assert_eq!(object(&mut db, b"FREQ", b"k"), Frame::Integer(f - 5));

@@ -261,6 +261,10 @@ pub(crate) fn advance_snapshot_segment(
         if snap.stream_backlogged() {
             return false;
         }
+        // Test-only (`MOON_TEST_SNAPSHOT_HOLD_FILE`): hold the epoch open.
+        if crate::shard::test_hooks::snapshot_hold_requested_for_test() {
+            return false;
+        }
         let current_db = snap.current_db_index();
         let db_count = shard_databases.db_count();
         if current_db < db_count {

@@ -529,8 +529,7 @@ pub struct Database {
     /// held) and self-correcting the moment the key is written or deleted.
     spill_inflight: std::collections::HashMap<bytes::Bytes, PendingSpill>,
     /// Running sum of `key.len() + value_bytes.len()` over [`Self::spill_inflight`]
-    /// (moon#466), plus the key handles of [`Self::spill_superseded`]
-    /// (moon#1253). See [`Self::pending_spill_bytes`].
+    /// (moon#466). See [`Self::pending_spill_bytes`].
     spill_inflight_bytes: usize,
     /// Spill requests that a DEL, an overwrite, a promoting read, a FLUSH or
     /// a newer eviction retired while they were still in flight, keyed by
@@ -550,6 +549,14 @@ pub struct Database {
     /// Bounded by the spills in flight: an entry is settled by its request's
     /// completion, whatever the outcome (`spill_superseded_settle`).
     spill_superseded: std::collections::HashMap<(bytes::Bytes, u64), Option<u64>>,
+    /// Bytes the [`Self::spill_superseded`] entries hold: key handles plus
+    /// map slots. Deliberately NOT part of [`Self::pending_spill_bytes`], the
+    /// charge `used_memory` and admission see. moon#466's contract is that a
+    /// FLUSH drops the pending charge with the records, so `used_memory` reads
+    /// 0 after it as in redis. These entries are transient and bounded by the
+    /// spill queue. Each one belongs to a request that is still queued and
+    /// that already pins its own copy of the key, unbilled once retired.
+    spill_superseded_bytes: usize,
     /// Ticket dispenser for the version stamped on a NEWLY CREATED entry.
     ///
     /// Versions are per-entry and die with the entry. Before this counter every
@@ -642,8 +649,8 @@ pub const HASH_SWEEP_MAX_FIELDS_PER_KEY: usize = 256;
 /// into sweep-sampling fallback.
 pub const PENDING_EXPIRED_CAP: usize = 8192;
 
-/// What [`Database::spill_superseded`] bills per entry on top of its key's
-/// bytes (moon#1253): the map slot's `(Bytes, u64)` key and TTL.
+/// What [`Database::spill_superseded_bytes`] counts per entry on top of its
+/// key's bytes (moon#1253): the map slot's `(Bytes, u64)` key and TTL.
 const SPILL_SUPERSEDED_OVERHEAD: usize =
     std::mem::size_of::<(bytes::Bytes, u64)>() + std::mem::size_of::<Option<u64>>();
 
@@ -685,6 +692,7 @@ impl Database {
             spill_inflight: std::collections::HashMap::new(),
             spill_inflight_bytes: 0,
             spill_superseded: std::collections::HashMap::new(),
+            spill_superseded_bytes: 0,
             birth_counter: 0,
             expiry_index: std::collections::BTreeSet::new(),
             hash_expiry_index: std::collections::BTreeSet::new(),
@@ -722,6 +730,7 @@ impl Database {
             spill_inflight: std::collections::HashMap::new(),
             spill_inflight_bytes: 0,
             spill_superseded: std::collections::HashMap::new(),
+            spill_superseded_bytes: 0,
             birth_counter: 0,
             expiry_index: std::collections::BTreeSet::new(),
             hash_expiry_index: std::collections::BTreeSet::new(),
@@ -838,24 +847,18 @@ impl Database {
         for (key, pending) in records {
             self.spill_superseded_note(key, pending.req_id, pending.ttl_ms);
         }
-        // The superseded handles noted before the flush keep their charge.
-        self.spill_inflight_bytes = self
-            .spill_superseded
-            .keys()
-            .map(|(key, _)| key.len() + SPILL_SUPERSEDED_OVERHEAD)
-            .sum();
     }
 
     /// Remember that request `req_id` of `key` was retired while in flight
-    /// (moon#1253). The key handle is billed like the in-flight bytes.
+    /// (moon#1253), counting its bytes in [`Self::spill_superseded_bytes`].
     fn spill_superseded_note(&mut self, key: bytes::Bytes, req_id: u64, ttl_ms: Option<u64>) {
-        let charge = key.len() + SPILL_SUPERSEDED_OVERHEAD;
+        let size = key.len() + SPILL_SUPERSEDED_OVERHEAD;
         if self
             .spill_superseded
             .insert((key, req_id), ttl_ms)
             .is_none()
         {
-            self.spill_inflight_bytes = self.spill_inflight_bytes.saturating_add(charge);
+            self.spill_superseded_bytes = self.spill_superseded_bytes.saturating_add(size);
         }
     }
 
@@ -875,7 +878,7 @@ impl Database {
             .is_some()
         {
             let credit = key.len() + SPILL_SUPERSEDED_OVERHEAD;
-            self.spill_inflight_bytes = self.spill_inflight_bytes.saturating_sub(credit);
+            self.spill_superseded_bytes = self.spill_superseded_bytes.saturating_sub(credit);
         }
     }
 
@@ -902,6 +905,13 @@ impl Database {
     #[inline]
     pub fn spill_superseded_len(&self) -> usize {
         self.spill_superseded.len()
+    }
+
+    /// Bytes held by the superseded in-flight requests (key handles plus map
+    /// slots). Not part of [`Self::pending_spill_bytes`]; see the field docs.
+    #[inline]
+    pub fn spill_superseded_bytes(&self) -> usize {
+        self.spill_superseded_bytes
     }
 
     /// Cheap (no disk I/O, no promotion) liveness probe for the in-flight
