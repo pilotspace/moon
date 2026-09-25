@@ -12,6 +12,9 @@ mod read_tests;
 #[cfg(test)]
 mod backlen_tests;
 
+#[cfg(test)]
+mod growth_tests;
+
 const LP_HDR_SIZE: usize = 7; // 4 bytes total_bytes + 2 bytes num_elements + 1 byte terminator
 const LP_TERMINATOR: u8 = 0xFF;
 
@@ -591,11 +594,20 @@ impl Listpack {
     /// HSET and ZADD update, where a fixed-width value is overwritten by
     /// another of the same width -- moves no tail at all.
     ///
-    /// `resize` is the only call that can touch the allocator, and only when
-    /// the listpack's own buffer has to GROW; it zero-fills the new bytes,
-    /// which the copies below immediately overwrite. That growth is the same
-    /// `lp_realloc` Redis pays, not the per-entry temporary moon#942 is
-    /// about.
+    /// `reserve_exact` + `resize` are the only calls that can touch the
+    /// allocator, and only when the listpack's own buffer has to GROW; the
+    /// resize zero-fills the new bytes, which the copies below immediately
+    /// overwrite. That growth is the same `lp_realloc` Redis pays, not the
+    /// per-entry temporary moon#942 is about.
+    ///
+    /// moon#1212: the growth is to the allocator's size class of the new
+    /// length — exactly what redis's `lp_realloc` to the new `total_bytes`
+    /// gets back from jemalloc, and no more. `Vec`'s doubling left a listpack
+    /// carrying up to 2x its bytes (a 925 B capped list sat in a 1,792 B
+    /// block; 3,791 vs redis's 2,224 B/key on the capped-list fixture). Taking
+    /// the whole class, instead of the bare length, costs no memory (the
+    /// allocator hands the class out either way) and reallocates once per
+    /// class crossed instead of once per push.
     ///
     /// Header fields are deliberately not touched here: whether the element
     /// count moves depends on the caller, so every caller stamps its own.
@@ -607,7 +619,12 @@ impl Listpack {
         match new_width.cmp(&old_width) {
             std::cmp::Ordering::Greater => {
                 let grow = new_width - old_width;
-                self.data.resize(orig_len + grow, 0);
+                let needed = orig_len + grow;
+                if needed > self.data.capacity() {
+                    let class = crate::storage::mem_size::size_class(needed).max(needed);
+                    self.data.reserve_exact(class - orig_len);
+                }
+                self.data.resize(needed, 0);
                 self.data.copy_within(range.end..orig_len, range.end + grow);
             }
             std::cmp::Ordering::Less => {

@@ -5,6 +5,8 @@
 //!   list to `linkedlist` for good.
 //! * SORT read listpack elements through the OWNING iterator — a `Vec` per
 //!   string, then copied again into the `Bytes` it kept.
+//! * A listpack's buffer grew by `Vec` doubling where redis `lp_realloc`s to
+//!   the exact size.
 //!
 //! (`LPUSHX`/`RPUSHX` are in `mod.rs`'s `lpushx_and_rpushx_keep_a_listpack_moon1212`.)
 
@@ -13,6 +15,7 @@ use bytes::Bytes;
 use crate::protocol::Frame;
 use crate::server::conn::blocking::immediate_scan;
 use crate::storage::Database;
+use crate::storage::compact_value::RedisValueRef;
 
 fn run(db: &mut Database, parts: &[&str]) -> Frame {
     let args: Vec<Frame> = parts[1..]
@@ -162,5 +165,39 @@ fn sort_reads_listpacks_without_owned_decodes() {
     assert_eq!(
         got,
         ["apple", "fig", "pear"].map(|s| Bytes::from_static(s.as_bytes()))
+    );
+}
+
+/// A listpack's buffer is its exact size (redis `lp_realloc`s to the new
+/// `total_bytes`), so what the ledger bills is the size class of the bytes
+/// actually used — not of a doubled capacity.
+///
+/// Checked at the capped list's peak (51 same-width entries, just before the
+/// LTRIM): every growth there was to the exact new length, and the trims in
+/// between keep that capacity, so it equals `total_bytes` to the byte. Pre-fix
+/// `Vec` doubling left 1,600 B of capacity (billed at the 1,792 B class) under
+/// a 925 B listpack.
+#[test]
+fn listpack_buffers_grow_to_their_exact_size() {
+    let mut db = Database::new();
+    for i in 0..100 {
+        run(
+            &mut db,
+            &["LPUSH", "capped", &format!("recent-item-{i:04}")],
+        );
+        run(&mut db, &["LTRIM", "capped", "0", "49"]);
+    }
+    run(&mut db, &["LPUSH", "capped", "recent-item-peak"]);
+    let entry = db.peek(b"capped").expect("capped");
+    let RedisValueRef::ListListpack(lp) = entry.as_redis_value() else {
+        panic!("the capped list must stay a listpack");
+    };
+    assert_eq!(lp.len(), 51);
+    assert_eq!(
+        lp.estimate_memory(),
+        std::mem::size_of::<crate::storage::listpack::Listpack>()
+            + crate::storage::mem_size::size_class(lp.total_bytes()),
+        "a {} B listpack carries slack past its size class (Vec doubling, moon#1212)",
+        lp.total_bytes()
     );
 }
