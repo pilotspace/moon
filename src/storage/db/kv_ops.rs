@@ -693,9 +693,11 @@ impl Database {
         // now-unreferenced spill file, exactly as it does for a DEL.
         //
         // Also drops the moon#466 pending-byte charge, which `used_memory = 0`
-        // above would otherwise contradict.
-        self.spill_inflight.clear();
-        self.spill_inflight_bytes = 0;
+        // above would otherwise contradict. The retired requests are still in
+        // flight and still write their slots: each is superseded, as by a DEL
+        // of its key, so a rewrite folded before its completion still writes
+        // the flushed key a head DEL (moon#1253).
+        self.spill_inflight_supersede_all();
     }
 
     /// The hot-key sketch (sampling hooks, HOTKEYS command, coordinator
