@@ -1367,9 +1367,9 @@ pub(crate) async fn publish_post_txn(
 /// A full ring used to drop the load SILENTLY, leaving that shard's script
 /// cache divergent: EVALSHA there answered NOSCRIPT for a sha this server had
 /// just returned. On give-up the drop is loud (warn + counter), and the caller
-/// decides what the client hears: `SCRIPT LOAD` still answers the sha,
-/// `EVAL` keeps the duty owed so its next call republishes
-/// ([`eval_script_fanout`]).
+/// decides what the client hears: `SCRIPT LOAD` reports it
+/// ([`script_command_fanout`]), `EVAL` keeps the duty owed so its next call
+/// republishes ([`eval_script_fanout`]).
 pub(crate) async fn script_fanout_bounded(
     ctx: &super::core::ConnectionContext,
     shutdown: &crate::runtime::cancel::CancellationToken,
@@ -1450,12 +1450,16 @@ pub(crate) async fn run_script_command(
 }
 
 /// Replay an accepted `SCRIPT LOAD` / `SCRIPT FLUSH` on every other shard and
-/// return the reply the client gets (moon#1235, moon#1229).
+/// return the reply the client gets (moon#1235, moon#1229, moon#567).
 ///
 /// `fanout` is what [`crate::scripting::handle_script_subcommand`] says the
 /// other shards are owed, epoch included, so the replay files the op in the
-/// same order on every shard as on this one. A flush that did not reach every
-/// shard is reported; a load's give-up is logged loudly and the sha returned.
+/// same order on every shard as on this one. The local reply stands when every
+/// shard confirmed; otherwise the client is told the op is only partly applied
+/// — for `SCRIPT LOAD` too, which used to answer the sha over a shard that
+/// never got the body (moon#567: a redis-py `Lock.release()` then met
+/// `NOSCRIPT` for a sha the server had just returned). A client may re-issue
+/// either op; both are idempotent.
 async fn script_command_fanout(
     ctx: &super::core::ConnectionContext,
     shutdown: &crate::runtime::cancel::CancellationToken,
@@ -1467,10 +1471,10 @@ async fn script_command_fanout(
     }
     let partial = match fanout {
         None => None,
-        Some(crate::scripting::ScriptFanout::Load { script, epoch }) => {
-            let _ = script_fanout_bounded(ctx, shutdown, &script, epoch).await;
-            None
-        }
+        Some(crate::scripting::ScriptFanout::Load { script, epoch }) => partial_fanout_reply(
+            "SCRIPT LOAD",
+            script_fanout_bounded(ctx, shutdown, &script, epoch).await,
+        ),
         Some(crate::scripting::ScriptFanout::Flush { epoch }) => {
             script_flush_fanout(ctx, shutdown, epoch).await
         }

@@ -223,3 +223,26 @@ fn function_load_vs_flush_converges_at_shards_2() {
 fn function_load_vs_flush_converges_at_shards_4() {
     functions(4);
 }
+
+/// moon#567: a `SCRIPT LOAD` whose replay did not reach every shard must say
+/// so, as `SCRIPT FLUSH` and `FUNCTION LOAD` already do. It used to answer the
+/// sha over shards that never got the body, so the client's next `EVALSHA`
+/// met `NOSCRIPT` for a sha the server had just returned (the redis-py
+/// `Lock.release()` failure). Every peer is wedged so the outcome does not
+/// depend on which shard the connection lands on (see
+/// `script_function_fanout::sff12`).
+///
+/// Red on `d155cd6` / `ae21476`: the reply was `$40\r\n<sha>`.
+#[test]
+fn script_load_partial_fanout_is_reported_not_swallowed() {
+    let dir = common::unique_test_dir("ws18-script-load-partial");
+    let (guard, port) = spawn_env(&dir, 4, &[("MOON_TEST_DROP_FANOUT_TO_SHARD", "0,1,2,3")]);
+    let r = Conn::open(port).send(&["SCRIPT", "LOAD", "return 'ws18-partial'"]);
+    assert_eq!(
+        r,
+        "-MOONERR partialfanout SCRIPT LOAD applied on 1 of 4 shards; re-issue it to converge\r\n",
+        "a SCRIPT LOAD the server could not publish must not answer the sha"
+    );
+    drop(guard);
+    let _ = std::fs::remove_dir_all(&dir);
+}
