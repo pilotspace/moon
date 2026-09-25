@@ -129,17 +129,46 @@ fn failed_then_clean_save(shards: usize) {
     // later.
     std::thread::sleep(Duration::from_millis(1100));
 
-    // The failing save: a large epoch, then FLUSHALL while it writes.
-    preload(&mut c, 600_000);
-    let dirty_before = info_field(&mut c, "rdb_changes_since_last_save");
-    assert!(c.send(&["BGSAVE"]).contains("Background saving started"));
-    std::thread::sleep(Duration::from_millis(30));
-    assert!(c.send(&["FLUSHALL"]).starts_with('+'));
-    assert_eq!(
-        wait_bgsave(&mut c, Duration::from_secs(120)),
-        "err",
-        "fixture: FLUSHALL mid-BGSAVE must fail that save (moon#1224)"
-    );
+    // The failing save: a large epoch, then FLUSHALL while it writes. The
+    // save is confirmed running (`rdb_bgsave_in_progress:1`) before the
+    // FLUSHALL is sent (PR #1233 review). On a starved runner the save can
+    // still finish before the FLUSHALL lands — then it did not fail, which
+    // is the fixture missing its window, not the property under test: the
+    // failing save is set up again (at most three times), and every
+    // assertion below is about the save that did fail.
+    let mut attempt = 0;
+    let (saved_at, dirty_before) = loop {
+        attempt += 1;
+        let saved_at = lastsave(&mut c);
+        preload(&mut c, 600_000);
+        let dirty_before = info_field(&mut c, "rdb_changes_since_last_save");
+        assert!(c.send(&["BGSAVE"]).contains("Background saving started"));
+        let started = Instant::now();
+        while info_field(&mut c, "rdb_bgsave_in_progress") != "1" {
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "the BGSAVE never showed as in progress"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        std::thread::sleep(Duration::from_millis(30));
+        assert!(c.send(&["FLUSHALL"]).starts_with('+'));
+        match wait_bgsave(&mut c, Duration::from_secs(120)).as_str() {
+            "err" => break (saved_at, dirty_before),
+            status => {
+                assert!(
+                    attempt < 3,
+                    "fixture: FLUSHALL mid-BGSAVE never failed a save in {attempt} attempts \
+                     (moon#1224); last status {status}"
+                );
+                eprintln!(
+                    "--shards {shards}: attempt {attempt}: the save finished before FLUSHALL \
+                     landed ({status}); setting it up again"
+                );
+                std::thread::sleep(Duration::from_millis(1100));
+            }
+        }
+    };
     // Every broken promise is collected, so one run shows them all.
     let mut violations: Vec<String> = Vec::new();
     let failed_at = lastsave(&mut c);
