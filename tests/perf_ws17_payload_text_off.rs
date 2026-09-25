@@ -19,6 +19,14 @@ const VEC_A: &str = "ABCDEFGHIJKLMNOP";
 const VEC_B: &str = "PONMLKJIHGFEDCBA";
 
 fn spawn(dir: &std::path::Path, payload_text: Option<&str>) -> (common::ServerGuard, u16) {
+    spawn_with_schema(dir, payload_text, None)
+}
+
+fn spawn_with_schema(
+    dir: &std::path::Path,
+    payload_text: Option<&str>,
+    payload_schema: Option<&str>,
+) -> (common::ServerGuard, u16) {
     common::spawn_listening_guarded(|port| {
         let mut cmd = Command::new(common::find_moon_binary());
         cmd.args([
@@ -39,6 +47,9 @@ fn spawn(dir: &std::path::Path, payload_text: Option<&str>) -> (common::ServerGu
         .env_remove("MOON_VECTOR_PAYLOAD_SCHEMA");
         if let Some(v) = payload_text {
             cmd.env("MOON_VECTOR_PAYLOAD_TEXT", v);
+        }
+        if let Some(v) = payload_schema {
+            cmd.env("MOON_VECTOR_PAYLOAD_SCHEMA", v);
         }
         cmd.spawn().expect("spawn moon")
     })
@@ -163,4 +174,25 @@ fn the_default_server_still_answers_a_full_text_knn_filter() {
         Some("on"),
         "FT.INFO must report the setting: {info:?}"
     );
+}
+
+/// Declared-schema mode takes the same refusal through the YIELDING capture
+/// (`capture_dense_knn_snapshot`) as the sync path: `body` is not declared a
+/// TEXT field, so with the payload text index off a TextMatch on it cannot be
+/// answered and must be an error — not an empty result (moon#1226 residual).
+#[test]
+fn declared_schema_refuses_a_text_match_on_an_undeclared_field_on_every_path() {
+    let dir = common::unique_test_dir("ws17-payload-text-off-declared");
+    let (_guard, port) = spawn_with_schema(&dir, Some("off"), Some("declared"));
+    let mut c = common::Conn::open(port);
+    seed(&mut c);
+
+    for round in 0..3 {
+        let inline = knn(&mut c, "@body:{red apple}=>[KNN 3 @vec $qq]");
+        assert!(
+            inline.starts_with("-ERR full-text KNN filter"),
+            "round {round}: a TextMatch the declared schema cannot answer must be an error, \
+             got {inline:?}"
+        );
+    }
 }

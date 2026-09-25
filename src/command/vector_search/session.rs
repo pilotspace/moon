@@ -62,8 +62,8 @@ pub fn filter_session_results(
 ///
 /// moon#1226: this copies `results` — on the no-session path a pure clone.
 /// A caller that owns its results should call [`retain_unseen_in_db`], which
-/// filters them in place and copies nothing; this borrowed form remains only
-/// for the `ft_search/dispatch.rs` call sites, which switch at integration.
+/// filters them in place and copies nothing; FT.SEARCH does. This borrowed
+/// form is kept for callers that only hold a reference.
 pub fn filter_session_results_in_db(
     results: &SmallVec<[SearchResult; 32]>,
     db: &Database,

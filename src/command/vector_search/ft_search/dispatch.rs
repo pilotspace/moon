@@ -268,10 +268,10 @@ pub fn ft_search(
         if let (Some(sess_key), Some(db)) = (session_key.as_ref(), db.as_mut()) {
             // moon#1196: probe the live session set in place (was a full
             // member-map clone per query).
-            let sv: SmallVec<[SearchResult; 32]> = fused.drain(..).collect();
-            let filtered =
-                session::filter_session_results_in_db(&sv, db, sess_key, &key_hash_to_key);
-            fused = filtered.into_vec();
+            // moon#1226: filtered in place — no copy of the result set.
+            let mut sv: SmallVec<[SearchResult; 32]> = fused.drain(..).collect();
+            session::retain_unseen_in_db(&mut sv, db, sess_key, &key_hash_to_key);
+            fused = sv.into_vec();
 
             crate::vector::metrics::increment_search();
             let response = build_hybrid_response(
@@ -333,10 +333,10 @@ pub fn ft_search(
         if let (Some(sess_key), Some(db)) = (session_key.as_ref(), db.as_mut()) {
             // moon#1196: probe the live session set in place (was a full
             // member-map clone per query).
-            let sv: SmallVec<[SearchResult; 32]> = fused.drain(..).collect();
-            let filtered =
-                session::filter_session_results_in_db(&sv, db, sess_key, &key_hash_to_key);
-            fused = filtered.into_vec();
+            // moon#1226: filtered in place — no copy of the result set.
+            let mut sv: SmallVec<[SearchResult; 32]> = fused.drain(..).collect();
+            session::retain_unseen_in_db(&mut sv, db, sess_key, &key_hash_to_key);
+            fused = sv.into_vec();
 
             crate::vector::metrics::increment_search();
             let response = build_hybrid_response(
@@ -397,8 +397,8 @@ pub fn ft_search(
                 // Filter out previously returned results, probing the live
                 // session set in place (moon#1196: was a full member-map
                 // clone per query).
-                results =
-                    session::filter_session_results_in_db(&results, db, sess_key, &key_hash_to_key);
+                // moon#1226: in place — no copy of the result set.
+                session::retain_unseen_in_db(&mut results, db, sess_key, &key_hash_to_key);
 
                 // Apply RANGE threshold filter (AGNT-05). Dense KNN distances.
                 if let (Some(threshold), Some(_)) = (range_threshold, range_metric) {
@@ -627,6 +627,13 @@ pub(crate) fn capture_dense_knn_snapshot(
     // WS5a: db-scoped — falls back to the sync path's NOTFOUND for a
     // cross-db name collision, same as every other lookup in this module.
     let idx = store.get_index_mut_for_db(index_name, db_index)?;
+
+    // moon#1226: a TextMatch filter this index's payload text cannot answer is
+    // refused with an ERR by the sync path (`execute.rs`). Leave it there —
+    // captured here it would run as an empty filter and answer an empty result.
+    if filter.is_some_and(|f| idx.payload_index.text_match_refusal(f).is_some()) {
+        return None;
+    }
 
     // Default field only — non-default field stays on the sync path.
     let dim = match field_name {
