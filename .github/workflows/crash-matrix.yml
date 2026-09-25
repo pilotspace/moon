@@ -91,7 +91,10 @@ jobs:
       # come back after a restart. The recovery-level half runs per-PR as lib
       # tests; this real-server half (kill -9 and clean SHUTDOWN, DEL / FLUSHDB
       # / overwrite / TTL cases) is #[ignore]d like the other crash suites, so
-      # the nightly is its gate. Both fold layouts: per-shard (4) and flat (1).
+      # the nightly is its gate. The binary is monoio (default features), so
+      # `--shards 4` runs the per-shard fold and `--shards 1` the TopLevel
+      # manifest fold. The tokio flat-file fold (`--shards 1` on tokio) has
+      # no real-server leg here; only its lib tests cover it.
       # moon#1253: the same, for a key whose spill was still IN FLIGHT when it
       # was deleted, flushed or overwritten (no settle before the mutation).
       - name: Cold-tier DEL survives rewrite + restart (moon#1215), --shards 4 and 1
