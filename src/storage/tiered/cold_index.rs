@@ -151,6 +151,11 @@ pub struct ColdIndex {
     /// sweep ([`Self::drain_pending_unlink`]). Pushed only on a zero-ref
     /// transition (rare), so it does not allocate on the common insert path.
     pub(super) pending_unlink: Vec<u64>,
+    /// Listed spill files the boot rebuild found missing from disk (a lost
+    /// tombstone commit, see [`Self::drain_pending_unlink`]), queued in
+    /// `pending_unlink` by the rebuild. Consumed by the first drain: only
+    /// these may skip the moon#1231 hold. Empty outside recovery.
+    missing_at_rebuild: Vec<u64>,
     /// Running total of approximate resident bytes charged by [`Self::insert`]
     /// / [`Self::remove`] / the sweep methods' direct removals / [`Self::clear_all`]
     /// (K4 accounting spine, kernel-m2-brief-2026-07-12 stage 2).
@@ -189,6 +194,10 @@ pub struct ColdIndex {
     /// waiting for a committed AOF fold before they are adopted and the old
     /// files unlinked — the ledger's bound (see [`super::cold_reclaim`]).
     pub(super) reclaim: super::cold_reclaim::ReclaimState,
+    /// Zero-ref files a replayable AOF generation may still read, kept on
+    /// disk until a committed fold covers them (moon#1231) — see
+    /// [`super::unlink_hold`].
+    pub(super) hold: super::unlink_hold::UnlinkHold,
 }
 
 /// Approximate fixed cost of one cold-index entry beyond the key bytes: the
@@ -357,10 +366,12 @@ impl ColdIndex {
             map: BTreeMap::new(),
             file_refs: HashMap::new(),
             pending_unlink: Vec::new(),
+            missing_at_rebuild: Vec::new(),
             resident_bytes: 0,
             older_copies: HashMap::new(),
             dead: super::dead_slots::DeadSlots::default(),
             reclaim: super::cold_reclaim::ReclaimState::default(),
+            hold: super::unlink_hold::UnlinkHold::default(),
         }
     }
 
@@ -606,6 +617,12 @@ impl ColdIndex {
             self.older_copies.entry(key).or_default().extend(copies);
         }
         self.dead.merge(other.dead);
+        self.hold.merge(other.hold);
+        // Zero-ref files the other index queued (a rebuild queues the listed
+        // files it found missing): the drain re-checks references before it
+        // unlinks anything, so a file `self` references is kept.
+        self.pending_unlink.extend(other.pending_unlink);
+        self.missing_at_rebuild.extend(other.missing_at_rebuild);
     }
 
     /// Number of entries tracked.
@@ -619,14 +636,16 @@ impl ColdIndex {
         self.file_refs.keys().copied().max()
     }
 
-    /// Whether any zero-ref files are queued for unlink by the next sweep.
+    /// Whether any zero-ref files are queued for unlink by the next sweep,
+    /// or held until a committed fold covers them (moon#1231).
     ///
     /// Files orphaned by `insert` overwrite (re-eviction) or `remove`
     /// (promotion) carry no hot∩cold key, so the sweep trigger must consult
     /// this in addition to the orphan-key set — otherwise those files are never
-    /// reclaimed on ticks where no key is hot-shadowed.
+    /// reclaimed on ticks where no key is hot-shadowed. A held file needs the
+    /// sweep too: the sweep is what releases it once a fold has committed.
     pub fn has_pending_unlink(&self) -> bool {
-        !self.pending_unlink.is_empty()
+        !self.pending_unlink.is_empty() || !self.hold.is_empty()
     }
 
     /// How many zero-ref files are queued for unlink — `INFO MoonStore`'s
@@ -635,9 +654,25 @@ impl ColdIndex {
     /// The level behind [`Self::has_pending_unlink`]'s boolean. A number that
     /// stays high across sweeps means files are being orphaned faster than the
     /// sweep reclaims them, which is invisible from a boolean.
+    ///
+    /// Held files (moon#1231) count too: they are zero-ref and waiting, for a
+    /// committed fold rather than for the sweep.
     #[inline]
     pub fn pending_unlink_len(&self) -> usize {
-        self.pending_unlink.len()
+        self.pending_unlink.len() + self.hold.len()
+    }
+
+    /// Hand the next unlink decision a fresh reading of the shard's AOF fold
+    /// state (moon#1231). The orphan sweep calls this right before each of its
+    /// sweeps whenever the process has an AOF writer; see
+    /// [`super::unlink_hold`] for the rule it enables.
+    pub fn observe_fold(&mut self, view: super::unlink_hold::FoldView) {
+        self.hold.observe(view);
+    }
+
+    /// Whether `file_id` is held until a committed fold covers it (moon#1231).
+    pub fn is_unlink_held(&self, file_id: u64) -> bool {
+        self.hold.is_held(file_id)
     }
 
     /// How many distinct heap files still hold at least one live cold key —
@@ -898,6 +933,9 @@ impl ColdIndex {
         }
 
         if expired_keys.is_empty() {
+            // Nothing to unlink: the fold view (moon#1231) dies with this
+            // sweep rather than serve a later decision stale.
+            self.hold.end_decision();
             return Ok(SweepStats::default());
         }
 
@@ -950,36 +988,87 @@ impl ColdIndex {
     /// entries) — the commit error is surfaced only after best-effort
     /// reclamation, and a file whose unlink itself errors is re-queued for a
     /// later sweep rather than leaked.
+    ///
+    /// moon#1231: which queued files go now, which are held until a committed
+    /// fold covers them, and which held files that fold releases, is
+    /// [`super::unlink_hold::UnlinkHold::admit`]'s decision.
     fn drain_pending_unlink(
         &mut self,
         shard_dir: &Path,
         manifest: Option<&mut crate::persistence::manifest::ShardManifest>,
     ) -> std::io::Result<u64> {
-        if self.pending_unlink.is_empty() {
+        if self.pending_unlink.is_empty() && self.hold.is_empty() {
+            self.hold.end_decision();
             return Ok(0);
         }
         let queued = std::mem::take(&mut self.pending_unlink);
-        self.unlink_queued(queued, shard_dir, manifest)
+        // A listed file the boot rebuild found missing — a manifest whose
+        // tombstone commit a crash lost (the reclaim's deferred one,
+        // moon#1240, or this sweep's own unlink-then-commit) — has nothing
+        // left for the hold to protect: the rebuild indexed none of its keys.
+        // Retire its manifest entry at the first drain rather than after a
+        // committed fold, so the rebuild counts it (`files_missing`, a
+        // `DEGRADED` summary line) on one boot, not on every boot until a
+        // fold (moon#1231 review). Only THOSE ids, and only if still missing:
+        // a file that is merely unreachable while a live sweep runs (moon#875:
+        // a remount, an operator `mv` — the bytes come back) goes through the
+        // hold like any other, or a crash before the next fold would lose the
+        // keys the committed generation reads there (review 5).
+        let rebuilt_missing = std::mem::take(&mut self.missing_at_rebuild);
+        let (gone, queued): (Vec<u64>, Vec<u64>) = if rebuilt_missing.is_empty() {
+            (Vec::new(), queued)
+        } else {
+            let data_dir = shard_dir.join("data");
+            queued.into_iter().partition(|&file_id| {
+                rebuilt_missing.contains(&file_id)
+                    && !self.file_refs.contains_key(&file_id)
+                    && matches!(
+                        std::fs::symlink_metadata(data_dir.join(format!("heap-{file_id:06}.mpf"))),
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound
+                    )
+            })
+        };
+        let refs = &self.file_refs;
+        self.hold
+            .forget_referenced(|file_id| refs.contains_key(&file_id));
+        let mut admitted = self.hold.admit(queued);
+        self.pending_unlink.extend(admitted.requeue);
+        admitted.unlink.extend(gone);
+        if admitted.unlink.is_empty() {
+            return Ok(0);
+        }
+        self.unlink_queued(admitted.unlink, shard_dir, manifest, false)
     }
 
     /// [`Self::drain_pending_unlink`] for exactly the queued files among
     /// `file_ids`; every other queued file stays queued for the orphan
     /// sweep. The reclaim uses it to unlink the files it just emptied
     /// without advancing the sweep's own schedule for anything else.
+    ///
+    /// Its tombstone commit is DEFERRED (moon#1240: the reclaim runs from the
+    /// shard's tick and must not wait for an fsync): a lost one leaves a
+    /// listed-but-missing file, which recovery counts (`files_missing`) and
+    /// retires — the same window the orphan sweep's unlink-then-commit has.
+    ///
+    /// It bypasses the moon#1231 hold, including for a file already held:
+    /// the caller must know that no replayable generation reads the file —
+    /// the reclaim's adoption does, for an old file each of whose live slots
+    /// has a durable copy below the committed cut.
     pub fn unlink_now(
         &mut self,
         file_ids: &[u64],
         shard_dir: &Path,
         manifest: Option<&mut crate::persistence::manifest::ShardManifest>,
     ) -> std::io::Result<u64> {
-        let (now, later): (Vec<u64>, Vec<u64>) = std::mem::take(&mut self.pending_unlink)
+        let (mut now, later): (Vec<u64>, Vec<u64>) = std::mem::take(&mut self.pending_unlink)
             .into_iter()
             .partition(|id| file_ids.contains(id));
         self.pending_unlink = later;
+        now.extend(self.hold.take(file_ids));
         if now.is_empty() {
             return Ok(0);
         }
-        self.unlink_queued(now, shard_dir, manifest)
+        self.unlink_queued(now, shard_dir, manifest, true)
     }
 
     fn unlink_queued(
@@ -987,6 +1076,7 @@ impl ColdIndex {
         mut queued: Vec<u64>,
         shard_dir: &Path,
         mut manifest: Option<&mut crate::persistence::manifest::ShardManifest>,
+        deferred_commit: bool,
     ) -> std::io::Result<u64> {
         let data_dir = shard_dir.join("data");
         queued.sort_unstable();
@@ -1040,7 +1130,12 @@ impl ColdIndex {
         // Single manifest commit for all tombstones in this drain.
         if manifest_dirty {
             if let Some(m) = manifest {
-                if let Err(e) = m.commit() {
+                let committed = if deferred_commit {
+                    m.commit_deferred()
+                } else {
+                    m.commit()
+                };
+                if let Err(e) = committed {
                     tracing::error!(err = %e, "orphan_sweep: manifest commit failed");
                     return Err(e);
                 }
@@ -1142,9 +1237,11 @@ impl ColdIndex {
                                 path = %heap_path.display(),
                                 "cold recovery: manifest lists an Active heap file that is not \
                                  on disk; its keys (if any were live) now read as absent. Benign \
-                                 if the orphan sweep unlinked it before committing the manifest \
-                                 (nothing lost); otherwise the file was removed externally. \
-                                 Queued so the sweep retires the manifest entry"
+                                 if the orphan sweep or the cold reclaim's adoption unlinked it \
+                                 and a crash lost the manifest tombstone that followed (nothing \
+                                 lost; this boot's DEGRADED summary then counts it too); \
+                                 otherwise the file was removed externally. Queued so the first \
+                                 sweep retires the manifest entry"
                             );
                         }
                         match missing_per_db.iter_mut().find(|(d, _)| *d == db) {
@@ -1283,6 +1380,7 @@ impl ColdIndex {
                 let mut index = Self::from_pairs_newest_wins(pairs);
                 if let Some((_, ids)) = missing_per_db.iter().find(|(d, _)| *d == db) {
                     index.pending_unlink.extend_from_slice(ids);
+                    index.missing_at_rebuild.extend_from_slice(ids);
                 }
                 (db, index)
             })
@@ -1381,669 +1479,15 @@ impl ColdIndex {
             map,
             file_refs,
             pending_unlink,
+            missing_at_rebuild: Vec::new(),
             resident_bytes,
             older_copies,
             dead: super::dead_slots::DeadSlots::default(),
             reclaim: super::cold_reclaim::ReclaimState::default(),
+            hold: super::unlink_hold::UnlinkHold::default(),
         }
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn loc_in(file_id: u64, slot: u16) -> ColdLocation {
-        ColdLocation {
-            file_id,
-            page_idx: 0,
-            slot_idx: slot,
-            ttl_ms: None,
-            value_type: crate::persistence::kv_page::ValueType::String,
-        }
-    }
-
-    /// moon#656: `INFO MoonStore` reports the cold tier's file-level shape,
-    /// and the two counters it needs are already maintained here — they were
-    /// simply not readable from outside this module.
-    #[test]
-    fn referenced_file_count_tracks_files_with_at_least_one_live_key() {
-        let mut idx = ColdIndex::new();
-        assert_eq!(
-            idx.referenced_file_count(),
-            0,
-            "empty index references no file"
-        );
-
-        // Two keys co-located in one file, one key in another: two files,
-        // three keys. A batched spill file holds up to FLUSH_ENTRY_CAP keys,
-        // so file count and key count are genuinely independent numbers —
-        // which is the whole point of reporting both.
-        idx.insert(Bytes::from_static(b"a"), loc_in(7, 0));
-        idx.insert(Bytes::from_static(b"b"), loc_in(7, 1));
-        idx.insert(Bytes::from_static(b"c"), loc_in(9, 0));
-        assert_eq!(idx.referenced_file_count(), 2);
-        assert_eq!(idx.len(), 3);
-
-        // Removing one of two co-located keys must NOT drop the file: its
-        // sibling still lives there. This is the invariant whose violation
-        // once collapsed cold read-through 200/200 -> 88/200.
-        idx.remove(b"a");
-        assert_eq!(idx.referenced_file_count(), 2, "file 7 still holds key b");
-
-        idx.remove(b"b");
-        assert_eq!(idx.referenced_file_count(), 1, "file 7 is now unreferenced");
-    }
-
-    /// The count reported as `cold_files_pending_unlink` — files whose last
-    /// live reference dropped and which the sweep has not yet unlinked.
-    #[test]
-    fn pending_unlink_len_counts_files_awaiting_the_sweep() {
-        let mut idx = ColdIndex::new();
-        assert_eq!(idx.pending_unlink_len(), 0);
-        assert!(!idx.has_pending_unlink());
-
-        idx.insert(Bytes::from_static(b"a"), loc_in(7, 0));
-        idx.insert(Bytes::from_static(b"c"), loc_in(9, 0));
-        assert_eq!(
-            idx.pending_unlink_len(),
-            0,
-            "both files are still referenced"
-        );
-
-        idx.remove(b"a");
-        assert_eq!(idx.pending_unlink_len(), 1, "file 7 dropped to zero refs");
-        assert!(idx.has_pending_unlink());
-
-        idx.remove(b"c");
-        assert_eq!(idx.pending_unlink_len(), 2);
-
-        // The existing boolean and the new count must never disagree — the
-        // sweep trigger reads one and INFO reports the other.
-        assert_eq!(idx.has_pending_unlink(), idx.pending_unlink_len() > 0);
-    }
-
-    #[test]
-    fn test_cold_index_insert_lookup_remove() {
-        let mut idx = ColdIndex::new();
-        let loc = ColdLocation {
-            file_id: 1,
-            page_idx: 0,
-            slot_idx: 0,
-            ttl_ms: None,
-            value_type: crate::persistence::kv_page::ValueType::String,
-        };
-        idx.insert(Bytes::from_static(b"key1"), loc);
-        assert_eq!(idx.len(), 1);
-        let found = idx.lookup(b"key1").unwrap();
-        assert_eq!(found.file_id, 1);
-        assert_eq!(found.page_idx, 0);
-        assert_eq!(found.slot_idx, 0);
-        idx.remove(b"key1");
-        assert!(idx.lookup(b"key1").is_none());
-    }
-
-    #[test]
-    fn range_from_is_hash_ordered_and_resumable() {
-        // 200 entries paged via range_from must drain every key exactly
-        // once in ascending (hash48, key) order — the #368 cold-plane
-        // contract SCAN's merged page walk depends on.
-        let mut idx = ColdIndex::new();
-        let loc = ColdLocation {
-            file_id: 1,
-            page_idx: 0,
-            slot_idx: 0,
-            ttl_ms: None,
-            value_type: crate::persistence::kv_page::ValueType::String,
-        };
-        for i in 0..200 {
-            idx.insert(Bytes::from(format!("rk:{i}")), loc);
-        }
-        let mut seen: std::collections::HashSet<Bytes> = std::collections::HashSet::new();
-        let mut cursor = 0u64;
-        loop {
-            let page: Vec<(u64, Bytes)> = idx
-                .range_from(cursor)
-                .take(16)
-                .map(|(h, k, _)| (h, k.clone()))
-                .collect();
-            if page.is_empty() {
-                break;
-            }
-            let mut prev: Option<(u64, &Bytes)> = None;
-            for (h, k) in &page {
-                assert_eq!(*h, scan_h48(k.as_ref()), "stored hash must match key");
-                assert!(*h >= cursor, "entry below resume point");
-                if let Some((ph, pk)) = prev {
-                    assert!((ph, pk) < (*h, k), "not ascending by (hash, key)");
-                }
-                prev = Some((*h, k));
-                assert!(seen.insert(k.clone()), "duplicate across pages");
-            }
-            #[allow(clippy::unwrap_used)] // page verified non-empty above
-            let last = page.last().unwrap().0;
-            cursor = last + 1;
-        }
-        assert_eq!(seen.len(), 200, "every entry exactly once");
-    }
-
-    #[test]
-    fn lookup_and_remove_survive_equal_hash_range_probe() {
-        // lookup/remove go through an equal-hash range probe now; two keys
-        // in the index must stay independently addressable, and removing
-        // one must not disturb the other.
-        let mut idx = ColdIndex::new();
-        let mk = |fid| ColdLocation {
-            file_id: fid,
-            page_idx: 0,
-            slot_idx: 0,
-            ttl_ms: None,
-            value_type: crate::persistence::kv_page::ValueType::String,
-        };
-        idx.insert(Bytes::from_static(b"alpha"), mk(1));
-        idx.insert(Bytes::from_static(b"beta"), mk(2));
-        assert_eq!(idx.lookup(b"alpha").map(|l| l.file_id), Some(1));
-        assert_eq!(idx.lookup(b"beta").map(|l| l.file_id), Some(2));
-        assert!(!idx.remove(b"missing"));
-        assert!(idx.remove(b"alpha"));
-        assert!(idx.lookup(b"alpha").is_none());
-        assert_eq!(idx.lookup(b"beta").map(|l| l.file_id), Some(2));
-        assert_eq!(idx.len(), 1);
-    }
-
-    // ── K4 accounting spine: resident_bytes O(1) accumulator ─────────────
-
-    #[test]
-    fn resident_bytes_zero_when_empty() {
-        assert_eq!(ColdIndex::new().resident_bytes(), 0);
-    }
-
-    #[test]
-    fn resident_bytes_grows_on_insert_shrinks_on_remove() {
-        let mut idx = ColdIndex::new();
-        let loc = ColdLocation {
-            file_id: 1,
-            page_idx: 0,
-            slot_idx: 0,
-            ttl_ms: None,
-            value_type: crate::persistence::kv_page::ValueType::String,
-        };
-        idx.insert(Bytes::from_static(b"a_reasonably_long_key"), loc);
-        let after_one = idx.resident_bytes();
-        assert!(after_one > 0);
-
-        idx.insert(Bytes::from_static(b"another_key"), loc);
-        assert!(idx.resident_bytes() > after_one);
-
-        // The index part shrinks on remove; the removed slot is still on
-        // disk in file 1, so the dead-slot ledger now charges its key
-        // (moon#1215) until the file is unlinked.
-        let map_part = |idx: &ColdIndex| idx.resident_bytes() - idx.dead_slots().resident_bytes();
-        idx.remove(b"another_key");
-        assert_eq!(map_part(&idx), after_one);
-        assert_eq!(idx.dead_slots().len(), 1);
-
-        idx.remove(b"a_reasonably_long_key");
-        assert_eq!(map_part(&idx), 0);
-        assert_eq!(idx.resident_bytes(), idx.dead_slots().resident_bytes());
-        assert!(idx.dead_slots().resident_bytes() > 0);
-    }
-
-    #[test]
-    fn resident_bytes_overwrite_same_key_does_not_double_count() {
-        let mut idx = ColdIndex::new();
-        let loc_a = ColdLocation {
-            file_id: 1,
-            page_idx: 0,
-            slot_idx: 0,
-            ttl_ms: None,
-            value_type: crate::persistence::kv_page::ValueType::String,
-        };
-        let loc_b = ColdLocation {
-            file_id: 2,
-            page_idx: 0,
-            slot_idx: 1,
-            ttl_ms: None,
-            value_type: crate::persistence::kv_page::ValueType::String,
-        };
-        idx.insert(Bytes::from_static(b"key1"), loc_a);
-        let after_first = idx.resident_bytes();
-        // Overwrite the SAME key with a different location (re-eviction to a
-        // different file). Byte length is unchanged, so resident_bytes must
-        // not grow.
-        idx.insert(Bytes::from_static(b"key1"), loc_b);
-        assert_eq!(
-            idx.resident_bytes() - idx.dead_slots().resident_bytes(),
-            after_first
-        );
-        // The superseded slot in file 1 is recorded as dead (moon#1215).
-        assert!(idx.dead_slots().file_has_dead_slots(1));
-    }
-
-    #[test]
-    fn resident_bytes_zero_after_clear_all() {
-        let mut idx = ColdIndex::new();
-        let loc = ColdLocation {
-            file_id: 1,
-            page_idx: 0,
-            slot_idx: 0,
-            ttl_ms: None,
-            value_type: crate::persistence::kv_page::ValueType::String,
-        };
-        idx.insert(Bytes::from_static(b"key1"), loc);
-        idx.insert(Bytes::from_static(b"key2"), loc);
-        assert!(idx.resident_bytes() > 0);
-        idx.clear_all();
-        assert_eq!(idx.len(), 0);
-        // Only the dead-slot ledger remains charged: both slots stay on disk
-        // until the sweep unlinks file 1 (moon#1215).
-        assert_eq!(idx.resident_bytes(), idx.dead_slots().resident_bytes());
-        assert_eq!(idx.dead_slots().len(), 2);
-    }
-
-    /// Create a shard dir with a `data/` subdir and a dummy heap-NNNNNN.mpf
-    /// file standing in for a batched multi-KV spill file.
-    fn make_shard_with_heap(file_ids: &[u64]) -> tempfile::TempDir {
-        let tmp = tempfile::tempdir().unwrap();
-        let data_dir = tmp.path().join("data");
-        std::fs::create_dir_all(&data_dir).unwrap();
-        for &fid in file_ids {
-            let p = data_dir.join(format!("heap-{:06}.mpf", fid));
-            std::fs::write(&p, vec![0xABu8; 4096]).unwrap();
-        }
-        tmp
-    }
-
-    fn heap_path(shard_dir: &Path, file_id: u64) -> std::path::PathBuf {
-        shard_dir
-            .join("data")
-            .join(format!("heap-{:06}.mpf", file_id))
-    }
-
-    /// REGRESSION (batch-file shared-deletion data loss): sweeping ONE orphan
-    /// key must NOT delete its `.mpf` while a co-located live key still
-    /// references the same file. Under spill batching a single file holds up
-    /// to 256 KVs; deleting it on one orphan key silently orphans the rest
-    /// (observed empirically as cold read-through 200/200 -> 88/200).
-    #[test]
-    fn test_sweep_retains_file_with_colocated_live_key() {
-        let tmp = make_shard_with_heap(&[5]);
-        let shard_dir = tmp.path();
-
-        let mut ci = ColdIndex::new();
-        // Two keys co-located in the SAME batched file (file_id = 5).
-        ci.insert(
-            Bytes::from_static(b"k_orphan"),
-            ColdLocation {
-                file_id: 5,
-                page_idx: 0,
-                slot_idx: 0,
-                ttl_ms: None,
-                value_type: crate::persistence::kv_page::ValueType::String,
-            },
-        );
-        ci.insert(
-            Bytes::from_static(b"k_live"),
-            ColdLocation {
-                file_id: 5,
-                page_idx: 0,
-                slot_idx: 1,
-                ttl_ms: None,
-                value_type: crate::persistence::kv_page::ValueType::String,
-            },
-        );
-
-        let before_sweep = ci.resident_bytes();
-
-        // Sweep ONLY the orphan key.
-        ci.sweep_known_orphans(vec![Bytes::from_static(b"k_orphan")], shard_dir, None)
-            .unwrap();
-
-        // K4: resident_bytes must shrink by exactly the orphan's cost, via
-        // the direct `self.map.remove` inside `sweep_known_orphans` (the
-        // bypass site that does NOT go through the public `remove()`).
-        assert!(
-            ci.resident_bytes() < before_sweep,
-            "sweeping an orphan must shrink resident_bytes"
-        );
-
-        // The co-located live key must remain resolvable AND its file present.
-        assert!(
-            ci.lookup(b"k_live").is_some(),
-            "co-located live key dropped from cold index",
-        );
-        assert!(
-            heap_path(shard_dir, 5).exists(),
-            "DATA LOSS: file holding a live co-located key was deleted",
-        );
-        // The orphan entry itself is gone.
-        assert!(ci.lookup(b"k_orphan").is_none(), "orphan entry not removed");
-    }
-
-    /// A batched file is unlinked only once its LAST live ref is removed.
-    #[test]
-    fn test_sweep_deletes_file_only_when_last_ref_removed() {
-        let tmp = make_shard_with_heap(&[7]);
-        let shard_dir = tmp.path();
-
-        let mut ci = ColdIndex::new();
-        ci.insert(
-            Bytes::from_static(b"k1"),
-            ColdLocation {
-                file_id: 7,
-                page_idx: 0,
-                slot_idx: 0,
-                ttl_ms: None,
-                value_type: crate::persistence::kv_page::ValueType::String,
-            },
-        );
-        ci.insert(
-            Bytes::from_static(b"k2"),
-            ColdLocation {
-                file_id: 7,
-                page_idx: 0,
-                slot_idx: 1,
-                ttl_ms: None,
-                value_type: crate::persistence::kv_page::ValueType::String,
-            },
-        );
-
-        // Sweep k1: one ref remains (k2) -> file MUST survive.
-        ci.sweep_known_orphans(vec![Bytes::from_static(b"k1")], shard_dir, None)
-            .unwrap();
-        assert!(
-            heap_path(shard_dir, 7).exists(),
-            "file deleted while k2 still references it",
-        );
-
-        // Sweep k2: last ref removed -> file now reclaimed.
-        ci.sweep_known_orphans(vec![Bytes::from_static(b"k2")], shard_dir, None)
-            .unwrap();
-        assert!(
-            !heap_path(shard_dir, 7).exists(),
-            "file not reclaimed after its last ref was swept",
-        );
-    }
-
-    /// Re-eviction churn: `insert` overwriting a key's location (old file_id ->
-    /// new file_id) drops the old file to zero refs. The hot∩cold sweep can
-    /// never see this file (no key references it anymore), so the index must
-    /// enqueue it for reclamation and a subsequent sweep must unlink it.
-    #[test]
-    fn test_overwrite_reclaims_orphaned_old_file() {
-        let tmp = make_shard_with_heap(&[10, 11]);
-        let shard_dir = tmp.path();
-
-        let mut ci = ColdIndex::new();
-        ci.insert(
-            Bytes::from_static(b"k"),
-            ColdLocation {
-                file_id: 10,
-                page_idx: 0,
-                slot_idx: 0,
-                ttl_ms: None,
-                value_type: crate::persistence::kv_page::ValueType::String,
-            },
-        );
-        // Key re-spilled to a NEW file (re-eviction) -> file 10 orphaned.
-        ci.insert(
-            Bytes::from_static(b"k"),
-            ColdLocation {
-                file_id: 11,
-                page_idx: 0,
-                slot_idx: 0,
-                ttl_ms: None,
-                value_type: crate::persistence::kv_page::ValueType::String,
-            },
-        );
-
-        // A sweep with NO orphan keys must still drain the pending unlink.
-        ci.sweep_known_orphans(vec![], shard_dir, None).unwrap();
-
-        assert!(
-            !heap_path(shard_dir, 10).exists(),
-            "orphaned old file (10) not reclaimed after overwrite",
-        );
-        assert!(
-            heap_path(shard_dir, 11).exists(),
-            "live file (11) wrongly deleted",
-        );
-        assert_eq!(ci.lookup(b"k").map(|l| l.file_id), Some(11));
-    }
-
-    // ── R1 / H-2: proactive TTL-expiry sweep ────────────────────────────────
-
-    /// RED->GREEN: a cold entry whose TTL has passed and which is NEVER
-    /// re-read (no GET touches it — the on-read reclaim path never fires)
-    /// must still be reclaimed by `sweep_expired`. This is the exact leak
-    /// described in tmp/OFFLOAD-COMPRESSION-REVIEW.md R1: before this fix,
-    /// nothing else in the system ever looks at a cold entry's TTL except a
-    /// read that never comes.
-    #[test]
-    fn test_sweep_expired_reclaims_never_read_entry() {
-        let tmp = make_shard_with_heap(&[20]);
-        let shard_dir = tmp.path();
-
-        let mut ci = ColdIndex::new();
-        ci.insert(
-            Bytes::from_static(b"stale_session"),
-            ColdLocation {
-                file_id: 20,
-                page_idx: 0,
-                slot_idx: 0,
-                ttl_ms: Some(1_000), // expires at t=1000ms
-                value_type: crate::persistence::kv_page::ValueType::String,
-            },
-        );
-
-        assert!(ci.resident_bytes() > 0, "insert must charge resident_bytes");
-
-        // Sweep strictly after expiry. The key was never read.
-        let stats = ci
-            .sweep_expired(2_000, shard_dir, None, MAX_EXPIRED_SWEEP_BATCH)
-            .unwrap();
-
-        assert_eq!(
-            stats.entries_reclaimed, 1,
-            "sweep must reclaim the never-read expired entry"
-        );
-        // K4: the direct `self.map.remove` bypass inside `sweep_expired`
-        // must also decrement resident_bytes.
-        assert_eq!(
-            ci.resident_bytes(),
-            0,
-            "resident_bytes must drop to 0 once the only entry expires"
-        );
-        assert!(
-            stats.bytes_reclaimed > 0,
-            "sweep must reclaim the backing file's bytes (last live ref)"
-        );
-        assert!(
-            ci.lookup(b"stale_session").is_none(),
-            "index entry must be gone after sweep"
-        );
-        assert!(
-            !heap_path(shard_dir, 20).exists(),
-            "backing DataFile must be unlinked once its last live ref expires"
-        );
-    }
-
-    /// A cold entry with no TTL (`ttl_ms: None`) or a TTL still in the future
-    /// must NEVER be swept — only entries strictly past `now_ms` are expired.
-    #[test]
-    fn test_sweep_expired_ignores_live_entries() {
-        let tmp = make_shard_with_heap(&[21]);
-        let shard_dir = tmp.path();
-
-        let mut ci = ColdIndex::new();
-        ci.insert(
-            Bytes::from_static(b"no_ttl"),
-            ColdLocation {
-                file_id: 21,
-                page_idx: 0,
-                slot_idx: 0,
-                ttl_ms: None,
-                value_type: crate::persistence::kv_page::ValueType::String,
-            },
-        );
-        ci.insert(
-            Bytes::from_static(b"future_ttl"),
-            ColdLocation {
-                file_id: 21,
-                page_idx: 0,
-                slot_idx: 1,
-                ttl_ms: Some(5_000),
-                value_type: crate::persistence::kv_page::ValueType::String,
-            },
-        );
-
-        let stats = ci
-            .sweep_expired(1_000, shard_dir, None, MAX_EXPIRED_SWEEP_BATCH)
-            .unwrap();
-
-        assert_eq!(stats.entries_reclaimed, 0, "no entry has expired yet");
-        assert!(ci.lookup(b"no_ttl").is_some());
-        assert!(ci.lookup(b"future_ttl").is_some());
-        assert!(
-            heap_path(shard_dir, 21).exists(),
-            "file must survive when nothing has expired"
-        );
-    }
-
-    /// Batch-file colocation must hold for the TTL sweep exactly as it does
-    /// for the orphan-shadow sweep: an expired key must NOT drag down a
-    /// co-located LIVE key's file. The file unlinks only once BOTH entries
-    /// are gone (mirrors `test_sweep_deletes_file_only_when_last_ref_removed`).
-    #[test]
-    fn test_sweep_expired_retains_file_with_colocated_live_key() {
-        let tmp = make_shard_with_heap(&[22]);
-        let shard_dir = tmp.path();
-
-        let mut ci = ColdIndex::new();
-        ci.insert(
-            Bytes::from_static(b"expired"),
-            ColdLocation {
-                file_id: 22,
-                page_idx: 0,
-                slot_idx: 0,
-                ttl_ms: Some(1_000),
-                value_type: crate::persistence::kv_page::ValueType::String,
-            },
-        );
-        ci.insert(
-            Bytes::from_static(b"still_live"),
-            ColdLocation {
-                file_id: 22,
-                page_idx: 0,
-                slot_idx: 1,
-                ttl_ms: Some(9_999_000),
-                value_type: crate::persistence::kv_page::ValueType::String,
-            },
-        );
-
-        // First sweep: only "expired" is past TTL.
-        let stats1 = ci
-            .sweep_expired(2_000, shard_dir, None, MAX_EXPIRED_SWEEP_BATCH)
-            .unwrap();
-        assert_eq!(stats1.entries_reclaimed, 1);
-        assert!(ci.lookup(b"expired").is_none());
-        assert!(
-            ci.lookup(b"still_live").is_some(),
-            "co-located live-TTL key must remain resolvable"
-        );
-        assert!(
-            heap_path(shard_dir, 22).exists(),
-            "DATA LOSS: file holding a live co-located key was deleted"
-        );
-
-        // Second sweep, now past the second key's TTL too: last ref drops,
-        // file must finally be reclaimed.
-        let stats2 = ci
-            .sweep_expired(9_999_001, shard_dir, None, MAX_EXPIRED_SWEEP_BATCH)
-            .unwrap();
-        assert_eq!(stats2.entries_reclaimed, 1);
-        assert!(
-            !heap_path(shard_dir, 22).exists(),
-            "file must be reclaimed once its last live ref also expires"
-        );
-    }
-
-    /// Design-for-failure: `max_batch` bounds one call's work. With more
-    /// expired entries than the cap, a single call must reclaim at most
-    /// `max_batch` of them (never zero, never more) — the remainder is
-    /// picked up by a subsequent call, proving no per-tick unbounded stall.
-    #[test]
-    fn test_sweep_expired_respects_batch_cap() {
-        let tmp = make_shard_with_heap(&[23]);
-        let shard_dir = tmp.path();
-
-        let mut ci = ColdIndex::new();
-        for i in 0..10u16 {
-            ci.insert(
-                Bytes::from(format!("k{i}")),
-                ColdLocation {
-                    file_id: 23,
-                    page_idx: 0,
-                    slot_idx: i,
-                    ttl_ms: Some(1_000),
-                    value_type: crate::persistence::kv_page::ValueType::String,
-                },
-            );
-        }
-        assert_eq!(ci.len(), 10);
-
-        // Cap at 3 per call.
-        let stats1 = ci.sweep_expired(2_000, shard_dir, None, 3).unwrap();
-        assert_eq!(
-            stats1.entries_reclaimed, 3,
-            "one call must reclaim exactly max_batch entries when more are expired"
-        );
-        assert_eq!(ci.len(), 7, "the other 7 must remain for the next sweep");
-
-        // Draining the rest across further capped calls must eventually
-        // reach zero — no entry is permanently skipped by the cap.
-        let mut total_reclaimed = stats1.entries_reclaimed;
-        for _ in 0..10 {
-            if ci.len() == 0 {
-                break;
-            }
-            let s = ci.sweep_expired(2_000, shard_dir, None, 3).unwrap();
-            total_reclaimed += s.entries_reclaimed;
-        }
-        assert_eq!(
-            ci.len(),
-            0,
-            "all 10 expired entries must eventually reclaim"
-        );
-        assert_eq!(total_reclaimed, 10);
-    }
-
-    /// A sweep call with nothing expired must be a true no-op: zero entries
-    /// reclaimed, zero bytes, and it must not touch `pending_unlink` state
-    /// belonging to unrelated (non-TTL) reclamation paths.
-    #[test]
-    fn test_sweep_expired_noop_when_nothing_expired() {
-        let tmp = make_shard_with_heap(&[24]);
-        let shard_dir = tmp.path();
-
-        let mut ci = ColdIndex::new();
-        ci.insert(
-            Bytes::from_static(b"k"),
-            ColdLocation {
-                file_id: 24,
-                page_idx: 0,
-                slot_idx: 0,
-                ttl_ms: None,
-                value_type: crate::persistence::kv_page::ValueType::String,
-            },
-        );
-
-        let stats = ci
-            .sweep_expired(1_000, shard_dir, None, MAX_EXPIRED_SWEEP_BATCH)
-            .unwrap();
-        assert_eq!(stats.entries_reclaimed, 0);
-        assert_eq!(stats.bytes_reclaimed, 0);
-        assert!(!ci.has_pending_unlink());
-        assert_eq!(ci.len(), 1);
-    }
-}
+mod tests;

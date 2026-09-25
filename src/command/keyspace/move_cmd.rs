@@ -48,6 +48,19 @@ pub fn move_core(
     // moon#1228: an armed snapshot epoch needs the key's state in BOTH
     // databases before it leaves one and lands in the other.
     crate::persistence::snapshot_cow::capture_two_db(src, src_idx, Some(key), dst, dst_idx, key);
+    // moon#1232: a MOVE is ONE keyspace change in redis, and a refused one is
+    // none — its remove-and-put-back must not count two.
+    let reply = {
+        let _quiet = crate::admin::metrics_setup::mute_keyspace_changes();
+        move_core_uncounted(src, dst, key)
+    };
+    if matches!(reply, Frame::Integer(1)) {
+        crate::admin::metrics_setup::record_keyspace_changes(1);
+    }
+    reply
+}
+
+fn move_core_uncounted(src: &mut Database, dst: &mut Database, key: &[u8]) -> Frame {
     // Key must exist in src (lazy expiry applied inside `remove`)
     let entry = match src.remove(key) {
         Some(e) => e,

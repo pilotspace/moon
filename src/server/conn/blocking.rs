@@ -1610,7 +1610,14 @@ fn stream_read_immediate(
         return None;
     }
     let frame = if cmd.eq_ignore_ascii_case(b"XREADGROUP") {
-        crate::command::stream::xreadgroup(db, args)
+        // moon#1232 review 5: served at once it counts as `XREADGROUP` does
+        // through its dispatch arm; outside that arm it counted 0.
+        crate::command::keyspace_changes::counted(
+            db,
+            args,
+            crate::command::keyspace_changes::Rule::Streams,
+            crate::command::stream::xreadgroup,
+        )
     } else {
         crate::command::stream::xread(db, args)
     };
@@ -2308,7 +2315,29 @@ fn move_destination_error(db: &mut Database, source: &Bytes, dest: &Bytes) -> Op
 }
 
 /// Try to pop data immediately (non-blocking fast path).
+///
+/// moon#1232: counted as the non-blocking pop it is, by redis's rule
+/// ([`crate::command::keyspace_changes::blocking_pop_changes`]); the storage
+/// funnels it passes through are muted.
 pub(crate) fn try_immediate_pop(
+    cmd: &[u8],
+    db: &mut Database,
+    key: &Bytes,
+    args: &[Frame],
+) -> Option<Frame> {
+    let reply = {
+        let _quiet = crate::admin::metrics_setup::mute_keyspace_changes();
+        try_immediate_pop_uncounted(cmd, db, key, args)
+    };
+    if let Some(frame) = reply.as_ref() {
+        crate::admin::metrics_setup::record_keyspace_changes(
+            crate::command::keyspace_changes::blocking_pop_changes(cmd, frame),
+        );
+    }
+    reply
+}
+
+fn try_immediate_pop_uncounted(
     cmd: &[u8],
     db: &mut Database,
     key: &Bytes,

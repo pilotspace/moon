@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use bytes::Bytes;
 
 use super::cold_index::ColdIndex;
-use super::cold_reclaim::awaiting_fold;
+use super::cold_reclaim::{awaiting_fold, held_files_pressure};
 use crate::persistence::aof::fold_stream::{
     fold_image_channel, stream_fold_image, write_fold_image,
 };
@@ -392,4 +392,316 @@ fn after_adoption_a_restart_keeps_survivors_and_deletes_with_no_ledger_left() {
         "served from the compacted file, which is below the new cut"
     );
     assert_restart_is_exact(&mut db, "after adoption");
+}
+
+/// moon#1231 in the adoption: survivors read-promoted AFTER the fold that
+/// allows the adoption were cold in the old file at that fold, so the
+/// committed generation reads them there. Every survivor changed, so their
+/// copy is never listed — and then the old file is their only durable copy.
+/// The adoption must leave it to the orphan sweep's hold instead of
+/// unlinking it.
+#[test]
+fn survivors_promoted_after_the_fold_keep_the_old_file() {
+    let (tmp, shard_dir, mut live, _log) = live_compacted();
+    let image = fold(&live, NEW + 5);
+    for k in ["k08", "k09"] {
+        assert!(live.promote_cold_if_present(k.as_bytes(), 0), "promote {k}");
+    }
+    let mut manifest = ShardManifest::open(&shard_dir.join("shard-0.manifest")).expect("manifest");
+    let ci = live.cold_index.as_mut().expect("cold index");
+    let r = ci.adopt_compactions(1, &shard_dir, &mut manifest);
+    let old_kept = heap(&shard_dir, OLD).exists() && listed(&manifest, OLD);
+    drop(manifest);
+    let mut db = recover(tmp.path(), &shard_dir, &image);
+    assert_restart_is_exact(&mut db, "survivors promoted after the fold");
+    assert_eq!(
+        (
+            r.compactions,
+            r.files_listed,
+            r.keys_moved,
+            r.files_unlinked
+        ),
+        (1, 0, 0, 0)
+    );
+    assert!(
+        old_kept,
+        "the old file is the promoted survivors' only durable copy"
+    );
+}
+
+/// moon#1231 review: the adoption unlinks an old file only when EVERY output
+/// of its compaction was listed. `survivors_promoted_after_the_fold_keep_the_
+/// old_file` discards the only output, so `begin_adoption` returns before the
+/// rule is consulted; the rule matters when a compaction writes several
+/// outputs (survivors over the spill writer's 4 MiB batch cap) and only some
+/// are discarded. Here one big survivor is promoted after the fold: its
+/// output goes, the other is listed, and the old file must stay — it is the
+/// promoted key's only copy the committed generation can read.
+#[test]
+fn a_partially_discarded_compaction_keeps_the_old_file() {
+    // Over half the spill writer's 4 MiB batch cap: one output per survivor.
+    const BIG: usize = 3 * 1024 * 1024;
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let dir = tmp.path().join("shard-0");
+    std::fs::create_dir_all(&dir).expect("dir");
+    let mut manifest = ShardManifest::create(&dir.join("shard-0.manifest")).expect("manifest");
+    let mut entries: Vec<SpillEntry> = [("big:a", b'a'), ("big:b", b'b')]
+        .into_iter()
+        .map(|(k, fill)| SpillEntry {
+            key: Bytes::from_static(k.as_bytes()),
+            value_bytes: Bytes::from(vec![fill; BIG]),
+            value_type: ValueType::String,
+            flags: 0,
+            ttl_ms: None,
+        })
+        .collect();
+    for i in 0..4 {
+        entries.push(SpillEntry {
+            key: Bytes::from(format!("dead:{i}")),
+            value_bytes: Bytes::from_static(b"x"),
+            value_type: ValueType::String,
+            flags: 0,
+            ttl_ms: None,
+        });
+    }
+    let batch = build_kv_spill_batch(&entries, OLD).expect("batch");
+    let byte_size = write_kv_spill_batch(&dir, OLD, &batch).expect("write");
+    manifest
+        .add_file(FileEntry {
+            file_id: OLD,
+            file_type: PageType::KvLeaf as u8,
+            status: FileStatus::Active,
+            tier: StorageTier::Hot,
+            page_size_log2: 12,
+            page_count: batch.pages.len() as u32,
+            byte_size,
+            created_lsn: 0,
+            db_index: 0,
+            max_key_hash: 0,
+            last_modified_lsn: 0,
+        })
+        .expect("add");
+    manifest.commit().expect("commit");
+    let mut ci = ColdIndex::rebuild_from_manifest(&dir, &manifest);
+    for i in 0..4 {
+        assert!(ci.remove(format!("dead:{i}").as_bytes()));
+    }
+
+    // Compaction at epoch 0: one output file per big survivor.
+    let mut next = NEW;
+    ci.compact_file(OLD, 0, &dir, &mut next, 0)
+        .expect("compact");
+    assert!(
+        heap(&dir, NEW).exists() && heap(&dir, NEW + 1).exists(),
+        "fixture: two output files"
+    );
+
+    // A fold (snapshot epoch 1) cuts and commits: both survivors are cold in
+    // OLD at that fold, so its base does not hold them. AFTER the fold big:a
+    // is read-promoted: its output is discarded at adoption, big:b's listed.
+    assert!(ci.remove(b"big:a"), "promotion removes the cold entry");
+    let r = ci.adopt_compactions(1, &dir, &mut manifest);
+    assert_eq!((r.compactions, r.files_listed, r.keys_moved), (1, 1, 1));
+
+    // The committed generation still reads big:a from OLD, its only durable
+    // copy: OLD stays on disk and listed, and a restart finds big:a.
+    let reopened = ShardManifest::open(&dir.join("shard-0.manifest")).expect("reopen");
+    let rebuilt = ColdIndex::rebuild_from_manifest(&dir, &reopened);
+    assert!(
+        heap(&dir, OLD).exists() && listed(&reopened, OLD),
+        "the adoption unlinked OLD although big:a's copy was discarded (files_unlinked = {})",
+        r.files_unlinked
+    );
+    assert_eq!(r.files_unlinked, 0);
+    assert!(
+        rebuilt.lookup(b"big:a").is_some(),
+        "a restart of the committed generation cannot find big:a"
+    );
+}
+
+/// moon#1231 review: a database whose held spill files wait for a fold while
+/// the ledger is over its threshold is signalled on its own counter, which
+/// the auto-rewrite monitor answers even with `auto-aof-rewrite-percentage
+/// 0` (`auto_rewrite::reclaim_due`); a waiting compaction is not.
+#[test]
+fn held_files_pressure_is_signalled_apart_from_compactions() {
+    use super::unlink_hold::FoldView;
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let dir = tmp.path().join("shard-0");
+    std::fs::create_dir_all(&dir).expect("dir");
+    let mut manifest = ShardManifest::create(&dir.join("shard-0.manifest")).expect("manifest");
+    spill(&dir, &mut manifest, OLD, &keys(4));
+    let mut ci = ColdIndex::rebuild_from_manifest(&dir, &manifest);
+    for (k, _) in keys(4) {
+        assert!(ci.remove(k.as_bytes()));
+    }
+    // A fold is in flight (snapshot epoch 1, nothing committed): OLD, below
+    // its cut, is held by the sweep.
+    ci.observe_fold(FoldView {
+        epoch: 1,
+        committed_floor: 0,
+        next_file_id: OLD + 1,
+    });
+    ci.sweep_known_orphans(Vec::new(), &dir, Some(&mut manifest))
+        .expect("sweep");
+    assert!(ci.is_unlink_held(OLD) && heap(&dir, OLD).exists());
+
+    // Only this test signals held-file pressure, so the deltas are exact.
+    let before = held_files_pressure();
+    ci.note_held_files_pressure(true, 0);
+    ci.note_held_files_pressure(true, 0);
+    assert_eq!(held_files_pressure(), before + 1, "one signal per database");
+    ci.note_held_files_pressure(false, 0);
+    assert_eq!(held_files_pressure(), before, "the ledger is back under");
+    ci.note_held_files_pressure(true, 0);
+    ci.note_held_files_pressure(true, 2);
+    assert_eq!(
+        held_files_pressure(),
+        before,
+        "a committed fold past the hold's stamp leaves nothing to wait for"
+    );
+    ci.note_held_files_pressure(true, 0);
+    drop(ci);
+    assert_eq!(
+        held_files_pressure(),
+        before,
+        "a dropped index withdraws it"
+    );
+}
+
+/// moon#1231 review, moon#1240's split adoption: an output is LISTED in phase
+/// A because some survivor was unchanged, and every survivor changes before
+/// phase B (the listing's commit is in flight). Phase B re-points nothing
+/// into it, so it never gets a reference, never reaches `pending_unlink`
+/// (only a ref_dec to zero queues a file) and is never a reclaim candidate
+/// (no live key): it stayed listed, on disk and in the ledger until a
+/// restart. Queued, the orphan sweep's hold keeps it while the committed
+/// generation may read it and releases it after.
+#[test]
+fn an_output_whose_survivors_all_change_during_the_ack_is_reclaimed() {
+    use super::unlink_hold::FoldView;
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let dir = tmp.path().join("shard-0");
+    std::fs::create_dir_all(&dir).expect("dir");
+    let mut manifest = ShardManifest::create(&dir.join("shard-0.manifest")).expect("manifest");
+    let kvs = keys(10);
+    spill(&dir, &mut manifest, OLD, &kvs);
+    let mut ci = ColdIndex::rebuild_from_manifest(&dir, &manifest);
+    for (k, _) in kvs.iter().take(8) {
+        assert!(ci.remove(k.as_bytes()));
+    }
+    let mut next = NEW;
+    ci.compact_file(OLD, 0, &dir, &mut next, 0)
+        .expect("compact");
+
+    // Phase A: a fold past the compaction has committed; NEW is listed.
+    let a = ci.begin_adoption(1, &dir, &mut manifest);
+    assert_eq!(a.files_listed, 1);
+    // While the listing's commit is in flight both survivors change.
+    assert!(ci.remove(b"k08") && ci.remove(b"k09"));
+    // Phase B: nothing is re-pointed; OLD (every output listed) is unlinked.
+    let (mut moved, mut unlinked) = (0, 0);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let b = ci.finish_adoptions(&dir, &mut manifest);
+        moved += b.keys_moved;
+        unlinked += b.files_unlinked;
+        if ci.adoptions_in_flight() == 0 || std::time::Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    assert_eq!((moved, unlinked), (0, 1));
+
+    // The first sweep holds NEW: a fold that cut after it (epoch 5) has not
+    // committed, and the committed generation may still read NEW.
+    ci.observe_fold(FoldView {
+        epoch: 5,
+        committed_floor: 1,
+        next_file_id: 100,
+    });
+    ci.sweep_known_orphans(Vec::new(), &dir, Some(&mut manifest))
+        .expect("sweep");
+    assert!(
+        ci.is_unlink_held(NEW) && listed(&manifest, NEW) && heap(&dir, NEW).exists(),
+        "NEW is held while no fold after it has committed"
+    );
+    // Two later folds commit, the orphan sweep runs after each.
+    for e in [6, 7] {
+        ci.observe_fold(FoldView {
+            epoch: e,
+            committed_floor: e,
+            next_file_id: 100,
+        });
+        ci.sweep_known_orphans(Vec::new(), &dir, Some(&mut manifest))
+            .expect("sweep");
+    }
+    assert!(
+        !listed(&manifest, NEW) && !heap(&dir, NEW).exists(),
+        "output {NEW} has no live key, two committed folds later it is still listed and on \
+         disk (refs {:?}, queued {}, held {}, dead slots {})",
+        ci.file_refs.get(&NEW),
+        ci.pending_unlink.contains(&NEW),
+        ci.is_unlink_held(NEW),
+        ci.dead_slots().file_has_dead_slots(NEW)
+    );
+    assert!(
+        !ci.dead_slots().file_has_dead_slots(NEW),
+        "the unlinked output's ledger entries go with it"
+    );
+}
+
+/// moon#1231 review: a crash between the reclaim adoption's unlink of an old
+/// file and its DEFERRED tombstone commit (moon#1240) leaves the manifest
+/// listing a file that is gone. The rebuild counts it (`files_missing`, an
+/// error-level `DEGRADED` summary) and queues it for the sweep — whose hold
+/// kept it, like any file below the cut, until a committed fold: every boot
+/// before one repeated the false alarm. A file already gone has nothing to
+/// protect, so the first sweep retires its entry, hold or no hold.
+#[test]
+fn a_listed_file_gone_from_disk_is_retired_at_the_first_sweep() {
+    use super::unlink_hold::FoldView;
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let dir = tmp.path().join("shard-0");
+    std::fs::create_dir_all(&dir).expect("dir");
+    let mut manifest = ShardManifest::create(&dir.join("shard-0.manifest")).expect("manifest");
+    spill(&dir, &mut manifest, OLD, &keys(4));
+    spill(&dir, &mut manifest, NEW, &keys(2));
+    // The adoption unlinked OLD; the crash lost the tombstone.
+    std::fs::remove_file(heap(&dir, OLD)).expect("unlink");
+    let rebuilt = ColdIndex::rebuild_from_manifest_per_db(&dir, &manifest);
+    assert_eq!(rebuilt.report.files_missing, 1);
+    // Recovery attaches the per-db index as is; `merge` (recovery into an
+    // index that already exists) carries the queue too.
+    let mut ci = ColdIndex::new();
+    for (_, index) in rebuilt.per_db {
+        ci.merge(index);
+    }
+    assert!(ci.pending_unlink.contains(&OLD), "queued for retirement");
+
+    // A fold is in flight, none has committed since the boot: the hold is
+    // active and OLD is below its cut.
+    ci.observe_fold(FoldView {
+        epoch: 1,
+        committed_floor: 0,
+        next_file_id: 100,
+    });
+    ci.sweep_known_orphans(Vec::new(), &dir, Some(&mut manifest))
+        .expect("sweep");
+    assert!(
+        !listed(&manifest, OLD) && !ci.is_unlink_held(OLD),
+        "the missing file's entry is retired at the first sweep"
+    );
+    let reopened = ShardManifest::open(&dir.join("shard-0.manifest")).expect("reopen");
+    assert_eq!(
+        ColdIndex::rebuild_from_manifest_per_db(&dir, &reopened)
+            .report
+            .files_missing,
+        0,
+        "the next boot's rebuild is clean"
+    );
+    assert!(
+        listed(&manifest, NEW) && heap(&dir, NEW).exists(),
+        "a live file stays"
+    );
 }

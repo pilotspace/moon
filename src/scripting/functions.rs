@@ -230,7 +230,7 @@ impl FunctionRegistry {
         read_only: bool,
         acl: &crate::acl::ScriptAcl,
     ) -> Frame {
-        let (lib, _func_def) = match self.lookup(func_name) {
+        let (lib, func_def) = match self.lookup(func_name) {
             Some(pair) => pair,
             None => {
                 return Frame::Error(Bytes::from_static(b"ERR Function not found"));
@@ -243,6 +243,12 @@ impl FunctionRegistry {
         if read_only {
             crate::scripting::bridge::set_script_read_only(true);
         }
+        // moon#1241: a shrink-only write (DEL, UNLINK, ...) passes the OOM
+        // gate only in a function registered with `allow-oom`; redis 7.0
+        // refuses any other function as a whole while over maxmemory.
+        crate::scripting::bridge::set_script_oom_shrink_bypass(
+            func_def.flags & func_flags::ALLOW_OOM != 0,
+        );
 
         let timeout = std::time::Duration::from_secs(5);
         if crate::scripting::sandbox::install_timeout_hook(&lib.lua, timeout).is_err() {

@@ -1,0 +1,161 @@
+//! moon#1241 against a real server: inside a script, a command that can only
+//! shrink memory (DEL, UNLINK, ...) is not refused for memory on an
+//! over-budget shard — as on the connection path and the routed leg, and as
+//! redis allows (those commands are not `denyoom`). A growing command in a
+//! script is still refused.
+//!
+//! Replies, measured against redis-server 7.0.15 (`noeviction`, over
+//! maxmemory):
+//! - `EVAL "return redis.call('DEL', KEYS[1])" 1 k` -> `:1`
+//! - `EVAL "return redis.pcall('UNLINK', KEYS[1])" 1 k` -> `:1`
+//! - `EVAL "return redis.call('SET', KEYS[1], 'v')" 1 k` -> `-OOM ...`
+//! - `FCALL` of a function registered WITHOUT `allow-oom` -> `-OOM ...`, even
+//!   if it only deletes: redis refuses the whole call.
+//! - `FCALL` of a function registered with `flags={'allow-oom'}` that deletes
+//!   -> `:1`.
+//!
+//! Before the fix moon answered `-OOM` to all five (the script gate had no
+//! command in scope). Runs at `--shards 1` and 4; all keys share a hash tag,
+//! so every call runs on the one shard that is over budget.
+
+#![allow(clippy::unwrap_used)]
+
+mod common;
+
+use common::{Conn, ServerGuard};
+
+const TAG: &str = "{oom}";
+
+fn spawn(dir: &std::path::Path, shards: usize) -> (ServerGuard, u16) {
+    let bin = common::find_moon_binary();
+    let (child, port) = common::spawn_listening(|port| {
+        std::process::Command::new(&bin)
+            .args([
+                "--port",
+                &port.to_string(),
+                "--dir",
+                &dir.to_string_lossy(),
+                "--shards",
+                &shards.to_string(),
+                "--appendonly",
+                "no",
+                "--save",
+                "",
+                "--disk-offload",
+                "disable",
+                "--maxmemory",
+                "4mb",
+                "--maxmemory-policy",
+                "noeviction",
+                "--disk-free-min-pct",
+                "0",
+            ])
+            .stdout(common::server_stderr(dir))
+            .stderr(common::server_stderr(dir))
+            .spawn()
+            .expect("spawn moon (build it first, or set MOON_BIN)")
+    });
+    (ServerGuard::new(child), port)
+}
+
+/// SET 64 KiB values under the tag until the shard refuses even a tiny
+/// write for memory. Returns the keys written (all still there:
+/// `noeviction`).
+fn fill_until_oom(c: &mut Conn, next: &mut usize) -> Vec<String> {
+    let value = "x".repeat(64 * 1024);
+    let mut written = Vec::new();
+    for _ in 0..2_000 {
+        let probe = c.send(&["SET", &format!("{TAG}:probe"), "v"]);
+        if probe.starts_with("-OOM") {
+            return written;
+        }
+        assert!(probe.starts_with("+OK"), "SET probe: {probe}");
+        let key = format!("{TAG}:big:{next}");
+        *next += 1;
+        let reply = c.send(&["SET", &key, &value]);
+        if reply.starts_with("+OK") {
+            written.push(key);
+        } else {
+            assert!(reply.starts_with("-OOM"), "SET {key}: {reply}");
+        }
+    }
+    panic!("the shard never refused a write under noeviction with --maxmemory 4mb");
+}
+
+/// A key the tag's shard holds, with the shard over budget right now.
+fn over_budget_victim(c: &mut Conn, next: &mut usize, keys: &mut Vec<String>) -> String {
+    keys.extend(fill_until_oom(c, next));
+    keys.pop().expect("a key to delete")
+}
+
+fn script_oom(shards: usize) {
+    let dir = common::unique_test_dir(&format!("ws19-1241-s{shards}"));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (mut server, port) = spawn(&dir, shards);
+    let mut c = Conn::open(port);
+    let lib = "#!lua name=ws19oom\n\
+        redis.register_function('fdel', function(keys, args) return redis.call('DEL', keys[1]) end)\n\
+        redis.register_function{function_name='fdel_oom', \
+          callback=function(keys, args) return redis.call('DEL', keys[1]) end, flags={'allow-oom'}}";
+    let loaded = c.send(&["FUNCTION", "LOAD", lib]);
+    assert!(loaded.contains("ws19oom"), "FUNCTION LOAD: {loaded}");
+
+    let mut next = 0usize;
+    let mut keys = Vec::new();
+    let mut wrong: Vec<String> = Vec::new();
+    let mut check = |what: &str, reply: String, ok: bool| {
+        if !ok {
+            wrong.push(format!("{what} answered {:?}", reply.trim()));
+        }
+    };
+
+    // Refused, as redis refuses them.
+    let victim = over_budget_victim(&mut c, &mut next, &mut keys);
+    let reply = c.send(&[
+        "EVAL",
+        "return redis.call('SET', KEYS[1], 'v')",
+        "1",
+        &format!("{TAG}:new"),
+    ]);
+    let ok = reply.starts_with("-OOM");
+    check("script SET over budget", reply, ok);
+    let reply = c.send(&["FCALL", "fdel", "1", &victim]);
+    let ok = reply.starts_with("-OOM");
+    check("FCALL of a DEL-only function without allow-oom", reply, ok);
+    keys.push(victim);
+
+    // Allowed.
+    let victim = over_budget_victim(&mut c, &mut next, &mut keys);
+    let reply = c.send(&["EVAL", "return redis.call('DEL', KEYS[1])", "1", &victim]);
+    let ok = reply.trim() == ":1";
+    check("script DEL over budget", reply, ok);
+
+    let victim = over_budget_victim(&mut c, &mut next, &mut keys);
+    let reply = c.send(&[
+        "EVAL",
+        "return redis.pcall('UNLINK', KEYS[1])",
+        "1",
+        &victim,
+    ]);
+    let ok = reply.trim() == ":1";
+    check("script UNLINK (pcall) over budget", reply, ok);
+
+    let victim = over_budget_victim(&mut c, &mut next, &mut keys);
+    let reply = c.send(&["FCALL", "fdel_oom", "1", &victim]);
+    let ok = reply.trim() == ":1";
+    check("FCALL of an allow-oom DEL function over budget", reply, ok);
+
+    server.kill_now();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(wrong.is_empty(), "--shards {shards}: {wrong:#?}");
+}
+
+#[test]
+fn shrink_only_script_commands_over_budget_one_shard() {
+    script_oom(1);
+}
+
+#[test]
+fn shrink_only_script_commands_over_budget_four_shards() {
+    script_oom(4);
+}

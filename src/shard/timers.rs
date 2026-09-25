@@ -398,14 +398,38 @@ pub const COLD_ORPHAN_SWEEP_INTERVAL_SECS: u64 = 300;
 /// shard's databases). Spill, read-promotion, and eviction all run through
 /// the same single-threaded exclusivity, preventing TOCTOU races with either
 /// sweep.
+///
+/// # Which zero-ref files it unlinks (moon#1231)
+///
+/// With an AOF writer (`aof_pool`), every unlink decision gets a fresh
+/// [`FoldView`](crate::storage::tiered::unlink_hold::FoldView) — this
+/// shard's fold epoch, committed floor and spill-file counter
+/// (`spill_file_id`), read right before the decision on this thread — and a
+/// file a replayable generation may still read is held until a committed fold
+/// covers it (`storage::tiered::unlink_hold`). Without one, files go as soon
+/// as their last key does, as before.
 pub(crate) fn run_cold_orphan_sweep(
     shard_databases: &Arc<super::shared_databases::ShardDatabases>,
     shard_id: usize,
     shard_dir: &std::path::Path,
     mut manifest: Option<&mut crate::persistence::manifest::ShardManifest>,
     now_ms: u64,
+    aof_pool: Option<&Arc<crate::persistence::aof::AofWriterPool>>,
+    spill_file_id: &std::cell::Cell<u64>,
 ) {
     use crate::storage::tiered::cold_index::{MAX_EXPIRED_SWEEP_BATCH, SweepStats};
+
+    // Read at each decision, never cached across one: see `unlink_hold`.
+    let fold_view = || {
+        aof_pool.map(|pool| {
+            let overflow = pool.overflow_for(shard_id);
+            crate::storage::tiered::unlink_hold::FoldView {
+                epoch: overflow.stamp().0,
+                committed_floor: overflow.committed_floor().0,
+                next_file_id: spill_file_id.get(),
+            }
+        })
+    };
 
     let db_count = shard_databases.db_count();
     let mut total = SweepStats::default();
@@ -439,6 +463,9 @@ pub(crate) fn run_cold_orphan_sweep(
             // Phase 2: delete files + update cold_index (orphan-shadow reclaim).
             let stats = crate::shard::slice::with_shard_db(db_idx, |db| {
                 db.cold_index.as_mut().and_then(|ci| {
+                    if let Some(view) = fold_view() {
+                        ci.observe_fold(view);
+                    }
                     ci.sweep_known_orphans(orphan_keys, shard_dir, manifest.as_deref_mut())
                         .map_err(|e| {
                             tracing::error!(
@@ -466,6 +493,9 @@ pub(crate) fn run_cold_orphan_sweep(
         // rather than being gated by the `continue` above.
         let expired_stats = crate::shard::slice::with_shard_db(db_idx, |db| {
             db.cold_index.as_mut().and_then(|ci| {
+                if let Some(view) = fold_view() {
+                    ci.observe_fold(view);
+                }
                 ci.sweep_expired(
                     now_ms,
                     shard_dir,
@@ -793,6 +823,9 @@ pub(crate) fn run_mvcc_sweep(
         );
     }
 }
+
+#[cfg(test)]
+mod promote_sweep_tests;
 
 #[cfg(test)]
 mod tests {

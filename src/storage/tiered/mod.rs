@@ -15,10 +15,12 @@ pub mod file_id_seed;
 pub mod kv_serde;
 pub mod kv_spill;
 pub mod orphan_reservation;
+pub(crate) mod reclaim_io;
 #[cfg(test)]
 mod replay_older_copy_tests;
 pub mod segment_handle;
 pub mod spill_thread;
+pub mod unlink_hold;
 pub mod warm_tier;
 
 pub use segment_handle::{SegmentHandle, SegmentLifetime};

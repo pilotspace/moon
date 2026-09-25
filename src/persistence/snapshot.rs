@@ -1161,6 +1161,11 @@ pub fn shard_snapshot_load<D: std::borrow::BorrowMut<Database>>(
     databases: &mut [D],
     path: &Path,
 ) -> Result<usize, MoonError> {
+    // moon#1232 review 5: booting from a snapshot is no keyspace change —
+    // redis 7.0.15 starts with `rdb_changes_since_last_save:0`. Counted, every
+    // loaded key armed the `--save` rules: `--save "3 100"` rewrote the whole
+    // snapshot 3 s after every boot with no client write.
+    let _quiet = crate::admin::metrics_setup::mute_keyspace_changes();
     let data = std::fs::read(path).map_err(|e| SnapshotError::Io {
         path: path.to_path_buf(),
         source: e,

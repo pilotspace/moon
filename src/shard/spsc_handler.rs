@@ -1819,14 +1819,23 @@ pub(crate) fn handle_shard_message_shared(
             };
             let mut reg = blocking_registry.borrow_mut();
             reg.register(db_index, key.clone(), entry);
-            // Check if data is already available (race: data arrived before registration).
+            // Check if data is already available (race: data arrived before
+            // registration, or the client's shard could not see it). A serve
+            // of this waiter here is the command served at once and counts as
+            // its non-blocking twin (moon#1232 review 5).
             crate::shard::slice::with_shard_db(db_index, |guard| {
                 if guard.exists(&key) {
-                    crate::blocking::wakeup::try_wake_list_waiter(&mut reg, guard, db_index, &key);
-                    crate::blocking::wakeup::try_wake_zset_waiter(&mut reg, guard, db_index, &key);
-                    crate::blocking::wakeup::try_wake_stream_waiter(
-                        &mut reg, guard, db_index, &key,
-                    );
+                    crate::blocking::wakeup::serve_at_registration(wait_id, || {
+                        crate::blocking::wakeup::try_wake_list_waiter(
+                            &mut reg, guard, db_index, &key,
+                        );
+                        crate::blocking::wakeup::try_wake_zset_waiter(
+                            &mut reg, guard, db_index, &key,
+                        );
+                        crate::blocking::wakeup::try_wake_stream_waiter(
+                            &mut reg, guard, db_index, &key,
+                        );
+                    });
                 }
             });
         }

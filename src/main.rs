@@ -2207,9 +2207,6 @@ fn main() -> anyhow::Result<()> {
         shard_handles.push(handle);
     }
 
-    // Set up change counter for auto-save
-    let change_counter = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-
     let listener_cancel = cancel_token.clone();
 
     // v0.9 C-1 (#405): the cluster control plane (bus + gossip + election) is
@@ -2291,10 +2288,10 @@ fn main() -> anyhow::Result<()> {
                 let rules = moon::persistence::auto_save::parse_save_rules(&config.save);
                 if !rules.is_empty() {
                     let auto_save_token = cancel_token.child_token();
-                    let auto_save_counter = change_counter.clone();
+                    // moon#1232: the trigger reads the per-shard dirty counts
+                    // (`rdb_changes_since_last_save`); no counter to hand over.
                     tokio::spawn(moon::persistence::auto_save::run_auto_save_sharded(
                         rules,
-                        auto_save_counter,
                         auto_save_token,
                         snapshot_trigger_tx,
                     ));
@@ -2339,7 +2336,7 @@ fn main() -> anyhow::Result<()> {
             let rules = moon::persistence::auto_save::parse_save_rules(&config.save);
             if !rules.is_empty() {
                 let auto_save_token = cancel_token.child_token();
-                let auto_save_counter = change_counter.clone();
+                // moon#1232: see the tokio arm.
                 let snap_tx = snapshot_trigger_tx;
                 std::thread::Builder::new()
                     .name("auto-save".to_string())
@@ -2351,7 +2348,6 @@ fn main() -> anyhow::Result<()> {
                             "auto-save".to_string(),
                             moon::persistence::auto_save::run_auto_save_sharded(
                                 rules,
-                                auto_save_counter,
                                 auto_save_token,
                                 snap_tx,
                             ),
