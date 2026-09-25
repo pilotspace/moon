@@ -357,6 +357,14 @@ impl DeadSlots {
             .get(&file_id)
             .is_some_and(|f| !f.slots.is_empty())
     }
+
+    /// `(file_id, dead slots, charged bytes)` for every file with a dead
+    /// slot — what the reclaim chooses from (`cold_reclaim`). O(files).
+    pub fn files(&self) -> impl Iterator<Item = (u64, usize, usize)> + '_ {
+        self.by_file
+            .iter()
+            .map(|(&id, f)| (id, f.slots.len(), f.bytes))
+    }
 }
 
 #[cfg(test)]
@@ -452,7 +460,7 @@ mod tests {
         let base = d.resident_bytes();
         d.charge_in_transit(64);
         assert_eq!(d.resident_bytes(), base + 64);
-        let mut e = DeadSlots::default();
+        let e = DeadSlots::default();
         e.charge_in_transit(8);
         d.merge(e);
         assert_eq!(d.resident_bytes(), base + 72);

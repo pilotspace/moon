@@ -321,6 +321,8 @@ impl FoldOutcome {
     pub(crate) fn adopt(self, previous: FoldEpoch, overflow: &RewriteOverflow) -> FoldEpoch {
         if let FoldOutcome::Committed { floor } = self {
             overflow.heal_on_commit(floor);
+            // The shard's cold-tier reclaim waits for this (moon#1215).
+            overflow.note_committed(floor);
         }
         self.floor_after(previous)
     }

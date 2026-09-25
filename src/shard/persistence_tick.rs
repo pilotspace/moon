@@ -721,6 +721,20 @@ pub(crate) fn run_eviction_tick(
     // counter's current value and is written back with `max` below.
     let mut cursor = spill_file_id.get();
     let next_file_id = &mut cursor;
+
+    // moon#1215 / PR #1233 review: bound the dead-slot ledger by compacting
+    // mostly-dead spill files and adopting the compactions a committed AOF
+    // fold made safe (`storage::tiered::cold_reclaim`).
+    cold_reclaim_tick::run(
+        shard_databases,
+        shard_id,
+        runtime_config,
+        shard_manifest,
+        next_file_id,
+        offload_shard_dir,
+        aof_pool,
+        cascade_ledger_bytes,
+    );
     if server_config.disk_offload_enabled()
         && should_run_pressure_cascade(
             runtime_config,
@@ -2302,6 +2316,8 @@ pub(crate) fn handle_checkpoint_tick(
 
 #[cfg(test)]
 mod checkpoint_tick_tests;
+
+mod cold_reclaim_tick;
 
 #[cfg(test)]
 mod cascade_ledger_tests;

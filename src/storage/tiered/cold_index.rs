@@ -136,7 +136,7 @@ pub struct ColdIndex {
     /// plane can range-resume from a hash-space cursor (#368). The u64 is
     /// always `scan_h48` of the Bytes it is paired with — every mutation
     /// site derives it from the key, never stores it independently.
-    map: BTreeMap<(u64, Bytes), ColdLocation>,
+    pub(super) map: BTreeMap<(u64, Bytes), ColdLocation>,
     /// Reverse liveness: `file_id` -> count of live `map` entries pointing at it.
     ///
     /// A batched spill file (`heap-NNNNNN.mpf`) holds up to `FLUSH_ENTRY_CAP`
@@ -145,12 +145,12 @@ pub struct ColdIndex {
     /// on a single orphan key silently orphans its co-located keys — observed
     /// empirically as cold read-through collapsing 200/200 -> 88/200 once the
     /// orphan sweep runs.
-    file_refs: HashMap<u64, u32>,
+    pub(super) file_refs: HashMap<u64, u32>,
     /// `file_id`s that dropped to zero live refs (via an `insert` overwrite or a
     /// `remove`) and are awaiting unlink. Drained off the hot path by the orphan
     /// sweep ([`Self::drain_pending_unlink`]). Pushed only on a zero-ref
     /// transition (rare), so it does not allocate on the common insert path.
-    pending_unlink: Vec<u64>,
+    pub(super) pending_unlink: Vec<u64>,
     /// Running total of approximate resident bytes charged by [`Self::insert`]
     /// / [`Self::remove`] / the sweep methods' direct removals / [`Self::clear_all`]
     /// (K4 accounting spine, kernel-m2-brief-2026-07-12 stage 2).
@@ -178,13 +178,17 @@ pub struct ColdIndex {
     /// entry did, the key's only replayable base is the older copy below the
     /// cut. The gate reads it from here instead of treating the key as
     /// absent, which replayed every post-rewrite write onto an empty value.
-    older_copies: HashMap<Bytes, Vec<ColdLocation>>,
+    pub(super) older_copies: HashMap<Bytes, Vec<ColdLocation>>,
     /// Slots still on disk in a listed file that are no longer their key's
     /// entry here (moon#1215) — see [`super::dead_slots`]. Every path below
     /// that takes a slot out of `map` or `older_copies` records it, and
     /// [`Self::drain_pending_unlink`] forgets a file's entries once the file
     /// is gone. The AOF rewrite fold reads it to keep deleted keys deleted.
-    dead: super::dead_slots::DeadSlots,
+    pub(super) dead: super::dead_slots::DeadSlots,
+    /// Mostly-dead files compacted into new, not-yet-listed spill files,
+    /// waiting for a committed AOF fold before they are adopted and the old
+    /// files unlinked — the ledger's bound (see [`super::cold_reclaim`]).
+    pub(super) reclaim: super::cold_reclaim::ReclaimState,
 }
 
 /// Approximate fixed cost of one cold-index entry beyond the key bytes: the
@@ -312,7 +316,7 @@ const REBUILD_DETAIL_LOG_CAP: u64 = 16;
 
 /// Why one `PAGE_4K` chunk was not a usable `KvLeaf` page.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PageVerdict {
+pub(super) enum PageVerdict {
     Leaf,
     Overflow,
     BadHeader,
@@ -323,7 +327,7 @@ enum PageVerdict {
 /// Classify one page-sized chunk by its header BEFORE `KvLeafPage::from_bytes`
 /// gets a say — that constructor answers `None` for a valid overflow page and
 /// for a corrupt one alike, and only one of those is a loss.
-fn classify_page(chunk: &[u8]) -> PageVerdict {
+pub(super) fn classify_page(chunk: &[u8]) -> PageVerdict {
     use crate::persistence::page::{MoonPageHeader, PageType};
     let Some(hdr) = MoonPageHeader::read_from(chunk) else {
         return PageVerdict::BadHeader;
@@ -356,6 +360,7 @@ impl ColdIndex {
             resident_bytes: 0,
             older_copies: HashMap::new(),
             dead: super::dead_slots::DeadSlots::default(),
+            reclaim: super::cold_reclaim::ReclaimState::default(),
         }
     }
 
@@ -368,10 +373,11 @@ impl ColdIndex {
 
     /// The ledger's resident bytes — the part of [`Self::resident_bytes`] no
     /// eviction can free (PR #1233 review: charged at write admission, kept
-    /// out of the eviction and pressure-cascade targets). O(1).
+    /// out of the eviction and pressure-cascade targets), plus what pending
+    /// reclaim compactions hold until they are adopted. O(1).
     #[inline]
     pub fn dead_slot_bytes(&self) -> usize {
-        self.dead.resident_bytes()
+        self.dead.resident_bytes() + self.reclaim.resident_bytes()
     }
 
     /// Record a slot of `key` in `file_id` that never became its entry here —
@@ -439,7 +445,7 @@ impl ColdIndex {
     /// per-call walk.
     #[inline]
     pub fn resident_bytes(&self) -> usize {
-        self.resident_bytes + self.dead.resident_bytes()
+        self.resident_bytes + self.dead_slot_bytes()
     }
 
     /// Increment a file's live-ref count.
@@ -947,13 +953,42 @@ impl ColdIndex {
     fn drain_pending_unlink(
         &mut self,
         shard_dir: &Path,
-        mut manifest: Option<&mut crate::persistence::manifest::ShardManifest>,
+        manifest: Option<&mut crate::persistence::manifest::ShardManifest>,
     ) -> std::io::Result<u64> {
         if self.pending_unlink.is_empty() {
             return Ok(0);
         }
+        let queued = std::mem::take(&mut self.pending_unlink);
+        self.unlink_queued(queued, shard_dir, manifest)
+    }
+
+    /// [`Self::drain_pending_unlink`] for exactly the queued files among
+    /// `file_ids`; every other queued file stays queued for the orphan
+    /// sweep. The reclaim uses it to unlink the files it just emptied
+    /// without advancing the sweep's own schedule for anything else.
+    pub fn unlink_now(
+        &mut self,
+        file_ids: &[u64],
+        shard_dir: &Path,
+        manifest: Option<&mut crate::persistence::manifest::ShardManifest>,
+    ) -> std::io::Result<u64> {
+        let (now, later): (Vec<u64>, Vec<u64>) = std::mem::take(&mut self.pending_unlink)
+            .into_iter()
+            .partition(|id| file_ids.contains(id));
+        self.pending_unlink = later;
+        if now.is_empty() {
+            return Ok(0);
+        }
+        self.unlink_queued(now, shard_dir, manifest)
+    }
+
+    fn unlink_queued(
+        &mut self,
+        mut queued: Vec<u64>,
+        shard_dir: &Path,
+        mut manifest: Option<&mut crate::persistence::manifest::ShardManifest>,
+    ) -> std::io::Result<u64> {
         let data_dir = shard_dir.join("data");
-        let mut queued = std::mem::take(&mut self.pending_unlink);
         queued.sort_unstable();
         queued.dedup();
 
@@ -1349,6 +1384,7 @@ impl ColdIndex {
             resident_bytes,
             older_copies,
             dead: super::dead_slots::DeadSlots::default(),
+            reclaim: super::cold_reclaim::ReclaimState::default(),
         }
     }
 }

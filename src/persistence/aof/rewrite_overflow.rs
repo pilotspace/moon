@@ -92,6 +92,13 @@ pub struct RewriteOverflow {
     /// at a fold's snapshot instant; read by every producer when it stamps
     /// a record.
     epoch: std::sync::atomic::AtomicU64,
+    /// The snapshot epoch of the latest fold whose generation this writer
+    /// adopted as COMMITTED (`FoldOutcome::adopt`); `INITIAL` until one
+    /// commits. Only ever raised. A shard reads it to learn that a fold cut
+    /// after some instant of its own (stamped with [`Self::stamp`]) is now the
+    /// durable generation — the cold tier's reclaim waits for exactly that
+    /// before it lists a compacted spill file (moon#1215, PR #1233 review).
+    committed: std::sync::atomic::AtomicU64,
     /// Whether this writer's log is missing an acked append, and since when:
     /// `0` for no hole, otherwise one more than the highest fold epoch
     /// current at any drop not yet folded back in (see "Dropped appends"
@@ -145,6 +152,7 @@ impl RewriteOverflow {
             bytes: std::sync::atomic::AtomicUsize::new(0),
             max_bytes,
             epoch: std::sync::atomic::AtomicU64::new(FoldEpoch::INITIAL.0),
+            committed: std::sync::atomic::AtomicU64::new(FoldEpoch::INITIAL.0),
             missing_since: parking_lot::Mutex::new(0),
             #[cfg(test)]
             in_progress_at_finish: parking_lot::Mutex::new(None),
@@ -191,6 +199,22 @@ impl RewriteOverflow {
             *missing = 0;
             AOF_WRITERS_MISSING_APPENDS.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
         }
+    }
+
+    /// Record that the fold with snapshot epoch `floor` committed (see the
+    /// `committed` field). Called by `FoldOutcome::adopt`, never for an
+    /// aborted fold.
+    pub(crate) fn note_committed(&self, floor: FoldEpoch) {
+        self.committed
+            .fetch_max(floor.0, std::sync::atomic::Ordering::AcqRel);
+    }
+
+    /// The snapshot epoch of the latest committed fold (`INITIAL` if none).
+    /// A mutation stamped `e` (by [`Self::stamp`]) is captured by the
+    /// committed generation iff `e.folded_below(committed_floor())`.
+    #[inline]
+    pub fn committed_floor(&self) -> FoldEpoch {
+        FoldEpoch(self.committed.load(std::sync::atomic::Ordering::Acquire))
     }
 
     /// Whether this writer's log is missing an acked append no committed
@@ -1184,5 +1208,35 @@ mod tests {
         let floor_b = b.advance_epoch();
         FoldOutcome::Committed { floor: floor_b }.adopt(FoldEpoch::INITIAL, &b);
         assert!(!b.is_missing_appends());
+    }
+
+    /// moon#1215 reclaim: the committed floor moves only on a COMMITTED
+    /// fold, only upwards, and a mutation stamped before a fold's snapshot is
+    /// captured by it once it commits.
+    #[test]
+    fn the_committed_floor_follows_committed_folds_only() {
+        let ovf = RewriteOverflow::new();
+        assert_eq!(ovf.committed_floor(), FoldEpoch::INITIAL);
+        let before = ovf.stamp();
+        let aborted = ovf.advance_epoch();
+        let f = FoldOutcome::Aborted.adopt(FoldEpoch::INITIAL, &ovf);
+        assert_eq!(
+            ovf.committed_floor(),
+            FoldEpoch::INITIAL,
+            "abort: unchanged"
+        );
+        assert!(!before.folded_below(ovf.committed_floor()));
+        let floor = ovf.advance_epoch();
+        assert!(floor > aborted);
+        let after_snapshot = ovf.stamp();
+        FoldOutcome::Committed { floor }.adopt(f, &ovf);
+        assert_eq!(ovf.committed_floor(), floor);
+        assert!(before.folded_below(ovf.committed_floor()));
+        assert!(
+            !after_snapshot.folded_below(ovf.committed_floor()),
+            "a mutation after the snapshot is not in that generation"
+        );
+        ovf.note_committed(FoldEpoch::INITIAL);
+        assert_eq!(ovf.committed_floor(), floor, "never lowered");
     }
 }
