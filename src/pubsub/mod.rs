@@ -86,19 +86,12 @@ fn list_remove_ids(subs: &mut SubList, slow: &[u64]) -> bool {
     true
 }
 
-/// A keyspace-relevant exact channel / pattern gained its first subscriber
-/// (moon#1214 item 2). Called when a channel/pattern entry is CREATED.
-#[inline]
-fn note_keyspace_added(name: &[u8]) {
-    if crate::notify::subscription_targets_keyspace(name) {
-        crate::notify::keyspace_listener_added();
-    }
-}
-
 /// A keyspace-relevant exact channel / pattern lost its last subscriber
 /// (moon#1214 item 2). Called when a channel/pattern entry is REMOVED. Paired
-/// 1:1 with [`note_keyspace_added`] via the map's present↔absent transitions,
-/// so the global count never leaks and (saturating) never goes negative.
+/// 1:1 with the increment `subscribe` / `psubscribe` make when they CREATE an
+/// entry (after inserting it, moon#1226) via the map's present↔absent
+/// transitions, so the global count never leaks and (saturating) never goes
+/// negative.
 #[inline]
 fn note_keyspace_removed(name: &[u8]) {
     if crate::notify::subscription_targets_keyspace(name) {
@@ -168,8 +161,13 @@ impl PubSubRegistry {
             Some(subs) => list_push(subs, sub),
             None => {
                 // First subscriber for this channel: a present transition.
-                note_keyspace_added(&channel);
+                // Counted AFTER the entry exists — the count's Release pairs
+                // with the notify gate's Acquire (moon#1226, `crate::notify`).
+                let keyspace = crate::notify::subscription_targets_keyspace(&channel);
                 self.channels.insert(channel, Arc::new(vec![sub]));
+                if keyspace {
+                    crate::notify::keyspace_listener_added();
+                }
             }
         }
     }
@@ -247,9 +245,13 @@ impl PubSubRegistry {
                 return;
             }
         }
-        // New pattern entry: a present transition.
-        note_keyspace_added(&pattern);
+        // New pattern entry: a present transition, counted after the entry
+        // exists (moon#1226, see `subscribe`).
+        let keyspace = crate::notify::subscription_targets_keyspace(&pattern);
         self.patterns.push((pattern, Arc::new(vec![sub])));
+        if keyspace {
+            crate::notify::keyspace_listener_added();
+        }
     }
 
     /// Unsubscribe from a glob pattern by subscriber ID.
