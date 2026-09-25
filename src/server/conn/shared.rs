@@ -1420,6 +1420,32 @@ pub(crate) async fn script_flush_fanout(
     }
 }
 
+/// Run one `SCRIPT …` command for a connection and return the client's reply:
+/// the subcommand on this shard's cache, then the replay the other shards are
+/// owed. The one body behind both runtimes' live and MULTI paths, so a change
+/// to how SCRIPT mutations reach the shards is made once (refs moon#1235).
+pub(crate) async fn run_script_command(
+    ctx: &super::core::ConnectionContext,
+    shutdown: &crate::runtime::cancel::CancellationToken,
+    cmd_args: &[Frame],
+) -> Frame {
+    let (mut response, fanout) =
+        crate::scripting::handle_script_subcommand(&ctx.script_cache, cmd_args);
+    if let Some((sha1, script_bytes)) = fanout {
+        // E3: bounded fan-out — a full ring no longer silently diverges that
+        // shard's script cache.
+        script_fanout_bounded(ctx, shutdown, &sha1, &script_bytes).await;
+    }
+    // moon#1229: the flush above cleared THIS shard's cache only; reply once
+    // every shard has flushed (or say which did not).
+    if is_accepted_script_flush(cmd_args, &response)
+        && let Some(partial) = script_flush_fanout(ctx, shutdown).await
+    {
+        response = partial;
+    }
+    response
+}
+
 /// Whether `SCRIPT <args>` was a `FLUSH` the local cache accepted — one the
 /// other shards are still owed (moon#1229).
 #[must_use]
@@ -1805,6 +1831,45 @@ pub(crate) async fn function_registry_fanout(
             targets + 1,
         )))),
     }
+}
+
+/// Run one `FUNCTION …` command for a connection: apply it to this shard's
+/// registry and, for an accepted `LOAD`/`DELETE`/`FLUSH`, replay it on every
+/// other shard. Returns the client's reply.
+///
+/// The one body behind the live paths of both runtimes and the MULTI path, so
+/// a change to how FUNCTION mutations reach the shards is made once (refs
+/// moon#1235).
+pub(crate) async fn run_function_command(
+    ctx: &super::core::ConnectionContext,
+    shutdown: &crate::runtime::cancel::CancellationToken,
+    func_registry: &std::rc::Rc<std::cell::RefCell<Option<crate::scripting::FunctionRegistry>>>,
+    cmd_args: &[Frame],
+) -> Frame {
+    crate::server::conn::core::ensure_function_registry(func_registry, ctx);
+    // Borrow scoped to this block and released before the fan-out await: the
+    // registry `RefCell` is shared with this shard thread's SPSC drain loop,
+    // which applies INBOUND fan-outs — holding it across a yield would make an
+    // arriving library land on a borrowed cell and be dropped. A trailing
+    // `drop(guard)` is not enough: it satisfies the borrow checker but still
+    // trips `await_holding_refcell_ref`.
+    let mut response = {
+        let mut guard = func_registry.borrow_mut();
+        match guard.as_mut() {
+            Some(reg) => crate::command::functions::handle_function(reg, cmd_args),
+            // `ensure_function_registry` just filled the slot.
+            None => Frame::Error(Bytes::from_static(b"ERR function registry unavailable")),
+        }
+    };
+    // A replay that did not reach every shard REPLACES the local reply. The
+    // client asked for a server-wide mutation; `+OK` over a registry that
+    // answers differently per shard is the defect, not a shape to preserve.
+    if let Some(op) = function_fanout_op(cmd_args, &response)
+        && let Some(partial) = function_registry_fanout(ctx, shutdown, op).await
+    {
+        response = partial;
+    }
+    response
 }
 
 /// The fan-out replay a `FUNCTION` invocation owes the other shards, if any.
@@ -3241,25 +3306,8 @@ pub(crate) async fn try_handle_function_in_txn(
     if !cmd.eq_ignore_ascii_case(b"FUNCTION") {
         return false;
     }
-    crate::server::conn::core::ensure_function_registry(func_registry, ctx);
-    // Borrow scoped and released BEFORE the fan-out await: the drain loop needs
-    // this cell to apply arriving libraries, and `await_holding_refcell_ref`
-    // rejects holding it across a yield even with a trailing `drop`.
-    let mut response = {
-        let mut guard = func_registry.borrow_mut();
-        #[allow(clippy::unwrap_used)]
-        // ensure_function_registry guarantees Some
-        crate::command::functions::handle_function(guard.as_mut().unwrap(), cmd_args)
-    };
-    if let Some(op) = function_fanout_op(cmd_args, &response)
-        && let Some(partial) = function_registry_fanout(ctx, shutdown, op).await
-    {
-        // A replay that did not reach every shard REPLACES the local reply, for
-        // the same reason it does on the live path: a `+OK` over a registry that
-        // answers differently per shard is the defect, not a shape to preserve.
-        response = partial;
-    }
-    out.push(response);
+    // The live path's body (refs moon#1235).
+    out.push(run_function_command(ctx, shutdown, func_registry, cmd_args).await);
     true
 }
 

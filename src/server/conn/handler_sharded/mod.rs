@@ -1458,42 +1458,15 @@ pub(crate) async fn handle_connection_sharded_inner<
                     // fall through to the MULTI queue gate instead of executing.
                     if !conn.in_multi {
                         if cmd.eq_ignore_ascii_case(b"FUNCTION") {
-                            crate::server::conn::core::ensure_function_registry(&func_registry, ctx);
-                            // Borrow SCOPED to this block, so it is released
-                            // before the fan-out await: the registry RefCell is
-                            // shared with this shard thread's SPSC drain loop,
-                            // which applies INBOUND fan-outs. A trailing
-                            // `drop(guard)` satisfies the borrow checker but
-                            // still trips `await_holding_refcell_ref`.
-                            let mut response = {
-                                let mut guard = func_registry.borrow_mut();
-                                #[allow(clippy::unwrap_used)]
-                                // ensure_function_registry guarantees Some
-                                crate::command::functions::handle_function(
-                                    guard.as_mut().unwrap(), cmd_args,
+                            // Local apply + replay on every other shard
+                            // (moon#514); one body for both runtimes and the
+                            // MULTI path, see `run_function_command`.
+                            responses.push(
+                                crate::server::conn::shared::run_function_command(
+                                    ctx, &shutdown, &func_registry, cmd_args,
                                 )
-                            };
-                            // moon#514: FUNCTION is a server-wide verb; replay
-                            // LOAD/DELETE/FLUSH on every other shard.
-                            // A replay that did not reach every shard
-                            // REPLACES the local reply: the client asked for a
-                            // server-wide mutation, and `+OK` over a registry
-                            // that answers differently per shard is the defect
-                            // this fix removes, not a shape to keep on the
-                            // failure path.
-                            if let Some(op) = crate::server::conn::shared::function_fanout_op(
-                                cmd_args, &response,
-                            ) {
-                                if let Some(partial) =
-                                    crate::server::conn::shared::function_registry_fanout(
-                                        ctx, &shutdown, op,
-                                    )
-                                    .await
-                                {
-                                    response = partial;
-                                }
-                            }
-                            responses.push(response);
+                                .await,
+                            );
                             continue;
                         }
                         let is_fcall = cmd.eq_ignore_ascii_case(b"FCALL");
