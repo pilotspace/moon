@@ -1814,6 +1814,63 @@ if should_run "pubsub"; then
     # so this row guards the wiring; the two-live-subscriber case that actually
     # exposes the counting bug is tests/pubsub_resp3_push.rs::ps14.
     assert_match "PUBSUB NUMPAT (none)" PUBSUB NUMPAT
+
+    # moon#1234: DEL/UNLINK/GETDEL publish `del` (class g) once per REMOVED
+    # key, plain, spanning and in MULTI; moon published nothing. Captured on a
+    # raw connection subscribed to __keyevent@0__:del; see test-consistency.sh
+    # for the Lua row.
+    keyevent_del_capture() {
+        local port="$1" order="$2"; shift 2
+        redis-cli -p "$port" CONFIG SET notify-keyspace-events KEA >/dev/null 2>&1 || true
+        exec 3<>"/dev/tcp/127.0.0.1/${port}" || { echo "__CONNECT_FAILED__:${port}"; return 0; }
+        printf 'SUBSCRIBE __keyevent@0__:del\r\n' >&3
+        local line="" keys="" state=0 i
+        for i in 1 2 3 4 5 6 7 8; do
+            IFS= read -r -t 2 line <&3 || break
+            [[ "${line%$'\r'}" == ":1" ]] && break
+        done
+        printf '%s\n' "$@" | redis-cli -p "$port" >/dev/null 2>&1 || true
+        while IFS= read -r -t 1 line <&3; do
+            line="${line%$'\r'}"
+            case "$state" in
+                2) keys="${keys}${line} "; state=0 ;;
+                1) state=2 ;;
+                *) [[ "$line" == "__keyevent@0__:del" ]] && state=1 ;;
+            esac
+        done
+        exec 3>&-
+        redis-cli -p "$port" CONFIG SET notify-keyspace-events "" >/dev/null 2>&1 || true
+        if [[ "$order" == sorted ]]; then
+            printf '%s' "$keys" | tr ' ' '\n' | sed '/^$/d' | sort | tr '\n' ' '
+        else
+            printf '%s' "$keys"
+        fi
+    }
+    # Compare two captured transcripts as one row.
+    assert_same_capture() {
+        local desc="$1" redis_out="$2" moon_out="$3"
+        TOTAL=$((TOTAL + 1))
+        if [[ "$redis_out" == "$moon_out" ]]; then
+            PASS=$((PASS + 1))
+        else
+            FAIL=$((FAIL + 1))
+            echo "  FAIL: $desc"
+            echo "    REDIS: $redis_out"
+            echo "    MOON:  $moon_out"
+        fi
+    }
+    for c in rcli mcli; do
+        $c DEL {kn}:a {kn}:b {kn}:c {kn}:t >/dev/null 2>&1
+        $c SET {kn}:a 1 >/dev/null 2>&1
+        $c RPUSH {kn}:b x >/dev/null 2>&1
+        $c SET {kn}:c 3 >/dev/null 2>&1
+        for i in 1 2 3 4 5 6 7 8; do $c DEL kn:span:$i >/dev/null 2>&1; done
+        for i in 1 3 5 7; do $c SET kn:span:$i v >/dev/null 2>&1; done
+    done
+    assert_same_capture "keyevent del: DEL/UNLINK/GETDEL (moon#1234)"         "$(keyevent_del_capture "$PORT_REDIS" seq 'DEL {kn}:a {kn}:nx {kn}:a' 'UNLINK {kn}:b' 'GETDEL {kn}:c' 'GETDEL {kn}:c')"         "$(keyevent_del_capture "$PORT_RUST"  seq 'DEL {kn}:a {kn}:nx {kn}:a' 'UNLINK {kn}:b' 'GETDEL {kn}:c' 'GETDEL {kn}:c')"
+    assert_same_capture "keyevent del: spanning DEL (moon#1234)"         "$(keyevent_del_capture "$PORT_REDIS" sorted 'DEL kn:span:1 kn:span:2 kn:span:3 kn:span:4 kn:span:5 kn:span:6 kn:span:7 kn:span:8')"         "$(keyevent_del_capture "$PORT_RUST"  sorted 'DEL kn:span:1 kn:span:2 kn:span:3 kn:span:4 kn:span:5 kn:span:6 kn:span:7 kn:span:8')"
+    rcli SET {kn}:t v >/dev/null 2>&1; mcli SET {kn}:t v >/dev/null 2>&1
+    assert_same_capture "keyevent del: MULTI DEL+UNLINK (moon#1234)"         "$(keyevent_del_capture "$PORT_REDIS" seq 'MULTI' 'DEL {kn}:t' 'UNLINK {kn}:t' 'EXEC')"         "$(keyevent_del_capture "$PORT_RUST"  seq 'MULTI' 'DEL {kn}:t' 'UNLINK {kn}:t' 'EXEC')"
 fi
 
 # ===========================================================================

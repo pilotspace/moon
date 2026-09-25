@@ -3155,6 +3155,65 @@ assert_tracking "tracking: ZRANGESTORE DEST invalidated [control]" \
     "{tz}:r" "ZRANGE {tz}:r 0 -1" ZRANGESTORE {tz}:r {tz}:a 0 -1
 
 # ---------------------------------------------------------------------------
+# moon#1234 -- DEL, UNLINK and GETDEL publish the `del` keyspace event (class
+# g) once per key they REMOVE, and nothing for an absent key: plain, spanning
+# (keys on several shards), inside MULTI/EXEC and from Lua. Moon published
+# nothing on any path. The capture subscribes to __keyevent@0__:del on a raw
+# connection, runs the commands down ONE redis-cli connection, and collects the
+# payload keys; the spanning row sorts them (several shards publish, and their
+# relative order is the mesh's, not the command line's). Checked against
+# redis-server 7.0.15 at --shards 1 and 4.
+# ---------------------------------------------------------------------------
+keyevent_del_capture() {
+    local port="$1" order="$2"; shift 2
+    redis-cli -p "$port" CONFIG SET notify-keyspace-events KEA >/dev/null 2>&1 || true
+    exec 3<>"/dev/tcp/127.0.0.1/${port}" || { echo "__CONNECT_FAILED__:${port}"; return 0; }
+    printf 'SUBSCRIBE __keyevent@0__:del\r\n' >&3
+    local line="" keys="" state=0 i
+    for i in 1 2 3 4 5 6 7 8; do
+        IFS= read -r -t 2 line <&3 || break
+        [[ "${line%$'\r'}" == ":1" ]] && break
+    done
+    printf '%s\n' "$@" | redis-cli -p "$port" >/dev/null 2>&1 || true
+    while IFS= read -r -t 1 line <&3; do
+        line="${line%$'\r'}"
+        case "$state" in
+            2) keys="${keys}${line} "; state=0 ;;
+            1) state=2 ;;
+            *) [[ "$line" == "__keyevent@0__:del" ]] && state=1 ;;
+        esac
+    done
+    exec 3>&-
+    redis-cli -p "$port" CONFIG SET notify-keyspace-events "" >/dev/null 2>&1 || true
+    if [[ "$order" == sorted ]]; then
+        printf '%s' "$keys" | tr ' ' '\n' | sed '/^$/d' | sort | tr '\n' ' '
+    else
+        printf '%s' "$keys"
+    fi
+}
+
+both DEL {kn}:a {kn}:b {kn}:c {kn}:t
+both SET {kn}:a 1
+both RPUSH {kn}:b x
+both SET {kn}:c 3
+assert_eq "moon#1234 DEL/UNLINK/GETDEL publish del per removed key" \
+    "$(keyevent_del_capture "$PORT_REDIS" seq 'DEL {kn}:a {kn}:nx {kn}:a' 'UNLINK {kn}:b' 'GETDEL {kn}:c' 'GETDEL {kn}:c')" \
+    "$(keyevent_del_capture "$PORT_RUST"  seq 'DEL {kn}:a {kn}:nx {kn}:a' 'UNLINK {kn}:b' 'GETDEL {kn}:c' 'GETDEL {kn}:c')"
+for i in 1 2 3 4 5 6 7 8; do both DEL kn:span:$i; done
+for i in 1 3 5 7; do both SET kn:span:$i v; done
+assert_eq "moon#1234 spanning DEL publishes del for every removed key" \
+    "$(keyevent_del_capture "$PORT_REDIS" sorted 'DEL kn:span:1 kn:span:2 kn:span:3 kn:span:4 kn:span:5 kn:span:6 kn:span:7 kn:span:8')" \
+    "$(keyevent_del_capture "$PORT_RUST"  sorted 'DEL kn:span:1 kn:span:2 kn:span:3 kn:span:4 kn:span:5 kn:span:6 kn:span:7 kn:span:8')"
+both SET {kn}:t v
+assert_eq "moon#1234 MULTI DEL+UNLINK of one key publishes one del" \
+    "$(keyevent_del_capture "$PORT_REDIS" seq 'MULTI' 'DEL {kn}:t' 'UNLINK {kn}:t' 'EXEC')" \
+    "$(keyevent_del_capture "$PORT_RUST"  seq 'MULTI' 'DEL {kn}:t' 'UNLINK {kn}:t' 'EXEC')"
+both SET {kn}:l1 v
+assert_eq "moon#1234 Lua redis.call DEL publishes del" \
+    "$(keyevent_del_capture "$PORT_REDIS" seq 'EVAL "return redis.call(\"DEL\", KEYS[1], KEYS[2])" 2 {kn}:l1 {kn}:l2')" \
+    "$(keyevent_del_capture "$PORT_RUST"  seq 'EVAL "return redis.call(\"DEL\", KEYS[1], KEYS[2])" 2 {kn}:l1 {kn}:l2')"
+
+# ---------------------------------------------------------------------------
 # moon#1013 -- a key that EXPIRES must invalidate exactly like one a command
 # writes. Moon's expiry sweep deleted the key and told keyspace notifications
 # and replicas, but never CLIENT TRACKING, so a client-side cache served the
