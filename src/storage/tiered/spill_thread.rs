@@ -824,8 +824,15 @@ impl SpillThread {
 
     /// Whether the superseded sets need a prune now: the watermark moved past
     /// the last one, or the thread is dead. Records the watermark as pruned.
-    pub(crate) fn take_prune(&self, done_below: u64) -> Option<SupersededPrune> {
-        if self.is_dead() {
+    ///
+    /// `was_dead` is [`Self::is_dead`] sampled BEFORE `done_below` was read
+    /// and the completions drained (refs moon#1253, review 5): a thread seen
+    /// dead then had sent everything it ever will, and the drain applied it.
+    /// Sampled after the drain, a thread that sent one more completion and
+    /// died in between had its entries cleared while that completion was
+    /// still queued, un-applied — which reopens the moon#1253 fold window.
+    pub(crate) fn take_prune(&self, done_below: u64, was_dead: bool) -> Option<SupersededPrune> {
+        if was_dead {
             return Some(SupersededPrune::All);
         }
         if done_below > self.pruned_below.fetch_max(done_below, Ordering::Relaxed) {
@@ -838,11 +845,19 @@ impl SpillThread {
     /// The thread exited while nobody asked it to stop (a panic): no
     /// completion will arrive for anything it had not flushed.
     pub fn is_dead(&self) -> bool {
-        !self.stop_flag.load(Ordering::Acquire)
+        let dead = !self.stop_flag.load(Ordering::Acquire)
             && self
                 .join_handle
                 .as_ref()
-                .is_some_and(std::thread::JoinHandle::is_finished)
+                .is_some_and(std::thread::JoinHandle::is_finished);
+        if dead {
+            // `is_finished` is a relaxed read of the value the thread's exit
+            // released; this fence orders everything the thread did before it
+            // exited (its last completion sends included) before the caller's
+            // next read of the completion channel.
+            std::sync::atomic::fence(Ordering::Acquire);
+        }
+        dead
     }
 
     /// A spill thread whose thread exited without being asked to (tests of
