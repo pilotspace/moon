@@ -46,7 +46,7 @@
 //! would come back the moment the key dies again.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use bytes::Bytes;
 
@@ -86,6 +86,44 @@ struct FileDead {
 /// Set once an AOF writer's fold state exists in this process (see the
 /// module doc). Never cleared: a writer lives for the process.
 static LEDGER_ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// Dead slots held by every ledger in the process — every shard, every
+/// database (`INFO` Memory `cold_dead_slots`).
+static DEAD_SLOTS_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// Their charged bytes, a fold's in-flight chunks included (`INFO` Memory
+/// `cold_dead_slot_bytes`).
+static DEAD_SLOT_BYTES_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// `(dead slots, charged bytes)` summed over every ledger in the process.
+/// Maintained by every ledger mutation (a relaxed add or sub each, on the
+/// cold paths that record or forget a slot), so reading it is two loads —
+/// no walk of any shard's state.
+pub fn totals() -> (u64, u64) {
+    (
+        DEAD_SLOTS_TOTAL.load(Ordering::Relaxed),
+        DEAD_SLOT_BYTES_TOTAL.load(Ordering::Relaxed),
+    )
+}
+
+#[inline]
+fn totals_add(slots: usize, bytes: usize) {
+    if slots != 0 {
+        DEAD_SLOTS_TOTAL.fetch_add(slots as u64, Ordering::Relaxed);
+    }
+    if bytes != 0 {
+        DEAD_SLOT_BYTES_TOTAL.fetch_add(bytes as u64, Ordering::Relaxed);
+    }
+}
+
+#[inline]
+fn totals_sub(slots: usize, bytes: usize) {
+    if slots != 0 {
+        DEAD_SLOTS_TOTAL.fetch_sub(slots as u64, Ordering::Relaxed);
+    }
+    if bytes != 0 {
+        DEAD_SLOT_BYTES_TOTAL.fetch_sub(bytes as u64, Ordering::Relaxed);
+    }
+}
 
 /// An AOF fold can consume the ledger from now on. Called when an AOF
 /// writer's fold state is created (`aof::rewrite::RewriteOverflow::new`),
@@ -172,6 +210,14 @@ impl Default for DeadSlots {
     }
 }
 
+impl Drop for DeadSlots {
+    /// A dropped ledger (its database's cold index replaced or freed) leaves
+    /// the process totals.
+    fn drop(&mut self) {
+        totals_sub(self.len, self.resident_bytes + *self.in_transit.get_mut());
+    }
+}
+
 impl DeadSlots {
     /// Record that `file_id` holds a slot of `key` (absolute TTL `ttl_ms`)
     /// that is no longer the key's cold-index entry. A no-op when no AOF fold
@@ -187,6 +233,7 @@ impl DeadSlots {
         }
         self.resident_bytes += cost;
         self.len += 1;
+        totals_add(1, cost);
         let file = self.by_file.entry(file_id).or_default();
         file.bytes += cost;
         file.slots.push(DeadSlot { key, ttl_ms });
@@ -197,6 +244,7 @@ impl DeadSlots {
         if let Some(file) = self.by_file.remove(&file_id) {
             self.len -= file.slots.len();
             self.resident_bytes = self.resident_bytes.saturating_sub(file.bytes);
+            totals_sub(file.slots.len(), file.bytes);
         }
     }
 
@@ -230,12 +278,14 @@ impl DeadSlots {
         self.earliest_ttl = earliest;
         self.len -= dropped;
         self.resident_bytes = self.resident_bytes.saturating_sub(freed);
+        totals_sub(dropped, freed);
         dropped
     }
 
     /// Fold another ledger into this one (recovery merges per-db indexes).
     /// Entries move as they are: whether to record them was decided when
-    /// they were recorded.
+    /// they were recorded, and the process totals already count them (the
+    /// emptied `other` leaves nothing to subtract when it drops).
     pub fn merge(&mut self, mut other: DeadSlots) {
         for (file_id, theirs) in std::mem::take(&mut other.by_file) {
             let mine = self.by_file.entry(file_id).or_default();
@@ -290,12 +340,15 @@ impl DeadSlots {
     /// `in_transit` field). `&self`: the fold holds a shared guard.
     pub fn charge_in_transit(&self, bytes: usize) {
         self.in_transit.fetch_add(bytes, Ordering::Relaxed);
+        totals_add(0, bytes);
     }
 
     /// Release the fold-transit charge (the shard's tick, once no rewrite is
     /// in progress). Returns what was released.
     pub fn clear_in_transit(&self) -> usize {
-        self.in_transit.swap(0, Ordering::Relaxed)
+        let released = self.in_transit.swap(0, Ordering::Relaxed);
+        totals_sub(0, released);
+        released
     }
 
     /// Whether `file_id` has any dead slot recorded (tests, diagnostics).

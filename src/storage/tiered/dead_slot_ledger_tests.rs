@@ -206,3 +206,43 @@ fn merge_carries_the_ledger() {
     a.merge(b);
     assert!(a.dead_slots().file_has_dead_slots(3));
 }
+
+/// PR #1233 review: `INFO` reports the ledger in its Memory section —
+/// `cold_dead_slots` and `cold_dead_slot_bytes`, summed over every ledger in
+/// the process (other tests run in parallel, so this one asserts only a
+/// floor: what it holds itself).
+#[test]
+fn info_memory_reports_the_ledger() {
+    let mut ci = ColdIndex::new();
+    for i in 0..8u16 {
+        ci.insert(Bytes::from(format!("info:{i}")), loc(77, i));
+    }
+    for i in 0..5u16 {
+        assert!(ci.remove(format!("info:{i}").as_bytes()));
+    }
+    let (mine_slots, mine_bytes) = (ci.dead_slots().len(), ci.dead_slot_bytes());
+    assert_eq!(mine_slots, 5);
+    let frame = crate::command::connection::info(&crate::storage::Database::new(), &[]);
+    let crate::protocol::Frame::BulkString(text) = frame else {
+        panic!("INFO must answer a bulk string");
+    };
+    let text = std::str::from_utf8(&text).expect("utf8");
+    let memory = text
+        .split("# Memory\r\n")
+        .nth(1)
+        .and_then(|rest| rest.split("\r\n\r\n").next())
+        .expect("a Memory section");
+    let field = |name: &str| -> u64 {
+        memory
+            .lines()
+            .find_map(|l| l.strip_prefix(&format!("{name}:")))
+            .unwrap_or_else(|| panic!("{name} missing from the Memory section"))
+            .trim()
+            .parse()
+            .expect("a number")
+    };
+    assert!(field("cold_dead_slots") >= mine_slots as u64);
+    assert!(field("cold_dead_slot_bytes") >= mine_bytes as u64);
+    let (slots, bytes) = crate::storage::tiered::dead_slots::totals();
+    assert!(slots >= mine_slots as u64 && bytes >= mine_bytes as u64);
+}
