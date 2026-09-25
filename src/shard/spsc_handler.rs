@@ -4389,21 +4389,21 @@ mod wal_append_tests {
         }
     }
 
-    /// FIX-W1-2 r2: the PipelineBatchSlotted arm (and the `PipelineBatch` arm
-    /// moon#1198 removed) MUST NOT forward writes to the AofWriterPool. The connection-handler coordinator already
-    /// appends AOF for these arms after collecting the shard response
-    /// (handler_monoio/mod.rs:2004, handler_sharded/mod.rs:1703).
+    /// The `wal_append_and_fanout` pool contract: called with `None` it puts
+    /// nothing in the AofWriterPool, called with `Some(&pool)` exactly one
+    /// append. This pins the helper, NOT which pool an arm passes.
     ///
-    /// Verify the invariant directly: `wal_append_and_fanout` called with
-    /// `None` (the pipelined-arm fix) must produce zero messages in the pool
-    /// channel, while the same call with `Some(&pool)` (the MultiExecute path)
-    /// must produce exactly one message.
-    ///
-    /// Red state (pre-fix): the pipelined arms passed `aof_pool` instead
-    /// of `None`, so calling this test function using the arm's actual argument
-    /// would have produced 1 message instead of 0 — the double-write.
+    /// History, so the `None` case is not misread as the pipelined arm's
+    /// contract: FIX-W1-2 r2 once had the pipelined arms pass `None` and the
+    /// connection handler append after collecting the reply. C4-FOLD-FIX
+    /// reversed that — `PipelineBatchSlotted` now passes `aof_pool` itself,
+    /// BEFORE filling its response slot, so the append is already in the AOF
+    /// channel when `AofFold` samples `pending_aof_count` (see the comment at
+    /// that call site); the handler-side append was removed. Passing `None`
+    /// there again would drop every routed pipelined write from the per-shard
+    /// AOF.
     #[test]
-    fn pipeline_batch_arm_passes_none_to_prevent_double_write() {
+    fn wal_append_and_fanout_appends_to_the_pool_only_when_given_one() {
         use crate::persistence::aof::{AofMessage, AofWriterPool, FsyncPolicy};
         use crate::runtime::channel::mpsc_bounded;
 
@@ -4419,8 +4419,7 @@ mod wal_append_tests {
             std::time::Duration::ZERO,
         );
 
-        // ── PipelineBatchSlotted path: caller passes None ──
-        // Pre-fix this was `aof_pool` (Some), which caused the double-write.
+        // ── `None`: no pool append ──
         wal_append_and_fanout(
             b"*3\r\n$3\r\nSET\r\n$1\r\na\r\n$1\r\n1\r\n",
             0,         // db
@@ -4429,18 +4428,17 @@ mod wal_append_tests {
             &mut vec![], // no replicas
             &None,       // no repl_state
             0,           // shard_id
-            None,        // pipelined-arm fix: None prevents double-write
+            None,        // no pool
             true,        // wal_kv_log
             &mut std::time::Duration::from_millis(5),
         );
         assert!(
             rx0.try_recv().is_err(),
-            "PipelineBatchSlotted must NOT forward to aof_pool (coordinator handles it); \
-             a message here means the double-write P0 bug is still present"
+            "wal_append_and_fanout(.., None, ..) must not append to the pool"
         );
         assert!(
             rx1.try_recv().is_err(),
-            "shard-1 pool must also be empty for PipelineBatchSlotted arm"
+            "wal_append_and_fanout(.., None, ..) must not append to shard 1's pool either"
         );
 
         // ── MultiExecute path: caller passes Some(&pool) ──
