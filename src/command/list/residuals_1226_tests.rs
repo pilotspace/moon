@@ -5,6 +5,8 @@
 //!   when something was removed / inserted), so a `WATCH`ing `EXEC` still
 //!   runs. Taking the mutable list handle IS moon's WATCH version bump
 //!   (moon#926), and both commands took it before looking.
+//! * `RPOP key n` / `LMPOP … RIGHT COUNT n` on a listpack were `n` single
+//!   pops, each seeking the tail from the head.
 
 use bytes::Bytes;
 
@@ -103,4 +105,69 @@ fn a_no_op_lrem_or_linsert_does_not_bump_the_watch_version() {
         run(&mut db, &["LINSERT", "s", "BEFORE", "a", "x"]),
         Frame::Error(e) if e.starts_with(b"WRONGTYPE")
     ));
+}
+
+/// `RPOP key n` on a listpack is one cut from the back: no head seek at all.
+/// It was `n` single pops, each seeking the tail from the head — 100 seeks
+/// for `RPOP k 100` on 128 entries. `LMPOP … RIGHT COUNT n` takes the same
+/// body. Replies are unchanged (tail first), and a small list stays a
+/// listpack.
+#[test]
+fn rpop_and_lmpop_with_a_count_are_one_cut_on_a_listpack() {
+    use crate::storage::listpack::head_seeks;
+    let mut db = Database::new();
+    let elems: Vec<String> = (0..128).map(|i| format!("e{i}")).collect();
+    let mut push = vec!["RPUSH", "q"];
+    push.extend(elems.iter().map(String::as_str));
+    run(&mut db, &push);
+    assert_eq!(encoding(&mut db, "q"), "listpack", "fixture");
+
+    let mark = head_seeks();
+    let got = run(&mut db, &["RPOP", "q", "100"]);
+    let seeks = head_seeks() - mark;
+    let want: Vec<Frame> = elems[28..]
+        .iter()
+        .rev()
+        .map(|e| Frame::BulkString(Bytes::copy_from_slice(e.as_bytes())))
+        .collect();
+    assert_eq!(got, Frame::Array(want.into()), "RPOP q 100");
+    assert_eq!(
+        seeks, 0,
+        "RPOP q 100 on a 128-entry listpack took {seeks} head seeks (was one per element)"
+    );
+
+    let mark = head_seeks();
+    let got = run(&mut db, &["LMPOP", "1", "q", "RIGHT", "COUNT", "10"]);
+    let seeks = head_seeks() - mark;
+    let want: Vec<Frame> = elems[18..28]
+        .iter()
+        .rev()
+        .map(|e| Frame::BulkString(Bytes::copy_from_slice(e.as_bytes())))
+        .collect();
+    assert_eq!(
+        got,
+        Frame::Array(
+            vec![
+                Frame::BulkString(Bytes::from_static(b"q")),
+                Frame::Array(want.into())
+            ]
+            .into()
+        ),
+        "LMPOP RIGHT COUNT 10"
+    );
+    assert_eq!(seeks, 0, "LMPOP RIGHT COUNT 10 took {seeks} head seeks");
+
+    // LPOP with a count keeps its order, and the rest is intact.
+    let got = run(&mut db, &["LPOP", "q", "3"]);
+    let want: Vec<Frame> = elems[..3]
+        .iter()
+        .map(|e| Frame::BulkString(Bytes::copy_from_slice(e.as_bytes())))
+        .collect();
+    assert_eq!(got, Frame::Array(want.into()));
+    assert_eq!(run(&mut db, &["LLEN", "q"]), Frame::Integer(15));
+    assert_eq!(encoding(&mut db, "q"), "listpack");
+    // Popping past the end empties and removes the key, as before.
+    let got = run(&mut db, &["RPOP", "q", "1000"]);
+    assert!(matches!(got, Frame::Array(ref v) if v.len() == 15));
+    assert_eq!(run(&mut db, &["EXISTS", "q"]), Frame::Integer(0));
 }

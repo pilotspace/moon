@@ -334,7 +334,9 @@ fn promote_list_listpack(db: &mut Database, key: &[u8], after: usize) {
 ///
 /// moon#1174 §2: the BACK used to be reached twice from the head
 /// (`iter_refs().nth(len - 1)` to read it, `remove_at(len - 1)` to seek to it
-/// again). `Listpack::pop_end` steps back over one backlen instead.
+/// again), then once. Since moon#1206 wrote backlens in redis's order,
+/// `Listpack::pop_end` steps back over the last entry's backlen instead: O(1)
+/// (moon#1226). A counted pop takes `Listpack::pop_n`, one cut for all.
 #[inline]
 fn listpack_pop_end(lp: &mut crate::storage::listpack::Listpack, front: bool) -> Option<Bytes> {
     lp.pop_end(front)
@@ -408,13 +410,10 @@ fn pop_listpack(db: &mut Database, key: &Bytes, count: Option<usize>, front: boo
             None => Frame::Null,
         },
         Some(c) => {
-            let actual = c.min(lp.len());
-            let mut items = Vec::with_capacity(actual);
-            for _ in 0..actual {
-                if let Some(v) = listpack_pop_end(lp, front) {
-                    items.push(Frame::BulkString(v));
-                }
-            }
+            // moon#1226: ONE cut for the whole count. `RPOP k n` used to be n
+            // single pops, each seeking the tail from the head.
+            let mut items = Vec::with_capacity(c.min(lp.len()));
+            lp.pop_n(front, c, |v| items.push(Frame::BulkString(v)));
             Frame::Array(items.into())
         }
     };

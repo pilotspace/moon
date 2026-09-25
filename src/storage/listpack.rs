@@ -352,7 +352,13 @@ impl Listpack {
         }
     }
 
-    /// Reverse iterator.
+    /// Reverse iterator: steps back over each entry's backlen.
+    ///
+    /// Kept `pub` (moon#1226): the backward step misread entries of 128 bytes
+    /// or more until moon#1206 wrote backlens in redis's order, and
+    /// `backlen_tests::iter_rev_is_correct_on_wide_entries` now pins it against
+    /// the forward walk across every backlen width. The tail pops in
+    /// `list_ops` take the same step.
     pub fn iter_rev(&self) -> ListpackRevIter<'_> {
         ListpackRevIter {
             data: &self.data,
