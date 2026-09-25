@@ -35,7 +35,7 @@ mod ws1_tests;
 
 pub use cold_replay_gate::{ReplayColdGate, ReplayColdReconcile, close_replay_generation};
 pub(crate) use incr::IncrOutcome;
-pub(crate) use kv_ops::ExpiredRemoval;
+pub(crate) use kv_ops::{ExpiredRemoval, KeyDeletion};
 pub use lazy_free::{
     LAZY_FREE_THRESHOLD, LAZY_FREE_TICK_BUDGET, lazy_free_pending_anywhere,
     lazy_free_queued_on_this_thread, lazy_free_resync_this_thread,

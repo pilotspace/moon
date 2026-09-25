@@ -1985,12 +1985,16 @@ async fn coordinate_multi_del_or_exists(
     // index/queue hooks (moon#1162) — `cmd_dispatch` alone left the deleted
     // documents in every vector index.
     if owners == 1 && !groups[my_shard].is_empty() {
+        let reaps = crate::command::key::expired_reaps();
         let resp = run_local(shard_databases, db_index, cached_clock, cmd, args);
         // v3-5 carried gap: the in-process DEL/UNLINK never reached the AOF —
         // deleted keys RESURRECTED from the seed writes on restart. Persist
         // only when something was actually removed (n=0 replays identically
-        // without a record).
-        if is_delete && matches!(resp, Frame::Integer(n) if n > 0) {
+        // without a record) — which includes an expired key the leg reaped
+        // while answering 0 for it (moon#1234: the AOF and every replica
+        // still hold that key, and a replica never expires on its own).
+        let reaped = crate::command::key::expired_reaps() != reaps;
+        if is_delete && (reaped || matches!(resp, Frame::Integer(n) if n > 0)) {
             match persist_local_group(aof_pool, repl_state, my_shard, db_index, &groups[my_shard])
                 .await
             {
@@ -2012,6 +2016,7 @@ async fn coordinate_multi_del_or_exists(
 
     let mut total_count: i64 = 0;
     if !local_group.is_empty() {
+        let reaps = crate::command::key::expired_reaps();
         // moon#1162: through `run_local`, so this slice's deleted
         // documents are tombstoned like the remote slices' are.
         let result = run_local(
@@ -2021,12 +2026,14 @@ async fn coordinate_multi_del_or_exists(
             name,
             &local_group[1..],
         );
+        let reaped = crate::command::key::expired_reaps() != reaps;
         if let Frame::Integer(n) = result {
             total_count += n;
             // v3-5 carried gap: persist the local slice (synthesized over
             // ONLY the keys this shard owns — remote slices persist on
-            // their owners via MultiExecute). Skip when nothing removed.
-            if is_delete && n > 0 {
+            // their owners via MultiExecute). Skip when nothing removed —
+            // an expired key reaped for a `:0` WAS removed (moon#1234).
+            if is_delete && (n > 0 || reaped) {
                 match persist_local_group(aof_pool, repl_state, my_shard, db_index, &local_group)
                     .await
                 {

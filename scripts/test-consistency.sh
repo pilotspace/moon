@@ -3272,6 +3272,55 @@ assert_eq "moon#1234 Lua redis.call DEL publishes del" \
     "$(keyevent_del_capture "$PORT_REDIS" seq 'EVAL "return redis.call(\"DEL\", KEYS[1], KEYS[2])" 2 {kn}:l1 {kn}:l2')" \
     "$(keyevent_del_capture "$PORT_RUST"  seq 'EVAL "return redis.call(\"DEL\", KEYS[1], KEYS[2])" 2 {kn}:l1 {kn}:l2')"
 
+# moon#1234 residual (part 3b review S1/P2): a key whose TTL has passed but
+# that active expiry has not reaped is ALREADY GONE to DEL/UNLINK/GETDEL in
+# redis (expireIfNeeded runs first): the reply is :0 / nil, the key publishes
+# `expired`, and nothing publishes `del`. moon answered :1 and published `del`.
+# The capture writes the TTL'd keys with its listener in place, waits 50 ms
+# (clears moon's idle-shard clock refresh, 10 ms), then prints the replies and
+# `<event>:<key>` tokens sorted (an expiry tick may reap a key first; a
+# spanning DEL publishes from several shards).
+keyevent_expired_capture() {
+    local port="$1" setup="$2"; shift 2
+    redis-cli -p "$port" CONFIG SET notify-keyspace-events KEA >/dev/null 2>&1 || true
+    exec 3<>"/dev/tcp/127.0.0.1/${port}" || { echo "__CONNECT_FAILED__:${port}"; return 0; }
+    printf 'SUBSCRIBE __keyevent@0__:del __keyevent@0__:expired\r\n' >&3
+    local line="" toks="" ev="" state=0 i
+    for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
+        IFS= read -r -t 2 line <&3 || break
+        [[ "${line%$'\r'}" == ":2" ]] && break
+    done
+    # The TTL'd keys are written only now, with the listener in place: an
+    # expiry tick that reaps one first publishes the same `expired`.
+    printf '%s\n' "$setup" | redis-cli -p "$port" >/dev/null 2>&1 || true
+    sleep 0.05
+    printf '%s\n' "$@" | redis-cli -p "$port" 2>&1 | tr '\n' ' '
+    while IFS= read -r -t 1 line <&3; do
+        line="${line%$'\r'}"
+        case "$state" in
+            2) toks="${toks}${ev}:${line}"$'\n'; state=0 ;;
+            1) state=2 ;;
+            *) case "$line" in
+                   __keyevent@0__:del) ev=del; state=1 ;;
+                   __keyevent@0__:expired) ev=expired; state=1 ;;
+               esac ;;
+        esac
+    done
+    exec 3>&-
+    redis-cli -p "$port" CONFIG SET notify-keyspace-events "" >/dev/null 2>&1 || true
+    printf '| %s' "$(printf '%s' "$toks" | sed '/^$/d' | sort | tr '\n' ' ')"
+}
+both DEL {kx}:d {kx}:u {kx}:g {kx}:m {kx}:l {kx}:live
+both SET {kx}:live v
+kx_setup=$(for k in {kx}:d {kx}:u {kx}:g {kx}:m {kx}:l; do echo "SET $k v PX 1"; done)
+assert_eq "moon#1234 DEL/UNLINK/GETDEL/MULTI/Lua of an expired key: :0, expired, no del" \
+    "$(keyevent_expired_capture "$PORT_REDIS" "$kx_setup" 'DEL {kx}:d {kx}:live' 'UNLINK {kx}:u' 'GETDEL {kx}:g' 'MULTI' 'DEL {kx}:m' 'EXEC' 'EVAL "return redis.call(\"DEL\", KEYS[1])" 1 {kx}:l')" \
+    "$(keyevent_expired_capture "$PORT_RUST"  "$kx_setup" 'DEL {kx}:d {kx}:live' 'UNLINK {kx}:u' 'GETDEL {kx}:g' 'MULTI' 'DEL {kx}:m' 'EXEC' 'EVAL "return redis.call(\"DEL\", KEYS[1])" 1 {kx}:l')"
+kx_setup=$(for i in 1 2 3 4 5 6 7 8; do echo "SET kx:span:$i v PX 1"; done)
+assert_eq "moon#1234 spanning DEL of expired keys: :0, expired, no del" \
+    "$(keyevent_expired_capture "$PORT_REDIS" "$kx_setup" 'DEL kx:span:1 kx:span:2 kx:span:3 kx:span:4 kx:span:5 kx:span:6 kx:span:7 kx:span:8')" \
+    "$(keyevent_expired_capture "$PORT_RUST"  "$kx_setup" 'DEL kx:span:1 kx:span:2 kx:span:3 kx:span:4 kx:span:5 kx:span:6 kx:span:7 kx:span:8')"
+
 # moon#1249: XSETID below the stream's top ITEM is refused with redis's text,
 # and a later XADD * never re-issues an id already in the stream (moon
 # accepted the XSETID, and the XADD * overwrote 99999999999999-5). The

@@ -1944,6 +1944,53 @@ if should_run "pubsub"; then
     assert_same_capture "keyevent del: spanning DEL (moon#1234)"         "$(keyevent_del_capture "$PORT_REDIS" sorted 'DEL kn:span:1 kn:span:2 kn:span:3 kn:span:4 kn:span:5 kn:span:6 kn:span:7 kn:span:8')"         "$(keyevent_del_capture "$PORT_RUST"  sorted 'DEL kn:span:1 kn:span:2 kn:span:3 kn:span:4 kn:span:5 kn:span:6 kn:span:7 kn:span:8')"
     rcli SET {kn}:t v >/dev/null 2>&1; mcli SET {kn}:t v >/dev/null 2>&1
     assert_same_capture "keyevent del: MULTI DEL+UNLINK (moon#1234)"         "$(keyevent_del_capture "$PORT_REDIS" seq 'MULTI' 'DEL {kn}:t' 'UNLINK {kn}:t' 'EXEC')"         "$(keyevent_del_capture "$PORT_RUST"  seq 'MULTI' 'DEL {kn}:t' 'UNLINK {kn}:t' 'EXEC')"
+
+    # moon#1234 residual (part 3b review S1/P2): DEL/UNLINK/GETDEL of a key
+    # whose TTL has passed but that active expiry has not reaped answers :0
+    # (GETDEL nil) and publishes `expired`, never `del` — redis's
+    # expireIfNeeded deletes it first. moon answered :1 and published `del`.
+    # The capture writes the TTL'd keys with its listener in place and waits
+    # 50 ms (clears moon's idle-shard clock refresh, 10 ms). Tokens are
+    # `<event>:<key>`, sorted: an expiry tick may reap a key first, and the
+    # spanning DEL publishes from several shards.
+    keyevent_expired_capture() {
+        local port="$1" setup="$2"; shift 2
+        redis-cli -p "$port" CONFIG SET notify-keyspace-events KEA >/dev/null 2>&1 || true
+        exec 3<>"/dev/tcp/127.0.0.1/${port}" || { echo "__CONNECT_FAILED__:${port}"; return 0; }
+        printf 'SUBSCRIBE __keyevent@0__:del __keyevent@0__:expired\r\n' >&3
+        local line="" toks="" ev="" state=0 i
+        for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
+            IFS= read -r -t 2 line <&3 || break
+            [[ "${line%$'\r'}" == ":2" ]] && break
+        done
+        # The TTL'd keys are written only now, with the listener in place: an
+        # expiry tick that reaps one first publishes the same `expired`.
+        printf '%s\n' "$setup" | redis-cli -p "$port" >/dev/null 2>&1 || true
+        sleep 0.05
+        printf '%s\n' "$@" | redis-cli -p "$port" 2>&1 | tr '\n' ' '
+        while IFS= read -r -t 1 line <&3; do
+            line="${line%$'\r'}"
+            case "$state" in
+                2) toks="${toks}${ev}:${line}"$'\n'; state=0 ;;
+                1) state=2 ;;
+                *) case "$line" in
+                       __keyevent@0__:del) ev=del; state=1 ;;
+                       __keyevent@0__:expired) ev=expired; state=1 ;;
+                   esac ;;
+            esac
+        done
+        exec 3>&-
+        redis-cli -p "$port" CONFIG SET notify-keyspace-events "" >/dev/null 2>&1 || true
+        printf '| %s' "$(printf '%s' "$toks" | sed '/^$/d' | sort | tr '\n' ' ')"
+    }
+    for c in rcli mcli; do
+        $c DEL {kx}:d {kx}:u {kx}:g {kx}:m {kx}:live >/dev/null 2>&1
+        $c SET {kx}:live v >/dev/null 2>&1
+    done
+    kx_setup=$(for k in {kx}:d {kx}:u {kx}:g {kx}:m; do echo "SET $k v PX 1"; done)
+    assert_same_capture "DEL/UNLINK/GETDEL/MULTI of an expired key: :0 + expired (moon#1234)"         "$(keyevent_expired_capture "$PORT_REDIS" "$kx_setup" 'DEL {kx}:d {kx}:live' 'UNLINK {kx}:u' 'GETDEL {kx}:g' 'MULTI' 'DEL {kx}:m' 'EXEC')"         "$(keyevent_expired_capture "$PORT_RUST"  "$kx_setup" 'DEL {kx}:d {kx}:live' 'UNLINK {kx}:u' 'GETDEL {kx}:g' 'MULTI' 'DEL {kx}:m' 'EXEC')"
+    kx_setup=$(for i in 1 2 3 4 5 6 7 8; do echo "SET kx:span:$i v PX 1"; done)
+    assert_same_capture "spanning DEL of expired keys: :0 + expired (moon#1234)"         "$(keyevent_expired_capture "$PORT_REDIS" "$kx_setup" 'DEL kx:span:1 kx:span:2 kx:span:3 kx:span:4 kx:span:5 kx:span:6 kx:span:7 kx:span:8')"         "$(keyevent_expired_capture "$PORT_RUST"  "$kx_setup" 'DEL kx:span:1 kx:span:2 kx:span:3 kx:span:4 kx:span:5 kx:span:6 kx:span:7 kx:span:8')"
 fi
 
 # ===========================================================================

@@ -1315,6 +1315,7 @@ pub(crate) fn handle_shard_message_shared(
                     }
 
                     let mut selected = db_idx;
+                    let reaps = crate::command::key::expired_reaps();
                     // moon#982: routed command — the timed interval is exactly
                     // the dispatch, as on the local paths.
                     let result = probe.observe(cmd, slowlog_argv(cmd_frame), || {
@@ -1324,6 +1325,9 @@ pub(crate) fn handle_shard_message_shared(
                         DispatchResult::Response(f) => f,
                         DispatchResult::Quit(f) => f,
                     };
+                    // moon#1234: a leg that reaped an already-expired key
+                    // answers `:0` for it but DID delete it.
+                    let reaped = crate::command::key::expired_reaps() != reaps;
 
                     let mut aof_ok = true;
                     if is_write && !matches!(frame, crate::protocol::Frame::Error(_)) {
@@ -1331,9 +1335,12 @@ pub(crate) fn handle_shard_message_shared(
                         // no-op (persistence + replication all off) — it was
                         // pure waste on every cross-shard write. moon#1184: a
                         // merged `DEL k1 k2 …` leg that deleted nothing has
-                        // nothing to log either (redis propagates no such DEL).
+                        // nothing to log either (redis propagates no such DEL)
+                        // — unless it reaped an expired key, which the AOF and
+                        // every replica still hold (a replica never expires on
+                        // its own).
                         if wal_fanout_has_work(wal_writer, replica_txs, aof_pool, wal_kv_log)
-                            && !crate::shard::write_hooks::deleted_nothing(cmd, &frame)
+                            && (reaped || !crate::shard::write_hooks::deleted_nothing(cmd, &frame))
                         {
                             // moon#825: the record is derived from the REPLY, never the
                             // verbatim frame — `SPOP`/`XADD *` and the relative-TTL family
