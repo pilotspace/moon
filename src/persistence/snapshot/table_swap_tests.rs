@@ -835,6 +835,51 @@ fn a_grown_flush_while_another_grown_table_is_trimming_fails_the_save() {
     }
 }
 
+/// Review 7, item 4: the untrimmed excess the S2 rule weighs was published
+/// by the drain, BEFORE the tick's walk ran. A walk that finished a
+/// database released its frozen table, trim unfinished; the published
+/// excess still counted it until the next drain, so a grown flush later in
+/// that tick failed the save although no other grown table was held.
+#[test]
+fn a_table_the_walk_released_is_not_weighed_against_a_later_flush() {
+    use crate::persistence::snapshot::frozen::set_trim_budget_for_test;
+    // One row a drain: db 1's trim outlasts the walk over db 1.
+    set_trim_budget_for_test(Some(1));
+    let mut dbs: Vec<Database> = (0..3).map(|_| Database::new()).collect();
+    preload(&mut dbs[1], "d1", 200);
+    preload(&mut dbs[2], "d2", 200);
+    let expected = string_keyspace(&dbs);
+    let mut epoch = Epoch::begin(&dbs);
+    let mut tail = Tail::new();
+    let value = vec![b'x'; 8 << 10];
+    let grow = |dbs: &mut Vec<Database>, tail: &mut Tail, db: usize| {
+        for j in 0..1200u32 {
+            let k = format!("g{db}:{j}");
+            live(dbs, tail, db, &[b"SET", k.as_bytes(), &value]);
+        }
+        live(dbs, tail, db, &[b"FLUSHDB"]);
+    };
+    grow(&mut dbs, &mut tail, 1);
+    epoch.drain();
+    // The walk writes db 1 from its frozen table and releases it, trimmed
+    // or not; the flush of db 2 comes right after that tick's advance.
+    while epoch.state.as_ref().expect("epoch").current_db_index() <= 1 {
+        assert!(!epoch.tick(&dbs));
+    }
+    assert_eq!(
+        epoch.state.as_ref().expect("epoch").untrimmed_excess(),
+        0,
+        "setup: db 1's table is released"
+    );
+    grow(&mut dbs, &mut tail, 2);
+    let outcome = epoch.try_finish(&dbs);
+    set_trim_budget_for_test(None);
+    let records = outcome.expect("one grown table was held: the save must complete");
+    assert_eq!(diverge(&expected, &records), Default::default());
+    let recovered = recover(3, records, &tail);
+    assert_eq!(string_keyspace(&recovered), string_keyspace(&dbs));
+}
+
 /// Review 6 (N1) and review 7: an UNLINKed large collection stays CHARGED to
 /// `used_memory` until the lazy-free drain frees it (moon#1190), and a
 /// FLUSHDB hands the epoch that ledger as the frozen table's bill. Review 5

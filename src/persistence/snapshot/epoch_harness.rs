@@ -100,6 +100,7 @@ impl Epoch {
             state.advance_one_segment(dbs)
         };
         snapshot_cow::note_progress(state.current_db_index(), state.cursor());
+        snapshot_cow::note_walk(state);
         done
     }
 

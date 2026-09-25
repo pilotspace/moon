@@ -778,7 +778,8 @@ The PR head (82e3064e) was merged first (fa9a5dc1). One commit per item:
 |---|---|---|
 | 1 FLUSHDB freed queued lazy-free values inline (review 6's N1 reclaim) | a453de8c | see below |
 | 2 the trim budget counted a collection as one row; only 4,096+ elements were offloaded | 0d3c5e2d | see below |
-| 3 the walk and an abort dropped frozen tables inline | (item 3) | see below |
+| 3 the walk and an abort dropped frozen tables inline | 17da0f6e | see below |
+| 4 `UNTRIMMED_EXCESS` was stale after the walk released a table | (item 4) | see below |
 
 ### Item 1 — the lazy-free charge follows the table into the epoch
 
@@ -891,3 +892,27 @@ Left as is, because main behaves the same:
 - the `Freeze` events `abort_epoch` discards within the same tick.
 
 Main drops those tables inline in that same command.
+
+### Item 4 — the untrimmed excess is re-published after the walk
+
+The S2 rule weighs a grown flush against `WAITING_EXCESS + UNTRIMMED_EXCESS`. The drain
+published `UNTRIMMED_EXCESS`, but the walk runs after the drain, and it can release a table
+whose trim has not finished (item 3's release site). A grown flush later in that tick then
+counted a table the epoch no longer held.
+
+The fix is a new `snapshot_cow::note_walk(snap)`, which re-publishes the excess. It is
+called:
+- after the advance in `persistence_tick::advance_snapshot_segment` (WS19's file, one line
+  next to `note_progress`);
+- after the advance in the epoch harness;
+- by `drain_into`, in place of its inline publish.
+
+Red → green, lib test `a_table_the_walk_released_is_not_weighed_against_a_later_flush`:
+- Setup: trim budget 1, so db 1's trim outlasts the walk. db 1 grows by 1,200 x 8 KiB and is
+  flushed; the walk passes db 1; db 2 then grows by the same amount and is flushed.
+- Red: "snapshot aborted: FLUSHDB detached databases that grew during the save faster than
+  the snapshot could trim them".
+- Green: the save completes with the epoch-start image, and file + tail equals live.
+
+`snapshot_cow.rs` is exactly 1,500 lines after this commit: three doc comments were
+shortened to make room.

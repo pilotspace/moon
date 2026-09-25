@@ -275,6 +275,7 @@ pub(crate) fn advance_snapshot_segment(
                 crate::shard::slice::with_shard_db(source, |db| snap.advance_budgeted_db(db));
             // Captures from here on are filtered against the new cursor.
             crate::persistence::snapshot_cow::note_progress(snap.current_db_index(), snap.cursor());
+            crate::persistence::snapshot_cow::note_walk(snap);
             done
         } else {
             // All databases serialized, return true to trigger finalization

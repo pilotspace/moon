@@ -102,9 +102,8 @@ thread_local! {
     /// `used_memory` at its flush above its database's epoch-start bill.
     static WAITING_EXCESS: Cell<u64> = const { Cell::new(0) };
     /// Post-epoch bytes the epoch's frozen tables still held after the last
-    /// drain, their trims unfinished (review 6, S2: the trim is budgeted, so
-    /// a grown table holds its post-epoch rows for ceil(work / budget)
-    /// drains, not one).
+    /// drain and walk, their trims unfinished (review 6, S2: a grown table
+    /// holds them for ceil(work / budget) drains, not one).
     static UNTRIMMED_EXCESS: Cell<u64> = const { Cell::new(0) };
     /// Bumped by every [`arm`]: a lazily freed value crediting an earlier
     /// epoch's frozen table cannot credit this one's (review 7).
@@ -290,6 +289,12 @@ fn arm_with_slots(num_databases: usize, slots: Vec<(usize, u64)>) {
 #[inline]
 fn db_addr(db: &Database) -> usize {
     db as *const Database as usize
+}
+
+/// Re-publish the frozen tables' untrimmed excess after the tick's advance
+/// (review 7): the walk releases a table it has written, trimmed or not.
+pub(crate) fn note_walk(snap: &SnapshotState) {
+    UNTRIMMED_EXCESS.with(|u| u.set(snap.untrimmed_excess()));
 }
 
 /// Publish the snapshot's cursor after a segment advance (moon#1186). Must
@@ -514,11 +519,10 @@ pub(crate) fn note_swapdb(a: usize, b: usize) {
 /// The trim clears ~512 rows a tick, faster than a client refills a database
 /// (8 x 40 MB of SETs + FLUSHDB completes in a release build).
 ///
-/// Returns the frozen table's charge when the table was queued to freeze:
-/// `table_bytes` includes the remaining charges of values the database's
-/// lazy-free queue has not finished freeing (moon#1190), so `clear` points
-/// those values' credits at the frozen bill (review 7) instead of freeing
-/// them inside the FLUSHDB. `None` otherwise.
+/// Returns the frozen table's charge when the table was queued to freeze
+/// (else `None`): `table_bytes` includes what the lazy-free queue has not
+/// freed yet (moon#1190), so `clear` points those values' credits at the
+/// frozen bill (review 7) instead of freeing them inside the FLUSHDB.
 ///
 /// A slot that cannot be identified (an epoch armed on a thread with no
 /// shard slice) keeps the old answer: an unfinished epoch is aborted. One
@@ -940,9 +944,8 @@ pub(crate) fn drain_into(snap: &mut SnapshotState) {
     // database and pending-ness do not depend on the table events, so the
     // order is free otherwise.
     apply_table_events(snap);
-    // Review 7: what the lazy-free drain freed of values whose charge moved
-    // to a frozen table's bill with the FLUSHDB — after the freezes (a
-    // credit may follow its table's flush within the tick), before the trim.
+    // Review 7: lazy-free credits to frozen bills — after the freezes (one
+    // may follow its table's flush within the tick), before the trim.
     FROZEN_CREDITS.with(|c| {
         for (db, bytes) in c.borrow_mut().drain(..) {
             snap.credit_frozen(db, bytes);
@@ -951,7 +954,7 @@ pub(crate) fn drain_into(snap: &mut SnapshotState) {
     // Review 6: the frozen tables' trims advance by a bounded amount per
     // drain (`snapshot::frozen::TRIM_BUDGET`), not whole in one.
     snap.trim_frozen(crate::persistence::snapshot::frozen::trim_budget());
-    UNTRIMMED_EXCESS.with(|u| u.set(snap.untrimmed_excess()));
+    note_walk(snap);
     // moon#1228: INFO `current_cow_size`.
     publish_cow_size(snap.cow_bytes() + DEDUPE_BYTES.with(Cell::get));
 }
