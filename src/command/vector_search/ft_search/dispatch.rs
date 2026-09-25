@@ -268,10 +268,9 @@ pub fn ft_search(
         if let (Some(sess_key), Some(db)) = (session_key.as_ref(), db.as_mut()) {
             // moon#1196: probe the live session set in place (was a full
             // member-map clone per query).
-            // moon#1226: filtered in place — no copy of the result set.
-            let mut sv: SmallVec<[SearchResult; 32]> = fused.drain(..).collect();
-            session::retain_unseen_in_db(&mut sv, db, sess_key, &key_hash_to_key);
-            fused = sv.into_vec();
+            // moon#1226: `fused` is filtered in place and recorded by
+            // reference — no copy of the result set.
+            session::retain_unseen_in_db(&mut fused, db, sess_key, &key_hash_to_key);
 
             crate::vector::metrics::increment_search();
             let response = build_hybrid_response(
@@ -288,8 +287,7 @@ pub fn ft_search(
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs_f64())
                 .unwrap_or(0.0);
-            let result_sv: SmallVec<[SearchResult; 32]> = fused.into_iter().collect();
-            session::record_session_results(&result_sv, db, sess_key, &key_hash_to_key, timestamp);
+            session::record_session_results(&fused, db, sess_key, &key_hash_to_key, timestamp);
 
             return response;
         }
@@ -333,10 +331,9 @@ pub fn ft_search(
         if let (Some(sess_key), Some(db)) = (session_key.as_ref(), db.as_mut()) {
             // moon#1196: probe the live session set in place (was a full
             // member-map clone per query).
-            // moon#1226: filtered in place — no copy of the result set.
-            let mut sv: SmallVec<[SearchResult; 32]> = fused.drain(..).collect();
-            session::retain_unseen_in_db(&mut sv, db, sess_key, &key_hash_to_key);
-            fused = sv.into_vec();
+            // moon#1226: `fused` is filtered in place and recorded by
+            // reference — no copy of the result set.
+            session::retain_unseen_in_db(&mut fused, db, sess_key, &key_hash_to_key);
 
             crate::vector::metrics::increment_search();
             let response = build_hybrid_response(
@@ -352,8 +349,7 @@ pub fn ft_search(
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs_f64())
                 .unwrap_or(0.0);
-            let result_sv: SmallVec<[SearchResult; 32]> = fused.into_iter().collect();
-            session::record_session_results(&result_sv, db, sess_key, &key_hash_to_key, timestamp);
+            session::record_session_results(&fused, db, sess_key, &key_hash_to_key, timestamp);
 
             return response;
         }

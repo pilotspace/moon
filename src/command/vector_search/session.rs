@@ -62,8 +62,9 @@ pub fn filter_session_results(
 ///
 /// moon#1226: this copies `results` — on the no-session path a pure clone.
 /// A caller that owns its results should call [`retain_unseen_in_db`], which
-/// filters them in place and copies nothing; FT.SEARCH does. This borrowed
-/// form is kept for callers that only hold a reference.
+/// filters them in place and copies nothing; every FT.SEARCH … SESSION path
+/// does (dense, hybrid and sparse). This borrowed form is kept for callers
+/// that only hold a reference.
 pub fn filter_session_results_in_db(
     results: &SmallVec<[SearchResult; 32]>,
     db: &Database,
@@ -75,12 +76,31 @@ pub fn filter_session_results_in_db(
     out
 }
 
+/// A result buffer the session filter shrinks in place: the dense path's
+/// `SmallVec` and the hybrid / sparse paths' fused `Vec` (moon#1242).
+pub trait ResultBuffer {
+    /// Keep only the results `keep` accepts, in order, in this buffer.
+    fn retain_results(&mut self, keep: impl FnMut(&SearchResult) -> bool);
+}
+
+impl ResultBuffer for Vec<SearchResult> {
+    fn retain_results(&mut self, keep: impl FnMut(&SearchResult) -> bool) {
+        self.retain(keep);
+    }
+}
+
+impl ResultBuffer for SmallVec<[SearchResult; 32]> {
+    fn retain_results(&mut self, mut keep: impl FnMut(&SearchResult) -> bool) {
+        self.retain(|r| keep(r));
+    }
+}
+
 /// [`filter_session_results_in_db`] IN PLACE (moon#1226): drop every result
 /// whose key the session set under `session_key` already holds. No copy and
 /// no allocation — a missing, expired or wrong-typed session key leaves
 /// `results` untouched, and the survivors keep their order.
 pub fn retain_unseen_in_db(
-    results: &mut SmallVec<[SearchResult; 32]>,
+    results: &mut impl ResultBuffer,
     db: &Database,
     session_key: &[u8],
     key_hash_to_key: &BucketedKeyMap<Bytes>,
@@ -88,7 +108,7 @@ pub fn retain_unseen_in_db(
     let Ok(Some(set)) = db.get_sorted_set_ref_if_alive(session_key, db.now_ms()) else {
         return;
     };
-    results.retain(|r| {
+    results.retain_results(|r| {
         !key_hash_to_key
             .get(&r.key_hash)
             .is_some_and(|redis_key| set.score(redis_key).is_some())
@@ -107,7 +127,7 @@ pub fn retain_unseen_in_db(
 /// - `key_hash_to_key`: mapping from key_hash to the original Redis key
 /// - `timestamp`: f64 epoch seconds to use as the sorted set score
 pub fn record_session_results(
-    results: &SmallVec<[SearchResult; 32]>,
+    results: &[SearchResult],
     db: &mut Database,
     session_key: &[u8],
     key_hash_to_key: &BucketedKeyMap<Bytes>,
