@@ -98,7 +98,9 @@ fn spawn_moon(shards: &str) -> Moon {
 }
 
 fn spawn_moon_env(shards: &str, env: &[(&str, &str)]) -> Moon {
-    let bin = std::path::PathBuf::from(env!("CARGO_BIN_EXE_moon"));
+    // `MOON_BIN` first (moon#1226): a shared target dir makes the cargo
+    // binary whatever the last build there produced.
+    let bin = common::find_moon_binary();
     let tmp_dirs: std::rc::Rc<std::cell::RefCell<Vec<std::path::PathBuf>>> =
         std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
     let seen = std::rc::Rc::clone(&tmp_dirs);
