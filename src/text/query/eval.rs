@@ -111,7 +111,7 @@ impl<'a> LeafTable<'a> {
 fn eval_set_cow<'a>(
     node: &QueryNode,
     idx: &'a TextIndex,
-    leaves: &LeafTable<'_>,
+    leaves: &LeafTable<'a>,
 ) -> Cow<'a, RoaringBitmap> {
     match node {
         QueryNode::Empty => Cow::Owned(RoaringBitmap::new()),
@@ -122,10 +122,11 @@ fn eval_set_cow<'a>(
         // the registry `eval_query_counted` resolves results through.
         QueryNode::MatchAll => Cow::Borrowed(idx.live_docs()),
 
-        QueryNode::Term { .. } => Cow::Owned(
-            leaves
-                .get(node)
-                .map_or_else(RoaringBitmap::new, LeafScorer::candidates),
+        // moon#1226: a leaf matching through one posting is borrowed, not
+        // cloned (`alpha beta` then allocates only the intersection).
+        QueryNode::Term { .. } => leaves.get(node).map_or_else(
+            || Cow::Owned(RoaringBitmap::new()),
+            LeafScorer::candidates_cow,
         ),
 
         QueryNode::Tag { field, values } => {
@@ -226,7 +227,10 @@ pub fn eval_query_counted(
 ) -> (Vec<TextSearchResult>, usize) {
     // 1. Authoritative membership (complete — no truncation), resolvable docs only.
     let leaves = LeafTable::build(node, idx, global_df, global_n);
-    let set = idx.restrict_to_live(eval_set_cow(node, idx, &leaves).into_owned());
+    let set = match eval_set_cow(node, idx, &leaves) {
+        Cow::Borrowed(set) => set & idx.live_docs(),
+        Cow::Owned(set) => idx.restrict_to_live(set),
+    };
     let total_matched = set.len() as usize;
     if total_matched == 0 {
         return (Vec::new(), 0);
@@ -603,5 +607,49 @@ mod leaf_table_tests {
             probes <= bound,
             "{probes} leaf-table comparisons for {N} leaves (bound {bound})"
         );
+    }
+
+    /// moon#1226 red test: a TEXT leaf that matches through ONE posting is
+    /// borrowed by the membership fold, not cloned — a broad term's bitmap
+    /// was copied on every query just to be read or intersected.
+    #[test]
+    fn a_single_posting_leaf_is_borrowed_not_cloned() {
+        let mut idx = TextIndex::new(
+            Bytes::from_static(b"t"),
+            vec![Bytes::from_static(b"d:")],
+            vec![TextFieldDef::new(Bytes::from_static(b"body"))],
+            BM25Config::default(),
+        );
+        for d in 0..40u32 {
+            let key = format!("d:{d}");
+            let body = if d % 3 == 0 { "common rare" } else { "common" };
+            idx.index_document(
+                u64::from(d) + 1,
+                key.as_bytes(),
+                &[
+                    Frame::BulkString(Bytes::from_static(b"body")),
+                    Frame::BulkString(Bytes::from_static(body.as_bytes())),
+                ],
+            );
+        }
+        let term = |t: &'static str| QueryNode::Term {
+            field: None,
+            token: Bytes::from_static(t.as_bytes()),
+            modifier: TermModifier::Exact,
+        };
+        let single = term("common");
+        let leaves = LeafTable::build(&single, &idx, None, None);
+        let set = eval_set_cow(&single, &idx, &leaves);
+        assert!(
+            matches!(set, Cow::Borrowed(_)),
+            "one-posting leaf must be borrowed"
+        );
+        assert_eq!(set.len(), 40);
+        // Two leaves: only their intersection is allocated; same answer.
+        let both = QueryNode::And(vec![term("common"), term("rare")]);
+        let leaves = LeafTable::build(&both, &idx, None, None);
+        assert_eq!(eval_set_cow(&both, &idx, &leaves).len(), 14);
+        let (page, total) = eval_query_counted(&idx, &single, None, None, 5);
+        assert_eq!((page.len(), total), (5, 40));
     }
 }

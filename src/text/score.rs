@@ -27,6 +27,7 @@
 //! (AST order). `bm25_from_parts` is a literal split of `bm25_score`. The
 //! ordering is HEAD's `score DESC, doc_id ASC`.
 
+use std::borrow::Cow;
 use std::collections::{BinaryHeap, HashMap};
 
 use roaring::RoaringBitmap;
@@ -338,6 +339,17 @@ impl<'a> FieldScorer<'a> {
         }
     }
 
+    /// [`Self::candidates`] without a copy when the match set IS one posting
+    /// (a single exact term, or a fuzzy/prefix expansion to one term) —
+    /// moon#1226: HEAD cloned that posting's bitmap (however broad) just to
+    /// read it.
+    pub(crate) fn candidates_cow(&self) -> Cow<'a, RoaringBitmap> {
+        match self.postings.as_slice() {
+            [only] => Cow::Borrowed(&only.doc_ids),
+            _ => Cow::Owned(self.candidates()),
+        }
+    }
+
     /// Choose how a fuzzy/prefix (`AnyMax`) leaf scores `candidates` — the
     /// docs [`Self::score`] will be asked about, ascending (moon#1220).
     ///
@@ -493,6 +505,15 @@ impl<'a> LeafScorer<'a> {
     fn prepare(&mut self, idx: &TextIndex, candidates: &RoaringBitmap) {
         for f in &mut self.fields {
             f.prepare(idx, candidates);
+        }
+    }
+
+    /// [`Self::candidates`], borrowed when the leaf is one field matching one
+    /// posting (moon#1226 — see [`FieldScorer::candidates_cow`]).
+    pub(crate) fn candidates_cow(&self) -> Cow<'a, RoaringBitmap> {
+        match self.fields.as_slice() {
+            [only] => only.candidates_cow(),
+            _ => Cow::Owned(self.candidates()),
         }
     }
 
@@ -700,7 +721,12 @@ pub(crate) fn top_k_for_field(
     top_k: usize,
     keep: impl Fn(u32) -> bool,
 ) -> Vec<TextSearchResult> {
-    let candidates = idx.restrict_to_live(field.candidates());
+    // A single-posting leaf is intersected with the live set straight from
+    // the posting (one allocation: the result), not cloned first (moon#1226).
+    let candidates = match field.candidates_cow() {
+        Cow::Borrowed(set) => set & idx.live_docs(),
+        Cow::Owned(set) => idx.restrict_to_live(set),
+    };
     field.prepare(idx, &candidates);
     let mut top = TopK::new(top_k, candidates.len() as usize);
     for doc in &candidates {
