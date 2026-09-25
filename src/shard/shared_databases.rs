@@ -714,6 +714,9 @@ pub(crate) fn apply_mq_create<T: MqApplyTarget>(
             // an earlier replayed record (or a surviving RDB/rrdshard load);
             // that's expected and fine, nothing else to do.
             let _ = stream.create_group(group_name, crate::storage::stream::StreamId::ZERO);
+            // moon#1250: charged to `used_memory` like the master's MQ.CREATE.
+            let delta = stream.take_unbilled();
+            crate::shard::mq_exec::bill_stream_delta(&mut db, delta);
         }
     }
 }
@@ -736,6 +739,9 @@ pub(crate) fn apply_mq_push<T: MqApplyTarget>(
             if !stream.entries.contains_key(&id) {
                 stream.add(id, fields);
             }
+            // moon#1250: charged to `used_memory` like the master's MQ.PUSH.
+            let delta = stream.take_unbilled();
+            crate::shard::mq_exec::bill_stream_delta(&mut db, delta);
         }
     }
 }
@@ -860,6 +866,9 @@ pub(crate) fn apply_mq_pop<T: MqApplyTarget>(
                     dlq_stream.add(dlq_id, fields);
                 }
             }
+            // moon#1250: charged like the master's dead letters.
+            let delta = dlq_stream.take_unbilled();
+            crate::shard::mq_exec::bill_stream_delta(&mut db, delta);
         }
     }
 }
@@ -880,6 +889,9 @@ pub(crate) fn apply_mq_ack<T: MqApplyTarget>(
         if let Ok(Some(stream)) = db.get_stream_mut(key) {
             let group_name = bytes::Bytes::from_static(MQ_GROUP_NAME);
             let _ = stream.xack(&group_name, &[id]);
+            // moon#1250: credited like the master's MQ.ACK.
+            let delta = stream.take_unbilled();
+            crate::shard::mq_exec::bill_stream_delta(&mut db, delta);
         }
     }
 }

@@ -2378,8 +2378,44 @@ pub(crate) fn handle_shard_message_shared(
                 command,
                 reply_tx,
             } = *payload;
-            let response =
-                crate::shard::mq_exec::execute_mq_on_owner(db_index, key_prefix, command);
+            // moon#1250: the owner's maxmemory / per-db-quota gate, as the
+            // routed write arms run it (with their plain-drop DEL records).
+            let mut reason_del_budget = crate::persistence::aof::AOF_REASON_DEL_BACKPRESSURE_BOUND;
+            let response = crate::shard::mq_exec::execute_mq_on_owner(
+                db_index,
+                key_prefix,
+                command,
+                &mut |db, idx| {
+                    if !evict_active {
+                        return Ok(());
+                    }
+                    spsc_eviction_gate(
+                        b"MQ",
+                        db,
+                        idx,
+                        shard_databases,
+                        shard_id,
+                        runtime_config,
+                        spill_sender,
+                        spill_file_id,
+                        disk_offload_dir,
+                        &mut |key| {
+                            crate::replication::reason_del::record_reason_del(
+                                key,
+                                idx,
+                                wal_writer,
+                                repl_backlog,
+                                replica_txs,
+                                repl_state,
+                                shard_id,
+                                aof_pool,
+                                wal_kv_log,
+                                &mut reason_del_budget,
+                            );
+                        },
+                    )
+                },
+            );
             // Ignore send failure: receiver dropped means the client disconnected.
             let _ = reply_tx.send(response);
         }

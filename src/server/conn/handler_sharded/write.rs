@@ -305,6 +305,37 @@ fn mq_key_prefix(workspace_id: Option<&crate::workspace::WorkspaceId>) -> bytes:
     }
 }
 
+/// moon#1250: the maxmemory / per-db-quota gate an MQ write that grows the
+/// keyspace runs on this runtime's local leg — the generic write path's gate
+/// (`handler_sharded` per-command arm), which MQ, intercepted before it,
+/// bypassed. The cross-shard leg runs `spsc_eviction_gate` on the owner.
+fn mq_write_gate(
+    ctx: &ConnectionContext,
+    db: &mut crate::storage::Database,
+    db_index: usize,
+) -> Result<(), Frame> {
+    use crate::storage::eviction::{EvictionRun, evict_to_budget};
+    let rt = ctx.runtime_config.read();
+    let budget = ctx.shard_databases.elastic_budget(ctx.shard_id);
+    if let Some(ref sender) = ctx.spill_sender {
+        let mut fid = ctx.spill_file_id.get();
+        let dir = ctx
+            .disk_offload_dir
+            .as_deref()
+            .unwrap_or(std::path::Path::new("."));
+        let res = evict_to_budget(
+            db,
+            &rt,
+            EvictionRun::async_spill(sender, dir, &mut fid, db_index, None).budget(budget),
+        );
+        ctx.spill_file_id.set(ctx.spill_file_id.get().max(fid));
+        res?;
+    } else {
+        evict_to_budget(db, &rt, EvictionRun::plain().budget(budget))?;
+    }
+    crate::storage::db_quota::check_db_maxmemory_for_command(db, db_index, &rt, b"MQ")
+}
+
 /// Dispatch one MQ.* command to its owning shard via the SPSC hop.
 ///
 /// If `owner == ctx.shard_id` (this shard owns the queue), executes
@@ -322,7 +353,13 @@ async fn mq_dispatch_to_owner(
     let command_arc = std::sync::Arc::new(frame.clone());
     if owner == ctx.shard_id {
         // Self-shard: execute directly — no channel allocation needed.
-        crate::shard::mq_exec::execute_mq_on_owner(db_index, key_prefix, command_arc)
+        // moon#1250: with the write path's maxmemory / per-db-quota gate.
+        crate::shard::mq_exec::execute_mq_on_owner(
+            db_index,
+            key_prefix,
+            command_arc,
+            &mut |db, idx| mq_write_gate(ctx, db, idx),
+        )
     } else {
         // Foreign shard: send via SPSC and await the oneshot reply.
         let (reply_tx, reply_rx) = crate::runtime::channel::oneshot();

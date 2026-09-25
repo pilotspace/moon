@@ -669,8 +669,11 @@ async fn mq_hop_or_local(
     command: std::sync::Arc<crate::protocol::Frame>,
 ) -> crate::protocol::Frame {
     if owner == ctx.shard_id {
-        // Self-short-circuit: run directly on this shard's slice.
-        crate::shard::mq_exec::execute_mq_on_owner(db_index, key_prefix, command)
+        // Self-short-circuit: run directly on this shard's slice. moon#1250:
+        // with the write path's own maxmemory / per-db-quota gate.
+        crate::shard::mq_exec::execute_mq_on_owner(db_index, key_prefix, command, &mut |db, idx| {
+            super::run_write_eviction_gate(ctx, db, idx, b"MQ")
+        })
     } else {
         // Cross-shard hop via MqCommand SPSC message (GraphCommand precedent).
         let (reply_tx, reply_rx) = crate::runtime::channel::oneshot();

@@ -395,6 +395,10 @@ fn group_reader_ready(
     let Ok(created) = stream.create_consumer(group, consumer.clone()) else {
         return GroupReadiness::Gone(xreadgroup_nogroup(key, group));
     };
+    // moon#1250: the new consumer is charged to `used_memory`, as
+    // `XREADGROUP` charges it.
+    let delta = stream.take_unbilled();
+    crate::shard::mq_exec::bill_stream_delta(db, delta);
     if created && noack && crate::blocking::pop_log::has_work() {
         // Nothing to tell the waiter if this record is refused: it has not
         // been served, and stays parked either way.
@@ -450,7 +454,12 @@ fn serve_group_read(
     // write happens (a wake that serves nothing captures nothing).
     crate::persistence::snapshot_cow::capture_write_pre_image(db, db_index, key);
     let stream = db.get_stream_mut(key).ok()??;
-    let entries = stream.read_group_new(group, consumer, count, noack).ok()?;
+    let entries = stream.read_group_new(group, consumer, count, noack).ok();
+    // moon#1250: the PEL entries the read adds are charged to `used_memory`,
+    // as `XREADGROUP` charges them.
+    let delta = stream.take_unbilled();
+    crate::shard::mq_exec::bill_stream_delta(db, delta);
+    let entries = entries?;
     if entries.is_empty() {
         return None;
     }
