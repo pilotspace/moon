@@ -1144,7 +1144,13 @@ fn a_snapshot_boot_counts_no_change() {
 /// A replica's full sync loads a foreign dataset: redis 7.0.15 leaves the
 /// replica's count unchanged (neither the discarded local keys nor the loaded
 /// ones count). moon counted both (`db.clear()` + the RDB load's `set`).
+///
+/// monoio only: a master answers PSYNC only under runtime-monoio.
 #[test]
+#[cfg_attr(
+    not(feature = "runtime-monoio"),
+    ignore = "needs a replica full sync, which needs a runtime-monoio master"
+)]
 fn a_replica_full_sync_counts_no_change() {
     let (dm, dr) = (
         common::unique_test_dir("ws19-r5-master"),
