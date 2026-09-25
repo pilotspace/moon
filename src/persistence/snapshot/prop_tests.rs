@@ -179,8 +179,11 @@ fn seed_dbs(rng: &mut Rng, now: u64) -> (Vec<Database>, Vec<u64>) {
                 }
                 3 => {
                     if i % 70 == 3 {
-                        // > LAZY_FREE_THRESHOLD fields: an UNLINK lazy-frees it.
-                        for f in 0..100 {
+                        // A hashtable (past `hash-max-listpack-entries`, 128)
+                        // of > LAZY_FREE_THRESHOLD fields: an UNLINK lazy-
+                        // frees it. (100 fields stayed a listpack, freed
+                        // inline: the workload never lazy-freed — review 7.)
+                        for f in 0..200 {
                             let f = format!("f{f}");
                             run(&mut dbs, d, &[b"HSET", k, f.as_bytes(), v]);
                         }
@@ -219,6 +222,9 @@ struct Coverage {
     swaps: u64,
     max_bill_error: i64,
     bill_checks: u64,
+    /// FLUSHDBs of a database with values still in its lazy-free queue:
+    /// their charges move to the frozen bill (review 7).
+    flushes_with_lazy_free_pending: u64,
     /// Frozen tables seen after a drain with their trim still running
     /// (budgeted across drains since review 6; the bound holds once done).
     trims_in_progress: u64,
@@ -283,6 +289,17 @@ fn check_after_drain(seed: u64, state: &SnapshotState, start_bills: &[u64], cov:
     }
 }
 
+/// The shard tick's lazy-free drain (moon#1190), whole: every queued value
+/// is freed and credited — to `used_memory`, or to the bill of the frozen
+/// table its charge moved to with a FLUSHDB (review 7). Run before every
+/// drain, so a bill check sees each credit. `partial`: free at most that
+/// many elements, as a time-budgeted tick does between two writes.
+fn lazy_free_tick(dbs: &mut [Database], partial: Option<usize>) {
+    for db in dbs.iter_mut() {
+        let _ = db.drain_lazy_free_elements(partial.unwrap_or(usize::MAX));
+    }
+}
+
 fn one_seed(seed: u64, cov: &mut Coverage) {
     let mut rng = Rng(seed);
     // Review 6 (S1): half the seeds spread every trim over many drains,
@@ -307,6 +324,9 @@ fn one_seed(seed: u64, cov: &mut Coverage) {
     loop {
         for _ in 0..1 + rng.below(12) {
             cov.ops += 1;
+            if rng.below(8) == 0 {
+                lazy_free_tick(&mut dbs, Some(rng.below(300) as usize));
+            }
             let mut db = rng.below(N_DBS as u64) as usize;
             let pick = rng.below(10);
             let owner = snapshot_cow::logical_of_slot_for_test()
@@ -408,6 +428,17 @@ fn one_seed(seed: u64, cov: &mut Coverage) {
                         db = slot;
                     }
                     let logical = snapshot_cow::logical_of_slot_for_test()[db];
+                    // Review 7: half the time UNLINK one of the database's
+                    // big hashes first, so the flush finds it still queued
+                    // for lazy free and moves its charge to the frozen bill.
+                    if rng.below(2) == 0
+                        && let Some(l) = logical
+                        && seeded[l] > 3
+                    {
+                        let i = 70 * rng.below((seeded[l] - 3).div_ceil(70)) + 3;
+                        let big = format!("s{l}:{i:05}");
+                        live(&mut dbs, &mut tail, db, &[b"UNLINK", big.as_bytes()]);
+                    }
                     if let Some(l) = logical
                         && l >= cur
                     {
@@ -418,6 +449,9 @@ fn one_seed(seed: u64, cov: &mut Coverage) {
                         if swapped_since_arm[db] {
                             cov.flush_after_swap += 1;
                         }
+                    }
+                    if dbs[db].lazy_free_len() > 0 {
+                        cov.flushes_with_lazy_free_pending += 1;
                     }
                     if rng.below(3) == 0 {
                         live(&mut dbs, &mut tail, db, &[b"FLUSHDB", b"ASYNC"]);
@@ -455,7 +489,11 @@ fn one_seed(seed: u64, cov: &mut Coverage) {
                             }
                         }
                         let segs_at_flush = dbs[db].data().segment_count();
+                        if dbs[db].lazy_free_len() > 0 {
+                            cov.flushes_with_lazy_free_pending += 1;
+                        }
                         live(&mut dbs, &mut tail, db, &[b"FLUSHDB"]);
+                        lazy_free_tick(&mut dbs, None);
                         epoch.drain();
                         if let Some(l) = logical
                             && let Some(frozen) = epoch
@@ -483,6 +521,7 @@ fn one_seed(seed: u64, cov: &mut Coverage) {
         {
             cov.walk_waits_for_rebuild += 1;
         }
+        lazy_free_tick(&mut dbs, None);
         let done = match rng.below(10) {
             0..=4 => {
                 epoch.drain();
@@ -621,8 +660,13 @@ fn the_file_is_exactly_the_epoch_start_image_over_random_workloads() {
     }
     crate::persistence::snapshot::frozen::set_trim_budget_for_test(None);
     eprintln!("snapshot property coverage: {cov:#?}");
+    // Review 7: every trimmed frozen table's bill is exactly its rows.
+    assert_eq!(cov.max_bill_error, 0, "a frozen bill drifted: {cov:#?}");
     assert!(
-        n < 8 || (cov.trims_in_progress > 0 && cov.rebuilds_seen > 0),
+        n < 8
+            || (cov.trims_in_progress > 0
+                && cov.rebuilds_seen > 0
+                && cov.flushes_with_lazy_free_pending > 0),
         "the seeds never spread a trim over several drains: {cov:#?}"
     );
 }

@@ -779,7 +779,8 @@ The PR head (82e3064e) was merged first (fa9a5dc1). One commit per item:
 | 1 FLUSHDB freed queued lazy-free values inline (review 6's N1 reclaim) | a453de8c | see below |
 | 2 the trim budget counted a collection as one row; only 4,096+ elements were offloaded | 0d3c5e2d | see below |
 | 3 the walk and an abort dropped frozen tables inline | 17da0f6e | see below |
-| 4 `UNTRIMMED_EXCESS` was stale after the walk released a table | (item 4) | see below |
+| 4 `UNTRIMMED_EXCESS` was stale after the walk released a table | 29b3e1ee | see below |
+| 5 tests: assert the bill error; the fixed 1.5 s wait | (item 5) | see below |
 
 ### Item 1 — the lazy-free charge follows the table into the epoch
 
@@ -916,3 +917,33 @@ Red → green, lib test `a_table_the_walk_released_is_not_weighed_against_a_late
 
 `snapshot_cow.rs` is exactly 1,500 lines after this commit: three doc comments were
 shortened to make room.
+
+### Item 5 — tests
+
+`prop_tests` now asserts `max_bill_error == 0`. The assertion alone passed trivially,
+because the workload never lazy-freed anything: its "big" hashes had 100 fields, which stay
+a listpack (`hash-max-listpack-entries` is 128), and a listpack is freed inline. So:
+- The big hashes now have 200 fields.
+- Half the FLUSHDBs UNLINK one of the database's big hashes first.
+- A `lazy_free_tick` stands in for the shard tick's lazy-free drain. It runs whole before
+  every drain and tick, and partially (0-299 elements) before one op in eight.
+- A new coverage counter, `flushes_with_lazy_free_pending`, must be non-zero from 8 seeds up;
+  16 seeds give 18.
+
+Red → green, 16 seeds unless noted:
+- 200 seeds with the 200-field hashes but no harness drain: red, `max_bill_error` 24,232
+  (one hash's charge left in a bill).
+- Mutation A, the harness never drains: red, 24,232, with 160 flushes finding a queued
+  value.
+- Mutation B, no redirect in `Database::clear`: red, 24,232.
+- Green: 200 seeds give bill error 0 over 10,013 checks.
+
+`perf_ws16_mq_billing`'s 1.5 s wait before kill -9 stays, now named
+`wait_for_the_wal_tick` and documented. There is no observable condition to wait on:
+- The MQ records go to the per-shard WAL v3 (`shard-0/wal-v3/`). Probed on the release
+  build: `aof_current_size` stayed at 96 B across 50 MQ PUSHes.
+- INFO persistence reports only the AOF.
+- `DEBUG RECLAMATION` has `wal_current_lsn`, the next LSN to assign, which moves before the
+  buffer is written.
+- Its `wal_total_bytes` is segment file sizes; waiting for it to stop growing is a timing
+  guess too.
