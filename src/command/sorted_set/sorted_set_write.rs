@@ -192,7 +192,12 @@ pub fn zadd(db: &mut Database, args: &[Frame]) -> Frame {
             Err(e) => return e,
         };
         // `CH` has no effect on the INCR reply, as on Redis.
-        return zincr_member(db, key, increment, member, IncrFlags { nx, xx, gt, lt });
+        let reply = zincr_member(db, key, increment, member, IncrFlags { nx, xx, gt, lt });
+        // moon#1232: as `ZINCRBY` (`command::keyspace_changes::Rule::ZIncr`).
+        crate::admin::metrics_setup::record_keyspace_changes(
+            crate::command::keyspace_changes::zincr_changes(increment, &reply),
+        );
+        return reply;
     }
 
     // moon#814: validate EVERY pair BEFORE touching the keyspace.
@@ -387,7 +392,12 @@ pub fn zadd(db: &mut Database, args: &[Frame]) -> Frame {
                             // next read disagreed with the reply. Neither side
                             // can be NaN: `parse_zadd_pair` rejects a NaN
                             // score, so `!=` is total here.
-                            if old_score != score {
+                            //
+                            // Without `CH` (`!consults_old`) the closure
+                            // replaced only bytes that DIFFERED, so the score
+                            // moved; that tally feeds the redis `dirty` count
+                            // below (moon#1232), never the reply.
+                            if !consults_old || old_score != score {
                                 changed += 1;
                             }
                         }
@@ -437,6 +447,8 @@ pub fn zadd(db: &mut Database, args: &[Frame]) -> Frame {
                     // charged from their real capacity (moon#788/#810).
                     db.upgrade_zset_listpack_to_bptree(key);
                 }
+                // moon#1232: redis `dirty += added + updated`.
+                crate::admin::metrics_setup::record_keyspace_changes(changed as u64);
                 return if ch {
                     Frame::Integer(changed)
                 } else {
@@ -542,6 +554,8 @@ pub fn zadd(db: &mut Database, args: &[Frame]) -> Frame {
         db.remove(key);
         return Frame::Integer(0);
     }
+    // moon#1232: redis `dirty += added + updated`.
+    crate::admin::metrics_setup::record_keyspace_changes(changed as u64);
 
     if ch {
         Frame::Integer(changed)

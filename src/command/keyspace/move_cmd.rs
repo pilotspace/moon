@@ -36,6 +36,19 @@ use crate::storage::Database;
 /// - `src` and `dst` are two **distinct** databases from the same shard
 /// - The caller holds exclusive (write) access to both
 pub fn move_core(src: &mut Database, dst: &mut Database, key: &[u8]) -> Frame {
+    // moon#1232: a MOVE is ONE keyspace change in redis, and a refused one is
+    // none — its remove-and-put-back must not count two.
+    let reply = {
+        let _quiet = crate::admin::metrics_setup::mute_keyspace_changes();
+        move_core_uncounted(src, dst, key)
+    };
+    if matches!(reply, Frame::Integer(1)) {
+        crate::admin::metrics_setup::record_keyspace_changes(1);
+    }
+    reply
+}
+
+fn move_core_uncounted(src: &mut Database, dst: &mut Database, key: &[u8]) -> Frame {
     // Key must exist in src (lazy expiry applied inside `remove`)
     let entry = match src.remove(key) {
         Some(e) => e,

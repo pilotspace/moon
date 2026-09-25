@@ -466,6 +466,10 @@ fn serve_list_key(
     pending_from: usize,
     budget: &mut std::time::Duration,
 ) -> bool {
+    // moon#1232: serving a parked waiter is no keyspace change in redis
+    // 7.0.15 (the push that fed it is the one counted), so the funnels the
+    // pops, pushes and put-backs below pass through are muted.
+    let _quiet = crate::admin::metrics_setup::mute_keyspace_changes();
     // moon#1217: the pops below write `key` (see `serve_ready_key`).
     crate::persistence::snapshot_cow::capture_wake_pre_image(db, db_index, key);
     // Loop: try waiters until one succeeds (oneshot receiver may be dropped = skip)
@@ -880,6 +884,8 @@ fn serve_zset_key(
     key: &Bytes,
     budget: &mut std::time::Duration,
 ) -> bool {
+    // moon#1232: not counted, as in `serve_list_key`.
+    let _quiet = crate::admin::metrics_setup::mute_keyspace_changes();
     // moon#1217: the pops below write `key` (see `serve_ready_key`).
     crate::persistence::snapshot_cow::capture_wake_pre_image(db, db_index, key);
     // moon#535: pop only waiters THIS waker can serve. The old blind

@@ -168,6 +168,8 @@ pub fn geoadd(db: &mut Database, args: &[Frame]) -> Frame {
     // `members`/`tree`'s borrow of `db` ends above.
     db.charge_memory(mem_charge);
     db.adjust_memory(table_before, table_after);
+    // moon#1232: GEOADD is ZADD in redis, `dirty += added + updated`.
+    crate::admin::metrics_setup::record_keyspace_changes(changed as u64);
 
     Frame::Integer(if ch { changed } else { added })
 }

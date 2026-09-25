@@ -955,6 +955,9 @@ fn rehydrate_unpublished_spill(
             crate::storage::eviction::rehydrate_spill_payload(vt, &bytes, ttl)
         }) {
             Some(hot) => {
+                // Putting an evicted value back is no keyspace change
+                // (moon#1232): the eviction was not counted either.
+                let _quiet = crate::admin::metrics_setup::mute_keyspace_changes();
                 db.set(&entry.key, hot);
                 crate::storage::tiered::spill_thread::record_spill_failed_reinserted();
             }
@@ -1072,6 +1075,8 @@ fn apply_completion_vec(
                         req.ttl_ms,
                     ) {
                         Some(entry) => {
+                            // No keyspace change (moon#1232), as above.
+                            let _quiet = crate::admin::metrics_setup::mute_keyspace_changes();
                             db.set(&req.key, entry);
                             crate::storage::tiered::spill_thread::record_spill_failed_reinserted();
                             tracing::error!(

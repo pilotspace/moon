@@ -11,8 +11,18 @@
 //! `--save "1 10"`: nine writes produce no snapshot within a few seconds; ten
 //! writes produce one (`LASTSAVE` and `rdb_last_save_time` advance, the status
 //! is `ok`, the count returns to 0, and every shard's `shard-N.rrdshard`
-//! exists). Runs at `--shards 1` and `--shards 4`. Pin the binary:
-//! `MOON_BIN=<moon> cargo test --test perf_ws19_save_rules`.
+//! exists). Runs at `--shards 1` and `--shards 4`, with string writes and with
+//! collection writes (which counted 0 until the review of moon#1232).
+//!
+//! What counts is redis 7.0.15's `server.dirty`, command by command
+//! (`dirty_count_matches_redis_7_0_15`: collection writes by their redis rule,
+//! a `DEL` / `EXPIRE` of a missing key 0, active expiry 0, `RENAME` 1), and a
+//! read never counts — not even the GET of a cold key, which promotes it and
+//! evicts others to make room (`cold_reads_do_not_count_as_changes`).
+//! `dirty_count_oracle_redis_agrees` (ignored; needs `redis-server` on PATH)
+//! re-measures the table's expectations against redis itself.
+//!
+//! Pin the binary: `MOON_BIN=<moon> cargo test --test perf_ws19_save_rules`.
 
 #![allow(clippy::unwrap_used)]
 
@@ -92,15 +102,34 @@ fn snapshot_files(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
     acc
 }
 
-fn write(c: &mut Conn, from: usize, n: usize) {
+/// How a test writes its changes: one keyspace change per command.
+#[derive(Clone, Copy)]
+enum Writes {
+    Strings,
+    Collections,
+}
+
+fn write(c: &mut Conn, writes: Writes, from: usize, n: usize) {
     for i in from..from + n {
         // Distinct keys, so every shard can own some at --shards 4.
-        let reply = c.send(&["SET", &format!("save-rule:{i}"), "v"]);
-        assert!(reply.starts_with("+OK"), "SET refused: {reply}");
+        let key = format!("save-rule:{i}");
+        let parts: Vec<&str> = match (writes, i % 4) {
+            (Writes::Strings, _) => vec!["SET", &key, "v"],
+            (Writes::Collections, 0) => vec!["HSET", &key, "f", "v"],
+            (Writes::Collections, 1) => vec!["RPUSH", &key, "a"],
+            (Writes::Collections, 2) => vec!["SADD", &key, "a"],
+            (Writes::Collections, _) => vec!["ZADD", &key, "1", "m"],
+        };
+        let reply = c.send(&parts);
+        assert!(!reply.starts_with('-'), "{} refused: {reply}", parts[0]);
     }
 }
 
 fn save_rule_fires_at_its_change_count(shards: usize) {
+    save_rule_fires_for(shards, Writes::Strings);
+}
+
+fn save_rule_fires_for(shards: usize, writes: Writes) {
     let dir = common::unique_test_dir(&format!("ws19-1232-s{shards}"));
     std::fs::create_dir_all(&dir).unwrap();
     let (mut server, port) = spawn(&dir, shards);
@@ -109,11 +138,11 @@ fn save_rule_fires_at_its_change_count(shards: usize) {
 
     // Nine changes: under the rule's threshold. Several ticks of the
     // one-second auto-save timer pass.
-    write(&mut c, 0, 9);
+    write(&mut c, writes, 0, 9);
     assert_eq!(
         info_field(&mut c, "rdb_changes_since_last_save"),
         "9",
-        "fixture: one SET is one change"
+        "fixture: each write is one change"
     );
     std::thread::sleep(Duration::from_millis(3500));
     assert_eq!(
@@ -128,7 +157,7 @@ fn save_rule_fires_at_its_change_count(shards: usize) {
     );
 
     // The tenth change: a snapshot within a few seconds.
-    write(&mut c, 9, 1);
+    write(&mut c, writes, 9, 1);
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
         let saved =
@@ -175,4 +204,547 @@ fn save_rule_fires_at_its_change_count_one_shard() {
 #[test]
 fn save_rule_fires_at_its_change_count_four_shards() {
     save_rule_fires_at_its_change_count(4);
+}
+
+/// Collection writes arm a rule too: `HSET`, `RPUSH`, `SADD` and `ZADD`
+/// counted 0 before the moon#1232 review, so a hash-, list- or set-only
+/// workload never saved.
+#[test]
+fn save_rule_fires_on_collection_writes_four_shards() {
+    save_rule_fires_for(4, Writes::Collections);
+}
+
+// ── What counts, against redis 7.0.15 ──────────────────────────────────────
+
+/// One measured row: `setup` runs unmeasured, then the delta of
+/// `rdb_changes_since_last_save` across `measured` must be `redis`, the delta
+/// redis-server 7.0.15 shows for the same commands. Pseudo commands:
+/// `SLEEP <ms>`, and `PARK <cmd...>`, which sends a command on a second
+/// connection without waiting for its reply (a client left blocked), read
+/// after the row.
+struct Row {
+    name: &'static str,
+    setup: &'static [&'static [&'static str]],
+    measured: &'static [&'static [&'static str]],
+    redis: u64,
+}
+
+macro_rules! row {
+    ($name:expr, [$($setup:expr),*], [$($measured:expr),*], $redis:expr) => {
+        Row { name: $name, setup: &[$(&$setup),*], measured: &[$(&$measured),*], redis: $redis }
+    };
+}
+
+const ROWS: &[Row] = &[
+    // The reviewer's table (moon#1232 review).
+    row!("SET new key", [], [["SET", "a", "1"]], 1),
+    row!(
+        "MSET 3 keys",
+        [],
+        [["MSET", "b", "1", "c", "2", "d", "3"]],
+        3
+    ),
+    row!("DEL missing key", [], [["DEL", "nope"]], 0),
+    row!(
+        "DEL 2 existing",
+        [["SET", "d1", "1"], ["SET", "d2", "1"]],
+        [["DEL", "d1", "d2"]],
+        2
+    ),
+    row!("GET hit", [["SET", "g", "1"]], [["GET", "g"]], 0),
+    row!("GET miss", [], [["GET", "nope2"]], 0),
+    row!(
+        "HSET 3 new fields",
+        [],
+        [["HSET", "h", "f1", "1", "f2", "2", "f3", "3"]],
+        3
+    ),
+    row!(
+        "RPUSH 5 elements",
+        [],
+        [["RPUSH", "l", "a", "b", "c", "d", "e"]],
+        5
+    ),
+    row!("SADD 3 members", [], [["SADD", "s", "a", "b", "c"]], 3),
+    row!("ZADD 2 members", [], [["ZADD", "z", "1", "a", "2", "b"]], 2),
+    row!("INCR", [], [["INCR", "n"]], 1),
+    row!(
+        "SET NX on existing (no-op)",
+        [["SET", "x", "1"]],
+        [["SET", "x", "2", "NX"]],
+        0
+    ),
+    row!("EXPIRE missing key", [], [["EXPIRE", "nope3", "10"]], 0),
+    row!("HGET", [["HSET", "h2", "f", "v"]], [["HGET", "h2", "f"]], 0),
+    row!(
+        "HDEL missing field",
+        [["HSET", "h3", "f", "v"]],
+        [["HDEL", "h3", "nof"]],
+        0
+    ),
+    row!("LPOP missing list", [], [["LPOP", "nolist"]], 0),
+    row!(
+        "LRANGE",
+        [["RPUSH", "l2", "a"]],
+        [["LRANGE", "l2", "0", "-1"]],
+        0
+    ),
+    row!("APPEND", [["SET", "ap", "v"]], [["APPEND", "ap", "x"]], 1),
+    row!(
+        "MULTI 2 SETs EXEC",
+        [],
+        [["MULTI"], ["SET", "m1", "1"], ["SET", "m2", "2"], ["EXEC"]],
+        2
+    ),
+    row!(
+        "EVAL 2 SETs",
+        [],
+        [[
+            "EVAL",
+            "redis.call('SET',KEYS[1],'1') redis.call('SET',KEYS[2],'2') return 1",
+            "2",
+            "e1",
+            "e2"
+        ]],
+        2
+    ),
+    row!(
+        "active expiry of 1 key",
+        [["SET", "ex", "v", "PX", "50"]],
+        [["SLEEP", "1500"]],
+        0
+    ),
+    row!(
+        "HSET existing, 1 new field",
+        [["HSET", "h4", "a", "1"]],
+        [["HSET", "h4", "b", "2"]],
+        1
+    ),
+    row!(
+        "HINCRBY existing",
+        [["HSET", "h5", "a", "1"]],
+        [["HINCRBY", "h5", "a", "1"]],
+        1
+    ),
+    row!(
+        "HDEL existing field",
+        [["HSET", "h6", "a", "1", "b", "2"]],
+        [["HDEL", "h6", "a"]],
+        1
+    ),
+    row!(
+        "RPUSH existing, 2 elems",
+        [["RPUSH", "l3", "a"]],
+        [["RPUSH", "l3", "b", "c"]],
+        2
+    ),
+    row!(
+        "LPOP existing",
+        [["RPUSH", "l4", "a", "b"]],
+        [["LPOP", "l4"]],
+        1
+    ),
+    row!(
+        "LSET",
+        [["RPUSH", "l5", "a", "b"]],
+        [["LSET", "l5", "0", "z"]],
+        1
+    ),
+    row!(
+        "SADD existing, 1 new",
+        [["SADD", "s2", "a"]],
+        [["SADD", "s2", "b"]],
+        1
+    ),
+    row!(
+        "SREM existing",
+        [["SADD", "s3", "a", "b"]],
+        [["SREM", "s3", "a"]],
+        1
+    ),
+    row!(
+        "ZADD existing, 1 new",
+        [["ZADD", "z2", "1", "a"]],
+        [["ZADD", "z2", "2", "b"]],
+        1
+    ),
+    row!(
+        "ZINCRBY existing",
+        [["ZADD", "z3", "1", "a"]],
+        [["ZINCRBY", "z3", "1", "a"]],
+        1
+    ),
+    row!(
+        "ZREM existing",
+        [["ZADD", "z4", "1", "a", "2", "b"]],
+        [["ZREM", "z4", "a"]],
+        1
+    ),
+    row!("XADD", [], [["XADD", "st", "*", "f", "v"]], 1),
+    row!("PFADD 2", [], [["PFADD", "hll", "a", "b"]], 3),
+    row!("SETBIT", [], [["SETBIT", "bits", "7", "1"]], 1),
+    row!(
+        "SETRANGE existing",
+        [["SET", "sr", "hello"]],
+        [["SETRANGE", "sr", "1", "a"]],
+        1
+    ),
+    row!(
+        "EXPIRE existing",
+        [["SET", "e1", "v"]],
+        [["EXPIRE", "e1", "100"]],
+        1
+    ),
+    row!(
+        "PERSIST existing TTL",
+        [["SET", "p1", "v", "EX", "100"]],
+        [["PERSIST", "p1"]],
+        1
+    ),
+    row!("RENAME", [["SET", "rn", "v"]], [["RENAME", "rn", "rn2"]], 1),
+    row!("GETDEL", [["SET", "gd", "v"]], [["GETDEL", "gd"]], 1),
+    row!("COPY", [["SET", "cp", "v"]], [["COPY", "cp", "cp2"]], 1),
+    row!(
+        "SUNIONSTORE",
+        [["SADD", "su1", "a"], ["SADD", "su2", "b"]],
+        [["SUNIONSTORE", "sud", "su1", "su2"]],
+        1
+    ),
+    row!(
+        "LMOVE",
+        [["RPUSH", "lm1", "a", "b"]],
+        [["LMOVE", "lm1", "lm2", "LEFT", "RIGHT"]],
+        1
+    ),
+    // Beyond the reviewer's table.
+    row!(
+        "HDEL every field",
+        [["HSET", "h7", "a", "1", "b", "2"]],
+        [["HDEL", "h7", "a", "b"]],
+        2
+    ),
+    row!(
+        "LTRIM 3 of 5",
+        [["RPUSH", "l6", "a", "b", "c", "d", "e"]],
+        [["LTRIM", "l6", "1", "2"]],
+        3
+    ),
+    row!(
+        "LMPOP 2",
+        [["RPUSH", "l7", "a", "b", "c"]],
+        [["LMPOP", "1", "l7", "LEFT", "COUNT", "2"]],
+        2
+    ),
+    row!(
+        "SPOP count 5 of 3",
+        [["SADD", "s4", "a", "b", "c"]],
+        [["SPOP", "s4", "5"]],
+        3
+    ),
+    row!(
+        "SMOVE to a new set",
+        [["SADD", "s5", "a"]],
+        [["SMOVE", "s5", "s6", "a"]],
+        2
+    ),
+    row!(
+        "ZADD same score",
+        [["ZADD", "z5", "1", "a"]],
+        [["ZADD", "z5", "1", "a"]],
+        0
+    ),
+    row!(
+        "ZPOPMIN 2",
+        [["ZADD", "z6", "1", "a", "2", "b", "3", "c"]],
+        [["ZPOPMIN", "z6", "2"]],
+        2
+    ),
+    row!(
+        "ZUNIONSTORE",
+        [["ZADD", "za", "1", "x"], ["ZADD", "zb", "1", "y"]],
+        [["ZUNIONSTORE", "zd", "2", "za", "zb"]],
+        1
+    ),
+    row!(
+        "ZINTERSTORE empty, no dst",
+        [["ZADD", "zc", "1", "x"], ["ZADD", "ze", "1", "y"]],
+        [["ZINTERSTORE", "zf", "2", "zc", "ze"]],
+        0
+    ),
+    row!(
+        "XTRIM 2",
+        [
+            ["XADD", "st2", "1-1", "f", "v"],
+            ["XADD", "st2", "1-2", "f", "v"],
+            ["XADD", "st2", "1-3", "f", "v"]
+        ],
+        [["XTRIM", "st2", "MAXLEN", "1"]],
+        2
+    ),
+    row!(
+        "GEOADD 2",
+        [],
+        [[
+            "GEOADD", "geo", "13.36", "38.11", "a", "15.08", "37.50", "b"
+        ]],
+        2
+    ),
+    row!(
+        "BLPOP ready",
+        [["RPUSH", "bl", "a"]],
+        [["BLPOP", "bl", "1"]],
+        1
+    ),
+    row!(
+        "BLMPOP ready",
+        [["RPUSH", "bm", "a", "b"]],
+        [["BLMPOP", "1", "1", "bm", "LEFT", "COUNT", "5"]],
+        2
+    ),
+    row!(
+        "BLPOP parked, served by RPUSH",
+        [],
+        [
+            ["PARK", "BLPOP", "wl", "5"],
+            ["SLEEP", "300"],
+            ["RPUSH", "wl", "x"],
+            ["SLEEP", "300"]
+        ],
+        1
+    ),
+    row!("MOVE", [["SET", "mv", "1"]], [["MOVE", "mv", "1"]], 1),
+    row!(
+        "FLUSHDB 3 keys",
+        [
+            ["FLUSHDB"],
+            ["SET", "f1", "1"],
+            ["SET", "f2", "1"],
+            ["SET", "f3", "1"]
+        ],
+        [["FLUSHDB"]],
+        3
+    ),
+];
+
+fn changes(c: &mut Conn) -> u64 {
+    info_field(c, "rdb_changes_since_last_save")
+        .parse()
+        .expect("numeric rdb_changes_since_last_save")
+}
+
+/// Run `cmds`; `PARK`ed commands go out on fresh connections, returned so the
+/// caller reads their replies once the row is done.
+fn run_cmds(c: &mut Conn, port: u16, cmds: &[&[&str]]) -> Vec<Conn> {
+    use std::io::Write;
+    let mut parked = Vec::new();
+    for cmd in cmds {
+        match cmd[0] {
+            "SLEEP" => std::thread::sleep(Duration::from_millis(cmd[1].parse().unwrap())),
+            "PARK" => {
+                let mut p = Conn::open(port);
+                p.sock.write_all(&common::encode(&cmd[1..])).unwrap();
+                parked.push(p);
+            }
+            _ => {
+                let _ = c.send(cmd);
+            }
+        }
+    }
+    parked
+}
+
+/// Each row's delta on the server at `port`, as `(row, delta)`.
+fn measure(port: u16) -> Vec<(&'static Row, u64)> {
+    let mut c = Conn::open(port);
+    ROWS.iter()
+        .map(|row| {
+            for mut p in run_cmds(&mut c, port, row.setup) {
+                p.read_replies(1);
+            }
+            let before = changes(&mut c);
+            let parked = run_cmds(&mut c, port, row.measured);
+            let delta = changes(&mut c) - before;
+            for mut p in parked {
+                p.read_replies(1);
+            }
+            (row, delta)
+        })
+        .collect()
+}
+
+fn table_mismatches(measured: &[(&Row, u64)], who: &str) -> Vec<String> {
+    measured
+        .iter()
+        .filter(|(row, got)| *got != row.redis)
+        .map(|(row, got)| {
+            format!(
+                "{:<32} redis 7.0.15 {:>2}   {who} {got:>2}",
+                row.name, row.redis
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn dirty_count_matches_redis_7_0_15() {
+    let dir = common::unique_test_dir("ws19-1232-parity");
+    std::fs::create_dir_all(&dir).unwrap();
+    let bin = common::find_moon_binary();
+    let (child, port) = common::spawn_listening(|port| {
+        std::process::Command::new(&bin)
+            .args(["--port", &port.to_string(), "--dir", &dir.to_string_lossy()])
+            .args([
+                "--shards",
+                "1",
+                "--appendonly",
+                "no",
+                "--disk-offload",
+                "disable",
+            ])
+            .args(["--maxmemory", "0", "--disk-free-min-pct", "0"])
+            .stdout(common::server_stderr(&dir))
+            .stderr(common::server_stderr(&dir))
+            .spawn()
+            .expect("spawn moon (build it first, or set MOON_BIN)")
+    });
+    let mut server = ServerGuard::new(child);
+    let wrong = table_mismatches(&measure(port), "moon");
+    server.kill_now();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        wrong.is_empty(),
+        "rdb_changes_since_last_save deltas differ from redis:\n{}",
+        wrong.join("\n")
+    );
+}
+
+/// The oracle: the table's expectations measured on a real `redis-server`.
+#[test]
+#[ignore] // Needs redis-server (7.0.15) on PATH; run explicitly.
+fn dirty_count_oracle_redis_agrees() {
+    let dir = common::unique_test_dir("ws19-1232-oracle");
+    std::fs::create_dir_all(&dir).unwrap();
+    let (mut server, port) = common::spawn_listening_guarded(|port| {
+        std::process::Command::new("redis-server")
+            .args([
+                "--port",
+                &port.to_string(),
+                "--save",
+                "",
+                "--appendonly",
+                "no",
+            ])
+            .arg("--dir")
+            .arg(&dir)
+            .stdout(common::server_stderr(&dir))
+            .stderr(common::server_stderr(&dir))
+            .spawn()
+            .expect("spawn redis-server (on PATH)")
+    });
+    let wrong = table_mismatches(&measure(port), "redis-server");
+    server.kill_now();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        wrong.is_empty(),
+        "the table is not redis's:\n{}",
+        wrong.join("\n")
+    );
+}
+
+// ── A read never counts ─────────────────────────────────────────────────────
+
+/// GETs of cold keys promote them into RAM, and the promotions evict other
+/// keys to make room; neither is a change. Before the review, 200 such GETs
+/// moved the count the `--save` trigger reads by ~165.
+#[test]
+fn cold_reads_do_not_count_as_changes() {
+    const PROBES: usize = 200;
+    const FILLERS: usize = 16_000;
+    let dir = common::unique_test_dir("ws19-1232-coldreads");
+    std::fs::create_dir_all(dir.join("off")).unwrap();
+    let bin = common::find_moon_binary();
+    let (child, port) = common::spawn_listening(|port| {
+        std::process::Command::new(&bin)
+            .args(["--port", &port.to_string(), "--dir", &dir.to_string_lossy()])
+            .args(["--shards", "1", "--disk-free-min-pct", "0"])
+            .args(["--maxmemory", &(8 * 1024 * 1024).to_string()])
+            .args([
+                "--maxmemory-policy",
+                "allkeys-lru",
+                "--disk-offload",
+                "enable",
+            ])
+            .arg("--disk-offload-dir")
+            .arg(dir.join("off"))
+            // Only an AOF server spills on eviction (others drop).
+            .args(["--appendonly", "yes"])
+            .stdout(common::server_stderr(&dir))
+            .stderr(common::server_stderr(&dir))
+            .spawn()
+            .expect("spawn moon (build it first, or set MOON_BIN)")
+    });
+    let mut server = ServerGuard::new(child);
+    let mut c = Conn::open(port);
+    let probe = "P".repeat(500);
+    let filler = "F".repeat(600);
+    for chunk in 0..(PROBES + FILLERS) / 1000 + 1 {
+        let cmds: Vec<Vec<String>> = (chunk * 1000..((chunk + 1) * 1000).min(PROBES + FILLERS))
+            .map(|i| {
+                if i < PROBES {
+                    vec!["SET".into(), format!("probe:{i}"), probe.clone()]
+                } else {
+                    vec!["SET".into(), format!("filler:{i}"), filler.clone()]
+                }
+            })
+            .collect();
+        let refs: Vec<Vec<&str>> = cmds
+            .iter()
+            .map(|v| v.iter().map(String::as_str).collect())
+            .collect();
+        let parts: Vec<&[&str]> = refs.iter().map(Vec::as_slice).collect();
+        if !parts.is_empty() {
+            c.pipeline(&parts);
+        }
+    }
+    let spilled = |c: &mut Conn| -> u64 {
+        let info = c.send(&["INFO", "stats"]);
+        info.lines()
+            .find_map(|l| l.strip_prefix("spilled_keys:"))
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(0)
+    };
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while spilled(&mut c) < 1000 {
+        assert!(
+            Instant::now() < deadline,
+            "precondition: nothing spilled in 30 s"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    // Let the spill and eviction settle, then prove the count is idle.
+    std::thread::sleep(Duration::from_secs(2));
+    let before = changes(&mut c);
+    std::thread::sleep(Duration::from_secs(2));
+    assert_eq!(changes(&mut c), before, "precondition: the count is idle");
+    let mut hits = 0;
+    for i in 0..PROBES {
+        let reply = c.send(&["GET", &format!("probe:{i}")]);
+        if reply.starts_with('$') && !reply.starts_with("$-1") {
+            hits += 1;
+        }
+    }
+    std::thread::sleep(Duration::from_secs(1));
+    let after = changes(&mut c);
+    server.kill_now();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        hits > PROBES / 2,
+        "precondition: only {hits} probe GETs answered"
+    );
+    assert_eq!(
+        after - before,
+        0,
+        "{PROBES} GETs of cold keys (no write at all) moved rdb_changes_since_last_save by {}",
+        after - before
+    );
 }

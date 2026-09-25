@@ -983,12 +983,16 @@ fn ltrim_listpack(db: &mut Database, key: &Bytes, start: i64, stop: i64) -> Fram
         Ok(None) => return ltrim_eager(db, key, start, stop),
         Err(e) => return e,
     };
-    let Some((s, e)) = trim_window(start, stop, lp.len()) else {
+    let len = lp.len();
+    let Some((s, e)) = trim_window(start, stop, len) else {
         // Everything goes. Whole-key removal credits the entry as it stands,
         // listpack included, so nothing needs trimming first.
         db.remove(key);
+        // moon#1232: redis `dirty += ltrim + rtrim`, the elements removed.
+        crate::admin::metrics_setup::record_keyspace_changes(len as u64);
         return Frame::SimpleString(Bytes::from_static(b"OK"));
     };
+    crate::admin::metrics_setup::record_keyspace_changes((len - (e - s + 1)) as u64);
     let before = lp.estimate_memory();
     if s > 0 || e + 1 < lp.len() {
         lp.retain_range(s, e);
@@ -1014,6 +1018,7 @@ fn ltrim_eager(db: &mut Database, key: &Bytes, start: i64, stop: i64) -> Frame {
     };
 
     let mut credit: usize = 0;
+    let len_before = list.len();
     match trim_window(start, stop, list.len()) {
         None => {
             // Empty range -- clear the list. Credit every dropped element's
@@ -1035,8 +1040,11 @@ fn ltrim_eager(db: &mut Database, key: &Bytes, start: i64, stop: i64) -> Frame {
         }
     }
     let is_empty = list.is_empty();
+    // moon#1232: redis `dirty += ltrim + rtrim`, the elements removed.
+    let removed = len_before - list.len();
     // `list`'s borrow of `db` ends above.
     db.credit_memory(credit);
+    crate::admin::metrics_setup::record_keyspace_changes(removed as u64);
 
     if is_empty {
         db.remove(key);

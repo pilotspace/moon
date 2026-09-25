@@ -1506,6 +1506,8 @@ fn evict_batch_durable(
     deficit: usize,
     on_plain_drop: &mut dyn FnMut(&[u8]),
 ) -> usize {
+    // moon#1232: eviction is no keyspace change (redis leaves `dirty` alone).
+    let _quiet = crate::admin::metrics_setup::mute_keyspace_changes();
     let mut seen: std::collections::HashSet<CompactKey> = std::collections::HashSet::new();
     let mut buffer: Vec<SpillRequest> = Vec::new();
     let mut staged_bytes = 0usize;
@@ -1674,6 +1676,8 @@ fn evict_one_async_spill(
     db_index: usize,
     on_plain_drop: &mut dyn FnMut(&[u8]),
 ) -> bool {
+    // moon#1232: eviction is no keyspace change (redis leaves `dirty` alone).
+    let _quiet = crate::admin::metrics_setup::mute_keyspace_changes();
     // Find victim key using the shared policy dispatch (same as sync path)
     let key = match select_victim(db, config, policy) {
         Some(k) => k,
@@ -1793,6 +1797,8 @@ pub(crate) fn evict_one_with_spill(
     spill: Option<&mut SpillContext<'_>>,
     on_plain_drop: &mut dyn FnMut(&[u8]),
 ) -> bool {
+    // moon#1232: eviction is no keyspace change (redis leaves `dirty` alone).
+    let _quiet = crate::admin::metrics_setup::mute_keyspace_changes();
     // W2: the SpillContext arm delegates to the ONE durable batch spiller
     // (deficit 1 byte stages exactly one victim). Everything the per-victim
     // path used to hand-roll — write-then-durable-then-drop ordering, the
