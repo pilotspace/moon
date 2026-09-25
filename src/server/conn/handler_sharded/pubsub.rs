@@ -334,7 +334,16 @@ pub(super) async fn run_subscriber_step<S: tokio::io::AsyncRead + tokio::io::Asy
                         if conn.subscription_count == 0 { break; }
                     }
                     Ok(None) => break,
-                    Err(_) => { return SubscriberAction::EarlyReturn; }
+                    Err(e) => {
+                        // Protocol fault: say so before closing, as the main
+                        // loop does (moon#1226 — this arm closed silently).
+                        if let crate::protocol::ParseError::Invalid { kind, .. } = e {
+                            let _ = stream
+                                .write_all(crate::server::conn::util::proto_error_frame(kind).as_bytes())
+                                .await;
+                        }
+                        return SubscriberAction::EarlyReturn;
+                    }
                 }
             }
             if sub_break { return SubscriberAction::BreakOuter; }

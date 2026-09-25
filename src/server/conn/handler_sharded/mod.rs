@@ -632,7 +632,9 @@ pub(crate) async fn handle_connection_sharded_inner<
                 } else {
                     std::mem::take(&mut carried_frames)
                 };
-                while batch.len() < super::util::MAX_BATCH_FRAMES {
+                // A latched fault (moon#1226) means the carried frames are the
+                // last valid ones: nothing behind the fault is ever parsed.
+                while proto_fault.is_none() && batch.len() < super::util::MAX_BATCH_FRAMES {
                     match crate::protocol::parse_resumable(&mut read_buf, &parse_config, &mut parse_state) {
                         Ok(Some(frame)) => batch.push(frame),
                         Ok(None) => break,
@@ -3177,6 +3179,10 @@ pub(crate) async fn handle_connection_sharded_inner<
                         super::util::spill_frames_to_front(&batch[from..num_frames], &mut read_buf);
                         // moon#1164: bytes were prepended — the resume cursor is void.
                         parse_state.reset();
+                        // moon#1226: the subscriber step parses these bytes,
+                        // and a fault never consumes its input, so it meets
+                        // the same bad frame right behind them and reports it.
+                        proto_fault = None;
                     } else {
                         batch.drain(..from);
                         carried_frames = batch;
@@ -3599,8 +3605,12 @@ pub(crate) async fn handle_connection_sharded_inner<
 
                 // The valid prefix has now been executed and flushed. Name the
                 // fault, then close — in that order, so the client can tell a
-                // bad encoder from a dropped network.
-                if let Some(kind) = proto_fault.take() {
+                // bad encoder from a dropped network. Unless part of that
+                // prefix was DEFERRED to the next iteration: redis runs every
+                // command before the fault, so it stays latched and the loop
+                // goes round without reading until the carried frames have
+                // run (moon#1226). They used to be dropped.
+                if carried_frames.is_empty() && let Some(kind) = proto_fault.take() {
                     let _ = stream
                         .write_all(super::util::proto_error_frame(kind).as_bytes())
                         .await;
