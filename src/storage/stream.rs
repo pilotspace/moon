@@ -320,6 +320,12 @@ impl Stream {
 
     /// Generate next auto-ID. Uses max(now_ms, last_id.ms) for monotonic guarantee.
     /// If clock goes backward, reuses last_id.ms and increments seq.
+    ///
+    /// At the last possible ID (`seq == u64::MAX`) the sequence WRAPS to
+    /// `ms-0`, at or below `last_id`, which [`Self::add`] refuses (moon#1249)
+    /// and every caller answers ("exhausted the last possible ID"). Wrapping
+    /// explicitly: the plain `+ 1` did that in a release build and panicked
+    /// the shard in a debug one (review 5).
     pub fn next_auto_id(&mut self) -> StreamId {
         let now_ms = current_time_ms();
         if now_ms > self.last_id.ms {
@@ -327,7 +333,7 @@ impl Stream {
         } else {
             StreamId {
                 ms: self.last_id.ms,
-                seq: self.last_id.seq + 1,
+                seq: self.last_id.seq.wrapping_add(1),
             }
         }
     }
@@ -1333,6 +1339,18 @@ mod tests {
         let id = s.next_auto_id();
         assert_eq!(id.ms, u64::MAX - 1);
         assert_eq!(id.seq, 6);
+    }
+
+    /// Review 5: at the last possible ID the next auto-ID wraps (no
+    /// overflow panic in a debug build) and `add` refuses it.
+    #[test]
+    fn next_auto_id_at_the_last_possible_id_is_refused_not_a_panic() {
+        let mut s = Stream::new();
+        s.last_id = StreamId::MAX;
+        let id = s.next_auto_id();
+        assert!(id <= s.last_id);
+        assert_eq!(s.add(id, vec![(Bytes::from("f"), Bytes::from("v"))]), None);
+        assert_eq!(s.length, 0);
     }
 
     #[test]

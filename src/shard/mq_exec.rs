@@ -287,14 +287,17 @@ pub(crate) fn materialize_mq_intents(
             && stream.durable
         {
             let msg_id = stream.next_auto_id();
-            payloads.push(crate::mq::wal::encode_mq_push(
-                db_index as u32,
-                &intent.queue_key,
-                msg_id.ms,
-                msg_id.seq,
-                &intent.fields,
-            ));
-            stream.add(msg_id, intent.fields.clone());
+            // Review 5: a push `add` refuses (moon#1249: the queue's last
+            // possible ID is taken) added nothing, so it logs nothing.
+            if stream.add(msg_id, intent.fields.clone()).is_some() {
+                payloads.push(crate::mq::wal::encode_mq_push(
+                    db_index as u32,
+                    &intent.queue_key,
+                    msg_id.ms,
+                    msg_id.seq,
+                    &intent.fields,
+                ));
+            }
             // moon#1250: charged like an MQ PUSH.
             let delta = stream.take_unbilled();
             bill_stream_delta(db, delta);
@@ -752,7 +755,6 @@ fn handle_pop(args: &[Frame], key_prefix: &Bytes, db_index: usize) -> Frame {
             let mut results: Vec<(StreamId, Vec<(Bytes, Bytes)>)> =
                 Vec::with_capacity(count.min(claimed.len()));
             let mut dlq_entries: Vec<(StreamId, Vec<(Bytes, Bytes)>)> = Vec::new();
-            let mut dlq_ack_ids: Vec<StreamId> = Vec::new();
             // Every id this POP KEEPS (delivered or dead-lettered), with its
             // delivery_count at claim time. Entries released below are
             // deliberately absent: replay rebuilds the PEL from this list, so
@@ -784,7 +786,6 @@ fn handle_pop(args: &[Frame], key_prefix: &Bytes, db_index: usize) -> Frame {
                 let delivery_count = pe.map(|pe| pe.delivery_count).unwrap_or(1);
                 if should_dead_letter(delivery_count, mdc) {
                     dlq_entries.push((*id, fields.clone()));
-                    dlq_ack_ids.push(*id);
                 } else if results.len() < count {
                     results.push((*id, fields.clone()));
                 } else {
@@ -843,27 +844,23 @@ fn handle_pop(args: &[Frame], key_prefix: &Bytes, db_index: usize) -> Frame {
                 .map(|c| c.seen_time)
                 .unwrap_or(0);
 
-            // Step 4: ACK DLQ entries from the main stream PEL.
-            if !dlq_ack_ids.is_empty() {
-                let _ = stream.xack(&group_name, &dlq_ack_ids);
-            }
-
             let last_delivered_id = stream
                 .groups
                 .get(group_name.as_ref())
                 .map(|g| g.last_delivered_id)
                 .unwrap_or(StreamId::ZERO);
-            // moon#1250: the claim (PEL, consumer), release and dead-letter
-            // ack are charged / credited to `used_memory`.
+            // moon#1250: the claim (PEL, consumer) and release are charged /
+            // credited to `used_memory`.
             let delta = stream.take_unbilled();
             bill_stream_delta(db, delta);
 
-            // Step 5: append DLQ entries to the sibling DLQ stream, capturing
+            // Step 4: append DLQ entries to the sibling DLQ stream, capturing
             // the ASSIGNED dlq-stream id for each (outcome-deterministic —
             // replay must reproduce the exact id, not regenerate one from
             // its own wall clock).
             let mut dlq_for_wal: Vec<crate::mq::wal::DlqRouting> =
                 Vec::with_capacity(dlq_entries.len());
+            let mut routed: smallvec::SmallVec<[StreamId; 8]> = smallvec::SmallVec::new();
             if !dlq_entries.is_empty() {
                 let dlq_key = {
                     let mut buf = Vec::with_capacity(eff_key.len() + 8);
@@ -875,14 +872,38 @@ fn handle_pop(args: &[Frame], key_prefix: &Bytes, db_index: usize) -> Frame {
                 crate::persistence::snapshot_cow::capture_write_pre_image(db, db_index, &dlq_key);
                 if let Ok(dlq_stream) = db.get_or_create_stream(&dlq_key) {
                     for (src_id, fields) in dlq_entries {
-                        let dlq_id = dlq_stream.next_auto_id();
-                        dlq_stream.add(dlq_id, fields);
+                        let next = dlq_stream.next_auto_id();
+                        // Review 5: `add` refuses an ID at or below the DLQ's
+                        // `last_id` (moon#1249: its last possible ID is
+                        // taken). Such a dead letter is neither routed nor
+                        // logged as routed, and step 5 leaves it pending in
+                        // the queue — where the MqPop record (it is claimed,
+                        // with no routing) replays it too — instead of acking
+                        // away a message the DLQ never received.
+                        let Some(dlq_id) = dlq_stream.add(next, fields) else {
+                            tracing::warn!(
+                                "MQ POP: the dead-letter stream of a queue has exhausted its \
+                                 last possible ID; the dead letter stays pending in the queue"
+                            );
+                            continue;
+                        };
                         dlq_for_wal.push((src_id.ms, src_id.seq, dlq_id.ms, dlq_id.seq));
+                        routed.push(src_id);
                     }
                     // moon#1250: the dead letters are charged too.
                     let delta = dlq_stream.take_unbilled();
                     bill_stream_delta(db, delta);
                 }
+            }
+
+            // Step 5: ACK the dead letters the DLQ received from the queue's
+            // PEL, credited like any ACK.
+            if !routed.is_empty()
+                && let Ok(Some(stream)) = db.get_stream_mut(&eff_key)
+            {
+                let _ = stream.xack(&group_name, &routed);
+                let delta = stream.take_unbilled();
+                bill_stream_delta(db, delta);
             }
 
             let wal_payload = crate::mq::wal::encode_mq_pop(
@@ -1431,6 +1452,102 @@ mod tests {
         .join()
         .map(|delivered| assert_eq!(delivered, 3, "every queued entry"))
         .expect("the POP panicked the shard thread");
+    }
+
+    /// Review 5 nit: a TXN MQ.PUBLISH into a queue whose `Stream::add`
+    /// refuses the next id (moon#1249: the last possible ID is taken) adds
+    /// nothing, so it must log no MqPush either. It used to encode and
+    /// return the payload before trying the add.
+    #[test]
+    fn a_refused_txn_push_logs_no_mq_push() {
+        use crate::shard::slice::with_shard_db;
+        std::thread::spawn(|| {
+            init_shard(make_test_slice(1));
+            assert_eq!(
+                mq(&["CREATE", "q"]),
+                Frame::SimpleString(Bytes::from_static(b"OK"))
+            );
+            with_shard_db(0, |db| {
+                db.get_stream_mut(b"q").unwrap().unwrap().last_id = StreamId::MAX;
+            });
+            let intents = [crate::transaction::MqIntent {
+                queue_key: Bytes::from_static(b"q"),
+                fields: vec![(Bytes::from_static(b"f"), Bytes::from_static(b"v"))],
+            }];
+            let payloads = with_shard_db(0, |db| materialize_mq_intents(db, 0, &intents));
+            let length = with_shard_db(0, |db| db.get_stream_mut(b"q").unwrap().unwrap().length);
+            (payloads.len(), length)
+        })
+        .join()
+        .map(|(payloads, length)| {
+            assert_eq!(length, 0, "setup: the push was refused");
+            assert_eq!(
+                payloads, 0,
+                "a refused push logged {payloads} MqPush record(s)"
+            );
+        })
+        .expect("test thread panicked");
+    }
+
+    /// Review 5 nit: a dead letter whose DLQ refuses the next id (its last
+    /// possible ID is taken) was acked from the queue's PEL AND logged as
+    /// routed, although the DLQ never received it — the message was lost,
+    /// and the MqPop record said it was dead-lettered. Now it is neither
+    /// routed nor logged nor acked: it stays pending in the queue's PEL, and
+    /// the MqPop record (which lists it as claimed, with no routing) replays
+    /// to the same state.
+    #[test]
+    fn a_dead_letter_the_dlq_refuses_stays_pending_and_is_not_logged_as_routed() {
+        use crate::persistence::wal_v3::record::WalRecordType;
+        use crate::shard::slice::{with_shard, with_shard_db};
+        std::thread::spawn(|| {
+            init_shard(make_test_slice(1));
+            let (tx, rx) = crate::runtime::channel::mpsc_bounded(64);
+            with_shard(|s| s.wal_append_tx = Some(tx));
+            // MAXDELIVERY 1 dead-letters the first delivery (moon#663).
+            assert_eq!(
+                mq(&["CREATE", "q", "MAXDELIVERY", "1"]),
+                Frame::SimpleString(Bytes::from_static(b"OK"))
+            );
+            let Frame::BulkString(id) = mq(&["PUSH", "q", "f", "v"]) else {
+                panic!("PUSH");
+            };
+            let id = StreamId::parse(&id, 0).expect("pushed id");
+            with_shard_db(0, |db| {
+                db.get_or_create_stream(b"q::mq:dlq").unwrap().last_id = StreamId::MAX;
+            });
+            while rx.try_recv().is_ok() {}
+            let _ = mq(&["POP", "q"]);
+            let mut routed = None;
+            while let Ok((kind, payload)) = rx.try_recv() {
+                if kind == WalRecordType::MqPop {
+                    let (_, _, _, claimed, dlq, _, _) =
+                        crate::mq::wal::decode_mq_pop(&payload).expect("MqPop payload");
+                    routed = Some((claimed.len(), dlq.len()));
+                }
+            }
+            let (pending, dlq_len) = with_shard_db(0, |db| {
+                let pending = db.get_stream_mut(b"q").unwrap().unwrap().groups
+                    [b"__mq_consumers".as_ref()]
+                .pel
+                .contains_key(&id);
+                let dlq_len = db.get_stream_mut(b"q::mq:dlq").unwrap().unwrap().length;
+                (pending, dlq_len)
+            });
+            (routed, pending, dlq_len)
+        })
+        .join()
+        .map(|(routed, pending, dlq_len)| {
+            assert_eq!(dlq_len, 0, "setup: the DLQ refused the dead letter");
+            assert_eq!(
+                routed,
+                Some((1, 0)),
+                "(claimed, routed) in the MqPop record: a routing logged for a dead letter \
+                 the DLQ never received"
+            );
+            assert!(pending, "the unrouted dead letter was acked away: lost");
+        })
+        .expect("test thread panicked");
     }
 
     // ── moon#1250: MQ writes are charged to used_memory and gated ─────────────
