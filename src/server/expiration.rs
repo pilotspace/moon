@@ -359,6 +359,10 @@ fn expire_cycle(db: &mut Database, on_removed: &mut dyn FnMut(&[u8])) {
     // for `set_cached_now_ms_for_test`.
     let hash_now_ms = db.now_ms();
     let mut visited = 0u32;
+    // moon#1232 review 5: expiry is housekeeping, not a keyspace change —
+    // redis 7.0.15 counts neither a whole key nor a field reaped by its TTL.
+    // The reap's `get_mut` and the `remove` of an emptied hash are muted.
+    let _quiet = crate::admin::metrics_setup::mute_keyspace_changes();
     while let Some((ts, key)) = db.peek_due_hash_expiry(hash_now_ms) {
         let outcome = db.reap_expired_fields_one_hash_at(
             key.as_bytes(),
@@ -675,6 +679,40 @@ mod tests {
             "with {DUE} due hashes and a {HASH_SWEEP_MAX_KEYS_PER_TICK} cap \
              the drain must take more than one tick"
         );
+    }
+
+    /// moon#1232 review 5: active hash-field expiry is housekeeping, like
+    /// whole-key expiry: redis 7.0.15 does not count it. The sweep's reap
+    /// went through `get_mut` (+1) and `remove` when it emptied the hash (+1).
+    #[test]
+    fn active_hash_field_expiry_counts_no_keyspace_change() {
+        use crate::admin::metrics_setup::keyspace_changes_on_this_thread as mine;
+        let mut db = Database::new();
+        let ttl = db.now_ms() + 1_000;
+        for key in [&b"gone"[..], &b"kept"[..]] {
+            {
+                let map = db.get_or_create_hash(key).expect("hash");
+                map.insert(Bytes::from_static(b"f"), Bytes::from_static(b"v"));
+                map.insert(Bytes::from_static(b"g"), Bytes::from_static(b"v"));
+            }
+            assert_eq!(
+                db.hash_set_field_ttl(key, b"f", ttl, HashTtlCond::Always),
+                Ok(1)
+            );
+        }
+        assert_eq!(
+            db.hash_set_field_ttl(b"gone", b"g", ttl, HashTtlCond::Always),
+            Ok(1)
+        );
+        db.set_cached_now_ms_for_test(ttl + 1);
+        let before = mine();
+        expire_cycle(&mut db, &mut |_| {});
+        assert!(!db.exists(b"gone"), "every field expired: the hash is gone");
+        assert_eq!(
+            db.get_hash(b"kept").expect("hash").expect("exists").len(),
+            1
+        );
+        assert_eq!(mine() - before, 0, "expiry is not a keyspace change");
     }
 
     /// A single enormous hash must not stall the loop either: one reap call

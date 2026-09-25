@@ -524,6 +524,111 @@ const ROWS: &[Row] = &[
         [["FLUSHDB"]],
         3
     ),
+    // Review 5 (moon#1232): a blocking read served at once counts as its
+    // non-blocking twin.
+    row!(
+        "XREADGROUP BLOCK served at once",
+        [
+            ["XADD", "xb", "1-1", "f", "v"],
+            ["XADD", "xb", "1-2", "f", "v"],
+            ["XGROUP", "CREATE", "xb", "g", "0"],
+            ["XGROUP", "CREATECONSUMER", "xb", "g", "c"]
+        ],
+        [[
+            "XREADGROUP",
+            "GROUP",
+            "g",
+            "c",
+            "BLOCK",
+            "100",
+            "STREAMS",
+            "xb",
+            ">"
+        ]],
+        1
+    ),
+    // Review 5, N5: the geo stores count the members stored (an empty result
+    // counts the destination it deleted), and RENAME onto itself is nothing.
+    row!(
+        "RENAME k k",
+        [["SET", "rs", "v"]],
+        [["RENAME", "rs", "rs"]],
+        0
+    ),
+    row!(
+        "GEOSEARCHSTORE 2",
+        [[
+            "GEOADD", "geo", "13.36", "38.11", "a", "15.08", "37.50", "b"
+        ]],
+        [[
+            "GEOSEARCHSTORE",
+            "geod",
+            "geo",
+            "FROMLONLAT",
+            "15",
+            "37",
+            "BYRADIUS",
+            "200",
+            "km"
+        ]],
+        2
+    ),
+    row!(
+        "GEORADIUS STORE 2",
+        [],
+        [[
+            "GEORADIUS",
+            "geo",
+            "15",
+            "37",
+            "200",
+            "km",
+            "STORE",
+            "geod2"
+        ]],
+        2
+    ),
+    row!(
+        "GEOSEARCHSTORE empty, dst existed",
+        [],
+        [[
+            "GEOSEARCHSTORE",
+            "geod",
+            "geo",
+            "FROMLONLAT",
+            "0",
+            "0",
+            "BYRADIUS",
+            "1",
+            "km"
+        ]],
+        1
+    ),
+    row!(
+        "GEOSEARCHSTORE empty, no dst",
+        [],
+        [[
+            "GEOSEARCHSTORE",
+            "geod3",
+            "geo",
+            "FROMLONLAT",
+            "0",
+            "0",
+            "BYRADIUS",
+            "1",
+            "km"
+        ]],
+        0
+    ),
+    // SWAPDB is one change, even onto itself. These rows come last: they
+    // leave db 0 holding the other database.
+    row!(
+        "SWAPDB 0 1",
+        [["SET", "sw", "1"]],
+        [["SWAPDB", "0", "1"]],
+        1
+    ),
+    row!("SWAPDB 0 0", [], [["SWAPDB", "0", "0"]], 1),
 ];
 
 fn changes(c: &mut Conn) -> u64 {
@@ -858,4 +963,255 @@ fn shutdown_during_an_auto_save_is_not_refused() {
         "the SHUTDOWN save does not hold a write made while the auto-save ran: {marker:?}"
     );
     assert_eq!(dbsize.trim(), format!(":{}", KEYS + 1));
+}
+
+// ── Review 5: paths outside the dispatch arms ──────────────────────────────
+
+fn spawn_with(dir: &std::path::Path, shards: usize, extra: &[&str]) -> (ServerGuard, u16) {
+    let bin = common::find_moon_binary();
+    let (child, port) = common::spawn_listening(|port| {
+        std::process::Command::new(&bin)
+            .args(["--port", &port.to_string(), "--dir", &dir.to_string_lossy()])
+            .args(["--shards", &shards.to_string(), "--maxmemory", "0"])
+            .args(["--disk-offload", "disable", "--disk-free-min-pct", "0"])
+            .args(extra)
+            .stdout(common::server_stderr(dir))
+            .stderr(common::server_stderr(dir))
+            .spawn()
+            .expect("spawn moon (build it first, or set MOON_BIN)")
+    });
+    (ServerGuard::new(child), port)
+}
+
+/// A blocking pop that finds data is its non-blocking twin (redis 7.0.15:
+/// BLPOP 1, BZPOPMIN 1). At `--shards 4` a key owned by another shard was
+/// served by that shard's `BlockRegister` handler through the parked-waiter
+/// serve (`serve_list_key` / `serve_zset_key`), which is muted: 0.
+#[test]
+fn blocking_pops_served_at_once_count_at_four_shards() {
+    let dir = common::unique_test_dir("ws19-r5-bpop");
+    std::fs::create_dir_all(&dir).unwrap();
+    let (mut server, port) = spawn_with(&dir, 4, &["--appendonly", "no"]);
+    let mut c = Conn::open(port);
+    let mut got = Vec::new();
+    for i in 0..16 {
+        let (l, z) = (format!("q{i}"), format!("zq{i}"));
+        c.send(&["RPUSH", &l, "a", "b"]);
+        c.send(&["ZADD", &z, "1", "a"]);
+        let d0 = changes(&mut c);
+        let blpop = c.send(&["BLPOP", &l, "1"]);
+        let d1 = changes(&mut c);
+        let bzpop = c.send(&["BZPOPMIN", &z, "1"]);
+        let d2 = changes(&mut c);
+        assert!(
+            blpop.starts_with("*2") && bzpop.starts_with("*3"),
+            "{blpop:?} {bzpop:?}"
+        );
+        got.push(format!("{}{}", d1 - d0, d2 - d1));
+    }
+    server.kill_now();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(
+        got.join(" "),
+        ["11"; 16].join(" "),
+        "(BLPOP, BZPOPMIN) change counts per key, --shards 4"
+    );
+}
+
+/// `XREADGROUP ... BLOCK` that finds entries is served at once outside the
+/// dispatch arm's `counted` wrapper: it counted 0, where the same read
+/// without BLOCK counts 1 (redis 7.0.15: 2, the stream plus the consumer it
+/// creates — a known difference, see `command::keyspace_changes`). The table
+/// row "XREADGROUP BLOCK served at once" pins the exact count with an
+/// existing consumer.
+#[test]
+fn xreadgroup_block_served_at_once_counts_like_xreadgroup() {
+    let dir = common::unique_test_dir("ws19-r5-xrg");
+    std::fs::create_dir_all(&dir).unwrap();
+    let (mut server, port) = spawn_with(&dir, 1, &["--appendonly", "no"]);
+    let mut c = Conn::open(port);
+    c.send(&["XGROUP", "CREATE", "xs", "g", "$", "MKSTREAM"]);
+    c.send(&["XADD", "xs", "1-1", "f", "v"]);
+    c.send(&["XADD", "xs", "1-2", "f", "v"]);
+    let d0 = changes(&mut c);
+    let r = c.send(&[
+        "XREADGROUP",
+        "GROUP",
+        "g",
+        "c",
+        "BLOCK",
+        "100",
+        "STREAMS",
+        "xs",
+        ">",
+    ]);
+    let delta = changes(&mut c) - d0;
+    server.kill_now();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(r.starts_with("*1"), "served at once: {r:?}");
+    assert!(
+        delta >= 1,
+        "XREADGROUP BLOCK served 2 entries at once: {delta}"
+    );
+}
+
+fn wait_until(what: &str, mut ok: impl FnMut() -> bool) {
+    let t0 = Instant::now();
+    while !ok() {
+        assert!(t0.elapsed() < Duration::from_secs(20), "timed out: {what}");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// `SWAPDB` is one change in redis 7.0.15. moon counted 0, so with RDB-only
+/// persistence a `--save "N 1"` rule never persisted a lone SWAPDB and a
+/// crash brought the old layout back.
+#[test]
+fn a_lone_swapdb_is_saved_by_a_save_rule() {
+    let dir = common::unique_test_dir("ws19-r5-swapdb");
+    std::fs::create_dir_all(&dir).unwrap();
+    let args = ["--appendonly", "no", "--save", "1 1"];
+    let (mut first, port) = spawn_with(&dir, 1, &args);
+    let mut c = Conn::open(port);
+    assert!(c.send(&["SET", "a", "1"]).starts_with("+OK"));
+    wait_until("the SET is saved", || changes(&mut c) == 0);
+    let before = changes(&mut c);
+    assert_eq!(c.send(&["SWAPDB", "0", "1"]), "+OK\r\n");
+    let delta = changes(&mut c) - before;
+    // The rule saves the swap if it counted (the count drops back to 0 when
+    // that save completes); then crash.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while changes(&mut c) != 0 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    first.kill_now();
+    drop(first);
+    // Booted with save points, as the snapshot is loaded only then.
+    let (mut again, port) = spawn_with(&dir, 1, &["--appendonly", "no", "--save", "3600 1"]);
+    let mut c = Conn::open(port);
+    let in_db0 = c.send(&["EXISTS", "a"]);
+    c.send(&["SELECT", "1"]);
+    let in_db1 = c.send(&["EXISTS", "a"]);
+    again.kill_now();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(delta, 1, "SWAPDB 0 1");
+    assert_eq!(
+        (in_db0.trim(), in_db1.trim()),
+        (":0", ":1"),
+        "after kill -9 the saved layout must have the key in db 1"
+    );
+}
+
+/// Loading a snapshot is no keyspace change: redis 7.0.15 boots from its RDB
+/// with `rdb_changes_since_last_save:0`. moon counted every loaded key
+/// (`shard_snapshot_load` -> `Database::set`), so a `--save "3 100"` rule
+/// rewrote the whole snapshot 3 s after every boot, with no client write.
+#[test]
+fn a_snapshot_boot_counts_no_change() {
+    let dir = common::unique_test_dir("ws19-r5-boot");
+    std::fs::create_dir_all(&dir).unwrap();
+    let args = ["--appendonly", "no", "--save", "3600 1"];
+    let (mut first, port) = spawn_with(&dir, 1, &args);
+    let mut c = Conn::open(port);
+    for chunk in 0..10 {
+        let cmds: Vec<[String; 3]> = (0..100)
+            .map(|i| ["SET".into(), format!("k{}", chunk * 100 + i), "v".into()])
+            .collect();
+        let parts: Vec<Vec<&str>> = cmds
+            .iter()
+            .map(|c| c.iter().map(String::as_str).collect())
+            .collect();
+        let refs: Vec<&[&str]> = parts.iter().map(Vec::as_slice).collect();
+        c.pipeline(&refs);
+    }
+    assert!(c.send(&["BGSAVE"]).starts_with('+'));
+    wait_until("the BGSAVE completes", || changes(&mut c) == 0);
+    first.kill_now();
+    drop(first);
+    let (mut again, port) = spawn_with(&dir, 1, &args);
+    let mut c = Conn::open(port);
+    let dbsize = c.send(&["DBSIZE"]);
+    let after_boot = changes(&mut c);
+    again.kill_now();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(dbsize, ":1000\r\n", "fixture: the snapshot loaded");
+    assert_eq!(
+        after_boot, 0,
+        "changes right after booting from the snapshot"
+    );
+}
+
+/// A replica's full sync loads a foreign dataset: redis 7.0.15 leaves the
+/// replica's count unchanged (neither the discarded local keys nor the loaded
+/// ones count). moon counted both (`db.clear()` + the RDB load's `set`).
+///
+/// monoio only: a master answers PSYNC only under runtime-monoio.
+#[test]
+#[cfg_attr(
+    not(feature = "runtime-monoio"),
+    ignore = "needs a replica full sync, which needs a runtime-monoio master"
+)]
+fn a_replica_full_sync_counts_no_change() {
+    let (dm, dr) = (
+        common::unique_test_dir("ws19-r5-master"),
+        common::unique_test_dir("ws19-r5-replica"),
+    );
+    std::fs::create_dir_all(&dm).unwrap();
+    std::fs::create_dir_all(&dr).unwrap();
+    let (mut master, mport) = spawn_with(&dm, 1, &["--appendonly", "no"]);
+    let (mut replica, rport) = spawn_with(&dr, 1, &["--appendonly", "no"]);
+    let mut m = Conn::open(mport);
+    let mut r = Conn::open(rport);
+    for i in 0..1000 {
+        m.send(&["SET", &format!("k{i}"), "v"]);
+    }
+    r.send(&["SET", "local1", "1"]);
+    r.send(&["SET", "local2", "1"]);
+    let before = changes(&mut r);
+    let replicaof = r.send(&["REPLICAOF", "127.0.0.1", &mport.to_string()]);
+    wait_until("the full sync lands", || r.send(&["DBSIZE"]) == ":1000\r\n");
+    let delta = changes(&mut r) - before;
+    replica.kill_now();
+    master.kill_now();
+    let _ = std::fs::remove_dir_all(&dm);
+    let _ = std::fs::remove_dir_all(&dr);
+    assert_eq!(replicaof, "+OK\r\n");
+    assert_eq!(delta, 0, "replica changes across a full sync");
+}
+
+/// The AOF boot is already at redis 7.0.15's count and must stay there while
+/// the snapshot and RDB loads are muted: the replayed tail counts (5), the
+/// rewritten base does not (redis loads it as an RDB preamble).
+#[test]
+fn an_aof_boot_counts_its_replayed_tail_like_redis() {
+    let dir = common::unique_test_dir("ws19-r5-aofboot");
+    std::fs::create_dir_all(&dir).unwrap();
+    // `always`, so the kill -9 below loses no acknowledged write.
+    let args = ["--appendonly", "yes", "--appendfsync", "always"];
+    let (mut first, port) = spawn_with(&dir, 1, &args);
+    let mut c = Conn::open(port);
+    for i in 0..100 {
+        c.send(&["SET", &format!("k{i}"), "v"]);
+    }
+    assert!(c.send(&["BGREWRITEAOF"]).starts_with('+'));
+    wait_until("the rewrite completes", || {
+        info_field(&mut c, "aof_rewrite_in_progress") == "0"
+            && info_field(&mut c, "aof_last_bgrewrite_status") == "ok"
+    });
+    for i in 0..5 {
+        c.send(&["SET", &format!("n{i}"), "v"]);
+    }
+    first.kill_now();
+    drop(first);
+    let (mut again, port) = spawn_with(&dir, 1, &args);
+    let mut c = Conn::open(port);
+    let dbsize = c.send(&["DBSIZE"]);
+    let after_boot = changes(&mut c);
+    again.kill_now();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(dbsize, ":105\r\n", "fixture: the AOF replayed");
+    assert_eq!(
+        after_boot, 5,
+        "changes right after an AOF boot (redis 7.0.15: 5)"
+    );
 }

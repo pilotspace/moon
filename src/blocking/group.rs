@@ -162,16 +162,21 @@ fn register_run(
     // keeps serving the key's waiters while it still holds data, so if this
     // waiter is still parked after the call, the key ran dry serving waiters
     // queued ahead of it.
-    for key in &keys {
-        if !registry.is_waiting(wait_id) {
-            break;
+    //
+    // moon#1232 review 5: a serve of THIS waiter here is the command served at
+    // once and counts as its non-blocking twin (`serve_at_registration`).
+    crate::blocking::wakeup::serve_at_registration(wait_id, || {
+        for key in &keys {
+            if !registry.is_waiting(wait_id) {
+                break;
+            }
+            if db.exists(key) && family.is_some_and(|f| family_type_error(db, key, f).is_none()) {
+                crate::blocking::wakeup::try_wake_list_waiter(registry, db, db_index, key);
+                crate::blocking::wakeup::try_wake_zset_waiter(registry, db, db_index, key);
+                crate::blocking::wakeup::try_wake_stream_waiter(registry, db, db_index, key);
+            }
         }
-        if db.exists(key) && family.is_some_and(|f| family_type_error(db, key, f).is_none()) {
-            crate::blocking::wakeup::try_wake_list_waiter(registry, db, db_index, key);
-            crate::blocking::wakeup::try_wake_zset_waiter(registry, db, db_index, key);
-            crate::blocking::wakeup::try_wake_stream_waiter(registry, db, db_index, key);
-        }
-    }
+    });
 }
 
 /// Redis's pre-block ladder, minus the pop: walk the keys in argument order,
@@ -315,6 +320,37 @@ mod tests {
                 "a served waiter is fully unregistered"
             );
         }
+    }
+
+    /// moon#1232 review 5: a waiter served inside its own registration is
+    /// the command served at once, and counts as its non-blocking twin
+    /// (BLMPOP COUNT 1: 1). A parked waiter served later by a push counts
+    /// nothing: the push is the counted write.
+    #[test]
+    fn a_serve_at_registration_counts_and_a_parked_serve_does_not() {
+        use crate::admin::metrics_setup::keyspace_changes_on_this_thread as mine;
+        let mut reg = BlockingRegistry::new(0);
+        let mut db = Database::new();
+        db.list_push_back(&b("b"), b("B1"));
+        let before = mine();
+        let (payload, rxs) = group(&mut reg, &["b"], blmpop, ClaimToken::new());
+        register_group(&mut reg, &mut db, payload);
+        assert_eq!(replies(&rxs).len(), 1);
+        assert_eq!(mine() - before, 1, "served at registration");
+
+        let (payload, rxs) = group(&mut reg, &["p"], blmpop, ClaimToken::new());
+        register_group(&mut reg, &mut db, payload);
+        assert!(replies(&rxs).is_empty(), "parked");
+        db.list_push_back(&b("p"), b("P1"));
+        let before = mine();
+        assert!(crate::blocking::wakeup::try_wake_list_waiter(
+            &mut reg,
+            &mut db,
+            0,
+            &b("p")
+        ));
+        assert_eq!(replies(&rxs).len(), 1);
+        assert_eq!(mine() - before, 0, "a parked serve is not counted");
     }
 
     /// The same key named twice is one pop, not two.

@@ -74,6 +74,9 @@ pub(super) fn run(
     let overflow = pool.overflow_for(shard_id);
     let committed = overflow.committed_floor().0;
     let db_count = shard_databases.db_count();
+    // Refs moon#1265: sampled before the answers are drained, so everything a
+    // dead thread sent is applied below before its other jobs are abandoned.
+    let dead = spill_thread.is_some_and(SpillThread::is_dead);
 
     // 1. Apply what the spill thread finished: a read becomes a write job
     //    (survivors filtered, output ids minted and the fold epoch stamped
@@ -86,6 +89,21 @@ pub(super) fn run(
             });
         }
     }
+    // Refs moon#1265: a dead spill thread answers nothing more. Abandon what
+    // it still held and start nothing new on it; it is not respawned (the
+    // death is logged and in INFO, `spill_thread_alive:0`).
+    let spill_thread = if dead {
+        for db_index in 0..db_count {
+            crate::shard::slice::with_shard_db(db_index, |db| {
+                if let Some(ci) = db.cold_index.as_mut() {
+                    ci.abandon_compactions_in_flight();
+                }
+            });
+        }
+        None
+    } else {
+        spill_thread
+    };
 
     // 2. Adoption: finish every listing whose commit is known, then list what
     //    a committed fold made safe. Neither waits for an fsync.

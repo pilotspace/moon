@@ -681,7 +681,7 @@ fn dispatch_inner_unchecked(
                 return resp(connection::readyz());
             }
             if cmd.eq_ignore_ascii_case(b"RENAME") {
-                return resp(counted(db, args, Rule::One, key::rename));
+                return resp(counted(db, args, Rule::Rename, key::rename));
             }
             if cmd.eq_ignore_ascii_case(b"RPUSHX") {
                 return resp(counted(db, args, Rule::PushedIfExists, list::rpushx));

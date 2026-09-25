@@ -379,7 +379,7 @@ fn a_superseded_request_whose_completion_never_arrives_is_pruned_by_the_watermar
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         let bytes_before = with_shard_db(0, |db| db.spill_superseded_bytes());
-        drain_and_apply(&st, &mut shard_manifest, &mut sink, 1);
+        drain_and_apply(&st, &mut shard_manifest, &mut sink, 1, 0);
         with_shard_db(0, |db| {
             assert_eq!(db.spill_superseded_len(), 1, "only request 20 is left");
             let left: Vec<_> = db.spill_superseded_keys_live_at(0).cloned().collect();
@@ -394,7 +394,7 @@ fn a_superseded_request_whose_completion_never_arrives_is_pruned_by_the_watermar
 
         // A dead spill thread: nothing it had will ever complete.
         let dead = crate::storage::tiered::spill_thread::SpillThread::exited_for_test();
-        drain_and_apply(&dead, &mut shard_manifest, &mut sink, 1);
+        drain_and_apply(&dead, &mut shard_manifest, &mut sink, 1, 0);
         with_shard_db(0, |db| {
             assert!(db.spill_superseded_is_empty());
             assert_eq!(db.spill_superseded_bytes(), 0);

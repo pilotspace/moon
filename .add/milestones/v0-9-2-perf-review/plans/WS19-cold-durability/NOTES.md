@@ -438,6 +438,10 @@ written after the auto-save started is there after restart. Red on the
 previous binary (`-ERR Background save already in progress`), green 3/3.
 Not done: aborting the running cooperative snapshot (redis kills its child);
 a SHUTDOWN during a long save now takes up to two save bounds (2 x 10 s).
+**Corrected in review 5 (N1):** as first committed, every wait got its own
+10 s bound, so three deferrals plus the save could take 4 x 10 s = 40 s.
+`shutdown_save` now has ONE deadline, `SHUTDOWN_SAVE_DEADLINE_MS` = 20 s
+from the call, for all of it.
 
 ## 7. Retry after 5 s under any rule (`55ce5d98`)
 `save_rule_due(rules, since_last_save, since_last_attempt, changes, ok)`;
@@ -463,3 +467,96 @@ Lua); reclaim jobs have their own channel and answer with `ReclaimDone`.
 See SUMMARY.md, "Phase 2 gates at `cd118031`": fmt, audits, clippy and
 check on both runtimes clean; full lib monoio 6659/0, tokio 5721/0;
 integration suites green on both runtimes with debug server binaries.
+
+# Review 5 (merged part-4 tree 340cfce1): MERGE-AFTER-FIXES
+
+Step 0: `origin/claude/confident-cerf-3n093x` (1421630b: main + WS16 with its
+review-5 fixes + WS19 69275e68) merged as `1d839fb2`, no conflicts.
+
+## SPLIT: `kv_ops.rs` 1545 -> 772 (`b167d1e6`)
+Pure move into `cold_promote.rs` (438), `keyspace_scan.rs` (258) and
+`bulk_load.rs` (96), visibility unchanged. The removed and the moved lines
+are the same multiset apart from the module doc and the `use` lines (both
+sorted and diffed). `cargo check --all-targets` on both runtimes and the
+`storage::db` lib tests on both runtimes green.
+
+## S1: a transiently missing held file (`df050595`)
+`f00e9903` let ANY queued zero-ref file that stat'ed NotFound skip the hold.
+Now only ids the boot rebuild recorded as missing (`missing_at_rebuild`,
+filled next to the rebuild's unlink queue, carried by `merge`, consumed by
+the first drain) and still missing then. The reviewer's proof is adopted
+into `promote_sweep_tests` (it copied that module's harness verbatim):
+red `(None, Some("x"), false, false)`, green `(Some("v08"), Some("v09x"),
+true, true)`; `f00e9903`'s own test stays green.
+
+## S2: blocking pops served inside a remote registration (`96879a03`)
+The `BlockRegister` / `BlockRegisterGroup` arms run their wakers under
+`serve_at_registration(wait_id)` (thread-local mark, restored on drop); a
+serve of THAT waiter records `registration_serve_changes` once delivered
+(`blocking_pop_changes` for pops, the XREADGROUP rule for a group read, 0
+for XREAD). Other serves in the pass and parked serves stay 0, as in redis.
+s4, 16 keys: red `00 00 10 01 11 10 00 00 01 00 11 00 11 00 01 00`, green
+`11` x 16. Remote `XREADGROUP BLOCK` served at registration at s4 counts 1
+per key (manual check, redis 1).
+
+## S3: XREADGROUP BLOCK served at once (`dafa7ad8`)
+`stream_read_immediate` now runs `counted(Rule::Streams)`. Table row with an
+existing consumer: red 0, green 1 (redis 1). The reviewer's new-consumer
+proof (`>= 1`): red 0, green 1 (redis 2, the listed consumer-creation
+difference).
+
+## S4: SWAPDB (`f723750d`)
+One change per successful SWAPDB (also `SWAPDB n n`), on the connection's
+leg, in both sharded handlers and the legacy single handler. kill -9 proof:
+red delta 0 and the pre-fix binary restarts with the key in db 0; green 3/3.
+Found: with `--appendonly no` and no `--save`, moon does not load its
+per-shard snapshot at boot (`persistence_dir` is set only for AOF or save
+points) — pre-existing, the test boots with save points.
+
+## S5: snapshot boot, replica full sync (`67bbecac`)
+Muted: `shard_snapshot_load`, `redis_rdb::load_rdb`, and the replica's
+clear-then-load. Red 1000 / 1002, green 0 / 0. AOF boot re-measured on
+redis-server 7.0.15 and moon: 100 SETs then boot -> 100 on both; 100 SETs,
+BGREWRITEAOF, 5 SETs, boot -> 5 on both. Kept, and pinned by
+`an_aof_boot_counts_its_replayed_tail_like_redis`. That test runs with
+`--appendfsync always`: under `everysec` the 5 SETs acknowledged right
+before a kill -9 were lost (DBSIZE 100) — an observation for the owners of
+the AOF writer, not changed here (redis writes the AOF before replying).
+
+## N1: SHUTDOWN save deadline (`9ecd604f`)
+One deadline per call, `SHUTDOWN_SAVE_DEADLINE_MS` = 20 s. Test red
+"gave up after 543ms, one deadline is 300ms".
+
+## N2: dead-thread prune (`6702b7cd`, refs moon#1253)
+`is_dead()` sampled before `done_below()` and the drain, passed to
+`take_prune`; `is_dead()` fences Acquire when it reports death. No
+deterministic red (the race is between two statements); the test pins the
+contract.
+
+## N3: active hash-field expiry (`060033be`)
+Sweep 2 muted; `get_mut`'s comment corrected (the sweep is its only
+production caller). Red 3, green 0.
+
+## N4: `awaits_fold` O(1) (`b9d475a0`)
+`max_stamp` kept exact by every insert and removal; test checks it against
+a walk after every operation; red with `take`'s recompute removed.
+
+## N5: known differences (`be2771ae`)
+Fixed as one-liners: geo stores count the members stored (redis `dirty +=
+returned_items`), `RENAME k k` counts 0 (`Rule::Rename`). Listed in the
+module doc: PFCOUNT (moon keeps no cached cardinality, so it writes
+nothing; redis 1 when it rewrites its cache), XREADGROUP history read of
+an empty PEL (0, redis 1), SETBIT of an unchanged bit (1, redis 0), next
+to the ones already listed. All new rows checked by the redis oracle.
+
+## N6: spill-thread death (`b78b38b3`, refs moon#1265)
+The reclaim tick samples `is_dead()` before draining answers, applies
+them, abandons every in-flight compaction (not given up on) and starts
+nothing new on the dead thread; one `error` line per dead thread;
+INFO `spill_thread_alive:0|1`. Test red 1 (in-flight pinned), green 0.
+
+## Review 5 gates
+See SUMMARY.md, "Review 5 gates": fmt, audits and clippy on both runtimes
+clean; full lib monoio 6693/0, tokio 5755/0; the integration list green on
+both runtimes (the full-resync tests run on monoio only, as a tokio master
+answers no PSYNC — `2e09e831` gates the new one).

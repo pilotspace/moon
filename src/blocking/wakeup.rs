@@ -6,6 +6,54 @@ use crate::framevec;
 use crate::protocol::Frame;
 use crate::storage::Database;
 
+thread_local! {
+    /// The waiter this shard is registering right now (moon#1232 review 5).
+    /// A key it owns that already holds data serves it inside the
+    /// registration: the blocking command served at once, which counts as its
+    /// non-blocking twin. Every other serve in that pass (a parked waiter
+    /// queued ahead of it, a move's destination) stays uncounted, as in redis.
+    static REGISTERING: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+/// Restores the previous [`REGISTERING`] mark when dropped.
+struct RegisteringMark(Option<u64>);
+
+impl Drop for RegisteringMark {
+    fn drop(&mut self) {
+        let prev = self.0;
+        REGISTERING.with(|r| r.set(prev));
+    }
+}
+
+/// Run `serve` — the wakers a registration calls for data that is already
+/// there — with `wait_id` marked as the waiter being registered.
+pub(crate) fn serve_at_registration<R>(wait_id: u64, serve: impl FnOnce() -> R) -> R {
+    let _restore = RegisteringMark(REGISTERING.with(|r| r.replace(Some(wait_id))));
+    serve()
+}
+
+/// What serving waiter `wait_id` with `result` adds to the change count: its
+/// non-blocking twin's count when it is the waiter being registered
+/// ([`serve_at_registration`]), 0 for a parked waiter.
+pub(crate) fn registration_serve_changes(
+    wait_id: u64,
+    cmd: &BlockedCommand,
+    result: &Frame,
+) -> u64 {
+    if REGISTERING.with(std::cell::Cell::get) != Some(wait_id) {
+        return 0;
+    }
+    use crate::command::keyspace_changes::{Rule, blocking_pop_changes, changes};
+    match cmd {
+        BlockedCommand::BLMPop { .. } | BlockedCommand::BZMPop { .. } => {
+            blocking_pop_changes(b"BLMPOP", result)
+        }
+        BlockedCommand::XReadGroup { .. } => changes(Rule::Streams, &[], result),
+        BlockedCommand::XRead { .. } => 0,
+        _ => blocking_pop_changes(b"BLPOP", result),
+    }
+}
+
 pub use crate::blocking::stream_wake::{stream_register_error, try_wake_stream_waiter};
 
 /// The ready keys of one write, in the order it wrote them. Most writes name
@@ -468,7 +516,9 @@ fn serve_list_key(
 ) -> bool {
     // moon#1232: serving a parked waiter is no keyspace change in redis
     // 7.0.15 (the push that fed it is the one counted), so the funnels the
-    // pops, pushes and put-backs below pass through are muted.
+    // pops, pushes and put-backs below pass through are muted. A waiter
+    // served inside its own registration is counted explicitly instead
+    // (`registration_serve_changes`).
     let _quiet = crate::admin::metrics_setup::mute_keyspace_changes();
     // moon#1217: the pops below write `key` (see `serve_ready_key`).
     crate::persistence::snapshot_cow::capture_wake_pre_image(db, db_index, key);
@@ -711,6 +761,7 @@ fn serve_list_key(
             _ => None,
         };
 
+        let at_once = registration_serve_changes(wait_id, &cmd, &result);
         let delivered = deliver(
             db,
             db_index,
@@ -725,6 +776,7 @@ fn serve_list_key(
         );
         if delivered.served() {
             served = true;
+            crate::admin::metrics_setup::record_keyspace_changes(at_once);
             if let Some(dest) = moved_to
                 && !worklist[pending_from..].contains(&dest)
             {
@@ -1006,6 +1058,7 @@ fn serve_zset_key(
         registry.remove_wait(wait_id);
 
         // Claim / log / A2 / keep-serving-while-data: see try_wake_list_waiter.
+        let at_once = registration_serve_changes(wait_id, &cmd, &result);
         let delivered = deliver(
             db,
             db_index,
@@ -1020,6 +1073,7 @@ fn serve_zset_key(
         );
         if delivered.served() {
             served = true;
+            crate::admin::metrics_setup::record_keyspace_changes(at_once);
             if delivered == Delivered::ServedAofLost {
                 // moon#1111: see serve_list_key.
                 defer_wake(db_index, key);

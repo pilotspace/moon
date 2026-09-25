@@ -705,7 +705,7 @@ fn the_watermark_covers_only_requests_whose_completions_were_sent() {
     let tmp = tempfile::tempdir().unwrap();
     let st = SpillThread::new(2);
     assert_eq!(st.done_below(), 0, "nothing flushed yet");
-    assert_eq!(st.take_prune(0), None);
+    assert_eq!(st.take_prune(0, st.is_dead()), None);
     let sender = st.sender();
     for (i, id) in [7u64, 8, 9].into_iter().enumerate() {
         sender
@@ -738,8 +738,15 @@ fn the_watermark_covers_only_requests_whose_completions_were_sent() {
             "request {id} covered but not queued: {done:?}"
         );
     }
-    assert_eq!(st.take_prune(10), Some(SupersededPrune::Below(10)));
-    assert_eq!(st.take_prune(10), None, "pruned once per watermark move");
+    assert_eq!(
+        st.take_prune(10, st.is_dead()),
+        Some(SupersededPrune::Below(10))
+    );
+    assert_eq!(
+        st.take_prune(10, st.is_dead()),
+        None,
+        "pruned once per watermark move"
+    );
     assert!(!st.is_dead());
     let _ = st.shutdown();
 }
@@ -750,6 +757,37 @@ fn the_watermark_covers_only_requests_whose_completions_were_sent() {
 fn a_dead_spill_thread_asks_for_every_superseded_entry_to_go() {
     let st = SpillThread::exited_for_test();
     assert!(st.is_dead());
-    assert_eq!(st.take_prune(0), Some(SupersededPrune::All));
-    assert_eq!(st.take_prune(0), Some(SupersededPrune::All), "every tick");
+    assert_eq!(st.take_prune(0, st.is_dead()), Some(SupersededPrune::All));
+    assert_eq!(
+        st.take_prune(0, st.is_dead()),
+        Some(SupersededPrune::All),
+        "every tick"
+    );
+}
+
+/// Refs moon#1253, review 5: the prune decides on the liveness its caller
+/// sampled BEFORE the drain, never on a fresh one. A thread that sends one
+/// more completion and dies between the drain and the decision must not get
+/// its entries cleared while that completion is still queued.
+#[test]
+fn the_prune_decides_on_the_liveness_sampled_before_the_drain() {
+    let st = SpillThread::exited_for_test();
+    assert!(st.is_dead(), "dead by now");
+    assert_eq!(
+        st.take_prune(0, false),
+        None,
+        "alive when sampled: no clear, nothing to prune below watermark 0"
+    );
+    assert_eq!(st.take_prune(0, true), Some(SupersededPrune::All));
+}
+
+/// Refs moon#1265: a dead spill thread is reported once — one error line and
+/// one count behind INFO `spill_thread_alive:0` — however many ticks see it.
+#[test]
+fn a_dead_spill_thread_is_reported_once() {
+    let st = SpillThread::exited_for_test();
+    assert!(!st.report_death_once(false, 0), "alive when sampled");
+    assert!(st.report_death_once(st.is_dead(), 0));
+    assert!(!spill_threads_alive());
+    assert!(!st.report_death_once(st.is_dead(), 0), "once");
 }

@@ -637,7 +637,10 @@ pub(super) async fn try_handle_swapdb(
         return true;
     }
 
+    // Still one change in redis 7.0.15 (moon#1232 review 5), like any
+    // SWAPDB that succeeds.
     if a == b {
+        crate::admin::metrics_setup::record_keyspace_changes(1);
         responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
         return true;
     }
@@ -667,6 +670,10 @@ pub(super) async fn try_handle_swapdb(
     // key parked on in either may now hold data. Remote shards serve their
     // own waiters from the `SwapDb` arm.
     if !matches!(response, Frame::Error(_)) {
+        // moon#1232 review 5: one keyspace change, as redis 7.0.15 counts a
+        // SWAPDB — without it a `--save` rule never persisted a lone swap
+        // under RDB-only persistence. Once per command, on this leg only.
+        crate::admin::metrics_setup::record_keyspace_changes(1);
         crate::blocking::wakeup::wake_swapped_dbs(&ctx.blocking_registry, a, b);
     }
     responses.push(response);

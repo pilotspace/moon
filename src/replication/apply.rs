@@ -1051,12 +1051,19 @@ pub(crate) fn load_snapshot(
         // ones are not yet in. That window did not exist while the slice was
         // single-threaded; splitting this into two `with_all` calls would
         // create it.
-        let loaded = s.databases.with_all(|dbs| {
-            for db in dbs.iter_mut() {
-                db.clear();
-            }
-            redis_rdb::load_rdb(dbs, rdb)
-        })?;
+        //
+        // moon#1232 review 5: neither the discarded local keys nor the loaded
+        // ones are a keyspace change — redis 7.0.15 leaves a replica's
+        // `rdb_changes_since_last_save` unchanged across a full sync.
+        let loaded = {
+            let _quiet = crate::admin::metrics_setup::mute_keyspace_changes();
+            s.databases.with_all(|dbs| {
+                for db in dbs.iter_mut() {
+                    db.clear();
+                }
+                redis_rdb::load_rdb(dbs, rdb)
+            })?
+        };
         install_snapshot_index_defs(s, vec_defs.as_deref(), text_defs.as_deref());
         // v0.7 graph replication: install the master's whole graph store
         // (authoritative replace — an EMPTY blob drops replica-local graphs;

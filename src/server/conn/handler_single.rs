@@ -982,6 +982,10 @@ pub async fn handle_connection(
                                     b"ERR value is not an integer or out of range",
                                 )),
                             };
+                            // moon#1232 review 5: one change, as in redis 7.0.15.
+                            if matches!(resp, Frame::SimpleString(_)) {
+                                crate::admin::metrics_setup::record_keyspace_changes(1);
+                            }
                             responses.push(resp);
                             continue;
                         }

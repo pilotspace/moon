@@ -68,6 +68,11 @@ pub struct UnlinkHold {
     /// O(N^2) on the shard thread (moon#1231 review; 390k files for 100M
     /// cold keys).
     held: std::collections::BTreeMap<u64, u64>,
+    /// The highest stamp in `held` (`None` when empty), kept exact by every
+    /// insert and removal so [`Self::awaits_fold`] — asked on every shard
+    /// tick while the ledger is over its threshold — is O(1), not a walk of
+    /// every held file (review 5).
+    max_stamp: Option<u64>,
     /// The view for the next decision, consumed by it.
     fresh: Option<FoldView>,
 }
@@ -122,13 +127,17 @@ impl UnlinkHold {
                 self.held.entry(file_id).or_insert(view.epoch);
             }
         }
+        let mut max_stamp = None;
         self.held.retain(|&file_id, &mut stamp| {
             let covered = stamp < view.committed_floor;
             if covered {
                 unlink.push(file_id);
+            } else {
+                max_stamp = max_stamp.max(Some(stamp));
             }
             !covered
         });
+        self.max_stamp = max_stamp;
         Admitted {
             unlink,
             requeue: Vec::new(),
@@ -139,17 +148,36 @@ impl UnlinkHold {
     /// file whose every live slot now has a durable copy below the committed
     /// cut, wherever it is queued. Returns the ones that were held.
     pub fn take(&mut self, file_ids: &[u64]) -> Vec<u64> {
-        file_ids
+        let mut took_max = false;
+        let taken = file_ids
             .iter()
             .copied()
-            .filter(|file_id| self.held.remove(file_id).is_some())
-            .collect()
+            .filter(|file_id| match self.held.remove(file_id) {
+                Some(stamp) => {
+                    took_max |= Some(stamp) == self.max_stamp;
+                    true
+                }
+                None => false,
+            })
+            .collect();
+        if took_max {
+            self.max_stamp = self.held.values().copied().max();
+        }
+        taken
     }
 
     /// Forget a held file that became referenced again (defensive: ids are
     /// minted once, so only a recovery merge could do it).
     pub fn forget_referenced(&mut self, is_referenced: impl Fn(u64) -> bool) {
-        self.held.retain(|&file_id, _| !is_referenced(file_id));
+        let mut max_stamp = None;
+        self.held.retain(|&file_id, &mut stamp| {
+            let keep = !is_referenced(file_id);
+            if keep {
+                max_stamp = max_stamp.max(Some(stamp));
+            }
+            keep
+        });
+        self.max_stamp = max_stamp;
     }
 
     /// Files held now.
@@ -167,7 +195,7 @@ impl UnlinkHold {
     /// not below `committed_floor`) — i.e. whether a fold would release
     /// anything that is not already releasable.
     pub fn awaits_fold(&self, committed_floor: u64) -> bool {
-        self.held.values().any(|&stamp| stamp >= committed_floor)
+        self.max_stamp.is_some_and(|stamp| stamp >= committed_floor)
     }
 
     /// Whether `file_id` is held (tests, diagnostics).
@@ -186,6 +214,7 @@ impl UnlinkHold {
         for (file_id, stamp) in other.held {
             self.held.entry(file_id).or_insert(stamp);
         }
+        self.max_stamp = self.held.values().copied().max();
     }
 }
 
@@ -322,6 +351,49 @@ mod tests {
         // A fold with snapshot epoch 2 commits: the stamp (1) is below it.
         h.observe(view(3, 2, 10));
         assert_eq!(h.admit(vec![]).unlink, vec![4]);
+    }
+
+    /// Review 5 (N4): `awaits_fold` reads the highest held stamp in O(1);
+    /// every insert and removal keeps it equal to a walk of the held set.
+    #[test]
+    fn awaits_fold_tracks_the_highest_held_stamp() {
+        fn check(h: &UnlinkHold) {
+            assert_eq!(h.max_stamp, h.held.values().copied().max(), "{h:?}");
+            for floor in 0..8 {
+                assert_eq!(
+                    h.awaits_fold(floor),
+                    h.held.values().any(|&s| s >= floor),
+                    "floor {floor}: {h:?}"
+                );
+            }
+        }
+        let mut h = UnlinkHold::default();
+        check(&h);
+        h.observe(view(1, 0, 100));
+        assert!(h.admit(vec![1, 2]).unlink.is_empty());
+        check(&h);
+        h.observe(view(3, 0, 100));
+        assert!(h.admit(vec![3, 1]).unlink.is_empty(), "1 keeps stamp 1");
+        check(&h);
+        assert_eq!(h.take(&[3]), vec![3], "the max-stamped file leaves");
+        check(&h);
+        h.observe(view(4, 0, 100));
+        assert!(h.admit(vec![4]).unlink.is_empty());
+        check(&h);
+        h.forget_referenced(|f| f == 4);
+        check(&h);
+        // A fold with snapshot epoch 2 commits: stamps 1 are released.
+        h.observe(view(5, 2, 100));
+        let mut released = h.admit(vec![]).unlink;
+        released.sort_unstable();
+        assert_eq!(released, vec![1, 2]);
+        check(&h);
+        assert!(h.is_empty() && !h.awaits_fold(0));
+        let mut other = UnlinkHold::default();
+        other.observe(view(6, 0, 100));
+        assert!(other.admit(vec![9]).unlink.is_empty());
+        h.merge(other);
+        check(&h);
     }
 
     #[test]

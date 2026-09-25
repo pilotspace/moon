@@ -139,6 +139,18 @@ static SPILL_LAST_HEARTBEAT_MS: AtomicU64 = AtomicU64::new(0);
 /// Cumulative number of spill batches flushed to disk across all shards.
 static SPILL_BATCHES_FLUSHED: AtomicU64 = AtomicU64::new(0);
 
+/// Spill threads found dead — exited without being asked to stop — across
+/// all shards. A dead thread is not respawned (moon#1265): its shard spills
+/// nothing more and its cold reclaim compacts nothing until a restart.
+static SPILL_THREADS_DEAD: AtomicU64 = AtomicU64::new(0);
+
+/// `false` once any shard's spill thread was found dead (INFO
+/// `spill_thread_alive`; refs moon#1265).
+#[inline]
+pub fn spill_threads_alive() -> bool {
+    SPILL_THREADS_DEAD.load(Ordering::Relaxed) == 0
+}
+
 /// Unix millis of the most recent spill-thread loop tick (0 = never ran).
 #[inline]
 pub fn spill_last_heartbeat_ms() -> u64 {
@@ -567,6 +579,9 @@ pub struct SpillThread {
     done_below: Arc<AtomicU64>,
     /// The watermark the shard last pruned its superseded sets with.
     pruned_below: AtomicU64,
+    /// Set once this thread's death was logged and counted
+    /// ([`Self::report_death_once`]).
+    death_reported: AtomicBool,
 }
 
 /// How [`SpillThread::take_prune`] says to prune the shard's superseded sets.
@@ -637,6 +652,7 @@ impl SpillThread {
             stop_flag,
             done_below,
             pruned_below: AtomicU64::new(0),
+            death_reported: AtomicBool::new(false),
         }
     }
 
@@ -824,8 +840,15 @@ impl SpillThread {
 
     /// Whether the superseded sets need a prune now: the watermark moved past
     /// the last one, or the thread is dead. Records the watermark as pruned.
-    pub(crate) fn take_prune(&self, done_below: u64) -> Option<SupersededPrune> {
-        if self.is_dead() {
+    ///
+    /// `was_dead` is [`Self::is_dead`] sampled BEFORE `done_below` was read
+    /// and the completions drained (refs moon#1253, review 5): a thread seen
+    /// dead then had sent everything it ever will, and the drain applied it.
+    /// Sampled after the drain, a thread that sent one more completion and
+    /// died in between had its entries cleared while that completion was
+    /// still queued, un-applied — which reopens the moon#1253 fold window.
+    pub(crate) fn take_prune(&self, done_below: u64, was_dead: bool) -> Option<SupersededPrune> {
+        if was_dead {
             return Some(SupersededPrune::All);
         }
         if done_below > self.pruned_below.fetch_max(done_below, Ordering::Relaxed) {
@@ -838,11 +861,38 @@ impl SpillThread {
     /// The thread exited while nobody asked it to stop (a panic): no
     /// completion will arrive for anything it had not flushed.
     pub fn is_dead(&self) -> bool {
-        !self.stop_flag.load(Ordering::Acquire)
+        let dead = !self.stop_flag.load(Ordering::Acquire)
             && self
                 .join_handle
                 .as_ref()
-                .is_some_and(std::thread::JoinHandle::is_finished)
+                .is_some_and(std::thread::JoinHandle::is_finished);
+        if dead {
+            // `is_finished` is a relaxed read of the value the thread's exit
+            // released; this fence orders everything the thread did before it
+            // exited (its last completion sends included) before the caller's
+            // next read of the completion channel.
+            std::sync::atomic::fence(Ordering::Acquire);
+        }
+        dead
+    }
+
+    /// Given [`Self::is_dead`] as the caller sampled it: the first time it is
+    /// `true`, log the death once at `error` and count it for INFO
+    /// (`spill_thread_alive:0`). Returns whether this call reported it.
+    /// Refs moon#1265: the thread is not respawned.
+    pub(crate) fn report_death_once(&self, was_dead: bool, shard_id: usize) -> bool {
+        if !was_dead || self.death_reported.swap(true, Ordering::Relaxed) {
+            return false;
+        }
+        SPILL_THREADS_DEAD.fetch_add(1, Ordering::Relaxed);
+        tracing::error!(
+            shard_id,
+            "spill thread died (it exited without a shutdown request): until the server \
+             restarts this shard spills no evicted key to disk (an eviction that needs a spill \
+             keeps its key in RAM, so a shard over maxmemory may answer -OOM) and its cold \
+             reclaim compacts nothing (moon#1265: no respawn yet)"
+        );
+        true
     }
 
     /// A spill thread whose thread exited without being asked to (tests of
@@ -870,6 +920,7 @@ impl SpillThread {
             stop_flag: Arc::new(AtomicBool::new(false)),
             done_below: Arc::new(AtomicU64::new(0)),
             pruned_below: AtomicU64::new(0),
+            death_reported: AtomicBool::new(false),
         }
     }
 
