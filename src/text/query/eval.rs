@@ -58,6 +58,16 @@ pub fn eval_set(node: &QueryNode, idx: &TextIndex) -> RoaringBitmap {
 /// order, which is the order leaf scores are summed in.
 struct LeafTable<'a> {
     leaves: Vec<(*const QueryNode, LeafScorer<'a>)>,
+    /// `(node address, index into leaves)`, sorted by address — `get` is a
+    /// binary search (moon#1226: it was a linear scan per leaf, so a wide OR
+    /// cost O(leaves²) before any posting was read).
+    by_addr: Vec<(usize, usize)>,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Address comparisons `LeafTable::get` made on this thread.
+    static LEAF_PROBES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 impl<'a> LeafTable<'a> {
@@ -69,15 +79,26 @@ impl<'a> LeafTable<'a> {
     ) -> Self {
         let mut leaves = Vec::new();
         collect_leaf_scorers(node, idx, global_df, global_n, &mut leaves);
-        Self { leaves }
+        let mut by_addr: Vec<(usize, usize)> = leaves
+            .iter()
+            .enumerate()
+            .map(|(i, (n, _))| (n.addr(), i))
+            .collect();
+        by_addr.sort_unstable();
+        Self { leaves, by_addr }
     }
 
     fn get(&self, node: &QueryNode) -> Option<&LeafScorer<'a>> {
-        let key: *const QueryNode = node;
-        self.leaves
-            .iter()
-            .find(|(n, _)| std::ptr::eq(*n, key))
-            .map(|(_, leaf)| leaf)
+        let key = (node as *const QueryNode).addr();
+        let at = self
+            .by_addr
+            .binary_search_by(|&(addr, _)| {
+                #[cfg(test)]
+                LEAF_PROBES.with(|c| c.set(c.get() + 1));
+                addr.cmp(&key)
+            })
+            .ok()?;
+        self.leaves.get(self.by_addr[at].1).map(|(_, leaf)| leaf)
     }
 
     fn into_scorer(self) -> QueryScorer<'a> {
@@ -530,3 +551,57 @@ fn collect_df_terms_inner(node: &QueryNode, idx: &TextIndex, acc: &mut DfAcc) {
 #[cfg(test)]
 #[path = "eval_oracle_tests.rs"]
 mod oracle_tests;
+
+#[cfg(test)]
+mod leaf_table_tests {
+    use bytes::Bytes;
+
+    use super::*;
+    use crate::protocol::Frame;
+    use crate::text::types::{BM25Config, TextFieldDef};
+
+    /// moon#1226 op-count red test: resolving every TEXT leaf of a wide OR is
+    /// O(leaves · log leaves) address comparisons. HEAD scanned the leaf
+    /// list linearly per leaf — O(leaves²): ~2 M comparisons for 2,000
+    /// leaves, before any posting was read.
+    #[test]
+    fn a_wide_or_resolves_its_leaves_in_n_log_n() {
+        let mut idx = TextIndex::new(
+            Bytes::from_static(b"t"),
+            vec![Bytes::from_static(b"d:")],
+            vec![TextFieldDef::new(Bytes::from_static(b"body"))],
+            BM25Config::default(),
+        );
+        for d in 0..50u32 {
+            let key = format!("d:{d}");
+            let body = format!("w{} w{} common", d % 7, d % 11);
+            idx.index_document(
+                u64::from(d) + 1,
+                key.as_bytes(),
+                &[
+                    Frame::BulkString(Bytes::from_static(b"body")),
+                    Frame::BulkString(Bytes::from(body)),
+                ],
+            );
+        }
+        const N: usize = 2_000;
+        let node = QueryNode::Or(
+            (0..N)
+                .map(|i| QueryNode::Term {
+                    field: None,
+                    token: Bytes::from(format!("w{i}")),
+                    modifier: TermModifier::Exact,
+                })
+                .collect(),
+        );
+        LEAF_PROBES.with(|c| c.set(0));
+        let set = eval_set(&node, &idx);
+        let probes = LEAF_PROBES.with(std::cell::Cell::get);
+        assert_eq!(set.len(), 50, "w0..w10 cover every doc");
+        let bound = N * ((N as f64).log2().ceil() as usize + 2);
+        assert!(
+            probes <= bound,
+            "{probes} leaf-table comparisons for {N} leaves (bound {bound})"
+        );
+    }
+}
