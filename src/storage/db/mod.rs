@@ -2,6 +2,8 @@ use bytes::Bytes;
 use std::collections::HashMap;
 
 mod accessors;
+mod bulk_load;
+mod cold_promote;
 mod cold_replay_gate;
 /// moon#1221 review INTEG-5: writes to compact collections record one access.
 #[cfg(test)]
@@ -14,6 +16,7 @@ mod incr;
 /// answered absent or re-created. Test-only.
 #[cfg(test)]
 mod inflight_expiry_1255_tests;
+mod keyspace_scan;
 mod kv_ops;
 /// moon#1190: per-database lazy-free queue, drained on the shard tick.
 mod lazy_free;
