@@ -250,9 +250,10 @@ fn table_swaps_during_bgsave_fail_the_save_not_the_server() {
 /// (the canary written between the saves gone). Or the straggler unlinked
 /// the new temp file and the second save failed.
 ///
-/// `rdb_last_bgsave_status` cannot judge the second save: the sharded
-/// BGSAVE path never resets it to `ok` after a failure (pre-existing), so
-/// the server log and the restart do.
+/// Since moon#1230 `rdb_last_bgsave_status` describes the LAST save, so it
+/// judges the second save directly (it used to stay `err` after the aborted
+/// one, and this test read the server log instead); the log still shows the
+/// first was aborted, and the restart proves the published file is sound.
 #[test]
 fn an_aborted_bgsave_cannot_corrupt_the_next_one() {
     let dir = common::unique_test_dir("ws12-abort-resave");
@@ -287,18 +288,17 @@ fn an_aborted_bgsave_cannot_corrupt_the_next_one() {
         assert!(Instant::now() < deadline, "BGSAVE never accepted: {reply}");
         std::thread::sleep(Duration::from_micros(200));
     }
-    let _ = wait_bgsave(&mut c, Duration::from_secs(120));
+    assert_eq!(
+        wait_bgsave(&mut c, Duration::from_secs(120)),
+        "ok",
+        "the BGSAVE after the aborted one must publish"
+    );
     // A straggler writer of the aborted save has at most tens of MiB left.
     std::thread::sleep(Duration::from_millis(500));
     let log = std::fs::read_to_string(dir.join("server.err")).unwrap_or_default();
     assert!(
         log.contains("aborted: FLUSHALL"),
         "fixture: the first BGSAVE must have been aborted by the FLUSHALL"
-    );
-    assert!(
-        log.lines()
-            .any(|l| l.contains("snapshot epoch") && l.trim_end().ends_with(" complete")),
-        "the BGSAVE after the aborted one must publish:\n{log:.3000}"
     );
     let published = std::fs::metadata(dir.join("shard-0.rrdshard"))
         .map(|m| m.len())

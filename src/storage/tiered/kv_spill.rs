@@ -1374,8 +1374,12 @@ mod tests {
             by_hand.insert(k.clone(), *l);
         }
         assert_eq!(bulk.len(), by_hand.len());
+        // The released older copy is still on disk in 303, so the dead-slot
+        // ledger (moon#1215) records it and charges it separately: compare
+        // the entries' share.
+        assert!(bulk.dead_slots().file_has_dead_slots(303));
         assert_eq!(
-            bulk.resident_bytes(),
+            bulk.resident_bytes() - bulk.dead_slots().resident_bytes(),
             by_hand.resident_bytes(),
             "bulk build must charge resident_bytes exactly once per distinct key"
         );

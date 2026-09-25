@@ -87,6 +87,21 @@ jobs:
         run: |
           cargo test --release --test crash_matrix_cross_plane -- --ignored --test-threads=1 \
             2>&1 | tee crash-matrix-nightly.log
+      # moon#1215 (P0): a cold-tier key DELeted before an AOF rewrite must not
+      # come back after a restart. The recovery-level half runs per-PR as lib
+      # tests; this real-server half (kill -9 and clean SHUTDOWN, DEL / FLUSHDB
+      # / overwrite / TTL cases) is #[ignore]d like the other crash suites, so
+      # the nightly is its gate. Both fold layouts: per-shard (4) and flat (1).
+      - name: Cold-tier DEL survives rewrite + restart (moon#1215), --shards 4 and 1
+        if: success() || failure()
+        run: |
+          cargo build --release --bin moon --test crash_recovery_cold_del_rewrite
+          export MOON_BIN="$CARGO_TARGET_DIR/release/moon"
+          for s in 4 1; do
+            MOON_TEST_COLD_DEL_SHARDS=$s cargo test --release --test crash_recovery_cold_del_rewrite \
+              -- --ignored --test-threads=1 2>&1 | tee -a crash-matrix-nightly.log
+            test "${PIPESTATUS[0]}" -eq 0 || exit 1
+          done
       - name: Collect spawned-server logs on failure
         if: failure()
         run: |

@@ -401,11 +401,18 @@ pub(super) async fn try_handle_script(
     if !cmd.eq_ignore_ascii_case(b"SCRIPT") {
         return false;
     }
-    let (response, fanout) =
+    let (mut response, fanout) =
         crate::scripting::handle_script_subcommand(&ctx.script_cache, cmd_args);
     if let Some((sha1, script_bytes)) = fanout {
         crate::server::conn::shared::script_fanout_bounded(ctx, shutdown, &sha1, &script_bytes)
             .await;
+    }
+    // moon#1229: the flush above cleared THIS shard's cache only; reply once
+    // every shard has flushed (or say which did not).
+    if crate::server::conn::shared::is_accepted_script_flush(cmd_args, &response)
+        && let Some(partial) = crate::server::conn::shared::script_flush_fanout(ctx, shutdown).await
+    {
+        response = partial;
     }
     responses.push(response);
     true

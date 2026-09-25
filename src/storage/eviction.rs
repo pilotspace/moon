@@ -773,6 +773,11 @@ pub struct EvictionRun<'s, 'm, 'r> {
     /// cold-tier copy. Fires ONLY for plain drops — a spilled entry stays
     /// cold-readable, not deleted, so it is never reported here.
     on_plain_drop: Option<&'r mut dyn FnMut(&[u8])>,
+    /// Unevictable bytes to admit against: the cold tier's dead-slot ledger
+    /// (moon#1215, PR #1233 review). `None` = [`cold_ledger_bytes`] of the
+    /// database being evicted; an aggregate run (`total`) passes the sum
+    /// over the databases its total covers.
+    ledger: Option<usize>,
 }
 
 impl<'s, 'm, 'r> EvictionRun<'s, 'm, 'r> {
@@ -783,6 +788,7 @@ impl<'s, 'm, 'r> EvictionRun<'s, 'm, 'r> {
             budget_override: 0,
             sink: EvictionSink::Plain,
             on_plain_drop: None,
+            ledger: None,
         }
     }
 
@@ -793,6 +799,7 @@ impl<'s, 'm, 'r> EvictionRun<'s, 'm, 'r> {
             budget_override: 0,
             sink: EvictionSink::SyncSpill(spill),
             on_plain_drop: None,
+            ledger: None,
         }
     }
 
@@ -816,6 +823,7 @@ impl<'s, 'm, 'r> EvictionRun<'s, 'm, 'r> {
                 manifest,
             },
             on_plain_drop: None,
+            ledger: None,
         }
     }
 
@@ -840,6 +848,46 @@ impl<'s, 'm, 'r> EvictionRun<'s, 'm, 'r> {
         self.on_plain_drop = Some(on_plain_drop);
         self
     }
+
+    /// Admit against this many unevictable ledger bytes instead of the
+    /// evicted database's own (an aggregate run's sum; see `ledger`).
+    #[must_use]
+    pub fn ledger(mut self, ledger_bytes: usize) -> Self {
+        self.ledger = Some(ledger_bytes);
+        self
+    }
+}
+
+/// The cold tier's dead-slot ledger of `db` (moon#1215): resident RAM that
+/// no eviction victim can free — only unlinking its spill files does. O(1):
+/// an `Option` check and a field read.
+#[inline]
+pub fn cold_ledger_bytes(db: &Database) -> usize {
+    db.cold_index.as_ref().map_or(0, |ci| ci.dead_slot_bytes())
+}
+
+/// What a write to `db` is ADMITTED against (PR #1233 review): the evictable
+/// memory ([`Database::estimated_memory`]) plus the ledger. The inline write
+/// pre-gate compares this, so a write it waves through is one
+/// [`evict_to_budget`] would admit too. O(1).
+#[inline]
+pub fn admission_memory(db: &Database) -> usize {
+    db.estimated_memory().saturating_add(cold_ledger_bytes(db))
+}
+
+/// How far eviction may push the evictable memory to make room for
+/// `ledger` unevictable bytes under `budget` (PR #1233 review): the
+/// budget minus the ledger, but never below half the budget.
+///
+/// Eviction cannot free a ledger byte. Paying for a small ledger by evicting
+/// live keys is right — it is real memory, like the vector bytes the tick
+/// charges. Paying for a large one is not: draining the hot set to disk buys
+/// nothing, so past half the budget the write is refused instead
+/// ([`evict_to_budget`]'s admission check) and the cold tier's reclaim is
+/// what brings the ledger down. With no ledger this is `budget` exactly.
+#[inline]
+pub(crate) fn eviction_target(budget: usize, ledger: usize) -> usize {
+    budget.saturating_sub(ledger).max(budget / 2)
 }
 
 /// Evict until memory is back under the shard budget (W4: the single
@@ -851,6 +899,12 @@ impl<'s, 'm, 'r> EvictionRun<'s, 'm, 'r> {
 /// `Err(Frame)` with an OOM error when eviction cannot free enough memory
 /// (`noeviction` policy, no evictable victims, or a sink that cannot make
 /// progress).
+///
+/// The cold tier's dead-slot ledger (moon#1215) is charged at ADMISSION but
+/// not chased by eviction (PR #1233 review): victims are taken down to
+/// [`eviction_target`], and the write is admitted only if what is left plus
+/// the ledger fits the budget — so a ledger no victim can shrink answers OOM
+/// instead of draining the hot set.
 ///
 /// The budget compared against is PER-SHARD (`maxmemory / num_shards`, or
 /// the elastic override capped at instance `maxmemory`) — `maxmemory` is a
@@ -888,6 +942,14 @@ pub fn evict_to_budget(
     // once accounted memory passes ~8.3 GB, holding REAL footprint near the
     // configured limit — which is what the operator asked for.
     let budget = run_budget(config, run.budget_override);
+    // PR #1233 review: the cold tier's dead-slot ledger is charged to the
+    // budget but cannot be evicted. Eviction reclaims down to
+    // `eviction_target` (never below half the budget to pay for it); the
+    // admission check after the loop refuses the write if what is left plus
+    // the ledger is still over budget. No ledger: target == budget, and
+    // this function behaves exactly as it did.
+    let ledger = run.ledger.unwrap_or_else(|| cold_ledger_bytes(db));
+    let target = eviction_target(budget, ledger);
 
     let mut sink = run.sink;
     let mut noop = |_: &[u8]| {};
@@ -900,7 +962,10 @@ pub fn evict_to_budget(
     // moon#600: consecutive iterations that claimed progress but changed
     // NOTHING observable. See `EVICTION_STALL_LIMIT`.
     let mut stalled = 0usize;
-    while current_total > budget {
+    // moon#466: spill bytes already scheduled for release that cover the
+    // rest of the overshoot — counted as released by the admission check.
+    let mut settling = 0usize;
+    while current_total > target {
         // moon#1221 review F1: bytes an UNLINK or an expiry handed to the
         // lazy-free queue are still charged (the drain credits them as it
         // frees) but are no longer the keyspace's. Win them back FIRST —
@@ -909,9 +974,9 @@ pub fn evict_to_budget(
         // is accepted here too, and no live key pays for a dead one. Only
         // over budget, and only the overshoot: one field read otherwise.
         if db.lazy_free_reclaimable() {
-            let credited = db.reclaim_lazy_free(current_total - budget);
+            let credited = db.reclaim_lazy_free(current_total - target);
             current_total = current_total.saturating_sub(credited);
-            if current_total <= budget {
+            if current_total <= target {
                 break;
             }
         }
@@ -931,8 +996,9 @@ pub fn evict_to_budget(
         // One `usize` read plus one comparison per victim: no allocation, no
         // lock, nothing added to the 100 ms sweep's cost.
         let pending = db.pending_spill_bytes();
-        if pending > 0 && current_total.saturating_sub(pending) <= budget {
-            return Ok(());
+        if pending > 0 && current_total.saturating_sub(pending) <= target {
+            settling = pending;
+            break;
         }
         // moon#600: the liveness probe. `progressed` is a claim by the sink;
         // this triple is the OBSERVATION. Three O(1) field reads, no
@@ -941,7 +1007,7 @@ pub fn evict_to_budget(
         // uses, so this replaces that read rather than adding one.
         let before_probe = EvictionProgress::probe(db);
         let before = before_probe.memory;
-        let deficit = current_total.saturating_sub(budget);
+        let deficit = current_total.saturating_sub(target);
         let progressed = match &mut sink {
             EvictionSink::Plain | EvictionSink::SyncSpill(None) => {
                 evict_one_with_spill(db, config, &policy, None, on_plain_drop)
@@ -1029,6 +1095,17 @@ pub fn evict_to_budget(
         current_total = current_total.saturating_sub(before.saturating_sub(after));
     }
 
+    // PR #1233 review (admission): the write is admitted only when what is
+    // left plus the ledger fits the budget. A ledger past half the budget
+    // lands here with the hot set at `target` — refused per policy, with no
+    // further victims taken for bytes eviction cannot free.
+    if current_total
+        .saturating_sub(settling)
+        .saturating_add(ledger)
+        > budget
+    {
+        return Err(oom_error());
+    }
     Ok(())
 }
 
@@ -4001,3 +4078,6 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod ledger_admission_tests;

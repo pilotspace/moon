@@ -244,28 +244,41 @@ pub fn generate_rewrite_commands(databases: &[Database]) -> BytesMut {
 /// moon#902: every AOF generation opens with `MOON.COLDCUT <watermark>` —
 /// cold files with `file_id < watermark` were sealed before this
 /// generation's base was cut, so a replay may read them as the base for
-/// every record that follows. Written and fsynced BEFORE any post-cut append
-/// so it is always the first record of the new incr; `framed` selects the
-/// per-shard `[lsn=0][len][RESP]` encoding.
-pub(crate) fn write_cold_cut_head(
+/// every record that follows. moon#1215: followed by a `DEL` of every key
+/// the fold found dead with a slot still on disk (`cold_deletes`), or the
+/// cut would authorize that slot and a restart would bring the key back.
+/// Written and fsynced BEFORE any post-cut append — and before the new
+/// generation is committed — so it is always the head of the new incr;
+/// `framed` selects the per-shard `[lsn=0][len][RESP]` encoding.
+pub(crate) fn write_generation_head(
     file: &mut std::fs::File,
     framed: bool,
     watermark: u64,
+    cold_deletes: crate::persistence::cold_records::ColdDeletes,
     path: &Path,
 ) -> Result<(), MoonError> {
-    use std::io::Write;
-    let resp = crate::persistence::cold_records::serialize_cold_cut(watermark);
     let io = |e: std::io::Error| AofError::Io {
         path: path.to_path_buf(),
         source: e,
     };
-    if framed {
-        file.write_all(&crate::persistence::cold_records::frame_unoffset(&resp))
-            .map_err(io)?;
-    } else {
-        file.write_all(&resp).map_err(io)?;
-    }
+    // Streamed chunk by chunk: the head never exists as one buffer (PR #1233
+    // review).
+    let written = crate::persistence::cold_records::write_generation_head_to(
+        file,
+        watermark,
+        cold_deletes,
+        framed,
+    )
+    .map_err(io)?;
     file.sync_data().map_err(io)?;
+    if written > 0 {
+        info!(
+            "AOF rewrite: new generation {} opens with DELs of {} key(s) whose cold slots \
+             outlive them (moon#1215)",
+            path.display(),
+            written
+        );
+    }
     Ok(())
 }
 
@@ -308,19 +321,23 @@ impl FoldOutcome {
     pub(crate) fn adopt(self, previous: FoldEpoch, overflow: &RewriteOverflow) -> FoldEpoch {
         if let FoldOutcome::Committed { floor } = self {
             overflow.heal_on_commit(floor);
+            // The shard's cold-tier reclaim waits for this (moon#1215).
+            overflow.note_committed(floor);
         }
         self.floor_after(previous)
     }
 }
 
-/// Open a fold's NEW incr for appending and write its `MOON.COLDCUT` head —
-/// everything a writer needs before it can switch to the new generation,
-/// done while the old one is still committed (#455, see [`FoldOutcome`]).
+/// Open a fold's NEW incr for appending and write its head
+/// ([`write_generation_head`]) — everything a writer needs before it can
+/// switch to the new generation, done while the old one is still committed
+/// (#455, see [`FoldOutcome`]).
 #[cfg(any(feature = "runtime-monoio", feature = "runtime-tokio"))]
 pub(crate) fn open_new_incr(
     path: &Path,
     framed: bool,
     cold_watermark: u64,
+    cold_deletes: crate::persistence::cold_records::ColdDeletes,
 ) -> Result<std::fs::File, MoonError> {
     #[cfg(test)]
     if test_fault::fail_new_incr_open() {
@@ -338,7 +355,7 @@ pub(crate) fn open_new_incr(
             path: path.to_path_buf(),
             source: e,
         })?;
-    write_cold_cut_head(&mut file, framed, cold_watermark, path)?;
+    write_generation_head(&mut file, framed, cold_watermark, cold_deletes, path)?;
     Ok(file)
 }
 
@@ -946,7 +963,7 @@ pub(crate) fn do_rewrite_per_shard(
         .manifest
         .lock()
         .shard_base_staging(shard_id, coord.new_seq)?;
-    let base_len = crate::persistence::aof::fold_stream::write_fold_image_file(
+    let (base_len, cold_deletes) = crate::persistence::aof::fold_stream::write_fold_image_file(
         &tmp_base,
         fold_snapshot.image,
         "do_rewrite_per_shard",
@@ -966,7 +983,12 @@ pub(crate) fn do_rewrite_per_shard(
     // appending to the old incr — it is the committed one. Any failure up to
     // here aborts the whole rewrite (the ShardDoneGuard marks it failed)
     // with `file` still on the old incr.
-    let new_file = open_new_incr(&new_incr, true, fold_snapshot.cold_file_watermark)?;
+    let new_file = open_new_incr(
+        &new_incr,
+        true,
+        fold_snapshot.cold_file_watermark,
+        cold_deletes,
+    )?;
 
     info!(
         "F6 per-shard rewrite: shard {} folded (drained {}+{} appends), new seq {}",
@@ -1073,7 +1095,7 @@ pub(crate) fn do_rewrite_single(
         .max()
         .unwrap_or(1);
     let now_ms = current_time_ms();
-    let snapshot: Vec<
+    let mut snapshot: Vec<
         Vec<(
             crate::storage::compact_key::CompactKey,
             crate::storage::entry::Entry,
@@ -1090,6 +1112,27 @@ pub(crate) fn do_rewrite_single(
             entries
         })
         .collect();
+    // moon#1223: in-flight spills are part of the keyspace, so of the base;
+    // moon#1215: dead cold slots get DELs in the new generation's head —
+    // the same two rules the streaming folds apply (`fold_stream`).
+    for (db_idx, (guard, entries)) in guards.iter().zip(snapshot.iter_mut()).enumerate() {
+        crate::persistence::aof::fold_stream::for_each_in_flight_base_entry(
+            guard,
+            db_idx,
+            now_ms,
+            |key, entry| {
+                entries.push((
+                    crate::storage::compact_key::CompactKey::from(key.as_ref()),
+                    entry,
+                ));
+                Ok(())
+            },
+        )?;
+    }
+    let cold_deletes = {
+        let refs: Vec<&Database> = guards.iter().map(|g| &**g).collect();
+        crate::persistence::aof::fold_stream::fold_cold_deletes(&refs, now_ms)
+    };
 
     // Phase 5: release locks. Handlers resume; new appends queue in the channel
     // and will be processed into the new incr after step 6.
@@ -1099,7 +1142,7 @@ pub(crate) fn do_rewrite_single(
     // switch of `file` below cannot fail (#455, see `FoldOutcome`).
     let rdb_bytes = crate::persistence::rdb::save_snapshot_to_bytes(&snapshot)?;
     let (_new_incr, new_file) = manifest.advance_with(&rdb_bytes, |new_incr| {
-        open_new_incr(new_incr, false, cold_watermark)
+        open_new_incr(new_incr, false, cold_watermark, cold_deletes)
     })?;
     *file = new_file;
     // task #35: fresh incr — replay always starts a segment at db 0.
@@ -1267,12 +1310,25 @@ pub(crate) fn do_rewrite_sharded(
     // it arrives — no cloned snapshot, no whole-image `Vec`.
     let cold_watermark = fold_snapshot.cold_file_watermark;
     let image = fold_snapshot.image;
+    // moon#1215: the base writer hands the fold's cold deletes to the incr
+    // opener, which writes them into the new generation's head.
+    let cold_deletes = std::cell::Cell::new(None);
     let (_new_incr, new_file) = manifest.advance_with_base(
-        |f| crate::persistence::aof::fold_stream::write_fold_image(image, f, "TopLevel fold"),
+        |f| {
+            let (len, deletes) =
+                crate::persistence::aof::fold_stream::write_fold_image(image, f, "TopLevel fold")?;
+            cold_deletes.set(Some(deletes));
+            Ok(len)
+        },
         |new_incr| {
-            // #455: opened (with its MOON.COLDCUT head) BEFORE the manifest
-            // flips, so switching `file` below cannot fail — see `FoldOutcome`.
-            open_new_incr(new_incr, false, cold_watermark)
+            // #455: opened (with its head) BEFORE the manifest flips, so
+            // switching `file` below cannot fail — see `FoldOutcome`.
+            open_new_incr(
+                new_incr,
+                false,
+                cold_watermark,
+                cold_deletes.take().unwrap_or_default(),
+            )
         },
     )?;
     *file = new_file;
@@ -1630,12 +1686,12 @@ pub(crate) fn rewrite_aof_sharded_sync(
     let base_len = {
         // moon#1185: the base image streams in from the shard and is
         // appended as it arrives — no cloned snapshot, no whole-image `Vec`.
-        let base_len = match crate::persistence::aof::fold_stream::write_fold_image(
+        let (base_len, cold_deletes) = match crate::persistence::aof::fold_stream::write_fold_image(
             image,
             &mut f,
             "rewrite_aof_sharded_sync (tokio)",
         ) {
-            Ok(n) => n,
+            Ok(written) => written,
             Err(e) => {
                 drop(f);
                 let _ = std::fs::remove_file(&tmp_path);
@@ -1650,18 +1706,9 @@ pub(crate) fn rewrite_aof_sharded_sync(
         // replay read every cold file ungated and re-applied post-rewrite
         // writes on top of a later spill of their own result (moon#902).
         // Written into the tmp file BEFORE the rename, so the file this
-        // rewrite publishes can never exist without its head.
-        f.write_all(&crate::persistence::cold_records::serialize_cold_cut(
-            cold_watermark,
-        ))
-        .map_err(|e| AofError::Io {
-            path: tmp_path.clone(),
-            source: e,
-        })?;
-        f.sync_data().map_err(|e| AofError::Io {
-            path: tmp_path.clone(),
-            source: e,
-        })?;
+        // rewrite publishes can never exist without its head — moon#1215's
+        // DELs of dead cold slots included.
+        write_generation_head(&mut f, false, cold_watermark, cold_deletes, &tmp_path)?;
         base_len
     };
     std::fs::rename(&tmp_path, aof_path).map_err(|e| AofError::RewriteFailed {
@@ -1833,6 +1880,60 @@ mod fold_tests {
         assert!(
             contains(&old_incr, marker),
             "appends after the aborted fold must land in the committed incr"
+        );
+    }
+
+    /// moon#1223: an in-flight spill payload that does not rehydrate cannot
+    /// be carried by the new base, and a base without it loses the key if
+    /// the spill then does not publish. The fold fails instead: nothing is
+    /// published, the manifest never flips, and the writer keeps appending
+    /// to the committed incr.
+    #[test]
+    fn an_unencodable_in_flight_payload_aborts_the_rewrite_on_the_committed_generation() {
+        let mut fx = fixture();
+        fx.dbs[0].write().spill_inflight_mark(
+            Bytes::from_static(b"broken"),
+            crate::storage::db::PendingSpill {
+                req_id: 1,
+                value_type: crate::persistence::kv_page::ValueType::Hash,
+                value_bytes: Bytes::from_static(b"\xff\xff not a hash body"),
+                ttl_ms: None,
+            },
+        );
+        let old_seq = fx.manifest.seq;
+        let old_incr = fx.manifest.incr_path();
+        let mut last_db = 0usize;
+
+        let res = do_rewrite_single(
+            &fx.dbs,
+            &mut fx.manifest,
+            &mut fx.file,
+            &fx.rx,
+            &mut last_db,
+            &fx.overflow,
+            FoldEpoch::INITIAL,
+        );
+
+        let err = res.expect_err("the fold must fail, not commit a base without the key");
+        assert!(err.to_string().contains("does not rehydrate"), "{err}");
+        assert_eq!(fx.manifest.seq, old_seq, "in-memory manifest unchanged");
+        let on_disk = AofManifest::load(&fx.dir)
+            .expect("load")
+            .expect("manifest present");
+        assert_eq!(on_disk.seq, old_seq, "the manifest never flipped");
+        assert!(old_incr.exists(), "the committed incr is still there");
+        assert!(
+            !fx.manifest.incr_path_seq(old_seq + 1).exists(),
+            "no new incr was published"
+        );
+        let marker = b"*1\r\n$4\r\nPING\r\n";
+        fx.file
+            .write_all(marker)
+            .expect("append after the aborted fold");
+        fx.file.sync_data().expect("fsync");
+        assert!(
+            contains(&old_incr, marker),
+            "appends after the aborted fold land in the committed incr"
         );
     }
 

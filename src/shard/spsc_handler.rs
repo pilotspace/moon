@@ -39,13 +39,22 @@ use super::shared_databases::ShardDatabases;
 /// OOM `Frame::Error` on failure) — this file is runtime-agnostic (shared by
 /// both `runtime-monoio` and `runtime-tokio`, so it cannot call that
 /// `#[cfg(feature = "runtime-monoio")]`-gated function directly. Cross-shard
-/// SPSC legs (`Execute`/`MultiExecute`/`PipelineBatch` + their `*Slotted`
-/// variants) execute writes against the TARGET shard's `&mut Database`
+/// SPSC legs (`Execute`/`MultiExecute`/`PipelineBatchSlotted`/`TxnExecute`)
+/// execute writes against the TARGET shard's `&mut Database`
 /// directly, bypassing the connection handlers' write path entirely — without
 /// this gate a scatter-gather write could grow a remote shard's memory past
 /// `maxmemory` without limit.
+///
+/// `cmd` is the routed command: one that can only shrink memory (DEL, HDEL,
+/// LPOP, ...) is never refused here, as in the connection gate
+/// (`run_write_eviction_gate`, WS6). Eviction still runs; only the reject is
+/// bypassed. Without it a key owned by another shard could not be deleted
+/// once that shard was over budget — under `noeviction`, and under any
+/// policy while the cold dead-slot ledger holds the shard over budget
+/// (moon#1215: eviction cannot shrink that ledger).
 #[allow(clippy::too_many_arguments)]
 pub(super) fn spsc_eviction_gate(
+    cmd: &[u8],
     db: &mut Database,
     db_idx: usize,
     shard_databases: &Arc<ShardDatabases>,
@@ -92,13 +101,17 @@ pub(super) fn spsc_eviction_gate(
             EvictionRun::plain().budget(budget).report(on_plain_drop),
         )
     };
-    global_result?;
+    let shrink_only = crate::storage::db_quota::is_shrink_only_command(cmd);
+    if !shrink_only {
+        global_result?;
+    }
     // WS5b: per-db quota, additive and finer-grained than the whole-instance
     // maxmemory gate above. Zero-cost when unconfigured for this db. This is
     // the ONE gate for cross-shard scatter-gather writes (MSET/DEL/etc. and
     // any command whose keys land on a shard other than the client's own),
     // so a quota'd db cannot be grown past its cap via a remote leg either.
-    crate::storage::db_quota::check_db_maxmemory(db, db_idx, &rt)
+    let db_quota_result = crate::storage::db_quota::check_db_maxmemory(db, db_idx, &rt);
+    if shrink_only { Ok(()) } else { db_quota_result }
 }
 
 /// Drain all SPSC consumer channels, processing cross-shard messages.
@@ -193,7 +206,7 @@ pub(crate) fn drain_spsc_shared(
     // limit. See `eviction::write_gate_active`.
     let evict_active = crate::storage::eviction::write_gate_active();
 
-    // Collect all messages first, then batch Execute/PipelineBatch under single borrow.
+    // Collect all messages first, then run the command legs under single borrow.
     //
     // Scratch buffers are thread-local (one shard per OS thread) so this
     // function — called from the 1ms tick and every I/O select arm — does
@@ -302,12 +315,9 @@ pub(crate) fn drain_spsc_shared(
                     }
                     match msg {
                         ShardMessage::Execute { .. }
-                        | ShardMessage::PipelineBatch { .. }
                         | ShardMessage::MultiExecute { .. }
                         | ShardMessage::TxnExecute(_)
-                        | ShardMessage::ExecuteSlotted { .. }
                         | ShardMessage::PipelineBatchSlotted { .. }
-                        | ShardMessage::MultiExecuteSlotted { .. }
                         | ShardMessage::VectorSearch(_)
                         | ShardMessage::VectorCommand { .. }
                         | ShardMessage::DocFreq(_)
@@ -358,7 +368,7 @@ pub(crate) fn drain_spsc_shared(
         }
     }
 
-    // Process Execute/PipelineBatch/MultiExecute batch under single borrow_mut
+    // Process the command legs (Execute/MultiExecute/PipelineBatchSlotted/TxnExecute)
     if !execute_batch.is_empty() {
         for msg in execute_batch.drain(..) {
             handle_shard_message_shared(
@@ -447,7 +457,7 @@ pub(crate) fn drain_spsc_shared(
 }
 
 /// The slowlog view of a routed command's frame, whether the arm holds it as
-/// `Arc<Frame>` (`Execute*`, `PipelineBatch*`) or `Frame` (`MultiExecute*`).
+/// `Arc<Frame>` (`Execute`, `PipelineBatchSlotted`) or `Frame` (`MultiExecute`).
 #[inline]
 fn slowlog_argv<F: std::borrow::Borrow<crate::protocol::Frame>>(
     frame: &F,
@@ -969,8 +979,8 @@ pub(crate) fn handle_shard_message_shared(
                             let serialized = aof::serialize_command(&command);
                             let mut aof_budget =
                                 crate::persistence::aof::AOF_SPSC_BACKPRESSURE_BOUND;
-                            if !wal_append_and_fanout(
-                                &serialized,
+                            if !wal_append_and_fanout_bytes(
+                                serialized,
                                 db_idx,
                                 wal_writer,
                                 repl_backlog,
@@ -1025,6 +1035,7 @@ pub(crate) fn handle_shard_message_shared(
                                 let mut reason_del_budget =
                                     crate::persistence::aof::AOF_REASON_DEL_BACKPRESSURE_BOUND;
                                 if let Err(oom) = spsc_eviction_gate(
+                                    cmd,
                                     db,
                                     db_idx,
                                     shard_databases,
@@ -1083,8 +1094,8 @@ pub(crate) fn handle_shard_message_shared(
                                 let mut aof_budget =
                                     crate::persistence::aof::AOF_SPSC_BACKPRESSURE_BOUND;
                                 for serialized in aof::serialize_effect_for_log(&command, &frame) {
-                                    aof_ok = wal_append_and_fanout(
-                                        &serialized,
+                                    aof_ok = wal_append_and_fanout_bytes(
+                                        serialized,
                                         db_idx,
                                         wal_writer,
                                         repl_backlog,
@@ -1121,29 +1132,15 @@ pub(crate) fn handle_shard_message_shared(
                             drop(db);
                             flush_every_database_on_flushall(&s.databases, cmd, db_idx, &frame);
 
-                            // Auto-index: if HSET succeeded and key matches a vector index prefix,
-                            // extract the vector field and append to mutable segment.
-                            // vector_store and text_store accessed here (same with_shard closure).
-                            if cmd.eq_ignore_ascii_case(b"HSET")
-                                && !matches!(frame, crate::protocol::Frame::Error(_))
-                            {
-                                if let Some(crate::protocol::Frame::BulkString(key_bytes)) =
-                                    args.first()
-                                {
-                                    // Plan 166-01: return value (index_name, key_hash)
-                                    // tuples will be consumed by Plan 166-02 to record
-                                    // VectorIntents on the active CrossStoreTxn. Discarded
-                                    // here because this path is not txn-aware yet.
-                                    let _ = auto_index_hset(
-                                        &mut s.vector_store,
-                                        &mut s.text_store,
-                                        key_bytes,
-                                        args,
-                                        0,
-                                        db_idx as u8,
-                                    );
-                                }
-                            }
+                            // moon#1162: the index/queue hooks (HSET auto-index,
+                            // DEL/UNLINK tombstones + MQ drops, HDEL, FLUSH index
+                            // clears) — one list shared with every other arm, run
+                            // on the dispatch reply (the mutation happened even if
+                            // the AOF append below turns the client reply into an
+                            // error).
+                            crate::shard::write_hooks::run_post_write_hooks(
+                                s, cmd, args, db_idx, &frame,
+                            );
 
                             // Fail-loud: the mutation is applied (wake/auto-index above
                             // ran on real state), but the client must not see success
@@ -1159,21 +1156,6 @@ pub(crate) fn handle_shard_message_shared(
                     }
                 };
 
-                // Auto-delete is a vector_store-only operation; runs outside the gate.
-                // Each arm uses its own flat with_shard borrow — no outer borrow is active.
-                if (cmd.eq_ignore_ascii_case(b"DEL") || cmd.eq_ignore_ascii_case(b"UNLINK"))
-                    && !matches!(frame, crate::protocol::Frame::Error(_))
-                {
-                    crate::shard::slice::with_shard(|s| {
-                        for arg in args.iter() {
-                            if let crate::protocol::Frame::BulkString(key_bytes) = arg {
-                                s.vector_store
-                                    .mark_deleted_for_key_for_db(key_bytes.as_ref(), db_idx as u8);
-                            }
-                        }
-                    });
-                }
-
                 frame
             };
             let _ = reply_tx.send(crate::shard::dispatch::ExecReply::plain(response));
@@ -1187,9 +1169,11 @@ pub(crate) fn handle_shard_message_shared(
             let db_count = shard_databases.db_count();
             let db_idx = db_index.min(db_count.saturating_sub(1));
             crate::shard::slice::with_shard(|s| {
-                s.databases
-                    .write(db_idx)
-                    .refresh_now_from_cache(cached_clock);
+                // moon#1198: the clock is refreshed inside the first command's
+                // own guard (below), not under an extra exclusive acquisition
+                // of its own — each exclusive hold is a window in which a
+                // foreign `try_read` of this db declines into a parked hop.
+                let mut clock_fresh = false;
                 // ONE backpressure budget for the whole batch: under sustained
                 // AOF backpressure the shard thread stalls at most BOUND total,
                 // not BOUND × batch-len (review finding, PR #211).
@@ -1238,8 +1222,8 @@ pub(crate) fn handle_shard_message_shared(
                                 )
                             {
                                 let serialized = aof::serialize_command(cmd_frame);
-                                aof_ok = wal_append_and_fanout(
-                                    &serialized,
+                                aof_ok = wal_append_and_fanout_bytes(
+                                    serialized,
                                     db_idx,
                                     wal_writer,
                                     repl_backlog,
@@ -1273,6 +1257,12 @@ pub(crate) fn handle_shard_message_shared(
                     }
 
                     let mut guard = s.databases.write(db_idx);
+                    if !clock_fresh {
+                        // One refresh per message, as before — now under the
+                        // guard this command takes anyway.
+                        guard.refresh_now_from_cache(cached_clock);
+                        clock_fresh = true;
+                    }
                     let is_write = metadata::is_write(cmd);
                     if is_write {
                         // M2 fix: same gate as the Execute arm, applied per
@@ -1283,6 +1273,7 @@ pub(crate) fn handle_shard_message_shared(
                             let mut reason_del_budget =
                                 crate::persistence::aof::AOF_REASON_DEL_BACKPRESSURE_BOUND;
                             if let Err(oom) = spsc_eviction_gate(
+                                cmd,
                                 &mut guard,
                                 db_idx,
                                 shard_databases,
@@ -1329,15 +1320,19 @@ pub(crate) fn handle_shard_message_shared(
                     if is_write && !matches!(frame, crate::protocol::Frame::Error(_)) {
                         // Skip the serialization alloc when the fanout would
                         // no-op (persistence + replication all off) — it was
-                        // pure waste on every cross-shard write.
-                        if wal_fanout_has_work(wal_writer, replica_txs, aof_pool, wal_kv_log) {
+                        // pure waste on every cross-shard write. moon#1184: a
+                        // merged `DEL k1 k2 …` leg that deleted nothing has
+                        // nothing to log either (redis propagates no such DEL).
+                        if wal_fanout_has_work(wal_writer, replica_txs, aof_pool, wal_kv_log)
+                            && !crate::shard::write_hooks::deleted_nothing(cmd, &frame)
+                        {
                             // moon#825: the record is derived from the REPLY, never the
                             // verbatim frame — `SPOP`/`XADD *` and the relative-TTL family
                             // do not reproduce themselves on replay. No record means the reply
                             // proves nothing was written, so nothing is appended.
                             for serialized in aof::serialize_effect_for_log(cmd_frame, &frame) {
-                                aof_ok = wal_append_and_fanout(
-                                    &serialized,
+                                aof_ok = wal_append_and_fanout_bytes(
+                                    serialized,
                                     db_idx,
                                     wal_writer,
                                     repl_backlog,
@@ -1375,278 +1370,12 @@ pub(crate) fn handle_shard_message_shared(
                     drop(guard);
                     flush_every_database_on_flushall(&s.databases, cmd, db_idx, &frame);
 
-                    results.push(if aof_ok {
-                        frame
-                    } else {
-                        crate::protocol::Frame::Error(bytes::Bytes::from_static(
-                            AOF_APPEND_LOST_ERR,
-                        ))
-                    });
-                }
-            });
-            let _ = reply_tx.send(results);
-        }
-        ShardMessage::PipelineBatch {
-            db_index,
-            commands,
-            reply_tx,
-        } => {
-            let mut results = Vec::with_capacity(commands.len());
-            let db_count = shard_databases.db_count();
-            let db_idx = db_index.min(db_count.saturating_sub(1));
-            // write_db and text_store (HSET auto-index) accessed in one with_shard
-            // closure to avoid re-entrant borrow (multi-resource arm).
-            crate::shard::slice::with_shard(|s| {
-                // One-time refresh via a scoped temporary borrow — `guard`
-                // itself moves INSIDE the loop below (Gap A) so the MOVE/
-                // COPY-DB branch can borrow `&mut s.databases` (both src and
-                // dst) for the same command.
-                s.databases
-                    .write(db_idx)
-                    .refresh_now_from_cache(cached_clock);
-                // ONE backpressure budget for the whole batch: under sustained
-                // AOF backpressure the shard thread stalls at most BOUND total,
-                // not BOUND × batch-len (review finding, PR #211).
-                let mut aof_budget = crate::persistence::aof::AOF_SPSC_BACKPRESSURE_BOUND;
-                for cmd_frame in &commands {
-                    let (cmd, args) = match extract_command_static(cmd_frame) {
-                        Some(pair) => pair,
-                        None => {
-                            results.push(crate::protocol::Frame::Error(bytes::Bytes::from_static(
-                                b"ERR invalid command format",
-                            )));
-                            continue;
-                        }
-                    };
-
-                    // Gap A: MOVE / COPY-DB two-db intercept, mirroring the
-                    // plain Execute arm — needs two &mut Database borrows at
-                    // once. Returns BEFORE the auto-index/wake hooks below
-                    // too, mirroring the Execute arm's pre-existing behavior
-                    // (not new for this fix — see the Gap A commit body).
-                    if cmd.eq_ignore_ascii_case(b"MOVE") || cmd.eq_ignore_ascii_case(b"COPY") {
-                        if let Some(crate::shard::spsc_two_db::TwoDbOutcome {
-                            response,
-                            wake: two_db_wake,
-                        }) = crate::shard::spsc_two_db::try_two_db_intercept(
-                            cmd,
-                            args,
-                            &s.databases,
-                            db_idx,
-                            db_count,
-                            cached_clock,
-                            evict_active,
-                            shard_databases,
-                            shard_id,
-                            runtime_config,
-                            spill_sender,
-                            spill_file_id,
-                            disk_offload_dir,
-                        ) {
-                            let mut aof_ok = true;
-                            if matches!(response, crate::protocol::Frame::Integer(1))
-                                && wal_fanout_has_work(
-                                    wal_writer,
-                                    replica_txs,
-                                    aof_pool,
-                                    wal_kv_log,
-                                )
-                            {
-                                let serialized = aof::serialize_command(cmd_frame);
-                                aof_ok = wal_append_and_fanout(
-                                    &serialized,
-                                    db_idx,
-                                    wal_writer,
-                                    repl_backlog,
-                                    replica_txs,
-                                    repl_state,
-                                    shard_id,
-                                    aof_pool, // FIX-C4-FOLD
-                                    wal_kv_log,
-                                    &mut aof_budget,
-                                );
-                            }
-                            // moon#1056: wake the destination only now that the command is
-                            // logged — a pop the wake serves is logged as it pops.
-                            crate::shard::spsc_two_db::wake_two_db_target(
-                                blocking_registry,
-                                &s.databases,
-                                two_db_wake,
-                                matches!(response, crate::protocol::Frame::Integer(1)),
-                            );
-                            results.push(if aof_ok {
-                                response
-                            } else {
-                                crate::protocol::Frame::Error(bytes::Bytes::from_static(
-                                    AOF_APPEND_LOST_ERR,
-                                ))
-                            });
-                            continue;
-                        }
-                        // COPY with no DB clause or same-db: fall through to
-                        // the generic single-db write path below.
-                    }
-
-                    let mut guard = s.databases.write(db_idx);
-                    let is_write = metadata::is_write(cmd);
-                    if is_write {
-                        // M2 fix: same gate as the Execute arm, applied per
-                        // command in this batch's shared `guard` borrow.
-                        if evict_active {
-                            // #454 P2.8: ONE shared backpressure bound for this entire sweep
-                            // (per-key minting could stall the shard bound x victim-count).
-                            let mut reason_del_budget =
-                                crate::persistence::aof::AOF_REASON_DEL_BACKPRESSURE_BOUND;
-                            if let Err(oom) = spsc_eviction_gate(
-                                &mut guard,
-                                db_idx,
-                                shard_databases,
-                                shard_id,
-                                runtime_config,
-                                spill_sender,
-                                spill_file_id,
-                                disk_offload_dir,
-                                // task #34 (Wave A): cross-shard write leg.
-                                &mut |key| {
-                                    crate::replication::reason_del::record_reason_del(
-                                        key,
-                                        db_idx,
-                                        wal_writer,
-                                        repl_backlog,
-                                        replica_txs,
-                                        repl_state,
-                                        shard_id,
-                                        aof_pool,
-                                        wal_kv_log,
-                                        &mut reason_del_budget,
-                                    );
-                                },
-                            ) {
-                                results.push(oom);
-                                continue;
-                            }
-                        }
-                        cow_intercept(snapshot_state, &guard, db_idx, cmd_frame);
-                    }
-
-                    let mut selected = db_idx;
-                    // moon#982: routed command — the timed interval is exactly
-                    // the dispatch, as on the local paths.
-                    let result = probe.observe(cmd, slowlog_argv(cmd_frame), || {
-                        cmd_dispatch(&mut guard, cmd, args, &mut selected, db_count)
-                    });
-                    let frame = match result {
-                        DispatchResult::Response(f) => f,
-                        DispatchResult::Quit(f) => f,
-                    };
-
-                    let mut aof_ok = true;
-                    if is_write && !matches!(frame, crate::protocol::Frame::Error(_)) {
-                        // See `wal_fanout_has_work` — skip the serialization alloc
-                        // entirely when the fanout would no-op (persistence off).
-                        if wal_fanout_has_work(wal_writer, replica_txs, aof_pool, wal_kv_log) {
-                            // moon#825: the record is derived from the REPLY, never the
-                            // verbatim frame — `SPOP`/`XADD *` and the relative-TTL family
-                            // do not reproduce themselves on replay. No record means the reply
-                            // proves nothing was written, so nothing is appended.
-                            for serialized in aof::serialize_effect_for_log(cmd_frame, &frame) {
-                                aof_ok = wal_append_and_fanout(
-                                    &serialized,
-                                    db_idx,
-                                    wal_writer,
-                                    repl_backlog,
-                                    replica_txs,
-                                    repl_state,
-                                    shard_id,
-                                    // C4-FOLD-FIX: AOF append MUST happen here (in the SPSC arm,
-                                    // before the response is sent) so the append is already in the
-                                    // AOF channel when AofFold reads sender.len(). Moving the append
-                                    // to the connection handler (after awaiting the response) defers
-                                    // it until AFTER drain_spsc_shared returns, so AofFold's
-                                    // pending_aof_count undercount by ≥1 and that append escapes
-                                    // into the NEW incr → double-apply on restart (+1 after
-                                    // restart observed in test_ssm4a_fold_4shard_experimental).
-                                    // The handler_monoio cross-shard AOF write is removed to avoid
-                                    // the double-write that was the original reason for None.
-                                    aof_pool, // FIX-C4-FOLD
-                                    wal_kv_log,
-                                    &mut aof_budget,
-                                );
-                                // A later record without an earlier one would
-                                // replay out of order: stop at the first refusal.
-                                if !aof_ok {
-                                    break;
-                                }
-                            }
-                        }
-                    }
-
-                    // Auto-index: if HSET succeeded, check for vector index match.
-                    // text_store and vector_store accessed here (same with_shard closure).
-                    if cmd.eq_ignore_ascii_case(b"HSET")
-                        && !matches!(frame, crate::protocol::Frame::Error(_))
-                    {
-                        if let Some(crate::protocol::Frame::BulkString(key_bytes)) = args.first() {
-                            // Plan 166-01: Vec<(idx, key_hash)> return discarded
-                            // here; Plan 166-02 threads it into CrossStoreTxn.
-                            let _ = auto_index_hset(
-                                &mut s.vector_store,
-                                &mut s.text_store,
-                                key_bytes,
-                                args,
-                                0,
-                                db_idx as u8,
-                            );
-                        }
-                    }
-
-                    // Auto-delete vectors on DEL/UNLINK (parity with the HSET
-                    // hook above and the Execute arm's auto-delete).
-                    if !matches!(frame, crate::protocol::Frame::Error(_))
-                        && (cmd.eq_ignore_ascii_case(b"DEL") || cmd.eq_ignore_ascii_case(b"UNLINK"))
-                    {
-                        auto_delete_vectors(&mut s.vector_store, args, db_idx as u8);
-                    }
-
-                    // R4: HDEL of an indexed vector field tombstones the vector.
-                    if !matches!(frame, crate::protocol::Frame::Error(_))
-                        && cmd.eq_ignore_ascii_case(b"HDEL")
-                    {
-                        auto_hdel_vectors(&mut s.vector_store, args, db_idx as u8);
-                    }
-
-                    // R3: FLUSHALL/FLUSHDB clears index contents (definitions kept).
-                    // WS5a: FLUSHDB scopes to `db_idx`; FLUSHALL clears every db.
-                    if !matches!(frame, crate::protocol::Frame::Error(_))
-                        && (cmd.eq_ignore_ascii_case(b"FLUSHDB")
-                            || cmd.eq_ignore_ascii_case(b"FLUSHALL"))
-                    {
-                        auto_flush_indexes(
-                            &mut s.vector_store,
-                            &mut s.text_store,
-                            cmd.eq_ignore_ascii_case(b"FLUSHDB"),
-                            db_idx as u8,
-                        );
-                    }
-
-                    // Post-dispatch wakeup hooks for producer commands (cross-shard blocking)
-                    if !matches!(frame, crate::protocol::Frame::Error(_)) {
-                        crate::blocking::wakeup::wake_written_keys(
-                            blocking_registry,
-                            &mut guard,
-                            db_idx,
-                            cmd,
-                            args,
-                        );
-                    }
-
-                    // moon#677: keyspace half of the flush. Placed after the
-                    // last use of `guard` (a `&mut s.databases[db_idx]`
-                    // borrow) so the slice can be re-borrowed here.
-                    // The sweep re-acquires EVERY db, `db_idx` included: release this
-                    // guard first (the old code ended its borrow of db_idx here too).
-                    drop(guard);
-                    flush_every_database_on_flushall(&s.databases, cmd, db_idx, &frame);
+                    // moon#1162: this arm carries the coordinator's spanning
+                    // DEL/UNLINK legs and every FLUSHALL/FLUSHDB broadcast leg,
+                    // and ran none of the index/queue hooks — deleted documents
+                    // kept matching FT.SEARCH, and a FLUSHALL cleared the index
+                    // contents of one shard in N.
+                    crate::shard::write_hooks::run_post_write_hooks(s, cmd, args, db_idx, &frame);
 
                     results.push(if aof_ok {
                         frame
@@ -1658,424 +1387,6 @@ pub(crate) fn handle_shard_message_shared(
                 }
             });
             let _ = reply_tx.send(results);
-        }
-        ShardMessage::ExecuteSlotted {
-            db_index,
-            command,
-            response_slot,
-        } => {
-            let db_count = shard_databases.db_count();
-            let db_idx = db_index.min(db_count.saturating_sub(1));
-            let (cmd, args) = match extract_command_static(&command) {
-                Some(pair) => pair,
-                None => {
-                    // Arc-owned slot: deref is safe, refcount keeps it alive.
-                    let slot = &*response_slot.0;
-                    slot.fill(vec![crate::protocol::Frame::Error(
-                        bytes::Bytes::from_static(b"ERR invalid command format"),
-                    )]);
-                    return;
-                }
-            };
-
-            // Gap A: MOVE / COPY-DB two-db intercept, mirroring the plain
-            // Execute arm — needs two &mut Database borrows at once.
-            if cmd.eq_ignore_ascii_case(b"MOVE") || cmd.eq_ignore_ascii_case(b"COPY") {
-                let intercepted = crate::shard::slice::with_shard(|s| {
-                    crate::shard::spsc_two_db::try_two_db_intercept(
-                        cmd,
-                        args,
-                        &s.databases,
-                        db_idx,
-                        db_count,
-                        cached_clock,
-                        evict_active,
-                        shard_databases,
-                        shard_id,
-                        runtime_config,
-                        spill_sender,
-                        spill_file_id,
-                        disk_offload_dir,
-                    )
-                });
-                if let Some(crate::shard::spsc_two_db::TwoDbOutcome {
-                    mut response,
-                    wake: two_db_wake,
-                }) = intercepted
-                {
-                    let wrote = matches!(response, crate::protocol::Frame::Integer(1));
-                    if wrote {
-                        let serialized = aof::serialize_command(&command);
-                        let mut aof_budget = crate::persistence::aof::AOF_SPSC_BACKPRESSURE_BOUND;
-                        if !wal_append_and_fanout(
-                            &serialized,
-                            db_idx,
-                            wal_writer,
-                            repl_backlog,
-                            replica_txs,
-                            repl_state,
-                            shard_id,
-                            aof_pool, // FIX-W1-2
-                            wal_kv_log,
-                            &mut aof_budget,
-                        ) {
-                            response = crate::protocol::Frame::Error(bytes::Bytes::from_static(
-                                AOF_APPEND_LOST_ERR,
-                            ));
-                        }
-                    }
-                    // moon#1056: wake the destination only now that the command is
-                    // logged — a pop the wake serves is logged as it pops.
-                    crate::shard::slice::with_shard(|s| {
-                        crate::shard::spsc_two_db::wake_two_db_target(
-                            blocking_registry,
-                            &s.databases,
-                            two_db_wake,
-                            wrote,
-                        )
-                    });
-                    // Arc-owned slot: deref is safe, refcount keeps it alive.
-                    let slot = &*response_slot.0;
-                    slot.fill(vec![response]);
-                    return;
-                }
-                // COPY with no DB clause or same-db: fall through to the
-                // generic single-db write path below.
-            }
-
-            {
-                let is_write = metadata::is_write(cmd);
-                // M2 fix: see the Execute arm for rationale/ordering.
-                let mut oom_frame: Option<crate::protocol::Frame> = None;
-                let frame = {
-                    if is_write {
-                        crate::shard::slice::with_shard_db(db_idx, |db| {
-                            if evict_active {
-                                // #454 P2.8: ONE shared backpressure bound for this entire sweep
-                                // (per-key minting could stall the shard bound x victim-count).
-                                let mut reason_del_budget =
-                                    crate::persistence::aof::AOF_REASON_DEL_BACKPRESSURE_BOUND;
-                                if let Err(oom) = spsc_eviction_gate(
-                                    db,
-                                    db_idx,
-                                    shard_databases,
-                                    shard_id,
-                                    runtime_config,
-                                    spill_sender,
-                                    spill_file_id,
-                                    disk_offload_dir,
-                                    // task #34 (Wave A): cross-shard write leg.
-                                    &mut |key| {
-                                        crate::replication::reason_del::record_reason_del(
-                                            key,
-                                            db_idx,
-                                            wal_writer,
-                                            repl_backlog,
-                                            replica_txs,
-                                            repl_state,
-                                            shard_id,
-                                            aof_pool,
-                                            wal_kv_log,
-                                            &mut reason_del_budget,
-                                        );
-                                    },
-                                ) {
-                                    oom_frame = Some(oom);
-                                    return;
-                                }
-                            }
-                            cow_intercept(snapshot_state, db, db_idx, &command);
-                        });
-                    }
-                    if let Some(oom) = oom_frame.take() {
-                        oom
-                    } else {
-                        crate::shard::slice::with_shard(|s| {
-                            let mut db = s.databases.write(db_idx);
-                            db.refresh_now_from_cache(cached_clock);
-                            let mut selected = db_idx;
-                            // moon#982: routed command — the timed interval is
-                            // exactly the dispatch, as on the local paths.
-                            let result = probe.observe(cmd, slowlog_argv(&command), || {
-                                cmd_dispatch(&mut db, cmd, args, &mut selected, db_count)
-                            });
-                            let frame = match result {
-                                DispatchResult::Response(f) => f,
-                                DispatchResult::Quit(f) => f,
-                            };
-
-                            let mut aof_ok = true;
-                            if is_write && !matches!(frame, crate::protocol::Frame::Error(_)) {
-                                // moon#825: the record is derived from the REPLY, never the
-                                // verbatim frame — `SPOP`/`XADD *` and the relative-TTL family
-                                // do not reproduce themselves on replay. No record means the reply
-                                // proves nothing was written, so nothing is appended.
-                                let mut aof_budget =
-                                    crate::persistence::aof::AOF_SPSC_BACKPRESSURE_BOUND;
-                                for serialized in aof::serialize_effect_for_log(&command, &frame) {
-                                    aof_ok = wal_append_and_fanout(
-                                        &serialized,
-                                        db_idx,
-                                        wal_writer,
-                                        repl_backlog,
-                                        replica_txs,
-                                        repl_state,
-                                        shard_id,
-                                        aof_pool, // FIX-W1-2
-                                        wal_kv_log,
-                                        &mut aof_budget,
-                                    );
-                                    // A later record without an earlier one would
-                                    // replay out of order: stop at the first refusal.
-                                    if !aof_ok {
-                                        break;
-                                    }
-                                }
-                            }
-
-                            if !matches!(frame, crate::protocol::Frame::Error(_)) {
-                                crate::blocking::wakeup::wake_written_keys(
-                                    blocking_registry,
-                                    &mut db,
-                                    db_idx,
-                                    cmd,
-                                    args,
-                                );
-                            }
-
-                            // moon#677: FLUSHALL empties every database on
-                            // this shard, not just the dispatched one.
-                            // The sweep re-acquires EVERY db, `db_idx` included: release this
-                            // guard first (the old code ended its borrow of db_idx here too).
-                            drop(db);
-                            flush_every_database_on_flushall(&s.databases, cmd, db_idx, &frame);
-
-                            // Fail-loud: mutation applied, but the client must not
-                            // see success for a write whose AOF record was dropped.
-                            if aof_ok {
-                                frame
-                            } else {
-                                crate::protocol::Frame::Error(bytes::Bytes::from_static(
-                                    AOF_APPEND_LOST_ERR,
-                                ))
-                            }
-                        })
-                    }
-                };
-                // Arc-owned slot: deref is safe, refcount keeps it alive.
-                let slot = &*response_slot.0;
-                slot.fill(vec![frame]);
-            }
-        }
-        ShardMessage::MultiExecuteSlotted {
-            db_index,
-            commands,
-            response_slot,
-        } => {
-            let mut results = Vec::with_capacity(commands.len());
-            let db_count = shard_databases.db_count();
-            let db_idx = db_index.min(db_count.saturating_sub(1));
-            crate::shard::slice::with_shard(|s| {
-                s.databases
-                    .write(db_idx)
-                    .refresh_now_from_cache(cached_clock);
-                // ONE backpressure budget for the whole batch: under sustained
-                // AOF backpressure the shard thread stalls at most BOUND total,
-                // not BOUND × batch-len (review finding, PR #211).
-                let mut aof_budget = crate::persistence::aof::AOF_SPSC_BACKPRESSURE_BOUND;
-                for (_key, cmd_frame) in &commands {
-                    let (cmd, args) = match extract_command_static(cmd_frame) {
-                        Some(pair) => pair,
-                        None => {
-                            results.push(crate::protocol::Frame::Error(bytes::Bytes::from_static(
-                                b"ERR invalid command format",
-                            )));
-                            continue;
-                        }
-                    };
-
-                    // Gap A: MOVE / COPY-DB two-db intercept, mirroring the
-                    // plain Execute arm — needs two &mut Database borrows at
-                    // once, so it must run before `guard` narrows to a single
-                    // db below.
-                    if cmd.eq_ignore_ascii_case(b"MOVE") || cmd.eq_ignore_ascii_case(b"COPY") {
-                        if let Some(crate::shard::spsc_two_db::TwoDbOutcome {
-                            response,
-                            wake: two_db_wake,
-                        }) = crate::shard::spsc_two_db::try_two_db_intercept(
-                            cmd,
-                            args,
-                            &s.databases,
-                            db_idx,
-                            db_count,
-                            cached_clock,
-                            evict_active,
-                            shard_databases,
-                            shard_id,
-                            runtime_config,
-                            spill_sender,
-                            spill_file_id,
-                            disk_offload_dir,
-                        ) {
-                            let mut aof_ok = true;
-                            if matches!(response, crate::protocol::Frame::Integer(1))
-                                && wal_fanout_has_work(
-                                    wal_writer,
-                                    replica_txs,
-                                    aof_pool,
-                                    wal_kv_log,
-                                )
-                            {
-                                let serialized = aof::serialize_command(cmd_frame);
-                                aof_ok = wal_append_and_fanout(
-                                    &serialized,
-                                    db_idx,
-                                    wal_writer,
-                                    repl_backlog,
-                                    replica_txs,
-                                    repl_state,
-                                    shard_id,
-                                    aof_pool, // FIX-W1-2
-                                    wal_kv_log,
-                                    &mut aof_budget,
-                                );
-                            }
-                            // moon#1056: wake the destination only now that the command is
-                            // logged — a pop the wake serves is logged as it pops.
-                            crate::shard::spsc_two_db::wake_two_db_target(
-                                blocking_registry,
-                                &s.databases,
-                                two_db_wake,
-                                matches!(response, crate::protocol::Frame::Integer(1)),
-                            );
-                            results.push(if aof_ok {
-                                response
-                            } else {
-                                crate::protocol::Frame::Error(bytes::Bytes::from_static(
-                                    AOF_APPEND_LOST_ERR,
-                                ))
-                            });
-                            continue;
-                        }
-                        // COPY with no DB clause or same-db: fall through to
-                        // the generic single-db write path below.
-                    }
-
-                    let mut guard = s.databases.write(db_idx);
-                    let is_write = metadata::is_write(cmd);
-                    if is_write {
-                        // M2 fix: same gate as the Execute arm, applied per
-                        // command in this batch's shared `guard` borrow.
-                        if evict_active {
-                            // #454 P2.8: ONE shared backpressure bound for this entire sweep
-                            // (per-key minting could stall the shard bound x victim-count).
-                            let mut reason_del_budget =
-                                crate::persistence::aof::AOF_REASON_DEL_BACKPRESSURE_BOUND;
-                            if let Err(oom) = spsc_eviction_gate(
-                                &mut guard,
-                                db_idx,
-                                shard_databases,
-                                shard_id,
-                                runtime_config,
-                                spill_sender,
-                                spill_file_id,
-                                disk_offload_dir,
-                                // task #34 (Wave A): cross-shard write leg.
-                                &mut |key| {
-                                    crate::replication::reason_del::record_reason_del(
-                                        key,
-                                        db_idx,
-                                        wal_writer,
-                                        repl_backlog,
-                                        replica_txs,
-                                        repl_state,
-                                        shard_id,
-                                        aof_pool,
-                                        wal_kv_log,
-                                        &mut reason_del_budget,
-                                    );
-                                },
-                            ) {
-                                results.push(oom);
-                                continue;
-                            }
-                        }
-                        cow_intercept(snapshot_state, &guard, db_idx, cmd_frame);
-                    }
-
-                    let mut selected = db_idx;
-                    // moon#982: routed command — the timed interval is exactly
-                    // the dispatch, as on the local paths.
-                    let result = probe.observe(cmd, slowlog_argv(cmd_frame), || {
-                        cmd_dispatch(&mut guard, cmd, args, &mut selected, db_count)
-                    });
-                    let frame = match result {
-                        DispatchResult::Response(f) => f,
-                        DispatchResult::Quit(f) => f,
-                    };
-
-                    let mut aof_ok = true;
-                    if is_write && !matches!(frame, crate::protocol::Frame::Error(_)) {
-                        // Skip the serialization alloc when the fanout would
-                        // no-op (persistence + replication all off) — it was
-                        // pure waste on every cross-shard write.
-                        if wal_fanout_has_work(wal_writer, replica_txs, aof_pool, wal_kv_log) {
-                            // moon#825: the record is derived from the REPLY, never the
-                            // verbatim frame — `SPOP`/`XADD *` and the relative-TTL family
-                            // do not reproduce themselves on replay. No record means the reply
-                            // proves nothing was written, so nothing is appended.
-                            for serialized in aof::serialize_effect_for_log(cmd_frame, &frame) {
-                                aof_ok = wal_append_and_fanout(
-                                    &serialized,
-                                    db_idx,
-                                    wal_writer,
-                                    repl_backlog,
-                                    replica_txs,
-                                    repl_state,
-                                    shard_id,
-                                    aof_pool, // FIX-W1-2
-                                    wal_kv_log,
-                                    &mut aof_budget,
-                                );
-                                // A later record without an earlier one would
-                                // replay out of order: stop at the first refusal.
-                                if !aof_ok {
-                                    break;
-                                }
-                            }
-                        }
-
-                        crate::blocking::wakeup::wake_written_keys(
-                            blocking_registry,
-                            &mut guard,
-                            db_idx,
-                            cmd,
-                            args,
-                        );
-                    }
-
-                    // moon#677: this is the arm the flush broadcast lands on
-                    // (`coordinate_flush_broadcast` sends `MultiExecute`), so
-                    // it is the arm that empties the OTHER shards. Outside the
-                    // `is_write` block above only because `guard` is borrowed
-                    // there; FLUSHALL is a write either way.
-                    // The sweep re-acquires EVERY db, `db_idx` included: release this
-                    // guard first (the old code ended its borrow of db_idx here too).
-                    drop(guard);
-                    flush_every_database_on_flushall(&s.databases, cmd, db_idx, &frame);
-
-                    results.push(if aof_ok {
-                        frame
-                    } else {
-                        crate::protocol::Frame::Error(bytes::Bytes::from_static(
-                            AOF_APPEND_LOST_ERR,
-                        ))
-                    });
-                }
-            });
-            // Arc-owned slot: deref is safe, refcount keeps it alive.
-            let slot = &*response_slot.0;
-            slot.fill(results);
         }
         ShardMessage::PipelineBatchSlotted {
             db_index,
@@ -2087,13 +1398,15 @@ pub(crate) fn handle_shard_message_shared(
             let db_idx = db_index.min(db_count.saturating_sub(1));
             // write_db and text_store (HSET auto-index) in one with_shard closure.
             crate::shard::slice::with_shard(|s| {
-                // One-time refresh via a scoped temporary borrow — `guard`
-                // itself moves INSIDE the loop below (Gap A) so the MOVE/
-                // COPY-DB branch can borrow `&mut s.databases` (both src and
-                // dst) for the same command.
-                s.databases
-                    .write(db_idx)
-                    .refresh_now_from_cache(cached_clock);
+                // moon#1198: the clock is refreshed inside the first command's
+                // own guard (below) — it used to take an extra exclusive
+                // acquisition per message just for this, and each exclusive
+                // hold is a window in which a foreign `try_read` of this db
+                // declines into a parked hop. `guard` moves INSIDE the loop
+                // (Gap A) so the MOVE/COPY-DB branch can borrow
+                // `&mut s.databases` (both src and dst) for the same command;
+                // that branch refreshes the two dbs it takes itself.
+                let mut clock_fresh = false;
                 // ONE backpressure budget for the whole batch: under sustained
                 // AOF backpressure the shard thread stalls at most BOUND total,
                 // not BOUND × batch-len (review finding, PR #211).
@@ -2143,8 +1456,8 @@ pub(crate) fn handle_shard_message_shared(
                                 )
                             {
                                 let serialized = aof::serialize_command(cmd_frame);
-                                aof_ok = wal_append_and_fanout(
-                                    &serialized,
+                                aof_ok = wal_append_and_fanout_bytes(
+                                    serialized,
                                     db_idx,
                                     wal_writer,
                                     repl_backlog,
@@ -2178,6 +1491,12 @@ pub(crate) fn handle_shard_message_shared(
                     }
 
                     let mut guard = s.databases.write(db_idx);
+                    if !clock_fresh {
+                        // One refresh per message, as before — now under the
+                        // guard this command takes anyway.
+                        guard.refresh_now_from_cache(cached_clock);
+                        clock_fresh = true;
+                    }
                     let is_write = metadata::is_write(cmd);
                     if is_write {
                         // M2 fix: same gate as the Execute arm, applied per
@@ -2188,6 +1507,7 @@ pub(crate) fn handle_shard_message_shared(
                             let mut reason_del_budget =
                                 crate::persistence::aof::AOF_REASON_DEL_BACKPRESSURE_BOUND;
                             if let Err(oom) = spsc_eviction_gate(
+                                cmd,
                                 &mut guard,
                                 db_idx,
                                 shard_databases,
@@ -2240,8 +1560,8 @@ pub(crate) fn handle_shard_message_shared(
                             // do not reproduce themselves on replay. No record means the reply
                             // proves nothing was written, so nothing is appended.
                             for serialized in aof::serialize_effect_for_log(cmd_frame, &frame) {
-                                aof_ok = wal_append_and_fanout(
-                                    &serialized,
+                                aof_ok = wal_append_and_fanout_bytes(
+                                    serialized,
                                     db_idx,
                                     wal_writer,
                                     repl_backlog,
@@ -2272,54 +1592,6 @@ pub(crate) fn handle_shard_message_shared(
                         }
                     }
 
-                    // Auto-index: if HSET succeeded, check for vector index match.
-                    // vector_store and text_store in same with_shard closure.
-                    if cmd.eq_ignore_ascii_case(b"HSET")
-                        && !matches!(frame, crate::protocol::Frame::Error(_))
-                    {
-                        if let Some(crate::protocol::Frame::BulkString(key_bytes)) = args.first() {
-                            // Plan 166-01: Vec<(idx, key_hash)> return discarded
-                            // here; Plan 166-02 threads it into CrossStoreTxn.
-                            let _ = auto_index_hset(
-                                &mut s.vector_store,
-                                &mut s.text_store,
-                                key_bytes,
-                                args,
-                                0,
-                                db_idx as u8,
-                            );
-                        }
-                    }
-
-                    // Auto-delete vectors on DEL/UNLINK (parity with the HSET
-                    // hook above and the Execute arm's auto-delete).
-                    if !matches!(frame, crate::protocol::Frame::Error(_))
-                        && (cmd.eq_ignore_ascii_case(b"DEL") || cmd.eq_ignore_ascii_case(b"UNLINK"))
-                    {
-                        auto_delete_vectors(&mut s.vector_store, args, db_idx as u8);
-                    }
-
-                    // R4: HDEL of an indexed vector field tombstones the vector.
-                    if !matches!(frame, crate::protocol::Frame::Error(_))
-                        && cmd.eq_ignore_ascii_case(b"HDEL")
-                    {
-                        auto_hdel_vectors(&mut s.vector_store, args, db_idx as u8);
-                    }
-
-                    // R3: FLUSHALL/FLUSHDB clears index contents (definitions kept).
-                    // WS5a: FLUSHDB scopes to `db_idx`; FLUSHALL clears every db.
-                    if !matches!(frame, crate::protocol::Frame::Error(_))
-                        && (cmd.eq_ignore_ascii_case(b"FLUSHDB")
-                            || cmd.eq_ignore_ascii_case(b"FLUSHALL"))
-                    {
-                        auto_flush_indexes(
-                            &mut s.vector_store,
-                            &mut s.text_store,
-                            cmd.eq_ignore_ascii_case(b"FLUSHDB"),
-                            db_idx as u8,
-                        );
-                    }
-
                     if !matches!(frame, crate::protocol::Frame::Error(_)) {
                         crate::blocking::wakeup::wake_written_keys(
                             blocking_registry,
@@ -2337,6 +1609,11 @@ pub(crate) fn handle_shard_message_shared(
                     // guard first (the old code ended its borrow of db_idx here too).
                     drop(guard);
                     flush_every_database_on_flushall(&s.databases, cmd, db_idx, &frame);
+
+                    // Index/queue hooks (HSET auto-index, DEL/UNLINK tombstones
+                    // + MQ drops, HDEL, FLUSH index clears) — moon#1162's one
+                    // list. After the guard: the MQ drop takes the whole slice.
+                    crate::shard::write_hooks::run_post_write_hooks(s, cmd, args, db_idx, &frame);
 
                     results.push(if aof_ok {
                         frame
@@ -2400,6 +1677,17 @@ pub(crate) fn handle_shard_message_shared(
             // the same bytes) and would mean memory corruption.
             if let Some(ack) = ack {
                 let _ = ack.send(computed == sha1);
+            }
+        }
+        ShardMessage::ScriptFlush { ack } => {
+            // moon#1229: another shard's connection ran `SCRIPT FLUSH`; the
+            // script cache is per shard, so without this every EVALSHA whose
+            // keys route here kept running a flushed script. `flush` drops the
+            // source map, the compiled functions (moon#1167) and the fan-out
+            // duties, exactly as on the originating shard.
+            script_cache.borrow_mut().flush();
+            if let Some(ack) = ack {
+                let _ = ack.send(true);
             }
         }
         ShardMessage::FunctionRegistry { op, ack } => {
@@ -2593,28 +1881,48 @@ pub(crate) fn handle_shard_message_shared(
                 reply_tx,
                 db_index,
             } = *payload;
-            // Phase 171 SCAT-01: honor coordinator-resolved AS_OF / TXN LSN
-            // for multi-shard FT.SEARCH. When `as_of_lsn == 0` the filter is a
-            // no-op and behavior matches the pre-171 path. Route through
-            // `search_local_filtered` with AS_OF threaded in to apply MVCC
-            // filtering against the committed treemap inside `search_local_raw`.
-            // Flat with_shard borrow — no outer borrow active, no re-entrancy.
-            // WS5a: db_index forwarded from the originating connection.
-            let response = crate::shard::slice::with_shard(|s| {
-                vector_search::search_local_filtered(
+            // moon#1182: this shard's leg of a multi-shard FT.SEARCH no longer
+            // searches synchronously inside the drain — that stopped this
+            // shard's 1 ms tick, SPSC drain and local connections for the whole
+            // search. The owned snapshot is captured HERE, in message order (so
+            // every write drained before this message is visible and none after
+            // it), then a local task awaits the cooperative search
+            // (`search_mvcc_yielding`, the C5 path the `--shards 1` handler
+            // uses) and sends the reply. Shapes the snapshot does not cover
+            // (unknown index, dimension mismatch) take the synchronous search,
+            // whose error frames they need. Phase 171 SCAT-01: `as_of_lsn` is
+            // honoured on both paths; WS5a: `db_index` from the origin.
+            let snapshot = crate::shard::slice::with_shard(|s| {
+                crate::shard::vector_scatter::capture_knn(
                     &mut s.vector_store,
+                    &s.text_store,
                     &index_name,
                     &query_blob,
                     k,
-                    None,
-                    0,
-                    usize::MAX,
-                    None,
                     as_of_lsn,
                     db_index,
                 )
             });
-            let _ = reply_tx.send(response);
+            match snapshot {
+                Some(snapshot) => crate::shard::vector_scatter::spawn_knn_reply(snapshot, reply_tx),
+                None => {
+                    let response = crate::shard::slice::with_shard(|s| {
+                        vector_search::search_local_filtered(
+                            &mut s.vector_store,
+                            &index_name,
+                            &query_blob,
+                            k,
+                            None,
+                            0,
+                            usize::MAX,
+                            None,
+                            as_of_lsn,
+                            db_index,
+                        )
+                    });
+                    let _ = reply_tx.send(response);
+                }
+            }
         }
         ShardMessage::ReadVersions(payload) => {
             // WATCH snapshot on the owning shard (task `watch-cas-transactions`).
@@ -2625,7 +1933,11 @@ pub(crate) fn handle_shard_message_shared(
                 keys,
                 reply_tx,
             } = *payload;
-            let versions = crate::shard::slice::with_shard_db(db_index, |db| {
+            // moon#1183: `get_version` is `&self` — the SHARED guard, so a
+            // foreign fast-path reader of this db is not turned away for the
+            // length of a WATCH snapshot (the exclusive hold it took was one
+            // more window for a parked hop, cost model §8.3).
+            let versions = crate::shard::slice::with_shard_db_read(db_index, |db| {
                 keys.iter().map(|k| db.get_version(k)).collect::<Vec<u32>>()
             });
             let _ = reply_tx.send(versions);
@@ -3409,8 +2721,8 @@ pub(crate) fn handle_shard_message_shared(
             // — attribute per entry, not the body's entry db.
             for (entry_db, entry_bytes) in &aof_entries {
                 wrote = true;
-                let ok = wal_append_and_fanout(
-                    entry_bytes,
+                let ok = wal_append_and_fanout_bytes(
+                    entry_bytes.clone(),
                     *entry_db,
                     wal_writer,
                     repl_backlog,
@@ -4734,6 +4046,92 @@ pub(crate) fn wal_append_and_fanout(
     wal_kv_log: bool,
     aof_budget: &mut std::time::Duration,
 ) -> bool {
+    // Borrowed-record entry point (reason-DELs build their own record): one
+    // copy up front, then the owned path. Skipped entirely when nothing
+    // would take the record.
+    if !wal_fanout_has_work(wal_writer, replica_txs, aof_pool, wal_kv_log) {
+        return true;
+    }
+    wal_append_and_fanout_bytes(
+        bytes::Bytes::copy_from_slice(data),
+        db,
+        wal_writer,
+        repl_backlog,
+        replica_txs,
+        repl_state,
+        shard_id,
+        aof_pool,
+        wal_kv_log,
+        aof_budget,
+    )
+}
+
+/// [`wal_append_and_fanout`] for a record the caller already owns — every
+/// SPSC write arm (moon#1177). The record is borrowed for the WAL and the
+/// backlog, shared (refcount) with the replica fan-out when it needs no
+/// `SELECT` prefix, and MOVED into the AOF pool last: the old slice-taking
+/// form paid a malloc + memcpy of every record (`Bytes::copy_from_slice`)
+/// and a cross-thread free on the writer, for bytes the caller already held.
+pub(crate) fn wal_append_and_fanout_bytes(
+    data: bytes::Bytes,
+    // task #35: db the command executed in — threaded into the AOF pool so
+    // the writer can inject a `SELECT <db>` record on a db-context change.
+    db: usize,
+    wal_writer: &mut Option<WalWriterV3>,
+    repl_backlog: &crate::replication::backlog::SharedBacklog,
+    replica_txs: &mut Vec<crate::shard::dispatch::ReplicaFanout>,
+    repl_state: &Option<crate::replication::state::OffsetHandle>,
+    shard_id: usize,
+    aof_pool: Option<&std::sync::Arc<crate::persistence::aof::AofWriterPool>>,
+    wal_kv_log: bool,
+    aof_budget: &mut std::time::Duration,
+) -> bool {
+    wal_append_and_fanout_hinted(
+        data,
+        db,
+        wal_writer,
+        repl_backlog,
+        replica_txs,
+        repl_state,
+        shard_id,
+        aof_pool,
+        wal_kv_log,
+        aof_budget,
+        crate::replication::state::fanout_hint_active(),
+    )
+}
+
+/// Whether a routed write appends its record to the replication backlog
+/// (moon#1177): when a replica is registered on this shard, or when one has
+/// begun attaching anywhere (`fanout_hint`, the process-global
+/// `replication::state::fanout_hint_active()`). With neither, the write
+/// skips the backlog mutex entirely. See the backlog step of
+/// [`wal_append_and_fanout_hinted`] for why skipping is sound.
+///
+/// Pure so the gate is testable on its own: the hint is sticky and
+/// process-wide, so a test that reads it can only observe the case the
+/// tests that ran before it left behind.
+#[inline]
+pub(crate) fn backlog_append_wanted(replicas_empty: bool, fanout_hint: bool) -> bool {
+    !replicas_empty || fanout_hint
+}
+
+/// The body of [`wal_append_and_fanout_bytes`], with the fan-out hint read
+/// once by the caller. Tests pass the hint directly, so the backlog gate runs
+/// in both states whatever the process-global holds.
+fn wal_append_and_fanout_hinted(
+    data: bytes::Bytes,
+    db: usize,
+    wal_writer: &mut Option<WalWriterV3>,
+    repl_backlog: &crate::replication::backlog::SharedBacklog,
+    replica_txs: &mut Vec<crate::shard::dispatch::ReplicaFanout>,
+    repl_state: &Option<crate::replication::state::OffsetHandle>,
+    shard_id: usize,
+    aof_pool: Option<&std::sync::Arc<crate::persistence::aof::AofWriterPool>>,
+    wal_kv_log: bool,
+    aof_budget: &mut std::time::Duration,
+    fanout_hint: bool,
+) -> bool {
     // S3.5b (2026-04-27): hot-path bypass when nothing actually has work.
     // See `wal_fanout_has_work` — callers use the same predicate to skip the
     // `aof::serialize_command` alloc entirely when the fanout would no-op.
@@ -4755,7 +4153,7 @@ pub(crate) fn wal_append_and_fanout(
             w.append_in_db(
                 crate::persistence::wal_v3::record::WalRecordType::Command,
                 db,
-                data,
+                &data,
             );
         }
     }
@@ -4776,18 +4174,31 @@ pub(crate) fn wal_append_and_fanout(
     // 2. Replication backlog (in-memory circular buffer for partial resync).
     //
     // The backlog is shared via Arc<Mutex<Option<...>>> with PSYNC handlers.
-    // Cost on the write path:
-    //   - When `None` (no replica ever connected): one branch, no lock acquire.
-    //   - When `Some` (replication active): one uncontended parking_lot::Mutex
-    //     acquire per WAL flush (typically once per 1ms tick batch, NOT per write).
-    let mut guard = repl_backlog.lock();
-    if let Some(backlog) = guard.as_mut() {
-        if let Some(prefix) = &select_prefix {
-            backlog.append(prefix);
+    // Cost on the write path, PER WRITE (moon#1177 — this comment used to
+    // claim "no lock acquire" and "once per 1ms tick", and the code locked on
+    // every write):
+    //   - No replica registered on this shard and none has ever begun
+    //     attaching (`fanout_hint_active()` false — the common case): a length
+    //     check and one relaxed load, no lock.
+    //   - Otherwise: one uncontended parking_lot::Mutex acquire.
+    // Skipping the append while the hint is false is what the local write
+    // path already does (`record_local_write` is gated on the same hint): a
+    // backlog a bare REPLCONF allocated in that window is realigned to the
+    // shard offset at every activation site before any cut is taken
+    // (`ReplicationState::ensure_backlogs_allocated`'s invariant), and the
+    // activation (`RegisterReplica`/`PrepareReplicaSync`) runs on THIS
+    // thread, which sets the hint first — so every later append here sees it.
+    // A registered replica (`replica_txs`) implies the hint; it is checked
+    // too so the append never depends on that implication.
+    if backlog_append_wanted(replica_txs.is_empty(), fanout_hint) {
+        let mut guard = repl_backlog.lock();
+        if let Some(backlog) = guard.as_mut() {
+            if let Some(prefix) = &select_prefix {
+                backlog.append(prefix);
+            }
+            backlog.append(&data);
         }
-        backlog.append(data);
     }
-    drop(guard);
     // 3. Advance monotonic replication offset (NEVER resets on WAL truncation)
     // QW3 (2026-06 review finding 1.4): `repl_state` is a lock-free
     // OffsetHandle cloned out of `RwLock<ReplicationState>` once at shard
@@ -4823,10 +4234,11 @@ pub(crate) fn wal_append_and_fanout(
             Some(prefix) => {
                 let mut combined = Vec::with_capacity(prefix.len() + data.len());
                 combined.extend_from_slice(prefix);
-                combined.extend_from_slice(data);
+                combined.extend_from_slice(&data);
                 bytes::Bytes::from(combined)
             }
-            None => bytes::Bytes::copy_from_slice(data),
+            // A refcount, not a copy.
+            None => data.clone(),
         };
         crate::shard::self_msg::push(crate::shard::dispatch::ShardMessage::ReplicaLiveFanout {
             bytes,
@@ -4843,14 +4255,10 @@ pub(crate) fn wal_append_and_fanout(
     // (handler_sharded / handler_single). LSN=0 is safe here: per-shard order
     // is preserved by write order; the LSN is only meaningful for cross-shard
     // TXN merge (RFC step 5, not yet wired).
+    // The record moves in (moon#1177): no copy, and the writer frees the
+    // caller's own allocation.
     if let Some(pool) = aof_pool {
-        return pool.send_append_bounded_blocking(
-            shard_id,
-            0,
-            db,
-            bytes::Bytes::copy_from_slice(data),
-            aof_budget,
-        );
+        return pool.send_append_bounded_blocking(shard_id, 0, db, data, aof_budget);
     }
     true
 }
@@ -4997,21 +4405,21 @@ mod wal_append_tests {
         }
     }
 
-    /// FIX-W1-2 r2: PipelineBatch/PipelineBatchSlotted arms MUST NOT forward
-    /// writes to the AofWriterPool. The connection-handler coordinator already
-    /// appends AOF for these arms after collecting the shard response
-    /// (handler_monoio/mod.rs:2004, handler_sharded/mod.rs:1703).
+    /// The `wal_append_and_fanout` pool contract: called with `None` it puts
+    /// nothing in the AofWriterPool, called with `Some(&pool)` exactly one
+    /// append. This pins the helper, NOT which pool an arm passes.
     ///
-    /// Verify the invariant directly: `wal_append_and_fanout` called with
-    /// `None` (the PipelineBatch fix) must produce zero messages in the pool
-    /// channel, while the same call with `Some(&pool)` (the MultiExecute path)
-    /// must produce exactly one message.
-    ///
-    /// Red state (pre-fix): the PipelineBatch arms passed `aof_pool` instead
-    /// of `None`, so calling this test function using the arm's actual argument
-    /// would have produced 1 message instead of 0 — the double-write.
+    /// History, so the `None` case is not misread as the pipelined arm's
+    /// contract: FIX-W1-2 r2 once had the pipelined arms pass `None` and the
+    /// connection handler append after collecting the reply. C4-FOLD-FIX
+    /// reversed that — `PipelineBatchSlotted` now passes `aof_pool` itself,
+    /// BEFORE filling its response slot, so the append is already in the AOF
+    /// channel when `AofFold` samples `pending_aof_count` (see the comment at
+    /// that call site); the handler-side append was removed. Passing `None`
+    /// there again would drop every routed pipelined write from the per-shard
+    /// AOF.
     #[test]
-    fn pipeline_batch_arm_passes_none_to_prevent_double_write() {
+    fn wal_append_and_fanout_appends_to_the_pool_only_when_given_one() {
         use crate::persistence::aof::{AofMessage, AofWriterPool, FsyncPolicy};
         use crate::runtime::channel::mpsc_bounded;
 
@@ -5027,8 +4435,7 @@ mod wal_append_tests {
             std::time::Duration::ZERO,
         );
 
-        // ── PipelineBatch path: caller passes None ──
-        // Pre-fix this was `aof_pool` (Some), which caused the double-write.
+        // ── `None`: no pool append ──
         wal_append_and_fanout(
             b"*3\r\n$3\r\nSET\r\n$1\r\na\r\n$1\r\n1\r\n",
             0,         // db
@@ -5037,18 +4444,17 @@ mod wal_append_tests {
             &mut vec![], // no replicas
             &None,       // no repl_state
             0,           // shard_id
-            None,        // PipelineBatch fix: None prevents double-write
+            None,        // no pool
             true,        // wal_kv_log
             &mut std::time::Duration::from_millis(5),
         );
         assert!(
             rx0.try_recv().is_err(),
-            "PipelineBatch must NOT forward to aof_pool (coordinator handles it); \
-             a message here means the double-write P0 bug is still present"
+            "wal_append_and_fanout(.., None, ..) must not append to the pool"
         );
         assert!(
             rx1.try_recv().is_err(),
-            "shard-1 pool must also be empty for PipelineBatch arm"
+            "wal_append_and_fanout(.., None, ..) must not append to shard 1's pool either"
         );
 
         // ── MultiExecute path: caller passes Some(&pool) ──
@@ -5241,7 +4647,7 @@ mod drain_cap_tests {
     /// (256) must return `true` — queued messages may remain, so the caller
     /// self-re-notifies — while a cycle that empties the rings returns
     /// `false`. The integration suite cannot reach the cap from one client
-    /// (pipelined commands coalesce into one PipelineBatch per target per
+    /// (pipelined commands coalesce into one PipelineBatchSlotted per target per
     /// read chunk), so the cap path is pinned here with 300 real ring
     /// messages. `BlockCancel` for an unknown wait_id is a harmless no-op,
     /// which keeps every other dependency inert (no WAL, no snapshot).
@@ -5372,7 +4778,7 @@ mod drain_cap_tests {
     /// moon#982: every command an SPSC execute arm runs is observed by the
     /// drain cycle's probe, so it lands in this thread's
     /// `total_commands_processed` slot when the probe drops — one
-    /// `PipelineBatchSlotted` of three plus one `ExecuteSlotted` is four,
+    /// `PipelineBatchSlotted` of three plus one of one is four,
     /// on a thread that ran nothing else. Pre-fix the delta was 0.
     #[test]
     fn routed_commands_land_in_total_commands_processed() {
@@ -5392,18 +4798,18 @@ mod drain_cap_tests {
                 prod.try_push(ShardMessage::PipelineBatchSlotted {
                     db_index: 0,
                     commands: vec![
-                        Arc::new(argv(&[b"SET", b"k", b"v"])),
-                        Arc::new(argv(&[b"GET", b"k"])),
-                        Arc::new(argv(&[b"INCR", b"n"])),
+                        argv(&[b"SET", b"k", b"v"]),
+                        argv(&[b"GET", b"k"]),
+                        argv(&[b"INCR", b"n"]),
                     ],
                     response_slot: crate::shard::dispatch::ResponseSlotPtr(Arc::clone(&batch_slot)),
                 })
                 .is_ok()
             );
             assert!(
-                prod.try_push(ShardMessage::ExecuteSlotted {
+                prod.try_push(ShardMessage::PipelineBatchSlotted {
                     db_index: 0,
-                    command: Arc::new(argv(&[b"GET", b"k"])),
+                    commands: vec![argv(&[b"GET", b"k"])],
                     response_slot: crate::shard::dispatch::ResponseSlotPtr(Arc::clone(
                         &single_slot
                     )),
@@ -5484,7 +4890,7 @@ mod drain_cap_tests {
             );
             let single = single_slot
                 .try_take()
-                .expect("ExecuteSlotted filled its slot");
+                .expect("the single-command batch filled its slot");
             assert_eq!(single.len(), 1);
 
             assert_eq!(
@@ -5538,3 +4944,9 @@ mod drain_rotation_tests {
 
 #[cfg(test)]
 mod aof_admission_tests;
+
+#[cfg(test)]
+mod guard_count_tests;
+
+#[cfg(test)]
+mod fanout_record_tests;

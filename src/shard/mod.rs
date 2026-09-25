@@ -25,6 +25,8 @@ pub(crate) mod mq_exec;
 pub mod numa;
 pub mod persistence_tick;
 pub(crate) mod recovery_rescan;
+/// moon#1177: the connection handlers' per-batch cross-shard command buffer.
+pub(crate) mod remote_batch;
 pub mod remote_subscriber_map;
 #[cfg(feature = "text-index")]
 pub mod scatter_aggregate;
@@ -46,6 +48,11 @@ pub mod spsc_handler;
 pub(crate) mod spsc_two_db;
 pub mod timers;
 pub mod uring_handler;
+/// moon#1182: multi-shard FT.SEARCH KNN legs on the cooperative search path.
+pub(crate) mod vector_scatter;
+/// moon#1162: the post-write index/queue hooks every shard-side write path
+/// runs — one list, so the dispatch arms cannot drift apart again.
+pub(crate) mod write_hooks;
 
 pub use disk_monitor::DiskMonitor;
 pub use slice::{

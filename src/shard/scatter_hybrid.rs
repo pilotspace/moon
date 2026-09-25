@@ -140,48 +140,47 @@ pub async fn scatter_hybrid_search(
     let field_queries: Vec<(Option<usize>, Vec<String>)> = vec![(None, term_strings.clone())];
     let mut dfs_receivers: Vec<channel::OneshotReceiver<Frame>> =
         Vec::with_capacity(num_shards.saturating_sub(1));
-    let mut local_dfs: Option<Frame> = None;
 
+    // moon#1182: every remote request goes out BEFORE the local leg runs.
     for shard_id in 0..num_shards {
         if shard_id == my_shard {
-            // Local DFS — direct read, no SPSC overhead. Drop guard before .await.
-            //
-            // Local DFS via slice — text_store accessed exclusively in the closure.
-            let response = crate::shard::slice::with_shard(|s| {
-                match s
-                    .text_store
-                    .get_index_for_db(query.index_name.as_ref(), db_index)
-                {
-                    Some(text_index) => {
-                        let mut items: Vec<Frame> = Vec::new();
-                        for (field_idx_opt, terms) in &field_queries {
-                            let fidx = field_idx_opt.unwrap_or(0);
-                            let (term_dfs, n) = text_index.doc_freq_for_terms(fidx, terms);
-                            for (term, df) in term_dfs {
-                                items.push(Frame::BulkString(Bytes::from(term)));
-                                items.push(Frame::Integer(i64::from(df)));
-                            }
-                            items.push(Frame::BulkString(Bytes::from_static(b"N")));
-                            items.push(Frame::Integer(i64::from(n)));
-                        }
-                        Frame::Array(FrameVec::from(items))
-                    }
-                    None => Frame::Error(Bytes::from_static(b"ERR unknown index")),
-                }
-            }); // shard slice released here
-            local_dfs = Some(response);
-        } else {
-            let (reply_tx, reply_rx) = channel::oneshot();
-            let msg = ShardMessage::DocFreq(Box::new(crate::shard::dispatch::DocFreqPayload {
-                index_name: query.index_name.clone(),
-                field_queries: field_queries.clone(),
-                reply_tx,
-                db_index,
-            }));
-            let _ = spsc_send(dispatch_tx, my_shard, shard_id, msg, spsc_notifiers).await;
-            dfs_receivers.push(reply_rx);
+            continue;
         }
+        let (reply_tx, reply_rx) = channel::oneshot();
+        let msg = ShardMessage::DocFreq(Box::new(crate::shard::dispatch::DocFreqPayload {
+            index_name: query.index_name.clone(),
+            field_queries: field_queries.clone(),
+            reply_tx,
+            db_index,
+        }));
+        let _ = spsc_send(dispatch_tx, my_shard, shard_id, msg, spsc_notifiers).await;
+        dfs_receivers.push(reply_rx);
     }
+    // Local DFS — direct read, no SPSC overhead. Shard slice released
+    // before any .await.
+    let response = crate::shard::slice::with_shard(|s| {
+        match s
+            .text_store
+            .get_index_for_db(query.index_name.as_ref(), db_index)
+        {
+            Some(text_index) => {
+                let mut items: Vec<Frame> = Vec::new();
+                for (field_idx_opt, terms) in &field_queries {
+                    let fidx = field_idx_opt.unwrap_or(0);
+                    let (term_dfs, n) = text_index.doc_freq_for_terms(fidx, terms);
+                    for (term, df) in term_dfs {
+                        items.push(Frame::BulkString(Bytes::from(term)));
+                        items.push(Frame::Integer(i64::from(df)));
+                    }
+                    items.push(Frame::BulkString(Bytes::from_static(b"N")));
+                    items.push(Frame::Integer(i64::from(n)));
+                }
+                Frame::Array(FrameVec::from(items))
+            }
+            None => Frame::Error(Bytes::from_static(b"ERR unknown index")),
+        }
+    }); // shard slice released here
+    let local_dfs: Option<Frame> = Some(response);
 
     let mut dfs_responses: Vec<Frame> = Vec::with_capacity(num_shards);
     if let Some(local) = local_dfs {
@@ -204,65 +203,67 @@ pub async fn scatter_hybrid_search(
     let sparse_blob = query.sparse.as_ref().map(|(_, b)| b.clone());
     let mut hyb_receivers: Vec<channel::OneshotReceiver<Frame>> =
         Vec::with_capacity(num_shards.saturating_sub(1));
-    let mut local_hyb: Option<Frame> = None;
 
+    // moon#1182: every remote hybrid leg goes out BEFORE the local one runs —
+    // the local three-stream search used to finish before any other shard
+    // started its own.
     for shard_id in 0..num_shards {
         if shard_id == my_shard {
-            // vector_store + text_store acquired in one with_shard closure to
-            // avoid reentrant RefCell double-borrow panics.
-            let sparse_pair = match (sparse_field.as_ref(), sparse_blob.as_ref()) {
-                (Some(f), Some(b)) => Some((f, b)),
-                _ => None,
-            };
-            // Phase 171 HYB-02 / SCAT-02: forward as_of_lsn through the
-            // local raw-streams executor (symmetric with remote payload).
-            // CHANGE F: clone filter for local path (shard-local allowlist eval).
-            let filter_clone = query.filter.clone();
-            let response = crate::shard::slice::with_shard(|s| {
-                crate::command::vector_search::hybrid_multi::execute_hybrid_search_local_raw_streams(
-                    &mut s.vector_store,
-                    &s.text_store,
-                    &query.index_name,
-                    &query_terms,
-                    &query.dense_field,
-                    &query.dense_blob,
-                    sparse_pair,
-                    query.weights,
-                    k_per_stream,
-                    top_k,
-                    &global_df,
-                    global_n,
-                    as_of_lsn,
-                    filter_clone.as_ref(),
-                    db_index,
-                )
-            });
-            local_hyb = Some(response);
-        } else {
-            let (reply_tx, reply_rx) = channel::oneshot();
-            let payload = FtHybridPayload {
-                index_name: query.index_name.clone(),
-                query_terms: query_terms.clone(),
-                dense_field: query.dense_field.clone(),
-                dense_blob: query.dense_blob.clone(),
-                sparse_field: sparse_field.clone(),
-                sparse_blob: sparse_blob.clone(),
-                weights: query.weights,
-                k_per_stream,
-                top_k,
-                global_df: global_df.clone(),
-                global_n,
-                as_of_lsn,
-                // CHANGE F: forward filter to remote shard payload.
-                filter: query.filter.clone(),
-                reply_tx,
-                db_index,
-            };
-            let msg = ShardMessage::FtHybrid(Box::new(payload));
-            let _ = spsc_send(dispatch_tx, my_shard, shard_id, msg, spsc_notifiers).await;
-            hyb_receivers.push(reply_rx);
+            continue;
         }
+        let (reply_tx, reply_rx) = channel::oneshot();
+        let payload = FtHybridPayload {
+            index_name: query.index_name.clone(),
+            query_terms: query_terms.clone(),
+            dense_field: query.dense_field.clone(),
+            dense_blob: query.dense_blob.clone(),
+            sparse_field: sparse_field.clone(),
+            sparse_blob: sparse_blob.clone(),
+            weights: query.weights,
+            k_per_stream,
+            top_k,
+            global_df: global_df.clone(),
+            global_n,
+            as_of_lsn,
+            // CHANGE F: forward filter to remote shard payload.
+            filter: query.filter.clone(),
+            reply_tx,
+            db_index,
+        };
+        let msg = ShardMessage::FtHybrid(Box::new(payload));
+        let _ = spsc_send(dispatch_tx, my_shard, shard_id, msg, spsc_notifiers).await;
+        hyb_receivers.push(reply_rx);
     }
+    // vector_store + text_store acquired in one with_shard closure to
+    // avoid reentrant RefCell double-borrow panics.
+    let sparse_pair = match (sparse_field.as_ref(), sparse_blob.as_ref()) {
+        (Some(f), Some(b)) => Some((f, b)),
+        _ => None,
+    };
+    // Phase 171 HYB-02 / SCAT-02: forward as_of_lsn through the
+    // local raw-streams executor (symmetric with remote payload).
+    // CHANGE F: clone filter for local path (shard-local allowlist eval).
+    let filter_clone = query.filter.clone();
+    let response = crate::shard::slice::with_shard(|s| {
+        crate::command::vector_search::hybrid_multi::execute_hybrid_search_local_raw_streams(
+            &mut s.vector_store,
+            &s.text_store,
+            &query.index_name,
+            &query_terms,
+            &query.dense_field,
+            &query.dense_blob,
+            sparse_pair,
+            query.weights,
+            k_per_stream,
+            top_k,
+            &global_df,
+            global_n,
+            as_of_lsn,
+            filter_clone.as_ref(),
+            db_index,
+        )
+    });
+    let local_hyb: Option<Frame> = Some(response);
 
     // ─── Phase 3a: collect per-shard raw three-stream replies ──────────────
     let mut replies: Vec<ShardHybridReply> = Vec::with_capacity(num_shards);

@@ -2999,7 +2999,12 @@ pub(crate) fn try_inline_dispatch(
     // `budget` and `est` were already computed on this path; only the branch
     // below is new.
     let budget = shard_databases.elastic_budget(shard_id);
-    let est = crate::shard::slice::with_shard_db(selected_db, |db| db.estimated_memory());
+    // PR #1233 review: admitted against evictable memory PLUS the cold
+    // tier's dead-slot ledger, the figure `evict_to_budget` admits against —
+    // otherwise this path waves through writes the slow path refuses.
+    let est = crate::shard::slice::with_shard_db(selected_db, |db| {
+        crate::storage::eviction::admission_memory(db)
+    });
     let needs_eviction = !crate::storage::eviction::inline_write_can_skip_eviction(est, budget);
 
     // moon#660: THE safety condition. With a live `spill_sender`, generic

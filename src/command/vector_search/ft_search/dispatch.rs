@@ -604,7 +604,10 @@ pub fn ft_search_capture(
 /// for any condition the yielding path does not handle (unknown index, non-default
 /// field, query dimension mismatch) so the caller falls back to the exact-frame
 /// synchronous path. After this returns, NO borrow into the store remains.
-fn capture_dense_knn_snapshot(
+///
+/// `pub(crate)` for the multi-shard KNN legs (moon#1182,
+/// `shard::vector_scatter`), which capture with the scatter's own parameters.
+pub(crate) fn capture_dense_knn_snapshot(
     store: &mut VectorStore,
     index_name: &[u8],
     query_blob: &[u8],

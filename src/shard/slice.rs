@@ -967,16 +967,24 @@ mod tests {
     /// D3 W1: the write actually lands, and a later foreign READ of the same
     /// database observes it. Without this the primitive could refuse
     /// everything and every other test here would still pass.
+    ///
+    /// The registered plane is process-wide: whichever test's
+    /// `ShardDatabases::new` wins the `OnceLock` installs its databases, and
+    /// that test may have written keys there (the coordinator's
+    /// `multikey_leg_tests` and `watch_versions_tests` do). So the closure
+    /// counts what ITS write added, under the exclusive guard, instead of
+    /// assuming the database starts empty.
     #[test]
     fn foreign_write_applies_and_is_visible_to_a_foreign_read() {
         std::thread::spawn(|| {
             join_plane(4);
             let applied = try_foreign_db_write(0, 0, |db| {
+                let before = db.logical_len();
                 db.set_string(
                     &bytes::Bytes::from_static(b"d3:k"),
                     bytes::Bytes::from_static(b"v"),
                 );
-                db.logical_len()
+                db.logical_len().saturating_sub(before)
             });
             assert_eq!(
                 applied,

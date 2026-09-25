@@ -136,7 +136,7 @@ pub struct ColdIndex {
     /// plane can range-resume from a hash-space cursor (#368). The u64 is
     /// always `scan_h48` of the Bytes it is paired with — every mutation
     /// site derives it from the key, never stores it independently.
-    map: BTreeMap<(u64, Bytes), ColdLocation>,
+    pub(super) map: BTreeMap<(u64, Bytes), ColdLocation>,
     /// Reverse liveness: `file_id` -> count of live `map` entries pointing at it.
     ///
     /// A batched spill file (`heap-NNNNNN.mpf`) holds up to `FLUSH_ENTRY_CAP`
@@ -145,12 +145,12 @@ pub struct ColdIndex {
     /// on a single orphan key silently orphans its co-located keys — observed
     /// empirically as cold read-through collapsing 200/200 -> 88/200 once the
     /// orphan sweep runs.
-    file_refs: HashMap<u64, u32>,
+    pub(super) file_refs: HashMap<u64, u32>,
     /// `file_id`s that dropped to zero live refs (via an `insert` overwrite or a
     /// `remove`) and are awaiting unlink. Drained off the hot path by the orphan
     /// sweep ([`Self::drain_pending_unlink`]). Pushed only on a zero-ref
     /// transition (rare), so it does not allocate on the common insert path.
-    pending_unlink: Vec<u64>,
+    pub(super) pending_unlink: Vec<u64>,
     /// Running total of approximate resident bytes charged by [`Self::insert`]
     /// / [`Self::remove`] / the sweep methods' direct removals / [`Self::clear_all`]
     /// (K4 accounting spine, kernel-m2-brief-2026-07-12 stage 2).
@@ -178,7 +178,17 @@ pub struct ColdIndex {
     /// entry did, the key's only replayable base is the older copy below the
     /// cut. The gate reads it from here instead of treating the key as
     /// absent, which replayed every post-rewrite write onto an empty value.
-    older_copies: HashMap<Bytes, Vec<ColdLocation>>,
+    pub(super) older_copies: HashMap<Bytes, Vec<ColdLocation>>,
+    /// Slots still on disk in a listed file that are no longer their key's
+    /// entry here (moon#1215) — see [`super::dead_slots`]. Every path below
+    /// that takes a slot out of `map` or `older_copies` records it, and
+    /// [`Self::drain_pending_unlink`] forgets a file's entries once the file
+    /// is gone. The AOF rewrite fold reads it to keep deleted keys deleted.
+    pub(super) dead: super::dead_slots::DeadSlots,
+    /// Mostly-dead files compacted into new, not-yet-listed spill files,
+    /// waiting for a committed AOF fold before they are adopted and the old
+    /// files unlinked — the ledger's bound (see [`super::cold_reclaim`]).
+    pub(super) reclaim: super::cold_reclaim::ReclaimState,
 }
 
 /// Approximate fixed cost of one cold-index entry beyond the key bytes: the
@@ -306,7 +316,7 @@ const REBUILD_DETAIL_LOG_CAP: u64 = 16;
 
 /// Why one `PAGE_4K` chunk was not a usable `KvLeaf` page.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PageVerdict {
+pub(super) enum PageVerdict {
     Leaf,
     Overflow,
     BadHeader,
@@ -317,7 +327,7 @@ enum PageVerdict {
 /// Classify one page-sized chunk by its header BEFORE `KvLeafPage::from_bytes`
 /// gets a say — that constructor answers `None` for a valid overflow page and
 /// for a corrupt one alike, and only one of those is a loss.
-fn classify_page(chunk: &[u8]) -> PageVerdict {
+pub(super) fn classify_page(chunk: &[u8]) -> PageVerdict {
     use crate::persistence::page::{MoonPageHeader, PageType};
     let Some(hdr) = MoonPageHeader::read_from(chunk) else {
         return PageVerdict::BadHeader;
@@ -349,7 +359,33 @@ impl ColdIndex {
             pending_unlink: Vec::new(),
             resident_bytes: 0,
             older_copies: HashMap::new(),
+            dead: super::dead_slots::DeadSlots::default(),
+            reclaim: super::cold_reclaim::ReclaimState::default(),
         }
+    }
+
+    /// The dead-slot ledger (moon#1215): keys whose slot is still on disk in
+    /// a listed file although it is no longer their entry here.
+    #[inline]
+    pub fn dead_slots(&self) -> &super::dead_slots::DeadSlots {
+        &self.dead
+    }
+
+    /// The ledger's resident bytes — the part of [`Self::resident_bytes`] no
+    /// eviction can free (PR #1233 review: charged at write admission, kept
+    /// out of the eviction and pressure-cascade targets), plus what pending
+    /// reclaim compactions hold until they are adopted. O(1).
+    #[inline]
+    pub fn dead_slot_bytes(&self) -> usize {
+        self.dead.resident_bytes() + self.reclaim.resident_bytes()
+    }
+
+    /// Record a slot of `key` in `file_id` that never became its entry here —
+    /// a spill completion that published `file_id` for OTHER keys while this
+    /// one was superseded or withdrawn (a ghost slot, moon#1215). `ttl_ms` is
+    /// the slot's own absolute TTL, as written.
+    pub fn note_dead_slot(&mut self, file_id: u64, key: Bytes, ttl_ms: Option<u64>) {
+        self.dead.note(file_id, key, ttl_ms);
     }
 
     /// The copies of `key` a rebuild found behind its current entry, newest
@@ -369,9 +405,15 @@ impl ColdIndex {
     pub fn release_older_copies(&mut self) -> usize {
         let older = std::mem::take(&mut self.older_copies);
         let keys = older.len();
-        for location in older.into_values().flatten() {
-            if self.ref_dec(location.file_id) {
-                self.pending_unlink.push(location.file_id);
+        for (key, copies) in older {
+            for location in copies {
+                // The slot stays on disk and outlives this release: once the
+                // key's newer copy goes, it would be the one a rebuild finds.
+                self.dead
+                    .note(location.file_id, key.clone(), location.ttl_ms);
+                if self.ref_dec(location.file_id) {
+                    self.pending_unlink.push(location.file_id);
+                }
             }
         }
         keys
@@ -385,10 +427,12 @@ impl ColdIndex {
         if self.older_copies.is_empty() {
             return;
         }
-        let Some(copies) = self.older_copies.remove(key) else {
+        let Some((owned, copies)) = self.older_copies.remove_entry(key) else {
             return;
         };
         for location in copies {
+            self.dead
+                .note(location.file_id, owned.clone(), location.ttl_ms);
             if self.ref_dec(location.file_id) {
                 self.pending_unlink.push(location.file_id);
             }
@@ -401,7 +445,7 @@ impl ColdIndex {
     /// per-call walk.
     #[inline]
     pub fn resident_bytes(&self) -> usize {
-        self.resident_bytes
+        self.resident_bytes + self.dead_slot_bytes()
     }
 
     /// Increment a file's live-ref count.
@@ -440,8 +484,10 @@ impl ColdIndex {
         let new_file = location.file_id;
         let key_len = key.len();
         let h = scan_h48(&key);
-        if let Some(old) = self.map.insert((h, key), location) {
+        if let Some(old) = self.map.insert((h, key.clone()), location) {
             if old.file_id != new_file {
+                // The superseded slot stays in its file (moon#1215).
+                self.dead.note(old.file_id, key, old.ttl_ms);
                 if self.ref_dec(old.file_id) {
                     self.pending_unlink.push(old.file_id);
                 }
@@ -462,7 +508,20 @@ impl ColdIndex {
     /// (the `Bytes` clone is a refcount bump, not a data copy) — `BTreeMap`
     /// cannot borrow-match a `(u64, &[u8])` probe against a
     /// `(u64, Bytes)` key.
+    ///
+    /// Every removal leaves the slot on disk, so it is recorded in the
+    /// dead-slot ledger here, once, for every caller (moon#1215) — except
+    /// [`Self::sweep_expired`]'s, whose slots have all expired and so can
+    /// never read as a value again ([`Self::remove_raw_unrecorded`]).
     fn remove_raw(&mut self, key: &[u8]) -> Option<ColdLocation> {
+        let (owned, location) = self.remove_raw_unrecorded(key)?;
+        self.dead.note(location.file_id, owned, location.ttl_ms);
+        Some(location)
+    }
+
+    /// [`Self::remove_raw`] without the ledger entry; returns the owned key
+    /// too.
+    fn remove_raw_unrecorded(&mut self, key: &[u8]) -> Option<(Bytes, ColdLocation)> {
         let h = scan_h48(key);
         let owned = self
             .map
@@ -470,7 +529,8 @@ impl ColdIndex {
             .take_while(|(k, _)| k.0 == h)
             .find(|(k, _)| k.1.as_ref() == key)
             .map(|(k, _)| k.clone())?;
-        self.map.remove(&owned)
+        let location = self.map.remove(&owned)?;
+        Some((owned.1, location))
     }
 
     /// Remove a key from the cold index (promotion back to RAM, DEL/UNLINK,
@@ -498,8 +558,17 @@ impl ColdIndex {
     /// files themselves are removed by the next orphan sweep, which holds
     /// the manifest handle this method deliberately does not need.
     pub fn clear_all(&mut self) {
-        self.map.clear();
-        self.older_copies = HashMap::new();
+        // Every slot stays on disk until the sweep unlinks its file; a
+        // rewrite before that must still delete each key (moon#1215).
+        for ((_, key), location) in std::mem::take(&mut self.map) {
+            self.dead.note(location.file_id, key, location.ttl_ms);
+        }
+        for (key, copies) in std::mem::take(&mut self.older_copies) {
+            for location in copies {
+                self.dead
+                    .note(location.file_id, key.clone(), location.ttl_ms);
+            }
+        }
         self.resident_bytes = 0;
         for (&file_id, _) in self.file_refs.iter() {
             self.pending_unlink.push(file_id);
@@ -536,6 +605,7 @@ impl ColdIndex {
             }
             self.older_copies.entry(key).or_default().extend(copies);
         }
+        self.dead.merge(other.dead);
     }
 
     /// Number of entries tracked.
@@ -797,6 +867,11 @@ impl ColdIndex {
         manifest: Option<&mut crate::persistence::manifest::ShardManifest>,
         max_batch: usize,
     ) -> std::io::Result<SweepStats> {
+        // Dead slots whose own TTL has passed since they were recorded can no
+        // longer come back: stop holding their keys (moon#1215 ledger, PR
+        // #1233 review). O(1) unless one has actually expired.
+        self.dead.prune_expired(now_ms);
+
         // Phase 1: identify expired keys, bounded to `max_batch`. Iteration
         // is in (hash48, key) order and restarts from the front each call;
         // an entry left behind by the cap is picked up by a later sweep once
@@ -827,10 +902,12 @@ impl ColdIndex {
         }
 
         // Phase 2: remove entries + decrement their files' ref counts (same
-        // shape as `sweep_known_orphans`).
+        // shape as `sweep_known_orphans`). Not recorded as dead slots: each
+        // one's own TTL has passed, so it can never read as a value again
+        // (see `dead_slots`).
         let mut stats = SweepStats::default();
         for key in &expired_keys {
-            if let Some(old) = self.remove_raw(key.as_ref()) {
+            if let Some((_, old)) = self.remove_raw_unrecorded(key.as_ref()) {
                 // moon#1013: a tracked key can be spilled and then expire on
                 // disk; its trackers must hear about it like a hot expiry.
                 crate::tracking::invalidation::invalidate_server_removed(key.as_ref());
@@ -876,13 +953,42 @@ impl ColdIndex {
     fn drain_pending_unlink(
         &mut self,
         shard_dir: &Path,
-        mut manifest: Option<&mut crate::persistence::manifest::ShardManifest>,
+        manifest: Option<&mut crate::persistence::manifest::ShardManifest>,
     ) -> std::io::Result<u64> {
         if self.pending_unlink.is_empty() {
             return Ok(0);
         }
+        let queued = std::mem::take(&mut self.pending_unlink);
+        self.unlink_queued(queued, shard_dir, manifest)
+    }
+
+    /// [`Self::drain_pending_unlink`] for exactly the queued files among
+    /// `file_ids`; every other queued file stays queued for the orphan
+    /// sweep. The reclaim uses it to unlink the files it just emptied
+    /// without advancing the sweep's own schedule for anything else.
+    pub fn unlink_now(
+        &mut self,
+        file_ids: &[u64],
+        shard_dir: &Path,
+        manifest: Option<&mut crate::persistence::manifest::ShardManifest>,
+    ) -> std::io::Result<u64> {
+        let (now, later): (Vec<u64>, Vec<u64>) = std::mem::take(&mut self.pending_unlink)
+            .into_iter()
+            .partition(|id| file_ids.contains(id));
+        self.pending_unlink = later;
+        if now.is_empty() {
+            return Ok(0);
+        }
+        self.unlink_queued(now, shard_dir, manifest)
+    }
+
+    fn unlink_queued(
+        &mut self,
+        mut queued: Vec<u64>,
+        shard_dir: &Path,
+        mut manifest: Option<&mut crate::persistence::manifest::ShardManifest>,
+    ) -> std::io::Result<u64> {
         let data_dir = shard_dir.join("data");
-        let mut queued = std::mem::take(&mut self.pending_unlink);
         queued.sort_unstable();
         queued.dedup();
 
@@ -898,8 +1004,11 @@ impl ColdIndex {
 
             // Delete the DataFile (idempotent — missing = already gone).
             match std::fs::remove_file(&file_path) {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                // Gone from disk: its dead slots cannot come back (moon#1215).
+                Ok(()) => self.dead.forget_file(file_id),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    self.dead.forget_file(file_id);
+                }
                 Err(e) => {
                     tracing::warn!(
                         file = %file_path.display(),
@@ -1274,6 +1383,8 @@ impl ColdIndex {
             pending_unlink,
             resident_bytes,
             older_copies,
+            dead: super::dead_slots::DeadSlots::default(),
+            reclaim: super::cold_reclaim::ReclaimState::default(),
         }
     }
 }
@@ -1464,11 +1575,18 @@ mod tests {
         idx.insert(Bytes::from_static(b"another_key"), loc);
         assert!(idx.resident_bytes() > after_one);
 
+        // The index part shrinks on remove; the removed slot is still on
+        // disk in file 1, so the dead-slot ledger now charges its key
+        // (moon#1215) until the file is unlinked.
+        let map_part = |idx: &ColdIndex| idx.resident_bytes() - idx.dead_slots().resident_bytes();
         idx.remove(b"another_key");
-        assert_eq!(idx.resident_bytes(), after_one);
+        assert_eq!(map_part(&idx), after_one);
+        assert_eq!(idx.dead_slots().len(), 1);
 
         idx.remove(b"a_reasonably_long_key");
-        assert_eq!(idx.resident_bytes(), 0);
+        assert_eq!(map_part(&idx), 0);
+        assert_eq!(idx.resident_bytes(), idx.dead_slots().resident_bytes());
+        assert!(idx.dead_slots().resident_bytes() > 0);
     }
 
     #[test]
@@ -1494,7 +1612,12 @@ mod tests {
         // different file). Byte length is unchanged, so resident_bytes must
         // not grow.
         idx.insert(Bytes::from_static(b"key1"), loc_b);
-        assert_eq!(idx.resident_bytes(), after_first);
+        assert_eq!(
+            idx.resident_bytes() - idx.dead_slots().resident_bytes(),
+            after_first
+        );
+        // The superseded slot in file 1 is recorded as dead (moon#1215).
+        assert!(idx.dead_slots().file_has_dead_slots(1));
     }
 
     #[test]
@@ -1511,7 +1634,11 @@ mod tests {
         idx.insert(Bytes::from_static(b"key2"), loc);
         assert!(idx.resident_bytes() > 0);
         idx.clear_all();
-        assert_eq!(idx.resident_bytes(), 0);
+        assert_eq!(idx.len(), 0);
+        // Only the dead-slot ledger remains charged: both slots stay on disk
+        // until the sweep unlinks file 1 (moon#1215).
+        assert_eq!(idx.resident_bytes(), idx.dead_slots().resident_bytes());
+        assert_eq!(idx.dead_slots().len(), 2);
     }
 
     /// Create a shard dir with a `data/` subdir and a dummy heap-NNNNNN.mpf

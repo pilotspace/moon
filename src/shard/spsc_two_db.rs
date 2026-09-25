@@ -7,8 +7,9 @@
 //! sees one `&mut Database`. The plain `Execute` arm in `spsc_handler.rs`
 //! special-cased both commands ahead of the generic path; this module
 //! extracts that logic into one helper so every other `ShardMessage` arm
-//! (`MultiExecute`, `PipelineBatch`, `ExecuteSlotted`, `MultiExecuteSlotted`,
-//! `PipelineBatchSlotted`) reuses it verbatim instead of silently falling
+//! (`MultiExecute`, `PipelineBatchSlotted`; the dead `PipelineBatch`,
+//! `ExecuteSlotted` and `MultiExecuteSlotted` arms were removed in moon#1198)
+//! reuses it verbatim instead of silently falling
 //! through to the single-db path — which, before this fix, meant COPY with
 //! a `DB` clause silently performed a same-db copy (wrong-db data
 //! corruption) and MOVE returned a loud-but-wrong "cross-db not supported"
@@ -161,6 +162,7 @@ pub(crate) fn try_two_db_intercept(
                     // other documented Wave-A gaps (db-quota eviction, Lua
                     // effects). A no-op sink preserves pre-#34 behavior.
                     if let Err(oom) = crate::shard::spsc_handler::spsc_eviction_gate(
+                        cmd,
                         dst,
                         ca.dst_db,
                         shard_databases,
