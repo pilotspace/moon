@@ -106,6 +106,7 @@ mod tests {
     use std::sync::Arc;
 
     use crate::vector::distance;
+    use crate::vector::filter::selectivity::FilterStrategy;
     use crate::vector::hnsw::search::SearchScratch;
     use crate::vector::segment::holder::{MvccContext, SearchSnapshot, SegmentHolder, YieldBudget};
     use crate::vector::test_support::EmbeddingLike;
@@ -132,6 +133,46 @@ mod tests {
         got.iter().filter(|g| want.contains(g)).count() as f64 / want.len() as f64
     }
 
+    /// The cooperative-yield scan of a mutable-only index, as FT.SEARCH's
+    /// capture builds it, with `filter` resolved to `strategy`.
+    fn yielding_scan(
+        holder: &SegmentHolder,
+        q: &[f32],
+        dim: usize,
+        n: usize,
+        filter: Option<&roaring::RoaringBitmap>,
+        strategy: crate::vector::filter::selectivity::FilterStrategy,
+    ) -> smallvec::SmallVec<[crate::vector::types::SearchResult; 32]> {
+        let budget = YieldBudget {
+            max_segments_per_chunk: usize::MAX,
+            max_graph_nodes_per_chunk: usize::MAX,
+            // No yield point under `block_on` (monoio's cooperative_yield
+            // needs its runtime); the chunked scan still runs.
+            max_brute_force_vecs_per_chunk: usize::MAX,
+        };
+        let mut snap = SearchSnapshot {
+            segments: holder.load_full(),
+            query_f32: q.to_vec(),
+            k: K,
+            ef_search: 64,
+            filter_bitmap: filter.map(|bm| Arc::new(bm.clone())),
+            filter_strategy: strategy,
+            snapshot_lsn: 0,
+            my_txn_id: 0,
+            committed: Arc::new(roaring::RoaringTreemap::new()),
+            dimension: dim as u32,
+            mutable_len: n,
+            scratch: SearchScratch::new(0, padded_dimension(dim as u32)),
+            key_hash_to_key: Default::default(),
+            ef_defaulted: false,
+            tuning: SearchTuning::default(),
+            pending_reloads: Vec::new(),
+        };
+        futures::executor::block_on(SegmentHolder::search_mvcc_yielding_with_pool(
+            &mut snap, budget, None,
+        ))
+    }
+
     /// moon#1226 red → green: far / out-of-distribution queries against a
     /// mutable-only EXACT index on an embedding-shaped corpus. The mutable
     /// leg ranked by TQ-ADC alone (moon#1207/#1208) lost far-query recall;
@@ -139,6 +180,14 @@ mod tests {
     /// reranks the ADC top `4·k` from `raw_f16` and must agree bit for bit.
     /// Relative evidence only — random embedding-shaped data, not MiniLM
     /// (CLAUDE.md gotcha); MiniLM validation is deferred.
+    ///
+    /// moon#1242: the same identity under a 90 % filter, for every strategy
+    /// the capture can resolve a filter to. `HnswPostFilter` (> 80 % of at
+    /// least 20K vectors) oversamples the GRAPH legs 3×; the yielding scan
+    /// also reranked its exactly-filtered mutable leg at that depth (the ADC
+    /// top `4·3k`) while `search_mvcc` reranks the ADC top `4·k`, so a plain
+    /// FT.SEARCH and the same query with RANGE or SESSION could return
+    /// different documents (red: 1 of 80 queries here).
     #[test]
     fn mutable_leg_exact_rerank_recovers_far_query_recall() {
         distance::init();
@@ -171,17 +220,18 @@ mod tests {
             ef_defaulted: false,
             tuning: SearchTuning::default(),
         };
-        let budget = YieldBudget {
-            max_segments_per_chunk: usize::MAX,
-            max_graph_nodes_per_chunk: usize::MAX,
-            // No yield point under `block_on` (monoio's cooperative_yield
-            // needs its runtime); the chunked scan still runs.
-            max_brute_force_vecs_per_chunk: usize::MAX,
-        };
+        // Every tenth document filtered out: 90 % selectivity.
+        let bm: roaring::RoaringBitmap = (0..n as u32).filter(|i| i % 10 != 0).collect();
+        let strategies = [
+            FilterStrategy::BruteForceFiltered,
+            FilterStrategy::HnswFiltered,
+            FilterStrategy::HnswPostFilter,
+        ];
         let classes: [(&str, Vec<Vec<f32>>); 2] = [
             ("far", (0..40).map(|_| g.far()).collect()),
             ("in", (0..40).map(|_| g.doc()).collect()),
         ];
+        let mut filtered_differ = Vec::new();
         for (class, queries) in classes {
             let (mut adc, mut reranked) = (0.0f64, 0.0f64);
             for q in &queries {
@@ -201,30 +251,26 @@ mod tests {
                 let mut scratch = SearchScratch::new(0, padded_dimension(dim as u32));
                 let sync = holder.search_filtered(q, K, 64, &mut scratch, None);
                 let mvcc = holder.search_mvcc(q, K, 64, &mut scratch, None, &ctx);
-                let mut snap = SearchSnapshot {
-                    segments: holder.load_full(),
-                    query_f32: q.clone(),
-                    k: K,
-                    ef_search: 64,
-                    filter_bitmap: None,
-                    filter_strategy: crate::vector::filter::selectivity::FilterStrategy::Unfiltered,
-                    snapshot_lsn: 0,
-                    my_txn_id: 0,
-                    committed: Arc::new(roaring::RoaringTreemap::new()),
-                    dimension: dim as u32,
-                    mutable_len: n,
-                    scratch: SearchScratch::new(0, padded_dimension(dim as u32)),
-                    key_hash_to_key: Default::default(),
-                    ef_defaulted: false,
-                    tuning: SearchTuning::default(),
-                    pending_reloads: Vec::new(),
-                };
-                let yielded = futures::executor::block_on(
-                    SegmentHolder::search_mvcc_yielding_with_pool(&mut snap, budget, None),
-                );
+                let yielded = yielding_scan(&holder, q, dim, n, None, FilterStrategy::Unfiltered);
                 assert_eq!(bits(&sync), bits(&mvcc), "{class}: sync vs MVCC");
                 assert_eq!(bits(&mvcc), bits(&yielded), "{class}: MVCC vs yielding");
                 reranked += recall(&ids(&mvcc), &want);
+
+                // moon#1242: filtered, every strategy.
+                let sync_f = holder.search_filtered(q, K, 64, &mut scratch, Some(&bm));
+                let mvcc_f = holder.search_mvcc(q, K, 64, &mut scratch, Some(&bm), &ctx);
+                assert_eq!(
+                    bits(&sync_f),
+                    bits(&mvcc_f),
+                    "{class}: filtered sync vs MVCC"
+                );
+                assert!(mvcc_f.iter().all(|r| bm.contains(r.id.0)));
+                for strategy in strategies {
+                    let yielded_f = yielding_scan(&holder, q, dim, n, Some(&bm), strategy);
+                    if bits(&mvcc_f) != bits(&yielded_f) {
+                        filtered_differ.push((class, strategy, bits(&mvcc_f), bits(&yielded_f)));
+                    }
+                }
             }
             let nq = queries.len() as f64;
             let (adc, reranked) = (adc / nq, reranked / nq);
@@ -238,6 +284,84 @@ mod tests {
                 "{class}: the rerank must not lose recall ({adc:.3} -> {reranked:.3})"
             );
         }
+        assert!(
+            filtered_differ.is_empty(),
+            "{} filtered (strategy, query) pairs: search_mvcc != yielding; first: {:?}",
+            filtered_differ.len(),
+            filtered_differ.first()
+        );
+    }
+
+    /// moon#1242 red → green: an index large enough for the capture to
+    /// resolve a broad filter to HnswPostFilter itself (≥ 20K matches at
+    /// > 80 % selectivity). The yielding scan (plain FT.SEARCH) and
+    /// `search_filtered`'s HnswPostFilter arm reranked the exactly-filtered
+    /// mutable leg at the graph legs' `3k` oversample; both must answer what
+    /// `search_mvcc` (FT.SEARCH with RANGE or SESSION) answers.
+    #[test]
+    fn post_filter_strategy_scans_agree_with_search_mvcc() {
+        distance::init();
+        crate::vector::turbo_quant::fwht::init_fwht();
+        let (dim, n) = (64usize, 20_500usize);
+        let col = Arc::new(CollectionMetadata::with_build_mode(
+            59,
+            dim as u32,
+            DistanceMetric::Cosine,
+            QuantizationConfig::TurboQuant4,
+            59,
+            BuildMode::Exact,
+        ));
+        let holder = SegmentHolder::new(dim as u32, Arc::clone(&col));
+        let mut g = EmbeddingLike::new(dim, 64, 31);
+        {
+            let list = holder.load();
+            for i in 0..n {
+                list.mutable.append(i as u64 + 1, &g.doc(), i as u64 + 1);
+            }
+        }
+        // 98 % selectivity over 20,090 matches: HnswPostFilter.
+        let bm: roaring::RoaringBitmap = (0..n as u32).filter(|i| i % 50 != 0).collect();
+        assert_eq!(
+            crate::vector::filter::selectivity::select_strategy(Some(&bm), holder.total_vectors()),
+            FilterStrategy::HnswPostFilter
+        );
+        let committed = roaring::RoaringTreemap::new();
+        let ctx = MvccContext {
+            snapshot_lsn: 0,
+            my_txn_id: 0,
+            committed: &committed,
+            dirty_set: &[],
+            dimension: dim as u32,
+            ef_defaulted: false,
+            tuning: SearchTuning::default(),
+        };
+        let bits = |r: &smallvec::SmallVec<[crate::vector::types::SearchResult; 32]>| {
+            r.iter()
+                .map(|x| (x.id.0, x.distance.to_bits()))
+                .collect::<Vec<_>>()
+        };
+        let mut scratch = SearchScratch::new(0, padded_dimension(dim as u32));
+        let (mut sync_differ, mut yield_differ) = (0usize, 0usize);
+        for _ in 0..30 {
+            let q = g.far();
+            let mvcc = holder.search_mvcc(&q, K, 64, &mut scratch, Some(&bm), &ctx);
+            let sync = holder.search_filtered(&q, K, 64, &mut scratch, Some(&bm));
+            let yielded = yielding_scan(
+                &holder,
+                &q,
+                dim,
+                n,
+                Some(&bm),
+                FilterStrategy::HnswPostFilter,
+            );
+            sync_differ += usize::from(bits(&sync) != bits(&mvcc));
+            yield_differ += usize::from(bits(&yielded) != bits(&mvcc));
+        }
+        assert_eq!(
+            (sync_differ, yield_differ),
+            (0, 0),
+            "of 30 queries, (search_filtered, yielding) != search_mvcc"
+        );
     }
 
     /// moon#1226 red test: a component beyond the f16 range (±65,504) is

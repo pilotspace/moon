@@ -587,9 +587,10 @@ impl SegmentHolder {
             }
             FilterStrategy::HnswPostFilter => {
                 let oversample_k = k * 3;
+                // Exactly filtered: `k`, as in `search_mvcc` (moon#1242).
                 all.extend(snapshot.mutable.brute_force_search_reranked(
                     query_f32,
-                    oversample_k,
+                    k,
                     filter_bitmap,
                     rerank_mult,
                 ));
@@ -1040,12 +1041,12 @@ impl SegmentHolder {
         //    produces.
         let chunk = budget.max_brute_force_vecs_per_chunk.max(1);
         if mutable_len > 0 {
-            // fetch_k oversamples under HnswPostFilter (filter still applied —
-            // the mutable scan is linear, filtering there is free).
-            // moon#1226: the ADC top `rerank_mult·fetch_k`, exact-reranked
-            // from `raw_f16` after the last chunk (same as `search_mvcc`).
-            let scan_k =
-                crate::vector::segment::mutable::exact_rerank_depth(fetch_k, tuning.rerank_mult);
+            // The filter is applied exactly in this scan, so it needs `k`, not
+            // the graph legs' HnswPostFilter oversample `fetch_k` (moon#1242:
+            // reranking the ADC top `mult·3k` diverged from `search_mvcc`).
+            // moon#1226: the ADC top `rerank_mult·k`, exact-reranked from
+            // `raw_f16` after the last chunk (same as `search_mvcc`).
+            let scan_k = crate::vector::segment::mutable::exact_rerank_depth(k, tuning.rerank_mult);
             let mut bf_query = segments.mutable.prepare_brute_force_query(
                 query_f32,
                 query_state.is_some(),
@@ -1074,7 +1075,7 @@ impl SegmentHolder {
             let mut mutable_hits = bf_query.into_results();
             segments
                 .mutable
-                .rerank_exact(&mut mutable_hits, query_f32, fetch_k);
+                .rerank_exact(&mut mutable_hits, query_f32, k);
             all.extend(mutable_hits);
         }
 
