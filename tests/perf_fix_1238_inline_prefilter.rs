@@ -198,7 +198,7 @@ fn same_answer_at_every_shard_count(
     one
 }
 
-fn knn_args(query: &'static str) -> [&'static str; 9] {
+fn knn_args(query: &str) -> [&str; 9] {
     [
         "FT.SEARCH",
         "fidx",
@@ -347,6 +347,69 @@ fn an_explicit_filter_clause_is_refused_at_multi_shard_never_dropped() {
         }
         assert_eq!(many[2], one[2], "shards={shards}: unreadable FILTER");
     }
+}
+
+/// The KNN prefilter's input limit (`MAX_KNN_FILTER_CONDITIONS`, 128
+/// conditions; parity with HybridFilter's parse-time limits and a bounded
+/// evaluation cost): a prefilter of exactly 128 conditions is honoured, one of
+/// 129 answers `ERR invalid FILTER expression` — inline or as an explicit
+/// `FILTER` clause, alike at every shard count.
+#[test]
+fn a_prefilter_over_the_condition_limit_is_an_error_at_every_shard_count() {
+    const LIMIT: usize = 128;
+    // `LIMIT - 1` conditions every document meets, then `@lang:{fr}`.
+    let at_limit = format!("{}@lang:{{fr}}", "@year:[2000 +inf] ".repeat(LIMIT - 1));
+    let over_limit = format!("@year:[(1999 2100] {at_limit}");
+    let inline_at = format!("{at_limit}=>[KNN 5 @vec $q]");
+    let inline_over = format!("{over_limit}=>[KNN 5 @vec $q]");
+    let clause = |filter: &str| -> Vec<String> {
+        [
+            "FT.SEARCH",
+            "fidx",
+            "*=>[KNN 5 @vec $q]",
+            "FILTER",
+            filter,
+            "PARAMS",
+            "2",
+            "q",
+            QUERY_VEC,
+            "DIALECT",
+            "2",
+        ]
+        .map(str::to_owned)
+        .to_vec()
+    };
+    let clause_over = clause(&over_limit);
+    let clause_at = clause(&at_limit);
+    let clause_over: Vec<&str> = clause_over.iter().map(String::as_str).collect();
+    let clause_at: Vec<&str> = clause_at.iter().map(String::as_str).collect();
+    let inline_at = knn_args(&inline_at);
+    let inline_over = knn_args(&inline_over);
+    // Answered alike at every shard count; the at-limit FILTER clause is
+    // checked apart, since a FILTER clause is refused at `--shards > 1`.
+    let queries: [&[&str]; 3] = [&inline_at, &inline_over, &clause_over];
+    let one = same_answer_at_every_shard_count("limit", &[], &[], false, &queries);
+    assert_eq!(
+        keys(&one[0]),
+        Some(expect_keys(&[1, 4, 7, 10])),
+        "{LIMIT} conditions: {:?}",
+        one[0]
+    );
+    for reply in &one[1..] {
+        assert_eq!(
+            reply,
+            "-ERR invalid FILTER expression\r\n",
+            "{} conditions",
+            LIMIT + 1
+        );
+    }
+    let clause_one = answers("limit-clause", 1, &[], &[], false, &[&clause_at]);
+    assert_eq!(
+        keys(&clause_one[0]),
+        Some(expect_keys(&[1, 4, 7, 10])),
+        "FILTER, {LIMIT} conditions: {:?}",
+        clause_one[0]
+    );
 }
 
 /// Schema-aware payload mode (`MOON_VECTOR_PAYLOAD_SCHEMA=declared`) with the

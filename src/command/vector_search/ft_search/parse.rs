@@ -304,8 +304,24 @@ fn parse_plain_number(s: &str) -> Option<f64> {
     if v.is_nan() { None } else { Some(v) }
 }
 
+/// The most conditions one KNN prefilter may AND together — the inline
+/// `<prefilter>=>[KNN …]` prefix and the explicit `FILTER` clause alike, since
+/// both are read by `parse_filter_string`. One more is `ERR invalid FILTER
+/// expression`, the reply for any filter that cannot be honoured as written.
+///
+/// An input limit, for parity with the limits `HybridFilter` already puts on
+/// its own filters at parse time (depth 4, 16 leaves; `hybrid_filter.rs`) and
+/// for a bounded evaluation cost: every condition resolves a bitmap over the
+/// index's payload and is intersected with the rest, so the work one query can
+/// ask for grows with the count. This grammar is a flat AND (no OR, NOT or
+/// nesting), so it gets more room than HybridFilter's 16 leaves: 128 is 8×
+/// that, where the prefilters in this repository's scripts and functional
+/// tests use at most two conditions. A flat AND of more conditions has no use
+/// a narrower filter cannot express.
+pub(crate) const MAX_KNN_FILTER_CONDITIONS: usize = 128;
+
 /// Parse filter string like "@field:{value}" or "@field:[min max]" or "@field:[lon lat radius_km]"
-/// Multiple conditions are implicitly ANDed.
+/// Multiple conditions are implicitly ANDed, at most [`MAX_KNN_FILTER_CONDITIONS`] of them.
 /// Datetime filtering: epoch seconds use NumRange -- no special handling needed (FNDN-02).
 fn parse_filter_string(s: &[u8]) -> Option<FilterExpr> {
     let s = std::str::from_utf8(s).ok()?;
@@ -318,6 +334,11 @@ fn parse_filter_string(s: &[u8]) -> Option<FilterExpr> {
         }
         if pos >= s.len() {
             break;
+        }
+        // One more condition than the input limit allows: refused before it
+        // is read (see `MAX_KNN_FILTER_CONDITIONS`).
+        if exprs.len() == MAX_KNN_FILTER_CONDITIONS {
+            return None;
         }
         if s.as_bytes()[pos] != b'@' {
             return None;
@@ -541,4 +562,95 @@ pub(crate) fn parse_as_of_clause(args: &[Frame]) -> Option<i64> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `n` conditions, cycling through every condition kind the grammar reads.
+    fn conditions(n: usize) -> String {
+        const KINDS: [&str; 5] = [
+            "@lang:{fr}",
+            "@year:[2000 +inf]",
+            "@active:{true}",
+            "@year:[(1999 2100]",
+            "@loc:[2.35 48.85 10]",
+        ];
+        (0..n)
+            .map(|i| KINDS[i % KINDS.len()])
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    fn leaves(e: &FilterExpr) -> usize {
+        match e {
+            FilterExpr::And(a, b) => leaves(a) + leaves(b),
+            _ => 1,
+        }
+    }
+
+    fn is_invalid_filter(p: FilterParse) -> bool {
+        match p.into_option() {
+            Err(Frame::Error(msg)) => msg.as_ref() == ERR_INVALID_FILTER,
+            _ => false,
+        }
+    }
+
+    fn filter_clause(filter: &str) -> [Frame; 5] {
+        [
+            Frame::BulkString(Bytes::from_static(b"idx")),
+            Frame::BulkString(Bytes::from_static(b"*=>[KNN 3 @vec $q]")),
+            Frame::BulkString(Bytes::from_static(b"FILTER")),
+            Frame::BulkString(Bytes::from(filter.to_owned())),
+            Frame::BulkString(Bytes::from_static(b"DIALECT")),
+        ]
+    }
+
+    #[test]
+    fn a_prefilter_at_the_condition_limit_parses_every_condition() {
+        for n in [
+            1,
+            2,
+            MAX_KNN_FILTER_CONDITIONS - 1,
+            MAX_KNN_FILTER_CONDITIONS,
+        ] {
+            let s = conditions(n);
+            let e = parse_filter_string(s.as_bytes()).expect("within the limit");
+            assert_eq!(leaves(&e), n, "{n} conditions");
+            // Both entry points accept it.
+            let inline = format!("{s}=>[KNN 3 @vec $q]");
+            match parse_inline_filter(inline.as_bytes()) {
+                FilterParse::Parsed(e) => assert_eq!(leaves(&e), n),
+                other => panic!("inline, {n} conditions: {other:?}"),
+            }
+            match parse_filter_clause(&filter_clause(&s)) {
+                FilterParse::Parsed(e) => assert_eq!(leaves(&e), n),
+                other => panic!("FILTER, {n} conditions: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_prefilter_over_the_condition_limit_is_an_invalid_filter() {
+        for n in [MAX_KNN_FILTER_CONDITIONS + 1, MAX_KNN_FILTER_CONDITIONS + 2] {
+            let s = conditions(n);
+            assert!(
+                parse_filter_string(s.as_bytes()).is_none(),
+                "{n} conditions"
+            );
+            let inline = format!("{s}=>[KNN 3 @vec $q]");
+            assert!(
+                is_invalid_filter(parse_inline_filter(inline.as_bytes())),
+                "inline, {n} conditions: ERR invalid FILTER expression"
+            );
+            assert!(
+                is_invalid_filter(parse_filter_clause(&filter_clause(&s))),
+                "FILTER, {n} conditions: ERR invalid FILTER expression"
+            );
+        }
+        // Trailing whitespace after the last allowed condition is not a condition.
+        let s = format!("{}   ", conditions(MAX_KNN_FILTER_CONDITIONS));
+        assert!(parse_filter_string(s.as_bytes()).is_some());
+    }
 }
