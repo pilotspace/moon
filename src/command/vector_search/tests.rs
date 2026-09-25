@@ -1591,10 +1591,10 @@ fn test_parse_ft_search_args_with_limit() {
         bulk(b"5"),
         bulk(b"20"),
     ];
-    let (_, _, k, _, offset, count) = parse_ft_search_args(&args).unwrap();
-    assert_eq!(k, 10);
-    assert_eq!(offset, 5);
-    assert_eq!(count, 20);
+    let parsed = parse_ft_search_args(&args).unwrap();
+    assert_eq!(parsed.k, 10);
+    assert_eq!(parsed.offset, 5);
+    assert_eq!(parsed.count, 20);
 }
 
 #[test]
@@ -1607,9 +1607,9 @@ fn test_parse_ft_search_args_without_limit() {
         bulk(b"query"),
         bulk(b"blobdata"),
     ];
-    let (_, _, _, _, offset, count) = parse_ft_search_args(&args).unwrap();
-    assert_eq!(offset, 0);
-    assert_eq!(count, usize::MAX);
+    let parsed = parse_ft_search_args(&args).unwrap();
+    assert_eq!(parsed.offset, 0);
+    assert_eq!(parsed.count, usize::MAX);
 }
 
 #[test]
