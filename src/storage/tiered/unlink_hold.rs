@@ -62,8 +62,12 @@ pub struct UnlinkHold {
     active: bool,
     seen_epoch: u64,
     hold_below: u64,
-    /// `(file_id, stamp)`: zero-ref files a replayable generation may read.
-    held: Vec<(u64, u64)>,
+    /// `file_id -> stamp`: zero-ref files a replayable generation may read.
+    /// A map, not a list: one sweep after a FLUSH of a large cold tier admits
+    /// every file of it at once, and deduplicating each against a list was
+    /// O(N^2) on the shard thread (moon#1231 review; 390k files for 100M
+    /// cold keys).
+    held: std::collections::BTreeMap<u64, u64>,
     /// The view for the next decision, consumed by it.
     fresh: Option<FoldView>,
 }
@@ -113,11 +117,12 @@ impl UnlinkHold {
         for file_id in queued {
             if file_id >= self.hold_below {
                 unlink.push(file_id);
-            } else if !self.held.iter().any(|&(f, _)| f == file_id) {
-                self.held.push((file_id, view.epoch));
+            } else {
+                // The first stamp stands: it is the earlier, longer hold.
+                self.held.entry(file_id).or_insert(view.epoch);
             }
         }
-        self.held.retain(|&(file_id, stamp)| {
+        self.held.retain(|&file_id, &mut stamp| {
             let covered = stamp < view.committed_floor;
             if covered {
                 unlink.push(file_id);
@@ -134,21 +139,17 @@ impl UnlinkHold {
     /// file whose every live slot now has a durable copy below the committed
     /// cut, wherever it is queued. Returns the ones that were held.
     pub fn take(&mut self, file_ids: &[u64]) -> Vec<u64> {
-        let mut taken = Vec::new();
-        self.held.retain(|&(file_id, _)| {
-            let hit = file_ids.contains(&file_id);
-            if hit {
-                taken.push(file_id);
-            }
-            !hit
-        });
-        taken
+        file_ids
+            .iter()
+            .copied()
+            .filter(|file_id| self.held.remove(file_id).is_some())
+            .collect()
     }
 
     /// Forget a held file that became referenced again (defensive: ids are
     /// minted once, so only a recovery merge could do it).
     pub fn forget_referenced(&mut self, is_referenced: impl Fn(u64) -> bool) {
-        self.held.retain(|&(file_id, _)| !is_referenced(file_id));
+        self.held.retain(|&file_id, _| !is_referenced(file_id));
     }
 
     /// Files held now.
@@ -166,12 +167,12 @@ impl UnlinkHold {
     /// not below `committed_floor`) — i.e. whether a fold would release
     /// anything that is not already releasable.
     pub fn awaits_fold(&self, committed_floor: u64) -> bool {
-        self.held.iter().any(|&(_, stamp)| stamp >= committed_floor)
+        self.held.values().any(|&stamp| stamp >= committed_floor)
     }
 
     /// Whether `file_id` is held (tests, diagnostics).
     pub fn is_held(&self, file_id: u64) -> bool {
-        self.held.iter().any(|&(f, _)| f == file_id)
+        self.held.contains_key(&file_id)
     }
 
     /// Fold another index's hold state into this one (recovery merges per-db
@@ -182,10 +183,8 @@ impl UnlinkHold {
             self.hold_below = self.hold_below.max(other.hold_below);
             self.seen_epoch = self.seen_epoch.max(other.seen_epoch);
         }
-        for held in other.held {
-            if !self.held.iter().any(|&(f, _)| f == held.0) {
-                self.held.push(held);
-            }
+        for (file_id, stamp) in other.held {
+            self.held.entry(file_id).or_insert(stamp);
         }
     }
 }
@@ -280,6 +279,49 @@ mod tests {
             },
             "the view is consumed by the decision it was taken for"
         );
+    }
+
+    /// moon#1231 review: one sweep after a FLUSH of a large cold tier admits
+    /// every file of it. Deduplicating each against a held LIST was O(N^2):
+    /// 80k files took 9.2 s in a debug build. The best of three runs keeps
+    /// the ratio from being a scheduler artefact.
+    #[test]
+    fn admitting_a_large_batch_is_not_quadratic() {
+        fn time_admit(n: u64) -> std::time::Duration {
+            (0..3)
+                .map(|_| {
+                    let mut h = UnlinkHold::default();
+                    h.observe(view(1, 0, n + 1));
+                    let t = std::time::Instant::now();
+                    let a = h.admit((0..n).collect());
+                    let d = t.elapsed();
+                    assert!(a.unlink.is_empty() && h.len() == n as usize);
+                    d
+                })
+                .min()
+                .unwrap_or_default()
+        }
+        let small = time_admit(20_000);
+        let big = time_admit(80_000);
+        assert!(
+            big < small * 8,
+            "admit of 80k files took {big:?} vs {small:?} for 20k ({:.1}x for 4x the files)",
+            big.as_secs_f64() / small.as_secs_f64().max(f64::MIN_POSITIVE)
+        );
+    }
+
+    /// Admitting a file already held keeps its first (earlier) stamp.
+    #[test]
+    fn a_file_admitted_twice_keeps_its_first_stamp() {
+        let mut h = UnlinkHold::default();
+        h.observe(view(1, 0, 10));
+        assert!(h.admit(vec![4]).unlink.is_empty());
+        h.observe(view(2, 0, 10));
+        assert!(h.admit(vec![4]).unlink.is_empty());
+        assert_eq!(h.len(), 1);
+        // A fold with snapshot epoch 2 commits: the stamp (1) is below it.
+        h.observe(view(3, 2, 10));
+        assert_eq!(h.admit(vec![]).unlink, vec![4]);
     }
 
     #[test]
