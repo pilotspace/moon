@@ -10,6 +10,10 @@ mod compact_write_access_tests;
 mod expiry_index;
 mod hash_ttl;
 mod incr;
+/// moon#1255: an expired in-flight spill record is retired when its key is
+/// answered absent or re-created. Test-only.
+#[cfg(test)]
+mod inflight_expiry_1255_tests;
 mod kv_ops;
 /// moon#1190: per-database lazy-free queue, drained on the shard tick.
 mod lazy_free;
@@ -912,6 +916,16 @@ impl Database {
     #[inline]
     pub fn spill_superseded_bytes(&self) -> usize {
         self.spill_superseded_bytes
+    }
+
+    /// True when `key` has an in-flight record whose TTL has passed at
+    /// `now_ms`: the key is logically expired, but the record still
+    /// authorizes its completion to publish (moon#1255).
+    #[inline]
+    pub fn spill_inflight_expired(&self, key: &[u8], now_ms: u64) -> bool {
+        self.spill_inflight
+            .get(key)
+            .is_some_and(|p| p.ttl_ms.is_some_and(|ttl| now_ms > ttl))
     }
 
     /// Cheap (no disk I/O, no promotion) liveness probe for the in-flight

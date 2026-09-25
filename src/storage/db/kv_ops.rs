@@ -205,11 +205,24 @@ impl Database {
     ///
     /// Every read path that can reach a cold key must call this first, or it
     /// will answer nil for a key that was only ever mid-spill.
+    ///
+    /// An EXPIRED record is retired too (moon#1255), and the answer is
+    /// `false`. The key is logically absent, and every caller then answers it
+    /// absent (a read) or creates it afresh (`get_or_create*` via
+    /// `settle_not_live`). The record, however, is still its request's
+    /// authorization to publish. Left in place, the completion publishes the
+    /// expired slot as the key's cold entry behind the new value and logs its
+    /// `MOON.SPILLED` after the write, and replaying that marker drops the
+    /// acknowledged write. A record whose payload does not rehydrate but has
+    /// not expired is left alone: its spill file is the key's only copy.
     pub fn promote_inflight_if_present(&mut self, key: &[u8], now_ms: u64) -> bool {
         if self.spill_inflight_is_empty() {
             return false;
         }
         let Some(entry) = self.spill_inflight_entry(key, now_ms) else {
+            if self.spill_inflight_expired(key, now_ms) {
+                self.spill_inflight_forget(key);
+            }
             return false;
         };
         self.spill_inflight_forget(key);

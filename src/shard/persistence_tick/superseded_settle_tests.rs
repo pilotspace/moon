@@ -195,3 +195,50 @@ fn every_completion_outcome_settles_its_superseded_request() {
     .join()
     .expect("shard thread");
 }
+
+/// moon#1255, the completion half: a key whose in-flight TTL passed is
+/// re-created by a collection write. The expired record is retired (superseded)
+/// by the write, so its completion must NOT publish the stale slot as the
+/// key's cold entry behind the live list. That publish also logged the
+/// `MOON.SPILLED` marker AFTER the write, and replay then dropped the write.
+#[test]
+fn an_expired_in_flight_record_is_not_published_behind_a_recreated_key() {
+    std::thread::spawn(|| {
+        init_shard(ShardSlice::new(make_init(0, 1)));
+        let tmp = tempfile::tempdir().unwrap();
+        let mut shard_manifest =
+            Some(ShardManifest::create(&tmp.path().join("shard-0.manifest")).unwrap());
+        with_shard_db(0, |db| {
+            db.cold_index = Some(crate::storage::tiered::cold_index::ColdIndex::new());
+            db.spill_inflight_mark(
+                bytes::Bytes::from_static(b"k"),
+                PendingSpill {
+                    req_id: 7,
+                    value_type: ValueType::String,
+                    value_bytes: bytes::Bytes::from_static(b"old"),
+                    ttl_ms: Some(1),
+                },
+            );
+            db.get_or_create_list(b"k")
+                .expect("list")
+                .push_back(bytes::Bytes::from_static(b"a"));
+        });
+        let mut sink = ColdMarkerSink {
+            aof_pool: None,
+            wal_writer: None,
+            shard_id: 0,
+            wal_kv_log: false,
+        };
+        apply_completion_vec(vec![published(7, &[b"k"])], &mut shard_manifest, &mut sink);
+        with_shard_db(0, |db| {
+            assert!(db.is_hot(b"k"), "the RPUSH value is live");
+            assert!(
+                db.cold_index.as_ref().unwrap().lookup(b"k").is_none(),
+                "request 7 published k's EXPIRED slot as its cold entry behind the live list"
+            );
+            assert!(db.spill_superseded_is_empty(), "settled by the completion");
+        });
+    })
+    .join()
+    .expect("shard thread");
+}
