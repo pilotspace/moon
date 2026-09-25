@@ -423,3 +423,72 @@ fn a_transiently_missing_held_file_keeps_its_hold() {
     .join()
     .expect("test thread");
 }
+
+/// PR #1268 review (CodeRabbit): a TopLevel pool maps every shard to ONE
+/// overflow, `overflow[0]`, and its fold snapshots shard 0 only (the C4
+/// `AofFold` goes to shard 0). With more than one shard, a committed TopLevel
+/// fold says nothing about another shard's cold files, so their hold must not
+/// be released by it. No shipped configuration builds that layout (see
+/// `run_cold_orphan_sweep`), so this pins the sweep's own guard: shard 1's
+/// held file stays held — and on disk — after shard 0's fold commits.
+#[test]
+fn a_top_level_fold_releases_nothing_on_another_shard() {
+    std::thread::spawn(|| {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join("shard-1");
+        std::fs::create_dir_all(&dir).expect("dir");
+        let mut manifest = ShardManifest::create(&dir.join("shard-1.manifest")).expect("manifest");
+        let kvs = keys("k", 2);
+        spill(&dir, &mut manifest, OLD, &kvs);
+        let mut ci =
+            crate::storage::tiered::cold_index::ColdIndex::rebuild_from_manifest(&dir, &manifest);
+        // Both keys left the cold index (read-promoted, say): OLD is queued.
+        for (k, _) in &kvs {
+            assert!(ci.remove(k.as_bytes()));
+        }
+        let (shared, mut inits) =
+            ShardDatabases::new(vec![vec![Database::new()], vec![Database::new()]]);
+        init_shard(ShardSlice::new(inits.remove(1)));
+        with_shard_db(0, |db| {
+            db.cold_index = Some(ci);
+            db.cold_shard_dir = Some(dir.clone());
+        });
+        let (tx, _rx) = crate::runtime::channel::mpsc_bounded::<AofMessage>(16);
+        let pool = AofWriterPool::top_level(tx);
+        let counter = Cell::new(CUT);
+        let sweep = |manifest: &mut ShardManifest| {
+            run_cold_orphan_sweep(
+                &shared,
+                1,
+                &dir,
+                Some(manifest),
+                crate::storage::entry::current_time_ms(),
+                Some(&pool),
+                &counter,
+            );
+        };
+        let held = || {
+            with_shard_db(0, |db| {
+                db.cold_index
+                    .as_ref()
+                    .is_some_and(|ci| ci.is_unlink_held(OLD))
+            })
+        };
+
+        // Shard 1's sweep holds OLD (below the cut, no fold committed).
+        sweep(&mut manifest);
+        assert!(held(), "fixture: OLD is held");
+
+        // Shard 0's TopLevel fold snapshots and commits: the shared floor moves.
+        let overflow = pool.overflow_for(0);
+        let floor = overflow.advance_epoch();
+        let _ = FoldOutcome::Committed { floor }.adopt(FoldEpoch::INITIAL, overflow);
+        sweep(&mut manifest);
+        assert!(
+            held() && heap(&dir, OLD).exists() && listed(&manifest, OLD),
+            "shard 0's fold released shard 1's file {OLD}"
+        );
+    })
+    .join()
+    .expect("test thread");
+}

@@ -407,7 +407,9 @@ pub const COLD_ORPHAN_SWEEP_INTERVAL_SECS: u64 = 300;
 /// (`spill_file_id`), read right before the decision on this thread — and a
 /// file a replayable generation may still read is held until a committed fold
 /// covers it (`storage::tiered::unlink_hold`). Without one, files go as soon
-/// as their last key does, as before.
+/// as their last key does, as before. In a TopLevel layout with more than one
+/// shard — which no shipped configuration builds — no committed fold covers
+/// this shard, so held files are never released (see the guard below).
 pub(crate) fn run_cold_orphan_sweep(
     shard_databases: &Arc<super::shared_databases::ShardDatabases>,
     shard_id: usize,
@@ -419,13 +421,32 @@ pub(crate) fn run_cold_orphan_sweep(
 ) {
     use crate::storage::tiered::cold_index::{MAX_EXPIRED_SWEEP_BATCH, SweepStats};
 
+    // A TopLevel pool maps every shard to ONE overflow (`overflow_for` ->
+    // `overflow[0]`), and its fold snapshots shard 0 only (the C4 `AofFold`
+    // goes to shard 0). With more than one shard, a committed TopLevel fold
+    // therefore says nothing about THIS shard's cold files, and releasing
+    // held files on its floor is the moon#1231 loss (PR #1268 review). No
+    // shipped configuration builds that layout — main.rs refuses a TopLevel
+    // manifest at `--shards >= 2` and builds the PerShard pool for a
+    // manifest-less multi-shard boot; the embedded server's TopLevel pool has
+    // no fold channels, so no fold of it ever commits — and the reclaim tick
+    // already stands down there. Should it ever exist, hold: a floor that
+    // never advances releases nothing (files stay on disk, nothing is lost).
+    let floor_covers_this_shard = aof_pool.is_none_or(|pool| {
+        pool.layout() != crate::persistence::aof_manifest::AofLayout::TopLevel
+            || shard_databases.num_shards() <= 1
+    });
     // Read at each decision, never cached across one: see `unlink_hold`.
     let fold_view = || {
         aof_pool.map(|pool| {
             let overflow = pool.overflow_for(shard_id);
             crate::storage::tiered::unlink_hold::FoldView {
                 epoch: overflow.stamp().0,
-                committed_floor: overflow.committed_floor().0,
+                committed_floor: if floor_covers_this_shard {
+                    overflow.committed_floor().0
+                } else {
+                    crate::persistence::aof::FoldEpoch::INITIAL.0
+                },
                 next_file_id: spill_file_id.get(),
             }
         })
