@@ -15,7 +15,7 @@ use crate::persistence::manifest::ShardManifest;
 /// fsync, rename, directory fsync) ON THE SHARD THREAD, so this is kept small
 /// (PR #1233 review: 16 files / 16 MiB per 100 ms tick measured 10–50 ms
 /// stalls): 2 files and 2 MiB per tick still reclaim ~20 files/s. Moving the
-/// writes to the spill thread is the real fix (tracked with moon#1231).
+/// writes to the spill thread is the real fix (moon#1240).
 const FILES_PER_TICK: usize = 2;
 /// Spill-file bytes read per shard tick at most (see [`FILES_PER_TICK`]).
 const READ_BYTES_PER_TICK: u64 = 2 << 20;
@@ -67,7 +67,12 @@ pub(super) fn run(
     let committed = overflow.committed_floor().0;
     let db_count = shard_databases.db_count();
 
-    // 1. Adopt what a committed fold made safe.
+    // 1. Adopt what a committed fold made safe — ONE database per tick: each
+    // database that adopts does one durable manifest commit on this thread,
+    // so the pass is bounded like the compaction pass below (PR #1233
+    // review). A database with ready compactions adopts all of them at once,
+    // so later databases get their turn on the next tick; nothing starves,
+    // and a compaction that waits a tick stays exactly as safe.
     for db_index in 0..db_count {
         let report =
             crate::shard::slice::with_shard_db(db_index, |db| match db.cold_index.as_mut() {
@@ -87,6 +92,7 @@ pub(super) fn run(
                 bytes_unlinked = report.bytes_unlinked,
                 "cold reclaim: adopted compacted spill files after a committed AOF fold"
             );
+            break;
         }
     }
 
