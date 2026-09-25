@@ -374,3 +374,81 @@ fn workspace_drop_during_bgsave_single_shard() {
 fn workspace_drop_during_bgsave_four_shards() {
     workspace_drop_during_bgsave(4);
 }
+
+/// `MQ PUSH` / `MQ POP` / `MQ ACK` while the save walks db 0: every queue
+/// must come back with the three messages it held when the save started.
+/// Before moon#1228 the owner-side MQ subcommands wrote the stream with no
+/// pre-image, so a queue whose range the save had not reached yet came back
+/// with the mid-save push in it.
+fn mq_during_bgsave(shards: usize) {
+    let dir = common::unique_test_dir(&format!("ws16-mq-s{shards}"));
+    let _cleanup = DirGuard(dir.clone());
+    let (mut server, port) = spawn(&dir, shards);
+    let mut c = Conn::open(port);
+    let mut probe = Conn::open(port);
+    const QUEUES: u64 = 64;
+    let q = |i: u64| format!("mq:{i:03}");
+    writes_during_bgsave(
+        &dir,
+        shards,
+        &mut c,
+        &mut probe,
+        1,
+        &mut |c, n| {
+            reset(c, n);
+            for i in 0..QUEUES {
+                assert!(c.send(&["MQ", "CREATE", &q(i)]).starts_with("+OK"));
+                for _ in 0..3 {
+                    let r = c.send(&["MQ", "PUSH", &q(i), "f", "v"]);
+                    assert!(r.starts_with('$'), "MQ PUSH: {r:?}");
+                }
+            }
+        },
+        &mut |_, r| {
+            if r > 0 {
+                return vec![cmd(&["PING"])];
+            }
+            let mut out = Vec::new();
+            for i in 0..QUEUES {
+                out.push(cmd(&["MQ", "PUSH", &q(i), "f", "mid-save"]));
+                out.push(cmd(&["MQ", "POP", &q(i), "COUNT", "1"]));
+            }
+            out
+        },
+    );
+
+    server.kill_now();
+    common::wait_for_port_down(port);
+    let (_server2, port2) = spawn(&dir, shards);
+    let mut c2 = Conn::open(port2);
+    let mut wrong = Vec::new();
+    for i in 0..QUEUES {
+        let len = c2.send(&["XLEN", &q(i)]);
+        let pending = c2.send(&["XPENDING", &q(i), "__mq_consumers"]);
+        if len.trim() != ":3" || !pending.starts_with("*4\r\n:0\r\n") {
+            wrong.push(format!(
+                "{}: XLEN {} XPENDING {:.24}",
+                q(i),
+                len.trim(),
+                pending.replace("\r\n", " ")
+            ));
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "restored snapshot of a save crossed by MQ PUSH/POP (--shards {shards}): {} of \
+         {QUEUES} queues are not at their epoch-start state (first: {:?})",
+        wrong.len(),
+        &wrong[..wrong.len().min(5)]
+    );
+}
+
+#[test]
+fn mq_during_bgsave_single_shard() {
+    mq_during_bgsave(1);
+}
+
+#[test]
+fn mq_during_bgsave_four_shards() {
+    mq_during_bgsave(4);
+}
