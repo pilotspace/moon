@@ -600,6 +600,12 @@ pub(crate) fn handle_shard_message_shared(
                             db_idx,
                             crate::blocking::wakeup::ScriptWakes::Serve(blocking_registry),
                             |db| {
+                                // A routed script runs against a database no
+                                // command on this shard may have refreshed in
+                                // a long while, and every expiry check inside
+                                // it reads that clock: refresh it, as the
+                                // Execute arms do before their dispatch.
+                                db.refresh_now_from_cache(cached_clock);
                                 if is_plain_eval {
                                     crate::scripting::handle_eval(
                                         &vm,
@@ -710,6 +716,9 @@ pub(crate) fn handle_shard_message_shared(
                             db_idx,
                             crate::blocking::wakeup::ScriptWakes::Serve(blocking_registry),
                             |db| {
+                                // Refresh the clock every expiry check in the
+                                // function reads (see the routed EVAL arm).
+                                db.refresh_now_from_cache(cached_clock);
                                 // moon#569 + moon#514: the ACL that travels with
                                 // `ShardMessage::Execute` is the ORIGIN connection's, so a
                                 // routed FCALL authorizes each inner `redis.call` exactly as
