@@ -327,6 +327,10 @@ fn a_restart_bills_a_churned_queue_as_the_live_server_did() {
 /// moon#1261 on a replica (review 5 proof, adopted): master 124,097 B,
 /// replica 28,421 B for the same queue.
 #[test]
+#[cfg_attr(
+    not(feature = "runtime-monoio"),
+    ignore = "needs a replica, which needs a runtime-monoio master (PSYNC)"
+)]
 fn a_replica_bills_a_churned_queue_as_its_master_does() {
     let dir = common::unique_test_dir("ws16-mq-replica-bill");
     let (master, mport) = spawn_with(&dir.join("m"), 1, "no");
@@ -364,6 +368,10 @@ fn a_replica_bills_a_churned_queue_as_its_master_does() {
 /// replay) hold exactly the master's PEL and `last_delivered_id`, and each
 /// serves the rest once, in order.
 #[test]
+#[cfg_attr(
+    not(feature = "runtime-monoio"),
+    ignore = "needs a replica, which needs a runtime-monoio master (PSYNC)"
+)]
 fn a_pop_surplus_release_agrees_on_master_replica_and_restart() {
     let dir = common::unique_test_dir("ws16-mq-pop-prop");
     let (mut master, mport) = spawn_with(&dir.join("m"), 1, "yes");
