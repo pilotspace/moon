@@ -553,9 +553,18 @@ fn spill_single_entry(req: &SpillRequest, file_id: u64) -> SpillCompletion {
 pub struct SpillThread {
     request_tx: flume::Sender<SpillRequest>,
     completion_rx: flume::Receiver<SpillCompletion>,
+    /// Cold-reclaim disk work (moon#1240, `super::reclaim_io`): the shard
+    /// sends reads and writes here so their I/O and fsyncs run on this
+    /// thread, not the event loop.
+    reclaim_tx: flume::Sender<super::reclaim_io::ReclaimJob>,
+    reclaim_done_rx: flume::Receiver<super::reclaim_io::ReclaimDone>,
     join_handle: Option<std::thread::JoinHandle<()>>,
     stop_flag: Arc<AtomicBool>,
 }
+
+/// Reclaim jobs queued for one spill thread at most. The shard sends with
+/// `try_send` and keeps only a few in flight, so this only bounds a bug.
+const RECLAIM_QUEUE_CAP: usize = 64;
 
 impl SpillThread {
     /// Spawn a new background spill thread for the given shard.
@@ -572,6 +581,11 @@ impl SpillThread {
     pub fn new(shard_id: usize) -> Self {
         let (request_tx, request_rx) = flume::bounded::<SpillRequest>(REQUEST_QUEUE_CAP);
         let (completion_tx, completion_rx) = flume::bounded::<SpillCompletion>(8192);
+        let (reclaim_tx, reclaim_rx) =
+            flume::bounded::<super::reclaim_io::ReclaimJob>(RECLAIM_QUEUE_CAP);
+        // Unbounded: at most one answer per job, and jobs are bounded above.
+        let (reclaim_done_tx, reclaim_done_rx) =
+            flume::unbounded::<super::reclaim_io::ReclaimDone>();
         let stop_flag = Arc::new(AtomicBool::new(false));
         let stop_flag_bg = stop_flag.clone();
 
@@ -585,13 +599,20 @@ impl SpillThread {
                 // single-core mask — re-pin to the non-shard core set as the
                 // first act, before anything else runs.
                 crate::shard::numa::pin_current_aux_thread(&format!("spill-{shard_id}"));
-                Self::run(request_rx, completion_tx, stop_flag_bg);
+                Self::run(
+                    request_rx,
+                    completion_tx,
+                    (reclaim_rx, reclaim_done_tx),
+                    stop_flag_bg,
+                );
             })
             .expect("failed to spawn spill thread");
 
         Self {
             request_tx,
             completion_rx,
+            reclaim_tx,
+            reclaim_done_rx,
             join_handle: Some(join_handle),
             stop_flag,
         }
@@ -606,6 +627,10 @@ impl SpillThread {
     fn run(
         request_rx: flume::Receiver<SpillRequest>,
         completion_tx: flume::Sender<SpillCompletion>,
+        (reclaim_rx, reclaim_done_tx): (
+            flume::Receiver<super::reclaim_io::ReclaimJob>,
+            flume::Sender<super::reclaim_io::ReclaimDone>,
+        ),
         stop_flag: Arc<AtomicBool>,
     ) {
         let mut buffer: Vec<SpillRequest> = Vec::with_capacity(FLUSH_ENTRY_CAP);
@@ -641,6 +666,14 @@ impl SpillThread {
                     Self::send_completions(&completion_tx, flush_buffer(&mut buffer), &stop_flag);
                 }
                 break;
+            }
+
+            // moon#1240: cold-reclaim reads and writes queued by the shard.
+            // Polled once per iteration, so a job waits at most one 100 ms
+            // `recv_timeout`; a shutdown drops unserved jobs (their outputs,
+            // if any, are unlisted files the startup orphan sweep removes).
+            while let Ok(job) = reclaim_rx.try_recv() {
+                let _ = reclaim_done_tx.send(super::reclaim_io::run_job(job));
             }
 
             match request_rx.recv_timeout(std::time::Duration::from_millis(100)) {
@@ -740,6 +773,20 @@ impl SpillThread {
                 }
             }
         }
+    }
+
+    /// Queue a cold-reclaim job (moon#1240). Never blocks: the job comes back
+    /// when the queue is full or the thread is gone.
+    pub(crate) fn try_submit_reclaim(
+        &self,
+        job: super::reclaim_io::ReclaimJob,
+    ) -> Result<(), super::reclaim_io::ReclaimJob> {
+        self.reclaim_tx.try_send(job).map_err(|e| e.into_inner())
+    }
+
+    /// Every reclaim answer ready now (non-blocking).
+    pub(crate) fn drain_reclaim_done(&self) -> Vec<super::reclaim_io::ReclaimDone> {
+        self.reclaim_done_rx.try_iter().collect()
     }
 
     /// Get a clone of the request sender for the event loop to hold.

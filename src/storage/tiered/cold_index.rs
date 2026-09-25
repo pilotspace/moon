@@ -999,13 +999,18 @@ impl ColdIndex {
         if admitted.unlink.is_empty() {
             return Ok(0);
         }
-        self.unlink_queued(admitted.unlink, shard_dir, manifest)
+        self.unlink_queued(admitted.unlink, shard_dir, manifest, false)
     }
 
     /// [`Self::drain_pending_unlink`] for exactly the queued files among
     /// `file_ids`; every other queued file stays queued for the orphan
     /// sweep. The reclaim uses it to unlink the files it just emptied
     /// without advancing the sweep's own schedule for anything else.
+    ///
+    /// Its tombstone commit is DEFERRED (moon#1240: the reclaim runs from the
+    /// shard's tick and must not wait for an fsync): a lost one leaves a
+    /// listed-but-missing file, which recovery counts (`files_missing`) and
+    /// retires — the same window the orphan sweep's unlink-then-commit has.
     ///
     /// It bypasses the moon#1231 hold, including for a file already held:
     /// the caller must know that no replayable generation reads the file —
@@ -1025,7 +1030,7 @@ impl ColdIndex {
         if now.is_empty() {
             return Ok(0);
         }
-        self.unlink_queued(now, shard_dir, manifest)
+        self.unlink_queued(now, shard_dir, manifest, true)
     }
 
     fn unlink_queued(
@@ -1033,6 +1038,7 @@ impl ColdIndex {
         mut queued: Vec<u64>,
         shard_dir: &Path,
         mut manifest: Option<&mut crate::persistence::manifest::ShardManifest>,
+        deferred_commit: bool,
     ) -> std::io::Result<u64> {
         let data_dir = shard_dir.join("data");
         queued.sort_unstable();
@@ -1086,7 +1092,12 @@ impl ColdIndex {
         // Single manifest commit for all tombstones in this drain.
         if manifest_dirty {
             if let Some(m) = manifest {
-                if let Err(e) = m.commit() {
+                let committed = if deferred_commit {
+                    m.commit_deferred()
+                } else {
+                    m.commit()
+                };
+                if let Err(e) = committed {
                     tracing::error!(err = %e, "orphan_sweep: manifest commit failed");
                     return Err(e);
                 }

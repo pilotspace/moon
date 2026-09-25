@@ -733,6 +733,7 @@ pub(crate) fn run_eviction_tick(
         next_file_id,
         offload_shard_dir,
         aof_pool,
+        spill_thread,
         cascade_ledger_bytes,
     );
     if server_config.disk_offload_enabled()
@@ -2350,6 +2351,9 @@ mod fold_inflight_tests;
 
 #[cfg(test)]
 mod ghost_slot_tests;
+
+#[cfg(test)]
+mod reclaim_offload_tests;
 
 #[cfg(test)]
 mod tests {
