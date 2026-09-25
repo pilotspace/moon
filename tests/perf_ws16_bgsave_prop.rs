@@ -582,9 +582,12 @@ fn a_pipelined_flush_of_a_grown_and_an_ungrown_db_keeps_the_save() {
              current_cow_size {cow}; rdb_changes_since_last_save {changes_before} -> \
              {changes_after} (removed 210 + 200 keys)"
         );
-        // The reviewer also pinned moon#1232 here (the flushes count their 410
-        // removed keys, once, in `rdb_changes_since_last_save`); that counting
-        // lands with part 4, which this branch has not merged.
+        // moon#1232: the flushes count their 410 removed keys, once.
+        assert_eq!(
+            changes_after - changes_before,
+            410,
+            "the flushes count their keys, once"
+        );
         assert_eq!(cow, "0");
         // Recovery after whatever happened: the next save completes.
         assert!(c.send(&["SELECT", "0"]).starts_with("+OK"));
