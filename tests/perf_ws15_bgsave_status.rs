@@ -8,9 +8,12 @@
 //! `SHUTDOWN SAVE` was refused with "background save error", because it
 //! reads the same flag after its own, successful, save); and a BGSAVE on a
 //! server with no persistence directory never finished
-//! (`rdb_bgsave_in_progress:1` forever). (That a sharded auto-save is now a
-//! counted save is unit-tested in `command::persistence`: in the shipped
-//! sharded server `--save` rules never fire at all — a separate finding.)
+//! (`rdb_bgsave_in_progress:1` forever). PR #1233 review: such a server now
+//! refuses BGSAVE and `SHUTDOWN SAVE` up front with an error, instead of
+//! answering "Background saving started" for a save that must fail. (That a
+//! sharded auto-save is now a counted save is unit-tested in
+//! `command::persistence`: in the shipped sharded server `--save` rules never
+//! fire at all — a separate finding.)
 //!
 //! Runs at `--shards 1` and `--shards 4`. Pin the binary:
 //! `MOON_BIN=<moon> cargo test --test perf_ws15_bgsave_status`.
@@ -223,28 +226,37 @@ fn bgsave_status_recovers_after_a_failed_save_shards_4() {
     failed_then_clean_save(4);
 }
 
-/// With no persistence directory (`--appendonly no`, no `--save`) a BGSAVE
-/// cannot write; it must end — as a failure — instead of staying in
-/// progress forever and refusing every later BGSAVE.
+/// With no persistence directory (`--appendonly no`, no `--save`) no shard
+/// can write a snapshot. BGSAVE and `SHUTDOWN SAVE` are refused up front with
+/// an error (PR #1233 review) — not "Background saving started" for a save
+/// that then fails (`rdb_last_bgsave_status:err`, and `SHUTDOWN SAVE`
+/// refused with "background save error"), and not a save stuck in progress
+/// forever (moon#1230). Nothing is marked in progress, the last status stays
+/// `ok`, the server stays up, and a later BGSAVE is refused the same way.
 #[test]
-fn bgsave_without_a_persistence_dir_fails_instead_of_hanging() {
+fn bgsave_without_a_persistence_dir_is_refused_up_front() {
     for shards in [1usize, 4] {
         let dir = common::unique_test_dir(&format!("ws15-1230-nodir-s{shards}"));
         std::fs::create_dir_all(&dir).unwrap();
         let (_server, port) = spawn(&dir, shards, &[]);
         let mut c = Conn::open(port);
         c.send(&["SET", "k", "v"]);
-        assert!(c.send(&["BGSAVE"]).contains("Background saving started"));
-        assert_eq!(
-            wait_bgsave(&mut c, Duration::from_secs(10)),
-            "err",
-            "--shards {shards}: nothing was written, so the save failed"
-        );
+        for attempt in 0..2 {
+            let reply = c.send(&["BGSAVE"]);
+            assert!(
+                reply.starts_with("-ERR background save unavailable"),
+                "--shards {shards} attempt {attempt}: BGSAVE must be refused up front: {reply:?}"
+            );
+            assert_eq!(info_field(&mut c, "rdb_bgsave_in_progress"), "0");
+            assert_eq!(info_field(&mut c, "rdb_last_bgsave_status"), "ok");
+        }
+        let reply = c.send(&["SHUTDOWN", "SAVE"]);
         assert!(
-            c.send(&["BGSAVE"]).contains("Background saving started"),
-            "--shards {shards}: the next BGSAVE must not be refused as in progress"
+            reply.starts_with("-ERR background save unavailable"),
+            "--shards {shards}: SHUTDOWN SAVE must be refused with the same error: {reply:?}"
         );
-        let _ = wait_bgsave(&mut c, Duration::from_secs(10));
+        assert_eq!(c.send(&["PING"]), "+PONG\r\n", "the server stays up");
+        assert!(c.send(&["GET", "k"]).contains('v'));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
