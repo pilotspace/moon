@@ -849,6 +849,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "text-index")]
     fn with_taat_block<R>(block: Option<u32>, f: impl FnOnce() -> R) -> R {
         let prev = TAAT_BLOCK_OVERRIDE.with(|c| c.replace(block));
         let out = f();
