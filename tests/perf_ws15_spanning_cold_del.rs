@@ -9,7 +9,8 @@
 //! once, in a NON-ZERO database, with same-named decoys in db 0:
 //!
 //!   db 0: probe:i = Z… (decoys, never touched) ; db 3: probe:i = P…
-//!   filler in db 3 -> probes spill cold
+//!   filler in db 3 -> probes spill cold, and the DELs follow AT ONCE, so
+//!   some probes are still in flight (moon#1253)
 //!   db 3: spanning DEL of the even probes (half as DEL, half as UNLINK)
 //!   BGREWRITEAOF -> every shard's new incr head must carry its OWN keys' DELs
 //!   SIGKILL -> restart -> db 3 even probes absent, odd intact, db 0 intact.
@@ -187,9 +188,18 @@ fn run(shards: usize) {
         assert_eq!(c.send(&["SET", &format!("probe:{i}"), &live]), "+OK\r\n");
     }
     filler_db3(port);
-    std::thread::sleep(Duration::from_secs(8));
+    // No settle (moon#1253): the deletes land while eviction is still
+    // spilling probes, so some are cold, some hot and some IN FLIGHT at
+    // their DEL. The in-flight ones are the case an 8 s settle used to hide
+    // on a fast host and a slow Windows runner still hit (3 of 100 back):
+    // a rewrite folded before their spill's completion carried no head DEL
+    // for them. Only wait until something is on disk.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while heap_files(&dir) == 0 {
+        assert!(Instant::now() < deadline, "precondition: nothing spilled");
+        std::thread::sleep(Duration::from_millis(20));
+    }
     let heaps = heap_files(&dir);
-    assert!(heaps > 0, "precondition: nothing spilled");
 
     // Spanning deletes in db 3: 50 keys per command (every command spans all
     // owners at --shards 4), even probes 0..100 via DEL, 100..200 via UNLINK.
