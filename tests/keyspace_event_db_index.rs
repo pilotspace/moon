@@ -1,12 +1,17 @@
 //! A keyspace event names the database the command RAN in.
 //!
 //! `Database::db_index` is the number `__keyspace@<db>__` / `__keyevent@<db>__`
-//! carry, and command code reads it from the database it was handed.
-//! `SWAPDB` (`DbPlane::swap`, AOF replay, the single-listener handler)
-//! replaced a database's CONTENTS and took the number along: after
-//! `SWAPDB 0 3`, a `DEL` in db 0 published `__keyevent@3__:del`. redis 7.0.15
-//! publishes `@0`. Part 3b memory review S2; the root cause predates part 3b
-//! (`set` events at `--shards 4` were wrong the same way on ae21476).
+//! carry, and command code reads it from the database it was handed. Two
+//! places replaced a database's CONTENTS and took the number along:
+//!
+//! - `SWAPDB` (`DbPlane::swap`, AOF replay, the single-listener handler):
+//!   after `SWAPDB 0 3`, a `DEL` in db 0 published `__keyevent@3__:del`. redis
+//!   7.0.15 publishes `@0`. Part 3b memory review S2; the root cause predates
+//!   part 3b (`set` events at `--shards 4` were wrong the same way on
+//!   ae21476).
+//! - `rdb::load` (`*live = temp`, a fresh `Database::new()` whose index is 0):
+//!   after a restart from an AOF with an RDB base, every event from db 3
+//!   named db 0.
 //!
 //! Pin the binary: `MOON_BIN=<moon> cargo test --test keyspace_event_db_index`.
 #![cfg(unix)]
@@ -16,7 +21,7 @@ mod common;
 
 use std::collections::BTreeMap;
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use common::{Conn, ServerGuard};
 
@@ -127,4 +132,78 @@ fn swapdb_events_name_the_db_the_command_ran_in_shards_1() {
 #[test]
 fn swapdb_events_name_the_db_the_command_ran_in_shards_4() {
     swapdb_events_name_the_db_the_command_ran_in(4);
+}
+
+/// Poll `INFO persistence` until no AOF rewrite is in progress.
+fn wait_rewrite_done(c: &mut Conn) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let info = c.send(&["INFO", "persistence"]);
+        if info.contains("aof_rewrite_in_progress:0") && !info.contains("aof_rewrite_scheduled:1") {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "AOF rewrite never finished: {info}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn events_after_a_restart_from_an_aof_base(shards: usize) {
+    let dir = common::unique_test_dir(&format!("keyevent-db-restart-s{shards}"));
+    std::fs::create_dir_all(&dir).unwrap();
+    let args = [
+        "--appendonly",
+        "yes",
+        "--appendfsync",
+        "always",
+        "--save",
+        "",
+    ];
+    let (mut guard, port) = spawn(&dir, shards, &args);
+    let mut c = Conn::open(port);
+    assert_eq!(c.send(&["SELECT", "3"]), "+OK\r\n");
+    assert_eq!(c.send(&["SET", "seed", "v"]), "+OK\r\n");
+    let reply = c.send(&["BGREWRITEAOF"]);
+    assert!(reply.starts_with('+'), "BGREWRITEAOF: {reply:?}");
+    std::thread::sleep(Duration::from_millis(200));
+    wait_rewrite_done(&mut c);
+    drop(c);
+    guard.kill_now();
+
+    // The seed now lives in the AOF's RDB base, loaded by `rdb::load`.
+    let (guard, port) = spawn(&dir, shards, &args);
+    let mut c = Conn::open(port);
+    assert_eq!(
+        c.send(&["CONFIG", "SET", "notify-keyspace-events", "KEA"]),
+        "+OK\r\n"
+    );
+    let mut sub = keyevent_subscriber(port);
+    assert_eq!(c.send(&["SELECT", "3"]), "+OK\r\n");
+    assert_eq!(
+        c.send(&["GET", "seed"]),
+        "$1\r\nv\r\n",
+        "the base was loaded"
+    );
+    assert_eq!(c.send(&["DEL", "seed"]), ":1\r\n");
+    let got = events(&mut sub, 1);
+    assert_eq!(
+        got.get("__keyevent@3__:del"),
+        Some(&vec!["seed".to_string()]),
+        "--shards {shards}: after a restart from an AOF base, DEL in db 3 \
+         published {got:?}"
+    );
+    drop(guard);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn events_name_the_right_db_after_a_restart_from_an_aof_base_shards_1() {
+    events_after_a_restart_from_an_aof_base(1);
+}
+
+#[test]
+fn events_name_the_right_db_after_a_restart_from_an_aof_base_shards_4() {
+    events_after_a_restart_from_an_aof_base(4);
 }

@@ -428,12 +428,28 @@ pub fn load(databases: &mut [Database], path: &Path) -> Result<usize, MoonError>
 
     // Recalculate memory on temp databases, then swap into live ones.
     // Only reached if all entries parsed successfully — no partial state.
+    // The slot keeps its `db_index` (see `keep_slot_identity`).
     for (live, mut temp) in databases.iter_mut().zip(temp_dbs.into_iter()) {
         temp.recalculate_memory();
+        keep_slot_identity(live, &mut temp);
         *live = temp;
     }
 
     Ok(total_keys)
+}
+
+/// Carry the live slot's `db_index` onto the freshly loaded database that
+/// replaces it wholesale (`*live = temp`).
+///
+/// `temp` is a `Database::new()`, whose `db_index` is 0. The index names the
+/// logical db in keyspace notifications, so a load that replaced db 3 left
+/// every later `del` in db 3 published as `__keyevent@0__:del` — measured
+/// after a restart from a multi-part AOF with an RDB base. Unlike the cold
+/// wiring (`shard_replay::take_cold_wiring`), the index is right for EVERY
+/// caller — local replay, replica full sync, `DEBUG RELOAD`: it is which
+/// slot this is, not state that came with the old contents.
+fn keep_slot_identity(live: &Database, temp: &mut Database) {
+    temp.db_index = live.db_index;
 }
 
 /// Fast first-pass: count entries per database without parsing values.
@@ -1049,8 +1065,10 @@ pub fn load_from_bytes(
 
     // Recalculate memory on temp databases, then swap into the live ones.
     // Only reached if all entries parsed successfully — no partial state.
+    // The slot keeps its `db_index` (see `keep_slot_identity`).
     for (live, mut temp) in databases.iter_mut().zip(temp_dbs.into_iter()) {
         temp.recalculate_memory();
+        keep_slot_identity(live, &mut temp);
         *live = temp;
     }
 
