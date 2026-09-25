@@ -96,7 +96,11 @@ Every item is addressed, one commit each; NOTES.md has the table.
 5. **MQ now refuses under maxmemory:** MQ CREATE and PUSH answer `-OOM` over the limit, as XADD does. This is a behaviour change for the CHANGELOG.
 6. **Artifact aliasing:** one unpinned run executed another tree's binary. Every result above names a pinned binary.
 7. **File sizes:** spsc_handler.rs (4,970), shared_databases.rs (2,724, +92 in review 5: the apply and its test) and storage/db/mod.rs (3,848, +11) were already over the limit. mq_exec.rs is at 1,094 after its tests moved out; stream.rs is at 1,462.
-8. **Residuals** (in NOTES):
+8. **By design, pre-existing (review 6, P1):** the RRDSHARD file holds hot keys only.
+   - Cold-tier keys (`--disk-offload`) live in the cold tier's own heap files and manifest, and recovery reads them from there.
+   - Spill-in-flight keys finish in the cold tier.
+   - A restore from the RRDSHARD file alone has neither kind.
+9. **Residuals** (in NOTES):
    - eviction takes no pre-image (the moon#1185 blocker, and a point-in-time gap for evicted keys);
    - the TXN.ABORT undo needs a decision;
    - ~~the replica MQ PEL bytes are untracked~~: review 4 called it a replica-only under-count; it was an over-credit on replay AND on the replica. Fixed in review 5 (moon#1261);

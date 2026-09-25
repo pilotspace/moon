@@ -517,6 +517,23 @@ replica).
   adopted without its MULTI leg, moon#1262): master, replica and restart hold the same PEL
   and cursor, and serve the rest once, in order. It passed before and after.
 
+## Review 6, P1 — what the RRDSHARD file does not hold (pre-existing, by design)
+
+The snapshot walk (`SnapshotState::advance_segment_inner`) serializes each database's HOT
+table, the DashTable, and nothing else:
+- **Cold-tier keys** (`--disk-offload`, in `cold_index`) are never in the RRDSHARD file. They
+  live in the cold tier's own heap files and manifest, which recovery reads separately
+  (`storage::tiered::cold_index` recovery). A restore from the RRDSHARD file ALONE, as the
+  real-server capture tests do with `--disk-offload disable`, has no cold keys.
+- **Spill-in-flight keys** are also absent: keys evicted to the cold tier whose spill has not
+  completed, whose payload is pinned by the in-flight record (`spill_inflight`). The spill
+  completes into the cold tier, or a DEL / overwrite retires the record (#459, moon#1253).
+- A frozen table (FLUSHDB during a save) holds hot rows only, so the same applies to it; the
+  bill excludes spill-in-flight bytes (52544bf3).
+
+No change here. Documented because the property tests judge the file against the hot
+keyspace: they run with offload disabled, so every key is hot.
+
 ## Capture-site audit table (WS12's table, updated at the end of WS16)
 
 Every path that mutates a key's table entry while a BGSAVE epoch may be armed, and how the
