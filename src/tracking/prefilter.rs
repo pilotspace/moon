@@ -107,3 +107,16 @@ pub(crate) fn bucket_count(key: &[u8]) -> u32 {
 pub(crate) fn prefix_count() -> usize {
     BCAST_PREFIXES.load(Ordering::SeqCst)
 }
+
+/// Serializes the unit tests that raise [`BCAST_PREFIXES`] against the ones
+/// that assert a write provably skips the table lock.
+///
+/// The counters are process-global and the test harness runs tests on
+/// parallel threads. While a BCAST registration is live, [`global_may_track`]
+/// answers `true` for EVERY key — correctly — so a concurrent
+/// `untracked_write_takes_no_global_table_lock` sees its worker take the lock
+/// its own thread holds and miss the deadline. Every test that registers a
+/// prefix on a GLOBAL table, or that needs the lock-free "no" for an
+/// untracked key, holds this for its whole body.
+#[cfg(test)]
+pub(crate) static GLOBAL_COUNTERS_TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
