@@ -621,7 +621,9 @@ pub(crate) fn run_eviction_tick(
             .store(pagecache_bytes, Ordering::Relaxed);
     }
 
-    {
+    // The shard's dead-slot ledger bytes, excluded from the pressure-cascade
+    // trigger below.
+    let cascade_ledger_bytes = {
         let rt = runtime_config.read();
         // C5 / Phase 3: compute per-shard KV memory via ShardSlice under one
         // batch of SHARED db guards (estimated_memory() is an O(1) accumulator
@@ -639,14 +641,20 @@ pub(crate) fn run_eviction_tick(
         // Database::estimated_memory()/resident_bytes() themselves, which
         // stay untouched O(1) hot-path reads for the per-write eviction
         // pre-gate (inline_write_can_skip_eviction / evict_to_budget).
-        let used = crate::shard::slice::with_shard(|s| {
+        //
+        // `ci.resident_bytes()` includes the dead-slot ledger (moon#1215): it
+        // is resident RAM, so `used_memory` and the elastic budget count it.
+        // The pressure cascade does not (`ledger_bytes`, PR #1233 review): no
+        // step of the cascade can free a ledger byte.
+        let (used, ledger) = crate::shard::slice::with_shard(|s| {
             s.databases.with_all_read(|dbs| {
-                dbs.iter()
-                    .map(|db| {
-                        db.estimated_memory()
-                            + db.cold_index.as_ref().map_or(0, |ci| ci.resident_bytes())
-                    })
-                    .sum::<usize>()
+                dbs.iter().fold((0usize, 0usize), |(used, ledger), db| {
+                    let ci = db.cold_index.as_ref();
+                    (
+                        used + db.estimated_memory() + ci.map_or(0, |ci| ci.resident_bytes()),
+                        ledger + ci.map_or(0, |ci| ci.dead_slot_bytes()),
+                    )
+                })
             })
         });
         shard_databases.publish_memory(shard_id, used);
@@ -654,7 +662,8 @@ pub(crate) fn run_eviction_tick(
         if rt.maxmemory > 0 {
             shard_databases.recompute_elastic_budget(shard_id, &rt);
         }
-    }
+        ledger
+    };
 
     // task #58 (LOW-1): publish `allocator_overhead_bytes` = RSS - tracked_sum
     // on this 100ms tick instead of only computing it on-demand (MEMORY
@@ -709,6 +718,7 @@ pub(crate) fn run_eviction_tick(
             shard_databases,
             shard_id,
             vector_resident_bytes,
+            cascade_ledger_bytes,
         )
     {
         handle_memory_pressure(
@@ -1196,12 +1206,19 @@ const PRESSURE_OFFLOAD_IDLE_SECS: u64 = 60;
 ///
 /// Returns `true` when the pressure cascade should run. Uses actual
 /// aggregate database memory estimate vs maxmemory * threshold.
+/// `ledger_bytes`: this shard's cold dead-slot ledger (moon#1215), which the
+/// published figure includes but no cascade step can free — page-cache
+/// eviction, vector demotion and KV eviction all leave it untouched. Counting
+/// it here fired the cascade on every tick once deletes left a large ledger
+/// behind, pushing live data to disk for nothing (PR #1233 review). Write
+/// admission charges it instead (`eviction::evict_to_budget`).
 pub(crate) fn should_run_pressure_cascade(
     runtime_config: &std::sync::Arc<parking_lot::RwLock<crate::config::RuntimeConfig>>,
     server_config: &std::sync::Arc<crate::config::ServerConfig>,
     shard_databases: &std::sync::Arc<super::shared_databases::ShardDatabases>,
     shard_id: usize,
     vector_resident_bytes: usize,
+    ledger_bytes: usize,
 ) -> bool {
     let rt = runtime_config.read();
     if rt.maxmemory == 0 {
@@ -1228,6 +1245,7 @@ pub(crate) fn should_run_pressure_cascade(
     // segments only ever offloaded on the wall-clock idle timer.
     let used = shard_databases
         .published_shard_memory(shard_id)
+        .saturating_sub(ledger_bytes)
         .saturating_add(vector_resident_bytes);
     used > threshold
 }
@@ -2276,6 +2294,9 @@ pub(crate) fn handle_checkpoint_tick(
 mod checkpoint_tick_tests;
 
 #[cfg(test)]
+mod cascade_ledger_tests;
+
+#[cfg(test)]
 mod fold_inflight_tests;
 
 #[cfg(test)]
@@ -2639,7 +2660,7 @@ mod tests {
         // Below the 85% threshold (e.g. 50%): must NOT trigger the cascade.
         shared.publish_memory(0, (1024 * 1024) / 2);
         assert!(
-            !should_run_pressure_cascade(&runtime_config, &server_config, &shared, 0, 0),
+            !should_run_pressure_cascade(&runtime_config, &server_config, &shared, 0, 0, 0),
             "50% used_memory must stay below the 85% disk-offload-threshold"
         );
 
@@ -2648,7 +2669,7 @@ mod tests {
         // whole point of WS3 priority 3.
         shared.publish_memory(0, (1024 * 1024 * 90) / 100);
         assert!(
-            should_run_pressure_cascade(&runtime_config, &server_config, &shared, 0, 0),
+            should_run_pressure_cascade(&runtime_config, &server_config, &shared, 0, 0, 0),
             "90% used_memory must cross the 85% disk-offload-threshold and \
              trigger the pressure cascade well before maxmemory is reached"
         );
@@ -2663,7 +2684,7 @@ mod tests {
             let runtime_config2 = Arc::new(parking_lot::RwLock::new(rt2));
             shared.publish_memory(0, usize::MAX / 2);
             assert!(
-                !should_run_pressure_cascade(&runtime_config2, &server_config, &shared, 0, 0),
+                !should_run_pressure_cascade(&runtime_config2, &server_config, &shared, 0, 0, 0),
                 "no memory limit configured => no pressure possible"
             );
         }
@@ -2691,7 +2712,7 @@ mod tests {
         // KV memory is trivial (well under the 85% threshold on its own)...
         shared.publish_memory(0, 1024);
         assert!(
-            !should_run_pressure_cascade(&runtime_config, &server_config, &shared, 0, 0),
+            !should_run_pressure_cascade(&runtime_config, &server_config, &shared, 0, 0, 0),
             "KV alone is far below threshold => no cascade without vector accounting"
         );
 
@@ -2699,7 +2720,7 @@ mod tests {
         // pushing total past the 85% (~892 KiB) threshold.
         let vec_bytes = (1024 * 1024 * 93) / 100;
         assert!(
-            should_run_pressure_cascade(&runtime_config, &server_config, &shared, 0, vec_bytes),
+            should_run_pressure_cascade(&runtime_config, &server_config, &shared, 0, vec_bytes, 0),
             "vector resident memory must contribute to the pressure trigger"
         );
     }

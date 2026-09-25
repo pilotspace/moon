@@ -366,6 +366,14 @@ impl ColdIndex {
         &self.dead
     }
 
+    /// The ledger's resident bytes — the part of [`Self::resident_bytes`] no
+    /// eviction can free (PR #1233 review: charged at write admission, kept
+    /// out of the eviction and pressure-cascade targets). O(1).
+    #[inline]
+    pub fn dead_slot_bytes(&self) -> usize {
+        self.dead.resident_bytes()
+    }
+
     /// Record a slot of `key` in `file_id` that never became its entry here —
     /// a spill completion that published `file_id` for OTHER keys while this
     /// one was superseded or withdrawn (a ghost slot, moon#1215). `ttl_ms` is
