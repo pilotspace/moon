@@ -38,6 +38,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **BEHAVIOUR CHANGE — DEL/UNLINK of a key whose TTL has passed answers 0 and publishes `expired`, not `del`** (moon#1234 review), on the plain, spanning, MULTI and Lua paths, as redis 7.0.15 does. The deletion still reaches the AOF and replicas.
+- **BEHAVIOUR CHANGE — a KNN prefilter accepts up to 128 conditions.** More answers `ERR invalid FILTER expression` (inline `…=>[KNN …]` and `FILTER`, at every shard count).
+- **BEHAVIOUR CHANGE — `XSETID` below the stream's top entry is refused** with redis's error (moon#1249). Before, a later `XADD *` could overwrite existing entries. Replaying an old AOF that contains such an XSETID now keeps the original entries.
+- **BEHAVIOUR CHANGE — multi-shard `FT.SEARCH` honours an inline KNN prefilter** (moon#1238).
+  - At `--shards > 1` the scatter used to drop the `@field:{v}` prefix of `@field:{v}=>[KNN …]` and return the nearest documents unfiltered. These queries now return what `--shards 1` returns.
+  - An unparseable prefilter now answers `ERR invalid FILTER expression` instead of rows.
+  - A shard that cannot evaluate the prefilter fails the query rather than being skipped.
+  - An explicit `FILTER` clause is still refused at `--shards > 1`.
+- **BEHAVIOUR CHANGE — a full-text KNN prefilter that cannot be evaluated is refused, not answered empty** (moon#1226).
+  - This applies with `MOON_VECTOR_PAYLOAD_TEXT=off`, in a build without `text-index`, and for a text match on a field the declared schema does not index. Before, an `@field:{multi word}` prefilter silently matched nothing.
+  - It now returns `ERR full-text KNN filter …` on every search path.
+  - `FT.INFO` reports `payload_text_index on|off`.
+- **BEHAVIOUR CHANGE — a `SCRIPT LOAD` that cannot reach every shard answers `-MOONERR partialfanout …`** (moon#567). Before, it returned a sha that some shards would answer `NOSCRIPT` for.
+- **BEHAVIOUR CHANGE — list and set moves refuse with `-IOERR` before popping when an endpoint's cold-tier copy cannot be read** (moon#1225). This covers `LMOVE`, `RPOPLPUSH`, `BLMOVE`, `BRPOPLPUSH`, `LMPOP`, `BLMPOP` and `SMOVE`. Before, the element was popped and returned, but its push onto the unreadable destination was dropped, so it was gone from both keys.
 - **BEHAVIOUR CHANGE — a BGSAVE crossed by FLUSHDB / FLUSHALL / SWAPDB on a database it has not
   finished now fails** (moon#1224) — error log, `rdb_last_bgsave_status:err`, the previous snapshot
   file kept — instead of panicking the shard (FLUSH*) or writing a mixed file (SWAPDB). A replica full
@@ -203,6 +217,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Performance
 
+2026-09 performance review fix wave, part 3b (index moon#1199). Evidence is in
+`.add/milestones/v0-9-2-perf-review/plans/{WS7,WS10,WS17,WS18,FIX-1238}-*/SUMMARY.md`. The A/Bs are relative, from a shared
+4-vCPU Linux container; re-measure on the GCE rig before quoting them.
+
+- **The connection hot path takes no process-global lock per batch** (moon#1175, moon#1165, moon#1176, moon#1178, moon#1198).
+  - `CLIENT PAUSE` costs one relaxed load per batch unless a pause may be in force, and query-buffer ceilings are read once per connection.
+  - After an ACL change, existing connections re-resolve their cached ACL at the top of the next batch. Before, one `ACL SETUSER` cost every existing connection its inline GET/SET path for life: GET went from −36…−39 % to −1…+7 %. Revocations still apply on the next command.
+  - Once a replica attaches, writes issue LSNs and record replication without the `ReplicationState` lock.
+  - Prometheus counters live in per-thread slots and are published at scrape time, so `--admin-port` now costs GET about 0 % instead of about −11 %. That delta is within this box's noise: the exporter leg's own repetitions spread +1/−1/+29 %. Histogram upkeep runs every 5 s, so an unscraped exporter no longer grows without bound.
+  - Read-only peeks on the inline paths take the shared db guard.
+- **One idle `CLIENT TRACKING` client no longer slows every writer** (moon#1166, partial).
+  - Writes to keys nobody tracks skip the tracking lock.
+  - The inline SET path stays enabled under tracking.
+  - SET with an idle tracker went from −39 % to −11 % (redis: −9 %). Table striping remains open.
+- **Lists** (moon#1212, moon#1226).
+  - LPUSHX, RPUSHX and the blocking serve path keep small lists in listpack form, and SORT reads listpack elements borrowed.
+  - Listpack buffers grow to the allocator size class of the new length instead of doubling: a capped list went from 3,791 to 2,257 B/key (redis 2,224).
+  - `RPOP key n` and `LMPOP … RIGHT COUNT n` cut the tail once, and `SRANDMEMBER key -N` on a listpack set copies each member once.
+- **Vector** (moon#1226, moon#1228).
+  - The mutable segment is exact-reranked from its f16 rows: far-query R@10 went from 0.70 to 0.99 on the test fixture, at 1.6–1.7× the mutable-scan CPU (measured at K=10 only). Under a broad filter (HnswPostFilter), the rerank depth is the same k on every search path, so a plain FT.SEARCH returns the same documents as the same query with RANGE or SESSION.
+  - `PreparedTqQuery` is built only for queries that span two or more graph segments.
+  - A declared-TEXT KNN filter resolves membership by bitmap, 1.9× faster.
+  - The HNSW prefetch covers misaligned code rows.
+- **Text** (moon#1226): term-at-a-time scoring uses a bounded scratch, query leaves are found by binary search, TopK sorts once when k covers every match, and posting runs no longer keep twice their memory.
+- **Shard upkeep** (moon#1198, moon#1226).
+  - Hot-key sampling uses a per-thread tick, stream IDs render without `format!`, and KEYS no longer clones or probes per key.
+  - The 1 ms lazy-free tick is gated per shard.
+  - Each tokio AOF writer's buffer is 2 MiB instead of 8 MiB.
+
 2026-09 performance review fix wave, part 3a (index moon#1199; evidence in
 `.add/milestones/v0-9-2-perf-review/plans/{WS8,WS15}-*/SUMMARY.md`). Relative A/Bs on a shared
 4-vCPU Linux container. No throughput change is claimed; only the deterministic counts below are.
@@ -309,6 +352,32 @@ shared 4-vCPU Linux container against HEAD `935c555` — re-measure on the GCE r
 
 ### Fixed
 
+- **P0: a key deleted, flushed or overwritten while its disk-offload spill was still in flight came back after BGREWRITEAOF + restart** (moon#1253). The moon#1215 fix covered keys that were already cold. It missed a DEL that lands while the spill request is in flight when a fold runs before that spill completes.
+  - The rewrite now writes a head `DEL` for every spill request a write retired in flight.
+  - Every completion outcome, including one after SWAPDB, settles its request.
+  - FLUSHALL still leaves `used_memory` at 0.
+  - A real-server suite, `crash_recovery_cold_del_inflight_1253`, now runs nightly. Before the fix, 1–12 probes per case came back.
+- **An expired in-flight spill no longer drops a collection write that re-creates its key** (moon#1255). Before, an acknowledged RPUSH/HSET/SADD/ZADD could be lost on restart.
+- **Keyspace events name the right database after SWAPDB, and after a restart from an AOF with an RDB base** (moon#1234 review). An RDB load used to reset every database's number to 0.
+- **Lua scripts no longer read an expired key as live.** Routed scripts, tokio's local scripts and MULTI-queued scripts now refresh the database clock.
+- **Script bodies and pub/sub channel names no longer pin the connection's read buffer** (moon#1160).
+- **FT.SEARCH SESSION on the hybrid and sparse paths filters in place,** and L2 vectors whose components are below f16 precision keep their quantized distance in the rerank, on HOT and WARM segments.
+- **The test suite passes on macOS and Windows again:**
+  - the vector checksum test pins libm-dependent goldens only on Linux x86_64 (the product issue is moon#1256);
+  - the APPEND amortisation bound is per platform;
+  - the WAL poison, LFU, BGSAVE-abort and MSET-during-BGSAVE tests are deterministic.
+- **Collection elements no longer pin the connection read buffer** (moon#1160).
+  - Hash fields and values, set and sorted-set members, list elements, and stream fields and names are now stored as exact-size copies.
+  - AOF replay streams through a bounded 1 MiB buffer.
+  - 100K small set members held +561 MiB RSS; they now hold +10 MiB.
+- **Streams are charged to `used_memory`** (moon#1163), about 206 B per one-field entry, so `maxmemory` binds on stream workloads. DEL credits exactly what was charged, and `MEMORY USAGE` of a stream reports its measured size, now in O(1). Durable MQ queues are billed separately in moon#1250.
+- **Listpack backlen bytes use redis's byte order and widths** (moon#1206). Backward walks over entries of 128 B or more are now correct.
+- **`DEL`, `UNLINK` and `GETDEL` publish the `del` keyspace event** (moon#1234), once per key removed. This holds on every path: plain, spanning shards, MULTI/EXEC and Lua. `GETDEL` of a missing key publishes `keymiss`.
+- **`SCRIPT LOAD` racing `SCRIPT FLUSH`, and `FUNCTION LOAD` racing `FUNCTION FLUSH`, no longer leave shards disagreeing** (moon#1235). At `--shards 4`, mixed trials went from 173/200 (SCRIPT) and 167/200 (FUNCTION) disagreeing to 0.
+- **An `LREM` that removes nothing, and an `LINSERT` with a missing pivot, no longer abort a WATCHing `EXEC`** (moon#1226).
+- **In a pipeline with a protocol error, the commands before the error are answered first, as in redis** (moon#1226). This covers commands deferred behind a blocking pop, SUBSCRIBE or the cross-shard ordering guard, and the fast-path GET/SET replies. RESP2 subscriber mode reports the error instead of closing silently.
+- **A prepared vector query no longer returns empty results when its collection lacks the sub-centroid table** (moon#1226).
+- **A `.tpost` file with doc-id holes is no longer refused at boot** (moon#1220). Refusing it forced a full text-index rebuild.
 - **P0: a deleted cold-tier key came back after an AOF rewrite and any restart** (moon#1215, pre-existing
   in v0.8.9, default config). The cold index now remembers every dead slot still on disk, and every
   rewrite opens its new generation with plain `DEL` records for the keys that are dead at the fold

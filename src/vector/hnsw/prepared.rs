@@ -128,14 +128,56 @@ pub(crate) fn unit_query_into<E: Extend<f32>>(query: &[f32], out: &mut E) {
     }
 }
 
+/// Squared RMS magnitude, in f16 subnormal steps (2^-24 ≈ 5.96e-8), below
+/// which an L2 row's f16 encoding is coarser than the TQ ADC estimate.
+///
+/// f16 rounding error is uniform in ±½ step: RMS ≈ step/√12 ≈ 1.7e-8 per
+/// component, whatever the component's size. TQ4's error is relative (about
+/// 0.1 per rotated coordinate) — it quantizes the unit direction and keeps
+/// the norm. The two meet at a component RMS of ≈ 1.7e-7 ≈ 3 steps, which is
+/// where a recall sweep (32d and 128d, 5e-8 … 1) crosses over: at 1e-7 the
+/// f16 rerank answered R@10 0.767 against ADC's 0.848, at 3e-7 0.917 against
+/// 0.848 (moon#1242).
+const MIN_L2_RERANK_RMS_STEPS_SQ: u64 = 9;
+
+/// Whether an L2 row's f16 encoding is too coarse to improve on the ADC
+/// estimate: every component is subnormal (zero exponent bits) and the row's
+/// RMS is below 3 subnormal steps ([`MIN_L2_RERANK_RMS_STEPS_SQ`]).
+///
+/// Exact and cheap: integer arithmetic on the stored bits (the same answer on
+/// every SIMD tier), and it returns at the first component with a nonzero
+/// exponent — component 0 for a row at any ordinary scale. Only rows that are
+/// wholly subnormal pay a full pass.
+#[inline]
+pub(crate) fn f16_row_below_rerank_precision(row: &[u16]) -> bool {
+    let mut steps_sq: u64 = 0;
+    for &h in row {
+        if h & 0x7C00 != 0 {
+            return false; // a normal, infinite or NaN component
+        }
+        let m = u64::from(h & 0x03FF);
+        steps_sq += m * m;
+    }
+    steps_sq < MIN_L2_RERANK_RMS_STEPS_SQ.saturating_mul(row.len() as u64)
+}
+
 /// The exact-rerank distance of one f16 row (HQ-1), in the convention every
 /// rerank shares so cross-segment merges stay consistent: true squared L2 for
 /// L2 (`q` is the raw query), `2 − 2·cos` for the unit-sphere metrics (`q` is
 /// the unit query, see [`unit_query_into`]; f16 rounding is clamped into
-/// `[-1, 1]`). `None` — the caller keeps its ADC estimate — for a zero row
-/// under a unit-sphere metric (its normalized form is undefined) and for a
-/// non-finite result: a component beyond the f16 range (±65,504) was stored
-/// as ±inf, and an `inf` / NaN distance would erase that row's rank (moon#1226).
+/// `[-1, 1]`). `None` — the caller keeps its ADC estimate:
+/// - for a zero row under a unit-sphere metric (its normalized form is
+///   undefined);
+/// - for a non-finite result: a component beyond the f16 range (±65,504) was
+///   stored as ±inf, and an `inf` / NaN distance would erase that row's rank
+///   (moon#1226);
+/// - for an L2 row deep in f16's subnormal range
+///   ([`f16_row_below_rerank_precision`]): its f16 form keeps a bit or two
+///   per component while the ADC estimate is scale-invariant, so the "exact"
+///   distance would lose recall (moon#1242). Unit-sphere metrics are not
+///   affected (measured: the rerank stays well above ADC at every scale), and
+///   their ADC estimate is not on the `2 − 2·cos` scale, so it is never mixed
+///   in for them on this account.
 #[inline]
 pub(crate) fn exact_f16_distance(
     kernels: &crate::vector::distance::DistanceTable,
@@ -144,6 +186,9 @@ pub(crate) fn exact_f16_distance(
     is_l2: bool,
 ) -> Option<f32> {
     let d = if is_l2 {
+        if f16_row_below_rerank_precision(row) {
+            return None;
+        }
         (kernels.f16_l2)(q, row)
     } else {
         let (dot, xsq) = (kernels.f16_dot_normsq)(q, row);
@@ -258,5 +303,60 @@ impl PreparedTqQuery {
                 Some(lut)
             })
             .as_deref()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{exact_f16_distance, f16_row_below_rerank_precision};
+    use crate::vector::f16::f32_to_f16;
+
+    #[test]
+    fn rows_below_three_subnormal_steps_rms_are_below_rerank_precision() {
+        let dim = 32;
+        assert!(f16_row_below_rerank_precision(&vec![0u16; dim]), "zero row");
+        // Every component 2 steps (either sign): RMS 2 steps.
+        let two: Vec<u16> = (0..dim).map(|i| 0x0002 | ((i as u16 & 1) << 15)).collect();
+        assert!(f16_row_below_rerank_precision(&two));
+        // RMS exactly 3 steps is kept exact.
+        assert!(!f16_row_below_rerank_precision(&vec![0x0003u16; dim]));
+        // One large subnormal component lifts the RMS over the bound.
+        let mut spike = vec![0x0001u16; dim];
+        spike[7] = 0x0011; // 17 steps: 31 + 289 = 320 >= 9 * 32
+        assert!(!f16_row_below_rerank_precision(&spike));
+        // Any normal (or infinite) component: the row is at an ordinary scale.
+        let mut normal = vec![0u16; dim];
+        normal[dim - 1] = 0x0400; // 2^-14, the smallest normal
+        assert!(!f16_row_below_rerank_precision(&normal));
+        let mut inf = vec![0u16; dim];
+        inf[0] = 0x7C00;
+        assert!(!f16_row_below_rerank_precision(&inf));
+        let ordinary: Vec<u16> = (0..dim).map(|i| f32_to_f16(0.01 * i as f32)).collect();
+        assert!(!f16_row_below_rerank_precision(&ordinary));
+        // Components of ~1e-7 (1-2 steps) are below it; ~1e-6 (17 steps) are not.
+        let e7: Vec<u16> = (0..dim)
+            .map(|i| f32_to_f16(1e-7 * (1 + i % 2) as f32))
+            .collect();
+        assert!(f16_row_below_rerank_precision(&e7));
+        let e6: Vec<u16> = (0..dim).map(|_| f32_to_f16(1e-6)).collect();
+        assert!(!f16_row_below_rerank_precision(&e6));
+    }
+
+    #[test]
+    fn only_l2_keeps_the_adc_estimate_for_a_row_below_rerank_precision() {
+        crate::vector::distance::init();
+        let kernels = crate::vector::distance::table();
+        let dim = 32;
+        let tiny: Vec<u16> = (0..dim).map(|_| f32_to_f16(1e-7)).collect();
+        let q: Vec<f32> = (0..dim).map(|i| 1e-7 * (i % 3) as f32).collect();
+        assert_eq!(exact_f16_distance(kernels, &q, &tiny, true), None, "L2");
+        let mut q_unit = Vec::new();
+        super::unit_query_into(&q, &mut q_unit);
+        assert!(
+            exact_f16_distance(kernels, &q_unit, &tiny, false).is_some(),
+            "unit-sphere metrics rerank it"
+        );
+        let ordinary: Vec<u16> = (0..dim).map(|i| f32_to_f16(0.5 + i as f32)).collect();
+        assert!(exact_f16_distance(kernels, &q, &ordinary, true).is_some());
     }
 }

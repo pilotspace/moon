@@ -617,6 +617,9 @@ pub(crate) fn execute_transaction_sharded(
                 )));
                 continue;
             };
+            // The script's expiry checks read the database clock; refresh it
+            // as the dispatch arm below does before every command.
+            crate::shard::slice::refresh_db_clock(selected, cached_clock);
             let outcome = super::txn_script::run_txn_script(
                 env, cmd, cmd_args, selected, shard_id, wake_armed,
             );

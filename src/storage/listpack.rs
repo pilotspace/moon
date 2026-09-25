@@ -879,9 +879,16 @@ fn encode_string_head(len: usize, head: &mut [u8; LP_MAX_ENTRY_HEAD]) -> usize {
 /// No persisted artifact carries these bytes: every RDB, AOF-rewrite base,
 /// DUMP payload and cold-tier record stores a listpack value as its ELEMENTS
 /// and rebuilds the listpack through `push_*` on load, and `Listpack` has no
-/// constructor from raw bytes. So flipping the order changes no on-disk
-/// format and needs no normalize pass; `persisted_forms_rebuild_through_the_encoder`
-/// pins that property.
+/// constructor from raw bytes. So flipping the order changed no on-disk
+/// format and needed no normalize pass. The byte order matches redis only
+/// IN MEMORY: moon's `DUMP` of a small list is a type-1 `LIST` payload of
+/// elements, where redis 7.0.15 writes a type-18 `QUICKLIST_2` one carrying
+/// the listpack, and `RESTORE` refuses redis's listpack and quicklist
+/// encodings (16-20) rather than reading them. What pins the rebuild: the
+/// `value_codec` round-trip tests (`small_list_round_trips_back_to_listpack_in_order`
+/// and its hash/set/zset siblings — the codec RDB snapshots and the cold
+/// tier share), and `dump_payload`'s `a_listpack_encoding_is_named_not_called_corrupt`
+/// for the refusal.
 #[inline]
 fn encode_backlen_into(entry_len: usize, out: &mut [u8; LP_MAX_BACKLEN]) -> usize {
     let n = backlen_size(entry_len);
@@ -1846,15 +1853,20 @@ mod byte_exactness_tests {
 
     /// A listpack is a byte-exact format, not merely a container.
     ///
-    /// moon persists listpack VALUES as their elements (the RDB writers emit
-    /// the plain `HASH`/`LIST`/`SET`/`ZSET_2` types and rebuild the listpack
-    /// on load), but the in-memory layout is redis's: a listpack reader for
-    /// redis's `*_LISTPACK` payloads, and every backward walk, depend on it.
-    /// The bar is identical BYTES, and these goldens are that bar: the
-    /// narrow ones were captured from the `Vec`-building encoder and committed
-    /// BEFORE the moon#942 stack-buffer rewrite; every multi-byte backlen was
-    /// re-captured from redis-server 7.0.15 `DUMP` output for moon#1206, which
-    /// flipped moon's low-group-first order to redis's.
+    /// moon persists listpack VALUES as their elements (the RDB and `DUMP`
+    /// writers emit the plain `HASH`/`LIST`/`SET`/`ZSET_2` types and rebuild
+    /// the listpack on load), so no moon payload is byte-identical to
+    /// redis's: redis 7.0.15 dumps a small list as a type-18 `QUICKLIST_2`,
+    /// moon as a type-1 `LIST`. The IN-MEMORY layout is redis's all the
+    /// same, because every backward walk (`iter_rev`, the tail pops, the
+    /// backlen decode) depends on it, and moon has no reader for redis's
+    /// `*_LISTPACK` payloads — `RESTORE` refuses encodings 16-20. The bar is
+    /// identical BYTES, and these goldens are that bar: the narrow ones were
+    /// captured from the `Vec`-building encoder and committed BEFORE the
+    /// moon#942 stack-buffer rewrite; every multi-byte backlen was
+    /// re-captured for moon#1206 from the listpack bytes EMBEDDED in
+    /// redis-server 7.0.15 `DUMP` output, which flipped moon's
+    /// low-group-first order to redis's.
     ///
     /// `007`, `000000012345`, `00`, `0000`, `+5`, `+0` and `-0` are in here
     /// deliberately: storing `000000012345` as the integer `12345` and

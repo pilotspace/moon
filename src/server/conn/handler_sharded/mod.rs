@@ -1340,6 +1340,9 @@ pub(crate) async fn handle_connection_sharded_inner<
                                 conn.selected_db,
                                 crate::blocking::wakeup::ScriptWakes::Serve(&ctx.blocking_registry),
                                 |db| {
+                            // This handler refreshes the clock per command in
+                            // its dispatch arm, which a script never reaches.
+                            db.refresh_now_from_cache(&ctx.cached_clock);
                             if script_is_eval {
                                 crate::scripting::handle_eval(
                                     &ctx.lua, &ctx.script_cache, cmd_args, db,
@@ -1516,6 +1519,9 @@ pub(crate) async fn handle_connection_sharded_inner<
                                     conn.selected_db,
                                     crate::blocking::wakeup::ScriptWakes::Serve(&ctx.blocking_registry),
                                     |db| {
+                                // Refresh the clock the function's expiry
+                                // checks read (see the EVAL arm above).
+                                db.refresh_now_from_cache(&ctx.cached_clock);
                                 // moon#569: FCALL runs under the caller's
                                 // ACL. Built once and shared by both arms —
                                 // main split FCALL and FCALL_RO into two

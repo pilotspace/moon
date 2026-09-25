@@ -962,7 +962,10 @@ pub async fn handle_connection(
                                             // Acquire in ascending index order (deadlock prevention).
                                             let mut guard_lo = db[lo].write();
                                             let mut guard_hi = db[hi].write();
-                                            std::mem::swap(&mut *guard_lo, &mut *guard_hi);
+                                            crate::shard::db_plane::swap_contents(
+                                                &mut guard_lo,
+                                                &mut guard_hi,
+                                            );
                                             drop(guard_hi);
                                             drop(guard_lo);
                                             // #386 — replication plane, exactly once per

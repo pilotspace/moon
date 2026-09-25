@@ -1570,8 +1570,10 @@ pub(crate) async fn handle_connection_sharded_monoio<
         // Inline dispatch: GET/SET directly from raw bytes, skipping Frame construction.
         // Skip when unauthenticated or workspace-bound (prefix injection in normal path only).
         if !frames_carried && conn.authenticated && conn.workspace_id.is_none() {
-            // Inline writes safe only when: ACL unrestricted, !in_multi, !tracking,
-            // !is_replica, no spill_sender. Replica check reads the lock-free
+            // Inline writes safe only when: ACL unrestricted, !in_multi, this
+            // connection not tracking, !is_replica (the spill case is a
+            // per-write bail-out since moon#660, see `can_inline_writes`
+            // below, not a term here). Replica check reads the lock-free
             // `is_replica_mirror` (kept in sync by `ReplicationState::set_role`)
             // instead of `repl_state.try_read()` — the RwLock CAS was a measured
             // per-op cost on ARM (see S3.5a note in dispatch.rs), and unlike
@@ -1626,8 +1628,10 @@ pub(crate) async fn handle_connection_sharded_monoio<
             // on the process-global `tracking_active()` — only THIS
             // connection's own reads populate its invalidation set, so one
             // tracking client must not push every other connection off the
-            // fast path (writes still use the global gate, since a
-            // non-tracking writer must invalidate everyone else).
+            // fast path. Since moon#1166 the write gate is not global either:
+            // an inline SET invalidates the key it wrote itself
+            // (`invalidation::invalidate_inline_write`), so only a connection
+            // that is itself tracking stands down, on reads and writes alike.
             //
             // `!conn.in_multi` is shared with the write gate and is not
             // optional: inside an open transaction a command must be QUEUED,

@@ -26,6 +26,8 @@ pub mod subscriber;
 
 use std::collections::HashMap;
 use std::sync::Arc;
+
+use crate::storage::owned_bytes::detach;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::{Bytes, BytesMut};
@@ -152,7 +154,14 @@ impl PubSubRegistry {
     }
 
     /// Subscribe to an exact channel.
+    ///
+    /// moon#1160: the name is stored as an exact-size copy. The caller hands
+    /// in a slice of the connection's request buffer, and keeping that slice
+    /// in a registry that lives as long as the subscription pinned the whole
+    /// read buffer (the same leak `storage::owned_bytes` closed for stored
+    /// collection elements). One copy per SUBSCRIBE, shared by both maps.
     pub fn subscribe(&mut self, channel: Bytes, sub: Subscriber) {
+        let channel = detach(&channel);
         self.sub_channels
             .entry(sub.id)
             .or_default()
@@ -245,6 +254,9 @@ impl PubSubRegistry {
                 return;
             }
         }
+        // moon#1160: a NEW pattern entry stores an exact-size copy, never a
+        // slice of the request buffer (see `subscribe`).
+        let pattern = detach(&pattern);
         // New pattern entry: a present transition, counted after the entry
         // exists (moon#1226, see `subscribe`).
         let keyspace = crate::notify::subscription_targets_keyspace(&pattern);
@@ -511,8 +523,10 @@ impl PubSubRegistry {
     // the slot's owner, which is `cluster-client-bootstrap`'s territory. What
     // is contracted here is what a standalone redis-server does.
 
-    /// Subscribe to a sharded channel.
+    /// Subscribe to a sharded channel. The name is stored as an exact-size
+    /// copy (moon#1160, see `subscribe`).
     pub fn ssubscribe(&mut self, channel: Bytes, sub: Subscriber) {
+        let channel = detach(&channel);
         self.sub_shard_channels
             .entry(sub.id)
             .or_default()

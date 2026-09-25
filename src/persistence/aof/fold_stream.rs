@@ -240,8 +240,12 @@ pub fn stream_fold_image(dbs: &[&Database], now_ms: u64, mut sink: FoldImageSink
 ///
 /// A key qualifies when it has a slot on disk that recovery would index —
 /// every key in the cold index's dead-slot ledger, plus `expired_shadows`
-/// (hot keys the base drops as expired whose cold entry is a stale shadow) —
-/// and it is NOT alive at the fold instant by the base's own rules:
+/// (hot keys the base drops as expired whose cold entry is a stale shadow),
+/// plus every key whose spill a write retired while it was still in flight
+/// (moon#1253: its slot lands in a file the new generation authorizes
+/// wholesale, and the ledger learns of it only when the completion is
+/// applied, possibly after this fold) — and it is NOT alive at the fold
+/// instant by the base's own rules:
 /// - hot and not expired: in the base, which wins over any cold slot;
 /// - in flight and not expired: in the base ([`write_in_flight_entries`]);
 ///   one whose payload does not rehydrate is also left alone, since its
@@ -275,7 +279,7 @@ pub(crate) fn for_each_cold_delete_chunk(
     let Some(ci) = db.cold_index.as_ref() else {
         return true;
     };
-    if ci.dead_slots().is_empty() && expired_shadows.is_empty() {
+    if ci.dead_slots().is_empty() && expired_shadows.is_empty() && db.spill_superseded_is_empty() {
         return true;
     }
     let alive = |key: &[u8]| {
@@ -311,7 +315,11 @@ pub(crate) fn for_each_cold_delete_chunk(
             return false;
         }
     }
-    for key in ci.dead_slots().keys_live_at(now_ms) {
+    for key in ci
+        .dead_slots()
+        .keys_live_at(now_ms)
+        .chain(db.spill_superseded_keys_live_at(now_ms))
+    {
         if alive(key) {
             continue;
         }
@@ -431,11 +439,9 @@ pub(crate) fn for_each_in_flight_base_entry(
 pub(crate) fn fold_cold_deletes(dbs: &[&Database], now_ms: u64) -> ColdDeletes {
     let mut out = ColdDeletes::default();
     for (db_idx, db) in dbs.iter().enumerate() {
-        let Some(ci) = db
-            .cold_index
-            .as_ref()
-            .filter(|ci| ci.len() > 0 || !ci.dead_slots().is_empty())
-        else {
+        let Some(ci) = db.cold_index.as_ref().filter(|ci| {
+            ci.len() > 0 || !ci.dead_slots().is_empty() || !db.spill_superseded_is_empty()
+        }) else {
             continue;
         };
         let expired_shadows: Vec<Bytes> = db

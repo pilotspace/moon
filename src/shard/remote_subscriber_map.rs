@@ -27,14 +27,16 @@ impl RemoteSubscriberMap {
         Self::default()
     }
 
-    /// Record that `shard_id` has a subscriber for `channel` (exact or pattern).
+    /// Record that `shard_id` has a subscriber for `channel` (exact or
+    /// pattern). A new name is stored as an exact-size copy (moon#1160, see
+    /// [`insert_name`]).
     pub fn add(&mut self, channel: Bytes, shard_id: usize, is_pattern: bool) {
         let map = if is_pattern {
             &mut self.patterns
         } else {
             &mut self.channels
         };
-        map.entry(channel).or_default().insert(shard_id);
+        insert_name(map, &channel, shard_id);
     }
 
     /// Remove `shard_id` from subscribers for `channel`. Cleans up empty entries.
@@ -102,12 +104,10 @@ impl RemoteSubscriberMap {
     // map keyed by name would fan a plain PUBLISH out to shards that only hold
     // sharded subscribers, and vice versa.
 
-    /// Record that `shard_id` has a SHARDED subscriber for `channel`.
+    /// Record that `shard_id` has a SHARDED subscriber for `channel` (a new
+    /// name is stored as an exact-size copy, as in [`Self::add`]).
     pub fn add_shard_channel(&mut self, channel: Bytes, shard_id: usize) {
-        self.shard_channels
-            .entry(channel)
-            .or_default()
-            .insert(shard_id);
+        insert_name(&mut self.shard_channels, &channel, shard_id);
     }
 
     /// Remove `shard_id` from sharded subscribers for `channel`.
@@ -128,6 +128,33 @@ impl RemoteSubscriberMap {
             .get(channel)
             .map(|s| s.iter().copied().collect())
             .unwrap_or_default()
+    }
+
+    /// Every stored channel, pattern and sharded-channel name (tests).
+    #[cfg(test)]
+    pub(crate) fn for_each_stored_name(&self, mut f: impl FnMut(&Bytes)) {
+        self.channels
+            .keys()
+            .chain(self.patterns.keys())
+            .chain(self.shard_channels.keys())
+            .for_each(|k| f(k));
+    }
+}
+
+/// Add `shard_id` under `name`, storing a NEW name as an exact-size copy
+/// (moon#1160): the caller's `Bytes` is a slice of the subscribing
+/// connection's request buffer, and this map outlives the request.
+fn insert_name(map: &mut HashMap<Bytes, HashSet<usize>>, name: &Bytes, shard_id: usize) {
+    match map.get_mut(name) {
+        Some(shards) => {
+            shards.insert(shard_id);
+        }
+        None => {
+            map.insert(
+                crate::storage::owned_bytes::detach(name),
+                HashSet::from([shard_id]),
+            );
+        }
     }
 }
 

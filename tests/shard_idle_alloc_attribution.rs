@@ -254,8 +254,10 @@ fn per_shard_idle_allocation_is_attributed_and_budgeted() {
         "mesh must allocate the N(N-1) x cap x size_of ring array and little else: \
          array term {ring_array_total:.0} B, measured {measured_mesh_total:.0} B (ratio {ratio:.3})"
     );
+    // 64 -> 56 B in moon#1235: `ScriptLoad` dropped its 24-byte
+    // `sha1: String` (the receiver digests the script itself) for a u64 epoch.
     assert_eq!(
-        msg_size, 64,
+        msg_size, 56,
         "the ring slot size the mesh model is built on"
     );
 
@@ -312,11 +314,12 @@ fn mesh_footprint_is_quadratic_and_pinned() {
 
     // The published per-shard figure at s8, confirmed against the measured
     // allocation in the attribution test above.
-    assert_eq!(ring, 16_384, "one SPSC ring");
-    assert_eq!(total(8) / 7, 131_072, "128 KiB per extra shard at s8");
+    assert_eq!(ring, 14_336, "one SPSC ring");
+    assert_eq!(total(8) / 7, 114_688, "112 KiB per extra shard at s8");
 
-    // The ceiling this file exists to keep visible. `total(32)` is 15.5 MiB —
-    // larger than moon's ENTIRE idle RSS at s8. Raising the depth or the
+    // The ceiling this file exists to keep visible. `total(32)` is 13.6 MiB
+    // (15.5 MiB before moon#1235 shrank the slot from 64 to 56 B) — larger
+    // than moon's ENTIRE idle RSS at s8. Raising the depth or the
     // message size multiplies that by N(N-1), not by N.
     assert!(
         total(32) <= 16 * 1024 * 1024,

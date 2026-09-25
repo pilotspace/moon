@@ -905,12 +905,6 @@ fn wcm13_the_recorded_no_op_over_abort_residue() {
             vec!["SADD", "k", "z"],
         ),
         (
-            "LREM of an absent element",
-            vec![vec!["RPUSH", "k", "a"]],
-            vec!["LREM", "k", "1", "no-such-element"],
-            vec!["RPUSH", "k", "z"],
-        ),
-        (
             "ZREM of an absent member",
             vec![vec!["ZADD", "k", "1", "a"]],
             vec!["ZREM", "k", "no-such-member"],
@@ -939,6 +933,35 @@ fn wcm13_the_recorded_no_op_over_abort_residue() {
             "{label}: this row is the RECORDED over-abort residue — it aborts today and \
              redis 8.6.1 commits. If you narrowed it deliberately, update this test and \
              the moon#926 notes; if it changed by accident, the stamp moved."
+        );
+    }
+
+    // Narrowed rows: these used to be in the residue above and now commit, as
+    // in redis. moon#1226 moved LREM and LINSERT's mutable handle below the
+    // search, so a no-op never takes it (`1d96a35`).
+    for (label, seed, mutation, body) in [
+        (
+            "LREM of an absent element",
+            vec![vec!["RPUSH", "k", "a"]],
+            vec!["LREM", "k", "1", "no-such-element"],
+            vec!["RPUSH", "k", "z"],
+        ),
+        (
+            "LINSERT with an absent pivot",
+            vec![vec!["RPUSH", "k", "a"]],
+            vec!["LINSERT", "k", "BEFORE", "no-such-pivot", "x"],
+            vec!["RPUSH", "k", "z"],
+        ),
+    ] {
+        assert!(
+            !watch_cycle(
+                port,
+                &seed.iter().map(|s| s.as_slice()).collect::<Vec<_>>(),
+                Some(&mutation),
+                &body
+            ),
+            "{label}: a no-op must not abort a WATCHing EXEC (redis commits; \
+             moon#1226). It aborted, so the list handle is taken before the search again."
         );
     }
 }

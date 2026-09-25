@@ -194,7 +194,16 @@ pub fn xadd(db: &mut Database, args: &[Frame]) -> Frame {
         None => stream.next_auto_id(),
     };
 
-    let result_id = stream.add(id, fields);
+    // An explicit `id` was validated against `last_id` above; `*` and `ms-*`
+    // are above it unless the sequence wrapped at the last possible ID. So
+    // `add`'s refusal (moon#1249: never at or below `last_id`) is only that
+    // case, answered with redis's wording. The stream existed already — a
+    // fresh one accepts any ID above 0-0 — so no phantom key is left.
+    let Some(result_id) = stream.add(id, fields) else {
+        return Frame::Error(Bytes::from_static(
+            b"ERR The stream has exhausted the last possible ID, unable to add more items",
+        ));
+    };
 
     // Apply trim if specified
     if let Some((strategy, approximate, threshold_bytes)) = trim_strategy {
@@ -1071,6 +1080,13 @@ pub fn xautoclaim(db: &mut Database, args: &[Frame]) -> Frame {
 /// XSETID key last-id [ENTRIESADDED entries-added]
 ///
 /// Sets the last delivered ID of a stream without adding entries.
+///
+/// moon#1249: an ID below the stream's top ITEM (its greatest remaining
+/// entry, not `last_id`) is refused with redis's exact error, as redis
+/// 7.0.15's `xsetidCommand` does. Accepting it let the next `XADD *` issue an
+/// ID that is already in the stream and overwrite that entry. An EMPTY
+/// stream takes any ID, like redis. Every path runs this body — plain,
+/// MULTI/EXEC, Lua, replica apply and AOF replay — so the check is here.
 pub fn xsetid(db: &mut Database, args: &[Frame]) -> Frame {
     if args.len() < 2 {
         return err_wrong_args("XSETID");
@@ -1090,6 +1106,15 @@ pub fn xsetid(db: &mut Database, args: &[Frame]) -> Frame {
 
     match db.get_stream_mut(key) {
         Ok(Some(stream)) => {
+            if stream
+                .entries
+                .last_key_value()
+                .is_some_and(|(&top, _)| id < top)
+            {
+                return Frame::Error(Bytes::from_static(
+                    b"ERR The ID specified in XSETID is smaller than the target stream top item",
+                ));
+            }
             stream.last_id = id;
             Frame::SimpleString(Bytes::from_static(b"OK"))
         }

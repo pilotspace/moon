@@ -697,3 +697,62 @@ fn test_publish_shared_no_subscribers_fast_path() {
         0
     );
 }
+
+/// moon#1160: a subscription stores its channel or pattern NAME as an
+/// exact-size copy — in the forward map, the reverse index, the sharded maps
+/// and the remote-subscriber map — never the slice of the request buffer the
+/// SUBSCRIBE arrived in. Red before the fix: every stored name pointed into
+/// the buffer, pinning all of it for as long as the subscription lived.
+#[test]
+fn stored_channel_names_never_share_the_request_buffer() {
+    use crate::storage::owned_bytes::test_support::WireArgs;
+    let mut reg = PubSubRegistry::new();
+
+    let wire = WireArgs::parse(&[b"SUBSCRIBE", b"news:sports"]);
+    reg.subscribe(wire.args[1].clone(), live_sub(7));
+    let (stored, _) = reg.channels.get_key_value(&b"news:sports"[..]).unwrap();
+    wire.assert_detached("channel map key", stored);
+    let joined = reg.sub_channels.get(&7).unwrap();
+    wire.assert_detached(
+        "reverse index entry",
+        joined.get(&b"news:sports"[..]).unwrap(),
+    );
+
+    let wire = WireArgs::parse(&[b"PSUBSCRIBE", b"news:*"]);
+    reg.psubscribe(wire.args[1].clone(), live_sub(7));
+    let (stored, _) = reg
+        .patterns
+        .iter()
+        .find(|(p, _)| p.as_ref() == b"news:*")
+        .unwrap();
+    wire.assert_detached("pattern entry", stored);
+
+    let wire = WireArgs::parse(&[b"SSUBSCRIBE", b"orders"]);
+    reg.ssubscribe(wire.args[1].clone(), live_sub(7));
+    let (stored, _) = reg.shard_channels.get_key_value(&b"orders"[..]).unwrap();
+    wire.assert_detached("sharded channel map key", stored);
+    let joined = reg.sub_shard_channels.get(&7).unwrap();
+    wire.assert_detached(
+        "sharded reverse index entry",
+        joined.get(&b"orders"[..]).unwrap(),
+    );
+
+    // The remote-subscriber map a subscription is announced into.
+    let mut remote = crate::shard::remote_subscriber_map::RemoteSubscriberMap::new();
+    let wire = WireArgs::parse(&[b"SUBSCRIBE", b"news:weather"]);
+    remote.add(wire.args[1].clone(), 3, false);
+    remote.add(wire.args[1].clone(), 4, false);
+    let wire_p = WireArgs::parse(&[b"PSUBSCRIBE", b"alerts:*"]);
+    remote.add(wire_p.args[1].clone(), 3, true);
+    let wire_s = WireArgs::parse(&[b"SSUBSCRIBE", b"orders"]);
+    remote.add_shard_channel(wire_s.args[1].clone(), 3);
+    assert_eq!(remote.shards_for_channel(b"news:weather").len(), 2);
+    let mut names = 0;
+    remote.for_each_stored_name(|name| {
+        names += 1;
+        wire.assert_detached("remote channel key", name);
+        wire_p.assert_detached("remote pattern key", name);
+        wire_s.assert_detached("remote sharded channel key", name);
+    });
+    assert_eq!(names, 3);
+}

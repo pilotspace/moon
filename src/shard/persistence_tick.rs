@@ -261,6 +261,10 @@ pub(crate) fn advance_snapshot_segment(
         if snap.stream_backlogged() {
             return false;
         }
+        // Test-only (`MOON_TEST_SNAPSHOT_HOLD_FILE`): hold the epoch open.
+        if crate::shard::test_hooks::snapshot_hold_requested_for_test() {
+            return false;
+        }
         let current_db = snap.current_db_index();
         let db_count = shard_databases.db_count();
         if current_db < db_count {
@@ -934,17 +938,20 @@ fn rehydrate_unpublished_spill(
     entry: &crate::storage::tiered::spill_thread::SpillCompletionEntry,
     file_id: u64,
 ) {
-    crate::shard::slice::with_shard_db(entry.db_index, |db| {
+    let stranded = crate::shard::slice::with_shard_db(entry.db_index, |db| {
+        // moon#1253: this request's completion is applied (withdrawn, or its
+        // file id refused).
+        let settled = db.spill_superseded_settle(&entry.key, entry.req_file_id);
         if !db.spill_inflight_is_newest(&entry.key, entry.req_file_id) {
             // Deleted, overwritten, read-promoted or re-evicted in flight:
             // the newer state owns the key.
             crate::storage::tiered::spill_thread::record_spill_completion_superseded();
-            return;
+            return !settled;
         }
         let payload = db.spill_inflight_payload(&entry.key, entry.req_file_id);
         db.spill_inflight_clear(&entry.key, entry.req_file_id);
         if db.get_version(&entry.key) != 0 {
-            return;
+            return false;
         }
         match payload.and_then(|(vt, bytes, ttl)| {
             crate::storage::eviction::rehydrate_spill_payload(vt, &bytes, ttl)
@@ -960,7 +967,38 @@ fn rehydrate_unpublished_spill(
                  until AOF-replay restart"
             ),
         }
+        false
     });
+    if stranded {
+        settle_superseded_elsewhere(entry.db_index, &entry.key, entry.req_file_id);
+    }
+}
+
+/// moon#1253, `SWAPDB`: settle request `req_id`'s superseded record for
+/// `key` in whichever of this shard's OTHER databases holds it.
+///
+/// The set lives in `Database`, beside the cold index whose dead-slot ledger
+/// it hands each slot to, so a `SWAPDB` while the request is in flight moves
+/// it with the rest of that database, and the completion, which carries the
+/// db index the request was MADE in, misses it. A per-shard set would need a
+/// db index per entry for the fold's head `DEL`, which the same swap makes
+/// stale; this keeps the set with the rest of its database's state. (Which
+/// db a swapped cold file is re-attached to on restart is moon#1237.)
+///
+/// Reached only after a not-newest completion missed in its own db: a write
+/// superseded the request and a swap then moved it, or a swap moved the
+/// request's live record. Request ids are unique per shard (one
+/// `next_file_id` counter, one id per request), so the first hit is the
+/// record. A completion that finds its record, or settles in its own db,
+/// never gets here, and each other database answers from `is_empty()` when
+/// its set is empty.
+fn settle_superseded_elsewhere(db_index: usize, key: &bytes::Bytes, req_id: u64) {
+    let dbs = crate::shard::slice::with_shard(|s| s.databases.db_count());
+    for other in (0..dbs).filter(|&d| d != db_index) {
+        if crate::shard::slice::with_shard_db(other, |db| db.spill_superseded_settle(key, req_id)) {
+            return;
+        }
+    }
 }
 
 /// Apply a batch of spill completions: ONE manifest `add_file`+commit per file,
@@ -1002,7 +1040,10 @@ fn apply_completion_vec(
             // key — bounded per tick and loudly counted, which beats silent
             // wrong answers.
             if let Some(req) = c.failed_request {
-                crate::shard::slice::with_shard_db(req.db_index, |db| {
+                let stranded = crate::shard::slice::with_shard_db(req.db_index, |db| {
+                    // moon#1253: this request's completion is applied (its
+                    // write failed, so no slot of it is published).
+                    let settled = db.spill_superseded_settle(&req.key, req.file_id);
                     // Deep-review P2 stale-shadow guard: if the key was
                     // re-created and re-evicted while this pwrite was in
                     // flight, a NEWER spill request supersedes this one —
@@ -1020,12 +1061,12 @@ fn apply_completion_vec(
                              landed, or the key was deleted / overwritten / read-promoted \
                              while this write was in flight — #459)"
                         );
-                        return;
+                        return !settled;
                     }
                     if db.get_version(&req.key) != 0 {
                         // A newer write recreated the key while the spill was
                         // in flight; the failed payload is stale — drop it.
-                        return;
+                        return false;
                     }
                     match crate::storage::eviction::rehydrate_spill_payload(
                         req.value_type,
@@ -1051,7 +1092,11 @@ fn apply_completion_vec(
                             );
                         }
                     }
+                    false
                 });
+                if stranded {
+                    settle_superseded_elsewhere(req.db_index, &req.key, req.file_id);
+                }
             } else {
                 tracing::warn!(
                     file_id = c.file_entry.file_id,
@@ -1110,18 +1155,26 @@ fn apply_completion_vec(
         // dead-slot ledger must know, so an AOF rewrite can keep them dead.
         let mut ghosts: Vec<(usize, bytes::Bytes, Option<u64>)> = Vec::new();
         for entry in c.entries {
-            let publishable = crate::shard::slice::with_shard_db(entry.db_index, |db| {
-                if !db.spill_inflight_is_newest(&entry.key, entry.req_file_id) {
-                    crate::storage::tiered::spill_thread::record_spill_completion_superseded();
-                    return false;
-                }
-                if db.cold_index.is_none() {
-                    // No cold plane to publish into: retire the record.
-                    db.spill_inflight_clear(&entry.key, entry.req_file_id);
-                    return false;
-                }
-                true
-            });
+            let (publishable, stranded) =
+                crate::shard::slice::with_shard_db(entry.db_index, |db| {
+                    // moon#1253: this request's completion is applied. A ghost
+                    // slot is noted in the dead-slot ledger below, once the
+                    // file is listed; a published one is the key's cold entry.
+                    let settled = db.spill_superseded_settle(&entry.key, entry.req_file_id);
+                    if !db.spill_inflight_is_newest(&entry.key, entry.req_file_id) {
+                        crate::storage::tiered::spill_thread::record_spill_completion_superseded();
+                        return (false, !settled);
+                    }
+                    if db.cold_index.is_none() {
+                        // No cold plane to publish into: retire the record.
+                        db.spill_inflight_clear(&entry.key, entry.req_file_id);
+                        return (false, false);
+                    }
+                    (true, false)
+                });
+            if stranded {
+                settle_superseded_elsewhere(entry.db_index, &entry.key, entry.req_file_id);
+            }
             if publishable {
                 match groups.iter_mut().find(|(d, _)| *d == entry.db_index) {
                     Some((_, entries)) => entries.push(entry),
@@ -2353,6 +2406,9 @@ mod fold_inflight_tests;
 
 #[cfg(test)]
 mod ghost_slot_tests;
+
+#[cfg(test)]
+mod superseded_settle_tests;
 
 #[cfg(test)]
 mod tests {

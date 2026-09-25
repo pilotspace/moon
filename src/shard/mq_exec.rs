@@ -596,7 +596,14 @@ fn handle_push(
                         msg_id.seq,
                         &fields,
                     );
-                    let msg_id = stream.add(msg_id, fields);
+                    // moon#1249: `add` refuses an ID at or below `last_id`.
+                    // `next_auto_id` is above it unless the sequence wrapped
+                    // at the last possible ID — redis's wording for that.
+                    let Some(msg_id) = stream.add(msg_id, fields) else {
+                        return Err(Frame::Error(Bytes::from_static(
+                            b"ERR The stream has exhausted the last possible ID, unable to add more items",
+                        )));
+                    };
                     (Some((msg_id, payload)), stream.take_unbilled())
                 }
             }

@@ -890,16 +890,68 @@ mod tests {
         assert!(meta_tq4.verify_checksum().is_ok());
     }
 
+    /// The pre-moon#1213 formula, evaluated one-shot at runtime: every field
+    /// in the historical order, then the materialized `qjl_matrices()`
+    /// concatenated as little-endian f32, one `xxh64(.., 0)` over all of it
+    /// (f32546c's `compute_checksum`, rewritten here rather than shared).
+    fn one_shot_checksum(meta: &CollectionMetadata) -> u64 {
+        let mut data = Vec::new();
+        data.extend_from_slice(&meta.collection_id.to_le_bytes());
+        data.extend_from_slice(&meta.created_at_lsn.to_le_bytes());
+        data.extend_from_slice(&meta.dimension.to_le_bytes());
+        data.extend_from_slice(&meta.padded_dimension.to_le_bytes());
+        data.push(meta.metric as u8);
+        data.push(meta.quantization as u8);
+        data.push(meta.codebook_version);
+        for v in meta.codebook.iter().chain(&meta.codebook_boundaries) {
+            data.extend_from_slice(&v.to_le_bytes());
+        }
+        for v in meta.fwht_sign_flips.as_slice() {
+            data.extend_from_slice(&v.to_le_bytes());
+        }
+        data.push(meta.build_mode as u8);
+        for matrix in meta.qjl_matrices() {
+            for v in matrix {
+                data.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+        xxhash_rust::xxh64::xxh64(&data, 0)
+    }
+
     /// moon#1213: the matrices are streamed into the checksum instead of
     /// held — the digest must be the one every persisted segment recorded.
-    /// Golden values were computed by the pre-change formula (materialized
-    /// `qjl_matrices` concatenated into the one-shot `xxh64` input) at
-    /// f32546c; a mismatch here means every EXACT segment on disk would fail
-    /// `verify_checksum` on reload and be re-indexed from the AOF.
+    ///
+    /// On every platform the streamed digest must equal [`one_shot_checksum`],
+    /// the historical formula evaluated at runtime on the same host. The
+    /// matrices it hashes come from the stream that
+    /// `qjl::tests::qjl_stream_chunks_concatenate_to_the_reference_generator`
+    /// pins, bit for bit, to the pre-moon#1213 generator. Together the two
+    /// prove the claim wherever the suite runs.
+    ///
+    /// The golden constants are an extra pin, computed at f32546c by the
+    /// pre-change formula on Linux x86_64 (glibc). The EXACT TurboQuant ones
+    /// hash QJL matrices, whose Box–Muller Gaussians go through `f32::ln`,
+    /// `cos` and `sin`: the host libm's `logf`, `cosf` and `sinf` (or
+    /// `sincosf`). Those are not correctly rounded (glibc 2.39's `logf`
+    /// misrounds 21 593 of the 2 989 120 inputs of these cases), so another
+    /// libm returns other last bits and another digest: for the first case
+    /// macOS aarch64 computed 12998692082669032190 and Windows x86_64
+    /// 2952564279481642555. Those goldens are pinned on Linux x86_64 glibc
+    /// only, where they were computed (glibc's SSE2 and FMA variants return
+    /// identical bits here). The LIGHT and SQ8 goldens hash no matrix, only
+    /// integer-LCG sign flips and a codebook scaled by an IEEE `sqrt`, so they
+    /// are pinned everywhere. What this means for a persisted EXACT segment
+    /// moved between platforms: `verify_checksum` fails on reload and
+    /// recovery re-indexes its keys (`recover_v2`, degradation level 3).
     #[test]
     fn metadata_checksum_matches_the_pre_streaming_formula() {
         use crate::vector::types::DistanceMetric as M;
         use QuantizationConfig as Q;
+        let pinned_libm = cfg!(all(
+            target_os = "linux",
+            target_arch = "x86_64",
+            target_env = "gnu"
+        ));
         for (cid, dim, metric, q, mode, golden) in [
             (
                 9u64,
@@ -943,11 +995,21 @@ mod tests {
             ),
         ] {
             let meta = CollectionMetadata::with_build_mode(cid, dim, metric, q, cid, mode);
+            let case = format!("{cid} {dim} {q:?} {mode:?}");
             assert_eq!(
-                meta.metadata_checksum, golden,
-                "{cid} {dim} {q:?} {mode:?}: checksum drifted from the persisted formula"
+                meta.metadata_checksum,
+                one_shot_checksum(&meta),
+                "{case}: the streamed checksum differs from the one-shot formula"
             );
-            assert!(meta.verify_checksum().is_ok());
+            assert!(meta.verify_checksum().is_ok(), "{case}");
+            let hashes_qjl = meta.qjl_num_projections > 0;
+            assert_eq!(hashes_qjl, mode == BuildMode::Exact && q != Q::Sq8);
+            if pinned_libm || !hashes_qjl {
+                assert_eq!(
+                    meta.metadata_checksum, golden,
+                    "{case}: checksum drifted from the persisted formula"
+                );
+            }
         }
     }
 

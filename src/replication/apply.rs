@@ -275,6 +275,41 @@ impl ApplyOutcome {
     }
 }
 
+thread_local! {
+    /// `true` while this thread dispatches a command from the master's stream.
+    static APPLYING_MASTER_STREAM: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether the command running on this thread came from the master's stream.
+///
+/// redis's `expireIfNeeded` answers "not expired" to the master client: a
+/// replica runs no expiry of its own and deletes a key only when the master
+/// says so, so a key the master deletes is live to the command that deletes
+/// it, whatever its TTL says here. `DEL`/`UNLINK` read this to count such a
+/// key and publish `del` for it rather than the `expired` a client's DEL of
+/// an expired key gets (moon#1234, `command::key::settle_deletion`).
+#[inline]
+pub(crate) fn applying_master_stream() -> bool {
+    APPLYING_MASTER_STREAM.with(std::cell::Cell::get)
+}
+
+/// Marks one master-stream dispatch; cleared on drop, so an early return or
+/// an unwind cannot leave a client command looking like the master's.
+struct MasterStreamScope;
+
+impl MasterStreamScope {
+    fn enter() -> Self {
+        APPLYING_MASTER_STREAM.with(|f| f.set(true));
+        MasterStreamScope
+    }
+}
+
+impl Drop for MasterStreamScope {
+    fn drop(&mut self) {
+        APPLYING_MASTER_STREAM.with(|f| f.set(false));
+    }
+}
+
 /// Apply one replicated command to the local shard's database.
 ///
 /// Runs synchronously on the shard thread through the thread-local `ShardSlice`
@@ -429,6 +464,7 @@ pub(crate) fn apply_local(
             // against real time.
             db.refresh_now();
             let mut selected = db_idx;
+            let _master = MasterStreamScope::enter();
             match cmd_dispatch(&mut db, cmd, args, &mut selected, db_count) {
                 DispatchResult::Response(f) | DispatchResult::Quit(f) => f,
             }
@@ -1411,6 +1447,42 @@ mod tests {
         })
         .join()
         .expect("test shard thread panicked")
+    }
+
+    /// moon#1234: a replica runs no expiry of its own, so the master's DEL
+    /// is how its expired keys go — the key must be DELETED and, as on a
+    /// redis replica (`expireIfNeeded` answers "not expired" to the master
+    /// client), counted as live. A client's DEL of the same expired key
+    /// reaps it too but counts nothing.
+    #[test]
+    fn a_master_stream_del_counts_an_expired_key_as_live() {
+        use crate::storage::entry::{Entry, current_time_ms};
+        let past = current_time_ms().saturating_sub(10_000);
+        let expired_db = || {
+            let mut db = crate::storage::Database::new();
+            db.set(
+                b"k",
+                Entry::new_string_with_expiry(Bytes::from_static(b"v"), past),
+            );
+            db
+        };
+        let args = [Frame::BulkString(Bytes::from_static(b"k"))];
+
+        let mut db = expired_db();
+        {
+            let _master = MasterStreamScope::enter();
+            assert!(applying_master_stream());
+            assert_eq!(crate::command::key::del(&mut db, &args), Frame::Integer(1));
+        }
+        assert!(!applying_master_stream(), "the scope ends with its guard");
+        assert_eq!(db.len(), 0, "the master's DEL deleted the key");
+
+        let mut db = expired_db();
+        assert_eq!(
+            crate::command::key::unlink(&mut db, &args),
+            Frame::Integer(0)
+        );
+        assert_eq!(db.len(), 0, "a client's UNLINK reaps it, counting nothing");
     }
 
     fn poison_count() -> u64 {
