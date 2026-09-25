@@ -98,6 +98,8 @@ pub fn bgsave_start(db: SharedDatabases, dir: String, dbfilename: String) -> Fra
             b"ERR Background save already in progress",
         ));
     }
+    // moon#1232: changes made after this point are not in the snapshot.
+    crate::admin::metrics_setup::mark_save_started();
 
     // Clone snapshot: lock each db individually with read lock
     let snapshot: Vec<
@@ -213,6 +215,10 @@ fn bgsave_start_sharded_with(
     }
 
     BGSAVE_CURRENT_FAILED.store(false, Ordering::SeqCst);
+    // moon#1232: before any shard picks the epoch up, so every change counted
+    // here is in some shard's snapshot (a change between this and a shard's
+    // pickup is saved AND stays counted: a spare save, never a lost one).
+    crate::admin::metrics_setup::mark_save_started();
     let epoch = SNAPSHOT_EPOCH.fetch_add(1, Ordering::SeqCst) + 1;
     BGSAVE_SHARDS_REMAINING.store(num_shards as u64, Ordering::SeqCst);
 
@@ -432,6 +438,8 @@ pub fn handle_save(db: &SharedDatabases, dir: &str, dbfilename: &str) -> Frame {
             b"ERR Background save already in progress",
         ));
     }
+    // moon#1232: see `bgsave_start`.
+    crate::admin::metrics_setup::mark_save_started();
 
     // Clone snapshot: lock each db individually with read lock (same pattern as bgsave_start)
     let snapshot: Vec<
@@ -687,6 +695,40 @@ mod tests {
         ));
         bgsave_shard_done(true);
         assert!(!SAVE_IN_PROGRESS.load(Ordering::SeqCst));
+    }
+
+    /// moon#1232: a change made while a save runs is not in that save's
+    /// snapshot, so the save's success must leave it counted (redis:
+    /// `dirty -= dirty_before_bgsave`). Before, completion marked every
+    /// change counted by then as saved, and a `--save` rule never re-armed
+    /// for writes that landed during a save.
+    ///
+    /// Deterministic under parallel tests: other threads' changes can only
+    /// raise both readings, and the mark must stay at least five below the
+    /// count read after this thread's five changes.
+    #[test]
+    fn changes_made_while_a_save_runs_stay_counted() {
+        use crate::admin::metrics_setup::{keyspace_change_marks_for_test, record_keyspace_change};
+        let _guard = BGSAVE_TEST_LOCK.lock();
+        SAVE_IN_PROGRESS.store(false, Ordering::SeqCst);
+        BGSAVE_SHARDS_REMAINING.store(0, Ordering::SeqCst);
+        let (tx, _rx) = crate::runtime::channel::watch(0u64);
+        assert!(matches!(
+            bgsave_start_sharded_with(&tx, 1, false),
+            Frame::SimpleString(_)
+        ));
+        for _ in 0..5 {
+            record_keyspace_change();
+        }
+        let (counted, _) = keyspace_change_marks_for_test();
+        bgsave_shard_done(true);
+        assert!(BGSAVE_LAST_STATUS.load(Ordering::SeqCst));
+        let (_, saved_mark) = keyspace_change_marks_for_test();
+        assert!(
+            saved_mark + 5 <= counted,
+            "the five changes made during the save were marked saved \
+             (mark {saved_mark}, counted {counted})"
+        );
     }
 
     /// A sharded auto-save starts as a COUNTED save (moon#1230): it arms the

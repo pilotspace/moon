@@ -386,6 +386,9 @@ static KEYSPACE_CHANGE_COUNTERS: [PaddedCounter; COMMAND_COUNTER_SLOTS] =
 /// since_last_save` is the difference; a save that completes concurrently with
 /// writes can only make the difference smaller, never negative (saturating).
 static KEYSPACE_CHANGES_AT_LAST_SAVE: AtomicU64 = AtomicU64::new(0);
+/// Value of the change counter when the save now running STARTED
+/// ([`mark_save_started`]) — redis's `dirty_before_bgsave`.
+static KEYSPACE_CHANGES_AT_SAVE_START: AtomicU64 = AtomicU64::new(0);
 
 /// Record one keyspace mutation. Hot path: one relaxed add, no allocation.
 #[inline]
@@ -410,12 +413,37 @@ pub fn rdb_changes_since_last_save() -> u64 {
     keyspace_changes_sum().saturating_sub(KEYSPACE_CHANGES_AT_LAST_SAVE.load(Ordering::Relaxed))
 }
 
-/// Mark a save as complete: subsequent changes count from here.
+/// Mark a save as started: its snapshot holds the changes counted so far.
+///
+/// Called when SAVE / BGSAVE (and the auto-save, which starts a BGSAVE)
+/// begins, before any shard takes its snapshot.
+pub fn mark_save_started() {
+    KEYSPACE_CHANGES_AT_SAVE_START.store(keyspace_changes_sum(), Ordering::Relaxed);
+}
+
+/// Mark a save as complete: the changes counted when it STARTED are now
+/// saved; the ones made while it ran are not (the snapshot predates them)
+/// and stay counted, as redis's `dirty -= dirty_before_bgsave` keeps them
+/// (moon#1232 — they now re-arm a `--save` rule instead of being forgotten).
 ///
 /// Called on SAVE / BGSAVE success, never on failure — a failed save left the
-/// dataset unpersisted, so the pending-change count must survive it.
+/// dataset unpersisted, so the pending-change count must survive it. A save
+/// that did not go through [`mark_save_started`] leaves the count higher,
+/// never lower: `fetch_max` never moves the mark back.
 pub fn mark_save_completed() {
-    KEYSPACE_CHANGES_AT_LAST_SAVE.store(keyspace_changes_sum(), Ordering::Relaxed);
+    KEYSPACE_CHANGES_AT_LAST_SAVE.fetch_max(
+        KEYSPACE_CHANGES_AT_SAVE_START.load(Ordering::Relaxed),
+        Ordering::Relaxed,
+    );
+}
+
+/// Test-only: `(changes counted so far, the mark of the last completed save)`.
+#[cfg(test)]
+pub(crate) fn keyspace_change_marks_for_test() -> (u64, u64) {
+    (
+        keyspace_changes_sum(),
+        KEYSPACE_CHANGES_AT_LAST_SAVE.load(Ordering::Relaxed),
+    )
 }
 
 // ── EC9: replica sync counters (INFO `sync_full` / `sync_partial_*`) ─────
