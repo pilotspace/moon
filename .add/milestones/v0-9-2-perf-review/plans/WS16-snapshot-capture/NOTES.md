@@ -144,14 +144,38 @@ inverse, `logical_of_slot`.
   (a thread with no shard slice): the old behaviour, abort an unfinished epoch.
 - A replica full resync keeps its abort (`note_table_replace`, WS12 F6), queued before its
   `clear` calls: the resync is not a record of the replica's own log, so a pre-resync image
-  with the post-resync WAL tail replayed on top would mix the two datasets. The tables its
-  `clear` calls freeze are dropped with the aborted epoch. A FLUSH or SWAPDB IS logged, so a
-  pre-flush image plus the replayed FLUSH lands on the live keyspace.
+  with the post-resync WAL tail replayed on top would mix the two datasets. A FLUSH or SWAPDB
+  IS logged, so a pre-flush image plus the replayed FLUSH lands on the live keyspace.
+
+### Review 4 — FLUSHALL aborts again (redis parity), FLUSHDB / SWAPDB keep the freeze
+
+redis's FLUSHALL runs `flushAllDataAndResetRDB()`, which calls `killRDBChild()`: an
+in-flight RDB save is aborted. 64816f8 froze every table a FLUSHALL detached instead, so the
+save completed with the pre-flush image — and held the whole pre-flush dataset beside the
+new one until the walk passed each table (up to ~2x RSS). ad3a795b restores the abort for
+FLUSHALL only: the dispatch hook queues it when the command will accept its arguments
+(`flush_args_accepted`, restored) and the epoch still has databases to write. While an abort
+is queued (FLUSHALL, replica resync) `note_cleared_table` drops each detached table at once
+instead of freezing it until the next drain (review nit). FLUSHDB and SWAPDB keep the
+freeze / slot map — redis keeps its child for those.
+
+**FLUSHDB of every database in a loop** (FLUSHALL by another name) is bounded, not a hole:
+a flushed slot is unmapped, so only the FIRST flush of each epoch database freezes a table
+(later flushes of that slot drop theirs), and each frozen table is released as soon as the
+walk finishes its database. Worst case: the epoch-start dataset beside the new one until the
+walk passes it — the same as redis, whose forked child keeps every pre-flush page on FLUSHDB.
+Documented on `note_cleared_table`; pinned by
+`table_swap_tests::flushdb_of_every_database_holds_at_most_the_epoch_start_tables` (4 dbs,
+80 flushes: held bytes <= epoch-start bytes, non-increasing through the walk, and <= the
+epoch-start bytes of the databases still to write). The frozen figure is `used_memory` at
+the flush, not `estimated_memory()` (52544bf3: spill-in-flight payloads are not in the table;
+red 1,467,473 B vs 418,890 B with 1 MiB in flight).
 
 ### Risks
-- Memory: a flushed-but-unwritten table stays allocated until the epoch passes its
+- Memory: a FLUSHDB'd-but-unwritten table stays allocated until the epoch passes its
   database (then it is dropped on the shard thread, as `clear` dropped it before) — the
-  same memory a fork keeps. Counted by item 2b's `current_cow_size`.
+  same memory a fork keeps, at most one table per epoch database (above). Counted by item
+  2b's `current_cow_size`. A FLUSHALL now aborts and frees at once.
 - The address table must describe the slots the tick serializes from; recorded once per
   arm from the shard's own `ShardDbSet`, whose boxed slots never move.
 - One-line edit in `persistence_tick.rs` (WS19's area): `advance_snapshot_segment` reads
@@ -162,19 +186,28 @@ inverse, `logical_of_slot`.
   `rdb_last_bgsave_status:err` after FLUSH*/SWAPDB mid-save — the behaviour moon#1228 removes.
   Renamed `…_keep_the_save_point_in_time`: status `ok`, and the snapshot restored alone after
   SIGKILL holds every `pre:` key in db 0 and nothing in db 1. It is the real-server red test of
-  item 2a (red on baseline-ae21476: status `err`).
+  item 2a (red on baseline-ae21476: status `err`). Since review 4 its FLUSHALL case expects
+  `err`, the abort logged and no file published; it waits for `shard-0.rrdshard.tmp` (the
+  armed epoch, part 3b's method) instead of a fixed 30 ms sleep (3c4e73fc).
 - `perf_ws12_bgsave_split::an_aborted_bgsave_cannot_corrupt_the_next_one` (moon#1227 F1) used a
-  FLUSHALL to abort a save whose writer holds a backlog. The one production abort left is a
-  replica full resync, so the test now makes the node a replica of an empty master mid-save
-  (`REPLICAOF` → link up → `REPLICAOF NO ONE`). The resync takes 50–300 ms on a debug build,
-  and a save whose walk finished first is — correctly — not aborted, so the attempt is set up
-  again with a longer walk (small keys interleaved with the big values) until the log shows the
-  abort. The F1 property (the next save restores) is asserted unchanged.
-  **monoio only** (2037de5): a master answers PSYNC only under runtime-monoio ("-ERR PSYNC
-  requires runtime-monoio on the master"), so on the tokio leg the test is `ignore`d with that
-  reason. The writer-cancel logic is runtime-independent and its unit guards
-  (`stream_tests::an_aborted_snapshot_cannot_*`) run on both runtimes — the tokio END-TO-END F1
-  guard is what no longer runs (it used to, via FLUSHALL).
+  FLUSHALL to abort a save whose writer holds a backlog. 5f6728d re-triggered it with a replica
+  full resync (monoio only, 2037de5). **Review 4 proved that rewrite NOT red:** with the
+  writer-cancel fix (5d02343) reverted it passed (1 of 1, and the same fixture passed every
+  later run on the reverted binary) — the small keys that let the resync land inside the walk
+  left the writer no backlog to race with. Now (236f563e, 5487322e) one helper,
+  `aborted_bgsave_then_resave`, runs two tests:
+  - `an_aborted_bgsave_cannot_corrupt_the_next_one` — FLUSHALL (it aborts again), ~375 MiB of
+    64 KiB values only (writer-bound), the walk held by `MOON_TEST_SNAPSHOT_HOLD_FILE` after
+    128 MiB is written while the FLUSHALL lands, the next BGSAVE within a millisecond of its
+    reply. **Both runtimes** — the tokio end-to-end F1 guard is back. RED on the reverted
+    binary 5 of 5 runs alone ("its 167973249-byte file did not restore"); GREEN 3 of 3 beside
+    the file's other tests, where freeing ~375 MiB in the FLUSHALL let the straggler drain
+    first. F1 is a race; its deterministic guards are `stream_tests::an_aborted_snapshot_cannot_*`.
+    Tried and dropped: six 64 MiB values (cheaper FLUSHALL, deeper backlog) was LESS red.
+  - `a_resync_mid_bgsave_fails_it_and_the_next_save_publishes` — the resync abort path
+    (`note_table_replace`) end to end, walk held until the resync is in (it used to need
+    800K–3.2M keys and still missed up to three attempts: link up took 0.7–1.7 s during a save
+    vs ~40 ms idle). Documented as NOT an F1 regression. monoio only (PSYNC).
 - `perf_ws15_bgsave_status` forced its failed save with the same FLUSHALL. It now squats a
   directory on every shard's snapshot path, so the writer's final `rename` fails (EISDIR) —
   deterministic, no timing window; every status/LASTSAVE/dirty assertion is unchanged.
@@ -240,6 +273,18 @@ accepted 20,000 of 20,000 pushes, MEMORY USAGE q 5,720,321, used_memory +24,534.
   (`handler_sharded::write::mq_write_gate`), and on a routed hop `spsc_eviction_gate` with the
   same plain-drop DEL records the routed write arms emit.
 
+### Review 4 — a POP's released surplus is credited (d0bd7f4e)
+`handle_pop` claims `COUNT + MAXDELIVERY` entries with `read_group_new` (billed: `PEL_SLOT +
+PENDING_SLOT` each through `unbilled`), then releases the surplus. It removed the released ids
+with direct `group.pel.remove` / `pending.remove` — untracked — so every POP billed PEL bytes
+that no longer existed, and the next POP re-claimed and billed them again: `used_memory`
+drifted up for ever (review proof: billed − true = 286,500 B after 500 POPs, control 0). The
+release now goes through `Stream::xack` (credits both slots) and rewinds `last_delivered_id`.
+Real server, `perf_ws16_mq_billing::pop_ack_churn_keeps_the_charge_exact_{single_shard,four_shards}`
+(`--appendonly no`, 16 KiB backlog, settled `used_memory` reads, a `MAXDELIVERY 0` control
+queue): prefix +97,586..+279,991 B over 500 POP/ACK vs MEMORY USAGE +176; fix +176..+367 on
+both queues, 3 runs.
+
 ### Residual
 - The replica `apply_mq_pop` writes the PEL through `group.pel` directly (not through a
   `Stream` method), so those bytes are not tracked in `unbilled` at all — a replica-only
@@ -261,14 +306,16 @@ are filed under the epoch database that slot's table belongs to (moon#1228 item 
 | blocking commands served on the spot / in MULTI | dispatch hook | moon#1227 F2 |
 | **MOVE / COPY … DB n** — every path (connection intercepts ×2 runtimes, SPSC, both MULTI executors, scripts, replica apply, replay) | `capture_two_db` inside `move_core` / `copy_core` (indexes are a required argument) | **WS16 c83598d** |
 | **WS DROP key sweep** (monoio / tokio owner leg, routed `WsDropCleanup`) | per key in `workspace::sweep_prefix` | **WS16 035b774** |
+| **replica `WS.DROP.APPLY`** (`replication::apply::apply_ws_drop` — a fourth sweep copy) | `workspace::sweep_prefix` | **WS16 review 4 f743bab2** (was: none; proof: 497 of 500 dropped keys missing from a replica's own BGSAVE) |
 | **MQ CREATE / PUSH / POP (+DLQ) / ACK** (`mq_exec`) | `capture_write_pre_image` per written key | **WS16 0328e7a** |
 | **TXN.COMMIT MQ.PUBLISH materialization** (self legs ×2, `MqTxnMaterialize`) | per intent in `materialize_mq_intents` | **WS16 0328e7a** |
 | **replica MQ apply** (`apply_mq_{create,push,pop,ack,drop}`) | per written key | **WS16 0328e7a** |
 | **stream waker group reads** (all four callers) | in `stream_wake.rs` before consumer creation and the `>` read | **WS16 fc1c863** |
-| **FLUSHDB / FLUSHALL** (every path — all reach `Database::clear`) | the detached table is frozen into the epoch | **WS16 64816f8** (was: abort) |
+| **FLUSHDB** (every path — all reach `Database::clear`) | the detached table is frozen into the epoch | **WS16 64816f8** (was: abort) |
+| **FLUSHALL** (every path runs the dispatch hook first) | abort the unfinished epoch — redis parity (`killRDBChild`); the detached tables are dropped at once | **WS16 review 4 ad3a795b** (64816f8 had frozen them) |
 | **SWAPDB** (`ShardDbSet::swap`) | slot ↔ epoch-database map follows the tables | **WS16 64816f8** (was: abort) |
 | replica full resync (`load_snapshot`) | abort (`note_table_replace`) — foreign data | moon#1227 F6 |
-| TXN.ABORT KV undo (`transaction::abort`) | not captured. A key the TXN wrote inside the epoch was captured by that write (dispatch), so the file holds its epoch-start state; for a TXN whose writes preceded the epoch the file gets the restored pre-TXN value instead of the uncommitted one — **open question, residual 2** | — |
+| TXN.ABORT KV undo (`transaction::abort`) | not captured (review 4: `capture_write_pre_image`'s doc wrongly listed it as a caller; corrected in 52544bf3). A key the TXN wrote inside the epoch was captured by that write (dispatch), so the file holds its epoch-start state; for a TXN whose writes preceded the epoch the file gets the restored pre-TXN value instead of the uncommitted one — **open question, residual 2** | — |
 | active / lazy expiry, hash-field TTL sweep | none — safe: TTLs are absolute, the loader filters | — |
 | eviction victims, plain drop and spill (`storage::eviction`) | **none** — a victim in a pending range is missing from the file | residual (moon#1185 blocker) |
 | spill-completion failure re-insert (`persistence_tick`) | none — re-inserts the value eviction removed (same key, same value) | — |
@@ -329,7 +376,7 @@ FLUSH during a fold would otherwise abort it.
   outside the X* commands now drains. Replica `apply_mq_pop` PEL bytes remain untracked (noted).
 - **1185 remainder:** DEFERRED with the exact blocker (eviction capture, TXN.ABORT decision).
 
-## Final gate run (HEAD 2037de5; debug builds of this branch copied to /home/user/wt/bin and pinned)
+## Gate run before review 4 (HEAD 2037de5; debug builds of this branch copied to /home/user/wt/bin and pinned)
 
 - `cargo fmt --check` clean; `scripts/audit-unsafe.sh` PASS (0 missing SAFETY);
   `scripts/audit-unwrap.sh` PASS (baseline 0).
@@ -351,3 +398,43 @@ FLUSH during a fold would otherwise abort it.
   perf_ws15_bgsave_status 3/3, perf_ws8_mset_bgsave_capture 1/1, mq_integration 17/17,
   workspace_integration 13/13, multi_move_copy_db_1062 6/6, script_move_copy_db_1068 6/6,
   move_copy_db_crash_recovery_1046 4/4, kill_snapshot 4/4, bgsave_startup_race 1/1.
+
+## Review 4 (MERGE-AFTER-FIXES) — what changed, and the merge of main
+
+| item | commit | evidence |
+|---|---|---|
+| 1 BLOCKING: MQ POP over-charged for ever (untracked surplus release) | d0bd7f4e (+ 04a0458d, a needless `mut`) | proof `r4_red_mq_pop_surplus_release_leaks_billed_bytes` red → green; real-server churn test above |
+| 2 replica `apply_ws_drop`, a fourth sweep copy with no capture | f743bab2 | proof `r4_red_replica_ws_drop_apply_captures_pre_images` red (497 of 500 missing) → green; audit table row |
+| 3 FLUSHALL parity (abort), FLUSHDB/SWAPDB keep the freeze; FLUSHDB-every-db bound | ad3a795b | 3 unit tests red with the hook + abort-drop neutralized; FLUSHDB bound test; real-server table-swap test |
+| 4 fixed sleeps → wait for `shard-0.rrdshard.tmp` | 3c4e73fc | — (flakiness fix) |
+| 5 prove the F1 fixture red | 236f563e, 5487322e | the resync rewrite was NOT red; the FLUSHALL variant is (5/5 alone); see the fixtures section |
+| 6 nits: TXN.ABORT doc, frozen bytes without spill-in-flight, drop tables at once on a queued abort | 52544bf3, ad3a795b | `a_frozen_table_is_billed_without_the_spill_in_flight_bytes` red (1,467,473 vs 418,890 B) → green; resync test asserts nothing queued to freeze |
+| merge `origin/main` (part 3b, 7ddc0cb) | 9915a665 | conflicts: `mq_exec::handle_push` (3b's `Stream::add` → `Option`, kept WS16's gate / capture / billing around its refusal arm); `perf_ws12_bgsave_split` (WS16's `wait_epoch_armed` already carries 3b's wait) |
+| post-merge: adopt 3b's `MOON_TEST_SNAPSHOT_HOLD_FILE` | 5487322e, 9e94d945 | the F1 fixtures' aborts always land; `perf_ws16_bgsave_capture` failed its 4-shard MQ case beside its siblings on the merged tree (0 rounds inside the save in 5 of 5 attempts; 2/2 alone) and now overlaps on the first attempt (6/6 in 6.5 s) |
+
+The review's proof file ran on the merged tree (registered temporarily, not committed): 5 of
+6 green; `r4_red_plain_eviction_mid_epoch_drops_epoch_start_keys` stays red — the eviction
+pre-image gap, residual 1, which the orchestrator is filing separately.
+
+## Gate run after review 4 and the merge (code HEAD 9e94d945; debug builds of the merged tree, pinned)
+
+- `cargo fmt --check` clean; `scripts/audit-unsafe.sh` PASS (0 missing SAFETY),
+  `scripts/audit-unwrap.sh` PASS (baseline 0), `audit-test-tempdirs` PASS,
+  `audit-encoding-limits` OK.
+- `cargo clippy --all-targets -- -D warnings` (monoio) exit 0;
+  `cargo clippy --all-targets --no-default-features --features runtime-tokio,jemalloc -- -D warnings`
+  exit 0.
+- `cargo test --lib`, filtered to persistence::snapshot, shard::persistence_tick,
+  shard::mq_exec, blocking::stream_wake, blocking::wakeup, command::keyspace::move_cmd,
+  scripting::bridge, shard::spsc_two_db, shard::shared_databases, replication::apply,
+  shard::db_plane, workspace, server::conn::tests, storage::db: monoio 598 passed / 1 ignored;
+  tokio 562 passed / 1 ignored.
+- Integration, monoio (`MOON_BIN=/home/user/wt/bin/ws16-dbg-r4-merged-monoio`):
+  perf_ws12_bgsave_split 5/5, perf_ws15_bgsave_status 3/3, perf_ws8_mset_bgsave_capture 1/1,
+  perf_ws16_bgsave_capture 6/6, perf_ws16_mq_billing 4/4; with `--include-ignored`:
+  replication_ws 4/4, replication_readonly_ws_mq 1/1, replication_mq 4/4, replication_swapdb 3/3.
+  (mq_integration and workspace_integration compile to no tests on monoio.)
+- Integration, tokio (`MOON_BIN=/home/user/wt/bin/ws16-dbg-r4-merged-tokio`):
+  perf_ws12_bgsave_split 4/4 + 1 ignored (the resync variant: PSYNC needs a monoio master),
+  perf_ws15_bgsave_status 3/3, perf_ws8_mset_bgsave_capture 1/1, perf_ws16_bgsave_capture 6/6,
+  perf_ws16_mq_billing 4/4, mq_integration 17/17, workspace_integration 13/13 + 1 ignored.
