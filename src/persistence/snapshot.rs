@@ -1405,6 +1405,9 @@ mod split_epoch_tests;
 mod table_swap_tests;
 
 #[cfg(test)]
+mod prop_tests;
+
+#[cfg(test)]
 mod multi_key_cow_tests;
 
 #[cfg(test)]

@@ -213,6 +213,26 @@ bytes pass `FREEZE_WAIT_SLACK` (8 MiB). An abort now also releases waiting table
   completes and restores db 0's 2,000 keys with dbs 1-8 empty.
 - The randomized flush/swap workload passed over 400 seeds (12 committed).
 
+**Property tests (review 6, adopted).** The reviewer checked fix A with two property tests,
+now permanent:
+- `persistence::snapshot::prop_tests` (lib): random mixed-type workloads, including MOVE,
+  COPY, SWAPDB, expiries, lazy-free UNLINKs, FLUSHDB (biased onto the database in progress)
+  and grow-then-FLUSHDB, with held, one-segment and budgeted ticks. After every drain the
+  frozen rows must stay within the epoch-start bills of the unwritten databases. At the end
+  the file must be EXACTLY the epoch-start image, and file + tail the live keyspace. It runs
+  16 seeds by default (~6 s debug); `MOON_TEST_SNAPSHOT_PROP_SEEDS` runs more. The reviewer
+  ran 2,000 with no counterexample. Here 64 seeds pass in 25.6 s, with 223 frozen flushes,
+  61 rebuilds and a max bill error of 0.
+- `tests/perf_ws16_bgsave_prop.rs` (real server): a random workload while the hold is
+  toggled, then kill -9 and restore the file alone. It runs 3 seeds at `--shards 1` and 3 at
+  `--shards 4` (20 s); the reviewer ran 80.
+- **Mutation evidence** (re-run here):
+  - Removing the pre-image restore from the trim makes seed 1 red: "the file is not the
+    epoch-start image: 5 missing".
+  - Applying the table events BEFORE the captures in `drain_into` makes the bound check red
+    at seed 1: "db 0's frozen rows are 30090 B; its epoch-start bill 0 B". The trim ran
+    without that tick's tombstones, so post-epoch rows stayed frozen.
+
 The frozen figure is `used_memory` at the flush, not `estimated_memory()` (52544bf3:
 spill-in-flight payloads are not in the table; red 1,467,473 B vs 418,890 B with 1 MiB in
 flight).
