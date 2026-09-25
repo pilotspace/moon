@@ -333,10 +333,35 @@ Real server, `perf_ws16_mq_billing::pop_ack_churn_keeps_the_charge_exact_{single
 queue): prefix +97,586..+279,991 B over 500 POP/ACK vs MEMORY USAGE +176; fix +176..+367 on
 both queues, 3 runs.
 
-### Residual
-- The replica `apply_mq_pop` writes the PEL through `group.pel` directly (not through a
-  `Stream` method), so those bytes are not tracked in `unbilled` at all — a replica-only
-  under-count (never an over-credit). Not touched here.
+### Review 5 — the MqPop apply bills its claims (moon#1261)
+Review 4 filed this as a residual: "the replica `apply_mq_pop` writes the PEL untracked — a
+replica-only under-count (never an over-credit)". **That was wrong on both counts.**
+- **Not replica-only:** `apply_mq_pop` also serves the master's own WAL replay.
+- **An over-credit:** the claims were never charged, but `apply_mq_ack` credits them through
+  `Stream::xack`. Every replayed or replicated POP+ACK credited ~191 B that was never
+  charged, so the queue's bill drained toward 0.
+- Reviewer's measurement: MEMORY USAGE q was 124,097 live and 28,421 after a restart's
+  replay; 124,097 on the master against 28,421 on its replica.
+
+**Fix:** the new `Stream::restore_claims` does what the apply did by hand, with every byte
+tracked in `unbilled` as `read_group_new` / `xack` track it on the master:
+- inserts the PEL entries and the consumer's pending ids, creating the consumer if needed;
+- sets the cursor;
+- removes the dead letters with `xack`.
+`apply_mq_pop` then drains `take_unbilled` into `bill_stream_delta`, for both callers (replay,
+replica).
+
+**Evidence:**
+- `restore_claims_bills_what_the_masters_claim_billed`: the same claims through
+  `read_group_new` + `xack` move the same bytes.
+- `test_replay_mq_wal_bills_pop_and_ack_like_the_live_server`: red (tracked 627 B vs a scan of
+  1,185 B), now green.
+- `perf_ws16_mq_billing::a_restart_bills_a_churned_queue_as_the_live_server_did` and
+  `::a_replica_bills_a_churned_queue_as_its_master_does` (the reviewer's proofs, adopted):
+  red with 28,421 vs 124,097 B; now exactly equal (124,097 = 124,097), 2 runs each.
+- `::a_pop_surplus_release_agrees_on_master_replica_and_restart` (the reviewer's Q1 proof,
+  adopted without its MULTI leg, moon#1262): master, replica and restart hold the same PEL
+  and cursor, and serve the rest once, in order. It passed before and after.
 
 ## Capture-site audit table (WS12's table, updated at the end of WS16)
 
@@ -421,7 +446,8 @@ FLUSH during a fold would otherwise abort it.
   ticks, 10x tombstones) with a 4x bound. The Linux-perf-host number is DEFERRED by the brief.
 - **1250 (MQ billing):** 0.92 · 0.9 · 0.95 · 0.9 · 0.9 · 0.9. Billing alone could not make
   `maxmemory` bind (MQ bypassed the gate), so the gate was added too; every stream mutation
-  outside the X* commands now drains. Replica `apply_mq_pop` PEL bytes remain untracked (noted).
+  outside the X* commands now drains. The MqPop apply (replay and replica) bills its claims since
+  review 5 (moon#1261).
 - **1185 remainder:** DEFERRED with the exact blocker (eviction capture, TXN.ABORT decision).
 
 ## Gate run before review 4 (HEAD 2037de5; debug builds of this branch copied to /home/user/wt/bin and pinned)
