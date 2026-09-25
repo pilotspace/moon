@@ -33,6 +33,11 @@ fn hold_file(dir: &Path) -> std::path::PathBuf {
 }
 
 fn spawn(dir: &Path, shards: usize) -> (ServerGuard, u16) {
+    spawn_with_maxmemory(dir, shards, "0")
+}
+
+/// [`spawn`] under `--maxmemory <maxmemory>` with `noeviction`.
+fn spawn_with_maxmemory(dir: &Path, shards: usize, maxmemory: &str) -> (ServerGuard, u16) {
     std::fs::create_dir_all(dir).expect("create test dir");
     let bin = common::find_moon_binary();
     let (child, port) = common::spawn_listening(|port| {
@@ -52,7 +57,9 @@ fn spawn(dir: &Path, shards: usize) -> (ServerGuard, u16) {
                 "--disk-offload",
                 "disable",
                 "--maxmemory",
-                "0",
+                maxmemory,
+                "--maxmemory-policy",
+                "noeviction",
                 "--disk-free-min-pct",
                 "0",
             ])
@@ -478,4 +485,96 @@ fn mq_during_bgsave_single_shard() {
 #[test]
 fn mq_during_bgsave_four_shards() {
     mq_during_bgsave(4);
+}
+
+fn info_int(c: &mut Conn, section: &str, field: &str) -> i64 {
+    let info = c.send(&["INFO", section]);
+    let prefix = format!("{field}:");
+    info.lines()
+        .find_map(|l| l.strip_prefix(prefix.as_str()))
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or_else(|| panic!("no {field} in INFO {section}: {info:.300}"))
+}
+
+/// moon#1228 review 5 (the reviewer's reproduction, adopted): fill a
+/// database, FLUSHDB it, database after database, while one BGSAVE is held
+/// open. The FLUSHDB freeze kept the table AS FLUSHED — every post-epoch
+/// row, all of them tombstoned and useless to the file — so under
+/// `--maxmemory 64mb` 8 x (40 MB of SETs + FLUSHDB) held 344,782,240 B in
+/// `current_cow_size` and grew RSS by 341 MB while `used_memory` stayed at
+/// the epoch-start 302,165 B: `maxmemory` never saw it. The drain now trims
+/// a frozen table to its epoch-start rows: here dbs 1-8 were empty at epoch
+/// start, so the epoch holds nothing for them. The save completes, and the
+/// restored file is the epoch-start keyspace (db 0's 2,000 keys, dbs 1-8
+/// empty).
+#[test]
+fn flushdb_after_post_epoch_inserts_holds_only_the_epoch_start_rows() {
+    let dir = common::unique_test_dir("ws16-flushdb-bound");
+    let _cleanup = DirGuard(dir.clone());
+    let (mut server, port) = spawn_with_maxmemory(&dir, 1, "64mb");
+    let mut c = Conn::open(port);
+    let mut out = Vec::new();
+    for j in 0..2000 {
+        out.extend_from_slice(&encode(&["SET", &format!("pre:{j:06}"), "v"]));
+    }
+    c.sock.write_all(&out).unwrap();
+    let _ = c.read_replies(2000);
+    std::thread::sleep(Duration::from_millis(300)); // used_memory settles
+    let start_used = info_int(&mut c, "memory", "used_memory");
+    let rss_before = info_int(&mut c, "memory", "used_memory_rss");
+
+    std::fs::write(hold_file(&dir), b"").expect("create the hold file");
+    assert!(c.send(&["BGSAVE"]).contains("Background saving started"));
+    assert!(wait_until_armed(&dir, 1, &mut c), "the held save ended");
+    let value = "x".repeat(4096);
+    for db in 1..=8 {
+        assert!(c.send(&["SELECT", &db.to_string()]).starts_with("+OK"));
+        let mut i = 0;
+        while i < 10_000 {
+            let mut out = Vec::new();
+            for j in i..i + 500 {
+                out.extend_from_slice(&encode(&["SET", &format!("post:{db}:{j}"), &value]));
+            }
+            c.sock.write_all(&out).unwrap();
+            let replies = c.read_replies(500);
+            assert!(
+                !replies.contains("-OOM"),
+                "db {db}: refused: {replies:.200}"
+            );
+            i += 500;
+        }
+        assert!(c.send(&["FLUSHDB"]).starts_with("+OK"));
+    }
+    std::thread::sleep(Duration::from_millis(200)); // the drains run
+    let used = info_int(&mut c, "memory", "used_memory");
+    let rss = info_int(&mut c, "memory", "used_memory_rss");
+    let cow = info_int(&mut c, "persistence", "current_cow_size");
+    assert!(bgsave_in_progress(&mut c), "the hold must still hold");
+    eprintln!(
+        "epoch-start used_memory {start_used}; after 8 x (40 MB SET + FLUSHDB): used_memory \
+         {used}, current_cow_size {cow}, RSS {rss_before} -> {rss} (+{} MB)",
+        (rss - rss_before) >> 20
+    );
+    std::fs::remove_file(hold_file(&dir)).expect("release the hold");
+    assert!(
+        cow <= start_used,
+        "the held save holds {cow} B (current_cow_size) after 8 x (40 MB SET + FLUSHDB); the \
+         epoch-start dataset is {start_used} B"
+    );
+    assert!(
+        rss - rss_before < 150 << 20,
+        "RSS grew {} MB under --maxmemory 64mb while used_memory is {used}",
+        (rss - rss_before) >> 20
+    );
+    wait_bgsave_done(&mut c);
+    assert_eq!(last_bgsave_status(&mut c), "ok", "the save must complete");
+
+    server.kill_now();
+    common::wait_for_port_down(port);
+    let (_server2, port2) = spawn_with_maxmemory(&dir, 1, "64mb");
+    let mut c2 = Conn::open(port2);
+    assert_eq!(dbsize(&mut c2, 0), 2000, "db 0: the epoch-start keys");
+    for db in 1..=8 {
+        assert_eq!(dbsize(&mut c2, db), 0, "db {db} was empty at epoch start");
+    }
 }

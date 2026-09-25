@@ -260,9 +260,11 @@ enum Source {
     /// database's own index; a SWAPDB moves the table, and this with it.
     Live(usize),
     /// The table a FLUSHDB detached before the epoch wrote it
-    /// (`Database::clear` hands it over instead of dropping it). Nothing
-    /// writes it any more, so with the pre-images captured before the flush
-    /// it IS the database's epoch-start contents.
+    /// (`Database::clear` hands it over instead of dropping it), trimmed to
+    /// the database's epoch-start rows still to write, pre-images restored
+    /// into it (review 5, `trim_to_epoch_start`); and its bill. Nothing
+    /// writes it any more: it IS the rest of the database's epoch-start
+    /// contents.
     Frozen(Box<Table>, u64),
     /// Fully written (a frozen table is dropped as soon as it is).
     Written,
@@ -563,6 +565,16 @@ impl SnapshotState {
         self.overflow_bytes + frozen
     }
 
+    /// Test-only: how many segments the table a flush froze for epoch
+    /// database `db` has, if one is frozen (moon#1228 review 5).
+    #[cfg(test)]
+    pub(crate) fn frozen_segments_for_test(&self, db: usize) -> Option<usize> {
+        match self.sources.get(db) {
+            Some(Source::Frozen(table, _)) => Some(table.segment_count()),
+            _ => None,
+        }
+    }
+
     /// Pre-images captured and not yet written, across every database.
     #[inline]
     pub fn pending_pre_images(&self) -> usize {
@@ -625,21 +637,28 @@ impl SnapshotState {
     }
 
     /// A FLUSHDB detached database `db`'s table before the epoch finished
-    /// writing it (moon#1228): keep the table as `db`'s epoch-start
-    /// contents. A table for a database already written (or an aborted
-    /// epoch) is dropped. Queued by `snapshot_cow::note_cleared_table`; a
-    /// FLUSHALL aborts the epoch instead (redis parity).
+    /// writing it (moon#1228): keep the table's EPOCH-START rows as `db`'s
+    /// contents. The table arrives as flushed, post-epoch rows included; it
+    /// is trimmed to the rows the walk still has to write first (review 5,
+    /// [`Self::trim_to_epoch_start`]), so what the epoch holds for `db` is
+    /// at most `db`'s epoch-start bill. A table for a database already
+    /// written (or an aborted epoch) is dropped. Queued by
+    /// `snapshot_cow::note_cleared_table`, and applied after the drain has
+    /// folded in the captures queued with it; a FLUSHALL aborts the epoch
+    /// instead (redis parity).
     ///
-    /// `bytes` is what the table held (its database's `used_memory` at the
-    /// flush, without spill-in-flight bytes), reported in
-    /// [`Self::cow_bytes`] while the epoch keeps it.
-    pub(crate) fn freeze(&mut self, db: usize, table: Box<Table>, bytes: u64) {
+    /// `bytes` is the table's `used_memory` at the flush (without
+    /// spill-in-flight bytes); the trimmed bill is reported in
+    /// [`Self::cow_bytes`] while the epoch keeps the table.
+    pub(crate) fn freeze(&mut self, db: usize, mut table: Box<Table>, bytes: u64) {
         if self.aborted.is_some() || db < self.current_db || db >= self.num_databases {
             return;
         }
-        if let Some(source @ Source::Live(_)) = self.sources.get_mut(db) {
-            *source = Source::Frozen(table, bytes);
+        if !matches!(self.sources.get(db), Some(Source::Live(_))) {
+            return;
         }
+        let bytes = self.trim_to_epoch_start(db, &mut table, bytes);
+        self.sources[db] = Source::Frozen(table, bytes);
     }
 
     /// Run `f` over the current database's epoch-start table: the frozen
@@ -1367,6 +1386,8 @@ pub fn shard_snapshot_load<D: std::borrow::BorrowMut<Database>>(
 
     Ok(total_keys)
 }
+
+mod frozen;
 
 #[cfg(test)]
 mod tests;

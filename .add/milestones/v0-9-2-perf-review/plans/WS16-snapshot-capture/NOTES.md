@@ -159,23 +159,71 @@ is queued (FLUSHALL, replica resync) `note_cleared_table` drops each detached ta
 instead of freezing it until the next drain (review nit). FLUSHDB and SWAPDB keep the
 freeze / slot map — redis keeps its child for those.
 
-**FLUSHDB of every database in a loop** (FLUSHALL by another name) is bounded, not a hole:
-a flushed slot is unmapped, so only the FIRST flush of each epoch database freezes a table
-(later flushes of that slot drop theirs), and each frozen table is released as soon as the
-walk finishes its database. Worst case: the epoch-start dataset beside the new one until the
-walk passes it — the same as redis, whose forked child keeps every pre-flush page on FLUSHDB.
-Documented on `note_cleared_table`; pinned by
-`table_swap_tests::flushdb_of_every_database_holds_at_most_the_epoch_start_tables` (4 dbs,
-80 flushes: held bytes <= epoch-start bytes, non-increasing through the walk, and <= the
-epoch-start bytes of the databases still to write). The frozen figure is `used_memory` at
-the flush, not `estimated_memory()` (52544bf3: spill-in-flight payloads are not in the table;
-red 1,467,473 B vs 418,890 B with 1 MiB in flight).
+**FLUSHDB of every database in a loop** (FLUSHALL by another name). Review 4's claim that
+it held "at most the epoch-start dataset" was WRONG (review 5): only the COUNT was bounded.
+A flushed slot is unmapped, so only the FIRST flush of each epoch database freezes a table,
+but that table was frozen AS FLUSHED, with every row inserted since the epoch began (all
+tombstoned, useless to the file). The pin test flushed BEFORE inserting, so it never saw
+one. The reviewer's reproduction held one save open under `--maxmemory 64mb` and ran
+8 x (40 MB of SETs into db N, FLUSHDB). It measured `current_cow_size` 344,782,240 and RSS
++341 MB, with `used_memory` still at the epoch-start 302,165 B. Main aborts that save
+instead (RSS +48 MB).
+
+**The fix (review 5):** the drain trims a flushed table to its epoch-start rows before it
+freezes it (`SnapshotState::trim_to_epoch_start`, `snapshot/frozen.rs`). The trim has three
+steps:
+1. Every key written since the epoch began has a pre-image in the database's overflow map.
+   The drain now folds the queued captures in before it applies table events, and nothing
+   captures for the slot after the flush. The trim removes that key's post-epoch row and
+   puts the epoch-start entry back (a tombstone puts nothing back), which empties the map.
+2. For the database in progress it also drops the rows below the cursor: written already,
+   or post-epoch writes into a written range.
+3. If the post-epoch rows had more than doubled the table's epoch-start segment count, it
+   moves the kept rows into a table sized for them, so no skeleton of the inserts survives.
+
+The kept rows are a subset of the epoch-start rows with their epoch-start entries. After
+every drain the epoch therefore holds at most the epoch-start bills of the databases it has
+not written, and releases each as the walk passes it. This is the same worst case as redis's
+FLUSHDB child. The bill is the table's `used_memory` at the flush, minus the removed rows'
+`entry_overhead`, plus the restored rows'.
+
+**The wait before the drain.** Until the drain (one tick) a flushed table waits whole. One
+grown table may wait: its rows were in `used_memory` an instant before. A second flush of a
+grown database before the drain (MULTI, a script) fails the save once the waiting post-epoch
+bytes pass `FREEZE_WAIT_SLACK` (8 MiB). An abort now also releases waiting tables at once.
+
+**Cost.** All on the shard thread at the drain:
+- step 1: one remove plus insert per key written since the epoch began, already paid for at
+  capture;
+- step 2: the segments below the cursor, already visited by the walk;
+- step 3: only after a doubling, at most the epoch-start rows.
+
+**Evidence:**
+- `flushdb_of_every_database_holds_at_most_the_epoch_start_tables` now inserts 300 x 1 KiB
+  and THEN flushes, 20 rounds x 4 dbs, and checks after every drain. It went red on the old
+  code ("round 0, db 1: the epoch holds 1297793 B after a drain; the epoch-start dataset is
+  1123560 B") and is green now.
+- `a_frozen_table_keeps_no_skeleton_of_post_epoch_rows` went red (515 of 515 segments kept,
+  epoch-start 2) and is green for a pending database and for the one in progress.
+- `grown_tables_flushed_before_one_drain_fail_the_save` went red (the save completed) and is
+  green.
+- Real server, `perf_ws16_bgsave_capture::flushdb_after_post_epoch_inserts_holds_only_the_epoch_start_rows`
+  (the reviewer's reproduction adopted): red on the old binary (`current_cow_size`
+  344,782,240, RSS +341 MB), green 3 of 3 (`current_cow_size` 0, RSS +49..+58 MB). The save
+  completes and restores db 0's 2,000 keys with dbs 1-8 empty.
+- The randomized flush/swap workload passed over 400 seeds (12 committed).
+
+The frozen figure is `used_memory` at the flush, not `estimated_memory()` (52544bf3:
+spill-in-flight payloads are not in the table; red 1,467,473 B vs 418,890 B with 1 MiB in
+flight).
 
 ### Risks
-- Memory: a FLUSHDB'd-but-unwritten table stays allocated until the epoch passes its
-  database (then it is dropped on the shard thread, as `clear` dropped it before) — the
-  same memory a fork keeps, at most one table per epoch database (above). Counted by item
-  2b's `current_cow_size`. A FLUSHALL now aborts and frees at once.
+- Memory: a FLUSHDB'd-but-unwritten table's EPOCH-START rows stay allocated until the
+  epoch passes its database (then they are dropped on the shard thread, as `clear` dropped
+  them before) — at most that database's epoch-start bill, the memory a fork keeps (review
+  5 trim, above). Until the next drain the table waits whole (one grown table at a time;
+  more fail the save). Counted by item 2b's `current_cow_size`. A FLUSHALL aborts and frees
+  at once.
 - The address table must describe the slots the tick serializes from; recorded once per
   arm from the shard's own `ShardDbSet`, whose boxed slots never move.
 - One-line edit in `persistence_tick.rs` (WS19's area): `advance_snapshot_segment` reads

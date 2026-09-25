@@ -57,7 +57,9 @@ use super::entry::{CachedClock, Entry, RedisValue, current_secs, current_time_ms
 pub use crate::storage::encoding_limits::{EncodingLimits, Shape};
 
 /// Estimate per-entry overhead: key length + value memory + struct overhead.
-fn entry_overhead(key: &[u8], entry: &Entry) -> usize {
+/// What `used_memory` charges for a row — also how a snapshot bills the rows
+/// a flushed table keeps (moon#1228).
+pub(crate) fn entry_overhead(key: &[u8], entry: &Entry) -> usize {
     entry_overhead_len(key.len(), entry)
 }
 
@@ -1401,6 +1403,15 @@ impl Database {
     /// to chase memory that cannot drop yet.
     pub fn estimated_memory(&self) -> usize {
         self.used_memory.saturating_add(self.spill_inflight_bytes)
+    }
+
+    /// The `used_memory` ledger alone: what the table's rows are billed,
+    /// without [`Self::estimated_memory`]'s spill-in-flight bytes (which the
+    /// table does not hold). A snapshot records it per database when it
+    /// starts, to bound what a FLUSHDB may hand it (moon#1228).
+    #[inline]
+    pub(crate) fn ledger_bytes(&self) -> usize {
+        self.used_memory
     }
 
     /// Resident bytes attributed to this database (alias for `estimated_memory`,
