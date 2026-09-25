@@ -96,18 +96,74 @@ const LAZY_FREE_LEGACY_BUDGET: Duration = Duration::from_millis(2);
 /// process-wide [`crate::storage::db::lazy_free_pending_anywhere`]: an idle
 /// shard must not be kept awake by another shard's queue. Databases past the
 /// deadline are only asked, not drained.
+///
+/// # Per shard, and fair across databases (moon#1226)
+///
+/// The process-wide count only says SOME shard has work. Gating on it alone,
+/// every shard took the write guard of every database every 1 ms while any
+/// one shard drained a large value — 16 exclusive acquisitions per shard per
+/// tick for nothing. The gate is now this shard's own count
+/// ([`crate::storage::db::lazy_free_queued_on_this_thread`]); an idle shard
+/// takes no guard. Every [`LAZY_FREE_SWEEP_TICKS`]-th tick still sweeps
+/// while anything is queued anywhere, so a queue the per-thread count cannot
+/// see (a database mutated from another thread) is drained within that many
+/// ticks rather than never; the sweep resyncs the count from what the
+/// databases hold.
+///
+/// And the first database drained rotates each tick: starting at db 0 every
+/// time, a large value there took the whole budget tick after tick while db
+/// 15's queue — perhaps the one holding the memory a gate needs — waited.
 pub fn drain_lazy_free_tick(db_count: usize) -> bool {
     if !crate::storage::db::lazy_free_pending_anywhere() {
         return false;
     }
+    let sweep = LAZY_FREE_TICK_STATE.with(|s| {
+        let t = s.ticks.get().wrapping_add(1);
+        s.ticks.set(t);
+        t % LAZY_FREE_SWEEP_TICKS == 0
+    });
+    if !sweep && !crate::storage::db::lazy_free_queued_on_this_thread() {
+        return false;
+    }
+    if db_count == 0 {
+        return false;
+    }
+    let start = LAZY_FREE_TICK_STATE.with(|s| {
+        let start = s.next_db.get() % db_count;
+        s.next_db.set((start + 1) % db_count);
+        start
+    });
     let deadline = Instant::now() + crate::storage::db::LAZY_FREE_TICK_BUDGET;
     let mut pending = false;
-    for i in 0..db_count {
+    for k in 0..db_count {
+        let i = (start + k) % db_count;
         pending |= crate::shard::slice::with_shard_db(i, |db| {
             db.lazy_free_len() != 0 && (Instant::now() >= deadline || db.drain_lazy_free(deadline))
         });
     }
+    // Every database was asked, so `pending` is the truth for this shard.
+    crate::storage::db::lazy_free_resync_this_thread(pending);
     pending
+}
+
+/// While anything is queued anywhere, a shard whose own count is zero still
+/// sweeps its databases once per this many ticks (moon#1226). See
+/// [`drain_lazy_free_tick`].
+pub const LAZY_FREE_SWEEP_TICKS: u32 = 64;
+
+/// Per-shard-thread state of [`drain_lazy_free_tick`].
+struct LazyFreeTickState {
+    ticks: std::cell::Cell<u32>,
+    next_db: std::cell::Cell<usize>,
+}
+
+thread_local! {
+    static LAZY_FREE_TICK_STATE: LazyFreeTickState = const {
+        LazyFreeTickState {
+            ticks: std::cell::Cell::new(0),
+            next_db: std::cell::Cell::new(0),
+        }
+    };
 }
 
 /// Public entry point for per-shard active expiry.
@@ -1240,7 +1296,8 @@ mod lazy_free_tick_tests {
 
     use bytes::Bytes;
 
-    use super::drain_lazy_free_tick;
+    use super::{LAZY_FREE_SWEEP_TICKS, drain_lazy_free_tick};
+    use crate::shard::db_plane::exclusive_count;
     use crate::shard::slice::{ShardSlice, init_shard, test_support::make_init, with_shard_db};
     use crate::storage::compact_value::CompactValue;
     use crate::storage::entry::{Entry, RedisValue};
@@ -1303,5 +1360,89 @@ mod lazy_free_tick_tests {
             left, 0,
             "the tick must report pending until the queue is empty"
         );
+    }
+
+    /// moon#1226: while another shard drains a large value, a shard with
+    /// nothing queued takes NO database guard on its tick — it used to take
+    /// the write guard of all 16 databases every 1 ms. The periodic safety
+    /// sweep (every `LAZY_FREE_SWEEP_TICKS`-th tick) is the one exception.
+    #[test]
+    fn an_idle_shard_takes_no_guard_while_another_shard_drains() {
+        let (queued_tx, queued_rx) = mpsc::channel::<()>();
+        let (go_tx, go_rx) = mpsc::channel::<()>();
+        let a = std::thread::spawn(move || {
+            init_shard(ShardSlice::new(make_init(0, 16)));
+            with_shard_db(3, |db| {
+                db.set(b"big", huge_hash(200_000));
+                assert!(db.unlink(b"big"));
+            });
+            queued_tx.send(()).expect("signal");
+            go_rx.recv().expect("wait");
+            while drain_lazy_free_tick(16) {}
+        });
+        queued_rx.recv().expect("shard A queued its value");
+        let b = std::thread::spawn(|| {
+            init_shard(ShardSlice::new(make_init(1, 16)));
+            assert!(crate::storage::db::lazy_free_pending_anywhere(), "fixture");
+            let before = exclusive_count::get();
+            for _ in 1..LAZY_FREE_SWEEP_TICKS {
+                assert!(!drain_lazy_free_tick(16));
+            }
+            let idle = exclusive_count::get() - before;
+            // The sweep tick visits every database once, finds nothing.
+            let before = exclusive_count::get();
+            assert!(!drain_lazy_free_tick(16));
+            (idle, exclusive_count::get() - before)
+        })
+        .join()
+        .expect("shard B");
+        go_tx.send(()).expect("release shard A");
+        a.join().expect("shard A");
+        assert_eq!(
+            b.0,
+            0,
+            "an idle shard took {} database write guards over {} ticks while another \
+             shard had lazy-free work queued (16 per tick before moon#1226)",
+            b.0,
+            LAZY_FREE_SWEEP_TICKS - 1
+        );
+        assert_eq!(b.1, 16, "the safety sweep visits each database once");
+    }
+
+    /// moon#1226: the first database a tick drains rotates, so a large value in
+    /// db 0 cannot take every tick's whole budget while db 1's queue waits.
+    #[test]
+    fn the_first_database_drained_rotates() {
+        std::thread::spawn(|| {
+            init_shard(ShardSlice::new(make_init(0, 2)));
+            for db_i in 0..2 {
+                with_shard_db(db_i, |db| {
+                    db.set(b"big", huge_hash(200_000));
+                    assert!(db.unlink(b"big"));
+                });
+            }
+            let charged = |i| with_shard_db(i, |db| db.estimated_memory());
+            let (m0, m1) = (charged(0), charged(1));
+            assert!(
+                drain_lazy_free_tick(2),
+                "one slice cannot free 2 x 200K fields"
+            );
+            let (a0, a1) = (charged(0), charged(1));
+            assert!(drain_lazy_free_tick(2));
+            let (b0, b1) = (charged(0), charged(1));
+            // One tick started at each database: each one moved once.
+            let first = (m0 - a0, m1 - a1);
+            let second = (a0 - b0, a1 - b1);
+            assert!(
+                (first.0 > 0 && second.1 > 0) || (first.1 > 0 && second.0 > 0),
+                "two ticks must each start at a different database: tick 1 freed \
+                 {first:?} bytes (db0, db1), tick 2 {second:?}"
+            );
+            while drain_lazy_free_tick(2) {}
+            assert_eq!(with_shard_db(0, |db| db.lazy_free_len()), 0);
+            assert_eq!(with_shard_db(1, |db| db.lazy_free_len()), 0);
+        })
+        .join()
+        .expect("shard thread");
     }
 }
