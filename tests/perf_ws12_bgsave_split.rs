@@ -249,7 +249,7 @@ fn table_swaps_during_bgsave_keep_the_save_point_in_time() {
         );
         server.kill_now();
         common::wait_for_port_down(port);
-        let (_server2, port2) = spawn(&dir, 1);
+        let (server2, port2) = spawn(&dir, 1);
         let mut c2 = Conn::open(port2);
         let wrong = wrong_pre_keys(&mut c2, N);
         assert!(c2.send(&["SELECT", "1"]).starts_with('+'));
@@ -259,6 +259,7 @@ fn table_swaps_during_bgsave_keep_the_save_point_in_time() {
             "{cmd:?}: the snapshot is not the keyspace the save started from: {wrong} of {N} \
              db-0 keys missing or changed, db 1 DBSIZE {in_db1:?}"
         );
+        drop(server2);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
@@ -282,7 +283,18 @@ fn table_swaps_during_bgsave_keep_the_save_point_in_time() {
 /// Since moon#1230 `rdb_last_bgsave_status` describes the LAST save, so it
 /// judges the second save directly; the log shows the first was aborted, and
 /// the restart proves the published file is sound.
+///
+/// monoio only: a master answers PSYNC only under runtime-monoio ("-ERR PSYNC
+/// requires runtime-monoio on the master"), so a tokio build has no resync
+/// to abort a save with. The writer-cancel logic under test is runtime-
+/// independent (`snapshot_stream`, a plain thread) and its unit guards —
+/// `persistence::snapshot::stream_tests::an_aborted_snapshot_cannot_corrupt_*`
+/// — run on both runtimes.
 #[test]
+#[cfg_attr(
+    not(feature = "runtime-monoio"),
+    ignore = "needs a replica full resync, which needs a runtime-monoio master"
+)]
 fn an_aborted_bgsave_cannot_corrupt_the_next_one() {
     let dir = common::unique_test_dir("ws12-abort-resave");
     std::fs::create_dir_all(&dir).unwrap();

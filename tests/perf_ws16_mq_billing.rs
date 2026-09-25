@@ -72,7 +72,7 @@ const PUSHES: usize = 20_000;
 
 fn mq_push_is_charged_so_maxmemory_binds(shards: usize) {
     let dir = common::unique_test_dir(&format!("ws16-mq-billing-s{shards}"));
-    let (_server, port) = spawn(&dir, shards);
+    let (server, port) = spawn(&dir, shards);
     let mut c = Conn::open(port);
     assert_eq!(c.send(&["MQ", "CREATE", "q"]), "+OK\r\n");
     let before = used_memory(&mut c);
@@ -113,6 +113,7 @@ fn mq_push_is_charged_so_maxmemory_binds(shards: usize) {
         !popped.starts_with('-'),
         "MQ POP refused over the limit: {popped}"
     );
+    drop(server);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
