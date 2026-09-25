@@ -42,20 +42,38 @@ fn the_aof_pool_receives_the_callers_record_without_a_copy() {
     }
 }
 
-/// With no replica registered on this shard and none ever attaching, a write
-/// never touches the replication backlog's mutex. The comment above the lock
-/// claimed "no lock acquire" for this case while the code locked on every
-/// write. Held here by this thread: a write that tries to lock it cannot
-/// finish, which the bounded join turns into a failure instead of a hang.
+/// The backlog gate, every row (moon#1177): a write appends to the
+/// replication backlog, taking its mutex, iff a replica is registered on this
+/// shard or one has begun attaching somewhere. The pure predicate is testable
+/// whatever the process-global hint holds; reading the hint directly made the
+/// integration test below vacuous whenever a `replication::state` test had
+/// already set it in the same `cargo test --lib` process.
 #[test]
-fn a_write_with_no_replica_never_takes_the_backlog_lock() {
-    if crate::replication::state::fanout_hint_active() {
-        // The hint is process-global and sticky; another test in this binary
-        // (a replica activation) turned it on, so "no replica ever attached"
-        // cannot be set up in this process. Nothing to observe.
-        eprintln!("fanout hint already active in this test process; skipping");
-        return;
+fn the_backlog_gate_opens_only_for_a_replica_or_the_fanout_hint() {
+    // (replicas_empty, fanout_hint) -> wanted
+    let table = [
+        ((true, false), false),
+        ((true, true), true),
+        ((false, false), true),
+        ((false, true), true),
+    ];
+    for ((replicas_empty, fanout_hint), wanted) in table {
+        assert_eq!(
+            backlog_append_wanted(replicas_empty, fanout_hint),
+            wanted,
+            "replicas_empty={replicas_empty} fanout_hint={fanout_hint}"
+        );
     }
+}
+
+/// One routed write through the real body, hint passed in (never read from
+/// the process-global), while this thread HOLDS the backlog mutex: a write
+/// that tries to lock it cannot finish, and the bounded wait turns that into
+/// a failure instead of a hang. Returns whether the write finished, and the
+/// backlog's end offset afterwards.
+fn write_with_backlog_held(
+    fanout_hint: bool,
+) -> (Result<bool, std::sync::mpsc::RecvTimeoutError>, Option<u64>) {
     let backlog: SharedBacklog =
         Arc::new(parking_lot::Mutex::new(Some(ReplicationBacklog::new(1024))));
     let held = backlog.lock();
@@ -65,7 +83,7 @@ fn a_write_with_no_replica_never_takes_the_backlog_lock() {
         let (tx, _rx) = mpsc_bounded::<AofMessage>(8);
         let pool = AofWriterPool::top_level_with_policy(tx, FsyncPolicy::EverySec, Duration::ZERO);
         let mut budget = crate::persistence::aof::AOF_SPSC_BACKPRESSURE_BOUND;
-        let ok = wal_append_and_fanout_bytes(
+        let ok = wal_append_and_fanout_hinted(
             bytes::Bytes::from_static(b"*1\r\n$4\r\nPING\r\n"),
             0,
             &mut None,
@@ -76,20 +94,49 @@ fn a_write_with_no_replica_never_takes_the_backlog_lock() {
             Some(&pool),
             false,
             &mut budget,
+            fanout_hint,
         );
         let _ = done_tx.send(ok);
     });
+    // Long enough for a write that does not lock to finish on a loaded box;
+    // a write that does lock waits here the whole time.
     let finished = done_rx.recv_timeout(Duration::from_secs(2));
     drop(held);
     let _ = worker.join();
+    let end = backlog.lock().as_ref().map(|b| b.end_offset());
+    (finished, end)
+}
+
+/// With no replica registered on this shard and none ever attaching, a write
+/// never touches the replication backlog's mutex. The comment above the lock
+/// claimed "no lock acquire" for this case while the code locked on every
+/// write.
+#[test]
+fn a_write_with_no_replica_never_takes_the_backlog_lock() {
+    let (finished, end) = write_with_backlog_held(false);
     assert_eq!(
         finished,
         Ok(true),
         "the write blocked on the replication backlog mutex with no replica anywhere"
     );
+    assert_eq!(end, Some(0), "and appended nothing to it");
+}
+
+/// The other side of the gate: once a replica has begun attaching (the hint),
+/// a write with no replica registered on this shard yet still appends, so the
+/// backlog holds every record a partial resync may ask for. The write waits
+/// for the mutex this thread holds, then appends once it is released.
+#[test]
+fn a_write_under_the_fanout_hint_appends_to_the_backlog() {
+    let (finished, end) = write_with_backlog_held(true);
     assert_eq!(
-        backlog.lock().as_ref().map(|b| b.end_offset()),
-        Some(0),
-        "and appended nothing to it"
+        finished,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout),
+        "the write must take the backlog mutex (it finished while this thread held it)"
+    );
+    assert_eq!(
+        end,
+        Some(b"*1\r\n$4\r\nPING\r\n".len() as u64),
+        "the record is in the backlog"
     );
 }

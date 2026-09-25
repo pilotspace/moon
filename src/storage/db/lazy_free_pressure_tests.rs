@@ -374,6 +374,7 @@ fn the_memory_pressure_cascade_reclaims_every_db_before_evicting_any() {
             &shared,
             0,
             &rt,
+            0, // no dead-slot ledger
             &mut None,
             &mut 0,
             &mut None,

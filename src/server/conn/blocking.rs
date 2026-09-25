@@ -3009,7 +3009,12 @@ pub(crate) fn try_inline_dispatch(
     // one. Every exclusive hold is a window in which a foreign shard's
     // `try_read` declines into a parked SPSC hop (cost model §8.3), and this
     // SET takes the exclusive guard again below for the write itself.
-    let est = crate::shard::slice::with_shard_db_read(selected_db, |db| db.estimated_memory());
+    // PR #1233 review: admitted against evictable memory PLUS the cold
+    // tier's dead-slot ledger, the figure `evict_to_budget` admits against —
+    // otherwise this path waves through writes the slow path refuses.
+    let est = crate::shard::slice::with_shard_db_read(selected_db, |db| {
+        crate::storage::eviction::admission_memory(db)
+    });
     let needs_eviction = !crate::storage::eviction::inline_write_can_skip_eviction(est, budget);
 
     // moon#660: THE safety condition. With a live `spill_sender`, generic

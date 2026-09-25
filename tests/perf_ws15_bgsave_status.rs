@@ -8,9 +8,12 @@
 //! `SHUTDOWN SAVE` was refused with "background save error", because it
 //! reads the same flag after its own, successful, save); and a BGSAVE on a
 //! server with no persistence directory never finished
-//! (`rdb_bgsave_in_progress:1` forever). (That a sharded auto-save is now a
-//! counted save is unit-tested in `command::persistence`: in the shipped
-//! sharded server `--save` rules never fire at all — a separate finding.)
+//! (`rdb_bgsave_in_progress:1` forever). PR #1233 review: such a server now
+//! refuses BGSAVE and `SHUTDOWN SAVE` up front with an error, instead of
+//! answering "Background saving started" for a save that must fail. (That a
+//! sharded auto-save is now a counted save is unit-tested in
+//! `command::persistence`: in the shipped sharded server `--save` rules never
+//! fire at all — a separate finding.)
 //!
 //! Runs at `--shards 1` and `--shards 4`. Pin the binary:
 //! `MOON_BIN=<moon> cargo test --test perf_ws15_bgsave_status`.
@@ -126,17 +129,66 @@ fn failed_then_clean_save(shards: usize) {
     // later.
     std::thread::sleep(Duration::from_millis(1100));
 
-    // The failing save: a large epoch, then FLUSHALL while it writes.
-    preload(&mut c, 600_000);
-    let dirty_before = info_field(&mut c, "rdb_changes_since_last_save");
-    assert!(c.send(&["BGSAVE"]).contains("Background saving started"));
-    std::thread::sleep(Duration::from_millis(30));
-    assert!(c.send(&["FLUSHALL"]).starts_with('+'));
-    assert_eq!(
-        wait_bgsave(&mut c, Duration::from_secs(120)),
-        "err",
-        "fixture: FLUSHALL mid-BGSAVE must fail that save (moon#1224)"
-    );
+    // The failing save: a large epoch, then FLUSHALL while it writes. The
+    // save is confirmed running (`rdb_bgsave_in_progress:1`) before the
+    // FLUSHALL is sent (PR #1233 review). On a starved runner the save can
+    // still finish before the FLUSHALL lands — then it did not fail, which
+    // is the fixture missing its window, not the property under test: the
+    // failing save is set up again (at most three times), and every
+    // assertion below is about the save that did fail.
+    let mut attempt = 0;
+    let (saved_at, dirty_before) = loop {
+        attempt += 1;
+        let saved_at = lastsave(&mut c);
+        preload(&mut c, 600_000);
+        let dirty_before = info_field(&mut c, "rdb_changes_since_last_save");
+        assert!(c.send(&["BGSAVE"]).contains("Background saving started"));
+        let started = Instant::now();
+        let mut missed = false;
+        while info_field(&mut c, "rdb_bgsave_in_progress") != "1" {
+            // Already finished before the first poll saw it running (a fast
+            // disk): LASTSAVE moved. That is the fixture's window missed, not
+            // the property — set the failing save up again.
+            if lastsave(&mut c) != saved_at {
+                missed = true;
+                break;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "the BGSAVE never showed as in progress"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        if missed {
+            assert!(
+                attempt < 3,
+                "fixture: every BGSAVE finished before it could be observed ({attempt} attempts)"
+            );
+            eprintln!(
+                "--shards {shards}: attempt {attempt}: the save finished before it was seen \
+                 running; setting it up again"
+            );
+            std::thread::sleep(Duration::from_millis(1100));
+            continue;
+        }
+        std::thread::sleep(Duration::from_millis(30));
+        assert!(c.send(&["FLUSHALL"]).starts_with('+'));
+        match wait_bgsave(&mut c, Duration::from_secs(120)).as_str() {
+            "err" => break (saved_at, dirty_before),
+            status => {
+                assert!(
+                    attempt < 3,
+                    "fixture: FLUSHALL mid-BGSAVE never failed a save in {attempt} attempts \
+                     (moon#1224); last status {status}"
+                );
+                eprintln!(
+                    "--shards {shards}: attempt {attempt}: the save finished before FLUSHALL \
+                     landed ({status}); setting it up again"
+                );
+                std::thread::sleep(Duration::from_millis(1100));
+            }
+        }
+    };
     // Every broken promise is collected, so one run shows them all.
     let mut violations: Vec<String> = Vec::new();
     let failed_at = lastsave(&mut c);
@@ -223,28 +275,37 @@ fn bgsave_status_recovers_after_a_failed_save_shards_4() {
     failed_then_clean_save(4);
 }
 
-/// With no persistence directory (`--appendonly no`, no `--save`) a BGSAVE
-/// cannot write; it must end — as a failure — instead of staying in
-/// progress forever and refusing every later BGSAVE.
+/// With no persistence directory (`--appendonly no`, no `--save`) no shard
+/// can write a snapshot. BGSAVE and `SHUTDOWN SAVE` are refused up front with
+/// an error (PR #1233 review) — not "Background saving started" for a save
+/// that then fails (`rdb_last_bgsave_status:err`, and `SHUTDOWN SAVE`
+/// refused with "background save error"), and not a save stuck in progress
+/// forever (moon#1230). Nothing is marked in progress, the last status stays
+/// `ok`, the server stays up, and a later BGSAVE is refused the same way.
 #[test]
-fn bgsave_without_a_persistence_dir_fails_instead_of_hanging() {
+fn bgsave_without_a_persistence_dir_is_refused_up_front() {
     for shards in [1usize, 4] {
         let dir = common::unique_test_dir(&format!("ws15-1230-nodir-s{shards}"));
         std::fs::create_dir_all(&dir).unwrap();
         let (_server, port) = spawn(&dir, shards, &[]);
         let mut c = Conn::open(port);
         c.send(&["SET", "k", "v"]);
-        assert!(c.send(&["BGSAVE"]).contains("Background saving started"));
-        assert_eq!(
-            wait_bgsave(&mut c, Duration::from_secs(10)),
-            "err",
-            "--shards {shards}: nothing was written, so the save failed"
-        );
+        for attempt in 0..2 {
+            let reply = c.send(&["BGSAVE"]);
+            assert!(
+                reply.starts_with("-ERR background save unavailable"),
+                "--shards {shards} attempt {attempt}: BGSAVE must be refused up front: {reply:?}"
+            );
+            assert_eq!(info_field(&mut c, "rdb_bgsave_in_progress"), "0");
+            assert_eq!(info_field(&mut c, "rdb_last_bgsave_status"), "ok");
+        }
+        let reply = c.send(&["SHUTDOWN", "SAVE"]);
         assert!(
-            c.send(&["BGSAVE"]).contains("Background saving started"),
-            "--shards {shards}: the next BGSAVE must not be refused as in progress"
+            reply.starts_with("-ERR background save unavailable"),
+            "--shards {shards}: SHUTDOWN SAVE must be refused with the same error: {reply:?}"
         );
-        let _ = wait_bgsave(&mut c, Duration::from_secs(10));
+        assert_eq!(c.send(&["PING"]), "+PONG\r\n", "the server stays up");
+        assert!(c.send(&["GET", "k"]).contains('v'));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

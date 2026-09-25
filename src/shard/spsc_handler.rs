@@ -44,8 +44,17 @@ use super::shared_databases::ShardDatabases;
 /// directly, bypassing the connection handlers' write path entirely — without
 /// this gate a scatter-gather write could grow a remote shard's memory past
 /// `maxmemory` without limit.
+///
+/// `cmd` is the routed command: one that can only shrink memory (DEL, HDEL,
+/// LPOP, ...) is never refused here, as in the connection gate
+/// (`run_write_eviction_gate`, WS6). Eviction still runs; only the reject is
+/// bypassed. Without it a key owned by another shard could not be deleted
+/// once that shard was over budget — under `noeviction`, and under any
+/// policy while the cold dead-slot ledger holds the shard over budget
+/// (moon#1215: eviction cannot shrink that ledger).
 #[allow(clippy::too_many_arguments)]
 pub(super) fn spsc_eviction_gate(
+    cmd: &[u8],
     db: &mut Database,
     db_idx: usize,
     shard_databases: &Arc<ShardDatabases>,
@@ -92,13 +101,17 @@ pub(super) fn spsc_eviction_gate(
             EvictionRun::plain().budget(budget).report(on_plain_drop),
         )
     };
-    global_result?;
+    let shrink_only = crate::storage::db_quota::is_shrink_only_command(cmd);
+    if !shrink_only {
+        global_result?;
+    }
     // WS5b: per-db quota, additive and finer-grained than the whole-instance
     // maxmemory gate above. Zero-cost when unconfigured for this db. This is
     // the ONE gate for cross-shard scatter-gather writes (MSET/DEL/etc. and
     // any command whose keys land on a shard other than the client's own),
     // so a quota'd db cannot be grown past its cap via a remote leg either.
-    crate::storage::db_quota::check_db_maxmemory(db, db_idx, &rt)
+    let db_quota_result = crate::storage::db_quota::check_db_maxmemory(db, db_idx, &rt);
+    if shrink_only { Ok(()) } else { db_quota_result }
 }
 
 /// Drain all SPSC consumer channels, processing cross-shard messages.
@@ -1022,6 +1035,7 @@ pub(crate) fn handle_shard_message_shared(
                                 let mut reason_del_budget =
                                     crate::persistence::aof::AOF_REASON_DEL_BACKPRESSURE_BOUND;
                                 if let Err(oom) = spsc_eviction_gate(
+                                    cmd,
                                     db,
                                     db_idx,
                                     shard_databases,
@@ -1259,6 +1273,7 @@ pub(crate) fn handle_shard_message_shared(
                             let mut reason_del_budget =
                                 crate::persistence::aof::AOF_REASON_DEL_BACKPRESSURE_BOUND;
                             if let Err(oom) = spsc_eviction_gate(
+                                cmd,
                                 &mut guard,
                                 db_idx,
                                 shard_databases,
@@ -1492,6 +1507,7 @@ pub(crate) fn handle_shard_message_shared(
                             let mut reason_del_budget =
                                 crate::persistence::aof::AOF_REASON_DEL_BACKPRESSURE_BOUND;
                             if let Err(oom) = spsc_eviction_gate(
+                                cmd,
                                 &mut guard,
                                 db_idx,
                                 shard_databases,
@@ -4045,7 +4061,6 @@ pub(crate) fn wal_append_and_fanout(
 /// `SELECT` prefix, and MOVED into the AOF pool last: the old slice-taking
 /// form paid a malloc + memcpy of every record (`Bytes::copy_from_slice`)
 /// and a cross-thread free on the writer, for bytes the caller already held.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn wal_append_and_fanout_bytes(
     data: bytes::Bytes,
     // task #35: db the command executed in — threaded into the AOF pool so
@@ -4059,6 +4074,52 @@ pub(crate) fn wal_append_and_fanout_bytes(
     aof_pool: Option<&std::sync::Arc<crate::persistence::aof::AofWriterPool>>,
     wal_kv_log: bool,
     aof_budget: &mut std::time::Duration,
+) -> bool {
+    wal_append_and_fanout_hinted(
+        data,
+        db,
+        wal_writer,
+        repl_backlog,
+        replica_txs,
+        repl_state,
+        shard_id,
+        aof_pool,
+        wal_kv_log,
+        aof_budget,
+        crate::replication::state::fanout_hint_active(),
+    )
+}
+
+/// Whether a routed write appends its record to the replication backlog
+/// (moon#1177): when a replica is registered on this shard, or when one has
+/// begun attaching anywhere (`fanout_hint`, the process-global
+/// `replication::state::fanout_hint_active()`). With neither, the write
+/// skips the backlog mutex entirely. See the backlog step of
+/// [`wal_append_and_fanout_hinted`] for why skipping is sound.
+///
+/// Pure so the gate is testable on its own: the hint is sticky and
+/// process-wide, so a test that reads it can only observe the case the
+/// tests that ran before it left behind.
+#[inline]
+pub(crate) fn backlog_append_wanted(replicas_empty: bool, fanout_hint: bool) -> bool {
+    !replicas_empty || fanout_hint
+}
+
+/// The body of [`wal_append_and_fanout_bytes`], with the fan-out hint read
+/// once by the caller. Tests pass the hint directly, so the backlog gate runs
+/// in both states whatever the process-global holds.
+fn wal_append_and_fanout_hinted(
+    data: bytes::Bytes,
+    db: usize,
+    wal_writer: &mut Option<WalWriterV3>,
+    repl_backlog: &crate::replication::backlog::SharedBacklog,
+    replica_txs: &mut Vec<crate::shard::dispatch::ReplicaFanout>,
+    repl_state: &Option<crate::replication::state::OffsetHandle>,
+    shard_id: usize,
+    aof_pool: Option<&std::sync::Arc<crate::persistence::aof::AofWriterPool>>,
+    wal_kv_log: bool,
+    aof_budget: &mut std::time::Duration,
+    fanout_hint: bool,
 ) -> bool {
     // S3.5b (2026-04-27): hot-path bypass when nothing actually has work.
     // See `wal_fanout_has_work` — callers use the same predicate to skip the
@@ -4118,7 +4179,7 @@ pub(crate) fn wal_append_and_fanout_bytes(
     // thread, which sets the hint first — so every later append here sees it.
     // A registered replica (`replica_txs`) implies the hint; it is checked
     // too so the append never depends on that implication.
-    if !replica_txs.is_empty() || crate::replication::state::fanout_hint_active() {
+    if backlog_append_wanted(replica_txs.is_empty(), fanout_hint) {
         let mut guard = repl_backlog.lock();
         if let Some(backlog) = guard.as_mut() {
             if let Some(prefix) = &select_prefix {
@@ -4333,21 +4394,21 @@ mod wal_append_tests {
         }
     }
 
-    /// FIX-W1-2 r2: PipelineBatch/PipelineBatchSlotted arms MUST NOT forward
-    /// writes to the AofWriterPool. The connection-handler coordinator already
-    /// appends AOF for these arms after collecting the shard response
-    /// (handler_monoio/mod.rs:2004, handler_sharded/mod.rs:1703).
+    /// The `wal_append_and_fanout` pool contract: called with `None` it puts
+    /// nothing in the AofWriterPool, called with `Some(&pool)` exactly one
+    /// append. This pins the helper, NOT which pool an arm passes.
     ///
-    /// Verify the invariant directly: `wal_append_and_fanout` called with
-    /// `None` (the PipelineBatch fix) must produce zero messages in the pool
-    /// channel, while the same call with `Some(&pool)` (the MultiExecute path)
-    /// must produce exactly one message.
-    ///
-    /// Red state (pre-fix): the PipelineBatch arms passed `aof_pool` instead
-    /// of `None`, so calling this test function using the arm's actual argument
-    /// would have produced 1 message instead of 0 — the double-write.
+    /// History, so the `None` case is not misread as the pipelined arm's
+    /// contract: FIX-W1-2 r2 once had the pipelined arms pass `None` and the
+    /// connection handler append after collecting the reply. C4-FOLD-FIX
+    /// reversed that — `PipelineBatchSlotted` now passes `aof_pool` itself,
+    /// BEFORE filling its response slot, so the append is already in the AOF
+    /// channel when `AofFold` samples `pending_aof_count` (see the comment at
+    /// that call site); the handler-side append was removed. Passing `None`
+    /// there again would drop every routed pipelined write from the per-shard
+    /// AOF.
     #[test]
-    fn pipeline_batch_arm_passes_none_to_prevent_double_write() {
+    fn wal_append_and_fanout_appends_to_the_pool_only_when_given_one() {
         use crate::persistence::aof::{AofMessage, AofWriterPool, FsyncPolicy};
         use crate::runtime::channel::mpsc_bounded;
 
@@ -4363,8 +4424,7 @@ mod wal_append_tests {
             std::time::Duration::ZERO,
         );
 
-        // ── PipelineBatch path: caller passes None ──
-        // Pre-fix this was `aof_pool` (Some), which caused the double-write.
+        // ── `None`: no pool append ──
         wal_append_and_fanout(
             b"*3\r\n$3\r\nSET\r\n$1\r\na\r\n$1\r\n1\r\n",
             0,         // db
@@ -4373,18 +4433,17 @@ mod wal_append_tests {
             &mut vec![], // no replicas
             &None,       // no repl_state
             0,           // shard_id
-            None,        // PipelineBatch fix: None prevents double-write
+            None,        // no pool
             true,        // wal_kv_log
             &mut std::time::Duration::from_millis(5),
         );
         assert!(
             rx0.try_recv().is_err(),
-            "PipelineBatch must NOT forward to aof_pool (coordinator handles it); \
-             a message here means the double-write P0 bug is still present"
+            "wal_append_and_fanout(.., None, ..) must not append to the pool"
         );
         assert!(
             rx1.try_recv().is_err(),
-            "shard-1 pool must also be empty for PipelineBatch arm"
+            "wal_append_and_fanout(.., None, ..) must not append to shard 1's pool either"
         );
 
         // ── MultiExecute path: caller passes Some(&pool) ──
@@ -4577,7 +4636,7 @@ mod drain_cap_tests {
     /// (256) must return `true` — queued messages may remain, so the caller
     /// self-re-notifies — while a cycle that empties the rings returns
     /// `false`. The integration suite cannot reach the cap from one client
-    /// (pipelined commands coalesce into one PipelineBatch per target per
+    /// (pipelined commands coalesce into one PipelineBatchSlotted per target per
     /// read chunk), so the cap path is pinned here with 300 real ring
     /// messages. `BlockCancel` for an unknown wait_id is a harmless no-op,
     /// which keeps every other dependency inert (no WAL, no snapshot).

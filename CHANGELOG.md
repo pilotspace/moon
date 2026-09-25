@@ -314,17 +314,30 @@ shared 4-vCPU Linux container against HEAD `935c555` — re-measure on the GCE r
   rewrite opens its new generation with plain `DEL` records for the keys that are dead at the fold
   instant. The real-server crash suite went from 44–157 resurrected keys per case to 8/8 cases passing
   at `--shards 1` and `--shards 4` on both runtimes. Every moon version replays `DEL`, so a downgrade
-  keeps the deletes. Cost: about 54 B of RAM per dead slot until its spill file is reclaimed, plus a
-  fold pass over those slots.
+  keeps the deletes until the older binary runs its own rewrite. The dead-slot ledger is bounded:
+  - only slots that can come back are recorded (not slots whose own TTL has passed, and nothing
+    without an AOF);
+  - `maxmemory` binds on the ledger at write admission (deletes are never refused), without making
+    eviction push live keys out to pay for it;
+  - the rewrite streams its head `DEL`s in bounded chunks;
+  - mostly-dead spill files are compacted and reclaimed once a committed rewrite makes that safe.
+
+  INFO reports the ledger as `cold_dead_slots` / `cold_dead_slot_bytes`. Under a 16 MB `maxmemory`
+  cold-delete churn it settles at 0.15× `maxmemory`, peaking at about 1.3–1.4× right after a burst of
+  deletes, where writes answer OOM until reclaim runs. Without the bound it reached 5×.
 - **P1: a key whose spill was in flight when a BGREWRITEAOF fold cut its base could be lost** (moon#1223)
   if the spill then did not publish (the marker was refused under AOF backpressure, the pwrite failed,
   or the file id was re-issued). The fold base image now includes in-flight spill payloads. On
-  `ae21476`, a kill -9 run lost 1,067 of 63,049 acknowledged keys.
+  `ae21476`, a kill -9 run lost 1,067 of 63,049 acknowledged keys. A payload that cannot be
+  re-encoded now fails the rewrite, which keeps the previous generation, instead of committing a
+  generation without the key.
 - **`rdb_last_bgsave_status` now reports the last save** (moon#1230). Before, one failed sharded BGSAVE
   latched `err` forever and every later `SHUTDOWN SAVE` was refused. `LASTSAVE`/`rdb_last_save_time`
   and `rdb_changes_since_last_save` now move only on a successful save. A shard that cannot write a
-  snapshot (no persistence dir, lost data dir) now fails the save instead of leaving
-  `rdb_bgsave_in_progress:1` forever, and sharded auto-saves start as counted saves.
+  snapshot (lost data dir) now fails the save instead of leaving `rdb_bgsave_in_progress:1`
+  forever, and sharded auto-saves start as counted saves. With no persistence directory at all,
+  `BGSAVE` and `SHUTDOWN SAVE` now answer an immediate `-ERR` instead of starting a save that can
+  only fail.
 - **A spanning `DEL`/`UNLINK`, a fanned-out `FLUSHDB`/`FLUSHALL`, or an `HSET`/`HDEL` executed on
   another shard now updates vector and text indexes and drops durable queues on every owner shard**
   (moon#1162). Before, all 20 deleted docs were still returned by FT.SEARCH at `--shards 4`.
@@ -332,6 +345,12 @@ shared 4-vCPU Linux container against HEAD `935c555` — re-measure on the GCE r
   still ran for up to 36 of 48 keys at `--shards 4`. An invalid mode now returns redis's error.
 - **The MSET coordinator's local leg now captures BGSAVE pre-images** (moon#1228, MSET item), so a
   snapshot taken during a spanning MSET stays point-in-time.
+- **`MSET` and `MSETNX` emit a keyspace `set` event per pair**, as redis does. This applies on every
+  path: a single shard, spanning owner legs, MULTI, Lua, replica apply and AOF replay. Before, a
+  spanning MSET notified only some keys, and the local leg and `--shards 1` notified none.
+- **A delete routed to another shard is never refused for memory.** `DEL`/`UNLINK` sent to an owner
+  shard over its budget answered `-OOM` under `noeviction` (144 of 200 at `--shards 4`); the
+  connection's own shard already let deletes through.
 - **P0: BGSAVE lost pre-snapshot keys when a DashTable segment split during the save**
   (moon#1216): 1,744 of 2,000 keys in the repro, 698K–726K of 1M under an insert flood. The epoch
   now walks hash space, so a split cannot move keys out of the walk. Copy-on-write also captures

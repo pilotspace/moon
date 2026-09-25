@@ -621,7 +621,9 @@ pub(crate) fn run_eviction_tick(
             .store(pagecache_bytes, Ordering::Relaxed);
     }
 
-    {
+    // The shard's dead-slot ledger bytes, excluded from the pressure-cascade
+    // trigger below.
+    let cascade_ledger_bytes = {
         let rt = runtime_config.read();
         // C5 / Phase 3: compute per-shard KV memory via ShardSlice under one
         // batch of SHARED db guards (estimated_memory() is an O(1) accumulator
@@ -639,14 +641,30 @@ pub(crate) fn run_eviction_tick(
         // Database::estimated_memory()/resident_bytes() themselves, which
         // stay untouched O(1) hot-path reads for the per-write eviction
         // pre-gate (inline_write_can_skip_eviction / evict_to_budget).
-        let used = crate::shard::slice::with_shard(|s| {
+        //
+        // `ci.resident_bytes()` includes the dead-slot ledger (moon#1215): it
+        // is resident RAM, so `used_memory` and the elastic budget count it.
+        // The pressure cascade does not (`ledger_bytes`, PR #1233 review): no
+        // step of the cascade can free a ledger byte.
+        //
+        // A rewrite's in-flight head chunks are charged to their ledger
+        // (`DeadSlots::charge_in_transit`) until the rewrite is over; with
+        // none in progress every chunk has been written or dropped, so the
+        // charge is released here first.
+        let rewriting = crate::command::persistence::AOF_REWRITE_IN_PROGRESS
+            .load(std::sync::atomic::Ordering::SeqCst);
+        let (used, ledger) = crate::shard::slice::with_shard(|s| {
             s.databases.with_all_read(|dbs| {
-                dbs.iter()
-                    .map(|db| {
-                        db.estimated_memory()
-                            + db.cold_index.as_ref().map_or(0, |ci| ci.resident_bytes())
-                    })
-                    .sum::<usize>()
+                dbs.iter().fold((0usize, 0usize), |(used, ledger), db| {
+                    let ci = db.cold_index.as_ref();
+                    if !rewriting && let Some(ci) = ci {
+                        ci.dead_slots().clear_in_transit();
+                    }
+                    (
+                        used + db.estimated_memory() + ci.map_or(0, |ci| ci.resident_bytes()),
+                        ledger + ci.map_or(0, |ci| ci.dead_slot_bytes()),
+                    )
+                })
             })
         });
         shard_databases.publish_memory(shard_id, used);
@@ -654,7 +672,8 @@ pub(crate) fn run_eviction_tick(
         if rt.maxmemory > 0 {
             shard_databases.recompute_elastic_budget(shard_id, &rt);
         }
-    }
+        ledger
+    };
 
     // task #58 (LOW-1): publish `allocator_overhead_bytes` = RSS - tracked_sum
     // on this 100ms tick instead of only computing it on-demand (MEMORY
@@ -702,6 +721,20 @@ pub(crate) fn run_eviction_tick(
     // counter's current value and is written back with `max` below.
     let mut cursor = spill_file_id.get();
     let next_file_id = &mut cursor;
+
+    // moon#1215 / PR #1233 review: bound the dead-slot ledger by compacting
+    // mostly-dead spill files and adopting the compactions a committed AOF
+    // fold made safe (`storage::tiered::cold_reclaim`).
+    cold_reclaim_tick::run(
+        shard_databases,
+        shard_id,
+        runtime_config,
+        shard_manifest,
+        next_file_id,
+        offload_shard_dir,
+        aof_pool,
+        cascade_ledger_bytes,
+    );
     if server_config.disk_offload_enabled()
         && should_run_pressure_cascade(
             runtime_config,
@@ -709,6 +742,7 @@ pub(crate) fn run_eviction_tick(
             shard_databases,
             shard_id,
             vector_resident_bytes,
+            cascade_ledger_bytes,
         )
     {
         handle_memory_pressure(
@@ -716,6 +750,7 @@ pub(crate) fn run_eviction_tick(
             shard_databases,
             shard_id,
             runtime_config,
+            cascade_ledger_bytes,
             shard_manifest,
             next_file_id,
             wal_v3_writer,
@@ -1070,7 +1105,7 @@ fn apply_completion_vec(
         // file is published for its other keys, those slots are on disk in a
         // listed file and a rebuild would index them: the cold index's
         // dead-slot ledger must know, so an AOF rewrite can keep them dead.
-        let mut ghosts: Vec<(usize, bytes::Bytes)> = Vec::new();
+        let mut ghosts: Vec<(usize, bytes::Bytes, Option<u64>)> = Vec::new();
         for entry in c.entries {
             let publishable = crate::shard::slice::with_shard_db(entry.db_index, |db| {
                 if !db.spill_inflight_is_newest(&entry.key, entry.req_file_id) {
@@ -1090,7 +1125,7 @@ fn apply_completion_vec(
                     None => groups.push((entry.db_index, vec![entry])),
                 }
             } else {
-                ghosts.push((entry.db_index, entry.key));
+                ghosts.push((entry.db_index, entry.key, entry.ttl_ms));
             }
         }
 
@@ -1113,7 +1148,7 @@ fn apply_completion_vec(
                 for entry in &entries {
                     rehydrate_unpublished_spill(entry, file_id);
                 }
-                ghosts.extend(keys.into_iter().map(|k| (db_index, k)));
+                ghosts.extend(entries.iter().map(|e| (db_index, e.key.clone(), e.ttl_ms)));
                 continue;
             }
             published_any = true;
@@ -1154,10 +1189,10 @@ fn apply_completion_vec(
                 tracing::error!(file_id, error = %e, "Spill completion: manifest add_file refused");
             } else {
                 manifest_dirty = true;
-                for (db_index, key) in ghosts {
+                for (db_index, key, ttl_ms) in ghosts {
                     crate::shard::slice::with_shard_db(db_index, |db| {
                         if let Some(ci) = db.cold_index.as_mut() {
-                            ci.note_dead_slot(file_id, key);
+                            ci.note_dead_slot(file_id, key, ttl_ms);
                         }
                     });
                 }
@@ -1196,12 +1231,19 @@ const PRESSURE_OFFLOAD_IDLE_SECS: u64 = 60;
 ///
 /// Returns `true` when the pressure cascade should run. Uses actual
 /// aggregate database memory estimate vs maxmemory * threshold.
+/// `ledger_bytes`: this shard's cold dead-slot ledger (moon#1215), which the
+/// published figure includes but no cascade step can free — page-cache
+/// eviction, vector demotion and KV eviction all leave it untouched. Counting
+/// it here fired the cascade on every tick once deletes left a large ledger
+/// behind, pushing live data to disk for nothing (PR #1233 review). Write
+/// admission charges it instead (`eviction::evict_to_budget`).
 pub(crate) fn should_run_pressure_cascade(
     runtime_config: &std::sync::Arc<parking_lot::RwLock<crate::config::RuntimeConfig>>,
     server_config: &std::sync::Arc<crate::config::ServerConfig>,
     shard_databases: &std::sync::Arc<super::shared_databases::ShardDatabases>,
     shard_id: usize,
     vector_resident_bytes: usize,
+    ledger_bytes: usize,
 ) -> bool {
     let rt = runtime_config.read();
     if rt.maxmemory == 0 {
@@ -1228,8 +1270,25 @@ pub(crate) fn should_run_pressure_cascade(
     // segments only ever offloaded on the wall-clock idle timer.
     let used = shard_databases
         .published_shard_memory(shard_id)
+        .saturating_sub(ledger_bytes)
         .saturating_add(vector_resident_bytes);
     used > threshold
+}
+
+/// What the pressure cascade's KV eviction evicts against (PR #1233 review):
+/// the published per-shard figure minus the dead-slot ledger. The ledger is
+/// resident RAM (so `used_memory` shows it) but no eviction victim can free a
+/// byte of it; counting it here made the cascade evict live keys for memory
+/// that stayed put. Its runs pass `.ledger(0)` for the same reason: write
+/// ADMISSION charges the ledger, eviction does not chase it.
+pub(crate) fn cascade_evictable_total(
+    shard_databases: &super::shared_databases::ShardDatabases,
+    shard_id: usize,
+    ledger_bytes: usize,
+) -> usize {
+    shard_databases
+        .published_shard_memory(shard_id)
+        .saturating_sub(ledger_bytes)
 }
 
 /// Memory pressure cascade per MoonStore v2 design section 8.5.
@@ -1248,6 +1307,9 @@ pub(crate) fn handle_memory_pressure(
     shard_databases: &std::sync::Arc<super::shared_databases::ShardDatabases>,
     shard_id: usize,
     runtime_config: &std::sync::Arc<parking_lot::RwLock<crate::config::RuntimeConfig>>,
+    // The shard's dead-slot ledger (moon#1215): counted in the published
+    // figure, freed by no step of this cascade — see `cascade_evictable_total`.
+    ledger_bytes: usize,
     shard_manifest: &mut Option<ShardManifest>,
     next_file_id: &mut u64,
     wal_v3: &mut Option<crate::persistence::wal_v3::segment::WalWriterV3>,
@@ -1332,7 +1394,7 @@ pub(crate) fn handle_memory_pressure(
         if rt.maxmemory > 0 {
             // C5 / Phase 3: read the already-published per-shard KV memory
             // (written earlier this same tick). Lock-free Relaxed load.
-            let total_mem = shard_databases.published_shard_memory(shard_id);
+            let total_mem = cascade_evictable_total(shard_databases, shard_id, ledger_bytes);
             // GAP-1: hot shards evict against their elastic budget (idle
             // siblings' donated headroom), not the static maxmemory/N.
             let budget = match shard_databases.elastic_budget(shard_id) {
@@ -1389,6 +1451,7 @@ pub(crate) fn handle_memory_pressure(
                                 )
                                 .total(total_mem)
                                 .budget(budget)
+                                .ledger(0)
                                 .report(
                                     // task #34 (Wave A): only the no-manifest,
                                     // `--appendonly no` plain-drop fallback
@@ -1450,6 +1513,7 @@ pub(crate) fn handle_memory_pressure(
                                     ))
                                     .total(total_mem)
                                     .budget(budget)
+                                    .ledger(0)
                                     .report(&mut |key| {
                                         crate::replication::reason_del::record_reason_del(
                                             key,
@@ -1474,6 +1538,7 @@ pub(crate) fn handle_memory_pressure(
                                     crate::storage::eviction::EvictionRun::plain()
                                         .total(total_mem)
                                         .budget(budget)
+                                        .ledger(0)
                                         .report(&mut |key| {
                                             crate::replication::reason_del::record_reason_del(
                                                 key,
@@ -2275,6 +2340,11 @@ pub(crate) fn handle_checkpoint_tick(
 #[cfg(test)]
 mod checkpoint_tick_tests;
 
+mod cold_reclaim_tick;
+
+#[cfg(test)]
+mod cascade_ledger_tests;
+
 #[cfg(test)]
 mod fold_inflight_tests;
 
@@ -2639,7 +2709,7 @@ mod tests {
         // Below the 85% threshold (e.g. 50%): must NOT trigger the cascade.
         shared.publish_memory(0, (1024 * 1024) / 2);
         assert!(
-            !should_run_pressure_cascade(&runtime_config, &server_config, &shared, 0, 0),
+            !should_run_pressure_cascade(&runtime_config, &server_config, &shared, 0, 0, 0),
             "50% used_memory must stay below the 85% disk-offload-threshold"
         );
 
@@ -2648,7 +2718,7 @@ mod tests {
         // whole point of WS3 priority 3.
         shared.publish_memory(0, (1024 * 1024 * 90) / 100);
         assert!(
-            should_run_pressure_cascade(&runtime_config, &server_config, &shared, 0, 0),
+            should_run_pressure_cascade(&runtime_config, &server_config, &shared, 0, 0, 0),
             "90% used_memory must cross the 85% disk-offload-threshold and \
              trigger the pressure cascade well before maxmemory is reached"
         );
@@ -2663,7 +2733,7 @@ mod tests {
             let runtime_config2 = Arc::new(parking_lot::RwLock::new(rt2));
             shared.publish_memory(0, usize::MAX / 2);
             assert!(
-                !should_run_pressure_cascade(&runtime_config2, &server_config, &shared, 0, 0),
+                !should_run_pressure_cascade(&runtime_config2, &server_config, &shared, 0, 0, 0),
                 "no memory limit configured => no pressure possible"
             );
         }
@@ -2691,7 +2761,7 @@ mod tests {
         // KV memory is trivial (well under the 85% threshold on its own)...
         shared.publish_memory(0, 1024);
         assert!(
-            !should_run_pressure_cascade(&runtime_config, &server_config, &shared, 0, 0),
+            !should_run_pressure_cascade(&runtime_config, &server_config, &shared, 0, 0, 0),
             "KV alone is far below threshold => no cascade without vector accounting"
         );
 
@@ -2699,7 +2769,7 @@ mod tests {
         // pushing total past the 85% (~892 KiB) threshold.
         let vec_bytes = (1024 * 1024 * 93) / 100;
         assert!(
-            should_run_pressure_cascade(&runtime_config, &server_config, &shared, 0, vec_bytes),
+            should_run_pressure_cascade(&runtime_config, &server_config, &shared, 0, vec_bytes, 0),
             "vector resident memory must contribute to the pressure trigger"
         );
     }
