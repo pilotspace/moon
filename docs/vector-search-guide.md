@@ -60,18 +60,20 @@ Two more per-index recall knobs are runtime-only (set via `FT.CONFIG`, persisted
 
 ### BUILD_MODE: Light vs Exact
 
+Both modes store and search the same segment layout; they differ only in how the HNSW graph is built at compaction, and in what the mutable segment retains until then.
+
 | Aspect | LIGHT (default) | EXACT |
 |--------|----------------|-------|
-| **HNSW build oracle** | TQ-decoded centroid L2 (approximate) | Exact f32 L2 (retains raw vectors) |
-| **QJL correction** | Disabled (not needed with sub-centroid) | Enabled (M=8 dense Gaussian projections) |
-| **Memory during insert** | ~372 B/vec | ~1,844 B/vec |
-| **Memory after compaction** | ~452 B/vec | ~644 B/vec |
-| **Compaction time (10K)** | ~1.6 s | ~8.6 s |
-| **First-search latency** | ~1.6 s (compaction) | ~8.6 s (compaction + QJL recompute) |
-| **R@10 (384d, 10K)** | ~89% | ~92% |
-| **QPS** | ~3,000 | ~1,400 |
+| **HNSW build oracle** | TQ-decoded centroid L2 (approximate) | Exact f32 L2 (retains raw vectors until compaction) |
+| **Mutable-segment search** | TQ-ADC scan, then exact rerank of the top `RERANK_MULT·k` from the f16 rows | same |
+| **Immutable-segment search** | HNSW beam (32-level sub-centroid LUT), then exact rerank of the top `RERANK_MULT·k` from the f16 sidecar | same |
+| **Memory during insert** (384d TQ4, computed from the layout) | ~1.4 KB/vec: TQ code 260 B + FastScan shadow 256 B + sub-centroid signs 64 B + f16 row 768 B + 48 B entry | ~2.9 KB/vec: LIGHT + raw f32 1,536 B |
+| **Memory after compaction** | TQ codes + sub-centroid signs + f16 exact-rerank sidecar + graph | same (EXACT keeps no QJL data since moon#1213) |
+| **Compaction time (10K docs)** | graph from decoded centroids | 1.5–1.6 s at 384d, 2.5 s at 768d (Linux 4-vCPU container, WS11 — relative figures) |
 
-**Recommendation**: Use `LIGHT` (default) for most workloads. Use `EXACT` only when you need the extra 3% recall and can tolerate 5× more memory during insert and slower compaction.
+No QJL correction runs in either mode any more: the mutable scan's QJL term was always multiplied by a zero residual (moon#1192), and compacted segments dropped their QJL data (moon#1213). Far / out-of-distribution queries used to lose recall on the mutable segment, which ranked by quantized ADC alone; it is now exact-reranked from the f16 rows it already keeps, like the immutable segments (moon#1226 — on an embedding-shaped 3,000 × 384d corpus, mutable-only, far-query R@10 went 0.703 → 0.990; relative evidence, not yet validated on real MiniLM embeddings).
+
+**Recommendation**: Use `LIGHT` (default) for most workloads. Use `EXACT` when graph quality matters more than insert memory: it keeps each vector's raw f32 (4·dim bytes) until compaction, roughly doubling the mutable segment's footprint.
 
 ```bash
 # Light mode (default) — fast insert, low memory, good recall
@@ -163,16 +165,16 @@ Drop the index and free all associated memory.
 ### Insert Path
 1. Vector arrives via HSET
 2. **TQ-MSE encoding**: normalize → zero-pad to power-of-2 → FWHT rotation → Lloyd-Max 4-bit quantize → nibble pack
-3. Stored in mutable segment:
-   - **Light mode**: ~372 B/vec (TQ codes + norm only)
-   - **Exact mode**: ~1,844 B/vec (TQ codes + raw f32 retained for HNSW build)
+3. Stored in mutable segment (384d TQ4, computed from the layout):
+   - **Light mode**: ~1.4 KB/vec (TQ codes + norm, FastScan shadow, sub-centroid signs, f16 row for the exact rerank / sidecar)
+   - **Exact mode**: ~2.9 KB/vec (Light + raw f32 retained for the exact-distance HNSW build)
 4. **No HNSW at insert time** — append-only for maximum throughput (30K+ vec/s)
 
 ### Compaction
 Triggered automatically on first search when mutable segment has ≥ `COMPACT_THRESHOLD` vectors:
 1. Freeze mutable segment
 2. **Light mode**: Build HNSW using TQ-decoded centroid pairwise distance
-3. **Exact mode**: Recompute QJL signs, build HNSW using exact f32 L2 pairwise distance
+3. **Exact mode**: Build HNSW using exact f32 L2 pairwise distance (no QJL work since moon#1213)
 4. BFS-reorder for cache locality
 5. Compute sub-centroid sign bits (doubles quantization resolution: 16 → 32 levels)
 6. Create immutable segment
@@ -183,15 +185,15 @@ Triggered automatically on first search when mutable segment has ≥ `COMPACT_TH
 2. Build per-query LUT: precomputed distance² for each sub-centroid (32 entries × dim, fits L1 cache)
 3. **HNSW beam search** with 32-level sub-centroid LUT scoring. Beam width (`ef`) is the full resolved value, unless the segment's compact-time saturation probe (AE-1, above) certified it "trivially easy" — then it searches at min-ef (24) instead. Never overridden when the user pins `EF_RUNTIME`.
 4. **Exact rerank:** the top `4·k` beam candidates are re-scored against the segment's f16 sidecar with true metric distances (SIMD: NEON integer-rescale on aarch64, F16C+FMA on x86_64, scalar fallback) before truncation. Segments without a sidecar (pre-HQ-1 reload, or a GraphUnion merge that dropped one) fall back to quantized ADC-only distances — check `FT.INFO`'s `segments_with_exact_rerank` for coverage.
-5. Merge results from mutable (brute-force) + immutable (HNSW) segments
+5. Merge results from mutable (brute-force) + immutable (HNSW) segments. The mutable scan ranks by TQ-ADC, then exact-reranks its top `RERANK_MULT·k` from the f16 rows it keeps (moon#1226), so every segment answers with the same distance convention
 6. Return top-K results
 
 ## Memory Usage
 
 | Stage | Light Mode | Exact Mode | Notes |
 |-------|-----------|-----------|-------|
-| During insert (mutable) | ~372 B/vec | ~1,844 B/vec | Light skips raw f32 retention |
-| After compaction (immutable) | ~452 B/vec | ~644 B/vec | Light skips QJL signs |
+| During insert (mutable) | ~1.4 KB/vec | ~2.9 KB/vec | 384d TQ4, computed from the layout (see BUILD_MODE); Light skips raw f32 retention |
+| After compaction (immutable) | ~452 B/vec | ~644 B/vec | Historical macOS figures from before the f16 exact-rerank sidecar (+2·dim B/vec) and before EXACT dropped its QJL data (moon#1213) — both modes now share one layout; not yet re-measured on Linux |
 | Redis Stack (FP32) | — | — | ~3,840 B/vec |
 | Qdrant (FP32) | — | — | ~1,536 B/vec |
 
