@@ -243,11 +243,15 @@ impl FunctionRegistry {
         if read_only {
             crate::scripting::bridge::set_script_read_only(true);
         }
-        // moon#1241: a shrink-only write (DEL, UNLINK, ...) passes the OOM
-        // gate only in a function registered with `allow-oom`; redis 7.0
-        // refuses any other function as a whole while over maxmemory.
-        crate::scripting::bridge::set_script_oom_shrink_bypass(
-            func_def.flags & func_flags::ALLOW_OOM != 0,
+        // moon#1241: a function registered with `allow-oom` runs ANY command
+        // over maxmemory, as redis 7.0 does; redis refuses any other function
+        // as a whole while over maxmemory.
+        crate::scripting::bridge::set_script_oom_mode(
+            if func_def.flags & func_flags::ALLOW_OOM != 0 {
+                crate::scripting::bridge::ScriptOomMode::AllowOom
+            } else {
+                crate::scripting::bridge::ScriptOomMode::Deny
+            },
         );
 
         let timeout = std::time::Duration::from_secs(5);
