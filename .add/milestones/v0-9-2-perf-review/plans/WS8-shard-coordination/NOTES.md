@@ -409,3 +409,181 @@ By name, green: `perf_ws8_spanning_del_hooks` (3), `perf_ws8_script_flush_fanout
 (they need `text-index`, absent without default features) — they are covered on monoio.
 Lib tests (`shard::`, `server::conn`, `scripting::`): monoio 598 passed, tokio 548
 passed, each including this workstream's 16 new unit tests.
+
+---
+
+# PR #1233 review fixes (FIX3-ws8, branch `fix3/ws8` from PR head `d4a2fd3`)
+
+Two deep reviews of PR #1233 found one blocking regression, one vacuous test, one flaky
+test and four nits in WS8's half. Worktree `/home/user/wt/FIX3-ws8`, ports 7480-7499.
+Binaries (debug, built with `touch src/lib.rs` first so cargo recompiles from THIS tree —
+the shared target's fingerprints are mtime-based and workspace-relative, so a plain
+`cargo build` can relink another worktree's lib): `/home/user/wt/bin/fix3ws8-dbg-*`.
+
+## R1 (BLOCKING, moon#1184) — a spanning MSET no longer notifies remote-owned keys
+
+**Mechanism verified.**
+- Keyspace events are queued in a thread-local outbox by `notify::notify_keyspace_event`
+  and drained by `notify_fanout::flush_from_connection` (end of every batch, both
+  handlers) or `flush_from_shard` (event loop, after the SPSC drain).
+- The only `"set"` emitters are `string::set`'s plain fast path and the monoio inline SET
+  (`server/conn/blocking.rs`). `string::mset` and `string::msetnx` emit nothing.
+- `ae21476`: a spanning MSET sent each remote pair as its own `SET k v` leg (SET's fast
+  path notified on the owner); the local slice was a `db.set_string` loop (silent).
+- `d4a2fd3`: moon#1184 turned the remote legs into one `MSET k v …` per owner, and
+  moon#1228 routed the local slice through `run_local` → `string::mset`. Both silent.
+- Probe (`scratchpad/probe_notify.sh`, `__keyevent@0__:*`) on `fix3ws8-dbg-d4a2fd3`: ZERO
+  `set` events at `--shards 4` and `--shards 1` for MSET, MSETNX, MULTI{MSET,MSETNX} and
+  `EVAL redis.call('MSET')`. redis 7.0.15 on the same probe: `a`×2 (duplicated pair), `b`,
+  both MSETNX keys (none for the refused MSETNX), both Lua keys, all three MULTI keys.
+
+**Fix.** `notify_set(db, key)` (STRING, `"set"`, `db.db_index`) after each `set_string`
+in `string::mset` and in `string::msetnx`'s phase 2 — exactly redis's
+`msetGenericCommand` (notify inside the pair loop). Per pair, not per distinct key:
+`MSET a 1 a 2` fires two events in redis 7.0.15 (probed).
+
+**Exactly-once audit (every path that runs the body).**
+| path | runs `string::mset`/`msetnx` | events per pair |
+|---|---|---|
+| `--shards 1` / local dispatch | `command::dispatch` once | 1 |
+| coordinator all-local fast path | `run_local` → `cmd_dispatch` once | 1 |
+| coordinator spanning | `group_by_owner` puts each pair in exactly ONE group; local group via `run_local`, each remote group via one `MultiExecute` sub-command | 1 |
+| MSETNX | one owner (CROSSSLOT refuses spanning), `run_local` or `run_remote` once | 1 on `:1`, 0 on `:0` |
+| MULTI/EXEC | `execute_transaction_sharded` dispatches each queued command once | 1 |
+| Lua `redis.call` | bridge dispatches once (cross-shard refused) | 1 |
+| replica apply | `apply_local` → `cmd_dispatch` once per record — same as SET, whose fast path already notified on replicas | 1 (redis 7.0.15 replica: also 1 per pair, probed) |
+| AOF replay at startup | no subscriber exists → `has_keyspace_listener()` false → nothing queued (same as SET) | 0 |
+No other code emits `set` for an MSET key; the inline dispatcher never serves MSET.
+
+**Risks.** Hot path: with notifications off, one Relaxed load per pair (SET pays the
+same); the key copy happens inside `notify.rs` only when a `__key*` listener exists.
+`string_write.rs` is a WS10 command file (cross-ownership edit, isolated commit).
+Pre-existing, out of scope: SET with options (`EX`/`PX`/`NX`/`XX`/`GET`/`KEEPTTL`) emits
+no `set` event (only the plain fast path does) — follow-up.
+
+## R2 (moon#1177) — the backlog-lock test was vacuous under `cargo test --lib`
+
+**Mechanism verified.** `fanout_record_tests::a_write_with_no_replica_never_takes_the_backlog_lock`
+returned early ("skipping") whenever `replication::state::fanout_hint_active()` was already
+true. `FANOUT_HINT` is a process-global, sticky `AtomicBool`; the `replication::state`
+tests call `mark_fanout_active()` and sort before `shard::` in one `cargo test --lib`
+process, so there the test asserted nothing (it had teeth only under nextest's
+process-per-test). The gate it guards is one inline expression in
+`wal_append_and_fanout_bytes`: `!replica_txs.is_empty() || fanout_hint_active()`.
+
+**Fix design.**
+- `backlog_append_wanted(replicas_empty: bool, fanout_hint: bool) -> bool` — pure,
+  `#[inline]`, the gate's only definition; the call site uses it.
+- The hint is read ONCE by `wal_append_and_fanout_bytes` (unchanged signature, every
+  caller untouched) and passed to a private `wal_append_and_fanout_hinted(…, fanout_hint)`
+  holding the body. The rewritten integration test calls the hinted body with
+  `fanout_hint = false`, so it runs — with the backlog mutex held by the test thread —
+  whatever other tests did to the global. A second test passes `true` and checks the
+  gate opens (record appended with no replica registered).
+- Truth table unit-tested exhaustively (4 rows).
+
+**Risks.** The hint is now loaded at the top of the function instead of after the
+`wal_fanout_has_work` bypass: one extra Relaxed load of a static on the bypass path (a
+plain `mov`). Reading it earlier cannot change the outcome: the activation arms
+(`RegisterReplica`/`PrepareReplicaSync`) run on this thread, never inside this
+synchronous call, and a concurrent PSYNC on another thread races the read at any
+position alike — the activation-time `realign_backlog` invariant covers that race, as
+before.
+
+## R3 (moon#1228) — `perf_ws8_mset_bgsave_capture` asserted a timing precondition
+
+**Mechanism verified.** The test slept 30 ms after `BGSAVE` (so every shard's 1 ms tick
+arms the epoch), asserted `rdb_bgsave_in_progress:1`, then wrote spanning MSETs in blocks
+of 16 and probed only after each block, requiring `during >= 16`. On a debug monoio
+binary the 400K-key sharded save can finish inside the 30 ms sleep ("the epoch ended
+before the writer started") or inside the first block ("only 0 spanning MSETs landed").
+Both are the save being SHORT relative to the fixed dead time, not a capture failure.
+
+**Fix design (the capture assertion is unchanged: after SIGKILL and a restore from the
+snapshot alone, every key holds its epoch-start `v<j>`).**
+- Arming is observed instead of slept for: a shard spawns its snapshot writer, which
+  creates `shard-<id>.rrdshard.tmp`, and arms the COW capture in the same synchronous
+  stretch of the shard thread. So once every shard's `.tmp` exists, any write that shard
+  runs afterwards runs after its arm point (writes to a shard's keyspace run only on its
+  own thread). A save that publishes before all `.tmp`s were seen is an attempt without
+  overlap.
+- `rdb_bgsave_in_progress` is probed after EVERY MSET: each MSET is pipelined with an
+  `INFO persistence` on the same connection, which runs only after the MSET completed on
+  every owner (one round trip per MSET — a separate probe connection doubled the per-MSET
+  time and halved the overlap). An MSET whose probe still saw `:1` landed inside the epoch.
+- Up to 5 attempts, the dataset doubling (400K → 800K → 1.6M → 3.2M, then 3.2M): an attempt with
+  fewer than 16 overlapped MSETs restores every key it overwrote to `v<j>`, grows the
+  keyspace and takes a new BGSAVE. The snapshot is restored and asserted only for the
+  attempt that overlapped (the file on disk is that attempt's — each save replaces it).
+- 16 overlapped MSETs (512 overwritten pairs, ~128 on the connection's own shard) keep
+  the red sensitivity of the original threshold.
+
+**Risks.** Relies on the `.tmp` naming (`snapshot_stream::run_helper`); if it changes, the
+wait sees no `.tmp` and every attempt reports "save ended before every shard armed" —
+a loud failure, never a false green. The 3.2M-key cap is only reached after three
+attempts without overlap; its snapshot is ~120 MB (14.6 MB per shard per 1.6M keys,
+measured).
+
+**Measured (debug monoio, `fix3ws8-dbg-notify`, first version with a separate probe
+connection):** 10/10 green, but only 4–45 MSETs overlapped a 400K-key save (~130 ms) and
+two runs needed the 1.6M attempt (16 and 28 overlapped) — too thin a margin. Pipelining
+the probe and raising the cap to 3.2M is the response.
+
+**Final version:** 10/10 green on debug monoio, every run within 1–2 attempts (overlap
+6–52 at 400K keys, 19–114 at 800K); tokio green under load avg ~10 (3 attempts, 29 at
+1.6M). RED with the capture reverted (`fix3ws8-dbg-nocapture`): 11 of 400000 / 77 of
+800000 keys post-epoch; RED on `ae21476`: 237 and 418 of 400000.
+
+## R4 — nits
+
+- `db_plane.rs`: the `#[cfg(test)] mod exclusive_count` (moon#1198) sat between
+  `guard_depth`'s re-entrancy-contract doc and `mod guard_depth`, so rustdoc attached the
+  contract to `exclusive_count` and `guard_depth` lost it. Moved the counter above the doc.
+- `write_hooks.rs`: the module doc claimed "one function, one list, called from every arm".
+  True for the SPSC `Execute`/`MultiExecute`/`PipelineBatchSlotted` arms and every
+  coordinator local leg (`run_local`); four paths still carry their own copy — the monoio
+  and tokio connection local write paths, `execute_transaction_sharded`, and
+  `replication::apply::apply_index_parity_hooks`. The doc now names both sets; routing the
+  four through `run_post_write_hooks` is a follow-up (not done here).
+- Stale names of the SPSC variants moon#1198 removed. Whole-repo `git grep` for
+  `ExecuteSlotted|MultiExecuteSlotted|PipelineBatch` (minus `PipelineBatchSlotted`):
+  - code comments fixed: `tests/spsc_two_db.rs` (module doc + the COPY pipeline comment),
+    `tests/crash_matrix_per_shard_aof.rs`, `tests/pipeline_auto_index.rs` (it runs at
+    `--shards 1`, so no SPSC arm is involved at all), `tests/oom_bypass_closure.rs`,
+    `tests/spsc_wake_floor_red.rs` (×2), `tests/wal_kv_db_context_1039.rs`,
+    `src/shard/aof_admission.rs`, `src/shard/spsc_handler.rs` (the FIX-W1-2 test's
+    comments + the drain-cap test doc), `src/persistence/aof/pool.rs` (WS15's directory:
+    its own commit);
+  - left as they are, because they describe the removal itself and are accurate:
+    `src/shard/dispatch.rs` (`ShardMessage` doc), `src/shard/spsc_two_db.rs` module doc;
+  - historical records left untouched: `CHANGELOG.md` (orchestrator-owned), `.add/tasks/**`,
+    `docs/reviews/**`, this plan dir's PLAN/NOTES/SUMMARY.
+- `#[allow(clippy::too_many_arguments)]` added by WS8 on `coordinate_mset`,
+  `coordinate_multi_del_or_exists` and `wal_append_and_fanout_bytes`: redundant with the
+  crate-wide `#![allow(clippy::too_many_arguments)]` in `lib.rs`; removed. The allows on
+  other coordinator functions predate WS8 and are left alone (not this review's scope).
+
+## R5 (found by this round's gates) — WS8's coordinator unit tests poison a slice test in one process
+
+**Mechanism verified.** `cargo test --lib -- shard::` fails on the PR head `d4a2fd3` (and on
+this branch before the fix), monoio and tokio alike:
+`shard::slice::tests::foreign_write_applies_and_is_visible_to_a_foreign_read` —
+`left: Some(4) right: Some(1)` at `slice.rs:981`. Alone it passes. Bisected by filter:
+`shard::slice:: shard::coordinator::multikey_leg_tests` → `Some(4)`,
+`… shard::coordinator::watch_versions_tests` → `Some(2)`; every other `shard::` module
+leaves it green. Cause: every `ShardDatabases::new` tries to install the process-wide L4
+registry (`db_plane::install_registry_sets`, a `OnceLock`); when one of those two WS8 test
+modules (PR #1233) wins it, the registered shard-0 db 0 holds the keys they wrote, and the
+slice test asserted `logical_len() == 1` after its own single write — i.e. that the
+registered database started empty. nextest (process per test) hides it. It is
+order-dependent: CI's full single-process tokio gate (`libtest-singleproc-gate.sh`,
+moon#904) happened to pass on `d4a2fd3` (5534 passed / 1 failed — only the root-only
+`cold_index_rebuild_tests` env failure), because in the full run some other test won the
+`OnceLock`; the `shard::`-filtered single-process run this round's gates prescribe is red
+every time (3/3).
+
+**Fix.** The victim counts what its own write added, under the exclusive guard
+(`logical_len()` after minus before) — the assertion's intent ("the closure ran against
+the owner's Database and mutated it") without the emptiness assumption. The polluters are
+left alone: any test whose `ShardDatabases` wins the `OnceLock` and writes is legitimate,
+so the robust side is the assertion that assumed a pristine global.

@@ -4056,7 +4056,6 @@ pub(crate) fn wal_append_and_fanout(
 /// `SELECT` prefix, and MOVED into the AOF pool last: the old slice-taking
 /// form paid a malloc + memcpy of every record (`Bytes::copy_from_slice`)
 /// and a cross-thread free on the writer, for bytes the caller already held.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn wal_append_and_fanout_bytes(
     data: bytes::Bytes,
     // task #35: db the command executed in — threaded into the AOF pool so
@@ -4070,6 +4069,52 @@ pub(crate) fn wal_append_and_fanout_bytes(
     aof_pool: Option<&std::sync::Arc<crate::persistence::aof::AofWriterPool>>,
     wal_kv_log: bool,
     aof_budget: &mut std::time::Duration,
+) -> bool {
+    wal_append_and_fanout_hinted(
+        data,
+        db,
+        wal_writer,
+        repl_backlog,
+        replica_txs,
+        repl_state,
+        shard_id,
+        aof_pool,
+        wal_kv_log,
+        aof_budget,
+        crate::replication::state::fanout_hint_active(),
+    )
+}
+
+/// Whether a routed write appends its record to the replication backlog
+/// (moon#1177): when a replica is registered on this shard, or when one has
+/// begun attaching anywhere (`fanout_hint`, the process-global
+/// `replication::state::fanout_hint_active()`). With neither, the write
+/// skips the backlog mutex entirely. See the backlog step of
+/// [`wal_append_and_fanout_hinted`] for why skipping is sound.
+///
+/// Pure so the gate is testable on its own: the hint is sticky and
+/// process-wide, so a test that reads it can only observe the case the
+/// tests that ran before it left behind.
+#[inline]
+pub(crate) fn backlog_append_wanted(replicas_empty: bool, fanout_hint: bool) -> bool {
+    !replicas_empty || fanout_hint
+}
+
+/// The body of [`wal_append_and_fanout_bytes`], with the fan-out hint read
+/// once by the caller. Tests pass the hint directly, so the backlog gate runs
+/// in both states whatever the process-global holds.
+fn wal_append_and_fanout_hinted(
+    data: bytes::Bytes,
+    db: usize,
+    wal_writer: &mut Option<WalWriterV3>,
+    repl_backlog: &crate::replication::backlog::SharedBacklog,
+    replica_txs: &mut Vec<crate::shard::dispatch::ReplicaFanout>,
+    repl_state: &Option<crate::replication::state::OffsetHandle>,
+    shard_id: usize,
+    aof_pool: Option<&std::sync::Arc<crate::persistence::aof::AofWriterPool>>,
+    wal_kv_log: bool,
+    aof_budget: &mut std::time::Duration,
+    fanout_hint: bool,
 ) -> bool {
     // S3.5b (2026-04-27): hot-path bypass when nothing actually has work.
     // See `wal_fanout_has_work` — callers use the same predicate to skip the
@@ -4129,7 +4174,7 @@ pub(crate) fn wal_append_and_fanout_bytes(
     // thread, which sets the hint first — so every later append here sees it.
     // A registered replica (`replica_txs`) implies the hint; it is checked
     // too so the append never depends on that implication.
-    if !replica_txs.is_empty() || crate::replication::state::fanout_hint_active() {
+    if backlog_append_wanted(replica_txs.is_empty(), fanout_hint) {
         let mut guard = repl_backlog.lock();
         if let Some(backlog) = guard.as_mut() {
             if let Some(prefix) = &select_prefix {
@@ -4344,17 +4389,17 @@ mod wal_append_tests {
         }
     }
 
-    /// FIX-W1-2 r2: PipelineBatch/PipelineBatchSlotted arms MUST NOT forward
-    /// writes to the AofWriterPool. The connection-handler coordinator already
+    /// FIX-W1-2 r2: the PipelineBatchSlotted arm (and the `PipelineBatch` arm
+    /// moon#1198 removed) MUST NOT forward writes to the AofWriterPool. The connection-handler coordinator already
     /// appends AOF for these arms after collecting the shard response
     /// (handler_monoio/mod.rs:2004, handler_sharded/mod.rs:1703).
     ///
     /// Verify the invariant directly: `wal_append_and_fanout` called with
-    /// `None` (the PipelineBatch fix) must produce zero messages in the pool
+    /// `None` (the pipelined-arm fix) must produce zero messages in the pool
     /// channel, while the same call with `Some(&pool)` (the MultiExecute path)
     /// must produce exactly one message.
     ///
-    /// Red state (pre-fix): the PipelineBatch arms passed `aof_pool` instead
+    /// Red state (pre-fix): the pipelined arms passed `aof_pool` instead
     /// of `None`, so calling this test function using the arm's actual argument
     /// would have produced 1 message instead of 0 — the double-write.
     #[test]
@@ -4374,7 +4419,7 @@ mod wal_append_tests {
             std::time::Duration::ZERO,
         );
 
-        // ── PipelineBatch path: caller passes None ──
+        // ── PipelineBatchSlotted path: caller passes None ──
         // Pre-fix this was `aof_pool` (Some), which caused the double-write.
         wal_append_and_fanout(
             b"*3\r\n$3\r\nSET\r\n$1\r\na\r\n$1\r\n1\r\n",
@@ -4384,18 +4429,18 @@ mod wal_append_tests {
             &mut vec![], // no replicas
             &None,       // no repl_state
             0,           // shard_id
-            None,        // PipelineBatch fix: None prevents double-write
+            None,        // pipelined-arm fix: None prevents double-write
             true,        // wal_kv_log
             &mut std::time::Duration::from_millis(5),
         );
         assert!(
             rx0.try_recv().is_err(),
-            "PipelineBatch must NOT forward to aof_pool (coordinator handles it); \
+            "PipelineBatchSlotted must NOT forward to aof_pool (coordinator handles it); \
              a message here means the double-write P0 bug is still present"
         );
         assert!(
             rx1.try_recv().is_err(),
-            "shard-1 pool must also be empty for PipelineBatch arm"
+            "shard-1 pool must also be empty for PipelineBatchSlotted arm"
         );
 
         // ── MultiExecute path: caller passes Some(&pool) ──
@@ -4588,7 +4633,7 @@ mod drain_cap_tests {
     /// (256) must return `true` — queued messages may remain, so the caller
     /// self-re-notifies — while a cycle that empties the rings returns
     /// `false`. The integration suite cannot reach the cap from one client
-    /// (pipelined commands coalesce into one PipelineBatch per target per
+    /// (pipelined commands coalesce into one PipelineBatchSlotted per target per
     /// read chunk), so the cap path is pinned here with 300 real ring
     /// messages. `BlockCancel` for an unknown wait_id is a harmless no-op,
     /// which keeps every other dependency inert (no WAL, no snapshot).

@@ -417,7 +417,8 @@ fn crash_01_lite_always_per_shard_aof_recovers_after_sigkill() {
 /// PIPELINE-DOUBLE-WRITE: FIX-W1-2 discriminating regression test.
 ///
 /// Before the fix, `wal_append_and_fanout` was called with `aof_pool` inside
-/// the `PipelineBatch` / `PipelineBatchSlotted` SPSC arms.  The connection-
+/// the pipelined SPSC arms (`PipelineBatchSlotted`, and `PipelineBatch`,
+/// which moon#1198 removed).  The connection-
 /// handler coordinator **also** writes the AOF entry after collecting each
 /// shard response (handler_sharded/mod.rs:1703 / handler_monoio/mod.rs:2004).
 /// The net effect was every cross-shard pipelined command written TWICE to

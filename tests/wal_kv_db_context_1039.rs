@@ -192,7 +192,7 @@ fn cross_shard_case(name: &str, extra: &[&str], replayed_since: fn(&Path, usize)
     let (mut server, port) = spawn(&dir, 4, extra);
     {
         // PIPELINED: a pipelined batch is what fans the foreign-owned SETs
-        // out to their owner shards' threads (`PipelineBatch`), and a write
+        // out to their owner shards' threads (`PipelineBatchSlotted`), and a write
         // that executes on a shard thread is what `--wal-kv-log` logs. One
         // unpipelined SET at a time never reaches the WAL (see the
         // non-vacuity check below).

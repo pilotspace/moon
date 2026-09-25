@@ -4,8 +4,8 @@
 //!
 //! # Where a leg waits
 //!
-//! A routed leg (`Execute`, `PipelineBatch`, `MultiExecute`, their `*Slotted`
-//! forms, `TxnExecute`) arrives on the SPSC ring of the shard that sent it.
+//! A routed leg (`Execute`, `PipelineBatchSlotted`, `MultiExecute`,
+//! `TxnExecute`) arrives on the SPSC ring of the shard that sent it.
 //! The drain looks at the head of each ring before it pops it. When the
 //! head is a write leg this shard's AOF writer cannot take yet, the drain
 //! leaves it where it is and moves on to the next ring. The ring is the
