@@ -94,6 +94,41 @@ thread_local! {
     /// Table changes the epoch follows (moon#1228), in the order they
     /// happened, applied to the `SnapshotState` by the next drain.
     static EVENTS: RefCell<Vec<TableEvent>> = const { RefCell::new(Vec::new()) };
+    /// Approximate bytes of `PENDING_KEYS` (moon#1228, INFO
+    /// `current_cow_size`).
+    static DEDUPE_BYTES: Cell<u64> = const { Cell::new(0) };
+    /// This shard's share of [`CURRENT_COW_SIZE`] as last published.
+    static PUBLISHED_COW: Cell<u64> = const { Cell::new(0) };
+}
+
+/// Bytes every shard's armed snapshot holds only for the snapshot's sake,
+/// summed: queued pre-images (entries and tombstones), tables a flush handed
+/// over (moon#1228), and the first-wins key sets. INFO persistence reports it
+/// as `current_cow_size` — redis's name for the copy-on-write memory its
+/// forked child pins.
+///
+/// Deliberately NOT part of `used_memory`: that figure drives `maxmemory`
+/// eviction and refusal, and a save's transient copies must not evict or
+/// refuse user writes because a BGSAVE happens to be running (redis does not
+/// count fork COW in `used_memory` either). The copies vanish as the walk
+/// passes their range, and the whole figure returns to 0 when the save ends.
+static CURRENT_COW_SIZE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// See [`CURRENT_COW_SIZE`]. Published by each shard at every drain (one
+/// tick stale at most).
+pub(crate) fn current_cow_size() -> u64 {
+    CURRENT_COW_SIZE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Publish this shard's COW bytes: the delta against what it last published.
+fn publish_cow_size(bytes: u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let before = PUBLISHED_COW.with(|p| p.replace(bytes));
+    if bytes > before {
+        CURRENT_COW_SIZE.fetch_add(bytes - before, Relaxed);
+    } else if before > bytes {
+        CURRENT_COW_SIZE.fetch_sub(before - bytes, Relaxed);
+    }
 }
 
 /// A whole-table change the armed epoch follows instead of aborting
@@ -101,8 +136,9 @@ thread_local! {
 enum TableEvent {
     /// `SWAPDB a b` exchanged shard slots `a` and `b`.
     Swap(usize, usize),
-    /// A flush detached this epoch database's table before it was written.
-    Freeze(usize, Box<Table>),
+    /// A flush detached this epoch database's table (holding the given
+    /// bytes) before it was written.
+    Freeze(usize, Box<Table>, u64),
 }
 
 /// Mirror of `SnapshotState`'s serialization cursor, so a capture can
@@ -255,6 +291,13 @@ pub(crate) fn drain_pending_for_test(snap: &mut SnapshotState) {
     drain_into(snap);
 }
 
+/// Test-only: this thread's share of `current_cow_size` as last published
+/// (the process-wide sum mixes in parallel tests' threads).
+#[cfg(test)]
+pub(crate) fn published_cow_size_for_test() -> u64 {
+    PUBLISHED_COW.with(Cell::get)
+}
+
 /// Test-only: the epoch database each shard slot maps to (moon#1228).
 #[cfg(test)]
 pub(crate) fn logical_of_slot_for_test() -> Vec<Option<usize>> {
@@ -275,6 +318,8 @@ pub(crate) fn abort_pending_for_test() -> Option<&'static str> {
 fn clear() {
     PENDING.with(|p| p.borrow_mut().clear());
     PENDING_KEYS.with(|k| k.borrow_mut().clear());
+    DEDUPE_BYTES.with(|b| b.set(0));
+    publish_cow_size(0);
     PROGRESS.with(|p| *p.borrow_mut() = None);
     ABORT.with(|a| a.set(None));
     EVENTS.with(|e| e.borrow_mut().clear());
@@ -381,9 +426,10 @@ pub(crate) fn note_cleared_table(db: &Database, table: Table) {
     });
     match outcome {
         Outcome::Freeze(logical) => {
+            let bytes = db.estimated_memory() as u64;
             EVENTS.with(|e| {
                 e.borrow_mut()
-                    .push(TableEvent::Freeze(logical, Box::new(table)))
+                    .push(TableEvent::Freeze(logical, Box::new(table), bytes))
             });
         }
         Outcome::Drop => {}
@@ -656,7 +702,10 @@ fn capture_key(db: &Database, slot: usize, key: &[u8]) {
         if sets.len() <= db_index {
             sets.resize_with(db_index + 1, HashSet::new);
         }
-        sets[db_index].insert(owned.clone());
+        if sets[db_index].insert(owned.clone()) {
+            // The key's bytes plus a hash-set slot and its `Bytes` header.
+            DEDUPE_BYTES.with(|b| b.set(b.get() + owned.len() as u64 + 48));
+        }
     });
     PENDING.with(|p| p.borrow_mut().push((db_index, owned, pre_image)));
 }
@@ -677,6 +726,8 @@ pub(crate) fn drain_into(snap: &mut SnapshotState) {
         // the whole epoch, so a hot key is cloned once, not once per tick.
         drain_captured(snap, captured);
     }
+    // moon#1228: INFO `current_cow_size`.
+    publish_cow_size(snap.cow_bytes() + DEDUPE_BYTES.with(Cell::get));
 }
 
 /// Fail the snapshot if a structural change queued an abort (moon#1224).
@@ -695,7 +746,7 @@ fn apply_table_events(snap: &mut SnapshotState) {
     for event in events {
         match event {
             TableEvent::Swap(a, b) => snap.swap_slots(a, b),
-            TableEvent::Freeze(db, table) => snap.freeze(db, table),
+            TableEvent::Freeze(db, table, bytes) => snap.freeze(db, table, bytes),
         }
     }
 }

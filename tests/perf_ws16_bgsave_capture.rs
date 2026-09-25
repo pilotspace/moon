@@ -230,6 +230,13 @@ fn writes_during_bgsave(
             assert!(Instant::now() < deadline, "BGSAVE outlived the writer");
         }
         assert_eq!(last_bgsave_status(probe), "ok", "BGSAVE failed");
+        // moon#1228: INFO `current_cow_size` (redis's field) reports what a
+        // save holds for its own sake, and nothing once it is over.
+        let info = probe.send(&["INFO", "persistence"]);
+        assert!(
+            info.lines().any(|l| l.trim() == "current_cow_size:0"),
+            "no save in flight: current_cow_size must be present and 0: {info:.400}"
+        );
         attempts.push(format!(
             "{n} keys: {during} rounds inside the epoch, save took {} ms",
             started.elapsed().as_millis()
