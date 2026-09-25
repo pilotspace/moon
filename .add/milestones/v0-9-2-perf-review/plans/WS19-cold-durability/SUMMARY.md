@@ -179,3 +179,59 @@ Green: 11/11 at s1 and 11/11 at s4, on both the monoio and tokio release binarie
 - Item 6 waits for a running save instead of killing it: a SHUTDOWN during a long save may take up to 20 s, one overall deadline (`SHUTDOWN_SAVE_DEADLINE_MS`; review 5 N1 — it was 4 x 10 s as first committed).
 - `src/storage/db/kv_ops.rs` was 1510 lines on main after the merge and is 1537 now (over the 1500 cap before this phase).
 - Disk: one errant `cargo build --tests` in this phase filled the shared disk for ~2 minutes (6.3 GB of test binaries); the binaries from that build window were deleted and the disk returned to 5.9 GB free.
+
+## Review 5 (merged part-4 tree 340cfce1): MERGE-AFTER-FIXES
+
+`origin/claude/confident-cerf-3n093x` (1421630b) merged as `1d839fb2`, no conflicts. One commit per item, red then green:
+
+| Item | Verdict | Commit | Red -> green |
+|---|---|---|---|
+| SPLIT `kv_ops.rs` 1545 lines | Pure move into `cold_promote.rs`, `keyspace_scan.rs`, `bulk_load.rs`; kv_ops 772 | `b167d1e6` | moved lines == removed lines (sorted multiset); check both runtimes, storage::db lib tests both runtimes |
+| S1 transiently missing held file tombstoned (data loss) | **FIXED** | `df050595` | reviewer proof (adopted in `promote_sweep_tests`): `(None, Some("x"), false, false)` -> `(Some("v08"), Some("v09x"), true, true)`; f00e9903's test green |
+| S2 blocking pop served at remote registration counted 0 | **FIXED** | `96879a03` | s4 16 keys: `00 00 10 01 11 10 …` -> `11` x 16; lib test red 0 -> 1 |
+| S3 XREADGROUP BLOCK served at once counted 0 | **FIXED** (new consumer still +1 short, listed) | `dafa7ad8` | table row 0 -> 1 (redis 1); proof 0 -> 1 |
+| S4 SWAPDB counted 0 | **FIXED** | `f723750d` | delta 0 -> 1; after kill -9 the key was back in db 0 -> in db 1 (3/3) |
+| S5 snapshot boot / replica full sync counted every key | **FIXED** (AOF boot unchanged, at parity, now pinned) | `67bbecac` | boot 1000 -> 0; full sync 1002 -> 0; lib 2 -> 0 |
+| N1 SHUTDOWN bound 4 x 10 s | **FIXED**: one 20 s deadline | `9ecd604f` | "gave up after 543ms, one deadline is 300ms" -> within 1.5x |
+| N2 `is_dead()` sampled after the drain | **FIXED** (refs moon#1253) | `6702b7cd` | contract test (no deterministic red: two-statement race) |
+| N3 active hash-field expiry counted | **FIXED** | `060033be` | 3 -> 0 |
+| N4 `awaits_fold` O(held) per tick | **FIXED**: O(1) `max_stamp` | `b9d475a0` | oracle-vs-walk test; red with `take`'s recompute removed |
+| N5 missing known differences | geo stores and `RENAME k k` **FIXED**; PFCOUNT, XREADGROUP history read, SETBIT **listed** | `be2771ae` | RENAME k k 1 -> 0, GEOSEARCHSTORE / GEORADIUS STORE 1 -> 2 (redis 2) |
+| N6 spill-thread death | **Mitigated** (refs moon#1265): in-flight compactions abandoned, one error line, INFO `spill_thread_alive` | `b78b38b3` | in-flight pinned 1 -> 0 |
+
+### Review 5 cross-ownership edits
+- S2: `src/blocking/{wakeup,group,stream_wake}.rs`, `src/shard/spsc_handler.rs` (the `BlockRegister` arm).
+- S3: `src/server/conn/blocking.rs` (`stream_read_immediate`).
+- S4: `src/server/conn/handler_monoio/dispatch.rs`, `handler_sharded/dispatch.rs`, `handler_single.rs`.
+- S5: `src/persistence/snapshot.rs`, `src/persistence/redis_rdb.rs`, `src/replication/apply.rs`.
+- N3: `src/server/expiration.rs`. N5: `src/command/geo/geo_cmd.rs`, `src/command/mod.rs` (RENAME arm). N6: `src/command/connection.rs` (INFO).
+- Files already over the 1500-line cap that grew: `blocking/wakeup.rs` 2336 -> 2390, `redis_rdb.rs` +19, `apply.rs` +7, `server/conn/blocking.rs` +7, `handler_monoio/dispatch.rs` +6, `handler_single.rs` +4, `persistence_tick.rs` +6, `spsc_handler.rs` +9, `connection.rs` +4, `storage/db/mod.rs` +3. `cold_index.rs` stays under 1500.
+
+### Review 5 observations (not changed here)
+- With `--appendonly no` and no `--save`, a server does not load its per-shard snapshot at boot (`persistence_dir` exists only for AOF or save points).
+- Under `appendfsync everysec`, SETs acknowledged immediately before a kill -9 of the process were missing after restart (5 of 105; `always` loses none). redis writes the AOF before it replies, so a process crash loses nothing there. For the AOF writer's owners.
+- Still not counted like redis (documented in `command::keyspace_changes`): consumer creation by XREADGROUP/XCLAIM/XAUTOCLAIM; XREADGROUP history read of an empty PEL; SORT STORE (1 vs the stored length); ZINCRBY of a new member by 0; XGROUP DELCONSUMER of a missing consumer; SETBIT of an unchanged bit; PFCOUNT's cache rewrite.
+
+### Review 5 gates (at `b78b38b3`, plus the test gate `2e09e831`)
+- fmt, `audit-unsafe` (no new `unsafe`), `audit-unwrap` (within baseline), `audit-test-tempdirs`, `audit-encoding-limits`: clean.
+- `cargo clippy --all-targets -- -D warnings` on monoio and on tokio: clean.
+- Full lib, no filter: monoio 6693 passed / 0 failed / 14 ignored; tokio 5755 / 0 / 13 (this branch's new tests present in both).
+- Integration, debug server binaries of `b78b38b3` pinned by `MOON_BIN`, test binaries rebuilt from this tree (names checked):
+  - monoio, all green: `perf_ws19_save_rules` 13/13 with the redis-server 7.0.15 oracle; `perf_ws19_script_oom` 2/2; `perf_ws15_ledger_bound` 2/2; `perf_ws15_spanning_cold_del` 2/2; `perf_ws12_bgsave_split` 5/5; `perf_ws15_bgsave_status` 3/3; `perf_ws16_bgsave_capture` 7/7; `crash_recovery_cold_del_rewrite --ignored` 11/11 at s4 and s1; `crash_recovery_cold_del_inflight_1253 --ignored` 3/3 at s4 and s1; `blocking_exec_wakeup` 3/3, `blocking_ready_key_wake` 8/8, `blocking_stream_read` 14/14, `keyspace_event_db_index` 4/4.
+  - tokio: the same list green. With monoio-built test binaries, the two full-resync tests failed against the tokio master (it answers no PSYNC); rebuilt with tokio features, `perf_ws12_bgsave_split` is 4/4 + 1 ignored and `perf_ws19_save_rules` 11/11 + 2 ignored (the oracle, run separately: green; the replica test, gated by `2e09e831`).
+  - The adopted proofs: S1 in the lib run (`promote_sweep_tests`); S2–S5 in `perf_ws19_save_rules` above.
+
+## WS19 CHANGELOG-ready bullets (all phases, supersedes the lists above)
+
+### Fixed
+- **Data loss (moon#1231):** a key could be lost at the next restart, or come back with the wrong value, when it was cold at an AOF rewrite, was then read back into memory or read-modify-written, and the orphan sweep later removed its spill file (reproduced on 143–179 of 200 keys). A spill file that a replayable AOF generation may still read is now kept until a later rewrite has committed, also when it is only briefly unreachable while the sweep runs; the cold-reclaim adoption no longer removes a compacted file whose survivors changed after the rewrite.
+- **`--save` rules (moon#1232):** `--save "<seconds> <changes>"` never fired in the sharded server. Rules now trigger on `rdb_changes_since_last_save`, time from the last successful save, and retry a failed save after 5 s whatever their seconds.
+- **Change counting, redis 7.0.15 parity (moon#1232):** `rdb_changes_since_last_save` now counts what redis counts — collection writes by their redis rule (HSET field-value pairs, LPUSH elements, SADD members added, ZADD added plus rescored, pops the elements popped, geo stores the members stored, …), blocking commands served at once as their non-blocking twins (also at `--shards` > 1), SWAPDB as one change, and writes made while a save runs. It no longer counts a DEL or EXPIRE of a missing key, key or hash-field expiry, eviction, a read that brings a cold key back into memory, `RENAME k k`, booting from a snapshot, or a replica's full sync (which made `--save "3 100"` rewrite the whole snapshot 3 s after every boot).
+- **SHUTDOWN (moon#1232):** `SHUTDOWN` with save points, or `SHUTDOWN SAVE`, during a running auto-save or BGSAVE no longer fails with "Background save already in progress": it waits for that save and then saves, within one 20 s deadline.
+- **Scripts over maxmemory (moon#1241):** inside EVAL/EVALSHA, and in functions registered with `allow-oom`, commands that can only free memory (DEL, UNLINK, HDEL, LPOP, EXPIRE, …) are no longer refused with `-OOM`. Growing commands, and functions without `allow-oom`, are still refused, as in redis.
+- **Cold tier housekeeping (moon#1231, moon#1240, refs moon#1253):** held spill files get the AOF rewrite that releases them even with `auto-aof-rewrite-percentage 0`; a compacted output whose keys all changed while its listing was committing is reclaimed instead of staying on disk until a restart; a listed spill file found missing at boot is retired by the first sweep, so the "cold index rebuild DEGRADED" alarm appears on one boot, not every boot until a rewrite; the set of in-flight spills retired by a write is bounded even when a completion never arrives.
+
+### Changed
+- **Performance (moon#1240):** the cold-tier reclaim no longer reads, writes or fsyncs spill files, or waits for manifest fsyncs, on the shard thread (same-host A/B: PING p99 during cold-delete churn -23%, p99.9 about 3x lower). Holding the spill files of a large cold tier after a FLUSHALL no longer costs O(N^2) on the shard thread, and the per-tick "does a held file need a rewrite" check is O(1).
+- **Behaviour:** deployments that pass `--save` to the sharded server now get the periodic snapshots the rules describe. A spill file below the latest AOF rewrite's cut stays on disk (and in `INFO cold_files_pending_unlink`) until the next committed rewrite and sweep; while such files keep the dead-slot ledger over its threshold they ask the auto-rewrite monitor for a rewrite.
+- **INFO (refs moon#1265):** new `spill_thread_alive` (0 once any shard's spill thread was found dead). A dead spill thread is logged once at `error`, and its in-flight compactions are abandoned so they no longer block the shard's reclaim; the thread is not yet respawned.
