@@ -167,6 +167,12 @@ impl ScriptCache {
     /// Insert a source body under `sha`, charging `source_bytes` only on a real
     /// insert (idempotent — a duplicate is a no-op, matching Redis). Returns
     /// `false` when the insert is older than the newest flush applied here.
+    ///
+    /// moon#1160: a real insert stores an exact-size COPY of the body. Every
+    /// caller (`SCRIPT LOAD`, `EVAL`, the fan-out to the other shards) hands
+    /// in a slice of the request buffer, and the cache keeps a body until
+    /// `SCRIPT FLUSH` — so the slice pinned the whole read buffer for the
+    /// life of the server. A duplicate copies nothing.
     fn store_source(&mut self, sha: String, script: Bytes, epoch: u64) -> bool {
         if epoch < self.flush_epoch {
             return false;
@@ -175,7 +181,7 @@ impl ScriptCache {
             std::collections::hash_map::Entry::Vacant(e) => {
                 self.source_bytes += e.key().len() + script.len();
                 e.insert(CachedScript {
-                    body: script,
+                    body: crate::storage::owned_bytes::detach(&script),
                     epoch,
                 });
             }
@@ -309,6 +315,39 @@ impl ScriptCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// moon#1160: every way a body enters the cache — `SCRIPT LOAD`, `EVAL`
+    /// (`load_precomputed`), the fan-out claim and a fan-out arriving from
+    /// another shard (`load_at`) — stores an exact-size copy, never the slice
+    /// of the request buffer the caller holds. Red before the fix: the cache
+    /// kept the slice, pinning the whole read buffer until `SCRIPT FLUSH`.
+    #[test]
+    fn stored_bodies_never_share_the_request_buffer() {
+        use crate::storage::owned_bytes::test_support::WireArgs;
+        let mut cache = ScriptCache::new();
+
+        let wire = WireArgs::parse(&[b"SCRIPT", b"LOAD", b"return 'load'"]);
+        let sha = cache.load_at(wire.args[2].clone(), 0);
+        wire.assert_detached("SCRIPT LOAD body", cache.get(&sha).unwrap());
+
+        let wire = WireArgs::parse(&[b"EVAL", b"return 'eval'", b"0"]);
+        let body = wire.args[1].clone();
+        let sha = sha1_smol::Sha1::from(&body[..]).hexdigest();
+        cache.load_precomputed(sha.clone(), body);
+        wire.assert_detached("EVAL body", cache.get(&sha).unwrap());
+
+        let wire = WireArgs::parse(&[b"EVAL", b"return 'fanout'", b"0"]);
+        let (sha, owed, _) = cache.claim_fanout_duty(wire.args[1].clone());
+        assert!(owed);
+        wire.assert_detached("fan-out claim body", cache.get(&sha).unwrap());
+
+        // The body is the same bytes, and a duplicate insert changes nothing.
+        assert_eq!(cache.get(&sha).unwrap().as_ref(), b"return 'fanout'");
+        let before = cache.resident_bytes();
+        let wire = WireArgs::parse(&[b"SCRIPT", b"LOAD", b"return 'fanout'"]);
+        cache.load_at(wire.args[2].clone(), 0);
+        assert_eq!(cache.resident_bytes(), before);
+    }
 
     #[test]
     fn test_load_and_get() {
