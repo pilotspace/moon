@@ -86,17 +86,30 @@ use crate::persistence::manifest_sync::CommitAck;
 use crate::persistence::page::PageType;
 use crate::storage::tiered::spill_thread::{SpillCompletion, SpillRequest};
 
-/// Compactions waiting for a committed fold, over every shard and database,
-/// plus one per database whose held spill files (moon#1231) keep its ledger
-/// over the reclaim threshold until a fold. The AOF auto-rewrite monitor
-/// dispatches a rewrite while this is non-zero.
+/// Compactions waiting for a committed fold, over every shard and database.
+/// The AOF auto-rewrite monitor dispatches a rewrite while this is non-zero
+/// and automatic rewrites are enabled.
 static AWAITING_FOLD: AtomicUsize = AtomicUsize::new(0);
 
-/// How many compactions (and pressured held-file sets) wait for a committed
-/// fold, process-wide.
+/// Databases whose held spill files (moon#1231) keep the ledger over the
+/// reclaim threshold until a fold. Counted apart from [`AWAITING_FOLD`]
+/// because the monitor answers it even with `auto-aof-rewrite-percentage 0`
+/// (moon#1231 review): the hold is a correctness rule, and without a fold
+/// its files — and the ledger bytes write admission is charged — are never
+/// released.
+static HELD_FILES_PRESSURE: AtomicUsize = AtomicUsize::new(0);
+
+/// How many compactions wait for a committed fold, process-wide.
 #[inline]
 pub fn awaiting_fold() -> usize {
     AWAITING_FOLD.load(Ordering::Relaxed)
+}
+
+/// How many databases' held spill files wait for a committed fold while
+/// their shard's ledger is over the reclaim threshold, process-wide.
+#[inline]
+pub fn held_files_pressure() -> usize {
+    HELD_FILES_PRESSURE.load(Ordering::Relaxed)
 }
 
 /// One survivor moved by a compaction: where it was read and where its copy
@@ -150,8 +163,8 @@ pub struct ReclaimState {
     /// every tick into a failing read. Tiny: one id per such file.
     skip: HashSet<u64>,
     bytes: usize,
-    /// Whether this database counts in [`AWAITING_FOLD`] for its held files
-    /// (see [`ColdIndex::note_held_files_pressure`]).
+    /// Whether this database counts in [`HELD_FILES_PRESSURE`] (see
+    /// [`ColdIndex::note_held_files_pressure`]).
     held_signal: bool,
 }
 
@@ -159,10 +172,8 @@ impl Drop for ReclaimState {
     fn drop(&mut self) {
         // A cold index dropped with compactions pending leaves their
         // unlisted files to the next startup orphan sweep.
-        AWAITING_FOLD.fetch_sub(
-            self.pending.len() + usize::from(self.held_signal),
-            Ordering::Relaxed,
-        );
+        AWAITING_FOLD.fetch_sub(self.pending.len(), Ordering::Relaxed);
+        HELD_FILES_PRESSURE.fetch_sub(usize::from(self.held_signal), Ordering::Relaxed);
     }
 }
 
@@ -242,17 +253,18 @@ impl ColdIndex {
     /// a committed fold releases it, and compaction cannot help (it has no
     /// live key). So while the shard's ledger is over the reclaim threshold
     /// (`over`) and some held file still waits for a fold, this database asks
-    /// the auto-rewrite monitor for one, exactly as a waiting compaction does
-    /// — otherwise write admission could stay refused on bytes only a fold
-    /// can free. Idempotent; the tick calls it every time.
+    /// the auto-rewrite monitor for one — even with automatic rewrites
+    /// disabled, which a waiting compaction does not do — otherwise write
+    /// admission could stay refused on bytes only a fold can free.
+    /// Idempotent; the tick calls it every time.
     pub fn note_held_files_pressure(&mut self, over: bool, committed_floor: u64) {
         let want = over && self.hold.awaits_fold(committed_floor);
         if want != self.reclaim.held_signal {
             self.reclaim.held_signal = want;
             if want {
-                AWAITING_FOLD.fetch_add(1, Ordering::Relaxed);
+                HELD_FILES_PRESSURE.fetch_add(1, Ordering::Relaxed);
             } else {
-                AWAITING_FOLD.fetch_sub(1, Ordering::Relaxed);
+                HELD_FILES_PRESSURE.fetch_sub(1, Ordering::Relaxed);
             }
         }
     }

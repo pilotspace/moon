@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use bytes::Bytes;
 
 use super::cold_index::ColdIndex;
-use super::cold_reclaim::awaiting_fold;
+use super::cold_reclaim::{awaiting_fold, held_files_pressure};
 use crate::persistence::aof::fold_stream::{
     fold_image_channel, stream_fold_image, write_fold_image,
 };
@@ -516,5 +516,55 @@ fn a_partially_discarded_compaction_keeps_the_old_file() {
     assert!(
         rebuilt.lookup(b"big:a").is_some(),
         "a restart of the committed generation cannot find big:a"
+    );
+}
+
+/// moon#1231 review: a database whose held spill files wait for a fold while
+/// the ledger is over its threshold is signalled on its own counter, which
+/// the auto-rewrite monitor answers even with `auto-aof-rewrite-percentage
+/// 0` (`auto_rewrite::reclaim_due`); a waiting compaction is not.
+#[test]
+fn held_files_pressure_is_signalled_apart_from_compactions() {
+    use super::unlink_hold::FoldView;
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let dir = tmp.path().join("shard-0");
+    std::fs::create_dir_all(&dir).expect("dir");
+    let mut manifest = ShardManifest::create(&dir.join("shard-0.manifest")).expect("manifest");
+    spill(&dir, &mut manifest, OLD, &keys(4));
+    let mut ci = ColdIndex::rebuild_from_manifest(&dir, &manifest);
+    for (k, _) in keys(4) {
+        assert!(ci.remove(k.as_bytes()));
+    }
+    // A fold is in flight (snapshot epoch 1, nothing committed): OLD, below
+    // its cut, is held by the sweep.
+    ci.observe_fold(FoldView {
+        epoch: 1,
+        committed_floor: 0,
+        next_file_id: OLD + 1,
+    });
+    ci.sweep_known_orphans(Vec::new(), &dir, Some(&mut manifest))
+        .expect("sweep");
+    assert!(ci.is_unlink_held(OLD) && heap(&dir, OLD).exists());
+
+    // Only this test signals held-file pressure, so the deltas are exact.
+    let before = held_files_pressure();
+    ci.note_held_files_pressure(true, 0);
+    ci.note_held_files_pressure(true, 0);
+    assert_eq!(held_files_pressure(), before + 1, "one signal per database");
+    ci.note_held_files_pressure(false, 0);
+    assert_eq!(held_files_pressure(), before, "the ledger is back under");
+    ci.note_held_files_pressure(true, 0);
+    ci.note_held_files_pressure(true, 2);
+    assert_eq!(
+        held_files_pressure(),
+        before,
+        "a committed fold past the hold's stamp leaves nothing to wait for"
+    );
+    ci.note_held_files_pressure(true, 0);
+    drop(ci);
+    assert_eq!(
+        held_files_pressure(),
+        before,
+        "a dropped index withdraws it"
     );
 }
