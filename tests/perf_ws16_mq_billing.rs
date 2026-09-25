@@ -188,7 +188,7 @@ fn pop_ack_churn_keeps_the_charge_exact(shards: usize) {
             assert!(r.starts_with('$'), "MQ PUSH {q}: {r:?}");
         }
     }
-    let mut churn = |c: &mut Conn, q: &str| -> (i64, i64) {
+    let churn = |c: &mut Conn, q: &str| -> (i64, i64) {
         let used_before = settled_used_memory(c);
         let usage_before = memory_usage(c, q);
         for _ in 0..500 {
