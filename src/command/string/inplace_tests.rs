@@ -267,12 +267,27 @@ fn setbit_cost_is_independent_of_bitmap_size() {
     );
 }
 
-/// APPEND is amortized O(1): 2000 x 100 B appended to a 10 KB string cost
-/// about what they cost appended to a 4 MB one (bound 8x). HEAD copied the
-/// whole value twice per APPEND — quadratic (a ~400x ratio here).
+/// APPEND is amortized O(1): 2000 x 8 B appended to a 10 KB string cost
+/// about what they cost appended to a 4 MB one. HEAD `935c555` copied the
+/// whole value into two fresh buffers per APPEND, so its cost grew with the
+/// value: 265-276x here (its body, Linux x86_64, debug build).
+///
+/// The chunks are small so that the ratio measures the work per CALL, which
+/// is what that regression adds, rather than the allocator's cost per
+/// appended BYTE. Lib tests run on the system allocator (`#[global_allocator]`
+/// is set only in `main.rs`), and the amortization of `string_grow_with`
+/// comes from the allocator (see its docs). glibc and macOS grow the 4 MB
+/// block in place: 1.0x here, bound 8x. The Windows heap moves it about once
+/// per 4 KiB of growth. With the former 100 B chunks the hosted Windows
+/// runner measured 14.4-16.2x at `c111e6b` and 19.5-20.6x at `ae21476`: t1
+/// ~94 ms over a t0 of ~4.5 ms, about 1.8 ms per 4 KiB crossed. The same
+/// costs predict ~2.7x with 8 B chunks. Windows gets 64x, a wide margin on
+/// that unverified prediction that still fails the HEAD path, which pays
+/// two fresh 4 MB buffers per call.
 #[test]
 fn append_growth_is_amortized_linear() {
-    let chunk = [b'x'; 100];
+    let chunk = [b'x'; 8];
+    let bound = if cfg!(windows) { 64.0 } else { 8.0 };
     let mut t = Vec::new();
     for start in [10_000usize, 4_000_000] {
         let mut db = Database::new();
@@ -285,8 +300,8 @@ fn append_growth_is_amortized_linear() {
     }
     let ratio = t[1] as f64 / t[0].max(1) as f64;
     assert!(
-        ratio < 8.0,
-        "APPEND onto 4 MB cost {ratio:.1}x onto 10 KB ({} vs {} ns)",
+        ratio < bound,
+        "APPEND onto 4 MB cost {ratio:.1}x onto 10 KB ({} vs {} ns, bound {bound}x)",
         t[1],
         t[0]
     );
