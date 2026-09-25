@@ -2746,9 +2746,9 @@ if should_run "vector"; then
     # vector arrives short, and every query below answers "dimension mismatch"
     # instead of exercising the filter. That makes the guard vacuous.
     KF_VEC="ABCDEFGHIJKLMNOP"
-    mcli HSET kf:1 vt 150 vec "$KF_VEC" >/dev/null 2>&1
-    mcli HSET kf:2 vt 250 vec "$KF_VEC" >/dev/null 2>&1
-    mcli HSET kf:3 vt 350 vec "$KF_VEC" >/dev/null 2>&1
+    mcli HSET kf:1 vt 150 lang en vec "$KF_VEC" >/dev/null 2>&1
+    mcli HSET kf:2 vt 250 lang fr vec "$KF_VEC" >/dev/null 2>&1
+    mcli HSET kf:3 vt 350 lang en vec "$KF_VEC" >/dev/null 2>&1
     sleep 0.5
 
     # KNNFILT-01 baseline: the prefilter is applied at all (150 only).
@@ -2789,6 +2789,18 @@ if should_run "vector"; then
         PASS=$((PASS + 1)); echo "  PASS: KNNFILT-04 inverted prefilter rejected, server still alive"
     else
         FAIL=$((FAIL + 1)); echo "  FAIL: KNNFILT-04 reply='$KF_INV' ping='$KF_ALIVE' (empty ping = process aborted)"
+    fi
+
+    # KNNFILT-05 (moon#1238): an inline TAG prefilter with exactly one match
+    # among three. At `--shards > 1` the KNN scatter used to drop the prefix and
+    # answer all three keys (it filtered only at `--shards 1`).
+    TOTAL=$((TOTAL + 1))
+    KF_TAG=$(mcli FT.SEARCH knnfilt '@lang:{fr}=>[KNN 4 @vec $q]' PARAMS 2 q "$KF_VEC" DIALECT 2 2>&1)
+    KF_NT=$(echo "$KF_TAG" | grep -c '^kf:' || true)
+    if [ "$KF_NT" -eq 1 ] && echo "$KF_TAG" | qgrep -q '^kf:2$'; then
+        PASS=$((PASS + 1)); echo "  PASS: KNNFILT-05 inline tag prefilter -> kf:2 only (shards=$SHARDS)"
+    else
+        FAIL=$((FAIL + 1)); echo "  FAIL: KNNFILT-05 expected kf:2 only, got $KF_NT keys (3 = prefilter dropped): $KF_TAG"
     fi
 
     mcli FT.DROPINDEX knnfilt DD >/dev/null 2>&1
