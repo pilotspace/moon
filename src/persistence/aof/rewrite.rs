@@ -1883,6 +1883,60 @@ mod fold_tests {
         );
     }
 
+    /// moon#1223: an in-flight spill payload that does not rehydrate cannot
+    /// be carried by the new base, and a base without it loses the key if
+    /// the spill then does not publish. The fold fails instead: nothing is
+    /// published, the manifest never flips, and the writer keeps appending
+    /// to the committed incr.
+    #[test]
+    fn an_unencodable_in_flight_payload_aborts_the_rewrite_on_the_committed_generation() {
+        let mut fx = fixture();
+        fx.dbs[0].write().spill_inflight_mark(
+            Bytes::from_static(b"broken"),
+            crate::storage::db::PendingSpill {
+                req_id: 1,
+                value_type: crate::persistence::kv_page::ValueType::Hash,
+                value_bytes: Bytes::from_static(b"\xff\xff not a hash body"),
+                ttl_ms: None,
+            },
+        );
+        let old_seq = fx.manifest.seq;
+        let old_incr = fx.manifest.incr_path();
+        let mut last_db = 0usize;
+
+        let res = do_rewrite_single(
+            &fx.dbs,
+            &mut fx.manifest,
+            &mut fx.file,
+            &fx.rx,
+            &mut last_db,
+            &fx.overflow,
+            FoldEpoch::INITIAL,
+        );
+
+        let err = res.expect_err("the fold must fail, not commit a base without the key");
+        assert!(err.to_string().contains("does not rehydrate"), "{err}");
+        assert_eq!(fx.manifest.seq, old_seq, "in-memory manifest unchanged");
+        let on_disk = AofManifest::load(&fx.dir)
+            .expect("load")
+            .expect("manifest present");
+        assert_eq!(on_disk.seq, old_seq, "the manifest never flipped");
+        assert!(old_incr.exists(), "the committed incr is still there");
+        assert!(
+            !fx.manifest.incr_path_seq(old_seq + 1).exists(),
+            "no new incr was published"
+        );
+        let marker = b"*1\r\n$4\r\nPING\r\n";
+        fx.file
+            .write_all(marker)
+            .expect("append after the aborted fold");
+        fx.file.sync_data().expect("fsync");
+        assert!(
+            contains(&old_incr, marker),
+            "appends after the aborted fold land in the committed incr"
+        );
+    }
+
     /// A committed fold hands the writer its snapshot epoch and a handle on
     /// the new incr (opened before the flip).
     #[test]

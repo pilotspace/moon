@@ -337,8 +337,8 @@ fn shadow_can_return(
 }
 
 /// In-flight spill payloads a fold base image could not carry because they
-/// did not rehydrate (moon#1223). Each is a key whose only copy is its spill
-/// file, IF that file publishes; each is logged when counted.
+/// did not rehydrate (moon#1223). Each fails its fold (the previous
+/// generation stays committed) and is logged when counted.
 pub static FOLD_IN_FLIGHT_UNENCODABLE: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
@@ -355,10 +355,17 @@ pub static FOLD_IN_FLIGHT_UNENCODABLE: std::sync::atomic::AtomicU64 =
 ///
 /// Skipped: a key that is also hot (the hot copy is newer — `set` retires the
 /// in-flight record, so this is defensive), and a payload expired at
-/// `now_ms` (the base's own filter). A payload that does not rehydrate (it
-/// cannot be produced by `build_spill_payload`; memory corruption) cannot be
-/// written; it is counted in [`FOLD_IN_FLIGHT_UNENCODABLE`] and logged,
-/// never silently dropped.
+/// `now_ms` (the base's own filter).
+///
+/// A payload that does not rehydrate (it cannot be produced by
+/// `build_spill_payload`; memory corruption) cannot be written, and a base
+/// without it would lose the key if the spill then does not publish — the
+/// moon#1223 loss this function exists to prevent. So it FAILS the fold:
+/// counted in [`FOLD_IN_FLIGHT_UNENCODABLE`], logged, and returned as
+/// `AofError::RewriteFailed`, which aborts the rewrite with the previous
+/// generation still committed. The in-flight record lasts until the spill
+/// completes, so a later rewrite (the auto-rewrite retry, or the next
+/// BGREWRITEAOF) succeeds once it has.
 fn write_in_flight_entries<W: Write>(
     w: &mut RdbStreamWriter<W>,
     db_idx: usize,
@@ -394,9 +401,18 @@ pub(crate) fn for_each_in_flight_base_entry(
                     db = db_idx,
                     key_len = key.len(),
                     "AOF rewrite fold: an in-flight spill payload does not rehydrate, so the new \
-                     base cannot carry the key; its spill file is its only copy if it publishes \
-                     (moon#1223)"
+                     base cannot carry the key; the rewrite fails and the previous generation \
+                     stays committed (moon#1223)"
                 );
+                return Err(AofError::RewriteFailed {
+                    detail: format!(
+                        "fold of db {db_idx}: an in-flight spill payload ({} byte key) does not \
+                         rehydrate, so the new base could not carry the key; the previous \
+                         generation stays committed",
+                        key.len()
+                    ),
+                }
+                .into());
             }
             // Expired at the fold instant: absent from the base, like a hot
             // key expired at the same instant.
@@ -718,11 +734,14 @@ mod tests {
         assert_eq!(string_at(&loaded[0], b"kept").as_deref(), Some(&b"y"[..]));
     }
 
-    /// A payload that does not rehydrate cannot be encoded: counted and
-    /// logged, and the rest of the image is still produced.
+    /// A payload that does not rehydrate cannot be encoded: a base without
+    /// it would lose the key if its spill then does not publish, so it fails
+    /// the fold (counted and logged too). That the previous generation stays
+    /// committed is checked on the rewrite itself:
+    /// `rewrite::fold_tests::an_unencodable_in_flight_payload_aborts_the_rewrite_on_the_committed_generation`.
     #[test]
-    fn an_undecodable_in_flight_payload_is_counted_not_fatal() {
-        let mut dbs = vec![Database::new()];
+    fn an_undecodable_in_flight_payload_fails_the_fold() {
+        let mut dbs = [Database::new()];
         dbs[0].spill_inflight_mark(
             Bytes::from_static(b"broken"),
             crate::storage::db::PendingSpill {
@@ -734,13 +753,23 @@ mod tests {
         );
         in_flight(&mut dbs[0], b"fine", b"ok", None);
         let before = FOLD_IN_FLIGHT_UNENCODABLE.load(std::sync::atomic::Ordering::Relaxed);
-        let loaded = image_of(&dbs, 0);
+        let (sink, image) = fold_image_channel();
+        let refs: Vec<&Database> = dbs.iter().collect();
+        stream_fold_image(&refs, 0, sink);
+        let mut out = Vec::new();
+        let err = write_fold_image(image, &mut out, "test")
+            .expect_err("a base that cannot carry an in-flight key must fail the fold");
+        assert!(
+            err.to_string().contains("does not rehydrate"),
+            "the error names the cause: {err}"
+        );
         assert!(
             FOLD_IN_FLIGHT_UNENCODABLE.load(std::sync::atomic::Ordering::Relaxed) > before,
             "the unencodable payload must be counted"
         );
-        assert_eq!(string_at(&loaded[0], b"broken"), None);
-        assert_eq!(string_at(&loaded[0], b"fine").as_deref(), Some(&b"ok"[..]));
+        // The legacy cloning fold's selection fails the same way.
+        let res = for_each_in_flight_base_entry(&dbs[0], 0, 0, |_, _| Ok(()));
+        assert!(res.is_err(), "do_rewrite_single's selection fails too");
     }
 
     fn cold_loc(file_id: u64) -> crate::storage::tiered::cold_index::ColdLocation {
