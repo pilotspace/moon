@@ -548,8 +548,18 @@ mod tests {
         s.groups[b"g".as_ref()].pel[&StreamId { ms, seq }].delivery_time
     }
 
+    /// moon#1222: the clock is pinned. `read_group_new` stamps each stream's
+    /// PEL entries with `current_time_ms()` once PER STREAM; outside a shard
+    /// the thread-local cache is unset, so that is a syscall per stream and
+    /// the millisecond could tick between `s` and `t`. The single `now`
+    /// derived from `s` below then replayed `t` 1 ms off and the state
+    /// comparison failed (FLAKY 2/3 in PR #1221's Check job). In a shard,
+    /// `TL_NOW_MS` is set once per tick and one command never spans a tick —
+    /// the invariant `rewrite_effect_for_propagation`'s single `now_ms`
+    /// relies on — and the pin reproduces exactly that.
     #[test]
     fn a_read_is_one_forced_claim_per_stream_that_replays_exactly() {
+        let _clock = crate::storage::entry::ClockPin::set(1_700_000_000, 1_700_000_000_123);
         let (mut live, mut replay) = twins(SETUP);
         let c = [
             "XREADGROUP",
