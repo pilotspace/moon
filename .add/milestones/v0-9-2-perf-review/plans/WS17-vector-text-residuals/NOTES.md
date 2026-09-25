@@ -163,3 +163,14 @@ Ownership constraints that shape the designs below:
   failed (num_docs 0 after restart) in an unpinned batch run at load 11; the rerun recompiled `moon` (another tree had
   replaced the shared artifacts) and passed, and the whole suite passed 16/16 with `MOON_BIN` pinned to
   `/home/user/wt/bin/ws17-dbg-9789b5a` (proven mine by perf_ws17_payload_text_off's FT.INFO field in the same run).
+
+## 4c follow-up — rows outside the f16 range (commit e4d31c4)
+- Found by probing a `--shards 2` server with the suites' ASCII test blob: every `__vec_score` was `inf`. A component
+  beyond ±65,504 is stored as ±inf in `raw_f16`; the exact distance is inf / NaN and every candidate tied → id order.
+  HQ-1's immutable rerank had the same behaviour since it landed. `exact_f16_distance` now returns `None` for a
+  non-finite result (caller keeps the ADC estimate), like the zero-row case. Red: `q=37: [inf, inf, inf, inf, inf]`.
+- Re-gated at e4d31c4: fmt 0, audits PASSED, clippy --all-targets 0, clippy tokio 0, check --all-targets tokio 0
+  (no warnings), `vector:: command::vector_search` lib 1075/1075 monoio, 914/914 tokio.
+- Orchestrator disk note (root volume < 5 % free): every server my tests spawn passes `--disk-free-min-pct 0`
+  (perf_ws17_payload_text_off, inverted_search_shard_consistency, vector_update_tombstones), so no `diskfull`
+  artefact applies to the results above.
