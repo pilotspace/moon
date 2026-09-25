@@ -352,6 +352,9 @@ fn store_geo_matches(
         },
     );
     db.set(dest, entry);
+    // moon#1232 review 5: redis counts every member stored (`dirty +=
+    // returned_items`); the `set` above counted the first.
+    crate::admin::metrics_setup::record_keyspace_changes(matches.len() as u64 - 1);
 
     Frame::Integer(matches.len() as i64)
 }

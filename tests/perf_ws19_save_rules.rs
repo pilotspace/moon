@@ -547,6 +547,79 @@ const ROWS: &[Row] = &[
         ]],
         1
     ),
+    // Review 5, N5: the geo stores count the members stored (an empty result
+    // counts the destination it deleted), and RENAME onto itself is nothing.
+    row!(
+        "RENAME k k",
+        [["SET", "rs", "v"]],
+        [["RENAME", "rs", "rs"]],
+        0
+    ),
+    row!(
+        "GEOSEARCHSTORE 2",
+        [[
+            "GEOADD", "geo", "13.36", "38.11", "a", "15.08", "37.50", "b"
+        ]],
+        [[
+            "GEOSEARCHSTORE",
+            "geod",
+            "geo",
+            "FROMLONLAT",
+            "15",
+            "37",
+            "BYRADIUS",
+            "200",
+            "km"
+        ]],
+        2
+    ),
+    row!(
+        "GEORADIUS STORE 2",
+        [],
+        [[
+            "GEORADIUS",
+            "geo",
+            "15",
+            "37",
+            "200",
+            "km",
+            "STORE",
+            "geod2"
+        ]],
+        2
+    ),
+    row!(
+        "GEOSEARCHSTORE empty, dst existed",
+        [],
+        [[
+            "GEOSEARCHSTORE",
+            "geod",
+            "geo",
+            "FROMLONLAT",
+            "0",
+            "0",
+            "BYRADIUS",
+            "1",
+            "km"
+        ]],
+        1
+    ),
+    row!(
+        "GEOSEARCHSTORE empty, no dst",
+        [],
+        [[
+            "GEOSEARCHSTORE",
+            "geod3",
+            "geo",
+            "FROMLONLAT",
+            "0",
+            "0",
+            "BYRADIUS",
+            "1",
+            "km"
+        ]],
+        0
+    ),
     // SWAPDB is one change, even onto itself. These rows come last: they
     // leave db 0 holding the other database.
     row!(

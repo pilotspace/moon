@@ -22,12 +22,19 @@
 //! ([`blocking_pop_changes`]); a PARKED waiter served later by a push counts
 //! nothing, as in redis 7.0.15, where only the push is counted.
 //!
-//! Known, bounded differences: `XREADGROUP` / `XCLAIM` / `XAUTOCLAIM` do not
-//! count the consumer they create (redis adds 1 when that consumer is served
-//! something, so the command already counts at least one), `SORT ... STORE`
-//! counts 1 where redis counts the stored length, `ZINCRBY` of a NEW member
-//! by 0 counts 0 (redis 1), and `XGROUP DELCONSUMER` of a missing consumer
-//! counts 1 (redis 0).
+//! Known, bounded differences (all measured on redis-server 7.0.15):
+//!
+//! - `XREADGROUP` / `XCLAIM` / `XAUTOCLAIM` do not count the consumer they
+//!   create (redis adds 1 when that consumer is served something, so the
+//!   command already counts at least one), and an `XREADGROUP` history read
+//!   (an id other than `>`) of an empty PEL counts 0 (redis 1 per stream);
+//! - `SORT ... STORE` counts 1 where redis counts the stored length;
+//! - `ZINCRBY` of a NEW member by 0 counts 0 (redis 1);
+//! - `XGROUP DELCONSUMER` of a missing consumer counts 1 (redis 0);
+//! - `SETBIT` of a bit that already had the value counts 1 (redis 0);
+//! - `PFCOUNT` counts 0; redis counts 1 when a single-key count rewrites the
+//!   HLL's cached cardinality (after a `PFADD` changed a register) — moon
+//!   keeps no such cache, so its `PFCOUNT` writes nothing.
 //!
 //! Hot path: one match on the reply after the handler; no allocation.
 
@@ -46,12 +53,13 @@ pub(crate) enum Rule {
     /// length, is 0 otherwise (`LPUSHX`, `RPUSHX`).
     PushedIfExists,
     /// One when the command succeeded with a non-null reply (`HINCRBY`,
-    /// `HINCRBYFLOAT`, `LSET`, `XADD`, `XSETID`, `LMOVE`, `RPOPLPUSH`,
-    /// `RENAME`).
+    /// `HINCRBYFLOAT`, `LSET`, `XADD`, `XSETID`, `LMOVE`, `RPOPLPUSH`).
     One,
     /// One when the integer reply is positive (`HSETNX`, `LINSERT`,
     /// `RENAMENX`).
     Positive,
+    /// `RENAME`: [`Rule::One`], but `RENAME k k` changes nothing (redis 0).
+    Rename,
     /// The integer reply (`SADD`, `SREM`, `HDEL`, `LREM`, `ZREM`,
     /// `ZREMRANGEBY*`, `XDEL`, `XTRIM`, `XACK`).
     Int,
@@ -142,6 +150,7 @@ pub(crate) fn changes(rule: Rule, args: &[Frame], reply: &Frame) -> u64 {
             _ => 0,
         },
         Rule::One => 1,
+        Rule::Rename => u64::from(args.first().and_then(bulk) != args.get(1).and_then(bulk)),
         Rule::Positive => match reply {
             Frame::Integer(n) if *n > 0 => 1,
             _ => 0,
@@ -340,6 +349,12 @@ mod tests {
             &[&["SET", "rn", "v"]],
             &["RENAME", "rn", "rn2"],
             1,
+        ),
+        (
+            "RENAME k k",
+            &[&["SET", "rs", "v"]],
+            &["RENAME", "rs", "rs"],
+            0,
         ),
         (
             "RENAMENX refused",
@@ -623,6 +638,60 @@ mod tests {
             "GEOADD same position",
             &[&["GEOADD", "g", "13.36", "38.11", "a"]],
             &["GEOADD", "g", "13.36", "38.11", "a"],
+            0,
+        ),
+        (
+            "GEOSEARCHSTORE 2",
+            &[&["GEOADD", "g", "13.36", "38.11", "a", "15.08", "37.50", "b"]],
+            &[
+                "GEOSEARCHSTORE",
+                "gd",
+                "g",
+                "FROMLONLAT",
+                "15",
+                "37",
+                "BYRADIUS",
+                "200",
+                "km",
+            ],
+            2,
+        ),
+        (
+            "GEORADIUS STORE 2",
+            &[&["GEOADD", "g", "13.36", "38.11", "a", "15.08", "37.50", "b"]],
+            &["GEORADIUS", "g", "15", "37", "200", "km", "STORE", "gd"],
+            2,
+        ),
+        (
+            "GEOSEARCHSTORE empty, destination existed",
+            &[&["GEOADD", "g", "13.36", "38.11", "a"], &["SET", "gd", "x"]],
+            &[
+                "GEOSEARCHSTORE",
+                "gd",
+                "g",
+                "FROMLONLAT",
+                "0",
+                "0",
+                "BYRADIUS",
+                "1",
+                "km",
+            ],
+            1,
+        ),
+        (
+            "GEOSEARCHSTORE empty, no destination",
+            &[&["GEOADD", "g", "13.36", "38.11", "a"]],
+            &[
+                "GEOSEARCHSTORE",
+                "gd",
+                "g",
+                "FROMLONLAT",
+                "0",
+                "0",
+                "BYRADIUS",
+                "1",
+                "km",
+            ],
             0,
         ),
         (
