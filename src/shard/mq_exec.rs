@@ -715,7 +715,10 @@ fn handle_pop(args: &[Frame], key_prefix: &Bytes, db_index: usize) -> Frame {
                 Err(e) => return (e, None),
             };
 
-            let request_count = count + (mdc as usize);
+            // Saturating: COUNT may be as large as `usize::MAX` (review 5 —
+            // the plain sum panicked a debug build and wrapped a release one
+            // to a claim smaller than COUNT).
+            let request_count = count.saturating_add(mdc as usize);
 
             // Step 2: read_group_new to claim entries.
             let stream = match db.get_stream_mut(&eff_key) {
@@ -1397,6 +1400,32 @@ mod tests {
             );
         })
         .expect("test thread panicked");
+    }
+
+    /// Review 5 nit: POP over-claims `COUNT + MAXDELIVERY` entries. With
+    /// COUNT near `usize::MAX` that sum overflowed: a debug build panicked
+    /// the shard, a release build wrapped to a claim of MAXDELIVERY - 1
+    /// entries and delivered fewer than were there.
+    #[test]
+    fn pop_with_a_count_near_usize_max_delivers_everything() {
+        std::thread::spawn(|| {
+            init_shard(make_test_slice(1));
+            assert_eq!(
+                mq(&["CREATE", "q"]),
+                Frame::SimpleString(Bytes::from_static(b"OK"))
+            );
+            for i in 0..3 {
+                let v = format!("m{i}");
+                assert!(matches!(mq(&["PUSH", "q", "f", &v]), Frame::BulkString(_)));
+            }
+            match mq(&["POP", "q", "COUNT", &usize::MAX.to_string()]) {
+                Frame::Array(entries) => entries.len(),
+                other => panic!("POP: {other:?}"),
+            }
+        })
+        .join()
+        .map(|delivered| assert_eq!(delivered, 3, "every queued entry"))
+        .expect("the POP panicked the shard thread");
     }
 
     // ── moon#1250: MQ writes are charged to used_memory and gated ─────────────
