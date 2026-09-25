@@ -66,11 +66,14 @@ use crate::persistence::manifest::{FileEntry, ShardManifest};
 use crate::persistence::page::{PAGE_4K, PageType};
 use crate::storage::tiered::spill_thread::{SpillRequest, flush_buffer};
 
-/// Compactions waiting for a committed fold, over every shard and database.
-/// The AOF auto-rewrite monitor dispatches a rewrite while this is non-zero.
+/// Compactions waiting for a committed fold, over every shard and database,
+/// plus one per database whose held spill files (moon#1231) keep its ledger
+/// over the reclaim threshold until a fold. The AOF auto-rewrite monitor
+/// dispatches a rewrite while this is non-zero.
 static AWAITING_FOLD: AtomicUsize = AtomicUsize::new(0);
 
-/// How many compactions wait for a committed fold, process-wide.
+/// How many compactions (and pressured held-file sets) wait for a committed
+/// fold, process-wide.
 #[inline]
 pub fn awaiting_fold() -> usize {
     AWAITING_FOLD.load(Ordering::Relaxed)
@@ -112,13 +115,19 @@ pub struct ReclaimState {
     /// every tick into a failing read. Tiny: one id per such file.
     skip: HashSet<u64>,
     bytes: usize,
+    /// Whether this database counts in [`AWAITING_FOLD`] for its held files
+    /// (see [`ColdIndex::note_held_files_pressure`]).
+    held_signal: bool,
 }
 
 impl Drop for ReclaimState {
     fn drop(&mut self) {
         // A cold index dropped with compactions pending leaves their
         // unlisted files to the next startup orphan sweep.
-        AWAITING_FOLD.fetch_sub(self.pending.len(), Ordering::Relaxed);
+        AWAITING_FOLD.fetch_sub(
+            self.pending.len() + usize::from(self.held_signal),
+            Ordering::Relaxed,
+        );
     }
 }
 
@@ -182,6 +191,25 @@ impl ColdIndex {
     #[inline]
     pub fn pending_compactions(&self) -> usize {
         self.reclaim.pending()
+    }
+
+    /// moon#1231: a held spill file keeps its dead-slot ledger entries until
+    /// a committed fold releases it, and compaction cannot help (it has no
+    /// live key). So while the shard's ledger is over the reclaim threshold
+    /// (`over`) and some held file still waits for a fold, this database asks
+    /// the auto-rewrite monitor for one, exactly as a waiting compaction does
+    /// — otherwise write admission could stay refused on bytes only a fold
+    /// can free. Idempotent; the tick calls it every time.
+    pub fn note_held_files_pressure(&mut self, over: bool, committed_floor: u64) {
+        let want = over && self.hold.awaits_fold(committed_floor);
+        if want != self.reclaim.held_signal {
+            self.reclaim.held_signal = want;
+            if want {
+                AWAITING_FOLD.fetch_add(1, Ordering::Relaxed);
+            } else {
+                AWAITING_FOLD.fetch_sub(1, Ordering::Relaxed);
+            }
+        }
     }
 
     /// Up to `max` files worth compacting now, most dead bytes first: files
@@ -410,10 +438,18 @@ impl ColdIndex {
         self.reclaim.bytes = self.reclaim.bytes.saturating_sub(held);
 
         // 1. List what is still worth listing; one durable commit.
+        //
+        // moon#1231: the old file is unlinked below only if EVERY output of
+        // its compaction is listed. A survivor that changed after the fold
+        // that made this adoption possible (a read promotion, say) was cold in
+        // the old file at that fold, so the committed generation still reads
+        // it there — unless its copy is listed below the cut. A discarded
+        // output leaves some such survivor with no other copy; its old file
+        // then goes through the orphan sweep's hold instead.
         let mut listed: Vec<(CompactedFile, Vec<bool>)> = Vec::new();
         let mut old_files: Vec<u64> = Vec::with_capacity(ready.len());
         for compaction in ready {
-            old_files.push(compaction.old_file);
+            let mut every_output_listed = true;
             for out in compaction.outputs {
                 let unchanged: Vec<bool> = out
                     .moved
@@ -424,11 +460,13 @@ impl ColdIndex {
                     // Every survivor changed since: nothing would point at
                     // the copy, so it is never listed.
                     discard_output(shard_dir, out.entry.file_id);
+                    every_output_listed = false;
                     continue;
                 }
                 match manifest.add_file(out.entry.clone()) {
                     Ok(()) => listed.push((out, unchanged)),
                     Err(e) => {
+                        every_output_listed = false;
                         // Unreachable while the file-id seed holds (moon#893):
                         // the manifest describes some other file under this
                         // id, so leave that file alone and adopt nothing here.
@@ -440,6 +478,9 @@ impl ColdIndex {
                         );
                     }
                 }
+            }
+            if every_output_listed {
+                old_files.push(compaction.old_file);
             }
         }
         if !listed.is_empty()

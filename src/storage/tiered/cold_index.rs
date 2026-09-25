@@ -189,6 +189,10 @@ pub struct ColdIndex {
     /// waiting for a committed AOF fold before they are adopted and the old
     /// files unlinked — the ledger's bound (see [`super::cold_reclaim`]).
     pub(super) reclaim: super::cold_reclaim::ReclaimState,
+    /// Zero-ref files a replayable AOF generation may still read, kept on
+    /// disk until a committed fold covers them (moon#1231) — see
+    /// [`super::unlink_hold`].
+    pub(super) hold: super::unlink_hold::UnlinkHold,
 }
 
 /// Approximate fixed cost of one cold-index entry beyond the key bytes: the
@@ -361,6 +365,7 @@ impl ColdIndex {
             older_copies: HashMap::new(),
             dead: super::dead_slots::DeadSlots::default(),
             reclaim: super::cold_reclaim::ReclaimState::default(),
+            hold: super::unlink_hold::UnlinkHold::default(),
         }
     }
 
@@ -606,6 +611,7 @@ impl ColdIndex {
             self.older_copies.entry(key).or_default().extend(copies);
         }
         self.dead.merge(other.dead);
+        self.hold.merge(other.hold);
     }
 
     /// Number of entries tracked.
@@ -619,14 +625,16 @@ impl ColdIndex {
         self.file_refs.keys().copied().max()
     }
 
-    /// Whether any zero-ref files are queued for unlink by the next sweep.
+    /// Whether any zero-ref files are queued for unlink by the next sweep,
+    /// or held until a committed fold covers them (moon#1231).
     ///
     /// Files orphaned by `insert` overwrite (re-eviction) or `remove`
     /// (promotion) carry no hot∩cold key, so the sweep trigger must consult
     /// this in addition to the orphan-key set — otherwise those files are never
-    /// reclaimed on ticks where no key is hot-shadowed.
+    /// reclaimed on ticks where no key is hot-shadowed. A held file needs the
+    /// sweep too: the sweep is what releases it once a fold has committed.
     pub fn has_pending_unlink(&self) -> bool {
-        !self.pending_unlink.is_empty()
+        !self.pending_unlink.is_empty() || !self.hold.is_empty()
     }
 
     /// How many zero-ref files are queued for unlink — `INFO MoonStore`'s
@@ -635,9 +643,25 @@ impl ColdIndex {
     /// The level behind [`Self::has_pending_unlink`]'s boolean. A number that
     /// stays high across sweeps means files are being orphaned faster than the
     /// sweep reclaims them, which is invisible from a boolean.
+    ///
+    /// Held files (moon#1231) count too: they are zero-ref and waiting, for a
+    /// committed fold rather than for the sweep.
     #[inline]
     pub fn pending_unlink_len(&self) -> usize {
-        self.pending_unlink.len()
+        self.pending_unlink.len() + self.hold.len()
+    }
+
+    /// Hand the next unlink decision a fresh reading of the shard's AOF fold
+    /// state (moon#1231). The orphan sweep calls this right before each of its
+    /// sweeps whenever the process has an AOF writer; see
+    /// [`super::unlink_hold`] for the rule it enables.
+    pub fn observe_fold(&mut self, view: super::unlink_hold::FoldView) {
+        self.hold.observe(view);
+    }
+
+    /// Whether `file_id` is held until a committed fold covers it (moon#1231).
+    pub fn is_unlink_held(&self, file_id: u64) -> bool {
+        self.hold.is_held(file_id)
     }
 
     /// How many distinct heap files still hold at least one live cold key —
@@ -898,6 +922,9 @@ impl ColdIndex {
         }
 
         if expired_keys.is_empty() {
+            // Nothing to unlink: the fold view (moon#1231) dies with this
+            // sweep rather than serve a later decision stale.
+            self.hold.end_decision();
             return Ok(SweepStats::default());
         }
 
@@ -950,32 +977,51 @@ impl ColdIndex {
     /// entries) — the commit error is surfaced only after best-effort
     /// reclamation, and a file whose unlink itself errors is re-queued for a
     /// later sweep rather than leaked.
+    ///
+    /// moon#1231: which queued files go now, which are held until a committed
+    /// fold covers them, and which held files that fold releases, is
+    /// [`super::unlink_hold::UnlinkHold::admit`]'s decision.
     fn drain_pending_unlink(
         &mut self,
         shard_dir: &Path,
         manifest: Option<&mut crate::persistence::manifest::ShardManifest>,
     ) -> std::io::Result<u64> {
-        if self.pending_unlink.is_empty() {
+        if self.pending_unlink.is_empty() && self.hold.is_empty() {
+            self.hold.end_decision();
             return Ok(0);
         }
         let queued = std::mem::take(&mut self.pending_unlink);
-        self.unlink_queued(queued, shard_dir, manifest)
+        let refs = &self.file_refs;
+        self.hold
+            .forget_referenced(|file_id| refs.contains_key(&file_id));
+        let admitted = self.hold.admit(queued);
+        self.pending_unlink.extend(admitted.requeue);
+        if admitted.unlink.is_empty() {
+            return Ok(0);
+        }
+        self.unlink_queued(admitted.unlink, shard_dir, manifest)
     }
 
     /// [`Self::drain_pending_unlink`] for exactly the queued files among
     /// `file_ids`; every other queued file stays queued for the orphan
     /// sweep. The reclaim uses it to unlink the files it just emptied
     /// without advancing the sweep's own schedule for anything else.
+    ///
+    /// It bypasses the moon#1231 hold, including for a file already held:
+    /// the caller must know that no replayable generation reads the file —
+    /// the reclaim's adoption does, for an old file each of whose live slots
+    /// has a durable copy below the committed cut.
     pub fn unlink_now(
         &mut self,
         file_ids: &[u64],
         shard_dir: &Path,
         manifest: Option<&mut crate::persistence::manifest::ShardManifest>,
     ) -> std::io::Result<u64> {
-        let (now, later): (Vec<u64>, Vec<u64>) = std::mem::take(&mut self.pending_unlink)
+        let (mut now, later): (Vec<u64>, Vec<u64>) = std::mem::take(&mut self.pending_unlink)
             .into_iter()
             .partition(|id| file_ids.contains(id));
         self.pending_unlink = later;
+        now.extend(self.hold.take(file_ids));
         if now.is_empty() {
             return Ok(0);
         }
@@ -1385,6 +1431,7 @@ impl ColdIndex {
             older_copies,
             dead: super::dead_slots::DeadSlots::default(),
             reclaim: super::cold_reclaim::ReclaimState::default(),
+            hold: super::unlink_hold::UnlinkHold::default(),
         }
     }
 }

@@ -98,12 +98,22 @@ pub(super) fn run(
         }
     }
 
-    // 2. Compact while the ledger is over its share.
+    // 2. Compact while the ledger is over its share. Held spill files
+    // (moon#1231) cannot be compacted — they have no live key — so a
+    // database whose held files wait for a fold asks for one meanwhile.
     let threshold = {
         let rt = runtime_config.read();
         reclaim_threshold(rt.maxmemory, rt.maxmemory_per_shard())
     };
-    if ledger_bytes <= threshold {
+    let over = ledger_bytes > threshold;
+    for db_index in 0..db_count {
+        crate::shard::slice::with_shard_db(db_index, |db| {
+            if let Some(ci) = db.cold_index.as_mut() {
+                ci.note_held_files_pressure(over, committed);
+            }
+        });
+    }
+    if !over {
         return;
     }
     let epoch = overflow.stamp().0;

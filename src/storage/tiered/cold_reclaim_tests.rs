@@ -393,3 +393,38 @@ fn after_adoption_a_restart_keeps_survivors_and_deletes_with_no_ledger_left() {
     );
     assert_restart_is_exact(&mut db, "after adoption");
 }
+
+/// moon#1231 in the adoption: survivors read-promoted AFTER the fold that
+/// allows the adoption were cold in the old file at that fold, so the
+/// committed generation reads them there. Every survivor changed, so their
+/// copy is never listed — and then the old file is their only durable copy.
+/// The adoption must leave it to the orphan sweep's hold instead of
+/// unlinking it.
+#[test]
+fn survivors_promoted_after_the_fold_keep_the_old_file() {
+    let (tmp, shard_dir, mut live, _log) = live_compacted();
+    let image = fold(&live, NEW + 5);
+    for k in ["k08", "k09"] {
+        assert!(live.promote_cold_if_present(k.as_bytes(), 0), "promote {k}");
+    }
+    let mut manifest = ShardManifest::open(&shard_dir.join("shard-0.manifest")).expect("manifest");
+    let ci = live.cold_index.as_mut().expect("cold index");
+    let r = ci.adopt_compactions(1, &shard_dir, &mut manifest);
+    let old_kept = heap(&shard_dir, OLD).exists() && listed(&manifest, OLD);
+    drop(manifest);
+    let mut db = recover(tmp.path(), &shard_dir, &image);
+    assert_restart_is_exact(&mut db, "survivors promoted after the fold");
+    assert_eq!(
+        (
+            r.compactions,
+            r.files_listed,
+            r.keys_moved,
+            r.files_unlinked
+        ),
+        (1, 0, 0, 0)
+    );
+    assert!(
+        old_kept,
+        "the old file is the promoted survivors' only durable copy"
+    );
+}

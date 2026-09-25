@@ -20,6 +20,11 @@
 //! ok   control_*_without_rewrite, overwritten_*, expired_*,
 //!      flushed_*_after_the_orphan_sweep
 //!
+//! moon#1231 (promote-then-sweep) lives at the end of the file: a probe cold
+//! at the rewrite, then read back into RAM (GET) or read-modify-written
+//! (APPEND) after its spill file's other keys were deleted, must survive the
+//! orphan sweep and a kill -9. RED on `ae21476` and on int/part3b (`5b14b82`).
+//!
 //! Run with (monoio default):
 //!   cargo build --release
 //!   MOON_BIN=target/release/moon cargo test --release \
@@ -651,4 +656,237 @@ fn flushed_cold_keys_stay_flushed_across_rewrite_after_the_orphan_sweep() {
         true,
         Expect::AllAbsent,
     );
+}
+
+// ── moon#1231: promote-then-sweep ────────────────────────────────────────────
+//
+// A probe that is cold when BGREWRITEAOF cuts its base is not in that base:
+// its spill slot is its only durable copy for the whole new generation. The
+// fillers that share its spill files are then DELeted and the probe itself is
+// read back into RAM (GET) or read-modify-written (APPEND) — neither leaves a
+// record that recreates its value. Once every key of a file has left the cold
+// index, the orphan sweep (1 s here) used to unlink it, and a kill -9 then
+// lost the probe (GET) or replayed the APPEND onto nothing (APPEND). Reproduced
+// 88/200 on `ae21476` by the WS15 probe script this scenario encodes.
+
+/// How each probe is touched after the rewrite.
+#[derive(Clone, Copy)]
+enum Touch {
+    /// `GET`: a read promotion, logged nowhere.
+    Get,
+    /// `APPEND probe +`: a read-modify-write promotion; only the APPEND is
+    /// logged.
+    Append,
+}
+
+fn appended_value() -> String {
+    format!("{}+", probe_value())
+}
+
+/// Pipelined `DEL filler:i` for every filler, reading every reply (see
+/// `write_filler` for why the replies must be drained).
+fn del_fillers(port: u16) {
+    let mut stream =
+        std::net::TcpStream::connect(format!("127.0.0.1:{}", port)).expect("connect for DEL");
+    stream.set_write_timeout(Some(Duration::from_secs(30))).ok();
+    let mut buf: Vec<u8> = Vec::with_capacity(64 * 1024);
+    for i in 0..FILLER_COUNT {
+        let key = format!("filler:{}", i);
+        buf.extend_from_slice(
+            format!("*2\r\n$3\r\nDEL\r\n${}\r\n{}\r\n", key.len(), key).as_bytes(),
+        );
+        if buf.len() >= 64 * 1024 {
+            stream.write_all(&buf).expect("DEL write");
+            buf.clear();
+        }
+    }
+    if !buf.is_empty() {
+        stream.write_all(&buf).expect("DEL tail write");
+    }
+    stream.flush().ok();
+    use std::io::Read;
+    stream.set_read_timeout(Some(Duration::from_secs(60))).ok();
+    let mut replies = 0usize;
+    let mut deleted = 0usize;
+    let mut chunk = [0u8; 64 * 1024];
+    let mut pending: Vec<u8> = Vec::new();
+    while replies < FILLER_COUNT {
+        let n = stream.read(&mut chunk).expect("DEL replies");
+        assert!(
+            n > 0,
+            "server closed the DEL connection after {replies} replies"
+        );
+        pending.extend_from_slice(&chunk[..n]);
+        while let Some(pos) = pending.iter().position(|&b| b == b'\n') {
+            let line: Vec<u8> = pending.drain(..=pos).collect();
+            assert!(
+                line.starts_with(b":"),
+                "DEL answered {:?}",
+                String::from_utf8_lossy(&line)
+            );
+            if line.starts_with(b":1") {
+                deleted += 1;
+            }
+            replies += 1;
+        }
+    }
+    assert!(
+        deleted * 10 >= FILLER_COUNT * 9,
+        "precondition failed: only {deleted} of {FILLER_COUNT} fillers existed to delete"
+    );
+}
+
+/// A numeric field of the default `INFO` (None until published).
+fn info_u64(port: u16, field: &str) -> Option<u64> {
+    let info = redis_cmd(port, &["INFO"]);
+    info.lines()
+        .find_map(|l| l.strip_prefix(&format!("{field}:")))
+        .and_then(|v| v.trim().parse().ok())
+}
+
+/// moon#1231 scenario (see the section comment). With `second_rewrite`, a
+/// second BGREWRITEAOF follows the touches: it captures the promoted probes in
+/// its base, after which the sweep must release the spill files it held — the
+/// hold is a wait for a fold, not a leak — and a kill -9 still loses nothing.
+fn run_promote_scenario(suffix: &str, touch: Touch, second_rewrite: bool) {
+    let port = common::reserve_port();
+    let dir = unique_dir(suffix);
+    std::fs::create_dir_all(&dir).expect("create test dir");
+    let sweep_secs = 1;
+
+    let mut server = start_moon(port, &dir, sweep_secs);
+    wait_for_port(port);
+
+    let val = probe_value();
+    for i in 0..PROBE_COUNT {
+        redis_set(port, &probe_key(i), &val);
+    }
+    write_filler(port);
+    std::thread::sleep(Duration::from_secs(SETTLE_AFTER_FILLER));
+    let heap_files = count_heap_files(&dir);
+    assert!(
+        heap_files > 0,
+        "precondition failed: no heap-*.mpf files — filler did not force a spill"
+    );
+    let cold_keys = info_u64(port, "cold_keys").unwrap_or(0);
+    assert!(
+        cold_keys > 0,
+        "precondition failed: INFO reports no cold key after the filler"
+    );
+
+    // The fold: the probes that are cold now are in no base.
+    rewrite_and_wait(port, &dir);
+    del_fillers(port);
+    let expected = match touch {
+        Touch::Get => val.clone(),
+        Touch::Append => appended_value(),
+    };
+    for i in 0..PROBE_COUNT {
+        match touch {
+            Touch::Get => assert_eq!(
+                redis_get(port, &probe_key(i)).as_deref(),
+                Some(val.as_str()),
+                "precondition failed: {} unreadable on the live server",
+                probe_key(i)
+            ),
+            Touch::Append => {
+                let len = redis_cmd(port, &["APPEND", &probe_key(i), "+"]);
+                assert_eq!(
+                    len.trim_start_matches("(integer) "),
+                    (PROBE_VALUE_LEN + 1).to_string(),
+                    "precondition failed: APPEND {} did not see the cold value",
+                    probe_key(i)
+                );
+            }
+        }
+    }
+    // Several 1 s orphan sweeps run.
+    std::thread::sleep(Duration::from_secs(5));
+    let files_before_second = count_heap_files(&dir);
+
+    let mut released = None;
+    if second_rewrite {
+        assert!(
+            files_before_second > 0,
+            "the spill files that backed the probes at the fold were unlinked before any \
+             later fold captured them ({heap_files} at the fold, 0 now)"
+        );
+        rewrite_and_wait(port, &dir);
+        std::thread::sleep(Duration::from_secs(4));
+        released = Some(count_heap_files(&dir));
+    }
+
+    server.kill_now();
+    wait_for_port_down(port);
+    let mut server2 = start_moon_alive(port, &dir, sweep_secs);
+    let mut lost = 0usize;
+    let mut wrong = Vec::new();
+    for i in 0..PROBE_COUNT {
+        let got = redis_get(port, &probe_key(i));
+        if got.as_deref() != Some(expected.as_str()) {
+            if got.is_none() {
+                lost += 1;
+            }
+            wrong.push((probe_key(i), got.map(|v| v.len())));
+        }
+    }
+    server2.kill_now();
+    if wrong.is_empty() && std::env::var("MOON_TEST_KEEP").is_err() {
+        let _ = std::fs::remove_dir_all(&dir);
+    } else {
+        eprintln!("preserved test dir for diagnosis: {}", dir.display());
+    }
+    assert!(
+        wrong.is_empty(),
+        "{} of {} acknowledged, never-deleted probes recovered wrong after BGREWRITEAOF, \
+         DEL of the fillers, {} of every probe, orphan sweeps{} and kill -9 ({} absent; \
+         first: {:?}; heap files: {} at the fold, {} before the kill; cold keys at the \
+         fold: {})",
+        wrong.len(),
+        PROBE_COUNT,
+        match touch {
+            Touch::Get => "GET",
+            Touch::Append => "APPEND",
+        },
+        if second_rewrite {
+            " + a second BGREWRITEAOF"
+        } else {
+            ""
+        },
+        lost,
+        wrong.first(),
+        heap_files,
+        released.unwrap_or(files_before_second),
+        cold_keys
+    );
+    if let Some(after) = released {
+        assert!(
+            after < files_before_second,
+            "the second rewrite committed but the sweep released no held spill file \
+             ({files_before_second} before, {after} after)"
+        );
+    }
+}
+
+/// moon#1231: read-promoted probes survive the orphan sweep and a kill -9.
+#[test]
+#[ignore]
+fn promoted_cold_keys_survive_the_orphan_sweep_and_crash() {
+    run_promote_scenario("promote-get", Touch::Get, false);
+}
+
+/// moon#1231: an APPEND logged after the promotion replays onto the value
+/// the spill file still holds, not onto nothing.
+#[test]
+#[ignore]
+fn appended_cold_keys_keep_their_value_across_the_orphan_sweep_and_crash() {
+    run_promote_scenario("promote-append", Touch::Append, false);
+}
+
+/// moon#1231: the files the sweep held are released once a later rewrite has
+/// captured the promoted probes, and a kill -9 after that still loses nothing.
+#[test]
+#[ignore]
+fn held_spill_files_are_released_after_the_next_rewrite() {
+    run_promote_scenario("promote-release", Touch::Get, true);
 }

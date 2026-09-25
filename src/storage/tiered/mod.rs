@@ -19,6 +19,7 @@ pub mod orphan_reservation;
 mod replay_older_copy_tests;
 pub mod segment_handle;
 pub mod spill_thread;
+pub mod unlink_hold;
 pub mod warm_tier;
 
 pub use segment_handle::{SegmentHandle, SegmentLifetime};
