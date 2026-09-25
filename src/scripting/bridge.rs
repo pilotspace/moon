@@ -768,7 +768,7 @@ pub fn make_redis_call_fn(
                 ),
                 Some(Err(reply)) => (reply, None),
                 Some(Ok(op)) => {
-                    let reply = run_two_db_op(db, &op, &eviction_ctx);
+                    let reply = run_two_db_op(db, db_idx, &op, &eviction_ctx);
                     let target = matches!(reply, Frame::Integer(1)).then(|| op.into_target());
                     (reply, Some(target))
                 }
@@ -881,6 +881,7 @@ pub fn make_redis_call_fn(
 /// applied to the one database in hand.
 fn run_two_db_op(
     src: &mut crate::storage::Database,
+    src_idx: usize,
     op: &crate::command::keyspace::move_cmd::TwoDbOp,
     eviction_ctx: &LuaEvictionCtx,
 ) -> Frame {
@@ -893,7 +894,7 @@ fn run_two_db_op(
         {
             return oom;
         }
-        op.apply(src, dst)
+        op.apply(src, src_idx, dst)
     })
     .unwrap_or_else(|| {
         Frame::Error(Bytes::from_static(

@@ -37,7 +37,7 @@ impl Epoch {
         let path = dir.path().join("shard-0.rrdshard");
         let state = SnapshotState::new(0, 1, dbs, path.clone());
         snapshot_cow::disarm();
-        snapshot_cow::arm_with_layout(state.segment_counts().to_vec());
+        snapshot_cow::arm_with_databases(dbs);
         Epoch {
             state: Some(state),
             path,
@@ -58,6 +58,15 @@ impl Epoch {
         self.step(dbs, false)
     }
 
+    /// A tick while the walk is HELD (`MOON_TEST_SNAPSHOT_HOLD_FILE`): the
+    /// drain runs — captures and table events reach the state — and no
+    /// segment is written.
+    pub(super) fn drain(&mut self) {
+        if let Some(state) = self.state.as_mut() {
+            snapshot_cow::drain_pending_for_test(state);
+        }
+    }
+
     fn step(&mut self, dbs: &[Database], budgeted: bool) -> bool {
         let Some(state) = self.state.as_mut() else {
             return true;
@@ -67,7 +76,7 @@ impl Epoch {
             return true;
         }
         let done = if budgeted {
-            let db = state.current_db_index();
+            let db = state.source_db_index();
             state.advance_budgeted_db(&dbs[db])
         } else {
             state.advance_one_segment(dbs)
@@ -91,11 +100,6 @@ impl Epoch {
         let outcome = state.finalize().map_err(|e| e.to_string());
         snapshot_cow::disarm();
         outcome.map(|()| read_records(&self.path))
-    }
-
-    /// Where this epoch publishes its file.
-    pub(super) fn path(&self) -> &Path {
-        &self.path
     }
 }
 

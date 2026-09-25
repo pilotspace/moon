@@ -190,25 +190,15 @@ pub(super) async fn try_handle_txn_commit(
                     // stage 2a: MQ.PUBLISH materialization durability).
                     if !self_intents.is_empty() {
                         let db_index = conn.selected_db;
+                        // moon#1228: the shared body captures each queue's
+                        // pre-image for an armed BGSAVE before pushing.
                         let payloads: Vec<Vec<u8>> =
                             crate::shard::slice::with_shard_db(db_index, |db| {
-                                let mut payloads = Vec::with_capacity(self_intents.len());
-                                for intent in &self_intents {
-                                    if let Ok(Some(stream)) = db.get_stream_mut(&intent.queue_key) {
-                                        if stream.durable {
-                                            let msg_id = stream.next_auto_id();
-                                            payloads.push(crate::mq::wal::encode_mq_push(
-                                                db_index as u32,
-                                                &intent.queue_key,
-                                                msg_id.ms,
-                                                msg_id.seq,
-                                                &intent.fields,
-                                            ));
-                                            stream.add(msg_id, intent.fields.clone());
-                                        }
-                                    }
-                                }
-                                payloads
+                                crate::shard::mq_exec::materialize_mq_intents(
+                                    db,
+                                    db_index,
+                                    &self_intents,
+                                )
                             });
                         for payload in payloads {
                             crate::shard::mq_exec::wal_append_on_slice(

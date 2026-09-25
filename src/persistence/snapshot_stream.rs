@@ -20,11 +20,12 @@
 //! previous `.rrdshard` or the new one, never a torn file under the real
 //! name.
 //!
-//! A snapshot abandoned before finalize (an epoch a FLUSH*/SWAPDB aborted,
-//! shard exit, error) CANCELS its helper and JOINS it (moon#1227 review F1):
-//! the helper stops writing at its next chunk boundary, drops the rest of its
-//! backlog unwritten, deletes its temp file and exits before the shard can
-//! start the next snapshot of the same path. It used to keep draining up to
+//! A snapshot abandoned before finalize (an epoch a FLUSHALL or a replica
+//! full resync aborted, shard exit, error) CANCELS its helper and JOINS it
+//! (moon#1227 review F1): the helper stops writing at its next chunk
+//! boundary, drops the rest of its backlog unwritten, deletes its temp file
+//! and exits before the shard can start the next snapshot of the same path.
+//! It used to keep draining up to
 //! [`SNAPSHOT_STREAM_MAX_IN_FLIGHT`] of queued blocks into
 //! `shard-N.rrdshard.tmp` while the next BGSAVE truncated and published that
 //! same inode — `BGSAVE OK` for a file that failed its checksum at restart.

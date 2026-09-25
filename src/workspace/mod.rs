@@ -465,6 +465,36 @@ fn strip_array_keys(ws_id: &WorkspaceId, frame: &mut Frame) {
     }
 }
 
+/// `WS DROP`'s key sweep on the shard that owns the workspace (the `{wsid}`
+/// hash tag co-locates every workspace key there): delete every key that
+/// starts with `prefix` from EVERY database — a workspace-bound connection can
+/// `SELECT` any db before writing — and return how many were deleted.
+///
+/// `dbs[i]` must be database `i` (the order `ShardDbSet::with_all` hands
+/// them out). Each key's epoch-start state is captured before it is deleted
+/// (moon#1228), exactly as a `DEL` through `command::dispatch` would: a sweep
+/// during a BGSAVE used to drop every workspace key whose range the save had
+/// not written yet from the snapshot.
+///
+/// Cost: a synchronous O(keys × databases) scan on the shard thread — see
+/// the `WsDropCleanup` handler in `shard::spsc_handler`.
+pub fn sweep_prefix(dbs: &mut [&mut crate::storage::Database], prefix: &[u8]) -> u64 {
+    let mut total = 0u64;
+    for (db_index, db) in dbs.iter_mut().enumerate() {
+        let keys_to_delete: Vec<Vec<u8>> = db
+            .keys()
+            .filter(|k| k.as_bytes().starts_with(prefix))
+            .map(|k| k.as_bytes().to_vec())
+            .collect();
+        total += keys_to_delete.len() as u64;
+        for key in &keys_to_delete {
+            crate::persistence::snapshot_cow::capture_write_pre_image(db, db_index, key);
+            db.remove(key);
+        }
+    }
+    total
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
