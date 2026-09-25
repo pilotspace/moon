@@ -547,6 +547,15 @@ const ROWS: &[Row] = &[
         ]],
         1
     ),
+    // SWAPDB is one change, even onto itself. These rows come last: they
+    // leave db 0 holding the other database.
+    row!(
+        "SWAPDB 0 1",
+        [["SET", "sw", "1"]],
+        [["SWAPDB", "0", "1"]],
+        1
+    ),
+    row!("SWAPDB 0 0", [], [["SWAPDB", "0", "0"]], 1),
 ];
 
 fn changes(c: &mut Conn) -> u64 {
@@ -970,5 +979,52 @@ fn xreadgroup_block_served_at_once_counts_like_xreadgroup() {
     assert!(
         delta >= 1,
         "XREADGROUP BLOCK served 2 entries at once: {delta}"
+    );
+}
+
+fn wait_until(what: &str, mut ok: impl FnMut() -> bool) {
+    let t0 = Instant::now();
+    while !ok() {
+        assert!(t0.elapsed() < Duration::from_secs(20), "timed out: {what}");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// `SWAPDB` is one change in redis 7.0.15. moon counted 0, so with RDB-only
+/// persistence a `--save "N 1"` rule never persisted a lone SWAPDB and a
+/// crash brought the old layout back.
+#[test]
+fn a_lone_swapdb_is_saved_by_a_save_rule() {
+    let dir = common::unique_test_dir("ws19-r5-swapdb");
+    std::fs::create_dir_all(&dir).unwrap();
+    let args = ["--appendonly", "no", "--save", "1 1"];
+    let (mut first, port) = spawn_with(&dir, 1, &args);
+    let mut c = Conn::open(port);
+    assert!(c.send(&["SET", "a", "1"]).starts_with("+OK"));
+    wait_until("the SET is saved", || changes(&mut c) == 0);
+    let before = changes(&mut c);
+    assert_eq!(c.send(&["SWAPDB", "0", "1"]), "+OK\r\n");
+    let delta = changes(&mut c) - before;
+    // The rule saves the swap if it counted (the count drops back to 0 when
+    // that save completes); then crash.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while changes(&mut c) != 0 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    first.kill_now();
+    drop(first);
+    // Booted with save points, as the snapshot is loaded only then.
+    let (mut again, port) = spawn_with(&dir, 1, &["--appendonly", "no", "--save", "3600 1"]);
+    let mut c = Conn::open(port);
+    let in_db0 = c.send(&["EXISTS", "a"]);
+    c.send(&["SELECT", "1"]);
+    let in_db1 = c.send(&["EXISTS", "a"]);
+    again.kill_now();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(delta, 1, "SWAPDB 0 1");
+    assert_eq!(
+        (in_db0.trim(), in_db1.trim()),
+        (":0", ":1"),
+        "after kill -9 the saved layout must have the key in db 1"
     );
 }
