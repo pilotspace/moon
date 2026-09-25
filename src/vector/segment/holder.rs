@@ -1041,11 +1041,10 @@ impl SegmentHolder {
         //    produces.
         let chunk = budget.max_brute_force_vecs_per_chunk.max(1);
         if mutable_len > 0 {
-            // The filter is applied exactly in this scan, so it needs `k`, not
-            // the graph legs' HnswPostFilter oversample `fetch_k` (moon#1242:
-            // reranking the ADC top `mult·3k` diverged from `search_mvcc`).
-            // moon#1226: the ADC top `rerank_mult·k`, exact-reranked from
-            // `raw_f16` after the last chunk (same as `search_mvcc`).
+            // moon#1226: the ADC top `rerank_mult·k`, exact-reranked from `raw_f16`
+            // after the last chunk, as in `search_mvcc`. `k`, not the graph legs'
+            // HnswPostFilter oversample `fetch_k`: this scan filters exactly
+            // (moon#1242: reranking the top `mult·3k` diverged from `search_mvcc`).
             let scan_k = crate::vector::segment::mutable::exact_rerank_depth(k, tuning.rerank_mult);
             let mut bf_query = segments.mutable.prepare_brute_force_query(
                 query_f32,
