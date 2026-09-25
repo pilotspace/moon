@@ -614,17 +614,27 @@ impl Ord for Ranked {
 }
 
 /// Bounded best-`k` selection in `score DESC, doc_id ASC` order.
+///
+/// moon#1226: when `k` covers every expected push (`k >= expected`, e.g.
+/// `LIMIT 0 10000` over a few hundred matches, or an unbounded caller) nothing
+/// can ever be evicted, so the pushes go into a plain `Vec` sorted once at the
+/// end — HEAD sifted each push into a `BinaryHeap` and then heap-sorted it.
+/// Same order either way: `Ranked`'s order is total over distinct docs.
 pub(crate) struct TopK {
     k: usize,
     heap: BinaryHeap<Ranked>,
+    /// The `k >= expected` mode: every push, unsorted (`None` = heap mode).
+    all: Option<Vec<Ranked>>,
 }
 
 impl TopK {
     /// `expected` bounds the number of pushes (sizes the heap).
     pub(crate) fn new(k: usize, expected: usize) -> Self {
+        let keep_all = k >= expected;
         Self {
             k,
-            heap: BinaryHeap::with_capacity(k.min(expected)),
+            heap: BinaryHeap::with_capacity(if keep_all { 0 } else { k.min(expected) }),
+            all: keep_all.then(|| Vec::with_capacity(expected)),
         }
     }
 
@@ -634,6 +644,15 @@ impl TopK {
             return;
         }
         let r = Ranked::new(doc, score);
+        if let Some(all) = &mut self.all {
+            if all.len() < self.k {
+                all.push(r);
+                return;
+            }
+            // More pushes than `expected` promised: continue as a heap.
+            self.heap = BinaryHeap::from(std::mem::take(all));
+            self.all = None;
+        }
         if self.heap.len() < self.k {
             self.heap.push(r);
         } else if let Some(mut worst) = self.heap.peek_mut() {
@@ -643,10 +662,21 @@ impl TopK {
         }
     }
 
+    /// Best-first ranked entries.
+    fn into_sorted(self) -> Vec<Ranked> {
+        match self.all {
+            Some(mut all) => {
+                all.sort_unstable();
+                all
+            }
+            None => self.heap.into_sorted_vec(),
+        }
+    }
+
     /// Best-first results; keys resolved (and cloned) only here, for the page.
     /// A doc without a key is skipped (callers already restricted to live docs).
     pub(crate) fn into_results(self, idx: &TextIndex) -> Vec<TextSearchResult> {
-        let ranked = self.heap.into_sorted_vec();
+        let ranked = self.into_sorted();
         let mut out = Vec::with_capacity(ranked.len());
         for r in ranked {
             if let Some(key) = idx.doc_id_to_key.get(&r.doc) {
@@ -873,19 +903,23 @@ mod tests {
             .map(|(i, &s)| (i as u32, s))
             .collect();
         all.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap().then(a.0.cmp(&b.0)));
-        for k in 0..=scores.len() + 2 {
-            let mut top = TopK::new(k, scores.len());
-            for (i, &s) in scores.iter().enumerate() {
-                top.push(i as u32, s);
+        // `expected` below, at and above the push count: heap mode, the
+        // keep-all mode (moon#1226) and its fall-back to the heap.
+        for expected in [scores.len(), scores.len() / 2, scores.len() + 5] {
+            for k in 0..=scores.len() + 2 {
+                let mut top = TopK::new(k, expected);
+                assert_eq!(top.all.is_some(), k >= expected, "mode for k={k}");
+                for (i, &s) in scores.iter().enumerate() {
+                    top.push(i as u32, s);
+                }
+                let got: Vec<(u32, f32)> = top
+                    .into_sorted()
+                    .into_iter()
+                    .map(|r| (r.doc, r.score))
+                    .collect();
+                let want: Vec<(u32, f32)> = all.iter().copied().take(k).collect();
+                assert_eq!(got, want, "k={k} expected={expected}");
             }
-            let got: Vec<(u32, f32)> = top
-                .heap
-                .into_sorted_vec()
-                .into_iter()
-                .map(|r| (r.doc, r.score))
-                .collect();
-            let want: Vec<(u32, f32)> = all.iter().copied().take(k).collect();
-            assert_eq!(got, want, "k={k}");
         }
     }
 }
