@@ -492,14 +492,19 @@ impl SegmentHolder {
         let prepared = prepare_graph_query(&snapshot, query_f32);
         let prepared = prepared.as_ref();
         let default_tuning = crate::vector::types::SearchTuning::default();
+        let rerank_mult = default_tuning.rerank_mult;
 
         match strategy {
             FilterStrategy::Unfiltered => {
-                all.extend(
-                    snapshot
-                        .mutable
-                        .brute_force_search(query_f32, query_state, k),
-                );
+                // moon#1226: every mutable leg is exact-reranked (see
+                // `mutable::rerank`); `query_state` is unused since moon#1192.
+                let _ = query_state;
+                all.extend(snapshot.mutable.brute_force_search_reranked(
+                    query_f32,
+                    k,
+                    None,
+                    rerank_mult,
+                ));
                 for imm in &snapshot.immutable {
                     all.extend(imm.search_prepared(
                         query_f32,
@@ -518,11 +523,11 @@ impl SegmentHolder {
                 }
             }
             FilterStrategy::BruteForceFiltered => {
-                all.extend(snapshot.mutable.brute_force_search_filtered(
+                all.extend(snapshot.mutable.brute_force_search_reranked(
                     query_f32,
-                    query_state,
                     k,
                     filter_bitmap,
+                    rerank_mult,
                 ));
                 for imm in &snapshot.immutable {
                     all.extend(imm.search_prepared(
@@ -547,11 +552,11 @@ impl SegmentHolder {
                 }
             }
             FilterStrategy::HnswFiltered => {
-                all.extend(snapshot.mutable.brute_force_search_filtered(
+                all.extend(snapshot.mutable.brute_force_search_reranked(
                     query_f32,
-                    query_state,
                     k,
                     filter_bitmap,
+                    rerank_mult,
                 ));
                 for imm in &snapshot.immutable {
                     all.extend(imm.search_prepared(
@@ -577,11 +582,11 @@ impl SegmentHolder {
             }
             FilterStrategy::HnswPostFilter => {
                 let oversample_k = k * 3;
-                all.extend(snapshot.mutable.brute_force_search_filtered(
+                all.extend(snapshot.mutable.brute_force_search_reranked(
                     query_f32,
-                    query_state,
                     oversample_k,
                     filter_bitmap,
+                    rerank_mult,
                 ));
                 let post_ef = ef_search.max(oversample_k);
                 for imm in &snapshot.immutable {
@@ -706,11 +711,12 @@ impl SegmentHolder {
         let query_state: Option<&crate::vector::turbo_quant::inner_product::TqProdQueryState> =
             None;
 
-        // 1. MVCC-aware brute-force (full mutable scan: 0..len)
+        // 1. MVCC-aware brute-force (full mutable scan: 0..len): the ADC top
+        //    `rerank_mult·k`, exact-reranked from `raw_f16` (moon#1226).
         let mut all = snapshot.mutable.brute_force_search_mvcc(
             query_f32,
             query_state,
-            k,
+            crate::vector::segment::mutable::exact_rerank_depth(k, mvcc.tuning.rerank_mult),
             filter_bitmap,
             mvcc.snapshot_lsn,
             mvcc.my_txn_id,
@@ -718,6 +724,7 @@ impl SegmentHolder {
             0,
             usize::MAX,
         );
+        snapshot.mutable.rerank_exact(&mut all, query_f32, k);
 
         // 2. HNSW search on immutable segments (TQ-ADC distance).
         // Immutable segment entries are committed by definition (compacted only
@@ -1030,10 +1037,14 @@ impl SegmentHolder {
         if mutable_len > 0 {
             // fetch_k oversamples under HnswPostFilter (filter still applied —
             // the mutable scan is linear, filtering there is free).
+            // moon#1226: the ADC top `rerank_mult·fetch_k`, exact-reranked
+            // from `raw_f16` after the last chunk (same as `search_mvcc`).
+            let scan_k =
+                crate::vector::segment::mutable::exact_rerank_depth(fetch_k, tuning.rerank_mult);
             let mut bf_query = segments.mutable.prepare_brute_force_query(
                 query_f32,
                 query_state.is_some(),
-                fetch_k,
+                scan_k,
             );
             let mut start = 0usize;
             while start < mutable_len {
@@ -1041,7 +1052,7 @@ impl SegmentHolder {
                 segments.mutable.brute_force_scan_mvcc_chunk(
                     &mut bf_query,
                     query_state,
-                    fetch_k,
+                    scan_k,
                     filter_ref,
                     snapshot_lsn,
                     my_txn_id,
@@ -1055,7 +1066,11 @@ impl SegmentHolder {
                     crate::runtime::cooperative_yield().await;
                 }
             }
-            all.extend(bf_query.into_results());
+            let mut mutable_hits = bf_query.into_results();
+            segments
+                .mutable
+                .rerank_exact(&mut mutable_hits, query_f32, fetch_k);
+            all.extend(mutable_hits);
         }
 
         let seg_cap = budget.max_segments_per_chunk.max(1);
