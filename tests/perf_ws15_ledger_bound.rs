@@ -24,6 +24,10 @@
 //! deleted keys stays deleted — the reclaim moved live cold keys between
 //! files and must not lose or resurrect one.
 //!
+//! Admission may now refuse writes on a shard whose ledger holds it over
+//! budget, under any policy. A delete must still get through, including one
+//! routed to another shard (`a_delete_routed_to_another_shard_is_never_refused_for_memory`).
+//!
 //! `MOON_BIN=<moon> cargo test --test perf_ws15_ledger_bound -- --nocapture`
 //! (both runtimes).
 
@@ -282,5 +286,101 @@ fn used_memory_stays_bounded_under_cold_delete_churn() {
     let (_server2, port2) = spawn(&dir);
     let mut c2 = Conn::open(port2);
     check(&mut c2, "after kill -9 + restart");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Write admission refuses a write on a shard over budget; a command that can
+/// only shrink memory must never be refused, or the keys that hold the shard
+/// over budget could not be deleted. The connection's own shard already
+/// exempted them (WS6); the leg of a command routed to ANOTHER shard ran the
+/// same gate without the exemption, so `DEL` of a key owned elsewhere answered
+/// `-OOM`. That was reachable under `noeviction` before (measured on
+/// `ae21476` and `d4a2fd3`: 144 of 200 single-key DELs refused at
+/// `--shards 4`), and the ledger charge made it reachable under every policy
+/// while a shard's dead-slot ledger holds it over budget. `noeviction` makes
+/// the over-budget state deterministic; the gate code is the same.
+///
+/// Covers the routed single-command leg, the pipelined leg and a multi-key
+/// DEL spanning shards.
+#[test]
+fn a_delete_routed_to_another_shard_is_never_refused_for_memory() {
+    let dir = common::unique_test_dir("ws15-routed-del-oom");
+    let bin = common::find_moon_binary();
+    let d = dir.clone();
+    let (child, port) = common::spawn_listening(move |port| {
+        Command::new(&bin)
+            .args(["--port", &port.to_string(), "--shards", "4"])
+            .args(["--maxmemory", &(4u64 << 20).to_string()])
+            .args(["--maxmemory-policy", "noeviction", "--appendonly", "no"])
+            .args(["--disk-free-min-pct", "0"])
+            .args(["--dir", d.to_str().unwrap()])
+            .stdout(common::server_stderr(&d))
+            .stderr(common::server_stderr(&d))
+            .spawn()
+            .unwrap()
+    });
+    let _server = ServerGuard::new(child);
+    let mut c = Conn::open(port);
+    let val = "v".repeat(1000);
+    let keys: Vec<String> = (0..12_000).map(|i| format!("routed-del:{i}")).collect();
+    let mut accepted = 0usize;
+    let mut refused = 0usize;
+    for chunk in keys.chunks(500) {
+        let cmds: Vec<Vec<&str>> = chunk
+            .iter()
+            .map(|k| vec!["SET", k.as_str(), &val])
+            .collect();
+        let refs: Vec<&[&str]> = cmds.iter().map(Vec::as_slice).collect();
+        for line in reply_lines(&c.pipeline(&refs)) {
+            if line == "+OK" {
+                accepted += 1;
+            } else {
+                assert!(line.starts_with("-OOM"), "unexpected SET reply {line:?}");
+                refused += 1;
+            }
+        }
+    }
+    assert!(
+        refused > 0 && accepted > 0,
+        "precondition: the shards filled past maxmemory ({accepted} SETs accepted, {refused} \
+         refused)"
+    );
+
+    let mut deleted = 0usize;
+    let mut tally = |reply: &str, what: &str| {
+        for line in reply_lines(reply) {
+            let n: usize = line
+                .strip_prefix(':')
+                .and_then(|n| n.parse().ok())
+                .unwrap_or_else(|| panic!("{what} answered {line:?}; a delete is never refused"));
+            deleted += n;
+        }
+    };
+    // One command at a time (the routed single-command leg).
+    for k in &keys[..200] {
+        tally(&c.send(&["DEL", k.as_str()]), "DEL");
+    }
+    // Pipelined (the routed pipelined leg), UNLINK too.
+    for (n, chunk) in keys[200..6_000].chunks(200).enumerate() {
+        let verb = if n % 2 == 0 { "DEL" } else { "UNLINK" };
+        let cmds: Vec<Vec<&str>> = chunk.iter().map(|k| vec![verb, k.as_str()]).collect();
+        let refs: Vec<&[&str]> = cmds.iter().map(Vec::as_slice).collect();
+        tally(&c.pipeline(&refs), verb);
+    }
+    // Multi-key DELs spanning every shard.
+    for chunk in keys[6_000..].chunks(100) {
+        let mut args = vec!["DEL"];
+        args.extend(chunk.iter().map(String::as_str));
+        tally(&c.send(&args), "multi-key DEL");
+    }
+    assert_eq!(
+        deleted, accepted,
+        "every key whose SET was accepted is deleted exactly once"
+    );
+    assert_eq!(
+        c.send(&["SET", "after", "v"]),
+        "+OK\r\n",
+        "memory was freed"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }

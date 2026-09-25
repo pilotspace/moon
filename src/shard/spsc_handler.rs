@@ -44,8 +44,17 @@ use super::shared_databases::ShardDatabases;
 /// directly, bypassing the connection handlers' write path entirely — without
 /// this gate a scatter-gather write could grow a remote shard's memory past
 /// `maxmemory` without limit.
+///
+/// `cmd` is the routed command: one that can only shrink memory (DEL, HDEL,
+/// LPOP, ...) is never refused here, as in the connection gate
+/// (`run_write_eviction_gate`, WS6). Eviction still runs; only the reject is
+/// bypassed. Without it a key owned by another shard could not be deleted
+/// once that shard was over budget — under `noeviction`, and under any
+/// policy while the cold dead-slot ledger holds the shard over budget
+/// (moon#1215: eviction cannot shrink that ledger).
 #[allow(clippy::too_many_arguments)]
 pub(super) fn spsc_eviction_gate(
+    cmd: &[u8],
     db: &mut Database,
     db_idx: usize,
     shard_databases: &Arc<ShardDatabases>,
@@ -92,13 +101,17 @@ pub(super) fn spsc_eviction_gate(
             EvictionRun::plain().budget(budget).report(on_plain_drop),
         )
     };
-    global_result?;
+    let shrink_only = crate::storage::db_quota::is_shrink_only_command(cmd);
+    if !shrink_only {
+        global_result?;
+    }
     // WS5b: per-db quota, additive and finer-grained than the whole-instance
     // maxmemory gate above. Zero-cost when unconfigured for this db. This is
     // the ONE gate for cross-shard scatter-gather writes (MSET/DEL/etc. and
     // any command whose keys land on a shard other than the client's own),
     // so a quota'd db cannot be grown past its cap via a remote leg either.
-    crate::storage::db_quota::check_db_maxmemory(db, db_idx, &rt)
+    let db_quota_result = crate::storage::db_quota::check_db_maxmemory(db, db_idx, &rt);
+    if shrink_only { Ok(()) } else { db_quota_result }
 }
 
 /// Drain all SPSC consumer channels, processing cross-shard messages.
@@ -1022,6 +1035,7 @@ pub(crate) fn handle_shard_message_shared(
                                 let mut reason_del_budget =
                                     crate::persistence::aof::AOF_REASON_DEL_BACKPRESSURE_BOUND;
                                 if let Err(oom) = spsc_eviction_gate(
+                                    cmd,
                                     db,
                                     db_idx,
                                     shard_databases,
@@ -1259,6 +1273,7 @@ pub(crate) fn handle_shard_message_shared(
                             let mut reason_del_budget =
                                 crate::persistence::aof::AOF_REASON_DEL_BACKPRESSURE_BOUND;
                             if let Err(oom) = spsc_eviction_gate(
+                                cmd,
                                 &mut guard,
                                 db_idx,
                                 shard_databases,
@@ -1492,6 +1507,7 @@ pub(crate) fn handle_shard_message_shared(
                             let mut reason_del_budget =
                                 crate::persistence::aof::AOF_REASON_DEL_BACKPRESSURE_BOUND;
                             if let Err(oom) = spsc_eviction_gate(
+                                cmd,
                                 &mut guard,
                                 db_idx,
                                 shard_databases,
