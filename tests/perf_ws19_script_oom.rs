@@ -223,3 +223,75 @@ fn shrink_only_script_commands_over_budget_one_shard() {
 fn shrink_only_script_commands_over_budget_four_shards() {
     script_oom(4);
 }
+
+// ── The per-database quota is not maxmemory (PR #1268 review) ──────────────
+
+/// `allow-oom` is redis's flag against `maxmemory`; moon's per-database
+/// `--db-maxmemory` quota is an additive tenant cap redis does not have, so
+/// an `allow-oom` function must not write past it. Under `noeviction` with db
+/// 1 over its quota: an `allow-oom` SET gets the quota error, while a
+/// shrink-only command — in an `allow-oom` function or an EVAL — is never
+/// refused by the quota (a tenant must be able to delete its way back).
+#[test]
+fn an_allow_oom_function_does_not_write_past_a_db_quota() {
+    let dir = common::unique_test_dir("ws19-1241-quota");
+    std::fs::create_dir_all(&dir).unwrap();
+    let bin = common::find_moon_binary();
+    let (child, port) = common::spawn_listening(|port| {
+        std::process::Command::new(&bin)
+            .args(["--port", &port.to_string(), "--dir", &dir.to_string_lossy()])
+            .args(["--shards", "1", "--appendonly", "no", "--save", ""])
+            .args(["--disk-offload", "disable", "--disk-free-min-pct", "0"])
+            .args(["--maxmemory", "0", "--maxmemory-policy", "noeviction"])
+            .args(["--db-maxmemory", "1:1mb"])
+            .stdout(common::server_stderr(&dir))
+            .stderr(common::server_stderr(&dir))
+            .spawn()
+            .expect("spawn moon (build it first, or set MOON_BIN)")
+    });
+    let mut server = ServerGuard::new(child);
+    let mut c = Conn::open(port);
+    let lib = "#!lua name=ws19quota\n\
+        redis.register_function{function_name='qset', \
+          callback=function(keys, args) return redis.call('SET', keys[1], 'v') end, flags={'allow-oom'}}\n\
+        redis.register_function{function_name='qdel', \
+          callback=function(keys, args) return redis.call('DEL', keys[1]) end, flags={'allow-oom'}}";
+    let loaded = c.send(&["FUNCTION", "LOAD", lib]);
+    assert!(loaded.contains("ws19quota"), "FUNCTION LOAD: {loaded}");
+    assert!(c.send(&["SELECT", "1"]).starts_with("+OK"));
+    let value = "x".repeat(16 * 1024);
+    let mut keys = Vec::new();
+    for i in 0..1_000 {
+        let key = format!("q:{i}");
+        let reply = c.send(&["SET", &key, &value]);
+        if !reply.starts_with("+OK") {
+            assert!(
+                reply.contains("db maxmemory exceeded"),
+                "SET {key}: {reply}"
+            );
+            break;
+        }
+        keys.push(key);
+    }
+    assert!(
+        c.send(&["SET", "probe", "v"])
+            .contains("db maxmemory exceeded"),
+        "fixture: db 1 over its quota"
+    );
+    let set = c.send(&["FCALL", "qset", "1", "grown"]);
+    let del_fn = c.send(&["FCALL", "qdel", "1", &keys.pop().unwrap()]);
+    let del_eval = c.send(&[
+        "EVAL",
+        "return redis.call('DEL', KEYS[1])",
+        "1",
+        &keys.pop().unwrap(),
+    ]);
+    server.kill_now();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        set.contains("db maxmemory exceeded"),
+        "an allow-oom SET past db 1's quota answered {set:?}"
+    );
+    assert_eq!(del_fn.trim(), ":1", "an allow-oom DEL over the quota");
+    assert_eq!(del_eval.trim(), ":1", "an EVAL DEL over the quota");
+}
