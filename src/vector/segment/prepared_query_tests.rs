@@ -309,3 +309,31 @@ fn prepared_state_without_the_sub_centroid_table_falls_back_to_a_local_lut() {
         );
     }
 }
+
+#[test]
+fn a_single_graph_segment_query_builds_no_prepared_state() {
+    // moon#1226 allocation red test: HEAD built a PreparedTqQuery — a heap
+    // rotated query, unit query and a zeroed 32–128 KB LUT — for EVERY query
+    // that visits a graph segment, even when only one segment exists to use
+    // it; that segment's own path fills the reused scratch without
+    // allocating. Now it is built only when ≥ 2 graph segments share it.
+    use crate::vector::hnsw::prepared::PREPARED_BUILDS;
+    let dim = 48u32;
+    for (segs, want_prepared) in [(1usize, 0usize), (2, 1), (4, 1)] {
+        let mut store = build_store(dim, segs, 80, 10);
+        let idx = store.get_index_mut(b"idx").unwrap();
+        let q = random_vec(dim as usize, 777);
+        let _ = mvcc_search(&idx.segments, &q, 10); // warm-up
+        PREPARED_BUILDS.with(|c| c.set(0));
+        LUT_BUILDS.with(|c| c.set(0));
+        let results = mvcc_search(&idx.segments, &q, 10);
+        assert_eq!(results.len(), 10);
+        assert_eq!(
+            PREPARED_BUILDS.with(std::cell::Cell::get),
+            want_prepared,
+            "{segs} graph segment(s)"
+        );
+        // Either way the LUT is built exactly once per query.
+        assert_eq!(LUT_BUILDS.with(std::cell::Cell::get), 1, "{segs} segs");
+    }
+}

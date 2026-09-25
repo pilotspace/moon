@@ -323,12 +323,17 @@ pub struct SegmentHolder {
 
 /// One [`PreparedTqQuery`] per query for every graph-tier segment it will
 /// visit (moon#1196), built against the index collection. `None` when the
-/// query visits no graph segment (nothing to share) or the collection is SQ8.
+/// collection is SQ8, or when the query visits fewer than TWO graph segments:
+/// with one there is nothing to share, and the per-segment path rotates the
+/// query and fills the LUT into the query's reused `SearchScratch` — no
+/// allocation — where the prepared state heap-allocates the rotated query,
+/// the unit query and a zeroed 32–128 KB LUT per query (moon#1226). The pool
+/// only fans out at ≥ 2 graph segments too, so it always gets one.
 fn prepare_graph_query(
     list: &SegmentList,
     query: &[f32],
 ) -> Option<crate::vector::hnsw::prepared::PreparedTqQuery> {
-    if list.immutable.is_empty() && list.warm.is_empty() {
+    if list.immutable.len() + list.warm.len() < 2 {
         return None;
     }
     crate::vector::hnsw::prepared::PreparedTqQuery::new(query, list.mutable.collection())

@@ -37,6 +37,14 @@ thread_local! {
     pub(crate) static LUT_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test-only counter of [`PreparedTqQuery`] constructions on this thread
+    /// — each one heap-allocates the rotated query (+ the unit query, + the
+    /// LUTs it builds lazily), so this pins when a query pays for them.
+    pub(crate) static PREPARED_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 #[inline]
 fn note_lut_build() {
     #[cfg(test)]
@@ -169,6 +177,8 @@ impl PreparedTqQuery {
         if padded < query.len() || collection.fwht_sign_flips.len() != padded {
             return None;
         }
+        #[cfg(test)]
+        PREPARED_BUILDS.with(|c| c.set(c.get() + 1));
         let mut q_rotated = vec![0.0f32; padded];
         let q_norm =
             rotate_query_into(query, collection.fwht_sign_flips.as_slice(), &mut q_rotated);
