@@ -452,6 +452,71 @@ fn one_drain_trims_at_most_the_budget() {
     assert_eq!(string_keyspace(&recovered), string_keyspace(&dbs));
 }
 
+/// Review 7, item 2: the budget counted a removed collection as one row
+/// operation whatever its size, and only values of 4,096+ elements were
+/// freed off the shard thread — one drain of 512 removed 1,000-field hashes
+/// charged and freed 512,000 elements inline (release server, 600 x 4,000
+/// fields: PING gaps of 74-85 ms). A collection now costs `1 + elements /
+/// 64` operations, and every lazily freeable one (> 64 elements) is freed
+/// by the helper thread.
+#[test]
+fn a_drain_trims_a_bounded_number_of_collection_elements() {
+    use crate::persistence::snapshot::frozen::{TRIM_BUDGET, take_trim_elements_for_test};
+    use crate::storage::db::LAZY_FREE_THRESHOLD;
+    const HASHES: usize = 64;
+    const FIELDS: usize = 1_000;
+    let mut dbs = vec![Database::new(), Database::new()];
+    preload(&mut dbs[0], "a", 100);
+    preload(&mut dbs[1], "b", 50);
+    let start_bill = dbs[1].ledger_bytes() as u64;
+    let expected = string_keyspace(&dbs);
+    let mut epoch = Epoch::begin(&dbs);
+    let mut tail = Tail::new();
+    let fields: Vec<Vec<u8>> = (0..FIELDS)
+        .flat_map(|f| [format!("f{f:05}").into_bytes(), b"value".to_vec()])
+        .collect();
+    for h in 0..HASHES {
+        let key = format!("hash:{h}");
+        let mut parts: Vec<&[u8]> = vec![b"HSET", key.as_bytes()];
+        parts.extend(fields.iter().map(Vec::as_slice));
+        live(&mut dbs, &mut tail, 1, &parts);
+    }
+    live(&mut dbs, &mut tail, 1, &[b"FLUSHDB"]);
+    let _ = take_trim_elements_for_test();
+    let (mut charged, mut inline, mut worst) = (0, 0, 0);
+    loop {
+        epoch.drain();
+        let (c, i) = take_trim_elements_for_test();
+        (charged, inline, worst) = (charged + c, inline + i, worst.max(c));
+        let state = epoch.state.as_ref().expect("epoch");
+        if state.frozen_trimmed_for_test(1) != Some(false) {
+            break;
+        }
+    }
+    assert_eq!(
+        charged,
+        HASHES * FIELDS,
+        "setup: the trim removed every hash"
+    );
+    assert!(
+        worst <= TRIM_BUDGET * LAZY_FREE_THRESHOLD + FIELDS,
+        "one drain charged {worst} collection elements (budget {TRIM_BUDGET} operations)"
+    );
+    assert_eq!(
+        inline, 0,
+        "the trim freed {inline} collection elements inline"
+    );
+    let held = epoch.state.as_ref().expect("epoch").cow_bytes();
+    assert!(
+        held <= start_bill,
+        "trimmed: {held} B held, epoch-start {start_bill} B"
+    );
+    let records = epoch.try_finish(&dbs).expect("the save must complete");
+    assert_eq!(diverge(&expected, &records), Default::default());
+    let recovered = recover(2, records, &tail);
+    assert_eq!(string_keyspace(&recovered), string_keyspace(&dbs));
+}
+
 /// Review 6 (S1), measurement only: the trim's cost per drain and in drains,
 /// against main's FLUSHDB (a drop). Run in a release build:
 /// `MOON_TEST_TRIM_N=<rows> cargo test --profile release-fast --lib trim_cost -- --ignored --nocapture`.

@@ -776,7 +776,8 @@ The PR head (82e3064e) was merged first (fa9a5dc1). One commit per item:
 
 | item | commit | red → green |
 |---|---|---|
-| 1 FLUSHDB freed queued lazy-free values inline (review 6's N1 reclaim) | (item 1) | see below |
+| 1 FLUSHDB freed queued lazy-free values inline (review 6's N1 reclaim) | a453de8c | see below |
+| 2 the trim budget counted a collection as one row; only 4,096+ elements were offloaded | (item 2) | see below |
 
 ### Item 1 — the lazy-free charge follows the table into the epoch
 
@@ -824,3 +825,46 @@ Red → green:
   FLUSHDB.
 - An UNLINK *during* the save deep-clones the value's pre-image. That cost is pre-existing
   (the reviewer is filing it) and this test does not measure it.
+
+### Item 2 — the trim budget weighs collections
+
+Before, a removed collection cost the budget one operation whatever its size, and only values
+of 4,096+ elements went to `moon-snapdrop`. Both fixes the reviewer offered are applied,
+because each bounds a different cost:
+
+- **Offload:** every collection UNLINK would free lazily (more than `LAZY_FREE_THRESHOLD` =
+  64 elements) is freed on the helper thread. Smaller ones are listpacks or intsets, whose
+  free is O(1).
+- **Weigh:** a row costs `1 + elements / 64` operations, for the post-epoch row and for the
+  pre-image restored in its place. The charge (`entry_overhead`) walks every element even
+  when the free is offloaded. With 4,100-field hashes, which were already offloaded, head
+  still stalled 34-48 ms on that walk.
+
+A row or segment that does not fit waits for the next drain, and that drain takes it even
+if it alone exceeds the budget. A single collection of more than ~32K elements is therefore
+walked whole by one drain, at about 17 ns an element. The `TRIM_BUDGET` doc now says so,
+replacing its old "under ~0.7 ms per drain" claim.
+
+Red → green, lib test `a_drain_trims_a_bounded_number_of_collection_elements` (64 post-epoch
+hashes of 1,000 fields, then FLUSHDB):
+- Red on head: "one drain charged 64000 collection elements".
+- Mutation, weights kept and the 4,096 offload cut restored: "the trim freed 64000
+  collection elements inline".
+- Green: at most `512 x 64` elements charged per drain, 0 freed inline.
+
+Release-fast server, the reviewer's `review7_trim_value_budget.py` (600 post-epoch hashes,
+held save, FLUSHDB, then the trim), worst PING gap over three runs each:
+
+| build | 4,000 fields | 4,100 fields |
+|---|---|---|
+| this fix (`ws16-r7-2-rf`) | 1.23 / 2.46 / 2.00 ms | 6.23 / 1.80 / 3.20 ms |
+| REVIEW7-head-rf | 105.6 / 75.4 / 74.0 ms | 47.8 / 33.5 / 35.8 ms |
+| REVIEW7-main-rf (its FLUSHDB aborts the save and frees inline) | 82.8 / 82.7 / 94.6 ms | 79.2 / 103.2 / 74.5 ms |
+
+The FLUSHDB itself answers in 0.23-0.41 ms on this fix.
+
+Tooling note: the shared `CARGO_TARGET_DIR` gives this worktree's and WS19's `moon` units
+the same file names, because cargo hashes a path package relative to its workspace root.
+One cargo run here executed WS19's lib-test binary (93 tests, without this branch's). Every
+build and check since then passes `--config 'profile.dev.package.moon.debug=false'`, which
+gives moon's units their own names and leaves the dependencies shared.

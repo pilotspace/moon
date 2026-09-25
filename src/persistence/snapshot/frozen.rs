@@ -25,32 +25,34 @@
 use super::{SnapshotState, Source, Table, pre_image_bytes, segment_block};
 use crate::storage::compact_key::CompactKey;
 use crate::storage::dashtable::hash_key;
-use crate::storage::db::{entry_overhead, lazy_free_weight};
+use crate::storage::db::{LAZY_FREE_THRESHOLD, entry_overhead, lazy_free_weight};
 use crate::storage::entry::Entry;
 
-/// Row operations (a row removed, restored or moved, or a segment visited)
-/// the trim does per drain, across every frozen table — never more: a
-/// segment that would not fit waits for the next drain (a segment holds far
-/// fewer rows than this). An operation costs ~0.1 us (a written row) to
-/// ~1.3 us (a pre-image of a million-row table, or a rebuild move) in a
-/// release build, so a drain spends under ~0.7 ms here, below the 1 ms
-/// tick: at 2,048 a drain could outlast the tick and the loop ran ticks back
-/// to back (PING p99.9 10-27 ms while an 8M-row table was trimmed; 1.0 ms at
-/// 512). Measured end to end in NOTES (review 6);
+/// Row operations the trim does per drain, across every frozen table: a
+/// row removed, restored or moved, or a segment visited — plus, for a
+/// collection removed or restored, one per `LAZY_FREE_THRESHOLD` of its
+/// elements, which its charge walks (review 7: a collection counted as one
+/// row whatever its size, and 512 hashes of 4,000 fields made one drain
+/// stall PING for 74-106 ms). A row or segment that would not fit waits for
+/// the next drain, which takes it even alone over the budget: a collection
+/// of more than ~32K elements is walked whole by one drain (~17 ns an
+/// element, release). An operation costs ~0.1 us (a written row) to ~1.3 us
+/// (a pre-image of a million-row table, a rebuild move, or 64 elements of a
+/// collection) in a release build, so a drain spends under ~0.7 ms here,
+/// below the 1 ms tick: at 2,048 a drain could outlast the tick and the loop
+/// ran ticks back to back (PING p99.9 10-27 ms while an 8M-row table was
+/// trimmed; 1.0 ms at 512). Measured end to end in NOTES (reviews 6 and 7);
 /// `table_swap_tests::trim_cost_of_a_large_flushed_table` (`--ignored`)
 /// measures drains in-process.
 pub(crate) const TRIM_BUDGET: usize = 512;
-
-/// A removed post-epoch value of at least this many elements is dropped off
-/// the shard thread (like UNLINK's lazy free); a smaller one inline.
-const OFFLOAD_ELEMENTS: usize = 4_096;
 
 /// What the trim frees off the shard thread.
 enum Discard {
     /// The emptied source of a rebuild: its skeleton alone took 19.6 ms to
     /// free inline (58,833 segments, release).
     Table(#[allow(dead_code)] Box<Table>),
-    /// A large post-epoch value the trim removed.
+    /// A post-epoch collection the trim removed, of more than
+    /// `LAZY_FREE_THRESHOLD` elements.
     Value(#[allow(dead_code)] Entry),
 }
 
@@ -79,10 +81,19 @@ fn discard(item: Discard) {
     }
 }
 
-/// Free a row the trim removed: off the shard thread if it is large.
+/// Free a row the trim removed: off the shard thread if UNLINK would free
+/// it lazily (more than `LAZY_FREE_THRESHOLD` elements), inline otherwise —
+/// an O(1) free. (Review 7: the cut was 4,096 elements, so a drain freed up
+/// to 512 collections of 4,095 elements inline.)
 fn dispose(entry: Entry) {
-    if lazy_free_weight(&entry).is_some_and(|n| n >= OFFLOAD_ELEMENTS) {
+    if lazy_free_weight(&entry).is_some() {
         discard(Discard::Value(entry));
+    } else {
+        #[cfg(test)]
+        ELEMENTS_FOR_TEST.with(|c| {
+            let (charged, inline) = c.get();
+            c.set((charged, inline + lazy_free_weight(&entry).unwrap_or(0)));
+        });
     }
 }
 
@@ -90,6 +101,17 @@ fn dispose(entry: Entry) {
 thread_local! {
     /// Test-only override of [`TRIM_BUDGET`] (this thread's drains).
     static BUDGET_FOR_TEST: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    /// Test-only: elements of the collections this thread's trims charged
+    /// (removed or restored), and of those they freed inline.
+    static ELEMENTS_FOR_TEST: std::cell::Cell<(usize, usize)> =
+        const { std::cell::Cell::new((0, 0)) };
+}
+
+/// Test-only: `(charged, freed inline)` collection elements of this
+/// thread's trims since the last call.
+#[cfg(test)]
+pub(crate) fn take_trim_elements_for_test() -> (usize, usize) {
+    ELEMENTS_FOR_TEST.with(|c| c.replace((0, 0)))
 }
 
 /// The budget of one drain's trim: [`TRIM_BUDGET`], or a test's override.
@@ -192,8 +214,21 @@ impl Frozen {
     }
 }
 
+/// What a row costs the trim's budget beyond its one operation: a
+/// collection's charge ([`charge`]) walks its elements, one operation per
+/// `LAZY_FREE_THRESHOLD` of them (review 7). 0 for a string or a listpack.
+#[inline]
+fn size_ops(entry: &Entry) -> usize {
+    lazy_free_weight(entry).map_or(0, |n| n / LAZY_FREE_THRESHOLD)
+}
+
 #[inline]
 fn charge(key: &[u8], entry: &Entry) -> u64 {
+    #[cfg(test)]
+    ELEMENTS_FOR_TEST.with(|c| {
+        let (charged, inline) = c.get();
+        c.set((charged + lazy_free_weight(entry).unwrap_or(0), inline));
+    });
     entry_overhead(key, entry) as u64
 }
 
@@ -257,7 +292,7 @@ impl SnapshotState {
         while used < budget {
             match &mut frozen.trim {
                 Trim::PreImages { below } => {
-                    let Some(((_, key), pre_image)) = self.overflow[db].pop_first() else {
+                    let Some(((_, key), pre_image)) = self.overflow[db].first_key_value() else {
                         // The walk may have passed more of the database in
                         // progress meanwhile, taking the pre-images there
                         // itself: the post-epoch rows of those keys are
@@ -274,6 +309,16 @@ impl SnapshotState {
                         };
                         continue;
                     };
+                    // The post-epoch row and the pre-image are both charged.
+                    let cost = 1
+                        + frozen.table.get(key).map_or(0, size_ops)
+                        + pre_image.as_ref().map_or(0, size_ops);
+                    if used > 0 && used + cost > budget {
+                        break; // the next drain takes this row
+                    }
+                    let Some(((_, key), pre_image)) = self.overflow[db].pop_first() else {
+                        break;
+                    };
                     self.overflow_bytes = self
                         .overflow_bytes
                         .saturating_sub(pre_image_bytes(&key, &pre_image));
@@ -285,7 +330,7 @@ impl SnapshotState {
                         frozen.bill = frozen.bill.saturating_add(charge(&key, &entry));
                         frozen.table.insert(CompactKey::from(key), entry);
                     }
-                    used += 1;
+                    used += cost;
                 }
                 Trim::Written { at, below } => {
                     if *at >= *below {
@@ -307,16 +352,20 @@ impl SnapshotState {
                     }
                     let table = &mut frozen.table;
                     let segment = table.segment(table.segment_index_for_hash(*at));
+                    let mut cost = 1;
                     let written: Vec<CompactKey> = segment
                         .iter_occupied()
                         .filter(|(key, _)| hash_key(key.as_bytes()) < *below)
-                        .map(|(key, _)| key.clone())
+                        .map(|(key, entry)| {
+                            cost += 1 + size_ops(entry);
+                            key.clone()
+                        })
                         .collect();
                     let end = segment_block(*at, segment.depth()).1;
-                    if used > 0 && used + 1 + written.len() > budget {
+                    if used > 0 && used + cost > budget {
                         break; // the next drain takes this segment
                     }
-                    used += 1 + written.len();
+                    used += cost;
                     for key in written {
                         if let Some(entry) = table.remove(key.as_bytes()) {
                             frozen.bill =
@@ -333,16 +382,6 @@ impl SnapshotState {
                         frozen.trim = Trim::Done;
                         continue;
                     }
-                    let keys: Vec<CompactKey> = frozen
-                        .table
-                        .segment(*next)
-                        .iter_occupied()
-                        .map(|(key, _)| key.clone())
-                        .collect();
-                    if used > 0 && used + 1 + keys.len() > budget {
-                        break; // the next drain takes this segment
-                    }
-                    used += 1 + keys.len();
                     // Rows the walk has passed since the flush (the database
                     // in progress) are written: dropped, not moved.
                     let written_below = if db == self.current_db {
@@ -350,11 +389,26 @@ impl SnapshotState {
                     } else {
                         0
                     };
-                    for key in keys {
+                    let mut cost = 1;
+                    let keys: Vec<(CompactKey, bool)> = frozen
+                        .table
+                        .segment(*next)
+                        .iter_occupied()
+                        .map(|(key, entry)| {
+                            let written = hash_key(key.as_bytes()) < written_below;
+                            cost += 1 + if written { size_ops(entry) } else { 0 };
+                            (key.clone(), written)
+                        })
+                        .collect();
+                    if used > 0 && used + cost > budget {
+                        break; // the next drain takes this segment
+                    }
+                    used += cost;
+                    for (key, written) in keys {
                         let Some((key, entry)) = frozen.table.remove_entry(key.as_bytes()) else {
                             continue;
                         };
-                        if hash_key(key.as_bytes()) < written_below {
+                        if written {
                             frozen.bill =
                                 frozen.bill.saturating_sub(charge(key.as_bytes(), &entry));
                             dispose(entry);
