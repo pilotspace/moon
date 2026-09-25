@@ -101,6 +101,11 @@ thread_local! {
     /// the drain that trims them (moon#1228 review 5): each table's
     /// `used_memory` at its flush above its database's epoch-start bill.
     static WAITING_EXCESS: Cell<u64> = const { Cell::new(0) };
+    /// Post-epoch bytes the epoch's frozen tables still held after the last
+    /// drain, their trims unfinished (review 6, S2: the trim is budgeted, so
+    /// a grown table holds its post-epoch rows for ceil(work / budget)
+    /// drains, not one).
+    static UNTRIMMED_EXCESS: Cell<u64> = const { Cell::new(0) };
     /// Approximate bytes of `PENDING_KEYS` (moon#1228, INFO
     /// `current_cow_size`).
     static DEDUPE_BYTES: Cell<u64> = const { Cell::new(0) };
@@ -144,8 +149,9 @@ enum TableEvent {
     /// `SWAPDB a b` exchanged shard slots `a` and `b`.
     Swap(usize, usize),
     /// A flush detached this epoch database's table (holding the given
-    /// bytes) before it was written.
-    Freeze(usize, Box<Table>, u64),
+    /// bytes; the last field is the database's epoch-start bill) before it
+    /// was written.
+    Freeze(usize, Box<Table>, u64, u64),
 }
 
 /// Mirror of `SnapshotState`'s serialization cursor, so a capture can
@@ -360,6 +366,7 @@ fn clear() {
     ABORT.with(|a| a.set(None));
     EVENTS.with(|e| e.borrow_mut().clear());
     WAITING_EXCESS.with(|w| w.set(0));
+    UNTRIMMED_EXCESS.with(|u| u.set(0));
 }
 
 /// Would the armed epoch still write anything? Without a published layout
@@ -385,6 +392,7 @@ fn abort_epoch(why: &'static str) {
             .retain(|event| !matches!(event, TableEvent::Freeze(..)))
     });
     WAITING_EXCESS.with(|w| w.set(0));
+    UNTRIMMED_EXCESS.with(|u| u.set(0));
 }
 
 /// `SWAPDB a b` is about to exchange the tables of shard slots `a` and `b`
@@ -459,11 +467,21 @@ pub(crate) fn note_swapdb(a: usize, b: usize) {
 /// FLUSHDB and is killed only by FLUSHALL (pinned by
 /// `table_swap_tests::flushdb_of_every_database_holds_at_most_the_epoch_start_tables`
 /// and `prop_tests`). Until then the table holds its post-epoch rows too.
-/// One grown table may wait for its first drain; a second flush of a grown
-/// database before that drain (a MULTI, a script) fails the save instead
-/// once the waiting post-epoch bytes pass [`FREEZE_WAIT_SLACK`], so the wait
-/// adds at most one table's post-epoch rows — memory that `used_memory`
-/// carried a moment before the flush.
+///
+/// When a flush fails the save instead (review 6, S2, re-derived for the
+/// budgeted trim): a table holds post-epoch rows from its flush until its
+/// trim's steps 1-2 are done — the queue until the next drain, then ceil(work
+/// / budget) drains. One GROWN table (bill above its database's epoch-start
+/// bill) may do so. A further flush of a grown database while another grown
+/// table is still waiting or trimming fails the save once their post-epoch
+/// bytes together pass [`FREEZE_WAIT_SLACK`] — whether the flushes come in
+/// one tick (a pipeline, MULTI, a script, two clients) or spread over the
+/// trim. A flush of a database that did not grow never does (it used to,
+/// whenever a grown table was already waiting). So the epoch holds at most
+/// one grown table's post-epoch rows, or the slack, beyond the epoch-start
+/// bills — memory that `used_memory` carried a moment before the flush.
+/// The trim clears ~512 rows a tick, faster than a client refills a database
+/// (8 x 40 MB of SETs + FLUSHDB completes in a release build).
 ///
 /// A slot that cannot be identified (an epoch armed on a thread with no
 /// shard slice) keeps the old answer: an unfinished epoch is aborted. One
@@ -503,9 +521,17 @@ pub(crate) fn note_cleared_table(db: &Database, table: Table, table_bytes: u64) 
     });
     match outcome {
         Outcome::Freeze(logical, start_bill) => {
+            // Review 6 (S2): only a table that GREW adds to what waits — a
+            // flush of an un-grown database (excess 0) never fails the save
+            // (it used to, whenever a grown one was already waiting: a
+            // plain `SELECT 1; FLUSHDB; SELECT 2; FLUSHDB` pipeline). What
+            // waits is what the queue holds since the last drain plus what
+            // the frozen tables' unfinished trims still hold.
             let excess = table_bytes.saturating_sub(start_bill);
-            let waiting = WAITING_EXCESS.with(Cell::get);
-            if waiting > 0 && waiting.saturating_add(excess) > FREEZE_WAIT_SLACK {
+            let waiting = WAITING_EXCESS
+                .with(Cell::get)
+                .saturating_add(UNTRIMMED_EXCESS.with(Cell::get));
+            if excess > 0 && waiting > 0 && waiting.saturating_add(excess) > FREEZE_WAIT_SLACK {
                 // `table` drops here, and the waiting ones with the abort.
                 abort_epoch(
                     "FLUSHDB detached databases that grew during the save faster than the \
@@ -513,10 +539,14 @@ pub(crate) fn note_cleared_table(db: &Database, table: Table, table_bytes: u64) 
                 );
                 return;
             }
-            WAITING_EXCESS.with(|w| w.set(waiting.saturating_add(excess)));
+            WAITING_EXCESS.with(|w| w.set(w.get().saturating_add(excess)));
             EVENTS.with(|e| {
-                e.borrow_mut()
-                    .push(TableEvent::Freeze(logical, Box::new(table), table_bytes))
+                e.borrow_mut().push(TableEvent::Freeze(
+                    logical,
+                    Box::new(table),
+                    table_bytes,
+                    start_bill,
+                ))
             });
         }
         Outcome::Drop => {}
@@ -529,9 +559,9 @@ pub(crate) fn note_cleared_table(db: &Database, table: Table, table_bytes: u64) 
 }
 
 /// Post-epoch bytes (above their databases' epoch-start bills) that flushed
-/// tables may hold while more than one of them waits for the drain that
-/// trims them (see [`note_cleared_table`]). The first grown table always
-/// waits: its rows were in `used_memory` an instant before the flush.
+/// tables may hold while more than one grown table waits for, or is in, its
+/// trim (see [`note_cleared_table`]). One grown table is always allowed:
+/// its rows were in `used_memory` an instant before the flush.
 const FREEZE_WAIT_SLACK: u64 = 8 << 20;
 
 /// Every database of this shard is about to be REPLACED wholesale outside
@@ -867,6 +897,7 @@ pub(crate) fn drain_into(snap: &mut SnapshotState) {
     // Review 6: the frozen tables' trims advance by a bounded amount per
     // drain (`snapshot::frozen::TRIM_BUDGET`), not whole in one.
     snap.trim_frozen(crate::persistence::snapshot::frozen::trim_budget());
+    UNTRIMMED_EXCESS.with(|u| u.set(snap.untrimmed_excess()));
     // moon#1228: INFO `current_cow_size`.
     publish_cow_size(snap.cow_bytes() + DEDUPE_BYTES.with(Cell::get));
 }
@@ -888,7 +919,9 @@ fn apply_table_events(snap: &mut SnapshotState) {
     for event in events {
         match event {
             TableEvent::Swap(a, b) => snap.swap_slots(a, b),
-            TableEvent::Freeze(db, table, bytes) => snap.freeze(db, table, bytes),
+            TableEvent::Freeze(db, table, bytes, start_bill) => {
+                snap.freeze(db, table, bytes, start_bill)
+            }
         }
     }
 }

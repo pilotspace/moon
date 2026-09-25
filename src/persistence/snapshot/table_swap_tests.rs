@@ -627,6 +627,101 @@ fn a_frozen_table_is_billed_without_the_spill_in_flight_bytes() {
     assert_eq!(held, table_bytes, "the frozen table's bill");
 }
 
+/// Review 6 (S2, the reviewer's proof): the abort fired on ANY second freeze
+/// once a grown table waited with more than `FREEZE_WAIT_SLACK` of excess,
+/// even a table that did not grow at all — `SELECT 1; FLUSHDB; SELECT 2;
+/// FLUSHDB` after a bulk load into db 1 failed the save, in either order
+/// only when the grown one went first. ONE grown table waiting is allowed:
+/// both orders must complete.
+#[test]
+fn an_ungrown_second_flush_does_not_fail_the_save() {
+    for grown_first in [true, false] {
+        let mut dbs: Vec<Database> = (0..3).map(|_| Database::new()).collect();
+        for (i, db) in dbs.iter_mut().enumerate() {
+            preload(db, &format!("d{i}"), 200);
+        }
+        let expected = string_keyspace(&dbs);
+        let mut epoch = Epoch::begin(&dbs);
+        assert!(!epoch.tick_one(&dbs));
+        let mut tail = Tail::new();
+        let value = vec![b'x'; 1 << 20];
+        for j in 0..10u32 {
+            let k = format!("big:{j}");
+            live(&mut dbs, &mut tail, 1, &[b"SET", k.as_bytes(), &value]);
+        }
+        let order: [usize; 2] = if grown_first { [1, 2] } else { [2, 1] };
+        for db in order {
+            live(&mut dbs, &mut tail, db, &[b"FLUSHDB"]);
+        }
+        let outcome = epoch.try_finish(&dbs);
+        let records = outcome.unwrap_or_else(|e| {
+            panic!(
+                "grown first = {grown_first}: only ONE grown table waited, yet the save failed: {e}"
+            )
+        });
+        assert_eq!(diverge(&expected, &records), Default::default());
+        let recovered = recover(3, records, &tail);
+        assert_eq!(string_keyspace(&recovered), string_keyspace(&dbs));
+    }
+}
+
+/// Review 6 (S2, re-derived for the budgeted trim): a grown table holds its
+/// post-epoch rows until its trim's steps 1-2 are done, which now takes
+/// ceil(work / budget) drains — not one. A second GROWN flush while the first
+/// grown table is still trimming fails the save once their post-epoch bytes
+/// pass `FREEZE_WAIT_SLACK`; the same flush after the first trim is done
+/// completes. So the epoch never holds more than one grown table's post-epoch
+/// rows (or the slack) beyond the epoch-start bills.
+#[test]
+fn a_grown_flush_while_another_grown_table_is_trimming_fails_the_save() {
+    use crate::persistence::snapshot::frozen::set_trim_budget_for_test;
+    for first_trim_done in [false, true] {
+        set_trim_budget_for_test(Some(16));
+        let mut dbs: Vec<Database> = (0..3).map(|_| Database::new()).collect();
+        for (i, db) in dbs.iter_mut().enumerate() {
+            preload(db, &format!("d{i}"), 200);
+        }
+        let mut epoch = Epoch::begin(&dbs);
+        assert!(!epoch.tick_one(&dbs));
+        let mut tail = Tail::new();
+        let value = vec![b'x'; 8 << 10];
+        let grow = |dbs: &mut Vec<Database>, tail: &mut Tail, db: usize| {
+            for j in 0..2000u32 {
+                let k = format!("g{db}:{j}");
+                live(dbs, tail, db, &[b"SET", k.as_bytes(), &value]);
+            }
+            live(dbs, tail, db, &[b"FLUSHDB"]);
+        };
+        grow(&mut dbs, &mut tail, 1);
+        epoch.drain();
+        assert_eq!(
+            epoch
+                .state
+                .as_ref()
+                .expect("epoch")
+                .frozen_trimmed_for_test(1),
+            Some(false),
+            "setup: db 1's trim spans many drains"
+        );
+        if first_trim_done {
+            epoch.drain_until_trimmed(1);
+        }
+        grow(&mut dbs, &mut tail, 2);
+        let outcome = epoch.try_finish(&dbs);
+        set_trim_budget_for_test(None);
+        if first_trim_done {
+            assert!(outcome.is_ok(), "db 1 was trimmed: {outcome:?}");
+        } else {
+            let Err(why) = outcome else {
+                panic!(
+                    "two grown tables held their post-epoch rows at once, and the save completed"
+                );
+            };
+            assert!(why.contains("FLUSHDB"), "abort reason: {why}");
+        }
+    }
+}
+
 /// The liveness half of moon#1228: a workload that FLUSHDBs (and SWAPDBs)
 /// more often than one save takes. It used to fail every BGSAVE; each tick
 /// here flushes, swaps, refills and increments, and the save must still

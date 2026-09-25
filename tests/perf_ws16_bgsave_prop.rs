@@ -495,3 +495,119 @@ fn the_restored_file_is_the_epoch_start_image_over_random_workloads() {
     }
     eprintln!("bgsave property coverage: {cov:#?}");
 }
+
+fn lastsave(c: &mut Conn) -> i64 {
+    match &parse_all(&c.send(&["LASTSAVE"]))[0] {
+        V::I(n) => *n,
+        other => panic!("LASTSAVE: {other:?}"),
+    }
+}
+
+fn dbsize(c: &mut Conn, db: usize) -> i64 {
+    let r = c.pipeline(&[&["SELECT", &db.to_string()], &["DBSIZE"]]);
+    match parse_all(&r).pop() {
+        Some(V::I(n)) => n,
+        other => panic!("DBSIZE: {other:?}"),
+    }
+}
+
+/// Review 6 (S2, the reviewer's proof, adopted): db 1 grows by 10 MiB during a
+/// held save; then ONE pipeline — or one MULTI — flushes db 1 and db 2 (db 2
+/// did not grow). Only one grown table waits for the drain, so the save must
+/// complete. It used to fail on the second freeze whatever that table held
+/// ("status err"). Also checks `current_cow_size` back at 0, that the next
+/// BGSAVE completes, and the restored file.
+#[test]
+fn a_pipelined_flush_of_a_grown_and_an_ungrown_db_keeps_the_save() {
+    let mut outcomes = Vec::new();
+    for use_multi in [false, true] {
+        let dir = common::unique_test_dir(&format!("ws16-bgsave-two-flushes-{use_multi}"));
+        let _cleanup = DirGuard(dir.clone());
+        let (mut server, port) = spawn(&dir, 1, &["--disk-offload", "disable"]);
+        let mut c = Conn::open(port);
+        for db in 0..3 {
+            let mut cmds = vec![cmd(&["SELECT", &db.to_string()])];
+            for j in 0..200 {
+                cmds.push(cmd(&["SET", &format!("d{db}:{j}"), "v"]));
+            }
+            let _ = pipe(&mut c, &cmds);
+        }
+        assert!(c.send(&["SELECT", "0"]).starts_with("+OK"));
+        assert!(c.send(&["BGSAVE"]).contains("started"));
+        wait_done(&mut c);
+        assert_eq!(info(&mut c, "persistence", "rdb_last_bgsave_status"), "ok");
+        let t1 = lastsave(&mut c);
+        std::thread::sleep(Duration::from_millis(1100));
+
+        std::fs::write(hold_file(&dir), b"").unwrap();
+        assert!(c.send(&["BGSAVE"]).contains("started"));
+        wait_armed(&dir, 1, &mut c);
+        let big = "x".repeat(1 << 20);
+        let mut cmds = vec![cmd(&["SELECT", "1"])];
+        for j in 0..10 {
+            cmds.push(cmd(&["SET", &format!("big:{j}"), &big]));
+        }
+        let _ = pipe(&mut c, &cmds);
+        std::thread::sleep(Duration::from_millis(20)); // drains run; the walk is held
+        let changes_before: i64 = info(&mut c, "persistence", "rdb_changes_since_last_save")
+            .parse()
+            .unwrap();
+        let reply = if use_multi {
+            c.pipeline(&[
+                &["MULTI"],
+                &["SELECT", "1"],
+                &["FLUSHDB"],
+                &["SELECT", "2"],
+                &["FLUSHDB"],
+                &["EXEC"],
+            ])
+        } else {
+            c.pipeline(&[
+                &["SELECT", "1"],
+                &["FLUSHDB"],
+                &["SELECT", "2"],
+                &["FLUSHDB"],
+            ])
+        };
+        let changes_after: i64 = info(&mut c, "persistence", "rdb_changes_since_last_save")
+            .parse()
+            .unwrap();
+        std::fs::remove_file(hold_file(&dir)).unwrap();
+        wait_done(&mut c);
+        let status = info(&mut c, "persistence", "rdb_last_bgsave_status");
+        let t2 = lastsave(&mut c);
+        let cow = info(&mut c, "persistence", "current_cow_size");
+        eprintln!(
+            "multi={use_multi}: reply {reply:?}; status {status}; LASTSAVE {t1} -> {t2}; \
+             current_cow_size {cow}; rdb_changes_since_last_save {changes_before} -> \
+             {changes_after} (removed 210 + 200 keys)"
+        );
+        // The reviewer also pinned moon#1232 here (the flushes count their 410
+        // removed keys, once, in `rdb_changes_since_last_save`); that counting
+        // lands with part 4, which this branch has not merged.
+        assert_eq!(cow, "0");
+        // Recovery after whatever happened: the next save completes.
+        assert!(c.send(&["SELECT", "0"]).starts_with("+OK"));
+        assert!(c.send(&["BGSAVE"]).contains("started"));
+        wait_done(&mut c);
+        assert_eq!(info(&mut c, "persistence", "rdb_last_bgsave_status"), "ok");
+        assert!(lastsave(&mut c) >= t1);
+        server.kill_now();
+        common::wait_for_port_down(port);
+        let (_s2, port2) = spawn(&dir, 1, &["--disk-offload", "disable"]);
+        let mut c2 = Conn::open(port2);
+        assert_eq!(
+            (dbsize(&mut c2, 0), dbsize(&mut c2, 1), dbsize(&mut c2, 2)),
+            (200, 0, 0)
+        );
+        if status == "err" {
+            assert_eq!(t2, t1, "a failed save must not move LASTSAVE");
+        }
+        outcomes.push((use_multi, status));
+    }
+    assert!(
+        outcomes.iter().all(|(_, s)| s == "ok"),
+        "ONE grown table (db 1) and an un-grown one (db 2) flushed in one tick failed the save: \
+         (multi, status) = {outcomes:?}"
+    );
+}

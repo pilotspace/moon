@@ -35,7 +35,7 @@ Every item is addressed, one commit each; NOTES.md has the table.
 - **A (BLOCKING):** `11cf616e`.
   - Review 4's FLUSHDB bound was count-only. A table was frozen as flushed, with every post-epoch row, so the reviewer's reproduction held 344 MB under `--maxmemory 64mb`.
   - The drain now trims a flushed table to its epoch-start rows, restoring its pre-images; it rebuilds the table when post-epoch inserts at least doubled it. The save holds at most the epoch-start bills of the databases it has not written.
-  - A second grown table flushed before one drain fails the save.
+  - A second grown table flushed before one drain fails the save. Corrected by review 6 (S2): the check also fired for a table that did not grow; the rule is now re-derived for the budgeted trim (risk 1).
   - Real server: `current_cow_size` 344,782,240 and RSS +341 MB before; 0 and +49..+58 MB now. The save completes and restores the epoch-start keyspace.
 - **B (moon#1261):** `6446832f`, `f9b89d65`. `Stream::restore_claims` bills the MqPop apply, on replay and on a replica. Before: 28,421 vs 124,097 B; now equal.
 - **C:** `ac6a4896`, docs only. The 2b trade-off table (under Measurements) and a "Changed" CHANGELOG bullet; no doc claims dispatch starves during a save.
@@ -89,7 +89,7 @@ Every item is addressed, one commit each; NOTES.md has the table.
    - **Review 6:** the trim is budgeted, 512 row operations per drain. The bound holds once it is done: after ceil(work / 512) drains, where work = keys written since the save began + rows below the cursor + the kept rows if the table is rebuilt.
      - The reviewer's 8 x 10K-row case takes about 20-40 drains per table.
      - A 2M + 6M-row table takes about 12 s (release), during which PING stays at p99.9 1.0 ms and max 9.2 ms. Main's FLUSHDB stalls 193 ms on that table; the unbudgeted trim took 4.33 s.
-   - **Until the first drain (one tick),** one grown table waits whole. A second grown one flushed before the drain fails the save.
+   - **Until its trim's steps 1-2 are done,** a grown table holds its post-epoch rows. A flush of another GROWN database meanwhile fails the save once their post-epoch bytes together pass 8 MiB (review 6, S2): within one tick (a pipeline, MULTI, a script or two clients) or during the trim. A flush of a database that did not grow never fails it. It used to, whenever a grown table was waiting: a plain `SELECT 1; FLUSHDB; SELECT 2; FLUSHDB` pipeline returned `status err`.
 2. **Merged with main (part 3b):** `persistence_tick.rs` and `kv_ops.rs::clear` auto-merged as the review expected. The gates below ran on the merged tree.
 3. **Slot identity is by `Database` address,** recorded at arm time. This holds because slots are boxed and SWAPDB swaps contents, not addresses. An unidentifiable flush aborts the save as before; it never freezes the wrong table.
 4. **Test fixtures:** the F1 end-to-end guard is FLUSHALL-based again and runs on both runtimes. It is red only on a quiet box: F1 is a race, and the deterministic guards are `stream_tests::an_aborted_snapshot_cannot_*`. The resync variant is `ignore`d on tokio. **Follow-up for the orchestrator:** a tokio-master PSYNC would let it run there too. Three WS16 tests now depend on 3b's `MOON_TEST_SNAPSHOT_HOLD_FILE`.
@@ -149,7 +149,10 @@ Every item is addressed, one commit each; NOTES.md has the table.
   - a stream waker's group read.
 
   Each now captures the key's pre-save state first. Before, a key moved during a save could come back in both databases or in neither, and queues and streams came back with post-save messages and pending entries.
-- **Changed (moon#1228):** `FLUSHDB` and `SWAPDB` during a BGSAVE no longer fail the save. It completes with the keyspace as it was when the save started, as redis does, so a workload that flushes more often than one save takes can now save at all. A `FLUSHALL` still fails an in-flight save, as redis's does, and so does a replica full resync.
+- **Changed (moon#1228):** `FLUSHDB` and `SWAPDB` during a BGSAVE no longer fail the save. It completes with the keyspace as it was when the save started, as redis does, so a workload that flushes more often than one save takes can now save at all.
+  - The save holds a flushed database's pre-save rows until it writes them, as redis's forked child does. INFO `current_cow_size` reports them.
+  - A `FLUSHALL` still fails an in-flight save, as redis's does, and so does a replica full resync.
+  - So does a `FLUSHDB` of a database that grew during the save, if another database that grew is still being trimmed and together they hold more than 8 MiB of rows written since the save began. This covers two such flushes within one tick (a pipeline, `MULTI`, a script or two clients) or during the trim.
 - **Changed (moon#1228):** while writes outpace a BGSAVE, the save now does more work per tick, up to 16x the entries and segments and 4x the bytes, scaled by how far writers are ahead of it. Saves under a write flood finish sooner and hold less copy-on-write memory, at the cost of higher write tail latency while the save runs.
   - Release build, `--shards 1`, SET flood: the save finished 2.6–2.9x sooner (2.26 s to 0.88 / 0.77 s).
   - Write p99 during the save roughly doubled (804 to 1,818 µs light, 2,383 to 4,294 µs heavy), and p99.9 rose 25–80%. Max latency did not change.

@@ -187,10 +187,38 @@ not written, and releases each as the walk passes it. This is the same worst cas
 FLUSHDB child. The bill is the table's `used_memory` at the flush, minus the removed rows'
 `entry_overhead`, plus the restored rows'.
 
-**The wait before the drain.** Until the drain (one tick) a flushed table waits whole. One
-grown table may wait: its rows were in `used_memory` an instant before. A second flush of a
-grown database before the drain (MULTI, a script) fails the save once the waiting post-epoch
-bytes pass `FREEZE_WAIT_SLACK` (8 MiB). An abort now also releases waiting tables at once.
+**When a flush fails the save (reviews 5 and 6).** Review 5's rule was: one grown table may
+wait for the drain, and a second flush before that drain fails the save once the waiting
+post-epoch bytes pass `FREEZE_WAIT_SLACK` (8 MiB). Review 6 (S2) found the check fired on ANY
+second freeze, including a table that did not grow (excess 0). A plain
+`SELECT 1; FLUSHDB; SELECT 2; FLUSHDB` pipeline after a bulk load into db 1 was enough, as
+was MULTI or two clients within one tick. The real server returned `status err`.
+
+Now only a flush of a grown database can fail the save (`excess > 0`).
+
+Re-derived for the budgeted trim (S1): a grown table holds its post-epoch rows from its flush
+until its trim's steps 1-2 finish, which is the queue until the next drain, then
+ceil(work / 512) drains. So "waiting" is the queued excess plus the untrimmed excess of the
+frozen tables (bill above the epoch-start bill while in steps 1-2), published after every
+drain (`UNTRIMMED_EXCESS`). A grown flush fails the save when another grown table is still
+waiting or trimming and together they pass 8 MiB. The epoch then holds at most one grown
+table's post-epoch rows, or the slack, beyond the epoch-start bills. An abort also releases
+waiting tables at once.
+
+Evidence:
+- `table_swap_tests::an_ungrown_second_flush_does_not_fail_the_save` (the reviewer's proof):
+  red ("only ONE grown table waited, yet the save failed"), now green in both orders.
+- `perf_ws16_bgsave_prop::a_pipelined_flush_of_a_grown_and_an_ungrown_db_keeps_the_save` (the
+  reviewer's proof): pipeline and MULTI were `status err`, now `status ok` twice; recovery
+  checks pass. The reviewer's moon#1232 assertion (`rdb_changes_since_last_save` counts the
+  410 removed keys) is left out: that counting lands with part 4, which this branch has not
+  merged.
+- `table_swap_tests::a_grown_flush_while_another_grown_table_is_trimming_fails_the_save`
+  (the re-derivation): fails the save while db 1 is still trimming, completes once it is
+  done. It is red with the untrimmed term removed.
+- `grown_tables_flushed_before_one_drain_fail_the_save` (review 5) stays green.
+- The 8 x 40 MB FLUSHDB reproduction completes 4 of 4 on a release-fast build: the trim of a
+  10K-row table (~20 drains) finishes before the client refills the next database.
 
 **Cost.** All on the shard thread at the drain:
 - step 1: one remove plus insert per key written since the epoch began, already paid for at

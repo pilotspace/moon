@@ -118,6 +118,9 @@ pub(crate) struct Frozen {
     /// `used_memory` at the flush, less the rows the trim removed, plus the
     /// epoch-start entries it restored — each at its `entry_overhead`.
     pub(super) bill: u64,
+    /// The database's `used_memory` when the epoch began: what the bill
+    /// holds above it while steps 1-2 run is post-epoch (review 6, S2).
+    start_bill: u64,
     trim: Trim,
 }
 
@@ -158,11 +161,24 @@ enum Trim {
 }
 
 impl Frozen {
-    pub(super) fn new(table: Box<Table>, bill: u64, below: u64) -> Self {
+    pub(super) fn new(table: Box<Table>, bill: u64, below: u64, start_bill: u64) -> Self {
         Frozen {
             table,
             bill,
+            start_bill,
             trim: Trim::PreImages { below },
+        }
+    }
+
+    /// Post-epoch bytes the table still holds: its bill above the
+    /// database's epoch-start bill until steps 1-2 are done (the rebuild
+    /// moves rows, it removes none), 0 after.
+    fn untrimmed_excess(&self) -> u64 {
+        match self.trim {
+            Trim::PreImages { .. } | Trim::Written { .. } => {
+                self.bill.saturating_sub(self.start_bill)
+            }
+            Trim::Rebuild { .. } | Trim::Done => 0,
         }
     }
 
@@ -182,6 +198,19 @@ fn charge(key: &[u8], entry: &Entry) -> u64 {
 }
 
 impl SnapshotState {
+    /// Post-epoch bytes the frozen tables still hold, summed (review 6, S2):
+    /// what `snapshot_cow::note_cleared_table` weighs a further grown flush
+    /// against. Published after every drain.
+    pub(crate) fn untrimmed_excess(&self) -> u64 {
+        self.sources
+            .iter()
+            .map(|s| match s {
+                Source::Frozen(frozen) => frozen.untrimmed_excess(),
+                _ => 0,
+            })
+            .sum()
+    }
+
     /// Advance the trims of the frozen tables, lowest database first (the
     /// walk needs it soonest), by at most `budget` row operations in all.
     /// Returns the operations done. Called by every drain.

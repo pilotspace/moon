@@ -655,8 +655,9 @@ impl SnapshotState {
     ///
     /// `bytes` is the table's `used_memory` at the flush (without
     /// spill-in-flight bytes); the trimmed bill is reported in
-    /// [`Self::cow_bytes`] while the epoch keeps the table.
-    pub(crate) fn freeze(&mut self, db: usize, table: Box<Table>, bytes: u64) {
+    /// [`Self::cow_bytes`] while the epoch keeps the table. `start_bill` is
+    /// `db`'s `used_memory` when the epoch began (review 6, S2).
+    pub(crate) fn freeze(&mut self, db: usize, table: Box<Table>, bytes: u64, start_bill: u64) {
         if self.aborted.is_some() || db < self.current_db || db >= self.num_databases {
             return;
         }
@@ -668,7 +669,9 @@ impl SnapshotState {
         } else {
             0
         };
-        self.sources[db] = Source::Frozen(Box::new(frozen::Frozen::new(table, bytes, below)));
+        self.sources[db] = Source::Frozen(Box::new(frozen::Frozen::new(
+            table, bytes, below, start_bill,
+        )));
     }
 
     /// Would the walk read the current database from a table whose rows are
