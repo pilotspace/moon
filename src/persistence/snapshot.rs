@@ -110,6 +110,44 @@ const TICK_SEGMENT_BUDGET: u32 = 64;
 /// much. A segment is the walk's unit of progress (the cursor moves past a
 /// whole hash block), so a tick can still end one segment past this.
 const TICK_BYTE_BUDGET: u64 = 4 * crate::persistence::snapshot_stream::SNAPSHOT_STREAM_CHUNK as u64;
+/// Upper bound on how far [`SnapshotState::advance_budgeted_db`] scales its
+/// entry and segment budgets up under a write flood (moon#1228): 16x = 1,024
+/// segments / 16,384 entries per tick.
+///
+/// The scale is `1 + pending_pre_images / TICK_ENTRY_BUDGET`. A pending
+/// pre-image is a write that hit a range the walk has not written yet — a
+/// tombstone for every insert there — so their number is exactly how far the
+/// writers are ahead of the walk, and it grows for as long as a flood out-
+/// splits a constant budget (the walk then never converges, and the
+/// tombstones pile up meanwhile). Scaling with it makes the walk speed up
+/// exactly then and cost what it always did otherwise; the cap bounds the
+/// worst tick (~1.6 ms of serialization instead of ~100 µs).
+const MAX_TICK_BUDGET_SCALE: u32 = 16;
+/// The byte budget grows with the same scale, capped lower: large values
+/// must not turn one tick into a multi-millisecond memcpy (moon#1227 review
+/// F3). The writer-backlog check still stops a tick in any case.
+const MAX_TICK_BYTE_SCALE: u64 = 4;
+
+/// The factor a tick's budgets are multiplied by with `pending` pre-images
+/// queued (see [`MAX_TICK_BUDGET_SCALE`]).
+#[inline]
+fn tick_budget_scale(pending: usize) -> u32 {
+    let scale = 1 + pending / TICK_ENTRY_BUDGET as usize;
+    scale.min(MAX_TICK_BUDGET_SCALE as usize) as u32
+}
+
+/// Approximate heap bytes a pre-image holds while it waits for its range:
+/// the key, the value (an entry's estimate plus its fixed overhead, as
+/// `used_memory` bills it), and the ordered-map slot. For INFO
+/// `current_cow_size` (moon#1228), not for any budget decision.
+#[inline]
+fn pre_image_bytes(key: &[u8], pre_image: &PreImage) -> u64 {
+    const MAP_SLOT: usize = 64;
+    let value = pre_image
+        .as_ref()
+        .map_or(0, |e| e.value.estimate_memory() + 128);
+    (key.len() + value + MAP_SLOT) as u64
+}
 
 /// Snapshot header metadata, peekable without fully loading the file.
 ///
@@ -170,6 +208,8 @@ pub struct SnapshotState {
     /// (moved, never cloned). First capture of a key wins (moon#517): it is
     /// the only one taken before ANY write of this epoch touched the key.
     overflow: Vec<BTreeMap<(u64, Bytes), PreImage>>,
+    /// [`pre_image_bytes`] of everything in `overflow` (moon#1228).
+    overflow_bytes: u64,
     /// Shard ID for the snapshot file header.
     shard_id: u16,
     /// Output file path.
@@ -184,15 +224,49 @@ pub struct SnapshotState {
     last_lsn: u64,
     /// Wall-clock at snapshot construction, milliseconds since unix epoch (v0.2).
     created_at_unix_ms: u64,
-    /// Set when a structural change the epoch cannot follow (a SWAPDB)
-    /// happened while it was in flight: the file would not be point-in-time,
-    /// so the snapshot fails loudly instead of publishing it.
+    /// Set when a structural change the epoch does not follow (a FLUSHALL,
+    /// a replica full resync) happened while it was in flight: the snapshot
+    /// fails loudly instead of publishing a file.
     aborted: Option<&'static str>,
+    /// Where each database of the epoch reads its epoch-start contents from
+    /// (moon#1228), indexed like the file's databases: a shard slot (moved
+    /// by SWAPDB) or a table a FLUSHDB detached before it was written. See
+    /// [`Source`].
+    sources: Vec<Source>,
+    /// Test-only: pin the per-tick budget to its constant (pre-moon#1228)
+    /// value, the control of the convergence tests.
+    fixed_budget: bool,
 }
 
 /// A key's state at the start of a snapshot epoch: its entry, or `None` when
 /// the key did not exist then (moon#1216 — see the module docs).
 pub type PreImage = Option<Entry>;
+
+/// A database's hash table, as a flush detaches it (moon#1228).
+pub(crate) type Table =
+    crate::storage::dashtable::DashTable<crate::storage::compact_key::CompactKey, Entry>;
+
+/// Where one database of an epoch reads its epoch-start contents from
+/// (moon#1228).
+///
+/// The epoch used to be tied to "database `i` is shard slot `i`, and its table
+/// is the one it had at epoch start", so a FLUSHDB of an unfinished database
+/// (its table replaced) or a SWAPDB (two slots' tables exchanged) could only
+/// ABORT the save — and a workload flushing more often than one save takes
+/// never completed one. redis's fork keeps the pre-flush pages instead (a
+/// FLUSHALL still aborts: redis kills its child for that one).
+enum Source {
+    /// The table in shard slot `.0` (`databases[slot]`). Starts as the
+    /// database's own index; a SWAPDB moves the table, and this with it.
+    Live(usize),
+    /// The table a FLUSHDB detached before the epoch wrote it
+    /// (`Database::clear` hands it over instead of dropping it). Nothing
+    /// writes it any more, so with the pre-images captured before the flush
+    /// it IS the database's epoch-start contents.
+    Frozen(Box<Table>, u64),
+    /// Fully written (a frozen table is dropped as soon as it is).
+    Written,
+}
 
 /// The aligned block of hash space owned by a DashTable segment of local
 /// depth `depth` that contains `hash`: `(start, end)`, `end` exclusive and
@@ -241,6 +315,7 @@ impl SnapshotState {
             output_buf: Vec::with_capacity(4096),
             stream: None,
             overflow: (0..num_databases).map(|_| BTreeMap::new()).collect(),
+            overflow_bytes: 0,
             shard_id,
             file_path,
             header_written: false,
@@ -248,7 +323,17 @@ impl SnapshotState {
             last_lsn: 0,
             created_at_unix_ms: current_time_ms() as u64,
             aborted: None,
+            sources: (0..num_databases).map(Source::Live).collect(),
+            fixed_budget: false,
         }
+    }
+
+    /// Test-only: pin [`Self::advance_budgeted_db`] to the constant per-tick
+    /// budget it had before moon#1228 (the control arm of the convergence
+    /// tests).
+    #[cfg(test)]
+    pub(crate) fn pin_fixed_budget(&mut self) {
+        self.fixed_budget = true;
     }
 
     /// Stamp the WAL LSN at which this snapshot was taken.
@@ -455,9 +540,27 @@ impl SnapshotState {
         if !self.is_hash_pending(db_index, hash) {
             return;
         }
-        self.overflow[db_index]
-            .entry((hash, key))
-            .or_insert(pre_image);
+        if let std::collections::btree_map::Entry::Vacant(slot) =
+            self.overflow[db_index].entry((hash, key))
+        {
+            self.overflow_bytes += pre_image_bytes(&slot.key().1, &pre_image);
+            slot.insert(pre_image);
+        }
+    }
+
+    /// Approximate bytes this epoch holds only for the snapshot's sake
+    /// (moon#1228): queued pre-images and tables a flush handed over. Not in
+    /// `used_memory` (see `snapshot_cow::current_cow_size`).
+    pub fn cow_bytes(&self) -> u64 {
+        let frozen: u64 = self
+            .sources
+            .iter()
+            .map(|s| match s {
+                Source::Frozen(_, bytes) => *bytes,
+                _ => 0,
+            })
+            .sum();
+        self.overflow_bytes + frozen
     }
 
     /// Pre-images captured and not yet written, across every database.
@@ -467,8 +570,9 @@ impl SnapshotState {
     }
 
     /// Fail this snapshot instead of publishing a file that is not
-    /// point-in-time (a SWAPDB swapped a database the epoch had not finished
-    /// with). The shard's next tick reports the failure; the previous
+    /// point-in-time (a replica full resync replaced databases the epoch had
+    /// not finished with), or because a FLUSHALL fails an in-flight save as
+    /// redis's does. The shard's next tick reports the failure; the previous
     /// snapshot file stays in place.
     pub fn abort(&mut self, why: &'static str) {
         if self.aborted.is_none() {
@@ -481,6 +585,89 @@ impl SnapshotState {
             self.aborted = Some(why);
         }
         self.overflow.iter_mut().for_each(BTreeMap::clear);
+        self.overflow_bytes = 0;
+        // Nothing will be written any more: release the detached tables.
+        for source in &mut self.sources {
+            if matches!(source, Source::Frozen(..)) {
+                *source = Source::Written;
+            }
+        }
+    }
+
+    /// The shard slot whose table holds the current database's epoch-start
+    /// contents (moon#1228) — what the persistence tick borrows and passes to
+    /// [`Self::advance_budgeted_db`]. The database's own index until a SWAPDB
+    /// moves its table; for a database whose table a flush detached the
+    /// borrowed database is not read at all (any valid slot will do, and the
+    /// current index is returned).
+    #[inline]
+    pub fn source_db_index(&self) -> usize {
+        match self.sources.get(self.current_db) {
+            Some(Source::Live(slot)) => *slot,
+            _ => self.current_db,
+        }
+    }
+
+    /// A SWAPDB exchanged the tables of shard slots `a` and `b` (moon#1228):
+    /// the databases of this epoch that read from either slot now read from
+    /// the other. Queued by `snapshot_cow::note_swapdb`, applied at the next
+    /// drain — before any further segment is written.
+    pub(crate) fn swap_slots(&mut self, a: usize, b: usize) {
+        for source in &mut self.sources {
+            if let Source::Live(slot) = source {
+                if *slot == a {
+                    *slot = b;
+                } else if *slot == b {
+                    *slot = a;
+                }
+            }
+        }
+    }
+
+    /// A FLUSHDB detached database `db`'s table before the epoch finished
+    /// writing it (moon#1228): keep the table as `db`'s epoch-start
+    /// contents. A table for a database already written (or an aborted
+    /// epoch) is dropped. Queued by `snapshot_cow::note_cleared_table`; a
+    /// FLUSHALL aborts the epoch instead (redis parity).
+    ///
+    /// `bytes` is what the table held (its database's `used_memory` at the
+    /// flush, without spill-in-flight bytes), reported in
+    /// [`Self::cow_bytes`] while the epoch keeps it.
+    pub(crate) fn freeze(&mut self, db: usize, table: Box<Table>, bytes: u64) {
+        if self.aborted.is_some() || db < self.current_db || db >= self.num_databases {
+            return;
+        }
+        if let Some(source @ Source::Live(_)) = self.sources.get_mut(db) {
+            *source = Source::Frozen(table, bytes);
+        }
+    }
+
+    /// Run `f` over the current database's epoch-start table: the frozen
+    /// table when a flush detached it, else `db` (which the caller borrowed
+    /// from [`Self::source_db_index`]). A frozen table is released once its
+    /// database is fully written.
+    fn with_current_table<R>(
+        &mut self,
+        db: &Database,
+        f: impl FnOnce(&mut Self, &Table) -> R,
+    ) -> R {
+        let cur = self.current_db;
+        let Some(source) = self.sources.get_mut(cur) else {
+            return f(self, db.data());
+        };
+        match std::mem::replace(source, Source::Written) {
+            Source::Frozen(table, bytes) => {
+                let out = f(self, &table);
+                if self.current_db == cur && self.aborted.is_none() {
+                    self.sources[cur] = Source::Frozen(table, bytes);
+                }
+                out
+            }
+            other => {
+                self.sources[cur] = other;
+                f(self, db.data())
+            }
+        }
     }
 
     /// Why this snapshot was aborted, if it was.
@@ -500,7 +687,7 @@ impl SnapshotState {
         if self.current_db >= self.num_databases || self.aborted.is_some() {
             return true;
         }
-        self.advance_segment_inner(db)
+        self.with_current_table(db, |s, table| s.advance_segment_inner(table))
     }
 
     /// The event loop's per-tick advance: serialize segments of the current
@@ -512,35 +699,57 @@ impl SnapshotState {
     /// needs its own `&Database`, i.e. the next tick). Every budget is checked
     /// BEFORE a segment, so a tick ends at most one segment past it. Returns
     /// true when every database is written.
+    ///
+    /// The entry, segment and byte budgets are multiplied by
+    /// [`tick_budget_scale`] of the pre-image backlog (moon#1228): 1 when no
+    /// writer is ahead of the walk, up to [`MAX_TICK_BUDGET_SCALE`] (bytes:
+    /// [`MAX_TICK_BYTE_SCALE`]) under an insert flood.
+    ///
+    /// `db` must be `databases[self.source_db_index()]` (moon#1228).
     pub fn advance_budgeted_db(&mut self, db: &Database) -> bool {
         self.write_header_if_needed();
-        let db_index = self.current_db;
-        let mut entries = 0u32;
-        let mut segments = 0u32;
-        let bytes_at_start = self.bytes_serialized;
-        while self.current_db == db_index
-            && self.current_db < self.num_databases
-            && self.aborted.is_none()
-            && entries < TICK_ENTRY_BUDGET
-            && segments < TICK_SEGMENT_BUDGET
-            && self.bytes_serialized - bytes_at_start < TICK_BYTE_BUDGET
-            && !self.stream_backlogged()
-        {
-            let before = self.entries_written;
-            self.advance_segment_inner(db);
-            entries += (self.entries_written - before) as u32;
-            segments += 1;
+        if self.current_db >= self.num_databases || self.aborted.is_some() {
+            return true;
         }
+        // moon#1228: the budgets grow with the pre-image backlog.
+        let scale = if self.fixed_budget {
+            1
+        } else {
+            tick_budget_scale(self.pending_pre_images())
+        };
+        let entry_budget = TICK_ENTRY_BUDGET * scale;
+        let segment_budget = TICK_SEGMENT_BUDGET * scale;
+        let byte_budget = TICK_BYTE_BUDGET * u64::from(scale).min(MAX_TICK_BYTE_SCALE);
+        self.with_current_table(db, |s, table| {
+            let db_index = s.current_db;
+            let mut entries = 0u32;
+            let mut segments = 0u32;
+            let bytes_at_start = s.bytes_serialized;
+            while s.current_db == db_index
+                && s.aborted.is_none()
+                && entries < entry_budget
+                && segments < segment_budget
+                && s.bytes_serialized - bytes_at_start < byte_budget
+                && !s.stream_backlogged()
+            {
+                let before = s.entries_written;
+                s.advance_segment_inner(table);
+                entries += (s.entries_written - before) as u32;
+                segments += 1;
+            }
+        });
         self.current_db >= self.num_databases || self.aborted.is_some()
     }
 
+    /// Advance by one segment over the shard's database slice (`databases[i]`
+    /// is shard slot `i`): the synchronous save helpers and tests.
     pub fn advance_one_segment(&mut self, databases: &[Database]) -> bool {
         self.write_header_if_needed();
         if self.current_db >= self.num_databases || self.aborted.is_some() {
             return true;
         }
-        let db = &databases[self.current_db];
-        self.advance_segment_inner(db)
+        let db = &databases[self.source_db_index()];
+        self.with_current_table(db, |s, table| s.advance_segment_inner(table))
     }
 
     fn write_header_if_needed(&mut self) {
@@ -566,16 +775,22 @@ impl SnapshotState {
     /// below the cursor, so this is exactly the range being written.
     fn take_pre_images_below(&mut self, end: Option<u64>) -> BTreeMap<(u64, Bytes), PreImage> {
         let map = &mut self.overflow[self.current_db];
-        match end {
+        let taken = match end {
             None => std::mem::take(map),
             Some(end) => {
                 let rest = map.split_off(&(end, Bytes::new()));
                 std::mem::replace(map, rest)
             }
-        }
+        };
+        let bytes: u64 = taken
+            .iter()
+            .map(|((_, k), pre)| pre_image_bytes(k, pre))
+            .sum();
+        self.overflow_bytes = self.overflow_bytes.saturating_sub(bytes);
+        taken
     }
 
-    fn advance_segment_inner(&mut self, db: &Database) -> bool {
+    fn advance_segment_inner(&mut self, table: &Table) -> bool {
         let now_ms = current_time_ms();
         let bytes_before = self.output_buf.len();
 
@@ -588,11 +803,12 @@ impl SnapshotState {
 
         // moon#1216: the segment covering the cursor, and the hash block it
         // owns. Splits never straddle the cursor (it only lands on block
-        // boundaries), so the block normally STARTS at the cursor. It starts
-        // below only if the table was replaced mid-epoch (FLUSHDB/FLUSHALL
-        // install a fresh one): its keys below the cursor were written into
-        // this db after its range was already in the file — skip them.
-        let table = db.data();
+        // boundaries), so the block normally STARTS at the cursor. It could
+        // start below only if the table had been replaced mid-epoch without
+        // the epoch hearing of it — a FLUSH now freezes the old table into
+        // the epoch (moon#1228) and a replica resync aborts it, so this is
+        // defence in depth: keys below the cursor would be post-epoch ones,
+        // skip them.
         let start = self.cursor;
         let seg_idx = table.segment_index_for_hash(start);
         let segment = table.segment(seg_idx);
@@ -1169,3 +1385,9 @@ mod table_swap_tests;
 
 #[cfg(test)]
 mod multi_key_cow_tests;
+
+#[cfg(test)]
+mod capture_gap_tests;
+
+#[cfg(test)]
+mod cow_budget_tests;

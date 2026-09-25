@@ -41,6 +41,7 @@ use crate::command::mq::{
 };
 use crate::mq::is_mq_command;
 use crate::protocol::Frame;
+use crate::storage::Database;
 use crate::storage::entry::current_time_ms;
 use crate::storage::stream::StreamId;
 
@@ -60,10 +61,17 @@ use crate::storage::stream::StreamId;
 /// - Allocations: only at result-building boundaries (`Vec::with_capacity`).
 ///   No `format!`, `to_string`, or needless `clone` on hot fields.
 /// - WAL appends use fire-and-forget `try_send` via `wal_append_on_slice`.
+///
+/// `gate` is the caller's maxmemory / per-db-quota write gate (moon#1250),
+/// run before a subcommand that grows the keyspace (CREATE, PUSH) — the
+/// same gate its runtime runs before any other write, which MQ bypassed
+/// entirely. It is only called while a limit is configured
+/// (`eviction::write_gate_active`).
 pub(crate) fn execute_mq_on_owner(
     db_index: usize,
     key_prefix: Bytes,
     command: std::sync::Arc<Frame>,
+    gate: MqWriteGate<'_>,
 ) -> Frame {
     // full_args[0] = command name (b"MQ"), full_args[1..] = subcommand + params.
     // Mirrors try_handle_mq_command which receives cmd and cmd_args separately:
@@ -92,10 +100,10 @@ pub(crate) fn execute_mq_on_owner(
     };
 
     if sub.eq_ignore_ascii_case(b"CREATE") {
-        return handle_create(cmd_args, &key_prefix, db_index);
+        return handle_create(cmd_args, &key_prefix, db_index, gate);
     }
     if sub.eq_ignore_ascii_case(b"PUSH") {
-        return handle_push(cmd_args, &key_prefix, db_index);
+        return handle_push(cmd_args, &key_prefix, db_index, gate);
     }
     if sub.eq_ignore_ascii_case(b"POP") {
         return handle_pop(cmd_args, &key_prefix, db_index);
@@ -111,6 +119,37 @@ pub(crate) fn execute_mq_on_owner(
     }
 
     Frame::Error(Bytes::from_static(ERR_MQ_UNKNOWN_SUB))
+}
+
+/// The write gate a caller hands [`execute_mq_on_owner`] (moon#1250): run
+/// against the owner database (`databases[db_index]`) before a write that
+/// grows it; `Err` is the refusal (`-OOM ...`) the subcommand answers with.
+pub(crate) type MqWriteGate<'a> = &'a mut dyn FnMut(&mut Database, usize) -> Result<(), Frame>;
+
+/// Run `gate` only while a memory limit is configured — the one relaxed
+/// atomic load every other write path pays when none is.
+#[inline]
+fn run_gate(gate: &mut MqWriteGate<'_>, db: &mut Database, db_index: usize) -> Result<(), Frame> {
+    if crate::storage::eviction::write_gate_active() {
+        gate(db, db_index)
+    } else {
+        Ok(())
+    }
+}
+
+/// Apply a stream's drained byte delta (`Stream::take_unbilled`) to
+/// `used_memory` (moon#1250) — what the X* commands do after every mutation
+/// (moon#1163). The MQ subcommands, the TXN MQ.PUBLISH materialization, the
+/// replica MQ apply and the stream waker write streams outside those
+/// commands and never drained it, so a queue grew without `used_memory`
+/// seeing it and `maxmemory` could not bind.
+#[inline]
+pub(crate) fn bill_stream_delta(db: &mut Database, delta: isize) {
+    if delta >= 0 {
+        db.charge_memory(delta.unsigned_abs());
+    } else {
+        db.credit_memory(delta.unsigned_abs());
+    }
 }
 
 // ── Effective-key derivation ──────────────────────────────────────────────────
@@ -223,6 +262,45 @@ pub(crate) fn wal_append_on_slice(
             }
         }
     });
+}
+
+/// TXN.COMMIT's MQ.PUBLISH materialization on the queue's owner shard: add
+/// each intent's fields to its durable stream in `db` (`databases[db_index]`)
+/// and return one `MqPush` WAL payload per applied intent, each carrying the
+/// ASSIGNED id so replay is outcome-deterministic (Wave B stage 2a). A
+/// missing or non-durable queue is skipped.
+///
+/// The one body behind the self-shard legs of both runtimes' TXN.COMMIT
+/// (`handler_monoio/txn.rs`, `handler_sharded/txn.rs`) and the foreign-shard
+/// `MqTxnMaterialize` arm (`spsc_handler.rs`). Each queue key's epoch-start
+/// state is captured before the push (moon#1228): like the MQ subcommands,
+/// this writes the stream outside `command::dispatch`.
+pub(crate) fn materialize_mq_intents(
+    db: &mut crate::storage::Database,
+    db_index: usize,
+    intents: &[crate::transaction::MqIntent],
+) -> Vec<Vec<u8>> {
+    let mut payloads = Vec::with_capacity(intents.len());
+    for intent in intents {
+        crate::persistence::snapshot_cow::capture_write_pre_image(db, db_index, &intent.queue_key);
+        if let Ok(Some(stream)) = db.get_stream_mut(&intent.queue_key)
+            && stream.durable
+        {
+            let msg_id = stream.next_auto_id();
+            payloads.push(crate::mq::wal::encode_mq_push(
+                db_index as u32,
+                &intent.queue_key,
+                msg_id.ms,
+                msg_id.seq,
+                &intent.fields,
+            ));
+            stream.add(msg_id, intent.fields.clone());
+            // moon#1250: charged like an MQ PUSH.
+            let delta = stream.take_unbilled();
+            bill_stream_delta(db, delta);
+        }
+    }
+    payloads
 }
 
 // ── Replication emission (Wave B stage 2b) ────────────────────────────────
@@ -408,7 +486,12 @@ fn emit_mq_drops(s: &mut crate::shard::slice::ShardSlice, db_index: usize, dropp
 /// MQ.CREATE — owner creates the durable stream + registry entry.
 ///
 /// Mirrors handler_sharded/write.rs MQ CREATE arm (lock-path `else` branch).
-fn handle_create(args: &[Frame], key_prefix: &Bytes, db_index: usize) -> Frame {
+fn handle_create(
+    args: &[Frame],
+    key_prefix: &Bytes,
+    db_index: usize,
+    mut gate: MqWriteGate<'_>,
+) -> Frame {
     let (raw_key, max_delivery_count, _debounce_ms) = match validate_mq_create(args) {
         Ok(v) => v,
         Err(e) => return e,
@@ -417,16 +500,24 @@ fn handle_create(args: &[Frame], key_prefix: &Bytes, db_index: usize) -> Frame {
 
     // Create / configure the durable stream.
     let create_result: Result<(), Frame> = crate::shard::slice::with_shard_db(db_index, |db| {
-        match db.get_or_create_stream(&eff_key) {
+        // moon#1250: a new queue grows the keyspace — the write gate first
+        // (it may evict, so before the pre-image capture).
+        run_gate(&mut gate, db, db_index)?;
+        // moon#1228: MQ runs outside `command::dispatch`, so an armed BGSAVE
+        // epoch gets the queue key's epoch-start state (or absence) here.
+        crate::persistence::snapshot_cow::capture_write_pre_image(db, db_index, &eff_key);
+        let delta = match db.get_or_create_stream(&eff_key) {
             Ok(stream) => {
                 stream.durable = true;
                 stream.max_delivery_count = max_delivery_count;
                 let group_name = Bytes::from_static(b"__mq_consumers");
                 let _ = stream.create_group(group_name, StreamId::ZERO);
-                Ok(())
+                stream.take_unbilled()
             }
-            Err(e) => Err(e),
-        }
+            Err(e) => return Err(e),
+        };
+        bill_stream_delta(db, delta);
+        Ok(())
     });
     if let Err(e) = create_result {
         return e;
@@ -468,7 +559,12 @@ fn handle_create(args: &[Frame], key_prefix: &Bytes, db_index: usize) -> Frame {
 /// Mirrors handler_sharded/write.rs MQ PUSH arm (lock-path `else` branch).
 /// Fires any registered trigger's debounce timer (sets `pending_fire_ms` if
 /// not already pending).
-fn handle_push(args: &[Frame], key_prefix: &Bytes, db_index: usize) -> Frame {
+fn handle_push(
+    args: &[Frame],
+    key_prefix: &Bytes,
+    db_index: usize,
+    mut gate: MqWriteGate<'_>,
+) -> Frame {
     let (raw_key, fields) = match validate_mq_push(args) {
         Ok(v) => v,
         Err(e) => return e,
@@ -483,10 +579,14 @@ fn handle_push(args: &[Frame], key_prefix: &Bytes, db_index: usize) -> Frame {
     // call, so it doesn't violate the non-reentrancy contract.
     type PushResult = Result<Option<(StreamId, Vec<u8>)>, Frame>;
     let push_result: PushResult = crate::shard::slice::with_shard_db(db_index, |db| {
-        match db.get_stream_mut(&eff_key) {
+        // moon#1250: see `handle_create`.
+        run_gate(&mut gate, db, db_index)?;
+        // moon#1228: see `handle_create`.
+        crate::persistence::snapshot_cow::capture_write_pre_image(db, db_index, &eff_key);
+        let (pushed, delta) = match db.get_stream_mut(&eff_key) {
             Ok(Some(stream)) => {
                 if !stream.durable {
-                    Ok(None)
+                    (None, 0)
                 } else {
                     let msg_id = stream.next_auto_id();
                     let payload = crate::mq::wal::encode_mq_push(
@@ -504,12 +604,15 @@ fn handle_push(args: &[Frame], key_prefix: &Bytes, db_index: usize) -> Frame {
                             b"ERR The stream has exhausted the last possible ID, unable to add more items",
                         )));
                     };
-                    Ok(Some((msg_id, payload)))
+                    (Some((msg_id, payload)), stream.take_unbilled())
                 }
             }
-            Ok(None) => Ok(None),
-            Err(e) => Err(e),
-        }
+            Ok(None) => (None, 0),
+            Err(e) => return Err(e),
+        };
+        // moon#1250: the pushed entry is charged to `used_memory`.
+        bill_stream_delta(db, delta);
+        Ok(pushed)
     });
 
     match push_result {
@@ -596,6 +699,10 @@ fn handle_pop(args: &[Frame], key_prefix: &Bytes, db_index: usize) -> Frame {
     // on any error/early-exit path (nothing claimed, nothing to record).
     let (reply, wal_payload): (Frame, Option<Vec<u8>>) =
         crate::shard::slice::with_shard_db(db_index, |db| -> (Frame, Option<Vec<u8>>) {
+            // moon#1228: the claim below writes the queue's PEL and group
+            // cursor (and may release, ack and dead-letter): an armed BGSAVE
+            // epoch gets the queue key's epoch-start state first.
+            crate::persistence::snapshot_cow::capture_write_pre_image(db, db_index, &eff_key);
             // Step 1: read max_delivery_count.
             let mdc = match db.get_stream_mut(&eff_key) {
                 Ok(Some(stream)) => {
@@ -632,6 +739,9 @@ fn handle_pop(args: &[Frame], key_prefix: &Bytes, db_index: usize) -> Frame {
                 Err(_) => return (Frame::Array(vec![].into()), None),
             };
             if claimed.is_empty() {
+                // moon#1250: the read may still have created the consumer.
+                let delta = stream.take_unbilled();
+                bill_stream_delta(db, delta);
                 return (Frame::Array(vec![].into()), None);
             }
 
@@ -687,23 +797,31 @@ fn handle_pop(args: &[Frame], key_prefix: &Bytes, db_index: usize) -> Frame {
             // Release the surplus: un-claim it from the PEL and the consumer's
             // pending set, and rewind the group cursor to the last entry this
             // POP actually kept, so the next POP re-reads from there.
-            if cut < claimed.len()
-                && let Some(group) = stream.groups.get_mut(group_name.as_ref())
-            {
-                for (id, _) in &claimed[cut..] {
-                    group.pel.remove(id);
-                    if let Some(c) = group.consumers.get_mut(consumer_name.as_ref()) {
-                        c.pending.remove(id);
-                    }
+            //
+            // moon#1250: the un-claim goes through `Stream::xack` (exactly the
+            // PEL + consumer-pending removal this did by hand) because xack
+            // also credits the stream's unbilled delta. `read_group_new`
+            // charged every over-claimed entry; removing them behind the
+            // stream's back left those bytes charged to `used_memory` after
+            // they were gone — again on every POP, since the next POP
+            // re-claims the same entries.
+            if cut < claimed.len() {
+                let released: smallvec::SmallVec<[StreamId; 8]> =
+                    claimed[cut..].iter().map(|(id, _)| *id).collect();
+                let _ = stream.xack(&group_name, &released);
+                if let Some(group) = stream.groups.get_mut(group_name.as_ref()) {
+                    group.last_delivered_id = if cut == 0 {
+                        prev_last_delivered
+                    } else {
+                        claimed[cut - 1].0
+                    };
                 }
-                group.last_delivered_id = if cut == 0 {
-                    prev_last_delivered
-                } else {
-                    claimed[cut - 1].0
-                };
             }
 
             if results.is_empty() && dlq_entries.is_empty() {
+                // moon#1250: the claim and its release both moved bytes.
+                let delta = stream.take_unbilled();
+                bill_stream_delta(db, delta);
                 return (Frame::Array(vec![].into()), None);
             }
 
@@ -727,6 +845,10 @@ fn handle_pop(args: &[Frame], key_prefix: &Bytes, db_index: usize) -> Frame {
                 .get(group_name.as_ref())
                 .map(|g| g.last_delivered_id)
                 .unwrap_or(StreamId::ZERO);
+            // moon#1250: the claim (PEL, consumer), release and dead-letter
+            // ack are charged / credited to `used_memory`.
+            let delta = stream.take_unbilled();
+            bill_stream_delta(db, delta);
 
             // Step 5: append DLQ entries to the sibling DLQ stream, capturing
             // the ASSIGNED dlq-stream id for each (outcome-deterministic —
@@ -741,12 +863,17 @@ fn handle_pop(args: &[Frame], key_prefix: &Bytes, db_index: usize) -> Frame {
                     buf.extend_from_slice(b"::mq:dlq");
                     Bytes::from(buf)
                 };
+                // moon#1228: the DLQ stream is a second written key.
+                crate::persistence::snapshot_cow::capture_write_pre_image(db, db_index, &dlq_key);
                 if let Ok(dlq_stream) = db.get_or_create_stream(&dlq_key) {
                     for (src_id, fields) in dlq_entries {
                         let dlq_id = dlq_stream.next_auto_id();
                         dlq_stream.add(dlq_id, fields);
                         dlq_for_wal.push((src_id.ms, src_id.seq, dlq_id.ms, dlq_id.seq));
                     }
+                    // moon#1250: the dead letters are charged too.
+                    let delta = dlq_stream.take_unbilled();
+                    bill_stream_delta(db, delta);
                 }
             }
 
@@ -817,17 +944,21 @@ fn handle_ack(args: &[Frame], key_prefix: &Bytes, db_index: usize) -> Frame {
         .map(|(ms, seq)| StreamId { ms: *ms, seq: *seq })
         .collect();
 
-    let ack_result =
-        crate::shard::slice::with_shard_db(db_index, |db| match db.get_stream_mut(&eff_key) {
+    let ack_result = crate::shard::slice::with_shard_db(db_index, |db| {
+        // moon#1228: see `handle_create`.
+        crate::persistence::snapshot_cow::capture_write_pre_image(db, db_index, &eff_key);
+        let (acked, delta) = match db.get_stream_mut(&eff_key) {
             Ok(Some(stream)) => {
                 let group_name = Bytes::from_static(b"__mq_consumers");
-                match stream.xack(&group_name, &ids) {
-                    Ok(count) => Some(count),
-                    Err(_) => None,
-                }
+                let acked = stream.xack(&group_name, &ids).ok();
+                (acked, stream.take_unbilled())
             }
-            _ => None,
-        });
+            _ => (None, 0),
+        };
+        // moon#1250: the PEL entries an ACK removes are credited back.
+        bill_stream_delta(db, delta);
+        acked
+    });
 
     match ack_result {
         Some(acked_count) => {
@@ -1058,7 +1189,7 @@ mod tests {
                 ]
                 .into(),
             ));
-            execute_mq_on_owner(0, Bytes::new(), cmd)
+            execute_mq_on_owner(0, Bytes::new(), cmd, &mut |_, _| Ok(()))
         })
         .join()
         .expect("test thread panicked");
@@ -1082,7 +1213,8 @@ mod tests {
                 ]
                 .into(),
             ));
-            let create_result = execute_mq_on_owner(0, Bytes::new(), create_cmd);
+            let create_result =
+                execute_mq_on_owner(0, Bytes::new(), create_cmd, &mut |_, _| Ok(()));
             assert_eq!(
                 create_result,
                 Frame::SimpleString(Bytes::from_static(b"OK")),
@@ -1098,11 +1230,236 @@ mod tests {
                 ]
                 .into(),
             ));
-            execute_mq_on_owner(0, Bytes::new(), dlqlen_cmd)
+            execute_mq_on_owner(0, Bytes::new(), dlqlen_cmd, &mut |_, _| Ok(()))
         })
         .join()
         .expect("test thread panicked");
 
         assert_eq!(result, Frame::Integer(0));
+    }
+
+    // ── moon#1228: snapshot pre-image capture ─────────────────────────────────
+
+    fn mq(parts: &[&str]) -> Frame {
+        let mut argv = vec![Frame::BulkString(Bytes::from_static(b"MQ"))];
+        argv.extend(
+            parts
+                .iter()
+                .map(|p| Frame::BulkString(Bytes::copy_from_slice(p.as_bytes()))),
+        );
+        execute_mq_on_owner(
+            0,
+            Bytes::new(),
+            Arc::new(Frame::Array(argv.into())),
+            &mut |_, _| Ok(()),
+        )
+    }
+
+    /// The id of the one entry an `MQ POP ... COUNT 1` reply carries.
+    fn popped_id(reply: &Frame) -> String {
+        let Frame::Array(entries) = reply else {
+            panic!("POP reply {reply:?}");
+        };
+        let Some(Frame::Array(entry)) = entries.first() else {
+            panic!("POP delivered nothing: {reply:?}");
+        };
+        match entry.first() {
+            Some(Frame::BulkString(id)) => String::from_utf8_lossy(id).into_owned(),
+            other => panic!("POP entry id {other:?}"),
+        }
+    }
+
+    /// MQ.CREATE / PUSH / POP / ACK, a TXN MQ.PUBLISH materialization and a
+    /// replicated MQ record all write their queue outside `command::dispatch`.
+    /// Under an armed BGSAVE epoch each must capture the queue's epoch-start
+    /// state first; before moon#1228 none did, so a queue whose range the save
+    /// had not written yet reached the file with its post-epoch length, PEL
+    /// and group cursor, and a queue created mid-save was in the file at all.
+    #[test]
+    fn mq_writes_mid_epoch_keep_the_snapshot_point_in_time() {
+        use crate::persistence::snapshot::{SnapshotState, shard_snapshot_load};
+        use crate::persistence::snapshot_cow;
+        use crate::shard::slice::with_shard_db;
+
+        std::thread::spawn(|| {
+            init_shard(make_test_slice(1));
+            const QUEUES: usize = 64;
+            let q = |i: usize| format!("q{i:03}");
+            with_shard_db(0, |db| {
+                for i in 0..3000u32 {
+                    db.set_string(format!("fill:{i}").as_bytes(), Bytes::from_static(b"x"));
+                }
+            });
+            for i in 0..QUEUES {
+                assert_eq!(
+                    mq(&["CREATE", &q(i)]),
+                    Frame::SimpleString(Bytes::from_static(b"OK"))
+                );
+                for _ in 0..3 {
+                    assert!(matches!(
+                        mq(&["PUSH", &q(i), "f", "v"]),
+                        Frame::BulkString(_)
+                    ));
+                }
+            }
+
+            // BGSAVE starts; one segment of db 0 is written.
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = dir.path().join("s.rrdshard");
+            let mut state = with_shard_db(0, |db| {
+                SnapshotState::new(0, 1, std::slice::from_ref(&*db), path.clone())
+            });
+            snapshot_cow::disarm();
+            snapshot_cow::arm_with_layout(state.segment_counts().to_vec());
+            assert!(!with_shard_db(0, |db| state.advance_one_segment_db(db)));
+            snapshot_cow::note_progress(state.current_db_index(), state.cursor());
+
+            // Mid-epoch MQ writes, on queues on both sides of the cursor.
+            for i in 0..QUEUES {
+                assert!(matches!(
+                    mq(&["PUSH", &q(i), "f", "v2"]),
+                    Frame::BulkString(_)
+                ));
+                let id = popped_id(&mq(&["POP", &q(i), "COUNT", "1"]));
+                if i % 2 == 0 {
+                    assert_eq!(mq(&["ACK", &q(i), &id]), Frame::Integer(1));
+                }
+            }
+            for i in QUEUES..QUEUES + 8 {
+                mq(&["CREATE", &q(i)]);
+            }
+            let intents: Vec<crate::transaction::MqIntent> = (0..QUEUES)
+                .step_by(3)
+                .map(|i| crate::transaction::MqIntent {
+                    queue_key: Bytes::from(q(i)),
+                    fields: vec![(Bytes::from_static(b"t"), Bytes::from_static(b"x"))],
+                })
+                .collect();
+            let pushed = with_shard_db(0, |db| materialize_mq_intents(db, 0, &intents)).len();
+            assert_eq!(pushed, intents.len(), "setup: TXN intents applied");
+            crate::shard::slice::with_shard(|s| {
+                for i in (1..QUEUES).step_by(3) {
+                    crate::shard::shared_databases::apply_mq_push(
+                        s,
+                        0,
+                        q(i).as_bytes(),
+                        StreamId { ms: 1, seq: 0 },
+                        vec![(Bytes::from_static(b"r"), Bytes::from_static(b"y"))],
+                    );
+                }
+            });
+
+            // The epoch finishes.
+            snapshot_cow::drain_pending_for_test(&mut state);
+            while !with_shard_db(0, |db| state.advance_one_segment_db(db)) {
+                snapshot_cow::note_progress(state.current_db_index(), state.cursor());
+            }
+            state.finalize().expect("finalize");
+            snapshot_cow::disarm();
+
+            let mut loaded = vec![Database::new()];
+            shard_snapshot_load(&mut loaded, &path).expect("load");
+            let mut wrong = Vec::new();
+            for i in 0..QUEUES {
+                let s = loaded[0]
+                    .get_stream(q(i).as_bytes())
+                    .ok()
+                    .flatten()
+                    .expect("queue in the file");
+                let g = &s.groups[b"__mq_consumers".as_ref()];
+                if s.length != 3 || !g.pel.is_empty() || g.last_delivered_id != StreamId::ZERO {
+                    wrong.push(format!(
+                        "{}: length {} pel {} cursor {:?}",
+                        q(i),
+                        s.length,
+                        g.pel.len(),
+                        g.last_delivered_id
+                    ));
+                }
+            }
+            let created: Vec<String> = (QUEUES..QUEUES + 8)
+                .map(q)
+                .filter(|k| loaded[0].get_stream(k.as_bytes()).ok().flatten().is_some())
+                .collect();
+            (wrong, created)
+        })
+        .join()
+        .map(|(wrong, created)| {
+            assert!(
+                wrong.is_empty(),
+                "{} queues reached the file at their post-epoch state: {:?}",
+                wrong.len(),
+                &wrong[..wrong.len().min(5)]
+            );
+            assert!(
+                created.is_empty(),
+                "queues created mid-epoch are in the file: {created:?}"
+            );
+        })
+        .expect("test thread panicked");
+    }
+
+    // ── moon#1250: MQ writes are charged to used_memory and gated ─────────────
+
+    /// Before moon#1250 no MQ subcommand drained the stream's unbilled delta
+    /// (`Stream::take_unbilled`), so 20,000 pushes of 100 B grew
+    /// `used_memory` by a few hundred bytes; and MQ ran no write gate, so
+    /// `maxmemory` could never refuse one.
+    #[test]
+    fn mq_writes_are_charged_to_used_memory_and_run_the_write_gate() {
+        use crate::shard::slice::with_shard_db;
+        std::thread::spawn(|| {
+            init_shard(make_test_slice(1));
+            assert_eq!(
+                mq(&["CREATE", "q"]),
+                Frame::SimpleString(Bytes::from_static(b"OK"))
+            );
+            let used = || with_shard_db(0, |db| db.estimated_memory());
+            let before = used();
+            let value = "v".repeat(100);
+            let mut ids = Vec::new();
+            for _ in 0..200 {
+                match mq(&["PUSH", "q", "f", &value]) {
+                    Frame::BulkString(id) => ids.push(String::from_utf8_lossy(&id).into_owned()),
+                    other => panic!("PUSH: {other:?}"),
+                }
+            }
+            let pushed = used() - before;
+            assert!(
+                pushed >= 200 * 100,
+                "200 pushes of 100 B must be charged: used_memory +{pushed}"
+            );
+            // A claim adds PEL entries; the ACK credits them back.
+            let _ = mq(&["POP", "q", "COUNT", "50"]);
+            let claimed = used();
+            let mut ack = vec!["ACK", "q"];
+            ack.extend(ids.iter().take(50).map(String::as_str));
+            assert_eq!(mq(&ack), Frame::Integer(50));
+            assert!(used() < claimed, "an ACK must credit its PEL entries back");
+
+            // The gate refuses a growing write, and nothing is pushed then.
+            let _gate = crate::storage::eviction::force_write_gate(true);
+            let oom = Frame::Error(Bytes::from_static(b"OOM test refusal"));
+            let refused = execute_mq_on_owner(
+                0,
+                Bytes::new(),
+                Arc::new(Frame::Array(
+                    vec![
+                        Frame::BulkString(Bytes::from_static(b"MQ")),
+                        Frame::BulkString(Bytes::from_static(b"PUSH")),
+                        Frame::BulkString(Bytes::from_static(b"q")),
+                        Frame::BulkString(Bytes::from_static(b"f")),
+                        Frame::BulkString(Bytes::from_static(b"v")),
+                    ]
+                    .into(),
+                )),
+                &mut |_, _| Err(oom.clone()),
+            );
+            assert_eq!(refused, oom);
+            let len = with_shard_db(0, |db| db.get_stream(b"q").ok().flatten().map(|s| s.length));
+            assert_eq!(len, Some(200), "a refused PUSH adds nothing");
+        })
+        .join()
+        .expect("test thread panicked");
     }
 }

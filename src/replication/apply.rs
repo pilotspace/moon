@@ -593,18 +593,10 @@ fn apply_ws_drop(
     // Every db exclusively guarded for the whole sweep: dropping a workspace
     // must not be observable half-done (db 0 swept, db 7 not), which is the
     // atomicity this loop had for free while the slice was single-threaded.
-    s.databases.with_all(|dbs| {
-        for db in dbs.iter_mut() {
-            let keys_to_delete: Vec<Vec<u8>> = db
-                .keys()
-                .filter(|k| k.as_bytes().starts_with(&prefix_bytes[..]))
-                .map(|k| k.as_bytes().to_vec())
-                .collect();
-            for key in &keys_to_delete {
-                db.remove(key);
-            }
-        }
-    });
+    // `sweep_prefix` is the one sweep body the master's paths run too, so a
+    // replica's own armed BGSAVE captures each key before it goes (moon#1228).
+    s.databases
+        .with_all(|dbs| crate::workspace::sweep_prefix(dbs, &prefix_bytes));
     true
 }
 
@@ -986,7 +978,7 @@ fn apply_two_db(
             Ok((key, dst)) => databases.with_pair(db_idx, dst, |src, dstdb| {
                 src.refresh_now();
                 dstdb.refresh_now();
-                ksmv::move_core(src, dstdb, &key)
+                ksmv::move_core(src, db_idx, dstdb, dst, &key)
             }),
         };
         return Some(resp);
@@ -999,7 +991,15 @@ fn apply_two_db(
         Ok(ca) => databases.with_pair(db_idx, ca.dst_db, |src, dst| {
             src.refresh_now();
             dst.refresh_now();
-            ksmv::copy_core(src, dst, &ca.src_key, &ca.dst_key, ca.replace)
+            ksmv::copy_core(
+                src,
+                db_idx,
+                dst,
+                ca.dst_db,
+                &ca.src_key,
+                &ca.dst_key,
+                ca.replace,
+            )
         }),
     };
     Some(resp)

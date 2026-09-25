@@ -1,19 +1,26 @@
-//! moon#1224 — FLUSHDB / FLUSHALL / SWAPDB while a snapshot epoch is in
-//! flight.
+//! moon#1224, moon#1228 — FLUSHDB / FLUSHALL / SWAPDB while a snapshot
+//! epoch is in flight.
 //!
 //! All three replace or exchange a database's whole table under the epoch.
 //! Before moon#1216's hash-space walk the serializer then indexed a segment
-//! the new table did not have and panicked the shard. Now the walk cannot
-//! go out of bounds, and the epoch reacts to the swap explicitly:
+//! the new table did not have and panicked the shard (moon#1224); the fix for
+//! that ABORTED the save whenever the flushed / swapped database was not
+//! finished, so a workload that flushed more often than one save takes never
+//! completed a BGSAVE (moon#1228). Now the epoch follows the tables:
 //!
-//! - the database was already fully written: nothing to do — the file holds
-//!   its epoch-start contents and the logged FLUSH/SWAPDB replays on top;
-//! - FLUSHDB of a database that was EMPTY: nothing changes for the file;
-//! - otherwise the file could no longer be one instant (part of the
-//!   database written before the swap, the rest gone or foreign), so the
-//!   snapshot is ABORTED: the BGSAVE reports failure and the previous file
-//!   stays in place. This is redis's own answer to `FLUSHALL` during a
-//!   `BGSAVE` (it kills the child); the next save point takes a new one.
+//! - a FLUSHDB of a database the epoch has not finished hands the detached
+//!   table to the epoch (`Database::clear` → `snapshot_cow::note_cleared_table`),
+//!   which writes the pre-flush contents — what redis's forked child writes;
+//! - a SWAPDB re-points the epoch's databases at the slots their tables moved
+//!   to, and captures after the swap are filed under the table's database;
+//! - a database already written, or a flush of an empty one, changes nothing.
+//!
+//! Every case checks the file is exactly the epoch-start keyspace AND that
+//! loading it and replaying the logged tail lands on the live keyspace. A
+//! FLUSHALL still aborts an unfinished epoch — redis kills its RDB child
+//! for it (`flushAllDataAndResetRDB`) — and so does a replica full resync
+//! (its data is not this node's log); the tables either one detaches are
+//! dropped at once, not frozen.
 
 use bytes::Bytes;
 
@@ -112,81 +119,318 @@ fn flushdb_mid_epoch_does_not_crash_the_serializer() {
     assert_eq!(keys.len(), records.len(), "no key written twice");
 }
 
-/// A FLUSH of the database being written, the SWAPDB of one not yet
-/// written, and FLUSHALL: each aborts the epoch. The BGSAVE fails loudly,
-/// nothing is published, and the previous snapshot file is untouched.
-fn assert_aborts(n_dbs: usize, after_ticks: usize, cmd: &[&[u8]]) {
+/// A FLUSHDB of the database being written, the SWAPDB of one not yet
+/// written: the save completes with the epoch-start keyspace (it used to
+/// abort — moon#1228), and file + replayed tail == live keyspace.
+/// Writes before and after the change hit every database, so pre-images
+/// captured before a freeze / swap and writes to a post-flush table are both
+/// exercised.
+fn assert_point_in_time(n_dbs: usize, after_ticks: usize, cmd: &[&[u8]]) {
     let mut dbs: Vec<Database> = (0..n_dbs).map(|_| Database::new()).collect();
     for (i, db) in dbs.iter_mut().enumerate() {
         preload(db, &format!("d{i}"), 1500);
     }
-    let epoch = Epoch::begin(&dbs);
-    // The previous generation, already on disk.
-    shard_snapshot_save(0, 0, &dbs[..1], epoch.path()).unwrap();
-    let previous = std::fs::read(epoch.path()).unwrap();
-    let mut epoch = epoch;
+    let expected = string_keyspace(&dbs);
+    let mut epoch = Epoch::begin(&dbs);
+    for _ in 0..after_ticks {
+        assert!(!epoch.tick_one(&dbs));
+    }
+    let mut tail = Tail::new();
+    for i in 0..n_dbs {
+        for j in (0..1500u32).step_by(97) {
+            let k = format!("d{i}:{j:06}");
+            live(&mut dbs, &mut tail, i, &[b"INCR", k.as_bytes()]);
+        }
+    }
+    live(&mut dbs, &mut tail, 0, cmd);
+    for i in 0..n_dbs {
+        live(&mut dbs, &mut tail, i, &[b"SET", b"after", b"1"]);
+        for j in (0..1500u32).step_by(89) {
+            let k = format!("d{i}:{j:06}");
+            live(&mut dbs, &mut tail, i, &[b"INCR", k.as_bytes()]);
+        }
+    }
+    let records = epoch
+        .try_finish(&dbs)
+        .expect("the save must complete (moon#1228: it used to abort)");
+    assert_eq!(
+        diverge(&expected, &records),
+        Default::default(),
+        "the file must be the epoch-start keyspace"
+    );
+    let recovered = recover(n_dbs, records, &tail);
+    assert_eq!(
+        string_keyspace(&recovered),
+        string_keyspace(&dbs),
+        "file + replayed tail must land on the live keyspace"
+    );
+}
+
+#[test]
+fn flushdb_of_the_database_in_progress_keeps_the_pre_flush_image() {
+    assert_point_in_time(1, 1, &[b"FLUSHDB"]);
+}
+
+#[test]
+fn flushdb_async_of_the_database_in_progress_keeps_the_pre_flush_image() {
+    assert_point_in_time(1, 1, &[b"FLUSHDB", b"ASYNC"]);
+}
+
+/// FLUSHDB of a NON-EMPTY database the epoch has not reached yet.
+#[test]
+fn flushdb_of_a_pending_non_empty_database_keeps_the_pre_flush_image() {
+    let mut dbs: Vec<Database> = (0..2).map(|_| Database::new()).collect();
+    preload(&mut dbs[0], "a", 1500);
+    preload(&mut dbs[1], "b", 10);
+    let expected = string_keyspace(&dbs);
+    let mut epoch = Epoch::begin(&dbs);
+    assert!(!epoch.tick_one(&dbs));
+    let mut tail = Tail::new();
+    live(&mut dbs, &mut tail, 1, &[b"FLUSHDB"]);
+    live(&mut dbs, &mut tail, 1, &[b"SET", b"b:000003", b"post"]);
+    let records = epoch.try_finish(&dbs).expect("db 1 was not written yet");
+    assert_eq!(diverge(&expected, &records), Default::default());
+    let recovered = recover(2, records, &tail);
+    assert_eq!(string_keyspace(&recovered), string_keyspace(&dbs));
+}
+
+/// Redis parity: `flushAllDataAndResetRDB` kills an in-flight RDB child,
+/// so a FLUSHALL while the epoch still has databases to write fails the
+/// save (the previous file stays). The tables its clears detach are dropped
+/// at once — frozen, they held a second copy of the whole dataset until the
+/// walk passed each one.
+fn assert_flushall_aborts(n_dbs: usize, after_ticks: usize, cmd: &[&[u8]]) {
+    let mut dbs: Vec<Database> = (0..n_dbs).map(|_| Database::new()).collect();
+    for (i, db) in dbs.iter_mut().enumerate() {
+        preload(db, &format!("d{i}"), 1500);
+    }
+    let mut epoch = Epoch::begin(&dbs);
     for _ in 0..after_ticks {
         assert!(!epoch.tick_one(&dbs));
     }
     let mut tail = Tail::new();
     live(&mut dbs, &mut tail, 0, cmd);
-    live(&mut dbs, &mut tail, 0, &[b"SET", b"after", b"1"]);
-    let path = epoch.path().to_path_buf();
-    let mut epoch = epoch;
-    let err = epoch
-        .try_finish(&dbs)
-        .expect_err("the snapshot must fail instead of publishing a mixed file");
-    assert!(err.contains("aborted"), "{err}");
-    assert_eq!(
-        std::fs::read(&path).unwrap(),
-        previous,
-        "an aborted snapshot must leave the previous file in place"
+    assert!(
+        dbs.iter().all(|db| db.data().is_empty()),
+        "setup: {cmd:?} must clear every database"
     );
+    assert_eq!(
+        snapshot_cow::frozen_tables_queued_for_test(),
+        0,
+        "{cmd:?}: the aborted epoch kept the detached tables"
+    );
+    let outcome = epoch.try_finish(&dbs);
+    let Err(why) = outcome else {
+        panic!("{cmd:?} mid-epoch must fail the save, as redis's does");
+    };
+    assert!(why.contains("FLUSHALL"), "abort reason: {why}");
 }
 
 #[test]
-fn flushdb_of_the_database_in_progress_aborts_the_snapshot() {
-    assert_aborts(1, 1, &[b"FLUSHDB"]);
+fn flushall_mid_epoch_aborts_the_save() {
+    assert_flushall_aborts(3, 2, &[b"FLUSHALL"]);
 }
 
 #[test]
-fn flushdb_async_of_the_database_in_progress_aborts_the_snapshot() {
-    assert_aborts(1, 1, &[b"FLUSHDB", b"ASYNC"]);
+fn flushall_async_mid_epoch_aborts_the_save() {
+    assert_flushall_aborts(2, 0, &[b"FLUSHALL", b"ASYNC"]);
 }
 
-/// FLUSHDB of a NON-EMPTY database the epoch has not reached yet: its
-/// epoch-start contents are gone before a byte of them was written.
+/// A FLUSHALL once every database is written changes nothing the file
+/// holds: no abort, and file + the replayed FLUSHALL == live keyspace.
 #[test]
-fn flushdb_of_a_pending_non_empty_database_aborts_the_snapshot() {
+fn flushall_after_every_database_is_written_does_not_abort() {
     let mut dbs: Vec<Database> = (0..2).map(|_| Database::new()).collect();
     preload(&mut dbs[0], "a", 1500);
-    preload(&mut dbs[1], "b", 10);
+    preload(&mut dbs[1], "b", 1500);
+    let expected = string_keyspace(&dbs);
+    let mut epoch = Epoch::begin(&dbs);
+    while !epoch.tick_one(&dbs) {}
+    let mut tail = Tail::new();
+    live(&mut dbs, &mut tail, 1, &[b"FLUSHALL"]);
+    live(&mut dbs, &mut tail, 0, &[b"SET", b"after", b"1"]);
+    assert!(snapshot_cow::abort_pending_for_test().is_none());
+    let records = epoch
+        .try_finish(&dbs)
+        .expect("a FLUSHALL after the walk must not fail the save");
+    assert_eq!(diverge(&expected, &records), Default::default());
+    let recovered = recover(2, records, &tail);
+    assert_eq!(string_keyspace(&recovered), string_keyspace(&dbs));
+}
+
+/// A FLUSHALL by another name — FLUSHDB of every database, over and over —
+/// is bounded: at most ONE frozen table per database of the epoch (the
+/// epoch-start one; a flushed slot is unmapped, so later flushes drop their
+/// table), so the epoch never holds more than the epoch-start dataset, and
+/// each table is released as soon as the walk finishes its database. The
+/// same worst case as redis, whose forked child keeps every pre-flush page
+/// on FLUSHDB (only FLUSHALL kills it). And the save still completes with
+/// the epoch-start keyspace.
+#[test]
+fn flushdb_of_every_database_holds_at_most_the_epoch_start_tables() {
+    const N_DBS: usize = 4;
+    let mut dbs: Vec<Database> = (0..N_DBS).map(|_| Database::new()).collect();
+    for (i, db) in dbs.iter_mut().enumerate() {
+        preload(db, &format!("d{i}"), 2000);
+    }
+    let start_bytes: Vec<u64> = dbs.iter().map(|db| db.estimated_memory() as u64).collect();
+    let expected = string_keyspace(&dbs);
     let mut epoch = Epoch::begin(&dbs);
     assert!(!epoch.tick_one(&dbs));
-    run(&mut dbs, 1, &[b"FLUSHDB"]);
-    let err = epoch
-        .try_finish(&dbs)
-        .expect_err("db 1 was not written yet");
-    assert!(err.contains("aborted"), "{err}");
+    let mut tail = Tail::new();
+    for round in 0..20 {
+        for db in 0..N_DBS {
+            live(&mut dbs, &mut tail, db, &[b"FLUSHDB"]);
+            for j in 0..300u32 {
+                let k = format!("r{round}:{j}");
+                live(&mut dbs, &mut tail, db, &[b"SET", k.as_bytes(), b"x"]);
+            }
+        }
+    }
+    assert!(!epoch.tick_one(&dbs));
+    let state = epoch.state.as_ref().expect("epoch");
+    let held = state.cow_bytes();
+    let start_total: u64 = start_bytes.iter().sum();
+    assert!(
+        held > 0 && held <= start_total,
+        "80 flushes held {held} B; the epoch-start dataset is {start_total} B"
+    );
+    // Released database by database as the walk passes it.
+    let mut last = held;
+    loop {
+        let state = epoch.state.as_ref().expect("epoch");
+        let cur = state.current_db_index();
+        let now = state.cow_bytes();
+        let still_to_write: u64 = start_bytes.iter().skip(cur).sum();
+        assert!(
+            now <= last,
+            "held bytes grew during the walk: {last} -> {now}"
+        );
+        assert!(
+            now <= still_to_write,
+            "db {cur}: {now} B held, but only {still_to_write} B of epoch-start tables are left"
+        );
+        last = now;
+        if epoch.tick_one(&dbs) {
+            break;
+        }
+    }
+    let records = epoch.try_finish(&dbs).expect("the save must complete");
+    assert_eq!(diverge(&expected, &records), Default::default());
+    let recovered = recover(N_DBS, records, &tail);
+    assert_eq!(string_keyspace(&recovered), string_keyspace(&dbs));
 }
 
 #[test]
-fn flushall_mid_epoch_aborts_the_snapshot() {
-    assert_aborts(3, 2, &[b"FLUSHALL"]);
+fn swapdb_of_an_unfinished_database_keeps_both_images() {
+    assert_point_in_time(3, 1, &[b"SWAPDB", b"1", b"2"]);
 }
 
+/// The database being written swapped with a pending one, mid-walk: the rest
+/// of db 0's range is read from the slot its table moved to.
 #[test]
-fn flushall_async_mid_epoch_aborts_the_snapshot() {
-    assert_aborts(2, 0, &[b"FLUSHALL", b"ASYNC"]);
+fn swapdb_of_the_database_in_progress_keeps_both_images() {
+    assert_point_in_time(2, 2, &[b"SWAPDB", b"0", b"1"]);
 }
 
+/// Review 4 nit: a frozen table is billed (INFO `current_cow_size`) at its
+/// database's `used_memory`, not `estimated_memory()` — the spill-in-flight
+/// payloads that figure adds are not in the table.
 #[test]
-fn swapdb_of_an_unfinished_database_aborts_the_snapshot() {
-    assert_aborts(3, 1, &[b"SWAPDB", b"1", b"2"]);
+fn a_frozen_table_is_billed_without_the_spill_in_flight_bytes() {
+    let mut dbs = vec![Database::new()];
+    preload(&mut dbs[0], "a", 3000);
+    let table_bytes = dbs[0].estimated_memory() as u64;
+    dbs[0].spill_inflight_mark(
+        Bytes::from_static(b"spilled"),
+        crate::storage::db::PendingSpill {
+            req_id: 1,
+            value_type: crate::persistence::kv_page::ValueType::String,
+            value_bytes: Bytes::from(vec![0u8; 1 << 20]),
+            ttl_ms: None,
+        },
+    );
+    assert!(
+        dbs[0].estimated_memory() as u64 > table_bytes + (1 << 20),
+        "setup: the in-flight payload is billed to the database"
+    );
+    let mut epoch = Epoch::begin(&dbs);
+    assert!(!epoch.tick_one(&dbs));
+    let _ = run(&mut dbs, 0, &[b"FLUSHDB"]);
+    // The drain freezes the table, and db 0 has segments left to write.
+    assert!(!epoch.tick_one(&dbs));
+    let held = epoch.state.as_ref().expect("epoch").cow_bytes();
+    let _ = epoch.try_finish(&dbs);
+    assert_eq!(held, table_bytes, "the frozen table's bill");
+}
+
+/// The liveness half of moon#1228: a workload that FLUSHDBs (and SWAPDBs)
+/// more often than one save takes. It used to fail every BGSAVE; each tick
+/// here flushes, swaps, refills and increments, and the save must still
+/// complete with the epoch-start keyspace. Randomized over seeds (printed on
+/// failure). (A FLUSHALL fails the save — redis parity, above — so it is
+/// not part of this workload.)
+#[test]
+fn a_workload_flushing_faster_than_one_save_still_completes_it() {
+    use super::epoch_harness::Rng;
+    for seed in 1..=12u64 {
+        let mut rng = Rng(seed);
+        let mut dbs: Vec<Database> = (0..3).map(|_| Database::new()).collect();
+        for (i, db) in dbs.iter_mut().enumerate() {
+            preload(db, &format!("d{i}"), 1200);
+        }
+        let expected = string_keyspace(&dbs);
+        let mut epoch = Epoch::begin(&dbs);
+        let mut tail = Tail::new();
+        let mut ticks = 0u32;
+        loop {
+            for _ in 0..8 {
+                let db = rng.below(3) as usize;
+                let k = format!("d{}:{:06}", rng.below(3), rng.below(1400));
+                match rng.below(10) {
+                    0 => live(&mut dbs, &mut tail, db, &[b"FLUSHDB"]),
+                    1 => live(&mut dbs, &mut tail, db, &[b"FLUSHDB", b"ASYNC"]),
+                    2 => {
+                        let a = rng.below(3).to_string();
+                        let b = rng.below(3).to_string();
+                        live(
+                            &mut dbs,
+                            &mut tail,
+                            db,
+                            &[b"SWAPDB", a.as_bytes(), b.as_bytes()],
+                        );
+                    }
+                    3 => live(&mut dbs, &mut tail, db, &[b"DEL", k.as_bytes()]),
+                    4 | 5 => live(&mut dbs, &mut tail, db, &[b"SET", k.as_bytes(), b"s"]),
+                    _ => live(&mut dbs, &mut tail, db, &[b"INCR", k.as_bytes()]),
+                }
+            }
+            ticks += 1;
+            if epoch.tick_one(&dbs) {
+                break;
+            }
+            assert!(ticks < 100_000, "seed {seed}: the epoch never converged");
+        }
+        let records = epoch
+            .try_finish(&dbs)
+            .unwrap_or_else(|e| panic!("seed {seed}: the save failed: {e}"));
+        assert_eq!(
+            diverge(&expected, &records),
+            Default::default(),
+            "seed {seed}: the file is not the epoch-start keyspace"
+        );
+        let recovered = recover(3, records, &tail);
+        assert_eq!(
+            string_keyspace(&recovered),
+            string_keyspace(&dbs),
+            "seed {seed}: file + tail is not the live keyspace"
+        );
+    }
 }
 
 /// The hook sits in the one place every SWAPDB path (coordinator local leg,
-/// the SPSC arm, replica apply) exchanges tables: `ShardDbSet::swap`.
+/// the SPSC arm, replica apply) exchanges tables: `ShardDbSet::swap`. Under
+/// an armed epoch it re-maps the slots (moon#1228) instead of aborting.
 #[test]
 fn shard_db_set_swap_notifies_the_armed_epoch() {
     let (shared, mut inits) = crate::shard::shared_databases::ShardDatabases::new(vec![vec![
@@ -198,15 +442,46 @@ fn shard_db_set_swap_notifies_the_armed_epoch() {
     snapshot_cow::disarm();
     snapshot_cow::arm_with_layout(vec![1, 1]);
     crate::shard::slice::with_shard(|s| s.databases.swap(0, 1));
+    let mapped = snapshot_cow::logical_of_slot_for_test();
     let aborted = snapshot_cow::abort_pending_for_test();
     snapshot_cow::disarm();
-    assert!(
-        aborted.is_some(),
+    assert_eq!(
+        mapped,
+        vec![Some(1), Some(0)],
         "SWAPDB under an armed epoch went unnoticed"
+    );
+    assert!(
+        aborted.is_none(),
+        "a SWAPDB must not fail the save any more"
     );
     // Unarmed: a swap is free and leaves nothing behind.
     crate::shard::slice::with_shard(|s| s.databases.swap(0, 1));
     assert!(snapshot_cow::abort_pending_for_test().is_none());
+}
+
+/// `Database::clear` on the shard's own db plane is recognised by address:
+/// a FLUSHDB of an unfinished database freezes its table instead of
+/// aborting, and unmaps the slot.
+#[test]
+fn a_flush_on_the_db_plane_freezes_the_table_of_an_unfinished_database() {
+    let (shared, mut inits) = crate::shard::shared_databases::ShardDatabases::new(vec![vec![
+        Database::new(),
+        Database::new(),
+    ]]);
+    let _keep = shared;
+    crate::shard::slice::reset_test_shard(crate::shard::slice::ShardSlice::new(inits.remove(0)));
+    crate::shard::slice::with_shard_db(1, |db| preload(db, "b", 50));
+    snapshot_cow::disarm();
+    snapshot_cow::arm_with_layout(vec![1, 1]);
+    crate::shard::slice::with_shard_db(1, |db| db.clear());
+    let mapped = snapshot_cow::logical_of_slot_for_test();
+    let aborted = snapshot_cow::abort_pending_for_test();
+    snapshot_cow::disarm();
+    assert_eq!(mapped, vec![Some(0), None], "slot 1's table was frozen");
+    assert!(
+        aborted.is_none(),
+        "a FLUSHDB must not fail the save any more"
+    );
 }
 
 /// moon#1227 review F6: a replica FULL RESYNC replaces every database of the
@@ -215,8 +490,8 @@ fn shard_db_set_swap_notifies_the_armed_epoch() {
 /// the FLUSH hook nor `ShardDbSet::swap` saw it, and an epoch armed on the
 /// replica published a file mixing its own epoch-start data with the
 /// master's. It must abort exactly like FLUSHALL (BGSAVE fails, the previous
-/// file stays); a resync with nothing armed, or after the epoch finished
-/// writing, changes nothing.
+/// file stays, the tables its clears detach are dropped at once); a resync
+/// with nothing armed, or after the epoch finished writing, changes nothing.
 #[test]
 fn a_replica_full_resync_aborts_an_unfinished_epoch() {
     let (shared, mut inits) = crate::shard::shared_databases::ShardDatabases::new(vec![vec![
@@ -234,8 +509,13 @@ fn a_replica_full_resync_aborts_an_unfinished_epoch() {
     snapshot_cow::arm_with_layout(vec![1, 1]);
     let loaded = crate::replication::apply::load_snapshot(&rdb, &shared).map_err(|e| e.to_string());
     let aborted = snapshot_cow::abort_pending_for_test();
+    let frozen = snapshot_cow::frozen_tables_queued_for_test();
     snapshot_cow::disarm();
     assert_eq!(loaded, Ok(10), "setup: the resync loads the master's keys");
+    assert_eq!(
+        frozen, 0,
+        "the resync's cleared tables must be dropped at once, not held until the next drain"
+    );
     assert!(
         aborted.is_some(),
         "a full resync under an armed epoch went unnoticed: the file would mix \

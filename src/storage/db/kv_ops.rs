@@ -692,7 +692,14 @@ impl Database {
     /// non-idempotent commands from pre-existing state would be double-applied.
     pub fn clear(&mut self) {
         crate::admin::metrics_setup::record_keyspace_change();
-        self.data = DashTable::new();
+        // moon#1228: an armed BGSAVE epoch that has not written this database
+        // yet keeps the old table as its epoch-start contents (the save then
+        // completes with the pre-flush image instead of aborting); otherwise
+        // `note_cleared_table` drops it, as this assignment used to. The
+        // table's bill is `used_memory` (not `estimated_memory`: the
+        // spill-in-flight bytes are not in the table).
+        let old = std::mem::replace(&mut self.data, DashTable::new());
+        crate::persistence::snapshot_cow::note_cleared_table(self, old, self.used_memory as u64);
         // moon#1190: the ledger restarts at 0; values still being freed must
         // not be credited against it again.
         self.lazy_free_forget_charges();

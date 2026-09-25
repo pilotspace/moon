@@ -268,8 +268,11 @@ pub(crate) fn advance_snapshot_segment(
         let current_db = snap.current_db_index();
         let db_count = shard_databases.db_count();
         if current_db < db_count {
+            // moon#1228: the slot holding the current database's epoch-start
+            // table — its own index unless a SWAPDB moved it.
+            let source = snap.source_db_index();
             let done =
-                crate::shard::slice::with_shard_db(current_db, |db| snap.advance_budgeted_db(db));
+                crate::shard::slice::with_shard_db(source, |db| snap.advance_budgeted_db(db));
             // Captures from here on are filtered against the new cursor.
             crate::persistence::snapshot_cow::note_progress(snap.current_db_index(), snap.cursor());
             done
