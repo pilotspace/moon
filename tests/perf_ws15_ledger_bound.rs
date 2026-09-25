@@ -16,7 +16,8 @@
 //!   ledger no eviction can shrink answers OOM instead of growing RSS;
 //! - the reclaim (`storage::tiered::cold_reclaim`) compacts the mostly-dead
 //!   files, and once the fold the auto-rewrite monitor dispatches commits,
-//!   adopts them and unlinks the old files — the ledger itself comes down.
+//!   adopts them and unlinks the old files — the ledger itself comes down,
+//!   to under a tenth of the keys deleted.
 //!
 //! Then the data: every key whose SET was acknowledged and never deleted
 //! reads back, before and after a `kill -9` restart, and a sample of the
@@ -177,17 +178,26 @@ fn used_memory_stays_bounded_under_cold_delete_churn() {
             assert!(r.starts_with(':'), "DEL is never refused: {r:?}");
         }
         deleted.extend(dead);
+        // Right after the DELs (before a reclaim fold can have committed) and
+        // again once things settle a little.
+        let fresh = sample(&mut c);
         std::thread::sleep(Duration::from_secs(3));
         let s = sample(&mut c);
-        if s.dead_bytes > peak.dead_bytes {
-            peak.dead_bytes = s.dead_bytes;
-            peak.dead_slots = s.dead_slots;
+        for x in [fresh, s] {
+            if x.dead_bytes > peak.dead_bytes {
+                peak.dead_bytes = x.dead_bytes;
+                peak.dead_slots = x.dead_slots;
+            }
+            peak.used = peak.used.max(x.used);
+            peak.rss = peak.rss.max(x.rss);
         }
-        peak.used = peak.used.max(s.used);
-        peak.rss = peak.rss.max(s.rss);
         eprintln!(
-            "round {r}: used_memory {} ({:.2}x maxmemory) rss {} cold_dead_slots {} \
-             cold_dead_slot_bytes {} writes refused so far {refused}",
+            "round {r}: after the DELs cold_dead_slots {} used_memory {} ({:.2}x); 3 s later \
+             used_memory {} ({:.2}x maxmemory) rss {} cold_dead_slots {} cold_dead_slot_bytes \
+             {} writes refused so far {refused}",
+            fresh.dead_slots,
+            fresh.used,
+            ratio(fresh.used),
             s.used,
             ratio(s.used),
             s.rss,
@@ -202,23 +212,30 @@ fn used_memory_stays_bounded_under_cold_delete_churn() {
         peak.dead_slots
     );
 
-    // The reclaim: the ledger comes down and used_memory settles within
-    // 1.5x maxmemory (a fold per reclaim cycle, dispatched by the monitor).
+    // The reclaim: used_memory settles within 1.5x maxmemory and the ledger
+    // holds under a tenth of the keys deleted. Without reclaim it holds every
+    // deleted cold key (~95% of them on the PR head), and even with writes
+    // refused at admission a whole round's worth (~20%): reclaim is what
+    // gets it lower. (It stops once the ledger is under its share of the
+    // budget, so "back to zero" is not the criterion.)
     let deadline = Instant::now() + Duration::from_secs(120);
+    let ledger_cap = (deleted.len() / 10) as u64;
     let settled = loop {
         let s = sample(&mut c);
-        if ratio(s.used) <= 1.5 && s.dead_bytes <= peak.dead_bytes / 2 {
+        if ratio(s.used) <= 1.5 && s.dead_slots <= ledger_cap {
             break s;
         }
         assert!(
             Instant::now() < deadline,
-            "used_memory {} is {:.2}x maxmemory {MAXMEMORY} (peak {:.2}x), ledger {} of a \
-             {}-byte peak, after {} rounds of delete churn; {refused} writes refused; dir {}",
+            "used_memory {} is {:.2}x maxmemory {MAXMEMORY} (peak {:.2}x), ledger {} slots \
+             ({} bytes) after deleting {} keys (cap {ledger_cap}), after {} rounds of delete \
+             churn; {refused} writes refused; dir {}",
             s.used,
             ratio(s.used),
             ratio(peak.used),
+            s.dead_slots,
             s.dead_bytes,
-            peak.dead_bytes,
+            deleted.len(),
             ROUNDS,
             dir.display()
         );
