@@ -67,12 +67,14 @@ pub(super) fn run(
     let committed = overflow.committed_floor().0;
     let db_count = shard_databases.db_count();
 
-    // 1. Adopt what a committed fold made safe — ONE database per tick: each
-    // database that adopts does one durable manifest commit on this thread,
-    // so the pass is bounded like the compaction pass below (PR #1233
-    // review). A database with ready compactions adopts all of them at once,
-    // so later databases get their turn on the next tick; nothing starves,
-    // and a compaction that waits a tick stays exactly as safe.
+    // 1. Adopt what a committed fold made safe — ONE database per tick (PR
+    // #1233 review). That database adopts ALL its ready compactions at once,
+    // which costs up to two durable manifest commits on this thread (listing
+    // the new files, then tombstoning the old ones it unlinks) plus those
+    // unlinks; the compaction limits below do not bound it. Later databases
+    // get their turn on the next tick, so nothing starves, and a compaction
+    // that waits a tick stays exactly as safe. Moving this I/O off the shard
+    // thread is moon#1240.
     for db_index in 0..db_count {
         let report =
             crate::shard::slice::with_shard_db(db_index, |db| match db.cold_index.as_mut() {
