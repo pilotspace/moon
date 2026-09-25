@@ -503,26 +503,38 @@ mod tests {
         let mut m = ShardManifest::create(&path).expect("create");
         m.enable_deferred_sync(8);
 
-        m.set_inject_sync_delay_ms(200);
+        // REVIEW7 R3: no wall-clock bound a loaded machine can miss. The
+        // persist sleeps `DELAY` before it writes, so an ack is resolved no
+        // earlier than `DELAY` after `t0`: a `commit_acked` that waited for
+        // it returns at `>= DELAY`, and a poll made before `DELAY` has passed
+        // must find it unresolved.
+        const DELAY: Duration = Duration::from_millis(2_000);
+        m.set_inject_sync_delay_ms(DELAY.as_millis() as u64);
         let t0 = Instant::now();
         m.add_file(make_entry(3)).unwrap();
         let mut ack = m.commit_acked();
         let elapsed = t0.elapsed();
         assert!(
-            elapsed < Duration::from_millis(100),
+            elapsed < DELAY,
             "an acked commit must not wait for the persist (took {elapsed:?})"
         );
-        assert!(ack.poll().is_none(), "not durable yet");
-        let deadline = Instant::now() + Duration::from_secs(10);
-        let outcome = loop {
-            if let Some(outcome) = ack.poll() {
-                break outcome;
-            }
-            assert!(Instant::now() < deadline, "the ack never resolved");
-            std::thread::sleep(Duration::from_millis(5));
+        let early = ack.poll();
+        if t0.elapsed() < DELAY {
+            assert!(early.is_none(), "not durable yet");
+        }
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let outcome = match early {
+            Some(outcome) => outcome,
+            None => loop {
+                if let Some(outcome) = ack.poll() {
+                    break outcome;
+                }
+                assert!(Instant::now() < deadline, "the ack never resolved");
+                std::thread::sleep(Duration::from_millis(5));
+            },
         };
         assert!(outcome.is_ok(), "{outcome:?}");
-        assert!(t0.elapsed() >= Duration::from_millis(200));
+        assert!(t0.elapsed() >= DELAY);
         assert!(ack.poll().is_some_and(|o| o.is_err()), "resolves once");
         m.set_inject_sync_delay_ms(0);
         let reopened = ShardManifest::open(&path).expect("reopen");

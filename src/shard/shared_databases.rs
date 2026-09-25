@@ -1216,6 +1216,10 @@ pub fn replay_graph_wal(
         let engine = DispatchReplayEngine::new();
         let mut dummy_dbs: Vec<Database> = (0..db_count).map(|_| Database::new()).collect();
         let mut selected_db = 0usize;
+        // moon#1232 (REVIEW7 R1): this pass only collects graph commands; the
+        // keyspace commands it runs land in throwaway databases and are no
+        // keyspace change (a WAL-logged SWAPDB counted twice at boot).
+        let _quiet = crate::admin::metrics_setup::mute_keyspace_changes();
         let on_command = &mut |record: &WalRecord| {
             if record.record_type != WalRecordType::Command {
                 return;

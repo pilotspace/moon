@@ -430,12 +430,30 @@ pub(crate) fn bgrewriteaof_start_sharded_with_flag(
 ///
 /// Clones all entries under read locks (same as BGSAVE), then serializes
 /// synchronously. Not supported in sharded mode -- use BGSAVE instead.
+///
+/// Claims [`SAVE_IN_PROGRESS`] for its whole run, as BGSAVE does (PR #1268
+/// review): the legacy single-listener server runs connections on several
+/// threads, and a SAVE that only read the flag let a second SAVE, or a
+/// BGSAVE, start alongside it — each `mark_save_started()` overwrote the
+/// other's mark, and the earlier save's completion then counted writes its
+/// snapshot does not hold as saved.
 pub fn handle_save(db: &SharedDatabases, dir: &str, dbfilename: &str) -> Frame {
-    if SAVE_IN_PROGRESS.load(Ordering::SeqCst) {
+    if SAVE_IN_PROGRESS
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
         return Frame::Error(Bytes::from_static(
             b"ERR Background save already in progress",
         ));
     }
+    /// Releases the claim on every exit, a panic included.
+    struct Claim;
+    impl Drop for Claim {
+        fn drop(&mut self) {
+            SAVE_IN_PROGRESS.store(false, Ordering::SeqCst);
+        }
+    }
+    let _claim = Claim;
     // moon#1232: see `bgsave_start`.
     crate::admin::metrics_setup::mark_save_started();
 
@@ -583,24 +601,28 @@ where
         snapshot_trigger,
         num_shards,
         sleep,
+        std::time::Instant::now,
         std::time::Duration::from_millis(SHUTDOWN_SAVE_DEADLINE_MS),
     )
     .await
 }
 
-/// [`shutdown_save`] with its overall budget passed in (tests).
-async fn shutdown_save_within<S, F>(
+/// [`shutdown_save`] with its clock and overall budget passed in (tests run
+/// it on a virtual clock the `sleep` advances).
+async fn shutdown_save_within<S, F, N>(
     snapshot_trigger: &crate::runtime::channel::WatchSender<u64>,
     num_shards: usize,
     sleep: S,
+    now: N,
     budget: std::time::Duration,
 ) -> Result<(), Frame>
 where
     S: Fn(std::time::Duration) -> F,
     F: std::future::Future<Output = ()>,
+    N: Fn() -> std::time::Instant,
 {
     let poll = std::time::Duration::from_millis(SHUTDOWN_SAVE_POLL_MS);
-    let deadline = std::time::Instant::now() + budget;
+    let deadline = now() + budget;
     let timed_out = || {
         Frame::Error(Bytes::from_static(
             b"ERR SHUTDOWN failed: background save timed out, check logs",
@@ -617,7 +639,7 @@ where
                     )));
                 }
                 deferred += 1;
-                wait_for_save(&sleep, poll, deadline)
+                wait_for_save(&sleep, &now, poll, deadline)
                     .await
                     .map_err(|()| timed_out())?;
             }
@@ -625,7 +647,7 @@ where
             // answer what BGSAVE would.
             Frame::Error(e) => return Err(Frame::Error(e)),
             _ => {
-                wait_for_save(&sleep, poll, deadline)
+                wait_for_save(&sleep, &now, poll, deadline)
                     .await
                     .map_err(|()| timed_out())?;
                 return save_outcome();
@@ -635,17 +657,19 @@ where
 }
 
 /// Poll until no save is in progress, `Err` once `deadline` has passed.
-async fn wait_for_save<S, F>(
+async fn wait_for_save<S, F, N>(
     sleep: &S,
+    now: &N,
     poll: std::time::Duration,
     deadline: std::time::Instant,
 ) -> Result<(), ()>
 where
     S: Fn(std::time::Duration) -> F,
     F: std::future::Future<Output = ()>,
+    N: Fn() -> std::time::Instant,
 {
     while SAVE_IN_PROGRESS.load(Ordering::SeqCst) {
-        if std::time::Instant::now() >= deadline {
+        if now() >= deadline {
             return Err(());
         }
         sleep(poll).await;
@@ -718,25 +742,29 @@ mod tests {
         use std::task::{Context, Poll, Waker};
         let _guard = BGSAVE_TEST_LOCK.lock();
         let (tx, _rx) = crate::runtime::channel::watch(0u64);
-        let budget = std::time::Duration::from_millis(300);
+        // REVIEW7 R3: on a virtual clock the sleeps advance — no wall-clock
+        // bound, so machine load cannot fail it — with the real deadline.
+        let budget = std::time::Duration::from_millis(SHUTDOWN_SAVE_DEADLINE_MS);
+        let poll = std::time::Duration::from_millis(SHUTDOWN_SAVE_POLL_MS);
         let start = std::time::Instant::now();
+        let clock = std::cell::Cell::new(start);
         // Another save runs, and ends at 80% of the budget.
         SAVE_IN_PROGRESS.store(true, Ordering::SeqCst);
         let other_ended = std::cell::Cell::new(false);
         let sleep = |d: std::time::Duration| {
-            std::thread::sleep(d);
-            if !other_ended.get() && start.elapsed() >= budget * 4 / 5 {
+            clock.set(clock.get() + d);
+            if !other_ended.get() && clock.get() - start >= budget * 4 / 5 {
                 other_ended.set(true);
                 SAVE_IN_PROGRESS.store(false, Ordering::SeqCst);
             }
             std::future::ready(())
         };
-        let mut fut = std::pin::pin!(shutdown_save_within(&tx, 1, sleep, budget));
+        let mut fut = std::pin::pin!(shutdown_save_within(&tx, 1, sleep, || clock.get(), budget));
         let reply = match fut.as_mut().poll(&mut Context::from_waker(Waker::noop())) {
             Poll::Ready(r) => r,
             Poll::Pending => panic!("every sleep is ready at once"),
         };
-        let elapsed = start.elapsed();
+        let elapsed = clock.get() - start;
         // SHUTDOWN's own save started and never completed: end it.
         assert!(other_ended.get() && SAVE_IN_PROGRESS.load(Ordering::SeqCst));
         bgsave_shard_done(true);
@@ -745,8 +773,76 @@ mod tests {
             "{reply:?}"
         );
         assert!(
-            elapsed < budget * 3 / 2,
-            "gave up after {elapsed:?}, one deadline is {budget:?}"
+            elapsed <= budget + poll,
+            "gave up after {elapsed:?} (virtual), one deadline is {budget:?}"
+        );
+    }
+
+    /// PR #1268 review (CodeRabbit): SAVE claimed nothing — it only READ
+    /// `SAVE_IN_PROGRESS` — so a second SAVE, or a BGSAVE starting while it
+    /// ran, could each `mark_save_started()` over the other's mark, and the
+    /// earlier save's completion then advanced the "saved" mark past writes
+    /// its snapshot does not hold. SAVE now claims the flag for its whole
+    /// run and releases it on every exit.
+    #[test]
+    fn a_save_claims_the_in_progress_flag_for_its_whole_run() {
+        let _guard = BGSAVE_TEST_LOCK.lock();
+        SAVE_IN_PROGRESS.store(false, Ordering::SeqCst);
+        let db: SharedDatabases = Arc::new(vec![parking_lot::RwLock::new(Database::new())]);
+        db[0].write().set_string(b"k", Bytes::from_static(b"v"));
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().to_string_lossy().into_owned();
+
+        // Hold the database's write lock: the SAVE blocks in its snapshot
+        // read, mid-run — deterministically, whatever the machine's load.
+        let held = db[0].write();
+        let saver = {
+            let (db, dir) = (Arc::clone(&db), dir.clone());
+            std::thread::spawn(move || handle_save(&db, &dir, "dump.rdb"))
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut claimed = false;
+        while !claimed && std::time::Instant::now() < deadline {
+            claimed = SAVE_IN_PROGRESS.load(Ordering::SeqCst);
+            std::thread::yield_now();
+        }
+        drop(held);
+        let reply = saver.join().expect("saver");
+        assert!(matches!(reply, Frame::SimpleString(_)), "{reply:?}");
+        assert!(
+            claimed,
+            "the SAVE ran without claiming SAVE_IN_PROGRESS: a concurrent save could start"
+        );
+        assert!(
+            !SAVE_IN_PROGRESS.load(Ordering::SeqCst),
+            "released on success"
+        );
+
+        // A save already running refuses the SAVE and keeps the other's claim.
+        SAVE_IN_PROGRESS.store(true, Ordering::SeqCst);
+        assert!(matches!(
+            handle_save(&db, &dir, "dump.rdb"),
+            Frame::Error(_)
+        ));
+        assert!(
+            SAVE_IN_PROGRESS.load(Ordering::SeqCst),
+            "not ours to release"
+        );
+        SAVE_IN_PROGRESS.store(false, Ordering::SeqCst);
+
+        // A failed save releases the flag too.
+        let missing = tmp
+            .path()
+            .join("no-such-dir")
+            .to_string_lossy()
+            .into_owned();
+        assert!(matches!(
+            handle_save(&db, &missing, "dump.rdb"),
+            Frame::Error(_)
+        ));
+        assert!(
+            !SAVE_IN_PROGRESS.load(Ordering::SeqCst),
+            "released on failure"
         );
     }
 
