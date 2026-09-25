@@ -176,6 +176,6 @@ Green: 11/11 at s1 and 11/11 at s4, on both the monoio and tokio release binarie
 
 ### Phase 2 residuals and notes
 - Item 1 known differences (documented in `command::keyspace_changes`): consumer creation by XREADGROUP/XCLAIM/XAUTOCLAIM not counted; SORT STORE counts 1; ZINCRBY of a new member by 0 counts 0; XGROUP DELCONSUMER of a missing consumer counts 1; SWAPDB 0; SETBIT of an unchanged bit 1. At `--shards 4` the cross-shard multi-key writes that moon accepts (MSET, DEL, UNLINK, MSETNX, COPY, FLUSHALL) match redis, and hash-tagged RENAME / SMOVE / ZUNIONSTORE match; the rest are refused with CROSSSLOT.
-- Item 6 waits for a running save instead of killing it: a SHUTDOWN during a long save may take up to two save bounds (2 x 10 s).
+- Item 6 waits for a running save instead of killing it: a SHUTDOWN during a long save may take up to 20 s, one overall deadline (`SHUTDOWN_SAVE_DEADLINE_MS`; review 5 N1 — it was 4 x 10 s as first committed).
 - `src/storage/db/kv_ops.rs` was 1510 lines on main after the merge and is 1537 now (over the 1500 cap before this phase).
 - Disk: one errant `cargo build --tests` in this phase filled the shared disk for ~2 minutes (6.3 GB of test binaries); the binaries from that build window were deleted and the disk returned to 5.9 GB free.

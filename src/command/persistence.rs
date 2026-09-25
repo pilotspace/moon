@@ -545,8 +545,15 @@ pub const SHUTDOWN_SAVE_TIMEOUT_MS: u64 = 10_000;
 const SAVE_ALREADY_IN_PROGRESS_ERR: &[u8] = b"ERR Background save already in progress";
 
 /// How many times SHUTDOWN's save defers to a save someone else started
-/// before giving up (each wait is bounded by [`SHUTDOWN_SAVE_TIMEOUT_MS`]).
+/// before giving up.
 const SHUTDOWN_SAVE_ATTEMPTS: usize = 3;
+
+/// ONE deadline for everything SHUTDOWN's save does — waiting out the saves
+/// someone else started and running its own — however many it defers to:
+/// two [`SHUTDOWN_SAVE_TIMEOUT_MS`], room for a running save and then this
+/// one. (Review 5: each wait used to get its own 10 s bound, so three
+/// deferrals plus the save could hold SHUTDOWN for 40 s.)
+pub const SHUTDOWN_SAVE_DEADLINE_MS: u64 = 2 * SHUTDOWN_SAVE_TIMEOUT_MS;
 
 /// SHUTDOWN's save in sharded / monoio mode: a cooperative per-shard BGSAVE,
 /// polled to completion with `sleep` (the caller's runtime timer).
@@ -560,8 +567,9 @@ const SHUTDOWN_SAVE_ATTEMPTS: usize = 3;
 /// started, and a SHUTDOWN save must hold them.
 ///
 /// `Err` carries the reply that refuses the SHUTDOWN (the server stays up):
-/// a save that failed or did not finish within [`SHUTDOWN_SAVE_TIMEOUT_MS`],
-/// or one that could not start (no persistence directory).
+/// a save that failed, or that did not finish by the one overall deadline
+/// ([`SHUTDOWN_SAVE_DEADLINE_MS`] from the call), or one that could not
+/// start (no persistence directory).
 pub async fn shutdown_save<S, F>(
     snapshot_trigger: &crate::runtime::channel::WatchSender<u64>,
     num_shards: usize,
@@ -571,8 +579,28 @@ where
     S: Fn(std::time::Duration) -> F,
     F: std::future::Future<Output = ()>,
 {
+    shutdown_save_within(
+        snapshot_trigger,
+        num_shards,
+        sleep,
+        std::time::Duration::from_millis(SHUTDOWN_SAVE_DEADLINE_MS),
+    )
+    .await
+}
+
+/// [`shutdown_save`] with its overall budget passed in (tests).
+async fn shutdown_save_within<S, F>(
+    snapshot_trigger: &crate::runtime::channel::WatchSender<u64>,
+    num_shards: usize,
+    sleep: S,
+    budget: std::time::Duration,
+) -> Result<(), Frame>
+where
+    S: Fn(std::time::Duration) -> F,
+    F: std::future::Future<Output = ()>,
+{
     let poll = std::time::Duration::from_millis(SHUTDOWN_SAVE_POLL_MS);
-    let bound = std::time::Duration::from_millis(SHUTDOWN_SAVE_TIMEOUT_MS);
+    let deadline = std::time::Instant::now() + budget;
     let timed_out = || {
         Frame::Error(Bytes::from_static(
             b"ERR SHUTDOWN failed: background save timed out, check logs",
@@ -589,7 +617,7 @@ where
                     )));
                 }
                 deferred += 1;
-                wait_for_save(&sleep, poll, bound)
+                wait_for_save(&sleep, poll, deadline)
                     .await
                     .map_err(|()| timed_out())?;
             }
@@ -597,7 +625,7 @@ where
             // answer what BGSAVE would.
             Frame::Error(e) => return Err(Frame::Error(e)),
             _ => {
-                wait_for_save(&sleep, poll, bound)
+                wait_for_save(&sleep, poll, deadline)
                     .await
                     .map_err(|()| timed_out())?;
                 return save_outcome();
@@ -606,19 +634,18 @@ where
     }
 }
 
-/// Poll until no save is in progress, at most `bound`.
+/// Poll until no save is in progress, `Err` once `deadline` has passed.
 async fn wait_for_save<S, F>(
     sleep: &S,
     poll: std::time::Duration,
-    bound: std::time::Duration,
+    deadline: std::time::Instant,
 ) -> Result<(), ()>
 where
     S: Fn(std::time::Duration) -> F,
     F: std::future::Future<Output = ()>,
 {
-    let start = std::time::Instant::now();
     while SAVE_IN_PROGRESS.load(Ordering::SeqCst) {
-        if start.elapsed() > bound {
+        if std::time::Instant::now() >= deadline {
             return Err(());
         }
         sleep(poll).await;
@@ -682,6 +709,47 @@ mod tests {
 
     /// Run one sharded save over `shards` shards whose outcomes are
     /// `results`, as the event loops report them.
+    /// Review 5: SHUTDOWN's save has ONE deadline. Someone else's save ends
+    /// just before it and SHUTDOWN's own save then never finishes: the call
+    /// gives up at the deadline, not a fresh bound after the deferral (which
+    /// let three deferrals and the save hold SHUTDOWN for 4 x 10 s).
+    #[test]
+    fn shutdown_save_has_one_deadline_across_deferrals() {
+        use std::task::{Context, Poll, Waker};
+        let _guard = BGSAVE_TEST_LOCK.lock();
+        let (tx, _rx) = crate::runtime::channel::watch(0u64);
+        let budget = std::time::Duration::from_millis(300);
+        let start = std::time::Instant::now();
+        // Another save runs, and ends at 80% of the budget.
+        SAVE_IN_PROGRESS.store(true, Ordering::SeqCst);
+        let other_ended = std::cell::Cell::new(false);
+        let sleep = |d: std::time::Duration| {
+            std::thread::sleep(d);
+            if !other_ended.get() && start.elapsed() >= budget * 4 / 5 {
+                other_ended.set(true);
+                SAVE_IN_PROGRESS.store(false, Ordering::SeqCst);
+            }
+            std::future::ready(())
+        };
+        let mut fut = std::pin::pin!(shutdown_save_within(&tx, 1, sleep, budget));
+        let reply = match fut.as_mut().poll(&mut Context::from_waker(Waker::noop())) {
+            Poll::Ready(r) => r,
+            Poll::Pending => panic!("every sleep is ready at once"),
+        };
+        let elapsed = start.elapsed();
+        // SHUTDOWN's own save started and never completed: end it.
+        assert!(other_ended.get() && SAVE_IN_PROGRESS.load(Ordering::SeqCst));
+        bgsave_shard_done(true);
+        assert!(
+            matches!(&reply, Err(Frame::Error(e)) if e.as_ref().ends_with(b"timed out, check logs")),
+            "{reply:?}"
+        );
+        assert!(
+            elapsed < budget * 3 / 2,
+            "gave up after {elapsed:?}, one deadline is {budget:?}"
+        );
+    }
+
     fn sharded_save(results: &[bool]) {
         let (tx, _rx) = crate::runtime::channel::watch(0u64);
         let reply = bgsave_start_sharded(&tx, results.len());

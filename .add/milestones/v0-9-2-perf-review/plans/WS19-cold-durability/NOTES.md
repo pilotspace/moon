@@ -438,6 +438,10 @@ written after the auto-save started is there after restart. Red on the
 previous binary (`-ERR Background save already in progress`), green 3/3.
 Not done: aborting the running cooperative snapshot (redis kills its child);
 a SHUTDOWN during a long save now takes up to two save bounds (2 x 10 s).
+**Corrected in review 5 (N1):** as first committed, every wait got its own
+10 s bound, so three deferrals plus the save could take 4 x 10 s = 40 s.
+`shutdown_save` now has ONE deadline, `SHUTDOWN_SAVE_DEADLINE_MS` = 20 s
+from the call, for all of it.
 
 ## 7. Retry after 5 s under any rule (`55ce5d98`)
 `save_rule_due(rules, since_last_save, since_last_attempt, changes, ok)`;
