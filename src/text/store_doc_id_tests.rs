@@ -264,14 +264,16 @@ fn reused_doc_ids_answer_exactly_like_a_fresh_index() {
     );
     assert_same_answers("churned", &churned, &fresh);
 
-    // Holes survive a `.tpost` round trip as free ids, and the loaded index still answers alike.
+    // moon#1220 item 3: a `.tpost` rewrite compacts the holes out — the loaded index numbers its
+    // documents densely and has no free ids (they used to survive the round trip) — and it still
+    // answers alike.
     let bytes = crate::text::postings_persist::encode_index(&churned);
     let mut loaded = empty_like(&churned);
     loaded
         .install_recovered(crate::text::postings_persist::decode(&bytes).expect("decode"))
         .expect("install");
-    assert_eq!(loaded.next_doc_id(), churned.next_doc_id());
-    assert_eq!(loaded.free_doc_ids(), churned.free_doc_ids());
+    assert_eq!(loaded.next_doc_id(), churned.num_docs());
+    assert!(loaded.free_doc_ids().is_empty());
     assert_same_answers("loaded", &loaded, &fresh);
 }
 
