@@ -722,6 +722,46 @@ fn a_grown_flush_while_another_grown_table_is_trimming_fails_the_save() {
     }
 }
 
+/// Review 6 (N1, the reviewer's proof): an UNLINKed large collection stays
+/// CHARGED to `used_memory` until the lazy-free drain frees it (moon#1190).
+/// A FLUSHDB before that drain handed the epoch `table_bytes` = the ledger
+/// WITH that charge while the table no longer held the row, and the trim then
+/// restored the pre-image and added its bytes a second time: the frozen bill
+/// (INFO `current_cow_size`) over-reported by the lazily-freed value for the
+/// rest of the save, above the database's epoch-start bill.
+#[test]
+fn a_lazy_free_charge_is_not_billed_to_the_frozen_table() {
+    let mut dbs = vec![Database::new(), Database::new()];
+    for i in 0..50 {
+        let k = format!("k{i}");
+        let _ = run(&mut dbs, 1, &[b"SET", k.as_bytes(), b"v"]);
+    }
+    for f in 0..2000 {
+        let f = format!("field-{f:06}");
+        let _ = run(&mut dbs, 1, &[b"HSET", b"big", f.as_bytes(), b"some-value"]);
+    }
+    let start_bill = dbs[1].ledger_bytes() as u64;
+    let mut epoch = Epoch::begin(&dbs);
+    let _ = run(&mut dbs, 1, &[b"UNLINK", b"big"]);
+    assert!(
+        dbs[1].lazy_free_reclaimable(),
+        "setup: the UNLINKed hash waits in the lazy-free queue, still charged"
+    );
+    let _ = run(&mut dbs, 1, &[b"FLUSHDB"]);
+    epoch.drain_until_trimmed(1);
+    let state = epoch.state.as_ref().expect("epoch");
+    let (bill, rows) = state.frozen_bill_and_rows_for_test(1).expect("frozen");
+    let _ = epoch.try_finish(&dbs);
+    assert_eq!(
+        bill, rows,
+        "the frozen bill must be what its rows hold (epoch-start bill {start_bill} B)"
+    );
+    assert!(
+        bill <= start_bill,
+        "{bill} B frozen, epoch-start {start_bill} B"
+    );
+}
+
 /// The liveness half of moon#1228: a workload that FLUSHDBs (and SWAPDBs)
 /// more often than one save takes. It used to fail every BGSAVE; each tick
 /// here flushes, swaps, refills and increments, and the save must still

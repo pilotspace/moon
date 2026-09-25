@@ -690,6 +690,23 @@ impl SnapshotState {
         }
     }
 
+    /// Test-only: the frozen table of `db`: its bill, and what its rows
+    /// hold at `entry_overhead` (review 6, N1).
+    #[cfg(test)]
+    pub(crate) fn frozen_bill_and_rows_for_test(&self, db: usize) -> Option<(u64, u64)> {
+        match self.sources.get(db) {
+            Some(Source::Frozen(frozen)) => Some((
+                frozen.bill,
+                frozen
+                    .table
+                    .iter()
+                    .map(|(k, e)| crate::storage::db::entry_overhead(k.as_bytes(), e) as u64)
+                    .sum(),
+            )),
+            _ => None,
+        }
+    }
+
     /// Test-only: row operations the last drain's trim did.
     #[cfg(test)]
     pub(crate) fn trim_ops_last_drain_for_test(&self) -> usize {

@@ -319,6 +319,22 @@ into single `BTreeMap::pop_first` calls; `GLIBC_TUNABLES=glibc.malloc.mxfast=0` 
 `TRIM_BUDGET` operations per drain, the trim done after about ceil(ops / budget) drains, and
 bound and file correct. It was red on the unbudgeted trim ("one drain trimmed 50000 rows").
 
+**Review 6, N1: lazy-free charges are not billed to a frozen table.** An UNLINKed large
+collection stays charged to `used_memory` until the lazy-free drain frees it (moon#1190).
+`clear` handed the epoch `table_bytes` = the ledger with that charge, although the table no
+longer held the row, and the trim then restored the pre-image and billed it again.
+`current_cow_size` over-reported by the value for the rest of the save, above the database's
+epoch-start bill: 551,044 B against rows of 278,817 B = the epoch-start bill.
+- **Fix:** with a save armed, `Database::clear` reclaims the charged lazy-free items first
+  (`reclaim_lazy_free`), then reads `used_memory`.
+- **Why not subtract?** Subtracting would need each queued value's remaining charge, which is
+  O(elements) to compute, since `estimate_memory` walks a collection.
+- **Cost:** the reclaim is the lazy-free drain's owed work, paid in the FLUSHDB instead of the
+  tick, and only while a BGSAVE runs.
+- **Test:** `table_swap_tests::a_lazy_free_charge_is_not_billed_to_the_frozen_table` (the
+  reviewer's proof) was red (551,044 vs 278,817) and is green (bill == rows <= epoch-start
+  bill).
+
 The frozen figure is `used_memory` at the flush, not `estimated_memory()` (52544bf3:
 spill-in-flight payloads are not in the table; red 1,467,473 B vs 418,890 B with 1 MiB in
 flight).
