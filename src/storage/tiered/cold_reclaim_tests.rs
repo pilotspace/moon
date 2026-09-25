@@ -428,3 +428,93 @@ fn survivors_promoted_after_the_fold_keep_the_old_file() {
         "the old file is the promoted survivors' only durable copy"
     );
 }
+
+/// moon#1231 review: the adoption unlinks an old file only when EVERY output
+/// of its compaction was listed. `survivors_promoted_after_the_fold_keep_the_
+/// old_file` discards the only output, so `begin_adoption` returns before the
+/// rule is consulted; the rule matters when a compaction writes several
+/// outputs (survivors over the spill writer's 4 MiB batch cap) and only some
+/// are discarded. Here one big survivor is promoted after the fold: its
+/// output goes, the other is listed, and the old file must stay — it is the
+/// promoted key's only copy the committed generation can read.
+#[test]
+fn a_partially_discarded_compaction_keeps_the_old_file() {
+    // Over half the spill writer's 4 MiB batch cap: one output per survivor.
+    const BIG: usize = 3 * 1024 * 1024;
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let dir = tmp.path().join("shard-0");
+    std::fs::create_dir_all(&dir).expect("dir");
+    let mut manifest = ShardManifest::create(&dir.join("shard-0.manifest")).expect("manifest");
+    let mut entries: Vec<SpillEntry> = [("big:a", b'a'), ("big:b", b'b')]
+        .into_iter()
+        .map(|(k, fill)| SpillEntry {
+            key: Bytes::from_static(k.as_bytes()),
+            value_bytes: Bytes::from(vec![fill; BIG]),
+            value_type: ValueType::String,
+            flags: 0,
+            ttl_ms: None,
+        })
+        .collect();
+    for i in 0..4 {
+        entries.push(SpillEntry {
+            key: Bytes::from(format!("dead:{i}")),
+            value_bytes: Bytes::from_static(b"x"),
+            value_type: ValueType::String,
+            flags: 0,
+            ttl_ms: None,
+        });
+    }
+    let batch = build_kv_spill_batch(&entries, OLD).expect("batch");
+    let byte_size = write_kv_spill_batch(&dir, OLD, &batch).expect("write");
+    manifest
+        .add_file(FileEntry {
+            file_id: OLD,
+            file_type: PageType::KvLeaf as u8,
+            status: FileStatus::Active,
+            tier: StorageTier::Hot,
+            page_size_log2: 12,
+            page_count: batch.pages.len() as u32,
+            byte_size,
+            created_lsn: 0,
+            db_index: 0,
+            max_key_hash: 0,
+            last_modified_lsn: 0,
+        })
+        .expect("add");
+    manifest.commit().expect("commit");
+    let mut ci = ColdIndex::rebuild_from_manifest(&dir, &manifest);
+    for i in 0..4 {
+        assert!(ci.remove(format!("dead:{i}").as_bytes()));
+    }
+
+    // Compaction at epoch 0: one output file per big survivor.
+    let mut next = NEW;
+    ci.compact_file(OLD, 0, &dir, &mut next, 0)
+        .expect("compact");
+    assert!(
+        heap(&dir, NEW).exists() && heap(&dir, NEW + 1).exists(),
+        "fixture: two output files"
+    );
+
+    // A fold (snapshot epoch 1) cuts and commits: both survivors are cold in
+    // OLD at that fold, so its base does not hold them. AFTER the fold big:a
+    // is read-promoted: its output is discarded at adoption, big:b's listed.
+    assert!(ci.remove(b"big:a"), "promotion removes the cold entry");
+    let r = ci.adopt_compactions(1, &dir, &mut manifest);
+    assert_eq!((r.compactions, r.files_listed, r.keys_moved), (1, 1, 1));
+
+    // The committed generation still reads big:a from OLD, its only durable
+    // copy: OLD stays on disk and listed, and a restart finds big:a.
+    let reopened = ShardManifest::open(&dir.join("shard-0.manifest")).expect("reopen");
+    let rebuilt = ColdIndex::rebuild_from_manifest(&dir, &reopened);
+    assert!(
+        heap(&dir, OLD).exists() && listed(&reopened, OLD),
+        "the adoption unlinked OLD although big:a's copy was discarded (files_unlinked = {})",
+        r.files_unlinked
+    );
+    assert_eq!(r.files_unlinked, 0);
+    assert!(
+        rebuilt.lookup(b"big:a").is_some(),
+        "a restart of the committed generation cannot find big:a"
+    );
+}
