@@ -7,8 +7,12 @@
 //! (the `perf_ws8_mset_bgsave_capture` method): an attempt waits until every
 //! shard has armed the epoch (its `shard-<id>.rrdshard.tmp` exists), pipelines
 //! each round of writes with an `INFO persistence` probe, and counts the rounds
-//! that ran while the save was still in progress. An attempt with too few is
-//! retried on a doubled keyspace; only an attempt that overlapped is judged.
+//! that ran while the save was still in progress. The first rounds run while
+//! the walk is HELD (`MOON_TEST_SNAPSHOT_HOLD_FILE`, part 3b's test hook), so
+//! they land inside the epoch by construction; the rest race the released
+//! walk, so captures also interleave with written ranges. An attempt with too
+//! few is retried on a doubled keyspace; only an attempt that overlapped is
+//! judged.
 //!
 //! Pin the binary: `MOON_BIN=<moon> cargo test --test perf_ws16_bgsave_capture`.
 
@@ -22,11 +26,18 @@ use std::time::{Duration, Instant};
 
 use common::{Conn, ServerGuard, encode};
 
+/// While this file exists a running save's epoch stays armed but its walk
+/// does not advance (`MOON_TEST_SNAPSHOT_HOLD_FILE`, test-only).
+fn hold_file(dir: &Path) -> std::path::PathBuf {
+    dir.join("snapshot.hold")
+}
+
 fn spawn(dir: &Path, shards: usize) -> (ServerGuard, u16) {
     std::fs::create_dir_all(dir).expect("create test dir");
     let bin = common::find_moon_binary();
     let (child, port) = common::spawn_listening(|port| {
         std::process::Command::new(&bin)
+            .env("MOON_TEST_SNAPSHOT_HOLD_FILE", hold_file(dir))
             .args([
                 "--port",
                 &port.to_string(),
@@ -199,8 +210,13 @@ fn writes_during_bgsave(
             let _ = std::fs::remove_file(dir.join(format!("shard-{s}.rrdshard.tmp")));
         }
         let started = Instant::now();
+        // Beside the other tests of this file, a 4-shard MQ attempt saw no
+        // round inside a save of 220-670 ms in 5 attempts of 5; the hold
+        // puts the first `min_overlap` rounds inside it by construction.
+        std::fs::write(hold_file(dir), b"").expect("create the hold file");
         assert!(c.send(&["BGSAVE"]).contains("Background saving started"));
         if !wait_until_armed(dir, shards, probe) {
+            let _ = std::fs::remove_file(hold_file(dir));
             wait_bgsave_done(probe);
             attempts.push(format!("{n} keys: the save ended before every shard armed"));
             continue;
@@ -208,6 +224,9 @@ fn writes_during_bgsave(
         let deadline = Instant::now() + Duration::from_secs(300);
         let mut during = 0u64;
         for r in 0.. {
+            if r == min_overlap {
+                let _ = std::fs::remove_file(hold_file(dir));
+            }
             let cmds = round(n, r);
             let mut parts: Vec<Vec<&str>> = cmds
                 .iter()
@@ -229,6 +248,7 @@ fn writes_during_bgsave(
             during += 1;
             assert!(Instant::now() < deadline, "BGSAVE outlived the writer");
         }
+        let _ = std::fs::remove_file(hold_file(dir));
         assert_eq!(last_bgsave_status(probe), "ok", "BGSAVE failed");
         // moon#1228: INFO `current_cow_size` (redis's field) reports what a
         // save holds for its own sake, and nothing once it is over.
