@@ -101,27 +101,44 @@ fn session_filter_cost_does_not_grow_with_session_size() {
     );
 }
 
-/// moon#1226: the in-place filter matches the borrowed one and never copies
-/// — the survivors stay in the caller's buffer (spilled past 32 inline
-/// results here, so a copy would show up as a different heap pointer), and
-/// the no-session path leaves the buffer untouched.
+/// moon#1226 / moon#1242: the in-place filter drops exactly the results the
+/// session has seen and never copies — for the dense path's `SmallVec`
+/// (spilled past 32 inline results, so a copy would show up as a different
+/// heap pointer) and the hybrid / sparse paths' `Vec` alike — and the
+/// no-session path leaves the buffer untouched. The expected survivors come
+/// from a plain filter written here, not from the session module.
 #[test]
 fn retain_unseen_filters_in_place_without_copying() {
-    let db = db_with_session(b"sess", &[1, 3, 4, 40], 20);
+    let seen = [1u64, 3, 4, 40];
+    let db = db_with_session(b"sess", &seen, 20);
     let k2k = keymap(48);
-    let res = results(48);
-    let want = session::filter_session_results_in_db(&res, &db, b"sess", &k2k);
+    // `results(48)` holds `doc:{i}` at key_hash 1000 + i.
+    let want: Vec<u64> = (0..48u64)
+        .filter(|i| !seen.contains(i))
+        .map(|i| 1_000 + i)
+        .collect();
+    let hashes = |r: &[SearchResult]| r.iter().map(|r| r.key_hash).collect::<Vec<_>>();
 
     let mut inplace = results(48);
     assert!(inplace.spilled());
     let buf = inplace.as_ptr();
     session::retain_unseen_in_db(&mut inplace, &db, b"sess", &k2k);
-    assert_eq!(inplace.as_ptr(), buf, "filtered in the caller's buffer");
     assert_eq!(
-        inplace.iter().map(|r| r.key_hash).collect::<Vec<_>>(),
-        want.iter().map(|r| r.key_hash).collect::<Vec<_>>()
+        inplace.as_ptr(),
+        buf,
+        "SmallVec: filtered in the caller's buffer"
     );
-    assert_eq!(inplace.len(), 44);
+    assert_eq!(hashes(&inplace), want, "SmallVec");
+
+    let mut fused: Vec<SearchResult> = results(48).into_vec();
+    let buf = fused.as_ptr();
+    session::retain_unseen_in_db(&mut fused, &db, b"sess", &k2k);
+    assert_eq!(fused.as_ptr(), buf, "Vec: filtered in the caller's buffer");
+    assert_eq!(hashes(&fused), want, "Vec");
+
+    // The borrowed form answers the same survivors.
+    let borrowed = session::filter_session_results_in_db(&results(48), &db, b"sess", &k2k);
+    assert_eq!(hashes(&borrowed), want, "borrowed");
 
     // No session key: nothing filtered, nothing moved.
     let mut untouched = results(48);
@@ -129,4 +146,109 @@ fn retain_unseen_filters_in_place_without_copying() {
     session::retain_unseen_in_db(&mut untouched, &db, b"no-such-session", &k2k);
     assert_eq!(untouched.as_ptr(), buf);
     assert_eq!(untouched.len(), 48);
+}
+
+/// moon#1242: FT.SEARCH … SESSION on the sparse-only and hybrid (KNN +
+/// SPARSE) paths, which filter and record the fused `Vec` in place. The
+/// first search returns both documents and records them; the same search
+/// again in the same session returns none, and another session is
+/// unaffected.
+#[test]
+fn sparse_and_hybrid_session_searches_skip_seen_documents() {
+    use super::tests::{
+        METRICS_LOCK, encode_sparse_blob, ft_create_hybrid_args, insert_hybrid_doc,
+    };
+    use crate::command::vector_search::{ft_create, ft_search};
+    use crate::protocol::Frame;
+
+    let _lock = METRICS_LOCK.write();
+    crate::vector::distance::init();
+    let mut store = crate::vector::store::VectorStore::new();
+    let created = ft_create(
+        &mut store,
+        &mut crate::text::store::TextStore::new(),
+        &ft_create_hybrid_args(),
+        0,
+    );
+    assert!(matches!(created, Frame::SimpleString(_)), "{created:?}");
+    insert_hybrid_doc(&mut store, b"doc:1", &[1.0, 0.0, 0.0, 0.0], &[(0, 1.0)]);
+    insert_hybrid_doc(&mut store, b"doc:2", &[0.0, 1.0, 0.0, 0.0], &[(0, 0.5)]);
+
+    let bulk = |b: &[u8]| Frame::BulkString(Bytes::copy_from_slice(b));
+    let dense: Vec<u8> = [0.9f32, 0.1, 0.0, 0.0]
+        .iter()
+        .flat_map(|f| f.to_le_bytes())
+        .collect();
+    let sparse = encode_sparse_blob(&[(0, 1.0)]);
+    let args = |query: &[u8], session: &[u8]| -> Vec<Frame> {
+        vec![
+            bulk(b"hybridx"),
+            bulk(query),
+            bulk(b"SPARSE"),
+            bulk(b"@sparse_vec"),
+            bulk(b"$sq"),
+            bulk(b"PARAMS"),
+            bulk(b"4"),
+            bulk(b"q"),
+            bulk(&dense),
+            bulk(b"sq"),
+            bulk(&sparse),
+            bulk(b"SESSION"),
+            bulk(session),
+        ]
+    };
+    let docs = |reply: &Frame| -> Vec<Bytes> {
+        let Frame::Array(items) = reply else {
+            panic!("expected an array, got {reply:?}");
+        };
+        let mut keys: Vec<Bytes> = items
+            .iter()
+            .filter_map(|f| match f {
+                Frame::BulkString(b) if b.starts_with(b"doc:") => Some(b.clone()),
+                _ => None,
+            })
+            .collect();
+        keys.sort();
+        keys
+    };
+    let both = vec![Bytes::from_static(b"doc:1"), Bytes::from_static(b"doc:2")];
+
+    let mut db = Database::new();
+    for (path, query) in [
+        ("sparse", &b"*"[..]),
+        ("hybrid", &b"*=>[KNN 10 @vec $q]"[..]),
+    ] {
+        let session = format!("sess:{path}");
+        let first = ft_search(
+            &mut store,
+            &args(query, session.as_bytes()),
+            Some(&mut db),
+            None,
+            0,
+            0,
+        );
+        assert_eq!(docs(&first), both, "{path}: first search");
+        let again = ft_search(
+            &mut store,
+            &args(query, session.as_bytes()),
+            Some(&mut db),
+            None,
+            0,
+            0,
+        );
+        assert_eq!(
+            docs(&again),
+            Vec::<Bytes>::new(),
+            "{path}: both already seen"
+        );
+        let other = ft_search(
+            &mut store,
+            &args(query, format!("{session}:other").as_bytes()),
+            Some(&mut db),
+            None,
+            0,
+            0,
+        );
+        assert_eq!(docs(&other), both, "{path}: another session");
+    }
 }

@@ -3,7 +3,7 @@ use parking_lot::RwLock;
 use smallvec::SmallVec;
 
 /// Serialize tests that touch global atomic metrics to avoid flaky interference.
-static METRICS_LOCK: RwLock<()> = RwLock::new(());
+pub(super) static METRICS_LOCK: RwLock<()> = RwLock::new(());
 
 fn bulk(s: &[u8]) -> Frame {
     Frame::BulkString(Bytes::from(s.to_vec()))
@@ -3579,7 +3579,7 @@ fn test_text_filter_without_feature_returns_empty() {
 // ---------------------------------------------------------------------------
 
 /// Build FT.CREATE args for an index with both VECTOR and SPARSE fields.
-fn ft_create_hybrid_args() -> Vec<Frame> {
+pub(super) fn ft_create_hybrid_args() -> Vec<Frame> {
     vec![
         bulk(b"hybridx"),
         bulk(b"ON"),
@@ -3606,7 +3606,7 @@ fn ft_create_hybrid_args() -> Vec<Frame> {
 }
 
 /// Helper: encode a sparse vector as alternating u32+f32 LE bytes.
-fn encode_sparse_blob(pairs: &[(u32, f32)]) -> Vec<u8> {
+pub(super) fn encode_sparse_blob(pairs: &[(u32, f32)]) -> Vec<u8> {
     let mut buf = Vec::with_capacity(pairs.len() * 8);
     for &(dim, weight) in pairs {
         buf.extend_from_slice(&dim.to_le_bytes());
@@ -3617,7 +3617,7 @@ fn encode_sparse_blob(pairs: &[(u32, f32)]) -> Vec<u8> {
 
 /// Insert a document into the hybrid index (both dense vector and sparse vector).
 /// Uses direct mutable segment append (same pattern as test_end_to_end_create_insert_search).
-fn insert_hybrid_doc(
+pub(super) fn insert_hybrid_doc(
     store: &mut VectorStore,
     key: &[u8],
     dense_vec: &[f32],
