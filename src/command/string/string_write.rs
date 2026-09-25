@@ -267,8 +267,29 @@ pub fn mset(db: &mut Database, args: &[Frame]) -> Frame {
             None => return err_wrong_args("MSET"),
         };
         db.set_string(key, value);
+        notify_set(db, key);
     }
     ok()
+}
+
+/// Queue the keyspace `set` event one MSET/MSETNX pair owes.
+///
+/// Redis's `msetGenericCommand` notifies inside its pair loop: every pair
+/// fires one event, a key named twice fires twice, and an MSETNX that sets
+/// nothing fires none. Every path that runs MSET or MSETNX (local dispatch,
+/// the coordinator's local and per-owner legs, MULTI, Lua, replica apply) runs
+/// this body once per pair it owns, so the event is emitted here and nowhere
+/// else. moon#1184 replaced the per-key `SET` legs of a spanning MSET, the only
+/// MSET keys that were notified, with per-owner `MSET` legs. With
+/// notifications off this is one Relaxed load per pair (see `crate::notify`).
+#[inline]
+fn notify_set(db: &Database, key: &[u8]) {
+    crate::notify::notify_keyspace_event(
+        crate::notify::NotifyFlags::STRING,
+        "set",
+        key,
+        db.db_index,
+    );
 }
 
 /// MSETNX command handler (single-shard atomic).
@@ -313,6 +334,7 @@ pub fn msetnx(db: &mut Database, args: &[Frame]) -> Frame {
             None => return err_wrong_args("MSETNX"),
         };
         db.set_string(key, value);
+        notify_set(db, key);
     }
     Frame::Integer(1)
 }
