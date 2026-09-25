@@ -4071,6 +4071,52 @@ pub(crate) fn wal_append_and_fanout_bytes(
     wal_kv_log: bool,
     aof_budget: &mut std::time::Duration,
 ) -> bool {
+    wal_append_and_fanout_hinted(
+        data,
+        db,
+        wal_writer,
+        repl_backlog,
+        replica_txs,
+        repl_state,
+        shard_id,
+        aof_pool,
+        wal_kv_log,
+        aof_budget,
+        crate::replication::state::fanout_hint_active(),
+    )
+}
+
+/// Whether a routed write appends its record to the replication backlog
+/// (moon#1177): when a replica is registered on this shard, or when one has
+/// begun attaching anywhere (`fanout_hint`, the process-global
+/// `replication::state::fanout_hint_active()`). With neither, the write
+/// skips the backlog mutex entirely. See the backlog step of
+/// [`wal_append_and_fanout_hinted`] for why skipping is sound.
+///
+/// Pure so the gate is testable on its own: the hint is sticky and
+/// process-wide, so a test that reads it can only observe the case the
+/// tests that ran before it left behind.
+#[inline]
+pub(crate) fn backlog_append_wanted(replicas_empty: bool, fanout_hint: bool) -> bool {
+    !replicas_empty || fanout_hint
+}
+
+/// The body of [`wal_append_and_fanout_bytes`], with the fan-out hint read
+/// once by the caller. Tests pass the hint directly, so the backlog gate runs
+/// in both states whatever the process-global holds.
+fn wal_append_and_fanout_hinted(
+    data: bytes::Bytes,
+    db: usize,
+    wal_writer: &mut Option<WalWriterV3>,
+    repl_backlog: &crate::replication::backlog::SharedBacklog,
+    replica_txs: &mut Vec<crate::shard::dispatch::ReplicaFanout>,
+    repl_state: &Option<crate::replication::state::OffsetHandle>,
+    shard_id: usize,
+    aof_pool: Option<&std::sync::Arc<crate::persistence::aof::AofWriterPool>>,
+    wal_kv_log: bool,
+    aof_budget: &mut std::time::Duration,
+    fanout_hint: bool,
+) -> bool {
     // S3.5b (2026-04-27): hot-path bypass when nothing actually has work.
     // See `wal_fanout_has_work` — callers use the same predicate to skip the
     // `aof::serialize_command` alloc entirely when the fanout would no-op.
@@ -4129,7 +4175,7 @@ pub(crate) fn wal_append_and_fanout_bytes(
     // thread, which sets the hint first — so every later append here sees it.
     // A registered replica (`replica_txs`) implies the hint; it is checked
     // too so the append never depends on that implication.
-    if !replica_txs.is_empty() || crate::replication::state::fanout_hint_active() {
+    if backlog_append_wanted(replica_txs.is_empty(), fanout_hint) {
         let mut guard = repl_backlog.lock();
         if let Some(backlog) = guard.as_mut() {
             if let Some(prefix) = &select_prefix {
