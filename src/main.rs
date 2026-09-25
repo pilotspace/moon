@@ -1072,6 +1072,12 @@ fn main() -> anyhow::Result<()> {
     } else {
         None
     };
+    // With no directory no shard can write a snapshot: BGSAVE / SHUTDOWN SAVE
+    // answer an immediate error instead of starting a save that must fail.
+    moon::command::persistence::SNAPSHOT_DIR_ABSENT.store(
+        persistence_dir.is_none(),
+        std::sync::atomic::Ordering::Relaxed,
+    );
 
     // Create replication state -- load persisted repl_id or generate new one.
     let (repl_id, repl_id2) =
