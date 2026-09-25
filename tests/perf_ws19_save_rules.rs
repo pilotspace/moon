@@ -524,6 +524,29 @@ const ROWS: &[Row] = &[
         [["FLUSHDB"]],
         3
     ),
+    // Review 5 (moon#1232): a blocking read served at once counts as its
+    // non-blocking twin.
+    row!(
+        "XREADGROUP BLOCK served at once",
+        [
+            ["XADD", "xb", "1-1", "f", "v"],
+            ["XADD", "xb", "1-2", "f", "v"],
+            ["XGROUP", "CREATE", "xb", "g", "0"],
+            ["XGROUP", "CREATECONSUMER", "xb", "g", "c"]
+        ],
+        [[
+            "XREADGROUP",
+            "GROUP",
+            "g",
+            "c",
+            "BLOCK",
+            "100",
+            "STREAMS",
+            "xb",
+            ">"
+        ]],
+        1
+    ),
 ];
 
 fn changes(c: &mut Conn) -> u64 {
@@ -910,5 +933,42 @@ fn blocking_pops_served_at_once_count_at_four_shards() {
         got.join(" "),
         ["11"; 16].join(" "),
         "(BLPOP, BZPOPMIN) change counts per key, --shards 4"
+    );
+}
+
+/// `XREADGROUP ... BLOCK` that finds entries is served at once outside the
+/// dispatch arm's `counted` wrapper: it counted 0, where the same read
+/// without BLOCK counts 1 (redis 7.0.15: 2, the stream plus the consumer it
+/// creates — a known difference, see `command::keyspace_changes`). The table
+/// row "XREADGROUP BLOCK served at once" pins the exact count with an
+/// existing consumer.
+#[test]
+fn xreadgroup_block_served_at_once_counts_like_xreadgroup() {
+    let dir = common::unique_test_dir("ws19-r5-xrg");
+    std::fs::create_dir_all(&dir).unwrap();
+    let (mut server, port) = spawn_with(&dir, 1, &["--appendonly", "no"]);
+    let mut c = Conn::open(port);
+    c.send(&["XGROUP", "CREATE", "xs", "g", "$", "MKSTREAM"]);
+    c.send(&["XADD", "xs", "1-1", "f", "v"]);
+    c.send(&["XADD", "xs", "1-2", "f", "v"]);
+    let d0 = changes(&mut c);
+    let r = c.send(&[
+        "XREADGROUP",
+        "GROUP",
+        "g",
+        "c",
+        "BLOCK",
+        "100",
+        "STREAMS",
+        "xs",
+        ">",
+    ]);
+    let delta = changes(&mut c) - d0;
+    server.kill_now();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(r.starts_with("*1"), "served at once: {r:?}");
+    assert!(
+        delta >= 1,
+        "XREADGROUP BLOCK served 2 entries at once: {delta}"
     );
 }

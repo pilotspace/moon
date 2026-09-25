@@ -1610,7 +1610,14 @@ fn stream_read_immediate(
         return None;
     }
     let frame = if cmd.eq_ignore_ascii_case(b"XREADGROUP") {
-        crate::command::stream::xreadgroup(db, args)
+        // moon#1232 review 5: served at once it counts as `XREADGROUP` does
+        // through its dispatch arm; outside that arm it counted 0.
+        crate::command::keyspace_changes::counted(
+            db,
+            args,
+            crate::command::keyspace_changes::Rule::Streams,
+            crate::command::stream::xreadgroup,
+        )
     } else {
         crate::command::stream::xread(db, args)
     };
