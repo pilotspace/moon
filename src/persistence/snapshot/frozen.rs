@@ -1,5 +1,5 @@
 //! What a table a FLUSHDB detached keeps while the epoch holds it
-//! (moon#1228, review 5).
+//! (moon#1228, reviews 5 and 6).
 //!
 //! `Database::clear` hands the epoch its table AS FLUSHED: the database's
 //! epoch-start rows, and every row written since the epoch began — rows the
@@ -8,110 +8,326 @@
 //! whole, that is unbounded: a client that fills a database and flushes it,
 //! database after database, made one held save keep 8 x 40 MB of
 //! post-epoch rows under `--maxmemory 64mb`, none of it in `used_memory`.
-//! The drain therefore trims the table before it freezes it
-//! ([`SnapshotState::trim_to_epoch_start`]), so a frozen table holds only
-//! the epoch-start rows its database still has to write.
+//! So the epoch TRIMS a frozen table to the epoch-start rows its database
+//! still has to write ([`Trim`]).
+//!
+//! The trim is budgeted (review 6): at most [`TRIM_BUDGET`] row operations
+//! per drain, across every frozen table, continued at the next drain — done
+//! whole inside one drain it cost 0.88 s for a pending database of 0.5M
+//! epoch-start rows grown by 1.5M, 4.33 s at 2M + 6M (release). The FILE
+//! never depends on the trim: until a key's pre-image is folded into the
+//! table, the walk shadows the table's row with it, and the walk never reads
+//! below its cursor. Only the byte bound does, so it holds once the trim is
+//! done: after `ceil(work / TRIM_BUDGET)` drains, work being the keys
+//! written since the epoch began + the rows below the cursor at the flush +
+//! (for a rebuild) the rows kept.
 
-use super::{SnapshotState, Table, pre_image_bytes, segment_block};
+use super::{SnapshotState, Source, Table, pre_image_bytes, segment_block};
 use crate::storage::compact_key::CompactKey;
 use crate::storage::dashtable::hash_key;
-use crate::storage::db::entry_overhead;
+use crate::storage::db::{entry_overhead, lazy_free_weight};
+use crate::storage::entry::Entry;
+
+/// Row operations (a row removed, restored or moved, or a segment visited)
+/// the trim does per drain, across every frozen table — never more: a
+/// segment that would not fit waits for the next drain (a segment holds far
+/// fewer rows than this). An operation costs ~0.1 us (a written row) to
+/// ~1.3 us (a pre-image of a million-row table, or a rebuild move) in a
+/// release build, so a drain spends under ~0.7 ms here, below the 1 ms
+/// tick: at 2,048 a drain could outlast the tick and the loop ran ticks back
+/// to back (PING p99.9 10-27 ms while an 8M-row table was trimmed; 1.0 ms at
+/// 512). Measured end to end in NOTES (review 6);
+/// `table_swap_tests::trim_cost_of_a_large_flushed_table` (`--ignored`)
+/// measures drains in-process.
+pub(crate) const TRIM_BUDGET: usize = 512;
+
+/// A removed post-epoch value of at least this many elements is dropped off
+/// the shard thread (like UNLINK's lazy free); a smaller one inline.
+const OFFLOAD_ELEMENTS: usize = 4_096;
+
+/// What the trim frees off the shard thread.
+enum Discard {
+    /// The emptied source of a rebuild: its skeleton alone took 19.6 ms to
+    /// free inline (58,833 segments, release).
+    Table(#[allow(dead_code)] Box<Table>),
+    /// A large post-epoch value the trim removed.
+    Value(#[allow(dead_code)] Entry),
+}
+
+/// Hand `item` to the lazily started `moon-snapdrop` helper, which drops it
+/// (one per process, parked in `recv` when idle — the `moon-lazyfree`
+/// pattern). Dropped here if the helper cannot be started or is gone.
+fn discard(item: Discard) {
+    static DROPPER: std::sync::OnceLock<Option<flume::Sender<Discard>>> =
+        std::sync::OnceLock::new();
+    let dropper = DROPPER.get_or_init(|| {
+        let (tx, rx) = flume::unbounded::<Discard>();
+        std::thread::Builder::new()
+            .name("moon-snapdrop".to_string())
+            .spawn(move || {
+                crate::shard::numa::pin_current_aux_thread("moon-snapdrop");
+                while let Ok(item) = rx.recv() {
+                    drop(item);
+                }
+            })
+            .ok()
+            .map(|_| tx)
+    });
+    if let Some(tx) = dropper {
+        // A failed send hands the item back in the error; it drops here.
+        let _ = tx.send(item);
+    }
+}
+
+/// Free a row the trim removed: off the shard thread if it is large.
+fn dispose(entry: Entry) {
+    if lazy_free_weight(&entry).is_some_and(|n| n >= OFFLOAD_ELEMENTS) {
+        discard(Discard::Value(entry));
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only override of [`TRIM_BUDGET`] (this thread's drains).
+    static BUDGET_FOR_TEST: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+/// The budget of one drain's trim: [`TRIM_BUDGET`], or a test's override.
+#[inline]
+pub(crate) fn trim_budget() -> usize {
+    #[cfg(test)]
+    if let Some(budget) = BUDGET_FOR_TEST.with(std::cell::Cell::get) {
+        return budget;
+    }
+    TRIM_BUDGET
+}
+
+/// Test-only: run this thread's trims with `budget` row operations per
+/// drain (`None`: [`TRIM_BUDGET`]) — a tiny one spreads every trim over many
+/// drains, interleaved with the walk.
+#[cfg(test)]
+pub(crate) fn set_trim_budget_for_test(budget: Option<usize>) {
+    BUDGET_FOR_TEST.with(|b| b.set(budget));
+}
+
+/// A table a FLUSHDB detached from an epoch database the walk had not
+/// finished (moon#1228): what the epoch reads that database from.
+pub(crate) struct Frozen {
+    pub(super) table: Box<Table>,
+    /// What the table's rows are billed (INFO `current_cow_size`): its
+    /// `used_memory` at the flush, less the rows the trim removed, plus the
+    /// epoch-start entries it restored — each at its `entry_overhead`.
+    pub(super) bill: u64,
+    trim: Trim,
+}
+
+/// Where a frozen table's trim stands. The steps run in order; each can
+/// stop at any row and resume at the next drain.
+enum Trim {
+    /// 1. Every key written since the epoch began has a pre-image in the
+    ///    database's overflow map (the drain folds the queued captures in
+    ///    before it freezes a table, and nothing writes the slot's epoch
+    ///    table after the flush). Its post-epoch row leaves the table, and
+    ///    the epoch-start entry goes back in its place (a tombstone puts
+    ///    nothing back). Done when the map is empty. `below`: the cursor
+    ///    when the table froze, if it was the database in progress (else 0).
+    PreImages {
+        below: u64,
+    },
+    /// 2. The rows hashing below `below` — the walk's cursor when step 1
+    ///    finished, for the database in progress — are written already, or
+    ///    are post-epoch: written into a written range (no pre-image is
+    ///    taken there), or a key whose pre-image the walk took itself while
+    ///    step 1 ran. The walk never reads them. Removed segment by segment
+    ///    from hash `at`.
+    Written {
+        at: u64,
+        below: u64,
+    },
+    /// 3. Removing rows does not shrink a DashTable's segments: when the
+    ///    post-epoch rows had grown the table past twice its epoch-start
+    ///    segment count, the kept rows move into `sized`, segment by segment
+    ///    from storage index `next`; rows below the walk's cursor (written
+    ///    since the flush) are dropped instead. The walk waits for this step
+    ///    to finish before it reads the table again.
+    Rebuild {
+        sized: Box<Table>,
+        next: usize,
+    },
+    Done,
+}
+
+impl Frozen {
+    pub(super) fn new(table: Box<Table>, bill: u64, below: u64) -> Self {
+        Frozen {
+            table,
+            bill,
+            trim: Trim::PreImages { below },
+        }
+    }
+
+    /// The walk must not read the table: its rows are moving to another.
+    pub(super) fn rebuilding(&self) -> bool {
+        matches!(self.trim, Trim::Rebuild { .. })
+    }
+
+    pub(super) fn trimmed(&self) -> bool {
+        matches!(self.trim, Trim::Done)
+    }
+}
+
+#[inline]
+fn charge(key: &[u8], entry: &Entry) -> u64 {
+    entry_overhead(key, entry) as u64
+}
 
 impl SnapshotState {
-    /// Trim `table`, which a FLUSHDB detached from epoch database `db`
-    /// before the walk finished it, to the rows the walk still has to write:
-    /// `db`'s EPOCH-START rows at or above the cursor. Returns the trimmed
-    /// table's bill, from `table_bytes` (its `used_memory` at the flush)
-    /// minus what was removed plus what was restored, each row at its
-    /// `entry_overhead`.
-    ///
-    /// 1. Every key written since the epoch began has a pre-image in `db`'s
-    ///    overflow map (all of them: the drain folds the queued captures in
-    ///    before it applies a freeze, and nothing writes the slot's epoch
-    ///    table after the flush). The row the table holds for such a key is
-    ///    post-epoch: it is removed, and the epoch-start entry put back in
-    ///    its place (a tombstone puts nothing back). The map for `db` is
-    ///    then empty — its pre-images live in the table.
-    /// 2. For the database in progress, rows below the cursor are written
-    ///    already, or were written into a written range after the epoch
-    ///    began (no pre-image is ever taken there): the walk never reads
-    ///    them, so they go too.
-    /// 3. Removing rows does not shrink a DashTable's segments. When the
-    ///    post-epoch rows had grown the table to more than twice its
-    ///    epoch-start segment count, the kept rows move into a table sized
-    ///    for them.
-    ///
-    /// The kept rows are a subset of `db`'s epoch-start rows, each with its
-    /// epoch-start entry, so the bill is at most `db`'s epoch-start bill.
-    ///
-    /// Cost, on the shard thread at the drain: step 1 is one remove (and
-    /// one insert) per key written since the epoch began, work those writes
-    /// already paid for when they were captured; step 2 visits only the
-    /// segments below the cursor, which the walk already visited; step 3
-    /// runs only when the post-epoch rows at least doubled the table, and
-    /// moves at most the epoch-start rows.
-    pub(super) fn trim_to_epoch_start(
-        &mut self,
-        db: usize,
-        table: &mut Table,
-        table_bytes: u64,
-    ) -> u64 {
-        let mut bytes = table_bytes;
-        let charge =
-            |key: &[u8], entry: &crate::storage::entry::Entry| entry_overhead(key, entry) as u64;
-
-        // 1. Post-epoch rows out, epoch-start entries back.
-        let pre_images = std::mem::take(&mut self.overflow[db]);
-        for ((_, key), pre_image) in pre_images {
-            self.overflow_bytes = self
-                .overflow_bytes
-                .saturating_sub(pre_image_bytes(&key, &pre_image));
-            if let Some(post) = table.remove(&key) {
-                bytes = bytes.saturating_sub(charge(&key, &post));
+    /// Advance the trims of the frozen tables, lowest database first (the
+    /// walk needs it soonest), by at most `budget` row operations in all.
+    /// Returns the operations done. Called by every drain.
+    pub(crate) fn trim_frozen(&mut self, budget: usize) -> usize {
+        let mut used = 0;
+        for db in self.current_db..self.num_databases {
+            if used >= budget {
+                break;
             }
-            if let Some(entry) = pre_image {
-                bytes = bytes.saturating_add(charge(&key, &entry));
-                table.insert(CompactKey::from(key), entry);
+            let Some(Source::Frozen(frozen)) = self.sources.get(db) else {
+                continue;
+            };
+            if frozen.trimmed() {
+                continue;
             }
+            let Source::Frozen(mut frozen) =
+                std::mem::replace(&mut self.sources[db], Source::Written)
+            else {
+                continue;
+            };
+            used += self.trim_step(db, &mut frozen, budget - used);
+            self.sources[db] = Source::Frozen(frozen);
         }
+        #[cfg(test)]
+        {
+            self.trim_ops_last_drain = used;
+        }
+        used
+    }
 
-        // 2. The database in progress: nothing below the cursor is read again.
-        if db == self.current_db && self.cursor > 0 {
-            let cursor = self.cursor;
-            let mut written: Vec<CompactKey> = Vec::new();
-            let mut at = 0u64;
-            while at < cursor {
-                let segment = table.segment(table.segment_index_for_hash(at));
-                written.extend(
-                    segment
+    /// Up to `budget` row operations of `db`'s trim.
+    fn trim_step(&mut self, db: usize, frozen: &mut Frozen, budget: usize) -> usize {
+        let mut used = 0;
+        while used < budget {
+            match &mut frozen.trim {
+                Trim::PreImages { below } => {
+                    let Some(((_, key), pre_image)) = self.overflow[db].pop_first() else {
+                        // The walk may have passed more of the database in
+                        // progress meanwhile, taking the pre-images there
+                        // itself: the post-epoch rows of those keys are
+                        // still in the table, below the cursor. Step 2
+                        // removes everything below the cursor as it is now.
+                        let cursor = if db == self.current_db {
+                            self.cursor
+                        } else {
+                            0
+                        };
+                        frozen.trim = Trim::Written {
+                            at: 0,
+                            below: (*below).max(cursor),
+                        };
+                        continue;
+                    };
+                    self.overflow_bytes = self
+                        .overflow_bytes
+                        .saturating_sub(pre_image_bytes(&key, &pre_image));
+                    if let Some(post) = frozen.table.remove(&key) {
+                        frozen.bill = frozen.bill.saturating_sub(charge(&key, &post));
+                        dispose(post);
+                    }
+                    if let Some(entry) = pre_image {
+                        frozen.bill = frozen.bill.saturating_add(charge(&key, &entry));
+                        frozen.table.insert(CompactKey::from(key), entry);
+                    }
+                    used += 1;
+                }
+                Trim::Written { at, below } => {
+                    if *at >= *below {
+                        let start_segments =
+                            self.segment_counts.get(db).copied().unwrap_or(1).max(1);
+                        frozen.trim = if frozen.table.segment_count() > 2 * start_segments {
+                            Trim::Rebuild {
+                                // Grown by splits as rows arrive, never
+                                // pre-sized: `with_capacity` adds a depth
+                                // level of headroom (twice the segments the
+                                // kept rows need).
+                                sized: Box::new(Table::new()),
+                                next: 0,
+                            }
+                        } else {
+                            Trim::Done
+                        };
+                        continue;
+                    }
+                    let table = &mut frozen.table;
+                    let segment = table.segment(table.segment_index_for_hash(*at));
+                    let written: Vec<CompactKey> = segment
                         .iter_occupied()
-                        .filter(|(key, _)| hash_key(key.as_bytes()) < cursor)
-                        .map(|(key, _)| key.clone()),
-                );
-                match segment_block(at, segment.depth()).1 {
-                    Some(end) => at = end,
-                    None => break,
+                        .filter(|(key, _)| hash_key(key.as_bytes()) < *below)
+                        .map(|(key, _)| key.clone())
+                        .collect();
+                    let end = segment_block(*at, segment.depth()).1;
+                    if used > 0 && used + 1 + written.len() > budget {
+                        break; // the next drain takes this segment
+                    }
+                    used += 1 + written.len();
+                    for key in written {
+                        if let Some(entry) = table.remove(key.as_bytes()) {
+                            frozen.bill =
+                                frozen.bill.saturating_sub(charge(key.as_bytes(), &entry));
+                            dispose(entry);
+                        }
+                    }
+                    *at = end.unwrap_or(*below);
                 }
-            }
-            for key in written {
-                if let Some(entry) = table.remove(key.as_bytes()) {
-                    bytes = bytes.saturating_sub(charge(key.as_bytes(), &entry));
+                Trim::Rebuild { sized, next } => {
+                    if *next >= frozen.table.segment_count() {
+                        let sized = std::mem::replace(sized, Box::new(Table::new()));
+                        discard(Discard::Table(std::mem::replace(&mut frozen.table, sized)));
+                        frozen.trim = Trim::Done;
+                        continue;
+                    }
+                    let keys: Vec<CompactKey> = frozen
+                        .table
+                        .segment(*next)
+                        .iter_occupied()
+                        .map(|(key, _)| key.clone())
+                        .collect();
+                    if used > 0 && used + 1 + keys.len() > budget {
+                        break; // the next drain takes this segment
+                    }
+                    used += 1 + keys.len();
+                    // Rows the walk has passed since the flush (the database
+                    // in progress) are written: dropped, not moved.
+                    let written_below = if db == self.current_db {
+                        self.cursor
+                    } else {
+                        0
+                    };
+                    for key in keys {
+                        let Some((key, entry)) = frozen.table.remove_entry(key.as_bytes()) else {
+                            continue;
+                        };
+                        if hash_key(key.as_bytes()) < written_below {
+                            frozen.bill =
+                                frozen.bill.saturating_sub(charge(key.as_bytes(), &entry));
+                            dispose(entry);
+                        } else {
+                            sized.insert(key, entry);
+                        }
+                    }
+                    *next += 1;
                 }
+                Trim::Done => break,
             }
         }
-
-        // 3. No skeleton of the post-epoch rows.
-        let start_segments = self.segment_counts.get(db).copied().unwrap_or(1).max(1);
-        if table.segment_count() > 2 * start_segments {
-            let kept: Vec<CompactKey> = table.keys().cloned().collect();
-            let mut sized = Table::with_capacity(kept.len());
-            for key in kept {
-                if let Some((key, entry)) = table.remove_entry(key.as_bytes()) {
-                    sized.insert(key, entry);
-                }
-            }
-            *table = sized;
-        }
-        bytes
+        used
     }
 }

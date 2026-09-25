@@ -444,22 +444,26 @@ pub(crate) fn note_swapdb(a: usize, b: usize) {
 /// already froze, or an epoch with an abort queued (a FLUSHALL or a resync —
 /// the tables its clears hand over are released now, not at the next drain).
 ///
-/// Memory bound (review 5): a table arrives AS FLUSHED, with every row
-/// written since the epoch began. The next drain trims it to its epoch-start
-/// rows (`SnapshotState::trim_to_epoch_start`) before freezing it, and at
-/// most ONE table per database of the epoch is frozen (a flushed slot is
-/// unmapped, so flushing it again drops the new table); each is released as
-/// soon as the walk finishes its database. After every drain the epoch
-/// therefore holds at most the epoch-start bills of the databases it has not
-/// written — however much a client inserts and flushes — the same worst case
-/// as redis, whose forked child keeps every pre-flush page on FLUSHDB and is
-/// killed only by FLUSHALL (pinned by
-/// `table_swap_tests::flushdb_of_every_database_holds_at_most_the_epoch_start_tables`).
-/// Until that drain (one tick) the table waits whole. One grown table may
-/// wait; a second flush of a grown database before the drain (a MULTI, a
-/// script) fails the save instead once the waiting post-epoch bytes pass
-/// [`FREEZE_WAIT_SLACK`], so the wait adds at most one table's post-epoch
-/// rows — memory that `used_memory` carried a moment before the flush.
+/// Memory bound (reviews 5, 6): a table arrives AS FLUSHED, with every row
+/// written since the epoch began. The next drain freezes it and starts
+/// trimming it to its epoch-start rows (`snapshot::frozen`), budgeted at
+/// `TRIM_BUDGET` row operations per drain and done after
+/// ceil(work / budget) drains — work being the keys written since the epoch
+/// began, the rows below the cursor, and the rows kept if the table is
+/// rebuilt. At most ONE table per database of the epoch is frozen (a flushed
+/// slot is unmapped, so flushing it again drops the new table); each is
+/// released as soon as the walk finishes its database. Once its trim is done
+/// the epoch therefore holds at most the epoch-start bills of the databases
+/// it has not written — however much a client inserts and flushes — the same
+/// worst case as redis, whose forked child keeps every pre-flush page on
+/// FLUSHDB and is killed only by FLUSHALL (pinned by
+/// `table_swap_tests::flushdb_of_every_database_holds_at_most_the_epoch_start_tables`
+/// and `prop_tests`). Until then the table holds its post-epoch rows too.
+/// One grown table may wait for its first drain; a second flush of a grown
+/// database before that drain (a MULTI, a script) fails the save instead
+/// once the waiting post-epoch bytes pass [`FREEZE_WAIT_SLACK`], so the wait
+/// adds at most one table's post-epoch rows — memory that `used_memory`
+/// carried a moment before the flush.
 ///
 /// A slot that cannot be identified (an epoch armed on a thread with no
 /// shard slice) keeps the old answer: an unfinished epoch is aborted. One
@@ -860,6 +864,9 @@ pub(crate) fn drain_into(snap: &mut SnapshotState) {
     // database and pending-ness do not depend on the table events, so the
     // order is free otherwise.
     apply_table_events(snap);
+    // Review 6: the frozen tables' trims advance by a bounded amount per
+    // drain (`snapshot::frozen::TRIM_BUDGET`), not whole in one.
+    snap.trim_frozen(crate::persistence::snapshot::frozen::trim_budget());
     // moon#1228: INFO `current_cow_size`.
     publish_cow_size(snap.cow_bytes() + DEDUPE_BYTES.with(Cell::get));
 }

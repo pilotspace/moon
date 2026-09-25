@@ -233,6 +233,64 @@ now permanent:
     at seed 1: "db 0's frozen rows are 30090 B; its epoch-start bill 0 B". The trim ran
     without that tick's tombstones, so post-epoch rows stayed frozen.
 
+**Review 6, S1: the trim is budgeted.** Review 5's trim ran whole inside one drain on the
+shard thread. The reviewer measured it (release-fast, in-process):
+- a 1M-row db in progress, cursor at 50%: 62 ms, against 27 ms for main's FLUSHDB drop;
+- 0.5M epoch-start + 1.5M post-epoch rows in a pending db: 0.88 s;
+- 2M + 6M: 4.33 s.
+
+Now `snapshot/frozen.rs` keeps a per-table state machine: pre-images, then written rows,
+then an optional rebuild. The drains advance it by at most `TRIM_BUDGET` = 512 row
+operations in all, lowest database first; a segment that would not fit waits for the next
+drain.
+- **The file never depends on the trim.** Until a key's pre-image is folded into the table,
+  the walk shadows the table's row with it, and the walk never reads below its cursor. So
+  steps 1 and 2 run while the walk writes the same database. Only the rebuild (rows moving
+  between tables) makes the walk wait a tick.
+- **Seed 104 found a bug in the first version.** With the walk interleaved, it takes the
+  pre-images of the range it passes itself, and those keys' post-epoch rows stayed below the
+  cursor. Step 2 now covers the cursor as it stands when step 1 ends. The property test was
+  red at seed 104 ("db 3's frozen rows are 674492 B; its epoch-start bill 658842 B") and is
+  now green over 400 seeds. Half of those run with a tiny random budget (1-40), giving 5,704
+  mid-trim observations and 11 ticks where the walk waited on a rebuild.
+- **The byte bound holds once the trim is done:** after ceil(work / 512) drains, where work
+  = keys written since the epoch began + rows below the cursor + (on a rebuild) the rows kept.
+  8 x 10K rows: about 20-40 drains each. 2M + 6M: about 16K drains.
+- **The rebuilt table grows by splits** (`Table::new`), since `with_capacity` adds a depth
+  level of headroom. The emptied old table, and any removed post-epoch value of 4,096 or more
+  elements, are freed on a lazily started `moon-snapdrop` helper thread (the `moon-lazyfree`
+  pattern). The old 8M-row skeleton alone took 19.6 ms to free inline.
+
+Measured end to end: release-fast server (jemalloc, its baked `background_thread:true,
+dirty_decay_ms:1000`), `--shards 1`, a held save. The db gets N epoch-start rows then 3N
+post-epoch rows, then FLUSHDB, while a second connection PINGs in a loop:
+
+| Case | FLUSHDB reply | PING after it: p99 / p99.9 / max | bill at its final value |
+|---|---|---|---|
+| main's FLUSHDB (no save), 0.5M + 1.5M | 45 ms | max 45 ms | — |
+| main's FLUSHDB (no save), 2M + 6M | 192-193 ms | max 192-193 ms | — |
+| budget 512, 0.5M + 1.5M | 0.2 ms | 0.33 / 0.69 / 4.2 ms | 2.9 s |
+| budget 512, 2M + 6M | 0.3 ms | 0.42 / 1.01 / 9.2 ms | 11.8 s |
+| budget 2,048, 2M + 6M (rejected) | 0.3 ms | 1.0-1.5 / 10-27 / 427-865 ms | 3.1-3.4 s |
+| budget 1,024, 2M + 6M (rejected) | 0.3 ms | 0.56 / 0.89 / 52.8 ms | 5.9 s |
+
+Why the larger budgets stall:
+- An operation costs ~0.1-1.3 us, so a 2,048-op drain can outlast the 1 ms tick, and the
+  event loop then runs ticks back to back ahead of connection I/O.
+- The 0.4-0.9 s stall at the end of a large rebuild is jemalloc returning the ~1 GB step 1
+  freed while the rebuild allocates. With purging disabled
+  (`background_thread:false,dirty_decay_ms:-1`) the max is 63 ms; with `dirty_decay_ms:0` it
+  is 617 ms; leaking the old table instead of freeing it did not remove it.
+- At 512 the purge spreads out over the longer trim, and no such stall was seen.
+
+Lib-test timings (`table_swap_tests::trim_cost_of_a_large_flushed_table`, `--ignored`) run
+on glibc: lib tests use the system allocator. glibc's fastbin consolidation put 26-98 ms
+into single `BTreeMap::pop_first` calls; `GLIBC_TUNABLES=glibc.malloc.mxfast=0` removes it
+(worst drain 13 ms). So those numbers are not the server's. The cheap budget assertion is
+`table_swap_tests::one_drain_trims_at_most_the_budget`: a 50,000-row table, at most
+`TRIM_BUDGET` operations per drain, the trim done after about ceil(ops / budget) drains, and
+bound and file correct. It was red on the unbudgeted trim ("one drain trimmed 50000 rows").
+
 The frozen figure is `used_memory` at the flush, not `estimated_memory()` (52544bf3:
 spill-in-flight payloads are not in the table; red 1,467,473 B vs 418,890 B with 1 MiB in
 flight).

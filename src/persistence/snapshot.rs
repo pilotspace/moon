@@ -236,6 +236,9 @@ pub struct SnapshotState {
     /// Test-only: pin the per-tick budget to its constant (pre-moon#1228)
     /// value, the control of the convergence tests.
     fixed_budget: bool,
+    /// Test-only: row operations the last drain's trim did (review 6).
+    #[cfg(test)]
+    trim_ops_last_drain: usize,
 }
 
 /// A key's state at the start of a snapshot epoch: its entry, or `None` when
@@ -260,12 +263,12 @@ enum Source {
     /// database's own index; a SWAPDB moves the table, and this with it.
     Live(usize),
     /// The table a FLUSHDB detached before the epoch wrote it
-    /// (`Database::clear` hands it over instead of dropping it), trimmed to
-    /// the database's epoch-start rows still to write, pre-images restored
-    /// into it (review 5, `trim_to_epoch_start`); and its bill. Nothing
-    /// writes it any more: it IS the rest of the database's epoch-start
-    /// contents.
-    Frozen(Box<Table>, u64),
+    /// (`Database::clear` hands it over instead of dropping it), being
+    /// trimmed to the database's epoch-start rows still to write, pre-images
+    /// restored into it (reviews 5 and 6, [`frozen::Frozen`]). Nothing writes
+    /// it any more: with the pre-images still in the overflow map it IS the
+    /// rest of the database's epoch-start contents.
+    Frozen(Box<frozen::Frozen>),
     /// Fully written (a frozen table is dropped as soon as it is).
     Written,
 }
@@ -327,6 +330,8 @@ impl SnapshotState {
             aborted: None,
             sources: (0..num_databases).map(Source::Live).collect(),
             fixed_budget: false,
+            #[cfg(test)]
+            trim_ops_last_drain: 0,
         }
     }
 
@@ -558,7 +563,7 @@ impl SnapshotState {
             .sources
             .iter()
             .map(|s| match s {
-                Source::Frozen(_, bytes) => *bytes,
+                Source::Frozen(frozen) => frozen.bill,
                 _ => 0,
             })
             .sum();
@@ -570,7 +575,7 @@ impl SnapshotState {
     #[cfg(test)]
     pub(crate) fn frozen_segments_for_test(&self, db: usize) -> Option<usize> {
         match self.sources.get(db) {
-            Some(Source::Frozen(table, _)) => Some(table.segment_count()),
+            Some(Source::Frozen(frozen)) => Some(frozen.table.segment_count()),
             _ => None,
         }
     }
@@ -638,10 +643,11 @@ impl SnapshotState {
 
     /// A FLUSHDB detached database `db`'s table before the epoch finished
     /// writing it (moon#1228): keep the table's EPOCH-START rows as `db`'s
-    /// contents. The table arrives as flushed, post-epoch rows included; it
-    /// is trimmed to the rows the walk still has to write first (review 5,
-    /// [`Self::trim_to_epoch_start`]), so what the epoch holds for `db` is
-    /// at most `db`'s epoch-start bill. A table for a database already
+    /// contents. The table arrives as flushed, post-epoch rows included; the
+    /// drains trim it to the rows the walk still has to write, a budget at a
+    /// time (reviews 5 and 6, [`frozen::Frozen`], [`Self::trim_frozen`]), so
+    /// once trimmed what the epoch holds for `db` is at most `db`'s
+    /// epoch-start bill. A table for a database already
     /// written (or an aborted epoch) is dropped. Queued by
     /// `snapshot_cow::note_cleared_table`, and applied after the drain has
     /// folded in the captures queued with it; a FLUSHALL aborts the epoch
@@ -650,15 +656,41 @@ impl SnapshotState {
     /// `bytes` is the table's `used_memory` at the flush (without
     /// spill-in-flight bytes); the trimmed bill is reported in
     /// [`Self::cow_bytes`] while the epoch keeps the table.
-    pub(crate) fn freeze(&mut self, db: usize, mut table: Box<Table>, bytes: u64) {
+    pub(crate) fn freeze(&mut self, db: usize, table: Box<Table>, bytes: u64) {
         if self.aborted.is_some() || db < self.current_db || db >= self.num_databases {
             return;
         }
         if !matches!(self.sources.get(db), Some(Source::Live(_))) {
             return;
         }
-        let bytes = self.trim_to_epoch_start(db, &mut table, bytes);
-        self.sources[db] = Source::Frozen(table, bytes);
+        let below = if db == self.current_db {
+            self.cursor
+        } else {
+            0
+        };
+        self.sources[db] = Source::Frozen(Box::new(frozen::Frozen::new(table, bytes, below)));
+    }
+
+    /// Would the walk read the current database from a table whose rows are
+    /// being moved (the trim's rebuild, review 6)? It waits a tick then.
+    fn current_table_rebuilding(&self) -> bool {
+        matches!(self.sources.get(self.current_db), Some(Source::Frozen(f)) if f.rebuilding())
+    }
+
+    /// Test-only: the frozen table of `db` is trimmed to its epoch-start
+    /// rows (review 6); `None` when `db` has no frozen table.
+    #[cfg(test)]
+    pub(crate) fn frozen_trimmed_for_test(&self, db: usize) -> Option<bool> {
+        match self.sources.get(db) {
+            Some(Source::Frozen(frozen)) => Some(frozen.trimmed()),
+            _ => None,
+        }
+    }
+
+    /// Test-only: row operations the last drain's trim did.
+    #[cfg(test)]
+    pub(crate) fn trim_ops_last_drain_for_test(&self) -> usize {
+        self.trim_ops_last_drain
     }
 
     /// Run `f` over the current database's epoch-start table: the frozen
@@ -675,10 +707,10 @@ impl SnapshotState {
             return f(self, db.data());
         };
         match std::mem::replace(source, Source::Written) {
-            Source::Frozen(table, bytes) => {
-                let out = f(self, &table);
+            Source::Frozen(frozen) => {
+                let out = f(self, &frozen.table);
                 if self.current_db == cur && self.aborted.is_none() {
-                    self.sources[cur] = Source::Frozen(table, bytes);
+                    self.sources[cur] = Source::Frozen(frozen);
                 }
                 out
             }
@@ -706,6 +738,9 @@ impl SnapshotState {
         if self.current_db >= self.num_databases || self.aborted.is_some() {
             return true;
         }
+        if self.current_table_rebuilding() {
+            return false;
+        }
         self.with_current_table(db, |s, table| s.advance_segment_inner(table))
     }
 
@@ -729,6 +764,9 @@ impl SnapshotState {
         self.write_header_if_needed();
         if self.current_db >= self.num_databases || self.aborted.is_some() {
             return true;
+        }
+        if self.current_table_rebuilding() {
+            return false;
         }
         // moon#1228: the budgets grow with the pre-image backlog.
         let scale = if self.fixed_budget {
@@ -766,6 +804,9 @@ impl SnapshotState {
         self.write_header_if_needed();
         if self.current_db >= self.num_databases || self.aborted.is_some() {
             return true;
+        }
+        if self.current_table_rebuilding() {
+            return false;
         }
         let db = &databases[self.source_db_index()];
         self.with_current_table(db, |s, table| s.advance_segment_inner(table))
@@ -1387,7 +1428,7 @@ pub fn shard_snapshot_load<D: std::borrow::BorrowMut<Database>>(
     Ok(total_keys)
 }
 
-mod frozen;
+pub(crate) mod frozen;
 
 #[cfg(test)]
 mod tests;

@@ -364,7 +364,7 @@ fn a_frozen_table_keeps_no_skeleton_of_post_epoch_rows() {
             "setup: {grown} segments vs {start_segments}"
         );
         live(&mut dbs, &mut tail, flushed, &[b"FLUSHDB"]);
-        epoch.drain();
+        epoch.drain_until_trimmed(flushed);
         let frozen = epoch
             .state
             .as_ref()
@@ -384,6 +384,163 @@ fn a_frozen_table_keeps_no_skeleton_of_post_epoch_rows() {
         );
         let recovered = recover(2, records, &tail);
         assert_eq!(string_keyspace(&recovered), string_keyspace(&dbs));
+    }
+}
+
+/// Review 6 (S1): the trim is budgeted across drains. Done whole inside one
+/// drain it cost 0.88 s for a pending database of 0.5M epoch-start rows
+/// grown by 1.5M (release). A table grown by 50,000 post-epoch rows: each
+/// drain does at most `TRIM_BUDGET` row operations, the trim completes after
+/// ceil(its work / budget) drains, and the save's file is still the
+/// epoch-start keyspace with the byte bound holding once the trim is done.
+#[test]
+fn one_drain_trims_at_most_the_budget() {
+    use crate::persistence::snapshot::frozen::TRIM_BUDGET;
+    let mut dbs = vec![Database::new(), Database::new()];
+    preload(&mut dbs[0], "a", 1500);
+    preload(&mut dbs[1], "b", 200);
+    let start_bill = dbs[1].ledger_bytes() as u64;
+    let expected = string_keyspace(&dbs);
+    let mut epoch = Epoch::begin(&dbs);
+    assert!(!epoch.tick_one(&dbs));
+    let mut tail = Tail::new();
+    const POST: usize = 50_000;
+    for j in 0..POST {
+        let k = format!("post:{j}");
+        live(&mut dbs, &mut tail, 1, &[b"SET", k.as_bytes(), b"v"]);
+    }
+    live(&mut dbs, &mut tail, 1, &[b"FLUSHDB"]);
+    // The first drain folds the 50,000 tombstones in, freezes the table and
+    // starts its trim: no more than the budget of them may be consumed.
+    epoch.drain();
+    let state = epoch.state.as_ref().expect("epoch");
+    let done = POST - state.pending_pre_images();
+    assert!(
+        done <= TRIM_BUDGET && state.trim_ops_last_drain_for_test() <= TRIM_BUDGET,
+        "one drain trimmed {done} rows of a {POST}-row table; the budget is {TRIM_BUDGET}"
+    );
+    assert_eq!(state.frozen_trimmed_for_test(1), Some(false));
+    let mut ops = state.trim_ops_last_drain_for_test();
+    let mut drains = 1;
+    while epoch
+        .state
+        .as_ref()
+        .expect("epoch")
+        .frozen_trimmed_for_test(1)
+        == Some(false)
+    {
+        epoch.drain();
+        let state = epoch.state.as_ref().expect("epoch");
+        assert!(state.trim_ops_last_drain_for_test() <= TRIM_BUDGET);
+        ops += state.trim_ops_last_drain_for_test();
+        drains += 1;
+    }
+    // Every drain but the last did (nearly) a full budget: a segment that
+    // does not fit waits for the next drain.
+    assert!(
+        ops > POST && drains <= ops.div_ceil(TRIM_BUDGET) + 1,
+        "{ops} row operations took {drains} drains of {TRIM_BUDGET}"
+    );
+    let held = epoch.state.as_ref().expect("epoch").cow_bytes();
+    assert!(
+        held <= start_bill,
+        "trimmed: {held} B held, epoch-start {start_bill} B"
+    );
+    let records = epoch.try_finish(&dbs).expect("the save must complete");
+    assert_eq!(diverge(&expected, &records), Default::default());
+    let recovered = recover(2, records, &tail);
+    assert_eq!(string_keyspace(&recovered), string_keyspace(&dbs));
+}
+
+/// Review 6 (S1), measurement only: the trim's cost per drain and in drains,
+/// against main's FLUSHDB (a drop). Run in a release build:
+/// `MOON_TEST_TRIM_N=<rows> cargo test --profile release-fast --lib trim_cost -- --ignored --nocapture`.
+#[test]
+#[ignore = "measurement: run with --ignored in a release build"]
+fn trim_cost_of_a_large_flushed_table() {
+    use std::time::{Duration, Instant};
+    let n: u32 = std::env::var("MOON_TEST_TRIM_N")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1_000_000);
+    let fill = |db: &mut Database, prefix: &str, n: u32| {
+        for i in 0..n {
+            db.set_string(
+                format!("{prefix}:{i:09}").as_bytes(),
+                Bytes::from_static(b"v"),
+            );
+        }
+    };
+    let drain_all = |epoch: &mut Epoch, db: usize| -> (usize, (Duration, usize), Duration) {
+        let (mut drains, mut worst, mut total) = (0, (Duration::ZERO, 0), Duration::ZERO);
+        loop {
+            let t = Instant::now();
+            epoch.drain();
+            let e = t.elapsed();
+            drains += 1;
+            if e > worst.0 {
+                worst = (e, drains);
+            }
+            total += e;
+            let trimmed = epoch
+                .state
+                .as_ref()
+                .and_then(|s| s.frozen_trimmed_for_test(db));
+            if trimmed != Some(false) {
+                return (drains, worst, total);
+            }
+        }
+    };
+    {
+        snapshot_cow::disarm();
+        let mut dbs = vec![Database::new()];
+        fill(&mut dbs[0], "a", n);
+        let t = Instant::now();
+        let _ = run(&mut dbs, 0, &[b"FLUSHDB"]);
+        eprintln!(
+            "[trim n={n}] FLUSHDB with no save running (a drop): {:?}",
+            t.elapsed()
+        );
+    }
+    // The database in progress, flushed with the cursor half way (step 2).
+    {
+        let mut dbs = vec![Database::new(), Database::new()];
+        fill(&mut dbs[0], "a", n);
+        let mut epoch = Epoch::begin(&dbs);
+        while epoch.state.as_ref().expect("epoch").cursor() < (1u64 << 63)
+            && epoch.state.as_ref().expect("epoch").current_db_index() == 0
+        {
+            epoch.tick(&dbs);
+        }
+        let _ = run(&mut dbs, 0, &[b"FLUSHDB"]);
+        let (drains, worst, total) = drain_all(&mut epoch, 0);
+        eprintln!(
+            "[trim n={n}] in-progress db, cursor at 50%: {drains} drains, worst {worst:?}, \
+             total {total:?}"
+        );
+        let _ = epoch.try_finish(&dbs);
+    }
+    // A pending database of n/2 rows grown by 1.5n (steps 1 and 3).
+    {
+        let mut dbs = vec![Database::new(), Database::new()];
+        fill(&mut dbs[0], "a", 1000);
+        fill(&mut dbs[1], "b", n / 2);
+        let mut epoch = Epoch::begin(&dbs);
+        for i in 0..(n + n / 2) {
+            let k = format!("p:{i:09}");
+            let _ = run(&mut dbs, 1, &[b"SET", k.as_bytes(), b"v"]);
+            if i % 4096 == 0 {
+                epoch.drain();
+            }
+        }
+        epoch.drain();
+        let _ = run(&mut dbs, 1, &[b"FLUSHDB"]);
+        let (drains, worst, total) = drain_all(&mut epoch, 1);
+        eprintln!(
+            "[trim n={n}] pending db n/2 grown by 1.5n: {drains} drains, worst {worst:?}, \
+             total {total:?}"
+        );
+        let _ = epoch.try_finish(&dbs);
     }
 }
 

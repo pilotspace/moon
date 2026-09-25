@@ -12,10 +12,12 @@
 //! / MOVE / COPY DB / SWAPDB / FLUSHDB [ASYNC] / grow-then-FLUSHDB runs,
 //! interleaved with held ticks (drain only), one-segment ticks and budgeted
 //! ticks — FLUSHDB is biased onto the database in progress (the cursor case).
-//! After every drain the frozen tables' rows are bounded by the epoch-start
-//! bills of the unwritten databases. At the end the published file must be
-//! EXACTLY the epoch-start image (no missing / extra / duplicated key, no
-//! wrong value, type or expiry), and file + replayed tail the live keyspace.
+//! After every drain, each frozen table whose (budgeted, review 6) trim is
+//! done holds at most its database's epoch-start bill, and together they
+//! stay within the epoch-start bills of the unwritten databases. At the end
+//! the published file must be EXACTLY the epoch-start image (no missing /
+//! extra / duplicated key, no wrong value, type or expiry), and file +
+//! replayed tail the live keyspace.
 //!
 //! 16 seeds by default (~6 s in a debug build; 64 take ~25 s);
 //! `MOON_TEST_SNAPSHOT_PROP_SEEDS=<n>` and
@@ -217,6 +219,13 @@ struct Coverage {
     swaps: u64,
     max_bill_error: i64,
     bill_checks: u64,
+    /// Frozen tables seen after a drain with their trim still running
+    /// (budgeted across drains since review 6; the bound holds once done).
+    trims_in_progress: u64,
+    /// Seeds run with a tiny trim budget (1-40 row operations per drain).
+    tiny_budget_seeds: u64,
+    /// Ticks at which the walk's database was being rebuilt (it waits).
+    walk_waits_for_rebuild: u64,
     max_frozen_over_unwritten_ratio_pct: u64,
 }
 
@@ -233,12 +242,19 @@ fn check_after_drain(seed: u64, state: &SnapshotState, start_bills: &[u64], cov:
     let mut frozen_bill = 0u64;
     let mut frozen_actual = 0u64;
     for (db, source) in state.sources.iter().enumerate() {
-        if let Source::Frozen(table, bill) = source {
+        if let Source::Frozen(frozen) = source {
             assert!(
                 db >= cur,
                 "seed {seed}: db {db} frozen behind the walk ({cur})"
             );
-            let actual: u64 = table
+            if !frozen.trimmed() {
+                // The byte bound holds once the (budgeted) trim is done.
+                cov.trims_in_progress += 1;
+                continue;
+            }
+            let bill = &frozen.bill;
+            let actual: u64 = frozen
+                .table
                 .iter()
                 .map(|(k, e)| entry_overhead(k.as_bytes(), e) as u64)
                 .sum();
@@ -269,6 +285,13 @@ fn check_after_drain(seed: u64, state: &SnapshotState, start_bills: &[u64], cov:
 
 fn one_seed(seed: u64, cov: &mut Coverage) {
     let mut rng = Rng(seed);
+    // Review 6 (S1): half the seeds spread every trim over many drains,
+    // interleaved with the walk writing the same database.
+    let tiny = (seed % 2 == 0).then(|| 1 + rng.below(40) as usize);
+    crate::persistence::snapshot::frozen::set_trim_budget_for_test(tiny);
+    if tiny.is_some() {
+        cov.tiny_budget_seeds += 1;
+    }
     let now = current_time_ms();
     let (mut dbs, seeded) = seed_dbs(&mut rng, now);
     let expected = dump(&mut dbs, now);
@@ -453,6 +476,13 @@ fn one_seed(seed: u64, cov: &mut Coverage) {
                 }
             }
         }
+        if epoch
+            .state
+            .as_ref()
+            .is_some_and(SnapshotState::current_table_rebuilding)
+        {
+            cov.walk_waits_for_rebuild += 1;
+        }
         let done = match rng.below(10) {
             0..=4 => {
                 epoch.drain();
@@ -589,5 +619,10 @@ fn the_file_is_exactly_the_epoch_start_image_over_random_workloads() {
     for seed in start..start + n {
         one_seed(seed, &mut cov);
     }
+    crate::persistence::snapshot::frozen::set_trim_budget_for_test(None);
     eprintln!("snapshot property coverage: {cov:#?}");
+    assert!(
+        n < 8 || (cov.trims_in_progress > 0 && cov.rebuilds_seen > 0),
+        "the seeds never spread a trim over several drains: {cov:#?}"
+    );
 }
