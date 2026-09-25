@@ -385,6 +385,10 @@ fn group_reader_ready(
     }
     // Redis creates a blocked reader's consumer without signalling the key's
     // watchers (`keyModified(..., signal=0)`), so neither does this.
+    //
+    // moon#1228: creating the consumer writes the stream outside
+    // `command::dispatch`; an armed BGSAVE epoch needs its state first.
+    crate::persistence::snapshot_cow::capture_write_pre_image(db, db_index, key);
     let Ok(Some(stream)) = db.get_stream_mut_unsignalled(key) else {
         return GroupReadiness::Gone(xreadgroup_nogroup(key, group));
     };
@@ -438,6 +442,13 @@ fn serve_group_read(
     use crate::command::stream::format_entry;
 
     let before = stream_log::group_read_before(db, key, group, consumer)?;
+    // moon#1228: the `>` read moves entries into the PEL and advances the
+    // group cursor, outside `command::dispatch`. `wakeup::serve_ready_key`
+    // captured the key before calling here, but the other callers — the
+    // `BlockRegister` re-check, `blocking::group::register_group` and
+    // `wakeup::recheck_group_readers` — did not, so capture here, where the
+    // write happens (a wake that serves nothing captures nothing).
+    crate::persistence::snapshot_cow::capture_write_pre_image(db, db_index, key);
     let stream = db.get_stream_mut(key).ok()??;
     let entries = stream.read_group_new(group, consumer, count, noack).ok()?;
     if entries.is_empty() {
@@ -783,6 +794,89 @@ mod tests {
         assert!(
             !crate::blocking::wakeup::may_wake(b"SET"),
             "and the gate narrows again"
+        );
+    }
+
+    /// moon#1228: a group read served by the waker writes the stream (PEL,
+    /// consumer, group cursor) outside `command::dispatch`. Three of its four
+    /// callers — the `BlockRegister` re-check, `group::register_group` and
+    /// `recheck_group_readers` — call it with no capture before it, so under
+    /// an armed BGSAVE every stream whose range the save had not written yet
+    /// reached the file with the read already in its PEL.
+    #[test]
+    fn a_wake_served_group_read_mid_epoch_keeps_the_snapshot_point_in_time() {
+        use crate::persistence::snapshot::{SnapshotState, shard_snapshot_load};
+        use crate::persistence::snapshot_cow;
+
+        const STREAMS: usize = 48;
+        let mut db = Database::new();
+        for i in 0..3000u32 {
+            db.set_string(format!("fill:{i}").as_bytes(), Bytes::from_static(b"x"));
+        }
+        let mut reg = BlockingRegistry::new(0);
+        let key = |i: usize| format!("s{i:03}");
+        let mut receivers = Vec::new();
+        for i in 0..STREAMS {
+            cmd(
+                &mut db,
+                &["XGROUP", "CREATE", &key(i), "g", "$", "MKSTREAM"],
+            );
+            cmd(&mut db, &["XADD", &key(i), "1-1", "f", "v"]);
+            // A reader parked BEFORE the save, as a remote registration
+            // whose re-check found nothing yet would leave it; `fresh` is a
+            // consumer the wake must create.
+            receivers.push(park_group_reader(&mut reg, &key(i), "fresh", None));
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.rrdshard");
+        let mut state = SnapshotState::new(0, 1, std::slice::from_ref(&db), path.clone());
+        snapshot_cow::disarm();
+        snapshot_cow::arm_with_layout(state.segment_counts().to_vec());
+        assert!(!state.advance_one_segment_db(&db));
+        snapshot_cow::note_progress(state.current_db_index(), state.cursor());
+
+        // Mid-epoch: the waker serves every parked reader directly, the way
+        // the three uncaptured callers reach it.
+        for i in 0..STREAMS {
+            assert!(try_wake_stream_waiter(&mut reg, &mut db, 0, &b(&key(i))));
+        }
+        assert!(
+            receivers
+                .iter()
+                .all(|rx| matches!(rx.try_recv(), Ok(Some(Frame::Array(_))))),
+            "setup: every reader is served"
+        );
+
+        snapshot_cow::drain_pending_for_test(&mut state);
+        while !state.advance_one_segment_db(&db) {}
+        state.finalize().unwrap();
+        snapshot_cow::disarm();
+
+        let mut loaded = vec![Database::new()];
+        shard_snapshot_load(&mut loaded, &path).unwrap();
+        let mut wrong = Vec::new();
+        for i in 0..STREAMS {
+            let s = loaded[0]
+                .get_stream(key(i).as_bytes())
+                .unwrap()
+                .expect("stream in the file");
+            let g = &s.groups[b"g".as_ref()];
+            if !g.pel.is_empty() || !g.consumers.is_empty() {
+                wrong.push(format!(
+                    "{}: pel {} consumers {}",
+                    key(i),
+                    g.pel.len(),
+                    g.consumers.len()
+                ));
+            }
+        }
+        assert!(
+            wrong.is_empty(),
+            "{} of {STREAMS} streams reached the file with the mid-save group read in it \
+             (first: {:?})",
+            wrong.len(),
+            &wrong[..wrong.len().min(5)]
         );
     }
 }
