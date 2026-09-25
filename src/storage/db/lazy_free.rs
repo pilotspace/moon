@@ -99,6 +99,49 @@ pub fn lazy_free_pending_anywhere() -> bool {
     PENDING_ITEMS.load(Relaxed) != 0
 }
 
+thread_local! {
+    /// Items queued by databases mutated on THIS thread and not yet freed
+    /// here (moon#1226) — the per-shard gate for the 1 ms drain tick.
+    ///
+    /// A shard's databases are mutated only on the shard's own thread (the
+    /// write guard is owner-only; the D3 foreign-write primitive has no
+    /// production caller), so this is the shard's own count. It is a HINT,
+    /// not a ledger: [`lazy_free_resync_this_thread`] lets the tick set it
+    /// from what its databases actually hold, and a queue filled or dropped
+    /// from another thread is caught by the tick's periodic full sweep.
+    static THIS_THREAD_QUEUED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// `true` if databases on this thread (this shard) may have lazy-free work
+/// queued (moon#1226). One thread-local read.
+#[inline]
+pub fn lazy_free_queued_on_this_thread() -> bool {
+    THIS_THREAD_QUEUED.with(|c| c.get() != 0)
+}
+
+/// Reset this thread's hint to what a full pass over the shard's databases
+/// found: nothing left (`false`) or something (`true`).
+#[inline]
+pub fn lazy_free_resync_this_thread(work_left: bool) {
+    THIS_THREAD_QUEUED.with(|c| {
+        if !work_left {
+            c.set(0);
+        } else if c.get() == 0 {
+            c.set(1);
+        }
+    });
+}
+
+#[inline]
+fn this_thread_add(n: usize) {
+    THIS_THREAD_QUEUED.with(|c| c.set(c.get().saturating_add(n)));
+}
+
+#[inline]
+fn this_thread_sub(n: usize) {
+    THIS_THREAD_QUEUED.with(|c| c.set(c.get().saturating_sub(n)));
+}
+
 /// Element count of `entry` when it is large enough to free lazily.
 pub(crate) fn lazy_free_weight(entry: &Entry) -> Option<usize> {
     let n = match entry.value.as_redis_value() {
@@ -193,6 +236,7 @@ impl Drop for LazyFreeQueue {
         // process-wide counter honest.
         if !self.items.is_empty() {
             PENDING_ITEMS.fetch_sub(self.items.len(), Relaxed);
+            this_thread_sub(self.items.len());
         }
     }
 }
@@ -455,6 +499,7 @@ impl Database {
             credited: 0,
         });
         PENDING_ITEMS.fetch_add(1, Relaxed);
+        this_thread_add(1);
     }
 
     /// Items queued in this database.
@@ -561,6 +606,7 @@ impl Database {
                 release_shell(done_item.work, done_item.weight);
             }
             PENDING_ITEMS.fetch_sub(1, Relaxed);
+            this_thread_sub(1);
         }
         freed
     }
