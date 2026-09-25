@@ -100,3 +100,33 @@ fn session_filter_cost_does_not_grow_with_session_size() {
         "50 session filters over a 200K-member session took {el:?}"
     );
 }
+
+/// moon#1226: the in-place filter matches the borrowed one and never copies
+/// — the survivors stay in the caller's buffer (spilled past 32 inline
+/// results here, so a copy would show up as a different heap pointer), and
+/// the no-session path leaves the buffer untouched.
+#[test]
+fn retain_unseen_filters_in_place_without_copying() {
+    let db = db_with_session(b"sess", &[1, 3, 4, 40], 20);
+    let k2k = keymap(48);
+    let res = results(48);
+    let want = session::filter_session_results_in_db(&res, &db, b"sess", &k2k);
+
+    let mut inplace = results(48);
+    assert!(inplace.spilled());
+    let buf = inplace.as_ptr();
+    session::retain_unseen_in_db(&mut inplace, &db, b"sess", &k2k);
+    assert_eq!(inplace.as_ptr(), buf, "filtered in the caller's buffer");
+    assert_eq!(
+        inplace.iter().map(|r| r.key_hash).collect::<Vec<_>>(),
+        want.iter().map(|r| r.key_hash).collect::<Vec<_>>()
+    );
+    assert_eq!(inplace.len(), 44);
+
+    // No session key: nothing filtered, nothing moved.
+    let mut untouched = results(48);
+    let buf = untouched.as_ptr();
+    session::retain_unseen_in_db(&mut untouched, &db, b"no-such-session", &k2k);
+    assert_eq!(untouched.as_ptr(), buf);
+    assert_eq!(untouched.len(), 48);
+}

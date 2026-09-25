@@ -59,26 +59,40 @@ pub fn filter_session_results(
 /// A missing, expired or wrong-typed session key filters nothing — the same
 /// outcome as the old snapshot path (whose `Err`/`None` arms produced an
 /// empty map).
+///
+/// moon#1226: this copies `results` — on the no-session path a pure clone.
+/// A caller that owns its results should call [`retain_unseen_in_db`], which
+/// filters them in place and copies nothing; this borrowed form remains only
+/// for the `ft_search/dispatch.rs` call sites, which switch at integration.
 pub fn filter_session_results_in_db(
     results: &SmallVec<[SearchResult; 32]>,
     db: &Database,
     session_key: &[u8],
     key_hash_to_key: &BucketedKeyMap<Bytes>,
 ) -> SmallVec<[SearchResult; 32]> {
-    let set = match db.get_sorted_set_ref_if_alive(session_key, db.now_ms()) {
-        Ok(Some(set)) => set,
-        _ => return results.clone(),
+    let mut out = results.clone();
+    retain_unseen_in_db(&mut out, db, session_key, key_hash_to_key);
+    out
+}
+
+/// [`filter_session_results_in_db`] IN PLACE (moon#1226): drop every result
+/// whose key the session set under `session_key` already holds. No copy and
+/// no allocation — a missing, expired or wrong-typed session key leaves
+/// `results` untouched, and the survivors keep their order.
+pub fn retain_unseen_in_db(
+    results: &mut SmallVec<[SearchResult; 32]>,
+    db: &Database,
+    session_key: &[u8],
+    key_hash_to_key: &BucketedKeyMap<Bytes>,
+) {
+    let Ok(Some(set)) = db.get_sorted_set_ref_if_alive(session_key, db.now_ms()) else {
+        return;
     };
-    let mut filtered = SmallVec::with_capacity(results.len());
-    for r in results {
-        if let Some(redis_key) = key_hash_to_key.get(&r.key_hash) {
-            if set.score(redis_key).is_some() {
-                continue; // already returned in this session
-            }
-        }
-        filtered.push(*r);
-    }
-    filtered
+    results.retain(|r| {
+        !key_hash_to_key
+            .get(&r.key_hash)
+            .is_some_and(|redis_key| set.score(redis_key).is_some())
+    });
 }
 
 /// Record newly returned results into the session sorted set.
