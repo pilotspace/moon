@@ -151,6 +151,11 @@ pub struct ColdIndex {
     /// sweep ([`Self::drain_pending_unlink`]). Pushed only on a zero-ref
     /// transition (rare), so it does not allocate on the common insert path.
     pub(super) pending_unlink: Vec<u64>,
+    /// Listed spill files the boot rebuild found missing from disk (a lost
+    /// tombstone commit, see [`Self::drain_pending_unlink`]), queued in
+    /// `pending_unlink` by the rebuild. Consumed by the first drain: only
+    /// these may skip the moon#1231 hold. Empty outside recovery.
+    missing_at_rebuild: Vec<u64>,
     /// Running total of approximate resident bytes charged by [`Self::insert`]
     /// / [`Self::remove`] / the sweep methods' direct removals / [`Self::clear_all`]
     /// (K4 accounting spine, kernel-m2-brief-2026-07-12 stage 2).
@@ -361,6 +366,7 @@ impl ColdIndex {
             map: BTreeMap::new(),
             file_refs: HashMap::new(),
             pending_unlink: Vec::new(),
+            missing_at_rebuild: Vec::new(),
             resident_bytes: 0,
             older_copies: HashMap::new(),
             dead: super::dead_slots::DeadSlots::default(),
@@ -616,6 +622,7 @@ impl ColdIndex {
         // files it found missing): the drain re-checks references before it
         // unlinks anything, so a file `self` references is kept.
         self.pending_unlink.extend(other.pending_unlink);
+        self.missing_at_rebuild.extend(other.missing_at_rebuild);
     }
 
     /// Number of entries tracked.
@@ -995,22 +1002,32 @@ impl ColdIndex {
             return Ok(0);
         }
         let queued = std::mem::take(&mut self.pending_unlink);
-        // A queued file that is already gone from disk — listed by a
-        // manifest whose tombstone commit a crash lost (the reclaim's
-        // deferred one, moon#1240, or this sweep's own unlink-then-commit),
-        // queued by the rebuild — has nothing left for the hold to protect:
-        // no generation can read it. Retire its manifest entry now rather
-        // than after a committed fold, so the rebuild counts it
-        // (`files_missing`, a `DEGRADED` summary line) on one boot, not on
-        // every boot until a fold (moon#1231 review).
-        let data_dir = shard_dir.join("data");
-        let (gone, queued): (Vec<u64>, Vec<u64>) = queued.into_iter().partition(|&file_id| {
-            !self.file_refs.contains_key(&file_id)
-                && matches!(
-                    std::fs::symlink_metadata(data_dir.join(format!("heap-{file_id:06}.mpf"))),
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound
-                )
-        });
+        // A listed file the boot rebuild found missing — a manifest whose
+        // tombstone commit a crash lost (the reclaim's deferred one,
+        // moon#1240, or this sweep's own unlink-then-commit) — has nothing
+        // left for the hold to protect: the rebuild indexed none of its keys.
+        // Retire its manifest entry at the first drain rather than after a
+        // committed fold, so the rebuild counts it (`files_missing`, a
+        // `DEGRADED` summary line) on one boot, not on every boot until a
+        // fold (moon#1231 review). Only THOSE ids, and only if still missing:
+        // a file that is merely unreachable while a live sweep runs (moon#875:
+        // a remount, an operator `mv` — the bytes come back) goes through the
+        // hold like any other, or a crash before the next fold would lose the
+        // keys the committed generation reads there (review 5).
+        let rebuilt_missing = std::mem::take(&mut self.missing_at_rebuild);
+        let (gone, queued): (Vec<u64>, Vec<u64>) = if rebuilt_missing.is_empty() {
+            (Vec::new(), queued)
+        } else {
+            let data_dir = shard_dir.join("data");
+            queued.into_iter().partition(|&file_id| {
+                rebuilt_missing.contains(&file_id)
+                    && !self.file_refs.contains_key(&file_id)
+                    && matches!(
+                        std::fs::symlink_metadata(data_dir.join(format!("heap-{file_id:06}.mpf"))),
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound
+                    )
+            })
+        };
         let refs = &self.file_refs;
         self.hold
             .forget_referenced(|file_id| refs.contains_key(&file_id));
@@ -1363,6 +1380,7 @@ impl ColdIndex {
                 let mut index = Self::from_pairs_newest_wins(pairs);
                 if let Some((_, ids)) = missing_per_db.iter().find(|(d, _)| *d == db) {
                     index.pending_unlink.extend_from_slice(ids);
+                    index.missing_at_rebuild.extend_from_slice(ids);
                 }
                 (db, index)
             })
@@ -1461,6 +1479,7 @@ impl ColdIndex {
             map,
             file_refs,
             pending_unlink,
+            missing_at_rebuild: Vec::new(),
             resident_bytes,
             older_copies,
             dead: super::dead_slots::DeadSlots::default(),

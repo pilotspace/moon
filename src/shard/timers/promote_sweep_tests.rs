@@ -386,3 +386,40 @@ fn without_an_aof_writer_nothing_is_held() {
     .join()
     .expect("test thread");
 }
+
+/// Review 5 (moon#1231): a held file that is only TRANSIENTLY missing while
+/// the sweep runs — the moon#875 case the cold read path is built to heal (a
+/// remount, an operator `mv`, a restore in progress: the bytes come back) —
+/// keeps its hold. `f00e9903` retired ANY queued zero-ref file that stat'ed
+/// NotFound at the sweep, so the manifest tombstoned it and a crash before
+/// the next committed fold lost the read-promoted `k08` and replayed
+/// `APPEND k09 x` onto nothing. Only a file the boot rebuild itself found
+/// missing takes that fast path now.
+#[test]
+fn a_transiently_missing_held_file_keeps_its_hold() {
+    std::thread::spawn(|| {
+        let mut live = Live::start();
+        let mut generation = live.fold_and_commit();
+        generation.extend_from_slice(&delete_promote_append());
+
+        // Unreachable while the sweep runs; its keys are all promoted or
+        // deleted, so it is queued.
+        let parked = live.dir.join("parked.mpf");
+        std::fs::rename(heap(&live.dir, OLD), &parked).expect("park");
+        live.sweep(true);
+        std::fs::rename(&parked, heap(&live.dir, OLD)).expect("unpark");
+        assert!(heap(&live.dir, OLD).exists(), "fixture: file {OLD} is back");
+        let still_listed = listed(&live.manifest, OLD);
+        let held = live.held(OLD);
+
+        // Crash now: the committed generation replays onto what is on disk.
+        let mut db = recover(live.tmp.path(), &live.dir, &generation);
+        assert_eq!(
+            (value(&mut db, "k08"), value(&mut db, "k09"), still_listed, held),
+            (Some("v08".into()), Some("v09x".into()), true, true),
+            "(k08, k09, file {OLD} listed, held) after a transient NotFound at the sweep and a crash"
+        );
+    })
+    .join()
+    .expect("test thread");
+}
