@@ -3981,6 +3981,37 @@ for NSHARDS in 1 4 12; do
         [[ "$OUT" == *"Function not found"* ]] && GONE=$((GONE + 1))
     done
     assert_eq "moon#514 shards=$NSHARDS: FUNCTION DELETE reaches every shard" "12" "$GONE"
+
+    # --- moon#1235: LOAD racing FLUSH from two connections leaves every shard
+    # agreeing (all run, or all NOSCRIPT / not found) -- never a mix. The two
+    # redis-cli processes are launched together; 20 trials per shard count.
+    RACE_MIXED=0
+    for t in $(seq 1 20); do
+        body="return 'r1235-$NSHARDS-$t'"
+        redis-cli -p "$PORT_RUST" SCRIPT LOAD "$body" >/dev/null 2>&1 &
+        redis-cli -p "$PORT_RUST" SCRIPT FLUSH >/dev/null 2>&1 &
+        wait
+        sha=$(redis-cli -p "$PORT_REDIS" SCRIPT LOAD "$body" 2>/dev/null)  # the oracle hashes (no sha1sum on macOS)
+        ran=0
+        for i in $(seq 1 12); do
+            [[ "$(redis-cli -p "$PORT_RUST" EVALSHA "$sha" 1 "r1235k$i" 2>&1)" == r1235-* ]] && ran=$((ran + 1))
+        done
+        (( ran != 0 && ran != 12 )) && RACE_MIXED=$((RACE_MIXED + 1))
+    done
+    assert_eq "moon#1235 shards=$NSHARDS: SCRIPT LOAD racing SCRIPT FLUSH never leaves shards disagreeing" "0" "$RACE_MIXED"
+    RACE_MIXED=0
+    for t in $(seq 1 20); do
+        lib=$'#!lua name=r1235lib'"$t"$'\nredis.register_function(\'r1235f'"$t"$'\', function(keys, args) return 1 end)\n'
+        redis-cli -p "$PORT_RUST" FUNCTION LOAD "$lib" >/dev/null 2>&1 &
+        redis-cli -p "$PORT_RUST" FUNCTION FLUSH >/dev/null 2>&1 &
+        wait
+        ran=0
+        for i in $(seq 1 12); do
+            [[ "$(redis-cli -p "$PORT_RUST" FCALL "r1235f$t" 1 "r1235k$i" 2>&1)" == 1 ]] && ran=$((ran + 1))
+        done
+        (( ran != 0 && ran != 12 )) && RACE_MIXED=$((RACE_MIXED + 1))
+    done
+    assert_eq "moon#1235 shards=$NSHARDS: FUNCTION LOAD racing FUNCTION FLUSH never leaves shards disagreeing" "0" "$RACE_MIXED"
 done
 
 # Restart moon with the originally-requested shard count so later sections work.

@@ -2403,6 +2403,26 @@ if should_run "scripting"; then
     for i in 1 2 3 4; do
         assert_match "FCALL after DELETE (key $i)" FCALL cmdset 1 "fn:d$i" x
     done
+    # moon#1235: the sequential LOAD / FLUSH replies stay redis's while the
+    # mutations are ordered across shards (the concurrent race itself is in
+    # test-consistency.sh, moon-only). Every row is a fresh connection, so a
+    # shard that kept the script / library would show up as a mismatch.
+    assert_match "SCRIPT LOAD (moon#1235)"          SCRIPT LOAD "return 'o1235'"
+    O1235_SHA=$(rcli SCRIPT LOAD "return 'o1235'")  # the oracle hashes (no sha1sum on macOS)
+    for i in 1 2 3 4; do
+        assert_match "EVALSHA after LOAD (key $i)" EVALSHA "$O1235_SHA" 1 "o1235:k$i"
+    done
+    assert_match "SCRIPT FLUSH (moon#1235)"         SCRIPT FLUSH
+    for i in 1 2 3 4; do
+        assert_match "EVALSHA after FLUSH (key $i)" EVALSHA "$O1235_SHA" 1 "o1235:k$i"
+    done
+    assert_match "SCRIPT EXISTS after FLUSH"        SCRIPT EXISTS "$O1235_SHA"
+    assert_match "FUNCTION LOAD (moon#1235)"        FUNCTION LOAD $'#!lua name=o1235lib\nredis.register_function(\'o1235f\', function(keys, args) return 7 end)\n'
+    assert_match "FUNCTION LOAD existing (moon#1235)" FUNCTION LOAD $'#!lua name=o1235lib\nredis.register_function(\'o1235f\', function(keys, args) return 7 end)\n'
+    assert_match "FUNCTION FLUSH (moon#1235)"       FUNCTION FLUSH
+    for i in 1 2 3 4; do
+        assert_match "FCALL after FUNCTION FLUSH (key $i)" FCALL o1235f 1 "o1235:k$i"
+    done
 fi
 
 # ===========================================================================
