@@ -53,6 +53,17 @@ fn spawn(dir: &Path, shards: usize) -> (ServerGuard, u16) {
     (ServerGuard::new(child), port)
 }
 
+/// Removes the test's `--dir` when the test ends, pass or fail: a failed run
+/// otherwise leaves a multi-megabyte snapshot behind on a shared box. Declare
+/// it BEFORE the server guard so the server is reaped first.
+struct DirGuard(std::path::PathBuf);
+
+impl Drop for DirGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 fn key(j: u64) -> String {
     format!("pre:{j:08}")
 }
@@ -133,7 +144,8 @@ fn dbsize(c: &mut Conn, db: usize) -> i64 {
 const MAX_ATTEMPTS: u32 = 5;
 /// Keys in db 0 in the first attempt; each retry doubles it, up to 8x.
 const FIRST_KEYS: u64 = 200_000;
-/// Rounds of writes that must land inside one epoch for it to count.
+/// Rounds of writes that must land inside one epoch for a stream of writes
+/// to count (a single bulk write such as `WS DROP` needs just its own round).
 const MIN_OVERLAP: u64 = 16;
 
 /// Every shard armed the save's epoch: a shard creates its
@@ -167,7 +179,7 @@ fn wait_bgsave_done(probe: &mut Conn) {
 type Round<'a> = &'a mut dyn FnMut(u64, u64) -> Vec<Vec<String>>;
 
 /// Run rounds of writes while a BGSAVE is in flight, retrying on a doubled
-/// keyspace until [`MIN_OVERLAP`] rounds landed inside the epoch. Returns the
+/// keyspace until `min_overlap` rounds landed inside the epoch. Returns the
 /// keyspace size and the overlapped round count of the judged attempt; the
 /// file on disk is that attempt's (each save replaces it).
 fn writes_during_bgsave(
@@ -175,6 +187,7 @@ fn writes_during_bgsave(
     shards: usize,
     c: &mut Conn,
     probe: &mut Conn,
+    min_overlap: u64,
     reset: &mut dyn FnMut(&mut Conn, u64),
     round: Round<'_>,
 ) -> (u64, u64) {
@@ -221,12 +234,12 @@ fn writes_during_bgsave(
             "{n} keys: {during} rounds inside the epoch, save took {} ms",
             started.elapsed().as_millis()
         ));
-        if during >= MIN_OVERLAP {
+        if during >= min_overlap {
             eprintln!("attempts: {attempts:#?}");
             return (n, during);
         }
     }
-    panic!("no BGSAVE in {MAX_ATTEMPTS} attempts overlapped {MIN_OVERLAP} rounds: {attempts:#?}");
+    panic!("no BGSAVE in {MAX_ATTEMPTS} attempts overlapped {min_overlap} rounds: {attempts:#?}");
 }
 
 fn cmd(parts: &[&str]) -> Vec<String> {
@@ -241,12 +254,19 @@ fn cmd(parts: &[&str]) -> Vec<String> {
 /// db 2.
 fn move_and_copy_during_bgsave(shards: usize) {
     let dir = common::unique_test_dir(&format!("ws16-move-copy-s{shards}"));
+    let _cleanup = DirGuard(dir.clone());
     let (mut server, port) = spawn(&dir, shards);
     let mut c = Conn::open(port);
     let mut probe = Conn::open(port);
     const PER_ROUND: u64 = 16;
-    let (n, during) =
-        writes_during_bgsave(&dir, shards, &mut c, &mut probe, &mut reset, &mut |n, r| {
+    let (n, during) = writes_during_bgsave(
+        &dir,
+        shards,
+        &mut c,
+        &mut probe,
+        MIN_OVERLAP,
+        &mut reset,
+        &mut |n, r| {
             let half = n / 2;
             let mut out = Vec::new();
             for i in 0..PER_ROUND {
@@ -256,7 +276,8 @@ fn move_and_copy_during_bgsave(shards: usize) {
                 out.push(cmd(&["COPY", &key(k), &key(k), "DB", "2"]));
             }
             out
-        });
+        },
+    );
 
     server.kill_now();
     common::wait_for_port_down(port);
@@ -273,7 +294,6 @@ fn move_and_copy_during_bgsave(shards: usize) {
         wrong.len(),
         &wrong[..wrong.len().min(5)]
     );
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -284,4 +304,73 @@ fn move_and_copy_during_bgsave_single_shard() {
 #[test]
 fn move_and_copy_during_bgsave_four_shards() {
     move_and_copy_during_bgsave(4);
+}
+
+/// `WS DROP` while the save walks db 0: the restored snapshot must still hold
+/// every workspace key (it existed when the save started). Before moon#1228
+/// the drop sweep deleted them with no pre-image, so every workspace key
+/// whose range the save had not reached yet was missing from the file.
+fn workspace_drop_during_bgsave(shards: usize) {
+    let dir = common::unique_test_dir(&format!("ws16-ws-drop-s{shards}"));
+    let _cleanup = DirGuard(dir.clone());
+    let (mut server, port) = spawn(&dir, shards);
+    let mut c = Conn::open(port);
+    let mut probe = Conn::open(port);
+    const WS_KEYS: u64 = 4000;
+    let ws_id = std::cell::RefCell::new(String::new());
+    let (n, _) = writes_during_bgsave(
+        &dir,
+        shards,
+        &mut c,
+        &mut probe,
+        1,
+        &mut |c, n| {
+            reset(c, n);
+            let created = c.send(&["WS", "CREATE", &format!("ws16-{n}")]);
+            let id = created
+                .lines()
+                .nth(1)
+                .unwrap_or_else(|| panic!("WS CREATE: {created:?}"))
+                .to_string();
+            let mut bound = Conn::open(port);
+            assert!(bound.send(&["WS", "AUTH", &id]).starts_with("+OK"));
+            let mut out = Vec::new();
+            for i in 0..WS_KEYS {
+                out.extend_from_slice(&encode(&["SET", &format!("w:{i}"), "ws"]));
+            }
+            bound.sock.write_all(&out).unwrap();
+            let reply = bound.read_replies(WS_KEYS as usize);
+            assert!(!reply.contains('-'), "workspace preload: {reply:.200}");
+            *ws_id.borrow_mut() = id;
+        },
+        &mut |_, r| {
+            if r == 0 {
+                vec![cmd(&["WS", "DROP", &ws_id.borrow()])]
+            } else {
+                vec![cmd(&["PING"])]
+            }
+        },
+    );
+
+    server.kill_now();
+    common::wait_for_port_down(port);
+    let (_server2, port2) = spawn(&dir, shards);
+    let mut c2 = Conn::open(port2);
+    let restored = dbsize(&mut c2, 0);
+    let expected = (n + WS_KEYS) as i64;
+    assert_eq!(
+        restored, expected,
+        "restored snapshot of a save crossed by WS DROP (--shards {shards}) must hold the \
+         {n} plain keys and the {WS_KEYS} workspace keys it started with"
+    );
+}
+
+#[test]
+fn workspace_drop_during_bgsave_single_shard() {
+    workspace_drop_during_bgsave(1);
+}
+
+#[test]
+fn workspace_drop_during_bgsave_four_shards() {
+    workspace_drop_during_bgsave(4);
 }

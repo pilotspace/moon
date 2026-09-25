@@ -259,3 +259,35 @@ fn two_db_op_apply_captures_both_databases() {
         "MOVE captures the destination's absence"
     );
 }
+
+/// `WS DROP`'s key sweep (`workspace::sweep_prefix`, the one body behind the
+/// monoio and tokio owner paths and the routed `WsDropCleanup` arm) deletes
+/// every `{wsid}:` key of every database. Mid-epoch, every one whose range
+/// the save had not written yet used to be missing from the file.
+#[test]
+fn workspace_drop_sweep_mid_epoch_keeps_the_file_point_in_time() {
+    let prefix = "{0123456789abcdef0123456789abcdef}:";
+    let mut dbs: Vec<Database> = (0..3).map(|_| Database::new()).collect();
+    preload(&mut dbs[0], "a", 1200);
+    preload(&mut dbs[0], &format!("{prefix}w"), 300);
+    preload(&mut dbs[1], &format!("{prefix}x"), 200);
+    preload(&mut dbs[2], "c", 100);
+    let expected = string_keyspace(&dbs);
+    let mut epoch = epoch_partway(&dbs);
+    let (written, pending) = split_by_pending(&epoch, 0, &format!("{prefix}w"), 300);
+    assert!(
+        !written.is_empty() && !pending.is_empty(),
+        "fixture: workspace keys on both sides of the cursor"
+    );
+
+    let mut refs: Vec<&mut Database> = dbs.iter_mut().collect();
+    let deleted = crate::workspace::sweep_prefix(&mut refs, prefix.as_bytes());
+    assert_eq!(deleted, 500, "setup: the sweep deletes every workspace key");
+
+    let records = epoch.finish(&dbs);
+    assert_eq!(
+        diverge(&expected, &records),
+        Default::default(),
+        "every swept key must still be in the file with its epoch-start value"
+    );
+}

@@ -443,6 +443,23 @@ pub(crate) fn capture_wake_pre_image(db: &Database, db_index: usize, key: &Bytes
     capture_key(db, db_index, key);
 }
 
+/// Capture the pre-image of a key that a writer OUTSIDE `command::dispatch`
+/// is about to create, change or delete (moon#1228): the `WS DROP` key sweep
+/// ([`crate::workspace::sweep_prefix`]), the owner-side `MQ` subcommands and
+/// their TXN / replica siblings, the stream waker's group reads, and
+/// `TXN.ABORT`'s undo. Each of them reaches the keyspace through `Database`
+/// methods directly, so no dispatch hook sees the key.
+///
+/// `db` MUST be `databases[db_index]`. One thread-local `bool` load when no
+/// snapshot is in flight.
+#[inline]
+pub(crate) fn capture_write_pre_image(db: &Database, db_index: usize, key: &[u8]) {
+    if !is_armed() {
+        return;
+    }
+    capture_key(db, db_index, key);
+}
+
 /// Capture the pre-images a `MOVE` or `COPY … DB n` needs before it writes
 /// (moon#1228). Both commands bypass `command::dispatch` — they need two
 /// databases — so the two-database cores (`move_cmd::move_core` /

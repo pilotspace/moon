@@ -135,17 +135,10 @@ pub(super) async fn try_handle_ws_command(
                                 // — same all-or-nothing view the
                                 // `&mut [Database]` walk had. Twin of the
                                 // monoio sweep in `handler_monoio/write.rs`.
+                                // moon#1228: the shared sweep captures each
+                                // key for an armed BGSAVE first.
                                 s.databases.with_all(|dbs| {
-                                    for db in dbs.iter_mut() {
-                                        let keys_to_delete: Vec<Vec<u8>> = db
-                                            .keys()
-                                            .filter(|k| k.as_bytes().starts_with(prefix.as_bytes()))
-                                            .map(|k| k.as_bytes().to_vec())
-                                            .collect();
-                                        for key in &keys_to_delete {
-                                            db.remove(key);
-                                        }
-                                    }
+                                    crate::workspace::sweep_prefix(dbs, prefix.as_bytes())
                                 });
                             });
                         } else {

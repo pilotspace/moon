@@ -2446,22 +2446,13 @@ pub(crate) fn handle_shard_message_shared(
             // admin-rare operation (create/drop a tenant); see
             // docs/guides/isolation.md's "WS DROP" cost-note for the
             // large-keyspace / large---databases caveat.
+            //
+            // moon#1228: `sweep_prefix` captures each key's pre-image for an
+            // armed BGSAVE epoch before deleting it (the three sweep copies
+            // this replaced captured nothing).
             let deleted_count = crate::shard::slice::with_shard(|s| {
-                s.databases.with_all(|dbs| {
-                    let mut total = 0u64;
-                    for db in dbs.iter_mut() {
-                        let keys_to_delete: Vec<Vec<u8>> = db
-                            .keys()
-                            .filter(|k| k.as_bytes().starts_with(prefix.as_ref()))
-                            .map(|k| k.as_bytes().to_vec())
-                            .collect();
-                        total += keys_to_delete.len() as u64;
-                        for key in &keys_to_delete {
-                            db.remove(key);
-                        }
-                    }
-                    total
-                })
+                s.databases
+                    .with_all(|dbs| crate::workspace::sweep_prefix(dbs, &prefix))
             });
             // Ignore send failure: caller logs the count but the drop already
             // completed; losing the ack is harmless.
