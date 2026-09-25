@@ -440,6 +440,112 @@ mod tests {
         }
     }
 
+    /// moon#1242 (review NIT-2) red → green: an L2 row whose components sit
+    /// deep in f16's subnormal range (steps of 5.96e-8) keeps a bit or two per
+    /// component in `raw_f16`, while the TQ ADC estimate is scale-invariant —
+    /// the rerank lost recall at 1e-7 (R@10 0.848 → 0.767). Such rows keep
+    /// their ADC estimate. At 1e-6 the f16 rows are still far better than
+    /// ADC, and Cosine rows are not affected at any scale: both must keep the
+    /// rerank's gain (an over-broad cut, e.g. "every component subnormal",
+    /// would give it back).
+    #[test]
+    fn tiny_l2_rows_keep_their_adc_estimate_where_f16_is_coarser() {
+        distance::init();
+        crate::vector::turbo_quant::fwht::init_fwht();
+        let (dim, n) = (32usize, 800usize);
+        // (metric, component scale, minimum R@10 gain of the rerank over ADC)
+        let cases = [
+            (DistanceMetric::L2, 1e-7f32, 0.0f64),
+            (DistanceMetric::L2, 1e-6, 0.05),
+            (DistanceMetric::Cosine, 1e-7, 0.1),
+        ];
+        for (metric, scale, min_gain) in cases {
+            let col = Arc::new(CollectionMetadata::with_build_mode(
+                53,
+                dim as u32,
+                metric,
+                QuantizationConfig::TurboQuant4,
+                53,
+                BuildMode::Exact,
+            ));
+            let holder = SegmentHolder::new(dim as u32, Arc::clone(&col));
+            let mut g = crate::vector::test_support::Gauss::new(11);
+            let docs: Vec<Vec<f32>> = (0..n)
+                .map(|_| (0..dim).map(|_| scale * g.next()).collect())
+                .collect();
+            {
+                let list = holder.load();
+                for (i, v) in docs.iter().enumerate() {
+                    list.mutable.append(i as u64 + 1, v, i as u64 + 1);
+                }
+            }
+            let committed = roaring::RoaringTreemap::new();
+            let ctx = MvccContext {
+                snapshot_lsn: 0,
+                my_txn_id: 0,
+                committed: &committed,
+                dirty_set: &[],
+                dimension: dim as u32,
+                ef_defaulted: false,
+                tuning: SearchTuning::default(),
+            };
+            let mut scratch = SearchScratch::new(0, padded_dimension(dim as u32));
+            let (mut adc_hits, mut rr_hits) = (0usize, 0usize);
+            let nq = 40usize;
+            for _ in 0..nq {
+                let q: Vec<f32> = (0..dim).map(|_| scale * g.next()).collect();
+                let norm = |v: &[f32]| v.iter().map(|x| f64::from(*x).powi(2)).sum::<f64>().sqrt();
+                let mut truth: Vec<(f64, u32)> = docs
+                    .iter()
+                    .enumerate()
+                    .map(|(i, v)| {
+                        let d = if metric == DistanceMetric::L2 {
+                            v.iter()
+                                .zip(&q)
+                                .map(|(a, b)| (f64::from(*a) - f64::from(*b)).powi(2))
+                                .sum::<f64>()
+                        } else {
+                            let dot: f64 = v
+                                .iter()
+                                .zip(&q)
+                                .map(|(a, b)| f64::from(*a) * f64::from(*b))
+                                .sum();
+                            -dot / (norm(v) * norm(&q))
+                        };
+                        (d, i as u32)
+                    })
+                    .collect();
+                truth.sort_by(|a, b| a.0.total_cmp(&b.0));
+                let want: Vec<u32> = truth.iter().take(K).map(|x| x.1).collect();
+                // The mutable leg before the rerank: the ADC top k.
+                let adc = holder.load().mutable.brute_force_search_mvcc(
+                    &q,
+                    None,
+                    K,
+                    None,
+                    0,
+                    0,
+                    &committed,
+                    0,
+                    usize::MAX,
+                );
+                let rr = holder.search_mvcc(&q, K, 64, &mut scratch, None, &ctx);
+                adc_hits += adc.iter().filter(|r| want.contains(&r.id.0)).count();
+                rr_hits += rr.iter().filter(|r| want.contains(&r.id.0)).count();
+            }
+            let (adc_r, rr_r) = (
+                adc_hits as f64 / (nq * K) as f64,
+                rr_hits as f64 / (nq * K) as f64,
+            );
+            println!("{metric:?} scale {scale:e} R@{K}: ADC {adc_r:.3} -> reranked {rr_r:.3}");
+            assert!(
+                rr_r >= adc_r + min_gain,
+                "{metric:?} rows at {scale:e}: ADC {adc_r:.3} -> reranked {rr_r:.3} \
+                 (the rerank must gain at least {min_gain})"
+            );
+        }
+    }
+
     #[test]
     fn rerank_depth_is_mult_times_k() {
         assert_eq!(super::exact_rerank_depth(10, 4), 40);
