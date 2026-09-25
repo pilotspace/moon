@@ -293,8 +293,8 @@ mod tests {
     }
 
     /// moon#1242 red → green: an index large enough for the capture to
-    /// resolve a broad filter to HnswPostFilter itself (≥ 20K matches at
-    /// > 80 % selectivity). The yielding scan (plain FT.SEARCH) and
+    /// resolve a broad filter to HnswPostFilter itself (at least 20K matches,
+    /// over 80 % selectivity). The yielding scan (plain FT.SEARCH) and
     /// `search_filtered`'s HnswPostFilter arm reranked the exactly-filtered
     /// mutable leg at the graph legs' `3k` oversample; both must answer what
     /// `search_mvcc` (FT.SEARCH with RANGE or SESSION) answers.
