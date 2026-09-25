@@ -261,3 +261,56 @@ fn the_reclaim_tick_never_does_the_disk_io_itself() {
     .join()
     .expect("test thread");
 }
+
+/// Refs moon#1265 (review 5, N6): a spill thread that died never answers the
+/// compactions it was given. They pinned the reclaim's in-flight set — and
+/// with it `MAX_IN_FLIGHT` — for good, so the shard never compacted again.
+/// The tick now abandons them once it sees the thread dead, and starts no
+/// new compaction on it.
+#[test]
+fn a_dead_spill_threads_compactions_are_abandoned() {
+    std::thread::spawn(|| {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let shard_dir = tmp.path().join("shard-0");
+        let live = fixture(tmp.path(), &shard_dir);
+        let (shared, mut inits) = ShardDatabases::new(vec![vec![Database::new()]]);
+        init_shard(ShardSlice::new(inits.remove(0)));
+        with_shard_db(0, |db| *db = live);
+        let mut manifest =
+            Some(ShardManifest::open(&shard_dir.join("shard-0.manifest")).expect("manifest"));
+        let (tx, _rx) = crate::runtime::channel::mpsc_bounded::<AofMessage>(16);
+        let pool = AofWriterPool::top_level(tx);
+        let runtime_config = Arc::new(parking_lot::RwLock::new(
+            crate::config::RuntimeConfig::default(),
+        ));
+        // A compaction whose job went to the thread before it died.
+        with_shard_db(0, |db| {
+            let ci = db.cold_index.as_mut().expect("cold index");
+            assert!(ci.start_compaction(OLD));
+        });
+        assert_eq!(count(|ci| ci.compactions_in_flight()), 1);
+
+        let dead = SpillThread::exited_for_test();
+        let mut next = FIRST_NEW;
+        cold_reclaim_tick::run(
+            &shared,
+            0,
+            &runtime_config,
+            &mut manifest,
+            &mut next,
+            Some(&shard_dir),
+            Some(&pool),
+            Some(&dead),
+            usize::MAX,
+        );
+        assert_eq!(
+            count(|ci| ci.compactions_in_flight()),
+            0,
+            "the dead thread's compaction still pins the in-flight set"
+        );
+        assert_eq!(next, FIRST_NEW, "no new compaction on a dead thread");
+        assert!(heap(&shard_dir, OLD).exists() && file_of("k08") == Some(OLD));
+    })
+    .join()
+    .expect("test thread");
+}

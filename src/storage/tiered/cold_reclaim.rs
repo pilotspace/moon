@@ -306,6 +306,18 @@ impl ColdIndex {
         true
     }
 
+    /// Refs moon#1265: forget every compaction whose job is on a spill thread
+    /// that died — its answer never comes, and the marks would pin the
+    /// in-flight set (and the shard's `MAX_IN_FLIGHT`) for good. Not given up
+    /// on: the files may be compacted again once a thread serves them. A
+    /// write the thread finished but never answered left at most an unlisted
+    /// output, which the startup orphan sweep removes. Returns how many.
+    pub fn abandon_compactions_in_flight(&mut self) -> usize {
+        let n = self.reclaim.in_flight.len();
+        self.reclaim.in_flight.clear();
+        n
+    }
+
     /// A compaction ends without output (its job could not be sent, or found
     /// nothing to do). `give_up`: never try this file again in this process.
     pub fn abandon_compaction(&mut self, file_id: u64, give_up: bool) {

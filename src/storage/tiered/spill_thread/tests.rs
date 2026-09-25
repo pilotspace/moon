@@ -780,3 +780,14 @@ fn the_prune_decides_on_the_liveness_sampled_before_the_drain() {
     );
     assert_eq!(st.take_prune(0, true), Some(SupersededPrune::All));
 }
+
+/// Refs moon#1265: a dead spill thread is reported once — one error line and
+/// one count behind INFO `spill_thread_alive:0` — however many ticks see it.
+#[test]
+fn a_dead_spill_thread_is_reported_once() {
+    let st = SpillThread::exited_for_test();
+    assert!(!st.report_death_once(false, 0), "alive when sampled");
+    assert!(st.report_death_once(st.is_dead(), 0));
+    assert!(!spill_threads_alive());
+    assert!(!st.report_death_once(st.is_dead(), 0), "once");
+}

@@ -855,12 +855,12 @@ pub(crate) fn apply_spill_completions(
     shard_id: usize,
     marker_sink: &mut ColdMarkerSink<'_>,
 ) {
-    let _ = shard_id; // E2 removes
     drain_and_apply(
         spill_thread,
         shard_manifest,
         marker_sink,
         shard_databases.db_count(),
+        shard_id,
     );
 }
 
@@ -871,6 +871,7 @@ fn drain_and_apply(
     shard_manifest: &mut Option<crate::persistence::manifest::ShardManifest>,
     marker_sink: &mut ColdMarkerSink<'_>,
     db_count: usize,
+    shard_id: usize,
 ) {
     // Refs moon#1253: the thread's death and the watermark are both read
     // BEFORE the drain, so every completion they cover is in the channel and
@@ -881,6 +882,8 @@ fn drain_and_apply(
     let completions = spill_thread.drain_completions();
     apply_completion_vec(completions, shard_manifest, marker_sink);
     prune_superseded(spill_thread.take_prune(done_below, was_dead), db_count);
+    // Refs moon#1265: one error line and INFO `spill_thread_alive:0`.
+    spill_thread.report_death_once(was_dead, shard_id);
 }
 
 /// Bound the superseded sets (refs moon#1253): a request whose completion
