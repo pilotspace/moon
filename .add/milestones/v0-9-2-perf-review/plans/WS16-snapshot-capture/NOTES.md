@@ -777,7 +777,8 @@ The PR head (82e3064e) was merged first (fa9a5dc1). One commit per item:
 | item | commit | red → green |
 |---|---|---|
 | 1 FLUSHDB freed queued lazy-free values inline (review 6's N1 reclaim) | a453de8c | see below |
-| 2 the trim budget counted a collection as one row; only 4,096+ elements were offloaded | (item 2) | see below |
+| 2 the trim budget counted a collection as one row; only 4,096+ elements were offloaded | 0d3c5e2d | see below |
+| 3 the walk and an abort dropped frozen tables inline | (item 3) | see below |
 
 ### Item 1 — the lazy-free charge follows the table into the epoch
 
@@ -868,3 +869,25 @@ the same file names, because cargo hashes a path package relative to its workspa
 One cargo run here executed WS19's lib-test binary (93 tests, without this branch's). Every
 build and check since then passes `--config 'profile.dev.package.moon.debug=false'`, which
 gives moon's units their own names and leaves the dependencies shared.
+
+### Item 3 — frozen tables are released off the shard thread
+
+`Frozen::release` hands the table to `moon-snapdrop`, along with a rebuild's target if the
+table was mid-rebuild. Two sites call it:
+- `with_current_table`, when the walk leaves the database (or the save aborted inside the
+  step);
+- `abort`, for every frozen source.
+
+Red → green, lib tests `the_walk_releases_a_frozen_table_off_the_shard_thread` and
+`an_aborted_save_releases_its_frozen_tables_off_the_shard_thread`. They count the tables
+handed to the helper with a test-only counter. Red: "left: 0, right: 1" and "left: 0,
+right: 2".
+
+Release numbers are in the re-measurement section below.
+
+Left as is, because main behaves the same:
+- tables a FLUSHDB or FLUSHALL drops inside its own command: an already-written database,
+  an aborted epoch, or the S2 abort;
+- the `Freeze` events `abort_epoch` discards within the same tick.
+
+Main drops those tables inline in that same command.

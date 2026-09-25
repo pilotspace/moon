@@ -517,6 +517,54 @@ fn a_drain_trims_a_bounded_number_of_collection_elements() {
     assert_eq!(string_keyspace(&recovered), string_keyspace(&dbs));
 }
 
+/// Review 7, item 3: once the walk has written a database whose table a
+/// FLUSHDB froze, the table was dropped inline, on the shard thread (release
+/// server, 2M rows: a 34-40 ms stall as the walk left that database, 4.5 ms
+/// without the FLUSHDB). It goes to the `moon-snapdrop` helper now.
+#[test]
+fn the_walk_releases_a_frozen_table_off_the_shard_thread() {
+    use crate::persistence::snapshot::frozen::take_tables_discarded_for_test;
+    let mut dbs = vec![Database::new(), Database::new()];
+    preload(&mut dbs[0], "a", 100);
+    preload(&mut dbs[1], "b", 2000);
+    let expected = string_keyspace(&dbs);
+    let mut epoch = Epoch::begin(&dbs);
+    let _ = run(&mut dbs, 1, &[b"FLUSHDB"]);
+    epoch.drain_until_trimmed(1);
+    let _ = take_tables_discarded_for_test();
+    let records = epoch.try_finish(&dbs).expect("the save must complete");
+    assert_eq!(
+        take_tables_discarded_for_test(),
+        1,
+        "the walk dropped db 1's frozen table inline"
+    );
+    assert_eq!(diverge(&expected, &records), Default::default());
+}
+
+/// Review 7, item 3: an aborted save dropped every frozen table inline.
+#[test]
+fn an_aborted_save_releases_its_frozen_tables_off_the_shard_thread() {
+    use crate::persistence::snapshot::frozen::take_tables_discarded_for_test;
+    let mut dbs = vec![Database::new(), Database::new(), Database::new()];
+    preload(&mut dbs[1], "b", 2000);
+    preload(&mut dbs[2], "c", 2000);
+    let mut epoch = Epoch::begin(&dbs);
+    let _ = run(&mut dbs, 1, &[b"FLUSHDB"]);
+    let _ = run(&mut dbs, 2, &[b"FLUSHDB"]);
+    epoch.drain_until_trimmed(1);
+    epoch.drain_until_trimmed(2);
+    let _ = take_tables_discarded_for_test();
+    apply(&mut dbs, 0, &[b"FLUSHALL"]);
+    epoch.drain();
+    assert!(epoch.state.as_ref().expect("epoch").aborted().is_some());
+    assert_eq!(
+        take_tables_discarded_for_test(),
+        2,
+        "the abort dropped the frozen tables inline"
+    );
+    assert!(epoch.try_finish(&dbs).is_err());
+}
+
 /// Review 6 (S1), measurement only: the trim's cost per drain and in drains,
 /// against main's FLUSHDB (a drop). Run in a release build:
 /// `MOON_TEST_TRIM_N=<rows> cargo test --profile release-fast --lib trim_cost -- --ignored --nocapture`.

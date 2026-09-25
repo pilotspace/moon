@@ -48,8 +48,9 @@ pub(crate) const TRIM_BUDGET: usize = 512;
 
 /// What the trim frees off the shard thread.
 enum Discard {
-    /// The emptied source of a rebuild: its skeleton alone took 19.6 ms to
-    /// free inline (58,833 segments, release).
+    /// The emptied source of a rebuild — its skeleton alone took 19.6 ms to
+    /// free inline (58,833 segments, release) — or a table the epoch is done
+    /// with ([`Frozen::release`]).
     Table(#[allow(dead_code)] Box<Table>),
     /// A post-epoch collection the trim removed, of more than
     /// `LAZY_FREE_THRESHOLD` elements.
@@ -60,6 +61,10 @@ enum Discard {
 /// (one per process, parked in `recv` when idle — the `moon-lazyfree`
 /// pattern). Dropped here if the helper cannot be started or is gone.
 fn discard(item: Discard) {
+    #[cfg(test)]
+    if matches!(item, Discard::Table(_)) {
+        TABLES_FOR_TEST.with(|c| c.set(c.get() + 1));
+    }
     static DROPPER: std::sync::OnceLock<Option<flume::Sender<Discard>>> =
         std::sync::OnceLock::new();
     let dropper = DROPPER.get_or_init(|| {
@@ -105,6 +110,15 @@ thread_local! {
     /// (removed or restored), and of those they freed inline.
     static ELEMENTS_FOR_TEST: std::cell::Cell<(usize, usize)> =
         const { std::cell::Cell::new((0, 0)) };
+    /// Test-only: tables this thread handed to the helper.
+    static TABLES_FOR_TEST: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Test-only: tables this thread handed to `moon-snapdrop` since the last
+/// call.
+#[cfg(test)]
+pub(crate) fn take_tables_discarded_for_test() -> usize {
+    TABLES_FOR_TEST.with(|c| c.replace(0))
 }
 
 /// Test-only: `(charged, freed inline)` collection elements of this
@@ -211,6 +225,18 @@ impl Frozen {
 
     pub(super) fn trimmed(&self) -> bool {
         matches!(self.trim, Trim::Done)
+    }
+
+    /// The epoch is done with the table — the walk wrote its database, or
+    /// the save was aborted: hand it (and a rebuild's target) to the helper
+    /// (review 7: dropped inline, a 2M-row table stalled the shard 34-40 ms
+    /// as the walk left its database).
+    pub(super) fn release(self) {
+        let Frozen { table, trim, .. } = self;
+        discard(Discard::Table(table));
+        if let Trim::Rebuild { sized, .. } = trim {
+            discard(Discard::Table(sized));
+        }
     }
 }
 
