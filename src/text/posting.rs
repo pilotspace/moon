@@ -230,14 +230,23 @@ impl Run {
     }
 
     fn split_off(&mut self, at: usize) -> Self {
-        Self {
+        let tail = Self {
             tf: self.tf.split_off(at),
             pos: if self.pos.len() == 0 {
                 PosColumn::default()
             } else {
                 self.pos.split_off(at)
             },
-        }
+        };
+        // moon#1226: `Vec::split_off` gives the tail an exact-size buffer but
+        // leaves this (left) half the whole pre-split capacity — about twice
+        // its entries. Under ascending (append) inserts the left run is never
+        // written again, so every settled run kept ~2x its tf / position
+        // memory for good. One small realloc per split (every ~RUN_MAX/2
+        // inserts) makes it exact-size like the tail.
+        self.tf.shrink_to_fit();
+        self.pos.shrink_to_fit();
+        tail
     }
 }
 
@@ -1712,6 +1721,35 @@ mod tests {
             assert_eq!(p.tf(d), tfs[i]);
             assert_eq!(p.positions_for(d), Some(pos[i].as_slice()));
         }
+    }
+
+    /// moon#1226 red test: runs left behind by a split hold what they store,
+    /// not the pre-split buffer. An ascending (append) load — the common
+    /// indexing order — writes only the last run, so HEAD's left halves kept
+    /// ~2x their tf / position capacity forever.
+    #[test]
+    fn split_runs_do_not_keep_the_pre_split_capacity() {
+        let mut store = PostingStore::new();
+        for d in 0..20_000u32 {
+            let tf = 1 + d % 3;
+            let positions: Vec<u32> = (0..tf).map(|k| k * 7 + d % 5).collect();
+            store.add_term_positions(1, d, &positions);
+        }
+        let p = store.get_posting(1).expect("posting");
+        assert_layout(p);
+        let chunks = p.chunks.as_ref().expect("chunked");
+        let settled = &chunks.runs[..chunks.runs.len() - 1]; // the last run is still growing
+        assert!(settled.len() > 50, "fixture must split many times");
+        let (mut len, mut cap) = (0usize, 0usize);
+        for r in settled {
+            len += r.tf.len() + r.pos.ends.len() + r.pos.data.len();
+            cap += r.tf.capacity() + r.pos.ends.capacity() + r.pos.data.capacity();
+        }
+        assert!(
+            cap * 10 <= len * 11,
+            "settled runs hold {cap} u32 slots for {len} values ({:.2}x)",
+            cap as f64 / len as f64
+        );
     }
 
     /// moon#1195 red test: re-indexing the OLDEST document of a large corpus
