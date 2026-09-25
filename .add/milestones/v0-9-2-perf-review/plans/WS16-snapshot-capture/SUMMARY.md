@@ -47,6 +47,18 @@ Every item is addressed, one commit each; NOTES.md has the table.
   - `Stream::next_auto_id` wraps explicitly at the last ID (it used to panic a debug build).
 - **File size:** `b559c1f1`. mq_exec.rs's tests moved out (1,616 to 1,094 lines).
 
+## Review 6 (MERGE-AFTER-FIXES)
+Fix A held under the reviewer's property tests (2,000 lib seeds, 80 real-server seeds). Every item is addressed, one commit each; NOTES.md has the table.
+- **Property tests adopted:** `32e55cd9`. Lib `prop_tests` (16 seeds by default, env override) and real-server `perf_ws16_bgsave_prop` (3 seeds at `--shards 1` and 3 at `--shards 4`). The mutation evidence is in NOTES.
+- **S1 (trim cost):** `103e996c`. The trim is budgeted at 512 row operations per drain; the bound holds after ceil(work / 512) drains. The walk waits only for a rebuild.
+  - The property test caught an interleaving bug (seed 104); it is fixed.
+  - Release server, 2M + 6M rows: PING p99.9 1.0 ms and max 9.2 ms during the trim. Main's FLUSHDB of that table stalls 193 ms; the unbudgeted trim took 4.33 s.
+- **S2 (abort rule):** `e091ebe7`. A table that did not grow never fails the save. The rule is re-derived over the whole trim: a grown flush fails the save only while another grown table is still waiting or trimming and together they pass 8 MiB.
+- **N1:** `66e06764`. A FLUSHDB during a save reclaims queued lazy-free charges before the table is billed.
+- **N2:** `f837ad19`. `XADD <ms>-*` at the last sequence answers redis's error; it used to panic a debug build.
+- **N3:** `06c7e3dd`. A POP of an empty queue creates no consumer, so master, replica and replay agree. The reviewer's B/F agreement test is adopted with it.
+- **P1:** `cba154c5`. Documents that the RRDSHARD file holds hot keys only.
+
 ## Measurements
 - **Real-server capture tests** restore from the RDB file alone after SIGKILL. Overlap is observed, not assumed: every `shard-<id>.rrdshard.tmp` must exist before the writes; each round is pipelined with `INFO persistence`; a round counts only if the save is still running. On baseline, 24–485 rounds landed inside saves of 72–221 ms.
 - **MQ billing:** 2 consecutive green runs, with the numbers above.
@@ -77,6 +89,10 @@ Every item is addressed, one commit each; NOTES.md has the table.
   - `perf_ws15_bgsave_status`: the failed save is forced by a directory squatting on the snapshot path.
 - **`864a3c8`:** a new INFO persistence field, `current_cow_size`, in command/connection.rs.
 - **Review 4:** `f743bab2`, in `replication/apply.rs::apply_ws_drop`, calls `workspace::sweep_prefix`. `52544bf3` changes `Database::clear` in kv_ops.rs, one line: it passes `used_memory` as the frozen table's bill.
+- **Review 6:**
+  - `103e996c` re-exports `lazy_free_weight` pub(crate) from storage/db/mod.rs.
+  - `66e06764` touches `Database::clear` in kv_ops.rs (3 lines: reclaim charged lazy-free items when a save is armed).
+  - `f837ad19` touches `command/stream/stream_write.rs` (`XADD <ms>-*`).
 - **`396dc1e`:**
   - The MQ local legs of both write.rs files pass the write gate (`handler_sharded::write::mq_write_gate`).
   - spsc_handler.rs's `MqCommand` arm gates through `spsc_eviction_gate`.
@@ -105,6 +121,21 @@ Every item is addressed, one commit each; NOTES.md has the table.
    - the TXN.ABORT undo needs a decision;
    - ~~the replica MQ PEL bytes are untracked~~: review 4 called it a replica-only under-count; it was an over-credit on replay AND on the replica. Fixed in review 5 (moon#1261);
    - `Database.db_index` went stale after SWAPDB (fixed by FIX3B-CM in #1242, now merged).
+
+## Test results after review 6 (production code `06c7e3dd`; P1 and this commit are docs)
+- **Lint and checks:** fmt and the four audits PASS. clippy `--all-targets -D warnings` is clean on monoio and tokio.
+- **Lib tests:**
+  - full monoio 6,659 passed;
+  - the touched modules (the 16 filters of review 5 plus `command::stream`): monoio 726, tokio 690;
+  - the property test at 400 seeds: 200 with tiny budgets, 7,302 mid-trim observations, 101 rebuild waits, bill error 0 over 17,931 checks.
+- **Integration, monoio (`/home/user/wt/bin/ws16-r6-final-monoio`):**
+  - perf_ws12 5/5, perf_ws15 3/3, perf_ws8 1/1;
+  - perf_ws16_bgsave_capture 7/7, perf_ws16_bgsave_prop 2/2 (and 12 seeds on a longer run), perf_ws16_mq_billing 10/10;
+  - with ignored tests included: replication_ws 4/4, replication_readonly_ws_mq 1/1, replication_mq 4/4, replication_swapdb 3/3.
+- **Integration, tokio (`/home/user/wt/bin/ws16-r6-final-tokio`):**
+  - perf_ws12 4/4 + 1 ignored, perf_ws15 3/3, perf_ws8 1/1;
+  - perf_ws16_bgsave_capture 7/7, perf_ws16_bgsave_prop 2/2, perf_ws16_mq_billing 6/6 + 4 ignored (they need a replica);
+  - mq_integration 17/17, workspace_integration 13/13.
 
 ## Test results after review 5 (production code `54d0f2c1`; test/doc commits after it)
 - **Lint and checks:** fmt and the four audits PASS. clippy `--all-targets -D warnings` is clean on monoio and tokio.
@@ -165,5 +196,16 @@ Every item is addressed, one commit each; NOTES.md has the table.
 - **Fixed (moon#1250):** MQ writes are now charged to `used_memory`, the same way `XADD` is. This covers `MQ CREATE`, `PUSH`, `POP`, `ACK`, TXN `MQ.PUBLISH`, stream-wake group reads and replicated MQ records.
   - Over `maxmemory`, `MQ CREATE` and `MQ PUSH` are refused with `-OOM` under noeviction, or evict under an evicting policy.
   - Before, 20,000 pushes of 100 B added about 24 KB to `used_memory` for a 5.7 MB queue.
+  - `MQ POP`/`ACK` churn keeps the charge exact. A POP's released surplus used to stay charged, so `used_memory` drifted up.
+- **Fixed (moon#1261):** after a restart's WAL replay and on a replica, `MQ` queues are billed as on the master. Replayed or replicated POPs never charged their pending entries while ACKs credited them, so a churned queue's bill drained toward 0: 28,421 B against 124,097 B live.
+- **Fixed (moon#1228):** during a BGSAVE, the memory held for a flushed database is bounded by that database's size when the save began.
+  - Rows written after the save began are trimmed away over the following ticks, at a bounded cost per tick. FLUSHDB of a 2M-row database grown by 6M rows kept PING under 10 ms.
+  - A queued lazy-free value is no longer counted twice in `current_cow_size`.
+- **Fixed:** `XADD key <ms>-*` when the stream's top ID already has the last possible sequence for `<ms>` now answers "ERR The ID specified in XADD is equal or smaller than the target stream top item". A debug build used to crash; a release build wrapped.
+- **Fixed:** at the last possible stream ID, `XADD *` and `MQ PUSH` answer an error instead of crashing a debug build.
+  - A TXN `MQ.PUBLISH` the stream refuses is no longer written to the WAL.
+  - A dead letter whose dead-letter stream is full stays pending in its queue instead of being lost.
+- **Fixed:** `MQ POP` of an empty queue no longer creates the internal consumer on the master only. Master, replicas and a restart now agree on `XINFO CONSUMERS` and `MEMORY USAGE`.
+- **Fixed:** `MQ POP … COUNT` with a count near 2^64 no longer overflows (it crashed a debug build) and delivers every queued message.
 
 (Committed by the orchestrator from the WS16 agent's final report, because the harness refused the agent's SUMMARY write.)

@@ -726,3 +726,46 @@ Notes:
     perf_ws8_mset_bgsave_capture 1/1;
   - perf_ws16_bgsave_capture 7/7, perf_ws16_mq_billing 5/5 + 2 ignored (replica);
   - mq_integration 17/17, workspace_integration 13/13 + 1 ignored.
+
+## Review 6 (MERGE-AFTER-FIXES) — what changed
+
+The reviewer's property tests (2,000 lib seeds, 80 real-server seeds at `--shards 1` and 4,
+kill -9 and restore) found no counterexample to fix A. The items:
+
+| item | commit | red → green |
+|---|---|---|
+| adopt the property tests | 32e55cd9 | green at adoption. Mutation evidence (item 2a above): no pre-image restore → seed 1 red; events before captures → bound red |
+| S1 the trim's CPU was unbounded | 103e996c | `one_drain_trims_at_most_the_budget`: "one drain trimmed 50000 rows" → at most 512 per drain. Property seed 104 caught an interleaving bug in the first version (fixed: step 2 covers the cursor at step 1's end). The release server measurements are in item 2a |
+| S2 the abort fired for an un-grown second table | e091ebe7 | reviewer's lib and server proofs → green; the re-derived rule over the whole trim is pinned (red without the untrimmed term) |
+| N1 lazy-free charges billed to a frozen table | 66e06764 | 551,044 vs 278,817 B → bill == rows |
+| N2 `XADD <ms>-*` overflowed at the last sequence | f837ad19 | debug panic / dead server → redis's error |
+| N3 an empty POP created a consumer on the master only | 06c7e3dd | 497 vs 321, *1 vs *0 → equal on all three |
+| P1 the RRDSHARD file holds hot keys only | cba154c5 | docs |
+
+Notes:
+- The adopted tests use `common::spawn_listening` ports.
+- The reviewer's moon#1232 assertion in the pipeline-abort proof is left out: part 4 carries
+  that counting fix, and this branch has not merged part 4.
+- The lib test's `REVIEW6_NO_BOUND` knob is not adopted.
+
+## Gate run after review 6 (production code 06c7e3dd; P1 and the final commit are docs)
+
+- `cargo fmt --check` clean; audit-unsafe, audit-unwrap, audit-test-tempdirs,
+  audit-encoding-limits PASS.
+- clippy `--all-targets -D warnings` clean on monoio and on
+  `--no-default-features --features runtime-tokio,jemalloc`.
+- `cargo test --lib` monoio, FULL: 6,659 passed, 15 ignored.
+- Touched modules, adding `command::stream` to the 16 review-5 filters: monoio 726, tokio 690.
+- `prop_tests` at 400 seeds: 200 with tiny budgets, 7,302 mid-trim observations, 101 rebuild
+  waits, bill error 0 over 17,931 checks.
+- Integration, monoio (`MOON_BIN=/home/user/wt/bin/ws16-r6-final-monoio`):
+  - perf_ws12_bgsave_split 5/5, perf_ws15_bgsave_status 3/3, perf_ws8_mset_bgsave_capture 1/1;
+  - perf_ws16_bgsave_capture 7/7, perf_ws16_bgsave_prop 2/2 (12 seeds on a longer run),
+    perf_ws16_mq_billing 10/10;
+  - `--include-ignored`: replication_ws 4/4, replication_readonly_ws_mq 1/1, replication_mq
+    4/4, replication_swapdb 3/3.
+- Integration, tokio (`MOON_BIN=/home/user/wt/bin/ws16-r6-final-tokio`):
+  - perf_ws12 4/4 + 1 ignored, perf_ws15 3/3, perf_ws8 1/1;
+  - perf_ws16_bgsave_capture 7/7, perf_ws16_bgsave_prop 2/2, perf_ws16_mq_billing 6/6 + 4
+    ignored (they need a replica);
+  - mq_integration 17/17, workspace_integration 13/13 + 1 ignored.
