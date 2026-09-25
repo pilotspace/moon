@@ -750,6 +750,10 @@ if should_run "list"; then
     assert_match "LPOS RANK 0"           LPOS {l1209}:l a RANK 0
     assert_match "LPOS COUNT abc"        LPOS {l1209}:l a COUNT abc
     assert_match "LPOS MAXLEN abc"       LPOS {l1209}:l a MAXLEN abc
+    # moon#1226: the two moon#1209 rows test-consistency.sh has and this file
+    # did not -- a negative COUNT, and RANK -1 COUNT 0 (every match, tail first).
+    assert_match "LPOS COUNT -1"         LPOS {l1209}:l a COUNT -1
+    assert_match "LPOS RANK -1 COUNT 0"  LPOS {l1209}:l a RANK -1 COUNT 0
     rcli RPUSH {l1209}:rot a >/dev/null 2>&1; mcli RPUSH {l1209}:rot a >/dev/null 2>&1
     rcli EXPIRE {l1209}:rot 100 >/dev/null 2>&1; mcli EXPIRE {l1209}:rot 100 >/dev/null 2>&1
     assert_match "LMOVE k k rotates"     LMOVE {l1209}:rot {l1209}:rot LEFT RIGHT
