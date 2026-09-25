@@ -1539,6 +1539,38 @@ assert_both "GEOSEARCH infinite radius" GEOSEARCH edge:geo FROMLONLAT 15 37 BYRA
 assert_both "GEOSEARCH BYRADIUS before FROMLONLAT" GEOSEARCH edge:geo BYRADIUS 200 km FROMLONLAT 15 37 ASC
 assert_both "GEOSEARCH centre not a float" GEOSEARCH edge:geo FROMLONLAT abc 37 BYRADIUS 1 km
 
+# moon#1209 (WS10, verified on redis-server 7.0.15): LPOS decides the option
+# NAME before parsing its value, with redis's texts; LMOVE k k on a one-element
+# list rotates in place and keeps the key's TTL (PERSIST answers 1 only when a
+# TTL survived -- timing-free, unlike reading TTL across two cli spawns).
+both DEL "{l1209}:l" "{l1209}:rot"
+both RPUSH "{l1209}:l" a b a c
+assert_both "moon#1209 LPOS unknown option before its value" LPOS "{l1209}:l" a FOO bar
+assert_both "moon#1209 LPOS RANK 0" LPOS "{l1209}:l" a RANK 0
+assert_both "moon#1209 LPOS COUNT not an integer" LPOS "{l1209}:l" a COUNT abc
+assert_both "moon#1209 LPOS MAXLEN not an integer" LPOS "{l1209}:l" a MAXLEN abc
+assert_both "moon#1209 LPOS negative COUNT" LPOS "{l1209}:l" a COUNT -1
+assert_both "moon#1209 LPOS RANK -1 COUNT 0" LPOS "{l1209}:l" a RANK -1 COUNT 0
+both RPUSH "{l1209}:rot" a
+both EXPIRE "{l1209}:rot" 100
+assert_both "moon#1209 LMOVE k k on a one-element list" LMOVE "{l1209}:rot" "{l1209}:rot" LEFT RIGHT
+assert_both "moon#1209 LMOVE k k keeps the TTL" PERSIST "{l1209}:rot"
+
+# moon#1211 (WS10): the LFU counter under `lfu-log-factor 0` grows by exactly one
+# per access, and neither MEMORY USAGE nor OBJECT FREQ itself touches it
+# (redis serves both with LOOKUP_NOTOUCH). Config restored afterwards.
+both CONFIG SET maxmemory-policy allkeys-lfu
+both CONFIG SET lfu-log-factor 0
+both DEL "{f1211}:k"
+both SET "{f1211}:k" v
+for _ in 1 2 3 4 5 6 7 8 9 10; do both GET "{f1211}:k"; done
+assert_both "moon#1211 OBJECT FREQ grows once per access" OBJECT FREQ "{f1211}:k"
+for _ in 1 2 3 4 5; do both MEMORY USAGE "{f1211}:k"; done
+assert_both "moon#1211 MEMORY USAGE does not touch" OBJECT FREQ "{f1211}:k"
+assert_both "moon#1211 OBJECT FREQ does not touch" OBJECT FREQ "{f1211}:k"
+both CONFIG SET maxmemory-policy noeviction
+both CONFIG SET lfu-log-factor 10
+
 # EXPIREAT / PEXPIREAT / EXPIRETIME / PEXPIRETIME
 both SET edge:eat "val"
 assert_both "EXPIREAT" EXPIREAT edge:eat 9999999999

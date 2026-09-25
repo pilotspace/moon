@@ -520,7 +520,7 @@ impl Database {
 
     /// The body of [`Self::set`] / [`Self::set_looked_up`]. `RECORD` is a
     /// const so the plain `set` monomorph is exactly the code it always was.
-    fn set_recording<const RECORD: bool>(&mut self, key: &[u8], entry: Entry) {
+    fn set_recording<const RECORD: bool>(&mut self, key: &[u8], mut entry: Entry) {
         crate::admin::metrics_setup::record_keyspace_change();
         // An overwrite makes any in-flight spill payload for this key stale.
         // Retiring the record here stops its completion publishing the OLD
@@ -531,6 +531,8 @@ impl Database {
         if !self.spill_inflight_is_empty() {
             self.spill_inflight_forget(key);
         }
+        // moon#1163: a stream arriving whole is billed at its measured size.
+        super::settle_stream_billing(&mut entry);
         let new_cost = entry_overhead(key, &entry);
         let has_expiry = entry.has_expiry();
         let new_ttl = entry.expires_at_ms();
@@ -716,6 +718,9 @@ impl Database {
     /// a decode is not measurable.
     #[inline]
     pub fn insert_for_load(&mut self, key: Bytes, mut entry: Entry) {
+        // moon#1163: `recalculate_memory` bills a stream at `billed_memory`;
+        // a loaded one is measured here, once.
+        super::settle_stream_billing(&mut entry);
         if entry.has_expiry() {
             self.maybe_has_expiring_keys = true;
             self.expiry_index_insert(entry.expires_at_ms(), &key);

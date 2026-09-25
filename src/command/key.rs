@@ -883,36 +883,13 @@ pub fn dbsize_readonly(db: &Database, _args: &[Frame]) -> Frame {
 /// Returns all keys matching the given glob-style pattern.
 /// Expired keys are excluded (lazy expiry check on each key).
 pub fn keys(db: &mut Database, args: &[Frame]) -> Frame {
-    if args.len() != 1 {
-        return err_wrong_args("KEYS");
-    }
-    let pattern = match extract_key(&args[0]) {
-        Some(p) => p,
-        None => return err_wrong_args("KEYS"),
-    };
-
-    // Collect all keys first (need to release immutable borrow before calling db.get)
-    let all_keys: Vec<CompactKey> = db.keys().cloned().collect();
+    // moon#1198: the read path's walk, exactly. This used to clone EVERY key
+    // into a Vec and then make two table probes per key (`exists` for its
+    // lazy-expiry side effect, then `peek_if_alive`) before the pattern test;
+    // redis's `keysCommand` tests the pattern and skips an expired key without
+    // deleting it — expiry is the active cycle's job, not KEYS'.
     let now_ms = db.now_ms();
-
-    let mut result = Vec::new();
-    for key in all_keys {
-        // Trigger lazy expiry by calling exists; membership below is strict
-        // hot-aliveness so cold-only keys enter exactly once, via the cold
-        // loop (#364 plane partition — see Database::cold_only_keys).
-        let _ = db.exists(key.as_bytes());
-        if db.peek_if_alive(key.as_bytes(), now_ms).is_some() && glob_match(pattern, key.as_bytes())
-        {
-            result.push(Frame::BulkString(key.to_bytes()));
-        }
-    }
-    for key in db.cold_only_keys(now_ms) {
-        if glob_match(pattern, key.as_ref()) {
-            result.push(Frame::BulkString(key.clone()));
-        }
-    }
-
-    Frame::Array(result.into())
+    keys_readonly(db, args, now_ms)
 }
 
 /// RENAME key newkey
@@ -1353,11 +1330,11 @@ pub fn keys_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
     };
 
     let mut result = Vec::new();
-    for key in db.keys() {
-        // Strict hot-aliveness: cold-visible keys enter exactly once, via
-        // the cold loop below (#364 plane partition).
-        if db.peek_if_alive(key.as_bytes(), now_ms).is_some() && glob_match(pattern, key.as_bytes())
-        {
+    // Strict hot-aliveness, judged from the entry the walk is already on — no
+    // per-key table probe (moon#1198); cold-visible keys enter exactly once,
+    // via the cold loop below (#364 plane partition).
+    for key in db.iter_live_keys(now_ms) {
+        if glob_match(pattern, key.as_bytes()) {
             result.push(Frame::BulkString(key.to_bytes()));
         }
     }

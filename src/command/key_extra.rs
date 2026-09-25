@@ -11,6 +11,13 @@ use crate::storage::Database;
 use super::helpers::err_wrong_args;
 use super::key::{extract_key, parse_int};
 
+/// An intset member rendered once, straight into the `Bytes` SORT keeps
+/// (`itoa` into a stack buffer; `to_string` built a `String` first).
+#[inline]
+fn int_bytes(v: i64) -> Bytes {
+    Bytes::copy_from_slice(itoa::Buffer::new().format(v).as_bytes())
+}
+
 /// COPY source destination [DB destination-db] [REPLACE]
 ///
 /// Copies the value stored at the source key to the destination key.
@@ -194,19 +201,20 @@ pub fn sort(db: &mut Database, args: &[Frame]) -> Frame {
         }
         Some(entry) => match entry.value.as_redis_value() {
             RedisValueRef::List(l) => l.iter().cloned().collect(),
-            RedisValueRef::ListListpack(lp) => lp.iter().map(|e| e.to_bytes()).collect(),
+            // moon#1212: borrowed walks, one copy per element kept — the
+            // owned `iter()` decoded every string into a `Vec` and `to_bytes`
+            // then copied it again; the zset arm also collected every member
+            // AND score before keeping half of them.
+            RedisValueRef::ListListpack(lp) => lp.iter_refs().map(|e| e.to_bytes()).collect(),
             RedisValueRef::Set(s) => s.iter().cloned().collect(),
-            RedisValueRef::SetListpack(lp) => lp.iter().map(|e| e.to_bytes()).collect(),
-            RedisValueRef::SetIntset(is) => is.iter().map(|v| Bytes::from(v.to_string())).collect(),
+            RedisValueRef::SetListpack(lp) => lp.iter_refs().map(|e| e.to_bytes()).collect(),
+            RedisValueRef::SetIntset(is) => is.iter().map(int_bytes).collect(),
             RedisValueRef::SortedSet { members, .. } => members.keys().cloned().collect(),
             RedisValueRef::SortedSetBPTree { members, .. } => members.keys().cloned().collect(),
             RedisValueRef::SortedSetListpack(lp) => {
-                // Listpack stores member, score pairs
-                let entries: Vec<_> = lp.iter().collect();
-                entries
-                    .chunks(2)
-                    .filter_map(|c| c.first().map(|e| e.to_bytes()))
-                    .collect()
+                // Listpack stores member, score pairs: the members are the
+                // even positions.
+                lp.iter_refs().step_by(2).map(|e| e.to_bytes()).collect()
             }
             _ => {
                 return Frame::Error(Bytes::from_static(
@@ -449,18 +457,15 @@ pub fn sort_ro_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
         None => return Frame::Array(framevec![]),
         Some(entry) => match entry.value.as_redis_value() {
             RedisValueRef::List(l) => l.iter().cloned().collect(),
-            RedisValueRef::ListListpack(lp) => lp.iter().map(|e| e.to_bytes()).collect(),
+            // moon#1212: borrowed walks — see `sort`.
+            RedisValueRef::ListListpack(lp) => lp.iter_refs().map(|e| e.to_bytes()).collect(),
             RedisValueRef::Set(s) => s.iter().cloned().collect(),
-            RedisValueRef::SetListpack(lp) => lp.iter().map(|e| e.to_bytes()).collect(),
-            RedisValueRef::SetIntset(is) => is.iter().map(|v| Bytes::from(v.to_string())).collect(),
+            RedisValueRef::SetListpack(lp) => lp.iter_refs().map(|e| e.to_bytes()).collect(),
+            RedisValueRef::SetIntset(is) => is.iter().map(int_bytes).collect(),
             RedisValueRef::SortedSet { members, .. } => members.keys().cloned().collect(),
             RedisValueRef::SortedSetBPTree { members, .. } => members.keys().cloned().collect(),
             RedisValueRef::SortedSetListpack(lp) => {
-                let entries: Vec<_> = lp.iter().collect();
-                entries
-                    .chunks(2)
-                    .filter_map(|c| c.first().map(|e| e.to_bytes()))
-                    .collect()
+                lp.iter_refs().step_by(2).map(|e| e.to_bytes()).collect()
             }
             _ => {
                 return Frame::Error(Bytes::from_static(

@@ -18,6 +18,7 @@ pub mod intset;
 pub mod listpack;
 pub mod mem_size;
 pub mod numeric;
+pub mod owned_bytes;
 pub mod stream;
 pub mod tier;
 pub mod tiered;

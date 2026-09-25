@@ -245,9 +245,17 @@ enum Work {
         members: std::collections::hash_map::IntoIter<Bytes, f64>,
         nodes: NodeDrain,
     },
+    /// moon#1163: a stream is credited exactly what the ledger BILLED for it
+    /// (`Stream::billed_memory`) — each freed entry at its `entry_cost`,
+    /// capped by what is left of the bill, and the remainder (groups, PELs,
+    /// the fixed part) when the entries are gone. A re-measure would credit
+    /// growth nobody charged.
     Stream {
         entries: std::collections::btree_map::IntoIter<StreamId, Vec<(Bytes, Bytes)>>,
-        rest: Box<Stream>,
+        /// The rest of the value (groups, PELs), freed with the finished item.
+        _rest: Box<Stream>,
+        /// Billed bytes not yet credited.
+        remaining: usize,
     },
 }
 
@@ -258,15 +266,6 @@ const BOXED_REDIS_VALUE_BYTES: usize =
 
 /// Per-entry overhead `entry_overhead` adds on top of key and value.
 const ENTRY_SLOT_OVERHEAD: usize = 128;
-
-/// `Stream::estimate_memory`'s per-entry term (MUST mirror it; the debug
-/// equality check in the drain is what catches a drift).
-fn stream_entry_cost(fields: &[(Bytes, Bytes)]) -> usize {
-    16 + fields
-        .iter()
-        .map(|(f, v)| f.len() + v.len() + 48)
-        .sum::<usize>()
-}
 
 impl Work {
     /// Take `value` apart. Returns the work and the O(1)-known part of its
@@ -306,12 +305,14 @@ impl Work {
                 )
             }
             RedisValue::Stream(mut s) => {
+                let remaining = s.billed_memory();
                 let entries: BTreeMap<StreamId, Vec<(Bytes, Bytes)>> =
                     std::mem::take(&mut s.entries);
                 (
                     Work::Stream {
                         entries: entries.into_iter(),
-                        rest: s,
+                        _rest: s,
+                        remaining,
                     },
                     boxed,
                 )
@@ -381,10 +382,17 @@ impl Work {
                 }
                 finished
             }
-            Work::Stream { entries, rest } => {
-                drain!(entries, |(_, fields)| stream_entry_cost(&fields));
+            // The groups go with `_rest` when the finished item is dropped.
+            Work::Stream {
+                entries, remaining, ..
+            } => {
+                drain!(entries, |(_, fields)| {
+                    let c = crate::storage::stream::entry_cost(&fields).min(*remaining);
+                    *remaining -= c;
+                    c
+                });
                 if n < budget {
-                    credit += rest.estimate_memory();
+                    credit += std::mem::take(remaining);
                     true
                 } else {
                     false

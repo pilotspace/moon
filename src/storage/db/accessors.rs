@@ -14,7 +14,7 @@ use crate::storage::entry::{Entry, RedisValue, current_time_ms};
 use crate::storage::intset::Intset;
 use crate::storage::stream::Stream as StreamData;
 
-use crate::storage::db::{Database, entry_overhead, list_elem_cost, stamp_mutation};
+use crate::storage::db::{Database, entry_overhead, stamp_mutation};
 
 /// Rendered width, in bytes, of the widest member of an intset — what the
 /// listpack value threshold would measure once the intset's `i64`s become
@@ -1390,12 +1390,16 @@ impl Database {
     /// See [`Self::get_hash_ref_if_alive`] for why this consults the cold
     /// tier without promoting on a hot miss (P0 cold-collection-visibility
     /// fix).
+    ///
+    /// A key that is INDEXED in the cold tier but whose bytes cannot be read
+    /// answers `Err(-IOERR)`, never `Ok(None)` — see
+    /// [`Self::list_absent_unless_cold_fault`] (moon#1225).
     pub fn get_list_ref_if_alive(
         &self,
         key: &[u8],
         now_ms: u64,
     ) -> Result<Option<ListRef<'_>>, Frame> {
-        self.get_ref_if_alive::<db_kind::ListKind>(key, now_ms)
+        self.list_absent_unless_cold_fault(self.get_ref_if_alive::<db_kind::ListKind>(key, now_ms))
     }
 
     /// [`Self::get_list_ref_if_alive`] without recording an access — a list
@@ -1405,7 +1409,35 @@ impl Database {
         key: &[u8],
         now_ms: u64,
     ) -> Result<Option<ListRef<'_>>, Frame> {
-        self.peek_ref_if_alive::<db_kind::ListKind>(key, now_ms)
+        self.list_absent_unless_cold_fault(self.peek_ref_if_alive::<db_kind::ListKind>(key, now_ms))
+    }
+
+    /// moon#1225: a list probe's "no such key" is only true when the cold
+    /// read behind the hot miss did not FAULT.
+    ///
+    /// The generic read-through raises the moon#875 flag and answers `None`,
+    /// leaving the reply to the dispatch-boundary gate. That is enough for a
+    /// read, but not for the list writes that act on the answer BEFORE the
+    /// reply is built: `LMOVE`/`RPOPLPUSH` (and the blocking `BLMOVE`
+    /// immediate and wake paths) took a faulted destination for an absent one,
+    /// popped the source, and the push's refusal was swallowed — the element
+    /// was acked and existed nowhere; `LMPOP` skipped a faulted key and popped
+    /// a later one. Every caller of these two probes already forwards an `Err`
+    /// to the client before mutating, so turning the fault into an `Err` HERE
+    /// refuses all of them before any pop, with no caller-side change.
+    ///
+    /// List-only on purpose: some hash/set/zset/stream callers map `Err(_)` to
+    /// "skip" (they only expect WRONGTYPE), and would swallow an `-IOERR` the
+    /// gate could then no longer see. Cost: one relaxed load on a miss.
+    #[inline]
+    fn list_absent_unless_cold_fault<'a>(
+        &self,
+        probe: Result<Option<ListRef<'a>>, Frame>,
+    ) -> Result<Option<ListRef<'a>>, Frame> {
+        match probe {
+            Ok(None) if self.take_cold_fault().is_some() => Err(Self::cold_fault_error()),
+            other => other,
+        }
     }
 
     /// Read-only set access via SetRef enum. Handles HashSet, Listpack, and Intset.
@@ -1446,71 +1478,7 @@ impl Database {
 
     // ---- Low-level helpers for blocking wakeup hooks ----
 
-    /// Pop the front element from a list. Returns None if key missing/empty/wrong type.
-    /// Removes the key if the list becomes empty. Handles compact listpack upgrade.
-    ///
-    /// moon#523/#539: the lookup is deliberately NON-creating. This helper
-    /// backs the blocking fast path (`try_immediate_pop` → BLPOP/BLMOVE/…),
-    /// so a `get_or_create_list` here materialised an empty list on every
-    /// miss — a phantom key that EXISTS/TYPE/DBSIZE reported, that a later
-    /// RPUSH rejected with WRONGTYPE, and that no path ever removed.
-    pub fn list_pop_front(&mut self, key: &[u8]) -> Option<Bytes> {
-        let list = self.get_mut_if_present::<db_kind::ListKind>(key).ok()??;
-        let val = list.pop_front()?;
-        let empty = list.is_empty();
-        // `list`'s borrow of `self` ends above.
-        //
-        // moon#949: credit the element UNCONDITIONALLY. The empty branch used
-        // to skip this on the theory that whole-key removal recovers the cost
-        // via `entry_overhead` — it does not. `entry_overhead` is computed
-        // from the CURRENT value, which by then no longer holds the element,
-        // so the push-time charge was never given back and `used_memory`
-        // drifted UP by one element every time a list was drained to empty.
-        // Unbounded on an empty keyspace, which is `--maxmemory` and eviction
-        // firing on a server holding nothing. `pop_eager` in
-        // `src/command/list/` always credited unconditionally; this is the
-        // same rule.
-        self.credit_memory(list_elem_cost(&val));
-        if empty {
-            self.remove(key);
-        }
-        Some(val)
-    }
-
-    /// Pop the back element from a list. Returns None if key missing/empty/wrong type.
-    /// Removes the key if the list becomes empty. Handles compact listpack upgrade.
-    ///
-    /// Non-creating on a missing key — see [`Self::list_pop_front`].
-    pub fn list_pop_back(&mut self, key: &[u8]) -> Option<Bytes> {
-        let list = self.get_mut_if_present::<db_kind::ListKind>(key).ok()??;
-        let val = list.pop_back()?;
-        let empty = list.is_empty();
-        // moon#949 — see `list_pop_front`.
-        self.credit_memory(list_elem_cost(&val));
-        if empty {
-            self.remove(key);
-        }
-        Some(val)
-    }
-
-    /// Push an element to the front of a list. Creates the list if it does not exist.
-    pub fn list_push_front(&mut self, key: &[u8], value: Bytes) {
-        // get_or_create_list creates the key if missing
-        let cost = list_elem_cost(&value);
-        if let Ok(list) = self.get_or_create_list(key) {
-            list.push_front(value);
-            self.charge_memory(cost);
-        }
-    }
-
-    /// Push an element to the back of a list. Creates the list if it does not exist.
-    pub fn list_push_back(&mut self, key: &[u8], value: Bytes) {
-        let cost = list_elem_cost(&value);
-        if let Ok(list) = self.get_or_create_list(key) {
-            list.push_back(value);
-            self.charge_memory(cost);
-        }
-    }
+    // (The list helpers live in `list_blocking.rs`.)
 
     /// Pop the minimum element from a sorted set. Returns (member, score) or None.
     /// Removes the key if the sorted set becomes empty.

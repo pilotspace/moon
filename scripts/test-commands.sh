@@ -743,6 +743,35 @@ if should_run "list"; then
     assert_match "RPOPLPUSH dest"      LRANGE lst:rl-d 0 -1
     assert_match "RPOPLPUSH miss"      RPOPLPUSH lst:rl-absent lst:rl-d
     assert_match "RPOPLPUSH arity"     RPOPLPUSH lst:rl
+    # moon#1209 (WS10): LPOS option errors decided by name first, with redis's
+    # texts; LMOVE k k rotates in place and keeps the key's TTL.
+    rcli RPUSH {l1209}:l a b a c >/dev/null 2>&1; mcli RPUSH {l1209}:l a b a c >/dev/null 2>&1
+    assert_match "LPOS unknown option"   LPOS {l1209}:l a FOO bar
+    assert_match "LPOS RANK 0"           LPOS {l1209}:l a RANK 0
+    assert_match "LPOS COUNT abc"        LPOS {l1209}:l a COUNT abc
+    assert_match "LPOS MAXLEN abc"       LPOS {l1209}:l a MAXLEN abc
+    rcli RPUSH {l1209}:rot a >/dev/null 2>&1; mcli RPUSH {l1209}:rot a >/dev/null 2>&1
+    rcli EXPIRE {l1209}:rot 100 >/dev/null 2>&1; mcli EXPIRE {l1209}:rot 100 >/dev/null 2>&1
+    assert_match "LMOVE k k rotates"     LMOVE {l1209}:rot {l1209}:rot LEFT RIGHT
+    assert_match "LMOVE k k keeps TTL"   PERSIST {l1209}:rot
+    # moon#1211 (WS10): OBJECT FREQ grows once per access under lfu-log-factor 0;
+    # MEMORY USAGE and OBJECT FREQ are NOTOUCH.
+    for c in rcli mcli; do
+        $c CONFIG SET maxmemory-policy allkeys-lfu >/dev/null 2>&1
+        $c CONFIG SET lfu-log-factor 0 >/dev/null 2>&1
+        $c DEL {f1211}:k >/dev/null 2>&1
+        $c SET {f1211}:k v >/dev/null 2>&1
+        for _ in 1 2 3 4 5 6 7 8 9 10; do $c GET {f1211}:k >/dev/null 2>&1; done
+    done
+    assert_match "OBJECT FREQ per access" OBJECT FREQ {f1211}:k
+    for c in rcli mcli; do
+        for _ in 1 2 3 4 5; do $c MEMORY USAGE {f1211}:k >/dev/null 2>&1; done
+    done
+    assert_match "MEMORY USAGE NOTOUCH"  OBJECT FREQ {f1211}:k
+    for c in rcli mcli; do
+        $c CONFIG SET maxmemory-policy noeviction >/dev/null 2>&1
+        $c CONFIG SET lfu-log-factor 10 >/dev/null 2>&1
+    done
 fi
 
 # ===========================================================================

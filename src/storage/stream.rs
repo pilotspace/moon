@@ -8,6 +8,8 @@ use bytes::Bytes;
 use std::collections::{BTreeMap, HashMap};
 
 use super::entry::current_time_ms;
+use super::mem_size::{amortized_hash_slot, size_class, vec_bytes};
+use super::owned_bytes::detach;
 
 /// Stream entry ID: <milliseconds>-<sequence>.
 /// Ordered by (ms, seq) for BTreeMap keying.
@@ -67,8 +69,24 @@ impl StreamId {
     }
 
     /// Format as "ms-seq" Bytes.
+    ///
+    /// moon#1198: two `itoa` renders into a stack buffer and ONE exact-size
+    /// copy — this runs per entry of every XRANGE/XREAD/XREADGROUP reply.
+    /// `format!` built a growing `String` and `Bytes::from` then allocated a
+    /// shared header for its slack capacity.
     pub fn to_bytes(self) -> Bytes {
-        Bytes::from(format!("{}-{}", self.ms, self.seq))
+        // u64::MAX renders in 20 digits: 20 + 1 + 20.
+        let mut buf = [0u8; 41];
+        let mut ms = itoa::Buffer::new();
+        let ms = ms.format(self.ms).as_bytes();
+        let mut seq = itoa::Buffer::new();
+        let seq = seq.format(self.seq).as_bytes();
+        let dash = ms.len();
+        let end = dash + 1 + seq.len();
+        buf[..dash].copy_from_slice(ms);
+        buf[dash] = b'-';
+        buf[dash + 1..end].copy_from_slice(seq);
+        Bytes::copy_from_slice(&buf[..end])
     }
 }
 
@@ -87,6 +105,97 @@ pub struct Stream {
     pub durable: bool,
     /// Maximum delivery attempts before dead-letter routing (0 = disabled).
     pub max_delivery_count: u32,
+    /// moon#1163: the contents bytes the `used_memory` ledger carries for
+    /// this stream — what `entry_overhead` bills (via
+    /// [`Self::billed_memory`]) and therefore what a DEL credits back.
+    ///
+    /// Kept apart from the true size ([`Self::estimate_memory`], a scan) so
+    /// charge and credit can never disagree: every change to it is made in
+    /// lockstep with `used_memory` ([`Self::take_unbilled`] at the command
+    /// sites, [`Self::settle_billing`] where a whole value enters the
+    /// keyspace). A mutation that nobody bills — a caller outside the stream
+    /// commands — is picked up by the next command that drains it, and until
+    /// then is simply not yet counted; it can never be credited without
+    /// having been charged (the moon#861 saturation class).
+    billed: usize,
+    /// Exact byte delta of the mutations made since the last drain, kept by
+    /// every mutating method below from the insert/remove results it sees.
+    unbilled: isize,
+    /// `billed` has been measured against the contents (see
+    /// [`Self::settle_billing`]). A stream built field by field by a loader
+    /// is not, until it enters the keyspace.
+    settled: bool,
+}
+
+// ---------------------------------------------------------------------------
+// moon#1163: allocator-truthful per-element costs, shared by the O(1) deltas
+// the mutating methods keep and by the O(n) `estimate_memory` scan, so the two
+// cannot drift. Same method as `storage::db`'s moon#788 constants: the
+// element's own bytes at their jemalloc size class, plus its container slot.
+// ---------------------------------------------------------------------------
+
+/// Fixed part of a stream's contents (its own scalars and empty maps).
+const STREAM_BASE: usize = 64;
+
+/// Per-pair share of a std `BTreeMap` leaf: up to 11 pairs plus ~12 B of
+/// header in one allocation. Stream ids, PEL ids and pending ids are appended
+/// in order, and an in-order insert splits a full leaf in two halves the map
+/// never refills — a leaf carries ~5 live pairs. Internal nodes (< 1/6 of
+/// the leaves) are left out; the leaf rounding already errs high.
+const fn btree_slot(kv: usize) -> usize {
+    size_class(12 + 11 * kv) / 5
+}
+
+/// One entry's slot in `entries`.
+const ENTRY_SLOT: usize = btree_slot(std::mem::size_of::<(StreamId, Vec<(Bytes, Bytes)>)>());
+/// One PEL entry (its `consumer` is a clone of the consumer's stored name).
+const PEL_SLOT: usize = btree_slot(std::mem::size_of::<(StreamId, PendingEntry)>());
+/// One id in a consumer's pending set.
+const PENDING_SLOT: usize = btree_slot(std::mem::size_of::<(StreamId, ())>());
+/// One consumer's slot in its group's map.
+const CONSUMER_SLOT: usize = amortized_hash_slot(std::mem::size_of::<(Bytes, Consumer)>());
+/// One group's slot in `groups`.
+const GROUP_SLOT: usize = amortized_hash_slot(std::mem::size_of::<(Bytes, ConsumerGroup)>());
+
+/// Bytes one stream entry costs: its slot, its field vector (sized by the
+/// capacity the caller allocated) and every field and value.
+#[inline]
+pub(crate) fn entry_cost(fields: &Vec<(Bytes, Bytes)>) -> usize {
+    ENTRY_SLOT
+        + vec_bytes(fields.capacity(), std::mem::size_of::<(Bytes, Bytes)>())
+        + fields
+            .iter()
+            .map(|(f, v)| size_class(f.len()) + size_class(v.len()))
+            .sum::<usize>()
+}
+
+/// A consumer without its pending ids (its name is ONE allocation shared by
+/// the map key and `Consumer::name`).
+#[inline]
+fn consumer_cost(name: &[u8]) -> usize {
+    CONSUMER_SLOT + size_class(name.len())
+}
+
+/// A group without its consumers and PEL.
+#[inline]
+fn group_shell_cost(name: &[u8]) -> usize {
+    GROUP_SLOT + size_class(name.len())
+}
+
+/// A whole group: shell, consumers, their pending ids and the PEL.
+fn group_cost(name: &[u8], group: &ConsumerGroup) -> usize {
+    group_shell_cost(name)
+        + group.pel.len() * PEL_SLOT
+        + group
+            .consumers
+            .iter()
+            .map(|(cname, c)| consumer_cost(cname) + c.pending.len() * PENDING_SLOT)
+            .sum::<usize>()
+}
+
+#[inline]
+fn signed(bytes: usize) -> isize {
+    isize::try_from(bytes).unwrap_or(isize::MAX)
 }
 
 /// Consumer group state.
@@ -140,7 +249,56 @@ impl Stream {
             groups: HashMap::new(),
             durable: false,
             max_delivery_count: 0,
+            billed: 0,
+            unbilled: 0,
+            settled: false,
         }
+    }
+
+    /// The contents' true size, by scan: every entry, group, consumer and
+    /// PEL slot at its [`entry_cost`]-family price. O(n) — the ledger never
+    /// calls it on a hot path (`MEMORY USAGE`, the settle of a whole value
+    /// arriving, tests).
+    fn contents_scan(&self) -> usize {
+        self.entries.values().map(entry_cost).sum::<usize>()
+            + self
+                .groups
+                .iter()
+                .map(|(name, g)| group_cost(name, g))
+                .sum::<usize>()
+    }
+
+    /// What the `used_memory` ledger carries for this stream (O(1)) — the
+    /// figure `entry_overhead` uses to charge it on the way in and credit it
+    /// on the way out (moon#1163).
+    #[inline]
+    pub fn billed_memory(&self) -> usize {
+        STREAM_BASE + self.billed
+    }
+
+    /// Measure `billed` against the contents, once, for a stream that enters
+    /// the keyspace whole (a loader built it field by field, or it arrives
+    /// from RESTORE / the cold tier / a replica). Its first charge is then the
+    /// truth, and every later change is a drained delta.
+    pub fn settle_billing(&mut self) {
+        if !self.settled {
+            self.billed = self.contents_scan();
+            self.unbilled = 0;
+            self.settled = true;
+        }
+    }
+
+    /// Fold the mutations made since the last drain into `billed` and return
+    /// the change, which the caller applies to `used_memory` in the same
+    /// breath (moon#1163). Clamped at zero, and the clamped figure is what is
+    /// returned, so the ledger and `billed` move by the same amount.
+    #[must_use]
+    pub fn take_unbilled(&mut self) -> isize {
+        let d = std::mem::take(&mut self.unbilled);
+        let next = signed(self.billed).saturating_add(d).max(0);
+        let actual = next - signed(self.billed);
+        self.billed = usize::try_from(next).unwrap_or(0);
+        actual
     }
 
     /// Generate next auto-ID. Uses max(now_ms, last_id.ms) for monotonic guarantee.
@@ -163,8 +321,19 @@ impl Stream {
     }
 
     /// Add an entry. Returns the assigned ID. Caller must ensure id > last_id.
-    pub fn add(&mut self, id: StreamId, fields: Vec<(Bytes, Bytes)>) -> StreamId {
-        self.entries.insert(id, fields);
+    ///
+    /// moon#1160: every field and value is stored as an exact-size copy —
+    /// the callers (`XADD`, the MQ paths) hand in `Bytes` sliced from the
+    /// request buffer, and storing those kept the whole buffer alive.
+    pub fn add(&mut self, id: StreamId, mut fields: Vec<(Bytes, Bytes)>) -> StreamId {
+        for (f, v) in &mut fields {
+            *f = detach(f);
+            *v = detach(v);
+        }
+        self.unbilled += signed(entry_cost(&fields));
+        if let Some(old) = self.entries.insert(id, fields) {
+            self.unbilled -= signed(entry_cost(&old));
+        }
         self.length += 1;
         self.last_id = id;
         id
@@ -221,8 +390,8 @@ impl Stream {
         let to_remove = (current - maxlen) as usize;
         let mut removed = 0u64;
         for _ in 0..to_remove {
-            if let Some((&id, _)) = self.entries.iter().next() {
-                self.entries.remove(&id);
+            if let Some((_, fields)) = self.entries.pop_first() {
+                self.unbilled -= signed(entry_cost(&fields));
                 removed += 1;
             }
         }
@@ -239,7 +408,9 @@ impl Stream {
         }
         let removed = to_remove.len() as u64;
         for id in to_remove {
-            self.entries.remove(&id);
+            if let Some(fields) = self.entries.remove(&id) {
+                self.unbilled -= signed(entry_cost(&fields));
+            }
         }
         self.length = self.length.saturating_sub(removed);
         removed
@@ -249,7 +420,8 @@ impl Stream {
     pub fn delete(&mut self, ids: &[StreamId]) -> u64 {
         let mut count = 0u64;
         for id in ids {
-            if self.entries.remove(id).is_some() {
+            if let Some(fields) = self.entries.remove(id) {
+                self.unbilled -= signed(entry_cost(&fields));
                 count += 1;
             }
         }
@@ -268,8 +440,10 @@ impl Stream {
         if self.groups.contains_key(&name) {
             return Err("BUSYGROUP Consumer Group name already exists");
         }
+        self.unbilled += signed(group_shell_cost(&name));
         self.groups.insert(
-            name,
+            // moon#1160: never store the request's slice.
+            detach(&name),
             ConsumerGroup {
                 last_delivered_id,
                 pel: BTreeMap::new(),
@@ -281,7 +455,13 @@ impl Stream {
 
     /// Destroy a consumer group. Returns true if it existed.
     pub fn destroy_group(&mut self, name: &[u8]) -> bool {
-        self.groups.remove(name).is_some()
+        match self.groups.remove_entry(name) {
+            Some((name, group)) => {
+                self.unbilled -= signed(group_cost(&name, &group));
+                true
+            }
+            None => false,
+        }
     }
 
     /// Set the last-delivered-id for a group.
@@ -308,14 +488,8 @@ impl Stream {
         if group.consumers.contains_key(&consumer_name) {
             Ok(false)
         } else {
-            group.consumers.insert(
-                consumer_name.clone(),
-                Consumer {
-                    name: consumer_name,
-                    pending: BTreeMap::new(),
-                    seen_time: current_time_ms(),
-                },
-            );
+            Self::insert_consumer(group, &consumer_name);
+            self.unbilled += signed(consumer_cost(&consumer_name));
             Ok(true)
         }
     }
@@ -333,29 +507,50 @@ impl Stream {
         match group.consumers.remove(consumer_name) {
             Some(consumer) => {
                 let count = consumer.pending.len() as u64;
+                let mut freed =
+                    consumer_cost(consumer_name) + consumer.pending.len() * PENDING_SLOT;
                 // Remove from group PEL
                 for (id, _) in &consumer.pending {
-                    group.pel.remove(id);
+                    if group.pel.remove(id).is_some() {
+                        freed += PEL_SLOT;
+                    }
                 }
+                self.unbilled -= signed(freed);
                 Ok(count)
             }
             None => Ok(0),
         }
     }
 
-    /// Ensure a consumer exists in a group, auto-creating if needed.
-    fn ensure_consumer(group: &mut ConsumerGroup, consumer_name: &Bytes) {
+    /// Insert a NEW consumer, its name stored as ONE exact-size copy that the
+    /// map key and `Consumer::name` share (moon#1160: `consumer_name` is the
+    /// request's slice). Returns the stored name.
+    fn insert_consumer(group: &mut ConsumerGroup, consumer_name: &[u8]) -> Bytes {
+        let name = detach(consumer_name);
+        group.consumers.insert(
+            name.clone(),
+            Consumer {
+                name: name.clone(),
+                pending: BTreeMap::new(),
+                seen_time: current_time_ms(),
+            },
+        );
+        name
+    }
+
+    /// Ensure a consumer exists in a group, auto-creating if needed, and
+    /// return its STORED name — the handle a PEL entry must keep (moon#1160:
+    /// a clone of the caller's `consumer_name` pinned the request buffer once
+    /// per delivered entry) — plus the bytes a creation added (moon#1163).
+    fn ensure_consumer(group: &mut ConsumerGroup, consumer_name: &Bytes) -> (Bytes, isize) {
         if let Some(consumer) = group.consumers.get_mut(consumer_name) {
             consumer.seen_time = current_time_ms();
+            (consumer.name.clone(), 0)
         } else {
-            group.consumers.insert(
-                consumer_name.clone(),
-                Consumer {
-                    name: consumer_name.clone(),
-                    pending: BTreeMap::new(),
-                    seen_time: current_time_ms(),
-                },
-            );
+            (
+                Self::insert_consumer(group, consumer_name),
+                signed(consumer_cost(consumer_name)),
+            )
         }
     }
 
@@ -388,7 +583,8 @@ impl Stream {
             .groups
             .get_mut(group_name.as_ref())
             .ok_or("NOGROUP No such consumer group for key name")?;
-        Self::ensure_consumer(group, consumer_name);
+        let (stored_name, created) = Self::ensure_consumer(group, consumer_name);
+        let mut delta = created;
 
         let start = StreamId {
             ms: group.last_delivered_id.ms,
@@ -425,20 +621,29 @@ impl Stream {
 
             if !noack {
                 // Add to group PEL
-                group.pel.insert(
-                    id,
-                    PendingEntry {
-                        consumer: consumer_name.clone(),
-                        delivery_time: now,
-                        delivery_count: 1,
-                    },
-                );
+                if group
+                    .pel
+                    .insert(
+                        id,
+                        PendingEntry {
+                            consumer: stored_name.clone(),
+                            delivery_time: now,
+                            delivery_count: 1,
+                        },
+                    )
+                    .is_none()
+                {
+                    delta += signed(PEL_SLOT);
+                }
                 // Add to consumer's pending set
-                if let Some(c) = group.consumers.get_mut(consumer_name) {
-                    c.pending.insert(id, ());
+                if let Some(c) = group.consumers.get_mut(consumer_name)
+                    && c.pending.insert(id, ()).is_none()
+                {
+                    delta += signed(PENDING_SLOT);
                 }
             }
         }
+        self.unbilled += delta;
         Ok(results)
     }
 
@@ -483,15 +688,20 @@ impl Stream {
             .ok_or("NOGROUP No such consumer group for key name")?;
 
         let mut count = 0u64;
+        let mut freed = 0usize;
         for id in ids {
             if let Some(pe) = group.pel.remove(id) {
                 count += 1;
+                freed += PEL_SLOT;
                 // Remove from consumer's pending set
-                if let Some(c) = group.consumers.get_mut(&pe.consumer) {
-                    c.pending.remove(id);
+                if let Some(c) = group.consumers.get_mut(&pe.consumer)
+                    && c.pending.remove(id).is_some()
+                {
+                    freed += PENDING_SLOT;
                 }
             }
         }
+        self.unbilled -= signed(freed);
         Ok(count)
     }
 
@@ -601,15 +811,19 @@ impl Stream {
             Some(t) if t >= 0 && (t as u64) <= now => t as u64,
             _ => now,
         };
-        Self::ensure_consumer(group, consumer_name);
+        let (stored_name, created) = Self::ensure_consumer(group, consumer_name);
+        let mut delta = created;
 
         let mut claimed = Vec::with_capacity(ids.len());
         for &id in ids {
             if !entries.contains_key(&id) {
-                if let Some(stale) = group.pel.remove(&id)
-                    && let Some(c) = group.consumers.get_mut(&stale.consumer)
-                {
-                    c.pending.remove(&id);
+                if let Some(stale) = group.pel.remove(&id) {
+                    delta -= signed(PEL_SLOT);
+                    if let Some(c) = group.consumers.get_mut(&stale.consumer)
+                        && c.pending.remove(&id).is_some()
+                    {
+                        delta -= signed(PENDING_SLOT);
+                    }
                 }
                 continue;
             }
@@ -619,11 +833,12 @@ impl Stream {
                 group.pel.insert(
                     id,
                     PendingEntry {
-                        consumer: consumer_name.clone(),
+                        consumer: stored_name.clone(),
                         delivery_time: now,
                         delivery_count: 1,
                     },
                 );
+                delta += signed(PEL_SLOT);
                 true
             } else {
                 continue;
@@ -636,12 +851,17 @@ impl Stream {
                 continue;
             }
             if forced || pe.consumer != *consumer_name {
-                if !forced && let Some(c) = group.consumers.get_mut(&pe.consumer) {
-                    c.pending.remove(&id);
+                if !forced
+                    && let Some(c) = group.consumers.get_mut(&pe.consumer)
+                    && c.pending.remove(&id).is_some()
+                {
+                    delta -= signed(PENDING_SLOT);
                 }
-                pe.consumer = consumer_name.clone();
-                if let Some(c) = group.consumers.get_mut(consumer_name) {
-                    c.pending.insert(id, ());
+                pe.consumer = stored_name.clone();
+                if let Some(c) = group.consumers.get_mut(consumer_name)
+                    && c.pending.insert(id, ()).is_none()
+                {
+                    delta += signed(PENDING_SLOT);
                 }
             }
             pe.delivery_time = delivery_time;
@@ -652,6 +872,7 @@ impl Stream {
             }
             claimed.push(id);
         }
+        self.unbilled += delta;
         Ok(claimed)
     }
 
@@ -676,7 +897,8 @@ impl Stream {
             .groups
             .get_mut(group_name.as_ref())
             .ok_or("NOGROUP No such consumer group for key name")?;
-        Self::ensure_consumer(group, consumer_name);
+        let (stored_name, created) = Self::ensure_consumer(group, consumer_name);
+        let mut delta = created;
 
         let now = current_time_ms();
         let mut claimed = Vec::new();
@@ -704,20 +926,24 @@ impl Stream {
             // Check if entry still exists in stream
             if self.entries.contains_key(id) {
                 // Remove from old consumer's pending
-                if let Some(c) = group.consumers.get_mut(old_consumer) {
-                    c.pending.remove(id);
+                if let Some(c) = group.consumers.get_mut(old_consumer)
+                    && c.pending.remove(id).is_some()
+                {
+                    delta -= signed(PENDING_SLOT);
                 }
 
                 // Update PEL entry
                 if let Some(pe) = group.pel.get_mut(id) {
-                    pe.consumer = consumer_name.clone();
+                    pe.consumer = stored_name.clone();
                     pe.delivery_time = now;
                     pe.delivery_count += 1;
                 }
 
                 // Add to new consumer's pending
-                if let Some(c) = group.consumers.get_mut(consumer_name) {
-                    c.pending.insert(*id, ());
+                if let Some(c) = group.consumers.get_mut(consumer_name)
+                    && c.pending.insert(*id, ()).is_none()
+                {
+                    delta += signed(PENDING_SLOT);
                 }
 
                 if let Some(fields) = self.entries.get(id) {
@@ -725,13 +951,18 @@ impl Stream {
                 }
             } else {
                 // Entry was deleted from stream, remove from PEL
-                group.pel.remove(id);
-                if let Some(c) = group.consumers.get_mut(old_consumer) {
-                    c.pending.remove(id);
+                if group.pel.remove(id).is_some() {
+                    delta -= signed(PEL_SLOT);
+                }
+                if let Some(c) = group.consumers.get_mut(old_consumer)
+                    && c.pending.remove(id).is_some()
+                {
+                    delta -= signed(PENDING_SLOT);
                 }
                 deleted.push(*id);
             }
         }
+        self.unbilled += delta;
 
         // If we didn't find a next cursor (scanned all candidates), return 0-0
         if next_id == StreamId::ZERO && scanned > 0 {
@@ -741,25 +972,12 @@ impl Stream {
         Ok((next_id, claimed, deleted))
     }
 
-    /// Estimate memory usage.
+    /// The stream's true size, by scan (O(n)): the fixed part plus every
+    /// entry, group, consumer and PEL slot at the same prices the O(1) deltas
+    /// use (moon#1163). What `MEMORY USAGE` reports; the ledger bills
+    /// [`Self::billed_memory`].
     pub fn estimate_memory(&self) -> usize {
-        let mut mem = 64; // struct overhead
-        for (_, fields) in &self.entries {
-            mem += 16; // StreamId
-            for (f, v) in fields {
-                mem += f.len() + v.len() + 48;
-            }
-        }
-        // Consumer groups overhead
-        for (name, group) in &self.groups {
-            mem += name.len() + 64;
-            mem += group.pel.len() * 64;
-            for (cname, consumer) in &group.consumers {
-                mem += cname.len() + 48;
-                mem += consumer.pending.len() * 16;
-            }
-        }
-        mem
+        STREAM_BASE + self.contents_scan()
     }
 }
 
@@ -786,6 +1004,34 @@ pub fn validate_explicit_id_against(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// moon#1198: the rendering is exact for every width, and lands in an
+    /// exact-size buffer — `format!`'s `String` carried slack capacity that
+    /// `Bytes::from` then had to wrap in a second, shared allocation.
+    #[test]
+    fn stream_id_renders_exactly_into_an_exact_buffer() {
+        for (ms, seq) in [
+            (0u64, 0u64),
+            (1, 2),
+            (1_700_000_000_123, 7),
+            (u64::MAX, u64::MAX),
+            (u64::MAX, 0),
+            (9, 10),
+        ] {
+            let b = StreamId { ms, seq }.to_bytes();
+            assert_eq!(b, Bytes::from(format!("{ms}-{seq}")));
+            let len = b.len();
+            let m = b
+                .try_into_mut()
+                .unwrap_or_else(|b| bytes::BytesMut::from(&b[..]));
+            assert_eq!(
+                m.capacity(),
+                len,
+                "{ms}-{seq}: rendered through a buffer with {} B of slack",
+                m.capacity() - len
+            );
+        }
+    }
 
     #[test]
     fn test_stream_id_parse_ms_seq() {

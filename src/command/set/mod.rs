@@ -104,6 +104,8 @@ pub use set_write::sunionstore;
 
 #[cfg(test)]
 mod algebra_tests;
+#[cfg(test)]
+mod smove_cold_fault_tests;
 
 #[cfg(test)]
 mod tests {
