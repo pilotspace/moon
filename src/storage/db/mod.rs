@@ -871,10 +871,15 @@ impl Database {
     /// from here on the cold index's dead-slot ledger knows the slot, or no
     /// slot was published. O(1); a no-op for a request that was never
     /// superseded, and free when nothing is.
+    ///
+    /// Returns `true` when this database held the request. A `SWAPDB` while
+    /// the request was in flight moves it with the rest of the database, so
+    /// a completion that misses here looks in the shard's other databases
+    /// (`persistence_tick::settle_superseded_elsewhere`).
     #[inline]
-    pub fn spill_superseded_settle(&mut self, key: &bytes::Bytes, req_id: u64) {
+    pub fn spill_superseded_settle(&mut self, key: &bytes::Bytes, req_id: u64) -> bool {
         if self.spill_superseded.is_empty() {
-            return;
+            return false;
         }
         if self
             .spill_superseded
@@ -883,7 +888,9 @@ impl Database {
         {
             let credit = key.len() + SPILL_SUPERSEDED_OVERHEAD;
             self.spill_superseded_bytes = self.spill_superseded_bytes.saturating_sub(credit);
+            return true;
         }
+        false
     }
 
     /// Keys whose superseded in-flight slot can still come back at `now_ms`

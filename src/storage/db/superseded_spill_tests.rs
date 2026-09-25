@@ -240,7 +240,7 @@ fn a_key_promoted_while_its_spill_is_in_flight_keeps_its_value() {
 fn a_completion_before_the_fold_hands_the_key_to_the_ledger() {
     let (_live_dir, mut live) = live();
     live.remove_counting_cold(b"k1");
-    live.spill_superseded_settle(&Bytes::from_static(b"k1"), 7);
+    assert!(live.spill_superseded_settle(&Bytes::from_static(b"k1"), 7));
     assert!(live.spill_superseded_is_empty());
     if let Some(ci) = live.cold_index.as_mut() {
         ci.note_dead_slot(7, Bytes::from_static(b"k1"), None);
@@ -273,14 +273,14 @@ fn superseded_entries_are_counted_apart_and_settle_to_zero() {
     );
     let entry = 2 + super::SPILL_SUPERSEDED_OVERHEAD;
     assert_eq!(db.spill_superseded_bytes(), 2 * entry);
-    db.spill_superseded_settle(&Bytes::from_static(b"k3"), 9);
+    assert!(!db.spill_superseded_settle(&Bytes::from_static(b"k3"), 9));
     assert_eq!(
         db.spill_superseded_len(),
         2,
         "request 9 was never superseded"
     );
-    db.spill_superseded_settle(&Bytes::from_static(b"k1"), 7);
-    db.spill_superseded_settle(&Bytes::from_static(b"k3"), 7);
+    assert!(db.spill_superseded_settle(&Bytes::from_static(b"k1"), 7));
+    assert!(db.spill_superseded_settle(&Bytes::from_static(b"k3"), 7));
     assert!(db.spill_superseded_is_empty());
     assert_eq!(db.spill_superseded_bytes(), 0);
     db.spill_inflight_clear(b"k3", 9);
