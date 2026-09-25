@@ -14,10 +14,17 @@
 //! Linux, tokio, `--shards 4`, debug build: 6-9 of 100 deleted probes back,
 //! in 4 runs out of 4.
 //!
+//! The window is proved, not assumed: INFO `spill_completion_superseded`
+//! counts completions of requests a write retired in flight. Each round
+//! reads it just before BGREWRITEAOF and after the rewrite, and a test whose
+//! rounds never saw it rise fails. Without that, a runner whose spills all
+//! land before the mutation would pass while exercising nothing.
+//!
 //! Per test: SET probes (db 0) -> filler evicts them -> mutate the EVEN probes
 //! at once -> BGREWRITEAOF, wait until every generation is cut -> SIGKILL ->
 //! restart -> every even probe reads its post-mutation state, every odd probe
-//! its original value.
+//! its original value. An overwriting SET the server still refuses with
+//! `-OOM` after `OOM_RETRIES` never happened: that probe keeps its original.
 //!
 //! Run (the nightly crash matrix runs both layouts):
 //!   cargo build --release --bin moon --test crash_recovery_cold_del_inflight_1253
@@ -39,10 +46,15 @@ const PROBES: usize = 200;
 const PROBE_LEN: usize = 500;
 const FILLER: usize = 16_000;
 const FILLER_LEN: usize = 600;
+/// Attempts per overwriting `SET` that the server refuses with `-OOM`
+/// (eviction can lag a burst of writes at this `maxmemory`), 5 ms apart. A
+/// SET still refused after them is judged against the probe's original value.
+const OOM_RETRIES: usize = 200;
 /// Rounds per test: each is an independent server and restart. The window
-/// the bug needs is hit in every round on a fast Linux host; more rounds make
-/// a slow runner that happens to settle between filler and mutation
-/// unlikely to hide it.
+/// the bug needs is hit in most rounds on a Linux host (33 of 36 on debug
+/// builds, both runtimes, both layouts), and the test requires it in at
+/// least one: more rounds make a runner that happens to settle between
+/// filler and rewrite unlikely to fail the window check, or to hide the bug.
 const ROUNDS: usize = 3;
 
 /// `--shards` for every server: 4 (the per-shard fold) by default,
@@ -119,6 +131,16 @@ fn get(c: &mut Conn, key: &str) -> Option<String> {
     Some(r.split("\r\n").nth(1).unwrap_or_default().to_string())
 }
 
+/// INFO `spill_completion_superseded`: completions applied for requests a
+/// write had retired while they were in flight (process-wide, all shards).
+fn superseded_completions(c: &mut Conn) -> u64 {
+    let info = c.send(&["INFO", "persistence"]);
+    info.lines()
+        .find_map(|l| l.strip_prefix("spill_completion_superseded:"))
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or_else(|| panic!("INFO persistence has no spill_completion_superseded: {info}"))
+}
+
 /// Newest incr sequence per AOF directory (per shard, or the TopLevel one),
 /// and `1` for a tokio `--shards 1` flat file once a rewrite gave it its RDB
 /// preamble (`MOON` magic): what a finished rewrite advances in every layout.
@@ -185,9 +207,16 @@ enum Want {
     Value(&'static str),
 }
 
+/// Mutates the even probes; returns the ones the server refused (`-OOM`),
+/// which keep their original value.
+type Mutate = fn(&mut Conn, &[String]) -> Vec<String>;
+
 /// One round: probes, filler, `mutate` the even probes WITHOUT settling,
-/// rewrite, SIGKILL, restart, judge. Returns the even probes that read wrong.
-fn round(tag: &str, mutate: fn(&mut Conn, &[String]), want: Want) -> Vec<String> {
+/// rewrite, SIGKILL, restart, judge. Returns the probes that read wrong, and
+/// how many superseded completions were applied from just before the
+/// BGREWRITEAOF until the rewrite finished: requests still in flight when
+/// the rewrite began, the window the bug needs.
+fn round(tag: &str, mutate: Mutate, want: Want) -> (Vec<String>, u64) {
     let dir = common::unique_test_dir(&format!("cold-del-inflight-1253-{tag}-{}", shards()));
     std::fs::create_dir_all(&dir).unwrap();
     let (mut server, port) = start(&dir);
@@ -204,8 +233,17 @@ fn round(tag: &str, mutate: fn(&mut Conn, &[String]), want: Want) -> Vec<String>
         .filter(|i| i % 2 == 0)
         .map(|i| format!("probe:{i}"))
         .collect();
-    mutate(&mut c, &even);
+    let refused = mutate(&mut c, &even);
+    if !refused.is_empty() {
+        eprintln!("{tag}: {} mutation(s) refused -OOM", refused.len());
+    }
+    assert!(
+        refused.len() < even.len(),
+        "{tag}: the server refused every mutation (-OOM)"
+    );
+    let superseded_before = superseded_completions(&mut c);
     rewrite(&mut c, &dir);
+    let hits = superseded_completions(&mut c).saturating_sub(superseded_before);
     server.kill_now();
     common::wait_for_port_down(port);
     drop(c);
@@ -216,8 +254,9 @@ fn round(tag: &str, mutate: fn(&mut Conn, &[String]), want: Want) -> Vec<String>
     for i in 0..PROBES {
         let key = format!("probe:{i}");
         let got = get(&mut c2, &key);
-        let ok = if i % 2 == 1 {
-            // FLUSHALL takes the odd probes too.
+        let ok = if i % 2 == 1 || refused.contains(&key) {
+            // Never mutated, or refused -OOM: the original value. FLUSHALL
+            // takes the odd probes too.
             match want {
                 Want::Absent if tag == "flushall" => got.is_none(),
                 _ => got.as_deref() == Some(original.as_str()),
@@ -240,12 +279,14 @@ fn round(tag: &str, mutate: fn(&mut Conn, &[String]), want: Want) -> Vec<String>
     } else {
         eprintln!("{tag}: dir kept at {}", dir.display());
     }
-    wrong
+    (wrong, hits)
 }
 
-fn run(tag: &str, mutate: fn(&mut Conn, &[String]), want: fn() -> Want) {
+fn run(tag: &str, mutate: Mutate, want: fn() -> Want) {
+    let mut hits = Vec::with_capacity(ROUNDS);
     for r in 0..ROUNDS {
-        let wrong = round(tag, mutate, want());
+        let (wrong, round_hits) = round(tag, mutate, want());
+        hits.push(round_hits);
         assert!(
             wrong.is_empty(),
             "--shards {}, round {r}: {} probe(s) read wrong after the restart (first: {:?})",
@@ -254,6 +295,17 @@ fn run(tag: &str, mutate: fn(&mut Conn, &[String]), want: fn() -> Want) {
             &wrong[..wrong.len().min(5)]
         );
     }
+    eprintln!(
+        "{tag}, --shards {}: superseded completions applied during the rewrite, per round: {hits:?}",
+        shards()
+    );
+    assert!(
+        hits.iter().any(|&h| h > 0),
+        "--shards {}: no round had a superseded spill completion applied during its rewrite \
+         (INFO spill_completion_superseded never rose): every in-flight spill landed before \
+         the BGREWRITEAOF, so this run never reached the moon#1253 window and proves nothing",
+        shards()
+    );
 }
 
 #[test]
@@ -268,6 +320,7 @@ fn keys_deleted_while_their_spill_is_in_flight_stay_deleted() {
                 let r = c.send(&args);
                 assert!(r.starts_with(':'), "DEL: {r:?}");
             }
+            Vec::new()
         },
         || Want::Absent,
     );
@@ -278,7 +331,10 @@ fn keys_deleted_while_their_spill_is_in_flight_stay_deleted() {
 fn keys_flushed_while_their_spill_is_in_flight_stay_flushed() {
     run(
         "flushall",
-        |c, _| assert_eq!(c.send(&["FLUSHALL"]), "+OK\r\n"),
+        |c, _| {
+            assert_eq!(c.send(&["FLUSHALL"]), "+OK\r\n");
+            Vec::new()
+        },
         || Want::Absent,
     );
 }
@@ -289,9 +345,29 @@ fn keys_overwritten_while_their_spill_is_in_flight_keep_the_new_value() {
     run(
         "overwrite",
         |c, even| {
+            let mut refused = Vec::new();
+            let mut retried = 0usize;
             for key in even {
-                assert_eq!(c.send(&["SET", key, "new"]), "+OK\r\n");
+                let mut attempts = 0;
+                loop {
+                    let r = c.send(&["SET", key, "new"]);
+                    if r == "+OK\r\n" {
+                        break;
+                    }
+                    assert!(r.starts_with("-OOM"), "SET: {r:?}");
+                    retried += usize::from(attempts == 0);
+                    attempts += 1;
+                    if attempts == OOM_RETRIES {
+                        refused.push(key.clone());
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
             }
+            if retried > 0 {
+                eprintln!("overwrite: {retried} SET(s) answered -OOM at least once");
+            }
+            refused
         },
         || Want::Value("new"),
     );
