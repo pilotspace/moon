@@ -363,8 +363,11 @@ impl<'a> ListRef<'a> {
 
     /// Get element at index.
     ///
-    /// A listpack is entered from its NEARER end and the entry is borrowed
-    /// until the one copy the caller keeps (moon#1174 §2).
+    /// A listpack takes ONE borrowed walk from its head to the entry, which
+    /// stays borrowed until the one copy the caller keeps (moon#1174 §2). Not
+    /// from the nearer end: a tail-side step is sound since moon#1206, but the
+    /// policy bounds a listpack at 128 entries, so the head walk is bounded
+    /// and `LINDEX`'s one-seek guard pins it.
     pub fn get(&self, index: usize) -> Option<Bytes> {
         match self {
             ListRef::Deque(d) => d.get(index).cloned(),
@@ -375,9 +378,9 @@ impl<'a> ListRef<'a> {
 
     /// Hand every element of `[start..=end]` to `f`, in order. Caller clamps.
     ///
-    /// moon#1174 §2: on a listpack this is ONE seek, from the nearer end, then
-    /// a walk (`Listpack::range_refs`). It used to be `get_at(i)` per index,
-    /// each walking from the head: `LRANGE 0 -1` on 128 entries decoded 8,256.
+    /// moon#1174 §2: on a listpack this is ONE seek from the head, then a walk
+    /// (`Listpack::range_refs`). It used to be `get_at(i)` per index, each
+    /// walking from the head: `LRANGE 0 -1` on 128 entries decoded 8,256.
     pub fn for_each_in_range(&self, start: usize, end: usize, mut f: impl FnMut(Bytes)) {
         let len = self.len();
         if start > end || start >= len {
@@ -427,10 +430,11 @@ impl<'a> ListRef<'a> {
             ListRef::Owned(d) => d,
             ListRef::Listpack(lp) => {
                 if from_tail {
-                    // The window is the last `limit` entries. A listpack is
-                    // never walked backwards (`listpack::list_ops` docs), so
-                    // the window's matches are gathered in one forward walk
-                    // and handed out tail first. Bounded by the policy's entry
+                    // The window is the last `limit` entries: its matches are
+                    // gathered in one forward walk and handed out tail first.
+                    // (A backward walk is sound since moon#1206, see the
+                    // `listpack::list_ops` docs, but this one reads the whole
+                    // window either way.) Bounded by the policy's entry
                     // count; the buffer spills to the heap only past 32 hits.
                     let first = len - limit.min(len);
                     let mut hits: smallvec::SmallVec<[usize; 32]> = smallvec::SmallVec::new();

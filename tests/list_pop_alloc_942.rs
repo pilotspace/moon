@@ -179,18 +179,26 @@ fn popping_one_listpack_element_allocates_once() {
     // ── CONTROL A: the FULL encoding pops with no allocation at all ─────
     // A `VecDeque<Bytes>` pop is a move. This is what says the surplus above
     // belongs to the listpack decode and not to building the reply.
+    //
+    // The push and the pop of each pair are counted apart. Since moon#1160 a
+    // push onto the full encoding stores an exact-size copy of the element
+    // (a slice of the request buffer would pin that whole buffer), so the
+    // push half costs one allocation by design and only the pop half is the
+    // control.
     let mut fdb = seeded(KEY, ELEM, 400);
     moon::command::list::lpush(&mut fdb, &push);
     moon::command::list::lpop(&mut fdb, &pop);
-    let mark = allocs();
+    let mut full_push = 0;
+    let mut full_pop = 0;
     for _ in 0..ROUNDS {
+        let mark = allocs();
         moon::command::list::lpush(&mut fdb, &push);
-        assert!(matches!(
-            moon::command::list::lpop(&mut fdb, &pop),
-            Frame::BulkString(_)
-        ));
+        let pushed = allocs();
+        let popped = moon::command::list::lpop(&mut fdb, &pop);
+        full_pop += allocs() - pushed;
+        full_push += pushed - mark;
+        assert!(matches!(popped, Frame::BulkString(_)));
     }
-    let full_pair = allocs() - mark;
 
     // ── CONTROL B: the counter can move ─────────────────────────────────
     let mark = allocs();
@@ -205,7 +213,8 @@ fn popping_one_listpack_element_allocates_once() {
          \x20 listpack LPOP  (string)    {listpack_lpop}\n\
          \x20 listpack RPOP  (string)    {listpack_rpop}\n\
          \x20 listpack LPOP  (integer)   {listpack_integer}\n\
-         \x20 full     PUSH+POP pair     {full_pair}\n\
+         \x20 full     LPUSH (moon#1160) {full_push}\n\
+         \x20 full     LPOP              {full_pop}\n\
          \x20 Vec::with_capacity         {control}"
     );
 
@@ -224,11 +233,20 @@ fn popping_one_listpack_element_allocates_once() {
          the pair windows below are not measuring the pop"
     );
     assert_eq!(
-        full_pair, 0,
-        "a PUSH/POP pair on the FULL encoding allocated {full_pair} times \
-         over {ROUNDS} rounds; a `VecDeque<Bytes>` pop is a move. If this is \
-         not zero the counter is picking up something other than the pop and \
-         the listpack numbers mean nothing"
+        full_push, ROUNDS,
+        "LPUSH onto the FULL encoding allocated {full_push} times over \
+         {ROUNDS} pushes. Since moon#1160 each push stores ONE exact-size copy \
+         of the element (`storage::owned_bytes::detach`): zero means the push \
+         stores a slice of the request buffer again and pins the whole buffer; \
+         more than one means the push copies twice or the deque reallocated \
+         inside a window of stationary length"
+    );
+    assert_eq!(
+        full_pop, 0,
+        "LPOP off the FULL encoding allocated {full_pop} times over {ROUNDS} \
+         pops; a `VecDeque<Bytes>` pop is a move. If this is not zero the \
+         counter is picking up something other than the pop and the listpack \
+         numbers mean nothing"
     );
     assert_eq!(
         listpack_lpop, ROUNDS,

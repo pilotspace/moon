@@ -165,22 +165,9 @@ pub(super) async fn try_handle_script(
     if !cmd.eq_ignore_ascii_case(b"SCRIPT") {
         return false;
     }
-    let (mut response, fanout) =
-        crate::scripting::handle_script_subcommand(&ctx.script_cache, cmd_args);
-    if let Some((sha1, script_bytes)) = fanout {
-        // E3: bounded fan-out — a full ring no longer silently diverges that
-        // shard's script cache.
-        crate::server::conn::shared::script_fanout_bounded(ctx, shutdown, &sha1, &script_bytes)
-            .await;
-    }
-    // moon#1229: the flush above cleared THIS shard's cache only; reply once
-    // every shard has flushed (or say which did not).
-    if crate::server::conn::shared::is_accepted_script_flush(cmd_args, &response)
-        && let Some(partial) = crate::server::conn::shared::script_flush_fanout(ctx, shutdown).await
-    {
-        response = partial;
-    }
-    responses.push(response);
+    // This shard's cache, then the replay every other shard is owed (moon#515,
+    // moon#1229); one body for both runtimes, see `run_script_command`.
+    responses.push(crate::server::conn::shared::run_script_command(ctx, shutdown, cmd_args).await);
     true
 }
 

@@ -10,6 +10,10 @@ mod compact_write_access_tests;
 mod expiry_index;
 mod hash_ttl;
 mod incr;
+/// moon#1255: an expired in-flight spill record is retired when its key is
+/// answered absent or re-created. Test-only.
+#[cfg(test)]
+mod inflight_expiry_1255_tests;
 mod kv_ops;
 /// moon#1190: per-database lazy-free queue, drained on the shard tick.
 mod lazy_free;
@@ -17,6 +21,7 @@ mod lazy_free;
 /// bytes before they evict or refuse. Test-only.
 #[cfg(test)]
 mod lazy_free_pressure_tests;
+mod list_blocking;
 /// moon#942: the accessors' DashTable probe budget, asserted with a counter
 /// rather than a clock. Test-only; see the module docs for why.
 #[cfg(test)]
@@ -24,7 +29,11 @@ mod probe_budget;
 /// moon#1221 review F3: read-modify-write string commands record one access.
 #[cfg(test)]
 mod rmw_access_tests;
+#[cfg(test)]
+mod stream_accounting_tests;
 pub(crate) mod string_mut;
+#[cfg(test)]
+mod superseded_spill_tests;
 /// WS1 (2026-09 perf review) storage-core regression tests: moon#1159,
 /// moon#1161, moon#1190, moon#1189. Test-only.
 #[cfg(test)]
@@ -32,8 +41,11 @@ mod ws1_tests;
 
 pub use cold_replay_gate::{ReplayColdGate, ReplayColdReconcile, close_replay_generation};
 pub(crate) use incr::IncrOutcome;
-pub(crate) use kv_ops::ExpiredRemoval;
-pub use lazy_free::{LAZY_FREE_THRESHOLD, LAZY_FREE_TICK_BUDGET, lazy_free_pending_anywhere};
+pub(crate) use kv_ops::{ExpiredRemoval, KeyDeletion};
+pub use lazy_free::{
+    LAZY_FREE_THRESHOLD, LAZY_FREE_TICK_BUDGET, lazy_free_pending_anywhere,
+    lazy_free_queued_on_this_thread, lazy_free_resync_this_thread,
+};
 
 pub use super::db_read::{HashRef, ListRef, SetRef, SortedSetRef, StreamRef};
 pub use accessors::{EntryView, SetHandle};
@@ -47,6 +59,19 @@ pub use crate::storage::encoding_limits::{EncodingLimits, Shape};
 /// Estimate per-entry overhead: key length + value memory + struct overhead.
 fn entry_overhead(key: &[u8], entry: &Entry) -> usize {
     entry_overhead_len(key.len(), entry)
+}
+
+/// moon#1163: measure a stream that enters the keyspace WHOLE (a loader,
+/// RESTORE, the cold tier, a replica, a moved entry) before `entry_overhead`
+/// bills it — a stream is billed at `Stream::billed_memory`, O(1), and a
+/// value built field by field has not been measured yet. Once per stream:
+/// a settled one (a RENAME) is not rescanned. One tag check for any other
+/// value kind.
+#[inline]
+pub(crate) fn settle_stream_billing(entry: &mut Entry) {
+    if let Some(crate::storage::entry::RedisValue::Stream(s)) = entry.value.as_redis_value_mut() {
+        s.settle_billing();
+    }
 }
 
 /// [`entry_overhead`] for a caller that has only the key's LENGTH (the
@@ -510,6 +535,32 @@ pub struct Database {
     /// Running sum of `key.len() + value_bytes.len()` over [`Self::spill_inflight`]
     /// (moon#466). See [`Self::pending_spill_bytes`].
     spill_inflight_bytes: usize,
+    /// Spill requests that a DEL, an overwrite, a promoting read, a FLUSH or
+    /// a newer eviction retired while they were still in flight, keyed by
+    /// `(key, request id)`, with the slot's own absolute TTL (moon#1253).
+    ///
+    /// Such a request still writes the key's slot into its spill file, and
+    /// the completion publishes that file for its other keys and records the
+    /// slot in the cold index's dead-slot ledger as a ghost. That note comes
+    /// too late when an AOF rewrite folds IN BETWEEN: the fold's head then
+    /// carries no `DEL` for the key, the rewrite discards the old
+    /// generation's `DEL`, and a restart resurrects the key from the file,
+    /// which the new generation's `MOON.COLDCUT` or `MOON.SPILLED`
+    /// authorizes wholesale. The fold therefore treats every key here that
+    /// is not alive at its instant exactly like a ledger key and writes it a
+    /// head `DEL` (`persistence::aof::fold_stream`).
+    ///
+    /// Bounded by the spills in flight: an entry is settled by its request's
+    /// completion, whatever the outcome (`spill_superseded_settle`).
+    spill_superseded: std::collections::HashMap<(bytes::Bytes, u64), Option<u64>>,
+    /// Bytes the [`Self::spill_superseded`] entries hold: key handles plus
+    /// map slots. Deliberately NOT part of [`Self::pending_spill_bytes`], the
+    /// charge `used_memory` and admission see. moon#466's contract is that a
+    /// FLUSH drops the pending charge with the records, so `used_memory` reads
+    /// 0 after it as in redis. These entries are transient and bounded by the
+    /// spill queue. Each one belongs to a request that is still queued and
+    /// that already pins its own copy of the key, unbilled once retired.
+    spill_superseded_bytes: usize,
     /// Ticket dispenser for the version stamped on a NEWLY CREATED entry.
     ///
     /// Versions are per-entry and die with the entry. Before this counter every
@@ -602,6 +653,11 @@ pub const HASH_SWEEP_MAX_FIELDS_PER_KEY: usize = 256;
 /// into sweep-sampling fallback.
 pub const PENDING_EXPIRED_CAP: usize = 8192;
 
+/// What [`Database::spill_superseded_bytes`] counts per entry on top of its
+/// key's bytes (moon#1253): the map slot's `(Bytes, u64)` key and TTL.
+const SPILL_SUPERSEDED_OVERHEAD: usize =
+    std::mem::size_of::<(bytes::Bytes, u64)>() + std::mem::size_of::<Option<u64>>();
+
 /// A spill that has left hot RAM but has not yet landed in `cold_index`.
 ///
 /// Holds enough to answer a read without touching disk — the window is short
@@ -639,6 +695,8 @@ impl Database {
             hot_keys: crate::storage::hotkey::HotKeySketch::new(),
             spill_inflight: std::collections::HashMap::new(),
             spill_inflight_bytes: 0,
+            spill_superseded: std::collections::HashMap::new(),
+            spill_superseded_bytes: 0,
             birth_counter: 0,
             expiry_index: std::collections::BTreeSet::new(),
             hash_expiry_index: std::collections::BTreeSet::new(),
@@ -675,6 +733,8 @@ impl Database {
             hot_keys: crate::storage::hotkey::HotKeySketch::new(),
             spill_inflight: std::collections::HashMap::new(),
             spill_inflight_bytes: 0,
+            spill_superseded: std::collections::HashMap::new(),
+            spill_superseded_bytes: 0,
             birth_counter: 0,
             expiry_index: std::collections::BTreeSet::new(),
             hash_expiry_index: std::collections::BTreeSet::new(),
@@ -698,10 +758,13 @@ impl Database {
         let key_len = key.len();
         let charge = key_len + pending.value_bytes.len();
         // A re-eviction of the same key REPLACES its record; credit the old
-        // one or the counter drifts upward forever.
+        // one or the counter drifts upward forever. The replaced request is
+        // still in flight, so it is superseded (moon#1253).
+        let handle = key.clone();
         if let Some(previous) = self.spill_inflight.insert(key, pending) {
             let credit = key_len + previous.value_bytes.len();
             self.spill_inflight_bytes = self.spill_inflight_bytes.saturating_sub(credit);
+            self.spill_superseded_note(handle, previous.req_id, previous.ttl_ms);
         }
         self.spill_inflight_bytes = self.spill_inflight_bytes.saturating_add(charge);
     }
@@ -713,15 +776,11 @@ impl Database {
     /// completion applied, DEL, overwriting SET, promoting read — goes
     /// through here, so the byte counter cannot drift away from the map.
     #[inline]
-    fn spill_inflight_retire(&mut self, key: &[u8]) -> bool {
-        match self.spill_inflight.remove_entry(key) {
-            Some((stored_key, pending)) => {
-                let credit = stored_key.len() + pending.value_bytes.len();
-                self.spill_inflight_bytes = self.spill_inflight_bytes.saturating_sub(credit);
-                true
-            }
-            None => false,
-        }
+    fn spill_inflight_retire(&mut self, key: &[u8]) -> Option<(bytes::Bytes, PendingSpill)> {
+        let (stored_key, pending) = self.spill_inflight.remove_entry(key)?;
+        let credit = stored_key.len() + pending.value_bytes.len();
+        self.spill_inflight_bytes = self.spill_inflight_bytes.saturating_sub(credit);
+        Some((stored_key, pending))
     }
 
     /// True when `req_id` is still the newest recorded spill request for
@@ -754,7 +813,7 @@ impl Database {
     /// to `req_id`; a newer request's record is left for its own completion.
     pub fn spill_inflight_clear(&mut self, key: &[u8], req_id: u64) {
         if self.spill_inflight.get(key).map(|p| p.req_id) == Some(req_id) {
-            self.spill_inflight_retire(key);
+            let _ = self.spill_inflight_retire(key);
         }
     }
 
@@ -765,12 +824,115 @@ impl Database {
     /// FINAL: the record is the only thing that authorizes the completion to
     /// insert into `cold_index`, so dropping it here is what stops the key
     /// coming back when the spill lands.
+    ///
+    /// The retired request is still in flight and still writes the key's
+    /// slot: it is remembered as superseded until its completion is applied
+    /// (moon#1253, see [`Self::spill_superseded`]).
     #[inline]
     pub fn spill_inflight_forget(&mut self, key: &[u8]) -> bool {
         if self.spill_inflight.is_empty() {
             return false;
         }
-        self.spill_inflight_retire(key)
+        match self.spill_inflight_retire(key) {
+            Some((stored_key, pending)) => {
+                self.spill_superseded_note(stored_key, pending.req_id, pending.ttl_ms);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Retire EVERY in-flight record (FLUSHDB / FLUSHALL): each request is
+    /// superseded exactly as by a `DEL` of its key, and the moon#466 byte
+    /// charge goes with the records.
+    pub(crate) fn spill_inflight_supersede_all(&mut self) {
+        let records = std::mem::take(&mut self.spill_inflight);
+        self.spill_inflight_bytes = 0;
+        for (key, pending) in records {
+            self.spill_superseded_note(key, pending.req_id, pending.ttl_ms);
+        }
+    }
+
+    /// Remember that request `req_id` of `key` was retired while in flight
+    /// (moon#1253), counting its bytes in [`Self::spill_superseded_bytes`].
+    fn spill_superseded_note(&mut self, key: bytes::Bytes, req_id: u64, ttl_ms: Option<u64>) {
+        let size = key.len() + SPILL_SUPERSEDED_OVERHEAD;
+        if self
+            .spill_superseded
+            .insert((key, req_id), ttl_ms)
+            .is_none()
+        {
+            self.spill_superseded_bytes = self.spill_superseded_bytes.saturating_add(size);
+        }
+    }
+
+    /// The completion of request `req_id` for `key` was applied, whatever
+    /// its outcome (published, ghost, failed write, withdrawn, rehydrated):
+    /// from here on the cold index's dead-slot ledger knows the slot, or no
+    /// slot was published. O(1); a no-op for a request that was never
+    /// superseded, and free when nothing is.
+    ///
+    /// Returns `true` when this database held the request. A `SWAPDB` while
+    /// the request was in flight moves it with the rest of the database, so
+    /// a completion that misses here looks in the shard's other databases
+    /// (`persistence_tick::settle_superseded_elsewhere`).
+    #[inline]
+    pub fn spill_superseded_settle(&mut self, key: &bytes::Bytes, req_id: u64) -> bool {
+        if self.spill_superseded.is_empty() {
+            return false;
+        }
+        if self
+            .spill_superseded
+            .remove(&(key.clone(), req_id))
+            .is_some()
+        {
+            let credit = key.len() + SPILL_SUPERSEDED_OVERHEAD;
+            self.spill_superseded_bytes = self.spill_superseded_bytes.saturating_sub(credit);
+            return true;
+        }
+        false
+    }
+
+    /// Keys whose superseded in-flight slot can still come back at `now_ms`
+    /// (its own TTL has not passed), for the AOF rewrite fold (moon#1253).
+    /// A key superseded twice is listed twice.
+    pub fn spill_superseded_keys_live_at(
+        &self,
+        now_ms: u64,
+    ) -> impl Iterator<Item = &bytes::Bytes> + '_ {
+        self.spill_superseded
+            .iter()
+            .filter(move |(_, ttl)| ttl.is_none_or(|t| now_ms <= t))
+            .map(|((key, _), _)| key)
+    }
+
+    /// True when no in-flight spill request is superseded.
+    #[inline]
+    pub fn spill_superseded_is_empty(&self) -> bool {
+        self.spill_superseded.is_empty()
+    }
+
+    /// How many superseded in-flight requests await their completion.
+    #[inline]
+    pub fn spill_superseded_len(&self) -> usize {
+        self.spill_superseded.len()
+    }
+
+    /// Bytes held by the superseded in-flight requests (key handles plus map
+    /// slots). Not part of [`Self::pending_spill_bytes`]; see the field docs.
+    #[inline]
+    pub fn spill_superseded_bytes(&self) -> usize {
+        self.spill_superseded_bytes
+    }
+
+    /// True when `key` has an in-flight record whose TTL has passed at
+    /// `now_ms`: the key is logically expired, but the record still
+    /// authorizes its completion to publish (moon#1255).
+    #[inline]
+    pub fn spill_inflight_expired(&self, key: &[u8], now_ms: u64) -> bool {
+        self.spill_inflight
+            .get(key)
+            .is_some_and(|p| p.ttl_ms.is_some_and(|ttl| now_ms > ttl))
     }
 
     /// Cheap (no disk I/O, no promotion) liveness probe for the in-flight

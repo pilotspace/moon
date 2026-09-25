@@ -14,7 +14,7 @@ use crate::framevec;
 use crate::protocol::Frame;
 use crate::storage::Database;
 
-use super::list_write::lrem_deque;
+use super::list_compact::lrem_deque;
 use super::{lpos, lpos_readonly, lrange_readonly, lrem, rpush};
 
 fn bs(s: &[u8]) -> Frame {

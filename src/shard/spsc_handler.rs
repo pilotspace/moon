@@ -600,6 +600,12 @@ pub(crate) fn handle_shard_message_shared(
                             db_idx,
                             crate::blocking::wakeup::ScriptWakes::Serve(blocking_registry),
                             |db| {
+                                // A routed script runs against a database no
+                                // command on this shard may have refreshed in
+                                // a long while, and every expiry check inside
+                                // it reads that clock: refresh it, as the
+                                // Execute arms do before their dispatch.
+                                db.refresh_now_from_cache(cached_clock);
                                 if is_plain_eval {
                                     crate::scripting::handle_eval(
                                         &vm,
@@ -710,6 +716,9 @@ pub(crate) fn handle_shard_message_shared(
                             db_idx,
                             crate::blocking::wakeup::ScriptWakes::Serve(blocking_registry),
                             |db| {
+                                // Refresh the clock every expiry check in the
+                                // function reads (see the routed EVAL arm).
+                                db.refresh_now_from_cache(cached_clock);
                                 // moon#569 + moon#514: the ACL that travels with
                                 // `ShardMessage::Execute` is the ORIGIN connection's, so a
                                 // routed FCALL authorizes each inner `redis.call` exactly as
@@ -1306,6 +1315,7 @@ pub(crate) fn handle_shard_message_shared(
                     }
 
                     let mut selected = db_idx;
+                    let reaps = crate::command::key::expired_reaps();
                     // moon#982: routed command — the timed interval is exactly
                     // the dispatch, as on the local paths.
                     let result = probe.observe(cmd, slowlog_argv(cmd_frame), || {
@@ -1315,6 +1325,9 @@ pub(crate) fn handle_shard_message_shared(
                         DispatchResult::Response(f) => f,
                         DispatchResult::Quit(f) => f,
                     };
+                    // moon#1234: a leg that reaped an already-expired key
+                    // answers `:0` for it but DID delete it.
+                    let reaped = crate::command::key::expired_reaps() != reaps;
 
                     let mut aof_ok = true;
                     if is_write && !matches!(frame, crate::protocol::Frame::Error(_)) {
@@ -1322,9 +1335,12 @@ pub(crate) fn handle_shard_message_shared(
                         // no-op (persistence + replication all off) — it was
                         // pure waste on every cross-shard write. moon#1184: a
                         // merged `DEL k1 k2 …` leg that deleted nothing has
-                        // nothing to log either (redis propagates no such DEL).
+                        // nothing to log either (redis propagates no such DEL)
+                        // — unless it reaped an expired key, which the AOF and
+                        // every replica still hold (a replica never expires on
+                        // its own).
                         if wal_fanout_has_work(wal_writer, replica_txs, aof_pool, wal_kv_log)
-                            && !crate::shard::write_hooks::deleted_nothing(cmd, &frame)
+                            && (reaped || !crate::shard::write_hooks::deleted_nothing(cmd, &frame))
                         {
                             // moon#825: the record is derived from the REPLY, never the
                             // verbatim frame — `SPOP`/`XADD *` and the relative-TTL family
@@ -1664,28 +1680,26 @@ pub(crate) fn handle_shard_message_shared(
             }
             slot.add(batch_total);
         }
-        ShardMessage::ScriptLoad { sha1, script, ack } => {
-            // Fan-out: cache this script on this shard so EVALSHA works locally
-            let computed = sha1_smol::Sha1::from(&script[..]).hexdigest();
-            if computed == sha1 {
-                script_cache.borrow_mut().load(script);
-            }
-            // Answered even on a digest mismatch — as a FAILURE. The sender
-            // is waiting to answer its client and must not hang, but it also
-            // must not be told a cache it never wrote is in step. A mismatch
-            // is impossible from the fan-out path (the digest is computed from
-            // the same bytes) and would mean memory corruption.
+        ShardMessage::ScriptLoad { script, epoch, ack } => {
+            // Fan-out: cache this script on this shard so EVALSHA works
+            // locally. Tagged with the origin's flush epoch (moon#1235): if a
+            // newer `SCRIPT FLUSH` has already been applied here, the load is
+            // ordered before it and is dropped — every shard makes the same
+            // call, so they agree. Acked `true` either way: the insert has
+            // taken its place in the agreed order.
+            script_cache.borrow_mut().load_at(script, epoch);
             if let Some(ack) = ack {
-                let _ = ack.send(computed == sha1);
+                let _ = ack.send(true);
             }
         }
-        ShardMessage::ScriptFlush { ack } => {
+        ShardMessage::ScriptFlush { epoch, ack } => {
             // moon#1229: another shard's connection ran `SCRIPT FLUSH`; the
             // script cache is per shard, so without this every EVALSHA whose
-            // keys route here kept running a flushed script. `flush` drops the
-            // source map, the compiled functions (moon#1167) and the fan-out
-            // duties, exactly as on the originating shard.
-            script_cache.borrow_mut().flush();
+            // keys route here kept running a flushed script. `flush_at` drops
+            // the bodies inserted before this flush's epoch (moon#1235), the
+            // compiled functions (moon#1167) and the fan-out duties, exactly
+            // as on the originating shard.
+            script_cache.borrow_mut().flush_at(epoch);
             if let Some(ack) = ack {
                 let _ = ack.send(true);
             }
@@ -1877,6 +1891,7 @@ pub(crate) fn handle_shard_message_shared(
                 index_name,
                 query_blob,
                 k,
+                filter,
                 as_of_lsn,
                 reply_tx,
                 db_index,
@@ -1891,35 +1906,25 @@ pub(crate) fn handle_shard_message_shared(
             // uses) and sends the reply. Shapes the snapshot does not cover
             // (unknown index, dimension mismatch) take the synchronous search,
             // whose error frames they need. Phase 171 SCAT-01: `as_of_lsn` is
-            // honoured on both paths; WS5a: `db_index` from the origin.
-            let snapshot = crate::shard::slice::with_shard(|s| {
-                crate::shard::vector_scatter::capture_knn(
+            // honoured on both paths; WS5a: `db_index` from the origin;
+            // moon#1238: the query's prefilter is evaluated on this shard.
+            let leg = crate::shard::slice::with_shard(|s| {
+                crate::shard::vector_scatter::plan_knn_leg(
                     &mut s.vector_store,
                     &s.text_store,
                     &index_name,
                     &query_blob,
                     k,
+                    filter.as_deref(),
                     as_of_lsn,
                     db_index,
                 )
             });
-            match snapshot {
-                Some(snapshot) => crate::shard::vector_scatter::spawn_knn_reply(snapshot, reply_tx),
-                None => {
-                    let response = crate::shard::slice::with_shard(|s| {
-                        vector_search::search_local_filtered(
-                            &mut s.vector_store,
-                            &index_name,
-                            &query_blob,
-                            k,
-                            None,
-                            0,
-                            usize::MAX,
-                            None,
-                            as_of_lsn,
-                            db_index,
-                        )
-                    });
+            match leg {
+                crate::shard::vector_scatter::KnnLeg::Yield(snapshot) => {
+                    crate::shard::vector_scatter::spawn_knn_reply(snapshot, reply_tx)
+                }
+                crate::shard::vector_scatter::KnnLeg::Done(response) => {
                     let _ = reply_tx.send(response);
                 }
             }

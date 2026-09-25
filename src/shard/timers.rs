@@ -624,6 +624,65 @@ pub(crate) fn sync_wal_v3(wal_v3: &mut Option<crate::persistence::wal_v3::segmen
     }
 }
 
+/// How many shard threads get their own slot in the max-gauges below; a
+/// thread past it shares the last slot (documented, never unsafe).
+const MVCC_GAUGE_SLOTS: usize = 256;
+
+static NEXT_MVCC_GAUGE_SLOT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Each shard's latest snapshot lag / age, for the MAX the gauges publish.
+static MVCC_LAG_SLOTS: [std::sync::atomic::AtomicU64; MVCC_GAUGE_SLOTS] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; MVCC_GAUGE_SLOTS];
+static MVCC_AGE_SLOTS: [std::sync::atomic::AtomicU64; MVCC_GAUGE_SLOTS] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; MVCC_GAUGE_SLOTS];
+
+thread_local! {
+    /// This shard thread's slot in the max-gauges, taken on its first tick.
+    static MVCC_GAUGE_SLOT: usize = NEXT_MVCC_GAUGE_SLOT
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        .min(MVCC_GAUGE_SLOTS - 1);
+    /// What this shard last added to the SUM gauges (committed, active).
+    static MVCC_SUM_CONTRIBUTION: std::cell::Cell<(u64, u64)> =
+        const { std::cell::Cell::new((0, 0)) };
+}
+
+/// Publish this shard's MVCC figures into the process-wide `RECL_MVCC_*`
+/// gauges as per-shard CONTRIBUTIONS (moon#1198).
+///
+/// Every shard used to `store` its own figures each second, so INFO showed
+/// whichever shard ticked last. Now the committed/active counts are SUMS
+/// (each shard adds the change in its own figure — exact under any
+/// interleaving) and the oldest-snapshot lag/age are the MAX over the shards'
+/// slots (the worst GC pressure anywhere is the one an operator acts on).
+pub(crate) fn publish_mvcc_gauges(committed: u64, active: u64, lag: u64, age_secs: u64) {
+    use crate::command::info_reclamation::{
+        RECL_MVCC_ACTIVE, RECL_MVCC_COMMITTED, RECL_MVCC_OLDEST_SNAPSHOT_AGE_SECS,
+        RECL_MVCC_OLDEST_SNAPSHOT_LAG,
+    };
+    use std::sync::atomic::Ordering::Relaxed;
+    MVCC_SUM_CONTRIBUTION.with(|prev| {
+        let (old_committed, old_active) = prev.replace((committed, active));
+        // Wrapping deltas: the gauge is a sum of every shard's contribution,
+        // so the transient wrap of one shard's decrease cancels exactly.
+        RECL_MVCC_COMMITTED.fetch_add(committed.wrapping_sub(old_committed), Relaxed);
+        RECL_MVCC_ACTIVE.fetch_add(active.wrapping_sub(old_active), Relaxed);
+    });
+    let slot = MVCC_GAUGE_SLOT.with(|s| *s);
+    MVCC_LAG_SLOTS[slot].store(lag, Relaxed);
+    MVCC_AGE_SLOTS[slot].store(age_secs, Relaxed);
+    let used = NEXT_MVCC_GAUGE_SLOT.load(Relaxed).min(MVCC_GAUGE_SLOTS);
+    let max_of = |slots: &[std::sync::atomic::AtomicU64]| {
+        slots[..used]
+            .iter()
+            .map(|v| v.load(Relaxed))
+            .max()
+            .unwrap_or(0)
+    };
+    RECL_MVCC_OLDEST_SNAPSHOT_LAG.store(max_of(&MVCC_LAG_SLOTS), Relaxed);
+    RECL_MVCC_OLDEST_SNAPSHOT_AGE_SECS.store(max_of(&MVCC_AGE_SLOTS), Relaxed);
+}
+
 /// MVCC sweep tick: prune committed treemap + sweep zombie intents + update RECL_* metrics.
 ///
 /// Called on the 1s timer (same cadence as WAL fsync). Takes mutable access to the
@@ -658,10 +717,7 @@ pub(crate) fn run_mvcc_sweep(
     use std::sync::atomic::Ordering;
     use std::time::{Duration, Instant};
 
-    use crate::command::info_reclamation::{
-        RECL_MVCC_ACTIVE, RECL_MVCC_COMMITTED, RECL_MVCC_OLDEST_SNAPSHOT_AGE_SECS,
-        RECL_MVCC_OLDEST_SNAPSHOT_LAG, RECL_MVCC_ZOMBIES_SWEPT_TOTAL,
-    };
+    use crate::command::info_reclamation::RECL_MVCC_ZOMBIES_SWEPT_TOTAL;
 
     let now = Instant::now();
     let mgr = vector_store.txn_manager_mut();
@@ -714,10 +770,7 @@ pub(crate) fn run_mvcc_sweep(
     // Killed snapshots are excluded so the metric reflects real GC pressure.
     let age_secs = mgr.oldest_snapshot_age(now).map_or(0, |d| d.as_secs());
 
-    RECL_MVCC_COMMITTED.store(committed_len, Ordering::Relaxed);
-    RECL_MVCC_ACTIVE.store(active_len, Ordering::Relaxed);
-    RECL_MVCC_OLDEST_SNAPSHOT_LAG.store(lag, Ordering::Relaxed);
-    RECL_MVCC_OLDEST_SNAPSHOT_AGE_SECS.store(age_secs, Ordering::Relaxed);
+    publish_mvcc_gauges(committed_len, active_len, lag, age_secs);
     if total_swept > 0 {
         RECL_MVCC_ZOMBIES_SWEPT_TOTAL.fetch_add(total_swept as u64, Ordering::Relaxed);
     }
@@ -744,6 +797,68 @@ pub(crate) fn run_mvcc_sweep(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// moon#1198: every shard used to OVERWRITE the process-wide MVCC gauges,
+    /// so INFO showed whichever shard ticked last. Two shard threads publish;
+    /// the counts must be their SUM and the lag/age their MAX, and a shard's
+    /// later zero retracts only its own contribution.
+    #[test]
+    fn mvcc_gauges_are_per_shard_contributions_not_last_writer() {
+        use crate::command::info_reclamation::{
+            RECL_MVCC_ACTIVE, RECL_MVCC_COMMITTED, RECL_MVCC_OLDEST_SNAPSHOT_AGE_SECS,
+            RECL_MVCC_OLDEST_SNAPSHOT_LAG,
+        };
+        use std::sync::atomic::Ordering::Relaxed;
+        // Distinctive, so a concurrent in-process shard publishing its own
+        // small figures cannot be mistaken for these.
+        const BIG_LAG: u64 = 1_000_000_007;
+        let base_committed = RECL_MVCC_COMMITTED.load(Relaxed);
+        let base_active = RECL_MVCC_ACTIVE.load(Relaxed);
+        let shard = |committed, active, lag, age| {
+            let (published_tx, published) = std::sync::mpsc::channel::<()>();
+            let (release, release_rx) = std::sync::mpsc::channel::<()>();
+            let t = std::thread::spawn(move || {
+                publish_mvcc_gauges(committed, active, lag, age);
+                let _ = published_tx.send(());
+                let _ = release_rx.recv();
+                publish_mvcc_gauges(0, 0, 0, 0);
+            });
+            let _ = published.recv();
+            (t, release)
+        };
+        let (a, release_a) = shard(10, 2, BIG_LAG, 70);
+        let (b, release_b) = shard(3, 1, 5, 1);
+        assert_eq!(
+            RECL_MVCC_COMMITTED.load(Relaxed) - base_committed,
+            13,
+            "committed: a sum"
+        );
+        assert_eq!(
+            RECL_MVCC_ACTIVE.load(Relaxed) - base_active,
+            3,
+            "active: a sum"
+        );
+        assert_eq!(
+            RECL_MVCC_OLDEST_SNAPSHOT_LAG.load(Relaxed),
+            BIG_LAG,
+            "lag: the max"
+        );
+        assert!(
+            RECL_MVCC_OLDEST_SNAPSHOT_AGE_SECS.load(Relaxed) >= 70,
+            "age: the max"
+        );
+        assert!(release_b.send(()).is_ok());
+        assert!(b.join().is_ok());
+        assert_eq!(
+            RECL_MVCC_COMMITTED.load(Relaxed) - base_committed,
+            10,
+            "shard b retracting its figure must leave shard a's"
+        );
+        assert!(release_a.send(()).is_ok());
+        assert!(a.join().is_ok());
+        assert_eq!(RECL_MVCC_COMMITTED.load(Relaxed), base_committed);
+        assert_eq!(RECL_MVCC_ACTIVE.load(Relaxed), base_active);
+    }
     use crate::storage::db::Database;
     use bytes::Bytes;
     use std::sync::atomic::Ordering;

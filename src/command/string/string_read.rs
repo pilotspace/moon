@@ -203,7 +203,18 @@ pub fn getdel(db: &mut Database, args: &[Frame]) -> Frame {
     // destroy the key (data-loss). as_bytes() borrows without cloning; the borrow
     // ends before db.remove() so the mutable re-borrow is sound.
     match db.get(key) {
-        None => return Frame::Null,
+        None => {
+            // moon#1234: redis's GETDEL looks the key up for READ first, so a
+            // miss publishes `keymiss` exactly as GET's does (class `m`, off
+            // unless asked for).
+            crate::notify::notify_keyspace_event(
+                crate::notify::NotifyFlags::KEY_MISS,
+                "keymiss",
+                key,
+                db.db_index,
+            );
+            return Frame::Null;
+        }
         Some(entry) => {
             if entry.value.as_bytes().is_none() {
                 return Frame::Error(Bytes::from_static(
@@ -214,10 +225,14 @@ pub fn getdel(db: &mut Database, args: &[Frame]) -> Frame {
     }
     // Confirmed string — safe to remove and return its bytes.
     match db.remove(key) {
-        Some(entry) => match entry.value.as_bytes_owned() {
-            Some(v) => Frame::BulkString(v),
-            None => Frame::Null,
-        },
+        Some(entry) => {
+            // moon#1234: the removal publishes `del`, as DEL's does.
+            crate::command::key::notify_del(key, db.db_index);
+            match entry.value.as_bytes_owned() {
+                Some(v) => Frame::BulkString(v),
+                None => Frame::Null,
+            }
+        }
         None => Frame::Null,
     }
 }

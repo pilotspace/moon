@@ -1,0 +1,684 @@
+//! Exact rerank of the mutable segment's brute-force scan (moon#1226).
+//!
+//! Immutable segments re-score their top `rerank_mult · k` beam candidates
+//! against the f16 sidecar (HQ-1, `ImmutableSegment::rerank_exact`). The
+//! mutable segment keeps the very same f16 rows (`raw_f16`, both build modes,
+//! every quantizer — it is what compaction hands the sidecar) but ranked by
+//! quantized ADC alone. moon#1207/#1208 made the mutable scan TQ-ADC in every
+//! build mode, and TQ-ADC's `‖ĉ‖²` term lets quantization noise dominate when
+//! the true neighbours are barely similar: far / out-of-distribution queries
+//! lost recall (EXACT far R@10 0.831 → 0.728 at server level; WS11 NOTES
+//! reproduced 0.675 at 384d and 0.669 at 768d on an embedding-shaped corpus,
+//! and an emulated f16 rerank of the top 4·k recovered 0.98).
+//!
+//! Every mutable scan entry point of `SegmentHolder` (sync unfiltered and
+//! filtered, MVCC, and the chunked cooperative-yield scan) now keeps the ADC
+//! top `rerank_mult · k`, re-scores them from `raw_f16` with the SAME kernel
+//! and distance convention as the immutable rerank
+//! (`hnsw::prepared::exact_f16_distance`), and truncates to `k`. So the
+//! mutable leg is as accurate as a compacted segment, and its distances are on
+//! the same scale as the immutable legs it is merged with (it used to merge
+//! ADC estimates against exact distances).
+//!
+//! When the rows are not all present (never expected: `raw_f16` is appended
+//! with every entry) the ADC order is kept — the top `k` of the ADC top
+//! `mult·k` is exactly the ADC top `k`.
+
+use smallvec::SmallVec;
+
+use super::MutableSegment;
+use crate::vector::types::{DistanceMetric, SearchResult};
+
+/// Candidates the mutable scan keeps for the exact rerank: `rerank_mult · k`
+/// (`rerank_mult` ≥ 1, FT.CONFIG RERANK_MULT, default 4).
+#[inline]
+pub(crate) fn exact_rerank_depth(k: usize, rerank_mult: u32) -> usize {
+    k.saturating_mul(rerank_mult.max(1) as usize)
+}
+
+impl MutableSegment {
+    /// Re-score `candidates` (global ids, as the scans return them) with
+    /// exact distances from `raw_f16`, re-sort ascending and keep the best
+    /// `k`. See the module docs.
+    pub fn rerank_exact(
+        &self,
+        candidates: &mut SmallVec<[SearchResult; 32]>,
+        query: &[f32],
+        k: usize,
+    ) {
+        if !candidates.is_empty() {
+            let inner = self.inner.read();
+            let dim = inner.dimension as usize;
+            let rows_complete = inner.raw_f16.len() >= inner.entries.len().saturating_mul(dim);
+            if dim > 0 && query.len() == dim && rows_complete {
+                let is_l2 = self.collection.metric == DistanceMetric::L2;
+                let mut q_unit: SmallVec<[f32; 512]> = SmallVec::new();
+                let q: &[f32] = if is_l2 {
+                    query
+                } else {
+                    crate::vector::hnsw::prepared::unit_query_into(query, &mut q_unit);
+                    &q_unit
+                };
+                let kernels = crate::vector::distance::table();
+                for r in candidates.iter_mut() {
+                    let Some(internal) = r.id.0.checked_sub(inner.global_id_base) else {
+                        continue;
+                    };
+                    let start = internal as usize * dim;
+                    let Some(row) = inner.raw_f16.get(start..start + dim) else {
+                        continue; // keep the ADC estimate
+                    };
+                    if let Some(d) =
+                        crate::vector::hnsw::prepared::exact_f16_distance(kernels, q, row, is_l2)
+                    {
+                        r.distance = d;
+                    }
+                }
+                candidates.sort_unstable();
+            }
+        }
+        candidates.truncate(k);
+    }
+
+    /// The unfiltered / filtered brute-force scan with the exact rerank: ADC
+    /// top `rerank_mult · k` (restricted to `allow_bitmap`), re-scored and
+    /// truncated to `k`.
+    pub fn brute_force_search_reranked(
+        &self,
+        query_f32: &[f32],
+        k: usize,
+        allow_bitmap: Option<&roaring::RoaringBitmap>,
+        rerank_mult: u32,
+    ) -> SmallVec<[SearchResult; 32]> {
+        let mut out = self.brute_force_search_filtered(
+            query_f32,
+            None,
+            exact_rerank_depth(k, rerank_mult),
+            allow_bitmap,
+        );
+        self.rerank_exact(&mut out, query_f32, k);
+        out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use crate::vector::distance;
+    use crate::vector::filter::selectivity::FilterStrategy;
+    use crate::vector::hnsw::search::SearchScratch;
+    use crate::vector::segment::holder::{MvccContext, SearchSnapshot, SegmentHolder, YieldBudget};
+    use crate::vector::test_support::EmbeddingLike;
+    use crate::vector::turbo_quant::collection::{
+        BuildMode, CollectionMetadata, QuantizationConfig,
+    };
+    use crate::vector::turbo_quant::encoder::padded_dimension;
+    use crate::vector::types::{DistanceMetric, SearchTuning};
+
+    const K: usize = 10;
+
+    fn exact_top_k(docs: &[Vec<f32>], q: &[f32]) -> Vec<u32> {
+        // Unit vectors: cosine distance order == dot product order (desc).
+        let mut d: Vec<(f32, u32)> = docs
+            .iter()
+            .enumerate()
+            .map(|(i, v)| (-v.iter().zip(q).map(|(a, b)| a * b).sum::<f32>(), i as u32))
+            .collect();
+        d.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+        d.into_iter().take(K).map(|x| x.1).collect()
+    }
+
+    fn recall(got: &[u32], want: &[u32]) -> f64 {
+        got.iter().filter(|g| want.contains(g)).count() as f64 / want.len() as f64
+    }
+
+    /// The cooperative-yield scan of a mutable-only index, as FT.SEARCH's
+    /// capture builds it, with `filter` resolved to `strategy`.
+    fn yielding_scan(
+        holder: &SegmentHolder,
+        q: &[f32],
+        dim: usize,
+        n: usize,
+        filter: Option<&roaring::RoaringBitmap>,
+        strategy: crate::vector::filter::selectivity::FilterStrategy,
+    ) -> smallvec::SmallVec<[crate::vector::types::SearchResult; 32]> {
+        let budget = YieldBudget {
+            max_segments_per_chunk: usize::MAX,
+            max_graph_nodes_per_chunk: usize::MAX,
+            // No yield point under `block_on` (monoio's cooperative_yield
+            // needs its runtime); the chunked scan still runs.
+            max_brute_force_vecs_per_chunk: usize::MAX,
+        };
+        let mut snap = SearchSnapshot {
+            segments: holder.load_full(),
+            query_f32: q.to_vec(),
+            k: K,
+            ef_search: 64,
+            filter_bitmap: filter.map(|bm| Arc::new(bm.clone())),
+            filter_strategy: strategy,
+            snapshot_lsn: 0,
+            my_txn_id: 0,
+            committed: Arc::new(roaring::RoaringTreemap::new()),
+            dimension: dim as u32,
+            mutable_len: n,
+            scratch: SearchScratch::new(0, padded_dimension(dim as u32)),
+            key_hash_to_key: Default::default(),
+            ef_defaulted: false,
+            tuning: SearchTuning::default(),
+            pending_reloads: Vec::new(),
+        };
+        futures::executor::block_on(SegmentHolder::search_mvcc_yielding_with_pool(
+            &mut snap, budget, None,
+        ))
+    }
+
+    /// moon#1226 red → green: far / out-of-distribution queries against a
+    /// mutable-only EXACT index on an embedding-shaped corpus. The mutable
+    /// leg ranked by TQ-ADC alone (moon#1207/#1208) lost far-query recall;
+    /// every holder entry point (sync, MVCC, cooperative-yield) now exact-
+    /// reranks the ADC top `4·k` from `raw_f16` and must agree bit for bit.
+    /// Relative evidence only — random embedding-shaped data, not MiniLM
+    /// (CLAUDE.md gotcha); MiniLM validation is deferred.
+    ///
+    /// moon#1242: the same identity under a 90 % filter, for every strategy
+    /// the capture can resolve a filter to. `HnswPostFilter` (> 80 % of at
+    /// least 20K vectors) oversamples the GRAPH legs 3×; the yielding scan
+    /// also reranked its exactly-filtered mutable leg at that depth (the ADC
+    /// top `4·3k`) while `search_mvcc` reranks the ADC top `4·k`, so a plain
+    /// FT.SEARCH and the same query with RANGE or SESSION could return
+    /// different documents (red: 1 of 80 queries here).
+    #[test]
+    fn mutable_leg_exact_rerank_recovers_far_query_recall() {
+        distance::init();
+        crate::vector::turbo_quant::fwht::init_fwht();
+        let (dim, n) = (384usize, 3_000usize);
+        let col = Arc::new(CollectionMetadata::with_build_mode(
+            41,
+            dim as u32,
+            DistanceMetric::Cosine,
+            QuantizationConfig::TurboQuant4,
+            41,
+            BuildMode::Exact,
+        ));
+        let holder = SegmentHolder::new(dim as u32, Arc::clone(&col));
+        let mut g = EmbeddingLike::new(dim, 64, 23);
+        let docs = g.docs(n);
+        {
+            let list = holder.load();
+            for (i, v) in docs.iter().enumerate() {
+                list.mutable.append(i as u64 + 1, v, i as u64 + 1);
+            }
+        }
+        let committed = roaring::RoaringTreemap::new();
+        let ctx = MvccContext {
+            snapshot_lsn: 0,
+            my_txn_id: 0,
+            committed: &committed,
+            dirty_set: &[],
+            dimension: dim as u32,
+            ef_defaulted: false,
+            tuning: SearchTuning::default(),
+        };
+        // Every tenth document filtered out: 90 % selectivity.
+        let bm: roaring::RoaringBitmap = (0..n as u32).filter(|i| i % 10 != 0).collect();
+        let strategies = [
+            FilterStrategy::BruteForceFiltered,
+            FilterStrategy::HnswFiltered,
+            FilterStrategy::HnswPostFilter,
+        ];
+        let classes: [(&str, Vec<Vec<f32>>); 2] = [
+            ("far", (0..40).map(|_| g.far()).collect()),
+            ("in", (0..40).map(|_| g.doc()).collect()),
+        ];
+        let mut filtered_differ = Vec::new();
+        for (class, queries) in classes {
+            let (mut adc, mut reranked) = (0.0f64, 0.0f64);
+            for q in &queries {
+                let want = exact_top_k(&docs, q);
+                let ids = |r: &smallvec::SmallVec<[crate::vector::types::SearchResult; 32]>| {
+                    r.iter().map(|x| x.id.0).collect::<Vec<u32>>()
+                };
+                let bits = |r: &smallvec::SmallVec<[crate::vector::types::SearchResult; 32]>| {
+                    r.iter()
+                        .map(|x| (x.id.0, x.distance.to_bits()))
+                        .collect::<Vec<_>>()
+                };
+                // HEAD's mutable leg: the ADC top k.
+                let list = holder.load();
+                adc += recall(&ids(&list.mutable.brute_force_search(q, None, K)), &want);
+
+                let mut scratch = SearchScratch::new(0, padded_dimension(dim as u32));
+                let sync = holder.search_filtered(q, K, 64, &mut scratch, None);
+                let mvcc = holder.search_mvcc(q, K, 64, &mut scratch, None, &ctx);
+                let yielded = yielding_scan(&holder, q, dim, n, None, FilterStrategy::Unfiltered);
+                assert_eq!(bits(&sync), bits(&mvcc), "{class}: sync vs MVCC");
+                assert_eq!(bits(&mvcc), bits(&yielded), "{class}: MVCC vs yielding");
+                reranked += recall(&ids(&mvcc), &want);
+
+                // moon#1242: filtered, every strategy.
+                let sync_f = holder.search_filtered(q, K, 64, &mut scratch, Some(&bm));
+                let mvcc_f = holder.search_mvcc(q, K, 64, &mut scratch, Some(&bm), &ctx);
+                assert_eq!(
+                    bits(&sync_f),
+                    bits(&mvcc_f),
+                    "{class}: filtered sync vs MVCC"
+                );
+                assert!(mvcc_f.iter().all(|r| bm.contains(r.id.0)));
+                for strategy in strategies {
+                    let yielded_f = yielding_scan(&holder, q, dim, n, Some(&bm), strategy);
+                    if bits(&mvcc_f) != bits(&yielded_f) {
+                        filtered_differ.push((class, strategy, bits(&mvcc_f), bits(&yielded_f)));
+                    }
+                }
+            }
+            let nq = queries.len() as f64;
+            let (adc, reranked) = (adc / nq, reranked / nq);
+            println!("moon#1226 mutable R@{K} {class}: ADC {adc:.3} -> reranked {reranked:.3}");
+            assert!(
+                reranked >= 0.95,
+                "{class}: exact-reranked mutable R@{K} {reranked:.3} (ADC-only {adc:.3})"
+            );
+            assert!(
+                reranked >= adc,
+                "{class}: the rerank must not lose recall ({adc:.3} -> {reranked:.3})"
+            );
+        }
+        assert!(
+            filtered_differ.is_empty(),
+            "{} filtered (strategy, query) pairs: search_mvcc != yielding; first: {:?}",
+            filtered_differ.len(),
+            filtered_differ.first()
+        );
+    }
+
+    /// moon#1242 red → green: an index large enough for the capture to
+    /// resolve a broad filter to HnswPostFilter itself (at least 20K matches,
+    /// over 80 % selectivity). The yielding scan (plain FT.SEARCH) and
+    /// `search_filtered`'s HnswPostFilter arm reranked the exactly-filtered
+    /// mutable leg at the graph legs' `3k` oversample; both must answer what
+    /// `search_mvcc` (FT.SEARCH with RANGE or SESSION) answers.
+    #[test]
+    fn post_filter_strategy_scans_agree_with_search_mvcc() {
+        distance::init();
+        crate::vector::turbo_quant::fwht::init_fwht();
+        let (dim, n) = (64usize, 20_500usize);
+        let col = Arc::new(CollectionMetadata::with_build_mode(
+            59,
+            dim as u32,
+            DistanceMetric::Cosine,
+            QuantizationConfig::TurboQuant4,
+            59,
+            BuildMode::Exact,
+        ));
+        let holder = SegmentHolder::new(dim as u32, Arc::clone(&col));
+        let mut g = EmbeddingLike::new(dim, 64, 31);
+        {
+            let list = holder.load();
+            for i in 0..n {
+                list.mutable.append(i as u64 + 1, &g.doc(), i as u64 + 1);
+            }
+        }
+        // 98 % selectivity over 20,090 matches: HnswPostFilter.
+        let bm: roaring::RoaringBitmap = (0..n as u32).filter(|i| i % 50 != 0).collect();
+        assert_eq!(
+            crate::vector::filter::selectivity::select_strategy(Some(&bm), holder.total_vectors()),
+            FilterStrategy::HnswPostFilter
+        );
+        let committed = roaring::RoaringTreemap::new();
+        let ctx = MvccContext {
+            snapshot_lsn: 0,
+            my_txn_id: 0,
+            committed: &committed,
+            dirty_set: &[],
+            dimension: dim as u32,
+            ef_defaulted: false,
+            tuning: SearchTuning::default(),
+        };
+        let bits = |r: &smallvec::SmallVec<[crate::vector::types::SearchResult; 32]>| {
+            r.iter()
+                .map(|x| (x.id.0, x.distance.to_bits()))
+                .collect::<Vec<_>>()
+        };
+        let mut scratch = SearchScratch::new(0, padded_dimension(dim as u32));
+        let (mut sync_differ, mut yield_differ) = (0usize, 0usize);
+        for _ in 0..30 {
+            let q = g.far();
+            let mvcc = holder.search_mvcc(&q, K, 64, &mut scratch, Some(&bm), &ctx);
+            let sync = holder.search_filtered(&q, K, 64, &mut scratch, Some(&bm));
+            let yielded = yielding_scan(
+                &holder,
+                &q,
+                dim,
+                n,
+                Some(&bm),
+                FilterStrategy::HnswPostFilter,
+            );
+            sync_differ += usize::from(bits(&sync) != bits(&mvcc));
+            yield_differ += usize::from(bits(&yielded) != bits(&mvcc));
+        }
+        assert_eq!(
+            (sync_differ, yield_differ),
+            (0, 0),
+            "of 30 queries, (search_filtered, yielding) != search_mvcc"
+        );
+    }
+
+    /// moon#1226 red test: a component beyond the f16 range (±65,504) is
+    /// stored as ±inf in `raw_f16`, so its exact distance is inf / NaN. Such
+    /// rows keep their ADC estimate instead of all tying at `inf` (which
+    /// ranked them by id, whatever their distance).
+    #[test]
+    fn rows_outside_the_f16_range_keep_their_adc_rank() {
+        distance::init();
+        crate::vector::turbo_quant::fwht::init_fwht();
+        let dim = 8usize;
+        let col = Arc::new(CollectionMetadata::with_build_mode(
+            47,
+            dim as u32,
+            DistanceMetric::L2,
+            QuantizationConfig::TurboQuant4,
+            47,
+            BuildMode::Exact,
+        ));
+        let holder = SegmentHolder::new(dim as u32, Arc::clone(&col));
+        let doc = |i: usize| -> Vec<f32> {
+            (0..dim)
+                .map(|j| {
+                    if j == 0 {
+                        200_000.0 + i as f32 * 1_000.0
+                    } else {
+                        ((i * 7 + j * 3) % 11) as f32
+                    }
+                })
+                .collect()
+        };
+        {
+            let list = holder.load();
+            for i in 0..60 {
+                list.mutable.append(i as u64 + 1, &doc(i), i as u64 + 1);
+            }
+        }
+        let committed = roaring::RoaringTreemap::new();
+        let ctx = MvccContext {
+            snapshot_lsn: 0,
+            my_txn_id: 0,
+            committed: &committed,
+            dirty_set: &[],
+            dimension: dim as u32,
+            ef_defaulted: false,
+            tuning: SearchTuning::default(),
+        };
+        let mut scratch = SearchScratch::new(0, padded_dimension(dim as u32));
+        let bits = |r: &smallvec::SmallVec<[crate::vector::types::SearchResult; 32]>| {
+            r.iter()
+                .map(|x| (x.id.0, x.distance.to_bits()))
+                .collect::<Vec<_>>()
+        };
+        for target in [37usize, 12, 55] {
+            let q = doc(target);
+            let got = holder.search_mvcc(&q, 5, 64, &mut scratch, None, &ctx);
+            assert!(
+                got.iter().all(|r| r.distance.is_finite()),
+                "q={target}: {:?}",
+                got.iter().map(|r| r.distance).collect::<Vec<_>>()
+            );
+            // Every row is out of range, so the leg answers exactly the ADC
+            // top k — what it answered before the rerank existed.
+            let adc = holder.load().mutable.brute_force_search_mvcc(
+                &q,
+                None,
+                5,
+                None,
+                0,
+                0,
+                &committed,
+                0,
+                usize::MAX,
+            );
+            assert_eq!(bits(&got), bits(&adc), "q={target}: the ADC top k");
+        }
+    }
+
+    /// moon#1242 (review NIT-2) red → green: an L2 row whose components sit
+    /// deep in f16's subnormal range (steps of 5.96e-8) keeps a bit or two per
+    /// component in `raw_f16`, while the TQ ADC estimate is scale-invariant —
+    /// the rerank lost recall at 1e-7 (R@10 0.848 → 0.767). Such rows keep
+    /// their ADC estimate. At 1e-6 the f16 rows are still far better than
+    /// ADC, and Cosine rows are not affected at any scale: both must keep the
+    /// rerank's gain (an over-broad cut, e.g. "every component subnormal",
+    /// would give it back).
+    #[test]
+    fn tiny_l2_rows_keep_their_adc_estimate_where_f16_is_coarser() {
+        distance::init();
+        crate::vector::turbo_quant::fwht::init_fwht();
+        let (dim, n) = (32usize, 800usize);
+        // (metric, component scale, minimum R@10 gain of the rerank over ADC)
+        let cases = [
+            (DistanceMetric::L2, 1e-7f32, 0.0f64),
+            (DistanceMetric::L2, 1e-6, 0.05),
+            (DistanceMetric::Cosine, 1e-7, 0.1),
+        ];
+        for (metric, scale, min_gain) in cases {
+            let col = Arc::new(CollectionMetadata::with_build_mode(
+                53,
+                dim as u32,
+                metric,
+                QuantizationConfig::TurboQuant4,
+                53,
+                BuildMode::Exact,
+            ));
+            let holder = SegmentHolder::new(dim as u32, Arc::clone(&col));
+            let mut g = crate::vector::test_support::Gauss::new(11);
+            let docs: Vec<Vec<f32>> = (0..n)
+                .map(|_| (0..dim).map(|_| scale * g.next()).collect())
+                .collect();
+            {
+                let list = holder.load();
+                for (i, v) in docs.iter().enumerate() {
+                    list.mutable.append(i as u64 + 1, v, i as u64 + 1);
+                }
+            }
+            let committed = roaring::RoaringTreemap::new();
+            let ctx = MvccContext {
+                snapshot_lsn: 0,
+                my_txn_id: 0,
+                committed: &committed,
+                dirty_set: &[],
+                dimension: dim as u32,
+                ef_defaulted: false,
+                tuning: SearchTuning::default(),
+            };
+            let mut scratch = SearchScratch::new(0, padded_dimension(dim as u32));
+            let (mut adc_hits, mut rr_hits) = (0usize, 0usize);
+            let nq = 40usize;
+            for _ in 0..nq {
+                let q: Vec<f32> = (0..dim).map(|_| scale * g.next()).collect();
+                let norm = |v: &[f32]| v.iter().map(|x| f64::from(*x).powi(2)).sum::<f64>().sqrt();
+                let mut truth: Vec<(f64, u32)> = docs
+                    .iter()
+                    .enumerate()
+                    .map(|(i, v)| {
+                        let d = if metric == DistanceMetric::L2 {
+                            v.iter()
+                                .zip(&q)
+                                .map(|(a, b)| (f64::from(*a) - f64::from(*b)).powi(2))
+                                .sum::<f64>()
+                        } else {
+                            let dot: f64 = v
+                                .iter()
+                                .zip(&q)
+                                .map(|(a, b)| f64::from(*a) * f64::from(*b))
+                                .sum();
+                            -dot / (norm(v) * norm(&q))
+                        };
+                        (d, i as u32)
+                    })
+                    .collect();
+                truth.sort_by(|a, b| a.0.total_cmp(&b.0));
+                let want: Vec<u32> = truth.iter().take(K).map(|x| x.1).collect();
+                // The mutable leg before the rerank: the ADC top k.
+                let adc = holder.load().mutable.brute_force_search_mvcc(
+                    &q,
+                    None,
+                    K,
+                    None,
+                    0,
+                    0,
+                    &committed,
+                    0,
+                    usize::MAX,
+                );
+                let rr = holder.search_mvcc(&q, K, 64, &mut scratch, None, &ctx);
+                adc_hits += adc.iter().filter(|r| want.contains(&r.id.0)).count();
+                rr_hits += rr.iter().filter(|r| want.contains(&r.id.0)).count();
+            }
+            let (adc_r, rr_r) = (
+                adc_hits as f64 / (nq * K) as f64,
+                rr_hits as f64 / (nq * K) as f64,
+            );
+            println!("{metric:?} scale {scale:e} R@{K}: ADC {adc_r:.3} -> reranked {rr_r:.3}");
+            assert!(
+                rr_r >= adc_r + min_gain,
+                "{metric:?} rows at {scale:e}: ADC {adc_r:.3} -> reranked {rr_r:.3} \
+                 (the rerank must gain at least {min_gain})"
+            );
+        }
+    }
+
+    #[test]
+    fn rerank_depth_is_mult_times_k() {
+        assert_eq!(super::exact_rerank_depth(10, 4), 40);
+        assert_eq!(super::exact_rerank_depth(10, 0), 10, "mult is at least 1");
+        assert_eq!(super::exact_rerank_depth(usize::MAX, 4), usize::MAX);
+    }
+}
+
+/// moon#1226 measurement: the mutable leg's cost with the exact rerank
+/// (ADC top `mult·k` + `mult·k` f16 rows) against HEAD's ADC-only top `k`,
+/// on the sync scan and on the MVCC scan FT.SEARCH runs (FastScan pre-filter,
+/// whose bound the deeper heap loosens), same segment, same queries,
+/// alternating per rep (7 reps, median), plus both arms' R@10. Measured on
+/// the 4-vCPU Linux box (release-fast): MVCC 384d n=1000 112 → 191 µs
+/// (x1.70, R@10 0.829 → 0.995), n=5000 225 → 358 µs (x1.59, 0.808 → 0.979),
+/// 768d n=5000 665 → 1075 µs (x1.62, 0.823 → 0.992); `mult = 2` x1.23–1.29
+/// for 0.935–0.968; the sync scan x1.01–1.05.
+///
+/// `#[ignore]`: meaningful only in an optimised build:
+/// `cargo test --profile release-fast --lib rerank_cost_ab -- --ignored --nocapture`.
+#[cfg(test)]
+mod cost {
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    use crate::vector::distance;
+    use crate::vector::segment::mutable::MutableSegment;
+    use crate::vector::test_support::EmbeddingLike;
+    use crate::vector::turbo_quant::collection::{
+        BuildMode, CollectionMetadata, QuantizationConfig,
+    };
+    use crate::vector::types::DistanceMetric;
+
+    #[test]
+    #[ignore = "measurement: run in release-fast with --ignored --nocapture"]
+    fn rerank_cost_ab() {
+        distance::init();
+        crate::vector::turbo_quant::fwht::init_fwht();
+        const K: usize = 10;
+        for (dim, n) in [(384usize, 1_000usize), (384, 5_000), (768, 5_000)] {
+            let col = Arc::new(CollectionMetadata::with_build_mode(
+                43,
+                dim as u32,
+                DistanceMetric::Cosine,
+                QuantizationConfig::TurboQuant4,
+                43,
+                BuildMode::Exact,
+            ));
+            let seg = MutableSegment::new(dim as u32, Arc::clone(&col));
+            let mut g = EmbeddingLike::new(dim, 64, 29);
+            let docs = g.docs(n);
+            for (i, v) in docs.iter().enumerate() {
+                seg.append(i as u64 + 1, v, i as u64 + 1);
+            }
+            let mut queries: Vec<Vec<f32>> = (0..50).map(|_| g.doc()).collect();
+            queries.extend((0..50).map(|_| g.far()));
+            let truth: Vec<Vec<u32>> = queries
+                .iter()
+                .map(|q| {
+                    let mut d: Vec<(f32, u32)> = docs
+                        .iter()
+                        .enumerate()
+                        .map(|(i, v)| (-v.iter().zip(q).map(|(a, b)| a * b).sum::<f32>(), i as u32))
+                        .collect();
+                    d.sort_by(|a, b| a.0.total_cmp(&b.0));
+                    d.into_iter().take(K).map(|x| x.1).collect()
+                })
+                .collect();
+            let committed = roaring::RoaringTreemap::new();
+            // (path, reranked): the sync scan, and the MVCC scan FT.SEARCH runs (FastScan
+            // pre-filter bounded by the heap's worst entry, which a 4·k heap loosens).
+            let arm = |mvcc: bool, mult: u32| -> (f64, f64) {
+                let t = Instant::now();
+                let mut hits = 0usize;
+                for (q, want) in queries.iter().zip(&truth) {
+                    let r = match (mvcc, mult) {
+                        (false, 0) => seg.brute_force_search(q, None, K),
+                        (false, m) => seg.brute_force_search_reranked(q, K, None, m),
+                        (true, m) => {
+                            let scan_k = K * m.max(1) as usize;
+                            let mut r = seg.brute_force_search_mvcc(
+                                q,
+                                None,
+                                scan_k,
+                                None,
+                                0,
+                                0,
+                                &committed,
+                                0,
+                                usize::MAX,
+                            );
+                            if m > 0 {
+                                seg.rerank_exact(&mut r, q, K);
+                            }
+                            r
+                        }
+                    };
+                    hits += r.iter().filter(|x| want.contains(&x.id.0)).count();
+                }
+                let ns = t.elapsed().as_nanos() as f64 / queries.len() as f64;
+                (ns, hits as f64 / (queries.len() * K) as f64)
+            };
+            for (mvcc, mult) in [(false, 4u32), (true, 4), (true, 2)] {
+                let _ = (arm(mvcc, 0), arm(mvcc, mult)); // warm
+                let (mut adc, mut rr) = (Vec::new(), Vec::new());
+                let (mut r_adc, mut r_rr) = (0.0, 0.0);
+                for rep in 0..7 {
+                    let order = if rep % 2 == 0 { [0, mult] } else { [mult, 0] };
+                    for m in order {
+                        let (ns, recall) = arm(mvcc, m);
+                        if m > 0 {
+                            rr.push(ns);
+                            r_rr = recall;
+                        } else {
+                            adc.push(ns);
+                            r_adc = recall;
+                        }
+                    }
+                }
+                adc.sort_by(f64::total_cmp);
+                rr.sort_by(f64::total_cmp);
+                println!(
+                    "rerank_cost_ab {dim}d n={n} {}: ADC-only k={K} median {:.1} us/query \
+                     (R@10 {r_adc:.3}) | reranked {mult}k median {:.1} us/query (R@10 {r_rr:.3}) | \
+                     cost x{:.2}; reps adc {:?} rr {:?}",
+                    if mvcc { "mvcc" } else { "sync" },
+                    adc[3] / 1e3,
+                    rr[3] / 1e3,
+                    rr[3] / adc[3],
+                    adc.iter().map(|x| (x / 1e3).round()).collect::<Vec<_>>(),
+                    rr.iter().map(|x| (x / 1e3).round()).collect::<Vec<_>>()
+                );
+            }
+        }
+    }
+}

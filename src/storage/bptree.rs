@@ -860,13 +860,24 @@ impl BPTree {
     /// `Bytes::copy_from_slice(member)` — an allocation on every ZREM and
     /// every rescore — just to compare against.
     pub fn remove(&mut self, score: OrderedFloat<f64>, member: &[u8]) -> bool {
+        self.take(score, member).is_some()
+    }
+
+    /// [`Self::remove`], handing back the member `Bytes` the tree STORED.
+    ///
+    /// A rescore re-inserts the member under its new score; re-inserting the
+    /// caller's probe instead stored the request's `Bytes` — a slice of the
+    /// connection read buffer that kept the whole buffer alive (moon#1160) —
+    /// and a refcount clone on top. The stored handle is already an exact-size
+    /// allocation the member map shares, so moving it back costs nothing.
+    pub fn take(&mut self, score: OrderedFloat<f64>, member: &[u8]) -> Option<Bytes> {
         #[cfg(test)]
         REMOVE_CALLS.with(|c| c.set(c.get() + 1));
         if self.len == 0 {
-            return false;
+            return None;
         }
         let removed = self.remove_recursive(self.root, score.0, member, self.height);
-        if removed {
+        if removed.is_some() {
             self.len -= 1;
             // Shrink root if internal with single child
             while self.height > 1 {
@@ -893,7 +904,7 @@ impl BPTree {
         score: f64,
         member: &[u8],
         level: usize,
-    ) -> bool {
+    ) -> Option<Bytes> {
         if level == 1 {
             return self.remove_from_leaf(node_id, score, member);
         }
@@ -902,7 +913,7 @@ impl BPTree {
         let child_id = self.internal(node_id).children[child_idx];
         let removed = self.remove_recursive(child_id, score, member, level - 1);
 
-        if removed {
+        if removed.is_some() {
             self.internal_mut(node_id).counts[child_idx] -= 1;
             // Check if child is underflowing
             self.rebalance_child(node_id, child_idx, level - 1);
@@ -910,18 +921,19 @@ impl BPTree {
         removed
     }
 
-    fn remove_from_leaf(&mut self, leaf_id: NodeId, score: f64, member: &[u8]) -> bool {
+    fn remove_from_leaf(&mut self, leaf_id: NodeId, score: f64, member: &[u8]) -> Option<Bytes> {
         match self.leaf(leaf_id).search_by(score, member) {
             Ok(idx) => {
                 let leaf = self.leaf_mut(leaf_id);
                 let n = leaf.entry_count();
                 leaf.entries[idx..n].rotate_left(1);
-                // Drops the removed entry's `Bytes` handle.
-                leaf.entries[n - 1] = Key::default();
+                // Takes the removed entry's `Bytes` handle, leaving the slot
+                // empty (`Key::default()`).
+                let (_, stored) = std::mem::take(&mut leaf.entries[n - 1]);
                 leaf.len -= 1;
-                true
+                Some(stored)
             }
-            Err(_) => false,
+            Err(_) => None,
         }
     }
 

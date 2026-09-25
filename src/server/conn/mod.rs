@@ -20,6 +20,7 @@ pub mod handler_single;
 pub mod intercept;
 pub mod monitor_mode;
 pub mod park_policy;
+pub(crate) mod script_fanout;
 pub mod shared;
 #[cfg(feature = "runtime-tokio")]
 pub(crate) mod single_aof_log;

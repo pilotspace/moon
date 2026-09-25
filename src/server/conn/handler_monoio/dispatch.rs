@@ -236,7 +236,8 @@ pub(super) async fn try_handle_evalsha(
     // moon#569: resolve the caller ONCE per script, then let every inner
     // `redis.call` be authorized against it (locally or on the shard this
     // script routes to).
-    let script_acl = crate::acl::ScriptAcl::for_user(&ctx.acl_table, &conn.current_user)
+    let script_acl = conn
+        .script_acl(&ctx.acl_table)
         .with_caller(conn.tracking_state.script_caller(conn.client_id));
     if let Some(routed) = crate::server::conn::shared::route_script_elsewhere(
         cmd,
@@ -325,7 +326,8 @@ pub(super) async fn try_handle_eval(
     // in that order over the same SPSC ring.
     crate::server::conn::shared::eval_script_fanout(ctx, shutdown, cmd_args).await;
     // moon#569: see `try_handle_evalsha`.
-    let script_acl = crate::acl::ScriptAcl::for_user(&ctx.acl_table, &conn.current_user)
+    let script_acl = conn
+        .script_acl(&ctx.acl_table)
         .with_caller(conn.tracking_state.script_caller(conn.client_id));
     if let Some(routed) = crate::server::conn::shared::route_script_elsewhere(
         cmd,
@@ -401,20 +403,9 @@ pub(super) async fn try_handle_script(
     if !cmd.eq_ignore_ascii_case(b"SCRIPT") {
         return false;
     }
-    let (mut response, fanout) =
-        crate::scripting::handle_script_subcommand(&ctx.script_cache, cmd_args);
-    if let Some((sha1, script_bytes)) = fanout {
-        crate::server::conn::shared::script_fanout_bounded(ctx, shutdown, &sha1, &script_bytes)
-            .await;
-    }
-    // moon#1229: the flush above cleared THIS shard's cache only; reply once
-    // every shard has flushed (or say which did not).
-    if crate::server::conn::shared::is_accepted_script_flush(cmd_args, &response)
-        && let Some(partial) = crate::server::conn::shared::script_flush_fanout(ctx, shutdown).await
-    {
-        response = partial;
-    }
-    responses.push(response);
+    // This shard's cache, then the replay every other shard is owed (moon#515,
+    // moon#1229); one body for both runtimes, see `run_script_command`.
+    responses.push(crate::server::conn::shared::run_script_command(ctx, shutdown, cmd_args).await);
     true
 }
 
@@ -1527,11 +1518,11 @@ pub(super) fn try_enforce_acl(
     if conn.acl_skip_allowed() {
         return false;
     }
-    #[allow(clippy::unwrap_used)] // std RwLock: poison = prior panic = unrecoverable
-    let acl_guard = ctx.acl_table.read().unwrap();
-    if let Some(deny_reason) = acl_guard.check_command_permission(&conn.current_user, cmd, cmd_args)
-    {
-        drop(acl_guard);
+    // moon#1165: a restricted user is checked against the connection's
+    // snapshot of its entry (no table lock, one resolution for the command
+    // AND the key check); see `ConnectionState::acl_denial`.
+    let denial = conn.acl_denial(&ctx.acl_table, cmd, cmd_args);
+    if let Some(crate::acl::AclDenial::Command(deny_reason)) = denial {
         conn.acl_log.push(crate::acl::AclLogEntry {
             reason: "command".to_string(),
             object: crate::acl::subcommand::command_log_object(cmd, cmd_args),
@@ -1548,12 +1539,8 @@ pub(super) fn try_enforce_acl(
         return true;
     }
 
-    // === ACL key pattern check (same lock guard) ===
-    let is_write_for_acl = metadata::is_write(cmd);
-    if let Some(deny_reason) =
-        acl_guard.check_key_permission(&conn.current_user, cmd, cmd_args, is_write_for_acl)
-    {
-        drop(acl_guard);
+    // === ACL key pattern check (resolved together with the command) ===
+    if let Some(crate::acl::AclDenial::Key(deny_reason)) = denial {
         conn.acl_log.push(crate::acl::AclLogEntry {
             reason: "command".to_string(),
             object: String::from_utf8_lossy(cmd).to_ascii_lowercase(),
@@ -1603,31 +1590,17 @@ pub(super) async fn try_handle_functions(
     let is_fcall = cmd.eq_ignore_ascii_case(b"FCALL");
     let is_fcall_ro = cmd.eq_ignore_ascii_case(b"FCALL_RO");
     if cmd.eq_ignore_ascii_case(b"FUNCTION") {
-        crate::server::conn::core::ensure_function_registry(func_registry, ctx);
-        // Borrow scoped to this block, and released before the fan-out await.
-        // The registry `RefCell` is shared with this shard thread's SPSC drain
-        // loop, which applies INBOUND fan-outs — holding it across a yield
-        // would make an arriving library land on a borrowed cell and be
-        // dropped. A trailing `drop(guard)` is not enough: it satisfies the
-        // borrow checker but still trips `await_holding_refcell_ref`.
-        let mut response = {
-            let mut guard = func_registry.borrow_mut();
-            #[allow(clippy::unwrap_used)]
-            // ensure_function_registry guarantees Some
-            crate::command::functions::handle_function(guard.as_mut().unwrap(), cmd_args)
-        };
-        // A replay that did not reach every shard REPLACES the local reply.
-        // The client asked for a server-wide mutation; telling it `+OK` over a
-        // registry that answers differently per shard is the defect this fix
-        // exists to remove, not a shape to preserve on the failure path.
-        if let Some(op) = crate::server::conn::shared::function_fanout_op(cmd_args, &response) {
-            if let Some(partial) =
-                crate::server::conn::shared::function_registry_fanout(ctx, shutdown, op).await
-            {
-                response = partial;
-            }
-        }
-        responses.push(response);
+        // Local apply + replay on every other shard (moon#514); one body for
+        // both runtimes and the MULTI path, see `run_function_command`.
+        responses.push(
+            crate::server::conn::shared::run_function_command(
+                ctx,
+                shutdown,
+                func_registry,
+                cmd_args,
+            )
+            .await,
+        );
         return true;
     }
     if is_fcall || is_fcall_ro {
@@ -1635,7 +1608,8 @@ pub(super) async fn try_handle_functions(
         // EVAL. Resolved BEFORE routing so the same identity is used whether
         // the call runs here or on the shard that owns the key — routing must
         // never change what a caller is allowed to do.
-        let script_acl = crate::acl::ScriptAcl::for_user(&ctx.acl_table, &conn.current_user)
+        let script_acl = conn
+            .script_acl(&ctx.acl_table)
             .with_caller(conn.tracking_state.script_caller(conn.client_id));
         // moon#514 defect 1 — the same root cause as moon#508. FCALL used to
         // require every key to hash to the CONNECTION's shard, so a single

@@ -13,7 +13,8 @@ use crate::admin::metrics_setup::{
     CONNECTED_CLIENTS, EVICTED_KEYS, EXPIRING_SPILL_SKIPPED, METRICS_INITIALIZED,
     PIPELINE_MULTIKEY_FANOUT_TOTAL, PIPELINE_REMOTE_DEFER_TOTAL, SPILLED_KEYS, TOTAL_CONNECTIONS,
     WAL_AGGRESSIVE_RECYCLE_BYTES_TOTAL, WAL_AGGRESSIVE_RECYCLE_SEGMENTS_TOTAL,
-    bump_dispatch_cross_read_fast, bump_dispatch_cross_spsc, bump_keyspace_hit, bump_keyspace_miss,
+    bump_dispatch_cross_read_fast, bump_dispatch_cross_spsc, bump_dispatch_local,
+    bump_dispatch_local_inline, bump_keyspace_hit, bump_keyspace_miss, bump_pubsub_published,
 };
 
 // ── Connection metrics ──────────────────────────────────────────────────
@@ -123,21 +124,16 @@ pub fn record_keyspace_hit() {
     // Ungated on purpose: `keyspace_hits` is an INFO field, and INFO must be
     // right with `--admin-port 0`. moon#774 made the increment land on this
     // THREAD's cache line so the cost is a private RMW, not a contended one.
+    //
+    // moon#1178: the Prometheus copy is published from the slot sums at
+    // scrape (`publish_sharded_counters`) — no registry lookup per GET.
     bump_keyspace_hit();
-    if !METRICS_INITIALIZED.load(Ordering::Relaxed) {
-        return;
-    }
-    counter!("moon_keyspace_hits_total").increment(1);
 }
 
 #[inline]
 pub fn record_keyspace_miss() {
-    // Ungated on purpose — see `record_keyspace_hit`.
+    // Ungated on purpose — see `record_keyspace_hit` (published at scrape).
     bump_keyspace_miss();
-    if !METRICS_INITIALIZED.load(Ordering::Relaxed) {
-        return;
-    }
-    counter!("moon_keyspace_misses_total").increment(1);
 }
 
 // ── Eviction metrics ────────────────────────────────────────────────────
@@ -249,14 +245,34 @@ pub fn wal_aggressive_recycle_bytes_total() -> u64 {
 
 // ── Shard metrics ───────────────────────────────────────────────────────
 
+thread_local! {
+    /// This shard thread's `moon_spsc_drain_batch_size{shard}` handle, built
+    /// on the first drain (moon#1178). A shard thread only ever drains its
+    /// own queue, so the cached id matches on every later call; a mismatch
+    /// (never in production) simply re-registers.
+    static DRAIN_HISTOGRAM: std::cell::RefCell<Option<(usize, metrics::Histogram)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 /// Record SPSC queue drain batch size.
+///
+/// moon#1178: this used to build a `String` label, a label `Vec`, hash the
+/// key and look it up in the registry on EVERY drain. The handle is now
+/// resolved once per thread.
 #[inline]
 pub fn record_spsc_drain(shard_id: usize, count: u64) {
     if !METRICS_INITIALIZED.load(Ordering::Relaxed) {
         return;
     }
-    let shard = itoa::Buffer::new().format(shard_id).to_string();
-    histogram!("moon_spsc_drain_batch_size", "shard" => shard).record(count as f64);
+    DRAIN_HISTOGRAM.with_borrow_mut(|slot| match slot {
+        Some((id, h)) if *id == shard_id => h.record(count as f64),
+        _ => {
+            let shard = itoa::Buffer::new().format(shard_id).to_string();
+            let h = histogram!("moon_spsc_drain_batch_size", "shard" => shard);
+            h.record(count as f64);
+            *slot = Some((shard_id, h));
+        }
+    });
 }
 
 // ── Dispatch routing counters (Phase 177, Step 6) ───────────────────────
@@ -267,12 +283,16 @@ pub fn record_spsc_drain(shard_id: usize, count: u64) {
 // (HotShardMessage split, outbox batching, waker relay fusion).
 
 /// Command executed on the connection's own shard (no cross-thread hop).
+///
+/// Prometheus-only (no INFO field), so still gated on the exporter; the count
+/// lands on this thread's hot-counter line and is published at scrape
+/// (moon#1178).
 #[inline]
 pub fn record_dispatch_local() {
     if !METRICS_INITIALIZED.load(Ordering::Relaxed) {
         return;
     }
-    counter!("moon_dispatch_path_total", "path" => "local").increment(1);
+    bump_dispatch_local(1);
 }
 
 /// Batched variant of `record_dispatch_local`: one atomic increment per
@@ -285,7 +305,7 @@ pub fn record_dispatch_local_batch(count: u64) {
     if count == 0 || !METRICS_INITIALIZED.load(Ordering::Relaxed) {
         return;
     }
-    counter!("moon_dispatch_path_total", "path" => "local").increment(count);
+    bump_dispatch_local(count);
 }
 
 /// Command deferred to cross-shard SPSC dispatch (the slow path).
@@ -298,11 +318,8 @@ pub fn record_dispatch_local_batch(count: u64) {
 pub fn record_dispatch_cross_spsc() {
     // Always increment the INFO-visible atomic (works even with admin_port=0);
     // moon#774 put it on this thread's private line.
+    // The Prometheus copy is published from the slots at scrape (moon#1178).
     bump_dispatch_cross_spsc(1);
-    if !METRICS_INITIALIZED.load(Ordering::Relaxed) {
-        return;
-    }
-    counter!("moon_dispatch_path_total", "path" => "cross_spsc").increment(1);
 }
 
 /// L4 S4: a cross-shard read answered on this thread under a shared guard,
@@ -310,10 +327,6 @@ pub fn record_dispatch_cross_spsc() {
 #[inline]
 pub fn record_dispatch_cross_read_fast() {
     bump_dispatch_cross_read_fast(1);
-    if !METRICS_INITIALIZED.load(Ordering::Relaxed) {
-        return;
-    }
-    counter!("moon_dispatch_path_total", "path" => "cross_read_fast").increment(1);
 }
 
 /// Cross-shard fan-out message dropped after bounded retry (c10k E1/E3):
@@ -388,12 +401,9 @@ pub fn record_dispatch_cross_spsc_batch(count: u64) {
     if count == 0 {
         return;
     }
-    // Always increment the INFO-visible atomic (works even with admin_port=0).
+    // Always increment the INFO-visible atomic (works even with admin_port=0);
+    // Prometheus reads the same slots at scrape (moon#1178).
     bump_dispatch_cross_spsc(count);
-    if !METRICS_INITIALIZED.load(Ordering::Relaxed) {
-        return;
-    }
-    counter!("moon_dispatch_path_total", "path" => "cross_spsc").increment(count);
 }
 
 /// Batched variant of [`record_dispatch_cross_read_fast`]: one increment per
@@ -404,12 +414,9 @@ pub fn record_dispatch_cross_read_fast_batch(count: u64) {
     if count == 0 {
         return;
     }
-    // Always increment the INFO-visible atomic (works even with admin_port=0).
+    // Always increment the INFO-visible atomic (works even with admin_port=0);
+    // Prometheus reads the same slots at scrape (moon#1178).
     bump_dispatch_cross_read_fast(count);
-    if !METRICS_INITIALIZED.load(Ordering::Relaxed) {
-        return;
-    }
-    counter!("moon_dispatch_path_total", "path" => "cross_read_fast").increment(count);
 }
 
 /// Command handled by the inline GET/SET fast path
@@ -422,7 +429,7 @@ pub fn record_dispatch_local_inline(count: u64) {
     if count == 0 || !METRICS_INITIALIZED.load(Ordering::Relaxed) {
         return;
     }
-    counter!("moon_dispatch_path_total", "path" => "local_inline").increment(count);
+    bump_dispatch_local_inline(count);
 }
 
 // ── Vector search metrics (v0.1.6) ─────────────────────────────────────
@@ -481,7 +488,8 @@ pub fn record_pubsub_published() {
     if !METRICS_INITIALIZED.load(Ordering::Relaxed) {
         return;
     }
-    counter!("moon_pubsub_messages_published_total").increment(1);
+    // Published from the per-thread slots at scrape (moon#1178).
+    bump_pubsub_published();
 }
 
 /// Record a slow subscriber drop.

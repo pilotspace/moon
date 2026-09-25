@@ -64,6 +64,11 @@ pub(super) fn search_local_raw(
             return SearchRawResult::Error(Frame::Error(Bytes::from_static(b"Unknown Index name")));
         }
     };
+    // moon#1226: a full-text node this index cannot answer is an error, not
+    // an empty page (the schema-aware case; see `text_match_refusal`).
+    if let Some(msg) = filter.and_then(|f| idx.payload_index.text_match_refusal(f)) {
+        return SearchRawResult::Error(Frame::Error(Bytes::from_static(msg)));
+    }
 
     // Resolve target field: determine dimension, segments, scratch, collection
     let (dim, use_default_field) = if let Some(fname) = field_name {
@@ -271,6 +276,11 @@ pub fn search_local_filtered_with_text(
         Some(i) => i,
         None => return Frame::Error(Bytes::from_static(b"Unknown Index name")),
     };
+    // moon#1226: a full-text node this index cannot answer is an error, not
+    // an empty page (the schema-aware case; see `text_match_refusal`).
+    if let Some(msg) = filter.and_then(|f| idx.payload_index.text_match_refusal(f)) {
+        return Frame::Error(Bytes::from_static(msg));
+    }
 
     // Resolve target field dimension
     let (dim, use_default_field) = if let Some(fname) = field_name {

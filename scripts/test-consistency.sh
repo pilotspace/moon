@@ -1539,6 +1539,97 @@ assert_both "GEOSEARCH infinite radius" GEOSEARCH edge:geo FROMLONLAT 15 37 BYRA
 assert_both "GEOSEARCH BYRADIUS before FROMLONLAT" GEOSEARCH edge:geo BYRADIUS 200 km FROMLONLAT 15 37 ASC
 assert_both "GEOSEARCH centre not a float" GEOSEARCH edge:geo FROMLONLAT abc 37 BYRADIUS 1 km
 
+# moon#1209 (WS10, verified on redis-server 7.0.15): LPOS decides the option
+# NAME before parsing its value, with redis's texts; LMOVE k k on a one-element
+# list rotates in place and keeps the key's TTL (PERSIST answers 1 only when a
+# TTL survived -- timing-free, unlike reading TTL across two cli spawns).
+both DEL "{l1209}:l" "{l1209}:rot"
+both RPUSH "{l1209}:l" a b a c
+assert_both "moon#1209 LPOS unknown option before its value" LPOS "{l1209}:l" a FOO bar
+assert_both "moon#1209 LPOS RANK 0" LPOS "{l1209}:l" a RANK 0
+assert_both "moon#1209 LPOS COUNT not an integer" LPOS "{l1209}:l" a COUNT abc
+assert_both "moon#1209 LPOS MAXLEN not an integer" LPOS "{l1209}:l" a MAXLEN abc
+assert_both "moon#1209 LPOS negative COUNT" LPOS "{l1209}:l" a COUNT -1
+assert_both "moon#1209 LPOS RANK -1 COUNT 0" LPOS "{l1209}:l" a RANK -1 COUNT 0
+both RPUSH "{l1209}:rot" a
+both EXPIRE "{l1209}:rot" 100
+assert_both "moon#1209 LMOVE k k on a one-element list" LMOVE "{l1209}:rot" "{l1209}:rot" LEFT RIGHT
+assert_both "moon#1209 LMOVE k k keeps the TTL" PERSIST "{l1209}:rot"
+
+# moon#1226 (verified on redis-server 7.0.15): counted pops on a listpack are
+# one cut from the end (strings, integers and a 60-byte entry mixed), and
+# SRANDMEMBER with a negative count answers from a per-member table.
+both DEL "{p1226}:l" "{p1226}:s1" "{p1226}:s3"
+both RPUSH "{p1226}:l" a 1 bb 22 "$(printf 'w%.0s' {1..60})" ccc -7 d 4444 e
+assert_both "moon#1226 RPOP k 3 on a listpack" RPOP "{p1226}:l" 3
+assert_both "moon#1226 LMPOP RIGHT COUNT 2" LMPOP 1 "{p1226}:l" RIGHT COUNT 2
+assert_both "moon#1226 LPOP k 2 on a listpack" LPOP "{p1226}:l" 2
+assert_both "moon#1226 what the pops left" LRANGE "{p1226}:l" 0 -1
+assert_both "moon#1226 RPOP past the end" RPOP "{p1226}:l" 100
+assert_both "moon#1226 the drained list is gone" EXISTS "{p1226}:l"
+both SADD "{p1226}:s1" only
+assert_both "moon#1226 SRANDMEMBER -3 on a one-member listpack set" SRANDMEMBER "{p1226}:s1" -3
+both SADD "{p1226}:s3" x 7 y
+assert_eq "moon#1226 SRANDMEMBER -60 draws every member of a 3-member set" \
+    "$(redis-cli -p "$PORT_REDIS" SRANDMEMBER "{p1226}:s3" -60 2>&1 | sort -u | tr '\n' ' ')" \
+    "$(redis-cli -p "$PORT_RUST" SRANDMEMBER "{p1226}:s3" -60 2>&1 | sort -u | tr '\n' ' ')"
+assert_eq "moon#1226 SRANDMEMBER -60 answers exactly 60" \
+    "$(redis-cli -p "$PORT_REDIS" SRANDMEMBER "{p1226}:s3" -60 2>&1 | wc -l | tr -d ' ')" \
+    "$(redis-cli -p "$PORT_RUST" SRANDMEMBER "{p1226}:s3" -60 2>&1 | wc -l | tr -d ' ')"
+
+# moon#1226 (verified on redis-server 7.0.15): an LREM that removes nothing and
+# an LINSERT whose pivot is missing are not writes -- redis signals the key only
+# when it changed, so a WATCHing EXEC still runs. Moon took the list's mutable
+# handle (its WATCH bump) before looking, and the EXEC aborted.
+# Prints the EXEC reply's first line (`*1` ran, `*-1` aborted) after WATCH on
+# the list, the mutation on ANOTHER connection, then MULTI / SET / EXEC.
+watch_exec_after() {
+    local port="$1" enc="$2"; shift 2
+    redis-cli -p "$port" DEL {wn}:l {wn}:x >/dev/null 2>&1 || true
+    if [[ "$enc" == linkedlist ]]; then
+        redis-cli -p "$port" RPUSH {wn}:l a b c "$(printf 'w%.0s' {1..80})" >/dev/null 2>&1 || true
+    else
+        redis-cli -p "$port" RPUSH {wn}:l a b c >/dev/null 2>&1 || true
+    fi
+    exec 4<>"/dev/tcp/127.0.0.1/${port}" || { echo "__CONNECT_FAILED__:${port}"; return 0; }
+    printf 'WATCH {wn}:l\r\n' >&4
+    local line="" out="NONE" i
+    IFS= read -r -t 2 line <&4 || true
+    redis-cli -p "$port" "$@" >/dev/null 2>&1 || true
+    printf 'MULTI\r\nSET {wn}:x 1\r\nEXEC\r\n' >&4
+    for i in 1 2 3; do IFS= read -r -t 2 line <&4 || break; done   # +OK +QUEUED, then the EXEC header
+    out="${line%$'\r'}"
+    exec 4>&-
+    echo "$out"
+}
+assert_eq "moon#1226 WATCH: LREM removing nothing (listpack) lets EXEC run" \
+    "$(watch_exec_after "$PORT_REDIS" listpack LREM {wn}:l 0 zz)" \
+    "$(watch_exec_after "$PORT_RUST"  listpack LREM {wn}:l 0 zz)"
+assert_eq "moon#1226 WATCH: LINSERT missing pivot (listpack) lets EXEC run" \
+    "$(watch_exec_after "$PORT_REDIS" listpack LINSERT {wn}:l BEFORE zz x)" \
+    "$(watch_exec_after "$PORT_RUST"  listpack LINSERT {wn}:l BEFORE zz x)"
+assert_eq "moon#1226 WATCH: LREM removing nothing (linkedlist) lets EXEC run" \
+    "$(watch_exec_after "$PORT_REDIS" linkedlist LREM {wn}:l -1 zz)" \
+    "$(watch_exec_after "$PORT_RUST"  linkedlist LREM {wn}:l -1 zz)"
+assert_eq "moon#1226 WATCH: an LREM that removes aborts EXEC [control]" \
+    "$(watch_exec_after "$PORT_REDIS" listpack LREM {wn}:l 1 a)" \
+    "$(watch_exec_after "$PORT_RUST"  listpack LREM {wn}:l 1 a)"
+
+# moon#1211 (WS10): the LFU counter under `lfu-log-factor 0` grows by exactly one
+# per access, and neither MEMORY USAGE nor OBJECT FREQ itself touches it
+# (redis serves both with LOOKUP_NOTOUCH). Config restored afterwards.
+both CONFIG SET maxmemory-policy allkeys-lfu
+both CONFIG SET lfu-log-factor 0
+both DEL "{f1211}:k"
+both SET "{f1211}:k" v
+for _ in 1 2 3 4 5 6 7 8 9 10; do both GET "{f1211}:k"; done
+assert_both "moon#1211 OBJECT FREQ grows once per access" OBJECT FREQ "{f1211}:k"
+for _ in 1 2 3 4 5; do both MEMORY USAGE "{f1211}:k"; done
+assert_both "moon#1211 MEMORY USAGE does not touch" OBJECT FREQ "{f1211}:k"
+assert_both "moon#1211 OBJECT FREQ does not touch" OBJECT FREQ "{f1211}:k"
+both CONFIG SET maxmemory-policy noeviction
+both CONFIG SET lfu-log-factor 10
+
 # EXPIREAT / PEXPIREAT / EXPIRETIME / PEXPIRETIME
 both SET edge:eat "val"
 assert_both "EXPIREAT" EXPIREAT edge:eat 9999999999
@@ -3123,6 +3214,126 @@ assert_tracking "tracking: ZRANGESTORE DEST invalidated [control]" \
     "{tz}:r" "ZRANGE {tz}:r 0 -1" ZRANGESTORE {tz}:r {tz}:a 0 -1
 
 # ---------------------------------------------------------------------------
+# moon#1234 -- DEL, UNLINK and GETDEL publish the `del` keyspace event (class
+# g) once per key they REMOVE, and nothing for an absent key: plain, spanning
+# (keys on several shards), inside MULTI/EXEC and from Lua. Moon published
+# nothing on any path. The capture subscribes to __keyevent@0__:del on a raw
+# connection, runs the commands down ONE redis-cli connection, and collects the
+# payload keys; the spanning row sorts them (several shards publish, and their
+# relative order is the mesh's, not the command line's). Checked against
+# redis-server 7.0.15 at --shards 1 and 4.
+# ---------------------------------------------------------------------------
+keyevent_del_capture() {
+    local port="$1" order="$2"; shift 2
+    redis-cli -p "$port" CONFIG SET notify-keyspace-events KEA >/dev/null 2>&1 || true
+    exec 3<>"/dev/tcp/127.0.0.1/${port}" || { echo "__CONNECT_FAILED__:${port}"; return 0; }
+    printf 'SUBSCRIBE __keyevent@0__:del\r\n' >&3
+    local line="" keys="" state=0 i
+    for i in 1 2 3 4 5 6 7 8; do
+        IFS= read -r -t 2 line <&3 || break
+        [[ "${line%$'\r'}" == ":1" ]] && break
+    done
+    printf '%s\n' "$@" | redis-cli -p "$port" >/dev/null 2>&1 || true
+    while IFS= read -r -t 1 line <&3; do
+        line="${line%$'\r'}"
+        case "$state" in
+            2) keys="${keys}${line} "; state=0 ;;
+            1) state=2 ;;
+            *) [[ "$line" == "__keyevent@0__:del" ]] && state=1 ;;
+        esac
+    done
+    exec 3>&-
+    redis-cli -p "$port" CONFIG SET notify-keyspace-events "" >/dev/null 2>&1 || true
+    if [[ "$order" == sorted ]]; then
+        printf '%s' "$keys" | tr ' ' '\n' | sed '/^$/d' | sort | tr '\n' ' '
+    else
+        printf '%s' "$keys"
+    fi
+}
+
+both DEL {kn}:a {kn}:b {kn}:c {kn}:t
+both SET {kn}:a 1
+both RPUSH {kn}:b x
+both SET {kn}:c 3
+assert_eq "moon#1234 DEL/UNLINK/GETDEL publish del per removed key" \
+    "$(keyevent_del_capture "$PORT_REDIS" seq 'DEL {kn}:a {kn}:nx {kn}:a' 'UNLINK {kn}:b' 'GETDEL {kn}:c' 'GETDEL {kn}:c')" \
+    "$(keyevent_del_capture "$PORT_RUST"  seq 'DEL {kn}:a {kn}:nx {kn}:a' 'UNLINK {kn}:b' 'GETDEL {kn}:c' 'GETDEL {kn}:c')"
+for i in 1 2 3 4 5 6 7 8; do both DEL kn:span:$i; done
+for i in 1 3 5 7; do both SET kn:span:$i v; done
+assert_eq "moon#1234 spanning DEL publishes del for every removed key" \
+    "$(keyevent_del_capture "$PORT_REDIS" sorted 'DEL kn:span:1 kn:span:2 kn:span:3 kn:span:4 kn:span:5 kn:span:6 kn:span:7 kn:span:8')" \
+    "$(keyevent_del_capture "$PORT_RUST"  sorted 'DEL kn:span:1 kn:span:2 kn:span:3 kn:span:4 kn:span:5 kn:span:6 kn:span:7 kn:span:8')"
+both SET {kn}:t v
+assert_eq "moon#1234 MULTI DEL+UNLINK of one key publishes one del" \
+    "$(keyevent_del_capture "$PORT_REDIS" seq 'MULTI' 'DEL {kn}:t' 'UNLINK {kn}:t' 'EXEC')" \
+    "$(keyevent_del_capture "$PORT_RUST"  seq 'MULTI' 'DEL {kn}:t' 'UNLINK {kn}:t' 'EXEC')"
+both SET {kn}:l1 v
+assert_eq "moon#1234 Lua redis.call DEL publishes del" \
+    "$(keyevent_del_capture "$PORT_REDIS" seq 'EVAL "return redis.call(\"DEL\", KEYS[1], KEYS[2])" 2 {kn}:l1 {kn}:l2')" \
+    "$(keyevent_del_capture "$PORT_RUST"  seq 'EVAL "return redis.call(\"DEL\", KEYS[1], KEYS[2])" 2 {kn}:l1 {kn}:l2')"
+
+# moon#1234 residual (part 3b review S1/P2): a key whose TTL has passed but
+# that active expiry has not reaped is ALREADY GONE to DEL/UNLINK/GETDEL in
+# redis (expireIfNeeded runs first): the reply is :0 / nil, the key publishes
+# `expired`, and nothing publishes `del`. moon answered :1 and published `del`.
+# The capture writes the TTL'd keys with its listener in place, waits 50 ms
+# (clears moon's idle-shard clock refresh, 10 ms), then prints the replies and
+# `<event>:<key>` tokens sorted (an expiry tick may reap a key first; a
+# spanning DEL publishes from several shards).
+keyevent_expired_capture() {
+    local port="$1" setup="$2"; shift 2
+    redis-cli -p "$port" CONFIG SET notify-keyspace-events KEA >/dev/null 2>&1 || true
+    exec 3<>"/dev/tcp/127.0.0.1/${port}" || { echo "__CONNECT_FAILED__:${port}"; return 0; }
+    printf 'SUBSCRIBE __keyevent@0__:del __keyevent@0__:expired\r\n' >&3
+    local line="" toks="" ev="" state=0 i
+    for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
+        IFS= read -r -t 2 line <&3 || break
+        [[ "${line%$'\r'}" == ":2" ]] && break
+    done
+    # The TTL'd keys are written only now, with the listener in place: an
+    # expiry tick that reaps one first publishes the same `expired`.
+    printf '%s\n' "$setup" | redis-cli -p "$port" >/dev/null 2>&1 || true
+    sleep 0.05
+    printf '%s\n' "$@" | redis-cli -p "$port" 2>&1 | tr '\n' ' '
+    while IFS= read -r -t 1 line <&3; do
+        line="${line%$'\r'}"
+        case "$state" in
+            2) toks="${toks}${ev}:${line}"$'\n'; state=0 ;;
+            1) state=2 ;;
+            *) case "$line" in
+                   __keyevent@0__:del) ev=del; state=1 ;;
+                   __keyevent@0__:expired) ev=expired; state=1 ;;
+               esac ;;
+        esac
+    done
+    exec 3>&-
+    redis-cli -p "$port" CONFIG SET notify-keyspace-events "" >/dev/null 2>&1 || true
+    printf '| %s' "$(printf '%s' "$toks" | sed '/^$/d' | sort | tr '\n' ' ')"
+}
+both DEL {kx}:d {kx}:u {kx}:g {kx}:m {kx}:l {kx}:live
+both SET {kx}:live v
+kx_setup=$(for k in {kx}:d {kx}:u {kx}:g {kx}:m {kx}:l; do echo "SET $k v PX 1"; done)
+assert_eq "moon#1234 DEL/UNLINK/GETDEL/MULTI/Lua of an expired key: :0, expired, no del" \
+    "$(keyevent_expired_capture "$PORT_REDIS" "$kx_setup" 'DEL {kx}:d {kx}:live' 'UNLINK {kx}:u' 'GETDEL {kx}:g' 'MULTI' 'DEL {kx}:m' 'EXEC' 'EVAL "return redis.call(\"DEL\", KEYS[1])" 1 {kx}:l')" \
+    "$(keyevent_expired_capture "$PORT_RUST"  "$kx_setup" 'DEL {kx}:d {kx}:live' 'UNLINK {kx}:u' 'GETDEL {kx}:g' 'MULTI' 'DEL {kx}:m' 'EXEC' 'EVAL "return redis.call(\"DEL\", KEYS[1])" 1 {kx}:l')"
+kx_setup=$(for i in 1 2 3 4 5 6 7 8; do echo "SET kx:span:$i v PX 1"; done)
+assert_eq "moon#1234 spanning DEL of expired keys: :0, expired, no del" \
+    "$(keyevent_expired_capture "$PORT_REDIS" "$kx_setup" 'DEL kx:span:1 kx:span:2 kx:span:3 kx:span:4 kx:span:5 kx:span:6 kx:span:7 kx:span:8')" \
+    "$(keyevent_expired_capture "$PORT_RUST"  "$kx_setup" 'DEL kx:span:1 kx:span:2 kx:span:3 kx:span:4 kx:span:5 kx:span:6 kx:span:7 kx:span:8')"
+
+# moon#1249: XSETID below the stream's top ITEM is refused with redis's text,
+# and a later XADD * never re-issues an id already in the stream (moon
+# accepted the XSETID, and the XADD * overwrote 99999999999999-5). The
+# far-future ms keeps XADD * on that ms, so both servers assign the same id.
+both DEL {xs}:s
+both XADD {xs}:s 99999999999999-5 f orig5
+assert_both "moon#1249 XSETID below the top item is refused" XSETID {xs}:s 99999999999999-0
+assert_both "moon#1249 XADD * after the refused XSETID" XADD {xs}:s '*' f new
+assert_both "moon#1249 XRANGE keeps the top entry" XRANGE {xs}:s - +
+assert_both "moon#1249 XLEN counts each entry once" XLEN {xs}:s
+assert_both "moon#1249 XSETID at the top item is accepted" XSETID {xs}:s 99999999999999-6
+
+# ---------------------------------------------------------------------------
 # moon#1013 -- a key that EXPIRES must invalidate exactly like one a command
 # writes. Moon's expiry sweep deleted the key and told keyspace notifications
 # and replicas, but never CLIENT TRACKING, so a client-side cache served the
@@ -3852,6 +4063,37 @@ for NSHARDS in 1 4 12; do
         [[ "$OUT" == *"Function not found"* ]] && GONE=$((GONE + 1))
     done
     assert_eq "moon#514 shards=$NSHARDS: FUNCTION DELETE reaches every shard" "12" "$GONE"
+
+    # --- moon#1235: LOAD racing FLUSH from two connections leaves every shard
+    # agreeing (all run, or all NOSCRIPT / not found) -- never a mix. The two
+    # redis-cli processes are launched together; 20 trials per shard count.
+    RACE_MIXED=0
+    for t in $(seq 1 20); do
+        body="return 'r1235-$NSHARDS-$t'"
+        redis-cli -p "$PORT_RUST" SCRIPT LOAD "$body" >/dev/null 2>&1 &
+        redis-cli -p "$PORT_RUST" SCRIPT FLUSH >/dev/null 2>&1 &
+        wait
+        sha=$(redis-cli -p "$PORT_REDIS" SCRIPT LOAD "$body" 2>/dev/null)  # the oracle hashes (no sha1sum on macOS)
+        ran=0
+        for i in $(seq 1 12); do
+            [[ "$(redis-cli -p "$PORT_RUST" EVALSHA "$sha" 1 "r1235k$i" 2>&1)" == r1235-* ]] && ran=$((ran + 1))
+        done
+        (( ran != 0 && ran != 12 )) && RACE_MIXED=$((RACE_MIXED + 1))
+    done
+    assert_eq "moon#1235 shards=$NSHARDS: SCRIPT LOAD racing SCRIPT FLUSH never leaves shards disagreeing" "0" "$RACE_MIXED"
+    RACE_MIXED=0
+    for t in $(seq 1 20); do
+        lib=$'#!lua name=r1235lib'"$t"$'\nredis.register_function(\'r1235f'"$t"$'\', function(keys, args) return 1 end)\n'
+        redis-cli -p "$PORT_RUST" FUNCTION LOAD "$lib" >/dev/null 2>&1 &
+        redis-cli -p "$PORT_RUST" FUNCTION FLUSH >/dev/null 2>&1 &
+        wait
+        ran=0
+        for i in $(seq 1 12); do
+            [[ "$(redis-cli -p "$PORT_RUST" FCALL "r1235f$t" 1 "r1235k$i" 2>&1)" == 1 ]] && ran=$((ran + 1))
+        done
+        (( ran != 0 && ran != 12 )) && RACE_MIXED=$((RACE_MIXED + 1))
+    done
+    assert_eq "moon#1235 shards=$NSHARDS: FUNCTION LOAD racing FUNCTION FLUSH never leaves shards disagreeing" "0" "$RACE_MIXED"
 done
 
 # Restart moon with the originally-requested shard count so later sections work.
@@ -3886,6 +4128,10 @@ FT_ASOF_RESULT_12=""
 DECAY_RESULT_1=""
 DECAY_RESULT_4=""
 DECAY_RESULT_12=""
+# moon#1238: inline KNN prefilter (`@f:{v}=>[KNN …]`) replies per shard config.
+PREFILTER_RESULT_1=""
+PREFILTER_RESULT_4=""
+PREFILTER_RESULT_12=""
 
 for NSHARDS in 1 4 12; do
     log "  -- temporal shards=$NSHARDS --"
@@ -3993,8 +4239,50 @@ PYEOF
     esac
     redis-cli -p "$PORT_RUST" GRAPH.DELETE decayg >/dev/null 2>&1
 
+    # moon#1238: the multi-shard KNN scatter dropped an inline prefilter and
+    # answered unfiltered, and answered rows for one it could not parse. Six
+    # docs spread over the shards; each vector is 16 NUL-free ASCII bytes (one
+    # FLOAT32 DIM 4 vector) whose distance to the query grows with i, so the
+    # merged order is fully determined. Replies are kept whole (keys, scores,
+    # errors) and must be byte-identical across configs.
+    redis-cli -p "$PORT_RUST" FT.CREATE pfidx ON HASH PREFIX 1 pf: SCHEMA vec VECTOR HNSW 6 TYPE FLOAT32 DIM 4 DISTANCE_METRIC L2 >/dev/null 2>&1 || true
+    for PF_I in 0 1 2 3 4 5; do
+        PF_C=$(printf "\\x$(printf %x $((0x30 + 3 * PF_I)))")
+        PF_LANG=en
+        if [[ $((PF_I % 3)) -eq 1 ]]; then PF_LANG=fr; fi
+        redis-cli -p "$PORT_RUST" HSET "pf:$PF_I" vec "00${PF_C}A00${PF_C}A00${PF_C}A00${PF_C}A" lang "$PF_LANG" year $((2000 + PF_I)) >/dev/null 2>&1 || true
+    done
+    PF_SIG=""
+    for PF_Q in '@lang:{fr}=>[KNN 5 @vec $q]' '@year:[(2001 2004]=>[KNN 5 @vec $q]' '@year:[abc def]=>[KNN 5 @vec $q]'; do
+        PF_OUT=$( (redis-cli -p "$PORT_RUST" FT.SEARCH pfidx "$PF_Q" PARAMS 2 q 000A000A000A000A DIALECT 2 2>&1 || true) | tr '\n' ' ')
+        PF_SIG="${PF_SIG}[${PF_OUT}]"
+    done
+    redis-cli -p "$PORT_RUST" FT.DROPINDEX pfidx DD >/dev/null 2>&1 || true
+    case "$NSHARDS" in
+        1)  PREFILTER_RESULT_1="$PF_SIG" ;;
+        4)  PREFILTER_RESULT_4="$PF_SIG" ;;
+        12) PREFILTER_RESULT_12="$PF_SIG" ;;
+    esac
+
     stop_moon
 done
+
+# moon#1238: the 1-shard reply is the oracle and must itself honour every
+# prefilter: fr -> pf:1 pf:4; year (2001 2004] -> pf:2 pf:3 pf:4; the
+# unparseable one -> ERR. 4 and 12 shards must answer it byte for byte.
+PF_KEYS_1=$( (echo "$PREFILTER_RESULT_1" | grep -oE 'pf:[0-9]+|\]' || true) | tr '\n' ' ')
+if [[ "$PF_KEYS_1" == "pf:1 pf:4 ] pf:2 pf:3 pf:4 ] ] " \
+      && "$PREFILTER_RESULT_1" == *"invalid FILTER expression"* \
+      && "$PREFILTER_RESULT_1" == "$PREFILTER_RESULT_4" \
+      && "$PREFILTER_RESULT_1" == "$PREFILTER_RESULT_12" ]]; then
+    PASS=$((PASS + 1)); echo "  PASS: FT.SEARCH inline KNN prefilter identical across 1/4/12 shards (moon#1238)"
+else
+    FAIL=$((FAIL + 1))
+    echo "  FAIL: FT.SEARCH inline KNN prefilter diverges across shard configs (moon#1238)"
+    echo "    1-shard:  $PREFILTER_RESULT_1"
+    echo "    4-shard:  $PREFILTER_RESULT_4"
+    echo "    12-shard: $PREFILTER_RESULT_12"
+fi
 
 # TEMP-SNAP consistency: all shard configs should return OK
 if [[ "$TEMP_SNAP_RESULT_1" == "OK" && "$TEMP_SNAP_RESULT_4" == "OK" && "$TEMP_SNAP_RESULT_12" == "OK" ]]; then

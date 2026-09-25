@@ -275,7 +275,24 @@ fn an_aborted_bgsave_cannot_corrupt_the_next_one() {
         assert!(!reply.contains('-'), "preload refused: {reply:.200}");
     }
     assert!(c.send(&["BGSAVE"]).contains("Background saving started"));
-    std::thread::sleep(Duration::from_millis(10));
+    // FLUSHALL must land INSIDE the epoch, so wait until the shard has armed
+    // it rather than for a fixed 10 ms: the shard picks the save up on its
+    // next tick, and on a loaded macOS runner that tick came after the
+    // FLUSHALL, which then flushed before the epoch began and aborted
+    // nothing ("fixture: the first BGSAVE must have been aborted"). The
+    // shard spawns the writer that creates `shard-0.rrdshard.tmp` in the
+    // same synchronous stretch that arms the epoch (as
+    // `perf_ws8_mset_bgsave_capture` relies on). The ~190 MiB epoch cannot
+    // finish in the poll interval.
+    let tmp = dir.join("shard-0.rrdshard.tmp");
+    let armed_by = Instant::now() + Duration::from_secs(30);
+    while !tmp.exists() {
+        assert!(
+            Instant::now() < armed_by,
+            "the BGSAVE never armed its epoch"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
     assert!(c.send(&["FLUSHALL"]).starts_with('+'));
     assert!(c.send(&["SET", "canary", "after-abort"]).starts_with('+'));
     // The next BGSAVE, the moment the shard has dropped the aborted one.

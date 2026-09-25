@@ -7,10 +7,14 @@
 //!
 //! Interior mutability: the read path (`dispatch_read`) holds only
 //! `&Database` and may run concurrently from other shard threads via the
-//! cross-shard fast path, so the tick counter is a relaxed atomic and the
-//! slot table sits behind a `parking_lot::Mutex` acquired with `try_lock` —
-//! a contended sample is simply dropped (sampling tolerates loss; the hot
-//! path never blocks).
+//! cross-shard fast path, so the slot table sits behind a
+//! `parking_lot::Mutex` acquired with `try_lock` — a contended sample is
+//! simply dropped (sampling tolerates loss; the hot path never blocks). The
+//! sampling counter is THREAD-LOCAL (moon#1198): it used to be a relaxed
+//! `fetch_add` on an atomic inside each `Database`, ticked by the owner's
+//! dispatch AND by every foreign shard's fast-path read of that database, so
+//! the line bounced between cores on every command. A per-thread counter
+//! samples the same 1 in 64 of each thread's commands with no shared write.
 //!
 //! SpaceSaving (Metwally et al. 2005): fixed K slots. A known key increments
 //! its counter; an unknown key with free capacity takes a slot at count 1;
@@ -29,8 +33,8 @@
 use crate::storage::compact_key::CompactKey;
 use bytes::Bytes;
 use parking_lot::Mutex;
+use std::cell::Cell;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU32, Ordering};
 
 /// Number of tracked slots. Keys hotter than total_samples/128 are guaranteed
 /// to be retained; in practice the top ~dozen are what operators act on.
@@ -54,13 +58,17 @@ fn hotkeys_disabled() -> bool {
     *DISABLED.get_or_init(|| std::env::var_os("MOON_NO_HOTKEYS").is_some_and(|v| v == "1"))
 }
 
+thread_local! {
+    /// The dispatch tick driving 1-in-64 sampling, one per thread (moon#1198):
+    /// a shard thread ticks it for its own commands, a foreign reader for
+    /// its fast-path reads — never the same cache line.
+    static SAMPLE_TICK: Cell<u32> = const { Cell::new(0) };
+}
+
 /// SpaceSaving top-K frequency sketch over sampled command keys.
 pub struct HotKeySketch {
     /// Unsorted (key, estimated_count) slots; at most `HOTKEY_CAPACITY`.
     entries: Mutex<Vec<(CompactKey, u64)>>,
-    /// Dispatch tick counter driving 1-in-64 sampling (relaxed — exact
-    /// cadence under concurrency doesn't matter, only the ~1/64 rate).
-    sample_tick: AtomicU32,
     /// Process-wide kill switch, latched at construction.
     enabled: bool,
 }
@@ -77,17 +85,22 @@ impl HotKeySketch {
             // Lazily grows toward HOTKEY_CAPACITY; avoids a 5 KB allocation
             // for the many short-lived Databases created in tests/tools.
             entries: Mutex::new(Vec::new()),
-            sample_tick: AtomicU32::new(0),
             enabled: !hotkeys_disabled(),
         }
     }
 
-    /// Advance the sampling counter; returns `true` when this command should
-    /// be observed (1 in 64). One relaxed fetch_add — the only per-dispatch cost.
+    /// Advance the calling thread's sampling counter; returns `true` when this
+    /// command should be observed (1 in 64 of the thread's commands). A
+    /// thread-local increment — the only per-dispatch cost, and no write to
+    /// memory another core reads (moon#1198).
     #[inline]
     pub fn tick(&self) -> bool {
-        let prev = self.sample_tick.fetch_add(1, Ordering::Relaxed);
-        self.enabled && prev.wrapping_add(1) & SAMPLE_SHIFT_MASK == 0
+        let next = SAMPLE_TICK.with(|t| {
+            let n = t.get().wrapping_add(1);
+            t.set(n);
+            n
+        });
+        self.enabled && next & SAMPLE_SHIFT_MASK == 0
     }
 
     /// Record one observation of `key` (SpaceSaving update). Single O(K)
@@ -212,6 +225,31 @@ mod tests {
         let n = (HOTKEY_SAMPLE_RATE as usize) * 10;
         let fired = (0..n).filter(|_| sk.tick()).count();
         assert_eq!(fired, 10);
+    }
+
+    /// moon#1198: another thread's ticks — a foreign shard's fast-path reads
+    /// of this database — must not move this thread's sampling cadence. With
+    /// the shared atomic, thread B's one tick landed on the 64th count and
+    /// thread A's 64th tick fired nothing: every core wrote the same line.
+    #[test]
+    fn a_foreign_threads_ticks_do_not_move_this_threads_cadence() {
+        use std::sync::Arc;
+        let sk = Arc::new(HotKeySketch::new());
+        // Align this thread's counter to a sampling boundary first.
+        while !sk.tick() {}
+        let mut fired = (0..63).filter(|_| sk.tick()).count();
+        let other = Arc::clone(&sk);
+        #[allow(clippy::unwrap_used)] // test-only join
+        std::thread::spawn(move || {
+            let _ = other.tick();
+        })
+        .join()
+        .unwrap();
+        fired += usize::from(sk.tick());
+        assert_eq!(
+            fired, 1,
+            "this thread's 64th tick must fire regardless of another thread's ticks"
+        );
     }
 
     #[test]

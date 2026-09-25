@@ -56,7 +56,15 @@ fn best_of(runs: usize, input: &[u8]) -> Duration {
         .unwrap_or_default()
 }
 
+/// moon#1226: skipped in unoptimised builds — a wall-time ratio on a shared runner is not a
+/// debug-CI signal. The deterministic guards for moon#1164 run everywhere:
+/// `protocol::flat::tests::chunked_upload_work_is_linear` (element-visit count) and
+/// `server::codec::tests::decode_frame_resumes_a_large_frame_across_reads`.
 #[test]
+#[cfg_attr(
+    debug_assertions,
+    ignore = "wall-clock ratio, meaningful only in an optimized build: cargo test --release --test perf_ws4_multibulk_linear (moon#1226)"
+)]
 fn chunked_multibulk_decode_time_is_linear_in_size() {
     let small = rpush(25_000);
     let large = rpush(200_000); // 8x the elements, 8x the bytes

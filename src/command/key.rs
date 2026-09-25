@@ -4,6 +4,7 @@ use crate::framevec;
 use crate::protocol::Frame;
 use crate::storage::Database;
 use crate::storage::compact_key::CompactKey;
+use crate::storage::db::KeyDeletion;
 use crate::storage::entry::current_time_ms;
 
 use super::helpers::{err_wrong_args, expiry_ms_in_range};
@@ -36,14 +37,92 @@ pub fn del(db: &mut Database, args: &[Frame]) -> Frame {
     for arg in args {
         if let Some(key) = extract_key(arg) {
             // Counting variant: a spilled (cold-only) key logically exists
-            // and must count as removed (D1).
-            let (removed, _hot) = db.remove_counting_cold(key);
-            if removed {
+            // and must count as removed (D1); an expired one does not
+            // (moon#1234, see `settle_deletion`).
+            let outcome = match db.remove_counting_cold(key) {
+                (true, _) => KeyDeletion::Live,
+                // A hot entry came out but did not count: its TTL had passed.
+                (false, Some(_)) => KeyDeletion::Expired,
+                (false, None) => KeyDeletion::Absent,
+            };
+            if settle_deletion(outcome, key, db.db_index) {
                 count += 1;
             }
         }
     }
     Frame::Integer(count)
+}
+
+/// Publish what deleting one key did and say whether DEL/UNLINK counts it
+/// (moon#1234 residual — redis 7.0.15 parity, captured with the same bytes).
+///
+/// - A live key: counted, `del` (class `g`).
+/// - A key whose TTL had passed but that active expiry had not reaped yet:
+///   redis's `expireIfNeeded` deletes it BEFORE DEL looks, so it answers
+///   `:0`, publishes `expired` (class `x`) and no `del`. moon reaped it here
+///   too, but counted it and published `del`. The deletion itself still
+///   reaches the AOF and replicas: DEL/UNLINK propagate verbatim whatever
+///   they answer, and the coordinator's in-process leg — the one path that
+///   skips a `:0` — asks [`expired_reaps`].
+/// - Applying the MASTER's stream on a replica, the key is live whatever its
+///   TTL says, as in redis (`expireIfNeeded` returns 0 for the master
+///   client): the master decided, so it is counted and publishes `del`. The
+///   replica runs no expiry of its own; this is how its expired keys go.
+/// - Absent: nothing.
+#[inline]
+fn settle_deletion(outcome: KeyDeletion, key: &[u8], db_index: usize) -> bool {
+    match outcome {
+        KeyDeletion::Live => {
+            notify_del(key, db_index);
+            true
+        }
+        KeyDeletion::Expired => {
+            EXPIRED_REAPS.with(|n| n.set(n.get().wrapping_add(1)));
+            if crate::replication::apply::applying_master_stream() {
+                notify_del(key, db_index);
+                true
+            } else {
+                crate::notify::notify_keyspace_event(
+                    crate::notify::NotifyFlags::EXPIRED,
+                    "expired",
+                    key,
+                    db_index,
+                );
+                false
+            }
+        }
+        KeyDeletion::Absent => false,
+    }
+}
+
+thread_local! {
+    /// Expired keys DEL/UNLINK reaped on this thread (moon#1234), ever.
+    static EXPIRED_REAPS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// How many already-expired keys DEL/UNLINK have reaped on this thread.
+///
+/// Such a reap answers `:0` yet deletes a key, so the deletion must still be
+/// logged. The multi-key coordinator persists its in-process leg only when
+/// it removed something; it reads this before and after the leg, and a
+/// change means the leg reaped a key the AOF and the replicas still hold.
+#[inline]
+pub(crate) fn expired_reaps() -> u64 {
+    EXPIRED_REAPS.with(std::cell::Cell::get)
+}
+
+/// Queue the `del` keyspace event for one key a delete REMOVED (moon#1234).
+///
+/// redis publishes it per removed key from `delGenericCommand` (DEL and
+/// UNLINK) and from `getdelCommand`, class `g`, and never for a key that was
+/// absent. Queued from the command body, so every path that runs the body
+/// publishes it exactly once: a plain command, each owner leg of a spanning
+/// delete (the coordinator's local slice and every remote `<CMD> k…` leg both
+/// run this body), MULTI/EXEC and Lua `redis.call`. With notifications off it
+/// is the notify gate's one Relaxed load and two masks, no allocation.
+#[inline]
+pub(crate) fn notify_del(key: &[u8], db_index: usize) {
+    crate::notify::notify_keyspace_event(crate::notify::NotifyFlags::GENERIC, "del", key, db_index);
 }
 
 /// EXISTS key [key ...]
@@ -883,36 +962,13 @@ pub fn dbsize_readonly(db: &Database, _args: &[Frame]) -> Frame {
 /// Returns all keys matching the given glob-style pattern.
 /// Expired keys are excluded (lazy expiry check on each key).
 pub fn keys(db: &mut Database, args: &[Frame]) -> Frame {
-    if args.len() != 1 {
-        return err_wrong_args("KEYS");
-    }
-    let pattern = match extract_key(&args[0]) {
-        Some(p) => p,
-        None => return err_wrong_args("KEYS"),
-    };
-
-    // Collect all keys first (need to release immutable borrow before calling db.get)
-    let all_keys: Vec<CompactKey> = db.keys().cloned().collect();
+    // moon#1198: the read path's walk, exactly. This used to clone EVERY key
+    // into a Vec and then make two table probes per key (`exists` for its
+    // lazy-expiry side effect, then `peek_if_alive`) before the pattern test;
+    // redis's `keysCommand` tests the pattern and skips an expired key without
+    // deleting it — expiry is the active cycle's job, not KEYS'.
     let now_ms = db.now_ms();
-
-    let mut result = Vec::new();
-    for key in all_keys {
-        // Trigger lazy expiry by calling exists; membership below is strict
-        // hot-aliveness so cold-only keys enter exactly once, via the cold
-        // loop (#364 plane partition — see Database::cold_only_keys).
-        let _ = db.exists(key.as_bytes());
-        if db.peek_if_alive(key.as_bytes(), now_ms).is_some() && glob_match(pattern, key.as_bytes())
-        {
-            result.push(Frame::BulkString(key.to_bytes()));
-        }
-    }
-    for key in db.cold_only_keys(now_ms) {
-        if glob_match(pattern, key.as_ref()) {
-            result.push(Frame::BulkString(key.clone()));
-        }
-    }
-
-    Frame::Array(result.into())
+    keys_readonly(db, args, now_ms)
 }
 
 /// RENAME key newkey
@@ -1017,12 +1073,14 @@ pub fn unlink(db: &mut Database, args: &[Frame]) -> Frame {
     let mut count: i64 = 0;
     for arg in args {
         if let Some(key) = extract_key(arg) {
-            // Counting variant: cold-only keys count as removed (D1).
+            // Counting variant: cold-only keys count as removed (D1), expired
+            // ones do not (moon#1234, see `settle_deletion`).
             // moon#1190: a large value is handed to the database's lazy-free
             // queue — no ledger walk and no drop inside the command, on
             // either runtime (monoio used to drop inline; tokio's
             // `spawn_blocking` still walked the value first).
-            if db.unlink(key) {
+            let outcome = db.unlink_key(key);
+            if settle_deletion(outcome, key, db.db_index) {
                 count += 1;
             }
         }
@@ -1353,11 +1411,11 @@ pub fn keys_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
     };
 
     let mut result = Vec::new();
-    for key in db.keys() {
-        // Strict hot-aliveness: cold-visible keys enter exactly once, via
-        // the cold loop below (#364 plane partition).
-        if db.peek_if_alive(key.as_bytes(), now_ms).is_some() && glob_match(pattern, key.as_bytes())
-        {
+    // Strict hot-aliveness, judged from the entry the walk is already on — no
+    // per-key table probe (moon#1198); cold-visible keys enter exactly once,
+    // via the cold loop below (#364 plane partition).
+    for key in db.iter_live_keys(now_ms) {
+        if glob_match(pattern, key.as_bytes()) {
             result.push(Frame::BulkString(key.to_bytes()));
         }
     }
@@ -1513,6 +1571,57 @@ mod tests {
             Entry::new_string_with_expiry(Bytes::copy_from_slice(val), expires_at_ms),
         );
         db
+    }
+
+    /// moon#1234 residual: a key whose TTL has passed but that active expiry
+    /// has not reaped is ALREADY GONE to DEL and UNLINK (redis's
+    /// `expireIfNeeded` runs first): `:0`, and the key is reaped. A live key
+    /// next to it still counts. Pre-fix both answered `:1` for it.
+    #[test]
+    fn del_and_unlink_reap_an_expired_key_without_counting_it() {
+        let past = current_time_ms().saturating_sub(10_000);
+        for unlink_it in [false, true] {
+            let mut db = setup_db_with_expiry(b"gone", b"v", past);
+            db.set(b"live", Entry::new_string(Bytes::from_static(b"v")));
+            let args = [bs(b"gone"), bs(b"live"), bs(b"absent")];
+            let reply = if unlink_it {
+                unlink(&mut db, &args)
+            } else {
+                del(&mut db, &args)
+            };
+            assert_eq!(
+                reply,
+                Frame::Integer(1),
+                "unlink={unlink_it}: only `live` counts"
+            );
+            assert_eq!(
+                db.len(),
+                0,
+                "unlink={unlink_it}: the expired entry was reaped too"
+            );
+        }
+    }
+
+    /// The reap bumps the thread's `expired_reaps` counter — what the
+    /// multi-key coordinator reads to still log a leg that answered `:0` —
+    /// and a live or absent key does not.
+    #[test]
+    fn only_an_expired_reap_moves_the_reap_counter() {
+        let past = current_time_ms().saturating_sub(10_000);
+        let mut db = setup_db_with_expiry(b"gone", b"v", past);
+        db.set(b"live", Entry::new_string(Bytes::from_static(b"v")));
+        let before = expired_reaps();
+        assert_eq!(
+            del(&mut db, &[bs(b"live"), bs(b"absent")]),
+            Frame::Integer(1)
+        );
+        assert_eq!(
+            expired_reaps(),
+            before,
+            "live and absent keys are not reaps"
+        );
+        assert_eq!(del(&mut db, &[bs(b"gone")]), Frame::Integer(0));
+        assert_eq!(expired_reaps(), before + 1);
     }
 
     // --- SCAN cursor tests (issue #368: hash-ordered stable-key cursor) ---

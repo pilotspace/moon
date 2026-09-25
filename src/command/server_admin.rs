@@ -403,9 +403,11 @@ fn estimate_serialized_length(entry: &Entry) -> usize {
             members.iter().map(|(m, _)| m.len() + 9).sum()
         }
         RedisValueRef::SortedSetListpack(lp) => lp.total_bytes(),
-        // Streams track their own size; the header is an acceptable lower
-        // bound for tooling — `XINFO STREAM` gives a richer picture.
-        RedisValueRef::Stream(_) => 64,
+        // moon#1163: the stream's measured size (entries, groups, PELs) —
+        // the constant 64 answered 114 for a 200K-entry stream. O(1): the
+        // billed size plus any undrained delta, equal to the O(n)
+        // `estimate_memory` scan (`stream_accounting_tests` pins it).
+        RedisValueRef::Stream(s) => s.memory_usage(),
     }
 }
 

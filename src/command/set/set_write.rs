@@ -7,6 +7,7 @@ use crate::storage::Database;
 use crate::storage::db::{SetHandle, SetRef, Shape, set_member_cost, set_table_bytes};
 use crate::storage::entry::{Entry, SetValue, boxed_payload_block};
 use crate::storage::listpack::Listpack;
+use crate::storage::owned_bytes::detach;
 
 use super::{parse_int, set_algebra};
 use crate::command::helpers::{err_wrong_args, extract_bytes};
@@ -123,8 +124,10 @@ pub fn sadd(db: &mut Database, args: &[Frame]) -> Frame {
                     // a member that genuinely has to be stored, exactly as on
                     // the standard path.
                     for arg in &args[resume_at..] {
+                        // moon#1160: an exact-size copy, not a slice of the
+                        // request buffer (see `storage::owned_bytes`).
                         if let Some(member) = extract_bytes(arg)
-                            && set.insert(member.clone())
+                            && set.insert(detach(member))
                         {
                             added += 1;
                         }
@@ -302,7 +305,9 @@ fn sadd_push_full(set: &mut SetValue, args: &[Frame]) -> PushedFull {
     let mut member_bytes: usize = 0;
     for arg in &args[1..] {
         if let Some(member) = extract_bytes(arg) {
-            if set.insert(member.clone()) {
+            // moon#1160: stored as an exact-size copy — a clone of the
+            // request's slice kept the whole read buffer alive.
+            if set.insert(detach(member)) {
                 added += 1;
                 member_bytes += set_member_cost(member);
             }
@@ -817,9 +822,16 @@ pub fn smove(db: &mut Database, args: &[Frame]) -> Frame {
         Err(e) => return e,
         Ok(Some(_)) => {}
     }
-    match db.get_set(destination) {
-        Ok(_) => {}
+    let destination_absent = match db.get_set(destination) {
+        Ok(found) => found.is_none(),
         Err(e) => return e,
+    };
+    // moon#1225's sibling: an unreadable cold destination reads as absent
+    // (the probe raises the fault flag and answers `None`). Refuse HERE,
+    // before the member leaves the source — the destination's create below
+    // would refuse it after the fact and the member would exist nowhere.
+    if destination_absent && db.take_cold_fault().is_some() {
+        return Database::cold_fault_error();
     }
 
     if source == destination {
@@ -839,9 +851,11 @@ pub fn smove(db: &mut Database, args: &[Frame]) -> Frame {
         Err(e) => return e,
     };
     let src_table_before = set_table_bytes(src_set);
-    if !src_set.swap_remove(&member) {
+    // moon#1160: take the SOURCE's stored member and move it across — never
+    // the request's slice, and no copy either.
+    let Some(stored) = src_set.swap_take(member.as_ref()) else {
         return Frame::Integer(0);
-    }
+    };
     let src_empty = src_set.is_empty();
     let src_table_after = set_table_bytes(src_set);
     // `src_set`'s borrow of `db` ends above.
@@ -857,7 +871,7 @@ pub fn smove(db: &mut Database, args: &[Frame]) -> Frame {
         Err(e) => return e,
     };
     let dst_table_before = set_table_bytes(dst_set);
-    let inserted = dst_set.insert(member.clone());
+    let inserted = dst_set.insert(stored);
     let dst_table_after = set_table_bytes(dst_set);
     // `dst_set`'s borrow of `db` ends above.
     if inserted {

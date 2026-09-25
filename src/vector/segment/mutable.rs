@@ -27,6 +27,9 @@ use crate::vector::turbo_quant::sq8::{
 use crate::vector::turbo_quant::tq_adc::tq_l2_adc_scaled;
 use crate::vector::types::{DistanceMetric, SearchResult, VectorId};
 
+mod rerank;
+pub(crate) use rerank::exact_rerank_depth;
+
 /// Maximum byte size before a mutable segment is considered full (128 MB).
 const MUTABLE_SEGMENT_MAX: usize = 128 * 1024 * 1024;
 

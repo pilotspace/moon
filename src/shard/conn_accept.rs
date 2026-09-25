@@ -27,10 +27,6 @@ use super::dispatch::ShardMessage;
 use super::remote_subscriber_map::RemoteSubscriberMap;
 use super::shared_databases::ShardDatabases;
 
-/// Type alias to distinguish pre-existing std::sync::RwLock (for ACL, runtime config, etc.)
-/// from parking_lot::RwLock (used for pubsub types).
-type StdRwLock<T> = std::sync::RwLock<T>;
-
 /// Maximum time a client may take to complete the TLS handshake after the
 /// TCP connection is accepted (prod-hardening #17). Without a bound, a peer
 /// that completes the TCP 3-way handshake on the TLS port and then sends no
@@ -174,7 +170,7 @@ pub(crate) fn spawn_tokio_connection(
     tracking_rc: &std::sync::Arc<parking_lot::Mutex<TrackingTable>>,
     lua_rc: &Rc<RefCell<Option<Rc<mlua::Lua>>>>,
     script_cache_rc: &Rc<RefCell<crate::scripting::ScriptCache>>,
-    acl_table: &Arc<StdRwLock<crate::acl::AclTable>>,
+    acl_table: &Arc<parking_lot::RwLock<crate::acl::AclTable>>,
     runtime_config: &Arc<parking_lot::RwLock<RuntimeConfig>>,
     server_config: &Arc<crate::config::ServerConfig>,
     all_notifiers: &[Arc<channel::Notify>],
@@ -435,7 +431,7 @@ pub(crate) fn spawn_migrated_tokio_connection(
     tracking_rc: &std::sync::Arc<parking_lot::Mutex<TrackingTable>>,
     lua_rc: &Rc<RefCell<Option<Rc<mlua::Lua>>>>,
     script_cache_rc: &Rc<RefCell<crate::scripting::ScriptCache>>,
-    acl_table: &Arc<StdRwLock<crate::acl::AclTable>>,
+    acl_table: &Arc<parking_lot::RwLock<crate::acl::AclTable>>,
     runtime_config: &Arc<parking_lot::RwLock<RuntimeConfig>>,
     server_config: &Arc<crate::config::ServerConfig>,
     all_notifiers: &[Arc<channel::Notify>],
@@ -619,7 +615,7 @@ pub(crate) fn spawn_monoio_connection(
     tracking_rc: &std::sync::Arc<parking_lot::Mutex<TrackingTable>>,
     lua_rc: &Rc<RefCell<Option<Rc<mlua::Lua>>>>,
     script_cache_rc: &Rc<RefCell<crate::scripting::ScriptCache>>,
-    acl_table: &Arc<StdRwLock<crate::acl::AclTable>>,
+    acl_table: &Arc<parking_lot::RwLock<crate::acl::AclTable>>,
     runtime_config: &Arc<parking_lot::RwLock<RuntimeConfig>>,
     server_config: &Arc<crate::config::ServerConfig>,
     all_notifiers: &[Arc<channel::Notify>],
@@ -1391,7 +1387,7 @@ pub(crate) fn spawn_migrated_monoio_connection(
     tracking_rc: &std::sync::Arc<parking_lot::Mutex<TrackingTable>>,
     lua_rc: &Rc<RefCell<Option<Rc<mlua::Lua>>>>,
     script_cache_rc: &Rc<RefCell<crate::scripting::ScriptCache>>,
-    acl_table: &Arc<StdRwLock<crate::acl::AclTable>>,
+    acl_table: &Arc<parking_lot::RwLock<crate::acl::AclTable>>,
     runtime_config: &Arc<parking_lot::RwLock<RuntimeConfig>>,
     server_config: &Arc<crate::config::ServerConfig>,
     all_notifiers: &[Arc<channel::Notify>],

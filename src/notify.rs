@@ -185,21 +185,34 @@ pub fn notifications_enabled() -> bool {
 // optimisation: a late (P)SUBSCRIBE that raises it from 0 makes every SUBSEQUENT
 // event flow, which is exactly Redis's own guarantee (a subscription established
 // after a write does not receive that write's event).
+//
+// Memory ordering (moon#1226): the updates are RELEASE and the gate's load is
+// ACQUIRE, a documented pairing. The registry entry is created under the
+// registry's write lock, and the count is bumped after it (see
+// `PubSubRegistry::subscribe` / `psubscribe`); a writer on another shard that
+// Acquire-loads a non-zero count therefore happens-after the entry's creation,
+// so the event it goes on to build is published into a registry that already
+// holds the subscriber. The publish path takes the registry's own lock, which is what
+// actually protects the data; Relaxed happened to work because of it, and
+// nothing in the orderings said so. Costs nothing on x86 (both are plain
+// moves) and one LDAR on aarch64, paid only when a notification class is on.
 
 static KEYSPACE_LISTENERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// Record that a keyspace-relevant channel/pattern gained its first subscriber.
+/// Release: pairs with [`has_keyspace_listener`]'s Acquire.
 #[inline]
 pub fn keyspace_listener_added() {
-    KEYSPACE_LISTENERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    KEYSPACE_LISTENERS.fetch_add(1, std::sync::atomic::Ordering::Release);
 }
 
 /// Record that a keyspace-relevant channel/pattern lost its last subscriber.
-/// Saturating at 0.
+/// Saturating at 0. Release on the update, as [`keyspace_listener_added`];
+/// the failed-CAS reload needs no ordering of its own.
 #[inline]
 pub fn keyspace_listener_removed() {
     let _ = KEYSPACE_LISTENERS.fetch_update(
-        std::sync::atomic::Ordering::Relaxed,
+        std::sync::atomic::Ordering::Release,
         std::sync::atomic::Ordering::Relaxed,
         |v| Some(v.saturating_sub(1)),
     );
@@ -207,15 +220,16 @@ pub fn keyspace_listener_removed() {
 
 /// `true` when at least one client is subscribed to a `__keyspace@*`/
 /// `__keyevent@*` channel or pattern anywhere in the process.
+/// Acquire: pairs with the Release updates above.
 #[inline]
 pub fn has_keyspace_listener() -> bool {
-    KEYSPACE_LISTENERS.load(std::sync::atomic::Ordering::Relaxed) > 0
+    KEYSPACE_LISTENERS.load(std::sync::atomic::Ordering::Acquire) > 0
 }
 
 /// The live keyspace-listener count (tests only).
 #[cfg(test)]
 pub fn keyspace_listener_count() -> usize {
-    KEYSPACE_LISTENERS.load(std::sync::atomic::Ordering::Relaxed)
+    KEYSPACE_LISTENERS.load(std::sync::atomic::Ordering::Acquire)
 }
 
 /// Whether a SUBSCRIBE channel or PSUBSCRIBE pattern could deliver keyspace

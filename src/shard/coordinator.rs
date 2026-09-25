@@ -1985,12 +1985,16 @@ async fn coordinate_multi_del_or_exists(
     // index/queue hooks (moon#1162) — `cmd_dispatch` alone left the deleted
     // documents in every vector index.
     if owners == 1 && !groups[my_shard].is_empty() {
+        let reaps = crate::command::key::expired_reaps();
         let resp = run_local(shard_databases, db_index, cached_clock, cmd, args);
         // v3-5 carried gap: the in-process DEL/UNLINK never reached the AOF —
         // deleted keys RESURRECTED from the seed writes on restart. Persist
         // only when something was actually removed (n=0 replays identically
-        // without a record).
-        if is_delete && matches!(resp, Frame::Integer(n) if n > 0) {
+        // without a record) — which includes an expired key the leg reaped
+        // while answering 0 for it (moon#1234: the AOF and every replica
+        // still hold that key, and a replica never expires on its own).
+        let reaped = crate::command::key::expired_reaps() != reaps;
+        if is_delete && (reaped || matches!(resp, Frame::Integer(n) if n > 0)) {
             match persist_local_group(aof_pool, repl_state, my_shard, db_index, &groups[my_shard])
                 .await
             {
@@ -2012,6 +2016,7 @@ async fn coordinate_multi_del_or_exists(
 
     let mut total_count: i64 = 0;
     if !local_group.is_empty() {
+        let reaps = crate::command::key::expired_reaps();
         // moon#1162: through `run_local`, so this slice's deleted
         // documents are tombstoned like the remote slices' are.
         let result = run_local(
@@ -2021,12 +2026,14 @@ async fn coordinate_multi_del_or_exists(
             name,
             &local_group[1..],
         );
+        let reaped = crate::command::key::expired_reaps() != reaps;
         if let Frame::Integer(n) = result {
             total_count += n;
             // v3-5 carried gap: persist the local slice (synthesized over
             // ONLY the keys this shard owns — remote slices persist on
-            // their owners via MultiExecute). Skip when nothing removed.
-            if is_delete && n > 0 {
+            // their owners via MultiExecute). Skip when nothing removed —
+            // an expired key reaped for a `:0` WAS removed (moon#1234).
+            if is_delete && (n > 0 || reaped) {
                 match persist_local_group(aof_pool, repl_state, my_shard, db_index, &local_group)
                     .await
                 {
@@ -2795,10 +2802,16 @@ pub async fn coordinate_hotkeys(
 /// coordinator's connection task nor a remote shard's event loop is held for
 /// the length of a search. Merge input order is unchanged: local first, then
 /// the remote shards in ascending order.
+///
+/// moon#1238: `filter` is the query's KNN prefilter. It rides to every leg —
+/// one `Arc` shared by refcount, not a deep clone per shard — and a leg that
+/// cannot evaluate it makes the whole query an error
+/// (`vector_scatter::merge_knn_legs`), never an unfiltered or partial answer.
 pub async fn scatter_vector_search_remote(
     index_name: Bytes,
     query_blob: Bytes,
     k: usize,
+    filter: Option<Arc<crate::vector::filter::FilterExpr>>,
     as_of_lsn: u64,
     my_shard: usize,
     num_shards: usize,
@@ -2822,6 +2835,7 @@ pub async fn scatter_vector_search_remote(
                 index_name: index_name.clone(),
                 query_blob: query_blob.clone(),
                 k,
+                filter: filter.clone(),
                 as_of_lsn,
                 reply_tx,
                 db_index,
@@ -2836,33 +2850,23 @@ pub async fn scatter_vector_search_remote(
     // Phase 171 SCAT-01: AS_OF honoured; WS5a: db-scoped. Shapes the snapshot
     // does not cover (unknown index, dimension mismatch) take the synchronous
     // search, whose error frames they need.
-    let snapshot = crate::shard::slice::with_shard(|s| {
-        crate::shard::vector_scatter::capture_knn(
+    let local_leg = crate::shard::slice::with_shard(|s| {
+        crate::shard::vector_scatter::plan_knn_leg(
             &mut s.vector_store,
             &s.text_store,
             &index_name,
             &query_blob,
             k,
+            filter.as_deref(),
             as_of_lsn,
             db_index,
         )
     });
-    let local_result = match snapshot {
-        Some(snapshot) => crate::shard::vector_scatter::run_knn(snapshot).await,
-        None => crate::shard::slice::with_shard(|s| {
-            crate::command::vector_search::search_local_filtered(
-                &mut s.vector_store,
-                &index_name,
-                &query_blob,
-                k,
-                None,
-                0,
-                usize::MAX,
-                None,
-                as_of_lsn,
-                db_index,
-            )
-        }),
+    let local_result = match local_leg {
+        crate::shard::vector_scatter::KnnLeg::Yield(snapshot) => {
+            crate::shard::vector_scatter::run_knn(snapshot).await
+        }
+        crate::shard::vector_scatter::KnnLeg::Done(frame) => frame,
     };
 
     let mut shard_responses = Vec::with_capacity(num_shards);
@@ -2878,7 +2882,7 @@ pub async fn scatter_vector_search_remote(
         }
     }
 
-    crate::command::vector_search::merge_search_results(&shard_responses, k, 0, usize::MAX)
+    crate::shard::vector_scatter::merge_knn_legs(&shard_responses, k, filter.is_some())
 }
 
 /// Broadcast an FT.* command (FT.CREATE, FT.DROPINDEX) to ALL shards.

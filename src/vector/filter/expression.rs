@@ -45,3 +45,23 @@ pub enum FilterExpr {
     /// without it, evaluate_bitmap returns an empty bitmap.
     TextMatch { field: Bytes, terms: Vec<Bytes> },
 }
+
+impl FilterExpr {
+    /// Whether any `TextMatch` node of this expression targets a field `pred`
+    /// accepts (moon#1226: the refusal check for a KNN full-text filter that
+    /// no index can answer).
+    pub fn any_text_match_field(&self, pred: &impl Fn(&[u8]) -> bool) -> bool {
+        match self {
+            FilterExpr::TextMatch { field, .. } => pred(field),
+            FilterExpr::And(a, b) | FilterExpr::Or(a, b) => {
+                a.any_text_match_field(pred) || b.any_text_match_field(pred)
+            }
+            FilterExpr::Not(inner) => inner.any_text_match_field(pred),
+            FilterExpr::TagEq { .. }
+            | FilterExpr::NumEq { .. }
+            | FilterExpr::NumRange { .. }
+            | FilterExpr::BoolEq { .. }
+            | FilterExpr::GeoRadius { .. } => false,
+        }
+    }
+}

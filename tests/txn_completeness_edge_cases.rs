@@ -196,7 +196,7 @@ async fn start_txn_server(num_shards: usize) -> (u16, CancellationToken) {
                     let local = tokio::task::LocalSet::new();
                     let (_snap_tx, snap_rx) = channel::watch(0u64);
                     let snap_tx = _snap_tx;
-                    let acl_t = std::sync::Arc::new(std::sync::RwLock::new(
+                    let acl_t = std::sync::Arc::new(parking_lot::RwLock::new(
                         moon::acl::AclTable::load_or_default(&shard_config),
                     ));
                     let rt_cfg = std::sync::Arc::new(parking_lot::RwLock::new(

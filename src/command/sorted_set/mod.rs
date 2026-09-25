@@ -176,9 +176,13 @@ pub(super) fn zset_update_existing(
     if new.to_bits() != old.to_bits() {
         *slot = new;
         work_budget::note_bptree_score_write();
-        // MUST move in both structures.
-        scores.remove(OrderedFloat(old), member);
-        scores.insert(OrderedFloat(new), member.clone());
+        // MUST move in both structures. moon#1160: the tree's own STORED
+        // member moves to the new score — `member` is the caller's probe,
+        // a slice of the request buffer that must never be stored.
+        let stored = scores
+            .take(OrderedFloat(old), member)
+            .unwrap_or_else(|| crate::storage::owned_bytes::detach(member));
+        scores.insert(OrderedFloat(new), stored);
     }
     Some(old)
 }

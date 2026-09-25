@@ -633,6 +633,17 @@ impl CompactValue {
     /// path copied the WHOLE string twice on every APPEND — quadratic: 11.2 s
     /// for 40K x 100 B. `tests`: `append_growth_is_amortized_linear`.
     ///
+    /// That argument is the ALLOCATOR's, not this function's. It holds for the
+    /// allocators moon binaries are built with: jemalloc, and mimalloc where
+    /// jemalloc does not build (Windows MSVC), whose `mi_realloc` also keeps a
+    /// block while the new size still fits it. It does NOT hold for the
+    /// Windows system heap, which only the lib tests run on
+    /// (`#[global_allocator]` is set in `main.rs` alone): `HeapReAlloc` moves
+    /// a large block, copying the whole value, about once per 4 KiB of growth
+    /// (as that test's timings on the hosted Windows runner imply). There,
+    /// appending `n` bytes copies the value about `n / 4096` times — a cost
+    /// per appended byte that grows with the value, not amortized O(1).
+    ///
     /// An inline (<= 12 byte) value is copied out into a fresh `Vec` — at most
     /// 12 bytes — and a result that still fits inline goes back inline.
     fn string_grow_with(&mut self, extra: usize, fill: impl FnOnce(&mut Vec<u8>)) {

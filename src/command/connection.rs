@@ -955,7 +955,7 @@ pub fn auth(args: &[Frame], requirepass: &Option<String>) -> Frame {
 /// Returns (response_frame, Option<authenticated_username>).
 pub fn auth_acl(
     args: &[Frame],
-    acl_table: &std::sync::Arc<std::sync::RwLock<crate::acl::AclTable>>,
+    acl_table: &std::sync::Arc<parking_lot::RwLock<crate::acl::AclTable>>,
 ) -> (Frame, Option<String>) {
     match args.len() {
         1 => {
@@ -968,13 +968,7 @@ pub fn auth_acl(
                     );
                 }
             };
-            // Fail closed: if the ACL lock is poisoned, deny authentication
-            let Ok(table) = acl_table.read() else {
-                return (
-                    Frame::Error(Bytes::from_static(b"ERR internal ACL error")),
-                    None,
-                );
-            };
+            let table = acl_table.read();
             // moon#640: the single-argument form is refused outright when the
             // `default` user carries `nopass` — i.e. no password is configured
             // on this server. `table.authenticate` would return Some for ANY
@@ -1030,13 +1024,7 @@ pub fn auth_acl(
                     );
                 }
             };
-            // Fail closed: if the ACL lock is poisoned, deny authentication
-            let Ok(table) = acl_table.read() else {
-                return (
-                    Frame::Error(Bytes::from_static(b"ERR internal ACL error")),
-                    None,
-                );
-            };
+            let table = acl_table.read();
             match table.authenticate(&username, &password) {
                 Some(uname) => (Frame::SimpleString(Bytes::from_static(b"OK")), Some(uname)),
                 None => (
@@ -1064,7 +1052,7 @@ pub fn hello_acl(
     args: &[Frame],
     current_proto: u8,
     client_id: u64,
-    acl_table: &std::sync::Arc<std::sync::RwLock<crate::acl::AclTable>>,
+    acl_table: &std::sync::Arc<parking_lot::RwLock<crate::acl::AclTable>>,
     authenticated: &mut bool,
     // (role, mode) read from ReplicationState/ClusterState by the caller.
     // Previously these were `Bytes::from_static` literals — "master" and
@@ -1136,15 +1124,7 @@ pub fn hello_acl(
                         );
                     }
                 };
-                // Fail closed: if the ACL lock is poisoned, deny authentication
-                let Ok(table) = acl_table.read() else {
-                    return (
-                        Frame::Error(Bytes::from_static(b"ERR internal ACL error")),
-                        current_proto,
-                        None,
-                        None,
-                    );
-                };
+                let table = acl_table.read();
                 match table.authenticate(&username, &password) {
                     Some(uname) => {
                         *authenticated = true;
@@ -1942,21 +1922,21 @@ mod tests {
 
     // === auth_acl tests ===
 
-    fn make_acl_table() -> std::sync::Arc<std::sync::RwLock<crate::acl::AclTable>> {
+    fn make_acl_table() -> std::sync::Arc<parking_lot::RwLock<crate::acl::AclTable>> {
         use crate::acl::{AclTable, AclUser};
         let mut table = AclTable::new();
         table.set_user("default".to_string(), AclUser::new_default_nopass());
-        std::sync::Arc::new(std::sync::RwLock::new(table))
+        std::sync::Arc::new(parking_lot::RwLock::new(table))
     }
 
-    fn make_acl_table_with_password() -> std::sync::Arc<std::sync::RwLock<crate::acl::AclTable>> {
+    fn make_acl_table_with_password() -> std::sync::Arc<parking_lot::RwLock<crate::acl::AclTable>> {
         use crate::acl::{AclTable, AclUser};
         let mut table = AclTable::new();
         table.set_user(
             "default".to_string(),
             AclUser::new_default_with_password("secret"),
         );
-        std::sync::Arc::new(std::sync::RwLock::new(table))
+        std::sync::Arc::new(parking_lot::RwLock::new(table))
     }
 
     /// moon#640. This test previously asserted `+OK` — it PINNED the defect:
@@ -2017,7 +1997,7 @@ mod tests {
         let table = make_acl_table();
         // Create alice with password
         {
-            let mut t = table.write().unwrap();
+            let mut t = table.write();
             t.apply_setuser("alice", &["on", ">alicepass", "~*", "+@all"]);
         }
         let (resp, user) = auth_acl(
@@ -2035,7 +2015,7 @@ mod tests {
     fn test_auth_acl_2arg_wrong_password() {
         let table = make_acl_table();
         {
-            let mut t = table.write().unwrap();
+            let mut t = table.write();
             t.apply_setuser("alice", &["on", ">alicepass", "~*", "+@all"]);
         }
         let (resp, user) = auth_acl(
@@ -2053,7 +2033,7 @@ mod tests {
     fn test_auth_acl_disabled_user() {
         let table = make_acl_table();
         {
-            let mut t = table.write().unwrap();
+            let mut t = table.write();
             t.apply_setuser("alice", &["off", ">alicepass"]);
         }
         let (resp, user) = auth_acl(

@@ -5,6 +5,7 @@ use crate::protocol::Frame;
 use crate::storage::Database;
 use crate::storage::db::{Shape, SortedSetRef, zset_member_cost, zset_table_bytes};
 use crate::storage::listpack::PairUpdate;
+use crate::storage::owned_bytes::detach;
 use crate::storage::zset_score::{ScoreBuf, render_score};
 
 use crate::command::helpers::{all_args_are_bytes, err, err_wrong_args, extract_bytes};
@@ -519,7 +520,8 @@ pub fn zadd(db: &mut Database, args: &[Frame]) -> Frame {
                 // New member: add unless XX.
                 if !xx {
                     mem_charge += zset_member_cost(member);
-                    zset_insert_absent(members, scores, member.clone(), score);
+                    // moon#1160: an exact-size copy, not the request's slice.
+                    zset_insert_absent(members, scores, detach(member), score);
                     added += 1;
                     changed += 1;
                 }
@@ -1116,7 +1118,8 @@ fn zincr_member(
     if inserted {
         // A member that was not there starts at 0.0, so its new score is the
         // increment itself — already in `new_score`.
-        zset_insert_absent(members, scores, member.clone(), new_score);
+        // moon#1160: an exact-size copy, not the request's slice.
+        zset_insert_absent(members, scores, detach(member), new_score);
     }
     let is_empty = members.is_empty();
     let table_after = zset_table_bytes(members, scores);

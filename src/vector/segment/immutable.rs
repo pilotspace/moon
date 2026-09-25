@@ -508,18 +508,12 @@ impl ImmutableSegment {
             let Some(vec_f16) = raw.get(start..start + dim) else {
                 continue; // Out-of-range id: keep the ADC estimate.
             };
-            if is_l2 {
-                result.distance = (dist_table.f16_l2)(q_ref, vec_f16);
-            } else {
-                // One pass: ⟨q̂,x⟩ and ‖x‖² from the f16-decoded vector.
-                let (dot, xsq) = (dist_table.f16_dot_normsq)(q_ref, vec_f16);
-                if xsq > 0.0 {
-                    // f16 rounding can push cos slightly outside [-1, 1];
-                    // clamp so distances stay in the metric's [0, 4] range.
-                    let cos = (dot / xsq.sqrt()).clamp(-1.0, 1.0);
-                    result.distance = 2.0 - 2.0 * cos;
-                }
-                // Zero vector: normalized form undefined — keep ADC estimate.
+            // One convention for every rerank (shared with the mutable
+            // segment's, moon#1226); a zero vector keeps its ADC estimate.
+            if let Some(d) =
+                crate::vector::hnsw::prepared::exact_f16_distance(dist_table, q_ref, vec_f16, is_l2)
+            {
+                result.distance = d;
             }
         }
         candidates.sort_unstable();

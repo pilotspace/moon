@@ -407,10 +407,23 @@ pub fn srandmember_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame
         if n > crate::command::RAND_DUP_COUNT_MAX {
             return Frame::Error(Bytes::from_static(crate::command::ERR_RAND_COUNT_RANGE));
         }
-        // moon#1174 §2: same draws, same order, one walk of a listpack.
+        // moon#1226: a listpack is at most a few hundred members (128 by the
+        // default policy), so materialise each member ONCE into a table in
+        // one walk, then answer every draw by index in O(1) — duplicates share
+        // their member's buffer. The moon#1174 gather built, sorted and walked
+        // a |COUNT|-sized pick list (up to 2^20 pairs, 16 MiB) and copied
+        // every draw separately. Same draws in the same order, so the same
+        // reply.
         if let crate::storage::db::SetRef::Listpack(lp) = &sref {
-            let draws = (0..n).map(|_| rng.random_range(0..len));
-            return Frame::Array(gather_listpack_members(lp, draws).into());
+            let table: smallvec::SmallVec<[Bytes; 128]> =
+                lp.iter_refs().map(|m| m.to_bytes()).collect();
+            let mut result = Vec::with_capacity(n);
+            for _ in 0..n {
+                if let Some(m) = table.get(rng.random_range(0..len)) {
+                    result.push(Frame::BulkString(m.clone()));
+                }
+            }
+            return Frame::Array(result.into());
         }
         let mut result = Vec::with_capacity(n);
         for _ in 0..n {
@@ -423,7 +436,8 @@ pub fn srandmember_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame
 }
 
 /// The listpack members at `indices`, as bulk strings in the order the
-/// indices were DRAWN, gathered in one forward walk (moon#1174 §2).
+/// indices were DRAWN, gathered in one forward walk (moon#1174 §2). Used for a
+/// POSITIVE count, where the picks are distinct and at most `len` of them.
 ///
 /// `SetRef::nth` is O(idx) on a listpack -- a walk from the head -- so a
 /// SRANDMEMBER of `n` members cost `n` walks. The random draws are unchanged
@@ -582,6 +596,68 @@ pub fn sintercard_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame 
     });
 
     Frame::Integer(count as i64)
+}
+
+#[cfg(test)]
+mod srandmember_negative_count_1226 {
+    use super::*;
+    use crate::command::set::sadd;
+
+    fn bs(s: &[u8]) -> Frame {
+        Frame::BulkString(Bytes::copy_from_slice(s))
+    }
+
+    /// moon#1226: a negative COUNT on a listpack set costs one copy per
+    /// MEMBER, not one per draw, and no |COUNT|-sized pick list. Observable
+    /// without an allocator hook: every draw of a member is a handle on the
+    /// same buffer, so the reply holds at most `len` distinct buffers however
+    /// large |COUNT| is (it held |COUNT| of them, one copy per draw).
+    #[test]
+    fn negative_count_on_a_listpack_copies_each_member_once() {
+        let mut db = Database::new();
+        let mut args = vec![bs(b"s")];
+        let members: Vec<Vec<u8>> = (0..100)
+            .map(|i| {
+                if i % 10 == 0 {
+                    format!("{}", i * 7).into_bytes() // integer entries too
+                } else {
+                    format!("member:{i:03}").into_bytes()
+                }
+            })
+            .collect();
+        args.extend(members.iter().map(|m| bs(m)));
+        sadd(&mut db, &args);
+        let enc = crate::command::key::object(&mut db, &[bs(b"ENCODING"), bs(b"s")]);
+        assert_eq!(
+            enc,
+            Frame::BulkString(Bytes::from_static(b"listpack")),
+            "fixture"
+        );
+        let Frame::Array(items) = srandmember(&mut db, &[bs(b"s"), bs(b"-20000")]) else {
+            panic!("expected an array")
+        };
+        assert_eq!(items.len(), 20_000, "exactly |COUNT| members");
+        let mut buffers = std::collections::HashSet::new();
+        let mut distinct = std::collections::HashSet::new();
+        for f in items.iter() {
+            let Frame::BulkString(b) = f else {
+                panic!("expected bulk, got {f:?}")
+            };
+            assert!(members.contains(&b.to_vec()), "a non-member was returned");
+            buffers.insert(b.as_ptr() as usize);
+            distinct.insert(b.to_vec());
+        }
+        assert!(
+            buffers.len() <= members.len(),
+            "SRANDMEMBER s -20000 materialised {} member buffers for a {}-member \
+             listpack (one per draw); one per member is the bound",
+            buffers.len(),
+            members.len()
+        );
+        // 20,000 uniform draws over 100 members miss one with probability
+        // ~100 * (0.99^20000) ≈ 2e-85.
+        assert_eq!(distinct.len(), members.len(), "draws cover the set");
+    }
 }
 
 #[cfg(test)]

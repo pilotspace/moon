@@ -327,6 +327,11 @@ fn limit_stops_the_label_scan_early() {
         got.nodes_scanned
     );
     assert!(want.nodes_scanned > 18_000);
+    // moon#1226: the wall-clock ratio below is asserted only in optimised builds — the
+    // `nodes_scanned` bound above is the deterministic guard and runs everywhere.
+    if cfg!(debug_assertions) {
+        return;
+    }
     let parsed = crate::graph::cypher::parse_cypher(q.as_bytes()).expect("parse");
     let plan = crate::graph::cypher::planner::compile(&parsed).expect("compile");
     let graph = store.get_graph(b"g").expect("graph");
@@ -358,6 +363,11 @@ fn order_by_limit_evaluates_keys_once_and_selects_the_page() {
     let plan = crate::graph::cypher::planner::compile(&parsed).expect("compile");
     let (got, want) = run(&store, q, &params);
     assert_eq!(render(&got), render(&want), "{q}");
+    // moon#1226: wall-clock ratio — asserted only in optimised builds (shared-runner noise and
+    // debug codegen swamp it); the row identity above runs everywhere.
+    if cfg!(debug_assertions) {
+        return;
+    }
     let live = best_of(5, || {
         std::hint::black_box(execute(graph, &plan, &params, &ctx).expect("exec"));
     });

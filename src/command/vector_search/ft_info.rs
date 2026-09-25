@@ -141,6 +141,18 @@ pub fn ft_info(
         Frame::Integer(unloaded_segments as i64),
         Frame::BulkString(Bytes::from_static(b"unloaded_segments_with_exact_rerank")),
         Frame::Integer(unloaded_segments_with_exact_rerank as i64),
+        // moon#1226: whether this process keeps the payload text index that
+        // answers `@field:{multi word}` KNN filters. `MOON_VECTOR_PAYLOAD_TEXT`
+        // is environment-only, so a primary and a replica can differ; with it
+        // `off` such a filter is refused (it used to match nothing, silently).
+        Frame::BulkString(Bytes::from_static(b"payload_text_index")),
+        Frame::BulkString(Bytes::from_static(
+            if crate::vector::filter::text_match_refusal::payload_text_unavailable().is_none() {
+                b"on"
+            } else {
+                b"off"
+            },
+        )),
     ];
 
     // Per-field stats: vector_fields array

@@ -5,8 +5,8 @@ use crate::runtime::cancel::CancellationToken;
 use crate::runtime::channel;
 use parking_lot::Mutex;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
-use std::sync::{Arc, RwLock};
 use tracing::{debug, error, info, warn};
 
 #[cfg(feature = "runtime-tokio")]
@@ -246,9 +246,9 @@ pub async fn run_with_shutdown(
     }
 
     // Build ACL table from config (load aclfile if configured, else bootstrap from requirepass)
-    let acl_table: Arc<RwLock<crate::acl::AclTable>> = {
+    let acl_table: Arc<parking_lot::RwLock<crate::acl::AclTable>> = {
         let table = crate::acl::AclTable::load_or_default(&config);
-        Arc::new(RwLock::new(table))
+        Arc::new(parking_lot::RwLock::new(table))
     };
 
     // VectorStore for single-shard FT.* commands

@@ -5,6 +5,7 @@ use crate::protocol::{Frame, FrameVec};
 use crate::storage::Database;
 use crate::storage::db::{HashTtlCond, Shape, hash_field_cost, hash_field_cost_len};
 use crate::storage::entry::boxed_payload_block;
+use crate::storage::owned_bytes::detach;
 
 use crate::command::helpers::{err_wrong_args, extract_bytes, ok};
 use crate::storage::listpack::{ListpackRef, PairUpdate};
@@ -205,16 +206,18 @@ pub fn hset(db: &mut Database, args: &[Frame]) -> Frame {
     let mut i = 1;
     while i < args.len() {
         let field = match extract_bytes(&args[i]) {
-            Some(f) => f.clone(),
+            Some(f) => f,
             None => return err_wrong_args("HSET"),
         };
         let value = match extract_bytes(&args[i + 1]) {
-            Some(v) => v.clone(),
+            Some(v) => v,
             None => return err_wrong_args("HSET"),
         };
         let field_len = field.len();
         let value_len = value.len();
-        match map.insert(field, value) {
+        // moon#1160: stored as exact-size copies, never as slices of the
+        // request buffer (see `storage::owned_bytes`).
+        match map.insert(detach(field), detach(value)) {
             Some(old_value) => {
                 let old_cost = hash_field_cost_len(field_len, old_value.len()) as i64;
                 let new_cost = hash_field_cost_len(field_len, value_len) as i64;
@@ -359,16 +362,18 @@ pub fn hmset(db: &mut Database, args: &[Frame]) -> Frame {
     let mut i = 1;
     while i < args.len() {
         let field = match extract_bytes(&args[i]) {
-            Some(f) => f.clone(),
+            Some(f) => f,
             None => return err_wrong_args("HMSET"),
         };
         let value = match extract_bytes(&args[i + 1]) {
-            Some(v) => v.clone(),
+            Some(v) => v,
             None => return err_wrong_args("HMSET"),
         };
         let field_len = field.len();
         let value_len = value.len();
-        match map.insert(field, value) {
+        // moon#1160: stored as exact-size copies, never as slices of the
+        // request buffer (see `storage::owned_bytes`).
+        match map.insert(detach(field), detach(value)) {
             Some(old_value) => {
                 let old_cost = hash_field_cost_len(field_len, old_value.len()) as i64;
                 let new_cost = hash_field_cost_len(field_len, value_len) as i64;
@@ -543,7 +548,9 @@ pub fn hincrby(db: &mut Database, args: &[Frame]) -> Frame {
         Ok(m) => m,
         Err(e) => return e,
     };
-    let current = match map.get(&field) {
+    // ONE probe finds the slot for both the read and the write.
+    let slot = map.get_mut(field.as_ref());
+    let current = match slot.as_deref() {
         Some(v) => match std::str::from_utf8(v)
             .ok()
             .and_then(|s| s.parse::<i64>().ok())
@@ -563,7 +570,12 @@ pub fn hincrby(db: &mut Database, args: &[Frame]) -> Frame {
     let field_len = field.len();
     let new_bytes = Bytes::copy_from_slice(ibuf.format(new_value).as_bytes());
     let new_value_len = new_bytes.len();
-    let old_value_len = map.insert(field, new_bytes).map(|v| v.len());
+    // moon#1160: a NEW field is stored as an exact-size copy, never as a
+    // slice of the request buffer; an existing field keeps its stored key.
+    let old_value_len = match slot {
+        Some(slot) => Some(std::mem::replace(slot, new_bytes).len()),
+        None => map.insert(detach(&field), new_bytes).map(|v| v.len()),
+    };
     // `map`'s borrow of `db` ends above.
     let new_cost = hash_field_cost_len(field_len, new_value_len) as i64;
     let old_cost = old_value_len.map_or(0, |l| hash_field_cost_len(field_len, l) as i64);
@@ -677,7 +689,8 @@ pub fn hincrbyfloat(db: &mut Database, args: &[Frame]) -> Frame {
         Ok(m) => m,
         Err(e) => return e,
     };
-    let current: f64 = match map.get(&field) {
+    let slot = map.get_mut(field.as_ref());
+    let current: f64 = match slot.as_deref() {
         Some(v) => match std::str::from_utf8(v).ok().and_then(|s| s.parse().ok()) {
             Some(n) => n,
             None => {
@@ -691,9 +704,12 @@ pub fn hincrbyfloat(db: &mut Database, args: &[Frame]) -> Frame {
     let formatted = format_float(new_value);
     let field_len = field.len();
     let new_value_len = formatted.len();
-    let old_value_len = map
-        .insert(field, Bytes::from(formatted.clone()))
-        .map(|v| v.len());
+    let new_bytes = Bytes::from(formatted.clone());
+    // moon#1160: see HINCRBY.
+    let old_value_len = match slot {
+        Some(slot) => Some(std::mem::replace(slot, new_bytes).len()),
+        None => map.insert(detach(&field), new_bytes).map(|v| v.len()),
+    };
     // `map`'s borrow of `db` ends above.
     let new_cost = hash_field_cost_len(field_len, new_value_len) as i64;
     let old_cost = old_value_len.map_or(0, |l| hash_field_cost_len(field_len, l) as i64);
@@ -793,7 +809,8 @@ pub fn hsetnx(db: &mut Database, args: &[Frame]) -> Frame {
         Frame::Integer(0)
     } else {
         let cost = hash_field_cost(&field, &value);
-        map.insert(field, value);
+        // moon#1160: exact-size copies, not slices of the request buffer.
+        map.insert(detach(&field), detach(&value));
         // `map`'s borrow of `db` ends above — field was absent, so this is a
         // pure charge (no prior cost to net out).
         db.charge_memory(cost);

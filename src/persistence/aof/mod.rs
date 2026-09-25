@@ -1053,10 +1053,19 @@ fn replay_aof_with_resync(
     engine: &dyn CommandReplayEngine,
     best_effort_resync: bool,
 ) -> Result<usize, MoonError> {
-    let data = std::fs::read(path)?;
-    if data.is_empty() {
+    use crate::persistence::replay::chunks::{ReplayChunks, ReplayNext};
+    use std::io::{Read, Seek};
+
+    // moon#1160: the RESP part is STREAMED through a bounded buffer. The old
+    // shape read the whole file and then `BytesMut::from(&data[..])` copied
+    // the RESP tail again — the log held twice — and every replayed element
+    // sliced that one buffer, pinning all of it after boot.
+    let mut file = std::fs::File::open(path)?;
+    if file.metadata()?.len() == 0 {
         return Ok(0);
     }
+    let mut magic = [0u8; 4];
+    let has_preamble = file.read_exact(&mut magic).is_ok() && &magic == b"MOON";
 
     // Detect RDB preamble: if the file starts with "MOON" magic, load the binary
     // RDB section first, then replay any RESP commands appended after it.
@@ -1078,7 +1087,11 @@ fn replay_aof_with_resync(
     // preserving is always correct here — unlike the generic `rdb::load`,
     // which also serves replica full-sync and `DEBUG RELOAD` with a FOREIGN
     // dataset whose values do not live in this node's cold files.
-    let (rdb_keys, resp_start) = if data.starts_with(b"MOON") {
+    let (rdb_keys, resp_start, file_len) = if has_preamble {
+        // The RDB loader takes the preamble as ONE slice, so this arm still
+        // reads the file whole — once — and drops it before the RESP tail
+        // below streams from the file.
+        let data = std::fs::read(path)?;
         let cold_wiring: Vec<_> = databases
             .iter_mut()
             .map(|db| (db.cold_shard_dir.take(), db.cold_index.take()))
@@ -1094,7 +1107,7 @@ fn replay_aof_with_resync(
                     "AOF RDB preamble loaded: {} keys ({} bytes)",
                     keys, consumed
                 );
-                (keys, consumed)
+                (keys, consumed as u64, data.len() as u64)
             }
             Err(e) => {
                 // Data starts with MOON magic — it IS RDB format.
@@ -1103,29 +1116,23 @@ fn replay_aof_with_resync(
             }
         }
     } else {
-        (0, 0)
+        (0, 0, u64::MAX)
     };
 
     // If the entire file was RDB (no RESP tail), we're done
-    if resp_start >= data.len() {
+    if resp_start >= file_len {
         return Ok(rdb_keys);
     }
 
-    let resp_data = &data[resp_start..];
-    let total_len = resp_data.len();
-    let mut buf = BytesMut::from(resp_data);
-    let config = ParseConfig::default();
+    file.seek(std::io::SeekFrom::Start(resp_start))?;
+    let mut chunks = ReplayChunks::new(file, resp_start);
     let mut selected_db: usize = 0;
     let mut count: usize = 0;
     let mut corruption_count: usize = 0;
 
     loop {
-        if buf.is_empty() {
-            break;
-        }
-
-        match parse::parse(&mut buf, &config) {
-            Ok(Some(frame)) => {
+        match chunks.next_frame()? {
+            ReplayNext::Frame(frame) => {
                 // Extract command name and args, then dispatch
                 let (cmd, cmd_args) = match &frame {
                     Frame::Array(arr) if !arr.is_empty() => {
@@ -1147,24 +1154,22 @@ fn replay_aof_with_resync(
                 engine.replay_command(databases, cmd, cmd_args, &mut selected_db);
                 count += 1;
             }
-            Ok(None) => {
-                // Incomplete frame at end of file - truncated AOF
-                if !buf.is_empty() {
-                    // Absolute file offset: resp_data sits after any RDB
-                    // preamble, and operator repair guidance must point at
-                    // the real file location.
-                    let offset = resp_start + (total_len - buf.len());
-                    warn!(
-                        "AOF truncated: {} unparseable bytes at offset {} (end of file)",
-                        buf.len(),
-                        offset
-                    );
-                }
+            ReplayNext::End => break,
+            ReplayNext::Truncated { offset, len } => {
+                // Incomplete frame at end of file - truncated AOF. The offset
+                // is absolute (the reader starts at `resp_start`, after any
+                // RDB preamble): operator repair guidance must point at the
+                // real file location.
+                warn!(
+                    "AOF truncated: {} unparseable bytes at offset {} (end of file)",
+                    len, offset
+                );
                 break;
             }
-            Err(e) => {
-                // Absolute file offset (includes any RDB preamble) — see above.
-                let error_offset = resp_start + (total_len - buf.len());
+            ReplayNext::Corrupt {
+                offset: error_offset,
+                err: e,
+            } => {
                 corruption_count += 1;
 
                 // Prod-hardening #12: DO NOT skip-and-resync by default.
@@ -1200,12 +1205,7 @@ fn replay_aof_with_resync(
                      misapplied).",
                     error_offset, count, e
                 );
-                let _ = buf.split_to(1);
-                if let Some(pos) = buf.iter().position(|&b| b == b'*') {
-                    let _ = buf.split_to(pos);
-                } else if buf.is_empty() {
-                    break;
-                } else {
+                if !chunks.skip_to_next_array()? {
                     // No more RESP array markers found; stop replay
                     warn!(
                         "AOF: no recoverable RESP frame found after offset {}; stopping",

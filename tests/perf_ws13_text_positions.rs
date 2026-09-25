@@ -9,6 +9,9 @@
 //!   entry held its own `Vec<u32>` of positions (a 24-byte header plus a heap chunk — 32 bytes
 //!   minimum under glibc, 8 under jemalloc — for what is usually ONE `u32`). Measured as this
 //!   process's `VmRSS` growth per posting entry while building a large index (Linux only).
+//!
+//! The tests share one lock (moon#1226): libtest runs them on concurrent threads of ONE process,
+//! and the golden corpora's allocations landed inside the `VmRSS` window of the per-entry test.
 
 #![cfg(feature = "text-index")]
 
@@ -35,6 +38,9 @@ fn new_index(fields: &[&'static [u8]]) -> TextIndex {
         BM25Config::default(),
     )
 }
+
+/// Serialises this binary's tests (see the module docs).
+static SERIAL: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
 fn index(idx: &mut TextIndex, d: u32, args: &[Frame]) {
     let key = format!("p:{d}");
@@ -79,12 +85,19 @@ fn golden_corpus() -> TextIndex {
     idx
 }
 
-/// xxh64 of the base layout's encoding of `golden_corpus()` (computed on the wave-1 base
-/// `f32546c`, before the contiguous-positions change).
-const GOLDEN_TPOST_XXH64: u64 = 0xe4dc_7f45_6580_79e0;
+/// xxh64 of the `.tpost` encoding of `golden_corpus()`.
+///
+/// WS13 pinned `0xe4dc_7f45_6580_79e0`, the wave-1 base layout's encoding (`f32546c`, before the
+/// contiguous-positions change), to prove that change invisible on disk. moon#1220 item 3 then
+/// made `.tpost` rewrites number documents densely when the index has holes, and this corpus
+/// deletes 141 documents it never re-adds: its file is now the same layout with every doc id
+/// replaced by its rank among the live ids (same length, 293,326 bytes). Verified when the value
+/// was taken: with the renumbering disabled the encoding still hashes to `0xe4dc_7f45_6580_79e0`.
+const GOLDEN_TPOST_XXH64: u64 = 0x6424_a6f3_373f_a40d;
 
 #[test]
 fn tpost_bytes_are_unchanged_by_the_position_layout() {
+    let _serial = SERIAL.lock();
     let idx = golden_corpus();
     let bytes = moon::text::postings_persist::encode_index(&idx);
     let got = xxhash_rust::xxh64::xxh64(&bytes, 0);
@@ -93,6 +106,55 @@ fn tpost_bytes_are_unchanged_by_the_position_layout() {
         got,
         GOLDEN_TPOST_XXH64,
         "the .tpost encoding changed: {got:#018x} ({} bytes)",
+        bytes.len()
+    );
+}
+
+/// `golden_corpus()` followed by new documents that take the freed ids back (the reuse allocator,
+/// moon#1221 review): smallest free id first, so the index ends hole-free and the encoding is the
+/// in-memory numbering verbatim — no renumbering involved.
+fn golden_corpus_with_reuse() -> TextIndex {
+    let mut idx = golden_corpus();
+    let freed = idx.free_doc_ids().len() as u32;
+    assert!(freed > 100, "the golden corpus leaves holes: {freed}");
+    for d in 0..freed + 40 {
+        let body = format!(
+            "reused{} anchor ember {}",
+            d % 5,
+            "flint ".repeat((d % 4) as usize)
+        );
+        index(&mut idx, 10_000 + d, &body_frames(b"body", body));
+    }
+    assert!(idx.free_doc_ids().is_empty(), "every freed id was reused");
+    idx
+}
+
+/// xxh64 of `golden_corpus_with_reuse()`'s encoding (311,915 bytes) — the same with and without
+/// the moon#1220 renumbering (the index has no holes; both were checked when it was taken).
+const GOLDEN_REUSE_TPOST_XXH64: u64 = 0x0e9d_e59f_a98b_a6de;
+
+/// moon#1226: a doc-id-reuse case in the golden set — reused ids interleave with old ones in
+/// every posting, and the file must still round-trip and stay stable.
+#[test]
+fn tpost_bytes_of_a_reused_id_corpus_are_pinned() {
+    let _serial = SERIAL.lock();
+    let idx = golden_corpus_with_reuse();
+    let bytes = moon::text::postings_persist::encode_index(&idx);
+    let got = xxhash_rust::xxh64::xxh64(&bytes, 0);
+    eprintln!(
+        "golden reuse .tpost: {} bytes, xxh64 {got:#018x}",
+        bytes.len()
+    );
+    let p = moon::text::postings_persist::decode(&bytes).expect("decode");
+    assert_eq!(
+        p.next_doc_id,
+        idx.next_doc_id(),
+        "hole-free: ids written as they are"
+    );
+    assert_eq!(
+        got,
+        GOLDEN_REUSE_TPOST_XXH64,
+        "the reused-id .tpost encoding changed: {got:#018x} ({} bytes)",
         bytes.len()
     );
 }
@@ -112,6 +174,7 @@ fn vm_rss() -> u64 {
 #[cfg(target_os = "linux")]
 #[test]
 fn positions_cost_bytes_per_entry_not_a_vec_each() {
+    let _serial = SERIAL.lock();
     const DOCS: u32 = 120_000;
     const TOKENS: u32 = 24;
     // A 60-word vocabulary: every posting is tens of thousands of entries long, so per-posting

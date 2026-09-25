@@ -743,6 +743,92 @@ if should_run "list"; then
     assert_match "RPOPLPUSH dest"      LRANGE lst:rl-d 0 -1
     assert_match "RPOPLPUSH miss"      RPOPLPUSH lst:rl-absent lst:rl-d
     assert_match "RPOPLPUSH arity"     RPOPLPUSH lst:rl
+    # moon#1209 (WS10): LPOS option errors decided by name first, with redis's
+    # texts; LMOVE k k rotates in place and keeps the key's TTL.
+    rcli RPUSH {l1209}:l a b a c >/dev/null 2>&1; mcli RPUSH {l1209}:l a b a c >/dev/null 2>&1
+    assert_match "LPOS unknown option"   LPOS {l1209}:l a FOO bar
+    assert_match "LPOS RANK 0"           LPOS {l1209}:l a RANK 0
+    assert_match "LPOS COUNT abc"        LPOS {l1209}:l a COUNT abc
+    assert_match "LPOS MAXLEN abc"       LPOS {l1209}:l a MAXLEN abc
+    # moon#1226: the two moon#1209 rows test-consistency.sh has and this file
+    # did not -- a negative COUNT, and RANK -1 COUNT 0 (every match, tail first).
+    assert_match "LPOS COUNT -1"         LPOS {l1209}:l a COUNT -1
+    assert_match "LPOS RANK -1 COUNT 0"  LPOS {l1209}:l a RANK -1 COUNT 0
+    # moon#1226: counted pops on a listpack are one cut from the end.
+    for c in rcli mcli; do
+        $c DEL {p1226}:l >/dev/null 2>&1
+        $c RPUSH {p1226}:l a 1 bb 22 "$(printf 'w%.0s' {1..60})" ccc -7 d 4444 e >/dev/null 2>&1
+    done
+    assert_match "RPOP k 3 (listpack)"   RPOP {p1226}:l 3
+    assert_match "LMPOP RIGHT COUNT 2"   LMPOP 1 {p1226}:l RIGHT COUNT 2
+    assert_match "LPOP k 2 (listpack)"   LPOP {p1226}:l 2
+    assert_match "pops left"             LRANGE {p1226}:l 0 -1
+    assert_match "RPOP past the end"     RPOP {p1226}:l 100
+    rcli RPUSH {l1209}:rot a >/dev/null 2>&1; mcli RPUSH {l1209}:rot a >/dev/null 2>&1
+    rcli EXPIRE {l1209}:rot 100 >/dev/null 2>&1; mcli EXPIRE {l1209}:rot 100 >/dev/null 2>&1
+    assert_match "LMOVE k k rotates"     LMOVE {l1209}:rot {l1209}:rot LEFT RIGHT
+    assert_match "LMOVE k k keeps TTL"   PERSIST {l1209}:rot
+
+    # moon#1226: an LREM that removes nothing / an LINSERT with a missing pivot
+    # is not a write, so a WATCHing EXEC still runs (redis 7.0.15).
+    # Prints the EXEC reply's first line (`*1` ran, `*-1` aborted) after WATCH on
+    # the list, the mutation on ANOTHER connection, then MULTI / SET / EXEC.
+    watch_exec_after() {
+        local port="$1" enc="$2"; shift 2
+        redis-cli -p "$port" DEL {wn}:l {wn}:x >/dev/null 2>&1 || true
+        if [[ "$enc" == linkedlist ]]; then
+            redis-cli -p "$port" RPUSH {wn}:l a b c "$(printf 'w%.0s' {1..80})" >/dev/null 2>&1 || true
+        else
+            redis-cli -p "$port" RPUSH {wn}:l a b c >/dev/null 2>&1 || true
+        fi
+        exec 4<>"/dev/tcp/127.0.0.1/${port}" || { echo "__CONNECT_FAILED__:${port}"; return 0; }
+        printf 'WATCH {wn}:l\r\n' >&4
+        local line="" out="NONE" i
+        IFS= read -r -t 2 line <&4 || true
+        redis-cli -p "$port" "$@" >/dev/null 2>&1 || true
+        printf 'MULTI\r\nSET {wn}:x 1\r\nEXEC\r\n' >&4
+        for i in 1 2 3; do IFS= read -r -t 2 line <&4 || break; done   # +OK +QUEUED, then the EXEC header
+        out="${line%$'\r'}"
+        exec 4>&-
+        echo "$out"
+    }
+    assert_same_watch() {
+        local desc="$1"; shift
+        TOTAL=$((TOTAL + 1))
+        local r m
+        r="$(watch_exec_after "$PORT_REDIS" "$@")"
+        m="$(watch_exec_after "$PORT_RUST" "$@")"
+        if [[ "$r" == "$m" ]]; then
+            PASS=$((PASS + 1))
+        else
+            FAIL=$((FAIL + 1))
+            echo "  FAIL: $desc"
+            echo "    REDIS: $r"
+            echo "    MOON:  $m"
+        fi
+    }
+    assert_same_watch "WATCH: LREM removing nothing (moon#1226)"  listpack LREM {wn}:l 0 zz
+    assert_same_watch "WATCH: LINSERT missing pivot (moon#1226)"  listpack LINSERT {wn}:l BEFORE zz x
+    assert_same_watch "WATCH: LREM removing nothing, linkedlist"  linkedlist LREM {wn}:l -1 zz
+    assert_same_watch "WATCH: LREM that removes aborts [control]" listpack LREM {wn}:l 1 a
+    # moon#1211 (WS10): OBJECT FREQ grows once per access under lfu-log-factor 0;
+    # MEMORY USAGE and OBJECT FREQ are NOTOUCH.
+    for c in rcli mcli; do
+        $c CONFIG SET maxmemory-policy allkeys-lfu >/dev/null 2>&1
+        $c CONFIG SET lfu-log-factor 0 >/dev/null 2>&1
+        $c DEL {f1211}:k >/dev/null 2>&1
+        $c SET {f1211}:k v >/dev/null 2>&1
+        for _ in 1 2 3 4 5 6 7 8 9 10; do $c GET {f1211}:k >/dev/null 2>&1; done
+    done
+    assert_match "OBJECT FREQ per access" OBJECT FREQ {f1211}:k
+    for c in rcli mcli; do
+        for _ in 1 2 3 4 5; do $c MEMORY USAGE {f1211}:k >/dev/null 2>&1; done
+    done
+    assert_match "MEMORY USAGE NOTOUCH"  OBJECT FREQ {f1211}:k
+    for c in rcli mcli; do
+        $c CONFIG SET maxmemory-policy noeviction >/dev/null 2>&1
+        $c CONFIG SET lfu-log-factor 10 >/dev/null 2>&1
+    done
 fi
 
 # ===========================================================================
@@ -823,6 +909,10 @@ if should_run "set"; then
     assert_match "SISMEMBER after SMOVE" SISMEMBER {s}:mvdst m1
     assert_moon_ok "SPOP"              SPOP s:k1
     assert_moon_ok "SRANDMEMBER"       SRANDMEMBER {s}:A
+    # moon#1226: a negative count on a listpack set answers from a per-member
+    # table; on a one-member set the reply is deterministic.
+    rcli SADD {s}:one only >/dev/null 2>&1; mcli SADD {s}:one only >/dev/null 2>&1
+    assert_match "SRANDMEMBER -3 (one member)" SRANDMEMBER {s}:one -3
     assert_moon_ok "SMEMBERS"          SMEMBERS {s}:A
     assert_moon_ok "SSCAN"             SSCAN {s}:A 0
 fi
@@ -1331,6 +1421,18 @@ if should_run "stream"; then
     assert_moon "XREAD BLOCK rejects leading zeros" \
         "ERR timeout is not an integer or out of range" \
         XREAD BLOCK 0300 STREAMS stream:k1 '$'
+
+    # moon#1249: XSETID below the stream's top ITEM is refused with redis's
+    # text, and the XADD * after it re-issues no id already in the stream (moon
+    # accepted the XSETID and the XADD * then overwrote 99999999999999-5). A
+    # far-future ms keeps XADD * on that ms, so both servers assign the same id.
+    rcli DEL stream:xsetid >/dev/null 2>&1; mcli DEL stream:xsetid >/dev/null 2>&1
+    rcli XADD stream:xsetid 99999999999999-5 f orig5 >/dev/null 2>&1
+    mcli XADD stream:xsetid 99999999999999-5 f orig5 >/dev/null 2>&1
+    assert_match "XSETID below the top item (moon#1249)" XSETID stream:xsetid 99999999999999-0
+    assert_match "XADD * after a refused XSETID (moon#1249)" XADD stream:xsetid '*' f new
+    assert_match "XRANGE keeps the top entry (moon#1249)" XRANGE stream:xsetid - +
+    assert_match "XSETID at the top item (moon#1249)" XSETID stream:xsetid 99999999999999-6
 fi
 
 # ===========================================================================
@@ -1785,6 +1887,110 @@ if should_run "pubsub"; then
     # so this row guards the wiring; the two-live-subscriber case that actually
     # exposes the counting bug is tests/pubsub_resp3_push.rs::ps14.
     assert_match "PUBSUB NUMPAT (none)" PUBSUB NUMPAT
+
+    # moon#1234: DEL/UNLINK/GETDEL publish `del` (class g) once per REMOVED
+    # key, plain, spanning and in MULTI; moon published nothing. Captured on a
+    # raw connection subscribed to __keyevent@0__:del; see test-consistency.sh
+    # for the Lua row.
+    keyevent_del_capture() {
+        local port="$1" order="$2"; shift 2
+        redis-cli -p "$port" CONFIG SET notify-keyspace-events KEA >/dev/null 2>&1 || true
+        exec 3<>"/dev/tcp/127.0.0.1/${port}" || { echo "__CONNECT_FAILED__:${port}"; return 0; }
+        printf 'SUBSCRIBE __keyevent@0__:del\r\n' >&3
+        local line="" keys="" state=0 i
+        for i in 1 2 3 4 5 6 7 8; do
+            IFS= read -r -t 2 line <&3 || break
+            [[ "${line%$'\r'}" == ":1" ]] && break
+        done
+        printf '%s\n' "$@" | redis-cli -p "$port" >/dev/null 2>&1 || true
+        while IFS= read -r -t 1 line <&3; do
+            line="${line%$'\r'}"
+            case "$state" in
+                2) keys="${keys}${line} "; state=0 ;;
+                1) state=2 ;;
+                *) [[ "$line" == "__keyevent@0__:del" ]] && state=1 ;;
+            esac
+        done
+        exec 3>&-
+        redis-cli -p "$port" CONFIG SET notify-keyspace-events "" >/dev/null 2>&1 || true
+        if [[ "$order" == sorted ]]; then
+            printf '%s' "$keys" | tr ' ' '\n' | sed '/^$/d' | sort | tr '\n' ' '
+        else
+            printf '%s' "$keys"
+        fi
+    }
+    # Compare two captured transcripts as one row.
+    assert_same_capture() {
+        local desc="$1" redis_out="$2" moon_out="$3"
+        TOTAL=$((TOTAL + 1))
+        if [[ "$redis_out" == "$moon_out" ]]; then
+            PASS=$((PASS + 1))
+        else
+            FAIL=$((FAIL + 1))
+            echo "  FAIL: $desc"
+            echo "    REDIS: $redis_out"
+            echo "    MOON:  $moon_out"
+        fi
+    }
+    for c in rcli mcli; do
+        $c DEL {kn}:a {kn}:b {kn}:c {kn}:t >/dev/null 2>&1
+        $c SET {kn}:a 1 >/dev/null 2>&1
+        $c RPUSH {kn}:b x >/dev/null 2>&1
+        $c SET {kn}:c 3 >/dev/null 2>&1
+        for i in 1 2 3 4 5 6 7 8; do $c DEL kn:span:$i >/dev/null 2>&1; done
+        for i in 1 3 5 7; do $c SET kn:span:$i v >/dev/null 2>&1; done
+    done
+    assert_same_capture "keyevent del: DEL/UNLINK/GETDEL (moon#1234)"         "$(keyevent_del_capture "$PORT_REDIS" seq 'DEL {kn}:a {kn}:nx {kn}:a' 'UNLINK {kn}:b' 'GETDEL {kn}:c' 'GETDEL {kn}:c')"         "$(keyevent_del_capture "$PORT_RUST"  seq 'DEL {kn}:a {kn}:nx {kn}:a' 'UNLINK {kn}:b' 'GETDEL {kn}:c' 'GETDEL {kn}:c')"
+    assert_same_capture "keyevent del: spanning DEL (moon#1234)"         "$(keyevent_del_capture "$PORT_REDIS" sorted 'DEL kn:span:1 kn:span:2 kn:span:3 kn:span:4 kn:span:5 kn:span:6 kn:span:7 kn:span:8')"         "$(keyevent_del_capture "$PORT_RUST"  sorted 'DEL kn:span:1 kn:span:2 kn:span:3 kn:span:4 kn:span:5 kn:span:6 kn:span:7 kn:span:8')"
+    rcli SET {kn}:t v >/dev/null 2>&1; mcli SET {kn}:t v >/dev/null 2>&1
+    assert_same_capture "keyevent del: MULTI DEL+UNLINK (moon#1234)"         "$(keyevent_del_capture "$PORT_REDIS" seq 'MULTI' 'DEL {kn}:t' 'UNLINK {kn}:t' 'EXEC')"         "$(keyevent_del_capture "$PORT_RUST"  seq 'MULTI' 'DEL {kn}:t' 'UNLINK {kn}:t' 'EXEC')"
+
+    # moon#1234 residual (part 3b review S1/P2): DEL/UNLINK/GETDEL of a key
+    # whose TTL has passed but that active expiry has not reaped answers :0
+    # (GETDEL nil) and publishes `expired`, never `del` — redis's
+    # expireIfNeeded deletes it first. moon answered :1 and published `del`.
+    # The capture writes the TTL'd keys with its listener in place and waits
+    # 50 ms (clears moon's idle-shard clock refresh, 10 ms). Tokens are
+    # `<event>:<key>`, sorted: an expiry tick may reap a key first, and the
+    # spanning DEL publishes from several shards.
+    keyevent_expired_capture() {
+        local port="$1" setup="$2"; shift 2
+        redis-cli -p "$port" CONFIG SET notify-keyspace-events KEA >/dev/null 2>&1 || true
+        exec 3<>"/dev/tcp/127.0.0.1/${port}" || { echo "__CONNECT_FAILED__:${port}"; return 0; }
+        printf 'SUBSCRIBE __keyevent@0__:del __keyevent@0__:expired\r\n' >&3
+        local line="" toks="" ev="" state=0 i
+        for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
+            IFS= read -r -t 2 line <&3 || break
+            [[ "${line%$'\r'}" == ":2" ]] && break
+        done
+        # The TTL'd keys are written only now, with the listener in place: an
+        # expiry tick that reaps one first publishes the same `expired`.
+        printf '%s\n' "$setup" | redis-cli -p "$port" >/dev/null 2>&1 || true
+        sleep 0.05
+        printf '%s\n' "$@" | redis-cli -p "$port" 2>&1 | tr '\n' ' '
+        while IFS= read -r -t 1 line <&3; do
+            line="${line%$'\r'}"
+            case "$state" in
+                2) toks="${toks}${ev}:${line}"$'\n'; state=0 ;;
+                1) state=2 ;;
+                *) case "$line" in
+                       __keyevent@0__:del) ev=del; state=1 ;;
+                       __keyevent@0__:expired) ev=expired; state=1 ;;
+                   esac ;;
+            esac
+        done
+        exec 3>&-
+        redis-cli -p "$port" CONFIG SET notify-keyspace-events "" >/dev/null 2>&1 || true
+        printf '| %s' "$(printf '%s' "$toks" | sed '/^$/d' | sort | tr '\n' ' ')"
+    }
+    for c in rcli mcli; do
+        $c DEL {kx}:d {kx}:u {kx}:g {kx}:m {kx}:live >/dev/null 2>&1
+        $c SET {kx}:live v >/dev/null 2>&1
+    done
+    kx_setup=$(for k in {kx}:d {kx}:u {kx}:g {kx}:m; do echo "SET $k v PX 1"; done)
+    assert_same_capture "DEL/UNLINK/GETDEL/MULTI of an expired key: :0 + expired (moon#1234)"         "$(keyevent_expired_capture "$PORT_REDIS" "$kx_setup" 'DEL {kx}:d {kx}:live' 'UNLINK {kx}:u' 'GETDEL {kx}:g' 'MULTI' 'DEL {kx}:m' 'EXEC')"         "$(keyevent_expired_capture "$PORT_RUST"  "$kx_setup" 'DEL {kx}:d {kx}:live' 'UNLINK {kx}:u' 'GETDEL {kx}:g' 'MULTI' 'DEL {kx}:m' 'EXEC')"
+    kx_setup=$(for i in 1 2 3 4 5 6 7 8; do echo "SET kx:span:$i v PX 1"; done)
+    assert_same_capture "spanning DEL of expired keys: :0 + expired (moon#1234)"         "$(keyevent_expired_capture "$PORT_REDIS" "$kx_setup" 'DEL kx:span:1 kx:span:2 kx:span:3 kx:span:4 kx:span:5 kx:span:6 kx:span:7 kx:span:8')"         "$(keyevent_expired_capture "$PORT_RUST"  "$kx_setup" 'DEL kx:span:1 kx:span:2 kx:span:3 kx:span:4 kx:span:5 kx:span:6 kx:span:7 kx:span:8')"
 fi
 
 # ===========================================================================
@@ -2270,6 +2476,26 @@ if should_run "scripting"; then
     for i in 1 2 3 4; do
         assert_match "FCALL after DELETE (key $i)" FCALL cmdset 1 "fn:d$i" x
     done
+    # moon#1235: the sequential LOAD / FLUSH replies stay redis's while the
+    # mutations are ordered across shards (the concurrent race itself is in
+    # test-consistency.sh, moon-only). Every row is a fresh connection, so a
+    # shard that kept the script / library would show up as a mismatch.
+    assert_match "SCRIPT LOAD (moon#1235)"          SCRIPT LOAD "return 'o1235'"
+    O1235_SHA=$(rcli SCRIPT LOAD "return 'o1235'")  # the oracle hashes (no sha1sum on macOS)
+    for i in 1 2 3 4; do
+        assert_match "EVALSHA after LOAD (key $i)" EVALSHA "$O1235_SHA" 1 "o1235:k$i"
+    done
+    assert_match "SCRIPT FLUSH (moon#1235)"         SCRIPT FLUSH
+    for i in 1 2 3 4; do
+        assert_match "EVALSHA after FLUSH (key $i)" EVALSHA "$O1235_SHA" 1 "o1235:k$i"
+    done
+    assert_match "SCRIPT EXISTS after FLUSH"        SCRIPT EXISTS "$O1235_SHA"
+    assert_match "FUNCTION LOAD (moon#1235)"        FUNCTION LOAD $'#!lua name=o1235lib\nredis.register_function(\'o1235f\', function(keys, args) return 7 end)\n'
+    assert_match "FUNCTION LOAD existing (moon#1235)" FUNCTION LOAD $'#!lua name=o1235lib\nredis.register_function(\'o1235f\', function(keys, args) return 7 end)\n'
+    assert_match "FUNCTION FLUSH (moon#1235)"       FUNCTION FLUSH
+    for i in 1 2 3 4; do
+        assert_match "FCALL after FUNCTION FLUSH (key $i)" FCALL o1235f 1 "o1235:k$i"
+    done
 fi
 
 # ===========================================================================
@@ -2717,9 +2943,9 @@ if should_run "vector"; then
     # vector arrives short, and every query below answers "dimension mismatch"
     # instead of exercising the filter. That makes the guard vacuous.
     KF_VEC="ABCDEFGHIJKLMNOP"
-    mcli HSET kf:1 vt 150 vec "$KF_VEC" >/dev/null 2>&1
-    mcli HSET kf:2 vt 250 vec "$KF_VEC" >/dev/null 2>&1
-    mcli HSET kf:3 vt 350 vec "$KF_VEC" >/dev/null 2>&1
+    mcli HSET kf:1 vt 150 lang en vec "$KF_VEC" >/dev/null 2>&1
+    mcli HSET kf:2 vt 250 lang fr vec "$KF_VEC" >/dev/null 2>&1
+    mcli HSET kf:3 vt 350 lang en vec "$KF_VEC" >/dev/null 2>&1
     sleep 0.5
 
     # KNNFILT-01 baseline: the prefilter is applied at all (150 only).
@@ -2760,6 +2986,18 @@ if should_run "vector"; then
         PASS=$((PASS + 1)); echo "  PASS: KNNFILT-04 inverted prefilter rejected, server still alive"
     else
         FAIL=$((FAIL + 1)); echo "  FAIL: KNNFILT-04 reply='$KF_INV' ping='$KF_ALIVE' (empty ping = process aborted)"
+    fi
+
+    # KNNFILT-05 (moon#1238): an inline TAG prefilter with exactly one match
+    # among three. At `--shards > 1` the KNN scatter used to drop the prefix and
+    # answer all three keys (it filtered only at `--shards 1`).
+    TOTAL=$((TOTAL + 1))
+    KF_TAG=$(mcli FT.SEARCH knnfilt '@lang:{fr}=>[KNN 4 @vec $q]' PARAMS 2 q "$KF_VEC" DIALECT 2 2>&1)
+    KF_NT=$(echo "$KF_TAG" | grep -c '^kf:' || true)
+    if [ "$KF_NT" -eq 1 ] && echo "$KF_TAG" | qgrep -q '^kf:2$'; then
+        PASS=$((PASS + 1)); echo "  PASS: KNNFILT-05 inline tag prefilter -> kf:2 only (shards=$SHARDS)"
+    else
+        FAIL=$((FAIL + 1)); echo "  FAIL: KNNFILT-05 expected kf:2 only, got $KF_NT keys (3 = prefilter dropped): $KF_TAG"
     fi
 
     mcli FT.DROPINDEX knnfilt DD >/dev/null 2>&1

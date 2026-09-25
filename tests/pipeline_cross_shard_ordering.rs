@@ -66,7 +66,9 @@ impl Drop for Moon {
 }
 
 fn spawn_moon(shards: &str) -> Moon {
-    let bin = std::path::PathBuf::from(env!("CARGO_BIN_EXE_moon"));
+    // `MOON_BIN` first (moon#1226): a shared target dir makes the cargo
+    // binary whatever the last build there produced.
+    let bin = common::find_moon_binary();
     let (child, port) = common::spawn_listening(|port| {
         let tmp_dir = std::env::temp_dir().join(format!("moon-pipeorder-{port}"));
         let _ = std::fs::create_dir_all(&tmp_dir);

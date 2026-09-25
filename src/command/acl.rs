@@ -1,4 +1,5 @@
-use std::sync::{Arc, RwLock};
+use parking_lot::RwLock;
+use std::sync::Arc;
 
 use bytes::Bytes;
 
@@ -51,9 +52,7 @@ pub fn handle_acl(
         // Sorted, because `list_users` sorts — a client diffing the set across
         // calls should not see order churn.
         "USERS" => {
-            let Ok(table) = acl_table.read() else {
-                return Frame::Error(Bytes::from_static(b"ERR internal ACL error"));
-            };
+            let table = acl_table.read();
             let names: Vec<Frame> = table
                 .list_users()
                 .iter()
@@ -76,9 +75,7 @@ pub fn handle_acl(
         "HELP" => crate::command::help_text::help_or_empty("ACL"),
 
         "LIST" => {
-            let Ok(table) = acl_table.read() else {
-                return Frame::Error(Bytes::from_static(b"ERR internal ACL error"));
-            };
+            let table = acl_table.read();
             let lines: Vec<Frame> = table
                 .list_users()
                 .iter()
@@ -99,9 +96,7 @@ pub fn handle_acl(
                     ));
                 }
             };
-            let Ok(table) = acl_table.read() else {
-                return Frame::Error(Bytes::from_static(b"ERR internal ACL error"));
-            };
+            let table = acl_table.read();
             match table.get_user(&username) {
                 None => Frame::Null,
                 Some(user) => {
@@ -223,9 +218,7 @@ pub fn handle_acl(
                     }
                 }
             }
-            let Ok(mut table) = acl_table.write() else {
-                return Frame::Error(Bytes::from_static(b"ERR internal ACL error"));
-            };
+            let mut table = acl_table.write();
             // #978: a category Moon cannot resolve is an ERROR, never a
             // silent no-op. It used to resolve to an empty command list, and
             // `-@bitmap` on a `+@all` user then rebuilt the permission set as
@@ -245,9 +238,7 @@ pub fn handle_acl(
             }
             let mut count = 0i64;
             let mut revoked: Vec<String> = Vec::new();
-            let Ok(mut table) = acl_table.write() else {
-                return Frame::Error(Bytes::from_static(b"ERR internal ACL error"));
-            };
+            let mut table = acl_table.write();
             for arg in args {
                 if let Some(name) = extract_str(arg) {
                     if name == "default" {
@@ -347,9 +338,7 @@ pub fn handle_acl(
                     b"ERR ACL file not configured. Use --aclfile or CONFIG SET aclfile",
                 )),
                 Some(path) => {
-                    let Ok(table) = acl_table.read() else {
-                        return Frame::Error(Bytes::from_static(b"ERR internal ACL error"));
-                    };
+                    let table = acl_table.read();
                     // Blocking save -- acceptable for admin command.
                     // Routed through `acl::io::acl_save`, which is now
                     // atomic via `atomic_write_durable` (task #49): temp +
@@ -386,9 +375,7 @@ pub fn handle_acl(
                         // without a `default` line must not brick the server.
                         let requirepass = runtime_config.read().requirepass.clone();
                         new_table.ensure_default_user(requirepass.as_deref());
-                        let Ok(mut table) = acl_table.write() else {
-                            return Frame::Error(Bytes::from_static(b"ERR internal ACL error"));
-                        };
+                        let mut table = acl_table.write();
                         // Preserve the Arc<AtomicU64> version handle that
                         // existing connections hold references to — if we
                         // replaced via `*table = new_table`, their handles
@@ -771,7 +758,7 @@ mod tests {
         assert_eq!(result, Frame::SimpleString(Bytes::from_static(b"OK")));
 
         // Verify alice still exists after load
-        let loaded_table = table.read().unwrap();
+        let loaded_table = table.read();
         assert!(loaded_table.get_user("alice").is_some());
     }
 
@@ -903,7 +890,7 @@ mod tests {
             "got {msg:?}"
         );
         assert!(
-            table.read().expect("lock").get_user("bin").is_none(),
+            table.read().get_user("bin").is_none(),
             "the passwordless +@all prefix must not be committed"
         );
     }
@@ -954,7 +941,7 @@ mod tests {
             Frame::BulkString(Bytes::from_static(b"~rw:* %R~r:* %W~w:*"))
         );
         let line = {
-            let t = table.read().expect("lock");
+            let t = table.read();
             crate::acl::io::user_to_acl_line(t.get_user("sel").expect("created"))
         };
         assert!(line.contains(" ~rw:* %R~r:* %W~w:* "), "LIST line: {line}");

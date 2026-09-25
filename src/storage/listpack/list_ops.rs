@@ -3,25 +3,23 @@
 //! These live in a child module only because `listpack.rs` is already past
 //! CLAUDE.md's 1500-line ceiling. As a descendant this module sees the parent's
 //! private buffer and helpers, so nothing here re-derives an entry width: every
-//! walk goes through `decode_entry_ref_at`, the function every other scan in
-//! the parent uses.
+//! walk goes through `decode_entry_ref_at` (forward) or `decode_backlen`
+//! (backward), the functions every other scan in the parent uses.
 //!
-//! # Every walk here goes FORWARD
+//! # Direction
 //!
-//! Stepping backwards over an entry means decoding its backlen from the tail,
-//! and moon's backlen is not decodable from the tail once it is wider than one
-//! byte: `encode_backlen_into` writes the 7-bit groups low group first
-//! (`[low | 0x80, high]`, pinned by `byte_exactness_tests`), while
-//! `decode_backlen` -- like Redis's `lpDecodeBacklen` -- reads them the other
-//! way (`[high, low | 0x80]`). The two agree only for entries shorter than 128
-//! bytes. Today's policy keeps every listpack element at or under 64 bytes, so
-//! no live listpack has a wider entry, but nothing in this module may depend on
-//! that staying true: a policy change (the Redis 8 KB list budget the
-//! authority reserves a field for) would turn a tail walk into silent
-//! corruption. A forward walk only ever needs an entry's WIDTH, which
-//! `backlen_size` derives from the head, so it is correct for every entry.
-//! Listpacks are bounded by the policy (128 entries by default), so the cost of
-//! reaching the tail from the head is a bounded, allocation-free width walk.
+//! Until moon#1206 moon wrote a multi-byte backlen low group first while
+//! `decode_backlen` -- like Redis's `lpDecodeBacklen` -- reads it high group
+//! first, so a walk BACKWARDS over an entry of 128 bytes or more landed off an
+//! entry boundary, and every walk in this module went forward from the head.
+//! moon#1206 (WS10) writes redis's order, which `backlen_tests` pins byte for
+//! byte against redis 7.0.15's DUMP, so stepping back over one backlen is now
+//! correct for every entry width. The tail pops use it (moon#1226):
+//! [`Listpack::pop_end`] at the back is O(1) and [`Listpack::pop_n`] at the
+//! back is O(n), where each used to seek from the head. The index-addressed
+//! reads (`offset_of`, `get_ref`, `range_refs`) still seek from the head; a
+//! listpack is bounded by the policy (128 entries by default), so that is a
+//! bounded, allocation-free width walk.
 //!
 //! The shape of every operation below is Redis's: work on the flat byte buffer
 //! in place, move each kept byte at most once, and never decode an entry into an
@@ -30,8 +28,8 @@
 use bytes::Bytes;
 
 use super::{
-    LP_TERMINATOR, Listpack, ListpackRef, ListpackRefIter, decode_entry_ref_at, encode_entry,
-    seek_to,
+    LP_TERMINATOR, Listpack, ListpackRef, ListpackRefIter, decode_backlen, decode_entry_ref_at,
+    encode_entry, seek_to,
 };
 
 /// Byte offset of the first entry: `total_bytes: u32` + `num_elements: u16`.
@@ -165,21 +163,60 @@ impl Listpack {
         }
     }
 
+    /// Byte offset of the first of the last `n` entries, found by stepping
+    /// back over `n` backlens from the terminator (moon#1226) -- no head seek.
+    ///
+    /// Sound for every entry width since moon#1206 (module docs). `None` when
+    /// `n > len()`, or when a backlen does not land on an entry boundary,
+    /// which a listpack moon built never produces; callers then fall back to
+    /// the forward seek rather than trust the bytes.
+    fn offset_from_back(&self, n: usize) -> Option<usize> {
+        if n > self.len() {
+            return None;
+        }
+        let mut pos = self.data.len() - 1; // the terminator
+        for _ in 0..n {
+            if pos <= LP_FIRST_ENTRY {
+                return None;
+            }
+            let (entry_len, backlen_len) = decode_backlen(&self.data, pos);
+            let start = pos.checked_sub(backlen_len.checked_add(entry_len)?)?;
+            if start < LP_FIRST_ENTRY {
+                return None;
+            }
+            // The entry must end exactly where the backlen said it starts.
+            if decode_entry_ref_at(&self.data, start).1 != pos {
+                return None;
+            }
+            pos = start;
+        }
+        Some(pos)
+    }
+
     /// Remove and return the entry at one END, materialised exactly once.
     ///
     /// `LPOP`/`RPOP`/`LMOVE` on a listpack. The back used to be reached TWICE
     /// from the head -- `iter_refs().nth(len - 1)` to read it, then
-    /// `remove_at(len - 1)` to seek to it again; one seek finds both the entry
-    /// and its extent. The one allocation is the reply's own copy
-    /// (`tests/list_pop_alloc_942.rs` pins that floor): it must own its bytes,
-    /// because the buffer is mutated out from under them on the next line.
+    /// `remove_at(len - 1)` to seek to it again (moon#1174 §2) -- and then
+    /// once, still from the head. It is now one step back over the last
+    /// entry's backlen (moon#1226): O(1) whatever the length. The one
+    /// allocation is the reply's own copy (`tests/list_pop_alloc_942.rs` pins
+    /// that floor): it must own its bytes, because the buffer is mutated out
+    /// from under them on the next line.
     pub fn pop_end(&mut self, front: bool) -> Option<Bytes> {
         let len = self.len();
         let index = if front { 0 } else { len.checked_sub(1)? };
         if index >= len {
             return None;
         }
-        let pos = self.offset_of(index)?;
+        let pos = if front {
+            self.offset_of(index)?
+        } else {
+            match self.offset_from_back(1) {
+                Some(pos) => pos,
+                None => self.offset_of(index)?,
+            }
+        };
         let (value, next) = {
             let (entry, next) = decode_entry_ref_at(&self.data, pos);
             (entry.to_bytes(), next)
@@ -187,6 +224,67 @@ impl Listpack {
         self.data.drain(pos..next);
         self.update_header_sub(1);
         Some(value)
+    }
+
+    /// Remove up to `n` entries from one END, handing each to `sink` in pop
+    /// order -- head first from the front, TAIL first from the back -- and
+    /// return how many were removed. `LPOP key n`, `RPOP key n` and `LMPOP …
+    /// COUNT n` on a listpack (moon#1226).
+    ///
+    /// Those used to be `n` calls of [`Self::pop_end`], and the back one sought
+    /// from the head each time: `RPOP k 100` on a 128-entry listpack was 100
+    /// head seeks (~6,000 entry steps) plus 100 buffer moves. Here the cut is
+    /// found once -- by stepping back over `n` backlens at the back, by the
+    /// forward walk that decodes the entries at the front -- and the buffer is
+    /// shortened ONCE. Each entry is materialised exactly once, as the reply's
+    /// own copy.
+    pub fn pop_n(&mut self, front: bool, n: usize, mut sink: impl FnMut(Bytes)) -> usize {
+        let len = self.len();
+        let n = n.min(len);
+        if n == 0 {
+            return 0;
+        }
+        if front {
+            let mut it = ListpackRefIter {
+                data: &self.data,
+                pos: LP_FIRST_ENTRY,
+                remaining: n,
+            };
+            let mut taken = 0usize;
+            for entry in it.by_ref() {
+                sink(entry.to_bytes());
+                taken += 1;
+            }
+            let cut = it.pos;
+            self.data.drain(LP_FIRST_ENTRY..cut);
+            self.update_header_sub(u16::try_from(taken).unwrap_or(u16::MAX));
+            return taken;
+        }
+        let Some(cut) = self.offset_from_back(n) else {
+            // Unreachable for a listpack moon built (see `offset_from_back`);
+            // the forward-seeking single pops are correct regardless.
+            let mut taken = 0usize;
+            while taken < n {
+                match self.pop_end(false) {
+                    Some(v) => sink(v),
+                    None => break,
+                }
+                taken += 1;
+            }
+            return taken;
+        };
+        // Validated above, so this walk lands on every boundary it steps to.
+        let mut pos = self.data.len() - 1;
+        while pos > cut {
+            let (entry_len, backlen_len) = decode_backlen(&self.data, pos);
+            let start = pos - backlen_len - entry_len;
+            sink(decode_entry_ref_at(&self.data, start).0.to_bytes());
+            pos = start;
+        }
+        self.data.truncate(cut);
+        self.data.push(LP_TERMINATOR);
+        self.update_header_sub(u16::try_from(n).unwrap_or(u16::MAX));
+        n
     }
 
     /// Hand the entries at several indices to `f`, in ONE forward walk.
@@ -482,10 +580,11 @@ mod tests {
         assert_eq!(lp.offset_of(len + 1), None);
     }
 
-    /// moon's multi-byte backlen is written low group first, which the
-    /// tail-side decoder cannot read (module docs). Every operation in this
-    /// module must therefore stay correct on WIDE entries -- the ones a looser
-    /// policy would admit -- at every position, tail included.
+    /// Every operation in this module must stay correct on WIDE entries --
+    /// the ones a looser policy would admit, with multi-byte backlens -- at
+    /// every position, tail included. The tail pops now step BACK over those
+    /// backlens (moon#1226), which is exactly what was unsound before moon#1206
+    /// (module docs).
     #[test]
     fn every_operation_is_correct_on_wide_entries() {
         let values: Vec<Vec<u8>> = vec![
@@ -510,6 +609,28 @@ mod tests {
         assert_eq!(tail.pop_end(false).as_deref(), Some(values[4].as_slice()));
         assert_eq!(tail.pop_end(false).as_deref(), Some(values[3].as_slice()));
         assert_eq!(contents(&tail), values[..3].to_vec());
+        assert_eq!(tail.data, build(&values[..3]).data);
+
+        for n in 0..=values.len() + 1 {
+            let mut back = build(&values);
+            let mut got = Vec::new();
+            assert_eq!(
+                back.pop_n(false, n, |v| got.push(v.to_vec())),
+                n.min(values.len())
+            );
+            let keep = values.len() - n.min(values.len());
+            let mut want: Vec<Vec<u8>> = values[keep..].to_vec();
+            want.reverse();
+            assert_eq!(got, want, "pop_n(back, {n})");
+            assert_eq!(back.data, build(&values[..keep]).data, "pop_n(back, {n})");
+
+            let mut front = build(&values);
+            let mut got = Vec::new();
+            front.pop_n(true, n, |v| got.push(v.to_vec()));
+            let cut = n.min(values.len());
+            assert_eq!(got, values[..cut].to_vec(), "pop_n(front, {n})");
+            assert_eq!(front.data, build(&values[cut..]).data, "pop_n(front, {n})");
+        }
 
         let mut rem = build(&values);
         assert_eq!(rem.remove_matches(b"x", true, 1), 1);
@@ -642,7 +763,11 @@ mod tests {
         let head = super::super::head_seeks();
         let back = lp.pop_end(false).expect("non-empty");
         assert_eq!(back.as_ref(), values.last().unwrap().as_slice());
-        assert_eq!(super::super::head_seeks() - head, 1, "one seek per pop");
+        assert_eq!(
+            super::super::head_seeks() - head,
+            0,
+            "the back pop steps over one backlen; it never seeks from the head (moon#1226)"
+        );
         let front = lp.pop_end(true).expect("non-empty");
         assert_eq!(front.as_ref(), values[0].as_slice());
         assert_eq!(contents(&lp), values[1..values.len() - 1].to_vec());
@@ -650,6 +775,44 @@ mod tests {
         let mut empty = Listpack::new();
         assert!(empty.pop_end(true).is_none());
         assert!(empty.pop_end(false).is_none());
+    }
+
+    /// moon#1226: a counted pop is ONE cut. From the back it takes no head
+    /// seek at all (it steps back over `n` backlens); it used to be `n` pops,
+    /// each seeking the tail from the head -- `RPOP k 100` on 128 entries was
+    /// 100 seeks. Agrees with `n` single pops on every count, both ends.
+    #[test]
+    fn pop_n_is_one_cut_and_agrees_with_single_pops() {
+        let values: Vec<Vec<u8>> = (0..128)
+            .map(|i| {
+                if i % 7 == 0 {
+                    vec![b'w'; 100 + i]
+                } else {
+                    format!("{}", i * 1000).into_bytes()
+                }
+            })
+            .collect();
+        for front in [false, true] {
+            for n in [0usize, 1, 2, 64, 127, 128, 129, 1000] {
+                let mut single = build(&values);
+                let mut want = Vec::new();
+                for _ in 0..n {
+                    match single.pop_end(front) {
+                        Some(v) => want.push(v),
+                        None => break,
+                    }
+                }
+                let mut bulk = build(&values);
+                let mut got = Vec::new();
+                let mark = super::super::head_seeks();
+                let taken = bulk.pop_n(front, n, |v| got.push(v));
+                let seeks = super::super::head_seeks() - mark;
+                assert_eq!(taken, want.len(), "front={front} n={n}");
+                assert_eq!(got, want, "front={front} n={n}");
+                assert_eq!(bulk.data, single.data, "front={front} n={n}");
+                assert_eq!(seeks, 0, "front={front} n={n}: {seeks} head seeks");
+            }
+        }
     }
 
     #[test]
