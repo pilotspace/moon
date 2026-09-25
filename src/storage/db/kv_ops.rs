@@ -20,6 +20,16 @@ pub(crate) enum ExpiredRemoval {
     NotYetDue,
 }
 
+/// What deleting one key found (moon#1234): `Live` is counted and publishes
+/// `del`; `Expired` — only a hot copy whose TTL had passed, reaped — is not
+/// counted and publishes `expired`, as redis's `expireIfNeeded` does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum KeyDeletion {
+    Absent,
+    Live,
+    Expired,
+}
+
 impl Database {
     /// Get an entry by key, performing lazy expiration.
     ///
@@ -205,11 +215,24 @@ impl Database {
     ///
     /// Every read path that can reach a cold key must call this first, or it
     /// will answer nil for a key that was only ever mid-spill.
+    ///
+    /// An EXPIRED record is retired too (moon#1255), and the answer is
+    /// `false`. The key is logically absent, and every caller then answers it
+    /// absent (a read) or creates it afresh (`get_or_create*` via
+    /// `settle_not_live`). The record, however, is still its request's
+    /// authorization to publish. Left in place, the completion publishes the
+    /// expired slot as the key's cold entry behind the new value and logs its
+    /// `MOON.SPILLED` after the write, and replaying that marker drops the
+    /// acknowledged write. A record whose payload does not rehydrate but has
+    /// not expired is left alone: its spill file is the key's only copy.
     pub fn promote_inflight_if_present(&mut self, key: &[u8], now_ms: u64) -> bool {
         if self.spill_inflight_is_empty() {
             return false;
         }
         let Some(entry) = self.spill_inflight_entry(key, now_ms) else {
+            if self.spill_inflight_expired(key, now_ms) {
+                self.spill_inflight_forget(key);
+            }
             return false;
         };
         self.spill_inflight_forget(key);
@@ -693,9 +716,11 @@ impl Database {
         // now-unreferenced spill file, exactly as it does for a DEL.
         //
         // Also drops the moon#466 pending-byte charge, which `used_memory = 0`
-        // above would otherwise contradict.
-        self.spill_inflight.clear();
-        self.spill_inflight_bytes = 0;
+        // above would otherwise contradict. The retired requests are still in
+        // flight and still write their slots: each is superseded, as by a DEL
+        // of its key, so a rewrite folded before its completion still writes
+        // the flushed key a head DEL (moon#1253).
+        self.spill_inflight_supersede_all();
     }
 
     /// The hot-key sketch (sampling hooks, HOTKEYS command, coordinator
@@ -807,13 +832,14 @@ impl Database {
         self.remove_hot(key)
     }
 
-    /// Remove hot + cold copies; returns `true` when EITHER existed, so
+    /// Remove hot + cold copies; returns `true` when a LIVE copy existed, so
     /// DEL/UNLINK count spilled keys as removed (Redis semantics: the key
-    /// logically exists). A cold entry that is already TTL-expired (judged
-    /// from the cached `ColdLocation::ttl_ms`, no disk read) is reclaimed
-    /// but NOT counted — DEL of a logically-expired key answers 0. The
-    /// removed hot entry, when present, is also returned so UNLINK can
-    /// size its async-drop decision.
+    /// logically exists). A copy that is already TTL-expired is reclaimed
+    /// but NOT counted — DEL of a logically-expired key answers 0: a cold
+    /// entry judged from the cached `ColdLocation::ttl_ms` (no disk read),
+    /// and a hot entry by the db clock (moon#1234; redis's `expireIfNeeded`
+    /// deletes it before DEL looks). The removed hot entry, when present, is
+    /// also returned — `DEL` tells an expired one by it.
     pub fn remove_counting_cold(&mut self, key: &[u8]) -> (bool, Option<Entry>) {
         crate::admin::metrics_setup::record_keyspace_change();
         let now_ms = self.cached_now_ms;
@@ -827,10 +853,8 @@ impl Database {
         let inflight_alive = self.spill_inflight_alive(key, now_ms);
         let had_cold = self.remove_cold_only(key);
         let hot = self.remove_hot(key);
-        (
-            hot.is_some() || (had_cold && cold_alive) || inflight_alive,
-            hot,
-        )
+        let hot_alive = hot.as_ref().is_some_and(|e| !e.is_expired_at(now_ms));
+        (hot_alive || (had_cold && cold_alive) || inflight_alive, hot)
     }
 
     /// `UNLINK` for one key (moon#1190): [`Self::remove_counting_cold`]'s
@@ -841,6 +865,12 @@ impl Database {
     /// expiry-index unindex, and a queue push. The value's bytes stay charged
     /// to `used_memory` until the shard tick's drain frees them.
     pub fn unlink(&mut self, key: &[u8]) -> bool {
+        self.unlink_key(key) == KeyDeletion::Live
+    }
+
+    /// [`Self::unlink`], classified: a hot copy whose TTL had passed is
+    /// reaped through the same lazy-free path, as [`KeyDeletion::Expired`].
+    pub(crate) fn unlink_key(&mut self, key: &[u8]) -> KeyDeletion {
         crate::admin::metrics_setup::record_keyspace_change();
         let now_ms = self.cached_now_ms;
         let cold_alive = self
@@ -851,7 +881,13 @@ impl Database {
         let inflight_alive = self.spill_inflight_alive(key, now_ms);
         let had_cold = self.remove_cold_only(key);
         let hot = self.remove_hot_lazily(key);
-        hot || (had_cold && cold_alive) || inflight_alive
+        if hot == Some(false) || (had_cold && cold_alive) || inflight_alive {
+            KeyDeletion::Live
+        } else if hot == Some(true) {
+            KeyDeletion::Expired
+        } else {
+            KeyDeletion::Absent
+        }
     }
 
     /// [`Self::remove`] for a server-initiated deletion (active expiry)
@@ -861,7 +897,7 @@ impl Database {
     pub(crate) fn remove_lazily(&mut self, key: &[u8]) -> bool {
         crate::admin::metrics_setup::record_keyspace_change();
         let _ = self.remove_cold_only(key);
-        self.remove_hot_lazily(key)
+        self.remove_hot_lazily(key).is_some()
     }
 
     /// [`Self::remove_hot`] without the O(n) parts for a large value: no
@@ -869,16 +905,16 @@ impl Database {
     /// hash-field index is unindexed from the value's cached minimum rather
     /// than a scan of its TTL sidecar (a missed pair is harmless there —
     /// stale-early pairs self-heal, see `hash_expiry_index`).
-    fn remove_hot_lazily(&mut self, key: &[u8]) -> bool {
-        let Some(entry) = self.data.remove(key) else {
-            return false;
-        };
+    /// `None` when no hot entry, else whether it had expired (moon#1234).
+    fn remove_hot_lazily(&mut self, key: &[u8]) -> Option<bool> {
+        let entry = self.data.remove(key)?;
+        let expired = entry.is_expired_at(self.cached_now_ms);
         if entry.has_expiry() {
             self.expiry_index_remove(entry.expires_at_ms(), key);
         }
         self.forget_removed_hash_ttl(key, &entry);
         self.lazy_free_or_drop(key.len(), entry, true);
-        true
+        Some(expired)
     }
 
     /// Unindex a just-removed entry from the hash-field index. For a value

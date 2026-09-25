@@ -482,8 +482,8 @@ fn handle_push(args: &[Frame], key_prefix: &Bytes, db_index: usize) -> Frame {
     // Encoding here is a pure function call, not a nested `with_shard*`
     // call, so it doesn't violate the non-reentrancy contract.
     type PushResult = Result<Option<(StreamId, Vec<u8>)>, Frame>;
-    let push_result: PushResult =
-        crate::shard::slice::with_shard_db(db_index, |db| match db.get_stream_mut(&eff_key) {
+    let push_result: PushResult = crate::shard::slice::with_shard_db(db_index, |db| {
+        match db.get_stream_mut(&eff_key) {
             Ok(Some(stream)) => {
                 if !stream.durable {
                     Ok(None)
@@ -496,13 +496,21 @@ fn handle_push(args: &[Frame], key_prefix: &Bytes, db_index: usize) -> Frame {
                         msg_id.seq,
                         &fields,
                     );
-                    let msg_id = stream.add(msg_id, fields);
+                    // moon#1249: `add` refuses an ID at or below `last_id`.
+                    // `next_auto_id` is above it unless the sequence wrapped
+                    // at the last possible ID — redis's wording for that.
+                    let Some(msg_id) = stream.add(msg_id, fields) else {
+                        return Err(Frame::Error(Bytes::from_static(
+                            b"ERR The stream has exhausted the last possible ID, unable to add more items",
+                        )));
+                    };
                     Ok(Some((msg_id, payload)))
                 }
             }
             Ok(None) => Ok(None),
             Err(e) => Err(e),
-        });
+        }
+    });
 
     match push_result {
         Ok(Some((msg_id, payload))) => {

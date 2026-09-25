@@ -404,8 +404,10 @@ fn estimate_serialized_length(entry: &Entry) -> usize {
         }
         RedisValueRef::SortedSetListpack(lp) => lp.total_bytes(),
         // moon#1163: the stream's measured size (entries, groups, PELs) —
-        // the constant 64 answered 114 for a 200K-entry stream.
-        RedisValueRef::Stream(s) => s.estimate_memory(),
+        // the constant 64 answered 114 for a 200K-entry stream. O(1): the
+        // billed size plus any undrained delta, equal to the O(n)
+        // `estimate_memory` scan (`stream_accounting_tests` pins it).
+        RedisValueRef::Stream(s) => s.memory_usage(),
     }
 }
 

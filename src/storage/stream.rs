@@ -276,6 +276,23 @@ impl Stream {
         STREAM_BASE + self.billed
     }
 
+    /// The stream's size for `MEMORY USAGE` and `DEBUG OBJECT`, in O(1): what
+    /// the ledger carries plus the mutations not yet drained into it.
+    ///
+    /// Equal to [`Self::estimate_memory`], the O(n) scan these used to run
+    /// (200K entries meant a 200K-node walk per `MEMORY USAGE`), by the
+    /// moon#1163 lockstep: every mutating method keeps `unbilled` exact, so
+    /// `billed + unbilled` IS the contents' size. After any stream command
+    /// `unbilled` is 0 (each drains before it returns) and this is
+    /// [`Self::billed_memory`], the identity `stream_accounting_tests` pins;
+    /// an MQ push that does not drain (`Stream::add` from the MQ paths) is
+    /// still counted here. Clamped at 0 like the drain.
+    #[inline]
+    pub fn memory_usage(&self) -> usize {
+        let contents = signed(self.billed).saturating_add(self.unbilled).max(0);
+        STREAM_BASE + usize::try_from(contents).unwrap_or(0)
+    }
+
     /// Measure `billed` against the contents, once, for a stream that enters
     /// the keyspace whole (a loader built it field by field, or it arrives
     /// from RESTORE / the cold tier / a replica). Its first charge is then the
@@ -320,23 +337,42 @@ impl Stream {
         validate_explicit_id_against(self.last_id, id)
     }
 
-    /// Add an entry. Returns the assigned ID. Caller must ensure id > last_id.
+    /// Add an entry at `id`. Returns `Some(id)`, or `None` when `id` is not
+    /// greater than the stream's last ID — that is REFUSED and nothing
+    /// changes.
+    ///
+    /// Every reader relies on IDs only growing (`XADD *`, `XREAD $`, a
+    /// group's `>`), and an `id <= last_id` can name an entry that is still
+    /// in the stream. This used to insert it anyway: the `BTreeMap` insert
+    /// REPLACED that entry, `length` counted it a second time and `last_id`
+    /// moved backward (moon#1249, reached through an `XSETID` below the top
+    /// item). The command paths validate first (`XADD` refuses with its own
+    /// error, the MQ paths take `next_auto_id`), so a refusal here is the
+    /// backstop, not a reply.
     ///
     /// moon#1160: every field and value is stored as an exact-size copy —
     /// the callers (`XADD`, the MQ paths) hand in `Bytes` sliced from the
     /// request buffer, and storing those kept the whole buffer alive.
-    pub fn add(&mut self, id: StreamId, mut fields: Vec<(Bytes, Bytes)>) -> StreamId {
+    pub fn add(&mut self, id: StreamId, mut fields: Vec<(Bytes, Bytes)>) -> Option<StreamId> {
+        if id <= self.last_id {
+            return None;
+        }
+        // No live path leaves an entry above `last_id` (`XSETID` refuses to
+        // go below the top item), but a loaded value is only as good as its
+        // file: probe with the entry API — the same one traversal an insert
+        // costs — so an occupied slot is refused rather than replaced.
+        let std::collections::btree_map::Entry::Vacant(slot) = self.entries.entry(id) else {
+            return None;
+        };
         for (f, v) in &mut fields {
             *f = detach(f);
             *v = detach(v);
         }
         self.unbilled += signed(entry_cost(&fields));
-        if let Some(old) = self.entries.insert(id, fields) {
-            self.unbilled -= signed(entry_cost(&old));
-        }
+        slot.insert(fields);
         self.length += 1;
         self.last_id = id;
-        id
+        Some(id)
     }
 
     /// Range query [start..=end] with optional count limit.
@@ -974,7 +1010,8 @@ impl Stream {
 
     /// The stream's true size, by scan (O(n)): the fixed part plus every
     /// entry, group, consumer and PEL slot at the same prices the O(1) deltas
-    /// use (moon#1163). What `MEMORY USAGE` reports; the ledger bills
+    /// use (moon#1163). The oracle the O(1) figures are tested against;
+    /// `MEMORY USAGE` reports [`Self::memory_usage`] and the ledger bills
     /// [`Self::billed_memory`].
     pub fn estimate_memory(&self) -> usize {
         STREAM_BASE + self.contents_scan()
@@ -1082,6 +1119,40 @@ mod tests {
         assert_eq!(id.to_bytes().as_ref(), b"100-3");
     }
 
+    /// moon#1249: `add` never overwrites. An ID at or below `last_id` is
+    /// refused with nothing changed — not the entry, not `length`, not
+    /// `last_id`, not the billing delta — and so is an occupied slot above a
+    /// `last_id` a damaged load left too low. Pre-fix every one of these
+    /// replaced the entry and counted it again.
+    #[test]
+    fn add_refuses_an_id_at_or_below_last_id_and_never_overwrites() {
+        let f =
+            |v: &'static str| vec![(Bytes::from_static(b"f"), Bytes::from_static(v.as_bytes()))];
+        let top = StreamId { ms: 5, seq: 5 };
+        let mut s = Stream::new();
+        assert_eq!(s.add(top, f("orig")), Some(top));
+        let billed = s.take_unbilled();
+        assert!(billed > 0);
+
+        for id in [top, StreamId { ms: 5, seq: 4 }, StreamId::ZERO] {
+            assert_eq!(s.add(id, f("new")), None, "{id:?} <= last_id");
+        }
+        // A `last_id` lowered under the top entry — what an XSETID below the
+        // top item did before moon#1249, or what a damaged file can carry.
+        s.last_id = StreamId { ms: 5, seq: 0 };
+        assert_eq!(s.add(top, f("new")), None, "occupied slot above last_id");
+
+        assert_eq!(s.entries.len(), 1);
+        assert_eq!(s.length, 1, "a refused add is not counted");
+        assert_eq!(s.entries[&top][0].1, Bytes::from_static(b"orig"));
+        assert_eq!(s.last_id, StreamId { ms: 5, seq: 0 }, "last_id untouched");
+        assert_eq!(s.take_unbilled(), 0, "a refused add bills nothing");
+
+        let next = StreamId { ms: 5, seq: 6 };
+        assert_eq!(s.add(next, f("next")), Some(next));
+        assert_eq!((s.length, s.last_id), (2, next));
+    }
+
     #[test]
     fn test_stream_add_and_range() {
         let mut s = Stream::new();
@@ -1105,7 +1176,9 @@ mod tests {
     #[test]
     fn test_stream_range_with_count() {
         let mut s = Stream::new();
-        for i in 0..10 {
+        // IDs start at 1-0: 0-0 is no stream's ID (XADD refuses it, and
+        // `add` refuses anything at or below `last_id`, moon#1249).
+        for i in 1..=10 {
             s.add(
                 StreamId { ms: i, seq: 0 },
                 vec![(Bytes::from("f"), Bytes::from("v"))],
@@ -1113,14 +1186,14 @@ mod tests {
         }
         let range = s.range(StreamId::ZERO, StreamId::MAX, Some(3));
         assert_eq!(range.len(), 3);
-        assert_eq!(range[0].0.ms, 0);
-        assert_eq!(range[2].0.ms, 2);
+        assert_eq!(range[0].0.ms, 1);
+        assert_eq!(range[2].0.ms, 3);
     }
 
     #[test]
     fn test_stream_range_rev() {
         let mut s = Stream::new();
-        for i in 0..5 {
+        for i in 1..=5 {
             s.add(
                 StreamId { ms: i, seq: 0 },
                 vec![(Bytes::from("f"), Bytes::from("v"))],
@@ -1128,8 +1201,8 @@ mod tests {
         }
         let rev = s.range_rev(StreamId::ZERO, StreamId::MAX, Some(2));
         assert_eq!(rev.len(), 2);
-        assert_eq!(rev[0].0.ms, 4);
-        assert_eq!(rev[1].0.ms, 3);
+        assert_eq!(rev[0].0.ms, 5);
+        assert_eq!(rev[1].0.ms, 4);
     }
 
     #[test]
@@ -1163,7 +1236,7 @@ mod tests {
     #[test]
     fn test_stream_trim_maxlen_exact() {
         let mut s = Stream::new();
-        for i in 0..10 {
+        for i in 1..=10 {
             s.add(
                 StreamId { ms: i, seq: 0 },
                 vec![(Bytes::from("f"), Bytes::from("v"))],
@@ -1173,15 +1246,15 @@ mod tests {
         assert_eq!(removed, 5);
         assert_eq!(s.entries.len(), 5);
         assert_eq!(s.length, 5);
-        // Should have kept entries 5-9
-        assert!(s.entries.contains_key(&StreamId { ms: 5, seq: 0 }));
-        assert!(!s.entries.contains_key(&StreamId { ms: 4, seq: 0 }));
+        // Should have kept entries 6-10
+        assert!(s.entries.contains_key(&StreamId { ms: 6, seq: 0 }));
+        assert!(!s.entries.contains_key(&StreamId { ms: 5, seq: 0 }));
     }
 
     #[test]
     fn test_stream_trim_maxlen_approximate() {
         let mut s = Stream::new();
-        for i in 0..10 {
+        for i in 1..=10 {
             s.add(
                 StreamId { ms: i, seq: 0 },
                 vec![(Bytes::from("f"), Bytes::from("v"))],
@@ -1200,22 +1273,22 @@ mod tests {
     #[test]
     fn test_stream_trim_minid() {
         let mut s = Stream::new();
-        for i in 0..10 {
+        for i in 1..=10 {
             s.add(
                 StreamId { ms: i, seq: 0 },
                 vec![(Bytes::from("f"), Bytes::from("v"))],
             );
         }
-        let removed = s.trim_minid(StreamId { ms: 5, seq: 0 }, false);
+        let removed = s.trim_minid(StreamId { ms: 6, seq: 0 }, false);
         assert_eq!(removed, 5);
         assert_eq!(s.entries.len(), 5);
-        assert!(s.entries.contains_key(&StreamId { ms: 5, seq: 0 }));
+        assert!(s.entries.contains_key(&StreamId { ms: 6, seq: 0 }));
     }
 
     #[test]
     fn test_stream_delete() {
         let mut s = Stream::new();
-        for i in 0..5 {
+        for i in 1..=5 {
             s.add(
                 StreamId { ms: i, seq: 0 },
                 vec![(Bytes::from("f"), Bytes::from("v"))],

@@ -5,12 +5,16 @@
 //! capture-free path, so on `ae21476` the restored snapshot holds post-epoch
 //! values for keys owned by the connection's shard.
 //!
-//! The overlap between the save and the writes is observed, never assumed
-//! (PR #1233 review: a fixed 30 ms sleep plus blocks of 16 MSETs failed 3 of
-//! 4 debug runs because the save ended first). Each attempt waits until every
-//! shard has armed the epoch, probes `rdb_bgsave_in_progress` after every
-//! MSET, and is retried on a larger keyspace when too few MSETs landed inside
-//! the epoch. Only an attempt that overlapped is restored and judged.
+//! The overlap between the save and the writes is made, not raced. The
+//! server runs with `MOON_TEST_SNAPSHOT_HOLD_FILE` (test-only): while that
+//! file exists, no shard advances the armed epoch's segments, so every key
+//! stays pending and every overwrite must be captured. The test waits until
+//! every shard armed the epoch, then pipelines its spanning MSETs, each
+//! followed by an `INFO persistence` that must still see the save running,
+//! and only then releases the hold. Racing the save instead failed twice:
+//! - PR #1233 review: a fixed 30 ms sleep, 3 of 4 debug runs;
+//! - PR #1242's hosted Check at `5d1a37c`: 4-12 MSETs inside epochs of
+//!   125-1022 ms, over 400K-3.2M keys, in all five attempts.
 //!
 //! Pin the binary: `MOON_BIN=<moon> cargo test --test perf_ws8_mset_bgsave_capture`.
 
@@ -25,11 +29,17 @@ use common::{Conn, ServerGuard, encode};
 
 const SHARDS: usize = 4;
 
+/// The hold file: while it exists, a running save's epoch cannot advance.
+fn hold_file(dir: &std::path::Path) -> std::path::PathBuf {
+    dir.join("snapshot.hold")
+}
+
 fn spawn(dir: &std::path::Path) -> (ServerGuard, u16) {
     std::fs::create_dir_all(dir).expect("create test dir");
     let bin = common::find_moon_binary();
     let (child, port) = common::spawn_listening(|port| {
         std::process::Command::new(&bin)
+            .env("MOON_TEST_SNAPSHOT_HOLD_FILE", hold_file(dir))
             .args([
                 "--port",
                 &port.to_string(),
@@ -119,17 +129,11 @@ fn wrong_pre_keys(c: &mut Conn, n: u64) -> Vec<String> {
     wrong
 }
 
-/// Attempts before the test gives up on overlapping a save with the writes.
-const MAX_ATTEMPTS: u32 = 5;
-/// Keys in the first attempt; each retry doubles it, up to [`MAX_KEYS`]
-/// (400K, 800K, 1.6M, 3.2M, 3.2M: small `v<j>` values, ~60 MB of snapshot
-/// per 1.6M keys).
-const FIRST_KEYS: u64 = 100_000 * SHARDS as u64;
-const MAX_KEYS: u64 = 8 * FIRST_KEYS;
-/// Spanning MSETs that must land inside one epoch for it to count: 512
-/// overwritten pairs, about 128 of them on the connection's own shard (the
-/// capture this test exists for), as many as the original threshold.
-const MIN_OVERLAP: u64 = 16;
+/// Keys preloaded: 100K per shard, each `v<j>` at the epoch's start.
+const KEYS: u64 = 100_000 * SHARDS as u64;
+/// Spanning MSETs inside the held epoch: 512 overwritten pairs, about 128 of
+/// them on the connection's own shard (the capture this test exists for).
+const MSETS: u64 = 16;
 /// Pairs per spanning MSET.
 const PAIRS: u64 = 32;
 
@@ -167,92 +171,66 @@ fn spanning_mset_during_bgsave_keeps_epoch_start_values() {
     let (mut server, port) = spawn(&dir);
     let mut c = Conn::open(port);
     let mut probe = Conn::open(port);
+    preload(&mut c, 0, KEYS);
 
-    // Keys `0..n` hold `v<j>`, the value every key has when the next BGSAVE
-    // starts; `dirty` keys were overwritten by an attempt that did not count
-    // and are restored before the next one.
-    let mut n = 0u64;
-    let mut dirty = 0u64;
-    let mut attempts: Vec<String> = Vec::new();
-    let mut overlapped: Option<u64> = None;
-    for attempt in 1..=MAX_ATTEMPTS {
-        let target = (FIRST_KEYS << (attempt - 1)).min(MAX_KEYS);
-        preload(&mut c, 0, dirty.min(n));
-        preload(&mut c, n, target);
-        n = target;
-        // A `.tmp` left by an earlier save must not read as this one armed.
-        for s in 0..SHARDS {
-            let _ = std::fs::remove_file(dir.join(format!("shard-{s}.rrdshard.tmp")));
-        }
+    // Hold the epoch, start the save, wait until every shard armed it.
+    std::fs::write(hold_file(&dir), b"").expect("create the hold file");
+    assert!(c.send(&["BGSAVE"]).contains("Background saving started"));
+    assert!(
+        wait_until_armed(&dir, &mut probe),
+        "the held BGSAVE ended before every shard armed it: the hold did not hold"
+    );
 
-        let started = Instant::now();
-        assert!(c.send(&["BGSAVE"]).contains("Background saving started"));
-        if !wait_until_armed(&dir, &mut probe) {
-            wait_bgsave_done(&mut probe);
-            attempts.push(format!("{n} keys: the save ended before every shard armed"));
-            dirty = 0;
-            continue;
-        }
-        let armed_ms = started.elapsed().as_millis();
-
-        // Overwrite with spanning MSETs until the epoch ends, probing after
-        // every one: each MSET is pipelined with an `INFO persistence` on the
-        // same connection, which runs only once the MSET has completed on
-        // every owner. An MSET followed by a probe that still sees the save
-        // running landed inside the epoch.
-        let deadline = Instant::now() + Duration::from_secs(300);
-        let mut j = 0u64;
-        let mut during = 0u64;
-        loop {
+    // Spanning MSETs over the epoch-start keys, each followed by a probe on
+    // the same connection. A probe runs only once the MSET before it has
+    // completed on every owner, so a probe that still sees the save running
+    // proves that MSET landed inside the epoch.
+    let mut j = 0u64;
+    let batch: Vec<Vec<String>> = (0..MSETS)
+        .map(|_| {
             let mut cmd: Vec<String> = vec!["MSET".into()];
             for _ in 0..PAIRS {
-                cmd.push(key(j % n));
+                cmd.push(key(j % KEYS));
                 cmd.push("new".into());
                 j += 1;
             }
-            let parts: Vec<&str> = cmd.iter().map(String::as_str).collect();
-            let reply = c.pipeline(&[parts.as_slice(), &["INFO", "persistence"]]);
-            assert!(reply.starts_with("+OK\r\n"), "spanning MSET: {reply:.200}");
-            if !reply
-                .lines()
-                .any(|l| l.trim() == "rdb_bgsave_in_progress:1")
-            {
-                break;
-            }
-            during += 1;
-            assert!(Instant::now() < deadline, "BGSAVE outlived the writer");
-        }
-        assert_eq!(last_bgsave_status(&mut probe), "ok", "BGSAVE failed");
-        attempts.push(format!(
-            "{n} keys: armed after {armed_ms} ms, {during} spanning MSETs inside the epoch, \
-             save took {} ms",
-            started.elapsed().as_millis()
-        ));
-        if during >= MIN_OVERLAP {
-            overlapped = Some(during);
-            break;
-        }
-        dirty = j;
+            cmd
+        })
+        .collect();
+    let mut parts: Vec<Vec<&str>> = Vec::with_capacity(2 * batch.len());
+    for cmd in &batch {
+        parts.push(cmd.iter().map(String::as_str).collect());
+        parts.push(vec!["INFO", "persistence"]);
     }
-    eprintln!("attempts: {attempts:#?}");
-    let Some(during) = overlapped else {
-        panic!(
-            "no BGSAVE in {MAX_ATTEMPTS} attempts overlapped {MIN_OVERLAP} spanning MSETs: \
-             {attempts:#?}"
-        );
-    };
+    let refs: Vec<&[&str]> = parts.iter().map(Vec::as_slice).collect();
+    let reply = c.pipeline(&refs);
+    let oks = reply.matches("+OK\r\n").count() as u64;
+    let inside = reply
+        .lines()
+        .filter(|l| l.trim() == "rdb_bgsave_in_progress:1")
+        .count() as u64;
+    assert_eq!(oks, MSETS, "spanning MSETs: {reply:.300}");
+    assert_eq!(
+        inside, MSETS,
+        "every spanning MSET must land inside the held epoch ({inside} of {MSETS} did)"
+    );
+    assert!(bgsave_in_progress(&mut probe), "the hold must still hold");
 
-    // Crash, restart from the snapshot alone: the file on disk is the save
-    // the writes overlapped (each save replaces it).
+    // Release the epoch and let the save finish.
+    std::fs::remove_file(hold_file(&dir)).expect("release the hold");
+    wait_bgsave_done(&mut probe);
+    assert_eq!(last_bgsave_status(&mut probe), "ok", "BGSAVE failed");
+
+    // Crash, restart from the snapshot alone.
     server.kill_now();
     common::wait_for_port_down(port);
     let (_server2, port2) = spawn(&dir);
     let mut c2 = Conn::open(port2);
-    let wrong = wrong_pre_keys(&mut c2, n);
+    let wrong = wrong_pre_keys(&mut c2, KEYS);
     assert!(
         wrong.is_empty(),
-        "{} of {n} keys hold a post-epoch value after restoring the BGSAVE taken \
-         under {during} spanning MSETs (first: {:?})",
+        "{} of {KEYS} keys hold a post-epoch value after restoring the BGSAVE taken \
+         under {MSETS} spanning MSETs (first: {:?})",
         wrong.len(),
         &wrong[..wrong.len().min(5)]
     );

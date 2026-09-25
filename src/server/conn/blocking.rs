@@ -2524,11 +2524,18 @@ pub(crate) fn format_blocking_score(score: f64) -> String {
 ///   Side-effects handled by this path:
 ///   - maxmemory eviction (`evict_to_budget`)
 ///   - AOF append (raw RESP bytes, zero re-serialization)
+///   - the `set` keyspace notification
+///   - CLIENT TRACKING invalidation of the written key, for every OTHER
+///     connection's tracking (moon#1166: `invalidation::invalidate_inline_write`,
+///     through the same global table and lock-free pre-filter as every other
+///     write — this path is no longer switched off while anyone tracks)
 ///
 ///   Side-effects intentionally skipped (caller gates via `can_inline_writes`):
 ///   - ACL permission check (caller sets `can_inline_writes = false` unless
 ///     `cached_acl_unrestricted`)
-///   - CLIENT TRACKING invalidation (guarded by `!tracking_state.enabled`)
+///   - a writer that is ITSELF a tracking connection: it stands down to
+///     generic dispatch (`!tracking_state.enabled`), so this path never
+///     serves a tracking client's own write
 ///   - MULTI transaction queue (guarded by `!in_multi`)
 ///   - Metrics / slowlog recording (matches existing inline GET behaviour)
 ///
@@ -2574,7 +2581,12 @@ pub(crate) fn try_inline_dispatch(
     // `can_inline_writes` in `handler_monoio/mod.rs` for the full invariant.
     spill_sender_active: bool,
     // moon#1166: the writing connection's id, for the CLIENT TRACKING
-    // invalidation this path now performs itself (NOLOOP needs the writer).
+    // invalidation this path now performs itself. DEFENSIVE: NOLOOP only
+    // ever suppresses a tracker's OWN write, and a tracking connection never
+    // inlines writes (`can_inline_writes` carries `!tracking_state.enabled`),
+    // so on this path the id never names a NOLOOP tracker and changes no
+    // delivery. It is passed anyway so that relaxing that gate could not
+    // silently echo a NOLOOP client's own writes back to it.
     writer_client_id: u64,
     // moon#963: the connection's latency probe. This path answers `GET`/`SET`
     // without entering generic dispatch, so it has to time them itself — and

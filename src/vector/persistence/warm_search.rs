@@ -660,10 +660,12 @@ impl WarmSearchSegment {
     /// candidates with (near-)exact distances decoded from the f16 sidecar,
     /// then re-sort ascending. No-op when this segment has no sidecar.
     ///
-    /// Mirrors `ImmutableSegment::rerank_exact` exactly (same distance
-    /// conventions: true squared L2 for `DistanceMetric::L2`, `2 - 2*cos`
-    /// for the unit-sphere metrics) so cross-segment merge stays consistent
-    /// whether a candidate came from a HOT or WARM segment.
+    /// Mirrors `ImmutableSegment::rerank_exact` exactly — both score a row
+    /// through `hnsw::prepared::exact_f16_distance` (true squared L2 for
+    /// `DistanceMetric::L2`, `2 - 2*cos` for the unit-sphere metrics, and the
+    /// ADC estimate kept where the f16 row cannot improve on it) — so
+    /// cross-segment merge stays consistent whether a candidate came from a
+    /// HOT or WARM segment (moon#1242: this copy scored every row itself).
     fn rerank_exact(
         &self,
         candidates: &mut SmallVec<[SearchResult; 32]>,
@@ -701,14 +703,10 @@ impl WarmSearchSegment {
             let Some(vec_f16) = raw.get(start..start + dim) else {
                 continue; // Out-of-range id: keep the ADC estimate.
             };
-            if is_l2 {
-                result.distance = (dist_table.f16_l2)(q_ref, vec_f16);
-            } else {
-                let (dot, xsq) = (dist_table.f16_dot_normsq)(q_ref, vec_f16);
-                if xsq > 0.0 {
-                    let cos = (dot / xsq.sqrt()).clamp(-1.0, 1.0);
-                    result.distance = 2.0 - 2.0 * cos;
-                }
+            if let Some(d) =
+                crate::vector::hnsw::prepared::exact_f16_distance(dist_table, q_ref, vec_f16, is_l2)
+            {
+                result.distance = d;
             }
         }
         candidates.sort_unstable();

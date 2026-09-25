@@ -480,6 +480,306 @@ fn check(shards: usize) {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Compare as sets: whether the active-expiry tick reaped a key first
+/// decides which path published its `expired`, and so its position.
+fn assert_same_keys(mut got: Vec<String>, mut want: Vec<String>, what: &str) {
+    got.sort();
+    want.sort();
+    assert_eq!(got, want, "{what}");
+}
+
+fn keyevent(events: &[Event], event: &str) -> Vec<String> {
+    let ch = format!("__keyevent@0__:{event}");
+    events
+        .iter()
+        .filter(|(c, _)| *c == ch)
+        .map(|(_, k)| k.clone())
+        .collect()
+}
+
+/// Past the moment every key written just before it has expired by the
+/// SHARD's clock, too: moon judges expiry against a cached clock that an
+/// idle shard refreshes every 10 ms, so a key written with `PX 1` can still
+/// read as live a few milliseconds later. 15 ms clears that; the 100 ms
+/// active-expiry tick reaps some keys first either way — those publish the
+/// same `expired` and answer the same `:0`, so the contract holds for both.
+const PAST_EXPIRY: Duration = Duration::from_millis(15);
+
+/// Keys `ws18:<tag>:<i>`, at least `per_shard` on every shard.
+fn covering_keys(tag: &str, shards: usize, per_shard: usize) -> Vec<String> {
+    let mut on = vec![0usize; shards];
+    let mut keys = Vec::new();
+    let mut i = 0usize;
+    while on.iter().any(|&n| n < per_shard) {
+        let k = format!("ws18:{tag}:{i}");
+        let s = moon::shard::dispatch::key_to_shard(k.as_bytes(), shards);
+        if on[s] < per_shard {
+            on[s] += 1;
+            keys.push(k);
+        }
+        i += 1;
+    }
+    keys
+}
+
+/// Keys written with `PX 1`, two on every shard.
+fn expired_keys(p: &mut Probe, tag: &str) -> Vec<String> {
+    let keys = covering_keys(&format!("exp:{tag}"), p.shards, 2);
+    for k in &keys {
+        assert_eq!(
+            p.cmd.cmd(&["SET", k, "v", "PX", "1"]),
+            Resp::Simple("OK".into())
+        );
+    }
+    std::thread::sleep(PAST_EXPIRY);
+    keys
+}
+
+/// moon#1234 residual (part 3b memory review S1/P2): DEL, UNLINK and GETDEL of
+/// a key whose TTL has passed but that active expiry has not reaped yet.
+///
+/// redis 7.0.15, same bytes (see FIX3B-CM NOTES.md): `expireIfNeeded`
+/// deletes the key BEFORE the command looks, so the reply is `:0` (GETDEL
+/// nil), the key publishes `expired` (class `x`), and nothing publishes
+/// `del`. Red on `5d1a37c`: every such key answered `:1` and published `del`.
+fn check_expired(shards: usize) {
+    let (guard, port, dir) = spawn(shards);
+    let mut p = Probe::new(port, shards, "KEA");
+
+    // Plain DEL and UNLINK, one key at a time.
+    let keys: Vec<String> = (0..12).map(|i| format!("ws18:exp:one:{i}")).collect();
+    let mut replies = Vec::new();
+    for (i, k) in keys.iter().enumerate() {
+        assert_eq!(
+            p.cmd.cmd(&["SET", k, "v", "PX", "1"]),
+            Resp::Simple("OK".into())
+        );
+        std::thread::sleep(PAST_EXPIRY);
+        replies.push(p.cmd.cmd(&[if i % 2 == 0 { "DEL" } else { "UNLINK" }, k]));
+    }
+    let events = p.settle();
+    assert!(
+        replies.iter().all(|r| *r == Resp::Int(0)),
+        "--shards {shards}: DEL/UNLINK of an expired key must answer :0, got {replies:?}"
+    );
+    assert_eq!(
+        keyevent(&events, "del"),
+        Vec::<String>::new(),
+        "--shards {shards}: DEL/UNLINK of an expired key published `del`"
+    );
+    assert_same_keys(
+        keyevent(&events, "expired"),
+        keys.clone(),
+        &format!("--shards {shards}: one `expired` per expired key"),
+    );
+
+    // A spanning DEL and UNLINK: expired keys on every shard, one live key
+    // and one absent. Only the live key counts and publishes `del`.
+    for cmd in ["DEL", "UNLINK"] {
+        let live = format!("ws18:exp:live:{cmd}");
+        p.cmd.cmd(&["SET", &live, "v"]);
+        p.settle();
+        let keys = expired_keys(&mut p, cmd);
+        let mut argv: Vec<&str> = vec![cmd];
+        argv.extend(keys.iter().map(String::as_str));
+        argv.push(&live);
+        argv.push("ws18:exp:absent");
+        let (reply, events) = p.run(&argv);
+        assert_eq!(reply, Resp::Int(1), "--shards {shards}: spanning {cmd}");
+        assert_eq!(
+            keyevent(&events, "del"),
+            vec![live.clone()],
+            "--shards {shards}: spanning {cmd} publishes `del` for the live key only"
+        );
+        assert_same_keys(
+            keyevent(&events, "expired"),
+            keys,
+            &format!("--shards {shards}: spanning {cmd} `expired`"),
+        );
+    }
+
+    // MULTI/EXEC and Lua run the same body.
+    let k = "ws18:exp:tx";
+    p.cmd.cmd(&["SET", k, "v", "PX", "1"]);
+    std::thread::sleep(PAST_EXPIRY);
+    assert_eq!(p.cmd.cmd(&["MULTI"]), Resp::Simple("OK".into()));
+    assert_eq!(p.cmd.cmd(&["DEL", k]), Resp::Simple("QUEUED".into()));
+    let (reply, events) = p.run(&["EXEC"]);
+    assert_eq!(reply, Resp::Array(Some(vec![Resp::Int(0)])), "EXEC");
+    assert!(keyevent(&events, "del").is_empty(), "MULTI: {events:?}");
+    assert_eq!(keyevent(&events, "expired"), vec![k.to_string()], "MULTI");
+
+    let k = "{ws18exp}lua";
+    p.cmd.cmd(&["SET", k, "v", "PX", "1"]);
+    std::thread::sleep(PAST_EXPIRY);
+    let (reply, events) = p.run(&["EVAL", "return redis.call('DEL', KEYS[1])", "1", k]);
+    assert_eq!(reply, Resp::Int(0), "EVAL DEL");
+    assert!(keyevent(&events, "del").is_empty(), "Lua: {events:?}");
+    assert_eq!(keyevent(&events, "expired"), vec![k.to_string()], "Lua");
+
+    // A script queued inside MULTI runs through the EXEC executor, not the
+    // script arm: it must see the same clock.
+    let k = "{ws18exp}txlua";
+    p.cmd.cmd(&["SET", k, "v", "PX", "1"]);
+    std::thread::sleep(PAST_EXPIRY);
+    assert_eq!(p.cmd.cmd(&["MULTI"]), Resp::Simple("OK".into()));
+    assert_eq!(
+        p.cmd
+            .cmd(&["EVAL", "return redis.call('DEL', KEYS[1])", "1", k]),
+        Resp::Simple("QUEUED".into())
+    );
+    let (reply, events) = p.run(&["EXEC"]);
+    assert_eq!(
+        reply,
+        Resp::Array(Some(vec![Resp::Int(0)])),
+        "MULTI EVAL DEL"
+    );
+    assert!(keyevent(&events, "del").is_empty(), "MULTI Lua: {events:?}");
+    assert_eq!(
+        keyevent(&events, "expired"),
+        vec![k.to_string()],
+        "MULTI Lua"
+    );
+
+    // GETDEL looks the key up for READ first, and that path hides an
+    // expired key and hands it to the active-expiry drain, which publishes
+    // `expired` on its next tick (<= 100 ms) rather than before the reply.
+    let k = "ws18:exp:getdel";
+    p.cmd.cmd(&["SET", k, "v", "PX", "1"]);
+    std::thread::sleep(PAST_EXPIRY);
+    let (reply, mut events) = p.run(&["GETDEL", k]);
+    assert_eq!(reply, Resp::Bulk(None), "GETDEL of an expired key is nil");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while keyevent(&events, "expired").is_empty() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+        events.extend(p.settle());
+    }
+    assert!(keyevent(&events, "del").is_empty(), "GETDEL: {events:?}");
+    assert_eq!(keyevent(&events, "expired"), vec![k.to_string()], "GETDEL");
+
+    drop(p);
+    drop(guard);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Every `incr.aof` under `dir`, concatenated.
+fn aof_bytes(dir: &std::path::Path) -> Vec<u8> {
+    fn walk(d: &std::path::Path, out: &mut Vec<u8>) {
+        let Ok(rd) = std::fs::read_dir(d) else {
+            return;
+        };
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                walk(&p, out);
+            } else if p.to_string_lossy().ends_with(".incr.aof") {
+                out.extend_from_slice(&std::fs::read(&p).unwrap_or_default());
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(dir, &mut out);
+    out
+}
+
+/// A DEL/UNLINK that reaps an expired key answers `:0` for it but DID delete
+/// it, so the deletion must still reach the AOF (and, through the same
+/// record, every replica — which runs no expiry of its own). Every path logs
+/// DEL/UNLINK whatever it answers except the multi-key coordinator's
+/// in-process leg, which skips a leg that removed nothing: that leg must
+/// count a reaped expired key as something (`command::key::expired_reaps`).
+/// Each key must therefore appear in the AOF twice — its `SET` and a
+/// deletion record.
+#[test]
+fn a_spanning_delete_that_reaps_expired_keys_still_logs_them_at_shards_4() {
+    let shards = 4;
+    let dir = common::unique_test_dir("ws18-del-expired-aof");
+    std::fs::create_dir_all(&dir).expect("create test dir");
+    let bin = common::find_moon_binary();
+    let d = dir.clone();
+    let (child, port) = common::spawn_listening(|port| {
+        std::process::Command::new(&bin)
+            .args([
+                "--port",
+                &port.to_string(),
+                "--dir",
+                &d.to_string_lossy(),
+                "--shards",
+                "4",
+                "--appendonly",
+                "yes",
+                "--appendfsync",
+                "always",
+                "--save",
+                "",
+                "--disk-offload",
+                "disable",
+                "--disk-free-min-pct",
+                "0",
+            ])
+            .stdout(common::server_stderr(&d))
+            .stderr(common::server_stderr(&d))
+            .spawn()
+            .expect("spawn moon")
+    });
+    let guard = ServerGuard::new(child);
+    let mut c = Client::open(port);
+    for cmd in ["DEL", "UNLINK"] {
+        let keys = covering_keys(&format!("aof:{cmd}"), shards, 2);
+        for k in &keys {
+            assert_eq!(
+                c.cmd(&["SET", k, "v", "PX", "1"]),
+                Resp::Simple("OK".into())
+            );
+        }
+        std::thread::sleep(PAST_EXPIRY);
+        let mut argv: Vec<&str> = vec![cmd];
+        argv.extend(keys.iter().map(String::as_str));
+        assert_eq!(c.cmd(&argv), Resp::Int(0), "{cmd} of expired keys");
+        // A key the DEL reaped is logged by the DEL's own leg. A key the
+        // active-expiry tick reaped first is logged by the tick
+        // (`record_reason_del`), which nothing awaits, so a loaded host can
+        // read the file before that record lands: poll, bounded.
+        let occurrences = |aof: &[u8], k: &str| {
+            let needle = format!("\r\n{k}\r\n");
+            aof.windows(needle.len())
+                .filter(|w| *w == needle.as_bytes())
+                .count()
+        };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let aof = aof_bytes(&dir);
+            let missing: Vec<(&String, usize)> = keys
+                .iter()
+                .map(|k| (k, occurrences(&aof, k)))
+                .filter(|(_, n)| *n < 2)
+                .collect();
+            if missing.is_empty() {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{cmd}: (key, occurrences) {missing:?} — each appears in the AOF \
+                 only as its SET, with no deletion record, so a replica (which \
+                 runs no expiry of its own) keeps it"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+    drop(guard);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn del_unlink_getdel_of_an_expired_key_publish_expired_at_shards_1() {
+    check_expired(1);
+}
+
+#[test]
+fn del_unlink_getdel_of_an_expired_key_publish_expired_at_shards_4() {
+    check_expired(4);
+}
+
 #[test]
 fn del_unlink_getdel_publish_del_at_shards_1() {
     check(1);

@@ -700,16 +700,30 @@ fn resolve_picks(
     let mut order: Vec<usize> = (0..picks.len()).collect();
     order.sort_unstable_by_key(|&slot| picks[slot]);
     let mut out: Vec<Option<(Bytes, Option<Bytes>)>> = vec![None; picks.len()];
+    let Some(&first) = order.first() else {
+        return Vec::new();
+    };
+    // The next position wanted, cached: a pair that is not drawn costs one
+    // compare. Re-reading `picks[order[next]]` for every pair cost 4.4 ns a
+    // step in a release build against 3.4 now, and 20 against 17 in debug
+    // (200K fields).
+    let mut want = picks[first];
     let mut next = 0usize;
     let mut pos = 0usize;
     walk_live_pairs(href, |f, v| {
-        while next < order.len() && picks[order[next]] == pos {
-            let value = with_values.then(|| v.to_reply());
-            out[order[next]] = Some((f.to_reply(), value));
-            next += 1;
+        if pos == want {
+            while next < order.len() && picks[order[next]] == pos {
+                let value = with_values.then(|| v.to_reply());
+                out[order[next]] = Some((f.to_reply(), value));
+                next += 1;
+            }
+            match order.get(next) {
+                Some(&slot) => want = picks[slot],
+                None => return false,
+            }
         }
         pos += 1;
-        next < order.len()
+        true
     });
     out.into_iter().flatten().collect()
 }
@@ -1072,12 +1086,32 @@ mod hrandfield_1171 {
             .unwrap_or(0)
     }
 
-    /// HRANDFIELD must cost well under what materializing the hash costs —
+    /// HRANDFIELD must cost well under what materializing the hash costs.
     /// HEAD `935c555` called `HashRef::entries()` (a clone of every pair) and
-    /// then built an N-element index Vec, so it cost MORE than `entries()`.
-    /// The borrowed walk stops at the drawn position and clones one pair
-    /// (measured in a debug build: ~1.6 ms vs ~85 ms per call on 200K fields;
-    /// the bound is 5x).
+    /// then built an N-element index Vec, so it cost MORE than `entries()`:
+    /// a ratio below 1 against the clone, in any build.
+    ///
+    /// Each form is bounded by what its borrowed walk structurally costs.
+    /// The walk steps over pairs up to the last drawn position and clones
+    /// only the drawn ones, so against `entries()` (a clone per pair) the
+    /// ratio is `clone / (step · reach)`. `reach` is n/2 on average for the
+    /// single field. For COUNT k, all k positions are resolved in ONE walk
+    /// (`resolve_picks`), up to the largest of k distinct uniform draws:
+    /// `n·k/(k+1)`, 5n/6 here, so this ratio is 1.2 × clone/step.
+    ///
+    /// Measured on 200K fields (clone vs step per pair; single-field and
+    /// COUNT-5 ratios):
+    ///
+    /// | Build | Clone | Step | Single | COUNT 5 |
+    /// |---|---|---|---|---|
+    /// | Linux debug | ~90 ns | 17 ns | 12-21x | 5.8-7.7x |
+    /// | Linux release-fast | ~59 ns | 3.4 ns | 80-138x | 20-23x |
+    /// | Hosted CI, debug, before the cheaper step | 144 ns | 36 ns | — | 4.8x |
+    ///
+    /// The last row failed the old common 5x bound. The single field keeps
+    /// 5x; the COUNT form gets 2x. Both still fail the HEAD path (< 1x): with
+    /// the count path materializing through `entries()` first, it measured
+    /// 0.87-0.90x, red.
     #[test]
     fn hrandfield_does_not_materialize_the_hash() {
         let mut db = Database::new();
@@ -1087,13 +1121,17 @@ mod hrandfield_1171 {
         let t_entries = best_ns(5, 5, || {
             std::hint::black_box(href.entries());
         });
-        for args in [frames(&[b"h"]), frames(&[b"h", b"5", b"WITHVALUES"])] {
+        for (args, bound) in [
+            (frames(&[b"h"]), 5),
+            (frames(&[b"h", b"5", b"WITHVALUES"]), 2),
+        ] {
             let t_rand = best_ns(5, 5, || {
                 std::hint::black_box(hrandfield_readonly(&db, std::hint::black_box(&args), now));
             });
             assert!(
-                t_rand * 5 < t_entries,
-                "HRANDFIELD ({} args) took {t_rand} ns vs {t_entries} ns to clone the hash",
+                t_rand * bound < t_entries,
+                "HRANDFIELD ({} args) took {t_rand} ns vs {t_entries} ns to clone the hash \
+                 (bound {bound}x)",
                 args.len()
             );
         }

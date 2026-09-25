@@ -91,30 +91,75 @@ fn idle_tracker_keeps_inline_set() {
     drop(tracker);
 }
 
+/// A key `<prefix>:<i>` owned by shard `shard` of `shards`.
+fn key_on_shard(prefix: &str, shard: usize, shards: usize) -> String {
+    (0..)
+        .map(|i| format!("{prefix}:{i}"))
+        .find(|k| moon::shard::dispatch::key_to_shard(k.as_bytes(), shards) == shard)
+        .unwrap()
+}
+
+/// The shard `w`'s connection lives on: the one whose key a plain SET from
+/// `w` is served INLINE for (the inline path only runs a key its own shard
+/// owns). monoio only — tokio has no inline path.
+#[cfg(feature = "runtime-monoio")]
+fn home_shard(w: &mut common::Conn, admin_port: u16, shards: usize) -> usize {
+    for s in 0..shards {
+        let k = key_on_shard("trk:home", s, shards);
+        let before = ws7::local_inline(admin_port);
+        assert_eq!(w.send(&["SET", &k, "x"]), "+OK\r\n");
+        if ws7::local_inline(admin_port) - before == 1 {
+            return s;
+        }
+    }
+    panic!("no plain SET from the writer was inlined on any of {shards} shards");
+}
+
 fn invalidations_reach_every_mode(shards: &str) {
     let srv = ws7::spawn("ws7-trk-inv", shards, &[]);
     let mut w = ws7::conn(srv.port);
+    let n_shards: usize = shards.parse().unwrap();
 
-    // Default mode, RESP3 push.
+    // Default mode, RESP3 push. The tracked key lives on the WRITER's own
+    // shard, so the SET below is eligible for the inline path — and on
+    // monoio the `local_inline` delta proves the inline path served it, so
+    // this is the inline SET's invalidation under test, not the generic
+    // path's (tokio has no inline path; there it is the generic one).
+    #[cfg(feature = "runtime-monoio")]
+    let home = home_shard(&mut w, srv.admin_port, n_shards);
+    #[cfg(not(feature = "runtime-monoio"))]
+    let home = 0;
+    let tracked = key_on_shard("trk:a", home, n_shards);
     let mut t = ws7::conn(srv.port);
     t.sock.write_all(&common::encode(&["HELLO", "3"])).unwrap();
     let _ = drain(&mut t, Duration::from_millis(200));
-    assert_eq!(w.send(&["SET", "trk:a", "1"]), "+OK\r\n");
+    assert_eq!(w.send(&["SET", &tracked, "1"]), "+OK\r\n");
     t.sock
         .write_all(&common::encode(&["CLIENT", "TRACKING", "ON"]))
         .unwrap();
     assert!(drain(&mut t, Duration::from_millis(200)).contains("+OK"));
     t.sock
-        .write_all(&common::encode(&["GET", "trk:a"]))
+        .write_all(&common::encode(&["GET", &tracked]))
         .unwrap();
     assert!(drain(&mut t, Duration::from_millis(200)).contains("$1\r\n1\r\n"));
     // An untracked key written first: no push for it.
     assert_eq!(w.send(&["SET", "trk:untracked", "x"]), "+OK\r\n");
-    assert_eq!(w.send(&["SET", "trk:a", "2"]), "+OK\r\n");
-    let got = wait_for(&mut t, "trk:a", Duration::from_secs(3));
+    let before = ws7::local_inline(srv.admin_port);
+    assert_eq!(w.send(&["SET", &tracked, "2"]), "+OK\r\n");
+    let inlined = ws7::local_inline(srv.admin_port) - before;
+    #[cfg(feature = "runtime-monoio")]
+    assert_eq!(
+        inlined, 1,
+        "the default-mode SET of {tracked} (writer's shard {home}) was not \
+         served inline, so this block would be testing the generic path's \
+         invalidation instead of the inline SET's"
+    );
+    #[cfg(not(feature = "runtime-monoio"))]
+    assert_eq!(inlined, 0, "tokio has no inline path");
+    let got = wait_for(&mut t, &tracked, Duration::from_secs(3));
     assert!(
-        got.contains("invalidate") && got.contains("trk:a"),
-        "tracked key written by a plain SET was not invalidated: {got:?}"
+        got.contains("invalidate") && got.contains(&tracked),
+        "tracked key {tracked} written by a plain SET was not invalidated: {got:?}"
     );
     assert!(
         !got.contains("trk:untracked"),
@@ -160,7 +205,13 @@ fn invalidations_reach_every_mode(shards: &str) {
     );
 
     // NOLOOP: the tracker's own write does not come back to it, another
-    // client's write does.
+    // client's write does. The tracker's own SET is never inlined — a
+    // tracking connection stands down from the inline path
+    // (`!tracking_state.enabled` in `can_inline_writes`) — so the writer id
+    // `try_inline_dispatch` passes to `invalidate_inline_write` is
+    // defensive: on that path it never names a NOLOOP tracker. What is
+    // proven here is the generic path's NOLOOP, and that a FOREIGN writer's
+    // SET (`w`, below) still reaches a NOLOOP tracker.
     let mut n = ws7::conn(srv.port);
     n.sock.write_all(&common::encode(&["HELLO", "3"])).unwrap();
     let _ = drain(&mut n, Duration::from_millis(200));
