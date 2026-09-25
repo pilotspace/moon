@@ -932,6 +932,9 @@ fn rehydrate_unpublished_spill(
     file_id: u64,
 ) {
     crate::shard::slice::with_shard_db(entry.db_index, |db| {
+        // moon#1253: this request's completion is applied (withdrawn, or its
+        // file id refused).
+        db.spill_superseded_settle(&entry.key, entry.req_file_id);
         if !db.spill_inflight_is_newest(&entry.key, entry.req_file_id) {
             // Deleted, overwritten, read-promoted or re-evicted in flight:
             // the newer state owns the key.
@@ -1000,6 +1003,9 @@ fn apply_completion_vec(
             // wrong answers.
             if let Some(req) = c.failed_request {
                 crate::shard::slice::with_shard_db(req.db_index, |db| {
+                    // moon#1253: this request's completion is applied (its
+                    // write failed, so no slot of it is published).
+                    db.spill_superseded_settle(&req.key, req.file_id);
                     // Deep-review P2 stale-shadow guard: if the key was
                     // re-created and re-evicted while this pwrite was in
                     // flight, a NEWER spill request supersedes this one —
@@ -1108,6 +1114,10 @@ fn apply_completion_vec(
         let mut ghosts: Vec<(usize, bytes::Bytes, Option<u64>)> = Vec::new();
         for entry in c.entries {
             let publishable = crate::shard::slice::with_shard_db(entry.db_index, |db| {
+                // moon#1253: this request's completion is applied. A ghost
+                // slot is noted in the dead-slot ledger below, once the file
+                // is listed; a published one is the key's cold entry.
+                db.spill_superseded_settle(&entry.key, entry.req_file_id);
                 if !db.spill_inflight_is_newest(&entry.key, entry.req_file_id) {
                     crate::storage::tiered::spill_thread::record_spill_completion_superseded();
                     return false;
@@ -2350,6 +2360,9 @@ mod fold_inflight_tests;
 
 #[cfg(test)]
 mod ghost_slot_tests;
+
+#[cfg(test)]
+mod superseded_settle_tests;
 
 #[cfg(test)]
 mod tests {
