@@ -79,9 +79,15 @@ fn golden_corpus() -> TextIndex {
     idx
 }
 
-/// xxh64 of the base layout's encoding of `golden_corpus()` (computed on the wave-1 base
-/// `f32546c`, before the contiguous-positions change).
-const GOLDEN_TPOST_XXH64: u64 = 0xe4dc_7f45_6580_79e0;
+/// xxh64 of the `.tpost` encoding of `golden_corpus()`.
+///
+/// WS13 pinned `0xe4dc_7f45_6580_79e0`, the wave-1 base layout's encoding (`f32546c`, before the
+/// contiguous-positions change), to prove that change invisible on disk. moon#1220 item 3 then
+/// made `.tpost` rewrites number documents densely when the index has holes, and this corpus
+/// deletes 141 documents it never re-adds: its file is now the same layout with every doc id
+/// replaced by its rank among the live ids (same length, 293,326 bytes). Verified when the value
+/// was taken: with the renumbering disabled the encoding still hashes to `0xe4dc_7f45_6580_79e0`.
+const GOLDEN_TPOST_XXH64: u64 = 0x6424_a6f3_373f_a40d;
 
 #[test]
 fn tpost_bytes_are_unchanged_by_the_position_layout() {
