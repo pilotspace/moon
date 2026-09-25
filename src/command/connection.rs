@@ -432,6 +432,16 @@ fn info_raw(db: &Database, facts: &InstanceFacts) -> String {
         // claim `noeviction` while the instance is in fact evicting.
         maxmemory_policy = crate::storage::eviction::maxmemory_policy_name(),
     );
+    // moon#1215 / PR #1233 review: the cold tier's dead-slot ledger — keys of
+    // deleted or superseded cold slots held until their spill file is
+    // unlinked. Counted in `used_memory` and at write admission, so an
+    // operator must be able to see how much of it is ledger. Summed over
+    // every shard and database; two relaxed loads.
+    let (cold_dead_slots, cold_dead_slot_bytes) = crate::storage::tiered::dead_slots::totals();
+    let _ = write!(
+        sections,
+        "cold_dead_slots:{cold_dead_slots}\r\ncold_dead_slot_bytes:{cold_dead_slot_bytes}\r\n"
+    );
 
     // Allocator counters, Redis's `allocator_*` field names so existing
     // dashboards and exporters read them without translation.

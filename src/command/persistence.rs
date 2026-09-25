@@ -57,6 +57,23 @@ static BGSAVE_CURRENT_FAILED: AtomicBool = AtomicBool::new(false);
 /// `bgrewriteaof_start_sharded` before dispatching the rewrite message.
 pub static MULTI_SHARD_AOF_REWRITE_UNSAFE: AtomicBool = AtomicBool::new(false);
 
+/// Set once in `main.rs` when the shards run with NO persistence directory
+/// (`--appendonly no` and no `--save`: `main` passes them `None`), so no
+/// shard can write a snapshot. `BGSAVE` and `SHUTDOWN SAVE` then answer an
+/// immediate error instead of "Background saving started" followed by a save
+/// every shard fails (PR #1233 review of moon#1230). `false` by default:
+/// callers that never record it (tests, embedded harnesses) keep the old
+/// behaviour, where a shard with no directory reports the save failed.
+pub static SNAPSHOT_DIR_ABSENT: AtomicBool = AtomicBool::new(false);
+
+/// The reply to a save request on a server with no persistence directory.
+fn no_snapshot_dir_error() -> Frame {
+    Frame::Error(Bytes::from_static(
+        b"ERR background save unavailable: the server was started without a persistence \
+          directory (start it with --save or --appendonly yes)",
+    ))
+}
+
 /// Global flag indicating whether a BGREWRITEAOF rewrite is currently in progress.
 ///
 /// Set to `true` when `bgrewriteaof_start` or `bgrewriteaof_start_sharded` dispatches
@@ -170,6 +187,25 @@ pub fn bgsave_start_sharded(
     snapshot_trigger: &crate::runtime::channel::WatchSender<u64>,
     num_shards: usize,
 ) -> Frame {
+    bgsave_start_sharded_with(
+        snapshot_trigger,
+        num_shards,
+        SNAPSHOT_DIR_ABSENT.load(Ordering::Relaxed),
+    )
+}
+
+/// [`bgsave_start_sharded`] with the persistence-directory fact passed in
+/// (tests drive it without touching the process-wide flag).
+fn bgsave_start_sharded_with(
+    snapshot_trigger: &crate::runtime::channel::WatchSender<u64>,
+    num_shards: usize,
+    snapshot_dir_absent: bool,
+) -> Frame {
+    // Refuse up front, before anything is marked in progress: no shard has
+    // anywhere to write, so "Background saving started" would be untrue.
+    if snapshot_dir_absent {
+        return no_snapshot_dir_error();
+    }
     if SAVE_IN_PROGRESS.swap(true, Ordering::SeqCst) {
         return Frame::Error(Bytes::from_static(
             b"ERR Background save already in progress",
@@ -620,6 +656,36 @@ mod tests {
         assert!(matches!(bgsave_start_sharded(&tx, 2), Frame::Error(_)));
         bgsave_shard_done(true);
         assert!(!BGSAVE_LAST_STATUS.load(Ordering::SeqCst));
+        assert!(!SAVE_IN_PROGRESS.load(Ordering::SeqCst));
+    }
+
+    /// PR #1233 review (moon#1230 area): with no persistence directory the
+    /// save is refused up front — nothing marked in progress, no epoch sent
+    /// to the shards, the last status untouched — instead of "Background
+    /// saving started" followed by a save every shard fails.
+    #[test]
+    fn bgsave_without_a_persistence_dir_is_refused_up_front() {
+        let _guard = BGSAVE_TEST_LOCK.lock();
+        SAVE_IN_PROGRESS.store(false, Ordering::SeqCst);
+        BGSAVE_SHARDS_REMAINING.store(0, Ordering::SeqCst);
+        BGSAVE_LAST_STATUS.store(true, Ordering::SeqCst);
+        let (tx, rx) = crate::runtime::channel::watch(0u64);
+        let before = rx.borrow();
+        let reply = bgsave_start_sharded_with(&tx, 4, true);
+        assert!(
+            matches!(&reply, Frame::Error(e) if e.starts_with(b"ERR background save unavailable")),
+            "{reply:?}"
+        );
+        assert!(!SAVE_IN_PROGRESS.load(Ordering::SeqCst));
+        assert_eq!(BGSAVE_SHARDS_REMAINING.load(Ordering::SeqCst), 0);
+        assert_eq!(rx.borrow(), before, "no shard is asked to snapshot");
+        assert!(BGSAVE_LAST_STATUS.load(Ordering::SeqCst));
+        // With a directory the same call starts the save.
+        assert!(matches!(
+            bgsave_start_sharded_with(&tx, 1, false),
+            Frame::SimpleString(_)
+        ));
+        bgsave_shard_done(true);
         assert!(!SAVE_IN_PROGRESS.load(Ordering::SeqCst));
     }
 

@@ -219,6 +219,43 @@ pub enum RewriteTrigger {
     Forced,
     /// The Redis growth predicate ([`should_trigger`]) fired.
     Growth,
+    /// The cold tier's reclaim has compacted spill files that can be adopted
+    /// only once a fold cut after the compaction commits
+    /// (`storage::tiered::cold_reclaim`, moon#1215): the rewrite is what
+    /// frees their dead-slot ledger. See [`reclaim_due`].
+    ColdReclaim,
+}
+
+/// Minimum spacing between two rewrites dispatched for the cold reclaim — a
+/// fold rewrites the whole base, so a reclaim that keeps compacting under a
+/// steady delete load batches its adoptions instead of folding per file.
+pub const RECLAIM_REWRITE_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// How long the monitor lets the reclaim keep compacting before it folds
+/// anyway. A fold adopts only the compactions made before its cut, so it is
+/// dispatched once a monitor tick saw no new compaction — the burst is done —
+/// or, under a steady delete load that never pauses, after this long.
+pub const RECLAIM_REWRITE_MAX_DEFER: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Whether the monitor should dispatch a rewrite for the cold reclaim
+/// (`storage::tiered::cold_reclaim`): some compactions wait for a fold,
+/// compaction has settled (`grew` = more compactions waiting than at the
+/// previous tick) or has been waiting [`RECLAIM_REWRITE_MAX_DEFER`], the last
+/// reclaim rewrite is at least [`RECLAIM_REWRITE_MIN_INTERVAL`] old, and
+/// automatic rewrites are not disabled (`percentage == 0` disables every
+/// automatic rewrite, this one included; a manual `BGREWRITEAOF` still
+/// adopts the compactions). Pure so it is unit tested without a thread.
+pub fn reclaim_due(
+    compactions_awaiting_fold: usize,
+    grew: bool,
+    waiting_for: std::time::Duration,
+    since_last_reclaim_rewrite: std::time::Duration,
+    percentage: u64,
+) -> bool {
+    compactions_awaiting_fold > 0
+        && percentage != 0
+        && since_last_reclaim_rewrite >= RECLAIM_REWRITE_MIN_INTERVAL
+        && (!grew || waiting_for >= RECLAIM_REWRITE_MAX_DEFER)
 }
 
 /// The monitor's per-tick decision. Pure so it is unit tested without a
@@ -288,6 +325,10 @@ fn monitor_loop(
     let mut cooldown_until = std::time::Instant::now();
     let mut saw_in_progress = false;
     let mut forced_pending = force_once;
+    let mut last_reclaim_rewrite: Option<std::time::Instant> = None;
+    // Compactions waiting at the previous tick, and since when some have.
+    let mut prev_awaiting = 0usize;
+    let mut awaiting_since: Option<std::time::Instant> = None;
     info!(
         "aof-auto-rewrite monitor started (percentage={}%, min_size={} bytes)",
         percentage, min_size
@@ -315,7 +356,22 @@ fn monitor_loop(
             || SAVE_IN_PROGRESS.load(Ordering::SeqCst)
             || std::time::Instant::now() < cooldown_until;
         let base = AOF_BASE_SIZE.load(Ordering::Relaxed);
+        let awaiting = crate::storage::tiered::cold_reclaim::awaiting_fold();
+        if awaiting == 0 {
+            awaiting_since = None;
+        } else if awaiting_since.is_none() {
+            awaiting_since = Some(std::time::Instant::now());
+        }
+        let reclaim = reclaim_due(
+            awaiting,
+            awaiting > prev_awaiting,
+            awaiting_since.map_or(std::time::Duration::ZERO, |t| t.elapsed()),
+            last_reclaim_rewrite.map_or(std::time::Duration::MAX, |t| t.elapsed()),
+            percentage,
+        );
+        prev_awaiting = awaiting;
         let Some(trigger) = next_trigger(forced_pending, busy, current, base, percentage, min_size)
+            .or_else(|| (!busy && reclaim).then_some(RewriteTrigger::ColdReclaim))
         else {
             continue;
         };
@@ -331,6 +387,15 @@ fn monitor_loop(
                  growth>={}%, min_size={})",
                 current, base, percentage, min_size
             ),
+            RewriteTrigger::ColdReclaim => {
+                last_reclaim_rewrite = Some(std::time::Instant::now());
+                awaiting_since = None;
+                info!(
+                    "aof-auto-rewrite: triggering BGREWRITEAOF so {} compacted cold spill \
+                     file(s) can be adopted and their dead-slot ledger freed (moon#1215)",
+                    crate::storage::tiered::cold_reclaim::awaiting_fold()
+                );
+            }
         }
         match crate::command::persistence::bgrewriteaof_start_sharded(pool, shard_databases.clone())
         {
@@ -449,6 +514,36 @@ mod tests {
         );
         assert_eq!(next_trigger(false, false, 1999, 1000, 100, 0), None);
         assert_eq!(next_trigger(false, false, u64::MAX, 1, 0, 0), None);
+    }
+
+    /// moon#1215 reclaim: a rewrite is due only with compactions waiting,
+    /// automatic rewrites enabled, and the previous reclaim rewrite at least
+    /// the minimum interval old.
+    #[test]
+    fn reclaim_rewrite_is_due_only_when_compactions_wait() {
+        use super::{RECLAIM_REWRITE_MAX_DEFER, RECLAIM_REWRITE_MIN_INTERVAL, reclaim_due};
+        use std::time::Duration;
+        let spaced = RECLAIM_REWRITE_MIN_INTERVAL;
+        let zero = Duration::ZERO;
+        assert!(reclaim_due(1, false, zero, spaced, 100), "settled");
+        assert!(reclaim_due(3, false, zero, Duration::MAX, 100), "never ran");
+        assert!(!reclaim_due(0, false, zero, spaced, 100), "nothing waits");
+        assert!(
+            !reclaim_due(1, false, zero, spaced, 0),
+            "automatic rewrites disabled"
+        );
+        assert!(
+            !reclaim_due(1, false, zero, spaced - Duration::from_millis(1), 100),
+            "spaced out"
+        );
+        assert!(
+            !reclaim_due(4, true, zero, spaced, 100),
+            "still compacting: wait for the burst to finish"
+        );
+        assert!(
+            reclaim_due(4, true, RECLAIM_REWRITE_MAX_DEFER, spaced, 100),
+            "a load that never pauses still gets its fold"
+        );
     }
 
     /// Only a failed rewrite keeps the forced rewrite pending.

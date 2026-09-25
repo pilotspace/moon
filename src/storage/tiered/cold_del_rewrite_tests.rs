@@ -310,9 +310,12 @@ fn a_key_with_two_dead_slots_stays_deleted() {
 /// the generation back on db 0.
 #[test]
 fn the_head_deletes_in_the_right_database_and_ends_on_db_0() {
-    use crate::persistence::cold_records::ColdDeletes;
+    use crate::persistence::cold_records::{ColdDeleteChunk, ColdDeletes};
     let deletes = ColdDeletes {
-        per_db: vec![(3, vec![Bytes::from_static(b"x")])],
+        chunks: vec![ColdDeleteChunk {
+            db: 3,
+            keys: vec![Bytes::from_static(b"x")],
+        }],
     };
     let head = generation_head(9, &deletes, false);
     let mut want = serialize_cold_cut(9).to_vec();
@@ -344,4 +347,33 @@ fn a_cold_key_expired_before_a_rewrite_stays_expired() {
     let (_dir, mut db) = recover(files, &aof);
     assert_eq!(string_value_at(&mut db, b"k1", 10_000), None);
     assert_eq!(string_value(&mut db, b"k2").as_deref(), Some(&b"v2"[..]));
+}
+
+/// PR #1233 review (the ledger records only slots that can come back): a
+/// DELeted cold key whose slot's own TTL has passed at the fold gets no head
+/// `DEL` — and still reads as absent after the restart, because the rebuilt
+/// slot is itself expired. Its live neighbour is untouched.
+#[test]
+fn a_deleted_cold_key_whose_ttl_passed_needs_no_del_and_stays_dead() {
+    const WITH_TTL: &[(u64, &[Kv<'static>])] =
+        &[(5, &[("k1", "v1", Some(5_000)), ("k2", "v2", None)])];
+    let (_live_dir, mut live) = live_with_both_cold(WITH_TTL);
+    live.remove_counting_cold(b"k1");
+    assert!(
+        live.cold_index
+            .as_ref()
+            .is_some_and(|ci| ci.lookup(b"k1").is_none() && ci.dead_slots().file_has_dead_slots(5)),
+        "fixture: the DEL took k1 out of the index and recorded its slot with its TTL"
+    );
+    let image = fold(&live, 6);
+    assert!(
+        !image.windows(6).any(|w| w == b"$2\r\nk1"),
+        "the fold must not write a DEL for a slot that has expired"
+    );
+    let (_dir, mut db) = recover(WITH_TTL, &image);
+    assert_eq!(string_value_at(&mut db, b"k1", 10_000), None);
+    assert_eq!(
+        string_value_at(&mut db, b"k2", 10_000).as_deref(),
+        Some(&b"v2"[..])
+    );
 }

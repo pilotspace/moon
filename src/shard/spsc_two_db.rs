@@ -162,6 +162,7 @@ pub(crate) fn try_two_db_intercept(
                     // other documented Wave-A gaps (db-quota eviction, Lua
                     // effects). A no-op sink preserves pre-#34 behavior.
                     if let Err(oom) = crate::shard::spsc_handler::spsc_eviction_gate(
+                        cmd,
                         dst,
                         ca.dst_db,
                         shard_databases,

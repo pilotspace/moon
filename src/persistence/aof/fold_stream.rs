@@ -35,7 +35,7 @@ use bytes::Bytes;
 use tracing::warn;
 
 use crate::error::{AofError, MoonError};
-use crate::persistence::cold_records::ColdDeletes;
+use crate::persistence::cold_records::{ColdDeleteChunk, ColdDeletes, HEAD_DEL_BATCH};
 use crate::persistence::rdb::RdbStreamWriter;
 use crate::storage::db::Database;
 
@@ -48,10 +48,13 @@ pub const FOLD_CHUNK_BYTES: usize = 1 << 20;
 pub enum FoldChunk {
     /// The next bytes of the base RDB image, in order.
     Data(Bytes),
-    /// Sent once, after the last `Data` and before `End`, when the fold found
-    /// dead cold slots (moon#1215): the keys the new generation's head must
-    /// delete. Absent means none.
-    ColdDeletes(ColdDeletes),
+    /// After the last `Data` and before `End`, one per batch of at most
+    /// [`HEAD_DEL_BATCH`] keys, when the fold found dead cold slots
+    /// (moon#1215): keys the new generation's head must delete. None sent
+    /// means none. Streamed, never one list (PR #1233 review); each chunk's
+    /// key handles are charged to its database's dead-slot ledger until the
+    /// rewrite is over (`DeadSlots::charge_in_transit`).
+    ColdDeletes(ColdDeleteChunk),
     /// The image is complete: the preceding `Data` chunks end with the EOF
     /// marker and CRC32 footer.
     End,
@@ -118,15 +121,19 @@ impl FoldImageSink {
         Ok(())
     }
 
-    /// Ship the tail, then the fold's cold deletes (if any), and mark the
-    /// image complete.
-    fn end(mut self, cold_deletes: ColdDeletes) {
-        if self.ship().is_err() {
-            return;
-        }
-        if !cold_deletes.is_empty() && self.tx.send(FoldChunk::ColdDeletes(cold_deletes)).is_err() {
-            return;
-        }
+    /// Ship the image's tail. `false` when the writer dropped the image.
+    fn finish_image(&mut self) -> bool {
+        self.ship().is_ok()
+    }
+
+    /// Ship one chunk of cold deletes. `false` when the writer dropped the
+    /// image.
+    fn send_deletes(&mut self, chunk: ColdDeleteChunk) -> bool {
+        self.tx.send(FoldChunk::ColdDeletes(chunk)).is_ok()
+    }
+
+    /// Mark the image complete.
+    fn end(self) {
         let _ = self.tx.send(FoldChunk::End);
     }
 
@@ -179,20 +186,22 @@ impl Write for FoldImageSink {
 /// in no durable artifact at all. See [`write_in_flight_entries`].
 ///
 /// It also decides which keys the new generation must DELETE (moon#1215,
-/// [`cold_deletes_of`]): shipped as [`FoldChunk::ColdDeletes`] and written
-/// by the writer right after the new incr's `MOON.COLDCUT`.
+/// [`for_each_cold_delete_chunk`]): shipped after the image, still inside
+/// this arm (same guards, same instant), as a stream of
+/// [`FoldChunk::ColdDeletes`] chunks the writer writes right after the new
+/// incr's `MOON.COLDCUT`.
 pub fn stream_fold_image(dbs: &[&Database], now_ms: u64, mut sink: FoldImageSink) {
-    let mut cold_deletes = ColdDeletes::default();
+    // Per db: keys the base drops as expired whose stale cold shadow would
+    // otherwise come back as their value (moon#1215).
+    let mut shadows: Vec<Vec<Bytes>> = Vec::with_capacity(dbs.len());
     let result = (|| -> Result<(), MoonError> {
         let mut w = RdbStreamWriter::new(&mut sink)?;
         for (db_idx, db) in dbs.iter().enumerate() {
             let cold = db.cold_index.as_ref().filter(|ci| ci.len() > 0);
-            // Keys the base drops as expired whose stale cold shadow would
-            // otherwise come back as their value (moon#1215).
             let mut expired_shadows: Vec<Bytes> = Vec::new();
             for (key, entry) in db.data().iter() {
                 if entry.is_expired_at(now_ms) {
-                    if cold.is_some_and(|ci| ci.lookup(key.as_bytes()).is_some()) {
+                    if cold.is_some_and(|ci| shadow_can_return(ci, key.as_bytes(), now_ms)) {
                         expired_shadows.push(Bytes::copy_from_slice(key.as_bytes()));
                     }
                     continue;
@@ -202,22 +211,32 @@ pub fn stream_fold_image(dbs: &[&Database], now_ms: u64, mut sink: FoldImageSink
             // Same db, right after its hot entries: the writer needs one
             // database's entries contiguous.
             write_in_flight_entries(&mut w, db_idx, db, now_ms)?;
-            let dead = cold_deletes_of(db, now_ms, expired_shadows);
-            if !dead.is_empty() {
-                cold_deletes.per_db.push((db_idx, dead));
-            }
+            shadows.push(expired_shadows);
         }
         w.finish()?;
         Ok(())
     })();
-    match result {
-        Ok(()) => sink.end(cold_deletes),
-        Err(e) => sink.fail(e.to_string()),
+    if let Err(e) = result {
+        sink.fail(e.to_string());
+        return;
     }
+    if !sink.finish_image() {
+        return;
+    }
+    for (db_idx, (db, expired_shadows)) in dbs.iter().zip(shadows).enumerate() {
+        if !for_each_cold_delete_chunk(db, db_idx, now_ms, expired_shadows, |chunk| {
+            sink.send_deletes(chunk)
+        }) {
+            return;
+        }
+    }
+    sink.end();
 }
 
-/// The keys of `db` a new AOF generation cut at `now_ms` must delete right
-/// after its `MOON.COLDCUT` (moon#1215).
+/// Emit, in chunks of at most [`HEAD_DEL_BATCH`], the keys of `db` a new AOF
+/// generation cut at `now_ms` must delete right after its `MOON.COLDCUT`
+/// (moon#1215). `emit` returns `false` to stop (the writer is gone); so does
+/// this function then.
 ///
 /// A key qualifies when it has a slot on disk that recovery would index —
 /// every key in the cold index's dead-slot ledger, plus `expired_shadows`
@@ -236,16 +255,28 @@ pub fn stream_fold_image(dbs: &[&Database], now_ms: u64, mut sink: FoldImageSink
 /// dead. The `DEL` removes whatever the rebuild indexed for the key (older
 /// copies included), and anything the key becomes after the fold is in the
 /// generation's own records.
-pub(crate) fn cold_deletes_of(
+///
+/// A dead slot whose own TTL has passed at `now_ms` is not a candidate: it
+/// reads as expired after any restart, so it cannot bring its key back
+/// (`dead_slots` module doc).
+///
+/// Memory (PR #1233 review): a chunk holds `Bytes` handles that share the
+/// ledger's key allocations (an expired shadow's key is a copy). Each chunk's
+/// handles — and the shadows' copies — are charged to `db`'s ledger as it is
+/// emitted, until the rewrite is over, so the maxmemory gate sees the
+/// in-flight head too.
+pub(crate) fn for_each_cold_delete_chunk(
     db: &Database,
+    db_idx: usize,
     now_ms: u64,
     expired_shadows: Vec<Bytes>,
-) -> Vec<Bytes> {
+    mut emit: impl FnMut(ColdDeleteChunk) -> bool,
+) -> bool {
     let Some(ci) = db.cold_index.as_ref() else {
-        return Vec::new();
+        return true;
     };
     if ci.dead_slots().is_empty() && expired_shadows.is_empty() {
-        return Vec::new();
+        return true;
     }
     let alive = |key: &[u8]| {
         if let Some(entry) = db.data().get(key) {
@@ -253,23 +284,61 @@ pub(crate) fn cold_deletes_of(
         }
         db.spill_inflight_alive(key, now_ms) || ci.lookup(key).is_some()
     };
+    let handle = std::mem::size_of::<Bytes>();
+    let mut keys: Vec<Bytes> = Vec::with_capacity(HEAD_DEL_BATCH);
+    let mut charge = 0usize;
+    let mut ship = |keys: &mut Vec<Bytes>, charge: &mut usize| -> bool {
+        if keys.is_empty() {
+            return true;
+        }
+        ci.dead_slots()
+            .charge_in_transit(*charge + std::mem::size_of::<ColdDeleteChunk>());
+        *charge = 0;
+        let chunk = ColdDeleteChunk {
+            db: db_idx,
+            keys: std::mem::replace(keys, Vec::with_capacity(HEAD_DEL_BATCH)),
+        };
+        emit(chunk)
+    };
     // No dedupe here: this runs on the shard thread inside the `AofFold` arm,
     // where every nanosecond per ledger key is stall. A key dead in several
-    // files (or also an expired shadow) is listed more than once, and
-    // `generation_head` dedupes on the writer thread.
-    let mut dead = expired_shadows;
-    dead.reserve(ci.dead_slots().len());
-    for key in ci.dead_slots().keys() {
-        if !alive(key) {
-            dead.push(key.clone());
+    // files (or also an expired shadow) is listed more than once; the writer
+    // writes each chunk's keys once, and a repeat across chunks is harmless.
+    for key in expired_shadows {
+        charge += handle + key.len();
+        keys.push(key);
+        if keys.len() == HEAD_DEL_BATCH && !ship(&mut keys, &mut charge) {
+            return false;
         }
     }
-    dead
+    for key in ci.dead_slots().keys_live_at(now_ms) {
+        if alive(key) {
+            continue;
+        }
+        charge += handle;
+        keys.push(key.clone());
+        if keys.len() == HEAD_DEL_BATCH && !ship(&mut keys, &mut charge) {
+            return false;
+        }
+    }
+    ship(&mut keys, &mut charge)
+}
+
+/// Whether the cold entry behind a hot key that the base drops as expired
+/// could come back as the key's value after a restart: it exists and its
+/// own TTL has not passed at `now_ms`.
+fn shadow_can_return(
+    ci: &crate::storage::tiered::cold_index::ColdIndex,
+    key: &[u8],
+    now_ms: u64,
+) -> bool {
+    ci.lookup(key)
+        .is_some_and(|loc| loc.ttl_ms.is_none_or(|ttl| now_ms <= ttl))
 }
 
 /// In-flight spill payloads a fold base image could not carry because they
-/// did not rehydrate (moon#1223). Each is a key whose only copy is its spill
-/// file, IF that file publishes; each is logged when counted.
+/// did not rehydrate (moon#1223). Each fails its fold (the previous
+/// generation stays committed) and is logged when counted.
 pub static FOLD_IN_FLIGHT_UNENCODABLE: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
@@ -286,10 +355,17 @@ pub static FOLD_IN_FLIGHT_UNENCODABLE: std::sync::atomic::AtomicU64 =
 ///
 /// Skipped: a key that is also hot (the hot copy is newer — `set` retires the
 /// in-flight record, so this is defensive), and a payload expired at
-/// `now_ms` (the base's own filter). A payload that does not rehydrate (it
-/// cannot be produced by `build_spill_payload`; memory corruption) cannot be
-/// written; it is counted in [`FOLD_IN_FLIGHT_UNENCODABLE`] and logged,
-/// never silently dropped.
+/// `now_ms` (the base's own filter).
+///
+/// A payload that does not rehydrate (it cannot be produced by
+/// `build_spill_payload`; memory corruption) cannot be written, and a base
+/// without it would lose the key if the spill then does not publish — the
+/// moon#1223 loss this function exists to prevent. So it FAILS the fold:
+/// counted in [`FOLD_IN_FLIGHT_UNENCODABLE`], logged, and returned as
+/// `AofError::RewriteFailed`, which aborts the rewrite with the previous
+/// generation still committed. The in-flight record lasts until the spill
+/// completes, so a later rewrite (the auto-rewrite retry, or the next
+/// BGREWRITEAOF) succeeds once it has.
 fn write_in_flight_entries<W: Write>(
     w: &mut RdbStreamWriter<W>,
     db_idx: usize,
@@ -325,9 +401,18 @@ pub(crate) fn for_each_in_flight_base_entry(
                     db = db_idx,
                     key_len = key.len(),
                     "AOF rewrite fold: an in-flight spill payload does not rehydrate, so the new \
-                     base cannot carry the key; its spill file is its only copy if it publishes \
-                     (moon#1223)"
+                     base cannot carry the key; the rewrite fails and the previous generation \
+                     stays committed (moon#1223)"
                 );
+                return Err(AofError::RewriteFailed {
+                    detail: format!(
+                        "fold of db {db_idx}: an in-flight spill payload ({} byte key) does not \
+                         rehydrate, so the new base could not carry the key; the previous \
+                         generation stays committed",
+                        key.len()
+                    ),
+                }
+                .into());
             }
             // Expired at the fold instant: absent from the base, like a hot
             // key expired at the same instant.
@@ -337,9 +422,10 @@ pub(crate) fn for_each_in_flight_base_entry(
     Ok(())
 }
 
-/// [`cold_deletes_of`] for every database, with its own pass for the
-/// expired shadows — for a fold that does not stream its base through
-/// [`stream_fold_image`] (the legacy cloning `do_rewrite_single`).
+/// [`for_each_cold_delete_chunk`] for every database, collected, with its
+/// own pass for the expired shadows — for a fold that does not stream its
+/// base through [`stream_fold_image`] (the legacy cloning
+/// `do_rewrite_single`).
 // Only the monoio-only `do_rewrite_single` folds without streaming.
 #[cfg_attr(not(feature = "runtime-monoio"), allow(dead_code))]
 pub(crate) fn fold_cold_deletes(dbs: &[&Database], now_ms: u64) -> ColdDeletes {
@@ -356,14 +442,14 @@ pub(crate) fn fold_cold_deletes(dbs: &[&Database], now_ms: u64) -> ColdDeletes {
             .data()
             .iter()
             .filter(|(key, entry)| {
-                entry.is_expired_at(now_ms) && ci.lookup(key.as_bytes()).is_some()
+                entry.is_expired_at(now_ms) && shadow_can_return(ci, key.as_bytes(), now_ms)
             })
             .map(|(key, _)| Bytes::copy_from_slice(key.as_bytes()))
             .collect();
-        let dead = cold_deletes_of(db, now_ms, expired_shadows);
-        if !dead.is_empty() {
-            out.per_db.push((db_idx, dead));
-        }
+        for_each_cold_delete_chunk(db, db_idx, now_ms, expired_shadows, |chunk| {
+            out.chunks.push(chunk);
+            true
+        });
     }
     out
 }
@@ -392,7 +478,9 @@ pub fn write_fold_image(
                 out.write_all(&chunk)?;
                 written += chunk.len() as u64;
             }
-            Ok(FoldChunk::ColdDeletes(d)) => cold_deletes = d,
+            // Kept as the chunks they came in until the new incr is open;
+            // the writer then streams them into its head chunk by chunk.
+            Ok(FoldChunk::ColdDeletes(chunk)) => cold_deletes.chunks.push(chunk),
             Ok(FoldChunk::End) => return Ok((written, cold_deletes)),
             Ok(FoldChunk::Failed(why)) => {
                 return Err(AofError::RewriteFailed {
@@ -646,11 +734,14 @@ mod tests {
         assert_eq!(string_at(&loaded[0], b"kept").as_deref(), Some(&b"y"[..]));
     }
 
-    /// A payload that does not rehydrate cannot be encoded: counted and
-    /// logged, and the rest of the image is still produced.
+    /// A payload that does not rehydrate cannot be encoded: a base without
+    /// it would lose the key if its spill then does not publish, so it fails
+    /// the fold (counted and logged too). That the previous generation stays
+    /// committed is checked on the rewrite itself:
+    /// `rewrite::fold_tests::an_unencodable_in_flight_payload_aborts_the_rewrite_on_the_committed_generation`.
     #[test]
-    fn an_undecodable_in_flight_payload_is_counted_not_fatal() {
-        let mut dbs = vec![Database::new()];
+    fn an_undecodable_in_flight_payload_fails_the_fold() {
+        let mut dbs = [Database::new()];
         dbs[0].spill_inflight_mark(
             Bytes::from_static(b"broken"),
             crate::storage::db::PendingSpill {
@@ -662,13 +753,23 @@ mod tests {
         );
         in_flight(&mut dbs[0], b"fine", b"ok", None);
         let before = FOLD_IN_FLIGHT_UNENCODABLE.load(std::sync::atomic::Ordering::Relaxed);
-        let loaded = image_of(&dbs, 0);
+        let (sink, image) = fold_image_channel();
+        let refs: Vec<&Database> = dbs.iter().collect();
+        stream_fold_image(&refs, 0, sink);
+        let mut out = Vec::new();
+        let err = write_fold_image(image, &mut out, "test")
+            .expect_err("a base that cannot carry an in-flight key must fail the fold");
+        assert!(
+            err.to_string().contains("does not rehydrate"),
+            "the error names the cause: {err}"
+        );
         assert!(
             FOLD_IN_FLIGHT_UNENCODABLE.load(std::sync::atomic::Ordering::Relaxed) > before,
             "the unencodable payload must be counted"
         );
-        assert_eq!(string_at(&loaded[0], b"broken"), None);
-        assert_eq!(string_at(&loaded[0], b"fine").as_deref(), Some(&b"ok"[..]));
+        // The legacy cloning fold's selection fails the same way.
+        let res = for_each_in_flight_base_entry(&dbs[0], 0, 0, |_, _| Ok(()));
+        assert!(res.is_err(), "do_rewrite_single's selection fails too");
     }
 
     fn cold_loc(file_id: u64) -> crate::storage::tiered::cold_index::ColdLocation {
@@ -726,7 +827,7 @@ mod tests {
         // `respilled` moved to file 2 (alive there); `twice` was also dead in
         // file 3 — one DEL.
         ci.insert(Bytes::from_static(b"respilled"), cold_loc(2));
-        ci.note_dead_slot(3, Bytes::from_static(b"twice"));
+        ci.note_dead_slot(3, Bytes::from_static(b"twice"), None);
         // A live cold key with no dead slot, and a stale shadow behind a hot
         // key whose value expired.
         ci.insert(Bytes::from_static(b"cold"), cold_loc(4));
@@ -739,9 +840,9 @@ mod tests {
         in_flight(&mut db, b"flying_expired", b"v", Some(now - 1));
 
         let deletes = deletes_of(&[Database::new(), db], now);
-        assert_eq!(deletes.per_db.len(), 1);
-        let (db_idx, keys) = &deletes.per_db[0];
-        assert_eq!(*db_idx, 1, "the deletes are tagged with their database");
+        assert_eq!(deletes.chunks.len(), 1, "fewer keys than one chunk");
+        let (db_idx, keys) = (deletes.chunks[0].db, &deletes.chunks[0].keys);
+        assert_eq!(db_idx, 1, "the deletes are tagged with their database");
         let mut unique = sorted(keys);
         unique.dedup();
         assert_eq!(
@@ -759,6 +860,103 @@ mod tests {
                 b"twice"
             ]
         );
+    }
+
+    /// PR #1233 review: a dead slot (or a stale shadow) whose own TTL has
+    /// passed at the fold instant reads as expired after any restart, so the
+    /// fold writes no `DEL` for it; one whose TTL is still ahead gets one.
+    #[test]
+    fn slots_expired_at_the_fold_instant_get_no_del() {
+        let now = 1_000_000u64;
+        let mut db = Database::new();
+        let mut ci = crate::storage::tiered::cold_index::ColdIndex::new();
+        let with_ttl = |file_id, ttl| crate::storage::tiered::cold_index::ColdLocation {
+            ttl_ms: Some(ttl),
+            ..cold_loc(file_id)
+        };
+        ci.insert(Bytes::from_static(b"dead_expired"), with_ttl(1, now - 1));
+        ci.insert(Bytes::from_static(b"dead_ttl_ahead"), with_ttl(1, now + 1));
+        ci.insert(Bytes::from_static(b"dead_no_ttl"), cold_loc(1));
+        ci.insert(Bytes::from_static(b"anchor"), cold_loc(1));
+        for k in [&b"dead_expired"[..], b"dead_ttl_ahead", b"dead_no_ttl"] {
+            ci.remove(k);
+        }
+        // Stale shadows behind hot keys the base drops as expired: one whose
+        // cold slot is itself expired, one whose cold slot is not.
+        ci.insert(Bytes::from_static(b"shadow_expired"), with_ttl(2, now - 1));
+        ci.insert(Bytes::from_static(b"shadow_live"), cold_loc(2));
+        db.cold_index = Some(ci);
+        db.set_string_with_expiry(b"shadow_expired", Bytes::from_static(b"v"), now - 5);
+        db.set_string_with_expiry(b"shadow_live", Bytes::from_static(b"v"), now - 5);
+
+        let deletes = deletes_of(std::slice::from_ref(&db), now);
+        let mut keys: Vec<&[u8]> = deletes.keys().map(|(_, k)| k.as_ref()).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec![&b"dead_no_ttl"[..], b"dead_ttl_ahead", b"shadow_live"]
+        );
+        assert_eq!(
+            fold_cold_deletes(&[&db], now),
+            deletes,
+            "the legacy fold selects the same keys"
+        );
+    }
+
+    /// PR #1233 review: the deletes leave the shard as a stream of chunks of
+    /// at most `HEAD_DEL_BATCH` keys, after the image, in database order —
+    /// never as one list — and each chunk is charged to its database's
+    /// ledger until the rewrite is over.
+    #[test]
+    fn cold_deletes_stream_in_bounded_chunks_charged_to_the_ledger() {
+        let n = 2 * HEAD_DEL_BATCH + 7;
+        let mut dbs: Vec<Database> = (0..3).map(|_| Database::new()).collect();
+        for (db_idx, count) in [(0usize, n), (2, 3)] {
+            let mut ci = crate::storage::tiered::cold_index::ColdIndex::new();
+            ci.insert(Bytes::from_static(b"anchor"), cold_loc(1));
+            for i in 0..count {
+                ci.note_dead_slot(1, Bytes::from(format!("dead:{i:05}")), None);
+            }
+            dbs[db_idx].cold_index = Some(ci);
+        }
+        let ledger_before =
+            |dbs: &[Database], i: usize| dbs[i].cold_index.as_ref().unwrap().dead_slot_bytes();
+        let before = (ledger_before(&dbs, 0), ledger_before(&dbs, 2));
+        let (sink, image) = fold_image_channel();
+        let refs: Vec<&Database> = dbs.iter().collect();
+        stream_fold_image(&refs, 1_000, sink);
+        let mut saw_data_after_deletes = false;
+        let mut chunks: Vec<(usize, usize)> = Vec::new();
+        loop {
+            match image.rx.recv().expect("stream") {
+                FoldChunk::Data(_) => saw_data_after_deletes |= !chunks.is_empty(),
+                FoldChunk::ColdDeletes(c) => {
+                    assert!(c.keys.len() <= HEAD_DEL_BATCH);
+                    chunks.push((c.db, c.keys.len()));
+                }
+                FoldChunk::End => break,
+                FoldChunk::Failed(w) => panic!("failed: {w}"),
+            }
+        }
+        assert!(!saw_data_after_deletes, "deletes follow the whole image");
+        assert_eq!(
+            chunks,
+            vec![(0, HEAD_DEL_BATCH), (0, HEAD_DEL_BATCH), (0, 7), (2, 3)]
+        );
+        assert!(
+            ledger_before(&dbs, 0) > before.0,
+            "db 0's chunks are charged"
+        );
+        assert!(ledger_before(&dbs, 2) > before.1, "db 2's chunk is charged");
+        let charged = ledger_before(&dbs, 0) - before.0;
+        assert!(charged >= n * std::mem::size_of::<Bytes>());
+        dbs[0]
+            .cold_index
+            .as_ref()
+            .unwrap()
+            .dead_slots()
+            .clear_in_transit();
+        assert_eq!(ledger_before(&dbs, 0), before.0, "released when cleared");
     }
 
     /// No cold tier, or nothing dead: no `ColdDeletes` chunk at all.
