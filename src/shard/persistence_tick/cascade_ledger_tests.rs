@@ -46,3 +46,22 @@ fn the_pressure_cascade_ignores_the_dead_slot_ledger() {
         ledger
     ));
 }
+
+/// When the cascade does fire (evictable memory over the threshold), its KV
+/// eviction must evict against the evictable part only: the ledger is not
+/// something a victim can free.
+#[test]
+fn the_cascade_evicts_against_the_evictable_part_only() {
+    let dbs = vec![vec![Database::new()]];
+    let (shared, _inits) = super::super::shared_databases::ShardDatabases::new(dbs);
+    let ledger = 600_000;
+    shared.publish_memory(0, 950_000 + ledger);
+    assert_eq!(
+        cascade_evictable_total(&shared, 0, ledger),
+        950_000,
+        "the ledger must not count toward what the cascade evicts"
+    );
+    assert_eq!(cascade_evictable_total(&shared, 0, 0), 950_000 + ledger);
+    // A ledger larger than the published figure (a stale read) saturates.
+    assert_eq!(cascade_evictable_total(&shared, 0, usize::MAX), 0);
+}

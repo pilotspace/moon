@@ -750,6 +750,7 @@ pub(crate) fn run_eviction_tick(
             shard_databases,
             shard_id,
             runtime_config,
+            cascade_ledger_bytes,
             shard_manifest,
             next_file_id,
             wal_v3_writer,
@@ -1274,6 +1275,22 @@ pub(crate) fn should_run_pressure_cascade(
     used > threshold
 }
 
+/// What the pressure cascade's KV eviction evicts against (PR #1233 review):
+/// the published per-shard figure minus the dead-slot ledger. The ledger is
+/// resident RAM (so `used_memory` shows it) but no eviction victim can free a
+/// byte of it; counting it here made the cascade evict live keys for memory
+/// that stayed put. Its runs pass `.ledger(0)` for the same reason: write
+/// ADMISSION charges the ledger, eviction does not chase it.
+pub(crate) fn cascade_evictable_total(
+    shard_databases: &super::shared_databases::ShardDatabases,
+    shard_id: usize,
+    ledger_bytes: usize,
+) -> usize {
+    shard_databases
+        .published_shard_memory(shard_id)
+        .saturating_sub(ledger_bytes)
+}
+
 /// Memory pressure cascade per MoonStore v2 design section 8.5.
 ///
 /// Ordered response:
@@ -1290,6 +1307,9 @@ pub(crate) fn handle_memory_pressure(
     shard_databases: &std::sync::Arc<super::shared_databases::ShardDatabases>,
     shard_id: usize,
     runtime_config: &std::sync::Arc<parking_lot::RwLock<crate::config::RuntimeConfig>>,
+    // The shard's dead-slot ledger (moon#1215): counted in the published
+    // figure, freed by no step of this cascade — see `cascade_evictable_total`.
+    ledger_bytes: usize,
     shard_manifest: &mut Option<ShardManifest>,
     next_file_id: &mut u64,
     wal_v3: &mut Option<crate::persistence::wal_v3::segment::WalWriterV3>,
@@ -1374,7 +1394,7 @@ pub(crate) fn handle_memory_pressure(
         if rt.maxmemory > 0 {
             // C5 / Phase 3: read the already-published per-shard KV memory
             // (written earlier this same tick). Lock-free Relaxed load.
-            let total_mem = shard_databases.published_shard_memory(shard_id);
+            let total_mem = cascade_evictable_total(shard_databases, shard_id, ledger_bytes);
             // GAP-1: hot shards evict against their elastic budget (idle
             // siblings' donated headroom), not the static maxmemory/N.
             let budget = match shard_databases.elastic_budget(shard_id) {
@@ -1431,6 +1451,7 @@ pub(crate) fn handle_memory_pressure(
                                 )
                                 .total(total_mem)
                                 .budget(budget)
+                                .ledger(0)
                                 .report(
                                     // task #34 (Wave A): only the no-manifest,
                                     // `--appendonly no` plain-drop fallback
@@ -1492,6 +1513,7 @@ pub(crate) fn handle_memory_pressure(
                                     ))
                                     .total(total_mem)
                                     .budget(budget)
+                                    .ledger(0)
                                     .report(&mut |key| {
                                         crate::replication::reason_del::record_reason_del(
                                             key,
@@ -1516,6 +1538,7 @@ pub(crate) fn handle_memory_pressure(
                                     crate::storage::eviction::EvictionRun::plain()
                                         .total(total_mem)
                                         .budget(budget)
+                                        .ledger(0)
                                         .report(&mut |key| {
                                             crate::replication::reason_del::record_reason_del(
                                                 key,
