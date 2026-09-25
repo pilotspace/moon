@@ -481,3 +481,232 @@ fn every_auto_id_form_is_refused_at_the_last_possible_id() {
     drop(server);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Review 6 (N3; the reviewer's proof, adopted): a POP of an EMPTY queue
+/// created the `__mq_default` consumer on the master (`read_group_new`,
+/// billed) but logged no MqPop, so the replica and a WAL replay had no
+/// consumer until the next claiming POP: MEMORY USAGE 497 vs 321, XINFO
+/// CONSUMERS *1 vs *0. All three must agree.
+#[test]
+#[cfg_attr(
+    not(feature = "runtime-monoio"),
+    ignore = "needs a replica, which needs a runtime-monoio master (PSYNC)"
+)]
+fn an_empty_pop_changes_nothing_on_master_replica_or_replay() {
+    let base = common::unique_test_dir("ws16-mq-empty-pop");
+    let (mut master, mport) = spawn_with(&base.join("m"), 1, "yes");
+    let (replica, rport) = spawn_with(&base.join("r"), 1, "no");
+    let mut m = Conn::open(mport);
+    let mut r = Conn::open(rport);
+    replicate(&mut r, mport);
+    assert_eq!(m.send(&["MQ", "CREATE", "e"]), "+OK\r\n");
+    assert_eq!(m.send(&["MQ", "POP", "e"]), "*0\r\n");
+    // A marker write, so the replica has applied everything before it.
+    assert!(m.send(&["SET", "marker", "1"]).starts_with("+OK"));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while r.send(&["GET", "marker"]) != "$1\r\n1\r\n" {
+        assert!(std::time::Instant::now() < deadline);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let consumers = |c: &mut Conn| c.send(&["XINFO", "CONSUMERS", "e", "__mq_consumers"]);
+    let mem = |c: &mut Conn| c.send(&["MEMORY", "USAGE", "e"]);
+    let (cm, cr) = (consumers(&mut m), consumers(&mut r));
+    let (mm, mr) = (mem(&mut m), mem(&mut r));
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    master.kill_now();
+    common::wait_for_port_down(mport);
+    let (master2, mport2) = spawn_with(&base.join("m"), 1, "yes");
+    let mut m2 = Conn::open(mport2);
+    let (cp, mp) = (consumers(&mut m2), mem(&mut m2));
+    eprintln!(
+        "consumers: master {cm:?} replica {cr:?} replayed {cp:?}\nMEMORY USAGE e: master {} \
+         replica {} replayed {}",
+        mm.trim(),
+        mr.trim(),
+        mp.trim()
+    );
+    assert_eq!(
+        (cr.as_str(), mr.as_str()),
+        (cm.as_str(), mm.as_str()),
+        "replica vs master"
+    );
+    assert_eq!(
+        (cp.as_str(), mp.as_str()),
+        (cm.as_str(), mm.as_str()),
+        "replay vs master"
+    );
+    drop(master2);
+    drop(replica);
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// Everything observable about the queues: length, PEL ids, cursor, and the
+/// tracked size (`MEMORY USAGE`, which is the stream's billed + undrained).
+fn state(c: &mut Conn, queues: &[&str]) -> Vec<String> {
+    let mut out = Vec::new();
+    for q in queues {
+        let len = c.send(&["XLEN", q]);
+        let pel = ids_in(&c.send(&["XPENDING", q, "__mq_consumers", "-", "+", "10000"]));
+        let groups = c.send(&["XINFO", "GROUPS", q]);
+        let cursor = groups
+            .split("\r\n")
+            .skip_while(|l| *l != "last-delivered-id")
+            .nth(2)
+            .unwrap_or("-")
+            .to_string();
+        let mem = c.send(&["MEMORY", "USAGE", q]);
+        out.push(format!(
+            "{q}: XLEN {} PEL {:?} cursor {cursor} MEMORY {}",
+            len.trim(),
+            pel,
+            mem.trim()
+        ));
+    }
+    out
+}
+
+fn wait_same(m: &mut Conn, r: &mut Conn, queues: &[&str]) -> (Vec<String>, Vec<String>) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        let (a, b) = (state(m, queues), state(r, queues));
+        if a == b || std::time::Instant::now() > deadline {
+            return (a, b);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+/// Review 6 (B moon#1261 + F + D, end to end; the reviewer's proof, adopted):
+/// one workload over a MAXDELIVERY 1 queue (every claim dead-letters), a
+/// default MAXDELIVERY 3 queue (surplus release, ACKs, some left pending, a
+/// double ACK and an ACK of an unknown id), a MAXDELIVERY 0 control, a
+/// MAXDELIVERY 1 queue whose DLQ sits at the last possible ID (its dead
+/// letters are refused and stay pending), and one whose DLQ takes the first
+/// dead letter of a POP and refuses the rest. Master (appendonly yes), its
+/// replica, and the master restarted from its WAL agree exactly — length,
+/// PEL, cursor and MEMORY USAGE of every queue and DLQ.
+#[test]
+#[cfg_attr(
+    not(feature = "runtime-monoio"),
+    ignore = "needs a replica, which needs a runtime-monoio master (PSYNC)"
+)]
+fn master_replica_and_replay_agree_on_every_queue_state_and_bill() {
+    let base = common::unique_test_dir("ws16-mq-agree");
+    let (mut master, mport) = spawn_with(&base.join("m"), 1, "yes");
+    let (replica, rport) = spawn_with(&base.join("r"), 1, "no");
+    let mut m = Conn::open(mport);
+    let mut r = Conn::open(rport);
+    replicate(&mut r, mport);
+    let qs = [
+        "dl",
+        "dl::mq:dlq",
+        "q3",
+        "q0",
+        "full",
+        "full::mq:dlq",
+        "mixed",
+        "mixed::mq:dlq",
+    ];
+    assert_eq!(
+        m.send(&["MQ", "CREATE", "dl", "MAXDELIVERY", "1"]),
+        "+OK\r\n"
+    );
+    assert_eq!(m.send(&["MQ", "CREATE", "q3"]), "+OK\r\n");
+    assert_eq!(
+        m.send(&["MQ", "CREATE", "q0", "MAXDELIVERY", "0"]),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        m.send(&["MQ", "CREATE", "full", "MAXDELIVERY", "1"]),
+        "+OK\r\n"
+    );
+    // `full`'s dead-letter stream already holds the last possible ID.
+    let r_full = m.send(&[
+        "XADD",
+        "full::mq:dlq",
+        &format!("{MAX_U64}-{MAX_U64}"),
+        "f",
+        "v",
+    ]);
+    assert!(r_full.starts_with('$'), "XADD at the max id: {r_full:?}");
+    // `mixed`'s DLQ is ONE id below the last possible id of a future ms:
+    // of the dead letters one POP routes, the first is accepted, the rest refused.
+    assert_eq!(
+        m.send(&["MQ", "CREATE", "mixed", "MAXDELIVERY", "1"]),
+        "+OK\r\n"
+    );
+    let future = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+        + 100_000_000;
+    let almost = format!("{future}-{}", u64::MAX - 1);
+    assert!(
+        m.send(&["XADD", "mixed::mq:dlq", &almost, "f", "v"])
+            .starts_with('$')
+    );
+    for i in 0..5 {
+        assert!(
+            m.send(&["MQ", "PUSH", "mixed", "f", &format!("x{i}")])
+                .starts_with('$')
+        );
+    }
+    let mixed_pop = m.send(&["MQ", "POP", "mixed", "COUNT", "2"]);
+    eprintln!("mixed POP COUNT 2 -> {mixed_pop:?}");
+    // D: a COUNT at usize::MAX saturates instead of overflowing (debug build).
+    let huge = m.send(&["MQ", "POP", "q0", "COUNT", "18446744073709551615"]);
+    assert!(!huge.starts_with('-'), "POP COUNT usize::MAX: {huge:?}");
+    let v = "v".repeat(24);
+    for i in 0..40 {
+        for q in ["dl", "q3", "q0", "full"] {
+            assert!(
+                m.send(&["MQ", "PUSH", q, "f", &format!("{v}{i}")])
+                    .starts_with('$'),
+                "push {q}"
+            );
+        }
+    }
+    let mut acked = 0;
+    for round in 0..12 {
+        let n = (1 + round % 4).to_string();
+        let _ = m.send(&["MQ", "POP", "dl", "COUNT", &n]);
+        let _ = m.send(&["MQ", "POP", "full", "COUNT", "1"]);
+        for q in ["q3", "q0"] {
+            let ids = ids_in(&m.send(&["MQ", "POP", q, "COUNT", &n]));
+            // ACK all but the last popped id; ACK the first twice.
+            for (j, id) in ids.iter().enumerate() {
+                if j + 1 < ids.len() || round % 3 == 0 {
+                    let _ = m.send(&["MQ", "ACK", q, id]);
+                    acked += 1;
+                }
+            }
+            if let Some(first) = ids.first() {
+                let _ = m.send(&["MQ", "ACK", q, first]);
+            }
+            let _ = m.send(&["MQ", "ACK", q, "1-1"]);
+        }
+    }
+    let full_pel = ids_in(&m.send(&["XPENDING", "full", "__mq_consumers", "-", "+", "100"]));
+    eprintln!(
+        "acked {acked}; refused dead letters left pending in `full`: {}",
+        full_pel.len()
+    );
+    let (on_master, on_replica) = wait_same(&mut m, &mut r, &qs);
+    // Replay: the WAL tick writes within ~1 ms; give it a margin, then kill -9.
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    master.kill_now();
+    common::wait_for_port_down(mport);
+    let (master2, mport2) = spawn_with(&base.join("m"), 1, "yes");
+    let mut m2 = Conn::open(mport2);
+    let replayed = state(&mut m2, &qs);
+    eprintln!("master:   {on_master:#?}\nreplica:  {on_replica:#?}\nreplayed: {replayed:#?}");
+    assert!(
+        !full_pel.is_empty(),
+        "the refused dead letters stay pending"
+    );
+    assert_eq!(on_replica, on_master, "replica vs master");
+    assert_eq!(replayed, on_master, "WAL replay vs the live master");
+    drop(master2);
+    drop(replica);
+    let _ = std::fs::remove_dir_all(&base);
+}

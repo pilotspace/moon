@@ -457,6 +457,43 @@ fn a_dead_letter_the_dlq_refuses_stays_pending_and_is_not_logged_as_routed() {
     .expect("test thread panicked");
 }
 
+/// Review 6 (N3): a POP of an EMPTY queue created the `__mq_default`
+/// consumer (`read_group_new` creates it before it looks for entries) and
+/// billed it, but logged no MqPop — nothing was claimed — so a replica and
+/// a WAL replay never had it: MEMORY USAGE 497 vs 321, XINFO CONSUMERS *1 vs
+/// *0. An empty read now changes nothing.
+#[test]
+fn a_pop_of_an_empty_queue_creates_no_consumer() {
+    use crate::shard::slice::with_shard_db;
+    std::thread::spawn(|| {
+        init_shard(make_test_slice(1));
+        assert_eq!(
+            mq(&["CREATE", "e"]),
+            Frame::SimpleString(Bytes::from_static(b"OK"))
+        );
+        let used = || with_shard_db(0, |db| db.estimated_memory());
+        let before = used();
+        let reply = mq(&["POP", "e"]);
+        let consumers = with_shard_db(0, |db| {
+            db.get_stream_mut(b"e").unwrap().unwrap().groups[b"__mq_consumers".as_ref()]
+                .consumers
+                .len()
+        });
+        (reply, consumers, used() - before)
+    })
+    .join()
+    .map(|(reply, consumers, grown)| {
+        assert_eq!(
+            reply,
+            Frame::Array(vec![].into()),
+            "an empty queue pops nothing"
+        );
+        assert_eq!(consumers, 0, "an empty POP created a consumer");
+        assert_eq!(grown, 0, "an empty POP billed {grown} B");
+    })
+    .expect("test thread panicked");
+}
+
 // ── moon#1250: MQ writes are charged to used_memory and gated ─────────────
 
 /// Before moon#1250 no MQ subcommand drained the stream's unbilled delta
