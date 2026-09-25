@@ -105,8 +105,10 @@ impl Database {
     pub fn get_mut(&mut self, key: &[u8]) -> Option<&mut Entry> {
         // Mutable access is a write intent, counted as one change for
         // `rdb_changes_since_last_save` (the over-count is the safe
-        // direction). No command reaches this: a command counts by its redis
-        // rule (moon#1232, `command::keyspace_changes`).
+        // direction). In production only the active hash-field expiry sweep
+        // reaches this (`reap_expired_fields_one_hash_at`), and it mutes the
+        // count: expiry is housekeeping (moon#1232 review 5). A command would
+        // count by its redis rule instead (`command::keyspace_changes`).
         crate::admin::metrics_setup::record_keyspace_change();
         let now = self.cached_now;
         let now_ms = self.cached_now_ms;
