@@ -38,6 +38,89 @@ mod tests {
             .collect()
     }
 
+    /// moon#1249: redis 7.0.15 refuses `XSETID` below the stream's top item
+    /// (exact text), accepts it at or above the top even when that lowers
+    /// `last_id`, and takes any ID on an empty stream. Pre-fix the refused
+    /// call answered `+OK`, and the `XADD *` after it re-issued an ID already
+    /// in the stream and OVERWROTE that entry (XLEN counted it twice).
+    #[test]
+    fn xsetid_below_the_top_item_is_refused_and_xadd_never_overwrites() {
+        let mut db = Database::new();
+        assert_eq!(
+            xadd(
+                &mut db,
+                &make_args(&[b"s", b"99999999999999-5", b"f", b"orig5"])
+            ),
+            Frame::BulkString(Bytes::from("99999999999999-5"))
+        );
+        assert_eq!(
+            xsetid(&mut db, &make_args(&[b"s", b"99999999999999-0"])),
+            Frame::Error(Bytes::from_static(
+                b"ERR The ID specified in XSETID is smaller than the target stream top item"
+            )),
+            "below the top item"
+        );
+        for _ in 0..5 {
+            assert!(matches!(
+                xadd(&mut db, &make_args(&[b"s", b"*", b"f", b"new"])),
+                Frame::BulkString(_)
+            ));
+        }
+        let entries = |db: &mut Database| -> Vec<(StreamId, Bytes)> {
+            let Ok(Some(st)) = db.get_stream_mut(b"s") else {
+                panic!("the stream exists");
+            };
+            st.entries
+                .iter()
+                .map(|(id, f)| (*id, f[0].1.clone()))
+                .collect()
+        };
+        let got = entries(&mut db);
+        assert_eq!(got.len(), 6, "five new entries plus the original: {got:?}");
+        assert_eq!(
+            got[0],
+            (
+                StreamId {
+                    ms: 99999999999999,
+                    seq: 5
+                },
+                Bytes::from_static(b"orig5")
+            ),
+            "the original entry survived"
+        );
+        assert_eq!(
+            xlen(&mut db, &make_args(&[b"s"])),
+            Frame::Integer(6),
+            "XLEN counts every entry once"
+        );
+
+        // At or above the top item is accepted — even back DOWN to the top
+        // item from a higher `last_id`, as redis allows.
+        assert_eq!(
+            xsetid(&mut db, &make_args(&[b"s", b"99999999999999-99"])),
+            Frame::SimpleString(Bytes::from_static(b"OK"))
+        );
+        let top = entries(&mut db).last().unwrap().0;
+        let top_s = format!("{}-{}", top.ms, top.seq);
+        assert_eq!(
+            xsetid(&mut db, &make_args(&[b"s", top_s.as_bytes()])),
+            Frame::SimpleString(Bytes::from_static(b"OK")),
+            "equal to the top item, below last_id"
+        );
+
+        // An empty stream takes any ID (redis checks the top ITEM only).
+        xadd(&mut db, &make_args(&[b"e", b"5-1", b"f", b"v"]));
+        crate::command::stream::xdel(&mut db, &make_args(&[b"e", b"5-1"]));
+        assert_eq!(
+            xsetid(&mut db, &make_args(&[b"e", b"5-0"])),
+            Frame::SimpleString(Bytes::from_static(b"OK"))
+        );
+        assert_eq!(
+            xsetid(&mut db, &make_args(&[b"nosuch", b"1-1"])),
+            Frame::Error(Bytes::from_static(b"ERR no such key"))
+        );
+    }
+
     #[test]
     fn test_xadd_auto_id() {
         let mut db = Database::new();

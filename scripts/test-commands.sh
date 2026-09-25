@@ -1421,6 +1421,18 @@ if should_run "stream"; then
     assert_moon "XREAD BLOCK rejects leading zeros" \
         "ERR timeout is not an integer or out of range" \
         XREAD BLOCK 0300 STREAMS stream:k1 '$'
+
+    # moon#1249: XSETID below the stream's top ITEM is refused with redis's
+    # text, and the XADD * after it re-issues no id already in the stream (moon
+    # accepted the XSETID and the XADD * then overwrote 99999999999999-5). A
+    # far-future ms keeps XADD * on that ms, so both servers assign the same id.
+    rcli DEL stream:xsetid >/dev/null 2>&1; mcli DEL stream:xsetid >/dev/null 2>&1
+    rcli XADD stream:xsetid 99999999999999-5 f orig5 >/dev/null 2>&1
+    mcli XADD stream:xsetid 99999999999999-5 f orig5 >/dev/null 2>&1
+    assert_match "XSETID below the top item (moon#1249)" XSETID stream:xsetid 99999999999999-0
+    assert_match "XADD * after a refused XSETID (moon#1249)" XADD stream:xsetid '*' f new
+    assert_match "XRANGE keeps the top entry (moon#1249)" XRANGE stream:xsetid - +
+    assert_match "XSETID at the top item (moon#1249)" XSETID stream:xsetid 99999999999999-6
 fi
 
 # ===========================================================================

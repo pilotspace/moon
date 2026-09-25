@@ -3272,6 +3272,18 @@ assert_eq "moon#1234 Lua redis.call DEL publishes del" \
     "$(keyevent_del_capture "$PORT_REDIS" seq 'EVAL "return redis.call(\"DEL\", KEYS[1], KEYS[2])" 2 {kn}:l1 {kn}:l2')" \
     "$(keyevent_del_capture "$PORT_RUST"  seq 'EVAL "return redis.call(\"DEL\", KEYS[1], KEYS[2])" 2 {kn}:l1 {kn}:l2')"
 
+# moon#1249: XSETID below the stream's top ITEM is refused with redis's text,
+# and a later XADD * never re-issues an id already in the stream (moon
+# accepted the XSETID, and the XADD * overwrote 99999999999999-5). The
+# far-future ms keeps XADD * on that ms, so both servers assign the same id.
+both DEL {xs}:s
+both XADD {xs}:s 99999999999999-5 f orig5
+assert_both "moon#1249 XSETID below the top item is refused" XSETID {xs}:s 99999999999999-0
+assert_both "moon#1249 XADD * after the refused XSETID" XADD {xs}:s '*' f new
+assert_both "moon#1249 XRANGE keeps the top entry" XRANGE {xs}:s - +
+assert_both "moon#1249 XLEN counts each entry once" XLEN {xs}:s
+assert_both "moon#1249 XSETID at the top item is accepted" XSETID {xs}:s 99999999999999-6
+
 # ---------------------------------------------------------------------------
 # moon#1013 -- a key that EXPIRES must invalidate exactly like one a command
 # writes. Moon's expiry sweep deleted the key and told keyspace notifications
