@@ -21,6 +21,13 @@ mod common;
 use common::{Conn, ServerGuard};
 
 fn spawn(dir: &std::path::Path, shards: usize) -> (ServerGuard, u16) {
+    spawn_with(dir, shards, "yes")
+}
+
+fn spawn_with(dir: &std::path::Path, shards: usize, appendonly: &str) -> (ServerGuard, u16) {
+    // The replication backlog is part of `used_memory` and grows with every
+    // logged MQ record until it reaches its size: a small one is full after
+    // the preload, so it cannot move the figure a test compares.
     std::fs::create_dir_all(dir).expect("create test dir");
     let bin = common::find_moon_binary();
     let (child, port) = common::spawn_listening(|port| {
@@ -33,13 +40,15 @@ fn spawn(dir: &std::path::Path, shards: usize) -> (ServerGuard, u16) {
                 "--shards",
                 &shards.to_string(),
                 "--appendonly",
-                "yes",
+                appendonly,
                 "--maxmemory",
                 "4mb",
                 "--maxmemory-policy",
                 "noeviction",
                 "--disk-offload",
                 "disable",
+                "--repl-backlog-size",
+                "16384",
                 "--disk-free-min-pct",
                 "0",
             ])
@@ -125,4 +134,94 @@ fn mq_push_is_charged_so_maxmemory_binds_single_shard() {
 #[test]
 fn mq_push_is_charged_so_maxmemory_binds_four_shards() {
     mq_push_is_charged_so_maxmemory_binds(4);
+}
+
+/// `used_memory` once it stops moving. Read right after a burst of writes it
+/// can still lag them (measured: the first window after 1,200 pushes carried
+/// 3–84 KB that belonged to the pushes; a 200 ms pause removed it).
+fn settled_used_memory(c: &mut Conn) -> i64 {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    std::thread::sleep(std::time::Duration::from_millis(250));
+    let mut last = used_memory(c);
+    loop {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let now = used_memory(c);
+        if now == last || std::time::Instant::now() > deadline {
+            return now;
+        }
+        last = now;
+    }
+}
+
+/// The id of the one entry an `MQ POP ... COUNT 1` reply carries.
+fn popped_id(reply: &str) -> String {
+    // *1 / *2 / $<n> / <id> / ...
+    reply
+        .split("\r\n")
+        .nth(3)
+        .unwrap_or_else(|| panic!("MQ POP reply {reply:?}"))
+        .to_string()
+}
+
+/// moon#1250: POP/ACK churn keeps the charge equal to the queue's true size.
+/// `MQ POP` over-claims COUNT + MAXDELIVERY entries and releases the surplus;
+/// the release used to bypass the stream's byte tracking, so every POP left
+/// the released entries' PEL bytes charged to `used_memory` although they
+/// were gone (+286,500 B over 500 POP+ACK pairs in-process), until a default
+/// queue hit `-OOM` while MEMORY USAGE stayed small.
+///
+/// Judged against a `MAXDELIVERY 0` control queue (no over-claim) under the
+/// same churn, because `used_memory` also moves with things that are not the
+/// queue (the AOF / replication buffers of 1,000 commands).
+fn pop_ack_churn_keeps_the_charge_exact(shards: usize) {
+    let dir = common::unique_test_dir(&format!("ws16-mq-churn-s{shards}"));
+    let (server, port) = spawn_with(&dir, shards, "no");
+    let mut c = Conn::open(port);
+    assert_eq!(c.send(&["MQ", "CREATE", "q"]), "+OK\r\n");
+    assert_eq!(
+        c.send(&["MQ", "CREATE", "ctl", "MAXDELIVERY", "0"]),
+        "+OK\r\n"
+    );
+    for q in ["q", "ctl"] {
+        for _ in 0..600 {
+            let r = c.send(&["MQ", "PUSH", q, "f", "v"]);
+            assert!(r.starts_with('$'), "MQ PUSH {q}: {r:?}");
+        }
+    }
+    let mut churn = |c: &mut Conn, q: &str| -> (i64, i64) {
+        let used_before = settled_used_memory(c);
+        let usage_before = memory_usage(c, q);
+        for _ in 0..500 {
+            let id = popped_id(&c.send(&["MQ", "POP", q, "COUNT", "1"]));
+            assert_eq!(c.send(&["MQ", "ACK", q, &id]), ":1\r\n");
+        }
+        (
+            used_memory(c) - used_before,
+            memory_usage(c, q) - usage_before,
+        )
+    };
+    let (charged, real) = churn(&mut c, "q");
+    let (charged_ctl, real_ctl) = churn(&mut c, "ctl");
+    eprintln!(
+        "--shards {shards}: 500 POP+ACK: default queue used_memory {charged:+} (MEMORY USAGE \
+         {real:+}); MAXDELIVERY 0 control used_memory {charged_ctl:+} (MEMORY USAGE {real_ctl:+})"
+    );
+    assert!(
+        (charged - charged_ctl).abs() <= 4096,
+        "--shards {shards}: 500 POP+ACK charged {charged} B on a default queue but \
+         {charged_ctl} B on a MAXDELIVERY 0 control (true sizes moved {real} / {real_ctl} B) — \
+         the released surplus of every POP stays charged"
+    );
+    drop(server);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn pop_ack_churn_keeps_the_charge_exact_single_shard() {
+    pop_ack_churn_keeps_the_charge_exact(1);
+}
+
+#[test]
+fn pop_ack_churn_keeps_the_charge_exact_four_shards() {
+    pop_ack_churn_keeps_the_charge_exact(4);
 }

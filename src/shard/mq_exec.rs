@@ -790,20 +790,25 @@ fn handle_pop(args: &[Frame], key_prefix: &Bytes, db_index: usize) -> Frame {
             // Release the surplus: un-claim it from the PEL and the consumer's
             // pending set, and rewind the group cursor to the last entry this
             // POP actually kept, so the next POP re-reads from there.
-            if cut < claimed.len()
-                && let Some(group) = stream.groups.get_mut(group_name.as_ref())
-            {
-                for (id, _) in &claimed[cut..] {
-                    group.pel.remove(id);
-                    if let Some(c) = group.consumers.get_mut(consumer_name.as_ref()) {
-                        c.pending.remove(id);
-                    }
+            //
+            // moon#1250: the un-claim goes through `Stream::xack` (exactly the
+            // PEL + consumer-pending removal this did by hand) because xack
+            // also credits the stream's unbilled delta. `read_group_new`
+            // charged every over-claimed entry; removing them behind the
+            // stream's back left those bytes charged to `used_memory` after
+            // they were gone — again on every POP, since the next POP
+            // re-claims the same entries.
+            if cut < claimed.len() {
+                let released: smallvec::SmallVec<[StreamId; 8]> =
+                    claimed[cut..].iter().map(|(id, _)| *id).collect();
+                let _ = stream.xack(&group_name, &released);
+                if let Some(group) = stream.groups.get_mut(group_name.as_ref()) {
+                    group.last_delivered_id = if cut == 0 {
+                        prev_last_delivered
+                    } else {
+                        claimed[cut - 1].0
+                    };
                 }
-                group.last_delivered_id = if cut == 0 {
-                    prev_last_delivered
-                } else {
-                    claimed[cut - 1].0
-                };
             }
 
             if results.is_empty() && dlq_entries.is_empty() {
