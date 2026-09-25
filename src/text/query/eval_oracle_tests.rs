@@ -1063,6 +1063,11 @@ fn broad_term_single_pass_is_cheaper_than_head() {
     };
     let (_, total) = eval_query_counted(idx, &node, None, None, 10);
     assert!(total > 500, "broad term must match many docs, got {total}");
+    // moon#1226: a wall-clock ratio — asserted only in optimised builds; the differential tests
+    // above pin the results in every build.
+    if cfg!(debug_assertions) {
+        return;
+    }
     let live = best(&|| eval_query_counted(idx, &node, None, None, 10).0.len());
     let head = best(&|| {
         head_eval_query_counted(idx, &corpus.model, &node, None, None, 10)

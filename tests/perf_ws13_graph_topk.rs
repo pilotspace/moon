@@ -66,15 +66,16 @@ fn return_order_by_limit_projects_only_the_page() {
     let graph = store.get_graph(b"g").expect("graph");
     let (params, ctx) = (HashMap::new(), ExecutionContext::default());
     let mut ratios = Vec::new();
-    // (query, minimum full/live ratio)
+    // (query, minimum full/live ratio). moon#1226: the narrow query had a 1.0 bound, which the
+    // base already cleared (1.51x) — it guarded nothing, so it is checked for identity only.
     for (q, bound) in [
         (
             "MATCH (n:L) RETURN n.x, n.y ORDER BY n.x DESC, n.y LIMIT 10",
-            1.0,
+            None,
         ),
         (
             "MATCH (n:L) RETURN n.name, n.w, n.y, n.x ORDER BY n.x, n.y DESC LIMIT 10",
-            2.0,
+            Some(2.0),
         ),
     ] {
         let plan = planner::compile(&parse_cypher(q.as_bytes()).expect("parse")).expect("plan");
@@ -89,6 +90,11 @@ fn return_order_by_limit_projects_only_the_page() {
             "{q}: rows"
         );
         assert_eq!(live.rows.len(), 10, "{q}");
+        // moon#1226: the ratio is asserted only in optimised builds (`cargo test --release
+        // --test perf_ws13_graph_topk`); the row identity above runs everywhere.
+        let Some(bound) = bound.filter(|_| !cfg!(debug_assertions)) else {
+            continue;
+        };
         let t_live = best_of(5, || {
             std::hint::black_box(execute(graph, &plan, &params, &ctx).expect("exec"));
         });

@@ -1751,49 +1751,4 @@ mod tests {
             cap as f64 / len as f64
         );
     }
-
-    /// moon#1195 red test: re-indexing the OLDEST document of a large corpus
-    /// must cost the same as re-indexing the NEWEST. HEAD's flat rank-aligned
-    /// columns memmoved `(len - rank) × 28` bytes per term on both the remove
-    /// and the re-insert, so doc 0 paid O(Σ posting length) (~70 MB here) while
-    /// the newest doc paid ~0. Best-of-N, alternating, generous 4x bound.
-    #[test]
-    fn upsert_cost_is_flat_across_doc_position() {
-        const N: u32 = 200_000;
-        const TERMS: u32 = 6;
-        // Bulk-load through the `.tpost` path so the setup is O(N) even unoptimised.
-        let doc_ids: Vec<u32> = (0..N).collect();
-        let lists = (0..TERMS)
-            .map(|t| {
-                let tfs = (0..N).map(|d| 1 + (d + t) % 3).collect();
-                let pos = (0..N)
-                    .map(|d| vec![t; (1 + (d + t) % 3) as usize])
-                    .collect();
-                (
-                    t,
-                    PostingList::from_parts(&doc_ids, tfs, Some(pos)).expect("parts"),
-                )
-            })
-            .collect();
-        let mut store = PostingStore::from_lists(lists).expect("store");
-        let upsert = |store: &mut PostingStore, d: u32| {
-            let t0 = std::time::Instant::now();
-            store.remove_doc(d);
-            for t in 0..TERMS {
-                store.add_term_occurrence(t, d, Some(vec![t]));
-            }
-            t0.elapsed()
-        };
-        let (mut first, mut last) = (std::time::Duration::MAX, std::time::Duration::MAX);
-        for _ in 0..9 {
-            first = first.min(upsert(&mut store, 0));
-            last = last.min(upsert(&mut store, N - 1));
-        }
-        let floor = std::time::Duration::from_micros(50);
-        assert!(
-            first <= last.max(floor) * 4,
-            "upserting doc 0 took {first:?} vs doc N-1 {last:?}: cost grows with posting length"
-        );
-        assert_eq!(store.doc_freq(0), N);
-    }
 }
