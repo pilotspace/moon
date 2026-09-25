@@ -46,14 +46,16 @@ const ACL_GUARDED: &[(&str, &str, &str)] = &[
         "dispatch::try_enforce_acl(",
         "DEBUG DIGEST (moon#636)",
     ),
+    // moon#1165: both handlers now resolve command AND key permissions in one
+    // call against the connection's cached ACL snapshot.
     (
         "src/server/conn/handler_sharded/mod.rs",
-        "check_command_permission(",
+        "conn.acl_denial(",
         "DEBUG DIGEST (moon#636)",
     ),
     (
         "src/server/conn/handler_single.rs",
-        "check_command_permission(",
+        "conn.acl_denial(",
         "DEBUG DIGEST (moon#636)",
     ),
 ];
