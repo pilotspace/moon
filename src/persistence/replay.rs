@@ -415,8 +415,10 @@ impl CommandReplayEngine for DispatchReplayEngine {
                 (Some(a), Some(b)) if a != b && a < databases.len() && b < databases.len() => {
                     let (lo, hi) = if a < b { (a, b) } else { (b, a) };
                     // Split the slice to get two non-overlapping mutable references.
+                    // Each slot keeps its `db_index` (the db its keyspace
+                    // events name), as the live SWAPDB does.
                     let (left, right) = databases.split_at_mut(lo + 1);
-                    std::mem::swap(&mut left[lo], &mut right[hi - lo - 1]);
+                    crate::shard::db_plane::swap_contents(&mut left[lo], &mut right[hi - lo - 1]);
                 }
                 _ => {
                     // Out-of-range or same-index — silently skip (same as Redis).
