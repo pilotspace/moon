@@ -397,7 +397,11 @@ pub(crate) fn note_swapdb(a: usize, b: usize) {
 /// `Database::clear` just detached `db`'s table (moon#1228): FLUSHDB (from
 /// a client, MULTI/EXEC, a script, a routed or replicated command), the
 /// clears of a FLUSHALL or of a replica full resync. `table` is the old
-/// table, which `clear` used to drop.
+/// table, which `clear` used to drop, and `table_bytes` what the database's
+/// ledger billed for it at the flush (`used_memory`, without the
+/// spill-in-flight bytes the table does not hold; it still counts a value a
+/// lazy free has not finished releasing, which is resident until the tick
+/// frees it). Reported in INFO `current_cow_size` while the epoch keeps it.
 ///
 /// If the table is the epoch-start table of a database the armed epoch has
 /// not finished writing, it is FROZEN into the epoch (moved, never cloned):
@@ -423,7 +427,7 @@ pub(crate) fn note_swapdb(a: usize, b: usize) {
 /// A slot that cannot be identified (an epoch armed on a thread with no
 /// shard slice) keeps the old answer: an unfinished epoch is aborted. One
 /// thread-local `bool` load when nothing is armed.
-pub(crate) fn note_cleared_table(db: &Database, table: Table) {
+pub(crate) fn note_cleared_table(db: &Database, table: Table, table_bytes: u64) {
     if !is_armed() {
         return;
     }
@@ -456,10 +460,9 @@ pub(crate) fn note_cleared_table(db: &Database, table: Table) {
     });
     match outcome {
         Outcome::Freeze(logical) => {
-            let bytes = db.estimated_memory() as u64;
             EVENTS.with(|e| {
                 e.borrow_mut()
-                    .push(TableEvent::Freeze(logical, Box::new(table), bytes))
+                    .push(TableEvent::Freeze(logical, Box::new(table), table_bytes))
             });
         }
         Outcome::Drop => {}
@@ -664,10 +667,12 @@ pub(crate) fn capture_wake_pre_image(db: &Database, db_index: usize, key: &Bytes
 
 /// Capture the pre-image of a key that a writer OUTSIDE `command::dispatch`
 /// is about to create, change or delete (moon#1228): the `WS DROP` key sweep
-/// ([`crate::workspace::sweep_prefix`]), the owner-side `MQ` subcommands and
-/// their TXN / replica siblings, the stream waker's group reads, and
-/// `TXN.ABORT`'s undo. Each of them reaches the keyspace through `Database`
-/// methods directly, so no dispatch hook sees the key.
+/// ([`crate::workspace::sweep_prefix`], on the master and in replica
+/// apply), the owner-side `MQ` subcommands and their TXN / replica siblings,
+/// and the stream waker's group reads. Each of them reaches the keyspace
+/// through `Database` methods directly, so no dispatch hook sees the key.
+/// `TXN.ABORT`'s KV undo (`transaction::abort`) writes through `Database`
+/// directly too, and is NOT a caller.
 ///
 /// `db` MUST be `databases[db_index]`. One thread-local `bool` load when no
 /// snapshot is in flight.

@@ -631,7 +631,8 @@ impl SnapshotState {
     /// FLUSHALL aborts the epoch instead (redis parity).
     ///
     /// `bytes` is what the table held (its database's `used_memory` at the
-    /// flush), reported in [`Self::cow_bytes`] while the epoch keeps it.
+    /// flush, without spill-in-flight bytes), reported in
+    /// [`Self::cow_bytes`] while the epoch keeps it.
     pub(crate) fn freeze(&mut self, db: usize, table: Box<Table>, bytes: u64) {
         if self.aborted.is_some() || db < self.current_db || db >= self.num_databases {
             return;

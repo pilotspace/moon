@@ -333,6 +333,37 @@ fn swapdb_of_the_database_in_progress_keeps_both_images() {
     assert_point_in_time(2, 2, &[b"SWAPDB", b"0", b"1"]);
 }
 
+/// Review 4 nit: a frozen table is billed (INFO `current_cow_size`) at its
+/// database's `used_memory`, not `estimated_memory()` — the spill-in-flight
+/// payloads that figure adds are not in the table.
+#[test]
+fn a_frozen_table_is_billed_without_the_spill_in_flight_bytes() {
+    let mut dbs = vec![Database::new()];
+    preload(&mut dbs[0], "a", 3000);
+    let table_bytes = dbs[0].estimated_memory() as u64;
+    dbs[0].spill_inflight_mark(
+        Bytes::from_static(b"spilled"),
+        crate::storage::db::PendingSpill {
+            req_id: 1,
+            value_type: crate::persistence::kv_page::ValueType::String,
+            value_bytes: Bytes::from(vec![0u8; 1 << 20]),
+            ttl_ms: None,
+        },
+    );
+    assert!(
+        dbs[0].estimated_memory() as u64 > table_bytes + (1 << 20),
+        "setup: the in-flight payload is billed to the database"
+    );
+    let mut epoch = Epoch::begin(&dbs);
+    assert!(!epoch.tick_one(&dbs));
+    let _ = run(&mut dbs, 0, &[b"FLUSHDB"]);
+    // The drain freezes the table, and db 0 has segments left to write.
+    assert!(!epoch.tick_one(&dbs));
+    let held = epoch.state.as_ref().expect("epoch").cow_bytes();
+    let _ = epoch.try_finish(&dbs);
+    assert_eq!(held, table_bytes, "the frozen table's bill");
+}
+
 /// The liveness half of moon#1228: a workload that FLUSHDBs (and SWAPDBs)
 /// more often than one save takes. It used to fail every BGSAVE; each tick
 /// here flushes, swaps, refills and increments, and the save must still
