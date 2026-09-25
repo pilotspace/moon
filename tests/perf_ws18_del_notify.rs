@@ -736,20 +736,34 @@ fn a_spanning_delete_that_reaps_expired_keys_still_logs_them_at_shards_4() {
         let mut argv: Vec<&str> = vec![cmd];
         argv.extend(keys.iter().map(String::as_str));
         assert_eq!(c.cmd(&argv), Resp::Int(0), "{cmd} of expired keys");
-        // `appendfsync always`: every record is on disk before its reply.
-        let aof = aof_bytes(&dir);
-        for k in &keys {
+        // A key the DEL reaped is logged by the DEL's own leg. A key the
+        // active-expiry tick reaped first is logged by the tick
+        // (`record_reason_del`), which nothing awaits, so a loaded host can
+        // read the file before that record lands: poll, bounded.
+        let occurrences = |aof: &[u8], k: &str| {
             let needle = format!("\r\n{k}\r\n");
-            let n = aof
-                .windows(needle.len())
+            aof.windows(needle.len())
                 .filter(|w| *w == needle.as_bytes())
-                .count();
+                .count()
+        };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let aof = aof_bytes(&dir);
+            let missing: Vec<(&String, usize)> = keys
+                .iter()
+                .map(|k| (k, occurrences(&aof, k)))
+                .filter(|(_, n)| *n < 2)
+                .collect();
+            if missing.is_empty() {
+                break;
+            }
             assert!(
-                n >= 2,
-                "{cmd} {k}: the key appears {n} time(s) in the AOF — its SET \
-                 but no deletion record, so a replica (which runs no expiry of \
-                 its own) keeps it"
+                Instant::now() < deadline,
+                "{cmd}: (key, occurrences) {missing:?} — each appears in the AOF \
+                 only as its SET, with no deletion record, so a replica (which \
+                 runs no expiry of its own) keeps it"
             );
+            std::thread::sleep(Duration::from_millis(50));
         }
     }
     drop(guard);

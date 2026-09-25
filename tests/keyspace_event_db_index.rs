@@ -134,12 +134,31 @@ fn swapdb_events_name_the_db_the_command_ran_in_shards_4() {
     swapdb_events_name_the_db_the_command_ran_in(4);
 }
 
-/// Poll `INFO persistence` until no AOF rewrite is in progress.
-fn wait_rewrite_done(c: &mut Conn) {
+/// How many rewrites have installed a base: the multi-part manifest's `seq`
+/// line, or — on tokio `--shards 1`, which keeps the legacy single
+/// `appendonly.aof` and no manifest — 1 once that file starts with a
+/// snapshot preamble (moon's `MOON` format, or redis's `REDIS`), else 0.
+fn rewrite_generation(dir: &Path) -> u64 {
+    if let Ok(m) = std::fs::read_to_string(dir.join("appendonlydir").join("moon.aof.manifest")) {
+        return m
+            .lines()
+            .find_map(|l| l.strip_prefix("seq "))
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(0);
+    }
+    let legacy = std::fs::read(dir.join("appendonly.aof")).unwrap_or_default();
+    u64::from(legacy.starts_with(b"MOON") || legacy.starts_with(b"REDIS"))
+}
+
+/// Poll until the rewrite started after `before` was read has FINISHED: none
+/// in progress, and a newer base installed. Waiting only for "none
+/// in progress" can pass before a slow rewrite has even started.
+fn wait_rewrite_done(c: &mut Conn, dir: &Path, before: u64) {
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         let info = c.send(&["INFO", "persistence"]);
-        if info.contains("aof_rewrite_in_progress:0") && !info.contains("aof_rewrite_scheduled:1") {
+        let idle = info.contains("aof_rewrite_in_progress:0");
+        if idle && rewrite_generation(dir) > before {
             return;
         }
         assert!(
@@ -165,10 +184,10 @@ fn events_after_a_restart_from_an_aof_base(shards: usize) {
     let mut c = Conn::open(port);
     assert_eq!(c.send(&["SELECT", "3"]), "+OK\r\n");
     assert_eq!(c.send(&["SET", "seed", "v"]), "+OK\r\n");
+    let before = rewrite_generation(&dir);
     let reply = c.send(&["BGREWRITEAOF"]);
     assert!(reply.starts_with('+'), "BGREWRITEAOF: {reply:?}");
-    std::thread::sleep(Duration::from_millis(200));
-    wait_rewrite_done(&mut c);
+    wait_rewrite_done(&mut c, &dir, before);
     drop(c);
     guard.kill_now();
 
