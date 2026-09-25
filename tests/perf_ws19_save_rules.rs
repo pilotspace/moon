@@ -1028,3 +1028,111 @@ fn a_lone_swapdb_is_saved_by_a_save_rule() {
         "after kill -9 the saved layout must have the key in db 1"
     );
 }
+
+/// Loading a snapshot is no keyspace change: redis 7.0.15 boots from its RDB
+/// with `rdb_changes_since_last_save:0`. moon counted every loaded key
+/// (`shard_snapshot_load` -> `Database::set`), so a `--save "3 100"` rule
+/// rewrote the whole snapshot 3 s after every boot, with no client write.
+#[test]
+fn a_snapshot_boot_counts_no_change() {
+    let dir = common::unique_test_dir("ws19-r5-boot");
+    std::fs::create_dir_all(&dir).unwrap();
+    let args = ["--appendonly", "no", "--save", "3600 1"];
+    let (mut first, port) = spawn_with(&dir, 1, &args);
+    let mut c = Conn::open(port);
+    for chunk in 0..10 {
+        let cmds: Vec<[String; 3]> = (0..100)
+            .map(|i| ["SET".into(), format!("k{}", chunk * 100 + i), "v".into()])
+            .collect();
+        let parts: Vec<Vec<&str>> = cmds
+            .iter()
+            .map(|c| c.iter().map(String::as_str).collect())
+            .collect();
+        let refs: Vec<&[&str]> = parts.iter().map(Vec::as_slice).collect();
+        c.pipeline(&refs);
+    }
+    assert!(c.send(&["BGSAVE"]).starts_with('+'));
+    wait_until("the BGSAVE completes", || changes(&mut c) == 0);
+    first.kill_now();
+    drop(first);
+    let (mut again, port) = spawn_with(&dir, 1, &args);
+    let mut c = Conn::open(port);
+    let dbsize = c.send(&["DBSIZE"]);
+    let after_boot = changes(&mut c);
+    again.kill_now();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(dbsize, ":1000\r\n", "fixture: the snapshot loaded");
+    assert_eq!(
+        after_boot, 0,
+        "changes right after booting from the snapshot"
+    );
+}
+
+/// A replica's full sync loads a foreign dataset: redis 7.0.15 leaves the
+/// replica's count unchanged (neither the discarded local keys nor the loaded
+/// ones count). moon counted both (`db.clear()` + the RDB load's `set`).
+#[test]
+fn a_replica_full_sync_counts_no_change() {
+    let (dm, dr) = (
+        common::unique_test_dir("ws19-r5-master"),
+        common::unique_test_dir("ws19-r5-replica"),
+    );
+    std::fs::create_dir_all(&dm).unwrap();
+    std::fs::create_dir_all(&dr).unwrap();
+    let (mut master, mport) = spawn_with(&dm, 1, &["--appendonly", "no"]);
+    let (mut replica, rport) = spawn_with(&dr, 1, &["--appendonly", "no"]);
+    let mut m = Conn::open(mport);
+    let mut r = Conn::open(rport);
+    for i in 0..1000 {
+        m.send(&["SET", &format!("k{i}"), "v"]);
+    }
+    r.send(&["SET", "local1", "1"]);
+    r.send(&["SET", "local2", "1"]);
+    let before = changes(&mut r);
+    let replicaof = r.send(&["REPLICAOF", "127.0.0.1", &mport.to_string()]);
+    wait_until("the full sync lands", || r.send(&["DBSIZE"]) == ":1000\r\n");
+    let delta = changes(&mut r) - before;
+    replica.kill_now();
+    master.kill_now();
+    let _ = std::fs::remove_dir_all(&dm);
+    let _ = std::fs::remove_dir_all(&dr);
+    assert_eq!(replicaof, "+OK\r\n");
+    assert_eq!(delta, 0, "replica changes across a full sync");
+}
+
+/// The AOF boot is already at redis 7.0.15's count and must stay there while
+/// the snapshot and RDB loads are muted: the replayed tail counts (5), the
+/// rewritten base does not (redis loads it as an RDB preamble).
+#[test]
+fn an_aof_boot_counts_its_replayed_tail_like_redis() {
+    let dir = common::unique_test_dir("ws19-r5-aofboot");
+    std::fs::create_dir_all(&dir).unwrap();
+    // `always`, so the kill -9 below loses no acknowledged write.
+    let args = ["--appendonly", "yes", "--appendfsync", "always"];
+    let (mut first, port) = spawn_with(&dir, 1, &args);
+    let mut c = Conn::open(port);
+    for i in 0..100 {
+        c.send(&["SET", &format!("k{i}"), "v"]);
+    }
+    assert!(c.send(&["BGREWRITEAOF"]).starts_with('+'));
+    wait_until("the rewrite completes", || {
+        info_field(&mut c, "aof_rewrite_in_progress") == "0"
+            && info_field(&mut c, "aof_last_bgrewrite_status") == "ok"
+    });
+    for i in 0..5 {
+        c.send(&["SET", &format!("n{i}"), "v"]);
+    }
+    first.kill_now();
+    drop(first);
+    let (mut again, port) = spawn_with(&dir, 1, &args);
+    let mut c = Conn::open(port);
+    let dbsize = c.send(&["DBSIZE"]);
+    let after_boot = changes(&mut c);
+    again.kill_now();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(dbsize, ":105\r\n", "fixture: the AOF replayed");
+    assert_eq!(
+        after_boot, 5,
+        "changes right after an AOF boot (redis 7.0.15: 5)"
+    );
+}
