@@ -144,12 +144,32 @@ fn failed_then_clean_save(shards: usize) {
         let dirty_before = info_field(&mut c, "rdb_changes_since_last_save");
         assert!(c.send(&["BGSAVE"]).contains("Background saving started"));
         let started = Instant::now();
+        let mut missed = false;
         while info_field(&mut c, "rdb_bgsave_in_progress") != "1" {
+            // Already finished before the first poll saw it running (a fast
+            // disk): LASTSAVE moved. That is the fixture's window missed, not
+            // the property — set the failing save up again.
+            if lastsave(&mut c) != saved_at {
+                missed = true;
+                break;
+            }
             assert!(
                 started.elapsed() < Duration::from_secs(10),
                 "the BGSAVE never showed as in progress"
             );
             std::thread::sleep(Duration::from_millis(1));
+        }
+        if missed {
+            assert!(
+                attempt < 3,
+                "fixture: every BGSAVE finished before it could be observed ({attempt} attempts)"
+            );
+            eprintln!(
+                "--shards {shards}: attempt {attempt}: the save finished before it was seen \
+                 running; setting it up again"
+            );
+            std::thread::sleep(Duration::from_millis(1100));
+            continue;
         }
         std::thread::sleep(Duration::from_millis(30));
         assert!(c.send(&["FLUSHALL"]).starts_with('+'));
