@@ -46,6 +46,8 @@ pub mod spsc_handler;
 /// arm (Gap A). Split out of `spsc_handler.rs` per the repo's file-size
 /// convention rather than growing that file further.
 pub(crate) mod spsc_two_db;
+/// Test-only `MOON_TEST_*` fault-injection hooks for the persistence tick.
+pub(crate) mod test_hooks;
 pub mod timers;
 pub mod uring_handler;
 /// moon#1182: multi-shard FT.SEARCH KNN legs on the cooperative search path.
