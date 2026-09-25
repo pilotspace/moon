@@ -36,8 +36,9 @@
 //!    `cow_intercept`, the monoio inline SET, a script's `redis.call`, the
 //!    blocking waker, a blocking command served on the spot by its
 //!    connection (`conn::blocking::immediate_serve`, and in MULTI
-//!    `blocking_txn::try_exec_blocking_in_txn`) — captures before it
-//!    mutates, for EVERY key it may write (moon#1217). Armed: the old entry, or a tombstone when the key
+//!    `blocking_txn::try_exec_blocking_in_txn`), the `MOVE` / `COPY … DB n`
+//!    cores on both databases ([`capture_two_db`], moon#1228) — captures
+//!    before it mutates, for EVERY key it may write (moon#1217). Armed: the old entry, or a tombstone when the key
 //!    does not exist yet (first capture of a key wins — a later one would
 //!    be a post-epoch state). Disarmed (the overwhelmingly common case, no
 //!    BGSAVE in flight): one thread-local `bool` load and return.
@@ -72,11 +73,12 @@ thread_local! {
     /// (moon#1216: absence is part of the epoch-start keyspace too).
     static PENDING: RefCell<Vec<(usize, Bytes, PreImage)>> = const { RefCell::new(Vec::new()) };
     /// First-wins dedupe set: every key whose pre-image was captured this
-    /// EPOCH. Held for the whole snapshot (moon#1186) — it used to be
-    /// cleared on every drain, so a hot key was deep-cloned again on every
-    /// tick only for `SnapshotState::capture_cow` to discard the copy.
-    static PENDING_KEYS: RefCell<HashSet<(usize, Bytes)>> =
-        RefCell::new(HashSet::new());
+    /// EPOCH, one set per database. Held for the whole snapshot (moon#1186)
+    /// — it used to be cleared on every drain, so a hot key was deep-cloned
+    /// again on every tick only for `SnapshotState::capture_cow` to discard
+    /// the copy. Per database so a lookup borrows the key (`&[u8]`) instead
+    /// of building an owned `(db, Bytes)` probe.
+    static PENDING_KEYS: RefCell<Vec<HashSet<Bytes>>> = const { RefCell::new(Vec::new()) };
     /// Serialization progress of the armed snapshot (moon#1186): lets
     /// `capture_key` skip keys whose range is already written, whose
     /// pre-image the drain would drop anyway. `None` = unknown (capture
@@ -441,8 +443,43 @@ pub(crate) fn capture_wake_pre_image(db: &Database, db_index: usize, key: &Bytes
     capture_key(db, db_index, key);
 }
 
+/// Capture the pre-images a `MOVE` or `COPY … DB n` needs before it writes
+/// (moon#1228). Both commands bypass `command::dispatch` — they need two
+/// databases — so the two-database cores (`move_cmd::move_core` /
+/// `copy_core`, which every live path, both MULTI executors, scripts, the
+/// replica apply and replay end in) call this first:
+///
+/// - `MOVE key db`: `src_key = Some(key)` (it leaves `src`) and
+///   `dst_key = key` (it lands in `dst`). Without the source capture a MOVE
+///   out of a pending range drops the key from `src`'s part of the file;
+///   without the destination capture a MOVE into a pending database
+///   serializes the key there too — a duplicate, or with a WAL tail a
+///   resurrection (the replayed MOVE finds the destination taken).
+/// - `COPY src dst DB n`: `src_key = None` (the source is only read) and
+///   `dst_key = dst`.
+///
+/// `src` / `dst` MUST be `databases[src_idx]` / `databases[dst_idx]`. One
+/// thread-local `bool` load when no snapshot is in flight.
+#[inline]
+pub(crate) fn capture_two_db(
+    src: &Database,
+    src_idx: usize,
+    src_key: Option<&[u8]>,
+    dst: &Database,
+    dst_idx: usize,
+    dst_key: &[u8],
+) {
+    if !is_armed() {
+        return;
+    }
+    if let Some(key) = src_key {
+        capture_key(src, src_idx, key);
+    }
+    capture_key(dst, dst_idx, dst_key);
+}
+
 /// Out-of-line slow path: record the key's current state, first write wins.
-fn capture_key(db: &Database, db_index: usize, key: &Bytes) {
+fn capture_key(db: &Database, db_index: usize, key: &[u8]) {
     // moon#1186: a key whose range is already written needs no pre-image —
     // the file holds its epoch-start bytes and the drain would drop the copy.
     // Skip it BEFORE the deep clone.
@@ -454,7 +491,11 @@ fn capture_key(db: &Database, db_index: usize, key: &Bytes) {
     if written {
         return;
     }
-    if PENDING_KEYS.with(|k| k.borrow().contains(&(db_index, key.clone()))) {
+    if PENDING_KEYS.with(|k| {
+        k.borrow()
+            .get(db_index)
+            .is_some_and(|set| set.contains(key))
+    }) {
         // Already captured this epoch — the FIRST pre-image is the
         // epoch-start state; a later one would be a state the snapshot must
         // not contain.
@@ -477,7 +518,13 @@ fn capture_key(db: &Database, db_index: usize, key: &Bytes) {
         return;
     };
     let pre_image: PreImage = Some(entry.clone());
-    PENDING_KEYS.with(|k| k.borrow_mut().insert((db_index, owned.clone())));
+    PENDING_KEYS.with(|k| {
+        let mut sets = k.borrow_mut();
+        if sets.len() <= db_index {
+            sets.resize_with(db_index + 1, HashSet::new);
+        }
+        sets[db_index].insert(owned.clone());
+    });
     PENDING.with(|p| p.borrow_mut().push((db_index, owned, pre_image)));
 }
 

@@ -1169,3 +1169,6 @@ mod table_swap_tests;
 
 #[cfg(test)]
 mod multi_key_cow_tests;
+
+#[cfg(test)]
+mod capture_gap_tests;

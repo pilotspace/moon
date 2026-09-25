@@ -45,7 +45,9 @@ pub fn move_core(
     dst_idx: usize,
     key: &[u8],
 ) -> Frame {
-    let _ = (src_idx, dst_idx);
+    // moon#1228: an armed snapshot epoch needs the key's state in BOTH
+    // databases before it leaves one and lands in the other.
+    crate::persistence::snapshot_cow::capture_two_db(src, src_idx, Some(key), dst, dst_idx, key);
     // Key must exist in src (lazy expiry applied inside `remove`)
     let entry = match src.remove(key) {
         Some(e) => e,
@@ -88,7 +90,9 @@ pub fn copy_core(
     dst_key: &[u8],
     replace: bool,
 ) -> Frame {
-    let _ = (src_idx, dst_idx);
+    // moon#1228: an armed snapshot epoch needs the destination key's state
+    // before the copy lands (the source is only read).
+    crate::persistence::snapshot_cow::capture_two_db(src, src_idx, None, dst, dst_idx, dst_key);
     // Source must exist
     let entry = match src.get(src_key) {
         Some(e) => e.clone(),
