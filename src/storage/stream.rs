@@ -276,6 +276,23 @@ impl Stream {
         STREAM_BASE + self.billed
     }
 
+    /// The stream's size for `MEMORY USAGE` and `DEBUG OBJECT`, in O(1): what
+    /// the ledger carries plus the mutations not yet drained into it.
+    ///
+    /// Equal to [`Self::estimate_memory`], the O(n) scan these used to run
+    /// (200K entries meant a 200K-node walk per `MEMORY USAGE`), by the
+    /// moon#1163 lockstep: every mutating method keeps `unbilled` exact, so
+    /// `billed + unbilled` IS the contents' size. After any stream command
+    /// `unbilled` is 0 (each drains before it returns) and this is
+    /// [`Self::billed_memory`], the identity `stream_accounting_tests` pins;
+    /// an MQ push that does not drain (`Stream::add` from the MQ paths) is
+    /// still counted here. Clamped at 0 like the drain.
+    #[inline]
+    pub fn memory_usage(&self) -> usize {
+        let contents = signed(self.billed).saturating_add(self.unbilled).max(0);
+        STREAM_BASE + usize::try_from(contents).unwrap_or(0)
+    }
+
     /// Measure `billed` against the contents, once, for a stream that enters
     /// the keyspace whole (a loader built it field by field, or it arrives
     /// from RESTORE / the cold tier / a replica). Its first charge is then the
@@ -974,7 +991,8 @@ impl Stream {
 
     /// The stream's true size, by scan (O(n)): the fixed part plus every
     /// entry, group, consumer and PEL slot at the same prices the O(1) deltas
-    /// use (moon#1163). What `MEMORY USAGE` reports; the ledger bills
+    /// use (moon#1163). The oracle the O(1) figures are tested against;
+    /// `MEMORY USAGE` reports [`Self::memory_usage`] and the ledger bills
     /// [`Self::billed_memory`].
     pub fn estimate_memory(&self) -> usize {
         STREAM_BASE + self.contents_scan()

@@ -43,12 +43,26 @@ fn assert_exact(db: &mut Database, key: &str, step: &str) {
         billed, measured,
         "{step}: billed {billed} B != measured {measured} B — a stream mutation's delta is wrong"
     );
+    assert_memory_usage_is_the_scan(db, key, step);
     let running = db.estimated_memory();
     db.recalculate_memory();
     assert_eq!(
         running,
         db.estimated_memory(),
         "{step}: the running ledger drifted from a recompute"
+    );
+}
+
+/// `MEMORY USAGE` answers the stream's O(1) size (FIX3B-CM N4), which must
+/// equal what the O(n) scan it replaced would have answered:
+/// `48 + key + estimate_memory()` (`server_admin::memory_usage_reply`).
+fn assert_memory_usage_is_the_scan(db: &mut Database, key: &str, step: &str) {
+    let measured = sizes(db, key).1;
+    let want = 48 + key.len() + measured;
+    assert_eq!(
+        run(db, &["MEMORY", "USAGE", key]),
+        Frame::Integer(want as i64),
+        "{step}: MEMORY USAGE {key} disagrees with the O(n) scan ({measured} B of contents)"
     );
 }
 
@@ -182,6 +196,9 @@ fn an_unbilled_mutation_is_caught_up_and_never_over_credited() {
         db.estimated_memory(),
         "not billed yet, and not credited either"
     );
+    // Not billed yet, but MEMORY USAGE already counts it: it reports the
+    // billed size PLUS the undrained delta, O(1), still equal to the scan.
+    assert_memory_usage_is_the_scan(&mut db, "st", "an undrained Stream::add");
     // The next stream command catches up.
     run(&mut db, &["XADD", "st", "2-0", "f", "v"]);
     assert_exact(&mut db, "st", "the XADD after an unbilled mutation");
