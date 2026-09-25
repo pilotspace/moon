@@ -30,6 +30,23 @@ All six items are addressed, each in its own commit; NOTES.md has the table.
 - **Merge of `origin/main`:** `9915a665` (part 3b). The conflicts were `mq_exec::handle_push` and `perf_ws12_bgsave_split`.
 - **After the merge:** 3b's snapshot-hold hook makes the F1 aborts and the first capture rounds deterministic (`5487322e`, `9e94d945`). The latter fixes a 4-shard MQ capture-test failure under parallel load.
 
+## Review 5 (MERGE-AFTER-FIXES)
+Every item is addressed, one commit each; NOTES.md has the table.
+- **A (BLOCKING):** `11cf616e`.
+  - Review 4's FLUSHDB bound was count-only. A table was frozen as flushed, with every post-epoch row, so the reviewer's reproduction held 344 MB under `--maxmemory 64mb`.
+  - The drain now trims a flushed table to its epoch-start rows, restoring its pre-images; it rebuilds the table when post-epoch inserts at least doubled it. The save holds at most the epoch-start bills of the databases it has not written.
+  - A second grown table flushed before one drain fails the save.
+  - Real server: `current_cow_size` 344,782,240 and RSS +341 MB before; 0 and +49..+58 MB now. The save completes and restores the epoch-start keyspace.
+- **B (moon#1261):** `6446832f`, `f9b89d65`. `Stream::restore_claims` bills the MqPop apply, on replay and on a replica. Before: 28,421 vs 124,097 B; now equal.
+- **C:** `ac6a4896`, docs only. The 2b trade-off table (under Measurements) and a "Changed" CHANGELOG bullet; no doc claims dispatch starves during a save.
+- **D:** `48414029`. POP's `COUNT + MAXDELIVERY` saturates.
+- **E:** `9037ebdd`. The defensive branches are kept, with comments.
+- **F:** `54d0f2c1`.
+  - A refused MQ push or dead letter is no longer logged.
+  - Dead letters are acked only once the DLQ took them.
+  - `Stream::next_auto_id` wraps explicitly at the last ID (it used to panic a debug build).
+- **File size:** `b559c1f1`. mq_exec.rs's tests moved out (1,616 to 1,094 lines).
+
 ## Measurements
 - **Real-server capture tests** restore from the RDB file alone after SIGKILL. Overlap is observed, not assumed: every `shard-<id>.rrdshard.tmp` must exist before the writes; each round is pipelined with `INFO persistence`; a round counts only if the save is still running. On baseline, 24–485 rounds landed inside saves of 72–221 ms.
 - **MQ billing:** 2 consecutive green runs, with the numbers above.
@@ -75,12 +92,23 @@ All six items are addressed, each in its own commit; NOTES.md has the table.
 4. **Test fixtures:** the F1 end-to-end guard is FLUSHALL-based again and runs on both runtimes. It is red only on a quiet box: F1 is a race, and the deterministic guards are `stream_tests::an_aborted_snapshot_cannot_*`. The resync variant is `ignore`d on tokio. **Follow-up for the orchestrator:** a tokio-master PSYNC would let it run there too. Three WS16 tests now depend on 3b's `MOON_TEST_SNAPSHOT_HOLD_FILE`.
 5. **MQ now refuses under maxmemory:** MQ CREATE and PUSH answer `-OOM` over the limit, as XADD does. This is a behaviour change for the CHANGELOG.
 6. **Artifact aliasing:** one unpinned run executed another tree's binary. Every result above names a pinned binary.
-7. **File sizes:** spsc_handler.rs (4,954) and shared_databases.rs (2,632) were already over the limit. mq_exec.rs is at 1,453.
+7. **File sizes:** spsc_handler.rs (4,970), shared_databases.rs (2,724, +92 in review 5: the apply and its test) and storage/db/mod.rs (3,848, +11) were already over the limit. mq_exec.rs is at 1,094 after its tests moved out; stream.rs is at 1,462.
 8. **Residuals** (in NOTES):
    - eviction takes no pre-image (the moon#1185 blocker, and a point-in-time gap for evicted keys);
    - the TXN.ABORT undo needs a decision;
    - ~~the replica MQ PEL bytes are untracked~~: review 4 called it a replica-only under-count; it was an over-credit on replay AND on the replica. Fixed in review 5 (moon#1261);
    - `Database.db_index` went stale after SWAPDB (fixed by FIX3B-CM in #1242, now merged).
+
+## Test results after review 5 (production code `54d0f2c1`; test/doc commits after it)
+- **Lint and checks:** fmt and the four audits PASS. clippy `--all-targets -D warnings` is clean on monoio and tokio.
+- **Lib tests:** full monoio 6,652 passed. The touched modules pass on both runtimes: monoio 677, tokio 641.
+- **Integration, monoio (pinned):**
+  - perf_ws12 5/5, perf_ws15 3/3, perf_ws8 1/1, perf_ws16_bgsave_capture 7/7, perf_ws16_mq_billing 7/7;
+  - replication_ws 4/4, replication_readonly_ws_mq 1/1, replication_mq 4/4, replication_swapdb 3/3.
+- **Integration, tokio (pinned):**
+  - perf_ws12 4/4 + 1 ignored, perf_ws15 3/3, perf_ws8 1/1;
+  - perf_ws16_bgsave_capture 7/7, perf_ws16_mq_billing 5/5 + 2 ignored (they need a replica, and PSYNC needs a monoio master);
+  - mq_integration 17/17, workspace_integration 13/13.
 
 ## Test results after review 4 and the merge (code HEAD `9e94d945`)
 - **Lint and checks:** fmt, audit-unsafe, audit-unwrap, audit-test-tempdirs and audit-encoding-limits PASS. clippy `--all-targets -D warnings` passes on monoio and on tokio.

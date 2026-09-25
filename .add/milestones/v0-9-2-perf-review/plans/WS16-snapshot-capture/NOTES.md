@@ -544,3 +544,46 @@ pre-image gap, residual 1, which the orchestrator is filing separately.
   perf_ws12_bgsave_split 4/4 + 1 ignored (the resync variant: PSYNC needs a monoio master),
   perf_ws15_bgsave_status 3/3, perf_ws8_mset_bgsave_capture 1/1, perf_ws16_bgsave_capture 6/6,
   perf_ws16_mq_billing 4/4, mq_integration 17/17, workspace_integration 13/13 + 1 ignored.
+
+## Review 5 (MERGE-AFTER-FIXES) — what changed
+
+| item | commit | evidence (red → green) |
+|---|---|---|
+| A BLOCKING: the FLUSHDB freeze had no byte bound (a regression against main) | 11cf616e | Bound test (insert THEN flush): 1,297,793 B held vs an epoch-start 1,123,560 B → within. Skeleton test: 515 of 515 segments kept → trimmed. Two grown tables before one drain: completed → fails. Real server (the reviewer's reproduction): `current_cow_size` 344,782,240, RSS +341 MB → 0, +49..+58 MB (3/3). Details in item 2a above. |
+| B moon#1261: the MqPop apply wrote the PEL untracked; the MqAck apply credits it | 6446832f, f9b89d65 | Lib replay test: 627 vs 1,185 B → equal. Restart and replica (the reviewer's proofs): 28,421 vs 124,097 → 124,097 = 124,097. Details under moon#1250 above. |
+| C the 2b budget's latency trade-off (docs; keep) | ac6a4896 | The reviewer's release A/B, in item 2b above. The 0.7–1.7 s delay was a debug-build and load artifact. |
+| D `count + mdc` overflowed on POP COUNT near `usize::MAX` | 48414029 | Debug panic ("attempt to add with overflow", mq_exec.rs:718) → delivers all 3. |
+| E POP's `cut == 0` rewind and empty-batch return are unreachable | 9037ebdd | Kept, with one-line comments naming the invariant (COUNT >= 1, `test_validate_mq_pop_count_zero`). Comment-only, no red. |
+| F a push or dead letter `Stream::add` refuses was still logged | 54d0f2c1 | TXN push: 1 MqPush logged for a refused add → 0. DLQ: routed (1, 1) with the entry acked away → (1, 0), the entry pending. `Stream::next_auto_id`'s `seq + 1` panicked a debug build at the last ID → explicit wrap. |
+| file size | b559c1f1 | mq_exec.rs's tests moved to mq_exec/tests.rs (1,616 → 1,094 lines). |
+
+Notes:
+- The adopted server tests use `common::spawn_listening` (collision-safe reservation), not a
+  fixed port range.
+- The reviewer's Q1 proof is adopted without its MULTI leg (moon#1262, not WS16's).
+- F (DLQ site): dropping the routing alone would have diverged on replay, which removes a
+  dead letter from the PEL only through its routing. So the DLQ adds now come first, and only
+  routed dead letters are acked.
+
+## Gate run after review 5 (production code 54d0f2c1; test/doc commits after it; pinned debug builds)
+
+- `cargo fmt --check` clean; audit-unsafe, audit-unwrap, audit-test-tempdirs,
+  audit-encoding-limits PASS.
+- `cargo clippy --all-targets -- -D warnings` clean on monoio and on
+  `--no-default-features --features runtime-tokio,jemalloc`.
+- `cargo test --lib`, monoio, FULL: 6,652 passed, 14 ignored.
+- `cargo test --lib`, filtered to the touched modules (persistence::snapshot,
+  shard::persistence_tick, shard::mq_exec, blocking::stream_wake, blocking::wakeup,
+  command::keyspace::move_cmd, scripting::bridge, shard::spsc_two_db, shard::shared_databases,
+  replication::apply, shard::db_plane, workspace, server::conn::tests, storage::db,
+  storage::stream, command::mq): monoio 677 passed, tokio 641 passed.
+- Integration, monoio (`MOON_BIN=/home/user/wt/bin/ws16-r5-final-monoio`):
+  - perf_ws12_bgsave_split 5/5, perf_ws15_bgsave_status 3/3, perf_ws8_mset_bgsave_capture 1/1;
+  - perf_ws16_bgsave_capture 7/7, perf_ws16_mq_billing 7/7;
+  - with `--include-ignored`: replication_ws 4/4, replication_readonly_ws_mq 1/1,
+    replication_mq 4/4, replication_swapdb 3/3.
+- Integration, tokio (`MOON_BIN=/home/user/wt/bin/ws16-r5-final-tokio`):
+  - perf_ws12_bgsave_split 4/4 + 1 ignored (resync), perf_ws15_bgsave_status 3/3,
+    perf_ws8_mset_bgsave_capture 1/1;
+  - perf_ws16_bgsave_capture 7/7, perf_ws16_mq_billing 5/5 + 2 ignored (replica);
+  - mq_integration 17/17, workspace_integration 13/13 + 1 ignored.
