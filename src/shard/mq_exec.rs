@@ -814,6 +814,9 @@ fn handle_pop(args: &[Frame], key_prefix: &Bytes, db_index: usize) -> Frame {
                 let _ = stream.xack(&group_name, &released);
                 if let Some(group) = stream.groups.get_mut(group_name.as_ref()) {
                     group.last_delivered_id = if cut == 0 {
+                        // Defensive, unreachable: COUNT >= 1 (`validate_mq_pop`,
+                        // `test_validate_mq_pop_count_zero`) keeps entry 0, so
+                        // `cut >= 1`; this arm keeps `cut - 1` from underflowing.
                         prev_last_delivered
                     } else {
                         claimed[cut - 1].0
@@ -822,6 +825,8 @@ fn handle_pop(args: &[Frame], key_prefix: &Bytes, db_index: usize) -> Frame {
             }
 
             if results.is_empty() && dlq_entries.is_empty() {
+                // Defensive, unreachable: entry 0 is always delivered or
+                // dead-lettered while COUNT >= 1 (see the `cut == 0` arm).
                 // moon#1250: the claim and its release both moved bytes.
                 let delta = stream.take_unbilled();
                 bill_stream_delta(db, delta);
