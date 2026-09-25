@@ -2581,7 +2581,12 @@ pub(crate) fn try_inline_dispatch(
     // `can_inline_writes` in `handler_monoio/mod.rs` for the full invariant.
     spill_sender_active: bool,
     // moon#1166: the writing connection's id, for the CLIENT TRACKING
-    // invalidation this path now performs itself (NOLOOP needs the writer).
+    // invalidation this path now performs itself. DEFENSIVE: NOLOOP only
+    // ever suppresses a tracker's OWN write, and a tracking connection never
+    // inlines writes (`can_inline_writes` carries `!tracking_state.enabled`),
+    // so on this path the id never names a NOLOOP tracker and changes no
+    // delivery. It is passed anyway so that relaxing that gate could not
+    // silently echo a NOLOOP client's own writes back to it.
     writer_client_id: u64,
     // moon#963: the connection's latency probe. This path answers `GET`/`SET`
     // without entering generic dispatch, so it has to time them itself — and
