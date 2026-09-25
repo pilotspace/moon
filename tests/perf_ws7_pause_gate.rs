@@ -113,6 +113,10 @@ fn spawn(shards: &str) -> Server {
                 "0",
                 "--disk-offload",
                 "disable",
+                // The shared box's volume sits below moon's default 5%-free
+                // disk guard; this suite is not about the guard.
+                "--disk-free-min-pct",
+                "0",
                 "--dir",
                 d.to_str().unwrap(),
             ])
