@@ -35,7 +35,7 @@ Every item is addressed, one commit each; NOTES.md has the table.
 - **A (BLOCKING):** `11cf616e`.
   - Review 4's FLUSHDB bound was count-only. A table was frozen as flushed, with every post-epoch row, so the reviewer's reproduction held 344 MB under `--maxmemory 64mb`.
   - The drain now trims a flushed table to its epoch-start rows, restoring its pre-images; it rebuilds the table when post-epoch inserts at least doubled it. The save holds at most the epoch-start bills of the databases it has not written.
-  - A second grown table flushed before one drain fails the save.
+  - A second grown table flushed before one drain fails the save. Corrected by review 6 (S2): the check also fired for a table that did not grow; the rule is now re-derived for the budgeted trim (risk 1).
   - Real server: `current_cow_size` 344,782,240 and RSS +341 MB before; 0 and +49..+58 MB now. The save completes and restores the epoch-start keyspace.
 - **B (moon#1261):** `6446832f`, `f9b89d65`. `Stream::restore_claims` bills the MqPop apply, on replay and on a replica. Before: 28,421 vs 124,097 B; now equal.
 - **C:** `ac6a4896`, docs only. The 2b trade-off table (under Measurements) and a "Changed" CHANGELOG bullet; no doc claims dispatch starves during a save.
@@ -46,6 +46,18 @@ Every item is addressed, one commit each; NOTES.md has the table.
   - Dead letters are acked only once the DLQ took them.
   - `Stream::next_auto_id` wraps explicitly at the last ID (it used to panic a debug build).
 - **File size:** `b559c1f1`. mq_exec.rs's tests moved out (1,616 to 1,094 lines).
+
+## Review 6 (MERGE-AFTER-FIXES)
+Fix A held under the reviewer's property tests (2,000 lib seeds, 80 real-server seeds). Every item is addressed, one commit each; NOTES.md has the table.
+- **Property tests adopted:** `32e55cd9`. Lib `prop_tests` (16 seeds by default, env override) and real-server `perf_ws16_bgsave_prop` (3 seeds at `--shards 1` and 3 at `--shards 4`). The mutation evidence is in NOTES.
+- **S1 (trim cost):** `103e996c`. The trim is budgeted at 512 row operations per drain; the bound holds after ceil(work / 512) drains. The walk waits only for a rebuild.
+  - The property test caught an interleaving bug (seed 104); it is fixed.
+  - Release server, 2M + 6M rows: PING p99.9 1.0 ms and max 9.2 ms during the trim. Main's FLUSHDB of that table stalls 193 ms; the unbudgeted trim took 4.33 s.
+- **S2 (abort rule):** `e091ebe7`. A table that did not grow never fails the save. The rule is re-derived over the whole trim: a grown flush fails the save only while another grown table is still waiting or trimming and together they pass 8 MiB.
+- **N1:** `66e06764`. A FLUSHDB during a save reclaims queued lazy-free charges before the table is billed.
+- **N2:** `f837ad19`. `XADD <ms>-*` at the last sequence answers redis's error; it used to panic a debug build.
+- **N3:** `06c7e3dd`. A POP of an empty queue creates no consumer, so master, replica and replay agree. The reviewer's B/F agreement test is adopted with it.
+- **P1:** `cba154c5`. Documents that the RRDSHARD file holds hot keys only.
 
 ## Measurements
 - **Real-server capture tests** restore from the RDB file alone after SIGKILL. Overlap is observed, not assumed: every `shard-<id>.rrdshard.tmp` must exist before the writes; each round is pipelined with `INFO persistence`; a round counts only if the save is still running. On baseline, 24–485 rounds landed inside saves of 72–221 ms.
@@ -77,6 +89,10 @@ Every item is addressed, one commit each; NOTES.md has the table.
   - `perf_ws15_bgsave_status`: the failed save is forced by a directory squatting on the snapshot path.
 - **`864a3c8`:** a new INFO persistence field, `current_cow_size`, in command/connection.rs.
 - **Review 4:** `f743bab2`, in `replication/apply.rs::apply_ws_drop`, calls `workspace::sweep_prefix`. `52544bf3` changes `Database::clear` in kv_ops.rs, one line: it passes `used_memory` as the frozen table's bill.
+- **Review 6:**
+  - `103e996c` re-exports `lazy_free_weight` pub(crate) from storage/db/mod.rs.
+  - `66e06764` touches `Database::clear` in kv_ops.rs (3 lines: reclaim charged lazy-free items when a save is armed).
+  - `f837ad19` touches `command/stream/stream_write.rs` (`XADD <ms>-*`).
 - **`396dc1e`:**
   - The MQ local legs of both write.rs files pass the write gate (`handler_sharded::write::mq_write_gate`).
   - spsc_handler.rs's `MqCommand` arm gates through `spsc_eviction_gate`.
@@ -85,19 +101,41 @@ Every item is addressed, one commit each; NOTES.md has the table.
 ## Risks for integration
 1. **Intended behaviour change:** a BGSAVE crossed by FLUSHDB/SWAPDB now completes with the pre-change image, as redis does, instead of failing. A FLUSHALL still fails it, as redis's does. INFO `current_cow_size` reports what a FLUSHDB leaves the save holding:
    - **Review 4's bound was wrong.** "At most one per database, never more than the epoch-start dataset" held for the table count only. A table was frozen as flushed, with every post-epoch row, so fill-then-FLUSHDB of 8 databases held 344 MB under `--maxmemory 64mb`.
-   - **Now (review 5):** the next drain trims a flushed table to its epoch-start rows, so the save holds at most the epoch-start bills of the databases it has not written.
-   - **Until that drain (one tick),** one grown table waits whole. A second grown one flushed before the drain fails the save.
+   - **Now (review 5):** the drains trim a flushed table to its epoch-start rows, so the save holds at most the epoch-start bills of the databases it has not written.
+   - **Review 6:** the trim is budgeted, 512 row operations per drain. The bound holds once it is done: after ceil(work / 512) drains, where work = keys written since the save began + rows below the cursor + the kept rows if the table is rebuilt.
+     - The reviewer's 8 x 10K-row case takes about 20-40 drains per table.
+     - A 2M + 6M-row table takes about 12 s (release), during which PING stays at p99.9 1.0 ms and max 9.2 ms. Main's FLUSHDB stalls 193 ms on that table; the unbudgeted trim took 4.33 s.
+   - **Until its trim's steps 1-2 are done,** a grown table holds its post-epoch rows. A flush of another GROWN database meanwhile fails the save once their post-epoch bytes together pass 8 MiB (review 6, S2): within one tick (a pipeline, MULTI, a script or two clients) or during the trim. A flush of a database that did not grow never fails it. It used to, whenever a grown table was waiting: a plain `SELECT 1; FLUSHDB; SELECT 2; FLUSHDB` pipeline returned `status err`.
 2. **Merged with main (part 3b):** `persistence_tick.rs` and `kv_ops.rs::clear` auto-merged as the review expected. The gates below ran on the merged tree.
 3. **Slot identity is by `Database` address,** recorded at arm time. This holds because slots are boxed and SWAPDB swaps contents, not addresses. An unidentifiable flush aborts the save as before; it never freezes the wrong table.
 4. **Test fixtures:** the F1 end-to-end guard is FLUSHALL-based again and runs on both runtimes. It is red only on a quiet box: F1 is a race, and the deterministic guards are `stream_tests::an_aborted_snapshot_cannot_*`. The resync variant is `ignore`d on tokio. **Follow-up for the orchestrator:** a tokio-master PSYNC would let it run there too. Three WS16 tests now depend on 3b's `MOON_TEST_SNAPSHOT_HOLD_FILE`.
 5. **MQ now refuses under maxmemory:** MQ CREATE and PUSH answer `-OOM` over the limit, as XADD does. This is a behaviour change for the CHANGELOG.
 6. **Artifact aliasing:** one unpinned run executed another tree's binary. Every result above names a pinned binary.
 7. **File sizes:** spsc_handler.rs (4,970), shared_databases.rs (2,724, +92 in review 5: the apply and its test) and storage/db/mod.rs (3,848, +11) were already over the limit. mq_exec.rs is at 1,094 after its tests moved out; stream.rs is at 1,462.
-8. **Residuals** (in NOTES):
+8. **By design, pre-existing (review 6, P1):** the RRDSHARD file holds hot keys only.
+   - Cold-tier keys (`--disk-offload`) live in the cold tier's own heap files and manifest, and recovery reads them from there.
+   - Spill-in-flight keys finish in the cold tier.
+   - A restore from the RRDSHARD file alone has neither kind.
+9. **Residuals** (in NOTES):
    - eviction takes no pre-image (the moon#1185 blocker, and a point-in-time gap for evicted keys);
    - the TXN.ABORT undo needs a decision;
    - ~~the replica MQ PEL bytes are untracked~~: review 4 called it a replica-only under-count; it was an over-credit on replay AND on the replica. Fixed in review 5 (moon#1261);
    - `Database.db_index` went stale after SWAPDB (fixed by FIX3B-CM in #1242, now merged).
+
+## Test results after review 6 (production code `06c7e3dd`; P1 and this commit are docs)
+- **Lint and checks:** fmt and the four audits PASS. clippy `--all-targets -D warnings` is clean on monoio and tokio.
+- **Lib tests:**
+  - full monoio 6,659 passed;
+  - the touched modules (the 16 filters of review 5 plus `command::stream`): monoio 726, tokio 690;
+  - the property test at 400 seeds: 200 with tiny budgets, 7,302 mid-trim observations, 101 rebuild waits, bill error 0 over 17,931 checks.
+- **Integration, monoio (`/home/user/wt/bin/ws16-r6-final-monoio`):**
+  - perf_ws12 5/5, perf_ws15 3/3, perf_ws8 1/1;
+  - perf_ws16_bgsave_capture 7/7, perf_ws16_bgsave_prop 2/2 (and 12 seeds on a longer run), perf_ws16_mq_billing 10/10;
+  - with ignored tests included: replication_ws 4/4, replication_readonly_ws_mq 1/1, replication_mq 4/4, replication_swapdb 3/3.
+- **Integration, tokio (`/home/user/wt/bin/ws16-r6-final-tokio`):**
+  - perf_ws12 4/4 + 1 ignored, perf_ws15 3/3, perf_ws8 1/1;
+  - perf_ws16_bgsave_capture 7/7, perf_ws16_bgsave_prop 2/2, perf_ws16_mq_billing 6/6 + 4 ignored (they need a replica);
+  - mq_integration 17/17, workspace_integration 13/13.
 
 ## Test results after review 5 (production code `54d0f2c1`; test/doc commits after it)
 - **Lint and checks:** fmt and the four audits PASS. clippy `--all-targets -D warnings` is clean on monoio and tokio.
@@ -146,7 +184,10 @@ Every item is addressed, one commit each; NOTES.md has the table.
   - a stream waker's group read.
 
   Each now captures the key's pre-save state first. Before, a key moved during a save could come back in both databases or in neither, and queues and streams came back with post-save messages and pending entries.
-- **Changed (moon#1228):** `FLUSHDB` and `SWAPDB` during a BGSAVE no longer fail the save. It completes with the keyspace as it was when the save started, as redis does, so a workload that flushes more often than one save takes can now save at all. A `FLUSHALL` still fails an in-flight save, as redis's does, and so does a replica full resync.
+- **Changed (moon#1228):** `FLUSHDB` and `SWAPDB` during a BGSAVE no longer fail the save. It completes with the keyspace as it was when the save started, as redis does, so a workload that flushes more often than one save takes can now save at all.
+  - The save holds a flushed database's pre-save rows until it writes them, as redis's forked child does. INFO `current_cow_size` reports them.
+  - A `FLUSHALL` still fails an in-flight save, as redis's does, and so does a replica full resync.
+  - So does a `FLUSHDB` of a database that grew during the save, if another database that grew is still being trimmed and together they hold more than 8 MiB of rows written since the save began. This covers two such flushes within one tick (a pipeline, `MULTI`, a script or two clients) or during the trim.
 - **Changed (moon#1228):** while writes outpace a BGSAVE, the save now does more work per tick, up to 16x the entries and segments and 4x the bytes, scaled by how far writers are ahead of it. Saves under a write flood finish sooner and hold less copy-on-write memory, at the cost of higher write tail latency while the save runs.
   - Release build, `--shards 1`, SET flood: the save finished 2.6–2.9x sooner (2.26 s to 0.88 / 0.77 s).
   - Write p99 during the save roughly doubled (804 to 1,818 µs light, 2,383 to 4,294 µs heavy), and p99.9 rose 25–80%. Max latency did not change.
@@ -155,5 +196,16 @@ Every item is addressed, one commit each; NOTES.md has the table.
 - **Fixed (moon#1250):** MQ writes are now charged to `used_memory`, the same way `XADD` is. This covers `MQ CREATE`, `PUSH`, `POP`, `ACK`, TXN `MQ.PUBLISH`, stream-wake group reads and replicated MQ records.
   - Over `maxmemory`, `MQ CREATE` and `MQ PUSH` are refused with `-OOM` under noeviction, or evict under an evicting policy.
   - Before, 20,000 pushes of 100 B added about 24 KB to `used_memory` for a 5.7 MB queue.
+  - `MQ POP`/`ACK` churn keeps the charge exact. A POP's released surplus used to stay charged, so `used_memory` drifted up.
+- **Fixed (moon#1261):** after a restart's WAL replay and on a replica, `MQ` queues are billed as on the master. Replayed or replicated POPs never charged their pending entries while ACKs credited them, so a churned queue's bill drained toward 0: 28,421 B against 124,097 B live.
+- **Fixed (moon#1228):** during a BGSAVE, the memory held for a flushed database is bounded by that database's size when the save began.
+  - Rows written after the save began are trimmed away over the following ticks, at a bounded cost per tick. FLUSHDB of a 2M-row database grown by 6M rows kept PING under 10 ms.
+  - A queued lazy-free value is no longer counted twice in `current_cow_size`.
+- **Fixed:** `XADD key <ms>-*` when the stream's top ID already has the last possible sequence for `<ms>` now answers "ERR The ID specified in XADD is equal or smaller than the target stream top item". A debug build used to crash; a release build wrapped.
+- **Fixed:** at the last possible stream ID, `XADD *` and `MQ PUSH` answer an error instead of crashing a debug build.
+  - A TXN `MQ.PUBLISH` the stream refuses is no longer written to the WAL.
+  - A dead letter whose dead-letter stream is full stays pending in its queue instead of being lost.
+- **Fixed:** `MQ POP` of an empty queue no longer creates the internal consumer on the master only. Master, replicas and a restart now agree on `XINFO CONSUMERS` and `MEMORY USAGE`.
+- **Fixed:** `MQ POP … COUNT` with a count near 2^64 no longer overflows (it crashed a debug build) and delivers every queued message.
 
 (Committed by the orchestrator from the WS16 agent's final report, because the harness refused the agent's SUMMARY write.)

@@ -38,6 +38,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **BEHAVIOUR CHANGE — FLUSHDB and SWAPDB during a BGSAVE no longer fail the save** (moon#1228). It completes with the keyspace as it was when the save started, as redis's forked child does, so a workload that flushes more often than a save takes can now save at all.
+  - The save holds a flushed database's start-of-save rows until it writes them; INFO `current_cow_size` reports them. Rows written after the save began are trimmed away over the following ticks, at most 512 row operations per tick, so the memory held is bounded by that database's size when the save began. A FLUSHDB of a 2M-row database grown by 6M rows kept PING under 10 ms (main's plain FLUSHDB of the same table: up to 193 ms).
+  - FLUSHALL still fails an in-flight save, as redis's does, and so does a replica full resync.
+  - So does a FLUSHDB of a database that grew during the save while another grown database is still waiting or being trimmed, once together they hold more than 8 MiB of rows written since the save began (two such flushes within one tick — a pipeline, MULTI, a script or two clients — or during the trim). A database that did not grow never fails the save.
+- **BEHAVIOUR CHANGE — a BGSAVE that writes are outpacing does more work per tick** (moon#1228): up to 16× the entries and segments and 4× the bytes, scaled by how far writers are ahead of it. Saves under a write flood finish sooner and hold less copy-on-write memory, and write tail latency is higher while the save runs.
+  - Release build, `--shards 1`, SET flood: the save finished 2.6–2.9× sooner (2.26 s → 0.88 / 0.77 s).
+  - Write p99 during the save roughly doubled (804 → 1,818 µs light, 2,383 → 4,294 µs heavy), and p99.9 rose 25–80%. Max latency did not change.
+  - Read-only load and `--shards 4` show no regression.
+  - New INFO persistence field `current_cow_size`: the memory a running save holds for itself. As in redis, it is not part of `used_memory`.
+- **BEHAVIOUR CHANGE — `MQ CREATE` and `MQ PUSH` answer `-OOM` over `maxmemory`** under noeviction, or evict under an evicting policy, as `XADD` does (moon#1250). POP and ACK are never refused.
+- **BEHAVIOUR CHANGE — `--save` rules fire in the sharded server** (moon#1232). `--save "<seconds> <changes>"` never fired there before; deployments that pass `--save` now get the periodic snapshots the rules describe.
+  - Rules trigger on `rdb_changes_since_last_save` and on the time since the last *successful* save; a failed save is retried after 5 s whatever the rule's seconds.
+  - `rdb_changes_since_last_save` now counts what redis 7.0.15 counts: collection writes by their redis rule (HSET field-value pairs, LPUSH elements, SADD members added, ZADD added plus rescored, pops by the elements popped, geo stores by the members stored), blocking commands served at once as their non-blocking twins (also at `--shards > 1`), SWAPDB as one change, and writes made while a save runs.
+  - It no longer counts a DEL or EXPIRE of a missing key, key or hash-field expiry, eviction, a read that brings a cold key back into memory, `RENAME k k`, booting from a snapshot, or a replica's full sync (which made `--save "3 100"` rewrite the whole snapshot 3 s after every boot).
+  - The remaining known differences are listed in `src/command/keyspace_changes.rs`.
+- **BEHAVIOUR CHANGE — `SHUTDOWN` during a running save waits for it, then saves** (moon#1232), within one 20 s deadline, instead of failing with "Background save already in progress". `SHUTDOWN NOSAVE` and SIGTERM still exit at once.
+- **BEHAVIOUR CHANGE — a spill file below the latest AOF rewrite's cut stays on disk until the next committed rewrite and sweep** (moon#1231), and shows in `INFO cold_files_pending_unlink`. While such files keep the dead-slot ledger over its threshold they ask the auto-rewrite monitor for a rewrite, also with `auto-aof-rewrite-percentage 0`.
+- **New INFO field `spill_thread_alive`** (refs moon#1265): 0 once any shard's spill thread was found dead. A dead spill thread is logged once at `error` and its in-flight compactions are abandoned so they no longer block the shard's reclaim; the thread is not yet respawned.
 - **BEHAVIOUR CHANGE — DEL/UNLINK of a key whose TTL has passed answers 0 and publishes `expired`, not `del`** (moon#1234 review), on the plain, spanning, MULTI and Lua paths, as redis 7.0.15 does. The deletion still reaches the AOF and replicas.
 - **BEHAVIOUR CHANGE — a KNN prefilter accepts up to 128 conditions.** More answers `ERR invalid FILTER expression` (inline `…=>[KNN …]` and `FILTER`, at every shard count).
 - **BEHAVIOUR CHANGE — `XSETID` below the stream's top entry is refused** with redis's error (moon#1249). Before, a later `XADD *` could overwrite existing entries. Replaying an old AOF that contains such an XSETID now keeps the original entries.
@@ -217,6 +235,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Performance
 
+- **Cold-tier reclaim runs off the shard thread** (moon#1240): it no longer reads, writes or fsyncs spill files, or waits for manifest fsyncs, on the shard thread. Same-host A/B: PING p99 during cold-delete churn −23%, p99.9 about 3× lower. Holding the spill files of a large cold tier after a FLUSHALL no longer costs O(N²) on the shard thread, and the per-tick "does a held file need a rewrite" check is O(1).
+- **The moon#1232 change counting costs no measurable throughput**: release A/B at `--shards 1`, SET/HSET/LPUSH/SADD/ZADD at pipeline 1 and 16, every row within ±3% of main or faster, CPU per op unchanged.
 2026-09 performance review fix wave, part 3b (index moon#1199). Evidence is in
 `.add/milestones/v0-9-2-perf-review/plans/{WS7,WS10,WS17,WS18,FIX-1238}-*/SUMMARY.md`. The A/Bs are relative, from a shared
 4-vCPU Linux container; re-measure on the GCE rig before quoting them.
@@ -352,6 +372,31 @@ shared 4-vCPU Linux container against HEAD `935c555` — re-measure on the GCE r
 
 ### Fixed
 
+- **A BGSAVE records each key as it was when the save started, even when that key changes before the save writes it** (moon#1228).
+  - Before, a key changed by any of these could be saved in its later state:
+    - `MOVE` and `COPY … DB n` (the key could come back in both databases or in neither);
+    - `WS DROP`, locally and on a replica;
+    - the `MQ` subcommands, TXN `MQ.PUBLISH` and replicated MQ records;
+    - a stream waker's group read.
+  - Queues and streams could come back with messages and pending entries from after the save started.
+  - Each of these now saves the key's start-of-save state first.
+- **MQ writes are charged to `used_memory`** (moon#1250, moon#1261), as `XADD` is: `MQ CREATE`, `PUSH`, `POP`, `ACK`, TXN `MQ.PUBLISH`, stream-wake group reads, replicated MQ records and WAL replay.
+  - Before, 20,000 pushes of 100 B added about 24 KB to `used_memory` for a 5.7 MB queue.
+  - `MQ POP`/`ACK` churn keeps the charge exact: a POP's released surplus used to stay charged, so `used_memory` drifted up.
+  - After a restart's WAL replay and on a replica, queues are billed as on the master. Replayed or replicated POPs never charged their pending entries while ACKs credited them, so a churned queue's bill drained toward 0 (28,421 B against 124,097 B live).
+- **MQ and stream edge cases** (part-4 review fixes):
+  - `MQ POP … COUNT` near 2^64 no longer overflows (a debug-build crash) and delivers every queued message.
+  - `MQ POP` of an empty queue no longer creates the internal consumer on the master only; master, replicas and a restart agree on `XINFO CONSUMERS` and `MEMORY USAGE`.
+  - At the last possible stream ID, `XADD *` and `MQ PUSH` answer an error instead of crashing a debug build; a TXN `MQ.PUBLISH` the stream refuses is no longer written to the WAL, and a dead letter whose dead-letter stream is full stays pending in its queue instead of being lost.
+  - `XADD key <ms>-*` when the top ID already has the last possible sequence for `<ms>` answers "ERR The ID specified in XADD is equal or smaller than the target stream top item" (a debug build crashed; a release build wrapped).
+- **`current_cow_size` no longer counts a queued lazy-free value twice** when a FLUSHDB lands during a BGSAVE (moon#1228).
+- **Data loss: a cold key could be lost at the next restart, or come back with the wrong value** (moon#1231), when it was cold at an AOF rewrite, was then read back into memory or read-modify-written, and the orphan sweep later removed its spill file (reproduced on 143–179 of 200 keys). A spill file that a replayable AOF generation may still read is now kept until a later rewrite has committed, also when it is only briefly unreachable while the sweep runs. The cold-reclaim adoption no longer removes a compacted file whose survivors changed after the rewrite.
+- **Scripts over `maxmemory`** (moon#1241): inside EVAL/EVALSHA, and in functions registered with `allow-oom`, commands that can only free memory (DEL, UNLINK, HDEL, LPOP, EXPIRE, …) are no longer refused with `-OOM`. Growing commands, and functions without `allow-oom`, are still refused, as in redis.
+- **Cold-tier housekeeping** (moon#1231, moon#1240, refs moon#1253):
+  - A compacted output whose keys all changed while its listing was committing is reclaimed, instead of staying on disk until a restart.
+  - A listed spill file found missing at boot is retired by the first sweep, so the "cold index rebuild DEGRADED" alarm appears on one boot, not on every boot until a rewrite.
+  - The set of in-flight spills superseded by a write (moon#1253) is bounded even when a completion never arrives.
+- **Tests:** the fan-out probe source scan (`perf_ws7_repl_offsets`) normalizes CRLF, so it passes on a Windows checkout.
 - **P0: a key deleted, flushed or overwritten while its disk-offload spill was still in flight came back after BGREWRITEAOF + restart** (moon#1253). The moon#1215 fix covered keys that were already cold. It missed a DEL that lands while the spill request is in flight when a fold runs before that spill completes.
   - The rewrite now writes a head `DEL` for every spill request a write retired in flight.
   - Every completion outcome, including one after SWAPDB, settles its request.
