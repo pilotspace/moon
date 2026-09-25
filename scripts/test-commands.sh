@@ -754,6 +754,16 @@ if should_run "list"; then
     # did not -- a negative COUNT, and RANK -1 COUNT 0 (every match, tail first).
     assert_match "LPOS COUNT -1"         LPOS {l1209}:l a COUNT -1
     assert_match "LPOS RANK -1 COUNT 0"  LPOS {l1209}:l a RANK -1 COUNT 0
+    # moon#1226: counted pops on a listpack are one cut from the end.
+    for c in rcli mcli; do
+        $c DEL {p1226}:l >/dev/null 2>&1
+        $c RPUSH {p1226}:l a 1 bb 22 "$(printf 'w%.0s' {1..60})" ccc -7 d 4444 e >/dev/null 2>&1
+    done
+    assert_match "RPOP k 3 (listpack)"   RPOP {p1226}:l 3
+    assert_match "LMPOP RIGHT COUNT 2"   LMPOP 1 {p1226}:l RIGHT COUNT 2
+    assert_match "LPOP k 2 (listpack)"   LPOP {p1226}:l 2
+    assert_match "pops left"             LRANGE {p1226}:l 0 -1
+    assert_match "RPOP past the end"     RPOP {p1226}:l 100
     rcli RPUSH {l1209}:rot a >/dev/null 2>&1; mcli RPUSH {l1209}:rot a >/dev/null 2>&1
     rcli EXPIRE {l1209}:rot 100 >/dev/null 2>&1; mcli EXPIRE {l1209}:rot 100 >/dev/null 2>&1
     assert_match "LMOVE k k rotates"     LMOVE {l1209}:rot {l1209}:rot LEFT RIGHT
@@ -899,6 +909,10 @@ if should_run "set"; then
     assert_match "SISMEMBER after SMOVE" SISMEMBER {s}:mvdst m1
     assert_moon_ok "SPOP"              SPOP s:k1
     assert_moon_ok "SRANDMEMBER"       SRANDMEMBER {s}:A
+    # moon#1226: a negative count on a listpack set answers from a per-member
+    # table; on a one-member set the reply is deterministic.
+    rcli SADD {s}:one only >/dev/null 2>&1; mcli SADD {s}:one only >/dev/null 2>&1
+    assert_match "SRANDMEMBER -3 (one member)" SRANDMEMBER {s}:one -3
     assert_moon_ok "SMEMBERS"          SMEMBERS {s}:A
     assert_moon_ok "SSCAN"             SSCAN {s}:A 0
 fi

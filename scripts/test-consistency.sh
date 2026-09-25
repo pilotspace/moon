@@ -1556,6 +1556,27 @@ both EXPIRE "{l1209}:rot" 100
 assert_both "moon#1209 LMOVE k k on a one-element list" LMOVE "{l1209}:rot" "{l1209}:rot" LEFT RIGHT
 assert_both "moon#1209 LMOVE k k keeps the TTL" PERSIST "{l1209}:rot"
 
+# moon#1226 (verified on redis-server 7.0.15): counted pops on a listpack are
+# one cut from the end (strings, integers and a 60-byte entry mixed), and
+# SRANDMEMBER with a negative count answers from a per-member table.
+both DEL "{p1226}:l" "{p1226}:s1" "{p1226}:s3"
+both RPUSH "{p1226}:l" a 1 bb 22 "$(printf 'w%.0s' {1..60})" ccc -7 d 4444 e
+assert_both "moon#1226 RPOP k 3 on a listpack" RPOP "{p1226}:l" 3
+assert_both "moon#1226 LMPOP RIGHT COUNT 2" LMPOP 1 "{p1226}:l" RIGHT COUNT 2
+assert_both "moon#1226 LPOP k 2 on a listpack" LPOP "{p1226}:l" 2
+assert_both "moon#1226 what the pops left" LRANGE "{p1226}:l" 0 -1
+assert_both "moon#1226 RPOP past the end" RPOP "{p1226}:l" 100
+assert_both "moon#1226 the drained list is gone" EXISTS "{p1226}:l"
+both SADD "{p1226}:s1" only
+assert_both "moon#1226 SRANDMEMBER -3 on a one-member listpack set" SRANDMEMBER "{p1226}:s1" -3
+both SADD "{p1226}:s3" x 7 y
+assert_eq "moon#1226 SRANDMEMBER -60 draws every member of a 3-member set" \
+    "$(redis-cli -p "$PORT_REDIS" SRANDMEMBER "{p1226}:s3" -60 2>&1 | sort -u | tr '\n' ' ')" \
+    "$(redis-cli -p "$PORT_RUST" SRANDMEMBER "{p1226}:s3" -60 2>&1 | sort -u | tr '\n' ' ')"
+assert_eq "moon#1226 SRANDMEMBER -60 answers exactly 60" \
+    "$(redis-cli -p "$PORT_REDIS" SRANDMEMBER "{p1226}:s3" -60 2>&1 | wc -l | tr -d ' ')" \
+    "$(redis-cli -p "$PORT_RUST" SRANDMEMBER "{p1226}:s3" -60 2>&1 | wc -l | tr -d ' ')"
+
 # moon#1226 (verified on redis-server 7.0.15): an LREM that removes nothing and
 # an LINSERT whose pivot is missing are not writes -- redis signals the key only
 # when it changed, so a WATCHing EXEC still runs. Moon took the list's mutable
