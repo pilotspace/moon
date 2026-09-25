@@ -354,3 +354,112 @@ number is DEFERRED (no perf host here).
   was `/home/user/wt/WS16-snapshot-capture/tests/...` — and
   `perf_ws15_bgsave_status` differs between the two trees under the same
   test names).
+
+# Phase 2 — adversarial review follow-ups (MERGE-AFTER-FIXES)
+
+Step 0: `origin/main` (7ddc0cb, PR #1242 incl. FIX-MAINCI moon#1253) merged
+as `f6237b84`; both test mods kept in `persistence_tick.rs`
+(`reclaim_offload_tests`, `superseded_settle_tests`).
+
+## 1. moon#1232 counts what redis 7.0.15 counts (`a2fa8147`)
+- **Oracle.** Every rule below was measured on redis-server 7.0.15 (on PATH):
+  `INFO persistence` `rdb_changes_since_last_save` across one command, 170+
+  cases (scratch probe), then pinned in two tables: the lib table
+  `command::keyspace_changes::tests` (63 rows, per-thread shadow counter, so
+  parallel tests cannot disturb it) and the integration table
+  `perf_ws19_save_rules::dirty_count_matches_redis_7_0_15` (the reviewer's 43
+  rows + 16), whose `#[ignore]` twin `dirty_count_oracle_redis_agrees` runs the
+  same table on redis-server (green).
+- **Mechanism.**
+  - Funnels count only what changed: `remove` (hot or cold copy found),
+    `remove_counting_cold` / `unlink_key` (a LIVE key), `set_expiry` (the same
+    predicate as its WATCH stamp: an expire-family write, or a PERSIST that
+    removed a TTL), `clear` (the keys removed — FLUSHDB of 3 keys is 3).
+  - Housekeeping is muted: `remove_lazily` and `remove_expired_at` (expiry),
+    the three victim-removing eviction functions, the cold and in-flight
+    promotions (`promote_cold_outcome`, `promote_inflight_if_present`), the two
+    spill-rehydrate `set`s in `persistence_tick`, a parked waiter's serve
+    (`serve_list_key`, `serve_zset_key`: 7.0.15 counts only the push).
+  - Collection writes: the dispatch arm the command already matched runs
+    `keyspace_changes::counted(db, args, Rule, handler)`: a thread-local mute
+    (depth counter, RAII guard) around the handler, then one count derived
+    from reply + args by the command's rule (`Pairs`, `Pushed`, `Int`,
+    `Popped`, `MultiPopped`, `Streams`, `FieldCodes`, …). Handler-counted
+    (`Rule::ByHandler`, via `record_keyspace_changes`, which the mute does not
+    silence): ZADD / GEOADD (added + rescored — the listpack arm's `changed`
+    tally now counts a byte-changing replace without `CH` too; it is replied
+    only under `CH`), LTRIM (removed), SMOVE (1 + added to dst), PFADD
+    (created + changed registers). ZUNIONSTORE / ZINTERSTORE / ZDIFFSTORE /
+    ZRANGESTORE (`counted_store`): 1 if stored, or if an empty result deleted a
+    destination that existed (checked with `exists` before). The set / geo
+    stores build their destination through `set` / `remove` and are right
+    through the funnels. `try_immediate_pop` counts as the non-blocking twin.
+    MOVE counts once (`move_core` muted + 1 on success).
+  - Cost: no phf lookup; one extra thread-local `Cell` read per funnel call,
+    and for collection writes a mute/unmute plus one match on the reply.
+- **Red** (`baseline-ae21476`): 34 of 59 integration rows differ; 200 GETs of
+  cold keys move the count by 161. **Green** on the fix.
+- **Known differences** (documented in the module): XREADGROUP / XCLAIM /
+  XAUTOCLAIM do not count the consumer they create (+1 in redis, only when it
+  is served something); SORT STORE counts 1 (redis: the stored length);
+  ZINCRBY of a NEW member by 0 counts 0 (redis 1); XGROUP DELCONSUMER of a
+  missing consumer counts 1 (redis 0); SWAPDB 0 (redis 1); SETBIT of an
+  unchanged bit 1 (redis 0). At `--shards 4`: MSET / DEL / UNLINK / MSETNX /
+  COPY / FLUSHALL across shards match redis; cross-shard RENAME, SMOVE, LMOVE,
+  *STORE and PFMERGE are refused with CROSSSLOT (0, correctly), and their
+  hash-tagged forms match (RENAME 1, SMOVE 2, ZUNIONSTORE 1).
+
+## 2. moon#1231 adoption rule pinned (`b796bf68`)
+`a_partially_discarded_compaction_keeps_the_old_file`: two 3 MiB survivors
+(one output each), one promoted after the fold. Red with the rule reverted;
+every other cold_reclaim test passes with it reverted (the reviewer's point).
+
+## 3. `UnlinkHold::admit` O(N^2) (`962aa2c2`)
+`held` is a `BTreeMap<file_id, stamp>`. Debug build, before: 20k 0.67 s,
+80k 10.4 s (15.6x); the scaling test (best of three per size, < 8x) is green.
+
+## 4. Held files at `auto-aof-rewrite-percentage 0` (`d9fb8bde`)
+Held-file pressure has its own counter (`held_files_pressure()`), which
+`reclaim_due` answers whatever the percentage (still spaced and settled);
+compactions alone still wait for a manual BGREWRITEAOF at 0.
+
+## 5. Output whose survivors all change during the ack (`2867ec35`)
+Phase B queues any adopted output left with zero refs; the hold keeps it
+while the committed generation may read it. Reviewer's test extended (held
+first, gone with its ledger entries after two committed folds); red with
+the queueing removed.
+
+## 6. SHUTDOWN during an auto-save (`8680eacf`)
+`persistence::shutdown_save` (both sharded handlers pass their runtime's
+sleep): a save already running is waited for (bounded) and followed by this
+one; at most 3 deferrals; no-persistence-dir still refused up front.
+Integration: 400k keys, SHUTDOWN while `rdb_bgsave_in_progress:1`, a key
+written after the auto-save started is there after restart. Red on the
+previous binary (`-ERR Background save already in progress`), green 3/3.
+Not done: aborting the running cooperative snapshot (redis kills its child);
+a SHUTDOWN during a long save now takes up to two save bounds (2 x 10 s).
+
+## 7. Retry after 5 s under any rule (`55ce5d98`)
+`save_rule_due(rules, since_last_save, since_last_attempt, changes, ok)`;
+the tick reads the last success from `LAST_SAVE_TIME` (max with the task's
+start). A manual BGSAVE restarts the rule's clock, as in redis.
+
+## 8. Deferred tombstone false alarm (`f00e9903`)
+Not tagged (would need a new manifest record). Instead a queued file already
+gone from disk is retired at the first sweep, bypassing the hold (nothing to
+protect), so the DEGRADED line appears on one boot, not every boot until a
+fold; the per-file warn names the reclaim's deferred tombstone as a benign
+cause. `ColdIndex::merge` now carries the unlink queue.
+
+## 9. Superseded-set watermark (`cd118031`, refs moon#1253)
+As designed in FIX-MAINCI NOTES R2: `done_below` stored (Release) after each
+flush's `send_completions`, loaded (Acquire) before the drain, prune below it
+after the drain (only when it moved); a dead thread clears. FIFO re-checked:
+ids are minted from the shard's one `spill_file_id` Cell synchronously before
+each `try_send` on the shard thread (connection gate, tick, SPSC handler,
+Lua); reclaim jobs have their own channel and answer with `ReclaimDone`.
+
+## Phase 2 gates
+See SUMMARY.md, "Phase 2 gates at `cd118031`": fmt, audits, clippy and
+check on both runtimes clean; full lib monoio 6659/0, tokio 5721/0;
+integration suites green on both runtimes with debug server binaries.

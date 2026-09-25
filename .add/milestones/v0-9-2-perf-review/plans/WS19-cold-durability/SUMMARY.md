@@ -9,8 +9,8 @@
 
 | Issue | Verdict | Commits | Evidence | Follow-ups |
 |---|---|---|---|---|
-| moon#1231: a promoted cold key is lost once the sweep unlinks its file | **FIXED** | `22c516b` (test move), `c0c8059` (cross-ownership), `478ab3e` | In-process red: `(k08, k09)` recovers as `(None, Some("x"))`. Real-server kill -9 red on both old binaries at `--shards 1` and 4 (table below). Green on both runtimes at both shard counts. | The no-AOF WAL/snapshot recovery path is not analysed; its behaviour is unchanged. With `auto-aof-rewrite-percentage 0`, held files wait for a manual BGREWRITEAOF. |
-| moon#1232: sharded `--save` never fires | **FIXED** | `a3247ad`, `7f9ca7a` (cross-ownership) | `perf_ws19_save_rules` red on both old binaries at s1 and s4: "ten changes with --save \"1 10\" produced no snapshot in 15 s". Green on both runtimes. Unit tests: `a_rule_fires_on_its_change_count_and_its_time`, `a_failed_save_is_retried_after_the_redis_delay`, `changes_made_while_a_save_runs_stay_counted`. | Embedded mode starts no auto-save (`server/embedded.rs`). The rule's clock starts at the last auto-save, not at `lastsave`. |
+| moon#1231: a promoted cold key is lost once the sweep unlinks its file | **FIXED** | `22c516b` (test move), `c0c8059` (cross-ownership), `478ab3e` | In-process red: `(k08, k09)` recovers as `(None, Some("x"))`. Real-server kill -9 red on both old binaries at `--shards 1` and 4 (table below). Green on both runtimes at both shard counts. | The no-AOF WAL/snapshot recovery path is not analysed; its behaviour is unchanged. ~~With `auto-aof-rewrite-percentage 0`, held files wait for a manual BGREWRITEAOF.~~ Phase 2 (`d9fb8bde`): held files get their fold at percentage 0 too. |
+| moon#1232: sharded `--save` never fires | **FIXED** | `a3247ad`, `7f9ca7a` (cross-ownership) | `perf_ws19_save_rules` red on both old binaries at s1 and s4: "ten changes with --save \"1 10\" produced no snapshot in 15 s". Green on both runtimes. Unit tests: `a_rule_fires_on_its_change_count_and_its_time`, `a_failed_save_is_retried_after_the_redis_delay`, `changes_made_while_a_save_runs_stay_counted`. | Embedded mode starts no auto-save (`server/embedded.rs`). ~~The rule's clock starts at the last auto-save, not at `lastsave`.~~ Phase 2 (`55ce5d98`): the rule runs from the last successful save. Phase 2 (`a2fa8147`): collection writes are counted, over-counts fixed. |
 | moon#1240: cold reclaim fsyncs and commits the manifest on the shard thread | **FIXED**; the Linux-perf-host number is **DEFERRED** | `4512085` (test move), `8822d1d` (cross-ownership), `0694e16` | `reclaim_offload_tests::the_reclaim_tick_never_does_the_disk_io_itself`, with a real spill thread and a 300 ms injected manifest fsync. Red: compaction reverted to inline gives "the tick compacted inline"; adoption reverted to blocking makes the tick block 301.9 ms. Green. `cold_reclaim_tests` (10), the crash suite and `perf_ws15_ledger_bound` are green. | Latency A/B on a Linux perf host. |
 | moon#1241: `redis.call('DEL')` answers `-OOM` over budget | **FIXED** | `71f7016`, `db3490a` (cross-ownership) | `perf_ws19_script_oom` red on both old binaries at s1 and s4. Green on both runtimes. The unit test is red with only the bypass reverted. | Pre-existing, unchanged: redis's `SCRIPT_WRITE_DIRTY`; `allow-oom` growing commands; shebang EVAL. |
 
@@ -90,7 +90,7 @@ Green: 11/11 at s1 and 11/11 at s4, on both the monoio and tokio release binarie
    - writes made during a save stay counted;
    - a spill file below the latest cut stays on disk (and in `INFO cold_files_pending_unlink`) until the next committed fold plus a sweep;
    - held files ask the auto-rewrite monitor for a fold while the ledger is over the reclaim threshold.
-3. **Deferred tombstone commit:** a crash between unlinking an old file and persisting its tombstone leaves a listed-but-missing file. Recovery counts it as `files_missing` with an error-level degraded rebuild. The orphan sweep has the same window.
+3. **Deferred tombstone commit:** a crash between unlinking an old file and persisting its tombstone leaves a listed-but-missing file. Recovery counts it as `files_missing` with an error-level degraded rebuild. The orphan sweep has the same window. Phase 2 (`f00e9903`): the first sweep retires such an entry (no hold), so the alarm appears on one boot only.
 4. **Shared-target aliasing** happened four times; each result was re-run until provenance was proven. WS16 changes the `perf_ws12_bgsave_split` and `perf_ws15_bgsave_status` expectations, so re-run both on the merged tree.
 5. **File sizes:**
    - Already over the limit and grew: `manifest.rs` 2473 → 2494, `event_loop.rs` +4, `persistence_tick.rs` 3402 → 3406.
@@ -128,4 +128,54 @@ Green: 11/11 at s1 and 11/11 at s4, on both the monoio and tokio release binarie
 - **Performance (moon#1240):** cold-tier reclaim no longer reads, writes or fsyncs spill files, or waits for manifest fsyncs, on the shard thread. PING p99 during cold-delete churn fell 23%, and p99.9 about 3×, in a same-host A/B.
 - **Fixed (redis parity, moon#1241):** inside EVAL/EVALSHA, and in functions registered with `allow-oom`, commands that can only free memory (DEL, UNLINK, HDEL, LPOP, EXPIRE, …) are no longer refused with `-OOM` on an over-budget shard. Eviction still runs, and growing commands are still refused. A function without `allow-oom` is still refused, as in redis.
 
-(Committed by the orchestrator from the WS19 agent's final report, because the harness refused the agent's SUMMARY write.)
+(Phase 1 committed by the orchestrator from the WS19 agent's final report, because the harness refused the agent's SUMMARY write.)
+
+## Phase 2: review follow-ups (MERGE-AFTER-FIXES)
+
+`origin/main` (7ddc0cb, PR #1242 incl. FIX-MAINCI moon#1253) merged as `f6237b84`, both test mods kept. Then one commit per item:
+
+| # | Item | Verdict | Commit | Evidence |
+|---|---|---|---|---|
+| 1 | moon#1232 counted string writes only; DEL/EXPIRE of a missing key, active expiry, RENAME and cold GETs over-counted | **FIXED** | `a2fa8147` (cross-ownership, see below) | Integration table vs redis 7.0.15 (the reviewer's 43 rows + 16): 34 rows differ on `baseline-ae21476`, 0 on the fix; `dirty_count_oracle_redis_agrees` (ignored) runs the same table on redis-server 7.0.15: green. 200 cold GETs: +161 before, 0 after. Lib table (63 rows) in `command::keyspace_changes::tests`. A collection-only `--save "1 10"` at `--shards 4` now saves. |
+| 2 | moon#1231 `every_output_listed` rule untested | **FIXED** (test) | `b796bf68` | `a_partially_discarded_compaction_keeps_the_old_file`: red with the rule reverted, while every other cold_reclaim test stays green. |
+| 3 | `UnlinkHold::admit` O(N^2) | **FIXED** | `962aa2c2` | Debug: 20k 0.67 s, 80k 10.4 s (15.6x) before; `admitting_a_large_batch_is_not_quadratic` green. |
+| 4 | Held files never released at `auto-aof-rewrite-percentage 0` | **FIXED** | `d9fb8bde` (touches `aof/auto_rewrite.rs`) | Held-file pressure has its own counter, answered whatever the percentage: `held_files_pressure_gets_a_fold_even_with_rewrites_disabled`, `held_files_pressure_is_signalled_apart_from_compactions`. |
+| 5 | Output whose survivors all change during the ack never reclaimed | **FIXED** | `2867ec35` | The reviewer's test, extended: held while no covering fold committed, gone with its ledger entries after two. Red with the fix removed. |
+| 6 | SHUTDOWN during an auto-save refused | **FIXED** (waits, then saves; does not abort) | `8680eacf` (both sharded handlers) | `shutdown_during_an_auto_save_is_not_refused`: red on the previous binary, green 3/3; a key written after the auto-save started survives the restart. |
+| 7 | 5 s retry only for rules with secs <= 5 | **FIXED** | `55ce5d98` | `save_rule_due` takes seconds since the last success and since the last attempt; `a_failed_save_is_retried_after_5s_under_a_60s_rule`. |
+| 8 | Deferred tombstone gives a DEGRADED false alarm every boot until a fold | **BOUNDED to one boot** (not tagged) | `f00e9903` | A queued file already gone from disk is retired at the first sweep, bypassing the hold: `a_listed_file_gone_from_disk_is_retired_at_the_first_sweep`, red through the hold. Tagging would need a new durable manifest record. |
+| 9 | Bound the moon#1253 superseded set (FIX-MAINCI R2) | **FIXED** | `cd118031` (refs moon#1253) | Watermark as designed; FIFO re-checked (ids minted from the shard's one counter before each `try_send`; reclaim jobs on their own channel). `a_superseded_request_whose_completion_never_arrives_is_pruned_by_the_watermark` (red without the prune), plus two spill-thread tests. |
+
+### Phase 2 cross-ownership edits (all inside the commit of their item)
+- Item 1 (`a2fa8147`): `src/command/mod.rs` (52 dispatch arms wrapped, 4 zset stores), new `src/command/keyspace_changes.rs`, handlers `hll.rs`, `geo/geo_cmd.rs`, `list/list_write.rs` (LTRIM), `set/set_write.rs` (SMOVE), `sorted_set/sorted_set_write.rs` (ZADD tally), `keyspace/move_cmd.rs`, `server_admin.rs` (comment), `src/server/conn/blocking.rs` (`try_immediate_pop`), `src/blocking/wakeup.rs` (mute), `src/storage/eviction.rs` (mute), `src/storage/db/kv_ops.rs` (funnels), `src/admin/metrics_setup/mod.rs` (mute + explicit count), `src/shard/persistence_tick.rs` (rehydrate mute).
+- Item 4 (`d9fb8bde`): `src/persistence/aof/auto_rewrite.rs` (`reclaim_due` signature).
+- Item 6 (`8680eacf`): `src/server/conn/handler_monoio/dispatch.rs`, `src/server/conn/handler_sharded/dispatch.rs`, `src/command/persistence.rs`.
+- Item 9 (`cd118031`): `src/storage/db/mod.rs` (prune / clear), `src/shard/persistence_tick.rs` (`drain_and_apply`).
+
+### For SUMMARY only (per the orchestrator)
+- **Pre-existing, moon#1231 with `--appendonly no`:** without an AOF writer there is no hold, so the reviewer's no-AOF scenario (a snapshot, then GET-promotions, then the sweep, then a crash) still loses promoted keys. Filed separately by the orchestrator.
+- **Unmeasured risk:** reclaim jobs are polled before every spill `recv_timeout` on the same thread, so a burst of reclaim reads/writes can delay a deep spill backlog (bounded: 2 jobs started per tick, 8 in flight per shard).
+- **Unmeasured risk:** a dead spill thread leaves `compactions_in_flight` stuck at 8 (their jobs never answer), which stops new compactions for the shard; item 9 clears the superseded sets in that case but not the reclaim's in-flight set.
+
+### Phase 2 gates at `cd118031`
+- fmt, `audit-unsafe` (no new `unsafe`), `audit-unwrap` (within baseline), `audit-test-tempdirs`, `audit-encoding-limits`: clean.
+- `cargo clippy --all-targets -- -D warnings` on monoio and on tokio (`--no-default-features --features runtime-tokio,jemalloc`): clean. Tokio `cargo check --all-targets`: clean.
+- Full lib, no filter: monoio 6659 passed / 0 failed / 14 ignored; tokio 5721 / 0 / 13 (own binaries: this branch's new test names present).
+- Integration, debug server binaries of `cd118031` pinned by `MOON_BIN` (monoio and tokio; the phase-1 release-build budget was spent), test binaries rebuilt from this tree and copied (names checked against the sources), all green on both runtimes:
+  - `perf_ws19_save_rules` 7/7 including the ignored redis-server oracle; `perf_ws19_script_oom` 2/2;
+  - `perf_ws15_ledger_bound` 2/2, `perf_ws15_spanning_cold_del` 2/2;
+  - `perf_ws15_bgsave_status` 3/3, `perf_ws12_bgsave_split` 4/4;
+  - `crash_recovery_cold_del_rewrite --ignored` 11/11 at `--shards 4` and at `--shards 1`;
+  - `blocking_exec_wakeup` 3/3, `blocking_ready_key_wake` 8/8, `blocking_stream_read` 14/14, `keyspace_event_db_index` 4/4.
+
+### Phase 2 CHANGELOG bullets
+- **Fixed (redis parity, moon#1232):** `rdb_changes_since_last_save`, which the `--save` trigger reads, now counts what redis 7.0.15's `dirty` counts: collection writes by their redis rule (HSET field-value pairs, LPUSH elements, SADD members added, ZADD added plus rescored, pops the elements popped, …), and no longer counts a DEL or EXPIRE of a missing key, key expiry, eviction, or a read that brings a cold key back into memory. RENAME counts 1 and FLUSHDB the keys it removed.
+- **Fixed (moon#1232):** `SHUTDOWN` (with save points, or `SHUTDOWN SAVE`) during a running auto-save or BGSAVE no longer fails with "Background save already in progress": it waits for that save and then saves.
+- **Fixed (moon#1232):** after a failed save a `--save` rule retries after 5 s whatever its seconds; a rule's seconds run from the last successful save.
+- **Fixed (moon#1231):** with `auto-aof-rewrite-percentage 0`, spill files held for a replayable AOF generation still get the rewrite that releases them when their ledger keeps write admission over budget.
+
+### Phase 2 residuals and notes
+- Item 1 known differences (documented in `command::keyspace_changes`): consumer creation by XREADGROUP/XCLAIM/XAUTOCLAIM not counted; SORT STORE counts 1; ZINCRBY of a new member by 0 counts 0; XGROUP DELCONSUMER of a missing consumer counts 1; SWAPDB 0; SETBIT of an unchanged bit 1. At `--shards 4` the cross-shard multi-key writes that moon accepts (MSET, DEL, UNLINK, MSETNX, COPY, FLUSHALL) match redis, and hash-tagged RENAME / SMOVE / ZUNIONSTORE match; the rest are refused with CROSSSLOT.
+- Item 6 waits for a running save instead of killing it: a SHUTDOWN during a long save may take up to two save bounds (2 x 10 s).
+- `src/storage/db/kv_ops.rs` was 1510 lines on main after the merge and is 1537 now (over the 1500 cap before this phase).
+- Disk: one errant `cargo build --tests` in this phase filled the shared disk for ~2 minutes (6.3 GB of test binaries); the binaries from that build window were deleted and the disk returned to 5.9 GB free.
