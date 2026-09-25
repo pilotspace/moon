@@ -1,5 +1,12 @@
 //! moon#1215: every path that takes a slot out of the cold index records it
 //! in the dead-slot ledger, and only unlinking the file forgets it.
+//!
+//! PR #1233 review: only slots that can come back are kept. Kept classes —
+//! DEL/UNLINK and promotion (`remove`), re-spill (`insert` over another
+//! file), FLUSH (`clear_all`), the hot-shadow sweep, released older copies,
+//! ghost slots — each have a test below; so do the dropped ones: the expiry
+//! sweep's own removals, entries whose TTL passed after they were recorded,
+//! and every class when no AOF fold exists to consume the ledger.
 
 use bytes::Bytes;
 
@@ -13,6 +20,13 @@ fn loc(file_id: u64, slot: u16) -> ColdLocation {
         slot_idx: slot,
         ttl_ms: None,
         value_type: ValueType::String,
+    }
+}
+
+fn loc_ttl(file_id: u64, slot: u16, ttl_ms: u64) -> ColdLocation {
+    ColdLocation {
+        ttl_ms: Some(ttl_ms),
+        ..loc(file_id, slot)
     }
 }
 
@@ -58,28 +72,67 @@ fn clear_all_records_every_slot_and_older_copy() {
     assert_eq!(dead_keys(&ci), vec![b"a".to_vec(), b"b".to_vec()]);
 }
 
+/// Kept: the hot-shadow sweep's slot can come back (its key's hot copy may
+/// die later). Dropped: the expiry sweep's — its own TTL has passed, so the
+/// slot reads as expired after any restart and never needs a `DEL`.
 #[test]
-fn the_sweeps_record_what_they_take() {
+fn the_shadow_sweep_records_what_it_takes_the_expiry_sweep_does_not() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(dir.path().join("data")).unwrap();
     let mut ci = ColdIndex::new();
     ci.insert(Bytes::from_static(b"shadowed"), loc(1, 0));
-    ci.insert(
-        Bytes::from_static(b"expired"),
-        ColdLocation {
-            ttl_ms: Some(10),
-            ..loc(1, 1)
-        },
-    );
+    ci.insert(Bytes::from_static(b"expired"), loc_ttl(1, 1, 10));
     ci.insert(Bytes::from_static(b"live"), loc(1, 2));
     ci.sweep_known_orphans(vec![Bytes::from_static(b"shadowed")], dir.path(), None)
         .unwrap();
     ci.sweep_expired(1_000, dir.path(), None, 16).unwrap();
+    assert_eq!(dead_keys(&ci), vec![b"shadowed".to_vec()]);
+    assert_eq!(ci.len(), 1);
+}
+
+/// Dropped after the fact: a DELeted key's slot whose own TTL is still ahead
+/// is kept; once that TTL passes the expiry sweep prunes it, and the
+/// ledger's bytes go with it.
+#[test]
+fn a_dead_slot_is_pruned_once_its_own_ttl_passes() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("data")).unwrap();
+    let mut ci = ColdIndex::new();
+    ci.insert(Bytes::from_static(b"session"), loc_ttl(1, 0, 5_000));
+    ci.insert(Bytes::from_static(b"plain"), loc(1, 1));
+    ci.insert(Bytes::from_static(b"anchor"), loc(1, 2));
+    assert!(ci.remove(b"session"));
+    assert!(ci.remove(b"plain"));
+    ci.sweep_expired(4_000, dir.path(), None, 16).unwrap();
     assert_eq!(
         dead_keys(&ci),
-        vec![b"expired".to_vec(), b"shadowed".to_vec()]
+        vec![b"plain".to_vec(), b"session".to_vec()],
+        "before its deadline the slot could still read as a value"
     );
-    assert_eq!(ci.len(), 1);
+    let before = ci.dead_slots().resident_bytes();
+    ci.sweep_expired(5_001, dir.path(), None, 16).unwrap();
+    assert_eq!(dead_keys(&ci), vec![b"plain".to_vec()]);
+    assert!(ci.dead_slots().resident_bytes() < before);
+    assert!(
+        ci.dead_slots().file_has_dead_slots(1),
+        "`plain` still pins file 1's entry"
+    );
+}
+
+/// Dropped: with no AOF fold in the process, no path records anything.
+#[test]
+fn no_path_records_without_an_aof_consumer() {
+    let _off = crate::storage::tiered::dead_slots::force_ledger(false);
+    let mut ci = ColdIndex::new();
+    ci.insert(Bytes::from_static(b"a"), loc(1, 0));
+    ci.insert(Bytes::from_static(b"b"), loc(1, 1));
+    ci.insert(Bytes::from_static(b"c"), loc(1, 2));
+    assert!(ci.remove(b"a"));
+    ci.insert(Bytes::from_static(b"b"), loc(2, 0));
+    ci.note_dead_slot(3, Bytes::from_static(b"ghost"), None);
+    ci.clear_all();
+    assert!(ci.dead_slots().is_empty());
+    assert_eq!(ci.dead_slots().resident_bytes(), 0);
 }
 
 #[test]
@@ -139,7 +192,7 @@ fn a_file_already_gone_forgets_its_slots() {
 #[test]
 fn a_ghost_slot_is_recorded_on_request() {
     let mut ci = ColdIndex::new();
-    ci.note_dead_slot(9, Bytes::from_static(b"ghost"));
+    ci.note_dead_slot(9, Bytes::from_static(b"ghost"), None);
     assert!(ci.dead_slots().file_has_dead_slots(9));
     assert_eq!(ci.len(), 0, "a ghost is never an entry");
 }

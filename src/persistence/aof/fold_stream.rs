@@ -192,7 +192,7 @@ pub fn stream_fold_image(dbs: &[&Database], now_ms: u64, mut sink: FoldImageSink
             let mut expired_shadows: Vec<Bytes> = Vec::new();
             for (key, entry) in db.data().iter() {
                 if entry.is_expired_at(now_ms) {
-                    if cold.is_some_and(|ci| ci.lookup(key.as_bytes()).is_some()) {
+                    if cold.is_some_and(|ci| shadow_can_return(ci, key.as_bytes(), now_ms)) {
                         expired_shadows.push(Bytes::copy_from_slice(key.as_bytes()));
                     }
                     continue;
@@ -236,6 +236,10 @@ pub fn stream_fold_image(dbs: &[&Database], now_ms: u64, mut sink: FoldImageSink
 /// dead. The `DEL` removes whatever the rebuild indexed for the key (older
 /// copies included), and anything the key becomes after the fold is in the
 /// generation's own records.
+///
+/// A dead slot whose own TTL has passed at `now_ms` is not a candidate: it
+/// reads as expired after any restart, so it cannot bring its key back
+/// (`dead_slots` module doc).
 pub(crate) fn cold_deletes_of(
     db: &Database,
     now_ms: u64,
@@ -259,12 +263,24 @@ pub(crate) fn cold_deletes_of(
     // `generation_head` dedupes on the writer thread.
     let mut dead = expired_shadows;
     dead.reserve(ci.dead_slots().len());
-    for key in ci.dead_slots().keys() {
+    for key in ci.dead_slots().keys_live_at(now_ms) {
         if !alive(key) {
             dead.push(key.clone());
         }
     }
     dead
+}
+
+/// Whether the cold entry behind a hot key that the base drops as expired
+/// could come back as the key's value after a restart: it exists and its
+/// own TTL has not passed at `now_ms`.
+fn shadow_can_return(
+    ci: &crate::storage::tiered::cold_index::ColdIndex,
+    key: &[u8],
+    now_ms: u64,
+) -> bool {
+    ci.lookup(key)
+        .is_some_and(|loc| loc.ttl_ms.is_none_or(|ttl| now_ms <= ttl))
 }
 
 /// In-flight spill payloads a fold base image could not carry because they
@@ -356,7 +372,7 @@ pub(crate) fn fold_cold_deletes(dbs: &[&Database], now_ms: u64) -> ColdDeletes {
             .data()
             .iter()
             .filter(|(key, entry)| {
-                entry.is_expired_at(now_ms) && ci.lookup(key.as_bytes()).is_some()
+                entry.is_expired_at(now_ms) && shadow_can_return(ci, key.as_bytes(), now_ms)
             })
             .map(|(key, _)| Bytes::copy_from_slice(key.as_bytes()))
             .collect();
@@ -726,7 +742,7 @@ mod tests {
         // `respilled` moved to file 2 (alive there); `twice` was also dead in
         // file 3 — one DEL.
         ci.insert(Bytes::from_static(b"respilled"), cold_loc(2));
-        ci.note_dead_slot(3, Bytes::from_static(b"twice"));
+        ci.note_dead_slot(3, Bytes::from_static(b"twice"), None);
         // A live cold key with no dead slot, and a stale shadow behind a hot
         // key whose value expired.
         ci.insert(Bytes::from_static(b"cold"), cold_loc(4));
@@ -758,6 +774,47 @@ mod tests {
                 b"shadowed_expired",
                 b"twice"
             ]
+        );
+    }
+
+    /// PR #1233 review: a dead slot (or a stale shadow) whose own TTL has
+    /// passed at the fold instant reads as expired after any restart, so the
+    /// fold writes no `DEL` for it; one whose TTL is still ahead gets one.
+    #[test]
+    fn slots_expired_at_the_fold_instant_get_no_del() {
+        let now = 1_000_000u64;
+        let mut db = Database::new();
+        let mut ci = crate::storage::tiered::cold_index::ColdIndex::new();
+        let with_ttl = |file_id, ttl| crate::storage::tiered::cold_index::ColdLocation {
+            ttl_ms: Some(ttl),
+            ..cold_loc(file_id)
+        };
+        ci.insert(Bytes::from_static(b"dead_expired"), with_ttl(1, now - 1));
+        ci.insert(Bytes::from_static(b"dead_ttl_ahead"), with_ttl(1, now + 1));
+        ci.insert(Bytes::from_static(b"dead_no_ttl"), cold_loc(1));
+        ci.insert(Bytes::from_static(b"anchor"), cold_loc(1));
+        for k in [&b"dead_expired"[..], b"dead_ttl_ahead", b"dead_no_ttl"] {
+            ci.remove(k);
+        }
+        // Stale shadows behind hot keys the base drops as expired: one whose
+        // cold slot is itself expired, one whose cold slot is not.
+        ci.insert(Bytes::from_static(b"shadow_expired"), with_ttl(2, now - 1));
+        ci.insert(Bytes::from_static(b"shadow_live"), cold_loc(2));
+        db.cold_index = Some(ci);
+        db.set_string_with_expiry(b"shadow_expired", Bytes::from_static(b"v"), now - 5);
+        db.set_string_with_expiry(b"shadow_live", Bytes::from_static(b"v"), now - 5);
+
+        let deletes = deletes_of(std::slice::from_ref(&db), now);
+        let mut keys: Vec<&[u8]> = deletes.per_db[0].1.iter().map(|k| k.as_ref()).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec![&b"dead_no_ttl"[..], b"dead_ttl_ahead", b"shadow_live"]
+        );
+        assert_eq!(
+            fold_cold_deletes(&[&db], now),
+            deletes,
+            "the legacy fold selects the same keys"
         );
     }
 

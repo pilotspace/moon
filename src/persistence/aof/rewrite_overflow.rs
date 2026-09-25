@@ -131,7 +131,14 @@ impl RewriteOverflow {
     }
 
     /// Explicit-cap constructor (tests exercise the cap-exceeded fallback).
+    ///
+    /// Every AOF writer owns one of these, created when its pool is built at
+    /// boot — before recovery replays the log. So this is also where the
+    /// process learns that an AOF rewrite fold exists to consume the cold
+    /// tier's dead-slot ledger (moon#1215): without one, the ledger records
+    /// nothing (`storage::tiered::dead_slots`).
     pub fn with_cap(max_bytes: usize) -> Self {
+        crate::storage::tiered::dead_slots::enable_ledger();
         Self {
             armed: std::sync::atomic::AtomicBool::new(false),
             buf: parking_lot::Mutex::new(Vec::new()),

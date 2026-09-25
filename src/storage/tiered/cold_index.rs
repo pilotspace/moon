@@ -368,9 +368,10 @@ impl ColdIndex {
 
     /// Record a slot of `key` in `file_id` that never became its entry here —
     /// a spill completion that published `file_id` for OTHER keys while this
-    /// one was superseded or withdrawn (a ghost slot, moon#1215).
-    pub fn note_dead_slot(&mut self, file_id: u64, key: Bytes) {
-        self.dead.note(file_id, key);
+    /// one was superseded or withdrawn (a ghost slot, moon#1215). `ttl_ms` is
+    /// the slot's own absolute TTL, as written.
+    pub fn note_dead_slot(&mut self, file_id: u64, key: Bytes, ttl_ms: Option<u64>) {
+        self.dead.note(file_id, key, ttl_ms);
     }
 
     /// The copies of `key` a rebuild found behind its current entry, newest
@@ -394,7 +395,8 @@ impl ColdIndex {
             for location in copies {
                 // The slot stays on disk and outlives this release: once the
                 // key's newer copy goes, it would be the one a rebuild finds.
-                self.dead.note(location.file_id, key.clone());
+                self.dead
+                    .note(location.file_id, key.clone(), location.ttl_ms);
                 if self.ref_dec(location.file_id) {
                     self.pending_unlink.push(location.file_id);
                 }
@@ -415,7 +417,8 @@ impl ColdIndex {
             return;
         };
         for location in copies {
-            self.dead.note(location.file_id, owned.clone());
+            self.dead
+                .note(location.file_id, owned.clone(), location.ttl_ms);
             if self.ref_dec(location.file_id) {
                 self.pending_unlink.push(location.file_id);
             }
@@ -470,7 +473,7 @@ impl ColdIndex {
         if let Some(old) = self.map.insert((h, key.clone()), location) {
             if old.file_id != new_file {
                 // The superseded slot stays in its file (moon#1215).
-                self.dead.note(old.file_id, key);
+                self.dead.note(old.file_id, key, old.ttl_ms);
                 if self.ref_dec(old.file_id) {
                     self.pending_unlink.push(old.file_id);
                 }
@@ -493,8 +496,18 @@ impl ColdIndex {
     /// `(u64, Bytes)` key.
     ///
     /// Every removal leaves the slot on disk, so it is recorded in the
-    /// dead-slot ledger here, once, for every caller (moon#1215).
+    /// dead-slot ledger here, once, for every caller (moon#1215) — except
+    /// [`Self::sweep_expired`]'s, whose slots have all expired and so can
+    /// never read as a value again ([`Self::remove_raw_unrecorded`]).
     fn remove_raw(&mut self, key: &[u8]) -> Option<ColdLocation> {
+        let (owned, location) = self.remove_raw_unrecorded(key)?;
+        self.dead.note(location.file_id, owned, location.ttl_ms);
+        Some(location)
+    }
+
+    /// [`Self::remove_raw`] without the ledger entry; returns the owned key
+    /// too.
+    fn remove_raw_unrecorded(&mut self, key: &[u8]) -> Option<(Bytes, ColdLocation)> {
         let h = scan_h48(key);
         let owned = self
             .map
@@ -503,8 +516,7 @@ impl ColdIndex {
             .find(|(k, _)| k.1.as_ref() == key)
             .map(|(k, _)| k.clone())?;
         let location = self.map.remove(&owned)?;
-        self.dead.note(location.file_id, owned.1);
-        Some(location)
+        Some((owned.1, location))
     }
 
     /// Remove a key from the cold index (promotion back to RAM, DEL/UNLINK,
@@ -535,11 +547,12 @@ impl ColdIndex {
         // Every slot stays on disk until the sweep unlinks its file; a
         // rewrite before that must still delete each key (moon#1215).
         for ((_, key), location) in std::mem::take(&mut self.map) {
-            self.dead.note(location.file_id, key);
+            self.dead.note(location.file_id, key, location.ttl_ms);
         }
         for (key, copies) in std::mem::take(&mut self.older_copies) {
             for location in copies {
-                self.dead.note(location.file_id, key.clone());
+                self.dead
+                    .note(location.file_id, key.clone(), location.ttl_ms);
             }
         }
         self.resident_bytes = 0;
@@ -840,6 +853,11 @@ impl ColdIndex {
         manifest: Option<&mut crate::persistence::manifest::ShardManifest>,
         max_batch: usize,
     ) -> std::io::Result<SweepStats> {
+        // Dead slots whose own TTL has passed since they were recorded can no
+        // longer come back: stop holding their keys (moon#1215 ledger, PR
+        // #1233 review). O(1) unless one has actually expired.
+        self.dead.prune_expired(now_ms);
+
         // Phase 1: identify expired keys, bounded to `max_batch`. Iteration
         // is in (hash48, key) order and restarts from the front each call;
         // an entry left behind by the cap is picked up by a later sweep once
@@ -870,10 +888,12 @@ impl ColdIndex {
         }
 
         // Phase 2: remove entries + decrement their files' ref counts (same
-        // shape as `sweep_known_orphans`).
+        // shape as `sweep_known_orphans`). Not recorded as dead slots: each
+        // one's own TTL has passed, so it can never read as a value again
+        // (see `dead_slots`).
         let mut stats = SweepStats::default();
         for key in &expired_keys {
-            if let Some(old) = self.remove_raw(key.as_ref()) {
+            if let Some((_, old)) = self.remove_raw_unrecorded(key.as_ref()) {
                 // moon#1013: a tracked key can be spilled and then expire on
                 // disk; its trackers must hear about it like a hot expiry.
                 crate::tracking::invalidation::invalidate_server_removed(key.as_ref());
