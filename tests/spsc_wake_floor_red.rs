@@ -392,7 +392,7 @@ fn swf1_notify_wakes_counter() {
 
 /// AMENDED during build (recorded in TASK.md §7): the original stimulus — one
 /// client's 4096-command pipeline — can never hit the 256-message drain cap,
-/// because pipelined commands COALESCE into one PipelineBatch message per
+/// because pipelined commands COALESCE into one PipelineBatchSlotted message per
 /// target shard per read chunk (a single connection yields ~a dozen ring
 /// messages, not thousands; a >256-message backlog needs >256 concurrent
 /// dispatching clients). The cap-path return value is unit-tested directly in
@@ -462,7 +462,7 @@ fn swf2_burst_renotify() {
 /// recorded in TASK.md §7):
 ///   1. >256 clients with concurrent in-flight dispatches. Each connection
 ///      > pipelines one small SET per hash tag t0..t7 — the tags split across
-///      > both shards, so EVERY connection contributes one PipelineBatch to each
+///      > both shards, so EVERY connection contributes one PipelineBatchSlotted to each
 ///      > ring regardless of where the kernel placed it (macOS SO_REUSEPORT does
 ///      > not load-balance — all conns on one shard; Linux splits them).
 ///   2. WRITE commands (cross-shard reads take the shared-read fastpath, no

@@ -347,17 +347,6 @@ impl std::ops::Deref for DbReadGuard<'_> {
     }
 }
 
-/// Re-entrancy contract, replacing the `RefCell` double-borrow panic that
-/// guarded database access before the locks existed.
-///
-/// A thread-local bitmask of db indexes held by *this* thread. Re-acquiring
-/// the same index from inside a guard's closure is a bug that would DEADLOCK
-/// on a real `RwLock` where the `RefCell` merely panicked; the mask restores
-/// the loud failure. One thread-local bit-op per acquire, released by
-/// [`DepthToken`]'s `Drop`.
-///
-/// Only owner acquisitions register: foreign `try_read` cannot deadlock, so it
-/// pays nothing here.
 /// Test-only count of the owner's EXCLUSIVE acquisitions ([`ShardDbSet::write`])
 /// on this thread. Each one is a window in which a foreign `try_read` of that
 /// database declines into a parked SPSC hop (cost model §8.3), so an arm that
@@ -381,6 +370,17 @@ pub(crate) mod exclusive_count {
     }
 }
 
+/// Re-entrancy contract, replacing the `RefCell` double-borrow panic that
+/// guarded database access before the locks existed.
+///
+/// A thread-local bitmask of db indexes held by *this* thread. Re-acquiring
+/// the same index from inside a guard's closure is a bug that would DEADLOCK
+/// on a real `RwLock` where the `RefCell` merely panicked; the mask restores
+/// the loud failure. One thread-local bit-op per acquire, released by
+/// [`DepthToken`]'s `Drop`.
+///
+/// Only owner acquisitions register: foreign `try_read` cannot deadlock, so it
+/// pays nothing here.
 mod guard_depth {
     use std::cell::Cell;
 

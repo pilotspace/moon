@@ -410,7 +410,8 @@ async fn pipeline_hset_fires_vector_and_text_auto_index() {
 
     // Build a 100-HSET non-atomic pipeline (redis::pipe() is non-atomic by
     // default — explicit `.atomic()` would wrap in MULTI/EXEC). This exercises
-    // the PipelineBatch/PipelineBatchSlotted auto-index path.
+    // the per-command auto-index hooks of the connection's local write path
+    // (one shard, so no SPSC arm is involved).
     // Use a unique-per-doc token ("alphadoc", "bravodoc", ...) plus a shared
     // "corpus" token so we can validate both per-doc and all-doc TEXT matches.
     // Unicode word segmentation splits on hyphens/digits (see

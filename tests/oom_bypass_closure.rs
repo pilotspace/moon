@@ -4,9 +4,11 @@
 //! `maxmemory` without limit:
 //!
 //! 1. Cross-shard SPSC write legs (`src/shard/spsc_handler.rs`): `Execute`,
-//!    `PipelineBatch`, `MultiExecute` (+ their `*Slotted` variants) executed
-//!    write commands against the TARGET shard's `&mut Database` directly,
-//!    bypassing the connection handler's eviction gate entirely.
+//!    `PipelineBatch`, `MultiExecute` (+ their `*Slotted` variants; moon#1198
+//!    later removed all but `Execute`, `MultiExecute` and
+//!    `PipelineBatchSlotted`) executed write commands against the TARGET
+//!    shard's `&mut Database` directly, bypassing the connection handler's
+//!    eviction gate entirely.
 //! 2. Lua `redis.call` writes (`src/scripting/bridge.rs`): EVAL/EVALSHA carry
 //!    no WRITE command flag (`src/command/metadata.rs`), so the dispatch-level
 //!    OOM check never saw them, and the bridge itself never ran the check

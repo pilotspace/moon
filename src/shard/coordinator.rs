@@ -1576,7 +1576,6 @@ async fn coordinate_mget(
 /// per pair, so an owner took its lock, serialized an AOF record and appended
 /// a replication record per KEY). The local slice runs in-process through
 /// [`run_local`]. Returns OK when every leg confirmed.
-#[allow(clippy::too_many_arguments)]
 async fn coordinate_mset(
     args: &[Frame],
     my_shard: usize,
@@ -1954,7 +1953,6 @@ fn summed_command_name(cmd: &[u8]) -> Option<&'static [u8]> {
 /// ONE `<CMD> k1 k2 …` (moon#1184 — it used to be one sub-command per key:
 /// per key, a lock acquire, an AOF record and a replication record on the
 /// owner), runs the local slice in-process, and sums the integer replies.
-#[allow(clippy::too_many_arguments)]
 async fn coordinate_multi_del_or_exists(
     cmd: &[u8],
     args: &[Frame],

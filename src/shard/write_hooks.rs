@@ -12,9 +12,23 @@
 //! the copies drifted: the `MultiExecute` arm — the one the coordinator's
 //! spanning `DEL`/`UNLINK` and every `FLUSHALL`/`FLUSHDB` broadcast land on —
 //! ran none of the hooks, so deleted documents kept matching `FT.SEARCH` and a
-//! `FLUSHALL` cleared the index contents of one shard in N. One function, one
-//! list, called from every arm, is the fix for the class rather than for one
-//! arm.
+//! `FLUSHALL` cleared the index contents of one shard in N.
+//!
+//! [`run_post_write_hooks`] is the one list for the shard-side paths:
+//! - the SPSC `Execute`, `MultiExecute` and `PipelineBatchSlotted` arms
+//!   (`spsc_handler.rs`);
+//! - every coordinator local leg (`coordinator::run_local`).
+//!
+//! Four paths still carry their own copy of the list, and a new hook must be
+//! added to each of them by hand until they are routed through this function
+//! (a follow-up):
+//! - the monoio connection's local write path
+//!   (`server/conn/handler_monoio/mod.rs`, `handle_connection_sharded_monoio`);
+//! - the tokio connection's local write path
+//!   (`server/conn/handler_sharded/mod.rs`, `handle_connection_sharded_inner`);
+//! - the MULTI/EXEC executor (`server/conn/shared.rs`,
+//!   `execute_transaction_sharded`);
+//! - replica apply (`replication/apply.rs`, `apply_index_parity_hooks`).
 //!
 //! The hooks, and why each exists:
 //! - `HSET` → [`auto_index_hset_public`]: index the hash's vector/text fields.
