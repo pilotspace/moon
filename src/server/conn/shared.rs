@@ -435,7 +435,7 @@ pub(crate) fn execute_transaction(
                 Ok(op) => match locks.pair(entry_db, op.dst_db()) {
                     Some((src, dst)) => {
                         dst.refresh_now();
-                        op.apply(src, dst)
+                        op.apply(src, entry_db, dst)
                     }
                     // Unreachable: `acquire` takes every db whenever the body
                     // holds a MOVE or a COPY with a DB clause, which is the
@@ -754,7 +754,7 @@ pub(crate) fn execute_transaction_sharded(
                     s.databases.with_pair(selected, op.dst_db(), |src, dst| {
                         src.refresh_now_from_cache(cached_clock);
                         dst.refresh_now_from_cache(cached_clock);
-                        op.apply(src, dst)
+                        op.apply(src, selected, dst)
                     })
                 }),
             };

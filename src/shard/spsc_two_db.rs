@@ -118,7 +118,7 @@ pub(crate) fn try_two_db_intercept(
                 let reply = databases.with_pair(db_idx, dst_db, |src, dst| {
                     src.refresh_now_from_cache(cached_clock);
                     dst.refresh_now_from_cache(cached_clock);
-                    ksmv::move_core(src, dst, &key)
+                    ksmv::move_core(src, db_idx, dst, dst_db, &key)
                 });
                 // moon#1069: the key now exists in `dst_db`; the caller
                 // wakes it once the MOVE is logged (moon#1056).
@@ -176,7 +176,15 @@ pub(crate) fn try_two_db_intercept(
                         return (oom, None);
                     }
                 }
-                let reply = ksmv::copy_core(src, dst, &ca.src_key, &ca.dst_key, ca.replace);
+                let reply = ksmv::copy_core(
+                    src,
+                    db_idx,
+                    dst,
+                    ca.dst_db,
+                    &ca.src_key,
+                    &ca.dst_key,
+                    ca.replace,
+                );
                 // moon#1069: the copy now exists in `ca.dst_db`; the caller
                 // wakes it once the COPY is logged (moon#1056).
                 (reply, Some((ca.dst_db, ca.dst_key.clone())))

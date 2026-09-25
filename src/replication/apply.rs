@@ -950,7 +950,7 @@ fn apply_two_db(
             Ok((key, dst)) => databases.with_pair(db_idx, dst, |src, dstdb| {
                 src.refresh_now();
                 dstdb.refresh_now();
-                ksmv::move_core(src, dstdb, &key)
+                ksmv::move_core(src, db_idx, dstdb, dst, &key)
             }),
         };
         return Some(resp);
@@ -963,7 +963,15 @@ fn apply_two_db(
         Ok(ca) => databases.with_pair(db_idx, ca.dst_db, |src, dst| {
             src.refresh_now();
             dst.refresh_now();
-            ksmv::copy_core(src, dst, &ca.src_key, &ca.dst_key, ca.replace)
+            ksmv::copy_core(
+                src,
+                db_idx,
+                dst,
+                ca.dst_db,
+                &ca.src_key,
+                &ca.dst_key,
+                ca.replace,
+            )
         }),
     };
     Some(resp)

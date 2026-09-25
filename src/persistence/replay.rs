@@ -210,7 +210,7 @@ fn replay_two_db(
             Err(e) => e,
             Ok((_key, dst_db)) if dst_db == src_db => Frame::Integer(0),
             Ok((key, dst_db)) => ksmv::with_two_slice_dbs(databases, src_db, dst_db, |src, dst| {
-                ksmv::move_core(src, dst, &key)
+                ksmv::move_core(src, src_db, dst, dst_db, &key)
             }),
         };
         return Some(resp);
@@ -218,7 +218,15 @@ fn replay_two_db(
     let resp = match ksmv::parse_copy_db_args(args, src_db, db_count)? {
         Err(e) => e,
         Ok(ca) => ksmv::with_two_slice_dbs(databases, src_db, ca.dst_db, |src, dst| {
-            ksmv::copy_core(src, dst, &ca.src_key, &ca.dst_key, ca.replace)
+            ksmv::copy_core(
+                src,
+                src_db,
+                dst,
+                ca.dst_db,
+                &ca.src_key,
+                &ca.dst_key,
+                ca.replace,
+            )
         }),
     };
     Some(resp)
