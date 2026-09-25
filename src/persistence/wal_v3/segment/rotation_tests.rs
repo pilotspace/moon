@@ -498,6 +498,14 @@ fn test_1221_r2_fallback_never_publishes_a_failed_agent_fsync() {
 /// no LSN is reported durable again, even one a genuine fsync covered — the
 /// contract the module docs state ("fail every subsequent wait_durable").
 /// At the PR head the fast path returned Ok for any LSN under the watermark.
+///
+/// The failure is armed only once the agent is idle. The test used to arm it
+/// as soon as `wait_durable(10)` returned; but a `wait_durable` that finds
+/// the LSN not yet published queues a sync request of its own (it cannot
+/// tell whether the one in flight covers the LSN), and that second fsync
+/// could run after the arming. It then poisoned the WAL before the
+/// `request_sync` below, whose `unwrap` failed — 3/3 on macOS at `ae21476`,
+/// where `F_FULLFSYNC` always leaves LSN 10 unpublished by that check.
 #[test]
 fn test_1221_r2_poison_is_checked_before_the_watermark() {
     let tmp = tempfile::tempdir().unwrap();
@@ -511,13 +519,27 @@ fn test_1221_r2_poison_is_checked_before_the_watermark() {
         writer.append(WalRecordType::Command, b"SET k v");
     }
     writer.request_sync().unwrap();
+    // The agent publishes LSN 10 after its one fsync settled, so the wait
+    // below is answered by the watermark and queues nothing.
+    wait_until(|| writer.sync_agent.as_ref().unwrap().durable_lsn() >= 10);
     writer.wait_durable(10, WAIT_DURABLE_TIMEOUT).unwrap();
+    assert_eq!(gate.calls(), 1, "exactly one fsync ran, and it succeeded");
     gate.fail.store(true, std::sync::atomic::Ordering::SeqCst);
     for _ in 0..10 {
         writer.append(WalRecordType::Command, b"SET k v");
     }
     writer.request_sync().unwrap();
     wait_until(|| writer.sync_agent.as_ref().is_some_and(|a| a.is_poisoned()));
+    assert_eq!(
+        gate.calls(),
+        2,
+        "the failed fsync is the one just requested"
+    );
+    let watermark = writer.sync_agent.as_ref().unwrap().durable_lsn();
+    assert!(
+        watermark >= 10,
+        "LSN 5 must be under the watermark ({watermark}), so only the poison can refuse it"
+    );
     assert!(
         writer
             .wait_durable(5, std::time::Duration::from_millis(50))
