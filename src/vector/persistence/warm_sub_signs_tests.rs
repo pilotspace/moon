@@ -92,11 +92,13 @@ fn hits(r: &[SearchResult]) -> Vec<(u32, u64, u32)> {
 
 /// Install the segment `build` makes as the only HOT segment of a fresh
 /// one-index store, search it, move it to WARM through the store's own
-/// transition, search again.
+/// transition, search again. Data and queries are the clustered fixture
+/// times `scale`.
 fn hot_then_warm(
     quant: QuantizationConfig,
     metric: DistanceMetric,
     dim: usize,
+    scale: f32,
     build: impl FnOnce(&Arc<CollectionMetadata>, &[Vec<f32>]) -> ImmutableSegment,
 ) -> (
     Hits,
@@ -112,11 +114,16 @@ fn hot_then_warm(
         .create_index(meta(dim as u32, quant, metric))
         .expect("create");
     let idx = store.get_index(b"w").expect("index");
-    let data = clustered(600, dim, 5);
+    let scaled = |v: Vec<Vec<f32>>| -> Vec<Vec<f32>> {
+        v.into_iter()
+            .map(|r| r.into_iter().map(|x| x * scale).collect())
+            .collect()
+    };
+    let data = scaled(clustered(600, dim, 5));
     let imm = Arc::new(build(&idx.collection, &data));
     let hot_signs = imm.sub_centroid_signs().to_vec();
 
-    let queries = clustered(40, dim, 6);
+    let queries = scaled(clustered(40, dim, 6));
     let mut scratch = SearchScratch::new(0, idx.collection.padded_dimension);
     let hot: Hits = queries
         .iter()
@@ -154,7 +161,7 @@ fn warm_segment_ranks_exactly_like_its_hot_source() {
     // dim 100 → padded 128: not a multiple of 16, sign rows of 16 bytes.
     for (dim, metric) in [(100usize, DistanceMetric::L2), (64, DistanceMetric::Cosine)] {
         let (hot, warm, hot_signs, warm_seg, _tmp) =
-            hot_then_warm(QuantizationConfig::TurboQuant4, metric, dim, segment);
+            hot_then_warm(QuantizationConfig::TurboQuant4, metric, dim, 1.0, segment);
         assert!(!hot_signs.is_empty(), "fixture must carry real signs");
         // Red on HEAD: the WARM beam scored with the 16-level LUT, so every
         // distance (and some rankings) differed from the HOT segment's.
@@ -198,7 +205,7 @@ fn placeholder_sign_buffers_are_not_carried_to_warm() {
         (QuantizationConfig::TurboQuant4, zero_signed_segment),
     ] {
         let (_hot, warm, hot_signs, warm_seg, tmp) =
-            hot_then_warm(quant, DistanceMetric::L2, 64, build);
+            hot_then_warm(quant, DistanceMetric::L2, 64, 1.0, build);
         // SQ8: a zero-filled buffer on this base, EMPTY after PR #1221's
         // "only real signs" fix — no signs either way.
         assert!(hot_signs.iter().all(|&b| b == 0), "{quant:?} fixture");
@@ -356,4 +363,43 @@ fn flagged_all_zero_signs_are_a_placeholder_not_signs() {
     let warm = open_warm(&dir, &col);
     assert!(warm.sub_centroid_signs().is_empty());
     assert_eq!(warm.codes_data(), imm.vectors_tq().as_slice());
+}
+
+/// A compacted segment for `col` WITH its f16 sidecar, so both tiers
+/// exact-rerank their beam candidates.
+fn segment_with_f16(col: &Arc<CollectionMetadata>, data: &[Vec<f32>]) -> ImmutableSegment {
+    let seg = MutableSegment::new(col.dimension, col.clone());
+    for (i, v) in data.iter().enumerate() {
+        seg.append(1_000 + i as u64, v, i as u64 + 1);
+    }
+    let imm = compact(&seg.freeze(), col, 99, None).expect("compact");
+    assert!(
+        imm.raw_f16().is_some(),
+        "fixture must carry the f16 sidecar"
+    );
+    imm
+}
+
+/// moon#1242: the WARM rerank scores its f16 rows through the same
+/// `exact_f16_distance` as the HOT rerank, so a row that keeps its ADC
+/// estimate on HOT — an L2 row below f16 precision (components ~1e-7), or a
+/// row with a component beyond the f16 range — ranks alike once WARM. The
+/// WARM copy computed the f16 distance for every row.
+#[test]
+fn warm_rerank_scores_rows_like_its_hot_source() {
+    // 1e-7: below f16 precision; 1e5: components past ±65,504; 1: control.
+    for scale in [1e-7f32, 1e5, 1.0] {
+        let (hot, warm, _signs, warm_seg, _tmp) = hot_then_warm(
+            QuantizationConfig::TurboQuant4,
+            DistanceMetric::L2,
+            64,
+            scale,
+            segment_with_f16,
+        );
+        assert!(
+            warm_seg.raw_f16().is_some(),
+            "{scale:e}: WARM keeps the sidecar"
+        );
+        assert_eq!(warm, hot, "{scale:e}: WARM must rerank like HOT");
+    }
 }
