@@ -132,8 +132,10 @@ pub(crate) fn unit_query_into<E: Extend<f32>>(query: &[f32], out: &mut E) {
 /// rerank shares so cross-segment merges stay consistent: true squared L2 for
 /// L2 (`q` is the raw query), `2 − 2·cos` for the unit-sphere metrics (`q` is
 /// the unit query, see [`unit_query_into`]; f16 rounding is clamped into
-/// `[-1, 1]`). `None` for a zero row under a unit-sphere metric — its
-/// normalized form is undefined and the caller keeps its ADC estimate.
+/// `[-1, 1]`). `None` — the caller keeps its ADC estimate — for a zero row
+/// under a unit-sphere metric (its normalized form is undefined) and for a
+/// non-finite result: a component beyond the f16 range (±65,504) was stored
+/// as ±inf, and an `inf` / NaN distance would erase that row's rank (moon#1226).
 #[inline]
 pub(crate) fn exact_f16_distance(
     kernels: &crate::vector::distance::DistanceTable,
@@ -141,14 +143,17 @@ pub(crate) fn exact_f16_distance(
     row: &[u16],
     is_l2: bool,
 ) -> Option<f32> {
-    if is_l2 {
-        return Some((kernels.f16_l2)(q, row));
-    }
-    let (dot, xsq) = (kernels.f16_dot_normsq)(q, row);
-    (xsq > 0.0).then(|| {
+    let d = if is_l2 {
+        (kernels.f16_l2)(q, row)
+    } else {
+        let (dot, xsq) = (kernels.f16_dot_normsq)(q, row);
+        if xsq <= 0.0 {
+            return None;
+        }
         let cos = (dot / xsq.sqrt()).clamp(-1.0, 1.0);
         2.0 - 2.0 * cos
-    })
+    };
+    d.is_finite().then_some(d)
 }
 
 /// See the module docs.

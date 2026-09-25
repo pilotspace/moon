@@ -240,6 +240,82 @@ mod tests {
         }
     }
 
+    /// moon#1226 red test: a component beyond the f16 range (±65,504) is
+    /// stored as ±inf in `raw_f16`, so its exact distance is inf / NaN. Such
+    /// rows keep their ADC estimate instead of all tying at `inf` (which
+    /// ranked them by id, whatever their distance).
+    #[test]
+    fn rows_outside_the_f16_range_keep_their_adc_rank() {
+        distance::init();
+        crate::vector::turbo_quant::fwht::init_fwht();
+        let dim = 8usize;
+        let col = Arc::new(CollectionMetadata::with_build_mode(
+            47,
+            dim as u32,
+            DistanceMetric::L2,
+            QuantizationConfig::TurboQuant4,
+            47,
+            BuildMode::Exact,
+        ));
+        let holder = SegmentHolder::new(dim as u32, Arc::clone(&col));
+        let doc = |i: usize| -> Vec<f32> {
+            (0..dim)
+                .map(|j| {
+                    if j == 0 {
+                        200_000.0 + i as f32 * 1_000.0
+                    } else {
+                        ((i * 7 + j * 3) % 11) as f32
+                    }
+                })
+                .collect()
+        };
+        {
+            let list = holder.load();
+            for i in 0..60 {
+                list.mutable.append(i as u64 + 1, &doc(i), i as u64 + 1);
+            }
+        }
+        let committed = roaring::RoaringTreemap::new();
+        let ctx = MvccContext {
+            snapshot_lsn: 0,
+            my_txn_id: 0,
+            committed: &committed,
+            dirty_set: &[],
+            dimension: dim as u32,
+            ef_defaulted: false,
+            tuning: SearchTuning::default(),
+        };
+        let mut scratch = SearchScratch::new(0, padded_dimension(dim as u32));
+        let bits = |r: &smallvec::SmallVec<[crate::vector::types::SearchResult; 32]>| {
+            r.iter()
+                .map(|x| (x.id.0, x.distance.to_bits()))
+                .collect::<Vec<_>>()
+        };
+        for target in [37usize, 12, 55] {
+            let q = doc(target);
+            let got = holder.search_mvcc(&q, 5, 64, &mut scratch, None, &ctx);
+            assert!(
+                got.iter().all(|r| r.distance.is_finite()),
+                "q={target}: {:?}",
+                got.iter().map(|r| r.distance).collect::<Vec<_>>()
+            );
+            // Every row is out of range, so the leg answers exactly the ADC
+            // top k — what it answered before the rerank existed.
+            let adc = holder.load().mutable.brute_force_search_mvcc(
+                &q,
+                None,
+                5,
+                None,
+                0,
+                0,
+                &committed,
+                0,
+                usize::MAX,
+            );
+            assert_eq!(bits(&got), bits(&adc), "q={target}: the ADC top k");
+        }
+    }
+
     #[test]
     fn rerank_depth_is_mult_times_k() {
         assert_eq!(super::exact_rerank_depth(10, 4), 40);
