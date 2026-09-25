@@ -698,6 +698,27 @@ impl ShardManifest {
         }
     }
 
+    /// Commit without blocking on the fsync and return its ack (moon#1240):
+    /// the snapshot is handed to the manifest-sync thread, and the caller
+    /// polls the ack from a later tick to learn when it is durable. Inline
+    /// (no sync thread) it persists here and the ack is already resolved.
+    /// For callers that must know the commit is durable before their next
+    /// step but must not stall the shard meanwhile.
+    pub(crate) fn commit_acked(&mut self) -> crate::persistence::manifest_sync::CommitAck {
+        use crate::persistence::manifest_sync::CommitAck;
+        let snapshot = self.snapshot_for_commit();
+        match &mut self.io {
+            IoBackend::Inline(io) => CommitAck::ready(io.persist(snapshot)),
+            IoBackend::Deferred(agent) => match agent.commit_acked(snapshot) {
+                Ok(rx) => CommitAck::waiting(rx),
+                Err(e) => CommitAck::ready(Err(e)),
+            },
+            IoBackend::Poisoned => CommitAck::ready(Err(std::io::Error::other(
+                "manifest io backend lost (sync thread died holding the handle)",
+            ))),
+        }
+    }
+
     /// Advance the epoch and clone the root for a commit. Each snapshot is a
     /// COMPLETE manifest state: the sync agent may coalesce a run of queued
     /// snapshots down to the newest one with no loss.

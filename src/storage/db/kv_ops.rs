@@ -236,6 +236,8 @@ impl Database {
             return false;
         };
         self.spill_inflight_forget(key);
+        // moon#1232: a read's promotion is no keyspace change.
+        let _quiet = crate::admin::metrics_setup::mute_keyspace_changes();
         self.set(key, entry);
         true
     }
@@ -323,7 +325,12 @@ impl Database {
                 if let Some(ttl) = ttl_ms {
                     entry.set_expires_at_ms(ttl);
                 }
-                self.set(key, entry);
+                {
+                    // moon#1232: bringing a cold value back into RAM changes
+                    // nothing in the keyspace — a GET must not count.
+                    let _quiet = crate::admin::metrics_setup::mute_keyspace_changes();
+                    self.set(key, entry);
+                }
                 if let Some(ref mut ci) = self.cold_index {
                     ci.remove(key);
                 }
@@ -472,9 +479,10 @@ impl Database {
     /// Optimized: immutable check for expiry (rare path), then single get_mut
     /// for LRU touch + return. Reduces from 3 lookups to 2 for non-expired keys.
     pub fn get_mut(&mut self, key: &[u8]) -> Option<&mut Entry> {
-        // Mutable access is a write intent; see `record_keyspace_change`
-        // for why counting the intent (rather than the mutation) is the
-        // safe direction for `rdb_changes_since_last_save`.
+        // Mutable access is a write intent, counted as one change for
+        // `rdb_changes_since_last_save` (the over-count is the safe
+        // direction). No command reaches this: a command counts by its redis
+        // rule (moon#1232, `command::keyspace_changes`).
         crate::admin::metrics_setup::record_keyspace_change();
         let now = self.cached_now;
         let now_ms = self.cached_now_ms;
@@ -691,7 +699,9 @@ impl Database {
     /// before loading the authoritative base RDB + incr log. Without this,
     /// non-idempotent commands from pre-existing state would be double-applied.
     pub fn clear(&mut self) {
-        crate::admin::metrics_setup::record_keyspace_change();
+        // moon#1232: redis counts a flush as the keys it removed (read before
+        // the table is swapped out below).
+        crate::admin::metrics_setup::record_keyspace_change_by(self.logical_len() as u64);
         // moon#1228: an armed BGSAVE epoch that has not written this database
         // yet keeps the old table as its epoch-start contents (the save then
         // completes with the pre-flush image instead of aborting); otherwise
@@ -834,9 +844,14 @@ impl Database {
     /// key returns `None` (no in-RAM entry exists); callers that must COUNT
     /// cold-only removals (DEL/UNLINK) use [`Self::remove_counting_cold`].
     pub fn remove(&mut self, key: &[u8]) -> Option<Entry> {
-        crate::admin::metrics_setup::record_keyspace_change();
-        let _ = self.remove_cold_only(key);
-        self.remove_hot(key)
+        let had_cold = self.remove_cold_only(key);
+        let hot = self.remove_hot(key);
+        // moon#1232: a removal that found nothing is no change (redis counts
+        // `DEL missing` as 0).
+        if had_cold || hot.is_some() {
+            crate::admin::metrics_setup::record_keyspace_change();
+        }
+        hot
     }
 
     /// Remove hot + cold copies; returns `true` when a LIVE copy existed, so
@@ -848,7 +863,6 @@ impl Database {
     /// deletes it before DEL looks). The removed hot entry, when present, is
     /// also returned — `DEL` tells an expired one by it.
     pub fn remove_counting_cold(&mut self, key: &[u8]) -> (bool, Option<Entry>) {
-        crate::admin::metrics_setup::record_keyspace_change();
         let now_ms = self.cached_now_ms;
         let cold_alive = self
             .cold_index
@@ -861,7 +875,14 @@ impl Database {
         let had_cold = self.remove_cold_only(key);
         let hot = self.remove_hot(key);
         let hot_alive = hot.as_ref().is_some_and(|e| !e.is_expired_at(now_ms));
-        (hot_alive || (had_cold && cold_alive) || inflight_alive, hot)
+        let live = hot_alive || (had_cold && cold_alive) || inflight_alive;
+        // moon#1232: only a LIVE key's removal is a change. An absent key is
+        // none, and an expired one is expiry's reap, which redis does not
+        // count either (`expireIfNeeded` runs before DEL looks).
+        if live {
+            crate::admin::metrics_setup::record_keyspace_change();
+        }
+        (live, hot)
     }
 
     /// `UNLINK` for one key (moon#1190): [`Self::remove_counting_cold`]'s
@@ -878,7 +899,6 @@ impl Database {
     /// [`Self::unlink`], classified: a hot copy whose TTL had passed is
     /// reaped through the same lazy-free path, as [`KeyDeletion::Expired`].
     pub(crate) fn unlink_key(&mut self, key: &[u8]) -> KeyDeletion {
-        crate::admin::metrics_setup::record_keyspace_change();
         let now_ms = self.cached_now_ms;
         let cold_alive = self
             .cold_index
@@ -889,6 +909,8 @@ impl Database {
         let had_cold = self.remove_cold_only(key);
         let hot = self.remove_hot_lazily(key);
         if hot == Some(false) || (had_cold && cold_alive) || inflight_alive {
+            // moon#1232: as `remove_counting_cold` — only a live key counts.
+            crate::admin::metrics_setup::record_keyspace_change();
             KeyDeletion::Live
         } else if hot == Some(true) {
             KeyDeletion::Expired
@@ -901,8 +923,10 @@ impl Database {
     /// whose value may be large: hot and cold copies go, and a large hot
     /// value is freed through the lazy-free queue (moon#1190). Returns
     /// whether a hot entry was removed.
+    ///
+    /// Not a keyspace change for `rdb_changes_since_last_save` (moon#1232):
+    /// redis's expiry (`deleteExpiredKeyAndPropagate`) leaves `dirty` alone.
     pub(crate) fn remove_lazily(&mut self, key: &[u8]) -> bool {
-        crate::admin::metrics_setup::record_keyspace_change();
         let _ = self.remove_cold_only(key);
         self.remove_hot_lazily(key).is_some()
     }
@@ -973,7 +997,8 @@ impl Database {
         });
         match outcome {
             crate::storage::dashtable::RemoveIf::Removed(entry) => {
-                crate::admin::metrics_setup::record_keyspace_change();
+                // No keyspace change counted: expiry is not one in redis
+                // (moon#1232, see `remove_lazily`).
                 let _ = self.remove_cold_only(key);
                 self.forget_removed_hash_ttl(key, &entry);
                 self.lazy_free_or_drop(key.len(), entry, true);
@@ -1351,7 +1376,6 @@ impl Database {
     /// Performs lazy expiry check first. Returns `false` if the key does not
     /// exist (or has already expired). Pass 0 to remove expiry.
     pub fn set_expiry(&mut self, key: &[u8], expires_at_ms: u64) -> bool {
-        crate::admin::metrics_setup::record_keyspace_change();
         let now_ms = self.cached_now_ms;
         if Self::check_expired(&self.data, key, now_ms) {
             // moon#541 rides moon#542: HIDE the expired key and queue it for
@@ -1374,6 +1398,10 @@ impl Database {
                 // actually removed something.
                 if expires_at_ms != 0 || old != 0 {
                     crate::storage::db::stamp_mutation(entry);
+                    // moon#1232: the same rule is redis's `dirty` — an
+                    // expire-family write counts, a PERSIST that removed
+                    // nothing and an EXPIRE of a missing key do not.
+                    crate::admin::metrics_setup::record_keyspace_change();
                 }
                 entry.set_expires_at_ms(expires_at_ms);
                 old

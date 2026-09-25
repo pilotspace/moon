@@ -2308,7 +2308,29 @@ fn move_destination_error(db: &mut Database, source: &Bytes, dest: &Bytes) -> Op
 }
 
 /// Try to pop data immediately (non-blocking fast path).
+///
+/// moon#1232: counted as the non-blocking pop it is, by redis's rule
+/// ([`crate::command::keyspace_changes::blocking_pop_changes`]); the storage
+/// funnels it passes through are muted.
 pub(crate) fn try_immediate_pop(
+    cmd: &[u8],
+    db: &mut Database,
+    key: &Bytes,
+    args: &[Frame],
+) -> Option<Frame> {
+    let reply = {
+        let _quiet = crate::admin::metrics_setup::mute_keyspace_changes();
+        try_immediate_pop_uncounted(cmd, db, key, args)
+    };
+    if let Some(frame) = reply.as_ref() {
+        crate::admin::metrics_setup::record_keyspace_changes(
+            crate::command::keyspace_changes::blocking_pop_changes(cmd, frame),
+        );
+    }
+    reply
+}
+
+fn try_immediate_pop_uncounted(
     cmd: &[u8],
     db: &mut Database,
     key: &Bytes,

@@ -179,6 +179,36 @@ impl LuaEvictionCtx {
     /// learned the bystander key was gone. Wired to the exact same
     /// dual-plane emission every other write-path eviction gate uses.
     fn gate(&self, db: &mut crate::storage::Database, db_index: usize) -> Result<(), Frame> {
+        self.gate_inner(db, db_index, None)
+    }
+
+    /// [`Self::gate`] for the script's own `redis.call(cmd, ...)` (moon#1241):
+    /// a command that can only shrink memory (`db_quota::is_shrink_only_command`:
+    /// DEL, UNLINK, HDEL, LPOP, EXPIRE, ...) is never REFUSED by the
+    /// maxmemory gate or the per-db quota — eviction still runs, only the
+    /// reject is bypassed — exactly as `run_write_eviction_gate` (connection
+    /// path) and `spsc_eviction_gate` (routed leg) do. Redis allows those in
+    /// a script under OOM because they are not `denyoom`.
+    ///
+    /// Only where redis would: an EVAL (redis's compat mode) or a FUNCTION
+    /// registered with `allow-oom` — see [`set_script_oom_shrink_bypass`]. A
+    /// FUNCTION without `allow-oom` is refused whole under OOM by redis 7.0,
+    /// so its writes keep the refusal here.
+    fn gate_command(
+        &self,
+        cmd: &[u8],
+        db: &mut crate::storage::Database,
+        db_index: usize,
+    ) -> Result<(), Frame> {
+        self.gate_inner(db, db_index, Some(cmd))
+    }
+
+    fn gate_inner(
+        &self,
+        db: &mut crate::storage::Database,
+        db_index: usize,
+        cmd: Option<&[u8]>,
+    ) -> Result<(), Frame> {
         let Some(inner) = self.0.as_ref() else {
             return Ok(());
         };
@@ -235,13 +265,27 @@ impl LuaEvictionCtx {
                     .report(&mut on_plain_drop),
             )
         };
-        global_result?;
+        // moon#1241: the connection gate's shrink-only bypass (see
+        // `gate_command`) — eviction above has run either way.
+        let shrink_only = cmd.is_some_and(|cmd| {
+            SCRIPT_OOM_SHRINK_BYPASS.with(Cell::get)
+                && crate::storage::db_quota::is_shrink_only_command(cmd)
+        });
+        if !shrink_only {
+            global_result?;
+        }
         // WS5b: per-db quota, additive and finer-grained than the
         // whole-instance maxmemory gate above. Zero-cost when unconfigured.
         // NOT wired to `on_plain_drop` — pre-existing, documented gap (see
         // `db_quota::check_db_maxmemory`'s own doc comment), out of scope
         // for task #34.
-        crate::storage::db_quota::check_db_maxmemory(db, db_index, &rt)
+        let quota = match cmd {
+            Some(cmd) => {
+                crate::storage::db_quota::check_db_maxmemory_for_command(db, db_index, &rt, cmd)
+            }
+            None => crate::storage::db_quota::check_db_maxmemory(db, db_index, &rt),
+        };
+        if shrink_only { Ok(()) } else { quota }
     }
 
     /// Wave A part 2 (task #34): dual-plane (AOF + replication) emission of
@@ -385,6 +429,11 @@ thread_local! {
     static SCRIPT_HAD_WRITE: Cell<bool> = const { Cell::new(false) };
     /// Whether this script is running in read-only mode (FCALL_RO).
     static SCRIPT_READ_ONLY: Cell<bool> = const { Cell::new(false) };
+    /// moon#1241: whether a shrink-only `redis.call` passes the OOM gate in
+    /// the CURRENT script — see [`set_script_oom_shrink_bypass`]. Reset to
+    /// the compat-EVAL default (`true`) by [`set_script_db`] and
+    /// [`clear_script_db`].
+    static SCRIPT_OOM_SHRINK_BYPASS: Cell<bool> = const { Cell::new(true) };
     /// moon#569: the ACL identity every `redis.call`/`redis.pcall` of the
     /// CURRENTLY RUNNING script is authorized against.
     ///
@@ -418,6 +467,7 @@ pub fn set_script_db(
     CURRENT_DB_IDX.with(|c| c.set(db_idx));
     CURRENT_DB_COUNT.with(|c| c.set(db_count));
     SCRIPT_HAD_WRITE.with(|c| c.set(false));
+    SCRIPT_OOM_SHRINK_BYPASS.with(|c| c.set(true));
     SCRIPT_CALLER.with(|c| c.set(acl.caller()));
     SCRIPT_ACL.with(|c| *c.borrow_mut() = acl.clone());
 }
@@ -430,11 +480,24 @@ pub fn set_script_db(
 pub fn clear_script_db() {
     CURRENT_DB.with(|c| c.set(std::ptr::null_mut()));
     SCRIPT_READ_ONLY.with(|c| c.set(false));
+    SCRIPT_OOM_SHRINK_BYPASS.with(|c| c.set(true));
     // Back to fail-closed: nothing may run until the next `set_script_db`.
     SCRIPT_ACL.with(|c| *c.borrow_mut() = ScriptAcl::deny());
     SCRIPT_CALLER
         .with(|c| c.replace(crate::tracking::ScriptCaller::default()))
         .finish_script();
+}
+
+/// moon#1241: whether the CURRENT script's shrink-only writes (DEL, UNLINK,
+/// HDEL, ...) may pass the OOM gate while the shard is over budget, as redis
+/// lets them. Call after [`set_script_db`], which resets it to `true`: every
+/// EVAL moon runs is redis's compat mode (a `#!` shebang body does not
+/// compile here), where only `denyoom` commands are refused under OOM. A
+/// FUNCTION sets it from its `allow-oom` flag: redis 7.0 refuses a function
+/// without it as a whole under OOM (measured against 7.0.15), and every write
+/// in it is refused here.
+pub fn set_script_oom_shrink_bypass(allowed: bool) {
+    SCRIPT_OOM_SHRINK_BYPASS.with(|c| c.set(allowed));
 }
 
 /// Set the read-only flag for the current script execution (FCALL_RO).
@@ -652,7 +715,7 @@ pub fn make_redis_call_fn(
                 // script could grow memory past `maxmemory` without limit
                 // (EVAL/EVALSHA carry no WRITE command flag, so the
                 // dispatch-level OOM check never sees them at all).
-                if let Err(oom) = eviction_ctx.gate(db, db_idx) {
+                if let Err(oom) = eviction_ctx.gate_command(&cmd_bytes, db, db_idx) {
                     return Ok(oom);
                 }
                 // moon#517: snapshot COW. `spsc_handler::cow_intercept` can
@@ -1353,5 +1416,56 @@ mod tests {
             "a script's write effect must be recorded to the AOF plane on this runtime — \
              without it the write is lost on restart"
         );
+    }
+
+    /// moon#1241: over budget under `noeviction`, a shrink-only command in a
+    /// script passes the gate as it does on the connection path, a growing
+    /// one is refused, and a FUNCTION that declared no `allow-oom` keeps the
+    /// refusal for both.
+    #[test]
+    fn shrink_only_script_commands_pass_the_oom_gate_where_redis_allows_them() {
+        let _gate_open = crate::storage::eviction::force_write_gate(true);
+        let (shard_databases, _inits) = ShardDatabases::new(vec![vec![Database::new()]]);
+        let runtime_config = Arc::new(parking_lot::RwLock::new(make_config(1, "noeviction")));
+        let ctx = LuaEvictionCtx::new(
+            shard_databases,
+            runtime_config,
+            0,
+            None,
+            Rc::new(Cell::new(1)),
+            None,
+            1,
+            None,
+            None,
+        );
+        let mut db = Database::new();
+        for i in 0..8 {
+            db.set_string(&Bytes::from(format!("k:{i}")), Bytes::from(vec![0u8; 64]));
+        }
+        assert!(ctx.gate(&mut db, 0).is_err(), "fixture: over budget");
+
+        set_script_oom_shrink_bypass(true);
+        for cmd in [&b"DEL"[..], b"unlink", b"HDEL", b"LPOP", b"EXPIRE"] {
+            assert!(
+                ctx.gate_command(cmd, &mut db, 0).is_ok(),
+                "{} must not be refused for memory",
+                String::from_utf8_lossy(cmd)
+            );
+        }
+        for cmd in [&b"SET"[..], b"APPEND", b"LPUSH"] {
+            assert!(
+                ctx.gate_command(cmd, &mut db, 0).is_err(),
+                "{} must still be refused",
+                String::from_utf8_lossy(cmd)
+            );
+        }
+        assert_eq!(db.len(), 8, "noeviction: nothing was evicted");
+
+        set_script_oom_shrink_bypass(false);
+        assert!(
+            ctx.gate_command(b"DEL", &mut db, 0).is_err(),
+            "no allow-oom declared: refused, as redis refuses the script"
+        );
+        set_script_oom_shrink_bypass(true);
     }
 }

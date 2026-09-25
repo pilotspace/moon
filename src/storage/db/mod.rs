@@ -551,7 +551,9 @@ pub struct Database {
     /// head `DEL` (`persistence::aof::fold_stream`).
     ///
     /// Bounded by the spills in flight: an entry is settled by its request's
-    /// completion, whatever the outcome (`spill_superseded_settle`).
+    /// completion, whatever the outcome (`spill_superseded_settle`), and one
+    /// whose completion never comes is pruned by the spill thread's
+    /// watermark (`spill_superseded_prune_below`, `spill_superseded_clear`).
     spill_superseded: std::collections::HashMap<(bytes::Bytes, u64), Option<u64>>,
     /// Bytes the [`Self::spill_superseded`] entries hold: key handles plus
     /// map slots. Deliberately NOT part of [`Self::pending_spill_bytes`], the
@@ -891,6 +893,39 @@ impl Database {
             return true;
         }
         false
+    }
+
+    /// Forget every superseded request whose id is below `done_below`, the
+    /// spill thread's watermark read BEFORE the completion drain that was
+    /// just applied (refs moon#1253): each of them had its completion sent
+    /// before that read, so either the drain settled it or its completion
+    /// was dropped and never comes — its file was never listed, and the
+    /// orphan sweep reclaims it. Returns how many were forgotten.
+    pub fn spill_superseded_prune_below(&mut self, done_below: u64) -> usize {
+        if self.spill_superseded.is_empty() {
+            return 0;
+        }
+        let before = self.spill_superseded.len();
+        let mut credit = 0usize;
+        self.spill_superseded.retain(|(key, req_id), _| {
+            let done = *req_id < done_below;
+            if done {
+                credit += key.len() + SPILL_SUPERSEDED_OVERHEAD;
+            }
+            !done
+        });
+        self.spill_superseded_bytes = self.spill_superseded_bytes.saturating_sub(credit);
+        before - self.spill_superseded.len()
+    }
+
+    /// Forget every superseded request: the spill thread died, so no
+    /// completion will arrive and none of their files gets listed (refs
+    /// moon#1253). Returns how many were forgotten.
+    pub fn spill_superseded_clear(&mut self) -> usize {
+        let n = self.spill_superseded.len();
+        self.spill_superseded.clear();
+        self.spill_superseded_bytes = 0;
+        n
     }
 
     /// Keys whose superseded in-flight slot can still come back at `now_ms`

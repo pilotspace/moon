@@ -238,22 +238,28 @@ pub const RECLAIM_REWRITE_MIN_INTERVAL: std::time::Duration = std::time::Duratio
 pub const RECLAIM_REWRITE_MAX_DEFER: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Whether the monitor should dispatch a rewrite for the cold reclaim
-/// (`storage::tiered::cold_reclaim`): some compactions wait for a fold,
-/// compaction has settled (`grew` = more compactions waiting than at the
-/// previous tick) or has been waiting [`RECLAIM_REWRITE_MAX_DEFER`], the last
-/// reclaim rewrite is at least [`RECLAIM_REWRITE_MIN_INTERVAL`] old, and
-/// automatic rewrites are not disabled (`percentage == 0` disables every
-/// automatic rewrite, this one included; a manual `BGREWRITEAOF` still
-/// adopts the compactions). Pure so it is unit tested without a thread.
+/// (`storage::tiered::cold_reclaim`): something waits for a fold, the wait
+/// has settled (`grew` = more waiting than at the previous tick) or has
+/// lasted [`RECLAIM_REWRITE_MAX_DEFER`], and the last reclaim rewrite is at
+/// least [`RECLAIM_REWRITE_MIN_INTERVAL`] old.
+///
+/// What waits: compactions (`compactions_awaiting_fold`), which
+/// `percentage == 0` leaves to a manual `BGREWRITEAOF` like every other
+/// automatic rewrite; and databases whose held spill files keep the ledger
+/// over its threshold (`held_files_pressure`, moon#1231), which are answered
+/// whatever the percentage, as a forced rewrite is — the hold is a
+/// correctness rule, and without a fold its ledger bytes, which write
+/// admission is charged, are never released. Pure so it is unit tested
+/// without a thread.
 pub fn reclaim_due(
     compactions_awaiting_fold: usize,
+    held_files_pressure: usize,
     grew: bool,
     waiting_for: std::time::Duration,
     since_last_reclaim_rewrite: std::time::Duration,
     percentage: u64,
 ) -> bool {
-    compactions_awaiting_fold > 0
-        && percentage != 0
+    ((compactions_awaiting_fold > 0 && percentage != 0) || held_files_pressure > 0)
         && since_last_reclaim_rewrite >= RECLAIM_REWRITE_MIN_INTERVAL
         && (!grew || waiting_for >= RECLAIM_REWRITE_MAX_DEFER)
 }
@@ -356,14 +362,17 @@ fn monitor_loop(
             || SAVE_IN_PROGRESS.load(Ordering::SeqCst)
             || std::time::Instant::now() < cooldown_until;
         let base = AOF_BASE_SIZE.load(Ordering::Relaxed);
-        let awaiting = crate::storage::tiered::cold_reclaim::awaiting_fold();
+        let compactions = crate::storage::tiered::cold_reclaim::awaiting_fold();
+        let held = crate::storage::tiered::cold_reclaim::held_files_pressure();
+        let awaiting = compactions + held;
         if awaiting == 0 {
             awaiting_since = None;
         } else if awaiting_since.is_none() {
             awaiting_since = Some(std::time::Instant::now());
         }
         let reclaim = reclaim_due(
-            awaiting,
+            compactions,
+            held,
             awaiting > prev_awaiting,
             awaiting_since.map_or(std::time::Duration::ZERO, |t| t.elapsed()),
             last_reclaim_rewrite.map_or(std::time::Duration::MAX, |t| t.elapsed()),
@@ -392,8 +401,10 @@ fn monitor_loop(
                 awaiting_since = None;
                 info!(
                     "aof-auto-rewrite: triggering BGREWRITEAOF so {} compacted cold spill \
-                     file(s) can be adopted and their dead-slot ledger freed (moon#1215)",
-                    crate::storage::tiered::cold_reclaim::awaiting_fold()
+                     file(s) can be adopted and {} database(s)' held spill files released, \
+                     freeing their dead-slot ledger (moon#1215, moon#1231)",
+                    crate::storage::tiered::cold_reclaim::awaiting_fold(),
+                    crate::storage::tiered::cold_reclaim::held_files_pressure()
                 );
             }
         }
@@ -525,25 +536,58 @@ mod tests {
         use std::time::Duration;
         let spaced = RECLAIM_REWRITE_MIN_INTERVAL;
         let zero = Duration::ZERO;
-        assert!(reclaim_due(1, false, zero, spaced, 100), "settled");
-        assert!(reclaim_due(3, false, zero, Duration::MAX, 100), "never ran");
-        assert!(!reclaim_due(0, false, zero, spaced, 100), "nothing waits");
+        assert!(reclaim_due(1, 0, false, zero, spaced, 100), "settled");
         assert!(
-            !reclaim_due(1, false, zero, spaced, 0),
+            reclaim_due(3, 0, false, zero, Duration::MAX, 100),
+            "never ran"
+        );
+        assert!(
+            !reclaim_due(0, 0, false, zero, spaced, 100),
+            "nothing waits"
+        );
+        assert!(
+            !reclaim_due(1, 0, false, zero, spaced, 0),
             "automatic rewrites disabled"
         );
         assert!(
-            !reclaim_due(1, false, zero, spaced - Duration::from_millis(1), 100),
+            !reclaim_due(1, 0, false, zero, spaced - Duration::from_millis(1), 100),
             "spaced out"
         );
         assert!(
-            !reclaim_due(4, true, zero, spaced, 100),
+            !reclaim_due(4, 0, true, zero, spaced, 100),
             "still compacting: wait for the burst to finish"
         );
         assert!(
-            reclaim_due(4, true, RECLAIM_REWRITE_MAX_DEFER, spaced, 100),
+            reclaim_due(4, 0, true, RECLAIM_REWRITE_MAX_DEFER, spaced, 100),
             "a load that never pauses still gets its fold"
         );
+    }
+
+    /// moon#1231 review: held spill files keeping the ledger over its
+    /// threshold are released only by a committed fold, so they get one even
+    /// with automatic rewrites disabled — still spaced and settled like any
+    /// reclaim rewrite. Compactions alone still wait for a manual rewrite.
+    #[test]
+    fn held_files_pressure_gets_a_fold_even_with_rewrites_disabled() {
+        use super::{RECLAIM_REWRITE_MIN_INTERVAL, reclaim_due};
+        use std::time::Duration;
+        let spaced = RECLAIM_REWRITE_MIN_INTERVAL;
+        let zero = Duration::ZERO;
+        assert!(reclaim_due(0, 1, false, zero, spaced, 0), "percentage 0");
+        assert!(
+            reclaim_due(2, 1, false, zero, spaced, 0),
+            "with compactions too"
+        );
+        assert!(reclaim_due(0, 1, false, zero, spaced, 100));
+        assert!(
+            !reclaim_due(2, 0, false, zero, spaced, 0),
+            "compactions only"
+        );
+        assert!(
+            !reclaim_due(0, 1, false, zero, spaced - Duration::from_millis(1), 0),
+            "still spaced out"
+        );
+        assert!(!reclaim_due(0, 1, true, zero, spaced, 0), "still settled");
     }
 
     /// Only a failed rewrite keeps the forced rewrite pending.
