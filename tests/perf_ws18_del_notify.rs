@@ -617,6 +617,30 @@ fn check_expired(shards: usize) {
     assert!(keyevent(&events, "del").is_empty(), "Lua: {events:?}");
     assert_eq!(keyevent(&events, "expired"), vec![k.to_string()], "Lua");
 
+    // A script queued inside MULTI runs through the EXEC executor, not the
+    // script arm: it must see the same clock.
+    let k = "{ws18exp}txlua";
+    p.cmd.cmd(&["SET", k, "v", "PX", "1"]);
+    std::thread::sleep(PAST_EXPIRY);
+    assert_eq!(p.cmd.cmd(&["MULTI"]), Resp::Simple("OK".into()));
+    assert_eq!(
+        p.cmd
+            .cmd(&["EVAL", "return redis.call('DEL', KEYS[1])", "1", k]),
+        Resp::Simple("QUEUED".into())
+    );
+    let (reply, events) = p.run(&["EXEC"]);
+    assert_eq!(
+        reply,
+        Resp::Array(Some(vec![Resp::Int(0)])),
+        "MULTI EVAL DEL"
+    );
+    assert!(keyevent(&events, "del").is_empty(), "MULTI Lua: {events:?}");
+    assert_eq!(
+        keyevent(&events, "expired"),
+        vec![k.to_string()],
+        "MULTI Lua"
+    );
+
     // GETDEL looks the key up for READ first, and that path hides an
     // expired key and hands it to the active-expiry drain, which publishes
     // `expired` on its next tick (<= 100 ms) rather than before the reply.
