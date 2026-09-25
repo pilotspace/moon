@@ -388,36 +388,37 @@ async fn ft_command_inner(
             // the coordinator and forward through the scatter helper so
             // every responder honors the same temporal snapshot.
             let response = match crate::command::vector_search::parse_ft_search_args(cmd_args) {
-                Ok((index_name, query_blob, k, filter, _offset, _count)) => {
-                    if filter.is_some() {
-                        Frame::Error(Bytes::from_static(
-                            b"ERR FILTER not supported in multi-shard mode yet",
-                        ))
-                    } else {
-                        match resolve_ft_search_as_of_lsn(
-                            cmd_args,
-                            Some(&ctx.shard_databases),
-                            conn.active_cross_txn.as_deref(),
-                        ) {
-                            Err(err_frame) => err_frame,
-                            Ok(as_of_lsn) => {
-                                crate::shard::coordinator::scatter_vector_search_remote(
-                                    index_name,
-                                    query_blob,
-                                    k,
-                                    as_of_lsn,
-                                    ctx.shard_id,
-                                    ctx.num_shards,
-                                    &ctx.shard_databases,
-                                    &ctx.dispatch_tx,
-                                    &ctx.spsc_notifiers,
-                                    conn.selected_db as u8,
-                                )
-                                .await
-                            }
-                        }
+                // An explicit FILTER clause is still refused at multi-shard.
+                // The inline `<prefilter>=>[KNN …]` prefix is not: it rides to
+                // every leg (moon#1238 — it used to be dropped, and the query
+                // answered unfiltered). An unreadable prefilter of either kind
+                // is already the parser's ERR, as at `--shards 1` (moon#648).
+                Ok(parsed) if parsed.filter_is_clause => Frame::Error(Bytes::from_static(
+                    b"ERR FILTER not supported in multi-shard mode yet",
+                )),
+                Ok(parsed) => match resolve_ft_search_as_of_lsn(
+                    cmd_args,
+                    Some(&ctx.shard_databases),
+                    conn.active_cross_txn.as_deref(),
+                ) {
+                    Err(err_frame) => err_frame,
+                    Ok(as_of_lsn) => {
+                        crate::shard::coordinator::scatter_vector_search_remote(
+                            parsed.index_name,
+                            parsed.query_blob,
+                            parsed.k,
+                            parsed.filter.map(std::sync::Arc::new),
+                            as_of_lsn,
+                            ctx.shard_id,
+                            ctx.num_shards,
+                            &ctx.shard_databases,
+                            &ctx.dispatch_tx,
+                            &ctx.spsc_notifiers,
+                            conn.selected_db as u8,
+                        )
+                        .await
                     }
-                }
+                },
                 Err(err_frame) => err_frame,
             };
             let mut response = response;

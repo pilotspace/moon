@@ -3918,6 +3918,10 @@ FT_ASOF_RESULT_12=""
 DECAY_RESULT_1=""
 DECAY_RESULT_4=""
 DECAY_RESULT_12=""
+# moon#1238: inline KNN prefilter (`@f:{v}=>[KNN …]`) replies per shard config.
+PREFILTER_RESULT_1=""
+PREFILTER_RESULT_4=""
+PREFILTER_RESULT_12=""
 
 for NSHARDS in 1 4 12; do
     log "  -- temporal shards=$NSHARDS --"
@@ -4025,8 +4029,50 @@ PYEOF
     esac
     redis-cli -p "$PORT_RUST" GRAPH.DELETE decayg >/dev/null 2>&1
 
+    # moon#1238: the multi-shard KNN scatter dropped an inline prefilter and
+    # answered unfiltered, and answered rows for one it could not parse. Six
+    # docs spread over the shards; each vector is 16 NUL-free ASCII bytes (one
+    # FLOAT32 DIM 4 vector) whose distance to the query grows with i, so the
+    # merged order is fully determined. Replies are kept whole (keys, scores,
+    # errors) and must be byte-identical across configs.
+    redis-cli -p "$PORT_RUST" FT.CREATE pfidx ON HASH PREFIX 1 pf: SCHEMA vec VECTOR HNSW 6 TYPE FLOAT32 DIM 4 DISTANCE_METRIC L2 >/dev/null 2>&1 || true
+    for PF_I in 0 1 2 3 4 5; do
+        PF_C=$(printf "\\x$(printf %x $((0x30 + 3 * PF_I)))")
+        PF_LANG=en
+        if [[ $((PF_I % 3)) -eq 1 ]]; then PF_LANG=fr; fi
+        redis-cli -p "$PORT_RUST" HSET "pf:$PF_I" vec "00${PF_C}A00${PF_C}A00${PF_C}A00${PF_C}A" lang "$PF_LANG" year $((2000 + PF_I)) >/dev/null 2>&1 || true
+    done
+    PF_SIG=""
+    for PF_Q in '@lang:{fr}=>[KNN 5 @vec $q]' '@year:[(2001 2004]=>[KNN 5 @vec $q]' '@year:[abc def]=>[KNN 5 @vec $q]'; do
+        PF_OUT=$( (redis-cli -p "$PORT_RUST" FT.SEARCH pfidx "$PF_Q" PARAMS 2 q 000A000A000A000A DIALECT 2 2>&1 || true) | tr '\n' ' ')
+        PF_SIG="${PF_SIG}[${PF_OUT}]"
+    done
+    redis-cli -p "$PORT_RUST" FT.DROPINDEX pfidx DD >/dev/null 2>&1 || true
+    case "$NSHARDS" in
+        1)  PREFILTER_RESULT_1="$PF_SIG" ;;
+        4)  PREFILTER_RESULT_4="$PF_SIG" ;;
+        12) PREFILTER_RESULT_12="$PF_SIG" ;;
+    esac
+
     stop_moon
 done
+
+# moon#1238: the 1-shard reply is the oracle and must itself honour every
+# prefilter: fr -> pf:1 pf:4; year (2001 2004] -> pf:2 pf:3 pf:4; the
+# unparseable one -> ERR. 4 and 12 shards must answer it byte for byte.
+PF_KEYS_1=$( (echo "$PREFILTER_RESULT_1" | grep -oE 'pf:[0-9]+|\]' || true) | tr '\n' ' ')
+if [[ "$PF_KEYS_1" == "pf:1 pf:4 ] pf:2 pf:3 pf:4 ] ] " \
+      && "$PREFILTER_RESULT_1" == *"invalid FILTER expression"* \
+      && "$PREFILTER_RESULT_1" == "$PREFILTER_RESULT_4" \
+      && "$PREFILTER_RESULT_1" == "$PREFILTER_RESULT_12" ]]; then
+    PASS=$((PASS + 1)); echo "  PASS: FT.SEARCH inline KNN prefilter identical across 1/4/12 shards (moon#1238)"
+else
+    FAIL=$((FAIL + 1))
+    echo "  FAIL: FT.SEARCH inline KNN prefilter diverges across shard configs (moon#1238)"
+    echo "    1-shard:  $PREFILTER_RESULT_1"
+    echo "    4-shard:  $PREFILTER_RESULT_4"
+    echo "    12-shard: $PREFILTER_RESULT_12"
+fi
 
 # TEMP-SNAP consistency: all shard configs should return OK
 if [[ "$TEMP_SNAP_RESULT_1" == "OK" && "$TEMP_SNAP_RESULT_4" == "OK" && "$TEMP_SNAP_RESULT_12" == "OK" ]]; then

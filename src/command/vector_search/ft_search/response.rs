@@ -4,7 +4,7 @@
 //! owns Frame construction: single-shard `build_search_response`, hybrid
 //! `build_hybrid_response`, graph-expansion `build_combined_response`, and the
 //! `merge_search_results` coordinator function. Also hosts `parse_ft_search_args`
-//! which returns a tuple for cross-shard dispatch (closely coupled to
+//! which returns an [`FtSearchArgs`] for cross-shard dispatch (closely coupled to
 //! `merge_search_results`), plus the private `extract_score_from_fields` helper.
 //!
 //! No behavior change relative to the original `ft_search.rs` — pure relocation.
@@ -17,7 +17,10 @@ use crate::vector::filter::FilterExpr;
 use crate::vector::keymap::BucketedKeyMap;
 use crate::vector::types::SearchResult;
 
-use super::parse::{extract_param_blob, parse_filter_clause, parse_knn_query, parse_limit_clause};
+use super::parse::{
+    FilterParse, extract_param_blob, parse_filter_clause, parse_inline_filter, parse_knn_query,
+    parse_limit_clause,
+};
 
 /// Build FT.SEARCH response array with pagination.
 /// Format: [total_matches, "doc:0", ["__vec_score", "0.5"], "doc:1", ["__vec_score", "0.8"], ...]
@@ -163,18 +166,38 @@ pub(super) fn extract_score_from_fields(fields: &Frame) -> f32 {
     f32::MAX
 }
 
-/// Parse FT.SEARCH arguments into (index_name, query_blob, k, filter, offset, count).
+/// A KNN FT.SEARCH parsed for the multi-shard scatter by
+/// [`parse_ft_search_args`].
+#[derive(Debug)]
+pub struct FtSearchArgs {
+    pub index_name: Bytes,
+    pub query_blob: Bytes,
+    pub k: usize,
+    /// The KNN prefilter, resolved exactly as `--shards 1` resolves it
+    /// (`ft_search/dispatch.rs`): an explicit `FILTER` clause, else the inline
+    /// `<prefilter>=>[KNN …]` prefix, through the same parser.
+    pub filter: Option<FilterExpr>,
+    /// `filter` came from an explicit `FILTER` clause, not the inline prefix.
+    /// The multi-shard handlers refuse that clause; the prefix is honoured.
+    pub filter_is_clause: bool,
+    /// LIMIT offset and count. Default (no LIMIT): `0` / `usize::MAX`;
+    /// `LIMIT 0 0` is count-only mode.
+    pub offset: usize,
+    pub count: usize,
+}
+
+/// Parse a KNN FT.SEARCH for the multi-shard scatter.
 ///
 /// Used by connection handlers to extract search parameters before dispatching
 /// to the coordinator's scatter_vector_search_remote. Returns Err(Frame::Error)
-/// if args are malformed.
+/// if args are malformed, or if a prefilter was supplied and cannot be
+/// honoured as written: the ERR `--shards 1` answers (moon#648).
 ///
-/// The last two tuple elements are LIMIT offset and count:
-/// - Default (no LIMIT): offset=0, count=usize::MAX (return all results)
-/// - LIMIT 0 0: count-only mode (returns total but no documents)
-pub fn parse_ft_search_args(
-    args: &[Frame],
-) -> Result<(Bytes, Bytes, usize, Option<FilterExpr>, usize, usize), Frame> {
+/// moon#1238: the filter used to come from an explicit `FILTER` clause only.
+/// The inline prefix was never looked at, so `@lang:{fr}=>[KNN …]` scattered
+/// as an UNFILTERED KNN at `--shards > 1`, and an unparseable prefix answered
+/// rows instead of an error.
+pub fn parse_ft_search_args(args: &[Frame]) -> Result<FtSearchArgs, Frame> {
     if args.len() < 2 {
         return Err(Frame::Error(Bytes::from_static(
             b"ERR wrong number of arguments for 'FT.SEARCH' command",
@@ -208,6 +231,16 @@ pub fn parse_ft_search_args(
         }
     };
 
+    // The `--shards 1` resolution, verbatim and in the same order (before the
+    // PARAMS lookup): the clause wins, an `Invalid` clause short-circuits
+    // instead of falling through to the prefix, and `Invalid` either way is
+    // the ERR, never an unfiltered search.
+    let clause = parse_filter_clause(args);
+    let filter_is_clause = !matches!(clause, FilterParse::Absent);
+    let filter = clause
+        .or_else(|| parse_inline_filter(&query_str))
+        .into_option()?;
+
     let query_blob = match extract_param_blob(args, &param_name) {
         Some(blob) => blob,
         None => {
@@ -217,9 +250,16 @@ pub fn parse_ft_search_args(
         }
     };
 
-    let filter = parse_filter_clause(args).into_option()?;
-    let (limit_offset, limit_count) = parse_limit_clause(args);
-    Ok((index_name, query_blob, k, filter, limit_offset, limit_count))
+    let (offset, count) = parse_limit_clause(args);
+    Ok(FtSearchArgs {
+        index_name,
+        query_blob,
+        k,
+        filter,
+        filter_is_clause,
+        offset,
+        count,
+    })
 }
 
 /// Build FT.SEARCH hybrid response with dense_hits and sparse_hits metadata.
@@ -370,4 +410,116 @@ pub(crate) fn build_combined_response(
     }
 
     Frame::Array(items.into())
+}
+
+#[cfg(test)]
+mod tests {
+    use bytes::Bytes;
+
+    use super::parse_ft_search_args;
+    use crate::command::vector_search::ft_search::parse::{
+        ERR_INVALID_FILTER, parse_filter_clause, parse_inline_filter,
+    };
+    use crate::protocol::Frame;
+    use crate::vector::filter::FilterExpr;
+
+    fn bulk(s: &str) -> Frame {
+        Frame::BulkString(Bytes::copy_from_slice(s.as_bytes()))
+    }
+
+    /// `FT.SEARCH idx <query> <extra…> PARAMS 2 q blob`.
+    fn args(query: &str, extra: &[&str]) -> Vec<Frame> {
+        let mut a = vec![bulk("idx"), bulk(query)];
+        a.extend(extra.iter().map(|s| bulk(s)));
+        a.extend([bulk("PARAMS"), bulk("2"), bulk("q"), bulk("blob")]);
+        a
+    }
+
+    /// moon#1238: the multi-shard parser resolves the prefilter exactly as
+    /// `--shards 1` does (`ft_search/dispatch.rs`) — the same `FilterExpr`, or
+    /// the same ERR — for the inline prefix, an explicit FILTER, both, and
+    /// every shape the grammar refuses.
+    #[test]
+    fn multi_shard_args_resolve_the_prefilter_as_one_shard_does() {
+        let cases: &[(&str, &[&str])] = &[
+            ("*=>[KNN 5 @vec $q]", &[]),
+            ("=>[KNN 5 @vec $q]", &[]),
+            ("[KNN 5 @vec $q]", &[]),
+            ("@lang:{fr}=>[KNN 5 @vec $q]", &[]),
+            ("@year:[(2003 2007]=>[KNN 5 @vec $q]", &[]),
+            ("@year:[2003 (2007]=>[KNN 5 @vec $q]", &[]),
+            ("@lang:{fr} @year:[2004 +inf]=>[KNN 5 @vec $q]", &[]),
+            // TextMatch: answered with `text-index`, refused without it —
+            // either way the same at every shard count.
+            ("@body:{red apple}=>[KNN 5 @vec $q]", &[]),
+            ("*=>[KNN 5 @vec $q]", &["FILTER", "@lang:{fr}"]),
+            ("@lang:{en}=>[KNN 5 @vec $q]", &["FILTER", "@lang:{fr}"]),
+            ("@year:[abc def]=>[KNN 5 @vec $q]", &[]),
+            ("@year:[2007 2003]=>[KNN 5 @vec $q]", &[]),
+            ("lang:{fr}=>[KNN 5 @vec $q]", &[]),
+            ("@lang:{fr} garbage=>[KNN 5 @vec $q]", &[]),
+            // An unreadable FILTER must not fall through to the prefix.
+            (
+                "@lang:{fr}=>[KNN 5 @vec $q]",
+                &["FILTER", "@year:[abc def]"],
+            ),
+        ];
+        for (query, extra) in cases {
+            let a = args(query, extra);
+            let one_shard = parse_filter_clause(&a)
+                .or_else(|| parse_inline_filter(query.as_bytes()))
+                .into_option();
+            match (one_shard, parse_ft_search_args(&a)) {
+                (Ok(want), Ok(got)) => {
+                    assert_eq!(
+                        format!("{:?}", got.filter),
+                        format!("{want:?}"),
+                        "{query:?} {extra:?}"
+                    );
+                    assert_eq!(
+                        got.filter_is_clause,
+                        !extra.is_empty(),
+                        "{query:?} {extra:?}"
+                    );
+                }
+                (Err(want), Err(got)) => assert_eq!(got, want, "{query:?} {extra:?}"),
+                (want, got) => {
+                    panic!("{query:?} {extra:?}: --shards 1 {want:?}, multi-shard {got:?}")
+                }
+            }
+        }
+    }
+
+    /// The reproduction's shape: the prefix is a filter, not decoration.
+    #[test]
+    fn an_inline_prefilter_is_parsed_and_an_unreadable_one_is_an_error() {
+        let got = parse_ft_search_args(&args("@lang:{fr}=>[KNN 5 @vec $q]", &[])).unwrap();
+        assert!(!got.filter_is_clause);
+        assert!(
+            matches!(
+                &got.filter,
+                Some(FilterExpr::TagEq { field, value }) if field == "lang" && value == "fr"
+            ),
+            "{:?}",
+            got.filter
+        );
+        assert_eq!(got.k, 5);
+
+        let unfiltered = parse_ft_search_args(&args("*=>[KNN 5 @vec $q]", &[])).unwrap();
+        assert!(unfiltered.filter.is_none() && !unfiltered.filter_is_clause);
+
+        let bad = parse_ft_search_args(&args("@year:[abc def]=>[KNN 5 @vec $q]", &[]));
+        assert_eq!(
+            bad.unwrap_err(),
+            Frame::Error(Bytes::from_static(ERR_INVALID_FILTER))
+        );
+
+        // Same precedence as `--shards 1`: the filter is judged before the
+        // PARAMS lookup, so a bad prefilter wins over a missing vector.
+        let bad_and_missing = vec![bulk("idx"), bulk("@year:[abc def]=>[KNN 5 @vec $nope]")];
+        assert_eq!(
+            parse_ft_search_args(&bad_and_missing).unwrap_err(),
+            Frame::Error(Bytes::from_static(ERR_INVALID_FILTER))
+        );
+    }
 }

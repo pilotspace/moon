@@ -337,6 +337,10 @@ pub struct VectorSearchPayload {
     pub index_name: Bytes,
     pub query_blob: Bytes,
     pub k: usize,
+    /// moon#1238: the query's KNN prefilter, shared by every leg (`None` =
+    /// unfiltered). It used to stop at the coordinator, so each remote leg
+    /// searched unfiltered.
+    pub filter: Option<Arc<crate::vector::filter::FilterExpr>>,
     pub as_of_lsn: u64,
     pub reply_tx: channel::OneshotSender<Frame>,
     /// WS5a: the originating connection's currently-SELECTed logical db —

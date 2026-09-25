@@ -1861,6 +1861,7 @@ pub(crate) fn handle_shard_message_shared(
                 index_name,
                 query_blob,
                 k,
+                filter,
                 as_of_lsn,
                 reply_tx,
                 db_index,
@@ -1875,35 +1876,25 @@ pub(crate) fn handle_shard_message_shared(
             // uses) and sends the reply. Shapes the snapshot does not cover
             // (unknown index, dimension mismatch) take the synchronous search,
             // whose error frames they need. Phase 171 SCAT-01: `as_of_lsn` is
-            // honoured on both paths; WS5a: `db_index` from the origin.
-            let snapshot = crate::shard::slice::with_shard(|s| {
-                crate::shard::vector_scatter::capture_knn(
+            // honoured on both paths; WS5a: `db_index` from the origin;
+            // moon#1238: the query's prefilter is evaluated on this shard.
+            let leg = crate::shard::slice::with_shard(|s| {
+                crate::shard::vector_scatter::plan_knn_leg(
                     &mut s.vector_store,
                     &s.text_store,
                     &index_name,
                     &query_blob,
                     k,
+                    filter.as_deref(),
                     as_of_lsn,
                     db_index,
                 )
             });
-            match snapshot {
-                Some(snapshot) => crate::shard::vector_scatter::spawn_knn_reply(snapshot, reply_tx),
-                None => {
-                    let response = crate::shard::slice::with_shard(|s| {
-                        vector_search::search_local_filtered(
-                            &mut s.vector_store,
-                            &index_name,
-                            &query_blob,
-                            k,
-                            None,
-                            0,
-                            usize::MAX,
-                            None,
-                            as_of_lsn,
-                            db_index,
-                        )
-                    });
+            match leg {
+                crate::shard::vector_scatter::KnnLeg::Yield(snapshot) => {
+                    crate::shard::vector_scatter::spawn_knn_reply(snapshot, reply_tx)
+                }
+                crate::shard::vector_scatter::KnnLeg::Done(response) => {
                     let _ = reply_tx.send(response);
                 }
             }
