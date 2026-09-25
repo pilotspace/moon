@@ -1556,6 +1556,44 @@ both EXPIRE "{l1209}:rot" 100
 assert_both "moon#1209 LMOVE k k on a one-element list" LMOVE "{l1209}:rot" "{l1209}:rot" LEFT RIGHT
 assert_both "moon#1209 LMOVE k k keeps the TTL" PERSIST "{l1209}:rot"
 
+# moon#1226 (verified on redis-server 7.0.15): an LREM that removes nothing and
+# an LINSERT whose pivot is missing are not writes -- redis signals the key only
+# when it changed, so a WATCHing EXEC still runs. Moon took the list's mutable
+# handle (its WATCH bump) before looking, and the EXEC aborted.
+# Prints the EXEC reply's first line (`*1` ran, `*-1` aborted) after WATCH on
+# the list, the mutation on ANOTHER connection, then MULTI / SET / EXEC.
+watch_exec_after() {
+    local port="$1" enc="$2"; shift 2
+    redis-cli -p "$port" DEL {wn}:l {wn}:x >/dev/null 2>&1 || true
+    if [[ "$enc" == linkedlist ]]; then
+        redis-cli -p "$port" RPUSH {wn}:l a b c "$(printf 'w%.0s' {1..80})" >/dev/null 2>&1 || true
+    else
+        redis-cli -p "$port" RPUSH {wn}:l a b c >/dev/null 2>&1 || true
+    fi
+    exec 4<>"/dev/tcp/127.0.0.1/${port}" || { echo "__CONNECT_FAILED__:${port}"; return 0; }
+    printf 'WATCH {wn}:l\r\n' >&4
+    local line="" out="NONE" i
+    IFS= read -r -t 2 line <&4 || true
+    redis-cli -p "$port" "$@" >/dev/null 2>&1 || true
+    printf 'MULTI\r\nSET {wn}:x 1\r\nEXEC\r\n' >&4
+    for i in 1 2 3; do IFS= read -r -t 2 line <&4 || break; done   # +OK +QUEUED, then the EXEC header
+    out="${line%$'\r'}"
+    exec 4>&-
+    echo "$out"
+}
+assert_eq "moon#1226 WATCH: LREM removing nothing (listpack) lets EXEC run" \
+    "$(watch_exec_after "$PORT_REDIS" listpack LREM {wn}:l 0 zz)" \
+    "$(watch_exec_after "$PORT_RUST"  listpack LREM {wn}:l 0 zz)"
+assert_eq "moon#1226 WATCH: LINSERT missing pivot (listpack) lets EXEC run" \
+    "$(watch_exec_after "$PORT_REDIS" listpack LINSERT {wn}:l BEFORE zz x)" \
+    "$(watch_exec_after "$PORT_RUST"  listpack LINSERT {wn}:l BEFORE zz x)"
+assert_eq "moon#1226 WATCH: LREM removing nothing (linkedlist) lets EXEC run" \
+    "$(watch_exec_after "$PORT_REDIS" linkedlist LREM {wn}:l -1 zz)" \
+    "$(watch_exec_after "$PORT_RUST"  linkedlist LREM {wn}:l -1 zz)"
+assert_eq "moon#1226 WATCH: an LREM that removes aborts EXEC [control]" \
+    "$(watch_exec_after "$PORT_REDIS" listpack LREM {wn}:l 1 a)" \
+    "$(watch_exec_after "$PORT_RUST"  listpack LREM {wn}:l 1 a)"
+
 # moon#1211 (WS10): the LFU counter under `lfu-log-factor 0` grows by exactly one
 # per access, and neither MEMORY USAGE nor OBJECT FREQ itself touches it
 # (redis serves both with LOOKUP_NOTOUCH). Config restored afterwards.

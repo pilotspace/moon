@@ -754,6 +754,49 @@ if should_run "list"; then
     rcli EXPIRE {l1209}:rot 100 >/dev/null 2>&1; mcli EXPIRE {l1209}:rot 100 >/dev/null 2>&1
     assert_match "LMOVE k k rotates"     LMOVE {l1209}:rot {l1209}:rot LEFT RIGHT
     assert_match "LMOVE k k keeps TTL"   PERSIST {l1209}:rot
+
+    # moon#1226: an LREM that removes nothing / an LINSERT with a missing pivot
+    # is not a write, so a WATCHing EXEC still runs (redis 7.0.15).
+    # Prints the EXEC reply's first line (`*1` ran, `*-1` aborted) after WATCH on
+    # the list, the mutation on ANOTHER connection, then MULTI / SET / EXEC.
+    watch_exec_after() {
+        local port="$1" enc="$2"; shift 2
+        redis-cli -p "$port" DEL {wn}:l {wn}:x >/dev/null 2>&1 || true
+        if [[ "$enc" == linkedlist ]]; then
+            redis-cli -p "$port" RPUSH {wn}:l a b c "$(printf 'w%.0s' {1..80})" >/dev/null 2>&1 || true
+        else
+            redis-cli -p "$port" RPUSH {wn}:l a b c >/dev/null 2>&1 || true
+        fi
+        exec 4<>"/dev/tcp/127.0.0.1/${port}" || { echo "__CONNECT_FAILED__:${port}"; return 0; }
+        printf 'WATCH {wn}:l\r\n' >&4
+        local line="" out="NONE" i
+        IFS= read -r -t 2 line <&4 || true
+        redis-cli -p "$port" "$@" >/dev/null 2>&1 || true
+        printf 'MULTI\r\nSET {wn}:x 1\r\nEXEC\r\n' >&4
+        for i in 1 2 3; do IFS= read -r -t 2 line <&4 || break; done   # +OK +QUEUED, then the EXEC header
+        out="${line%$'\r'}"
+        exec 4>&-
+        echo "$out"
+    }
+    assert_same_watch() {
+        local desc="$1"; shift
+        TOTAL=$((TOTAL + 1))
+        local r m
+        r="$(watch_exec_after "$PORT_REDIS" "$@")"
+        m="$(watch_exec_after "$PORT_RUST" "$@")"
+        if [[ "$r" == "$m" ]]; then
+            PASS=$((PASS + 1))
+        else
+            FAIL=$((FAIL + 1))
+            echo "  FAIL: $desc"
+            echo "    REDIS: $r"
+            echo "    MOON:  $m"
+        fi
+    }
+    assert_same_watch "WATCH: LREM removing nothing (moon#1226)"  listpack LREM {wn}:l 0 zz
+    assert_same_watch "WATCH: LINSERT missing pivot (moon#1226)"  listpack LINSERT {wn}:l BEFORE zz x
+    assert_same_watch "WATCH: LREM removing nothing, linkedlist"  linkedlist LREM {wn}:l -1 zz
+    assert_same_watch "WATCH: LREM that removes aborts [control]" listpack LREM {wn}:l 1 a
     # moon#1211 (WS10): OBJECT FREQ grows once per access under lfu-log-factor 0;
     # MEMORY USAGE and OBJECT FREQ are NOTOUCH.
     for c in rcli mcli; do
