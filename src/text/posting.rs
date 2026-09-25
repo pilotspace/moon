@@ -810,6 +810,23 @@ impl PostingCursor<'_> {
         }
     }
 
+    /// Call `f(doc, tf)` for every entry from the cursor's position through
+    /// `last` (inclusive), in order, leaving the cursor on the first entry
+    /// after `last` — the per-term resume point of the blocked
+    /// term-at-a-time fold (moon#1226). Pair with [`Self::seek`] to skip what
+    /// lies before a block.
+    #[inline]
+    pub fn drain_through(&mut self, last: u32, mut f: impl FnMut(u32, u32)) {
+        while let Some(c) = self.cur {
+            if c > last {
+                break;
+            }
+            f(c, self.tf_here());
+            self.cur = self.iter.next();
+            self.step();
+        }
+    }
+
     /// Move the rank position forward by one entry.
     #[inline]
     fn step(&mut self) {

@@ -98,22 +98,97 @@ const TAAT_MIN_TERMS: usize = 4;
 /// most this many per seek saved.
 const TAAT_ENTRIES_PER_SEEK: u64 = 4;
 
+/// Ids folded per term-at-a-time block (moon#1226). The fold's scratch is two
+/// `f32` per id of ONE block — 32 KB — however wide the candidates' id window;
+/// it used to be two `f32` per id of the whole window, which the cost model
+/// bounds only by `|candidates| × terms` (a 50-term prefix over sparse
+/// candidates could ask for tens of MB).
+const TAAT_BLOCK: u32 = 4096;
+
 /// A fuzzy/prefix field-leaf's scores, folded term-at-a-time over the id
-/// window `[lo, lo + best.len())` (moon#1220): `best[d - lo]` is the leaf's
-/// score for doc `d`, NaN when no expanded term contains `d`. A real score is
-/// never NaN — the `>`-max starts at `0.0` and NaN never compares greater.
-struct TaatScores {
+/// window `[lo, hi]` (moon#1220) one block at a time (moon#1226): `best[d -
+/// block_lo]` is the leaf's score for doc `d` of the current block, NaN when
+/// no expanded term contains `d`. A real score is never NaN — the `>`-max
+/// starts at `0.0` and NaN never compares greater. Each expanded term keeps
+/// its own cursor as the resume point between blocks, so the whole window
+/// still costs one pass over every posting.
+struct TaatScores<'a> {
     lo: u32,
+    hi: u32,
+    /// First id of the folded block; `best.len()` ids from here (0 = none yet).
+    block_lo: u32,
     best: Vec<f32>,
+    len_norm: Vec<f32>,
+    /// One resume point per expanded term (same order as `FieldScorer::terms`).
+    cursors: Vec<PostingCursor<'a>>,
+    block: u32,
 }
 
-impl TaatScores {
+impl TaatScores<'_> {
     /// `Some(Some(score))` / `Some(None)` (not matched) inside the window,
-    /// `None` outside it.
+    /// `None` outside it — or for a doc behind the folded block, which the
+    /// ascending contract never asks for (the caller's cursors answer it).
     #[inline]
-    fn get(&self, doc: u32) -> Option<Option<f32>> {
-        let s = *self.best.get(doc.checked_sub(self.lo)? as usize)?;
+    fn get(
+        &mut self,
+        idx: &TextIndex,
+        doc: u32,
+        terms: &[TermCursor<'_>],
+        ctx: &FieldCtx,
+    ) -> Option<Option<f32>> {
+        if doc < self.lo || doc > self.hi || doc < self.block_lo {
+            return None;
+        }
+        let at = (doc - self.block_lo) as usize;
+        if at >= self.best.len() {
+            self.fold_block(idx, doc, terms, ctx);
+        }
+        let s = *self.best.get((doc - self.block_lo) as usize)?;
         Some((!s.is_nan()).then_some(s))
+    }
+
+    /// Fold the block `[start, min(start + block - 1, hi)]`, term by term in
+    /// expansion order: per doc exactly [`FieldScorer::score`]'s fold
+    /// (`best = 0.0`, then `if s > best { best = s }` for each matching term,
+    /// `s` from the same `contribution(tf, len_norm)`) — so the same bits.
+    fn fold_block(
+        &mut self,
+        idx: &TextIndex,
+        start: u32,
+        terms: &[TermCursor<'_>],
+        ctx: &FieldCtx,
+    ) {
+        let end = start.saturating_add(self.block - 1).min(self.hi);
+        self.block_lo = start;
+        self.len_norm.clear();
+        self.len_norm.extend((start..=end).map(|d| {
+            bm25_len_norm(
+                idx.doc_field_len(d, ctx.field_idx),
+                ctx.avgdl,
+                ctx.k1,
+                ctx.b,
+            )
+        }));
+        self.best.clear();
+        self.best.resize(self.len_norm.len(), f32::NAN);
+        let (best, len_norm) = (&mut self.best, &self.len_norm);
+        for (cursor, term) in self.cursors.iter_mut().zip(terms) {
+            // Resume: skip what lies before this block, fold what lies in it.
+            let _ = cursor.seek(start);
+            cursor.drain_through(end, |doc, tf| {
+                let at = (doc - start) as usize;
+                if let (Some(slot), Some(&norm)) = (best.get_mut(at), len_norm.get(at)) {
+                    let score = term.contribution(tf, norm, ctx);
+                    let base = if slot.is_nan() { 0.0 } else { *slot };
+                    *slot = if score > base { score } else { base };
+                }
+            });
+        }
+        #[cfg(test)]
+        TAAT_SCRATCH_PEAK.with(|c| {
+            let bytes = (self.best.capacity() + self.len_norm.capacity()) * 4;
+            c.set(c.get().max(bytes));
+        });
     }
 }
 
@@ -129,6 +204,19 @@ thread_local! {
     /// How many term-at-a-time folds ran on this thread (tests assert the
     /// path they compare was actually taken).
     static TAAT_FOLDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Test override of [`TAAT_BLOCK`] (multi-block folds on small corpora).
+    static TAAT_BLOCK_OVERRIDE: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+    /// Largest scratch (bytes) one term-at-a-time fold held on this thread.
+    static TAAT_SCRATCH_PEAK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[inline]
+fn taat_block() -> u32 {
+    #[cfg(test)]
+    if let Some(b) = TAAT_BLOCK_OVERRIDE.with(std::cell::Cell::get) {
+        return b.max(1);
+    }
+    TAAT_BLOCK
 }
 
 /// Term-at-a-time folds run on this thread so far.
@@ -155,7 +243,7 @@ pub(crate) struct FieldScorer<'a> {
     /// The postings, for building the candidate set.
     postings: Vec<&'a PostingList>,
     /// Term-at-a-time scores of an `AnyMax` leaf (see [`Self::prepare`]).
-    taat: Option<TaatScores>,
+    taat: Option<TaatScores<'a>>,
 }
 
 impl<'a> FieldScorer<'a> {
@@ -255,14 +343,15 @@ impl<'a> FieldScorer<'a> {
     ///
     /// Document-at-a-time seeks every expanded term's cursor per candidate:
     /// `|candidates| × terms` seeks. Term-at-a-time walks each expanded
-    /// posting once and folds its contributions into a dense window over the
-    /// candidates' id range: `Σ |posting| + window` steps. The latter is
+    /// posting once and folds its contributions into dense blocks of the
+    /// candidates' id range (`TAAT_BLOCK` ids of scratch at a time, moon#1226):
+    /// `Σ |posting| + window` steps. The latter is
     /// taken when it is clearly cheaper — typically a bare prefix/fuzzy query
     /// (the candidates ARE the postings' union); a prefix ANDed with a narrow
     /// filter keeps seeking. Either way the scores are bit-identical: each doc
     /// folds its matching terms in expansion order with the same `>`-max from
     /// `0.0`. Exact (`AllSum`) leaves are unaffected.
-    pub(crate) fn prepare(&mut self, idx: &TextIndex, candidates: &RoaringBitmap) {
+    pub(crate) fn prepare(&mut self, _idx: &TextIndex, candidates: &RoaringBitmap) {
         self.taat = None;
         if self.combine != Combine::AnyMax {
             return;
@@ -279,44 +368,37 @@ impl<'a> FieldScorer<'a> {
         #[cfg(test)]
         let cheaper = FORCE_TAAT.with(std::cell::Cell::get).unwrap_or(cheaper);
         if cheaper {
-            self.taat = Some(self.fold_term_at_a_time(idx, lo, hi));
+            self.taat = Some(self.fold_term_at_a_time(lo, hi));
         }
     }
 
-    /// The `AnyMax` score of every doc in `[lo, hi]`, term by term. Per doc
-    /// this is exactly [`Self::score`]'s fold: `best = 0.0`, then for each
-    /// matching term IN EXPANSION ORDER `if s > best { best = s }`, with `s`
-    /// from the same `contribution(tf, len_norm)` — so the bits are the same.
-    fn fold_term_at_a_time(&self, idx: &TextIndex, lo: u32, hi: u32) -> TaatScores {
+    /// Term-at-a-time state for the window `[lo, hi]`: one resume cursor per
+    /// expanded term and block-sized scratch; blocks are folded lazily as
+    /// [`Self::score`] walks the candidates (see [`TaatScores`]).
+    fn fold_term_at_a_time(&self, lo: u32, hi: u32) -> TaatScores<'a> {
         #[cfg(test)]
         TAAT_FOLDS.with(|c| c.set(c.get() + 1));
-        let ctx = self.ctx;
-        let len_norm: Vec<f32> = (lo..=hi).map(|d| self.len_norm(idx, d)).collect();
-        let mut best = vec![f32::NAN; len_norm.len()];
-        for (term, posting) in self.terms.iter().zip(&self.postings) {
-            posting.for_each_tf(|doc, tf| {
-                let Some(at) = doc.checked_sub(lo) else {
-                    return true; // below the window
-                };
-                let at = at as usize;
-                let (Some(slot), Some(&norm)) = (best.get_mut(at), len_norm.get(at)) else {
-                    return false; // past the window: the rest of the posting is too
-                };
-                let score = term.contribution(tf, norm, &ctx);
-                let base = if slot.is_nan() { 0.0 } else { *slot };
-                *slot = if score > base { score } else { base };
-                true
-            });
+        let block = taat_block();
+        let cap = (hi - lo).saturating_add(1).min(block) as usize;
+        TaatScores {
+            lo,
+            hi,
+            block_lo: lo,
+            best: Vec::with_capacity(cap),
+            len_norm: Vec::with_capacity(cap),
+            cursors: self.postings.iter().map(|p| p.cursor()).collect(),
+            block,
         }
-        TaatScores { lo, best }
     }
 
     /// Score `doc` (ascending across calls). `None` when `doc` is not in this
     /// field-leaf's match set; otherwise HEAD's exact per-field score.
     #[inline]
     pub(crate) fn score(&mut self, idx: &TextIndex, doc: u32) -> Option<f32> {
-        if let Some(scored) = self.taat.as_ref().and_then(|t| t.get(doc)) {
-            return scored;
+        if let Some(taat) = self.taat.as_mut() {
+            if let Some(scored) = taat.get(idx, doc, &self.terms, &self.ctx) {
+                return scored;
+            }
         }
         let ctx = self.ctx;
         match self.combine {
@@ -680,28 +762,105 @@ mod tests {
             assert!(idx.field_postings[0].doc_freq(path) > 256);
 
             let window: RoaringBitmap = (300u32..620).filter(|d| d % 3 != 1).collect();
-            let mut taat = FieldScorer::any_of(&idx, 0, &ids, None).expect("scorer");
-            with_forced_taat(Some(true), || taat.prepare(&idx, &window));
-            assert!(taat.taat.is_some(), "forced term-at-a-time did not fold");
-            let mut cursor = FieldScorer::any_of(&idx, 0, &ids, None).expect("scorer");
-            with_forced_taat(Some(false), || cursor.prepare(&idx, &window));
-            assert!(cursor.taat.is_none());
-            let mut matched = 0;
-            for d in 0..900u32 {
-                let (a, b) = (taat.score(&idx, d), cursor.score(&idx, d));
+            // moon#1226: one block (default), many blocks, odd-sized blocks and
+            // single-id blocks — the per-term resume points must carry every
+            // posting across block boundaries without skipping or repeating.
+            for block in [None, Some(64u32), Some(7), Some(1)] {
+                let mut taat = FieldScorer::any_of(&idx, 0, &ids, None).expect("scorer");
+                with_taat_block(block, || {
+                    with_forced_taat(Some(true), || taat.prepare(&idx, &window))
+                });
+                assert!(taat.taat.is_some(), "forced term-at-a-time did not fold");
+                let mut cursor = FieldScorer::any_of(&idx, 0, &ids, None).expect("scorer");
+                with_forced_taat(Some(false), || cursor.prepare(&idx, &window));
+                assert!(cursor.taat.is_none());
+                let mut matched = 0;
+                for d in 0..900u32 {
+                    let (a, b) = (taat.score(&idx, d), cursor.score(&idx, d));
+                    assert_eq!(
+                        a.map(f32::to_bits),
+                        b.map(f32::to_bits),
+                        "doc {d} w={weight} block={block:?}"
+                    );
+                    matched += usize::from(b.is_some_and(|s| s != 0.0));
+                }
                 assert_eq!(
-                    a.map(f32::to_bits),
-                    b.map(f32::to_bits),
-                    "doc {d} w={weight}"
+                    matched > 0,
+                    weight > 0.0,
+                    "w={weight}: positive scores exist"
                 );
-                matched += usize::from(b.is_some_and(|s| s != 0.0));
             }
+        }
+    }
+
+    fn with_taat_block<R>(block: Option<u32>, f: impl FnOnce() -> R) -> R {
+        let prev = TAAT_BLOCK_OVERRIDE.with(|c| c.replace(block));
+        let out = f();
+        TAAT_BLOCK_OVERRIDE.with(|c| c.set(prev));
+        out
+    }
+
+    /// moon#1226 red test: the term-at-a-time scratch is bounded by one
+    /// block, however wide the candidates' id window. HEAD allocated two f32
+    /// per id of the whole window (`len_norm` + `best`), bounded only by
+    /// `|candidates| × terms`: 8 B × 60,000 ids = 480 KB here, and tens of MB
+    /// for a wide expansion over a large corpus.
+    #[cfg(feature = "text-index")]
+    #[test]
+    fn term_at_a_time_scratch_is_one_block_not_the_whole_window() {
+        use crate::text::types::{BM25Config, TextFieldDef};
+        use bytes::Bytes;
+
+        let mut idx = TextIndex::new(
+            Bytes::from_static(b"t"),
+            vec![Bytes::from_static(b"d:")],
+            vec![TextFieldDef::new(Bytes::from_static(b"body"))],
+            BM25Config::default(),
+        );
+        // Bulk-load 60,000 docs through the store API: 6 expanded terms with
+        // distinct per-doc tfs, one of them in every doc.
+        let words = ["pa", "pat", "path", "patch", "pater", "patio"];
+        for d in 0..60_000u32 {
+            let mut body = String::from("path ");
+            for (i, w) in words.iter().enumerate() {
+                for _ in 0..((d as usize + i) % 3) {
+                    body.push_str(w);
+                    body.push(' ');
+                }
+            }
+            let key = format!("d:{d}");
+            let args = [
+                crate::protocol::Frame::BulkString(Bytes::from_static(b"body")),
+                crate::protocol::Frame::BulkString(Bytes::from(body)),
+            ];
+            idx.index_document(u64::from(d) + 1, key.as_bytes(), &args);
+        }
+        let ids: Vec<u32> = words
+            .iter()
+            .filter_map(|w| idx.field_term_dicts[0].get(w))
+            .collect();
+        let window = idx.live_docs().clone();
+        assert_eq!(window.len(), 60_000);
+        TAAT_SCRATCH_PEAK.with(|c| c.set(0));
+        let mut taat = FieldScorer::any_of(&idx, 0, &ids, None).expect("scorer");
+        with_forced_taat(Some(true), || taat.prepare(&idx, &window));
+        let mut cursor = FieldScorer::any_of(&idx, 0, &ids, None).expect("scorer");
+        with_forced_taat(Some(false), || cursor.prepare(&idx, &window));
+        for d in &window {
             assert_eq!(
-                matched > 0,
-                weight > 0.0,
-                "w={weight}: positive scores exist"
+                taat.score(&idx, d).map(f32::to_bits),
+                cursor.score(&idx, d).map(f32::to_bits),
+                "doc {d}"
             );
         }
+        let peak = TAAT_SCRATCH_PEAK.with(std::cell::Cell::get);
+        assert!(peak > 0, "the fold ran");
+        // The design bound: two f32 per id of one 4096-id block (32 KiB).
+        const ONE_BLOCK: usize = 8 * 4096;
+        assert!(
+            peak <= ONE_BLOCK,
+            "term-at-a-time scratch {peak} B for a 60,000-id window (bound: {ONE_BLOCK} B)"
+        );
     }
 
     #[test]
