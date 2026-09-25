@@ -225,6 +225,42 @@ pub(crate) fn wal_append_on_slice(
     });
 }
 
+/// TXN.COMMIT's MQ.PUBLISH materialization on the queue's owner shard: add
+/// each intent's fields to its durable stream in `db` (`databases[db_index]`)
+/// and return one `MqPush` WAL payload per applied intent, each carrying the
+/// ASSIGNED id so replay is outcome-deterministic (Wave B stage 2a). A
+/// missing or non-durable queue is skipped.
+///
+/// The one body behind the self-shard legs of both runtimes' TXN.COMMIT
+/// (`handler_monoio/txn.rs`, `handler_sharded/txn.rs`) and the foreign-shard
+/// `MqTxnMaterialize` arm (`spsc_handler.rs`). Each queue key's epoch-start
+/// state is captured before the push (moon#1228): like the MQ subcommands,
+/// this writes the stream outside `command::dispatch`.
+pub(crate) fn materialize_mq_intents(
+    db: &mut crate::storage::Database,
+    db_index: usize,
+    intents: &[crate::transaction::MqIntent],
+) -> Vec<Vec<u8>> {
+    let mut payloads = Vec::with_capacity(intents.len());
+    for intent in intents {
+        crate::persistence::snapshot_cow::capture_write_pre_image(db, db_index, &intent.queue_key);
+        if let Ok(Some(stream)) = db.get_stream_mut(&intent.queue_key)
+            && stream.durable
+        {
+            let msg_id = stream.next_auto_id();
+            payloads.push(crate::mq::wal::encode_mq_push(
+                db_index as u32,
+                &intent.queue_key,
+                msg_id.ms,
+                msg_id.seq,
+                &intent.fields,
+            ));
+            stream.add(msg_id, intent.fields.clone());
+        }
+    }
+    payloads
+}
+
 // ── Replication emission (Wave B stage 2b) ────────────────────────────────
 
 /// The current shard's index, read off the thread-local `ShardSlice`.
@@ -417,6 +453,9 @@ fn handle_create(args: &[Frame], key_prefix: &Bytes, db_index: usize) -> Frame {
 
     // Create / configure the durable stream.
     let create_result: Result<(), Frame> = crate::shard::slice::with_shard_db(db_index, |db| {
+        // moon#1228: MQ runs outside `command::dispatch`, so an armed BGSAVE
+        // epoch gets the queue key's epoch-start state (or absence) here.
+        crate::persistence::snapshot_cow::capture_write_pre_image(db, db_index, &eff_key);
         match db.get_or_create_stream(&eff_key) {
             Ok(stream) => {
                 stream.durable = true;
@@ -482,8 +521,10 @@ fn handle_push(args: &[Frame], key_prefix: &Bytes, db_index: usize) -> Frame {
     // Encoding here is a pure function call, not a nested `with_shard*`
     // call, so it doesn't violate the non-reentrancy contract.
     type PushResult = Result<Option<(StreamId, Vec<u8>)>, Frame>;
-    let push_result: PushResult =
-        crate::shard::slice::with_shard_db(db_index, |db| match db.get_stream_mut(&eff_key) {
+    let push_result: PushResult = crate::shard::slice::with_shard_db(db_index, |db| {
+        // moon#1228: see `handle_create`.
+        crate::persistence::snapshot_cow::capture_write_pre_image(db, db_index, &eff_key);
+        match db.get_stream_mut(&eff_key) {
             Ok(Some(stream)) => {
                 if !stream.durable {
                     Ok(None)
@@ -502,7 +543,8 @@ fn handle_push(args: &[Frame], key_prefix: &Bytes, db_index: usize) -> Frame {
             }
             Ok(None) => Ok(None),
             Err(e) => Err(e),
-        });
+        }
+    });
 
     match push_result {
         Ok(Some((msg_id, payload))) => {
@@ -588,6 +630,10 @@ fn handle_pop(args: &[Frame], key_prefix: &Bytes, db_index: usize) -> Frame {
     // on any error/early-exit path (nothing claimed, nothing to record).
     let (reply, wal_payload): (Frame, Option<Vec<u8>>) =
         crate::shard::slice::with_shard_db(db_index, |db| -> (Frame, Option<Vec<u8>>) {
+            // moon#1228: the claim below writes the queue's PEL and group
+            // cursor (and may release, ack and dead-letter): an armed BGSAVE
+            // epoch gets the queue key's epoch-start state first.
+            crate::persistence::snapshot_cow::capture_write_pre_image(db, db_index, &eff_key);
             // Step 1: read max_delivery_count.
             let mdc = match db.get_stream_mut(&eff_key) {
                 Ok(Some(stream)) => {
@@ -733,6 +779,8 @@ fn handle_pop(args: &[Frame], key_prefix: &Bytes, db_index: usize) -> Frame {
                     buf.extend_from_slice(b"::mq:dlq");
                     Bytes::from(buf)
                 };
+                // moon#1228: the DLQ stream is a second written key.
+                crate::persistence::snapshot_cow::capture_write_pre_image(db, db_index, &dlq_key);
                 if let Ok(dlq_stream) = db.get_or_create_stream(&dlq_key) {
                     for (src_id, fields) in dlq_entries {
                         let dlq_id = dlq_stream.next_auto_id();
@@ -809,8 +857,10 @@ fn handle_ack(args: &[Frame], key_prefix: &Bytes, db_index: usize) -> Frame {
         .map(|(ms, seq)| StreamId { ms: *ms, seq: *seq })
         .collect();
 
-    let ack_result =
-        crate::shard::slice::with_shard_db(db_index, |db| match db.get_stream_mut(&eff_key) {
+    let ack_result = crate::shard::slice::with_shard_db(db_index, |db| {
+        // moon#1228: see `handle_create`.
+        crate::persistence::snapshot_cow::capture_write_pre_image(db, db_index, &eff_key);
+        match db.get_stream_mut(&eff_key) {
             Ok(Some(stream)) => {
                 let group_name = Bytes::from_static(b"__mq_consumers");
                 match stream.xack(&group_name, &ids) {
@@ -819,7 +869,8 @@ fn handle_ack(args: &[Frame], key_prefix: &Bytes, db_index: usize) -> Frame {
                 }
             }
             _ => None,
-        });
+        }
+    });
 
     match ack_result {
         Some(acked_count) => {
@@ -1096,5 +1147,161 @@ mod tests {
         .expect("test thread panicked");
 
         assert_eq!(result, Frame::Integer(0));
+    }
+
+    // ── moon#1228: snapshot pre-image capture ─────────────────────────────────
+
+    fn mq(parts: &[&str]) -> Frame {
+        let mut argv = vec![Frame::BulkString(Bytes::from_static(b"MQ"))];
+        argv.extend(
+            parts
+                .iter()
+                .map(|p| Frame::BulkString(Bytes::copy_from_slice(p.as_bytes()))),
+        );
+        execute_mq_on_owner(0, Bytes::new(), Arc::new(Frame::Array(argv.into())))
+    }
+
+    /// The id of the one entry an `MQ POP ... COUNT 1` reply carries.
+    fn popped_id(reply: &Frame) -> String {
+        let Frame::Array(entries) = reply else {
+            panic!("POP reply {reply:?}");
+        };
+        let Some(Frame::Array(entry)) = entries.first() else {
+            panic!("POP delivered nothing: {reply:?}");
+        };
+        match entry.first() {
+            Some(Frame::BulkString(id)) => String::from_utf8_lossy(id).into_owned(),
+            other => panic!("POP entry id {other:?}"),
+        }
+    }
+
+    /// MQ.CREATE / PUSH / POP / ACK, a TXN MQ.PUBLISH materialization and a
+    /// replicated MQ record all write their queue outside `command::dispatch`.
+    /// Under an armed BGSAVE epoch each must capture the queue's epoch-start
+    /// state first; before moon#1228 none did, so a queue whose range the save
+    /// had not written yet reached the file with its post-epoch length, PEL
+    /// and group cursor, and a queue created mid-save was in the file at all.
+    #[test]
+    fn mq_writes_mid_epoch_keep_the_snapshot_point_in_time() {
+        use crate::persistence::snapshot::{SnapshotState, shard_snapshot_load};
+        use crate::persistence::snapshot_cow;
+        use crate::shard::slice::with_shard_db;
+
+        std::thread::spawn(|| {
+            init_shard(make_test_slice(1));
+            const QUEUES: usize = 64;
+            let q = |i: usize| format!("q{i:03}");
+            with_shard_db(0, |db| {
+                for i in 0..3000u32 {
+                    db.set_string(format!("fill:{i}").as_bytes(), Bytes::from_static(b"x"));
+                }
+            });
+            for i in 0..QUEUES {
+                assert_eq!(
+                    mq(&["CREATE", &q(i)]),
+                    Frame::SimpleString(Bytes::from_static(b"OK"))
+                );
+                for _ in 0..3 {
+                    assert!(matches!(
+                        mq(&["PUSH", &q(i), "f", "v"]),
+                        Frame::BulkString(_)
+                    ));
+                }
+            }
+
+            // BGSAVE starts; one segment of db 0 is written.
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = dir.path().join("s.rrdshard");
+            let mut state = with_shard_db(0, |db| {
+                SnapshotState::new(0, 1, std::slice::from_ref(&*db), path.clone())
+            });
+            snapshot_cow::disarm();
+            snapshot_cow::arm_with_layout(state.segment_counts().to_vec());
+            assert!(!with_shard_db(0, |db| state.advance_one_segment_db(db)));
+            snapshot_cow::note_progress(state.current_db_index(), state.cursor());
+
+            // Mid-epoch MQ writes, on queues on both sides of the cursor.
+            for i in 0..QUEUES {
+                assert!(matches!(
+                    mq(&["PUSH", &q(i), "f", "v2"]),
+                    Frame::BulkString(_)
+                ));
+                let id = popped_id(&mq(&["POP", &q(i), "COUNT", "1"]));
+                if i % 2 == 0 {
+                    assert_eq!(mq(&["ACK", &q(i), &id]), Frame::Integer(1));
+                }
+            }
+            for i in QUEUES..QUEUES + 8 {
+                mq(&["CREATE", &q(i)]);
+            }
+            let intents: Vec<crate::transaction::MqIntent> = (0..QUEUES)
+                .step_by(3)
+                .map(|i| crate::transaction::MqIntent {
+                    queue_key: Bytes::from(q(i)),
+                    fields: vec![(Bytes::from_static(b"t"), Bytes::from_static(b"x"))],
+                })
+                .collect();
+            let pushed = with_shard_db(0, |db| materialize_mq_intents(db, 0, &intents)).len();
+            assert_eq!(pushed, intents.len(), "setup: TXN intents applied");
+            crate::shard::slice::with_shard(|s| {
+                for i in (1..QUEUES).step_by(3) {
+                    crate::shard::shared_databases::apply_mq_push(
+                        s,
+                        0,
+                        q(i).as_bytes(),
+                        StreamId { ms: 1, seq: 0 },
+                        vec![(Bytes::from_static(b"r"), Bytes::from_static(b"y"))],
+                    );
+                }
+            });
+
+            // The epoch finishes.
+            snapshot_cow::drain_pending_for_test(&mut state);
+            while !with_shard_db(0, |db| state.advance_one_segment_db(db)) {
+                snapshot_cow::note_progress(state.current_db_index(), state.cursor());
+            }
+            state.finalize().expect("finalize");
+            snapshot_cow::disarm();
+
+            let mut loaded = vec![Database::new()];
+            shard_snapshot_load(&mut loaded, &path).expect("load");
+            let mut wrong = Vec::new();
+            for i in 0..QUEUES {
+                let s = loaded[0]
+                    .get_stream(q(i).as_bytes())
+                    .ok()
+                    .flatten()
+                    .expect("queue in the file");
+                let g = &s.groups[b"__mq_consumers".as_ref()];
+                if s.length != 3 || !g.pel.is_empty() || g.last_delivered_id != StreamId::ZERO {
+                    wrong.push(format!(
+                        "{}: length {} pel {} cursor {:?}",
+                        q(i),
+                        s.length,
+                        g.pel.len(),
+                        g.last_delivered_id
+                    ));
+                }
+            }
+            let created: Vec<String> = (QUEUES..QUEUES + 8)
+                .map(q)
+                .filter(|k| loaded[0].get_stream(k.as_bytes()).ok().flatten().is_some())
+                .collect();
+            (wrong, created)
+        })
+        .join()
+        .map(|(wrong, created)| {
+            assert!(
+                wrong.is_empty(),
+                "{} queues reached the file at their post-epoch state: {:?}",
+                wrong.len(),
+                &wrong[..wrong.len().min(5)]
+            );
+            assert!(
+                created.is_empty(),
+                "queues created mid-epoch are in the file: {created:?}"
+            );
+        })
+        .expect("test thread panicked");
     }
 }

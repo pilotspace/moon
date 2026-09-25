@@ -703,6 +703,9 @@ pub(crate) fn apply_mq_create<T: MqApplyTarget>(
     );
 
     if let Some(mut db) = target.mq_db(db_index) {
+        // moon#1228: a replicated MQ record writes outside `command::dispatch`;
+        // an armed BGSAVE epoch on this replica needs the key's state first.
+        crate::persistence::snapshot_cow::capture_write_pre_image(&db, db_index, key);
         if let Ok(stream) = db.get_or_create_stream(key) {
             stream.durable = true;
             stream.max_delivery_count = max_delivery_count;
@@ -727,6 +730,8 @@ pub(crate) fn apply_mq_push<T: MqApplyTarget>(
     fields: Vec<(bytes::Bytes, bytes::Bytes)>,
 ) {
     if let Some(mut db) = target.mq_db(db_index) {
+        // moon#1228: see `apply_mq_create`.
+        crate::persistence::snapshot_cow::capture_write_pre_image(&db, db_index, key);
         if let Ok(stream) = db.get_or_create_stream(key) {
             if !stream.entries.contains_key(&id) {
                 stream.add(id, fields);
@@ -778,6 +783,8 @@ pub(crate) fn apply_mq_pop<T: MqApplyTarget>(
     let Some(mut db) = target.mq_db(db_index) else {
         return;
     };
+    // moon#1228: see `apply_mq_create`.
+    crate::persistence::snapshot_cow::capture_write_pre_image(&db, db_index, key);
 
     let dlq_pushes: Vec<(
         crate::storage::stream::StreamId,
@@ -846,6 +853,7 @@ pub(crate) fn apply_mq_pop<T: MqApplyTarget>(
         let mut dlq_key = Vec::with_capacity(key.len() + 8);
         dlq_key.extend_from_slice(key);
         dlq_key.extend_from_slice(b"::mq:dlq");
+        crate::persistence::snapshot_cow::capture_write_pre_image(&db, db_index, &dlq_key);
         if let Ok(dlq_stream) = db.get_or_create_stream(&dlq_key) {
             for (dlq_id, fields) in dlq_pushes {
                 if !dlq_stream.entries.contains_key(&dlq_id) {
@@ -867,6 +875,8 @@ pub(crate) fn apply_mq_ack<T: MqApplyTarget>(
     id: crate::storage::stream::StreamId,
 ) {
     if let Some(mut db) = target.mq_db(db_index) {
+        // moon#1228: see `apply_mq_create`.
+        crate::persistence::snapshot_cow::capture_write_pre_image(&db, db_index, key);
         if let Ok(Some(stream)) = db.get_stream_mut(key) {
             let group_name = bytes::Bytes::from_static(MQ_GROUP_NAME);
             let _ = stream.xack(&group_name, &[id]);
@@ -919,6 +929,8 @@ pub(crate) fn apply_mq_drop<T: MqApplyTarget>(target: &mut T, db_index: usize, k
         reg.remove(key);
     }
     if let Some(mut db) = target.mq_db(db_index) {
+        // moon#1228: see `apply_mq_create`.
+        crate::persistence::snapshot_cow::capture_write_pre_image(&db, db_index, key);
         let _ = db.remove_counting_cold(key);
     }
 }
