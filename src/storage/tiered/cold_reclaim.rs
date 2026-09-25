@@ -601,6 +601,7 @@ impl ColdIndex {
     /// Phase B of adoption, for every listing whose commit is now known:
     /// durable -> re-point every survivor still exactly where it was read
     /// (checked NOW), record the new slots of the ones that changed as dead,
+    /// queue for the orphan sweep an output none of whose survivors is left,
     /// and unlink the old files nothing references any more (their ledger
     /// entries go with them; the tombstones are a deferred commit — a lost
     /// one leaves a listed-but-missing file, which recovery counts and
@@ -636,6 +637,7 @@ impl ColdIndex {
                 continue;
             }
             for out in adopting.outputs {
+                let file_id = out.entry.file_id;
                 for m in out.moved {
                     if self.lookup(&m.key) == Some(m.from) {
                         self.insert(m.key, m.to);
@@ -643,6 +645,18 @@ impl ColdIndex {
                     } else {
                         self.note_dead_slot(m.to.file_id, m.key, m.to.ttl_ms);
                     }
+                }
+                // moon#1231 review: an output listed in phase A because some
+                // survivor was unchanged, whose survivors ALL changed while
+                // the listing's commit was in flight, is re-pointed nothing.
+                // Only a ref_dec to zero queues a file, and a file with no
+                // live key is no reclaim candidate, so it would stay listed,
+                // on disk and in the ledger until a restart. Queue it: the
+                // orphan sweep's hold keeps it while the committed generation
+                // may read it (it is the listed copy of those survivors) and
+                // releases it after.
+                if !self.file_refs.contains_key(&file_id) {
+                    self.pending_unlink.push(file_id);
                 }
             }
             let mut old_files = adopting.old_files;

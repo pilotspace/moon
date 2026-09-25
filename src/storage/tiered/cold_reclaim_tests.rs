@@ -568,3 +568,85 @@ fn held_files_pressure_is_signalled_apart_from_compactions() {
         "a dropped index withdraws it"
     );
 }
+
+/// moon#1231 review, moon#1240's split adoption: an output is LISTED in phase
+/// A because some survivor was unchanged, and every survivor changes before
+/// phase B (the listing's commit is in flight). Phase B re-points nothing
+/// into it, so it never gets a reference, never reaches `pending_unlink`
+/// (only a ref_dec to zero queues a file) and is never a reclaim candidate
+/// (no live key): it stayed listed, on disk and in the ledger until a
+/// restart. Queued, the orphan sweep's hold keeps it while the committed
+/// generation may read it and releases it after.
+#[test]
+fn an_output_whose_survivors_all_change_during_the_ack_is_reclaimed() {
+    use super::unlink_hold::FoldView;
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let dir = tmp.path().join("shard-0");
+    std::fs::create_dir_all(&dir).expect("dir");
+    let mut manifest = ShardManifest::create(&dir.join("shard-0.manifest")).expect("manifest");
+    let kvs = keys(10);
+    spill(&dir, &mut manifest, OLD, &kvs);
+    let mut ci = ColdIndex::rebuild_from_manifest(&dir, &manifest);
+    for (k, _) in kvs.iter().take(8) {
+        assert!(ci.remove(k.as_bytes()));
+    }
+    let mut next = NEW;
+    ci.compact_file(OLD, 0, &dir, &mut next, 0)
+        .expect("compact");
+
+    // Phase A: a fold past the compaction has committed; NEW is listed.
+    let a = ci.begin_adoption(1, &dir, &mut manifest);
+    assert_eq!(a.files_listed, 1);
+    // While the listing's commit is in flight both survivors change.
+    assert!(ci.remove(b"k08") && ci.remove(b"k09"));
+    // Phase B: nothing is re-pointed; OLD (every output listed) is unlinked.
+    let (mut moved, mut unlinked) = (0, 0);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let b = ci.finish_adoptions(&dir, &mut manifest);
+        moved += b.keys_moved;
+        unlinked += b.files_unlinked;
+        if ci.adoptions_in_flight() == 0 || std::time::Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    assert_eq!((moved, unlinked), (0, 1));
+
+    // The first sweep holds NEW: a fold that cut after it (epoch 5) has not
+    // committed, and the committed generation may still read NEW.
+    ci.observe_fold(FoldView {
+        epoch: 5,
+        committed_floor: 1,
+        next_file_id: 100,
+    });
+    ci.sweep_known_orphans(Vec::new(), &dir, Some(&mut manifest))
+        .expect("sweep");
+    assert!(
+        ci.is_unlink_held(NEW) && listed(&manifest, NEW) && heap(&dir, NEW).exists(),
+        "NEW is held while no fold after it has committed"
+    );
+    // Two later folds commit, the orphan sweep runs after each.
+    for e in [6, 7] {
+        ci.observe_fold(FoldView {
+            epoch: e,
+            committed_floor: e,
+            next_file_id: 100,
+        });
+        ci.sweep_known_orphans(Vec::new(), &dir, Some(&mut manifest))
+            .expect("sweep");
+    }
+    assert!(
+        !listed(&manifest, NEW) && !heap(&dir, NEW).exists(),
+        "output {NEW} has no live key, two committed folds later it is still listed and on \
+         disk (refs {:?}, queued {}, held {}, dead slots {})",
+        ci.file_refs.get(&NEW),
+        ci.pending_unlink.contains(&NEW),
+        ci.is_unlink_held(NEW),
+        ci.dead_slots().file_has_dead_slots(NEW)
+    );
+    assert!(
+        !ci.dead_slots().file_has_dead_slots(NEW),
+        "the unlinked output's ledger entries go with it"
+    );
+}
