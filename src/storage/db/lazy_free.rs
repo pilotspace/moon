@@ -194,16 +194,25 @@ fn release_shell(work: Work, weight: usize) {
 fn shell_dropper() -> Option<&'static flume::Sender<Work>> {
     static DROPPER: std::sync::OnceLock<Option<flume::Sender<Work>>> = std::sync::OnceLock::new();
     DROPPER
-        .get_or_init(|| spawn_shell_dropper("moon-lazyfree"))
+        .get_or_init(|| spawn_dropper("moon-lazyfree"))
         .as_ref()
 }
 
-/// Start a shell-dropping thread named `name`; `None` if the OS refused.
-/// Split from [`shell_dropper`] so a test can start one from a thread it
-/// controls — the process-wide one is spawned once, by whichever shard
-/// thread happens to need it first.
-fn spawn_shell_dropper(name: &str) -> Option<flume::Sender<Work>> {
-    let (tx, rx) = flume::unbounded::<Work>();
+/// Start a thread named `name` that drops whatever is sent to it; `None` if
+/// the OS refused. Split from [`shell_dropper`] so a test can start one from
+/// a thread it controls — the process-wide one is spawned once, by whichever
+/// shard thread happens to need it first. Shared with the snapshot's
+/// `moon-snapdrop` (`persistence::snapshot::frozen`, moon#1228 review 7).
+///
+/// The channel is unbounded: the sender is a shard thread, which must never
+/// block on it. What is in flight is memory already credited — out of
+/// `used_memory` (a lazily freed shell) and out of `current_cow_size` (a
+/// frozen table's removed rows, or a table the epoch released) — but not
+/// yet returned to the allocator. Nothing counts it, and only the senders
+/// pace it: the lazy-free and trim budgets per tick, and a released table
+/// is one send.
+pub(crate) fn spawn_dropper<T: Send + 'static>(name: &str) -> Option<flume::Sender<T>> {
+    let (tx, rx) = flume::unbounded::<T>();
     let label = name.to_string();
     std::thread::Builder::new()
         .name(name.to_string())
@@ -217,8 +226,8 @@ fn spawn_shell_dropper(name: &str) -> Option<flume::Sender<Work>> {
             // for the very frees it exists to take off it. A no-op off Linux,
             // with `MOON_NO_AUX_PIN=1`, or when there is no non-shard core.
             crate::shard::numa::pin_current_aux_thread(&label);
-            while let Ok(shell) = rx.recv() {
-                drop(shell);
+            while let Ok(item) = rx.recv() {
+                drop(item);
             }
         })
         .ok()
@@ -844,7 +853,7 @@ mod tests {
             if mine.as_deref() != Some("0") {
                 return Err(format!("cannot pin the test thread (affinity {mine:?})"));
             }
-            let tx = super::spawn_shell_dropper(NAME).expect("spawn the helper");
+            let tx = super::spawn_dropper::<super::Work>(NAME).expect("spawn the helper");
             // The helper re-pins itself as the first act of its closure,
             // after `spawn` returned: poll until it has, or give up.
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);

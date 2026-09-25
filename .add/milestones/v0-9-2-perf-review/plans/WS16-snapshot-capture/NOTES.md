@@ -780,7 +780,8 @@ The PR head (82e3064e) was merged first (fa9a5dc1). One commit per item:
 | 2 the trim budget counted a collection as one row; only 4,096+ elements were offloaded | 0d3c5e2d | see below |
 | 3 the walk and an abort dropped frozen tables inline | 17da0f6e | see below |
 | 4 `UNTRIMMED_EXCESS` was stale after the walk released a table | 29b3e1ee | see below |
-| 5 tests: assert the bill error; the fixed 1.5 s wait | (item 5) | see below |
+| 5 tests: assert the bill error; the fixed 1.5 s wait | 4c4e0c80 | see below |
+| 6 `moon-snapdrop` duplicated the lazy-free dropper | (item 6) | refactor + docs, no behaviour change |
 
 ### Item 1 — the lazy-free charge follows the table into the epoch
 
@@ -947,3 +948,18 @@ Red → green, 16 seeds unless noted:
   buffer is written.
 - Its `wal_total_bytes` is segment file sizes; waiting for it to stop growing is a timing
   guess too.
+
+### Item 6 — one dropper helper
+
+`lazy_free::spawn_shell_dropper` became `storage::db::spawn_dropper<T>`, which is generic
+over what it drops.
+- `moon-lazyfree` (shells) and `moon-snapdrop` (the trim's values and released tables) are
+  each spawned by it: the same aux-core re-pin, the same `recv` loop.
+- They remain two threads, one per item type. A shared thread would need a `Box<dyn Send>`
+  per send.
+- Its doc now covers the unbounded channel and the uncounted in-flight bytes. The sender is
+  a shard thread and must never block. What is in flight is already credited: it is out of
+  `used_memory` or `current_cow_size`, but not yet back with the allocator. Only the
+  senders pace it: the lazy-free and trim budgets per tick, and a released table is one
+  send.
+- The helper's affinity test (`lazy_free::tests`) passes unchanged.

@@ -58,8 +58,10 @@ enum Discard {
 }
 
 /// Hand `item` to the lazily started `moon-snapdrop` helper, which drops it
-/// (one per process, parked in `recv` when idle — the `moon-lazyfree`
-/// pattern). Dropped here if the helper cannot be started or is gone.
+/// (one per process, parked in `recv` when idle; spawned by
+/// `storage::db::spawn_dropper`, as `moon-lazyfree` is — its doc covers the
+/// unbounded channel and the uncounted bytes in flight). Dropped here if
+/// the helper cannot be started or is gone.
 fn discard(item: Discard) {
     #[cfg(test)]
     if matches!(item, Discard::Table(_)) {
@@ -67,19 +69,7 @@ fn discard(item: Discard) {
     }
     static DROPPER: std::sync::OnceLock<Option<flume::Sender<Discard>>> =
         std::sync::OnceLock::new();
-    let dropper = DROPPER.get_or_init(|| {
-        let (tx, rx) = flume::unbounded::<Discard>();
-        std::thread::Builder::new()
-            .name("moon-snapdrop".to_string())
-            .spawn(move || {
-                crate::shard::numa::pin_current_aux_thread("moon-snapdrop");
-                while let Ok(item) = rx.recv() {
-                    drop(item);
-                }
-            })
-            .ok()
-            .map(|_| tx)
-    });
+    let dropper = DROPPER.get_or_init(|| crate::storage::db::spawn_dropper("moon-snapdrop"));
     if let Some(tx) = dropper {
         // A failed send hands the item back in the error; it drops here.
         let _ = tx.send(item);
