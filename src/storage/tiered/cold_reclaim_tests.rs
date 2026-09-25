@@ -650,3 +650,58 @@ fn an_output_whose_survivors_all_change_during_the_ack_is_reclaimed() {
         "the unlinked output's ledger entries go with it"
     );
 }
+
+/// moon#1231 review: a crash between the reclaim adoption's unlink of an old
+/// file and its DEFERRED tombstone commit (moon#1240) leaves the manifest
+/// listing a file that is gone. The rebuild counts it (`files_missing`, an
+/// error-level `DEGRADED` summary) and queues it for the sweep — whose hold
+/// kept it, like any file below the cut, until a committed fold: every boot
+/// before one repeated the false alarm. A file already gone has nothing to
+/// protect, so the first sweep retires its entry, hold or no hold.
+#[test]
+fn a_listed_file_gone_from_disk_is_retired_at_the_first_sweep() {
+    use super::unlink_hold::FoldView;
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let dir = tmp.path().join("shard-0");
+    std::fs::create_dir_all(&dir).expect("dir");
+    let mut manifest = ShardManifest::create(&dir.join("shard-0.manifest")).expect("manifest");
+    spill(&dir, &mut manifest, OLD, &keys(4));
+    spill(&dir, &mut manifest, NEW, &keys(2));
+    // The adoption unlinked OLD; the crash lost the tombstone.
+    std::fs::remove_file(heap(&dir, OLD)).expect("unlink");
+    let rebuilt = ColdIndex::rebuild_from_manifest_per_db(&dir, &manifest);
+    assert_eq!(rebuilt.report.files_missing, 1);
+    // Recovery attaches the per-db index as is; `merge` (recovery into an
+    // index that already exists) carries the queue too.
+    let mut ci = ColdIndex::new();
+    for (_, index) in rebuilt.per_db {
+        ci.merge(index);
+    }
+    assert!(ci.pending_unlink.contains(&OLD), "queued for retirement");
+
+    // A fold is in flight, none has committed since the boot: the hold is
+    // active and OLD is below its cut.
+    ci.observe_fold(FoldView {
+        epoch: 1,
+        committed_floor: 0,
+        next_file_id: 100,
+    });
+    ci.sweep_known_orphans(Vec::new(), &dir, Some(&mut manifest))
+        .expect("sweep");
+    assert!(
+        !listed(&manifest, OLD) && !ci.is_unlink_held(OLD),
+        "the missing file's entry is retired at the first sweep"
+    );
+    let reopened = ShardManifest::open(&dir.join("shard-0.manifest")).expect("reopen");
+    assert_eq!(
+        ColdIndex::rebuild_from_manifest_per_db(&dir, &reopened)
+            .report
+            .files_missing,
+        0,
+        "the next boot's rebuild is clean"
+    );
+    assert!(
+        listed(&manifest, NEW) && heap(&dir, NEW).exists(),
+        "a live file stays"
+    );
+}

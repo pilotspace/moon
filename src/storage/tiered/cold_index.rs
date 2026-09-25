@@ -612,6 +612,10 @@ impl ColdIndex {
         }
         self.dead.merge(other.dead);
         self.hold.merge(other.hold);
+        // Zero-ref files the other index queued (a rebuild queues the listed
+        // files it found missing): the drain re-checks references before it
+        // unlinks anything, so a file `self` references is kept.
+        self.pending_unlink.extend(other.pending_unlink);
     }
 
     /// Number of entries tracked.
@@ -991,11 +995,28 @@ impl ColdIndex {
             return Ok(0);
         }
         let queued = std::mem::take(&mut self.pending_unlink);
+        // A queued file that is already gone from disk — listed by a
+        // manifest whose tombstone commit a crash lost (the reclaim's
+        // deferred one, moon#1240, or this sweep's own unlink-then-commit),
+        // queued by the rebuild — has nothing left for the hold to protect:
+        // no generation can read it. Retire its manifest entry now rather
+        // than after a committed fold, so the rebuild counts it
+        // (`files_missing`, a `DEGRADED` summary line) on one boot, not on
+        // every boot until a fold (moon#1231 review).
+        let data_dir = shard_dir.join("data");
+        let (gone, queued): (Vec<u64>, Vec<u64>) = queued.into_iter().partition(|&file_id| {
+            !self.file_refs.contains_key(&file_id)
+                && matches!(
+                    std::fs::symlink_metadata(data_dir.join(format!("heap-{file_id:06}.mpf"))),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound
+                )
+        });
         let refs = &self.file_refs;
         self.hold
             .forget_referenced(|file_id| refs.contains_key(&file_id));
-        let admitted = self.hold.admit(queued);
+        let mut admitted = self.hold.admit(queued);
         self.pending_unlink.extend(admitted.requeue);
+        admitted.unlink.extend(gone);
         if admitted.unlink.is_empty() {
             return Ok(0);
         }
@@ -1199,9 +1220,11 @@ impl ColdIndex {
                                 path = %heap_path.display(),
                                 "cold recovery: manifest lists an Active heap file that is not \
                                  on disk; its keys (if any were live) now read as absent. Benign \
-                                 if the orphan sweep unlinked it before committing the manifest \
-                                 (nothing lost); otherwise the file was removed externally. \
-                                 Queued so the sweep retires the manifest entry"
+                                 if the orphan sweep or the cold reclaim's adoption unlinked it \
+                                 and a crash lost the manifest tombstone that followed (nothing \
+                                 lost; this boot's DEGRADED summary then counts it too); \
+                                 otherwise the file was removed externally. Queued so the first \
+                                 sweep retires the manifest entry"
                             );
                         }
                         match missing_per_db.iter_mut().find(|(d, _)| *d == db) {
