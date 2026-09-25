@@ -1360,22 +1360,26 @@ pub(crate) async fn publish_post_txn(
     local_count + slot.get()
 }
 
-/// Fan one `SCRIPT LOAD` out to every other shard with bounded backpressure
-/// (E3). A full ring used to drop the load SILENTLY, leaving that shard's
-/// script cache divergent: EVALSHA there answered NOSCRIPT for a sha this
-/// server had just returned. On give-up the drop is loud (warn + counter);
-/// the client still gets the sha — the script IS loaded locally, and client
-/// libraries' NOSCRIPT→EVAL fallback covers the divergent-shard window.
+/// Fan one script-cache insert out to every other shard with bounded
+/// backpressure (E3), tagged with the flush epoch it was issued under
+/// (moon#1235) so every shard places it on the same side of every flush.
+///
+/// A full ring used to drop the load SILENTLY, leaving that shard's script
+/// cache divergent: EVALSHA there answered NOSCRIPT for a sha this server had
+/// just returned. On give-up the drop is loud (warn + counter), and the caller
+/// decides what the client hears: `SCRIPT LOAD` still answers the sha,
+/// `EVAL` keeps the duty owed so its next call republishes
+/// ([`eval_script_fanout`]).
 pub(crate) async fn script_fanout_bounded(
     ctx: &super::core::ConnectionContext,
     shutdown: &crate::runtime::cancel::CancellationToken,
-    sha1: &str,
     script: &Bytes,
+    epoch: u64,
 ) -> FanoutOutcome {
     fanout_to_other_shards(ctx, shutdown, "script_load", |ack| {
         crate::shard::dispatch::ShardMessage::ScriptLoad {
-            sha1: sha1.to_owned(),
             script: script.clone(),
+            epoch,
             ack: Some(ack),
         }
     })
@@ -1397,23 +1401,35 @@ pub(crate) async fn script_fanout_bounded(
 /// an `+OK` over caches that still run the script. `SYNC` and `ASYNC` take the
 /// same path: moon's flush is a map clear either way, and redis's `ASYNC`
 /// only defers freeing memory — the scripts are gone when it replies.
+///
+/// `epoch` is the flush's own epoch (moon#1235): each shard drops only what
+/// was inserted before it.
 #[must_use]
 pub(crate) async fn script_flush_fanout(
     ctx: &super::core::ConnectionContext,
     shutdown: &crate::runtime::cancel::CancellationToken,
+    epoch: u64,
 ) -> Option<Frame> {
     if ctx.num_shards <= 1 {
         return None;
     }
-    match fanout_to_other_shards(ctx, shutdown, "script_flush", |ack| {
-        crate::shard::dispatch::ShardMessage::ScriptFlush { ack: Some(ack) }
+    let outcome = fanout_to_other_shards(ctx, shutdown, "script_flush", |ack| {
+        crate::shard::dispatch::ShardMessage::ScriptFlush {
+            epoch,
+            ack: Some(ack),
+        }
     })
-    .await
-    {
+    .await;
+    partial_fanout_reply("SCRIPT FLUSH", outcome)
+}
+
+/// The reply that replaces a script mutation's own when its fan-out did not
+/// reach every shard. The mutation is idempotent, so re-issuing converges.
+fn partial_fanout_reply(what: &str, outcome: FanoutOutcome) -> Option<Frame> {
+    match outcome {
         FanoutOutcome::Complete => None,
         FanoutOutcome::Partial { reached, targets } => Some(Frame::Error(Bytes::from(format!(
-            "MOONERR partialfanout SCRIPT FLUSH applied on {} of {} shards; re-issue it to \
-             converge",
+            "MOONERR partialfanout {what} applied on {} of {} shards; re-issue it to converge",
             reached + 1,
             targets + 1,
         )))),
@@ -1422,39 +1438,44 @@ pub(crate) async fn script_flush_fanout(
 
 /// Run one `SCRIPT …` command for a connection and return the client's reply:
 /// the subcommand on this shard's cache, then the replay the other shards are
-/// owed. The one body behind both runtimes' live and MULTI paths, so a change
-/// to how SCRIPT mutations reach the shards is made once (refs moon#1235).
+/// owed. The one body behind both runtimes' live and MULTI paths.
 pub(crate) async fn run_script_command(
     ctx: &super::core::ConnectionContext,
     shutdown: &crate::runtime::cancel::CancellationToken,
     cmd_args: &[Frame],
 ) -> Frame {
-    let (mut response, fanout) =
+    let (response, fanout) =
         crate::scripting::handle_script_subcommand(&ctx.script_cache, cmd_args);
-    if let Some((sha1, script_bytes)) = fanout {
-        // E3: bounded fan-out — a full ring no longer silently diverges that
-        // shard's script cache.
-        script_fanout_bounded(ctx, shutdown, &sha1, &script_bytes).await;
-    }
-    // moon#1229: the flush above cleared THIS shard's cache only; reply once
-    // every shard has flushed (or say which did not).
-    if is_accepted_script_flush(cmd_args, &response)
-        && let Some(partial) = script_flush_fanout(ctx, shutdown).await
-    {
-        response = partial;
-    }
-    response
+    script_command_fanout(ctx, shutdown, response, fanout).await
 }
 
-/// Whether `SCRIPT <args>` was a `FLUSH` the local cache accepted — one the
-/// other shards are still owed (moon#1229).
-#[must_use]
-pub(crate) fn is_accepted_script_flush(cmd_args: &[Frame], response: &Frame) -> bool {
-    !matches!(response, Frame::Error(_))
-        && matches!(
-            cmd_args.first(),
-            Some(Frame::BulkString(sub)) if sub.eq_ignore_ascii_case(b"FLUSH")
-        )
+/// Replay an accepted `SCRIPT LOAD` / `SCRIPT FLUSH` on every other shard and
+/// return the reply the client gets (moon#1235, moon#1229).
+///
+/// `fanout` is what [`crate::scripting::handle_script_subcommand`] says the
+/// other shards are owed, epoch included, so the replay files the op in the
+/// same order on every shard as on this one. A flush that did not reach every
+/// shard is reported; a load's give-up is logged loudly and the sha returned.
+async fn script_command_fanout(
+    ctx: &super::core::ConnectionContext,
+    shutdown: &crate::runtime::cancel::CancellationToken,
+    response: Frame,
+    fanout: Option<crate::scripting::ScriptFanout>,
+) -> Frame {
+    if ctx.num_shards <= 1 {
+        return response;
+    }
+    let partial = match fanout {
+        None => None,
+        Some(crate::scripting::ScriptFanout::Load { script, epoch }) => {
+            let _ = script_fanout_bounded(ctx, shutdown, &script, epoch).await;
+            None
+        }
+        Some(crate::scripting::ScriptFanout::Flush { epoch }) => {
+            script_flush_fanout(ctx, shutdown, epoch).await
+        }
+    };
+    partial.unwrap_or(response)
 }
 
 /// Shards whose inbound fan-out pushes are forced to fail, from
@@ -1759,16 +1780,18 @@ pub(crate) async fn eval_script_fanout(
     let Some(Frame::BulkString(script)) = cmd_args.first() else {
         return;
     };
-    // Borrow scoped tight: never held across the fan-out's awaits.
-    let (sha1, owed) = {
+    // Borrow scoped tight: never held across the fan-out's awaits. The claim
+    // is this shard's copy of the insert; the fan-out carries the same flush
+    // epoch, so all copies are ONE insert in the agreed order (moon#1235).
+    let (sha1, owed, epoch) = {
         let mut cache = ctx.script_cache.borrow_mut();
         cache.claim_fanout_duty(script.clone())
     };
     if !owed {
         return;
     }
-    if script_fanout_bounded(ctx, shutdown, &sha1, script).await == FanoutOutcome::Complete {
-        ctx.script_cache.borrow_mut().mark_fanned_out(&sha1);
+    if script_fanout_bounded(ctx, shutdown, script, epoch).await == FanoutOutcome::Complete {
+        ctx.script_cache.borrow_mut().mark_fanned_out(&sha1, epoch);
     }
 }
 
@@ -1790,17 +1813,16 @@ pub(crate) async fn eval_script_fanout(
 /// strictly better than `+OK` over a registry that answers differently
 /// depending on which shard a key lands on.
 ///
-/// # Known limitation: no total order
+/// # Order
 ///
 /// Each origin shard replays on its own set of rings, so two registry
-/// mutations issued CONCURRENTLY from connections on different shards can
-/// apply in different orders on different shards, and nothing reconciles them
-/// afterwards. A `FUNCTION LOAD` on shard 0 racing a `FUNCTION FLUSH` on shard
-/// 3 can leave the library present on some shards and absent on others, with
-/// both clients told `+OK`. Fixing it needs an ordering authority — routing
-/// every registry mutation through one designated shard — which is a larger
-/// change than this fix and is tracked separately. Until then: issue
-/// `FUNCTION` mutations from one connection at a time.
+/// mutations issued CONCURRENTLY from connections on different shards used to
+/// apply in different orders on different shards (moon#1235: a `FUNCTION
+/// LOAD` racing a `FUNCTION FLUSH` left the library on some shards only, both
+/// clients told `+OK`). Callers now hold the process-wide function-order token
+/// ([`crate::scripting::order::acquire_function_order`]) from before their
+/// local apply until this returns — see [`run_function_command`] — so the
+/// mutations form one sequence and every shard applies it in that order.
 #[must_use]
 pub(crate) async fn function_registry_fanout(
     ctx: &super::core::ConnectionContext,
@@ -1833,13 +1855,35 @@ pub(crate) async fn function_registry_fanout(
     }
 }
 
+/// Whether `FUNCTION <sub> …` would mutate the registry, decided from the
+/// subcommand NAME before anything runs — the order token must be taken
+/// before the local apply, not after it (moon#1235).
+fn is_function_mutation(cmd_args: &[Frame]) -> bool {
+    matches!(
+        cmd_args.first(),
+        Some(Frame::BulkString(sub))
+            if sub.eq_ignore_ascii_case(b"LOAD")
+                || sub.eq_ignore_ascii_case(b"DELETE")
+                || sub.eq_ignore_ascii_case(b"FLUSH")
+    )
+}
+
 /// Run one `FUNCTION …` command for a connection: apply it to this shard's
 /// registry and, for an accepted `LOAD`/`DELETE`/`FLUSH`, replay it on every
 /// other shard. Returns the client's reply.
 ///
 /// The one body behind the live paths of both runtimes and the MULTI path, so
-/// a change to how FUNCTION mutations reach the shards is made once (refs
-/// moon#1235).
+/// the ordering rule below cannot be present on one and missing on another.
+///
+/// At `--shards > 1` a mutation holds the process-wide function-order token
+/// from BEFORE the local apply until every other shard has acknowledged the
+/// replay (moon#1235). Mutations therefore form one sequence that every shard
+/// applies in the same order, and the local validation (`LOAD` of an existing
+/// library, a function name another library owns) sees the registry every
+/// shard has — redis's answer. The wait for the token is bounded by the same
+/// budget as a fan-out; a mutation that cannot get it in time is NOT applied
+/// anywhere, and the client is told so rather than having it applied out of
+/// order.
 pub(crate) async fn run_function_command(
     ctx: &super::core::ConnectionContext,
     shutdown: &crate::runtime::cancel::CancellationToken,
@@ -1847,6 +1891,25 @@ pub(crate) async fn run_function_command(
     cmd_args: &[Frame],
 ) -> Frame {
     crate::server::conn::core::ensure_function_registry(func_registry, ctx);
+    let _order = if ctx.num_shards > 1 && is_function_mutation(cmd_args) {
+        match crate::scripting::order::acquire_function_order(fanout_budget(ctx)).await {
+            Some(guard) => Some(guard),
+            None => {
+                tracing::warn!(
+                    "shard {}: FUNCTION mutation refused: another FUNCTION mutation held the \
+                     order token past the fan-out budget (a shard may be wedged)",
+                    ctx.shard_id
+                );
+                crate::admin::metrics_setup::record_xshard_fanout_drop("function_op");
+                return Frame::Error(Bytes::from_static(
+                    b"MOONERR partialfanout FUNCTION not applied: another FUNCTION mutation is \
+                      still reaching the shards; re-issue it",
+                ));
+            }
+        }
+    } else {
+        None
+    };
     // Borrow scoped to this block and released before the fan-out await: the
     // registry `RefCell` is shared with this shard thread's SPSC drain loop,
     // which applies INBOUND fan-outs — holding it across a yield would make an
@@ -1870,6 +1933,7 @@ pub(crate) async fn run_function_command(
         response = partial;
     }
     response
+    // `_order` drops here: the next mutation, from any shard, may start.
 }
 
 /// The fan-out replay a `FUNCTION` invocation owes the other shards, if any.
@@ -3306,7 +3370,7 @@ pub(crate) async fn try_handle_function_in_txn(
     if !cmd.eq_ignore_ascii_case(b"FUNCTION") {
         return false;
     }
-    // The live path's body (refs moon#1235).
+    // The live path's body, ordering token included (moon#1235).
     out.push(run_function_command(ctx, shutdown, func_registry, cmd_args).await);
     true
 }

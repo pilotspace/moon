@@ -1,6 +1,7 @@
 pub mod bridge;
 pub mod cache;
 pub mod functions;
+pub mod order;
 pub mod pending_flush;
 pub mod sandbox;
 pub mod types;
@@ -116,7 +117,13 @@ pub fn handle_eval(
     // moon#1167: cache the source (idempotent) AND get-or-compile the function,
     // computing the sha exactly once. A compile error surfaces here with the
     // same frame `run_script` produced on HEAD.
-    let func = match ensure_compiled_eval(lua, cache, &script) {
+    //
+    // moon#1235: at `--shards > 1` the body is cached by the ORIGIN's fan-out
+    // (`eval_script_fanout` claims it locally and replays it, one tagged
+    // insert, before the script is routed or run). An insert here would be a
+    // second, shard-local insert under a later epoch, which a `SCRIPT FLUSH`
+    // landing between the two would leave on this shard only.
+    let func = match ensure_compiled_eval(lua, cache, &script, num_shards <= 1) {
         Ok(func) => func,
         Err(frame) => return frame,
     };
@@ -235,12 +242,25 @@ pub fn handle_evalsha(
     )
 }
 
+/// The replay a `SCRIPT` subcommand owes the other shards, with the flush
+/// epoch that places it in the order every shard agrees on (moon#1235, see
+/// [`order`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScriptFanout {
+    /// `SCRIPT LOAD` of `script`, inserted under flush epoch `epoch`.
+    Load { script: Bytes, epoch: u64 },
+    /// `SCRIPT FLUSH`, issued as flush epoch `epoch`.
+    Flush { epoch: u64 },
+}
+
 /// Handle SCRIPT subcommands (LOAD, EXISTS, FLUSH).
-/// Returns (response, Option<(sha1, script)>) -- the Option signals fan-out for SCRIPT LOAD.
+///
+/// Returns the reply and, for a LOAD or FLUSH this shard accepted, the replay
+/// the other shards are owed. A refused subcommand owes nothing.
 pub fn handle_script_subcommand(
     cache: &Rc<RefCell<ScriptCache>>,
     args: &[Frame],
-) -> (Frame, Option<(String, Bytes)>) {
+) -> (Frame, Option<ScriptFanout>) {
     let sub = match args.first() {
         Some(Frame::BulkString(b)) => b.clone(),
         _ => {
@@ -270,10 +290,13 @@ pub fn handle_script_subcommand(
                 );
             }
         };
-        let sha = cache.borrow_mut().load(script.clone());
+        // Tagged with the flush epoch current now; the fan-out carries the
+        // same tag so every shard files this as one insert (moon#1235).
+        let epoch = order::script_flush_epoch();
+        let sha = cache.borrow_mut().load_at(script.clone(), epoch);
         (
-            Frame::BulkString(Bytes::from(sha.clone())),
-            Some((sha, script)),
+            Frame::BulkString(Bytes::from(sha)),
+            Some(ScriptFanout::Load { script, epoch }),
         )
     } else if sub.eq_ignore_ascii_case(b"EXISTS") {
         let cache_ref = cache.borrow();
@@ -309,8 +332,11 @@ pub fn handle_script_subcommand(
                 None,
             );
         }
-        cache.borrow_mut().flush();
-        (Frame::SimpleString(Bytes::from_static(b"OK")), None)
+        let epoch = cache.borrow_mut().flush();
+        (
+            Frame::SimpleString(Bytes::from_static(b"OK")),
+            Some(ScriptFanout::Flush { epoch }),
+        )
     } else {
         (
             crate::command::helpers::err_unknown_subcommand("SCRIPT", &sub),
@@ -575,12 +601,15 @@ fn ensure_compiled_eval(
     lua: &Lua,
     cache: &Rc<RefCell<ScriptCache>>,
     script: &Bytes,
+    store_source: bool,
 ) -> Result<LuaFunction, Frame> {
     let sha = sha1_smol::Sha1::from(&script[..]).hexdigest();
     let key = sha_str_to_key(&sha);
     {
         let mut c = cache.borrow_mut();
-        c.load_precomputed(sha, script.clone());
+        if store_source {
+            c.load_precomputed(sha, script.clone());
+        }
         if let Some(func) = c.get_compiled(&key) {
             return Ok(func);
         }
@@ -1240,11 +1269,18 @@ mod tests {
             Frame::BulkString(Bytes::from_static(b"return 1")),
         ];
         let (response, fanout) = handle_script_subcommand(&cache, &args);
-        assert!(matches!(response, Frame::BulkString(_)));
-        assert!(fanout.is_some());
-        let (sha, script) = fanout.unwrap();
+        let Frame::BulkString(sha) = response else {
+            panic!("SCRIPT LOAD answers the sha");
+        };
         assert_eq!(sha.len(), 40);
-        assert_eq!(script, Bytes::from_static(b"return 1"));
+        // The replay carries the body and the epoch the local insert used.
+        match fanout {
+            Some(ScriptFanout::Load { script, epoch }) => {
+                assert_eq!(script, Bytes::from_static(b"return 1"));
+                assert!(epoch <= order::script_flush_epoch());
+            }
+            other => panic!("SCRIPT LOAD owes a Load replay, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1279,7 +1315,9 @@ mod tests {
         let args = vec![Frame::BulkString(Bytes::from_static(b"FLUSH"))];
         let (response, fanout) = handle_script_subcommand(&cache, &args);
         assert!(matches!(response, Frame::SimpleString(_)));
-        assert!(fanout.is_none());
+        // moon#1229/#1235: an accepted flush owes the other shards a replay,
+        // under a fresh epoch.
+        assert!(matches!(fanout, Some(ScriptFanout::Flush { epoch }) if epoch > 0));
         assert_eq!(cache.borrow().len(), 0);
     }
 
@@ -1302,13 +1340,14 @@ mod tests {
         ] {
             let cache = Rc::new(RefCell::new(ScriptCache::new()));
             cache.borrow_mut().load(Bytes::from_static(b"return 1"));
-            let (response, _) = handle_script_subcommand(&cache, &bad);
+            let (response, fanout) = handle_script_subcommand(&cache, &bad);
             assert_eq!(
                 response,
                 Frame::Error(Bytes::from_static(
                     b"ERR SCRIPT FLUSH only support SYNC|ASYNC option"
                 ))
             );
+            assert!(fanout.is_none(), "a refused flush owes nobody anything");
             assert_eq!(cache.borrow().len(), 1, "a refused flush keeps the cache");
         }
     }

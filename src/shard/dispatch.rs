@@ -779,7 +779,13 @@ pub enum ShardMessage {
     /// connection's shard left `EVALSHA` working for keys routed anywhere
     /// else. `ack` follows [`Self::ScriptLoad`]'s contract: the sender replies
     /// to its client only once every shard has flushed.
+    ///
+    /// `epoch` is the flush's place in the order every shard agrees on
+    /// (moon#1235, `scripting::order`): the receiver drops only the bodies
+    /// inserted before it, so a LOAD fan-out that overtook this flush on the
+    /// mesh is not wrongly erased.
     ScriptFlush {
+        epoch: u64,
         ack: Option<channel::OneshotSender<bool>>,
     },
     /// Fan-out a loaded script to all shards so EVALSHA works regardless of which shard receives it.
@@ -795,9 +801,14 @@ pub enum ShardMessage {
     /// shard can receive the message and still fail to install it, and an ack
     /// that cannot say so turns every such failure into a silent divergence
     /// the client was told did not happen. `None` where no one is waiting.
+    ///
+    /// `epoch` is the flush epoch the insert was issued under (moon#1235): a
+    /// shard that has already applied a newer `SCRIPT FLUSH` drops it, so the
+    /// shards agree on LOAD-vs-FLUSH order whatever order the messages
+    /// arrive in. The receiver computes the digest itself from `script`.
     ScriptLoad {
-        sha1: String,
         script: bytes::Bytes,
+        epoch: u64,
         ack: Option<channel::OneshotSender<bool>>,
     },
     /// Fan-out of a `FUNCTION LOAD`/`DELETE`/`FLUSH` to every other shard, so
