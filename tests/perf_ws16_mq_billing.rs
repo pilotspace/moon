@@ -436,3 +436,48 @@ fn a_pop_surplus_release_agrees_on_master_replica_and_restart() {
     drop(replica);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+const MAX_U64: &str = "18446744073709551615";
+
+/// Review 6 (F end to end, and N2; the reviewer's proof, adopted): at the
+/// last possible stream ID, `XADD *`, `XADD <ms>-*` and `MQ PUSH` answer an
+/// error and the server — a DEBUG build here, which panics on integer
+/// overflow — survives each. `XADD <ms>-*` computed `last_id.seq + 1` and
+/// panicked shard 0 (the server then stopped accepting connections).
+#[test]
+fn every_auto_id_form_is_refused_at_the_last_possible_id() {
+    let dir = common::unique_test_dir("ws16-max-stream-id");
+    let (server, port) = spawn_with(&dir, 1, "no");
+    let mut c = Conn::open(port);
+    let top = format!("{MAX_U64}-{MAX_U64}");
+    assert!(c.send(&["XADD", "s", &top, "f", "v"]).starts_with('$'));
+    assert_eq!(c.send(&["MQ", "CREATE", "q"]), "+OK\r\n");
+    assert!(c.send(&["XADD", "q", &top, "f", "v"]).starts_with('$'));
+    let alive = |port: u16| {
+        std::net::TcpStream::connect(("127.0.0.1", port)).is_ok()
+            && Conn::open(port).send(&["PING"]).starts_with("+PONG")
+    };
+    let star = c.send(&["XADD", "s", "*", "f", "v"]);
+    assert!(alive(port), "XADD * killed the server");
+    let push = c.send(&["MQ", "PUSH", "q", "f", "v"]);
+    assert!(alive(port), "MQ PUSH killed the server");
+    assert!(star.starts_with("-ERR"), "XADD *: {star:?}");
+    assert!(push.starts_with("-ERR"), "MQ PUSH: {push:?}");
+    assert_eq!(c.send(&["XLEN", "q"]), ":1\r\n");
+    let mut c2 = Conn::open(port);
+    c2.sock
+        .set_read_timeout(Some(std::time::Duration::from_secs(3)))
+        .unwrap();
+    let partial = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        c2.send(&["XADD", "s", &format!("{MAX_U64}-*"), "f", "v"])
+    }));
+    let survived = alive(port);
+    assert!(
+        matches!(&partial, Ok(r) if r.starts_with("-ERR The ID specified in XADD is equal or smaller"))
+            && survived,
+        "XADD <ms>-* at the last possible ID must be refused, not panic: reply {partial:?}, \
+         server alive {survived}"
+    );
+    drop(server);
+    let _ = std::fs::remove_dir_all(&dir);
+}
