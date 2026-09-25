@@ -4,9 +4,9 @@
 //!
 //! The failure is forced deterministically: a DIRECTORY squats on every
 //! shard's snapshot path, so each writer's final `rename` over it fails. (A
-//! FLUSHALL landing mid-save used to abort it — moon#1224 — and was the
-//! fixture here; since moon#1228 that save completes with the pre-flush
-//! image, as redis's does.)
+//! FLUSHALL landing mid-save aborts it — moon#1224, as redis kills its
+//! child — and was the fixture here; that needs the FLUSHALL to land inside
+//! the save's window, which the squatter does not.)
 //! Before the fix the status then stayed `err` forever (and every later
 //! `SHUTDOWN SAVE` was refused with "background save error", because it
 //! reads the same flag after its own, successful, save); and a BGSAVE on a

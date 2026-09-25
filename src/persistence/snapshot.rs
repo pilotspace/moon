@@ -224,14 +224,14 @@ pub struct SnapshotState {
     last_lsn: u64,
     /// Wall-clock at snapshot construction, milliseconds since unix epoch (v0.2).
     created_at_unix_ms: u64,
-    /// Set when a structural change the epoch cannot follow (a replica full
-    /// resync) happened while it was in flight: the file would not be
-    /// point-in-time, so the snapshot fails loudly instead of publishing it.
+    /// Set when a structural change the epoch does not follow (a FLUSHALL,
+    /// a replica full resync) happened while it was in flight: the snapshot
+    /// fails loudly instead of publishing a file.
     aborted: Option<&'static str>,
     /// Where each database of the epoch reads its epoch-start contents from
     /// (moon#1228), indexed like the file's databases: a shard slot (moved
-    /// by SWAPDB) or a table FLUSHDB / FLUSHALL detached before it was
-    /// written. See [`Source`].
+    /// by SWAPDB) or a table a FLUSHDB detached before it was written. See
+    /// [`Source`].
     sources: Vec<Source>,
     /// Test-only: pin the per-tick budget to its constant (pre-moon#1228)
     /// value, the control of the convergence tests.
@@ -253,12 +253,13 @@ pub(crate) type Table =
 /// is the one it had at epoch start", so a FLUSHDB of an unfinished database
 /// (its table replaced) or a SWAPDB (two slots' tables exchanged) could only
 /// ABORT the save — and a workload flushing more often than one save takes
-/// never completed one. redis's fork keeps the pre-flush pages instead.
+/// never completed one. redis's fork keeps the pre-flush pages instead (a
+/// FLUSHALL still aborts: redis kills its child for that one).
 enum Source {
     /// The table in shard slot `.0` (`databases[slot]`). Starts as the
     /// database's own index; a SWAPDB moves the table, and this with it.
     Live(usize),
-    /// The table a FLUSHDB / FLUSHALL detached before the epoch wrote it
+    /// The table a FLUSHDB detached before the epoch wrote it
     /// (`Database::clear` hands it over instead of dropping it). Nothing
     /// writes it any more, so with the pre-images captured before the flush
     /// it IS the database's epoch-start contents.
@@ -570,8 +571,9 @@ impl SnapshotState {
 
     /// Fail this snapshot instead of publishing a file that is not
     /// point-in-time (a replica full resync replaced databases the epoch had
-    /// not finished with). The shard's next tick reports the failure; the
-    /// previous snapshot file stays in place.
+    /// not finished with), or because a FLUSHALL fails an in-flight save as
+    /// redis's does. The shard's next tick reports the failure; the previous
+    /// snapshot file stays in place.
     pub fn abort(&mut self, why: &'static str) {
         if self.aborted.is_none() {
             tracing::error!(
@@ -622,10 +624,11 @@ impl SnapshotState {
         }
     }
 
-    /// A FLUSHDB / FLUSHALL detached database `db`'s table before the epoch
-    /// finished writing it (moon#1228): keep the table as `db`'s epoch-start
+    /// A FLUSHDB detached database `db`'s table before the epoch finished
+    /// writing it (moon#1228): keep the table as `db`'s epoch-start
     /// contents. A table for a database already written (or an aborted
-    /// epoch) is dropped. Queued by `snapshot_cow::note_cleared_table`.
+    /// epoch) is dropped. Queued by `snapshot_cow::note_cleared_table`; a
+    /// FLUSHALL aborts the epoch instead (redis parity).
     ///
     /// `bytes` is what the table held (its database's `used_memory` at the
     /// flush), reported in [`Self::cow_bytes`] while the epoch keeps it.

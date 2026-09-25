@@ -46,8 +46,8 @@
 //!    **before** advancing, dropping pre-images whose range was already
 //!    written (the file already holds their epoch-start bytes), and first
 //!    applying the table changes queued since (moon#1228: a SWAPDB re-points
-//!    the epoch's databases, a flush freezes the detached table into it) and
-//!    any abort a replica full resync queued (moon#1224).
+//!    the epoch's databases, a FLUSHDB freezes the detached table into it)
+//!    and any abort a FLUSHALL or a replica full resync queued (moon#1224).
 //!
 //! One shard per OS thread, and every producer/consumer here runs on that
 //! shard's thread, so a `thread_local!` IS the per-shard queue — same
@@ -86,10 +86,11 @@ thread_local! {
     /// pre-image the drain would drop anyway. `None` = unknown (capture
     /// everything, the pre-moon#1186 behaviour).
     static PROGRESS: RefCell<Option<Progress>> = const { RefCell::new(None) };
-    /// A whole-table change the armed epoch cannot follow (moon#1224): a
-    /// replica full resync over databases the epoch has not finished (a FLUSH
-    /// or SWAPDB no longer aborts, moon#1228). The next drain fails the
-    /// snapshot with this reason.
+    /// A whole-table change the armed epoch does not follow (moon#1224): a
+    /// FLUSHALL or a replica full resync while the epoch has databases left
+    /// to write (a FLUSHDB or SWAPDB no longer aborts, moon#1228). The next
+    /// drain fails the snapshot with this reason; a table `Database::clear`
+    /// hands over meanwhile is dropped at once, never frozen.
     static ABORT: Cell<Option<&'static str>> = const { Cell::new(None) };
     /// Table changes the epoch follows (moon#1228), in the order they
     /// happened, applied to the `SnapshotState` by the next drain.
@@ -309,6 +310,18 @@ pub(crate) fn logical_of_slot_for_test() -> Vec<Option<usize>> {
     })
 }
 
+/// Test-only: how many flushed tables are queued to be frozen into the
+/// epoch at the next drain (moon#1228).
+#[cfg(test)]
+pub(crate) fn frozen_tables_queued_for_test() -> usize {
+    EVENTS.with(|e| {
+        e.borrow()
+            .iter()
+            .filter(|ev| matches!(ev, TableEvent::Freeze(..)))
+            .count()
+    })
+}
+
 /// Test-only: the abort a structural change queued for the next drain.
 #[cfg(test)]
 pub(crate) fn abort_pending_for_test() -> Option<&'static str> {
@@ -381,25 +394,42 @@ pub(crate) fn note_swapdb(a: usize, b: usize) {
     }
 }
 
-/// `Database::clear` just detached `db`'s table (moon#1228): FLUSHDB,
-/// FLUSHALL (the selected database through `dispatch`, every other one
-/// through `server_admin::flush_every_database`), a script's deferred flush,
-/// a replica full resync. `table` is the old table, which `clear` used to
-/// drop.
+/// `Database::clear` just detached `db`'s table (moon#1228): FLUSHDB (from
+/// a client, MULTI/EXEC, a script, a routed or replicated command), the
+/// clears of a FLUSHALL or of a replica full resync. `table` is the old
+/// table, which `clear` used to drop.
 ///
 /// If the table is the epoch-start table of a database the armed epoch has
 /// not finished writing, it is FROZEN into the epoch (moved, never cloned):
 /// with the pre-images captured before the flush it is exactly that
 /// database's epoch-start contents, so the BGSAVE completes with the
-/// pre-flush image — redis's fork does the same — where it used to abort. The
-/// slot's new contents are post-epoch, so writes to it capture nothing from
-/// here on. Otherwise the table is dropped here, where `clear` dropped it.
+/// pre-flush image — redis's fork does the same for FLUSHDB — where it used
+/// to abort. The slot's new contents are post-epoch, so writes to it capture
+/// nothing from here on. Otherwise the table is dropped here, where `clear`
+/// dropped it: a database already written, a slot whose epoch table an
+/// earlier flush already froze, or an epoch with an abort queued (a FLUSHALL
+/// or a resync — the tables its clears hand over are released now, not at
+/// the next drain).
+///
+/// Memory bound: at most ONE frozen table per database of the epoch — a
+/// flushed slot is unmapped, so flushing it again drops the new table — and
+/// each is released as soon as the walk finishes its database. A client
+/// that FLUSHDBs every database in turn therefore holds at most the
+/// epoch-start dataset beside the new one until the walk passes it: the
+/// same worst case as redis, whose forked child keeps every pre-flush page
+/// on FLUSHDB and is killed only by FLUSHALL (pinned by
+/// `table_swap_tests::flushdb_of_every_database_holds_at_most_the_epoch_start_tables`).
 ///
 /// A slot that cannot be identified (an epoch armed on a thread with no
 /// shard slice) keeps the old answer: an unfinished epoch is aborted. One
 /// thread-local `bool` load when nothing is armed.
 pub(crate) fn note_cleared_table(db: &Database, table: Table) {
     if !is_armed() {
+        return;
+    }
+    if ABORT.with(|a| a.get().is_some()) {
+        // The epoch is being failed: nothing will be written from this
+        // table. `table` drops here.
         return;
     }
     enum Outcome {
@@ -449,10 +479,39 @@ pub(crate) fn note_cleared_table(db: &Database, table: Table) {
 /// tail replayed on top would mix this node's data with the master's. So an
 /// unfinished epoch is aborted — the BGSAVE fails loudly and the previous
 /// file stays; the tables the resync's `clear` calls hand over are dropped
-/// with it. One thread-local `bool` load when nothing is armed.
+/// at once ([`note_cleared_table`]). One thread-local `bool` load when
+/// nothing is armed.
 pub(crate) fn note_table_replace(why: &'static str) {
     if is_armed() && epoch_unfinished() {
         abort_epoch(why);
+    }
+}
+
+/// A FLUSHALL is about to clear every database of this shard while an epoch
+/// is armed. Redis parity: `flushAllDataAndResetRDB` kills an in-flight
+/// RDB child (`killRDBChild`), so a FLUSHALL fails the BGSAVE — here the
+/// epoch is aborted when it still has databases to write, the previous file
+/// stays, and the tables the FLUSHALL's clears hand over are dropped at once
+/// instead of being held until the walk passes them. A FLUSHDB (or SWAPDB)
+/// does not abort: redis keeps its child for those, and so does the epoch
+/// (moon#1228, [`note_cleared_table`]). Nothing happens when every database
+/// is already written (the logged FLUSHALL replays on top of the file), or
+/// when the command will refuse its arguments and flush nothing.
+fn note_flushall(args: &[Frame]) {
+    if flush_args_accepted(args) && epoch_unfinished() {
+        abort_epoch("FLUSHALL cleared databases the snapshot had not finished writing");
+    }
+}
+
+/// Exactly `command::server_admin`'s FLUSHDB/FLUSHALL argument check: no
+/// argument, or one of `ASYNC` / `SYNC`. Anything else is refused before
+/// `Database::clear` runs (pinned by `table_swap_tests::a_refused_flush_does_not_abort`).
+fn flush_args_accepted(args: &[Frame]) -> bool {
+    match args {
+        [] => true,
+        [only] => crate::command::helpers::extract_bytes(only)
+            .is_some_and(|s| s.eq_ignore_ascii_case(b"ASYNC") || s.eq_ignore_ascii_case(b"SYNC")),
+        _ => false,
     }
 }
 
@@ -519,9 +578,17 @@ pub(crate) fn capture_dispatch_pre_image(
     if !is_armed() {
         return;
     }
-    // The whole-table writes have no key to capture: `Database::clear`
+    // The whole-table writes have no key to capture. FLUSHDB: `clear`
     // hands the epoch the table itself (`note_cleared_table`, moon#1228).
-    if cmd.eq_ignore_ascii_case(b"FLUSHDB") || cmd.eq_ignore_ascii_case(b"FLUSHALL") {
+    // FLUSHALL fails the save first, as redis kills its child — every
+    // FLUSHALL on a shard (client, MULTI/EXEC, script, routed, replicated)
+    // runs through `dispatch`, and its other databases are cleared right
+    // after by `flush_every_database`, on the same shard.
+    if cmd.eq_ignore_ascii_case(b"FLUSHDB") {
+        return;
+    }
+    if cmd.eq_ignore_ascii_case(b"FLUSHALL") {
+        note_flushall(args);
         return;
     }
     if !crate::command::metadata::is_write(cmd) {

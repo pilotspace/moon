@@ -2,10 +2,10 @@
 //! inserting (so the DashTable keeps splitting mid-epoch) must restore every
 //! key that existed before the save started, with its value (moon#1216);
 //! a FLUSHDB / FLUSHALL / SWAPDB landing mid-BGSAVE must neither crash the
-//! shard (moon#1224) nor publish a mixed file — since moon#1228 the save
-//! completes with the pre-flush image, as redis's does; and a save that IS
-//! aborted (a replica full resync) must not let its writer corrupt the NEXT
-//! one (moon#1227 review F1).
+//! shard (moon#1224) nor publish a mixed file — since moon#1228 a FLUSHDB or
+//! SWAPDB save completes with the pre-change image, and a FLUSHALL fails the
+//! save, as redis's do; and a save that IS aborted (a replica full resync)
+//! must not let its writer corrupt the NEXT one (moon#1227 review F1).
 //!
 //! Pin the binary: `MOON_BIN=<moon> cargo test --test perf_ws12_bgsave_split`
 //! (falls back to the binary Cargo built for this run).
@@ -204,19 +204,24 @@ fn split_during_bgsave_keeps_every_pre_epoch_key_shards_4() {
 
 /// moon#1224, moon#1228: each whole-table write, issued while the BGSAVE
 /// epoch is still writing (thousands of segments to go), must leave the
-/// server serving (it panicked the shard before moon#1224) AND let the save
-/// complete with the keyspace it started from — the save used to be
-/// aborted (`err`) instead, so a workload flushing more often than one save
-/// takes never saved at all. Restored alone after SIGKILL: every `pre:` key in
-/// db 0 with its value, and nothing in db 1.
+/// server serving (it panicked the shard before moon#1224).
+///
+/// A FLUSHDB or SWAPDB must let the save complete with the keyspace it
+/// started from — the save used to be aborted (`err`) instead, so a workload
+/// flushing more often than one save takes never saved at all. Restored
+/// alone after SIGKILL: every `pre:` key in db 0 with its value, and nothing
+/// in db 1.
+///
+/// A FLUSHALL fails the save, as redis's does (`flushAllDataAndResetRDB`
+/// kills the RDB child): `err`, no file published, the abort logged.
 #[test]
 fn table_swaps_during_bgsave_keep_the_save_point_in_time() {
     const N: u64 = 600_000;
-    for cmd in [
-        &["FLUSHALL"][..],
-        &["FLUSHDB"][..],
-        &["FLUSHDB", "ASYNC"][..],
-        &["SWAPDB", "0", "1"][..],
+    for (cmd, aborts) in [
+        (&["FLUSHALL"][..], true),
+        (&["FLUSHDB"][..], false),
+        (&["FLUSHDB", "ASYNC"][..], false),
+        (&["SWAPDB", "0", "1"][..], false),
     ] {
         let dir = common::unique_test_dir("ws12-swap");
         std::fs::create_dir_all(&dir).unwrap();
@@ -243,6 +248,26 @@ fn table_swaps_during_bgsave_keep_the_save_point_in_time() {
             "{cmd:?} during BGSAVE killed the server"
         );
         let status = wait_bgsave(&mut probe, Duration::from_secs(120));
+        if aborts {
+            assert_eq!(
+                status, "err",
+                "{cmd:?} crossed the epoch: the save must fail, as redis's does"
+            );
+            let log = std::fs::read_to_string(dir.join("server.err")).unwrap_or_default();
+            assert!(
+                log.contains("aborted: FLUSHALL cleared databases"),
+                "{cmd:?}: the abort was not logged"
+            );
+            assert!(
+                !dir.join("shard-0.rrdshard").exists(),
+                "{cmd:?}: the failed save published a file"
+            );
+            drop(probe);
+            drop(c);
+            drop(server);
+            let _ = std::fs::remove_dir_all(&dir);
+            continue;
+        }
         assert_eq!(
             status, "ok",
             "{cmd:?} crossed the epoch: the save must complete with the pre-change image"
@@ -274,11 +299,10 @@ fn table_swaps_during_bgsave_keep_the_save_point_in_time() {
 /// between the saves gone). Or the straggler unlinked the new temp file and
 /// the second save failed.
 ///
-/// The abort is a replica FULL RESYNC landing mid-save (moon#1227 review F6):
-/// since moon#1228 a FLUSHALL no longer aborts a save (it completes with the
-/// pre-flush image), and a resync is the one whole-table replacement that
-/// still must — the node's data becomes the master's, which is not a record
-/// of its own log.
+/// The abort here is a replica FULL RESYNC landing mid-save (moon#1227
+/// review F6) — the node's data becomes the master's, which is not a record
+/// of its own log. A FLUSHALL aborts a save too (redis parity, pinned by
+/// `table_swaps_during_bgsave_keep_the_save_point_in_time`).
 ///
 /// Since moon#1230 `rdb_last_bgsave_status` describes the LAST save, so it
 /// judges the second save directly; the log shows the first was aborted, and
