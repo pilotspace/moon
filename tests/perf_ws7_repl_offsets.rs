@@ -80,7 +80,10 @@ fn connection_write_path_issues_lsns_without_the_state_lock() {
 
 #[test]
 fn fanout_probe_takes_no_lock() {
-    let ft = std::fs::read_to_string(root().join("src/server/conn/handler_monoio/ft.rs")).unwrap();
+    // CRLF on a Windows checkout would hide the `\n}\n` body end.
+    let ft = std::fs::read_to_string(root().join("src/server/conn/handler_monoio/ft.rs"))
+        .unwrap()
+        .replace("\r\n", "\n");
     let start = ft
         .find("fn replication_fanout_active")
         .expect("probe present");
