@@ -696,3 +696,60 @@ fn test_shutdown_with_pending_work() {
         elapsed
     );
 }
+
+/// Refs moon#1253: once a flush's completions are sent the thread publishes
+/// one past the flush's largest request id, and everything that watermark
+/// covers is already queued for the shard. The shard prunes once per move.
+#[test]
+fn the_watermark_covers_only_requests_whose_completions_were_sent() {
+    let tmp = tempfile::tempdir().unwrap();
+    let st = SpillThread::new(2);
+    assert_eq!(st.done_below(), 0, "nothing flushed yet");
+    assert_eq!(st.take_prune(0), None);
+    let sender = st.sender();
+    for (i, id) in [7u64, 8, 9].into_iter().enumerate() {
+        sender
+            .send(SpillRequest {
+                key: Bytes::from(format!("wm{i}")),
+                db_index: 0,
+                value_bytes: Bytes::from_static(b"v"),
+                value_type: ValueType::String,
+                flags: 0,
+                ttl_ms: None,
+                file_id: id,
+                shard_dir: tmp.path().to_path_buf(),
+            })
+            .unwrap();
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while st.done_below() < 10 {
+        assert!(std::time::Instant::now() < deadline, "no flush in 5 s");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert_eq!(st.done_below(), 10);
+    let done: Vec<u64> = st
+        .drain_completions()
+        .iter()
+        .flat_map(|c| c.entries.iter().map(|e| e.req_file_id))
+        .collect();
+    for id in [7, 8, 9] {
+        assert!(
+            done.contains(&id),
+            "request {id} covered but not queued: {done:?}"
+        );
+    }
+    assert_eq!(st.take_prune(10), Some(SupersededPrune::Below(10)));
+    assert_eq!(st.take_prune(10), None, "pruned once per watermark move");
+    assert!(!st.is_dead());
+    let _ = st.shutdown();
+}
+
+/// Refs moon#1253: a thread that exited unasked will never send another
+/// completion, so every superseded entry goes.
+#[test]
+fn a_dead_spill_thread_asks_for_every_superseded_entry_to_go() {
+    let st = SpillThread::exited_for_test();
+    assert!(st.is_dead());
+    assert_eq!(st.take_prune(0), Some(SupersededPrune::All));
+    assert_eq!(st.take_prune(0), Some(SupersededPrune::All), "every tick");
+}

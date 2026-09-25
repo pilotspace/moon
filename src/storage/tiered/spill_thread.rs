@@ -560,6 +560,23 @@ pub struct SpillThread {
     reclaim_done_rx: flume::Receiver<super::reclaim_io::ReclaimDone>,
     join_handle: Option<std::thread::JoinHandle<()>>,
     stop_flag: Arc<AtomicBool>,
+    /// Every request with a file id below this has had its completion sent
+    /// (or dropped at shutdown): the thread stores one past the largest id
+    /// of each flush, after that flush's `send_completions` returns (refs
+    /// moon#1253, see [`Self::done_below`]).
+    done_below: Arc<AtomicU64>,
+    /// The watermark the shard last pruned its superseded sets with.
+    pruned_below: AtomicU64,
+}
+
+/// How [`SpillThread::take_prune`] says to prune the shard's superseded sets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SupersededPrune {
+    /// Every request below this id is done.
+    Below(u64),
+    /// The thread is dead: no pending completion will ever arrive, and no
+    /// file of an unflushed request gets listed.
+    All,
 }
 
 /// Reclaim jobs queued for one spill thread at most. The shard sends with
@@ -588,6 +605,8 @@ impl SpillThread {
             flume::unbounded::<super::reclaim_io::ReclaimDone>();
         let stop_flag = Arc::new(AtomicBool::new(false));
         let stop_flag_bg = stop_flag.clone();
+        let done_below = Arc::new(AtomicU64::new(0));
+        let done_below_bg = done_below.clone();
 
         #[allow(clippy::expect_used)]
         // Startup: spill thread is critical infrastructure — spawn failure is fatal
@@ -604,6 +623,7 @@ impl SpillThread {
                     completion_tx,
                     (reclaim_rx, reclaim_done_tx),
                     stop_flag_bg,
+                    &done_below_bg,
                 );
             })
             .expect("failed to spawn spill thread");
@@ -615,6 +635,8 @@ impl SpillThread {
             reclaim_done_rx,
             join_handle: Some(join_handle),
             stop_flag,
+            done_below,
+            pruned_below: AtomicU64::new(0),
         }
     }
 
@@ -632,8 +654,21 @@ impl SpillThread {
             flume::Sender<super::reclaim_io::ReclaimDone>,
         ),
         stop_flag: Arc<AtomicBool>,
+        done_below: &AtomicU64,
     ) {
         let mut buffer: Vec<SpillRequest> = Vec::with_capacity(FLUSH_ENTRY_CAP);
+        // Flush the buffer, send its completions, then publish the watermark
+        // (refs moon#1253): the requests are handled FIFO and their file ids
+        // are minted in send order on the shard thread, so once a flush's
+        // completions are sent every id up to its largest is done. Release:
+        // a shard that reads the watermark finds those completions queued.
+        let flush = |buffer: &mut Vec<SpillRequest>| {
+            let through = buffer.iter().map(|r| r.file_id).max();
+            Self::send_completions(&completion_tx, flush_buffer(buffer), &stop_flag);
+            if let Some(id) = through {
+                done_below.fetch_max(id.saturating_add(1), Ordering::Release);
+            }
+        };
 
         // Task #59 lever 2: after a durable batch flush, briefly yield the
         // device to any waiting cold reader. Never paces at shutdown or when
@@ -663,7 +698,7 @@ impl SpillThread {
                     buffer.push(req);
                 }
                 if !buffer.is_empty() {
-                    Self::send_completions(&completion_tx, flush_buffer(&mut buffer), &stop_flag);
+                    flush(&mut buffer);
                 }
                 break;
             }
@@ -680,33 +715,21 @@ impl SpillThread {
                 Ok(req) => {
                     buffer.push(req);
                     if buffer.len() >= FLUSH_ENTRY_CAP {
-                        Self::send_completions(
-                            &completion_tx,
-                            flush_buffer(&mut buffer),
-                            &stop_flag,
-                        );
+                        flush(&mut buffer);
                         pace(&request_rx);
                     }
                 }
                 Err(flume::RecvTimeoutError::Timeout) => {
                     // Latency guard: flush non-empty buffer on tick.
                     if !buffer.is_empty() {
-                        Self::send_completions(
-                            &completion_tx,
-                            flush_buffer(&mut buffer),
-                            &stop_flag,
-                        );
+                        flush(&mut buffer);
                         pace(&request_rx);
                     }
                 }
                 Err(flume::RecvTimeoutError::Disconnected) => {
                     // Drain guard: flush remaining entries then exit.
                     if !buffer.is_empty() {
-                        Self::send_completions(
-                            &completion_tx,
-                            flush_buffer(&mut buffer),
-                            &stop_flag,
-                        );
+                        flush(&mut buffer);
                     }
                     break;
                 }
@@ -787,6 +810,67 @@ impl SpillThread {
     /// Every reclaim answer ready now (non-blocking).
     pub(crate) fn drain_reclaim_done(&self) -> Vec<super::reclaim_io::ReclaimDone> {
         self.reclaim_done_rx.try_iter().collect()
+    }
+
+    /// Every spill request whose file id is below this has had its completion
+    /// sent (or dropped at shutdown) — read it BEFORE draining completions,
+    /// and once the drain is applied every superseded entry below it has
+    /// been settled or will never be (refs moon#1253). Acquire pairs with the
+    /// thread's Release store.
+    #[inline]
+    pub fn done_below(&self) -> u64 {
+        self.done_below.load(Ordering::Acquire)
+    }
+
+    /// Whether the superseded sets need a prune now: the watermark moved past
+    /// the last one, or the thread is dead. Records the watermark as pruned.
+    pub(crate) fn take_prune(&self, done_below: u64) -> Option<SupersededPrune> {
+        if self.is_dead() {
+            return Some(SupersededPrune::All);
+        }
+        if done_below > self.pruned_below.fetch_max(done_below, Ordering::Relaxed) {
+            Some(SupersededPrune::Below(done_below))
+        } else {
+            None
+        }
+    }
+
+    /// The thread exited while nobody asked it to stop (a panic): no
+    /// completion will arrive for anything it had not flushed.
+    pub fn is_dead(&self) -> bool {
+        !self.stop_flag.load(Ordering::Acquire)
+            && self
+                .join_handle
+                .as_ref()
+                .is_some_and(std::thread::JoinHandle::is_finished)
+    }
+
+    /// A spill thread whose thread exited without being asked to (tests of
+    /// [`Self::is_dead`]).
+    #[cfg(test)]
+    pub(crate) fn exited_for_test() -> Self {
+        let (request_tx, _) = flume::bounded::<SpillRequest>(1);
+        let (_, completion_rx) = flume::bounded::<SpillCompletion>(1);
+        let (reclaim_tx, _) = flume::bounded::<super::reclaim_io::ReclaimJob>(1);
+        let (_, reclaim_done_rx) = flume::unbounded::<super::reclaim_io::ReclaimDone>();
+        #[allow(clippy::expect_used)] // test-only
+        let join_handle = std::thread::Builder::new()
+            .name("spill-exited".to_string())
+            .spawn(|| {})
+            .expect("spawn");
+        while !join_handle.is_finished() {
+            std::thread::yield_now();
+        }
+        Self {
+            request_tx,
+            completion_rx,
+            reclaim_tx,
+            reclaim_done_rx,
+            join_handle: Some(join_handle),
+            stop_flag: Arc::new(AtomicBool::new(false)),
+            done_below: Arc::new(AtomicU64::new(0)),
+            pruned_below: AtomicU64::new(0),
+        }
     }
 
     /// Get a clone of the request sender for the event loop to hold.

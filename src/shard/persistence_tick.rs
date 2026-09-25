@@ -852,10 +852,61 @@ pub(crate) fn apply_spill_completions(
     shard_id: usize,
     marker_sink: &mut ColdMarkerSink<'_>,
 ) {
-    let _ = shard_databases; // E2 removes
     let _ = shard_id; // E2 removes
+    drain_and_apply(
+        spill_thread,
+        shard_manifest,
+        marker_sink,
+        shard_databases.db_count(),
+    );
+}
+
+/// [`apply_spill_completions`]' body: drain and apply every completion,
+/// then prune the superseded sets by the spill thread's watermark.
+fn drain_and_apply(
+    spill_thread: &crate::storage::tiered::spill_thread::SpillThread,
+    shard_manifest: &mut Option<crate::persistence::manifest::ShardManifest>,
+    marker_sink: &mut ColdMarkerSink<'_>,
+    db_count: usize,
+) {
+    // Refs moon#1253: the watermark is read BEFORE the drain, so every
+    // completion it covers is in the channel and applied below.
+    let done_below = spill_thread.done_below();
     let completions = spill_thread.drain_completions();
     apply_completion_vec(completions, shard_manifest, marker_sink);
+    prune_superseded(spill_thread.take_prune(done_below), db_count);
+}
+
+/// Bound the superseded sets (refs moon#1253): a request whose completion
+/// never arrives — dropped at shutdown, or its spill thread dead — would stay
+/// in its database's set for good. Runs only when the spill thread's
+/// watermark moved (or it died), and touches only non-empty sets.
+fn prune_superseded(
+    prune: Option<crate::storage::tiered::spill_thread::SupersededPrune>,
+    db_count: usize,
+) {
+    use crate::storage::tiered::spill_thread::SupersededPrune;
+    let Some(prune) = prune else {
+        return;
+    };
+    for db_index in 0..db_count {
+        crate::shard::slice::with_shard_db(db_index, |db| {
+            if db.spill_superseded_is_empty() {
+                return;
+            }
+            let pruned = match prune {
+                SupersededPrune::Below(done_below) => db.spill_superseded_prune_below(done_below),
+                SupersededPrune::All => db.spill_superseded_clear(),
+            };
+            if pruned > 0 {
+                tracing::debug!(
+                    db = db_index,
+                    pruned,
+                    "spill: forgot superseded requests whose completion never arrived"
+                );
+            }
+        });
+    }
 }
 
 /// moon#902: where a published spill batch's `MOON.SPILLED <file_id> key…`
