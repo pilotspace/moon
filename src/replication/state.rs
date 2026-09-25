@@ -1,4 +1,5 @@
 use bytes::Bytes;
+use crossbeam_utils::CachePadded;
 use rand::RngExt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -24,7 +25,10 @@ pub struct ReplicationState {
     /// Length = num_shards. Arc'd so `offset_handle()` can hand shards a
     /// lock-free clone — the per-write advance must never take the
     /// surrounding `RwLock` (QW3, 2026-06 review).
-    pub shard_offsets: Arc<[AtomicU64]>,
+    ///
+    /// Cache-padded (moon#1176): unpadded, eight shards' counters shared one
+    /// 64-byte line and every shard's per-write `fetch_add` bounced it.
+    pub shard_offsets: Arc<[CachePadded<AtomicU64>]>,
     /// Sum of all shard offsets -- global master replication offset.
     /// Arc'd for the same lock-free `offset_handle()` distribution.
     pub master_repl_offset: Arc<AtomicU64>,
@@ -53,7 +57,15 @@ pub struct ReplicationState {
     /// in the SAME synchronous stretch as every FULLRESYNC snapshot capture —
     /// the first post-snapshot write then re-establishes the context for the
     /// freshly-attached replica (Redis's `slaveseldb = -1` idiom).
-    pub stream_db: Vec<std::sync::atomic::AtomicI64>,
+    /// `Arc`'d so a shard's [`ReplWriteHandle`] shares it without the lock.
+    pub stream_db: Arc<[std::sync::atomic::AtomicI64]>,
+    /// "The replication plane has something to feed" (moon#1176): set once a
+    /// backlog is allocated (or the locked probe in
+    /// [`ReplWriteHandle::fanout_active`] finds a replica or an allocated
+    /// shard-0 backlog), and never cleared — backlogs are never freed.
+    /// Lets the per-write fan-out probe answer with one Acquire load instead
+    /// of this struct's read lock plus shard 0's backlog mutex.
+    pub plane_live: Arc<AtomicBool>,
 }
 
 pub enum ReplicationRole {
@@ -82,7 +94,9 @@ impl ReplicationState {
             role: ReplicationRole::Master,
             repl_id,
             repl_id2,
-            shard_offsets: (0..num_shards).map(|_| AtomicU64::new(0)).collect(),
+            shard_offsets: (0..num_shards)
+                .map(|_| CachePadded::new(AtomicU64::new(0)))
+                .collect(),
             master_repl_offset: Arc::new(AtomicU64::new(0)),
             replicas: Vec::new(),
             per_shard_backlogs: (0..num_shards)
@@ -93,6 +107,7 @@ impl ReplicationState {
             stream_db: (0..num_shards)
                 .map(|_| std::sync::atomic::AtomicI64::new(-1))
                 .collect(),
+            plane_live: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -165,6 +180,9 @@ impl ReplicationState {
                 ));
             }
         }
+        // After the slots are allocated: a writer that sees the flag also
+        // sees an allocated backlog (moon#1176, see `plane_live`).
+        self.plane_live.store(true, Ordering::Release);
     }
 
     /// Realign an already-allocated backlog for `shard_id` to the shard's
@@ -360,7 +378,7 @@ impl ReplicationState {
 /// — both operate on the same `Arc`'d atomics.
 #[derive(Clone)]
 pub struct OffsetHandle {
-    shard_offsets: Arc<[AtomicU64]>,
+    shard_offsets: Arc<[CachePadded<AtomicU64>]>,
     master_repl_offset: Arc<AtomicU64>,
 }
 
@@ -496,6 +514,211 @@ pub fn record_local_write_global(shard_id: usize, bytes: Bytes) {
     record_local_write_on(&g, shard_id, bytes);
 }
 
+/// `SELECT 0` .. `SELECT 15` as RESP, byte-identical to
+/// [`crate::persistence::aof::serialize_select_record`] (unit-tested), so the
+/// replication stream's db prefix costs no serialization or allocation for
+/// the databases every deployment uses (moon#1176).
+static SELECT_RECORDS: [&[u8]; 16] = [
+    b"*2\r\n$6\r\nSELECT\r\n$1\r\n0\r\n",
+    b"*2\r\n$6\r\nSELECT\r\n$1\r\n1\r\n",
+    b"*2\r\n$6\r\nSELECT\r\n$1\r\n2\r\n",
+    b"*2\r\n$6\r\nSELECT\r\n$1\r\n3\r\n",
+    b"*2\r\n$6\r\nSELECT\r\n$1\r\n4\r\n",
+    b"*2\r\n$6\r\nSELECT\r\n$1\r\n5\r\n",
+    b"*2\r\n$6\r\nSELECT\r\n$1\r\n6\r\n",
+    b"*2\r\n$6\r\nSELECT\r\n$1\r\n7\r\n",
+    b"*2\r\n$6\r\nSELECT\r\n$1\r\n8\r\n",
+    b"*2\r\n$6\r\nSELECT\r\n$1\r\n9\r\n",
+    b"*2\r\n$6\r\nSELECT\r\n$2\r\n10\r\n",
+    b"*2\r\n$6\r\nSELECT\r\n$2\r\n11\r\n",
+    b"*2\r\n$6\r\nSELECT\r\n$2\r\n12\r\n",
+    b"*2\r\n$6\r\nSELECT\r\n$2\r\n13\r\n",
+    b"*2\r\n$6\r\nSELECT\r\n$2\r\n14\r\n",
+    b"*2\r\n$6\r\nSELECT\r\n$2\r\n15\r\n",
+];
+
+/// The `SELECT <db>` replication record: static for db 0..15.
+#[inline]
+pub(crate) fn select_record(db: usize) -> Bytes {
+    match SELECT_RECORDS.get(db) {
+        Some(rec) => Bytes::from_static(rec),
+        None => crate::persistence::aof::serialize_select_record(db),
+    }
+}
+
+/// Lock-free per-shard handle to everything a connection's WRITE path needs
+/// from the replication plane (moon#1176): LSN issue, the fan-out probe, and
+/// recording a write into this shard's backlog + offsets.
+///
+/// Built once per connection from one `ReplicationState` read
+/// ([`ReplicationState::write_handle`]). Every field is an `Arc` whose
+/// identity is fixed for the process — the offset atomics, this shard's
+/// backlog slot (the event loop already clones it once at startup for the
+/// same reason) and the stream-db context — so going through the handle is
+/// the SAME state the locked path touched, minus the lock.
+#[derive(Clone)]
+pub struct ReplWriteHandle {
+    shard_id: usize,
+    num_shards: usize,
+    offsets: OffsetHandle,
+    backlog: SharedBacklog,
+    stream_db: Arc<[std::sync::atomic::AtomicI64]>,
+    plane_live: Arc<AtomicBool>,
+    /// Only for the fan-out probe's slow leg, taken while the hint is set
+    /// but the plane has not been seen live yet.
+    state: Arc<parking_lot::RwLock<ReplicationState>>,
+}
+
+impl ReplicationState {
+    /// The [`ReplWriteHandle`] for `shard_id`. `state` must be the lock
+    /// `self` was read from.
+    pub fn write_handle(
+        &self,
+        state: &Arc<parking_lot::RwLock<ReplicationState>>,
+        shard_id: usize,
+    ) -> ReplWriteHandle {
+        ReplWriteHandle {
+            shard_id,
+            num_shards: self.num_shards(),
+            offsets: self.offset_handle(),
+            backlog: self
+                .per_shard_backlogs
+                .get(shard_id)
+                .cloned()
+                .unwrap_or_else(|| Arc::new(parking_lot::Mutex::new(None))),
+            stream_db: Arc::clone(&self.stream_db),
+            plane_live: Arc::clone(&self.plane_live),
+            state: Arc::clone(state),
+        }
+    }
+}
+
+impl ReplWriteHandle {
+    /// Issue the AOF LSN for a write of `delta` bytes — `issue_lsn` with no
+    /// `RwLock` (the connection layer's twin of the SPSC path's handle).
+    #[inline]
+    pub fn issue_lsn(&self, delta: usize) -> u64 {
+        self.offsets.issue_lsn(self.shard_id, delta as u64)
+    }
+
+    /// The replication fan-out probe: true once a replica has begun
+    /// attaching (the sticky hint) AND the plane has something to feed (an
+    /// allocated backlog or a registered replica).
+    ///
+    /// Same answer as the old locked probe (`!replicas.is_empty() ||
+    /// backlog[0].is_some()` under `repl_state.read()` + shard 0's backlog
+    /// mutex), which was already a point-in-time check released before the
+    /// write: fast path one Acquire load once the plane is live; the locked
+    /// check runs only while the hint is set and the plane has not been seen
+    /// live, and latches the flag when it finds it live. Sticky-true can only
+    /// err towards recording a write for replication, never towards dropping
+    /// one.
+    #[inline]
+    pub fn fanout_active(&self) -> bool {
+        if !fanout_hint_active() {
+            return false;
+        }
+        if self.plane_live.load(Ordering::Acquire) {
+            return true;
+        }
+        self.fanout_probe_slow()
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn fanout_probe_slow(&self) -> bool {
+        let live = {
+            let g = self.state.read();
+            !g.replicas.is_empty()
+                || g.per_shard_backlogs
+                    .first()
+                    .is_some_and(|slot| slot.lock().is_some())
+        };
+        if live {
+            self.plane_live.store(true, Ordering::Release);
+        }
+        live
+    }
+
+    /// [`record_local_write_on`] without the `ReplicationState` lock.
+    #[inline]
+    pub fn record_local_write(&self, bytes: Bytes) {
+        let shard_id = self.shard_id;
+        record_core(Some(&self.backlog), bytes, |d| {
+            self.offsets.increment_shard_offset(shard_id, d)
+        });
+    }
+
+    /// [`record_local_write_db_on`] without the `ReplicationState` lock.
+    #[inline]
+    pub fn record_local_write_db(&self, db: usize, bytes: Bytes) {
+        record_db_core(
+            self.num_shards,
+            &self.stream_db,
+            self.shard_id,
+            db,
+            bytes,
+            |b| self.record_local_write(b),
+        );
+    }
+}
+
+/// The body of every "record one replication record" path: backlog append,
+/// then the offset advance (`advance(len)` returns the per-shard end offset),
+/// then the deferred live fan-out.
+#[inline]
+fn record_core(backlog: Option<&SharedBacklog>, bytes: Bytes, advance: impl FnOnce(u64) -> u64) {
+    if let Some(slot) = backlog {
+        if let Some(backlog) = slot.lock().as_mut() {
+            backlog.append(&bytes);
+        }
+    }
+    let end_offset = advance(bytes.len() as u64);
+    crate::shard::self_msg::push(crate::shard::dispatch::ShardMessage::ReplicaLiveFanout {
+        bytes,
+        end_offset,
+    });
+}
+
+/// The db-binding rule shared by [`record_local_write_db_on`] and
+/// [`ReplWriteHandle::record_local_write_db`]; `record` records one record.
+#[inline]
+fn record_db_core(
+    num_shards: usize,
+    stream_db: &[std::sync::atomic::AtomicI64],
+    shard_id: usize,
+    db: usize,
+    bytes: Bytes,
+    mut record: impl FnMut(Bytes),
+) {
+    if num_shards > 1 {
+        if fanout_hint_active() {
+            // One buffer for prefix + payload: the two must travel as ONE
+            // record so no cross-shard interleave can split them.
+            let select = select_record(db);
+            let mut combined = Vec::with_capacity(select.len() + bytes.len());
+            combined.extend_from_slice(&select);
+            combined.extend_from_slice(&bytes);
+            record(Bytes::from(combined));
+        } else {
+            record(bytes);
+        }
+        return;
+    }
+    let needs_select = stream_db.get(shard_id).is_some_and(|slot| {
+        if slot.load(Ordering::Relaxed) != db as i64 {
+            slot.store(db as i64, Ordering::Relaxed);
+            true
+        } else {
+            false
+        }
+    });
+    if needs_select {
+        record(select_record(db));
+    }
+    record(bytes);
+}
+
 /// Ctx-free twin of `handler_monoio::ft::replication_fanout_active`: true
 /// once the replication plane has anything to feed — a registered replica or
 /// an allocated backlog — so a write path that is NOT a connection handler
@@ -536,15 +759,8 @@ pub fn fanout_active_for(repl_state: &Option<Arc<parking_lot::RwLock<Replication
 /// a `thread_local!` queue drained by that shard's event loop).
 #[inline]
 pub fn record_local_write_on(g: &ReplicationState, shard_id: usize, bytes: Bytes) {
-    if let Some(slot) = g.per_shard_backlogs.get(shard_id) {
-        if let Some(backlog) = slot.lock().as_mut() {
-            backlog.append(&bytes);
-        }
-    }
-    let end_offset = g.increment_shard_offset(shard_id, bytes.len() as u64);
-    crate::shard::self_msg::push(crate::shard::dispatch::ShardMessage::ReplicaLiveFanout {
-        bytes,
-        end_offset,
+    record_core(g.per_shard_backlogs.get(shard_id), bytes, |d| {
+        g.increment_shard_offset(shard_id, d)
     });
 }
 
@@ -564,34 +780,9 @@ pub fn record_local_write_on(g: &ReplicationState, shard_id: usize, bytes: Bytes
 /// same self-queue.
 #[inline]
 pub fn record_local_write_db_on(g: &ReplicationState, shard_id: usize, db: usize, bytes: Bytes) {
-    if g.num_shards() > 1 {
-        if fanout_hint_active() {
-            let select = crate::persistence::aof::serialize_select_record(db);
-            let mut combined = Vec::with_capacity(select.len() + bytes.len());
-            combined.extend_from_slice(&select);
-            combined.extend_from_slice(&bytes);
-            record_local_write_on(g, shard_id, Bytes::from(combined));
-        } else {
-            record_local_write_on(g, shard_id, bytes);
-        }
-        return;
-    }
-    let needs_select = g.stream_db.get(shard_id).is_some_and(|slot| {
-        if slot.load(Ordering::Relaxed) != db as i64 {
-            slot.store(db as i64, Ordering::Relaxed);
-            true
-        } else {
-            false
-        }
+    record_db_core(g.num_shards(), &g.stream_db, shard_id, db, bytes, |b| {
+        record_local_write_on(g, shard_id, b)
     });
-    if needs_select {
-        record_local_write_on(
-            g,
-            shard_id,
-            crate::persistence::aof::serialize_select_record(db),
-        );
-    }
-    record_local_write_on(g, shard_id, bytes);
 }
 
 /// Db-aware ctx-free twin of `record_local_write_db`, for the same
@@ -1107,5 +1298,182 @@ mod tests {
         let (loaded1, loaded2) = load_replication_state(dir.path());
         assert_eq!(loaded1, id1);
         assert_eq!(loaded2, ZEROED_ID);
+    }
+
+    /// moon#1176: every shard advances its own offset per write; unpadded,
+    /// eight of them shared one 64-byte line. Red on the pre-fix layout
+    /// (`Arc<[AtomicU64]>`: 8 bytes apart).
+    #[test]
+    fn shard_offsets_do_not_share_a_cache_line() {
+        let state = ReplicationState::new(4, generate_repl_id(), ZEROED_ID.to_string());
+        let a = &state.shard_offsets[0] as *const _ as usize;
+        let b = &state.shard_offsets[1] as *const _ as usize;
+        assert!(
+            b - a >= 64,
+            "shard offsets {a:#x} and {b:#x} are {} bytes apart: two shards' \
+             per-write fetch_adds share one cache line",
+            b - a
+        );
+    }
+
+    /// moon#1176: the write handle never takes the `ReplicationState` lock —
+    /// the test holds it for WRITE while a worker issues LSNs, probes the
+    /// fan-out gate and records a replication write through the handle.
+    ///
+    /// Reddening mutation: route `ReplWriteHandle::fanout_active` (or
+    /// `issue_lsn`) back through `self.state.read()`; the worker blocks behind
+    /// the held lock and the deadline fires.
+    #[test]
+    fn write_handle_takes_no_state_lock() {
+        let _serial = HINT_LOCK.lock();
+        mark_fanout_active();
+        let rs = Arc::new(parking_lot::RwLock::new(ReplicationState::new(
+            2,
+            generate_repl_id(),
+            ZEROED_ID.to_string(),
+        )));
+        rs.read().ensure_backlogs_allocated();
+        let h = rs.read().write_handle(&rs, 1);
+        let held = rs.write();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let lsn = h.issue_lsn(10);
+            let live = h.fanout_active();
+            h.record_local_write_db(0, Bytes::from_static(b"*1\r\n$4\r\nPING\r\n"));
+            let _ = tx.send((lsn, live));
+        });
+        let got = rx.recv_timeout(std::time::Duration::from_millis(500));
+        drop(held);
+        worker.join().expect("worker");
+        assert!(
+            matches!(got, Ok((_, true))),
+            "the connection write path took the ReplicationState lock (or \
+             missed the live plane): {got:?}"
+        );
+    }
+
+    /// The handle issues from the SAME atomics as the locked path: LSNs are
+    /// unique and increasing across both, and the shard + master offsets
+    /// move in lockstep (sum invariant).
+    #[test]
+    fn write_handle_lsns_share_the_locked_namespace() {
+        let rs = Arc::new(parking_lot::RwLock::new(ReplicationState::new(
+            3,
+            generate_repl_id(),
+            ZEROED_ID.to_string(),
+        )));
+        let h1 = rs.read().write_handle(&rs, 1);
+        let h2 = rs.read().write_handle(&rs, 2);
+        let mut last = None;
+        for i in 0..30usize {
+            let lsn = match i % 3 {
+                0 => h1.issue_lsn(7),
+                1 => h2.issue_lsn(5),
+                _ => rs.read().issue_lsn(0, 3),
+            };
+            if let Some(prev) = last {
+                assert!(lsn > prev, "LSN {lsn} not above {prev}");
+            }
+            last = Some(lsn);
+        }
+        let g = rs.read();
+        let sum: u64 = (0..3).map(|i| g.shard_offset(i)).sum();
+        assert_eq!(
+            sum,
+            g.total_offset(),
+            "shard offsets must sum to the master offset"
+        );
+        assert_eq!(g.shard_offset(1), 70);
+        assert_eq!(g.shard_offset(2), 50);
+    }
+
+    /// Same answers as the old locked probe: hint off => false; hint on but
+    /// nothing to feed => false; a backlog allocated => true (and sticky).
+    #[test]
+    fn write_handle_fanout_probe_matches_the_locked_probe() {
+        let _serial = HINT_LOCK.lock();
+        mark_fanout_active();
+        let rs = Arc::new(parking_lot::RwLock::new(ReplicationState::new(
+            2,
+            generate_repl_id(),
+            ZEROED_ID.to_string(),
+        )));
+        let h = rs.read().write_handle(&rs, 0);
+        let handle = Some(rs.clone());
+        assert_eq!(h.fanout_active(), fanout_active_for(&handle));
+        assert!(!h.fanout_active(), "nothing to feed yet");
+        rs.read().ensure_backlogs_allocated();
+        assert_eq!(h.fanout_active(), fanout_active_for(&handle));
+        assert!(h.fanout_active(), "allocated backlog => live");
+        // A shard-0 slot allocated outside `ensure_backlogs_allocated` (the
+        // RegisterReplica arm's lazy init) is still seen, via the slow leg.
+        let rs2 = Arc::new(parking_lot::RwLock::new(ReplicationState::new(
+            2,
+            generate_repl_id(),
+            ZEROED_ID.to_string(),
+        )));
+        let h2 = rs2.read().write_handle(&rs2, 1);
+        *rs2.read().per_shard_backlogs[0].lock() =
+            Some(crate::replication::backlog::ReplicationBacklog::new(1024));
+        assert!(
+            h2.fanout_active(),
+            "lazily allocated shard-0 backlog => live"
+        );
+    }
+
+    /// The static SELECT records are byte-identical to the serializer, and
+    /// a db past the table falls back to it.
+    #[test]
+    fn static_select_records_match_the_serializer() {
+        for db in 0..40usize {
+            assert_eq!(
+                select_record(db),
+                crate::persistence::aof::serialize_select_record(db),
+                "SELECT {db}"
+            );
+        }
+    }
+
+    /// The handle records exactly what the locked path records: same bytes
+    /// in the backlog, same offsets, on both master topologies.
+    #[test]
+    fn write_handle_records_what_the_locked_path_records() {
+        let _serial = HINT_LOCK.lock();
+        mark_fanout_active();
+        for shards in [1usize, 3] {
+            let a = Arc::new(parking_lot::RwLock::new(ReplicationState::new(
+                shards,
+                generate_repl_id(),
+                ZEROED_ID.to_string(),
+            )));
+            let b = Arc::new(parking_lot::RwLock::new(ReplicationState::new(
+                shards,
+                generate_repl_id(),
+                ZEROED_ID.to_string(),
+            )));
+            a.read().ensure_backlogs_allocated();
+            b.read().ensure_backlogs_allocated();
+            let shard = shards - 1;
+            let h = b.read().write_handle(&b, shard);
+            for (db, payload) in [
+                (0usize, &b"*2\r\n$3\r\nDEL\r\n$1\r\nk\r\n"[..]),
+                (0, b"*2\r\n$3\r\nDEL\r\n$1\r\nj\r\n"),
+                (5, b"*2\r\n$4\r\nINCR\r\n$1\r\nc\r\n"),
+                (21, b"*1\r\n$4\r\nPING\r\n"),
+            ] {
+                record_local_write_db_on(&a.read(), shard, db, Bytes::from_static(payload));
+                h.record_local_write_db(db, Bytes::from_static(payload));
+            }
+            let (ga, gb) = (a.read(), b.read());
+            assert_eq!(ga.total_offset(), gb.total_offset(), "{shards} shards");
+            assert_eq!(ga.shard_offset(shard), gb.shard_offset(shard));
+            let bytes = |g: &ReplicationState| {
+                g.per_shard_backlogs[shard]
+                    .lock()
+                    .as_ref()
+                    .and_then(|bl| bl.bytes_from(bl.start_offset()))
+            };
+            assert_eq!(bytes(&ga), bytes(&gb), "{shards} shards: backlog bytes");
+        }
     }
 }

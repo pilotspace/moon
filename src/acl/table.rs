@@ -8,7 +8,8 @@ use crate::protocol::Frame;
 use super::rules::{
     AclRuleError, apply_rule, get_category_commands, hash_password, verify_password,
 };
-use super::subcommand::{clear_first_arg_rules, command_log_object, first_arg, permits};
+use super::subcommand::{clear_first_arg_rules, permits};
+use super::verdict::AclDenial;
 
 #[derive(Clone, Debug)]
 pub struct KeyPattern {
@@ -299,7 +300,10 @@ impl AclUser {
 }
 
 pub struct AclTable {
-    users: HashMap<String, AclUser>,
+    /// `Arc` so a connection can keep the entry it resolved as a lock-free
+    /// snapshot (moon#1165, see [`Self::get_user_arc`]); mutation replaces the
+    /// `Arc` (copy-on-write), so a held snapshot never changes under a reader.
+    users: HashMap<String, Arc<AclUser>>,
     /// Monotonic version counter bumped on every mutation (set/del/apply).
     /// Readers outside the `RwLock<AclTable>` can subscribe to this counter
     /// via [`Self::version_handle`] and detect stale per-connection caches
@@ -391,18 +395,26 @@ impl AclTable {
     }
 
     pub fn get_user(&self, username: &str) -> Option<&AclUser> {
-        self.users.get(username)
+        self.users.get(username).map(|u| &**u)
+    }
+
+    /// The shared entry for `username`, for a per-connection snapshot
+    /// (moon#1165). Only meaningful together with the [`Self::version`] read
+    /// under the SAME guard: the entry is the user as of that version.
+    pub fn get_user_arc(&self, username: &str) -> Option<Arc<AclUser>> {
+        self.users.get(username).cloned()
     }
 
     pub fn get_user_mut(&mut self, username: &str) -> Option<&mut AclUser> {
         // Callers that mutate via this handle must call bump_version() after
         // their mutation is complete (or go through set_user / apply_setuser
         // which bump automatically).  See src/command/acl.rs for call sites.
-        self.users.get_mut(username)
+        // Copy-on-write: a connection's snapshot of this user is untouched.
+        self.users.get_mut(username).map(Arc::make_mut)
     }
 
     pub fn set_user(&mut self, username: String, user: AclUser) {
-        self.users.insert(username, user);
+        self.users.insert(username, Arc::new(user));
         self.bump_version();
     }
 
@@ -415,7 +427,7 @@ impl AclTable {
     }
 
     pub fn list_users(&self) -> Vec<&AclUser> {
-        let mut users: Vec<&AclUser> = self.users.values().collect();
+        let mut users: Vec<&AclUser> = self.users.values().map(|u| &**u).collect();
         users.sort_by(|a, b| a.username.cmp(&b.username));
         users
     }
@@ -440,14 +452,14 @@ impl AclTable {
         rules: &[&'r str],
     ) -> Result<(), (&'r str, AclRuleError)> {
         let mut user = match self.users.get(username) {
-            Some(existing) => existing.clone(),
+            Some(existing) => AclUser::clone(existing),
             None if username == "default" => AclUser::new_default_nopass(),
             None => AclUser::default_deny(username.to_string()),
         };
         for rule in rules {
             apply_rule(&mut user, rule).map_err(|err| (*rule, err))?;
         }
-        self.users.insert(username.to_string(), user);
+        self.users.insert(username.to_string(), Arc::new(user));
         self.bump_version();
         Ok(())
     }
@@ -510,28 +522,7 @@ impl AclTable {
         let Some(user) = self.users.get(username) else {
             return Some(format!("user {} no longer exists", username));
         };
-        // Hot path: unrestricted user (default `on nopass ~* &* +@all`)
-        // short-circuits before any per-command allocation. Profile showed
-        // ~1% of CPU here for the lowercasing + HashSet probe; the
-        // unrestricted check is a single bool load.
-        if user.unrestricted {
-            return None;
-        }
-        if !user.enabled {
-            return Some(format!("User {} is disabled", username));
-        }
-        let cmd_str = std::str::from_utf8(cmd).unwrap_or("").to_ascii_lowercase();
-        // `argv[1]` takes part: `-config|set` / `+select|0` rules are keyed on
-        // it. Probing the bare name alone let `+@all -config|set` run
-        // `CONFIG SET` (see `acl::subcommand`).
-        if !permits(&user.allowed_commands, &cmd_str, first_arg(args)) {
-            return Some(format!(
-                "User {} has no permissions to run the '{}' command",
-                username,
-                command_log_object(cmd, args)
-            ));
-        }
-        None
+        user.command_denial(username, cmd, args)
     }
 
     /// Check key access for the user. Extracts relevant keys from cmd+args.
@@ -553,68 +544,20 @@ impl AclTable {
         let Some(user) = self.users.get(username) else {
             return Some(format!("user {} no longer exists", username));
         };
-        // Hot path: unrestricted user skips key extraction (keyspec) + the
-        // O(patterns*keys) glob match loop. Profile showed ~1.2% of CPU
-        // here, most of it in glob_match and Vec allocation for the
-        // extracted keys.
-        if user.unrestricted {
-            return None;
+        user.key_denial(username, cmd, args, is_write)
+    }
+
+    /// [`AclUser::denial`] for `username` under this guard: one lookup for
+    /// both the command and the key check. An unknown user is DENIED (c10k
+    /// hardening B2), with the same reason the command check gives.
+    pub fn check_denial(&self, username: &str, cmd: &[u8], args: &[Frame]) -> Option<AclDenial> {
+        match self.users.get(username) {
+            Some(user) => user.denial(username, cmd, args),
+            None => Some(AclDenial::Command(format!(
+                "user {} no longer exists",
+                username
+            ))),
         }
-        // NOTE (#979): there used to be an early `key_patterns.is_empty()`
-        // deny here, ahead of the keyless-command check below. It made a user
-        // with no key patterns unable to run PING, DBSIZE or any other command
-        // that names no key -- redis gates only KEYED commands on key
-        // patterns (`RESETKEYS` then `FLUSHALL` is permitted there). The loop
-        // at the bottom already denies every keyed command when the pattern
-        // list is empty (`any` over nothing is false), so removing the early
-        // return loses no protection.
-        //
-        // ~* (read+write) shortcut -- fast path for users that have
-        // unrestricted keys but restricted commands (so `unrestricted`
-        // above was false for other reasons).
-        if user
-            .key_patterns
-            .iter()
-            .any(|kp| kp.pattern == "*" && kp.read && kp.write)
-        {
-            return None;
-        }
-        // moon#566: key extraction is derived from the command registry's key
-        // specs and fails CLOSED. The old hand-maintained match returned an
-        // empty vec for anything it did not name — and an empty key list does
-        // not mean "check less precisely", it means the loop below never runs,
-        // so every `~pattern` was silently ignored for that command.
-        let keys = match super::keyspec::command_keys(cmd, args) {
-            // The command provably names no key (PING, CONFIG, SUBSCRIBE...):
-            // there is nothing for key patterns to gate.
-            super::keyspec::CommandKeys::None => return None,
-            super::keyspec::CommandKeys::Keys(keys) => keys,
-            // Known (or suspected) to touch keys, but this argv could not be
-            // enumerated: deny, and say so once per command name so a missing
-            // key spec is visible in the log rather than silently permissive.
-            super::keyspec::CommandKeys::Indeterminate => {
-                super::keyspec::warn_indeterminate(cmd);
-                return Some(format!(
-                    "User {} has no permissions to access one of the keys used as arguments to '{}'",
-                    username,
-                    String::from_utf8_lossy(cmd).to_ascii_lowercase()
-                ));
-            }
-        };
-        for key in keys {
-            let key_str = std::str::from_utf8(key).unwrap_or("");
-            let allowed = user.key_patterns.iter().any(|kp| {
-                let access_ok = if is_write { kp.write } else { kp.read };
-                access_ok && crate::command::key::glob_match(kp.pattern.as_bytes(), key)
-            });
-            if !allowed {
-                return Some(format!(
-                    "User {} has no permissions to access key '{}'",
-                    username, key_str
-                ));
-            }
-        }
-        None
     }
 
     /// Check channel access for pub/sub.

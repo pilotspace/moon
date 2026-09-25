@@ -538,7 +538,14 @@ pub(crate) async fn handle_connection_sharded_monoio<
     // c10k C1: reply-write ceiling. 0 = wait forever (pre-C1 behaviour).
     // Read once, like the idle timeout above — this must not touch the lock on
     // the hot path.
-    let (write_timeout, out_cap_normal) = {
+    //
+    // moon#1175: the query-buffer ceilings join the same snapshot. They were
+    // read under the process-global `RuntimeConfig` lock on EVERY read
+    // iteration (and on every hinted read), a lock word every shard thread
+    // bounces. `CONFIG SET` has no arm for either, so they cannot change
+    // after startup and one read per connection is exact. If an arm is ever
+    // added it reaches connections accepted after it, like `write_timeout`.
+    let (write_timeout, out_cap_normal, qbuf_limit, qbuf_preauth) = {
         let rt = ctx.runtime_config.read();
         (
             match rt.client_write_timeout_ms {
@@ -546,6 +553,8 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 ms => Some(std::time::Duration::from_millis(ms)),
             },
             rt.client_output_buffer_limit_normal,
+            rt.client_query_buffer_limit,
+            rt.client_query_buffer_limit_preauth,
         )
     };
 
@@ -716,8 +725,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                                                         if let Some(channel) = extract_bytes(arg) {
                                                             // ACL channel permission check
                                                             let denied = {
-                                                                #[allow(clippy::unwrap_used)] // std RwLock: poison = prior panic = unrecoverable
-                                                                let acl_guard = ctx.acl_table.read().unwrap();
+                                                                let acl_guard = ctx.acl_table.read();
                                                                 acl_guard.check_channel_permission(&conn.current_user, channel.as_ref())
                                                             };
                                                             if let Some(deny_reason) = denied {
@@ -776,8 +784,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                                                     for arg in cmd_args {
                                                         if let Some(channel) = extract_bytes(arg) {
                                                             let denied = {
-                                                                #[allow(clippy::unwrap_used)] // std RwLock: poison = prior panic = unrecoverable
-                                                                let acl_guard = ctx.acl_table.read().unwrap();
+                                                                let acl_guard = ctx.acl_table.read();
                                                                 acl_guard.check_channel_permission(&conn.current_user, channel.as_ref())
                                                             };
                                                             if let Some(deny_reason) = denied {
@@ -890,8 +897,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                                                         if let Some(pattern) = extract_bytes(arg) {
                                                             // ACL channel permission check
                                                             let denied = {
-                                                                #[allow(clippy::unwrap_used)] // std RwLock: poison = prior panic = unrecoverable
-                                                                let acl_guard = ctx.acl_table.read().unwrap();
+                                                                let acl_guard = ctx.acl_table.read();
                                                                 acl_guard.check_channel_permission(&conn.current_user, pattern.as_ref())
                                                             };
                                                             if let Some(deny_reason) = denied {
@@ -1092,9 +1098,8 @@ pub(crate) async fn handle_connection_sharded_monoio<
         // `read_want` the reserve an ordinary read makes in `read_buf` —
         // larger when the incomplete front frame is known to need more
         // (moon#1164: a known bulk remainder in one read, or geometric growth
-        // for a long tail; never for an unauthenticated client). The first
-        // `hinted_read_len` call takes no lock; only a real hint reads the
-        // query-buffer limits.
+        // for a long tail; never for an unauthenticated client). The limits
+        // are the per-connection snapshot (moon#1175): no lock here.
         let park_len = if downshifted {
             idle_park::IDLE_PROBE_BUF
         } else {
@@ -1105,24 +1110,13 @@ pub(crate) async fn handle_connection_sharded_monoio<
             idle_park::IDLE_PROBE_BUF
         } else {
             let pending = codec.parse_state().pending_len();
-            let hinted =
-                super::util::hinted_read_len(read_buf.len(), pending, conn.authenticated, 0, 0)
-                    .and_then(|_| {
-                        let (limit, preauth) = {
-                            let rt = ctx.runtime_config.read();
-                            (
-                                rt.client_query_buffer_limit,
-                                rt.client_query_buffer_limit_preauth,
-                            )
-                        };
-                        super::util::hinted_read_len(
-                            read_buf.len(),
-                            pending,
-                            conn.authenticated,
-                            limit,
-                            preauth,
-                        )
-                    });
+            let hinted = super::util::hinted_read_len(
+                read_buf.len(),
+                pending,
+                conn.authenticated,
+                qbuf_limit,
+                qbuf_preauth,
+            );
             read_grow = hinted.is_some();
             hinted.unwrap_or(read_base)
         };
@@ -1539,14 +1533,13 @@ pub(crate) async fn handle_connection_sharded_monoio<
         // no credentials. Unauthenticated connections get the much smaller
         // pre-auth ceiling; see `util::query_buf_limit`.
         {
-            let (limit, preauth) = {
-                let rt = ctx.runtime_config.read();
-                (
-                    rt.client_query_buffer_limit,
-                    rt.client_query_buffer_limit_preauth,
-                )
-            };
-            if super::util::query_buf_exceeded(read_buf.len(), conn.authenticated, limit, preauth) {
+            // moon#1175: per-connection snapshot, no config lock per read.
+            if super::util::query_buf_exceeded(
+                read_buf.len(),
+                conn.authenticated,
+                qbuf_limit,
+                qbuf_preauth,
+            ) {
                 let (_r, _b): (std::io::Result<usize>, bytes::Bytes) = stream
                     .write_all(bytes::Bytes::from_static(
                         super::util::QUERY_BUF_LIMIT_ERROR,
@@ -1555,6 +1548,14 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 break;
             }
         }
+
+        // moon#1165: re-resolve a stale ACL cache before this batch's gates
+        // read it. Without this one ACL mutation — for ANY user — left every
+        // existing connection off the inline path and on the locked
+        // per-command check until it reconnected. Fail-closed: see
+        // `ConnectionState::refresh_acl_cache_if_stale`. One Acquire load
+        // when nothing changed.
+        conn.refresh_acl_cache_if_stale(&ctx.acl_table);
 
         // Inline dispatch: GET/SET directly from raw bytes, skipping Frame construction.
         // Skip when unauthenticated or workspace-bound (prefix injection in normal path only).
@@ -1569,10 +1570,13 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 .is_replica_mirror
                 .as_ref()
                 .is_some_and(|m| m.load(std::sync::atomic::Ordering::Acquire));
-            // `!tracking_active()`: inline writes bypass the dispatch-path
-            // CLIENT TRACKING invalidation hook, so ANY tracking client in
-            // the process (not just this conn) forces writes through the
-            // normal path. One relaxed atomic load; free when tracking is off.
+            // moon#1166: there used to be a `!tracking_active()` term on the
+            // write gate — inline writes bypassed the dispatch-path CLIENT
+            // TRACKING hook, so ONE idle tracking client anywhere pushed every
+            // connection's SETs off this path (review: -41%). The inline SET
+            // now invalidates the key it wrote itself
+            // (`invalidation::invalidate_inline_write`). A connection that is
+            // itself tracking still stands down (`!tracking_state.enabled`).
             //
             // task #34 (Wave A) fix: `try_inline_dispatch`'s SET fast path
             // (`server::conn::blocking`) does NOT feed the replication
@@ -1776,7 +1780,6 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 && !conn.in_multi
                 && !conn.in_cross_txn()
                 && !conn.tracking_state.enabled
-                && !crate::tracking::tracking_active()
                 && !is_replica
                 && !crate::replication::state::fanout_hint_active();
             // moon#660: refresh the shard's cached clock once per batch, the
@@ -1812,6 +1815,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 conn.selected_db,
                 &ctx.aof_pool,
                 &ctx.repl_state,
+                ctx.repl_write.as_ref(),
                 ctx.cached_clock.ms(),
                 ctx.num_shards,
                 can_inline_reads,
@@ -1828,6 +1832,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 // spill thread, so the inline path must NOT resolve eviction
                 // itself — it stands down to generic dispatch under pressure.
                 spill_sender_active,
+                client_id,
                 &mut probe,
             );
             drop(probe);
@@ -1902,9 +1907,11 @@ pub(crate) async fn handle_connection_sharded_monoio<
             continue;
         }
 
-        // CLIENT PAUSE: delay processing if server is paused
-        crate::client_pause::expire_if_needed();
-        if let Some(remaining) = crate::client_pause::check_pause(true) {
+        // CLIENT PAUSE: delay processing if server is paused. moon#1175: the
+        // gate is one Relaxed load unless a pause may be in force — the old
+        // unconditional `expire_if_needed()` took the process-global PAUSE
+        // WRITE lock on every batch of every shard.
+        if let Some(remaining) = crate::client_pause::batch_pause_remaining() {
             monoio::time::sleep(remaining).await;
         }
 
@@ -2145,6 +2152,14 @@ pub(crate) async fn handle_connection_sharded_monoio<
             // connection-level command names. Cut per-command dispatch cost
             // from ~14 non-matching function calls to ~1 on SET/GET workloads.
             let cmd_len = cmd.len();
+            // moon#1198 item 3: the command's metadata, resolved ONCE. For any
+            // name outside the 24-entry fast table every `metadata::is_write`
+            // is a stack uppercase + UTF-8 check + phf probe, and this loop
+            // asked up to four times per command. `cmd` is not rebound below
+            // (only `cmd_args` is, by the workspace rewrite).
+            let cmd_meta = metadata::lookup(cmd);
+            let cmd_is_write =
+                cmd_meta.is_some_and(|m| m.flags.contains(metadata::CommandFlags::WRITE));
             // MONITOR feed for the two ACL-EXEMPT commands below.
             //
             // AUTH and HELLO carry Redis's NO_AUTH flag and are therefore
@@ -2350,9 +2365,9 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 // moon#1035: the ACL gate above checks command and keys, never
                 // a PUBLISH channel — refuse a denied one HERE so the block
                 // aborts, instead of at EXEC after the rest of it ran.
-                if let Some(err) = crate::server::conn::shared::queued_publish_channel_deny(
+                if let Some(err) = crate::server::conn::shared::conn_queued_publish_channel_deny(
+                    &conn,
                     &ctx.acl_table,
-                    &conn.current_user,
                     cmd,
                     cmd_args,
                 ) {
@@ -2465,7 +2480,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
             // Fail-safe by construction: an unknown command has no metadata and
             // an unmarked one has no bit, so both take the full chain. Only an
             // explicitly-marked command skips it.
-            let skip_name_gates = crate::command::metadata::lookup(cmd).is_some_and(|m| {
+            let skip_name_gates = cmd_meta.is_some_and(|m| {
                 m.flags
                     .contains(crate::command::metadata::CommandFlags::NO_INTERCEPT)
             }) && !conn.in_multi
@@ -2831,19 +2846,20 @@ pub(crate) async fn handle_connection_sharded_monoio<
                     for p in exec_publishes.drain(..) {
                         // Channel ACL gates the txn publish path (C2 security):
                         // a denied channel is patched with NOPERM, never sent.
-                        let patched = match crate::server::conn::shared::publish_channel_acl_deny(
-                            &ctx.acl_table,
-                            &conn.current_user,
-                            &p.channel,
-                        ) {
-                            Some(err) => err,
-                            None => Frame::Integer(
-                                crate::server::conn::shared::publish_post_txn(
-                                    ctx, &shutdown, &p.channel, &p.message, p.kind,
-                                )
-                                .await,
-                            ),
-                        };
+                        let patched =
+                            match crate::server::conn::shared::conn_publish_channel_acl_deny(
+                                &conn,
+                                &ctx.acl_table,
+                                &p.channel,
+                            ) {
+                                Some(err) => err,
+                                None => Frame::Integer(
+                                    crate::server::conn::shared::publish_post_txn(
+                                        ctx, &shutdown, &p.channel, &p.message, p.kind,
+                                    )
+                                    .await,
+                                ),
+                            };
                         if let Frame::Array(items) = &mut responses[exec_idx] {
                             if p.slot < items.len() {
                                 items[p.slot] = patched;
@@ -2962,7 +2978,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
             // the reason is identical — there is no cross-shard undo log.
             let txn_multikey_write = ctx.num_shards > 1
                 && conn.in_cross_txn()
-                && metadata::is_write(cmd)
+                && cmd_is_write
                 && is_multi_key_command(cmd, cmd_args);
             if txn_multikey_write
                 && crate::server::conn::shared::single_owner_shard(cmd, cmd_args, ctx.num_shards)
@@ -3397,11 +3413,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                                 );
                                 0
                             } else {
-                                aof::AofWriterPool::issue_append_lsn(
-                                    &ctx.repl_state,
-                                    ctx.shard_id,
-                                    serialized.len(),
-                                )
+                                ctx.issue_append_lsn(serialized.len())
                             };
                             if let Some(ref pool) = ctx.aof_pool {
                                 // No await since `move_core`: the fold epoch
@@ -3511,11 +3523,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                                     );
                                     0
                                 } else {
-                                    aof::AofWriterPool::issue_append_lsn(
-                                        &ctx.repl_state,
-                                        ctx.shard_id,
-                                        serialized.len(),
-                                    )
+                                    ctx.issue_append_lsn(serialized.len())
                                 };
                                 if let Some(ref pool) = ctx.aof_pool {
                                     // No await since `copy_core` (see MOVE).
@@ -3557,7 +3565,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                     // No DB clause or same-db: fall through to normal write path
                 }
 
-                if metadata::is_write(cmd) {
+                if cmd_is_write {
                     // WRITE PATH: eviction + dispatch via ShardSlice.
                     //
                     // Fast path: when neither maxmemory nor disk-offload is
@@ -3913,11 +3921,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                             let lsn = if repl_active {
                                 0
                             } else {
-                                aof::AofWriterPool::issue_append_lsn(
-                                    &ctx.repl_state,
-                                    ctx.shard_id,
-                                    serialized.len(),
-                                )
+                                ctx.issue_append_lsn(serialized.len())
                             };
                             if let Some(ref pool) = ctx.aof_pool {
                                 match pool
@@ -4089,7 +4093,26 @@ pub(crate) async fn handle_connection_sharded_monoio<
                     // using the original synchronous cold-read path
                     // (`Database::promote_cold_if_present`), unchanged.
                     if cmd.eq_ignore_ascii_case(b"GET") {
-                        if let Some(key) = cmd_args.first().and_then(extract_bytes) {
+                        // moon#1198 item 2: the peek runs under the SHARED
+                        // guard first; only a key that is not hot (the rare
+                        // cold/mid-spill case) takes the exclusive guard the
+                        // promotion needs. The owner is the only mutator of
+                        // this db, so "hot" cannot change before
+                        // `dispatch_read` below. It used to take the exclusive
+                        // guard (and clone the key) for every non-inlined GET.
+                        let key_is_hot = match cmd_args.first() {
+                            Some(Frame::BulkString(k)) => {
+                                crate::shard::slice::with_shard_db_read(conn.selected_db, |db| {
+                                    db.is_hot(k.as_ref())
+                                })
+                            }
+                            _ => false,
+                        };
+                        if let Some(key) = cmd_args
+                            .first()
+                            .filter(|_| !key_is_hot)
+                            .and_then(extract_bytes)
+                        {
                             let peek_now_ms = ctx.cached_clock.ms();
                             let cold_loc =
                                 crate::shard::slice::with_shard_db(conn.selected_db, |db| {
@@ -4194,7 +4217,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
             // (tracking and response push handled inside read/write branches above)
             } else if let Some(target) = target_shard {
                 // TXN cross-shard guard: reject cross-shard writes in active TXN (no undo log).
-                if conn.in_cross_txn() && metadata::is_write(cmd) {
+                if conn.in_cross_txn() && cmd_is_write {
                     // #499: poison the txn — the rejected write is NOT part of the
                     // transaction, so TXN.COMMIT must refuse rather than commit the
                     // accepted subset behind a `+OK`.

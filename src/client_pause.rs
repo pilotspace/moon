@@ -104,6 +104,34 @@ pub fn check_pause(is_write: bool) -> Option<std::time::Duration> {
     Some(state.until - now)
 }
 
+/// Batch-top pause gate for the connection handlers (moon#1175).
+///
+/// Returns how long the batch must wait, or `None` to run it now.
+///
+/// The handlers used to run `expire_if_needed()` + `check_pause(true)` at the
+/// top of every batch: an unconditional PAUSE **write** lock plus a read lock,
+/// on a cache line every shard thread writes, even with no pause ever issued.
+/// The lock-free hint answers the common case: `false` is authoritative (see
+/// [`PAUSE_ANY`]), so nothing is locked unless a pause may be in force. While
+/// the hint reads `true` this is exactly the old sequence, so an expired pause
+/// is still cleared here (which also clears the hint) and an active one still
+/// delays the batch for its remaining time.
+///
+/// Visibility across threads: `CLIENT PAUSE` publishes the hint before its
+/// reply is written, and any command that must observe the pause is causally
+/// after that reply (socket write -> client -> socket read, each ordered by
+/// the kernel's socket locks). The inline SET pre-gate relies on the same
+/// argument.
+#[inline]
+#[must_use]
+pub fn batch_pause_remaining() -> Option<std::time::Duration> {
+    if !pause_possibly_active() {
+        return None;
+    }
+    expire_if_needed();
+    check_pause(true)
+}
+
 /// Clean up expired pause state (called periodically from handlers).
 /// Takes a write lock to avoid TOCTOU between expiry check and clear.
 pub fn expire_if_needed() {
@@ -191,6 +219,66 @@ mod tests {
 
         unpause();
         assert!(check_pause(true).is_none());
+    }
+
+    /// moon#1175: with no pause in force the batch gate must not touch the
+    /// PAUSE lock at all. The test thread holds the WRITE lock — the state a
+    /// concurrent `CLIENT PAUSE`/`UNPAUSE` or another shard's expiry puts it
+    /// in — and the gate must still answer at once.
+    ///
+    /// Reddening mutation (the pre-fix handler sequence): replace the body of
+    /// `batch_pause_remaining` with `expire_if_needed(); check_pause(true)`.
+    /// The call then blocks on the held lock and the deadline assertion fires.
+    #[test]
+    fn batch_gate_takes_no_lock_when_no_pause_is_possible() {
+        let _lock = TEST_LOCK_FN();
+        unpause();
+        assert!(!pause_possibly_active(), "precondition: hint cleared");
+
+        let held = PAUSE.write();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let gate = std::thread::spawn(move || {
+            let r = batch_pause_remaining();
+            let _ = tx.send(r.is_none());
+        });
+        let answered = rx.recv_timeout(std::time::Duration::from_millis(500));
+        drop(held);
+        gate.join().expect("gate thread");
+        assert_eq!(
+            answered,
+            Ok(true),
+            "the batch pause gate took the PAUSE lock with no pause in force \
+             (it blocked behind a held write lock)"
+        );
+    }
+
+    /// The gate still delays while a pause is in force, still honours WRITE
+    /// mode conservatively (batch granularity: every batch waits, as before),
+    /// and clears an expired pause — hint included — when it runs.
+    #[test]
+    fn batch_gate_delays_while_paused_and_clears_on_expiry() {
+        let _lock = TEST_LOCK_FN();
+        unpause();
+        pause(5_000, PauseMode::All);
+        let remaining = batch_pause_remaining().expect("paused: must delay");
+        assert!(remaining > std::time::Duration::from_millis(4_000));
+
+        pause(5_000, PauseMode::Write);
+        assert!(
+            batch_pause_remaining().is_some(),
+            "WRITE mode keeps the conservative per-batch delay"
+        );
+
+        pause(1, PauseMode::All);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        assert!(pause_possibly_active(), "hint stays set until expiry runs");
+        assert!(batch_pause_remaining().is_none(), "expired: no delay");
+        assert!(
+            !pause_possibly_active(),
+            "the gate's expiry pass must clear the hint, or every later batch \
+             keeps paying the lock"
+        );
+        unpause();
     }
 
     #[test]

@@ -10,6 +10,9 @@ mod latency;
 mod memory;
 mod publishers;
 mod recorders;
+mod sharded;
+#[cfg(test)]
+mod tests_1178;
 
 pub use command_metrics::*;
 pub use globals::*;
@@ -18,6 +21,7 @@ pub use latency::*;
 pub use memory::*;
 pub use publishers::*;
 pub use recorders::*;
+pub use sharded::publish_sharded_counters;
 
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 
@@ -41,15 +45,11 @@ static TOTAL_CONNECTIONS: AtomicU64 = AtomicU64::new(0);
 static CONNECTED_CLIENTS: AtomicU64 = AtomicU64::new(0);
 
 // ── spsc-wake-floor (M5): event-driven wake observability ───────────────
-// Bumped at most once per shard-loop wake / per capped drain cycle — never
-// per command — so plain (unsharded) atomics are fine here.
-static SPSC_NOTIFY_WAKES: AtomicU64 = AtomicU64::new(0);
-static SPSC_DRAIN_RENOTIFY: AtomicU64 = AtomicU64::new(0);
-// Busy-poll skip-notify: cross-shard notifies elided because the target
-// shard's driver advertised it is spin-polling (and will discover ringbuf
-// items via its own probe). Per-dispatch rate, but only on the cross-shard
-// path with busy-poll active — plain atomic is fine.
-static SPSC_NOTIFY_SKIPPED: AtomicU64 = AtomicU64::new(0);
+// `spsc_notify_wakes`, `spsc_drain_renotify` and `spsc_notify_skipped` live in
+// [`HOT_COUNTERS`] (moon#1178). They were unsharded globals on the assumption
+// that they fire "never per command", but the cost model (§8.2) measured
+// 1.5-1.8 `spsc_notify_wakes` per command for MSET — every shard core RMW'd
+// one shared line at command rate, the defect moon#774 fixed for the rest.
 
 // ── ft-search-off-eventloop (C5): cooperative-yield observability ────────
 // Bumped once per cooperative yield taken by the FT.SEARCH local slice (the
@@ -110,39 +110,39 @@ pub fn ft_search_cooperative_yields() -> u64 {
 /// token can carry both causes).
 #[inline]
 pub fn bump_spsc_notify_wake() {
-    SPSC_NOTIFY_WAKES.fetch_add(1, Ordering::Relaxed);
+    bump_hot(|s| &s.spsc_notify_wakes, 1);
 }
 
 /// Total shard-loop wakes driven by the cross-shard `Notify` (for INFO Stats).
 #[inline]
 pub fn spsc_notify_wakes() -> u64 {
-    SPSC_NOTIFY_WAKES.load(Ordering::Relaxed)
+    sum_hot(|s| &s.spsc_notify_wakes)
 }
 
 /// Count a self-re-notify issued because `drain_spsc_shared` stopped at the
 /// per-cycle drain cap with messages possibly remaining.
 #[inline]
 pub fn bump_spsc_drain_renotify() {
-    SPSC_DRAIN_RENOTIFY.fetch_add(1, Ordering::Relaxed);
+    bump_hot(|s| &s.spsc_drain_renotify, 1);
 }
 
 /// Total capped-drain self-re-notifies (for INFO Stats).
 #[inline]
 pub fn spsc_drain_renotify() -> u64 {
-    SPSC_DRAIN_RENOTIFY.load(Ordering::Relaxed)
+    sum_hot(|s| &s.spsc_drain_renotify)
 }
 
 /// Count a cross-shard notify elided because the target shard's busy-poll
 /// driver advertised it will discover the ringbuf push via its spin probe.
 #[inline]
 pub fn bump_spsc_notify_skipped() {
-    SPSC_NOTIFY_SKIPPED.fetch_add(1, Ordering::Relaxed);
+    bump_hot(|s| &s.spsc_notify_skipped, 1);
 }
 
 /// Total skip-wake-elided cross-shard notifies (for INFO Stats).
 #[inline]
 pub fn spsc_notify_skipped() -> u64 {
-    SPSC_NOTIFY_SKIPPED.load(Ordering::Relaxed)
+    sum_hot(|s| &s.spsc_notify_skipped)
 }
 
 // ── QW4 (2026-06 review finding 1.6): sharded total-commands counter ────
@@ -229,12 +229,18 @@ pub fn record_replica_apply() {
 // nobody else writes it. Readers sum all slots, and the sum is exact — every
 // increment lands in exactly one slot.
 //
-// The five counters share ONE line per thread rather than taking a line each.
-// A cross-shard GET bumps a keyspace counter AND a dispatch-path counter in
-// the same command; on separate lines that would be two private cache misses
-// where one suffices. 5 × 8 = 40 bytes used, 24 bytes of padding — and the
-// padding is the point, since it is what keeps this thread's line off every
-// other thread's.
+// The per-command counters share ONE line per thread rather than taking a
+// line each. A cross-shard GET bumps a keyspace counter AND a dispatch-path
+// counter in the same command; on separate lines that would be two private
+// cache misses where one suffices. The padding is the point, since it is what
+// keeps this thread's lines off every other thread's.
+//
+// moon#1178: the slot grew to two lines. The two Prometheus-only dispatch
+// paths (`local`, `local_inline`), the published-message count and the three
+// SPSC wake counters joined it, and the Prometheus copies of every counter
+// here are now published from the slot sums at scrape time
+// (`sharded::publish_sharded_counters`) instead of through a registry lookup
+// per event. The first line keeps the five fields a command touches.
 #[repr(align(64))]
 struct HotCounterSlot {
     keyspace_hits: AtomicU64,
@@ -242,6 +248,12 @@ struct HotCounterSlot {
     expired_keys: AtomicU64,
     dispatch_cross_spsc: AtomicU64,
     dispatch_cross_read_fast: AtomicU64,
+    dispatch_local: AtomicU64,
+    dispatch_local_inline: AtomicU64,
+    pubsub_published: AtomicU64,
+    spsc_notify_wakes: AtomicU64,
+    spsc_drain_renotify: AtomicU64,
+    spsc_notify_skipped: AtomicU64,
 }
 
 #[allow(clippy::declare_interior_mutable_const)] // template for static array init only
@@ -251,16 +263,22 @@ const HOT_COUNTER_SLOT_ZERO: HotCounterSlot = HotCounterSlot {
     expired_keys: AtomicU64::new(0),
     dispatch_cross_spsc: AtomicU64::new(0),
     dispatch_cross_read_fast: AtomicU64::new(0),
+    dispatch_local: AtomicU64::new(0),
+    dispatch_local_inline: AtomicU64::new(0),
+    pubsub_published: AtomicU64::new(0),
+    spsc_notify_wakes: AtomicU64::new(0),
+    spsc_drain_renotify: AtomicU64::new(0),
+    spsc_notify_skipped: AtomicU64::new(0),
 };
 
 static HOT_COUNTERS: [HotCounterSlot; COMMAND_COUNTER_SLOTS] =
     [HOT_COUNTER_SLOT_ZERO; COMMAND_COUNTER_SLOTS];
 
-// A slot that outgrew its line would silently re-introduce the defect: two
-// threads' counters would land on one line again. Fail the build instead.
+// A slot that is not a whole number of lines would silently re-introduce the
+// defect: two threads' counters would share a line. Fail the build instead.
 const _: () = assert!(
-    core::mem::size_of::<HotCounterSlot>() == 64,
-    "HotCounterSlot must occupy exactly one 64-byte cache line"
+    core::mem::size_of::<HotCounterSlot>() == 128,
+    "HotCounterSlot must occupy exactly two 64-byte cache lines"
 );
 
 /// Add to one field of THIS thread's hot-counter slot. Hot path: one TLS
@@ -319,6 +337,24 @@ pub(crate) fn bump_dispatch_cross_spsc(n: u64) {
 #[inline]
 pub(crate) fn bump_dispatch_cross_read_fast(n: u64) {
     bump_hot(|s| &s.dispatch_cross_read_fast, n);
+}
+
+/// Add `n` to `moon_dispatch_path_total{path="local"}` (moon#1178).
+#[inline]
+pub(crate) fn bump_dispatch_local(n: u64) {
+    bump_hot(|s| &s.dispatch_local, n);
+}
+
+/// Add `n` to `moon_dispatch_path_total{path="local_inline"}` (moon#1178).
+#[inline]
+pub(crate) fn bump_dispatch_local_inline(n: u64) {
+    bump_hot(|s| &s.dispatch_local_inline, n);
+}
+
+/// Count one published pub/sub message (moon#1178).
+#[inline]
+pub(crate) fn bump_pubsub_published() {
+    bump_hot(|s| &s.pubsub_published, 1);
 }
 
 /// Exact sum across all counter slots. O(64) loads — read paths only
@@ -751,6 +787,7 @@ mod tests {
 
     #[test]
     fn dispatch_path_counters_no_op_before_init() {
+        let _lock = super::tests_1178::metrics_init_test_lock();
         // METRICS_INITIALIZED starts false; all three helpers must early-return.
         // We just assert they do not panic. The absence of a global recorder
         // means counter!() would otherwise be a no-op, but the guard is what
@@ -788,6 +825,7 @@ mod tests {
 
     #[test]
     fn record_command_cached_no_op_before_init() {
+        let _lock = super::tests_1178::metrics_init_test_lock();
         assert!(!METRICS_INITIALIZED.load(Ordering::Relaxed));
         let mut cache = CachedMetricsHandles::new();
         record_command_cached("set", 1, &mut cache);

@@ -34,12 +34,6 @@ use crate::workspace::WorkspaceId;
 
 use super::affinity::{AffinityTracker, MigratedConnectionState};
 
-/// Type alias for std::sync::RwLock to distinguish from parking_lot::RwLock.
-/// `ReplicationState` no longer uses this (task #70 — migrated to
-/// `parking_lot::RwLock`, see `repl_state` below); it remains in use for
-/// `acl_table` and `cluster_state`, which are out of scope for that migration.
-pub(crate) type StdRwLock<T> = std::sync::RwLock<T>;
-
 /// Immutable context shared across all connections on a shard.
 ///
 /// Created once per shard and passed by reference to each connection handler.
@@ -66,11 +60,17 @@ pub(crate) struct ConnectionContext {
     /// dispatch by `try_enforce_readonly` to avoid the per-command RwLock CAS.
     /// `None` when replication is disabled entirely.
     pub is_replica_mirror: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// Lock-free write-path handle to this shard's replication state
+    /// (moon#1176): LSN issue, the fan-out probe and backlog recording, none
+    /// of which may take `repl_state`'s process-wide `RwLock` per write.
+    /// Built once in `new()`, like `is_replica_mirror`. `None` when
+    /// replication is disabled entirely.
+    pub repl_write: Option<crate::replication::state::ReplWriteHandle>,
     pub cluster_state: Option<Arc<parking_lot::RwLock<crate::cluster::ClusterState>>>,
     pub lua: Rc<mlua::Lua>,
     pub script_cache: Rc<RefCell<crate::scripting::ScriptCache>>,
     pub config_port: u16,
-    pub acl_table: Arc<StdRwLock<AclTable>>,
+    pub acl_table: Arc<parking_lot::RwLock<AclTable>>,
     pub runtime_config: Arc<parking_lot::RwLock<RuntimeConfig>>,
     pub config: Arc<ServerConfig>,
     pub dispatch_tx: Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
@@ -113,7 +113,7 @@ impl ConnectionContext {
         lua: Rc<mlua::Lua>,
         script_cache: Rc<RefCell<crate::scripting::ScriptCache>>,
         config_port: u16,
-        acl_table: Arc<StdRwLock<AclTable>>,
+        acl_table: Arc<parking_lot::RwLock<AclTable>>,
         runtime_config: Arc<parking_lot::RwLock<RuntimeConfig>>,
         config: Arc<ServerConfig>,
         dispatch_tx: Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
@@ -136,9 +136,16 @@ impl ConnectionContext {
         // try_enforce_readonly can avoid taking the RwLock per command.
         // The Arc is cloned out under the read-lock once at connection setup;
         // ReplicationState::set_role() updates the same AtomicBool thereafter.
-        let is_replica_mirror = repl_state
-            .as_ref()
-            .map(|rs| rs.read().is_replica_mirror.clone());
+        let (is_replica_mirror, repl_write) = match repl_state.as_ref() {
+            Some(rs) => {
+                let g = rs.read();
+                (
+                    Some(g.is_replica_mirror.clone()),
+                    Some(g.write_handle(rs, shard_id)),
+                )
+            }
+            None => (None, None),
+        };
         Self {
             shard_databases,
             shard_id,
@@ -150,6 +157,7 @@ impl ConnectionContext {
             tracking_table,
             repl_state,
             is_replica_mirror,
+            repl_write,
             cluster_state,
             lua,
             script_cache,
@@ -169,6 +177,14 @@ impl ConnectionContext {
             spill_file_id,
             disk_offload_dir,
         }
+    }
+
+    /// Issue the AOF LSN for a `delta`-byte record written on this shard —
+    /// `AofWriterPool::issue_append_lsn` through the lock-free handle
+    /// (moon#1176). 0 when replication is disabled (the same sentinel).
+    #[inline]
+    pub fn issue_append_lsn(&self, delta: usize) -> u64 {
+        self.repl_write.as_ref().map_or(0, |h| h.issue_lsn(delta))
     }
 
     /// Build the eviction context for FCALL-internal `redis.call` writes
@@ -272,6 +288,14 @@ pub(crate) struct ConnectionState {
     /// pointer stays stable across ACL LOAD because the table uses
     /// `replace_with` to preserve the counter's identity.
     pub acl_version_handle: Arc<std::sync::atomic::AtomicU64>,
+
+    /// The table entry `refresh_acl_cache` resolved `current_user` to, at
+    /// `cached_acl_version` (moon#1165). `None` for a user missing from the
+    /// table. Lets a RESTRICTED connection run its per-command check against
+    /// this immutable snapshot instead of taking the process-wide table lock
+    /// and hashing its username twice per command — see
+    /// [`Self::acl_denial`] for when it may be trusted.
+    pub acl_cache_user: Option<Arc<crate::acl::AclUser>>,
 
     // Pub/Sub
     pub subscription_count: usize,
@@ -458,6 +482,7 @@ impl ConnectionState {
             // to the placeholder and bypass the lock-free staleness check;
             // the first `refresh_acl_cache()` call eliminates that window.
             acl_version_handle: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            acl_cache_user: None,
         }
     }
 
@@ -478,7 +503,11 @@ impl ConnectionState {
     ///
     /// The registry write takes a stripe lock, which is fine here: AUTH and
     /// HELLO are per-session events, never the steady-state batch loop.
-    pub fn adopt_user(&mut self, username: String, acl_table: &StdRwLock<crate::acl::AclTable>) {
+    pub fn adopt_user(
+        &mut self,
+        username: String,
+        acl_table: &parking_lot::RwLock<crate::acl::AclTable>,
+    ) {
         self.current_user = username;
         self.refresh_acl_cache(acl_table);
         let user = self.current_user.clone();
@@ -492,18 +521,49 @@ impl ConnectionState {
     /// `acl_version_handle` pointing at the table's real counter, so this
     /// function always refreshes the handle (cheap Arc clone).  Reading
     /// the handle and the user data in the same critical section ensures
-    /// the snapshot stays consistent: any mutator bumps the version only
-    /// after releasing the write lock via Drop, so we cannot observe a
-    /// post-mutation version with pre-mutation user data.
+    /// the snapshot stays consistent: every mutator bumps the version inside
+    /// its write-locked `&mut AclTable` method (`set_user`, `del_user`,
+    /// `try_apply_setuser`, `replace_with`), so a reader holding the read
+    /// guard sees data and version from the same side of every mutation.
     #[inline]
-    pub fn refresh_acl_cache(&mut self, acl_table: &StdRwLock<crate::acl::AclTable>) {
-        // std RwLock: poison = prior panic = unrecoverable. Same convention
-        // used throughout the server for the acl_table lock.
-        #[allow(clippy::unwrap_used)]
-        let guard = acl_table.read().unwrap();
+    pub fn refresh_acl_cache(&mut self, acl_table: &parking_lot::RwLock<crate::acl::AclTable>) {
+        let guard = acl_table.read();
         self.acl_version_handle = guard.version_handle();
-        self.cached_acl_unrestricted = guard.is_user_unrestricted(&self.current_user);
+        self.acl_cache_user = guard.get_user_arc(&self.current_user);
+        self.cached_acl_unrestricted = self
+            .acl_cache_user
+            .as_ref()
+            .is_some_and(|u| u.unrestricted());
         self.cached_acl_version = guard.version();
+    }
+
+    /// Batch-top ACL cache maintenance (moon#1165): re-resolve the cache once
+    /// the table has moved on, so ONE `ACL SETUSER`/`DELUSER`/`LOAD` —
+    /// for any user, including one nobody is connected as — no longer leaves
+    /// every existing connection on the locked per-command check (and off the
+    /// inline GET/SET path) for the rest of its life.
+    ///
+    /// Fail-closed by construction, whatever the interleaving:
+    /// - this only changes what the cache SAYS; every command still gates on
+    ///   [`Self::acl_skip_allowed`], which re-checks freshness per command, so a
+    ///   mutation landing after this refresh (mid-batch) sends the very next
+    ///   command back to the full check against the live table;
+    /// - the refresh reads the unrestricted verdict and the version under ONE
+    ///   read guard, and mutators bump the version while holding the write
+    ///   guard, so the pair is consistent (never "new version, old verdict");
+    /// - a user that became restricted, was deleted, or was disabled caches
+    ///   `false` — the full check then answers NOPERM exactly as before.
+    ///
+    /// It never changes `current_user` (identity changes stay with
+    /// AUTH/HELLO/RESET). Cost when nothing changed: one Acquire load.
+    #[inline]
+    pub fn refresh_acl_cache_if_stale(
+        &mut self,
+        acl_table: &parking_lot::RwLock<crate::acl::AclTable>,
+    ) {
+        if !self.acl_cache_fresh() {
+            self.refresh_acl_cache(acl_table);
+        }
     }
 
     /// Lock-free check: is the cached unrestricted flag still valid?
@@ -530,6 +590,79 @@ impl ConnectionState {
     #[inline]
     pub fn acl_skip_allowed(&self) -> bool {
         self.cached_acl_unrestricted && self.acl_cache_fresh()
+    }
+
+    /// [`Self::acl_skip_allowed`] for the permission checks OUTSIDE the
+    /// per-command gate — PUBLISH/SPUBLISH channels, the EXEC-time publish
+    /// re-check, a script's inner `redis.call`s (moon#1165). They used to take
+    /// the table lock for every caller; they skip it only when the cached
+    /// verdict is fresh, unrestricted AND was resolved for the identity the
+    /// connection has now (the same conservative bind as
+    /// [`Self::acl_snapshot`]), so no skip is ever granted on a verdict
+    /// resolved for another name.
+    #[inline]
+    pub fn acl_skip_allowed_for_current_user(&self) -> bool {
+        self.acl_skip_allowed()
+            && self
+                .acl_cache_user
+                .as_ref()
+                .is_some_and(|u| u.username == self.current_user)
+    }
+
+    /// The ACL identity a script run by this connection executes under
+    /// (moon#569). For a user that may skip ACL checks, built from the
+    /// connection's cached (version, verdict) pair without the table lock
+    /// (moon#1165); otherwise resolved under the lock as before. Either way
+    /// every inner `redis.call` re-checks the version, so a mutation during
+    /// the script still bites on its next call.
+    pub fn script_acl(
+        &self,
+        acl_table: &Arc<parking_lot::RwLock<crate::acl::AclTable>>,
+    ) -> crate::acl::ScriptAcl {
+        if self.acl_skip_allowed_for_current_user() {
+            crate::acl::ScriptAcl::for_unrestricted_at(
+                acl_table,
+                &self.current_user,
+                Arc::clone(&self.acl_version_handle),
+                self.cached_acl_version,
+            )
+        } else {
+            crate::acl::ScriptAcl::for_user(acl_table, &self.current_user)
+        }
+    }
+
+    /// This connection's resolved user, when the snapshot may stand in for
+    /// the live table: the table has not changed since it was taken
+    /// (`acl_cache_fresh`) AND it was resolved for the name the connection
+    /// runs as now. The name comparison is a conservative belt: a snapshot is
+    /// never consulted for a name it was not resolved for — the check then
+    /// takes the locked lookup, exactly as it did before snapshots existed.
+    #[inline]
+    pub fn acl_snapshot(&self) -> Option<&crate::acl::AclUser> {
+        let user = self.acl_cache_user.as_deref()?;
+        (self.acl_cache_fresh() && user.username == self.current_user).then_some(user)
+    }
+
+    /// The dispatch-time ACL gate for one command (all three handlers):
+    /// `None` = run it, `Some` = refuse with this reason (moon#1165).
+    ///
+    /// The caller has already taken the `acl_skip_allowed()` fast path for an
+    /// unrestricted user. A restricted user is checked against
+    /// [`Self::acl_snapshot`] — no table lock, no username hashing — and falls
+    /// back to one locked lookup (command + keys under one guard) when the
+    /// snapshot cannot be trusted. Fail-closed either way: the snapshot is an
+    /// immutable copy of the entry as of a version that is re-verified per
+    /// command, and a missing user is denied.
+    pub fn acl_denial(
+        &self,
+        acl_table: &parking_lot::RwLock<crate::acl::AclTable>,
+        cmd: &[u8],
+        args: &[Frame],
+    ) -> Option<crate::acl::AclDenial> {
+        if let Some(user) = self.acl_snapshot() {
+            return user.denial(&self.current_user, cmd, args);
+        }
+        acl_table.read().check_denial(&self.current_user, cmd, args)
     }
 
     /// Check if connection is bound to a workspace.
@@ -696,4 +829,334 @@ pub(crate) enum CoreAction {
     Close,
     /// Migrate connection to a different shard.
     Migrate { target_shard: usize },
+}
+
+#[cfg(test)]
+mod acl_cache_tests {
+    use super::*;
+    use bytes::Bytes;
+
+    fn conn() -> ConnectionState {
+        ConnectionState::new(1, "127.0.0.1:1".into(), &None, 0, 1, false, 16, None)
+    }
+
+    fn table() -> parking_lot::RwLock<AclTable> {
+        let mut t = AclTable::new();
+        t.ensure_default_user(None);
+        parking_lot::RwLock::new(t)
+    }
+
+    /// moon#1165: an unrelated mutation stales the cache; the batch-top
+    /// refresh brings an unrestricted connection back to the skip path.
+    #[test]
+    fn stale_cache_is_refreshed_back_to_skip_for_an_unrestricted_user() {
+        let table = table();
+        let mut c = conn();
+        c.refresh_acl_cache(&table);
+        assert!(c.acl_skip_allowed());
+
+        table
+            .write()
+            .apply_setuser("probe", &["on", "nopass", "+ping"]);
+        assert!(!c.acl_skip_allowed(), "a mutation must stale the cache");
+        c.refresh_acl_cache_if_stale(&table);
+        assert!(
+            c.acl_skip_allowed(),
+            "after the refresh the unrestricted default user skips again"
+        );
+    }
+
+    /// Fail-closed: when the mutation restricts THIS connection's user, the
+    /// refresh caches `false` — the full check keeps running.
+    #[test]
+    fn refresh_after_revocation_caches_restricted() {
+        let table = table();
+        let mut c = conn();
+        c.refresh_acl_cache(&table);
+        table.write().apply_setuser("default", &["-get"]);
+        c.refresh_acl_cache_if_stale(&table);
+        assert!(
+            !c.acl_skip_allowed(),
+            "revoked user must not skip the check"
+        );
+
+        // A deleted user never caches unrestricted either.
+        c.current_user = "ghost".into();
+        table.write().apply_setuser("default", &["+get"]);
+        c.refresh_acl_cache_if_stale(&table);
+        assert!(!c.acl_skip_allowed(), "an unknown user must not skip");
+    }
+
+    fn bulk(words: &[&str]) -> Vec<Frame> {
+        words
+            .iter()
+            .map(|w| Frame::BulkString(Bytes::copy_from_slice(w.as_bytes())))
+            .collect()
+    }
+
+    fn restricted_table() -> parking_lot::RwLock<AclTable> {
+        let t = table();
+        t.write().apply_setuser(
+            "alice",
+            &[
+                "on",
+                "nopass",
+                "~app:*",
+                "+get",
+                "+set",
+                "-config|set",
+                "+config",
+            ],
+        );
+        t.write()
+            .apply_setuser("bob", &["on", "nopass", "~*", "-@all", "+get"]);
+        t
+    }
+
+    /// moon#1165: the snapshot verdict is exactly the locked table verdict —
+    /// command, first-arg rule, key pattern, allowed and denied.
+    #[test]
+    fn snapshot_verdict_matches_the_locked_table() {
+        let table = restricted_table();
+        let mut c = conn();
+        c.current_user = "alice".into();
+        c.refresh_acl_cache(&table);
+        assert!(!c.acl_skip_allowed(), "alice is restricted");
+        assert!(c.acl_snapshot().is_some(), "fresh snapshot for alice");
+        let cases: &[&[&str]] = &[
+            &["GET", "app:1"],
+            &["get", "other"],
+            &["SET", "app:1", "v"],
+            &["SET", "nope", "v"],
+            &["DEL", "app:1"],
+            &["CONFIG", "GET", "maxmemory"],
+            &["CONFIG", "SET", "maxmemory", "1"],
+            &["config", "set", "maxmemory", "1"],
+            &["PING"],
+            &["MGET", "app:1", "other"],
+        ];
+        for argv in cases {
+            let cmd = argv[0].as_bytes();
+            let args = bulk(&argv[1..]);
+            let locked = {
+                let g = table.read();
+                g.check_command_permission("alice", cmd, &args)
+                    .map(crate::acl::AclDenial::Command)
+                    .or_else(|| {
+                        let w = crate::command::metadata::is_write(cmd);
+                        g.check_key_permission("alice", cmd, &args, w)
+                            .map(crate::acl::AclDenial::Key)
+                    })
+            };
+            assert_eq!(c.acl_denial(&table, cmd, &args), locked, "argv {argv:?}");
+        }
+    }
+
+    /// The point of the snapshot: a restricted connection's per-command check
+    /// takes no table lock. The test thread holds the WRITE lock.
+    ///
+    /// Reddening mutation: make `acl_denial` always take the locked path
+    /// (`acl_table.read().check_denial(..)`) — the check then blocks behind
+    /// the held lock and the deadline fires.
+    #[test]
+    fn restricted_check_takes_no_table_lock() {
+        let table = std::sync::Arc::new(restricted_table());
+        let mut c = conn();
+        c.current_user = "alice".into();
+        c.refresh_acl_cache(&table);
+        let held = table.write();
+        let t2 = std::sync::Arc::clone(&table);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let checker = std::thread::spawn(move || {
+            let d1 = c.acl_denial(&t2, b"GET", &bulk(&["app:1"]));
+            let d2 = c.acl_denial(&t2, b"GET", &bulk(&["other"]));
+            let _ = tx.send((d1.is_none(), d2.is_some()));
+        });
+        let got = rx.recv_timeout(std::time::Duration::from_millis(500));
+        drop(held);
+        #[allow(clippy::unwrap_used)] // test thread
+        checker.join().unwrap();
+        assert_eq!(
+            got,
+            Ok((true, true)),
+            "a restricted connection's ACL check took the process-wide table \
+             lock (it blocked behind a held write lock)"
+        );
+    }
+
+    /// Fail-closed: a mutation after the snapshot makes the next check use
+    /// the live table — a revocation bites at once, and so does a deletion.
+    #[test]
+    fn stale_snapshot_is_never_trusted() {
+        let table = restricted_table();
+        let mut c = conn();
+        c.current_user = "alice".into();
+        c.refresh_acl_cache(&table);
+        assert!(c.acl_denial(&table, b"GET", &bulk(&["app:1"])).is_none());
+        table.write().apply_setuser("alice", &["-get"]);
+        assert!(
+            c.acl_snapshot().is_none(),
+            "stale snapshot must not be offered"
+        );
+        assert!(
+            matches!(
+                c.acl_denial(&table, b"GET", &bulk(&["app:1"])),
+                Some(crate::acl::AclDenial::Command(_))
+            ),
+            "revoked GET must be denied before any refresh"
+        );
+        table.write().del_user("alice");
+        c.refresh_acl_cache_if_stale(&table);
+        assert!(
+            matches!(
+                c.acl_denial(&table, b"PING", &[]),
+                Some(crate::acl::AclDenial::Command(_))
+            ),
+            "a deleted user is denied"
+        );
+    }
+
+    /// The snapshot is keyed to the name it was resolved for: a check for any
+    /// other name resolves that name under the lock instead.
+    #[test]
+    fn snapshot_is_bound_to_the_name_it_was_resolved_for() {
+        let table = restricted_table();
+        let mut c = conn();
+        c.current_user = "bob".into();
+        c.refresh_acl_cache(&table);
+        c.current_user = "alice".into();
+        assert!(
+            c.acl_snapshot().is_none(),
+            "bob's snapshot must not serve alice"
+        );
+        // alice may SET app:*; bob (`-@all +get`) may not — alice's verdict wins.
+        assert!(
+            c.acl_denial(&table, b"SET", &bulk(&["app:1", "v"]))
+                .is_none()
+        );
+    }
+
+    /// Copy-on-write: mutating a user never changes a snapshot already held.
+    #[test]
+    fn mutation_does_not_touch_a_held_snapshot() {
+        let table = restricted_table();
+        let snap = table.read().get_user_arc("alice");
+        #[allow(clippy::unwrap_used)] // present by construction
+        let snap = snap.unwrap();
+        table.write().apply_setuser("alice", &["-get"]);
+        if let Some(u) = table.write().get_user_mut("alice") {
+            u.enabled = false;
+        }
+        assert!(snap.enabled, "held snapshot changed under its reader");
+        assert!(
+            snap.command_denial("alice", b"GET", &bulk(&["app:1"]))
+                .is_none()
+        );
+    }
+
+    /// Runs `f` on another thread while the test holds the table WRITE lock;
+    /// `Ok` iff `f` finished within the deadline (i.e. took no table lock).
+    fn runs_without_the_table_lock<T: Send + 'static>(
+        table: &std::sync::Arc<parking_lot::RwLock<AclTable>>,
+        f: impl FnOnce() -> T + Send + 'static,
+    ) -> Result<T, std::sync::mpsc::RecvTimeoutError> {
+        let held = table.write();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let _ = tx.send(f());
+        });
+        let got = rx.recv_timeout(std::time::Duration::from_millis(500));
+        drop(held);
+        #[allow(clippy::unwrap_used)] // test thread
+        worker.join().unwrap();
+        got
+    }
+
+    /// moon#1165: an unrestricted connection builds its script identity and
+    /// clears a PUBLISH channel check without the table lock.
+    ///
+    /// Reddening mutation: make `script_acl` always call
+    /// `ScriptAcl::for_user` (or drop the skip in
+    /// `conn_publish_channel_acl_deny`) — the worker blocks behind the held
+    /// write lock and the deadline fires.
+    #[test]
+    fn unrestricted_script_and_publish_checks_take_no_table_lock() {
+        let table = std::sync::Arc::new(table());
+        let mut c = conn();
+        c.refresh_acl_cache(&table);
+        assert!(c.acl_skip_allowed_for_current_user());
+        let t2 = std::sync::Arc::clone(&table);
+        let got = runs_without_the_table_lock(&table, move || {
+            let acl = c.script_acl(&t2);
+            let script_ok = acl.check(b"GET", &bulk(&["k"])).is_none();
+            let publish_ok =
+                crate::server::conn::shared::conn_publish_channel_acl_deny(&c, &t2, b"news")
+                    .is_none();
+            (script_ok, publish_ok)
+        });
+        assert_eq!(
+            got,
+            Ok((true, true)),
+            "an unrestricted connection's script identity / PUBLISH channel \
+             check took the process-wide ACL table lock"
+        );
+    }
+
+    /// The lock-free script identity is exactly as strict as the locked one:
+    /// a revocation after it was built bites on the next `redis.call`.
+    #[test]
+    fn lock_free_script_identity_still_sees_a_revocation() {
+        let table = std::sync::Arc::new(table());
+        let mut c = conn();
+        c.refresh_acl_cache(&table);
+        let acl = c.script_acl(&table);
+        assert!(acl.check(b"GET", &bulk(&["k"])).is_none());
+        table.write().apply_setuser("default", &["-get"]);
+        assert!(
+            acl.check(b"GET", &bulk(&["k"])).is_some(),
+            "a revoked command must be refused inside a running script"
+        );
+    }
+
+    /// The skip is bound to the name the verdict was resolved for: for any
+    /// other name the checks resolve that name under the lock.
+    #[test]
+    fn publish_and_script_skip_is_bound_to_the_resolved_name() {
+        let table = std::sync::Arc::new(restricted_table());
+        table
+            .write()
+            .apply_setuser("carol", &["on", "nopass", "~*", "&allowed", "+@all"]);
+        let mut c = conn();
+        c.refresh_acl_cache(&table); // resolved for `default` (unrestricted)
+        c.current_user = "carol".into();
+        assert!(!c.acl_skip_allowed_for_current_user());
+        assert!(
+            crate::server::conn::shared::conn_publish_channel_acl_deny(&c, &table, b"secret")
+                .is_some(),
+            "carol may only publish to `allowed`"
+        );
+        assert!(
+            c.script_acl(&table).is_enforcing()
+                && crate::server::conn::shared::conn_publish_channel_acl_deny(
+                    &c, &table, b"allowed"
+                )
+                .is_none()
+        );
+    }
+
+    /// A fresh cache is left alone (no lock taken): the refresh is a no-op.
+    #[test]
+    fn fresh_cache_is_not_re_resolved() {
+        let table = table();
+        let mut c = conn();
+        c.refresh_acl_cache(&table);
+        // Poison the cached verdict without touching the version: a refresh
+        // that re-resolved would overwrite it.
+        c.cached_acl_unrestricted = false;
+        c.refresh_acl_cache_if_stale(&table);
+        assert!(
+            !c.cached_acl_unrestricted,
+            "a fresh cache must not re-resolve"
+        );
+    }
 }

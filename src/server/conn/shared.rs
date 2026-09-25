@@ -980,11 +980,7 @@ pub(crate) async fn persist_txn_aof(
         let lsn = if repl_recorded {
             0
         } else {
-            crate::persistence::aof::AofWriterPool::issue_append_lsn(
-                &ctx.repl_state,
-                ctx.shard_id,
-                bytes.len(),
-            )
+            ctx.issue_append_lsn(bytes.len())
         };
         match pool
             .send_append_group(ctx.shard_id, lsn, db, bytes, fold_stamp)
@@ -1142,12 +1138,11 @@ mod exec_publish_queue_tests {
 /// which poisons the transaction as redis does; this EXEC-time check remains
 /// for rules that change between queue and EXEC.
 pub(crate) fn publish_channel_acl_deny(
-    acl_table: &std::sync::RwLock<crate::acl::AclTable>,
+    acl_table: &parking_lot::RwLock<crate::acl::AclTable>,
     user: &str,
     channel: &[u8],
 ) -> Option<Frame> {
-    #[allow(clippy::unwrap_used)] // std RwLock: poison = prior panic = unrecoverable
-    let guard = acl_table.read().unwrap();
+    let guard = acl_table.read();
     guard
         .check_channel_permission(user, channel)
         .map(|reason| Frame::Error(Bytes::from(format!("NOPERM {reason}"))))
@@ -1179,7 +1174,7 @@ pub(crate) fn publish_channel_acl_deny(
 /// A malformed argv (no channel) returns `None`; the queue gate's arity check
 /// has already refused it.
 pub(crate) fn queued_publish_channel_deny(
-    acl_table: &std::sync::RwLock<crate::acl::AclTable>,
+    acl_table: &parking_lot::RwLock<crate::acl::AclTable>,
     user: &str,
     cmd: &[u8],
     args: &[Frame],
@@ -1194,6 +1189,34 @@ pub(crate) fn queued_publish_channel_deny(
     publish_channel_acl_deny(acl_table, user, channel)
 }
 
+/// [`publish_channel_acl_deny`] for a connection (moon#1165): no table lock
+/// when the connection's fresh cached verdict says its current user is
+/// unrestricted — the check would return `None` for it.
+pub(crate) fn conn_publish_channel_acl_deny(
+    conn: &super::core::ConnectionState,
+    acl_table: &parking_lot::RwLock<crate::acl::AclTable>,
+    channel: &[u8],
+) -> Option<Frame> {
+    if conn.acl_skip_allowed_for_current_user() {
+        return None;
+    }
+    publish_channel_acl_deny(acl_table, &conn.current_user, channel)
+}
+
+/// [`queued_publish_channel_deny`] for a connection (moon#1165): the same
+/// lock-free skip as [`conn_publish_channel_acl_deny`].
+pub(crate) fn conn_queued_publish_channel_deny(
+    conn: &super::core::ConnectionState,
+    acl_table: &parking_lot::RwLock<crate::acl::AclTable>,
+    cmd: &[u8],
+    args: &[Frame],
+) -> Option<Frame> {
+    if conn.acl_skip_allowed_for_current_user() {
+        return None;
+    }
+    queued_publish_channel_deny(acl_table, &conn.current_user, cmd, args)
+}
+
 /// Command-level ACL gate for the pub/sub intercepts (H-3). PUBLISH/SUBSCRIBE/
 /// PSUBSCRIBE are handled BEFORE the generic ACL gate in every handler, so
 /// without this the command-level `+`/`-`/`-@pubsub` rules were never
@@ -1206,13 +1229,12 @@ pub(crate) fn queued_publish_channel_deny(
 /// default (monoio) build doesn't flag it as dead code.
 #[cfg(feature = "runtime-tokio")]
 pub(crate) fn pubsub_command_acl_deny(
-    acl_table: &std::sync::RwLock<crate::acl::AclTable>,
+    acl_table: &parking_lot::RwLock<crate::acl::AclTable>,
     user: &str,
     cmd: &[u8],
     cmd_args: &[Frame],
 ) -> Option<Frame> {
-    #[allow(clippy::unwrap_used)] // std RwLock: poison = prior panic = unrecoverable
-    let guard = acl_table.read().unwrap();
+    let guard = acl_table.read();
     guard
         .check_command_permission(user, cmd, cmd_args)
         .map(|reason| Frame::Error(Bytes::from(format!("NOPERM {reason}"))))
@@ -6685,13 +6707,13 @@ mod queued_publish_channel_tests {
     use crate::protocol::Frame;
     use bytes::Bytes;
 
-    fn table() -> std::sync::RwLock<AclTable> {
+    fn table() -> parking_lot::RwLock<AclTable> {
         let mut t = AclTable::new();
         t.apply_setuser(
             "c",
             &["on", "nopass", "~*", "resetchannels", "&allowed", "+@all"],
         );
-        std::sync::RwLock::new(t)
+        parking_lot::RwLock::new(t)
     }
 
     fn argv(parts: &[&str]) -> Vec<Frame> {

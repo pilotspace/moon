@@ -51,6 +51,11 @@ pub fn invalidate_after_write(
     if !crate::command::metadata::is_write(cmd) {
         return;
     }
+    // moon#1166: nothing tracked and no BCAST prefix — no write can match,
+    // so skip even the key extraction (the idle-tracker case).
+    if crate::tracking::is_global(table) && crate::tracking::global_table_idle() {
+        return;
+    }
     let keys = written_keys(cmd, cmd_args);
     invalidate_keys(table, &keys, writer_client_id);
 }
@@ -130,6 +135,9 @@ pub fn invalidate_after_blocking_serve(
     if !crate::tracking::tracking_active() {
         return;
     }
+    if crate::tracking::is_global(table) && crate::tracking::global_table_idle() {
+        return;
+    }
     let keys = blocking_served_keys(cmd, cmd_args, reply);
     invalidate_keys(table, &keys, writer_client_id);
 }
@@ -144,6 +152,13 @@ pub fn invalidate_keys(
     writer_client_id: u64,
 ) {
     if keys.is_empty() {
+        return;
+    }
+    // moon#1166: a write to keys nobody tracks (and no BCAST prefix) never
+    // takes the table lock — see the pre-filter in `tracking`.
+    if crate::tracking::is_global(table)
+        && !keys.iter().any(|k| crate::tracking::global_may_track(k))
+    {
         return;
     }
     // One item per REDIRECT inbox for the whole key list, or for the whole
@@ -193,10 +208,33 @@ const SERVER_REMOVAL_WRITER: u64 = 0;
 /// route a cross-shard write takes, with nothing to await.
 #[inline]
 pub fn invalidate_server_removed(key: &[u8]) {
-    if !crate::tracking::tracking_active() {
+    if !crate::tracking::tracking_active() || !crate::tracking::global_may_track(key) {
         return;
     }
     invalidate_server_removed_in(&crate::tracking::global_table(), key);
+}
+
+/// Invalidation for a key the inline SET fast path just wrote (moon#1166).
+///
+/// The inline path is no longer switched off server-wide while anyone
+/// tracks: it invalidates the key it wrote itself, through the same table
+/// and routing as every other write. Hot-path contract: nobody tracking is
+/// one relaxed load; somebody tracking but not this key is a hash and one
+/// load — no copy, no lock.
+#[inline]
+pub fn invalidate_inline_write(key: &[u8], writer_client_id: u64) {
+    if !crate::tracking::tracking_active() || !crate::tracking::global_may_track(key) {
+        return;
+    }
+    invalidate_inline_write_slow(key, writer_client_id);
+}
+
+#[cold]
+#[inline(never)]
+fn invalidate_inline_write_slow(key: &[u8], writer_client_id: u64) {
+    if let Some(table) = crate::tracking::global_table_ref() {
+        invalidate_keys(table, &[Bytes::copy_from_slice(key)], writer_client_id);
+    }
 }
 
 /// [`invalidate_server_removed`] against an explicit table (unit tests; the
@@ -646,6 +684,52 @@ mod tests {
         t.untrack_all(10);
         t.untrack_all(11);
         t.untrack_all(12);
+    }
+
+    /// moon#1166: a write to a key nobody tracks never takes the global
+    /// table's lock. The test holds that lock while a worker invalidates an
+    /// untracked key. Red on ae21476: `invalidate_keys` always locked, so the
+    /// worker blocks until the deadline.
+    #[test]
+    fn untracked_write_takes_no_global_table_lock() {
+        let table = crate::tracking::global_table();
+        let held = table.lock();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let t = crate::tracking::global_table();
+            invalidate_keys(&t, &[Bytes::from_static(b"ws7:1166:never-tracked")], 0);
+            let _ = tx.send(());
+        });
+        let got = rx.recv_timeout(std::time::Duration::from_millis(500));
+        drop(held);
+        worker.join().expect("worker");
+        assert!(
+            got.is_ok(),
+            "a write to an untracked key took the process-wide tracking lock \
+             (it blocked behind a held table lock)"
+        );
+    }
+
+    /// ... and a key that IS tracked still gets its invalidation, through the
+    /// pre-filter, from both the generic entry point and the inline SET's.
+    #[test]
+    fn tracked_key_still_invalidates_through_the_prefilter() {
+        let tracker = test_support::GlobalTracker::tracking(b"ws7:1166:tracked");
+        invalidate_keys(
+            &crate::tracking::global_table(),
+            &[Bytes::from_static(b"ws7:1166:tracked")],
+            0,
+        );
+        assert_eq!(
+            tracker.invalidated_keys(),
+            vec![Bytes::from_static(b"ws7:1166:tracked")]
+        );
+        let tracker = test_support::GlobalTracker::tracking(b"ws7:1166:inline");
+        invalidate_inline_write(b"ws7:1166:inline", 0);
+        assert_eq!(
+            tracker.invalidated_keys(),
+            vec![Bytes::from_static(b"ws7:1166:inline")]
+        );
     }
 
     /// The public entry point reaches the GLOBAL table.

@@ -95,6 +95,7 @@ fn inline_get_and_set_are_observed_by_the_probe() {
             0,
             &aof_pool,
             &None,
+            None,
             0,
             1,
             reads,
@@ -102,6 +103,7 @@ fn inline_get_and_set_are_observed_by_the_probe() {
             false,
             &rt_config,
             false,
+            0,
             &mut probe,
         );
         assert_eq!(n, 1, "the command must have been served inline");
@@ -162,6 +164,7 @@ fn test_inline_get_hit() {
         0,
         &aof_pool,
         &None,
+        None,
         0,
         1,
         true,  // can_inline_reads
@@ -169,6 +172,7 @@ fn test_inline_get_hit() {
         false, // resp3: a RESP2 connection (moon#522)
         &rt_config,
         false, // spill_sender_active (moon#660): no spill thread in unit tests
+        0,     // writer_client_id (moon#1166)
         &mut test_probe(),
     );
     assert_eq!(result, 1);
@@ -221,6 +225,7 @@ fn test_inline_get_does_not_wait_behind_a_shared_reader() {
         0,
         &aof_pool,
         &None,
+        None,
         0,
         1,
         true,  // can_inline_reads
@@ -228,6 +233,7 @@ fn test_inline_get_does_not_wait_behind_a_shared_reader() {
         false, // resp3: a RESP2 connection (moon#522)
         &rt_config,
         false, // spill_sender_active (moon#660): no spill thread in unit tests
+        0,     // writer_client_id (moon#1166)
         &mut test_probe(),
     );
     let waited = started.elapsed();
@@ -277,6 +283,7 @@ fn test_inline_get_answers_a_mid_spill_key() {
         0,
         &aof_pool,
         &None,
+        None,
         0,
         1,
         true,  // can_inline_reads
@@ -284,6 +291,7 @@ fn test_inline_get_answers_a_mid_spill_key() {
         false, // resp3: a RESP2 connection (moon#522)
         &rt_config,
         false, // spill_sender_active (moon#660): no spill thread in unit tests
+        0,     // writer_client_id (moon#1166)
         &mut test_probe(),
     );
     assert_eq!(result, 1);
@@ -325,6 +333,7 @@ fn test_inline_get_hit_byte_parity_sizes() {
             0,
             &aof_pool,
             &None,
+            None,
             0,
             1,
             true,  // can_inline_reads
@@ -332,6 +341,7 @@ fn test_inline_get_hit_byte_parity_sizes() {
             false, // resp3: a RESP2 connection (moon#522)
             &rt_config,
             false, // spill_sender_active (moon#660): no spill thread in unit tests
+            0,     // writer_client_id (moon#1166)
             &mut test_probe(),
         );
 
@@ -375,6 +385,7 @@ fn test_inline_get_miss() {
         0,
         &aof_pool,
         &None,
+        None,
         0,
         1,
         true,  // can_inline_reads
@@ -382,6 +393,7 @@ fn test_inline_get_miss() {
         false, // resp3: a RESP2 connection (moon#522)
         &rt_config,
         false, // spill_sender_active (moon#660): no spill thread in unit tests
+        0,     // writer_client_id (moon#1166)
         &mut test_probe(),
     );
     assert_eq!(result, 1);
@@ -416,6 +428,7 @@ fn test_inline_get_miss_null_spelling_follows_protocol() {
             0,
             &aof_pool,
             &None,
+            None,
             0,
             1,
             true,  // can_inline_reads
@@ -423,6 +436,7 @@ fn test_inline_get_miss_null_spelling_follows_protocol() {
             resp3,
             &rt_config,
             false, // spill_sender_active (moon#660): no spill thread in unit tests
+            0,     // writer_client_id (moon#1166)
             &mut test_probe(),
         );
 
@@ -463,6 +477,7 @@ fn test_inline_get_hit_is_protocol_independent() {
             0,
             &aof_pool,
             &None,
+            None,
             0,
             1,
             true,  // can_inline_reads
@@ -470,6 +485,7 @@ fn test_inline_get_hit_is_protocol_independent() {
             resp3,
             &rt_config,
             false, // spill_sender_active (moon#660): no spill thread in unit tests
+            0,     // writer_client_id (moon#1166)
             &mut test_probe(),
         );
         assert_eq!(result, 1);
@@ -501,6 +517,7 @@ fn test_inline_set_falls_through_when_writes_disabled() {
         0,
         &aof_pool,
         &None,
+        None,
         0,
         1,
         true,  // can_inline_reads
@@ -508,6 +525,7 @@ fn test_inline_set_falls_through_when_writes_disabled() {
         false, // resp3: a RESP2 connection (moon#522)
         &rt_config,
         false, // spill_sender_active (moon#660): no spill thread in unit tests
+        0,     // writer_client_id (moon#1166)
         &mut test_probe(),
     );
     assert_eq!(result, 0, "SET should fall through inline dispatch");
@@ -534,6 +552,7 @@ fn test_inline_set_executes_when_writes_enabled() {
         0,
         &aof_pool,
         &None,
+        None,
         0,
         1,
         true,  // can_inline_reads
@@ -541,6 +560,7 @@ fn test_inline_set_executes_when_writes_enabled() {
         false, // resp3: a RESP2 connection (moon#522)
         &rt_config,
         false, // spill_sender_active (moon#660): no spill thread in unit tests
+        0,     // writer_client_id (moon#1166)
         &mut test_probe(),
     );
     assert_eq!(result, 1, "SET should be inlined");
@@ -596,6 +616,7 @@ fn test_inline_set_stands_down_when_aof_writer_is_full() {
         0,
         &aof_pool,
         &None,
+        None,
         0,
         1,
         true,  // can_inline_reads
@@ -603,6 +624,7 @@ fn test_inline_set_stands_down_when_aof_writer_is_full() {
         false, // resp3
         &rt_config,
         false, // spill_sender_active
+        0,     // writer_client_id (moon#1166)
         &mut test_probe(),
     );
     let took = started.elapsed();
@@ -644,6 +666,7 @@ fn test_inline_set_stands_down_when_aof_writer_is_full() {
         0,
         &aof_pool,
         &None,
+        None,
         0,
         1,
         true,
@@ -651,6 +674,7 @@ fn test_inline_set_stands_down_when_aof_writer_is_full() {
         false,
         &rt_config,
         false,
+        0,
         &mut test_probe(),
     );
     assert_eq!(result, 1, "with room in the channel the SET inlines");
@@ -701,6 +725,7 @@ fn test_inline_set_captures_snapshot_pre_image() {
         0,
         &aof_pool,
         &None,
+        None,
         0,
         1,
         true,  // can_inline_reads
@@ -708,6 +733,7 @@ fn test_inline_set_captures_snapshot_pre_image() {
         false, // resp3
         &rt_config,
         false, // spill_sender_active (moon#660): no spill thread in unit tests
+        0,     // writer_client_id (moon#1166)
         &mut test_probe(),
     );
     let pending = snapshot_cow::pending_for_test();
@@ -752,6 +778,7 @@ fn test_inline_get_captures_nothing_under_snapshot() {
         0,
         &aof_pool,
         &None,
+        None,
         0,
         1,
         true,
@@ -759,6 +786,7 @@ fn test_inline_get_captures_nothing_under_snapshot() {
         false,
         &rt_config,
         false, // spill_sender_active (moon#660): no spill thread in unit tests
+        0,     // writer_client_id (moon#1166)
         &mut test_probe(),
     );
     let pending = snapshot_cow::pending_for_test();
@@ -787,6 +815,7 @@ fn test_inline_set_with_options_falls_through() {
         0,
         &aof_pool,
         &None,
+        None,
         0,
         1,
         true,  // can_inline_reads
@@ -794,6 +823,7 @@ fn test_inline_set_with_options_falls_through() {
         false, // resp3: a RESP2 connection (moon#522)
         &rt_config,
         false, // spill_sender_active (moon#660): no spill thread in unit tests
+        0,     // writer_client_id (moon#1166)
         &mut test_probe(),
     );
     assert_eq!(result, 0, "SET with options should fall through");
@@ -819,6 +849,7 @@ fn test_inline_fallthrough() {
         0,
         &aof_pool,
         &None,
+        None,
         0,
         1,
         true,  // can_inline_reads
@@ -826,6 +857,7 @@ fn test_inline_fallthrough() {
         false, // resp3: a RESP2 connection (moon#522)
         &rt_config,
         false, // spill_sender_active (moon#660): no spill thread in unit tests
+        0,     // writer_client_id (moon#1166)
         &mut test_probe(),
     );
     assert_eq!(result, 0);
@@ -857,6 +889,7 @@ fn test_inline_mixed_batch() {
         0,
         &aof_pool,
         &None,
+        None,
         0,
         1,
         true,  // can_inline_reads: unrestricted, non-tracking connection
@@ -865,6 +898,7 @@ fn test_inline_mixed_batch() {
         false, // resp3: a RESP2 connection (moon#522)
         &rt_config,
         false, // spill_sender_active (moon#660): no spill thread in unit tests
+        0,
         &mut test_probe(),
     );
     assert_eq!(total, 1);
@@ -899,6 +933,7 @@ fn test_inline_get_refused_when_reads_not_inlinable() {
         0,
         &aof_pool,
         &None,
+        None,
         0,
         1,
         false, // can_inline_reads: restricted ACL or CLIENT TRACKING conn
@@ -907,6 +942,7 @@ fn test_inline_get_refused_when_reads_not_inlinable() {
         false, // resp3: a RESP2 connection (moon#522)
         &rt_config,
         false, // spill_sender_active (moon#660): no spill thread in unit tests
+        0,     // writer_client_id (moon#1166)
         &mut test_probe(),
     );
     assert_eq!(total, 0, "GET must not be inlined when reads are gated off");
@@ -941,6 +977,7 @@ fn test_inline_case_insensitive() {
         0,
         &aof_pool,
         &None,
+        None,
         0,
         1,
         true,  // can_inline_reads
@@ -948,6 +985,7 @@ fn test_inline_case_insensitive() {
         false, // resp3: a RESP2 connection (moon#522)
         &rt_config,
         false, // spill_sender_active (moon#660): no spill thread in unit tests
+        0,     // writer_client_id (moon#1166)
         &mut test_probe(),
     );
     assert_eq!(result, 1);
@@ -974,6 +1012,7 @@ fn test_inline_partial() {
         0,
         &aof_pool,
         &None,
+        None,
         0,
         1,
         true,  // can_inline_reads
@@ -981,6 +1020,7 @@ fn test_inline_partial() {
         false, // resp3: a RESP2 connection (moon#522)
         &rt_config,
         false, // spill_sender_active (moon#660): no spill thread in unit tests
+        0,     // writer_client_id (moon#1166)
         &mut test_probe(),
     );
     assert_eq!(result, 0);
@@ -1012,6 +1052,7 @@ fn test_inline_set_with_aof_falls_through_when_writes_disabled() {
         0,
         &aof_pool,
         &None,
+        None,
         0,
         1,
         true,  // can_inline_reads
@@ -1019,6 +1060,7 @@ fn test_inline_set_with_aof_falls_through_when_writes_disabled() {
         false, // resp3: a RESP2 connection (moon#522)
         &rt_config,
         false, // spill_sender_active (moon#660): no spill thread in unit tests
+        0,     // writer_client_id (moon#1166)
         &mut test_probe(),
     );
     assert_eq!(
@@ -1052,6 +1094,7 @@ fn test_inline_multiple_gets() {
         0,
         &aof_pool,
         &None,
+        None,
         0,
         1,
         true,  // can_inline_reads: unrestricted, non-tracking connection
@@ -1060,6 +1103,7 @@ fn test_inline_multiple_gets() {
         false, // resp3: a RESP2 connection (moon#522)
         &rt_config,
         false, // spill_sender_active (moon#660): no spill thread in unit tests
+        0,
         &mut test_probe(),
     );
     assert_eq!(total, 2);
@@ -1090,6 +1134,7 @@ fn test_inline_loop_disabled_in_cluster_mode() {
         0,
         &aof_pool,
         &None,
+        None,
         0,
         1,
         true,  // even with reads inlinable...
@@ -1098,6 +1143,7 @@ fn test_inline_loop_disabled_in_cluster_mode() {
         false, // resp3: a RESP2 connection (moon#522)
         &rt_config,
         false, // spill_sender_active (moon#660): no spill thread in unit tests
+        0,     // writer_client_id (moon#1166)
         &mut test_probe(),
     );
     assert_eq!(
@@ -1175,6 +1221,7 @@ fn test_inline_get_declines_for_cold_key_instead_of_blocking() {
         0,
         &aof_pool,
         &None,
+        None,
         0,
         1,
         true,  // can_inline_reads
@@ -1182,6 +1229,7 @@ fn test_inline_get_declines_for_cold_key_instead_of_blocking() {
         false, // resp3: a RESP2 connection (moon#522)
         &rt_config,
         false, // spill_sender_active (moon#660): no spill thread in unit tests
+        0,     // writer_client_id (moon#1166)
         &mut test_probe(),
     );
     let elapsed = start.elapsed();
@@ -1231,6 +1279,7 @@ fn test_inline_get_genuine_miss_still_answers_inline() {
         0,
         &aof_pool,
         &None,
+        None,
         0,
         1,
         true,  // can_inline_reads
@@ -1238,6 +1287,7 @@ fn test_inline_get_genuine_miss_still_answers_inline() {
         false, // resp3: a RESP2 connection (moon#522)
         &rt_config,
         false, // spill_sender_active (moon#660): no spill thread in unit tests
+        0,     // writer_client_id (moon#1166)
         &mut test_probe(),
     );
     assert_eq!(result, 1);
@@ -1381,6 +1431,7 @@ fn test_inline_set_stands_down_under_client_pause() {
         0,
         &aof_pool,
         &None,
+        None,
         0,
         1,
         true,
@@ -1388,6 +1439,7 @@ fn test_inline_set_stands_down_under_client_pause() {
         false,
         &rt_config,
         false,
+        0,
         &mut test_probe(),
     );
     assert_eq!(control, 1, "CONTROL: an unpaused plain SET must inline");
@@ -1405,6 +1457,7 @@ fn test_inline_set_stands_down_under_client_pause() {
         0,
         &aof_pool,
         &None,
+        None,
         0,
         1,
         true,
@@ -1412,6 +1465,7 @@ fn test_inline_set_stands_down_under_client_pause() {
         false,
         &rt_config,
         false,
+        0,
         &mut test_probe(),
     );
     crate::client_pause::unpause();
@@ -1481,6 +1535,7 @@ fn test_inline_set_bails_only_when_a_spill_sender_is_live() {
             0,
             &aof_pool,
             &None,
+            None,
             0,
             1,
             true,
@@ -1488,6 +1543,7 @@ fn test_inline_set_bails_only_when_a_spill_sender_is_live() {
             false,
             &rt_config,
             spill_sender_active,
+            0,
             &mut test_probe(),
         );
         (consumed, read_buf.len(), write_buf.len())
@@ -1551,6 +1607,7 @@ fn test_inline_set_stands_down_while_loading() {
         0,
         &aof_pool,
         &None,
+        None,
         0,
         1,
         true,
@@ -1558,6 +1615,7 @@ fn test_inline_set_stands_down_while_loading() {
         false,
         &rt_config,
         false,
+        0,
         &mut test_probe(),
     );
     assert_eq!(control, 1, "CONTROL: a SET must inline when not loading");
@@ -1574,6 +1632,7 @@ fn test_inline_set_stands_down_while_loading() {
         0,
         &aof_pool,
         &None,
+        None,
         0,
         1,
         true,
@@ -1581,6 +1640,7 @@ fn test_inline_set_stands_down_while_loading() {
         false,
         &rt_config,
         false,
+        0,
         &mut test_probe(),
     );
     crate::shard::loading::set_loading(false);

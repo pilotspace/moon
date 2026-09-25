@@ -441,7 +441,12 @@ pub(crate) async fn handle_connection_sharded_inner<
 
     // c10k C1: reply-write ceiling. 0 = wait forever (pre-C1 behaviour).
     // Read once at connection setup — never on the hot path.
-    let (write_timeout, out_cap_normal) = {
+    //
+    // moon#1175: the query-buffer ceilings join the snapshot (they were read
+    // under the global `RuntimeConfig` lock on every read). `CONFIG SET` has
+    // no arm for either, so one read per connection is exact — see the
+    // monoio twin.
+    let (write_timeout, out_cap_normal, qbuf_limit, qbuf_preauth) = {
         let rt = ctx.runtime_config.read();
         (
             match rt.client_write_timeout_ms {
@@ -449,6 +454,8 @@ pub(crate) async fn handle_connection_sharded_inner<
                 ms => Some(std::time::Duration::from_millis(ms)),
             },
             rt.client_output_buffer_limit_normal,
+            rt.client_query_buffer_limit,
+            rt.client_query_buffer_limit_preauth,
         )
     };
 
@@ -549,34 +556,18 @@ pub(crate) async fn handle_connection_sharded_inner<
         }
         // moon#1164: make room for what the incomplete front frame is known to
         // need, so a large upload is read in a geometric series of reads
-        // rather than whatever spare capacity happens to be left. The first
-        // call skips the config lock whenever there is no hint at all.
+        // rather than whatever spare capacity happens to be left. The limits
+        // are the per-connection snapshot (moon#1175), so no lock either way.
         // moon#1179 item 5: a carried tail counts as input even when every
         // remaining byte was already parsed.
         let have_carry = carried_input && (!read_buf.is_empty() || !carried_frames.is_empty());
-        if !have_carry
-            && super::util::hinted_read_len(
-                read_buf.len(),
-                parse_state.pending_len(),
-                conn.authenticated,
-                0,
-                0,
-            )
-            .is_some()
-        {
-            let (limit, preauth) = {
-                let rt = ctx.runtime_config.read();
-                (
-                    rt.client_query_buffer_limit,
-                    rt.client_query_buffer_limit_preauth,
-                )
-            };
+        if !have_carry {
             if let Some(want) = super::util::hinted_read_len(
                 read_buf.len(),
                 parse_state.pending_len(),
                 conn.authenticated,
-                limit,
-                preauth,
+                qbuf_limit,
+                qbuf_preauth,
             ) {
                 read_buf.reserve(want);
             }
@@ -625,11 +616,8 @@ pub(crate) async fn handle_connection_sharded_inner<
                 // runs after parsing so it costs no credentials. See
                 // `util::query_buf_limit` for the pre-auth ceiling.
                 {
-                    let (limit, preauth) = {
-                        let rt = ctx.runtime_config.read();
-                        (rt.client_query_buffer_limit, rt.client_query_buffer_limit_preauth)
-                    };
-                    if super::util::query_buf_exceeded(read_buf.len(), conn.authenticated, limit, preauth) {
+                    // moon#1175: per-connection snapshot, no config lock per read.
+                    if super::util::query_buf_exceeded(read_buf.len(), conn.authenticated, qbuf_limit, qbuf_preauth) {
                         use tokio::io::AsyncWriteExt;
                         let _ = stream.write_all(super::util::QUERY_BUF_LIMIT_ERROR).await;
                         break;
@@ -687,10 +675,14 @@ pub(crate) async fn handle_connection_sharded_inner<
 
                 // CLIENT PAUSE: delay processing if server is paused
                 // Check with is_write=true (conservative — pauses all batches in ALL mode)
-                crate::client_pause::expire_if_needed();
-                if let Some(remaining) = crate::client_pause::check_pause(true) {
+                // moon#1175: lock-free unless a pause may be in force.
+                if let Some(remaining) = crate::client_pause::batch_pause_remaining() {
                     tokio::time::sleep(remaining).await;
                 }
+                // moon#1165: re-resolve a stale ACL cache once per batch (after
+                // any pause, so the batch runs against the table as it is now).
+                // Fail-closed: see `ConnectionState::refresh_acl_cache_if_stale`.
+                conn.refresh_acl_cache_if_stale(&ctx.acl_table);
 
                 let mut responses: Vec<Frame> = Vec::with_capacity(batch.len());
                 // v3-5 group commit: response indexes of coordinator LOCAL-leg
@@ -1069,10 +1061,11 @@ pub(crate) async fn handle_connection_sharded_inner<
                     // with a fresh cache.  Stale caches (after ACL SETUSER /
                     // DELUSER / LOAD) fall through to the full check.
                     if !conn.acl_skip_allowed() {
-                        #[allow(clippy::unwrap_used)] // std RwLock: poison = prior panic = unrecoverable
-                        let acl_guard = ctx.acl_table.read().unwrap();
-                        if let Some(deny_reason) = acl_guard.check_command_permission(&conn.current_user, cmd, cmd_args) {
-                            drop(acl_guard);
+                        // moon#1165: snapshot check for a restricted user (no
+                        // table lock; command + keys resolved once) — see
+                        // `ConnectionState::acl_denial`.
+                        let denial = conn.acl_denial(&ctx.acl_table, cmd, cmd_args);
+                        if let Some(crate::acl::AclDenial::Command(deny_reason)) = denial {
                             conn.acl_log.push(crate::acl::AclLogEntry {
                                 reason: "command".to_string(),
                                 object: crate::acl::subcommand::command_log_object(cmd, cmd_args),
@@ -1085,9 +1078,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                             responses.push(Frame::Error(Bytes::from(format!("NOPERM {}", deny_reason))));
                             continue;
                         }
-                        let is_write_for_acl = metadata::is_write(cmd);
-                        if let Some(deny_reason) = acl_guard.check_key_permission(&conn.current_user, cmd, cmd_args, is_write_for_acl) {
-                            drop(acl_guard);
+                        if let Some(crate::acl::AclDenial::Key(deny_reason)) = denial {
                             conn.acl_log.push(crate::acl::AclLogEntry {
                                 reason: "command".to_string(),
                                 object: String::from_utf8_lossy(cmd).to_ascii_lowercase(),
@@ -1194,9 +1185,9 @@ pub(crate) async fn handle_connection_sharded_inner<
                         // moon#1035: the ACL gate above checks command and keys,
                         // never a PUBLISH channel — refuse a denied one HERE so
                         // the block aborts, instead of at EXEC after the rest ran.
-                        if let Some(err) = crate::server::conn::shared::queued_publish_channel_deny(
+                        if let Some(err) = crate::server::conn::shared::conn_queued_publish_channel_deny(
+                            &conn,
                             &ctx.acl_table,
-                            &conn.current_user,
                             cmd,
                             cmd_args,
                         ) {
@@ -1321,10 +1312,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                         // moon#569: resolve the caller once, authorize every
                         // inner `redis.call` against it — locally and on the
                         // shard this script may route to.
-                        let script_acl = crate::acl::ScriptAcl::for_user(
-                            &ctx.acl_table,
-                            &conn.current_user,
-                        )
+                        let script_acl = conn.script_acl(&ctx.acl_table)
                         .with_caller(conn.tracking_state.script_caller(conn.client_id));
                         if let Some(routed) = crate::server::conn::shared::route_script_elsewhere(
                             cmd,
@@ -1457,48 +1445,12 @@ pub(crate) async fn handle_connection_sharded_inner<
                         continue;
                     }
 
-                    // === CLIENT PAUSE check ===
-                    // Extract pause info with short lock hold, then sleep outside lock scope
-                    let pause_wait_ms = {
-                        let rt = ctx.runtime_config.read();
-                        let deadline = rt.client_pause_deadline_ms;
-                        if deadline > 0 {
-                            let now = crate::storage::entry::current_time_ms();
-                            if now < deadline {
-                                let should_pause = if rt.client_pause_write_only {
-                                    crate::command::metadata::is_write(cmd)
-                                } else {
-                                    true
-                                };
-                                if should_pause { deadline.saturating_sub(now) } else { 0 }
-                            } else { 0 }
-                        } else { 0 }
-                    };
-                    if pause_wait_ms > 0 {
-                        // Poll in 50ms intervals so CLIENT UNPAUSE takes effect quickly
-                        let mut remaining = pause_wait_ms;
-                        while remaining > 0 {
-                            let chunk = remaining.min(50);
-                            #[cfg(feature = "runtime-tokio")]
-                            {
-                                tokio::time::sleep(std::time::Duration::from_millis(chunk)).await;
-                            }
-                            #[cfg(feature = "runtime-monoio")]
-                            {
-                                monoio::time::sleep(std::time::Duration::from_millis(chunk)).await;
-                            }
-                            remaining = remaining.saturating_sub(chunk);
-                            // Re-check if UNPAUSE was called
-                            let still_paused = {
-                                let rt = ctx.runtime_config.read();
-                                rt.client_pause_deadline_ms > 0
-                                    && crate::storage::entry::current_time_ms() < rt.client_pause_deadline_ms
-                            };
-                            if !still_paused {
-                                break;
-                            }
-                        }
-                    }
+                    // moon#1175: the per-command `client_pause_deadline_ms` read
+                    // (a `RuntimeConfig` read lock per command) is gone. Only
+                    // `handler_single` writes that field; this handler's CLIENT
+                    // PAUSE goes through `client_pause::pause`, enforced by the
+                    // batch-top `batch_pause_remaining()` gate, so here it always
+                    // read 0.
 
 
                     // --- Functions API: FUNCTION/FCALL/FCALL_RO ---
@@ -1551,10 +1503,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                             // routing so the same identity applies whether the
                             // call runs here or on the shard owning the key —
                             // routing must never change what a caller may do.
-                            let script_acl = crate::acl::ScriptAcl::for_user(
-                                &ctx.acl_table,
-                                &conn.current_user,
-                            )
+                            let script_acl = conn.script_acl(&ctx.acl_table)
                             .with_caller(conn.tracking_state.script_caller(conn.client_id));
                             // moon#514 defect 1 (== moon#508): route to the
                             // shard owning the key instead of refusing
@@ -1745,9 +1694,9 @@ pub(crate) async fn handle_connection_sharded_inner<
                                 // Channel ACL gates the txn publish path (C2
                                 // security): a denied channel is patched with
                                 // NOPERM and never fanned out.
-                                let patched = match crate::server::conn::shared::publish_channel_acl_deny(
+                                let patched = match crate::server::conn::shared::conn_publish_channel_acl_deny(
+                                    &conn,
                                     &ctx.acl_table,
-                                    &conn.current_user,
                                     &p.channel,
                                 ) {
                                     Some(err) => err,
@@ -2439,7 +2388,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                             if matches!(response, Frame::Integer(1)) {
                                 if let Some(ref bytes) = aof_bytes {
                                     if let Some(ref pool) = ctx.aof_pool {
-                                        let lsn = aof::AofWriterPool::issue_append_lsn(&ctx.repl_state, ctx.shard_id, bytes.len());
+                                        let lsn = ctx.issue_append_lsn(bytes.len());
                                         match pool
                                             .send_append_group(
                                                 ctx.shard_id,
@@ -2538,7 +2487,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                                 if matches!(response, Frame::Integer(1)) {
                                     if let Some(ref bytes) = aof_bytes {
                                         if let Some(ref pool) = ctx.aof_pool {
-                                            let lsn = aof::AofWriterPool::issue_append_lsn(&ctx.repl_state, ctx.shard_id, bytes.len());
+                                            let lsn = ctx.issue_append_lsn(bytes.len());
                                             match pool
                                                 .send_append_group(
                                                     ctx.shard_id,
@@ -2962,7 +2911,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                             };
                             if let Some(ref pool) = ctx.aof_pool {
                                 for bytes in aof_records {
-                                    let lsn = aof::AofWriterPool::issue_append_lsn(&ctx.repl_state, ctx.shard_id, bytes.len());
+                                    let lsn = ctx.issue_append_lsn(bytes.len());
                                     match pool
                                         .send_append_group(
                                             ctx.shard_id,

@@ -1,5 +1,6 @@
 pub mod client_cmd;
 pub mod invalidation;
+mod prefilter;
 pub mod queue;
 
 pub use queue::{InvalidationRx, InvalidationTx, invalidation_queue};
@@ -36,12 +37,30 @@ pub fn tracking_active() -> bool {
 /// so a write on shard A pushes directly into a connection's channel on
 /// shard B; the connection's own event loop writes it to the socket.
 pub fn global_table() -> std::sync::Arc<parking_lot::Mutex<TrackingTable>> {
-    static GLOBAL: std::sync::OnceLock<std::sync::Arc<parking_lot::Mutex<TrackingTable>>> =
-        std::sync::OnceLock::new();
-    GLOBAL
-        .get_or_init(|| std::sync::Arc::new(parking_lot::Mutex::new(TrackingTable::new())))
+    GLOBAL_TABLE
+        .get_or_init(|| std::sync::Arc::new(parking_lot::Mutex::new(TrackingTable::new_global())))
         .clone()
 }
+
+static GLOBAL_TABLE: std::sync::OnceLock<std::sync::Arc<parking_lot::Mutex<TrackingTable>>> =
+    std::sync::OnceLock::new();
+
+/// The global table without an `Arc` clone (`None` before first use — then
+/// nothing can be tracked yet either).
+#[inline]
+pub(crate) fn global_table_ref() -> Option<&'static parking_lot::Mutex<TrackingTable>> {
+    GLOBAL_TABLE.get().map(|t| &**t)
+}
+
+/// Whether `table` is THE global table — the only one the lock-free
+/// pre-filter below describes. (Unit tests build private tables; for those
+/// every write takes the lock, as before.)
+#[inline]
+pub(crate) fn is_global(table: &parking_lot::Mutex<TrackingTable>) -> bool {
+    global_table_ref().is_some_and(|g| std::ptr::eq(g, table))
+}
+
+pub(crate) use prefilter::{global_may_track, global_table_idle};
 
 /// Per-client tracking configuration.
 #[derive(Debug, Clone, Default)]
@@ -583,6 +602,10 @@ pub struct TrackingTable {
     is_connected: fn(u64) -> bool,
     /// Maximum keys tracked (bounded table)
     max_keys: usize,
+    /// This is the process-global table (moon#1166): its key and prefix
+    /// changes are mirrored into the lock-free pre-filter. `false` for every
+    /// private (test) table.
+    global: bool,
 }
 
 impl Default for TrackingTable {
@@ -608,6 +631,31 @@ impl TrackingTable {
             broken: HashSet::new(),
             is_connected: crate::client_registry::is_registered,
             max_keys,
+            global: false,
+        }
+    }
+
+    /// The process-global table: mirrors its contents into the pre-filter.
+    fn new_global() -> Self {
+        Self {
+            global: true,
+            ..Self::new()
+        }
+    }
+
+    /// A key is about to enter `key_clients` (call BEFORE inserting).
+    #[inline]
+    fn filter_add_key(&self, key: &[u8]) {
+        if self.global {
+            prefilter::key_added(key);
+        }
+    }
+
+    /// A key has left `key_clients` (call AFTER removing).
+    #[inline]
+    fn filter_remove_key(&self, key: &[u8]) {
+        if self.global {
+            prefilter::key_removed(key);
         }
     }
 
@@ -713,6 +761,9 @@ impl TrackingTable {
         {
             entry.2 = noloop;
             return;
+        }
+        if self.global {
+            prefilter::prefixes_added(1);
         }
         self.bcast_clients.push((client_id, prefix, noloop));
     }
@@ -824,6 +875,7 @@ impl TrackingTable {
             #[allow(clippy::unwrap_used)] // len >= 1 guaranteed by the branch
             let victim = self.key_clients.keys().next().unwrap().clone();
             let clients = self.key_clients.remove(&victim).unwrap_or_default();
+            self.filter_remove_key(&victim);
             let mut recipients = Vec::new();
             for (cid, _noloop) in clients {
                 Self::forget_client_key(&mut self.client_keys, cid, &victim);
@@ -838,6 +890,7 @@ impl TrackingTable {
             None
         };
 
+        self.filter_add_key(key);
         self.key_clients
             .insert(key.clone(), vec![(client_id, noloop)]);
         self.client_keys
@@ -863,6 +916,7 @@ impl TrackingTable {
 
         // Normal mode: check key_clients
         if let Some(clients) = self.key_clients.remove(key) {
+            self.filter_remove_key(key);
             for (cid, noloop) in clients {
                 // The key is gone from the forward map, so it must go from the
                 // reverse one too -- a stale entry would make the reverse index
@@ -917,11 +971,16 @@ impl TrackingTable {
                 clients.retain(|(id, _)| *id != client_id);
                 if clients.is_empty() {
                     self.key_clients.remove(&key);
+                    self.filter_remove_key(&key);
                 }
             }
         }
         // Remove from bcast_clients
+        let before = self.bcast_clients.len();
         self.bcast_clients.retain(|(id, _, _)| *id != client_id);
+        if self.global {
+            prefilter::prefixes_removed(before - self.bcast_clients.len());
+        }
         // Remove channel and redirect
         if self.client_channels.remove(&client_id).is_some() {
             ACTIVE_TRACKERS.fetch_sub(1, Ordering::Relaxed);
@@ -954,12 +1013,23 @@ impl TrackingTable {
     /// invalidation (`invalidate` + Null payload, the Redis convention) — to
     /// the redirect target where there is one.
     pub fn invalidate_all(&mut self) -> Vec<Delivery> {
+        let dropped: Vec<Bytes> = if self.global {
+            self.key_clients.keys().cloned().collect()
+        } else {
+            Vec::new()
+        };
         self.key_clients.clear();
+        for key in &dropped {
+            self.filter_remove_key(key);
+        }
         self.client_keys.clear();
         let ids: Vec<u64> = self.client_channels.keys().copied().collect();
         ids.into_iter().filter_map(|id| self.route(id)).collect()
     }
 }
+
+#[cfg(test)]
+mod prefilter_tests;
 
 #[cfg(test)]
 mod tests {
