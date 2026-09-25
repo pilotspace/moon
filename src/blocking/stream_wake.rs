@@ -162,6 +162,17 @@ pub(crate) fn try_wake_stream_waiter_budgeted(
                     let served = serve_group_read(
                         db, db_index, key, group, consumer, *count, *noack, budget,
                     );
+                    // moon#1232 review 5: a reader served inside its own
+                    // registration counts as `XREADGROUP`; a parked one 0.
+                    if let Some((frame, _)) = &served {
+                        crate::admin::metrics_setup::record_keyspace_changes(
+                            crate::blocking::wakeup::registration_serve_changes(
+                                entry.wait_id,
+                                &entry.cmd,
+                                frame,
+                            ),
+                        );
+                    }
                     if let Some((_, true)) = served {
                         aof_lost = true;
                     }

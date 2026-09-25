@@ -859,3 +859,56 @@ fn shutdown_during_an_auto_save_is_not_refused() {
     );
     assert_eq!(dbsize.trim(), format!(":{}", KEYS + 1));
 }
+
+// ── Review 5: paths outside the dispatch arms ──────────────────────────────
+
+fn spawn_with(dir: &std::path::Path, shards: usize, extra: &[&str]) -> (ServerGuard, u16) {
+    let bin = common::find_moon_binary();
+    let (child, port) = common::spawn_listening(|port| {
+        std::process::Command::new(&bin)
+            .args(["--port", &port.to_string(), "--dir", &dir.to_string_lossy()])
+            .args(["--shards", &shards.to_string(), "--maxmemory", "0"])
+            .args(["--disk-offload", "disable", "--disk-free-min-pct", "0"])
+            .args(extra)
+            .stdout(common::server_stderr(dir))
+            .stderr(common::server_stderr(dir))
+            .spawn()
+            .expect("spawn moon (build it first, or set MOON_BIN)")
+    });
+    (ServerGuard::new(child), port)
+}
+
+/// A blocking pop that finds data is its non-blocking twin (redis 7.0.15:
+/// BLPOP 1, BZPOPMIN 1). At `--shards 4` a key owned by another shard was
+/// served by that shard's `BlockRegister` handler through the parked-waiter
+/// serve (`serve_list_key` / `serve_zset_key`), which is muted: 0.
+#[test]
+fn blocking_pops_served_at_once_count_at_four_shards() {
+    let dir = common::unique_test_dir("ws19-r5-bpop");
+    std::fs::create_dir_all(&dir).unwrap();
+    let (mut server, port) = spawn_with(&dir, 4, &["--appendonly", "no"]);
+    let mut c = Conn::open(port);
+    let mut got = Vec::new();
+    for i in 0..16 {
+        let (l, z) = (format!("q{i}"), format!("zq{i}"));
+        c.send(&["RPUSH", &l, "a", "b"]);
+        c.send(&["ZADD", &z, "1", "a"]);
+        let d0 = changes(&mut c);
+        let blpop = c.send(&["BLPOP", &l, "1"]);
+        let d1 = changes(&mut c);
+        let bzpop = c.send(&["BZPOPMIN", &z, "1"]);
+        let d2 = changes(&mut c);
+        assert!(
+            blpop.starts_with("*2") && bzpop.starts_with("*3"),
+            "{blpop:?} {bzpop:?}"
+        );
+        got.push(format!("{}{}", d1 - d0, d2 - d1));
+    }
+    server.kill_now();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(
+        got.join(" "),
+        ["11"; 16].join(" "),
+        "(BLPOP, BZPOPMIN) change counts per key, --shards 4"
+    );
+}
