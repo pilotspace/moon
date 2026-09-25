@@ -43,11 +43,13 @@
 //!    be a post-epoch state). Disarmed (the overwhelmingly common case, no
 //!    BGSAVE in flight): one thread-local `bool` load and return.
 //! 3. The next tick [`drain_into`]s the queue into the live `SnapshotState`
-//!    **before** advancing, dropping pre-images whose range was already
-//!    written (the file already holds their epoch-start bytes), and first
-//!    applying the table changes queued since (moon#1228: a SWAPDB re-points
-//!    the epoch's databases, a FLUSHDB freezes the detached table into it)
-//!    and any abort a FLUSHALL or a replica full resync queued (moon#1224).
+//!    **before** advancing: first any abort a FLUSHALL or a replica full
+//!    resync queued (moon#1224), then the pre-images, dropping those whose
+//!    range was already written (the file already holds their epoch-start
+//!    bytes), then the table changes queued since (moon#1228: a SWAPDB
+//!    re-points the epoch's databases, a FLUSHDB freezes the detached
+//!    table into it — trimmed to its epoch-start rows, which needs every
+//!    pre-image of its database in the state first).
 //!
 //! One shard per OS thread, and every producer/consumer here runs on that
 //! shard's thread, so a `thread_local!` IS the per-shard queue — same
@@ -95,6 +97,10 @@ thread_local! {
     /// Table changes the epoch follows (moon#1228), in the order they
     /// happened, applied to the `SnapshotState` by the next drain.
     static EVENTS: RefCell<Vec<TableEvent>> = const { RefCell::new(Vec::new()) };
+    /// Post-epoch bytes of the flushed tables in `EVENTS`, waiting whole for
+    /// the drain that trims them (moon#1228 review 5): each table's
+    /// `used_memory` at its flush above its database's epoch-start bill.
+    static WAITING_EXCESS: Cell<u64> = const { Cell::new(0) };
     /// Approximate bytes of `PENDING_KEYS` (moon#1228, INFO
     /// `current_cow_size`).
     static DEDUPE_BYTES: Cell<u64> = const { Cell::new(0) };
@@ -160,6 +166,11 @@ struct Progress {
     /// a SWAPDB exchanges contents, not addresses). Empty when the arming
     /// thread has no shard slice.
     slot_addrs: Vec<usize>,
+    /// Each epoch database's `used_memory` at arm, its epoch-start bill
+    /// (moon#1228 review 5): what a flushed table holds beyond it is
+    /// post-epoch. Indexed like the file's databases; empty with
+    /// `slot_addrs`.
+    start_bills: Vec<u64>,
 }
 
 impl Progress {
@@ -198,12 +209,15 @@ pub(crate) fn arm() {
 /// outside any `with_shard` borrow — both arming sites in
 /// `shard::persistence_tick` are.
 pub(crate) fn arm_with_layout(segment_counts: Vec<usize>) {
-    let slot_addrs = crate::shard::slice::try_with_shard(|s| {
-        s.databases
-            .with_all_read(|dbs| dbs.iter().map(|db| db_addr(db)).collect::<Vec<_>>())
+    let slots = crate::shard::slice::try_with_shard(|s| {
+        s.databases.with_all_read(|dbs| {
+            dbs.iter()
+                .map(|db| (db_addr(db), db.ledger_bytes() as u64))
+                .collect::<Vec<_>>()
+        })
     })
     .unwrap_or_default();
-    arm_with_slots(segment_counts.len(), slot_addrs);
+    arm_with_slots(segment_counts.len(), slots);
 }
 
 /// [`arm_with_layout`] over an explicit database slice (`dbs[i]` is shard
@@ -211,11 +225,19 @@ pub(crate) fn arm_with_layout(segment_counts: Vec<usize>) {
 /// `Vec<Database>` instead of a shard slice.
 #[cfg(test)]
 pub(crate) fn arm_with_databases(dbs: &[Database]) {
-    arm_with_slots(dbs.len(), dbs.iter().map(db_addr).collect());
+    arm_with_slots(
+        dbs.len(),
+        dbs.iter()
+            .map(|db| (db_addr(db), db.ledger_bytes() as u64))
+            .collect(),
+    );
 }
 
-fn arm_with_slots(num_databases: usize, slot_addrs: Vec<usize>) {
+/// `slots[i]`: shard slot `i`'s `Database` address and `used_memory` now,
+/// at the epoch's start.
+fn arm_with_slots(num_databases: usize, slots: Vec<(usize, u64)>) {
     arm();
+    let (slot_addrs, start_bills) = slots.into_iter().unzip();
     PROGRESS.with(|p| {
         *p.borrow_mut() = Some(Progress {
             current_db: 0,
@@ -223,6 +245,7 @@ fn arm_with_slots(num_databases: usize, slot_addrs: Vec<usize>) {
             num_databases,
             logical_of_slot: (0..num_databases).map(Some).collect(),
             slot_addrs,
+            start_bills,
         })
     });
 }
@@ -336,6 +359,7 @@ fn clear() {
     PROGRESS.with(|p| *p.borrow_mut() = None);
     ABORT.with(|a| a.set(None));
     EVENTS.with(|e| e.borrow_mut().clear());
+    WAITING_EXCESS.with(|w| w.set(0));
 }
 
 /// Would the armed epoch still write anything? Without a published layout
@@ -348,13 +372,19 @@ fn epoch_unfinished() -> bool {
 }
 
 /// Queue the failure of the armed epoch (moon#1224): the next drain aborts
-/// it, before another segment is written.
+/// it, before another segment is written. Flushed tables still waiting to
+/// be frozen are released now — nothing will be written from them.
 fn abort_epoch(why: &'static str) {
     ABORT.with(|a| {
         if a.get().is_none() {
             a.set(Some(why));
         }
     });
+    EVENTS.with(|e| {
+        e.borrow_mut()
+            .retain(|event| !matches!(event, TableEvent::Freeze(..)))
+    });
+    WAITING_EXCESS.with(|w| w.set(0));
 }
 
 /// `SWAPDB a b` is about to exchange the tables of shard slots `a` and `b`
@@ -405,24 +435,31 @@ pub(crate) fn note_swapdb(a: usize, b: usize) {
 ///
 /// If the table is the epoch-start table of a database the armed epoch has
 /// not finished writing, it is FROZEN into the epoch (moved, never cloned):
-/// with the pre-images captured before the flush it is exactly that
-/// database's epoch-start contents, so the BGSAVE completes with the
-/// pre-flush image — redis's fork does the same for FLUSHDB — where it used
-/// to abort. The slot's new contents are post-epoch, so writes to it capture
-/// nothing from here on. Otherwise the table is dropped here, where `clear`
-/// dropped it: a database already written, a slot whose epoch table an
-/// earlier flush already froze, or an epoch with an abort queued (a FLUSHALL
-/// or a resync — the tables its clears hand over are released now, not at
-/// the next drain).
+/// with the pre-images captured before the flush it holds that database's
+/// epoch-start contents, so the BGSAVE completes with the pre-flush image —
+/// redis's fork does the same for FLUSHDB — where it used to abort. The
+/// slot's new contents are post-epoch, so writes to it capture nothing from
+/// here on. Otherwise the table is dropped here, where `clear` dropped it: a
+/// database already written, a slot whose epoch table an earlier flush
+/// already froze, or an epoch with an abort queued (a FLUSHALL or a resync —
+/// the tables its clears hand over are released now, not at the next drain).
 ///
-/// Memory bound: at most ONE frozen table per database of the epoch — a
-/// flushed slot is unmapped, so flushing it again drops the new table — and
-/// each is released as soon as the walk finishes its database. A client
-/// that FLUSHDBs every database in turn therefore holds at most the
-/// epoch-start dataset beside the new one until the walk passes it: the
-/// same worst case as redis, whose forked child keeps every pre-flush page
-/// on FLUSHDB and is killed only by FLUSHALL (pinned by
+/// Memory bound (review 5): a table arrives AS FLUSHED, with every row
+/// written since the epoch began. The next drain trims it to its epoch-start
+/// rows (`SnapshotState::trim_to_epoch_start`) before freezing it, and at
+/// most ONE table per database of the epoch is frozen (a flushed slot is
+/// unmapped, so flushing it again drops the new table); each is released as
+/// soon as the walk finishes its database. After every drain the epoch
+/// therefore holds at most the epoch-start bills of the databases it has not
+/// written — however much a client inserts and flushes — the same worst case
+/// as redis, whose forked child keeps every pre-flush page on FLUSHDB and is
+/// killed only by FLUSHALL (pinned by
 /// `table_swap_tests::flushdb_of_every_database_holds_at_most_the_epoch_start_tables`).
+/// Until that drain (one tick) the table waits whole. One grown table may
+/// wait; a second flush of a grown database before the drain (a MULTI, a
+/// script) fails the save instead once the waiting post-epoch bytes pass
+/// [`FREEZE_WAIT_SLACK`], so the wait adds at most one table's post-epoch
+/// rows — memory that `used_memory` carried a moment before the flush.
 ///
 /// A slot that cannot be identified (an epoch armed on a thread with no
 /// shard slice) keeps the old answer: an unfinished epoch is aborted. One
@@ -437,7 +474,8 @@ pub(crate) fn note_cleared_table(db: &Database, table: Table, table_bytes: u64) 
         return;
     }
     enum Outcome {
-        Freeze(usize),
+        /// The epoch database, and its epoch-start bill.
+        Freeze(usize, u64),
         Drop,
         Unknown,
     }
@@ -453,13 +491,25 @@ pub(crate) fn note_cleared_table(db: &Database, table: Table, table_bytes: u64) 
         match progress.logical_of(slot) {
             Some(logical) if progress.is_unfinished(logical) => {
                 progress.logical_of_slot[slot] = None;
-                Outcome::Freeze(logical)
+                let start_bill = progress.start_bills.get(logical).copied().unwrap_or(0);
+                Outcome::Freeze(logical, start_bill)
             }
             _ => Outcome::Drop,
         }
     });
     match outcome {
-        Outcome::Freeze(logical) => {
+        Outcome::Freeze(logical, start_bill) => {
+            let excess = table_bytes.saturating_sub(start_bill);
+            let waiting = WAITING_EXCESS.with(Cell::get);
+            if waiting > 0 && waiting.saturating_add(excess) > FREEZE_WAIT_SLACK {
+                // `table` drops here, and the waiting ones with the abort.
+                abort_epoch(
+                    "FLUSHDB detached databases that grew during the save faster than the \
+                     snapshot could trim them",
+                );
+                return;
+            }
+            WAITING_EXCESS.with(|w| w.set(waiting.saturating_add(excess)));
             EVENTS.with(|e| {
                 e.borrow_mut()
                     .push(TableEvent::Freeze(logical, Box::new(table), table_bytes))
@@ -473,6 +523,12 @@ pub(crate) fn note_cleared_table(db: &Database, table: Table, table_bytes: u64) 
         }
     }
 }
+
+/// Post-epoch bytes (above their databases' epoch-start bills) that flushed
+/// tables may hold while more than one of them waits for the drain that
+/// trims them (see [`note_cleared_table`]). The first grown table always
+/// waits: its rows were in `used_memory` an instant before the flush.
+const FREEZE_WAIT_SLACK: u64 = 8 << 20;
 
 /// Every database of this shard is about to be REPLACED wholesale outside
 /// `command::dispatch` (moon#1227 review F6): a replica full resync
@@ -790,7 +846,6 @@ fn capture_key(db: &Database, slot: usize, key: &[u8]) {
 /// cursor that moved past it in the meantime.
 pub(crate) fn drain_into(snap: &mut SnapshotState) {
     apply_queued_abort(snap);
-    apply_table_events(snap);
     if !PENDING.with(|p| p.borrow().is_empty()) {
         let captured: Vec<(usize, Bytes, PreImage)> =
             PENDING.with(|p| std::mem::take(&mut *p.borrow_mut()));
@@ -798,6 +853,13 @@ pub(crate) fn drain_into(snap: &mut SnapshotState) {
         // the whole epoch, so a hot key is cloned once, not once per tick.
         drain_captured(snap, captured);
     }
+    // After the captures (moon#1228 review 5): a freeze trims its table
+    // against every pre-image of its database, and the ones queued before
+    // the flush are in `captured`. Nothing captured after a flush belongs
+    // to the flushed database (its slot is unmapped), and a capture's
+    // database and pending-ness do not depend on the table events, so the
+    // order is free otherwise.
+    apply_table_events(snap);
     // moon#1228: INFO `current_cow_size`.
     publish_cow_size(snap.cow_bytes() + DEDUPE_BYTES.with(Cell::get));
 }
@@ -815,6 +877,7 @@ fn apply_queued_abort(snap: &mut SnapshotState) {
 /// tables into it. Runs before any further segment is written.
 fn apply_table_events(snap: &mut SnapshotState) {
     let events = EVENTS.with(|e| std::mem::take(&mut *e.borrow_mut()));
+    WAITING_EXCESS.with(|w| w.set(0));
     for event in events {
         match event {
             TableEvent::Swap(a, b) => snap.swap_slots(a, b),

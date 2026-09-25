@@ -258,14 +258,20 @@ fn flushall_after_every_database_is_written_does_not_abort() {
     assert_eq!(string_keyspace(&recovered), string_keyspace(&dbs));
 }
 
-/// A FLUSHALL by another name — FLUSHDB of every database, over and over —
-/// is bounded: at most ONE frozen table per database of the epoch (the
-/// epoch-start one; a flushed slot is unmapped, so later flushes drop their
-/// table), so the epoch never holds more than the epoch-start dataset, and
-/// each table is released as soon as the walk finishes its database. The
-/// same worst case as redis, whose forked child keeps every pre-flush page
-/// on FLUSHDB (only FLUSHALL kills it). And the save still completes with
-/// the epoch-start keyspace.
+/// A FLUSHALL by another name — fill a database, FLUSHDB it, database after
+/// database, over and over — is bounded by the EPOCH-START dataset.
+///
+/// At most one table per database is frozen (a flushed slot is unmapped, so
+/// later flushes drop theirs), and review 5 of moon#1228 showed that the
+/// count bound is not a byte bound: the table a FLUSHDB detaches holds every
+/// key inserted since the epoch began, all of them tombstoned and useless to
+/// the file (8 x 40 MB of SETs + FLUSHDB held 344 MB under `--maxmemory
+/// 64mb`). The drain now trims a frozen table to its epoch-start rows, so
+/// after every drain the epoch holds at most the epoch-start bills of the
+/// databases it has not written, and releases each as the walk passes it.
+/// The walk is held (drains only) while the client fills and flushes, as
+/// the real-server reproduction held it. The save still completes with the
+/// epoch-start keyspace.
 #[test]
 fn flushdb_of_every_database_holds_at_most_the_epoch_start_tables() {
     const N_DBS: usize = 4;
@@ -274,29 +280,36 @@ fn flushdb_of_every_database_holds_at_most_the_epoch_start_tables() {
         preload(db, &format!("d{i}"), 2000);
     }
     let start_bytes: Vec<u64> = dbs.iter().map(|db| db.estimated_memory() as u64).collect();
+    let start_total: u64 = start_bytes.iter().sum();
     let expected = string_keyspace(&dbs);
     let mut epoch = Epoch::begin(&dbs);
     assert!(!epoch.tick_one(&dbs));
     let mut tail = Tail::new();
+    let value = vec![b'x'; 1024];
+    let mut peak = 0u64;
     for round in 0..20 {
         for db in 0..N_DBS {
-            live(&mut dbs, &mut tail, db, &[b"FLUSHDB"]);
+            // Post-epoch inserts FIRST, then the flush: the detached table
+            // holds them (a flush before the inserts, as this test did
+            // until review 5, detaches only the epoch-start rows).
             for j in 0..300u32 {
                 let k = format!("r{round}:{j}");
-                live(&mut dbs, &mut tail, db, &[b"SET", k.as_bytes(), b"x"]);
+                live(&mut dbs, &mut tail, db, &[b"SET", k.as_bytes(), &value]);
             }
+            live(&mut dbs, &mut tail, db, &[b"FLUSHDB"]);
+            epoch.drain();
+            let held = epoch.state.as_ref().expect("epoch").cow_bytes();
+            peak = peak.max(held);
+            assert!(
+                held <= start_total,
+                "round {round}, db {db}: the epoch holds {held} B after a drain; the \
+                 epoch-start dataset is {start_total} B"
+            );
         }
     }
-    assert!(!epoch.tick_one(&dbs));
-    let state = epoch.state.as_ref().expect("epoch");
-    let held = state.cow_bytes();
-    let start_total: u64 = start_bytes.iter().sum();
-    assert!(
-        held > 0 && held <= start_total,
-        "80 flushes held {held} B; the epoch-start dataset is {start_total} B"
-    );
+    assert!(peak > 0, "the flushed tables were frozen");
     // Released database by database as the walk passes it.
-    let mut last = held;
+    let mut last = epoch.state.as_ref().expect("epoch").cow_bytes();
     loop {
         let state = epoch.state.as_ref().expect("epoch");
         let cur = state.current_db_index();
@@ -321,6 +334,98 @@ fn flushdb_of_every_database_holds_at_most_the_epoch_start_tables() {
     assert_eq!(string_keyspace(&recovered), string_keyspace(&dbs));
 }
 
+/// Review 5 of moon#1228: removing the post-epoch rows from a frozen table
+/// does not shrink its segments. An insert flood into a small database grew
+/// its table far past the epoch-start one; frozen, it keeps a skeleton for
+/// every inserted row unless the drain moves the epoch-start rows into a
+/// table sized for them. Both a pending database and the one in progress
+/// (whose written rows go too, and whose walk then resumes mid-hash-space
+/// on the fresh table): the file is the epoch-start keyspace either way.
+#[test]
+fn a_frozen_table_keeps_no_skeleton_of_post_epoch_rows() {
+    for flushed in [1usize, 0] {
+        let mut dbs = vec![Database::new(), Database::new()];
+        preload(&mut dbs[0], "a", 1500);
+        preload(&mut dbs[1], "b", 100);
+        let start_segments = dbs[flushed].data().segment_count();
+        let expected = string_keyspace(&dbs);
+        let mut epoch = Epoch::begin(&dbs);
+        for _ in 0..3 {
+            assert!(!epoch.tick_one(&dbs));
+        }
+        let mut tail = Tail::new();
+        for j in 0..20_000u32 {
+            let k = format!("post:{j}");
+            live(&mut dbs, &mut tail, flushed, &[b"SET", k.as_bytes(), b"v"]);
+        }
+        let grown = dbs[flushed].data().segment_count();
+        assert!(
+            grown > 8 * start_segments,
+            "setup: {grown} segments vs {start_segments}"
+        );
+        live(&mut dbs, &mut tail, flushed, &[b"FLUSHDB"]);
+        epoch.drain();
+        let frozen = epoch
+            .state
+            .as_ref()
+            .expect("epoch")
+            .frozen_segments_for_test(flushed)
+            .expect("the flushed table is frozen");
+        assert!(
+            frozen <= 2 * start_segments.max(4),
+            "db {flushed}: the frozen table kept {frozen} segments of a {grown}-segment \
+             table; the epoch-start one had {start_segments}"
+        );
+        let records = epoch.try_finish(&dbs).expect("the save must complete");
+        assert_eq!(
+            diverge(&expected, &records),
+            Default::default(),
+            "db {flushed}: the file is not the epoch-start keyspace"
+        );
+        let recovered = recover(2, records, &tail);
+        assert_eq!(string_keyspace(&recovered), string_keyspace(&dbs));
+    }
+}
+
+/// The trim runs at the drain, so a flushed table waits whole until then
+/// (one tick). Two databases that GREW during the save, flushed before one
+/// drain (a MULTI, a script, a pipeline), fail the save the way every flush
+/// used to — the epoch never holds more than one grown table's post-epoch
+/// rows, or `FREEZE_WAIT_SLACK`, beside the epoch-start dataset. The same
+/// flushes with a drain between them are trimmed and the save completes.
+#[test]
+fn grown_tables_flushed_before_one_drain_fail_the_save() {
+    for drain_between in [false, true] {
+        let mut dbs: Vec<Database> = (0..3).map(|_| Database::new()).collect();
+        for (i, db) in dbs.iter_mut().enumerate() {
+            preload(db, &format!("d{i}"), 200);
+        }
+        let mut epoch = Epoch::begin(&dbs);
+        assert!(!epoch.tick_one(&dbs));
+        let mut tail = Tail::new();
+        let value = vec![b'x'; 1 << 20];
+        for db in [1, 2] {
+            for j in 0..5u32 {
+                let k = format!("big:{j}");
+                live(&mut dbs, &mut tail, db, &[b"SET", k.as_bytes(), &value]);
+            }
+            live(&mut dbs, &mut tail, db, &[b"FLUSHDB"]);
+            if drain_between {
+                epoch.drain();
+            }
+        }
+        let outcome = epoch.try_finish(&dbs);
+        if drain_between {
+            assert!(outcome.is_ok(), "drained between the flushes: {outcome:?}");
+        } else {
+            let Err(why) = outcome else {
+                panic!("two grown tables waited whole for one drain, and the save completed");
+            };
+            assert!(why.contains("FLUSHDB"), "abort reason: {why}");
+        }
+    }
+}
+
 #[test]
 fn swapdb_of_an_unfinished_database_keeps_both_images() {
     assert_point_in_time(3, 1, &[b"SWAPDB", b"1", b"2"]);
@@ -335,13 +440,15 @@ fn swapdb_of_the_database_in_progress_keeps_both_images() {
 
 /// Review 4 nit: a frozen table is billed (INFO `current_cow_size`) at its
 /// database's `used_memory`, not `estimated_memory()` — the spill-in-flight
-/// payloads that figure adds are not in the table.
+/// payloads that figure adds are not in the table. (The flushed database is
+/// one the walk has not reached, so the review-5 trim keeps every row.)
 #[test]
 fn a_frozen_table_is_billed_without_the_spill_in_flight_bytes() {
-    let mut dbs = vec![Database::new()];
-    preload(&mut dbs[0], "a", 3000);
-    let table_bytes = dbs[0].estimated_memory() as u64;
-    dbs[0].spill_inflight_mark(
+    let mut dbs = vec![Database::new(), Database::new()];
+    preload(&mut dbs[0], "a", 1500);
+    preload(&mut dbs[1], "b", 3000);
+    let table_bytes = dbs[1].estimated_memory() as u64;
+    dbs[1].spill_inflight_mark(
         Bytes::from_static(b"spilled"),
         crate::storage::db::PendingSpill {
             req_id: 1,
@@ -351,14 +458,13 @@ fn a_frozen_table_is_billed_without_the_spill_in_flight_bytes() {
         },
     );
     assert!(
-        dbs[0].estimated_memory() as u64 > table_bytes + (1 << 20),
+        dbs[1].estimated_memory() as u64 > table_bytes + (1 << 20),
         "setup: the in-flight payload is billed to the database"
     );
     let mut epoch = Epoch::begin(&dbs);
     assert!(!epoch.tick_one(&dbs));
-    let _ = run(&mut dbs, 0, &[b"FLUSHDB"]);
-    // The drain freezes the table, and db 0 has segments left to write.
-    assert!(!epoch.tick_one(&dbs));
+    let _ = run(&mut dbs, 1, &[b"FLUSHDB"]);
+    epoch.drain();
     let held = epoch.state.as_ref().expect("epoch").cow_bytes();
     let _ = epoch.try_finish(&dbs);
     assert_eq!(held, table_bytes, "the frozen table's bill");

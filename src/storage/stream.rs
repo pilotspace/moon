@@ -320,6 +320,12 @@ impl Stream {
 
     /// Generate next auto-ID. Uses max(now_ms, last_id.ms) for monotonic guarantee.
     /// If clock goes backward, reuses last_id.ms and increments seq.
+    ///
+    /// At the last possible ID (`seq == u64::MAX`) the sequence WRAPS to
+    /// `ms-0`, at or below `last_id`, which [`Self::add`] refuses (moon#1249)
+    /// and every caller answers ("exhausted the last possible ID"). Wrapping
+    /// explicitly: the plain `+ 1` did that in a release build and panicked
+    /// the shard in a debug one (review 5).
     pub fn next_auto_id(&mut self) -> StreamId {
         let now_ms = current_time_ms();
         if now_ms > self.last_id.ms {
@@ -327,7 +333,7 @@ impl Stream {
         } else {
             StreamId {
                 ms: self.last_id.ms,
-                seq: self.last_id.seq + 1,
+                seq: self.last_id.seq.wrapping_add(1),
             }
         }
     }
@@ -739,6 +745,62 @@ impl Stream {
         }
         self.unbilled -= signed(freed);
         Ok(count)
+    }
+
+    /// Rebuild the claims one `MQ POP` recorded — the WAL replay and replica
+    /// apply of an MqPop (moon#1261). Each claimed id enters the group's PEL
+    /// with its recorded delivery count and time, and `consumer_name`'s
+    /// pending set (the consumer is created with `seen_time` if missing);
+    /// the group's cursor moves to `last_delivered`; the dead-lettered ids
+    /// leave the PEL again through [`Self::xack`]. Every byte is tracked in
+    /// `unbilled` as [`Self::read_group_new`] and `xack` track it on the
+    /// master, so the caller's drain charges exactly what a later ACK
+    /// credits. `NOGROUP` if the group is missing.
+    pub fn restore_claims(
+        &mut self,
+        group_name: &Bytes,
+        consumer_name: &Bytes,
+        claimed: &[(StreamId, u64)],
+        delivery_time: u64,
+        seen_time: u64,
+        last_delivered: StreamId,
+        dead_lettered: &[StreamId],
+    ) -> Result<(), &'static str> {
+        let group = self
+            .groups
+            .get_mut(group_name.as_ref())
+            .ok_or("NOGROUP No such consumer group for key name")?;
+        let mut delta = 0isize;
+        for &(id, delivery_count) in claimed {
+            let pending = PendingEntry {
+                consumer: consumer_name.clone(),
+                delivery_time,
+                delivery_count,
+            };
+            if group.pel.insert(id, pending).is_none() {
+                delta += signed(PEL_SLOT);
+            }
+            let consumer = match group.consumers.entry(consumer_name.clone()) {
+                std::collections::hash_map::Entry::Occupied(o) => o.into_mut(),
+                std::collections::hash_map::Entry::Vacant(v) => {
+                    delta += signed(consumer_cost(consumer_name));
+                    v.insert(Consumer {
+                        name: consumer_name.clone(),
+                        pending: BTreeMap::new(),
+                        seen_time,
+                    })
+                }
+            };
+            if consumer.pending.insert(id, ()).is_none() {
+                delta += signed(PENDING_SLOT);
+            }
+        }
+        group.last_delivered_id = last_delivered;
+        self.unbilled += delta;
+        if !dead_lettered.is_empty() {
+            self.xack(group_name, dead_lettered)?;
+        }
+        Ok(())
     }
 
     /// Get pending entries summary: [count, min_id, max_id, [[consumer, count], ...]]
@@ -1153,6 +1215,67 @@ mod tests {
         assert_eq!((s.length, s.last_id), (2, next));
     }
 
+    /// moon#1261: a replayed / replicated MqPop moves exactly the bytes the
+    /// master's POP moved — the same claims through `read_group_new`, the
+    /// same dead letter through `xack` — so a later ACK credits only what
+    /// was charged, and the tracked size stays the scan's.
+    #[test]
+    fn restore_claims_bills_what_the_masters_claim_billed() {
+        let group = Bytes::from_static(b"g");
+        let consumer = Bytes::from_static(b"c");
+        let build = || {
+            let mut s = Stream::new();
+            for seq in 0..3 {
+                let id = StreamId { ms: 1, seq };
+                s.add(
+                    id,
+                    vec![(Bytes::from_static(b"f"), Bytes::from_static(b"v"))],
+                );
+            }
+            s.create_group(group.clone(), StreamId::ZERO).unwrap();
+            let _ = s.take_unbilled();
+            s
+        };
+        let ids: Vec<StreamId> = (0..3).map(|seq| StreamId { ms: 1, seq }).collect();
+
+        let mut master = build();
+        master
+            .read_group_new(&group, &consumer, Some(3), false)
+            .unwrap();
+        master.xack(&group, &ids[..1]).unwrap();
+        let master_delta = master.take_unbilled();
+
+        let mut applied = build();
+        let claimed: Vec<(StreamId, u64)> = ids.iter().map(|id| (*id, 1)).collect();
+        applied
+            .restore_claims(&group, &consumer, &claimed, 7, 7, ids[2], &ids[..1])
+            .unwrap();
+        assert_eq!(applied.take_unbilled(), master_delta, "the claim's bytes");
+        assert!(master_delta > 0);
+        assert_eq!(applied.memory_usage(), applied.estimate_memory());
+        let g = &applied.groups[&group];
+        assert_eq!(g.pel.keys().copied().collect::<Vec<_>>(), ids[1..].to_vec());
+        assert_eq!(g.last_delivered_id, ids[2]);
+
+        // The ACK credits what the claim charged: back to the empty group.
+        applied.xack(&group, &ids[1..]).unwrap();
+        master.xack(&group, &ids[1..]).unwrap();
+        assert_eq!(applied.take_unbilled(), master.take_unbilled());
+        assert_eq!(applied.billed_memory(), applied.estimate_memory());
+        assert_eq!(
+            applied.restore_claims(
+                &Bytes::from_static(b"nope"),
+                &consumer,
+                &[],
+                0,
+                0,
+                ids[0],
+                &[]
+            ),
+            Err("NOGROUP No such consumer group for key name")
+        );
+    }
+
     #[test]
     fn test_stream_add_and_range() {
         let mut s = Stream::new();
@@ -1216,6 +1339,18 @@ mod tests {
         let id = s.next_auto_id();
         assert_eq!(id.ms, u64::MAX - 1);
         assert_eq!(id.seq, 6);
+    }
+
+    /// Review 5: at the last possible ID the next auto-ID wraps (no
+    /// overflow panic in a debug build) and `add` refuses it.
+    #[test]
+    fn next_auto_id_at_the_last_possible_id_is_refused_not_a_panic() {
+        let mut s = Stream::new();
+        s.last_id = StreamId::MAX;
+        let id = s.next_auto_id();
+        assert!(id <= s.last_id);
+        assert_eq!(s.add(id, vec![(Bytes::from("f"), Bytes::from("v"))]), None);
+        assert_eq!(s.length, 0);
     }
 
     #[test]

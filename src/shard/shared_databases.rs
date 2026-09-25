@@ -752,7 +752,10 @@ pub(crate) fn apply_mq_push<T: MqApplyTarget>(
 /// into the sibling DLQ stream at its ORIGINAL assigned id). Field content
 /// for DLQ pushes is looked up from the main stream's `entries` map, which
 /// by this point already reflects every MqPush record replayed so far
-/// (records are applied strictly in WAL order).
+/// (records are applied strictly in WAL order). The claims and the dead
+/// letters' removal go through [`crate::storage::stream::Stream::restore_claims`],
+/// and the bytes they move are charged to `used_memory` like the master's
+/// POP (moon#1261). Serves both the WAL replay and the replica apply.
 pub(crate) fn apply_mq_pop<T: MqApplyTarget>(
     target: &mut T,
     db_index: usize,
@@ -773,7 +776,6 @@ pub(crate) fn apply_mq_pop<T: MqApplyTarget>(
     seen_time_ms: u64,
 ) {
     use crate::storage::entry::current_time_ms;
-    use crate::storage::stream::{Consumer, PendingEntry};
 
     let delivery_time = if delivery_time_ms != 0 {
         delivery_time_ms
@@ -792,15 +794,16 @@ pub(crate) fn apply_mq_pop<T: MqApplyTarget>(
     // moon#1228: see `apply_mq_create`.
     crate::persistence::snapshot_cow::capture_write_pre_image(&db, db_index, key);
 
-    let dlq_pushes: Vec<(
-        crate::storage::stream::StreamId,
-        Vec<(bytes::Bytes, bytes::Bytes)>,
-    )> = match db.get_stream_mut(key) {
+    let (dlq_pushes, delta): (
+        Vec<(
+            crate::storage::stream::StreamId,
+            Vec<(bytes::Bytes, bytes::Bytes)>,
+        )>,
+        isize,
+    ) = match db.get_stream_mut(key) {
         Ok(Some(stream)) => {
-            // Look up DLQ field content FIRST (reads of `stream.entries`)
-            // before taking a mutable borrow of `stream.groups` below —
-            // keeps the borrow shape unambiguous rather than relying on
-            // interleaved disjoint-field access.
+            // Look up DLQ field content FIRST (reads of `stream.entries`),
+            // before the claims below rewrite the group.
             let dlq_fields: Vec<Vec<(bytes::Bytes, bytes::Bytes)>> = dlq
                 .iter()
                 .map(|(src_id, _)| stream.entries.get(src_id).cloned().unwrap_or_default())
@@ -814,46 +817,36 @@ pub(crate) fn apply_mq_pop<T: MqApplyTarget>(
                 let _ =
                     stream.create_group(group_name.clone(), crate::storage::stream::StreamId::ZERO);
             }
-
-            match stream.groups.get_mut(group_name.as_ref()) {
-                Some(group) => {
-                    for (id, delivery_count) in &claimed {
-                        group.pel.insert(
-                            *id,
-                            PendingEntry {
-                                consumer: consumer_name.clone(),
-                                delivery_time,
-                                delivery_count: *delivery_count,
-                            },
-                        );
-                        let consumer =
-                            group
-                                .consumers
-                                .entry(consumer_name.clone())
-                                .or_insert_with(|| Consumer {
-                                    name: consumer_name.clone(),
-                                    pending: std::collections::BTreeMap::new(),
-                                    seen_time,
-                                });
-                        consumer.pending.insert(*id, ());
-                    }
-                    group.last_delivered_id = last_delivered;
-
-                    let mut collected = Vec::with_capacity(dlq.len());
-                    for ((src_id, dlq_id), fields) in dlq.iter().zip(dlq_fields) {
-                        group.pel.remove(src_id);
-                        if let Some(c) = group.consumers.get_mut(consumer_name.as_ref()) {
-                            c.pending.remove(src_id);
-                        }
-                        collected.push((*dlq_id, fields));
-                    }
-                    collected
-                }
-                None => Vec::new(),
-            }
+            // moon#1261: the claims, the cursor and the dead letters' removal
+            // through `Stream` methods that track their bytes, the way the
+            // master's POP (`read_group_new`, `xack`) tracked them — this
+            // used to write the PEL by hand, untracked, so every replayed or
+            // replicated POP+ACK credited PEL bytes that were never charged.
+            let dead_lettered: Vec<crate::storage::stream::StreamId> =
+                dlq.iter().map(|(src_id, _)| *src_id).collect();
+            let restored = stream.restore_claims(
+                &group_name,
+                &consumer_name,
+                &claimed,
+                delivery_time,
+                seen_time,
+                last_delivered,
+                &dead_lettered,
+            );
+            let pushes = match restored {
+                Ok(()) => dlq
+                    .iter()
+                    .zip(dlq_fields)
+                    .map(|((_, dlq_id), fields)| (*dlq_id, fields))
+                    .collect(),
+                Err(_) => Vec::new(),
+            };
+            (pushes, stream.take_unbilled())
         }
-        _ => Vec::new(),
+        _ => (Vec::new(), 0),
     };
+    // moon#1261: charged like the master's POP.
+    crate::shard::mq_exec::bill_stream_delta(&mut db, delta);
 
     if !dlq_pushes.is_empty() {
         let mut dlq_key = Vec::with_capacity(key.len() + 8);
@@ -2098,6 +2091,105 @@ mod tests {
         assert!(
             group.pel.is_empty(),
             "DLQ-routed entry must NOT remain pending in the main PEL"
+        );
+    }
+
+    /// moon#1261: the MqPop apply rebuilt the PEL by hand, untracked, while
+    /// the MqAck apply credits through `Stream::xack` — every replayed
+    /// POP+ACK credited PEL bytes never charged, and the queue's bill (and
+    /// `used_memory`) drained toward 0. After replaying claims, a dead
+    /// letter and an ACK, both streams must be billed at their true size.
+    #[test]
+    fn test_replay_mq_wal_bills_pop_and_ack_like_the_live_server() {
+        use crate::mq::wal::{encode_mq_ack, encode_mq_create, encode_mq_pop, encode_mq_push};
+        use crate::persistence::wal_v3::record::WalRecordType;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let queue_key = b"billedq".to_vec();
+        let dbs = vec![vec![Database::new()]];
+        let (_shared, mut inits) = ShardDatabases::new(dbs);
+        let f = |v: &[u8]| {
+            (
+                bytes::Bytes::from_static(b"f"),
+                bytes::Bytes::copy_from_slice(v),
+            )
+        };
+        write_mq_wal_records(
+            tmp.path(),
+            0,
+            &[
+                (WalRecordType::MqCreate, encode_mq_create(0, &queue_key, 3)),
+                (
+                    WalRecordType::MqPush,
+                    encode_mq_push(0, &queue_key, 1, 0, &[f(b"a")]),
+                ),
+                (
+                    WalRecordType::MqPush,
+                    encode_mq_push(0, &queue_key, 1, 1, &[f(b"b")]),
+                ),
+                (
+                    WalRecordType::MqPush,
+                    encode_mq_push(0, &queue_key, 1, 2, &[f(b"c")]),
+                ),
+                // Claims (1,0) (dead-lettered at DLQ id (9,0)) and (1,1).
+                (
+                    WalRecordType::MqPop,
+                    encode_mq_pop(
+                        0,
+                        &queue_key,
+                        (1, 1),
+                        &[(1, 0, 4), (1, 1, 1)],
+                        &[(1, 0, 9, 0)],
+                        1,
+                        1,
+                    ),
+                ),
+                (WalRecordType::MqAck, encode_mq_ack(0, &queue_key, 1, 1)),
+                // One more claim, left pending.
+                (
+                    WalRecordType::MqPop,
+                    encode_mq_pop(0, &queue_key, (1, 2), &[(1, 2, 1)], &[], 1, 1),
+                ),
+            ],
+        );
+
+        replay_mq_wal(&mut inits, tmp.path());
+
+        let mut dlq_key = queue_key.clone();
+        dlq_key.extend_from_slice(b"::mq:dlq");
+        let mut db = inits[0].databases.try_write(0).expect("db 0");
+        for key in [&queue_key, &dlq_key] {
+            let stream = db
+                .get_stream_mut(key)
+                .expect("get_stream_mut")
+                .expect("stream rebuilt from the WAL");
+            let name = String::from_utf8_lossy(key).into_owned();
+            assert_eq!(
+                stream.memory_usage(),
+                stream.estimate_memory(),
+                "{name}: tracked size vs the scan"
+            );
+            assert_eq!(
+                stream.billed_memory(),
+                stream.estimate_memory(),
+                "{name}: billed to `used_memory` vs the scan"
+            );
+        }
+        let pel: Vec<_> = db
+            .get_stream_mut(&queue_key)
+            .expect("get_stream_mut")
+            .expect("stream")
+            .groups
+            .get(bytes::Bytes::from_static(b"__mq_consumers").as_ref())
+            .expect("group")
+            .pel
+            .keys()
+            .copied()
+            .collect();
+        assert_eq!(
+            pel,
+            vec![crate::storage::stream::StreamId { ms: 1, seq: 2 }],
+            "only the last claim is pending"
         );
     }
 

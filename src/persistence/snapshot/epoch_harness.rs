@@ -58,6 +58,15 @@ impl Epoch {
         self.step(dbs, false)
     }
 
+    /// A tick while the walk is HELD (`MOON_TEST_SNAPSHOT_HOLD_FILE`): the
+    /// drain runs — captures and table events reach the state — and no
+    /// segment is written.
+    pub(super) fn drain(&mut self) {
+        if let Some(state) = self.state.as_mut() {
+            snapshot_cow::drain_pending_for_test(state);
+        }
+    }
+
     fn step(&mut self, dbs: &[Database], budgeted: bool) -> bool {
         let Some(state) = self.state.as_mut() else {
             return true;

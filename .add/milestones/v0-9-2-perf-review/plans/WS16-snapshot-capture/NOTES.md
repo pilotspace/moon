@@ -159,23 +159,71 @@ is queued (FLUSHALL, replica resync) `note_cleared_table` drops each detached ta
 instead of freezing it until the next drain (review nit). FLUSHDB and SWAPDB keep the
 freeze / slot map — redis keeps its child for those.
 
-**FLUSHDB of every database in a loop** (FLUSHALL by another name) is bounded, not a hole:
-a flushed slot is unmapped, so only the FIRST flush of each epoch database freezes a table
-(later flushes of that slot drop theirs), and each frozen table is released as soon as the
-walk finishes its database. Worst case: the epoch-start dataset beside the new one until the
-walk passes it — the same as redis, whose forked child keeps every pre-flush page on FLUSHDB.
-Documented on `note_cleared_table`; pinned by
-`table_swap_tests::flushdb_of_every_database_holds_at_most_the_epoch_start_tables` (4 dbs,
-80 flushes: held bytes <= epoch-start bytes, non-increasing through the walk, and <= the
-epoch-start bytes of the databases still to write). The frozen figure is `used_memory` at
-the flush, not `estimated_memory()` (52544bf3: spill-in-flight payloads are not in the table;
-red 1,467,473 B vs 418,890 B with 1 MiB in flight).
+**FLUSHDB of every database in a loop** (FLUSHALL by another name). Review 4's claim that
+it held "at most the epoch-start dataset" was WRONG (review 5): only the COUNT was bounded.
+A flushed slot is unmapped, so only the FIRST flush of each epoch database freezes a table,
+but that table was frozen AS FLUSHED, with every row inserted since the epoch began (all
+tombstoned, useless to the file). The pin test flushed BEFORE inserting, so it never saw
+one. The reviewer's reproduction held one save open under `--maxmemory 64mb` and ran
+8 x (40 MB of SETs into db N, FLUSHDB). It measured `current_cow_size` 344,782,240 and RSS
++341 MB, with `used_memory` still at the epoch-start 302,165 B. Main aborts that save
+instead (RSS +48 MB).
+
+**The fix (review 5):** the drain trims a flushed table to its epoch-start rows before it
+freezes it (`SnapshotState::trim_to_epoch_start`, `snapshot/frozen.rs`). The trim has three
+steps:
+1. Every key written since the epoch began has a pre-image in the database's overflow map.
+   The drain now folds the queued captures in before it applies table events, and nothing
+   captures for the slot after the flush. The trim removes that key's post-epoch row and
+   puts the epoch-start entry back (a tombstone puts nothing back), which empties the map.
+2. For the database in progress it also drops the rows below the cursor: written already,
+   or post-epoch writes into a written range.
+3. If the post-epoch rows had more than doubled the table's epoch-start segment count, it
+   moves the kept rows into a table sized for them, so no skeleton of the inserts survives.
+
+The kept rows are a subset of the epoch-start rows with their epoch-start entries. After
+every drain the epoch therefore holds at most the epoch-start bills of the databases it has
+not written, and releases each as the walk passes it. This is the same worst case as redis's
+FLUSHDB child. The bill is the table's `used_memory` at the flush, minus the removed rows'
+`entry_overhead`, plus the restored rows'.
+
+**The wait before the drain.** Until the drain (one tick) a flushed table waits whole. One
+grown table may wait: its rows were in `used_memory` an instant before. A second flush of a
+grown database before the drain (MULTI, a script) fails the save once the waiting post-epoch
+bytes pass `FREEZE_WAIT_SLACK` (8 MiB). An abort now also releases waiting tables at once.
+
+**Cost.** All on the shard thread at the drain:
+- step 1: one remove plus insert per key written since the epoch began, already paid for at
+  capture;
+- step 2: the segments below the cursor, already visited by the walk;
+- step 3: only after a doubling, at most the epoch-start rows.
+
+**Evidence:**
+- `flushdb_of_every_database_holds_at_most_the_epoch_start_tables` now inserts 300 x 1 KiB
+  and THEN flushes, 20 rounds x 4 dbs, and checks after every drain. It went red on the old
+  code ("round 0, db 1: the epoch holds 1297793 B after a drain; the epoch-start dataset is
+  1123560 B") and is green now.
+- `a_frozen_table_keeps_no_skeleton_of_post_epoch_rows` went red (515 of 515 segments kept,
+  epoch-start 2) and is green for a pending database and for the one in progress.
+- `grown_tables_flushed_before_one_drain_fail_the_save` went red (the save completed) and is
+  green.
+- Real server, `perf_ws16_bgsave_capture::flushdb_after_post_epoch_inserts_holds_only_the_epoch_start_rows`
+  (the reviewer's reproduction adopted): red on the old binary (`current_cow_size`
+  344,782,240, RSS +341 MB), green 3 of 3 (`current_cow_size` 0, RSS +49..+58 MB). The save
+  completes and restores db 0's 2,000 keys with dbs 1-8 empty.
+- The randomized flush/swap workload passed over 400 seeds (12 committed).
+
+The frozen figure is `used_memory` at the flush, not `estimated_memory()` (52544bf3:
+spill-in-flight payloads are not in the table; red 1,467,473 B vs 418,890 B with 1 MiB in
+flight).
 
 ### Risks
-- Memory: a FLUSHDB'd-but-unwritten table stays allocated until the epoch passes its
-  database (then it is dropped on the shard thread, as `clear` dropped it before) — the
-  same memory a fork keeps, at most one table per epoch database (above). Counted by item
-  2b's `current_cow_size`. A FLUSHALL now aborts and frees at once.
+- Memory: a FLUSHDB'd-but-unwritten table's EPOCH-START rows stay allocated until the
+  epoch passes its database (then they are dropped on the shard thread, as `clear` dropped
+  them before) — at most that database's epoch-start bill, the memory a fork keeps (review
+  5 trim, above). Until the next drain the table waits whole (one grown table at a time;
+  more fail the save). Counted by item 2b's `current_cow_size`. A FLUSHALL aborts and frees
+  at once.
 - The address table must describe the slots the tick serializes from; recorded once per
   arm from the shard's own `ShardDbSet`, whose boxed slots never move.
 - One-line edit in `persistence_tick.rs` (WS19's area): `advance_snapshot_segment` reads
@@ -206,8 +254,11 @@ red 1,467,473 B vs 418,890 B with 1 MiB in flight).
     Tried and dropped: six 64 MiB values (cheaper FLUSHALL, deeper backlog) was LESS red.
   - `a_resync_mid_bgsave_fails_it_and_the_next_save_publishes` — the resync abort path
     (`note_table_replace`) end to end, walk held until the resync is in (it used to need
-    800K–3.2M keys and still missed up to three attempts: link up took 0.7–1.7 s during a save
-    vs ~40 ms idle). Documented as NOT an F1 regression. monoio only (PSYNC).
+    800K–3.2M keys and still missed up to three attempts: in a DEBUG build beside the other
+    tests, link up took 0.7–1.7 s during a save vs ~40 ms idle). Review 5: a release build
+    did not reproduce that. It was a debug-build and load artifact, not command dispatch
+    starving during a save (see the item 2b trade-off below). Documented as NOT an F1
+    regression. monoio only (PSYNC).
 - `perf_ws15_bgsave_status` forced its failed save with the same FLUSHALL. It now squats a
   directory on every shard's snapshot path, so the writer's final `rename` fails (EISDIR) —
   deterministic, no timing window; every status/LASTSAVE/dirty assertion is unchanged.
@@ -243,10 +294,39 @@ memory: `used_memory` never saw pre-images, the dedupe set or (new in 2a) frozen
   frozen tables (their `used_memory` at flush), and the first-wins key set, summed across
   shards; 0 when no save runs.
 
+### Review 5 — the latency trade-off, measured (release A/B); decision: KEEP the scaling
+The reviewer A/B'd release builds with and without the 2b budget scaling:
+
+| Load during one BGSAVE (release, `--shards 1`) | Without scaling | With scaling (WS16) |
+|---|---|---|
+| SET flood, light: write p99 | 804 µs | 1,818 µs |
+| SET flood, heavy: write p99 | 2,383 µs | 4,294 µs |
+| SET flood: write p99.9 | — | +25–80% |
+| SET flood: max latency | — | no worse |
+| SET flood: save duration | 2.26 s | 0.88 s (light) / 0.77 s (heavy): 2.6–2.9x sooner |
+| Reads only; and `--shards 4` | — | no regression |
+| Worst stall, 76 release saves | 39 ms (100 B values), 92 ms (64 KiB) | the same |
+
+**Trade-off.** Under a write flood on one shard, the scaled budget does up to 16x the
+entries and segments (4x the bytes) per tick while writers are ahead of the walk. Each tick
+is longer, so write p99 during the save roughly doubles and p99.9 rises 25–80%. The save
+ends 2.6–2.9x sooner, which shortens the window in which every write to a pending range
+costs a pre-image (the tombstone memory 2b exists to bound). Max latency and the worst
+stall are unchanged. Reads and multi-shard loads show no regression.
+
+**Decision (orchestrator): keep the scaling, document the trade-off.** CHANGELOG "Changed"
+bullet in SUMMARY.
+
+**Correction.** The 0.7–1.7 s replica-link delay during a save (F1 fixtures, above) did not
+reproduce in release. It was a debug-build and load artifact. The release worst stall
+(39 / 92 ms, both builds) is the measured bound. The two `perf_ws12_bgsave_split` comments
+that read like a starved dispatch now say what was observed: a debug build beside other
+tests.
+
 ### Risks / deferred
 - The Linux-perf-host measurement at pipelined insert rates (the issue's second half) is
-  DEFERRED: this box is a 4-vCPU shared container, and the numbers would not transfer.
-  The deterministic in-process flood test is the evidence here.
+  DEFERRED: this box is a 4-vCPU shared container, and the numbers would not transfer. The
+  release A/B above (review 5) covers latency and save duration on `--shards 1` and 4.
 
 ## moon#1250 (added by the orchestrator) — MQ writes never charged to used_memory
 
@@ -285,10 +365,35 @@ Real server, `perf_ws16_mq_billing::pop_ack_churn_keeps_the_charge_exact_{single
 queue): prefix +97,586..+279,991 B over 500 POP/ACK vs MEMORY USAGE +176; fix +176..+367 on
 both queues, 3 runs.
 
-### Residual
-- The replica `apply_mq_pop` writes the PEL through `group.pel` directly (not through a
-  `Stream` method), so those bytes are not tracked in `unbilled` at all — a replica-only
-  under-count (never an over-credit). Not touched here.
+### Review 5 — the MqPop apply bills its claims (moon#1261)
+Review 4 filed this as a residual: "the replica `apply_mq_pop` writes the PEL untracked — a
+replica-only under-count (never an over-credit)". **That was wrong on both counts.**
+- **Not replica-only:** `apply_mq_pop` also serves the master's own WAL replay.
+- **An over-credit:** the claims were never charged, but `apply_mq_ack` credits them through
+  `Stream::xack`. Every replayed or replicated POP+ACK credited ~191 B that was never
+  charged, so the queue's bill drained toward 0.
+- Reviewer's measurement: MEMORY USAGE q was 124,097 live and 28,421 after a restart's
+  replay; 124,097 on the master against 28,421 on its replica.
+
+**Fix:** the new `Stream::restore_claims` does what the apply did by hand, with every byte
+tracked in `unbilled` as `read_group_new` / `xack` track it on the master:
+- inserts the PEL entries and the consumer's pending ids, creating the consumer if needed;
+- sets the cursor;
+- removes the dead letters with `xack`.
+`apply_mq_pop` then drains `take_unbilled` into `bill_stream_delta`, for both callers (replay,
+replica).
+
+**Evidence:**
+- `restore_claims_bills_what_the_masters_claim_billed`: the same claims through
+  `read_group_new` + `xack` move the same bytes.
+- `test_replay_mq_wal_bills_pop_and_ack_like_the_live_server`: red (tracked 627 B vs a scan of
+  1,185 B), now green.
+- `perf_ws16_mq_billing::a_restart_bills_a_churned_queue_as_the_live_server_did` and
+  `::a_replica_bills_a_churned_queue_as_its_master_does` (the reviewer's proofs, adopted):
+  red with 28,421 vs 124,097 B; now exactly equal (124,097 = 124,097), 2 runs each.
+- `::a_pop_surplus_release_agrees_on_master_replica_and_restart` (the reviewer's Q1 proof,
+  adopted without its MULTI leg, moon#1262): master, replica and restart hold the same PEL
+  and cursor, and serve the rest once, in order. It passed before and after.
 
 ## Capture-site audit table (WS12's table, updated at the end of WS16)
 
@@ -373,7 +478,8 @@ FLUSH during a fold would otherwise abort it.
   ticks, 10x tombstones) with a 4x bound. The Linux-perf-host number is DEFERRED by the brief.
 - **1250 (MQ billing):** 0.92 · 0.9 · 0.95 · 0.9 · 0.9 · 0.9. Billing alone could not make
   `maxmemory` bind (MQ bypassed the gate), so the gate was added too; every stream mutation
-  outside the X* commands now drains. Replica `apply_mq_pop` PEL bytes remain untracked (noted).
+  outside the X* commands now drains. The MqPop apply (replay and replica) bills its claims since
+  review 5 (moon#1261).
 - **1185 remainder:** DEFERRED with the exact blocker (eviction capture, TXN.ABORT decision).
 
 ## Gate run before review 4 (HEAD 2037de5; debug builds of this branch copied to /home/user/wt/bin and pinned)
@@ -438,3 +544,46 @@ pre-image gap, residual 1, which the orchestrator is filing separately.
   perf_ws12_bgsave_split 4/4 + 1 ignored (the resync variant: PSYNC needs a monoio master),
   perf_ws15_bgsave_status 3/3, perf_ws8_mset_bgsave_capture 1/1, perf_ws16_bgsave_capture 6/6,
   perf_ws16_mq_billing 4/4, mq_integration 17/17, workspace_integration 13/13 + 1 ignored.
+
+## Review 5 (MERGE-AFTER-FIXES) — what changed
+
+| item | commit | evidence (red → green) |
+|---|---|---|
+| A BLOCKING: the FLUSHDB freeze had no byte bound (a regression against main) | 11cf616e | Bound test (insert THEN flush): 1,297,793 B held vs an epoch-start 1,123,560 B → within. Skeleton test: 515 of 515 segments kept → trimmed. Two grown tables before one drain: completed → fails. Real server (the reviewer's reproduction): `current_cow_size` 344,782,240, RSS +341 MB → 0, +49..+58 MB (3/3). Details in item 2a above. |
+| B moon#1261: the MqPop apply wrote the PEL untracked; the MqAck apply credits it | 6446832f, f9b89d65 | Lib replay test: 627 vs 1,185 B → equal. Restart and replica (the reviewer's proofs): 28,421 vs 124,097 → 124,097 = 124,097. Details under moon#1250 above. |
+| C the 2b budget's latency trade-off (docs; keep) | ac6a4896 | The reviewer's release A/B, in item 2b above. The 0.7–1.7 s delay was a debug-build and load artifact. |
+| D `count + mdc` overflowed on POP COUNT near `usize::MAX` | 48414029 | Debug panic ("attempt to add with overflow", mq_exec.rs:718) → delivers all 3. |
+| E POP's `cut == 0` rewind and empty-batch return are unreachable | 9037ebdd | Kept, with one-line comments naming the invariant (COUNT >= 1, `test_validate_mq_pop_count_zero`). Comment-only, no red. |
+| F a push or dead letter `Stream::add` refuses was still logged | 54d0f2c1 | TXN push: 1 MqPush logged for a refused add → 0. DLQ: routed (1, 1) with the entry acked away → (1, 0), the entry pending. `Stream::next_auto_id`'s `seq + 1` panicked a debug build at the last ID → explicit wrap. |
+| file size | b559c1f1 | mq_exec.rs's tests moved to mq_exec/tests.rs (1,616 → 1,094 lines). |
+
+Notes:
+- The adopted server tests use `common::spawn_listening` (collision-safe reservation), not a
+  fixed port range.
+- The reviewer's Q1 proof is adopted without its MULTI leg (moon#1262, not WS16's).
+- F (DLQ site): dropping the routing alone would have diverged on replay, which removes a
+  dead letter from the PEL only through its routing. So the DLQ adds now come first, and only
+  routed dead letters are acked.
+
+## Gate run after review 5 (production code 54d0f2c1; test/doc commits after it; pinned debug builds)
+
+- `cargo fmt --check` clean; audit-unsafe, audit-unwrap, audit-test-tempdirs,
+  audit-encoding-limits PASS.
+- `cargo clippy --all-targets -- -D warnings` clean on monoio and on
+  `--no-default-features --features runtime-tokio,jemalloc`.
+- `cargo test --lib`, monoio, FULL: 6,652 passed, 14 ignored.
+- `cargo test --lib`, filtered to the touched modules (persistence::snapshot,
+  shard::persistence_tick, shard::mq_exec, blocking::stream_wake, blocking::wakeup,
+  command::keyspace::move_cmd, scripting::bridge, shard::spsc_two_db, shard::shared_databases,
+  replication::apply, shard::db_plane, workspace, server::conn::tests, storage::db,
+  storage::stream, command::mq): monoio 677 passed, tokio 641 passed.
+- Integration, monoio (`MOON_BIN=/home/user/wt/bin/ws16-r5-final-monoio`):
+  - perf_ws12_bgsave_split 5/5, perf_ws15_bgsave_status 3/3, perf_ws8_mset_bgsave_capture 1/1;
+  - perf_ws16_bgsave_capture 7/7, perf_ws16_mq_billing 7/7;
+  - with `--include-ignored`: replication_ws 4/4, replication_readonly_ws_mq 1/1,
+    replication_mq 4/4, replication_swapdb 3/3.
+- Integration, tokio (`MOON_BIN=/home/user/wt/bin/ws16-r5-final-tokio`):
+  - perf_ws12_bgsave_split 4/4 + 1 ignored (resync), perf_ws15_bgsave_status 3/3,
+    perf_ws8_mset_bgsave_capture 1/1;
+  - perf_ws16_bgsave_capture 7/7, perf_ws16_mq_billing 5/5 + 2 ignored (replica);
+  - mq_integration 17/17, workspace_integration 13/13 + 1 ignored.

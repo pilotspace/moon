@@ -388,8 +388,10 @@ fn aborted_bgsave_then_resave(dir: &std::path::Path, abort: Abort) {
             // The resync (connect, PSYNC, load) must land while the epoch is
             // still WRITING: the walk is held (`MOON_TEST_SNAPSHOT_HOLD_FILE`)
             // until the resync is in, so any dataset will do. Racing the walk
-            // instead needed up to 3.2M keys and still missed the window:
-            // link up took 0.7-1.7 s during a save vs ~40 ms idle.
+            // instead needed up to 3.2M keys and still missed the window in
+            // this DEBUG build beside the file's other tests (link up
+            // 0.7-1.7 s during a save vs ~40 ms idle; a release build did
+            // not reproduce it — a debug-build and load artifact).
             Abort::Resync { .. } => {
                 preload(&mut c, 10_000);
                 std::fs::write(&hold, b"").expect("create the hold file");
@@ -415,10 +417,10 @@ fn aborted_bgsave_then_resave(dir: &std::path::Path, abort: Abort) {
                     std::thread::sleep(Duration::from_millis(1));
                 }
                 // Then hold the walk, so the FLUSHALL lands inside the epoch
-                // however loaded the box is: beside this file's other tests
-                // a busy shard dispatched it only after the walk ended, in 4
-                // attempts of 4. The writer keeps draining its backlog; the
-                // hold only stops new blocks.
+                // however slow the build and the box are: in a debug build
+                // beside this file's other tests the walk ended before the
+                // FLUSHALL arrived in 4 attempts of 4. The writer keeps
+                // draining its backlog; the hold only stops new blocks.
                 std::fs::write(&hold, b"").expect("create the hold file");
                 assert!(c.send(&["FLUSHALL"]).starts_with('+'));
                 std::fs::remove_file(&hold).expect("release the hold");
