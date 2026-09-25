@@ -192,7 +192,8 @@ impl LuaEvictionCtx {
     ///
     /// Only where redis would, by [`ScriptOomMode`]: in an EVAL (redis's
     /// compat mode) shrink-only commands pass; in a FUNCTION registered with
-    /// `allow-oom` EVERY command passes (redis's `SCRIPT_ALLOW_OOM`); a
+    /// `allow-oom` EVERY command passes maxmemory (redis's
+    /// `SCRIPT_ALLOW_OOM`), the per-db quota still refusing growth; a
     /// FUNCTION without it is refused whole under OOM by redis 7.0, so its
     /// writes keep the refusal here.
     fn gate_command(
@@ -267,13 +268,15 @@ impl LuaEvictionCtx {
             )
         };
         // moon#1241: the script's bypass (see `gate_command`) — eviction
-        // above has run either way.
-        let bypass = cmd.is_some_and(|cmd| match SCRIPT_OOM_MODE.with(Cell::get) {
-            ScriptOomMode::Compat => crate::storage::db_quota::is_shrink_only_command(cmd),
-            ScriptOomMode::AllowOom => true,
-            ScriptOomMode::Deny => false,
-        });
-        if !bypass {
+        // above has run either way. `allow-oom` is redis's flag against
+        // maxmemory only: moon's per-db quota, a tenant cap redis lacks,
+        // still refuses an allow-oom function's growing writes (PR #1268
+        // review) and, as everywhere, never a shrink-only command.
+        let mode = SCRIPT_OOM_MODE.with(Cell::get);
+        let shrink_only = cmd.is_some_and(crate::storage::db_quota::is_shrink_only_command);
+        let bypass_quota = shrink_only && mode != ScriptOomMode::Deny;
+        let bypass_global = bypass_quota || (cmd.is_some() && mode == ScriptOomMode::AllowOom);
+        if !bypass_global {
             global_result?;
         }
         // WS5b: per-db quota, additive and finer-grained than the
@@ -287,7 +290,7 @@ impl LuaEvictionCtx {
             }
             None => crate::storage::db_quota::check_db_maxmemory(db, db_index, &rt),
         };
-        if bypass { Ok(()) } else { quota }
+        if bypass_quota { Ok(()) } else { quota }
     }
 
     /// Wave A part 2 (task #34): dual-plane (AOF + replication) emission of

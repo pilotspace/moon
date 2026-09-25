@@ -586,8 +586,9 @@ pub const SHUTDOWN_SAVE_DEADLINE_MS: u64 = 2 * SHUTDOWN_SAVE_TIMEOUT_MS;
 ///
 /// `Err` carries the reply that refuses the SHUTDOWN (the server stays up):
 /// a save that failed, or that did not finish by the one overall deadline
-/// ([`SHUTDOWN_SAVE_DEADLINE_MS`] from the call), or one that could not
-/// start (no persistence directory).
+/// ([`SHUTDOWN_SAVE_DEADLINE_MS`] from the call, observed at the next poll),
+/// or one that could not start (no persistence directory). No save is
+/// started once the deadline has passed.
 pub async fn shutdown_save<S, F>(
     snapshot_trigger: &crate::runtime::channel::WatchSender<u64>,
     num_shards: usize,
@@ -630,6 +631,15 @@ where
     };
     let mut deferred = 0;
     loop {
+        // PR #1268 review: a save someone else started may end in the poll
+        // that crosses the deadline. Starting ours then would be answered
+        // "timed out" at once and keep running in the background, so no save
+        // starts past the deadline. (Our OWN save that completes in that
+        // poll counts: it is durable — the bound is the deadline plus one
+        // poll.)
+        if now() >= deadline {
+            return Err(timed_out());
+        }
         match bgsave_start_sharded(snapshot_trigger, num_shards) {
             Frame::Error(e) if e.as_ref() == SAVE_ALREADY_IN_PROGRESS_ERR => {
                 // Someone else's save is running: wait for it, then save.
@@ -731,8 +741,6 @@ mod tests {
         let _ = LAST_SAVE_TIME.load(Ordering::Relaxed);
     }
 
-    /// Run one sharded save over `shards` shards whose outcomes are
-    /// `results`, as the event loops report them.
     /// Review 5: SHUTDOWN's save has ONE deadline. Someone else's save ends
     /// just before it and SHUTDOWN's own save then never finishes: the call
     /// gives up at the deadline, not a fresh bound after the deferral (which
@@ -846,6 +854,82 @@ mod tests {
         );
     }
 
+    /// PR #1268 review (CodeRabbit): a save someone else started that ends
+    /// only after SHUTDOWN's deadline has passed (within the poll that
+    /// crossed it) must not let SHUTDOWN start its OWN save past the
+    /// deadline: that save would be refused as timed out at once, yet keep
+    /// running in the background. Virtual clock, real deadline.
+    #[test]
+    fn no_shutdown_save_starts_after_the_deadline() {
+        use std::task::{Context, Poll, Waker};
+        let _guard = BGSAVE_TEST_LOCK.lock();
+        let (tx, _rx) = crate::runtime::channel::watch(0u64);
+        let budget = std::time::Duration::from_millis(SHUTDOWN_SAVE_DEADLINE_MS);
+        let start = std::time::Instant::now();
+        let clock = std::cell::Cell::new(start);
+        // Another save runs, and ends in the poll that crosses the deadline.
+        SAVE_IN_PROGRESS.store(true, Ordering::SeqCst);
+        let sleep = |d: std::time::Duration| {
+            clock.set(clock.get() + d);
+            if clock.get() - start >= budget {
+                SAVE_IN_PROGRESS.store(false, Ordering::SeqCst);
+            }
+            std::future::ready(())
+        };
+        let mut fut = std::pin::pin!(shutdown_save_within(&tx, 1, sleep, || clock.get(), budget));
+        let reply = match fut.as_mut().poll(&mut Context::from_waker(Waker::noop())) {
+            Poll::Ready(r) => r,
+            Poll::Pending => panic!("every sleep is ready at once"),
+        };
+        let started_late = SAVE_IN_PROGRESS.load(Ordering::SeqCst);
+        if started_late {
+            bgsave_shard_done(true);
+        }
+        assert!(
+            matches!(&reply, Err(Frame::Error(e)) if e.as_ref().ends_with(b"timed out, check logs")),
+            "{reply:?}"
+        );
+        assert!(
+            !started_late,
+            "SHUTDOWN started its own save after its deadline had passed"
+        );
+    }
+
+    /// The other half of the same review point, decided the other way:
+    /// SHUTDOWN's OWN save that completes in the poll that crosses the
+    /// deadline counts. The snapshot is durable; answering "timed out" would
+    /// keep the server up and make the operator's retry write it again. The
+    /// bound is the deadline plus one poll.
+    #[test]
+    fn a_shutdown_save_that_completes_at_the_deadline_counts() {
+        use std::task::{Context, Poll, Waker};
+        let _guard = BGSAVE_TEST_LOCK.lock();
+        SAVE_IN_PROGRESS.store(false, Ordering::SeqCst);
+        let (tx, _rx) = crate::runtime::channel::watch(0u64);
+        let budget = std::time::Duration::from_millis(SHUTDOWN_SAVE_DEADLINE_MS);
+        let poll = std::time::Duration::from_millis(SHUTDOWN_SAVE_POLL_MS);
+        let start = std::time::Instant::now();
+        let clock = std::cell::Cell::new(start);
+        let done = std::cell::Cell::new(false);
+        let sleep = |d: std::time::Duration| {
+            clock.set(clock.get() + d);
+            if !done.get() && clock.get() - start >= budget {
+                done.set(true);
+                bgsave_shard_done(true);
+            }
+            std::future::ready(())
+        };
+        let mut fut = std::pin::pin!(shutdown_save_within(&tx, 1, sleep, || clock.get(), budget));
+        let reply = match fut.as_mut().poll(&mut Context::from_waker(Waker::noop())) {
+            Poll::Ready(r) => r,
+            Poll::Pending => panic!("every sleep is ready at once"),
+        };
+        assert!(done.get() && reply.is_ok(), "{reply:?}");
+        assert!(clock.get() - start <= budget + poll);
+    }
+
+    /// Run one sharded save over `shards` shards whose outcomes are
+    /// `results`, as the event loops report them.
     fn sharded_save(results: &[bool]) {
         let (tx, _rx) = crate::runtime::channel::watch(0u64);
         let reply = bgsave_start_sharded(&tx, results.len());
