@@ -1,9 +1,11 @@
 //! WS12 end to end, against a real server: a BGSAVE taken while clients keep
 //! inserting (so the DashTable keeps splitting mid-epoch) must restore every
 //! key that existed before the save started, with its value (moon#1216);
-//! and a FLUSHDB / FLUSHALL / SWAPDB landing mid-BGSAVE must neither crash
-//! the shard (moon#1224) nor publish a mixed file — nor, once it aborted the
-//! save, let that save's writer corrupt the NEXT one (moon#1227 review F1).
+//! a FLUSHDB / FLUSHALL / SWAPDB landing mid-BGSAVE must neither crash the
+//! shard (moon#1224) nor publish a mixed file — since moon#1228 the save
+//! completes with the pre-flush image, as redis's does; and a save that IS
+//! aborted (a replica full resync) must not let its writer corrupt the NEXT
+//! one (moon#1227 review F1).
 //!
 //! Pin the binary: `MOON_BIN=<moon> cargo test --test perf_ws12_bgsave_split`
 //! (falls back to the binary Cargo built for this run).
@@ -200,12 +202,16 @@ fn split_during_bgsave_keeps_every_pre_epoch_key_shards_4() {
     split_during_bgsave_keeps_every_pre_epoch_key(4);
 }
 
-/// moon#1224: each whole-table write, issued right after BGSAVE started (the
-/// epoch is still writing thousands of segments), must leave the server
-/// serving — the save fails (it cannot be one instant any more) and the
-/// server says so.
+/// moon#1224, moon#1228: each whole-table write, issued while the BGSAVE
+/// epoch is still writing (thousands of segments to go), must leave the
+/// server serving (it panicked the shard before moon#1224) AND let the save
+/// complete with the keyspace it started from — the save used to be
+/// aborted (`err`) instead, so a workload flushing more often than one save
+/// takes never saved at all. Restored alone after SIGKILL: every `pre:` key in
+/// db 0 with its value, and nothing in db 1.
 #[test]
-fn table_swaps_during_bgsave_fail_the_save_not_the_server() {
+fn table_swaps_during_bgsave_keep_the_save_point_in_time() {
+    const N: u64 = 600_000;
     for cmd in [
         &["FLUSHALL"][..],
         &["FLUSHDB"][..],
@@ -214,15 +220,21 @@ fn table_swaps_during_bgsave_fail_the_save_not_the_server() {
     ] {
         let dir = common::unique_test_dir("ws12-swap");
         std::fs::create_dir_all(&dir).unwrap();
-        let (_server, port) = spawn(&dir, 1);
+        let (mut server, port) = spawn(&dir, 1);
         let mut c = Conn::open(port);
-        preload(&mut c, 600_000);
+        preload(&mut c, N);
         assert!(c.send(&["BGSAVE"]).contains("Background saving started"));
         // Let the shard pick the epoch up (1 ms tick). At ~1,024 entries per
         // tick, 600K keys keep the epoch open for ~0.6 s after this.
         std::thread::sleep(Duration::from_millis(30));
-        let reply = c.send(cmd);
-        assert!(reply.starts_with('+'), "{cmd:?} refused: {reply}");
+        let reply = c.pipeline(&[cmd, &["INFO", "persistence"]]);
+        assert!(reply.starts_with('+'), "{cmd:?} refused: {reply:.200}");
+        assert!(
+            reply.contains("rdb_bgsave_in_progress:1"),
+            "fixture: the save ended before {cmd:?} landed"
+        );
+        // Writes after the change land in the post-epoch tables.
+        assert!(c.send(&["SET", "pre:00000007", "post"]).starts_with('+'));
         // The shard must still be serving (it panicked here before).
         std::thread::sleep(Duration::from_millis(50));
         let mut probe = Conn::open(port);
@@ -232,51 +244,113 @@ fn table_swaps_during_bgsave_fail_the_save_not_the_server() {
         );
         let status = wait_bgsave(&mut probe, Duration::from_secs(120));
         assert_eq!(
-            status, "err",
-            "{cmd:?} crossed the epoch: the save must fail, not publish a mixed file"
+            status, "ok",
+            "{cmd:?} crossed the epoch: the save must complete with the pre-change image"
         );
-        assert!(probe.send(&["PING"]).contains("PONG"));
+        server.kill_now();
+        common::wait_for_port_down(port);
+        let (_server2, port2) = spawn(&dir, 1);
+        let mut c2 = Conn::open(port2);
+        let wrong = wrong_pre_keys(&mut c2, N);
+        assert!(c2.send(&["SELECT", "1"]).starts_with('+'));
+        let in_db1 = c2.send(&["DBSIZE"]);
+        assert!(
+            wrong == 0 && in_db1 == ":0\r\n",
+            "{cmd:?}: the snapshot is not the keyspace the save started from: {wrong} of {N} \
+             db-0 keys missing or changed, db 1 DBSIZE {in_db1:?}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
 
-/// moon#1227 review F1, end to end. A BGSAVE aborted by FLUSHALL while its
-/// writer thread still holds a backlog, then the next BGSAVE as soon as the
-/// shard takes it. The aborted save's writer used to keep appending that
-/// backlog into `shard-0.rrdshard.tmp` — the same inode the next save had
-/// just truncated and was renaming into place: the second save completed
-/// ("BGSAVE OK"), and the file it published held ~65 MiB of the aborted
-/// save's blocks behind its own ~300 bytes, failing its checksum at restart
-/// (the canary written between the saves gone). Or the straggler unlinked
-/// the new temp file and the second save failed.
+/// moon#1227 review F1, end to end. A BGSAVE aborted while its writer thread
+/// still holds a backlog, then the next BGSAVE as soon as the shard takes it.
+/// The aborted save's writer used to keep appending that backlog into
+/// `shard-0.rrdshard.tmp` — the same inode the next save had just truncated
+/// and was renaming into place: the second save completed ("BGSAVE OK"), and
+/// the file it published held ~65 MiB of the aborted save's blocks behind its
+/// own ~300 bytes, failing its checksum at restart (the canary written
+/// between the saves gone). Or the straggler unlinked the new temp file and
+/// the second save failed.
+///
+/// The abort is a replica FULL RESYNC landing mid-save (moon#1227 review F6):
+/// since moon#1228 a FLUSHALL no longer aborts a save (it completes with the
+/// pre-flush image), and a resync is the one whole-table replacement that
+/// still must — the node's data becomes the master's, which is not a record
+/// of its own log.
 ///
 /// Since moon#1230 `rdb_last_bgsave_status` describes the LAST save, so it
-/// judges the second save directly (it used to stay `err` after the aborted
-/// one, and this test read the server log instead); the log still shows the
-/// first was aborted, and the restart proves the published file is sound.
+/// judges the second save directly; the log shows the first was aborted, and
+/// the restart proves the published file is sound.
 #[test]
 fn an_aborted_bgsave_cannot_corrupt_the_next_one() {
     let dir = common::unique_test_dir("ws12-abort-resave");
     std::fs::create_dir_all(&dir).unwrap();
+    let mdir = common::unique_test_dir("ws12-abort-resave-master");
+    std::fs::create_dir_all(&mdir).unwrap();
+    let (_master, mport) = spawn(&mdir, 1);
     let (mut server, port) = spawn(&dir, 1);
     let mut c = Conn::open(port);
-    // ~190 MiB of 64 KiB values: the writer thread, not the walk, is the
-    // bottleneck of this epoch, so it holds a deep backlog when FLUSHALL
-    // lands.
-    let value = "v".repeat(64 * 1024);
-    for batch in 0..30u32 {
-        let keys: Vec<String> = (0..100).map(|i| format!("big:{batch}:{i}")).collect();
-        let cmds: Vec<Vec<&str>> = keys
-            .iter()
-            .map(|k| vec!["SET", k.as_str(), value.as_str()])
-            .collect();
-        let refs: Vec<&[&str]> = cmds.iter().map(|c| c.as_slice()).collect();
-        let reply = c.pipeline(&refs);
-        assert!(!reply.contains('-'), "preload refused: {reply:.200}");
+    let aborted_saves = |dir: &std::path::Path| {
+        std::fs::read_to_string(dir.join("server.err"))
+            .unwrap_or_default()
+            .matches("aborted: a replica full resync")
+            .count()
+    };
+    // The resync (connect, PSYNC, load) takes tens to hundreds of ms and must
+    // land while the epoch is still WRITING — a walk that already finished is
+    // not aborted, its file is complete. An attempt that misses the window is
+    // set up again with a longer walk (the resync emptied the node).
+    let mut attempt = 0u32;
+    loop {
+        attempt += 1;
+        // ~190 MiB of 64 KiB values: the writer thread is the bottleneck
+        // whenever the walk reaches them, so it holds a backlog when the
+        // resync lands...
+        let value = "v".repeat(64 * 1024);
+        for batch in 0..30u32 {
+            let keys: Vec<String> = (0..100).map(|i| format!("big:{batch}:{i}")).collect();
+            let cmds: Vec<Vec<&str>> = keys
+                .iter()
+                .map(|k| vec!["SET", k.as_str(), value.as_str()])
+                .collect();
+            let refs: Vec<&[&str]> = cmds.iter().map(|c| c.as_slice()).collect();
+            let reply = c.pipeline(&refs);
+            assert!(!reply.contains('-'), "preload refused: {reply:.200}");
+        }
+        // ...and small keys interleaved with them in the same database keep
+        // the walk going (~1,024 entries per 1 ms tick). 200K and 400K missed
+        // the window in 4 of 5 debug runs; 800K caught it in all of them.
+        preload(&mut c, 800_000 << (attempt - 1));
+        let aborted_before = aborted_saves(&dir);
+        assert!(c.send(&["BGSAVE"]).contains("Background saving started"));
+        std::thread::sleep(Duration::from_millis(10));
+        // The master is empty: after the resync this node holds nothing.
+        assert!(
+            c.send(&["REPLICAOF", "127.0.0.1", &mport.to_string()])
+                .starts_with('+')
+        );
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !c
+            .send(&["INFO", "replication"])
+            .contains("master_link_status:up")
+        {
+            assert!(Instant::now() < deadline, "the replica link never came up");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(c.send(&["REPLICAOF", "NO", "ONE"]).starts_with('+'));
+        // The abort is logged by the next persistence tick after the resync.
+        std::thread::sleep(Duration::from_millis(20));
+        if aborted_saves(&dir) > aborted_before {
+            break;
+        }
+        assert!(
+            attempt < 3,
+            "fixture: the resync never landed inside the save in {attempt} attempts"
+        );
+        eprintln!("attempt {attempt}: the save finished before the resync; setting it up again");
+        wait_bgsave(&mut c, Duration::from_secs(120));
     }
-    assert!(c.send(&["BGSAVE"]).contains("Background saving started"));
-    std::thread::sleep(Duration::from_millis(10));
-    assert!(c.send(&["FLUSHALL"]).starts_with('+'));
     assert!(c.send(&["SET", "canary", "after-abort"]).starts_with('+'));
     // The next BGSAVE, the moment the shard has dropped the aborted one.
     let deadline = Instant::now() + Duration::from_secs(60);
@@ -295,11 +369,6 @@ fn an_aborted_bgsave_cannot_corrupt_the_next_one() {
     );
     // A straggler writer of the aborted save has at most tens of MiB left.
     std::thread::sleep(Duration::from_millis(500));
-    let log = std::fs::read_to_string(dir.join("server.err")).unwrap_or_default();
-    assert!(
-        log.contains("aborted: FLUSHALL"),
-        "fixture: the first BGSAVE must have been aborted by the FLUSHALL"
-    );
     let published = std::fs::metadata(dir.join("shard-0.rrdshard"))
         .map(|m| m.len())
         .unwrap_or(0);
@@ -314,4 +383,5 @@ fn an_aborted_bgsave_cannot_corrupt_the_next_one() {
     );
     assert_eq!(c2.send(&["DBSIZE"]), ":1\r\n");
     let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&mdir);
 }
