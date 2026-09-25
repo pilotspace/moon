@@ -404,6 +404,9 @@ pub(crate) fn run_cold_orphan_sweep(
     shard_dir: &std::path::Path,
     mut manifest: Option<&mut crate::persistence::manifest::ShardManifest>,
     now_ms: u64,
+    // moon#1231: read by the unlink decision (next commit).
+    _aof_pool: Option<&Arc<crate::persistence::aof::AofWriterPool>>,
+    _spill_file_id: &std::cell::Cell<u64>,
 ) {
     use crate::storage::tiered::cold_index::{MAX_EXPIRED_SWEEP_BATCH, SweepStats};
 
