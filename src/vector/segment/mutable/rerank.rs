@@ -247,3 +247,132 @@ mod tests {
         assert_eq!(super::exact_rerank_depth(usize::MAX, 4), usize::MAX);
     }
 }
+
+/// moon#1226 measurement: the mutable leg's cost with the exact rerank
+/// (ADC top `mult·k` + `mult·k` f16 rows) against HEAD's ADC-only top `k`,
+/// on the sync scan and on the MVCC scan FT.SEARCH runs (FastScan pre-filter,
+/// whose bound the deeper heap loosens), same segment, same queries,
+/// alternating per rep (7 reps, median), plus both arms' R@10. Measured on
+/// the 4-vCPU Linux box (release-fast): MVCC 384d n=1000 112 → 191 µs
+/// (x1.70, R@10 0.829 → 0.995), n=5000 225 → 358 µs (x1.59, 0.808 → 0.979),
+/// 768d n=5000 665 → 1075 µs (x1.62, 0.823 → 0.992); `mult = 2` x1.23–1.29
+/// for 0.935–0.968; the sync scan x1.01–1.05.
+///
+/// `#[ignore]`: meaningful only in an optimised build:
+/// `cargo test --profile release-fast --lib rerank_cost_ab -- --ignored --nocapture`.
+#[cfg(test)]
+mod cost {
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    use crate::vector::distance;
+    use crate::vector::segment::mutable::MutableSegment;
+    use crate::vector::test_support::EmbeddingLike;
+    use crate::vector::turbo_quant::collection::{
+        BuildMode, CollectionMetadata, QuantizationConfig,
+    };
+    use crate::vector::types::DistanceMetric;
+
+    #[test]
+    #[ignore = "measurement: run in release-fast with --ignored --nocapture"]
+    fn rerank_cost_ab() {
+        distance::init();
+        crate::vector::turbo_quant::fwht::init_fwht();
+        const K: usize = 10;
+        for (dim, n) in [(384usize, 1_000usize), (384, 5_000), (768, 5_000)] {
+            let col = Arc::new(CollectionMetadata::with_build_mode(
+                43,
+                dim as u32,
+                DistanceMetric::Cosine,
+                QuantizationConfig::TurboQuant4,
+                43,
+                BuildMode::Exact,
+            ));
+            let seg = MutableSegment::new(dim as u32, Arc::clone(&col));
+            let mut g = EmbeddingLike::new(dim, 64, 29);
+            let docs = g.docs(n);
+            for (i, v) in docs.iter().enumerate() {
+                seg.append(i as u64 + 1, v, i as u64 + 1);
+            }
+            let mut queries: Vec<Vec<f32>> = (0..50).map(|_| g.doc()).collect();
+            queries.extend((0..50).map(|_| g.far()));
+            let truth: Vec<Vec<u32>> = queries
+                .iter()
+                .map(|q| {
+                    let mut d: Vec<(f32, u32)> = docs
+                        .iter()
+                        .enumerate()
+                        .map(|(i, v)| (-v.iter().zip(q).map(|(a, b)| a * b).sum::<f32>(), i as u32))
+                        .collect();
+                    d.sort_by(|a, b| a.0.total_cmp(&b.0));
+                    d.into_iter().take(K).map(|x| x.1).collect()
+                })
+                .collect();
+            let committed = roaring::RoaringTreemap::new();
+            // (path, reranked): the sync scan, and the MVCC scan FT.SEARCH runs (FastScan
+            // pre-filter bounded by the heap's worst entry, which a 4·k heap loosens).
+            let arm = |mvcc: bool, mult: u32| -> (f64, f64) {
+                let t = Instant::now();
+                let mut hits = 0usize;
+                for (q, want) in queries.iter().zip(&truth) {
+                    let r = match (mvcc, mult) {
+                        (false, 0) => seg.brute_force_search(q, None, K),
+                        (false, m) => seg.brute_force_search_reranked(q, K, None, m),
+                        (true, m) => {
+                            let scan_k = K * m.max(1) as usize;
+                            let mut r = seg.brute_force_search_mvcc(
+                                q,
+                                None,
+                                scan_k,
+                                None,
+                                0,
+                                0,
+                                &committed,
+                                0,
+                                usize::MAX,
+                            );
+                            if m > 0 {
+                                seg.rerank_exact(&mut r, q, K);
+                            }
+                            r
+                        }
+                    };
+                    hits += r.iter().filter(|x| want.contains(&x.id.0)).count();
+                }
+                let ns = t.elapsed().as_nanos() as f64 / queries.len() as f64;
+                (ns, hits as f64 / (queries.len() * K) as f64)
+            };
+            for (mvcc, mult) in [(false, 4u32), (true, 4), (true, 2)] {
+                let _ = (arm(mvcc, 0), arm(mvcc, mult)); // warm
+                let (mut adc, mut rr) = (Vec::new(), Vec::new());
+                let (mut r_adc, mut r_rr) = (0.0, 0.0);
+                for rep in 0..7 {
+                    let order = if rep % 2 == 0 { [0, mult] } else { [mult, 0] };
+                    for m in order {
+                        let (ns, recall) = arm(mvcc, m);
+                        if m > 0 {
+                            rr.push(ns);
+                            r_rr = recall;
+                        } else {
+                            adc.push(ns);
+                            r_adc = recall;
+                        }
+                    }
+                }
+                adc.sort_by(f64::total_cmp);
+                rr.sort_by(f64::total_cmp);
+                println!(
+                    "rerank_cost_ab {dim}d n={n} {}: ADC-only k={K} median {:.1} us/query \
+                     (R@10 {r_adc:.3}) | reranked {mult}k median {:.1} us/query (R@10 {r_rr:.3}) | \
+                     cost x{:.2}; reps adc {:?} rr {:?}",
+                    if mvcc { "mvcc" } else { "sync" },
+                    adc[3] / 1e3,
+                    rr[3] / 1e3,
+                    rr[3] / adc[3],
+                    adc.iter().map(|x| (x / 1e3).round()).collect::<Vec<_>>(),
+                    rr.iter().map(|x| (x / 1e3).round()).collect::<Vec<_>>()
+                );
+            }
+        }
+    }
+}
