@@ -748,3 +748,114 @@ fn cold_reads_do_not_count_as_changes() {
         after - before
     );
 }
+
+// ── SHUTDOWN while an auto-save runs ────────────────────────────────────────
+
+fn spawn_saving(dir: &std::path::Path, save: &str) -> (ServerGuard, u16) {
+    let bin = common::find_moon_binary();
+    let (child, port) = common::spawn_listening(|port| {
+        std::process::Command::new(&bin)
+            .args(["--port", &port.to_string(), "--dir", &dir.to_string_lossy()])
+            .args([
+                "--shards",
+                "1",
+                "--appendonly",
+                "no",
+                "--disk-offload",
+                "disable",
+            ])
+            .args([
+                "--maxmemory",
+                "0",
+                "--disk-free-min-pct",
+                "0",
+                "--save",
+                save,
+            ])
+            .stdout(common::server_stderr(dir))
+            .stderr(common::server_stderr(dir))
+            .spawn()
+            .expect("spawn moon (build it first, or set MOON_BIN)")
+    });
+    (ServerGuard::new(child), port)
+}
+
+/// moon#1232 makes sharded auto-saves run, which makes this reachable:
+/// `SHUTDOWN` (default mode with save points) while an auto-save is in
+/// progress used to answer "Background save already in progress" and leave
+/// the server running. redis 7.0.15's `prepareForShutdown` kills the saving
+/// child and saves synchronously; SHUTDOWN never fails because a save is
+/// running. moon waits for the running save and saves again: a key written
+/// after the auto-save started — which only the SHUTDOWN save can hold — is
+/// there after a restart.
+#[test]
+fn shutdown_during_an_auto_save_is_not_refused() {
+    use std::io::{Read, Write};
+    const KEYS: usize = 400_000;
+    let dir = common::unique_test_dir("ws19-1232-shutdown");
+    std::fs::create_dir_all(&dir).unwrap();
+    let (mut server, port) = spawn_saving(&dir, "1 1");
+    let mut c = Conn::open(port);
+    // A dataset whose snapshot takes a while.
+    for chunk in 0..KEYS / 10_000 {
+        let cmds: Vec<[String; 3]> = (0..10_000)
+            .map(|i| {
+                [
+                    "SET".into(),
+                    format!("k:{chunk}:{i}"),
+                    "vvvvvvvvvvvvvvvv".into(),
+                ]
+            })
+            .collect();
+        let parts: Vec<Vec<&str>> = cmds
+            .iter()
+            .map(|c| c.iter().map(String::as_str).collect())
+            .collect();
+        let refs: Vec<&[&str]> = parts.iter().map(Vec::as_slice).collect();
+        c.pipeline(&refs);
+    }
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while info_field(&mut c, "rdb_bgsave_in_progress") != "1" {
+        assert!(Instant::now() < deadline, "no auto-save started");
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    // Only a save started after this write can hold it.
+    assert!(
+        c.send(&["SET", "marker", "after-the-auto-save-started"])
+            .starts_with("+OK")
+    );
+    c.sock.write_all(&common::encode(&["SHUTDOWN"])).unwrap();
+    c.sock
+        .set_read_timeout(Some(Duration::from_secs(60)))
+        .unwrap();
+    let mut buf = [0u8; 256];
+    let reply = match c.sock.read(&mut buf) {
+        Ok(n) => String::from_utf8_lossy(&buf[..n]).into_owned(),
+        Err(e) => format!("<read error {e}>"),
+    };
+    assert!(
+        !reply.starts_with('-'),
+        "SHUTDOWN during an auto-save was refused: {reply}"
+    );
+    let exited = (0..600).any(|_| {
+        std::thread::sleep(Duration::from_millis(100));
+        matches!(server.as_mut().try_wait(), Ok(Some(_)))
+    });
+    assert!(
+        exited,
+        "SHUTDOWN during an auto-save: the server did not exit in 60 s"
+    );
+    drop(server);
+
+    let (mut again, port) = spawn_saving(&dir, "");
+    let mut c = Conn::open(port);
+    let marker = c.send(&["GET", "marker"]);
+    let dbsize = c.send(&["DBSIZE"]);
+    again.kill_now();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        marker.contains("after-the-auto-save-started"),
+        "the SHUTDOWN save does not hold a write made while the auto-save ran: {marker:?}"
+    );
+    assert_eq!(dbsize.trim(), format!(":{}", KEYS + 1));
+}

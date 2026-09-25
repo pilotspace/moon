@@ -209,9 +209,7 @@ fn bgsave_start_sharded_with(
         return no_snapshot_dir_error();
     }
     if SAVE_IN_PROGRESS.swap(true, Ordering::SeqCst) {
-        return Frame::Error(Bytes::from_static(
-            b"ERR Background save already in progress",
-        ));
+        return Frame::Error(Bytes::from_static(SAVE_ALREADY_IN_PROGRESS_ERR));
     }
 
     BGSAVE_CURRENT_FAILED.store(false, Ordering::SeqCst);
@@ -542,6 +540,102 @@ pub const SHUTDOWN_SAVE_POLL_MS: u64 = 5;
 /// (large) snapshot under normal disk I/O, short enough that an operator
 /// (or a client with a bounded read timeout) isn't left hanging.
 pub const SHUTDOWN_SAVE_TIMEOUT_MS: u64 = 10_000;
+
+/// What a save start answers while another save runs.
+const SAVE_ALREADY_IN_PROGRESS_ERR: &[u8] = b"ERR Background save already in progress";
+
+/// How many times SHUTDOWN's save defers to a save someone else started
+/// before giving up (each wait is bounded by [`SHUTDOWN_SAVE_TIMEOUT_MS`]).
+const SHUTDOWN_SAVE_ATTEMPTS: usize = 3;
+
+/// SHUTDOWN's save in sharded / monoio mode: a cooperative per-shard BGSAVE,
+/// polled to completion with `sleep` (the caller's runtime timer).
+///
+/// A save already running — an auto-save, or a client's BGSAVE — is not a
+/// reason to refuse (moon#1232 review): redis's `prepareForShutdown` kills
+/// the saving child and saves synchronously, and SHUTDOWN never fails
+/// because a save is in progress. A cooperative snapshot cannot be killed
+/// safely mid-shard, so this waits for it (bounded like its own save) and
+/// then saves again: the running snapshot predates the writes made since it
+/// started, and a SHUTDOWN save must hold them.
+///
+/// `Err` carries the reply that refuses the SHUTDOWN (the server stays up):
+/// a save that failed or did not finish within [`SHUTDOWN_SAVE_TIMEOUT_MS`],
+/// or one that could not start (no persistence directory).
+pub async fn shutdown_save<S, F>(
+    snapshot_trigger: &crate::runtime::channel::WatchSender<u64>,
+    num_shards: usize,
+    sleep: S,
+) -> Result<(), Frame>
+where
+    S: Fn(std::time::Duration) -> F,
+    F: std::future::Future<Output = ()>,
+{
+    let poll = std::time::Duration::from_millis(SHUTDOWN_SAVE_POLL_MS);
+    let bound = std::time::Duration::from_millis(SHUTDOWN_SAVE_TIMEOUT_MS);
+    let timed_out = || {
+        Frame::Error(Bytes::from_static(
+            b"ERR SHUTDOWN failed: background save timed out, check logs",
+        ))
+    };
+    let mut deferred = 0;
+    loop {
+        match bgsave_start_sharded(snapshot_trigger, num_shards) {
+            Frame::Error(e) if e.as_ref() == SAVE_ALREADY_IN_PROGRESS_ERR => {
+                // Someone else's save is running: wait for it, then save.
+                if deferred == SHUTDOWN_SAVE_ATTEMPTS {
+                    return Err(Frame::Error(Bytes::from_static(
+                        b"ERR SHUTDOWN failed: other background saves kept starting, check logs",
+                    )));
+                }
+                deferred += 1;
+                wait_for_save(&sleep, poll, bound)
+                    .await
+                    .map_err(|()| timed_out())?;
+            }
+            // This save cannot run at all (no persistence directory):
+            // answer what BGSAVE would.
+            Frame::Error(e) => return Err(Frame::Error(e)),
+            _ => {
+                wait_for_save(&sleep, poll, bound)
+                    .await
+                    .map_err(|()| timed_out())?;
+                return save_outcome();
+            }
+        }
+    }
+}
+
+/// Poll until no save is in progress, at most `bound`.
+async fn wait_for_save<S, F>(
+    sleep: &S,
+    poll: std::time::Duration,
+    bound: std::time::Duration,
+) -> Result<(), ()>
+where
+    S: Fn(std::time::Duration) -> F,
+    F: std::future::Future<Output = ()>,
+{
+    let start = std::time::Instant::now();
+    while SAVE_IN_PROGRESS.load(Ordering::SeqCst) {
+        if start.elapsed() > bound {
+            return Err(());
+        }
+        sleep(poll).await;
+    }
+    Ok(())
+}
+
+/// The outcome of the save SHUTDOWN just waited for.
+fn save_outcome() -> Result<(), Frame> {
+    if BGSAVE_LAST_STATUS.load(Ordering::Relaxed) {
+        Ok(())
+    } else {
+        Err(Frame::Error(Bytes::from_static(
+            b"ERR SHUTDOWN failed: background save error, check logs",
+        )))
+    }
+}
 
 /// Decide whether SHUTDOWN's `Default` mode should perform a synchronous
 /// save, mirroring Redis: save iff at least one RDB save point is
