@@ -1556,6 +1556,65 @@ both EXPIRE "{l1209}:rot" 100
 assert_both "moon#1209 LMOVE k k on a one-element list" LMOVE "{l1209}:rot" "{l1209}:rot" LEFT RIGHT
 assert_both "moon#1209 LMOVE k k keeps the TTL" PERSIST "{l1209}:rot"
 
+# moon#1226 (verified on redis-server 7.0.15): counted pops on a listpack are
+# one cut from the end (strings, integers and a 60-byte entry mixed), and
+# SRANDMEMBER with a negative count answers from a per-member table.
+both DEL "{p1226}:l" "{p1226}:s1" "{p1226}:s3"
+both RPUSH "{p1226}:l" a 1 bb 22 "$(printf 'w%.0s' {1..60})" ccc -7 d 4444 e
+assert_both "moon#1226 RPOP k 3 on a listpack" RPOP "{p1226}:l" 3
+assert_both "moon#1226 LMPOP RIGHT COUNT 2" LMPOP 1 "{p1226}:l" RIGHT COUNT 2
+assert_both "moon#1226 LPOP k 2 on a listpack" LPOP "{p1226}:l" 2
+assert_both "moon#1226 what the pops left" LRANGE "{p1226}:l" 0 -1
+assert_both "moon#1226 RPOP past the end" RPOP "{p1226}:l" 100
+assert_both "moon#1226 the drained list is gone" EXISTS "{p1226}:l"
+both SADD "{p1226}:s1" only
+assert_both "moon#1226 SRANDMEMBER -3 on a one-member listpack set" SRANDMEMBER "{p1226}:s1" -3
+both SADD "{p1226}:s3" x 7 y
+assert_eq "moon#1226 SRANDMEMBER -60 draws every member of a 3-member set" \
+    "$(redis-cli -p "$PORT_REDIS" SRANDMEMBER "{p1226}:s3" -60 2>&1 | sort -u | tr '\n' ' ')" \
+    "$(redis-cli -p "$PORT_RUST" SRANDMEMBER "{p1226}:s3" -60 2>&1 | sort -u | tr '\n' ' ')"
+assert_eq "moon#1226 SRANDMEMBER -60 answers exactly 60" \
+    "$(redis-cli -p "$PORT_REDIS" SRANDMEMBER "{p1226}:s3" -60 2>&1 | wc -l | tr -d ' ')" \
+    "$(redis-cli -p "$PORT_RUST" SRANDMEMBER "{p1226}:s3" -60 2>&1 | wc -l | tr -d ' ')"
+
+# moon#1226 (verified on redis-server 7.0.15): an LREM that removes nothing and
+# an LINSERT whose pivot is missing are not writes -- redis signals the key only
+# when it changed, so a WATCHing EXEC still runs. Moon took the list's mutable
+# handle (its WATCH bump) before looking, and the EXEC aborted.
+# Prints the EXEC reply's first line (`*1` ran, `*-1` aborted) after WATCH on
+# the list, the mutation on ANOTHER connection, then MULTI / SET / EXEC.
+watch_exec_after() {
+    local port="$1" enc="$2"; shift 2
+    redis-cli -p "$port" DEL {wn}:l {wn}:x >/dev/null 2>&1 || true
+    if [[ "$enc" == linkedlist ]]; then
+        redis-cli -p "$port" RPUSH {wn}:l a b c "$(printf 'w%.0s' {1..80})" >/dev/null 2>&1 || true
+    else
+        redis-cli -p "$port" RPUSH {wn}:l a b c >/dev/null 2>&1 || true
+    fi
+    exec 4<>"/dev/tcp/127.0.0.1/${port}" || { echo "__CONNECT_FAILED__:${port}"; return 0; }
+    printf 'WATCH {wn}:l\r\n' >&4
+    local line="" out="NONE" i
+    IFS= read -r -t 2 line <&4 || true
+    redis-cli -p "$port" "$@" >/dev/null 2>&1 || true
+    printf 'MULTI\r\nSET {wn}:x 1\r\nEXEC\r\n' >&4
+    for i in 1 2 3; do IFS= read -r -t 2 line <&4 || break; done   # +OK +QUEUED, then the EXEC header
+    out="${line%$'\r'}"
+    exec 4>&-
+    echo "$out"
+}
+assert_eq "moon#1226 WATCH: LREM removing nothing (listpack) lets EXEC run" \
+    "$(watch_exec_after "$PORT_REDIS" listpack LREM {wn}:l 0 zz)" \
+    "$(watch_exec_after "$PORT_RUST"  listpack LREM {wn}:l 0 zz)"
+assert_eq "moon#1226 WATCH: LINSERT missing pivot (listpack) lets EXEC run" \
+    "$(watch_exec_after "$PORT_REDIS" listpack LINSERT {wn}:l BEFORE zz x)" \
+    "$(watch_exec_after "$PORT_RUST"  listpack LINSERT {wn}:l BEFORE zz x)"
+assert_eq "moon#1226 WATCH: LREM removing nothing (linkedlist) lets EXEC run" \
+    "$(watch_exec_after "$PORT_REDIS" linkedlist LREM {wn}:l -1 zz)" \
+    "$(watch_exec_after "$PORT_RUST"  linkedlist LREM {wn}:l -1 zz)"
+assert_eq "moon#1226 WATCH: an LREM that removes aborts EXEC [control]" \
+    "$(watch_exec_after "$PORT_REDIS" listpack LREM {wn}:l 1 a)" \
+    "$(watch_exec_after "$PORT_RUST"  listpack LREM {wn}:l 1 a)"
+
 # moon#1211 (WS10): the LFU counter under `lfu-log-factor 0` grows by exactly one
 # per access, and neither MEMORY USAGE nor OBJECT FREQ itself touches it
 # (redis serves both with LOOKUP_NOTOUCH). Config restored afterwards.
@@ -3155,6 +3214,65 @@ assert_tracking "tracking: ZRANGESTORE DEST invalidated [control]" \
     "{tz}:r" "ZRANGE {tz}:r 0 -1" ZRANGESTORE {tz}:r {tz}:a 0 -1
 
 # ---------------------------------------------------------------------------
+# moon#1234 -- DEL, UNLINK and GETDEL publish the `del` keyspace event (class
+# g) once per key they REMOVE, and nothing for an absent key: plain, spanning
+# (keys on several shards), inside MULTI/EXEC and from Lua. Moon published
+# nothing on any path. The capture subscribes to __keyevent@0__:del on a raw
+# connection, runs the commands down ONE redis-cli connection, and collects the
+# payload keys; the spanning row sorts them (several shards publish, and their
+# relative order is the mesh's, not the command line's). Checked against
+# redis-server 7.0.15 at --shards 1 and 4.
+# ---------------------------------------------------------------------------
+keyevent_del_capture() {
+    local port="$1" order="$2"; shift 2
+    redis-cli -p "$port" CONFIG SET notify-keyspace-events KEA >/dev/null 2>&1 || true
+    exec 3<>"/dev/tcp/127.0.0.1/${port}" || { echo "__CONNECT_FAILED__:${port}"; return 0; }
+    printf 'SUBSCRIBE __keyevent@0__:del\r\n' >&3
+    local line="" keys="" state=0 i
+    for i in 1 2 3 4 5 6 7 8; do
+        IFS= read -r -t 2 line <&3 || break
+        [[ "${line%$'\r'}" == ":1" ]] && break
+    done
+    printf '%s\n' "$@" | redis-cli -p "$port" >/dev/null 2>&1 || true
+    while IFS= read -r -t 1 line <&3; do
+        line="${line%$'\r'}"
+        case "$state" in
+            2) keys="${keys}${line} "; state=0 ;;
+            1) state=2 ;;
+            *) [[ "$line" == "__keyevent@0__:del" ]] && state=1 ;;
+        esac
+    done
+    exec 3>&-
+    redis-cli -p "$port" CONFIG SET notify-keyspace-events "" >/dev/null 2>&1 || true
+    if [[ "$order" == sorted ]]; then
+        printf '%s' "$keys" | tr ' ' '\n' | sed '/^$/d' | sort | tr '\n' ' '
+    else
+        printf '%s' "$keys"
+    fi
+}
+
+both DEL {kn}:a {kn}:b {kn}:c {kn}:t
+both SET {kn}:a 1
+both RPUSH {kn}:b x
+both SET {kn}:c 3
+assert_eq "moon#1234 DEL/UNLINK/GETDEL publish del per removed key" \
+    "$(keyevent_del_capture "$PORT_REDIS" seq 'DEL {kn}:a {kn}:nx {kn}:a' 'UNLINK {kn}:b' 'GETDEL {kn}:c' 'GETDEL {kn}:c')" \
+    "$(keyevent_del_capture "$PORT_RUST"  seq 'DEL {kn}:a {kn}:nx {kn}:a' 'UNLINK {kn}:b' 'GETDEL {kn}:c' 'GETDEL {kn}:c')"
+for i in 1 2 3 4 5 6 7 8; do both DEL kn:span:$i; done
+for i in 1 3 5 7; do both SET kn:span:$i v; done
+assert_eq "moon#1234 spanning DEL publishes del for every removed key" \
+    "$(keyevent_del_capture "$PORT_REDIS" sorted 'DEL kn:span:1 kn:span:2 kn:span:3 kn:span:4 kn:span:5 kn:span:6 kn:span:7 kn:span:8')" \
+    "$(keyevent_del_capture "$PORT_RUST"  sorted 'DEL kn:span:1 kn:span:2 kn:span:3 kn:span:4 kn:span:5 kn:span:6 kn:span:7 kn:span:8')"
+both SET {kn}:t v
+assert_eq "moon#1234 MULTI DEL+UNLINK of one key publishes one del" \
+    "$(keyevent_del_capture "$PORT_REDIS" seq 'MULTI' 'DEL {kn}:t' 'UNLINK {kn}:t' 'EXEC')" \
+    "$(keyevent_del_capture "$PORT_RUST"  seq 'MULTI' 'DEL {kn}:t' 'UNLINK {kn}:t' 'EXEC')"
+both SET {kn}:l1 v
+assert_eq "moon#1234 Lua redis.call DEL publishes del" \
+    "$(keyevent_del_capture "$PORT_REDIS" seq 'EVAL "return redis.call(\"DEL\", KEYS[1], KEYS[2])" 2 {kn}:l1 {kn}:l2')" \
+    "$(keyevent_del_capture "$PORT_RUST"  seq 'EVAL "return redis.call(\"DEL\", KEYS[1], KEYS[2])" 2 {kn}:l1 {kn}:l2')"
+
+# ---------------------------------------------------------------------------
 # moon#1013 -- a key that EXPIRES must invalidate exactly like one a command
 # writes. Moon's expiry sweep deleted the key and told keyspace notifications
 # and replicas, but never CLIENT TRACKING, so a client-side cache served the
@@ -3884,6 +4002,37 @@ for NSHARDS in 1 4 12; do
         [[ "$OUT" == *"Function not found"* ]] && GONE=$((GONE + 1))
     done
     assert_eq "moon#514 shards=$NSHARDS: FUNCTION DELETE reaches every shard" "12" "$GONE"
+
+    # --- moon#1235: LOAD racing FLUSH from two connections leaves every shard
+    # agreeing (all run, or all NOSCRIPT / not found) -- never a mix. The two
+    # redis-cli processes are launched together; 20 trials per shard count.
+    RACE_MIXED=0
+    for t in $(seq 1 20); do
+        body="return 'r1235-$NSHARDS-$t'"
+        redis-cli -p "$PORT_RUST" SCRIPT LOAD "$body" >/dev/null 2>&1 &
+        redis-cli -p "$PORT_RUST" SCRIPT FLUSH >/dev/null 2>&1 &
+        wait
+        sha=$(redis-cli -p "$PORT_REDIS" SCRIPT LOAD "$body" 2>/dev/null)  # the oracle hashes (no sha1sum on macOS)
+        ran=0
+        for i in $(seq 1 12); do
+            [[ "$(redis-cli -p "$PORT_RUST" EVALSHA "$sha" 1 "r1235k$i" 2>&1)" == r1235-* ]] && ran=$((ran + 1))
+        done
+        (( ran != 0 && ran != 12 )) && RACE_MIXED=$((RACE_MIXED + 1))
+    done
+    assert_eq "moon#1235 shards=$NSHARDS: SCRIPT LOAD racing SCRIPT FLUSH never leaves shards disagreeing" "0" "$RACE_MIXED"
+    RACE_MIXED=0
+    for t in $(seq 1 20); do
+        lib=$'#!lua name=r1235lib'"$t"$'\nredis.register_function(\'r1235f'"$t"$'\', function(keys, args) return 1 end)\n'
+        redis-cli -p "$PORT_RUST" FUNCTION LOAD "$lib" >/dev/null 2>&1 &
+        redis-cli -p "$PORT_RUST" FUNCTION FLUSH >/dev/null 2>&1 &
+        wait
+        ran=0
+        for i in $(seq 1 12); do
+            [[ "$(redis-cli -p "$PORT_RUST" FCALL "r1235f$t" 1 "r1235k$i" 2>&1)" == 1 ]] && ran=$((ran + 1))
+        done
+        (( ran != 0 && ran != 12 )) && RACE_MIXED=$((RACE_MIXED + 1))
+    done
+    assert_eq "moon#1235 shards=$NSHARDS: FUNCTION LOAD racing FUNCTION FLUSH never leaves shards disagreeing" "0" "$RACE_MIXED"
 done
 
 # Restart moon with the originally-requested shard count so later sections work.

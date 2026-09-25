@@ -1052,7 +1052,17 @@ pub(crate) async fn handle_connection_sharded_monoio<
                                         }
                                     }
                                     Ok(None) => break, // need more data
-                                    Err(_) => return (MonoioHandlerResult::Done, None),  // parse error
+                                    Err(_) => {
+                                        // Protocol fault: say so, as the main
+                                        // loop does, then close (moon#1226 —
+                                        // this arm closed silently).
+                                        if let Some(kind) = codec.take_last_fault() {
+                                            let data = bytes::Bytes::from(super::util::proto_error_frame(kind));
+                                            let (_wr, _b): (std::io::Result<usize>, bytes::Bytes) =
+                                                stream.write_all(data).await;
+                                        }
+                                        return (MonoioHandlerResult::Done, None);
+                                    }
                                 }
                             }
                         }
@@ -1872,7 +1882,9 @@ pub(crate) async fn handle_connection_sharded_monoio<
         if !std::mem::take(&mut frames_carried) {
             frames.clear();
         }
-        while frames.len() < super::util::MAX_BATCH_FRAMES {
+        // A latched fault (moon#1226) means the carried frames are the last
+        // valid ones: nothing behind the fault is ever parsed.
+        while proto_fault.is_none() && frames.len() < super::util::MAX_BATCH_FRAMES {
             match codec.decode_frame(&mut read_buf) {
                 Ok(Some(frame)) => frames.push(frame),
                 Ok(None) => break,
@@ -1897,11 +1909,21 @@ pub(crate) async fn handle_connection_sharded_monoio<
         }
 
         if frames.is_empty() {
-            // Nothing valid preceded the fault: report it and close.
+            // Nothing valid preceded the fault in frame form: report it and
+            // close. Commands the inline fast path already ran from this same
+            // read left their replies in `write_buf` (moon#1226: `SET k v`
+            // then a bad frame applied the SET and sent only the error) —
+            // they go out first, in one write with the error.
             if let Some(kind) = proto_fault.take() {
-                let data = bytes::Bytes::from(super::util::proto_error_frame(kind));
-                let (_wr, _b): (std::io::Result<usize>, bytes::Bytes) =
-                    stream.write_all(data).await;
+                write_buf.extend_from_slice(super::util::proto_error_frame(kind).as_bytes());
+                let _ = flush_write_buf_bounded!(
+                    stream,
+                    write_buf,
+                    write_timeout,
+                    out_cap_normal,
+                    client_live,
+                    client_id
+                );
                 return (MonoioHandlerResult::Done, None);
             }
             continue;
@@ -4443,6 +4465,10 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 super::util::spill_frames_to_front(&frames[from..num_frames], &mut read_buf);
                 // moon#1164: bytes were prepended — the resume cursor is void.
                 codec.reset_parse_state();
+                // moon#1226: the subscriber loop parses these bytes, and a
+                // fault never consumes its input, so it meets the same bad
+                // frame right behind them and reports it itself.
+                proto_fault = None;
             } else {
                 frames.drain(..from);
                 frames_carried = true;
@@ -4909,8 +4935,12 @@ pub(crate) async fn handle_connection_sharded_monoio<
         }
 
         // The valid prefix has been executed and flushed. Name the fault,
-        // then close — in that order.
-        if let Some(kind) = proto_fault.take() {
+        // then close — in that order. Unless part of that prefix was DEFERRED
+        // to the next iteration (a blocking command, SUBSCRIBE, the #507
+        // ordering guard): redis runs every command before the fault, so the
+        // fault stays latched and the loop goes round without reading until
+        // the carried frames have run (moon#1226). They used to be dropped.
+        if !frames_carried && let Some(kind) = proto_fault.take() {
             let data = bytes::Bytes::from(super::util::proto_error_frame(kind));
             let (_wr, _b): (std::io::Result<usize>, bytes::Bytes) = stream.write_all(data).await;
             return (MonoioHandlerResult::Done, None);

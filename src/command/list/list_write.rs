@@ -254,6 +254,49 @@ fn list_route(db: &Database, key: &[u8]) -> Result<Option<ListRoute>, Frame> {
     }
 }
 
+/// [`list_route`], plus whether the list holds an element equal to `element`
+/// -- decided on the read-only view, before any mutable handle exists.
+///
+/// moon#1226 (WATCH parity): acquiring a list's mutable handle IS its WATCH
+/// version bump (moon#926), so an `LREM` that removes nothing and an `LINSERT`
+/// whose pivot is missing used to abort a `WATCH`ing `EXEC`. redis 7.0.15
+/// calls `signalModifiedKey` only when something was removed / inserted, and
+/// that EXEC runs. Those two no-ops are answered from here and never reach a
+/// write accessor. The probe itself is `LOOKUP_NOTOUCH`; the no-op path
+/// records the command's one access with [`touch_list`].
+///
+/// The scan stops at the first match, so a list that does hold the element
+/// pays at most one extra partial walk before the write.
+fn list_route_holding(
+    db: &Database,
+    key: &[u8],
+    element: &[u8],
+) -> Result<Option<(ListRoute, bool)>, Frame> {
+    match db.peek_list_ref_if_alive(key, db.now_ms()) {
+        Ok(None) => Ok(None),
+        Ok(Some(list)) => {
+            let route = match list {
+                ListRef::Listpack(_) => ListRoute::Listpack,
+                ListRef::Deque(_) | ListRef::Owned(_) => ListRoute::Full,
+            };
+            let mut found = false;
+            list.for_each_match(element, false, usize::MAX, |_| {
+                found = true;
+                false
+            });
+            Ok(Some((route, found)))
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Record a list command's one access without a mutable handle -- the access
+/// redis's `lookupKeyWrite` records for an `LREM`/`LINSERT` that turns out to
+/// be a no-op (moon#1226). A second, touching lookup on the no-op path only.
+fn touch_list(db: &Database, key: &[u8]) {
+    let _ = db.get_list_ref_if_alive(key, db.now_ms());
+}
+
 /// Promote a `ListListpack` to the full `VecDeque` and settle the one-time
 /// cost-model swing, `after` being the listpack's last billed size.
 ///
@@ -291,7 +334,9 @@ fn promote_list_listpack(db: &mut Database, key: &[u8], after: usize) {
 ///
 /// moon#1174 §2: the BACK used to be reached twice from the head
 /// (`iter_refs().nth(len - 1)` to read it, `remove_at(len - 1)` to seek to it
-/// again). `Listpack::pop_end` steps back over one backlen instead.
+/// again), then once. Since moon#1206 wrote backlens in redis's order,
+/// `Listpack::pop_end` steps back over the last entry's backlen instead: O(1)
+/// (moon#1226). A counted pop takes `Listpack::pop_n`, one cut for all.
 #[inline]
 fn listpack_pop_end(lp: &mut crate::storage::listpack::Listpack, front: bool) -> Option<Bytes> {
     lp.pop_end(front)
@@ -365,13 +410,10 @@ fn pop_listpack(db: &mut Database, key: &Bytes, count: Option<usize>, front: boo
             None => Frame::Null,
         },
         Some(c) => {
-            let actual = c.min(lp.len());
-            let mut items = Vec::with_capacity(actual);
-            for _ in 0..actual {
-                if let Some(v) = listpack_pop_end(lp, front) {
-                    items.push(Frame::BulkString(v));
-                }
-            }
+            // moon#1226: ONE cut for the whole count. `RPOP k n` used to be n
+            // single pops, each seeking the tail from the head.
+            let mut items = Vec::with_capacity(c.min(lp.len()));
+            lp.pop_n(front, c, |v| items.push(Frame::BulkString(v)));
             Frame::Array(items.into())
         }
     };
@@ -660,12 +702,17 @@ pub fn linsert(db: &mut Database, args: &[Frame]) -> Frame {
         return Frame::Error(Bytes::from_static(b"ERR syntax error"));
     };
 
-    // A missing key answers 0 and is not created.
-    match list_route(db, key) {
+    // A missing key answers 0 and is not created; a missing pivot answers -1
+    // and is not a write (moon#1226: no mutable handle, so no WATCH bump).
+    match list_route_holding(db, key, pivot) {
         Err(e) => e,
         Ok(None) => Frame::Integer(0),
-        Ok(Some(ListRoute::Listpack)) => linsert_listpack(db, key, pivot, element, before),
-        Ok(Some(ListRoute::Full)) => linsert_eager(db, key, pivot, element, before),
+        Ok(Some((_, false))) => {
+            touch_list(db, key);
+            Frame::Integer(-1)
+        }
+        Ok(Some((ListRoute::Listpack, true))) => linsert_listpack(db, key, pivot, element, before),
+        Ok(Some((ListRoute::Full, true))) => linsert_eager(db, key, pivot, element, before),
     }
 }
 
@@ -789,11 +836,19 @@ pub fn lrem(db: &mut Database, args: &[Frame]) -> Frame {
     };
     let from_tail = count < 0;
 
-    match list_route(db, key) {
+    // Nothing to remove is not a write (moon#1226): answered from the
+    // read-only view, so a WATCHing EXEC still runs, as in redis.
+    match list_route_holding(db, key, element) {
         Err(e) => e,
         Ok(None) => Frame::Integer(0),
-        Ok(Some(ListRoute::Listpack)) => lrem_listpack(db, key, element, from_tail, max_remove),
-        Ok(Some(ListRoute::Full)) => lrem_eager(db, key, element, from_tail, max_remove),
+        Ok(Some((_, false))) => {
+            touch_list(db, key);
+            Frame::Integer(0)
+        }
+        Ok(Some((ListRoute::Listpack, true))) => {
+            lrem_listpack(db, key, element, from_tail, max_remove)
+        }
+        Ok(Some((ListRoute::Full, true))) => lrem_eager(db, key, element, from_tail, max_remove),
     }
 }
 

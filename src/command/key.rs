@@ -40,10 +40,25 @@ pub fn del(db: &mut Database, args: &[Frame]) -> Frame {
             let (removed, _hot) = db.remove_counting_cold(key);
             if removed {
                 count += 1;
+                notify_del(key, db.db_index);
             }
         }
     }
     Frame::Integer(count)
+}
+
+/// Queue the `del` keyspace event for one key a delete REMOVED (moon#1234).
+///
+/// redis publishes it per removed key from `delGenericCommand` (DEL and
+/// UNLINK) and from `getdelCommand`, class `g`, and never for a key that was
+/// absent. Queued from the command body, so every path that runs the body
+/// publishes it exactly once: a plain command, each owner leg of a spanning
+/// delete (the coordinator's local slice and every remote `<CMD> k…` leg both
+/// run this body), MULTI/EXEC and Lua `redis.call`. With notifications off it
+/// is the notify gate's one Relaxed load and two masks, no allocation.
+#[inline]
+pub(crate) fn notify_del(key: &[u8], db_index: usize) {
+    crate::notify::notify_keyspace_event(crate::notify::NotifyFlags::GENERIC, "del", key, db_index);
 }
 
 /// EXISTS key [key ...]
@@ -1001,6 +1016,7 @@ pub fn unlink(db: &mut Database, args: &[Frame]) -> Frame {
             // `spawn_blocking` still walked the value first).
             if db.unlink(key) {
                 count += 1;
+                notify_del(key, db.db_index);
             }
         }
     }

@@ -1,0 +1,31 @@
+# WS18-parity-residuals — PLAN (wave 2, part 3b; runs alongside WS17 and the PR #1233 review fixes)
+personas: `.add/personas/routing-dispatch-engineer.md` (lead: parity across all dispatch paths and shard counts) · `.add/personas/performance-engineer.md` · `.add/personas/ci-test-integrity-engineer.md`
+
+Base: `int/part3b` @ `d155cd6` = the PR #1233 head `d4a2fd3` (WS8 + WS15) + WS7 + WS10 merged. Baseline binary for red runs: `/home/user/wt/bin/baseline-ae21476` (and a debug build of `d155cd6` for "red on the integration base"). Ports 7500–7519.
+Every item is small and independent: one commit per item, `(moon#NNNN)` / `refs moon#1226`.
+
+## Items (parity bugs first)
+1. **moon#1234** DEL / UNLINK (and GETDEL) never emit the `del` keyspace event. Emit one `del` (class `g`) per key actually removed — single-key, multi-key, spanning (each owner leg runs the command body), MULTI/EXEC, Lua `redis.call`; none for absent keys; GETDEL emits redis's order. Check every dispatch path (`command::dispatch`, `dispatch_read`, `try_inline_dispatch`) and that no path double-notifies. Integration test at `--shards 1` and `--shards 4` vs redis-server 7.0.15 (PSUBSCRIBE `__keyevent@0__:del` and `__keyspace@0__:*`), consistency-script rows if the scripts have a notification section. NOTE: a PR #1233 review fix (FIX3-ws8) is adding per-key `set` events to MSET in `src/command/string/string_write.rs` — do not touch MSET/SET notification code.
+2. **moon#1235** SCRIPT LOAD vs SCRIPT FLUSH (and FUNCTION LOAD vs FUNCTION FLUSH) racing across shards leave shards permanently disagreeing (121/400 trials). Give all script-cache / function-library mutations one total order on every shard — preferred: a sequencer shard (e.g. shard 0) through whose FIFO SPSC ring every LOAD/FLUSH fans out, reply after all shards ack; alternative: flush epochs. Keep the sequential behaviour and `SCRIPT FLUSH` / `FUNCTION FLUSH` replies byte-identical to redis. Regression test: the concurrent trial loop (barrier-released LOAD + FLUSH on two connections, then SCRIPT EXISTS / FCALL from 16 connections) must show 0 mixed trials over ≥200 trials at `--shards 2` and `4`; red on `d155cd6`. Also look at moon#567 (NOSCRIPT after SCRIPT LOAD under load) — same fan-out; fix it too if the sequencer makes LOAD visible everywhere before the reply, else say why not.
+3. **moon#1226 lists / listpack (WS3 items)**
+   - WATCH parity: an LREM that removes nothing and an LINSERT with a missing pivot bump the WATCH version, while redis 7.0.15 lets EXEC run — decide on the read-only view before `get_or_create_list_listpack` (`list_write.rs:~681/801`); test vs redis.
+   - Stale doc comments ("steps back over one backlen", "entered from its NEARER end") in `list_write.rs:~286-288` and `db_read.rs:~366-379` — reconcile with WS10's moon#1206 backlen fix.
+   - `Listpack::iter_rev` is `pub` — after WS10's moon#1206 fix, verify it is correct on wide entries (test) and keep it, or make it `#[cfg(test)]`.
+   - SRANDMEMBER with a negative count on a listpack set builds and sorts a |count|-sized Vec (up to 2^20): use a ≤128-entry offset table (`set_read.rs:~447-451`); allocation/complexity test.
+   - `RPOP k N` / `LMPOP … RIGHT COUNT N` on a listpack seek from the head per element: add `pop_back_n`; complexity test.
+   - moon#1209 consistency rows (LPOS error texts; `RPUSH k a; EXPIRE k 100; LMOVE k k …; TTL k`) — WS10 added #1209/#1211 rows in `b461c5c`; verify they cover these exactly, add what is missing.
+4. **moon#1226 storage core (WS1 items)**
+   - Shared lazy-free counter: `PENDING_ITEMS` is process-global — while any shard has queued work every shard takes write guards on all 16 DBs each 1 ms. Per-shard count + rotate the start db (`server/expiration.rs:~84-97`); test that an idle shard takes no guard while another shard has queued work.
+   - Split test gap: a fixture that forces a fallback placement and then a split, asserting `has_non_home_keys` stays set.
+   - `dashtable/mod.rs` (2020 lines) over the 1500-line rule: pure-move split into a directory module (tests to a sibling file), no logic change.
+5. **moon#1226 pub/sub + protocol + persistence (WS9 / WS4 / WS6 items)**
+   - `KEYSPACE_LISTENERS`: Release on update / Acquire on load (document the pairing); pubsub unit tests gated on `runtime-tokio` so none run in the default monoio lib run — make the runtime-neutral ones run on monoio.
+   - Batch with a deferral and a protocol fault: the connection is closed before the deferred commands run; redis runs them first (monoio batch end, `proto_fault` handling) — keep looping without reading while frames are carried, then report the fault; test on both runtimes.
+   - Tokio AOF writer: an 8 MiB `BufWriter` per writer that never shrinks, and `tokio::fs::File` writes ≤2 MiB per blocking hop — use 1–2 MiB or shrink after bursts like `BatchBuf` (`persistence/aof/writer_task.rs:~37-38`).
+6. **Test harness**: `pipeline_cross_shard_ordering`, `ft_search_yield_red`, `script_function_fanout`, `replication_swapdb` hard-code `CARGO_BIN_EXE_moon` and ignore `MOON_BIN` → switch to `common::find_moon_binary()`.
+
+## Owned files
+`src/command/key.rs` + the DEL/UNLINK/GETDEL command bodies, `src/notify.rs` (read; edit only if needed), `src/scripting/**` (cache/function mutation ordering), the SCRIPT/FUNCTION fan-out helpers in `src/server/conn/shared.rs` and the matching `ShardMessage` arms in `src/shard/dispatch.rs` / `src/shard/spsc_handler.rs` (script/function arms ONLY), `src/command/list/**`, `src/storage/listpack*` (iter_rev + pop_back_n only), `src/command/set/set_read.rs`, `src/storage/db/db_read.rs` (comments), `src/server/expiration.rs`, `src/storage/dashtable/**`, `src/pubsub/**`, the proto_fault/batch-end region of `src/server/conn/handler_monoio/mod.rs` + `handler_sharded/mod.rs`, `src/persistence/aof/writer_task.rs`, the four named `tests/*.rs` harness lines, `scripts/test-consistency.sh` + `scripts/test-commands.sh` (new rows), tests `tests/perf_ws18_*.rs`.
+
+## Not yours
+`src/command/string/**` (FIX3-ws8 is editing MSET), `src/storage/tiered/**`, `src/persistence/**` other than `writer_task.rs`, `src/storage/eviction.rs` (FIX3-ws15), `src/vector/**`, `src/text/**`, `src/graph/**`, `src/protocol/parse.rs` (WS17), the MOVE/COPY/MQ/stream-wake/snapshot capture sites and `shard/timers.rs` (WS16, queued).

@@ -34,11 +34,10 @@ use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::Duration;
 
+/// The shared resolver (moon#1226): `MOON_BIN` when set, non-empty and
+/// present, else the cargo binary — an empty `MOON_BIN` used to spawn "".
 fn moon_bin() -> std::path::PathBuf {
-    if let Ok(p) = std::env::var("MOON_BIN") {
-        return std::path::PathBuf::from(p);
-    }
-    std::path::PathBuf::from(env!("CARGO_BIN_EXE_moon"))
+    common::find_moon_binary()
 }
 
 fn start_moon(port: u16, dir: &str, shards: usize, extra: &[&str]) -> Child {

@@ -16,6 +16,9 @@ mod cold_fault_1225_tests;
 #[cfg(test)]
 mod listpack_residuals_1212_tests;
 
+#[cfg(test)]
+mod residuals_1226_tests;
+
 use crate::protocol::Frame;
 
 use super::helpers::extract_bytes;

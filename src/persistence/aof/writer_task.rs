@@ -29,13 +29,27 @@ use super::group_commit::{BatchBuf, GroupCommitSink, commit_group_commit_batch_w
 #[cfg(feature = "runtime-tokio")]
 const AOF_TOKIO_UNFLUSHED_TAIL_BOUND: usize = 8 * 1024;
 
-/// The tokio writers' `BufWriter` (moon#1187): sized for a whole group-commit
-/// batch so a batch reaches the kernel in ONE `tokio::fs` blocking-pool hop
-/// instead of one per 8 KiB (~128 per 1 MiB batch). The durability bound is
-/// kept by the batch-end [`flush_tail_if_over_bound`], not by the capacity.
+/// Capacity of the tokio writers' `BufWriter`: `tokio::fs::File`'s own
+/// per-operation maximum (tokio's `DEFAULT_MAX_BUF_SIZE`, 2 MiB). A
+/// `tokio::fs::File` hands at most that much to one blocking-pool hop,
+/// whatever it is given, so a larger `BufWriter` buys no fewer hops.
 #[cfg(feature = "runtime-tokio")]
-fn aof_buf_writer(file: tokio::fs::File) -> tokio::io::BufWriter<tokio::fs::File> {
-    tokio::io::BufWriter::with_capacity(AOF_GROUP_COMMIT_MAX_BYTES, file)
+const AOF_TOKIO_BUF_CAPACITY: usize = 2 * 1024 * 1024;
+
+/// The tokio writers' `BufWriter` (moon#1187): large enough that a batch
+/// reaches the kernel in one `tokio::fs` blocking-pool hop per 2 MiB instead
+/// of one per 8 KiB (~128 per 1 MiB batch). The durability bound is kept by
+/// the batch-end [`flush_tail_if_over_bound`], not by the capacity.
+///
+/// Sized at [`AOF_TOKIO_BUF_CAPACITY`], not at a whole group-commit batch
+/// (moon#1226): it was `AOF_GROUP_COMMIT_MAX_BYTES` (8 MiB) per writer, one
+/// per shard, never shrunk — up to 8 MiB resident per shard after one large
+/// batch — and the file below still took it 2 MiB per hop. Same hop count,
+/// a quarter of the memory. Generic over the sink only so the hop count can
+/// be tested against a model of `tokio::fs::File`.
+#[cfg(feature = "runtime-tokio")]
+fn aof_buf_writer<W: tokio::io::AsyncWrite>(file: W) -> tokio::io::BufWriter<W> {
+    tokio::io::BufWriter::with_capacity(AOF_TOKIO_BUF_CAPACITY, file)
 }
 
 /// After a batch is buffered: push it to the kernel when more than
@@ -2076,6 +2090,9 @@ pub async fn per_shard_aof_writer_task(
         }
     }
 }
+
+#[cfg(all(test, feature = "runtime-tokio"))]
+mod buf_tests;
 
 #[cfg(test)]
 mod idle_wait_tests {

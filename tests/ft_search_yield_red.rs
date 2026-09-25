@@ -36,11 +36,13 @@ use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 
 // ---------------------------------------------------------------------------
-// Shared harness (CARGO_BIN_EXE spawn pattern, mirrors spsc_wake_floor_red.rs)
+// Shared harness (spawn pattern mirrors spsc_wake_floor_red.rs)
 // ---------------------------------------------------------------------------
 
+/// `MOON_BIN` first (moon#1226): a shared target dir makes the cargo binary
+/// whatever the last build there produced.
 fn moon_binary() -> std::path::PathBuf {
-    std::path::PathBuf::from(env!("CARGO_BIN_EXE_moon"))
+    common::find_moon_binary()
 }
 
 /// Fresh unique `--dir` per server (CWD persistence-reload trap: an inherited
@@ -76,7 +78,7 @@ fn spawn_single_shard(port: u16, dir: &std::path::Path) -> Child {
         .stdout(std::fs::File::create(dir.join("moon.stdout.log")).expect("stdout log"))
         .stderr(std::fs::File::create(dir.join("moon.stderr.log")).expect("stderr log"))
         .spawn()
-        .expect("spawn moon (CARGO_BIN_EXE_moon)")
+        .expect("spawn moon (common::find_moon_binary)")
 }
 
 /// Reserve a port, spawn a single-shard server into its own fresh `--dir`

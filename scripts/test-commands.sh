@@ -750,10 +750,67 @@ if should_run "list"; then
     assert_match "LPOS RANK 0"           LPOS {l1209}:l a RANK 0
     assert_match "LPOS COUNT abc"        LPOS {l1209}:l a COUNT abc
     assert_match "LPOS MAXLEN abc"       LPOS {l1209}:l a MAXLEN abc
+    # moon#1226: the two moon#1209 rows test-consistency.sh has and this file
+    # did not -- a negative COUNT, and RANK -1 COUNT 0 (every match, tail first).
+    assert_match "LPOS COUNT -1"         LPOS {l1209}:l a COUNT -1
+    assert_match "LPOS RANK -1 COUNT 0"  LPOS {l1209}:l a RANK -1 COUNT 0
+    # moon#1226: counted pops on a listpack are one cut from the end.
+    for c in rcli mcli; do
+        $c DEL {p1226}:l >/dev/null 2>&1
+        $c RPUSH {p1226}:l a 1 bb 22 "$(printf 'w%.0s' {1..60})" ccc -7 d 4444 e >/dev/null 2>&1
+    done
+    assert_match "RPOP k 3 (listpack)"   RPOP {p1226}:l 3
+    assert_match "LMPOP RIGHT COUNT 2"   LMPOP 1 {p1226}:l RIGHT COUNT 2
+    assert_match "LPOP k 2 (listpack)"   LPOP {p1226}:l 2
+    assert_match "pops left"             LRANGE {p1226}:l 0 -1
+    assert_match "RPOP past the end"     RPOP {p1226}:l 100
     rcli RPUSH {l1209}:rot a >/dev/null 2>&1; mcli RPUSH {l1209}:rot a >/dev/null 2>&1
     rcli EXPIRE {l1209}:rot 100 >/dev/null 2>&1; mcli EXPIRE {l1209}:rot 100 >/dev/null 2>&1
     assert_match "LMOVE k k rotates"     LMOVE {l1209}:rot {l1209}:rot LEFT RIGHT
     assert_match "LMOVE k k keeps TTL"   PERSIST {l1209}:rot
+
+    # moon#1226: an LREM that removes nothing / an LINSERT with a missing pivot
+    # is not a write, so a WATCHing EXEC still runs (redis 7.0.15).
+    # Prints the EXEC reply's first line (`*1` ran, `*-1` aborted) after WATCH on
+    # the list, the mutation on ANOTHER connection, then MULTI / SET / EXEC.
+    watch_exec_after() {
+        local port="$1" enc="$2"; shift 2
+        redis-cli -p "$port" DEL {wn}:l {wn}:x >/dev/null 2>&1 || true
+        if [[ "$enc" == linkedlist ]]; then
+            redis-cli -p "$port" RPUSH {wn}:l a b c "$(printf 'w%.0s' {1..80})" >/dev/null 2>&1 || true
+        else
+            redis-cli -p "$port" RPUSH {wn}:l a b c >/dev/null 2>&1 || true
+        fi
+        exec 4<>"/dev/tcp/127.0.0.1/${port}" || { echo "__CONNECT_FAILED__:${port}"; return 0; }
+        printf 'WATCH {wn}:l\r\n' >&4
+        local line="" out="NONE" i
+        IFS= read -r -t 2 line <&4 || true
+        redis-cli -p "$port" "$@" >/dev/null 2>&1 || true
+        printf 'MULTI\r\nSET {wn}:x 1\r\nEXEC\r\n' >&4
+        for i in 1 2 3; do IFS= read -r -t 2 line <&4 || break; done   # +OK +QUEUED, then the EXEC header
+        out="${line%$'\r'}"
+        exec 4>&-
+        echo "$out"
+    }
+    assert_same_watch() {
+        local desc="$1"; shift
+        TOTAL=$((TOTAL + 1))
+        local r m
+        r="$(watch_exec_after "$PORT_REDIS" "$@")"
+        m="$(watch_exec_after "$PORT_RUST" "$@")"
+        if [[ "$r" == "$m" ]]; then
+            PASS=$((PASS + 1))
+        else
+            FAIL=$((FAIL + 1))
+            echo "  FAIL: $desc"
+            echo "    REDIS: $r"
+            echo "    MOON:  $m"
+        fi
+    }
+    assert_same_watch "WATCH: LREM removing nothing (moon#1226)"  listpack LREM {wn}:l 0 zz
+    assert_same_watch "WATCH: LINSERT missing pivot (moon#1226)"  listpack LINSERT {wn}:l BEFORE zz x
+    assert_same_watch "WATCH: LREM removing nothing, linkedlist"  linkedlist LREM {wn}:l -1 zz
+    assert_same_watch "WATCH: LREM that removes aborts [control]" listpack LREM {wn}:l 1 a
     # moon#1211 (WS10): OBJECT FREQ grows once per access under lfu-log-factor 0;
     # MEMORY USAGE and OBJECT FREQ are NOTOUCH.
     for c in rcli mcli; do
@@ -852,6 +909,10 @@ if should_run "set"; then
     assert_match "SISMEMBER after SMOVE" SISMEMBER {s}:mvdst m1
     assert_moon_ok "SPOP"              SPOP s:k1
     assert_moon_ok "SRANDMEMBER"       SRANDMEMBER {s}:A
+    # moon#1226: a negative count on a listpack set answers from a per-member
+    # table; on a one-member set the reply is deterministic.
+    rcli SADD {s}:one only >/dev/null 2>&1; mcli SADD {s}:one only >/dev/null 2>&1
+    assert_match "SRANDMEMBER -3 (one member)" SRANDMEMBER {s}:one -3
     assert_moon_ok "SMEMBERS"          SMEMBERS {s}:A
     assert_moon_ok "SSCAN"             SSCAN {s}:A 0
 fi
@@ -1814,6 +1875,63 @@ if should_run "pubsub"; then
     # so this row guards the wiring; the two-live-subscriber case that actually
     # exposes the counting bug is tests/pubsub_resp3_push.rs::ps14.
     assert_match "PUBSUB NUMPAT (none)" PUBSUB NUMPAT
+
+    # moon#1234: DEL/UNLINK/GETDEL publish `del` (class g) once per REMOVED
+    # key, plain, spanning and in MULTI; moon published nothing. Captured on a
+    # raw connection subscribed to __keyevent@0__:del; see test-consistency.sh
+    # for the Lua row.
+    keyevent_del_capture() {
+        local port="$1" order="$2"; shift 2
+        redis-cli -p "$port" CONFIG SET notify-keyspace-events KEA >/dev/null 2>&1 || true
+        exec 3<>"/dev/tcp/127.0.0.1/${port}" || { echo "__CONNECT_FAILED__:${port}"; return 0; }
+        printf 'SUBSCRIBE __keyevent@0__:del\r\n' >&3
+        local line="" keys="" state=0 i
+        for i in 1 2 3 4 5 6 7 8; do
+            IFS= read -r -t 2 line <&3 || break
+            [[ "${line%$'\r'}" == ":1" ]] && break
+        done
+        printf '%s\n' "$@" | redis-cli -p "$port" >/dev/null 2>&1 || true
+        while IFS= read -r -t 1 line <&3; do
+            line="${line%$'\r'}"
+            case "$state" in
+                2) keys="${keys}${line} "; state=0 ;;
+                1) state=2 ;;
+                *) [[ "$line" == "__keyevent@0__:del" ]] && state=1 ;;
+            esac
+        done
+        exec 3>&-
+        redis-cli -p "$port" CONFIG SET notify-keyspace-events "" >/dev/null 2>&1 || true
+        if [[ "$order" == sorted ]]; then
+            printf '%s' "$keys" | tr ' ' '\n' | sed '/^$/d' | sort | tr '\n' ' '
+        else
+            printf '%s' "$keys"
+        fi
+    }
+    # Compare two captured transcripts as one row.
+    assert_same_capture() {
+        local desc="$1" redis_out="$2" moon_out="$3"
+        TOTAL=$((TOTAL + 1))
+        if [[ "$redis_out" == "$moon_out" ]]; then
+            PASS=$((PASS + 1))
+        else
+            FAIL=$((FAIL + 1))
+            echo "  FAIL: $desc"
+            echo "    REDIS: $redis_out"
+            echo "    MOON:  $moon_out"
+        fi
+    }
+    for c in rcli mcli; do
+        $c DEL {kn}:a {kn}:b {kn}:c {kn}:t >/dev/null 2>&1
+        $c SET {kn}:a 1 >/dev/null 2>&1
+        $c RPUSH {kn}:b x >/dev/null 2>&1
+        $c SET {kn}:c 3 >/dev/null 2>&1
+        for i in 1 2 3 4 5 6 7 8; do $c DEL kn:span:$i >/dev/null 2>&1; done
+        for i in 1 3 5 7; do $c SET kn:span:$i v >/dev/null 2>&1; done
+    done
+    assert_same_capture "keyevent del: DEL/UNLINK/GETDEL (moon#1234)"         "$(keyevent_del_capture "$PORT_REDIS" seq 'DEL {kn}:a {kn}:nx {kn}:a' 'UNLINK {kn}:b' 'GETDEL {kn}:c' 'GETDEL {kn}:c')"         "$(keyevent_del_capture "$PORT_RUST"  seq 'DEL {kn}:a {kn}:nx {kn}:a' 'UNLINK {kn}:b' 'GETDEL {kn}:c' 'GETDEL {kn}:c')"
+    assert_same_capture "keyevent del: spanning DEL (moon#1234)"         "$(keyevent_del_capture "$PORT_REDIS" sorted 'DEL kn:span:1 kn:span:2 kn:span:3 kn:span:4 kn:span:5 kn:span:6 kn:span:7 kn:span:8')"         "$(keyevent_del_capture "$PORT_RUST"  sorted 'DEL kn:span:1 kn:span:2 kn:span:3 kn:span:4 kn:span:5 kn:span:6 kn:span:7 kn:span:8')"
+    rcli SET {kn}:t v >/dev/null 2>&1; mcli SET {kn}:t v >/dev/null 2>&1
+    assert_same_capture "keyevent del: MULTI DEL+UNLINK (moon#1234)"         "$(keyevent_del_capture "$PORT_REDIS" seq 'MULTI' 'DEL {kn}:t' 'UNLINK {kn}:t' 'EXEC')"         "$(keyevent_del_capture "$PORT_RUST"  seq 'MULTI' 'DEL {kn}:t' 'UNLINK {kn}:t' 'EXEC')"
 fi
 
 # ===========================================================================
@@ -2298,6 +2416,26 @@ if should_run "scripting"; then
     assert_match "FUNCTION DELETE"     FUNCTION DELETE cmdlib
     for i in 1 2 3 4; do
         assert_match "FCALL after DELETE (key $i)" FCALL cmdset 1 "fn:d$i" x
+    done
+    # moon#1235: the sequential LOAD / FLUSH replies stay redis's while the
+    # mutations are ordered across shards (the concurrent race itself is in
+    # test-consistency.sh, moon-only). Every row is a fresh connection, so a
+    # shard that kept the script / library would show up as a mismatch.
+    assert_match "SCRIPT LOAD (moon#1235)"          SCRIPT LOAD "return 'o1235'"
+    O1235_SHA=$(rcli SCRIPT LOAD "return 'o1235'")  # the oracle hashes (no sha1sum on macOS)
+    for i in 1 2 3 4; do
+        assert_match "EVALSHA after LOAD (key $i)" EVALSHA "$O1235_SHA" 1 "o1235:k$i"
+    done
+    assert_match "SCRIPT FLUSH (moon#1235)"         SCRIPT FLUSH
+    for i in 1 2 3 4; do
+        assert_match "EVALSHA after FLUSH (key $i)" EVALSHA "$O1235_SHA" 1 "o1235:k$i"
+    done
+    assert_match "SCRIPT EXISTS after FLUSH"        SCRIPT EXISTS "$O1235_SHA"
+    assert_match "FUNCTION LOAD (moon#1235)"        FUNCTION LOAD $'#!lua name=o1235lib\nredis.register_function(\'o1235f\', function(keys, args) return 7 end)\n'
+    assert_match "FUNCTION LOAD existing (moon#1235)" FUNCTION LOAD $'#!lua name=o1235lib\nredis.register_function(\'o1235f\', function(keys, args) return 7 end)\n'
+    assert_match "FUNCTION FLUSH (moon#1235)"       FUNCTION FLUSH
+    for i in 1 2 3 4; do
+        assert_match "FCALL after FUNCTION FLUSH (key $i)" FCALL o1235f 1 "o1235:k$i"
     done
 fi
 

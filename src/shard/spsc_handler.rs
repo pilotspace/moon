@@ -1648,28 +1648,26 @@ pub(crate) fn handle_shard_message_shared(
             }
             slot.add(batch_total);
         }
-        ShardMessage::ScriptLoad { sha1, script, ack } => {
-            // Fan-out: cache this script on this shard so EVALSHA works locally
-            let computed = sha1_smol::Sha1::from(&script[..]).hexdigest();
-            if computed == sha1 {
-                script_cache.borrow_mut().load(script);
-            }
-            // Answered even on a digest mismatch — as a FAILURE. The sender
-            // is waiting to answer its client and must not hang, but it also
-            // must not be told a cache it never wrote is in step. A mismatch
-            // is impossible from the fan-out path (the digest is computed from
-            // the same bytes) and would mean memory corruption.
+        ShardMessage::ScriptLoad { script, epoch, ack } => {
+            // Fan-out: cache this script on this shard so EVALSHA works
+            // locally. Tagged with the origin's flush epoch (moon#1235): if a
+            // newer `SCRIPT FLUSH` has already been applied here, the load is
+            // ordered before it and is dropped — every shard makes the same
+            // call, so they agree. Acked `true` either way: the insert has
+            // taken its place in the agreed order.
+            script_cache.borrow_mut().load_at(script, epoch);
             if let Some(ack) = ack {
-                let _ = ack.send(computed == sha1);
+                let _ = ack.send(true);
             }
         }
-        ShardMessage::ScriptFlush { ack } => {
+        ShardMessage::ScriptFlush { epoch, ack } => {
             // moon#1229: another shard's connection ran `SCRIPT FLUSH`; the
             // script cache is per shard, so without this every EVALSHA whose
-            // keys route here kept running a flushed script. `flush` drops the
-            // source map, the compiled functions (moon#1167) and the fan-out
-            // duties, exactly as on the originating shard.
-            script_cache.borrow_mut().flush();
+            // keys route here kept running a flushed script. `flush_at` drops
+            // the bodies inserted before this flush's epoch (moon#1235), the
+            // compiled functions (moon#1167) and the fan-out duties, exactly
+            // as on the originating shard.
+            script_cache.borrow_mut().flush_at(epoch);
             if let Some(ack) = ack {
                 let _ = ack.send(true);
             }
