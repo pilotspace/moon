@@ -561,7 +561,7 @@ are filed under the epoch database that slot's table belongs to (moon#1228 item 
 | replica full resync (`load_snapshot`) | abort (`note_table_replace`) — foreign data | moon#1227 F6 |
 | TXN.ABORT KV undo (`transaction::abort`) | not captured (review 4: `capture_write_pre_image`'s doc wrongly listed it as a caller; corrected in 52544bf3). A key the TXN wrote inside the epoch was captured by that write (dispatch), so the file holds its epoch-start state; for a TXN whose writes preceded the epoch the file gets the restored pre-TXN value instead of the uncommitted one — **open question, residual 2** | — |
 | active / lazy expiry, hash-field TTL sweep | none — safe: TTLs are absolute, the loader filters | — |
-| eviction victims, plain drop and spill (`storage::eviction`) | **none** — a victim in a pending range is missing from the file | residual (moon#1185 blocker) |
+| eviction victims, plain drop and spill (`storage::eviction`) | **none** — a victim in a pending range is missing from the file | residual, tracked as moon#1257 (also the moon#1185 blocker) |
 | spill-completion failure re-insert (`persistence_tick`) | none — re-inserts the value eviction removed (same key, same value) | — |
 
 Residuals (not in WS16's plan, recorded for the next wave):
