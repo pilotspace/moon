@@ -728,6 +728,13 @@ fn handle_pop(args: &[Frame], key_prefix: &Bytes, db_index: usize) -> Frame {
                 Ok(Some(s)) => s,
                 _ => return (Frame::Error(Bytes::from_static(ERR_MQ_NOT_DURABLE)), None),
             };
+            // Review 6 (N3): nothing to claim — answer without reading.
+            // `read_group_new` would create (and bill) the `__mq_default`
+            // consumer first, and an empty POP logs no MqPop, so the replica
+            // and a WAL replay never had it (MEMORY USAGE 497 vs 321).
+            if stream.group_has_new(&group_name) == Some(false) {
+                return (Frame::Array(vec![].into()), None);
+            }
             // The group's cursor BEFORE this call, so the release below can
             // rewind to it if this POP ends up keeping nothing.
             let prev_last_delivered = stream

@@ -364,7 +364,7 @@ fn a_frozen_table_keeps_no_skeleton_of_post_epoch_rows() {
             "setup: {grown} segments vs {start_segments}"
         );
         live(&mut dbs, &mut tail, flushed, &[b"FLUSHDB"]);
-        epoch.drain();
+        epoch.drain_until_trimmed(flushed);
         let frozen = epoch
             .state
             .as_ref()
@@ -384,6 +384,163 @@ fn a_frozen_table_keeps_no_skeleton_of_post_epoch_rows() {
         );
         let recovered = recover(2, records, &tail);
         assert_eq!(string_keyspace(&recovered), string_keyspace(&dbs));
+    }
+}
+
+/// Review 6 (S1): the trim is budgeted across drains. Done whole inside one
+/// drain it cost 0.88 s for a pending database of 0.5M epoch-start rows
+/// grown by 1.5M (release). A table grown by 50,000 post-epoch rows: each
+/// drain does at most `TRIM_BUDGET` row operations, the trim completes after
+/// ceil(its work / budget) drains, and the save's file is still the
+/// epoch-start keyspace with the byte bound holding once the trim is done.
+#[test]
+fn one_drain_trims_at_most_the_budget() {
+    use crate::persistence::snapshot::frozen::TRIM_BUDGET;
+    let mut dbs = vec![Database::new(), Database::new()];
+    preload(&mut dbs[0], "a", 1500);
+    preload(&mut dbs[1], "b", 200);
+    let start_bill = dbs[1].ledger_bytes() as u64;
+    let expected = string_keyspace(&dbs);
+    let mut epoch = Epoch::begin(&dbs);
+    assert!(!epoch.tick_one(&dbs));
+    let mut tail = Tail::new();
+    const POST: usize = 50_000;
+    for j in 0..POST {
+        let k = format!("post:{j}");
+        live(&mut dbs, &mut tail, 1, &[b"SET", k.as_bytes(), b"v"]);
+    }
+    live(&mut dbs, &mut tail, 1, &[b"FLUSHDB"]);
+    // The first drain folds the 50,000 tombstones in, freezes the table and
+    // starts its trim: no more than the budget of them may be consumed.
+    epoch.drain();
+    let state = epoch.state.as_ref().expect("epoch");
+    let done = POST - state.pending_pre_images();
+    assert!(
+        done <= TRIM_BUDGET && state.trim_ops_last_drain_for_test() <= TRIM_BUDGET,
+        "one drain trimmed {done} rows of a {POST}-row table; the budget is {TRIM_BUDGET}"
+    );
+    assert_eq!(state.frozen_trimmed_for_test(1), Some(false));
+    let mut ops = state.trim_ops_last_drain_for_test();
+    let mut drains = 1;
+    while epoch
+        .state
+        .as_ref()
+        .expect("epoch")
+        .frozen_trimmed_for_test(1)
+        == Some(false)
+    {
+        epoch.drain();
+        let state = epoch.state.as_ref().expect("epoch");
+        assert!(state.trim_ops_last_drain_for_test() <= TRIM_BUDGET);
+        ops += state.trim_ops_last_drain_for_test();
+        drains += 1;
+    }
+    // Every drain but the last did (nearly) a full budget: a segment that
+    // does not fit waits for the next drain.
+    assert!(
+        ops > POST && drains <= ops.div_ceil(TRIM_BUDGET) + 1,
+        "{ops} row operations took {drains} drains of {TRIM_BUDGET}"
+    );
+    let held = epoch.state.as_ref().expect("epoch").cow_bytes();
+    assert!(
+        held <= start_bill,
+        "trimmed: {held} B held, epoch-start {start_bill} B"
+    );
+    let records = epoch.try_finish(&dbs).expect("the save must complete");
+    assert_eq!(diverge(&expected, &records), Default::default());
+    let recovered = recover(2, records, &tail);
+    assert_eq!(string_keyspace(&recovered), string_keyspace(&dbs));
+}
+
+/// Review 6 (S1), measurement only: the trim's cost per drain and in drains,
+/// against main's FLUSHDB (a drop). Run in a release build:
+/// `MOON_TEST_TRIM_N=<rows> cargo test --profile release-fast --lib trim_cost -- --ignored --nocapture`.
+#[test]
+#[ignore = "measurement: run with --ignored in a release build"]
+fn trim_cost_of_a_large_flushed_table() {
+    use std::time::{Duration, Instant};
+    let n: u32 = std::env::var("MOON_TEST_TRIM_N")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1_000_000);
+    let fill = |db: &mut Database, prefix: &str, n: u32| {
+        for i in 0..n {
+            db.set_string(
+                format!("{prefix}:{i:09}").as_bytes(),
+                Bytes::from_static(b"v"),
+            );
+        }
+    };
+    let drain_all = |epoch: &mut Epoch, db: usize| -> (usize, (Duration, usize), Duration) {
+        let (mut drains, mut worst, mut total) = (0, (Duration::ZERO, 0), Duration::ZERO);
+        loop {
+            let t = Instant::now();
+            epoch.drain();
+            let e = t.elapsed();
+            drains += 1;
+            if e > worst.0 {
+                worst = (e, drains);
+            }
+            total += e;
+            let trimmed = epoch
+                .state
+                .as_ref()
+                .and_then(|s| s.frozen_trimmed_for_test(db));
+            if trimmed != Some(false) {
+                return (drains, worst, total);
+            }
+        }
+    };
+    {
+        snapshot_cow::disarm();
+        let mut dbs = vec![Database::new()];
+        fill(&mut dbs[0], "a", n);
+        let t = Instant::now();
+        let _ = run(&mut dbs, 0, &[b"FLUSHDB"]);
+        eprintln!(
+            "[trim n={n}] FLUSHDB with no save running (a drop): {:?}",
+            t.elapsed()
+        );
+    }
+    // The database in progress, flushed with the cursor half way (step 2).
+    {
+        let mut dbs = vec![Database::new(), Database::new()];
+        fill(&mut dbs[0], "a", n);
+        let mut epoch = Epoch::begin(&dbs);
+        while epoch.state.as_ref().expect("epoch").cursor() < (1u64 << 63)
+            && epoch.state.as_ref().expect("epoch").current_db_index() == 0
+        {
+            epoch.tick(&dbs);
+        }
+        let _ = run(&mut dbs, 0, &[b"FLUSHDB"]);
+        let (drains, worst, total) = drain_all(&mut epoch, 0);
+        eprintln!(
+            "[trim n={n}] in-progress db, cursor at 50%: {drains} drains, worst {worst:?}, \
+             total {total:?}"
+        );
+        let _ = epoch.try_finish(&dbs);
+    }
+    // A pending database of n/2 rows grown by 1.5n (steps 1 and 3).
+    {
+        let mut dbs = vec![Database::new(), Database::new()];
+        fill(&mut dbs[0], "a", 1000);
+        fill(&mut dbs[1], "b", n / 2);
+        let mut epoch = Epoch::begin(&dbs);
+        for i in 0..(n + n / 2) {
+            let k = format!("p:{i:09}");
+            let _ = run(&mut dbs, 1, &[b"SET", k.as_bytes(), b"v"]);
+            if i % 4096 == 0 {
+                epoch.drain();
+            }
+        }
+        epoch.drain();
+        let _ = run(&mut dbs, 1, &[b"FLUSHDB"]);
+        let (drains, worst, total) = drain_all(&mut epoch, 1);
+        eprintln!(
+            "[trim n={n}] pending db n/2 grown by 1.5n: {drains} drains, worst {worst:?}, \
+             total {total:?}"
+        );
+        let _ = epoch.try_finish(&dbs);
     }
 }
 
@@ -468,6 +625,141 @@ fn a_frozen_table_is_billed_without_the_spill_in_flight_bytes() {
     let held = epoch.state.as_ref().expect("epoch").cow_bytes();
     let _ = epoch.try_finish(&dbs);
     assert_eq!(held, table_bytes, "the frozen table's bill");
+}
+
+/// Review 6 (S2, the reviewer's proof): the abort fired on ANY second freeze
+/// once a grown table waited with more than `FREEZE_WAIT_SLACK` of excess,
+/// even a table that did not grow at all — `SELECT 1; FLUSHDB; SELECT 2;
+/// FLUSHDB` after a bulk load into db 1 failed the save, in either order
+/// only when the grown one went first. ONE grown table waiting is allowed:
+/// both orders must complete.
+#[test]
+fn an_ungrown_second_flush_does_not_fail_the_save() {
+    for grown_first in [true, false] {
+        let mut dbs: Vec<Database> = (0..3).map(|_| Database::new()).collect();
+        for (i, db) in dbs.iter_mut().enumerate() {
+            preload(db, &format!("d{i}"), 200);
+        }
+        let expected = string_keyspace(&dbs);
+        let mut epoch = Epoch::begin(&dbs);
+        assert!(!epoch.tick_one(&dbs));
+        let mut tail = Tail::new();
+        let value = vec![b'x'; 1 << 20];
+        for j in 0..10u32 {
+            let k = format!("big:{j}");
+            live(&mut dbs, &mut tail, 1, &[b"SET", k.as_bytes(), &value]);
+        }
+        let order: [usize; 2] = if grown_first { [1, 2] } else { [2, 1] };
+        for db in order {
+            live(&mut dbs, &mut tail, db, &[b"FLUSHDB"]);
+        }
+        let outcome = epoch.try_finish(&dbs);
+        let records = outcome.unwrap_or_else(|e| {
+            panic!(
+                "grown first = {grown_first}: only ONE grown table waited, yet the save failed: {e}"
+            )
+        });
+        assert_eq!(diverge(&expected, &records), Default::default());
+        let recovered = recover(3, records, &tail);
+        assert_eq!(string_keyspace(&recovered), string_keyspace(&dbs));
+    }
+}
+
+/// Review 6 (S2, re-derived for the budgeted trim): a grown table holds its
+/// post-epoch rows until its trim's steps 1-2 are done, which now takes
+/// ceil(work / budget) drains — not one. A second GROWN flush while the first
+/// grown table is still trimming fails the save once their post-epoch bytes
+/// pass `FREEZE_WAIT_SLACK`; the same flush after the first trim is done
+/// completes. So the epoch never holds more than one grown table's post-epoch
+/// rows (or the slack) beyond the epoch-start bills.
+#[test]
+fn a_grown_flush_while_another_grown_table_is_trimming_fails_the_save() {
+    use crate::persistence::snapshot::frozen::set_trim_budget_for_test;
+    for first_trim_done in [false, true] {
+        set_trim_budget_for_test(Some(16));
+        let mut dbs: Vec<Database> = (0..3).map(|_| Database::new()).collect();
+        for (i, db) in dbs.iter_mut().enumerate() {
+            preload(db, &format!("d{i}"), 200);
+        }
+        let mut epoch = Epoch::begin(&dbs);
+        assert!(!epoch.tick_one(&dbs));
+        let mut tail = Tail::new();
+        let value = vec![b'x'; 8 << 10];
+        let grow = |dbs: &mut Vec<Database>, tail: &mut Tail, db: usize| {
+            for j in 0..2000u32 {
+                let k = format!("g{db}:{j}");
+                live(dbs, tail, db, &[b"SET", k.as_bytes(), &value]);
+            }
+            live(dbs, tail, db, &[b"FLUSHDB"]);
+        };
+        grow(&mut dbs, &mut tail, 1);
+        epoch.drain();
+        assert_eq!(
+            epoch
+                .state
+                .as_ref()
+                .expect("epoch")
+                .frozen_trimmed_for_test(1),
+            Some(false),
+            "setup: db 1's trim spans many drains"
+        );
+        if first_trim_done {
+            epoch.drain_until_trimmed(1);
+        }
+        grow(&mut dbs, &mut tail, 2);
+        let outcome = epoch.try_finish(&dbs);
+        set_trim_budget_for_test(None);
+        if first_trim_done {
+            assert!(outcome.is_ok(), "db 1 was trimmed: {outcome:?}");
+        } else {
+            let Err(why) = outcome else {
+                panic!(
+                    "two grown tables held their post-epoch rows at once, and the save completed"
+                );
+            };
+            assert!(why.contains("FLUSHDB"), "abort reason: {why}");
+        }
+    }
+}
+
+/// Review 6 (N1, the reviewer's proof): an UNLINKed large collection stays
+/// CHARGED to `used_memory` until the lazy-free drain frees it (moon#1190).
+/// A FLUSHDB before that drain handed the epoch `table_bytes` = the ledger
+/// WITH that charge while the table no longer held the row, and the trim then
+/// restored the pre-image and added its bytes a second time: the frozen bill
+/// (INFO `current_cow_size`) over-reported by the lazily-freed value for the
+/// rest of the save, above the database's epoch-start bill.
+#[test]
+fn a_lazy_free_charge_is_not_billed_to_the_frozen_table() {
+    let mut dbs = vec![Database::new(), Database::new()];
+    for i in 0..50 {
+        let k = format!("k{i}");
+        let _ = run(&mut dbs, 1, &[b"SET", k.as_bytes(), b"v"]);
+    }
+    for f in 0..2000 {
+        let f = format!("field-{f:06}");
+        let _ = run(&mut dbs, 1, &[b"HSET", b"big", f.as_bytes(), b"some-value"]);
+    }
+    let start_bill = dbs[1].ledger_bytes() as u64;
+    let mut epoch = Epoch::begin(&dbs);
+    let _ = run(&mut dbs, 1, &[b"UNLINK", b"big"]);
+    assert!(
+        dbs[1].lazy_free_reclaimable(),
+        "setup: the UNLINKed hash waits in the lazy-free queue, still charged"
+    );
+    let _ = run(&mut dbs, 1, &[b"FLUSHDB"]);
+    epoch.drain_until_trimmed(1);
+    let state = epoch.state.as_ref().expect("epoch");
+    let (bill, rows) = state.frozen_bill_and_rows_for_test(1).expect("frozen");
+    let _ = epoch.try_finish(&dbs);
+    assert_eq!(
+        bill, rows,
+        "the frozen bill must be what its rows hold (epoch-start bill {start_bill} B)"
+    );
+    assert!(
+        bill <= start_bill,
+        "{bill} B frozen, epoch-start {start_bill} B"
+    );
 }
 
 /// The liveness half of moon#1228: a workload that FLUSHDBs (and SWAPDBs)

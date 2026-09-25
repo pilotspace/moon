@@ -67,6 +67,24 @@ impl Epoch {
         }
     }
 
+    /// [`Self::drain`] until epoch database `db`'s frozen table is trimmed
+    /// (review 6: the trim is budgeted across drains). Returns the drains.
+    pub(super) fn drain_until_trimmed(&mut self, db: usize) -> usize {
+        let mut drains = 0;
+        loop {
+            self.drain();
+            drains += 1;
+            let trimmed = self
+                .state
+                .as_ref()
+                .and_then(|s| s.frozen_trimmed_for_test(db));
+            if trimmed != Some(false) {
+                return drains;
+            }
+            assert!(drains < 1_000_000, "db {db}'s trim never finished");
+        }
+    }
+
     fn step(&mut self, dbs: &[Database], budgeted: bool) -> bool {
         let Some(state) = self.state.as_mut() else {
             return true;

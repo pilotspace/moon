@@ -187,10 +187,38 @@ not written, and releases each as the walk passes it. This is the same worst cas
 FLUSHDB child. The bill is the table's `used_memory` at the flush, minus the removed rows'
 `entry_overhead`, plus the restored rows'.
 
-**The wait before the drain.** Until the drain (one tick) a flushed table waits whole. One
-grown table may wait: its rows were in `used_memory` an instant before. A second flush of a
-grown database before the drain (MULTI, a script) fails the save once the waiting post-epoch
-bytes pass `FREEZE_WAIT_SLACK` (8 MiB). An abort now also releases waiting tables at once.
+**When a flush fails the save (reviews 5 and 6).** Review 5's rule was: one grown table may
+wait for the drain, and a second flush before that drain fails the save once the waiting
+post-epoch bytes pass `FREEZE_WAIT_SLACK` (8 MiB). Review 6 (S2) found the check fired on ANY
+second freeze, including a table that did not grow (excess 0). A plain
+`SELECT 1; FLUSHDB; SELECT 2; FLUSHDB` pipeline after a bulk load into db 1 was enough, as
+was MULTI or two clients within one tick. The real server returned `status err`.
+
+Now only a flush of a grown database can fail the save (`excess > 0`).
+
+Re-derived for the budgeted trim (S1): a grown table holds its post-epoch rows from its flush
+until its trim's steps 1-2 finish, which is the queue until the next drain, then
+ceil(work / 512) drains. So "waiting" is the queued excess plus the untrimmed excess of the
+frozen tables (bill above the epoch-start bill while in steps 1-2), published after every
+drain (`UNTRIMMED_EXCESS`). A grown flush fails the save when another grown table is still
+waiting or trimming and together they pass 8 MiB. The epoch then holds at most one grown
+table's post-epoch rows, or the slack, beyond the epoch-start bills. An abort also releases
+waiting tables at once.
+
+Evidence:
+- `table_swap_tests::an_ungrown_second_flush_does_not_fail_the_save` (the reviewer's proof):
+  red ("only ONE grown table waited, yet the save failed"), now green in both orders.
+- `perf_ws16_bgsave_prop::a_pipelined_flush_of_a_grown_and_an_ungrown_db_keeps_the_save` (the
+  reviewer's proof): pipeline and MULTI were `status err`, now `status ok` twice; recovery
+  checks pass. The reviewer's moon#1232 assertion (`rdb_changes_since_last_save` counts the
+  410 removed keys) is left out: that counting lands with part 4, which this branch has not
+  merged.
+- `table_swap_tests::a_grown_flush_while_another_grown_table_is_trimming_fails_the_save`
+  (the re-derivation): fails the save while db 1 is still trimming, completes once it is
+  done. It is red with the untrimmed term removed.
+- `grown_tables_flushed_before_one_drain_fail_the_save` (review 5) stays green.
+- The 8 x 40 MB FLUSHDB reproduction completes 4 of 4 on a release-fast build: the trim of a
+  10K-row table (~20 drains) finishes before the client refills the next database.
 
 **Cost.** All on the shard thread at the drain:
 - step 1: one remove plus insert per key written since the epoch began, already paid for at
@@ -212,6 +240,100 @@ bytes pass `FREEZE_WAIT_SLACK` (8 MiB). An abort now also releases waiting table
   344,782,240, RSS +341 MB), green 3 of 3 (`current_cow_size` 0, RSS +49..+58 MB). The save
   completes and restores db 0's 2,000 keys with dbs 1-8 empty.
 - The randomized flush/swap workload passed over 400 seeds (12 committed).
+
+**Property tests (review 6, adopted).** The reviewer checked fix A with two property tests,
+now permanent:
+- `persistence::snapshot::prop_tests` (lib): random mixed-type workloads, including MOVE,
+  COPY, SWAPDB, expiries, lazy-free UNLINKs, FLUSHDB (biased onto the database in progress)
+  and grow-then-FLUSHDB, with held, one-segment and budgeted ticks. After every drain the
+  frozen rows must stay within the epoch-start bills of the unwritten databases. At the end
+  the file must be EXACTLY the epoch-start image, and file + tail the live keyspace. It runs
+  16 seeds by default (~6 s debug); `MOON_TEST_SNAPSHOT_PROP_SEEDS` runs more. The reviewer
+  ran 2,000 with no counterexample. Here 64 seeds pass in 25.6 s, with 223 frozen flushes,
+  61 rebuilds and a max bill error of 0.
+- `tests/perf_ws16_bgsave_prop.rs` (real server): a random workload while the hold is
+  toggled, then kill -9 and restore the file alone. It runs 3 seeds at `--shards 1` and 3 at
+  `--shards 4` (20 s); the reviewer ran 80.
+- **Mutation evidence** (re-run here):
+  - Removing the pre-image restore from the trim makes seed 1 red: "the file is not the
+    epoch-start image: 5 missing".
+  - Applying the table events BEFORE the captures in `drain_into` makes the bound check red
+    at seed 1: "db 0's frozen rows are 30090 B; its epoch-start bill 0 B". The trim ran
+    without that tick's tombstones, so post-epoch rows stayed frozen.
+
+**Review 6, S1: the trim is budgeted.** Review 5's trim ran whole inside one drain on the
+shard thread. The reviewer measured it (release-fast, in-process):
+- a 1M-row db in progress, cursor at 50%: 62 ms, against 27 ms for main's FLUSHDB drop;
+- 0.5M epoch-start + 1.5M post-epoch rows in a pending db: 0.88 s;
+- 2M + 6M: 4.33 s.
+
+Now `snapshot/frozen.rs` keeps a per-table state machine: pre-images, then written rows,
+then an optional rebuild. The drains advance it by at most `TRIM_BUDGET` = 512 row
+operations in all, lowest database first; a segment that would not fit waits for the next
+drain.
+- **The file never depends on the trim.** Until a key's pre-image is folded into the table,
+  the walk shadows the table's row with it, and the walk never reads below its cursor. So
+  steps 1 and 2 run while the walk writes the same database. Only the rebuild (rows moving
+  between tables) makes the walk wait a tick.
+- **Seed 104 found a bug in the first version.** With the walk interleaved, it takes the
+  pre-images of the range it passes itself, and those keys' post-epoch rows stayed below the
+  cursor. Step 2 now covers the cursor as it stands when step 1 ends. The property test was
+  red at seed 104 ("db 3's frozen rows are 674492 B; its epoch-start bill 658842 B") and is
+  now green over 400 seeds. Half of those run with a tiny random budget (1-40), giving 5,704
+  mid-trim observations and 11 ticks where the walk waited on a rebuild.
+- **The byte bound holds once the trim is done:** after ceil(work / 512) drains, where work
+  = keys written since the epoch began + rows below the cursor + (on a rebuild) the rows kept.
+  8 x 10K rows: about 20-40 drains each. 2M + 6M: about 16K drains.
+- **The rebuilt table grows by splits** (`Table::new`), since `with_capacity` adds a depth
+  level of headroom. The emptied old table, and any removed post-epoch value of 4,096 or more
+  elements, are freed on a lazily started `moon-snapdrop` helper thread (the `moon-lazyfree`
+  pattern). The old 8M-row skeleton alone took 19.6 ms to free inline.
+
+Measured end to end: release-fast server (jemalloc, its baked `background_thread:true,
+dirty_decay_ms:1000`), `--shards 1`, a held save. The db gets N epoch-start rows then 3N
+post-epoch rows, then FLUSHDB, while a second connection PINGs in a loop:
+
+| Case | FLUSHDB reply | PING after it: p99 / p99.9 / max | bill at its final value |
+|---|---|---|---|
+| main's FLUSHDB (no save), 0.5M + 1.5M | 45 ms | max 45 ms | — |
+| main's FLUSHDB (no save), 2M + 6M | 192-193 ms | max 192-193 ms | — |
+| budget 512, 0.5M + 1.5M | 0.2 ms | 0.33 / 0.69 / 4.2 ms | 2.9 s |
+| budget 512, 2M + 6M | 0.3 ms | 0.42 / 1.01 / 9.2 ms | 11.8 s |
+| budget 2,048, 2M + 6M (rejected) | 0.3 ms | 1.0-1.5 / 10-27 / 427-865 ms | 3.1-3.4 s |
+| budget 1,024, 2M + 6M (rejected) | 0.3 ms | 0.56 / 0.89 / 52.8 ms | 5.9 s |
+
+Why the larger budgets stall:
+- An operation costs ~0.1-1.3 us, so a 2,048-op drain can outlast the 1 ms tick, and the
+  event loop then runs ticks back to back ahead of connection I/O.
+- The 0.4-0.9 s stall at the end of a large rebuild is jemalloc returning the ~1 GB step 1
+  freed while the rebuild allocates. With purging disabled
+  (`background_thread:false,dirty_decay_ms:-1`) the max is 63 ms; with `dirty_decay_ms:0` it
+  is 617 ms; leaking the old table instead of freeing it did not remove it.
+- At 512 the purge spreads out over the longer trim, and no such stall was seen.
+
+Lib-test timings (`table_swap_tests::trim_cost_of_a_large_flushed_table`, `--ignored`) run
+on glibc: lib tests use the system allocator. glibc's fastbin consolidation put 26-98 ms
+into single `BTreeMap::pop_first` calls; `GLIBC_TUNABLES=glibc.malloc.mxfast=0` removes it
+(worst drain 13 ms). So those numbers are not the server's. The cheap budget assertion is
+`table_swap_tests::one_drain_trims_at_most_the_budget`: a 50,000-row table, at most
+`TRIM_BUDGET` operations per drain, the trim done after about ceil(ops / budget) drains, and
+bound and file correct. It was red on the unbudgeted trim ("one drain trimmed 50000 rows").
+
+**Review 6, N1: lazy-free charges are not billed to a frozen table.** An UNLINKed large
+collection stays charged to `used_memory` until the lazy-free drain frees it (moon#1190).
+`clear` handed the epoch `table_bytes` = the ledger with that charge, although the table no
+longer held the row, and the trim then restored the pre-image and billed it again.
+`current_cow_size` over-reported by the value for the rest of the save, above the database's
+epoch-start bill: 551,044 B against rows of 278,817 B = the epoch-start bill.
+- **Fix:** with a save armed, `Database::clear` reclaims the charged lazy-free items first
+  (`reclaim_lazy_free`), then reads `used_memory`.
+- **Why not subtract?** Subtracting would need each queued value's remaining charge, which is
+  O(elements) to compute, since `estimate_memory` walks a collection.
+- **Cost:** the reclaim is the lazy-free drain's owed work, paid in the FLUSHDB instead of the
+  tick, and only while a BGSAVE runs.
+- **Test:** `table_swap_tests::a_lazy_free_charge_is_not_billed_to_the_frozen_table` (the
+  reviewer's proof) was red (551,044 vs 278,817) and is green (bill == rows <= epoch-start
+  bill).
 
 The frozen figure is `used_memory` at the flush, not `estimated_memory()` (52544bf3:
 spill-in-flight payloads are not in the table; red 1,467,473 B vs 418,890 B with 1 MiB in
@@ -394,6 +516,23 @@ replica).
 - `::a_pop_surplus_release_agrees_on_master_replica_and_restart` (the reviewer's Q1 proof,
   adopted without its MULTI leg, moon#1262): master, replica and restart hold the same PEL
   and cursor, and serve the rest once, in order. It passed before and after.
+
+## Review 6, P1 — what the RRDSHARD file does not hold (pre-existing, by design)
+
+The snapshot walk (`SnapshotState::advance_segment_inner`) serializes each database's HOT
+table, the DashTable, and nothing else:
+- **Cold-tier keys** (`--disk-offload`, in `cold_index`) are never in the RRDSHARD file. They
+  live in the cold tier's own heap files and manifest, which recovery reads separately
+  (`storage::tiered::cold_index` recovery). A restore from the RRDSHARD file ALONE, as the
+  real-server capture tests do with `--disk-offload disable`, has no cold keys.
+- **Spill-in-flight keys** are also absent: keys evicted to the cold tier whose spill has not
+  completed, whose payload is pinned by the in-flight record (`spill_inflight`). The spill
+  completes into the cold tier, or a DEL / overwrite retires the record (#459, moon#1253).
+- A frozen table (FLUSHDB during a save) holds hot rows only, so the same applies to it; the
+  bill excludes spill-in-flight bytes (52544bf3).
+
+No change here. Documented because the property tests judge the file against the hot
+keyspace: they run with offload disabled, so every key is hot.
 
 ## Capture-site audit table (WS12's table, updated at the end of WS16)
 
@@ -586,4 +725,47 @@ Notes:
   - perf_ws12_bgsave_split 4/4 + 1 ignored (resync), perf_ws15_bgsave_status 3/3,
     perf_ws8_mset_bgsave_capture 1/1;
   - perf_ws16_bgsave_capture 7/7, perf_ws16_mq_billing 5/5 + 2 ignored (replica);
+  - mq_integration 17/17, workspace_integration 13/13 + 1 ignored.
+
+## Review 6 (MERGE-AFTER-FIXES) — what changed
+
+The reviewer's property tests (2,000 lib seeds, 80 real-server seeds at `--shards 1` and 4,
+kill -9 and restore) found no counterexample to fix A. The items:
+
+| item | commit | red → green |
+|---|---|---|
+| adopt the property tests | 32e55cd9 | green at adoption. Mutation evidence (item 2a above): no pre-image restore → seed 1 red; events before captures → bound red |
+| S1 the trim's CPU was unbounded | 103e996c | `one_drain_trims_at_most_the_budget`: "one drain trimmed 50000 rows" → at most 512 per drain. Property seed 104 caught an interleaving bug in the first version (fixed: step 2 covers the cursor at step 1's end). The release server measurements are in item 2a |
+| S2 the abort fired for an un-grown second table | e091ebe7 | reviewer's lib and server proofs → green; the re-derived rule over the whole trim is pinned (red without the untrimmed term) |
+| N1 lazy-free charges billed to a frozen table | 66e06764 | 551,044 vs 278,817 B → bill == rows |
+| N2 `XADD <ms>-*` overflowed at the last sequence | f837ad19 | debug panic / dead server → redis's error |
+| N3 an empty POP created a consumer on the master only | 06c7e3dd | 497 vs 321, *1 vs *0 → equal on all three |
+| P1 the RRDSHARD file holds hot keys only | cba154c5 | docs |
+
+Notes:
+- The adopted tests use `common::spawn_listening` ports.
+- The reviewer's moon#1232 assertion in the pipeline-abort proof is left out: part 4 carries
+  that counting fix, and this branch has not merged part 4.
+- The lib test's `REVIEW6_NO_BOUND` knob is not adopted.
+
+## Gate run after review 6 (production code 06c7e3dd; P1 and the final commit are docs)
+
+- `cargo fmt --check` clean; audit-unsafe, audit-unwrap, audit-test-tempdirs,
+  audit-encoding-limits PASS.
+- clippy `--all-targets -D warnings` clean on monoio and on
+  `--no-default-features --features runtime-tokio,jemalloc`.
+- `cargo test --lib` monoio, FULL: 6,659 passed, 15 ignored.
+- Touched modules, adding `command::stream` to the 16 review-5 filters: monoio 726, tokio 690.
+- `prop_tests` at 400 seeds: 200 with tiny budgets, 7,302 mid-trim observations, 101 rebuild
+  waits, bill error 0 over 17,931 checks.
+- Integration, monoio (`MOON_BIN=/home/user/wt/bin/ws16-r6-final-monoio`):
+  - perf_ws12_bgsave_split 5/5, perf_ws15_bgsave_status 3/3, perf_ws8_mset_bgsave_capture 1/1;
+  - perf_ws16_bgsave_capture 7/7, perf_ws16_bgsave_prop 2/2 (12 seeds on a longer run),
+    perf_ws16_mq_billing 10/10;
+  - `--include-ignored`: replication_ws 4/4, replication_readonly_ws_mq 1/1, replication_mq
+    4/4, replication_swapdb 3/3.
+- Integration, tokio (`MOON_BIN=/home/user/wt/bin/ws16-r6-final-tokio`):
+  - perf_ws12 4/4 + 1 ignored, perf_ws15 3/3, perf_ws8 1/1;
+  - perf_ws16_bgsave_capture 7/7, perf_ws16_bgsave_prop 2/2, perf_ws16_mq_billing 6/6 + 4
+    ignored (they need a replica);
   - mq_integration 17/17, workspace_integration 13/13 + 1 ignored.

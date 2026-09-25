@@ -146,6 +146,31 @@ mod tests {
         assert_eq!(result, Frame::BulkString(Bytes::from("2-0")));
     }
 
+    /// Review 6 (N2): `XADD k <ms>-*` takes its sequence from `last_id`. At
+    /// `seq == u64::MAX` the `+ 1` overflowed: a debug build panicked the
+    /// shard (the server stopped accepting connections), a release build
+    /// wrapped to `<ms>-0`. Refused with redis's error, the stream unchanged.
+    #[test]
+    fn test_xadd_ms_star_at_the_last_sequence_is_refused() {
+        let mut db = Database::new();
+        let top = format!("5-{}", u64::MAX);
+        assert_eq!(
+            xadd(&mut db, &make_args(&[b"s", top.as_bytes(), b"f", b"v"])),
+            Frame::BulkString(Bytes::from(top.clone()))
+        );
+        assert_eq!(
+            xadd(&mut db, &make_args(&[b"s", b"5-*", b"f", b"v"])),
+            Frame::Error(Bytes::from_static(
+                b"ERR The ID specified in XADD is equal or smaller than the target stream top item"
+            ))
+        );
+        assert_eq!(
+            xadd(&mut db, &make_args(&[b"s", b"6-*", b"f", b"v"])),
+            Frame::BulkString(Bytes::from("6-0")),
+            "a later millisecond still takes a sequence"
+        );
+    }
+
     #[test]
     fn test_xadd_nomkstream_nonexistent() {
         let mut db = Database::new();
