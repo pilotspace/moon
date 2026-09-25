@@ -39,3 +39,69 @@ pub fn detach(bytes: &[u8]) -> Bytes {
 
 #[cfg(test)]
 mod tests;
+
+/// Shared by the pointer-range tests of the OTHER long-lived stores that keep
+/// request bytes (the script cache, the pub/sub registries): arguments exactly
+/// as the RESP parser hands them out, and the address range of the buffer
+/// they are slices of.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::ops::Range;
+
+    use bytes::{Bytes, BytesMut};
+
+    use crate::protocol::{Frame, ParseConfig, parse};
+
+    /// One parsed request. The argument slices keep the buffer alive, so no
+    /// other allocation can land inside `range` while this lives — an address
+    /// inside it can only be a slice of the request.
+    pub(crate) struct WireArgs {
+        pub(crate) args: Vec<Bytes>,
+        range: Range<usize>,
+    }
+
+    impl WireArgs {
+        /// Encode `parts` as one RESP array into its own 4 KiB buffer (the
+        /// shape of a connection read buffer) and parse it with the real
+        /// parser.
+        pub(crate) fn parse(parts: &[&[u8]]) -> Self {
+            let mut buf = BytesMut::with_capacity(4096);
+            buf.extend_from_slice(format!("*{}\r\n", parts.len()).as_bytes());
+            for p in parts {
+                buf.extend_from_slice(format!("${}\r\n", p.len()).as_bytes());
+                buf.extend_from_slice(p);
+                buf.extend_from_slice(b"\r\n");
+            }
+            let base = buf.as_ptr() as usize;
+            let range = base..base + buf.capacity();
+            let frame = parse::parse(&mut buf, &ParseConfig::default())
+                .expect("well-formed RESP")
+                .expect("one complete frame");
+            let Frame::Array(items) = frame else {
+                panic!("a command parses to an array");
+            };
+            let args: Vec<Bytes> = items
+                .iter()
+                .map(|f| match f {
+                    Frame::BulkString(b) => b.clone(),
+                    other => panic!("every argument is a bulk string, got {other:?}"),
+                })
+                .collect();
+            for a in &args {
+                assert!(
+                    range.contains(&(a.as_ptr() as usize)),
+                    "precondition: the parser hands arguments out as slices of the read buffer"
+                );
+            }
+            Self { args, range }
+        }
+
+        /// Assert `stored` does not point into the request buffer.
+        pub(crate) fn assert_detached(&self, what: &str, stored: &Bytes) {
+            assert!(
+                !self.range.contains(&(stored.as_ptr() as usize)),
+                "{what}: the stored bytes are a slice of the request buffer (moon#1160)"
+            );
+        }
+    }
+}

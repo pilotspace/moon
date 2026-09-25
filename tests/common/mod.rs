@@ -417,19 +417,29 @@ fn settled(child: &mut Child, settle: Duration) -> Result<(), std::process::Exit
 
 /// Resolve the `moon` server binary for crash/integration suites.
 ///
-/// Precedence: `MOON_BIN` env var (only if non-empty and the path exists) →
+/// Precedence: `MOON_BIN` env var (when set and non-empty) →
 /// `CARGO_BIN_EXE_moon` (the exact binary Cargo built for THIS test run —
 /// right profile, right `CARGO_TARGET_DIR`, right `.exe` suffix on Windows)
 /// → `target/release/moon` → `target/debug/moon`. Panics with a actionable
 /// message if none resolve.
+///
+/// A `MOON_BIN` that is set but names no file PANICS instead of falling
+/// through. Whoever set it pinned a binary on purpose (a red run against a
+/// pre-fix build, one runtime's build), and falling back to
+/// `CARGO_BIN_EXE_moon` turned a typo into a run against a different binary
+/// whose verdict was then reported as the pinned one's.
 pub fn find_moon_binary() -> PathBuf {
     if let Ok(bin) = std::env::var("MOON_BIN")
         && !bin.trim().is_empty()
     {
         let p = PathBuf::from(&bin);
-        if p.exists() {
-            return p;
-        }
+        assert!(
+            p.is_file(),
+            "MOON_BIN={bin:?} does not name a file. MOON_BIN is set, so this \
+             suite will not fall back to another binary: fix the path, or \
+             unset MOON_BIN to use the one Cargo built for this test run"
+        );
+        return p;
     }
     let cargo_bin = PathBuf::from(env!("CARGO_BIN_EXE_moon"));
     if cargo_bin.exists() {

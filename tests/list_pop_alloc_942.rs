@@ -233,6 +233,15 @@ fn popping_one_listpack_element_allocates_once() {
          the pair windows below are not measuring the pop"
     );
     assert_eq!(
+        full_push, ROUNDS,
+        "LPUSH onto the FULL encoding allocated {full_push} times over \
+         {ROUNDS} pushes. Since moon#1160 each push stores ONE exact-size copy \
+         of the element (`storage::owned_bytes::detach`): zero means the push \
+         stores a slice of the request buffer again and pins the whole buffer; \
+         more than one means the push copies twice or the deque reallocated \
+         inside a window of stationary length"
+    );
+    assert_eq!(
         full_pop, 0,
         "LPOP off the FULL encoding allocated {full_pop} times over {ROUNDS} \
          pops; a `VecDeque<Bytes>` pop is a move. If this is not zero the \

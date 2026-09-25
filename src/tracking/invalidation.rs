@@ -692,6 +692,9 @@ mod tests {
     /// worker blocks until the deadline.
     #[test]
     fn untracked_write_takes_no_global_table_lock() {
+        // A BCAST test running concurrently would (correctly) route this
+        // write through the lock; serialize rather than widen the deadline.
+        let _serial = crate::tracking::prefilter::GLOBAL_COUNTERS_TEST_LOCK.lock();
         let table = crate::tracking::global_table();
         let held = table.lock();
         let (tx, rx) = std::sync::mpsc::channel();

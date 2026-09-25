@@ -253,13 +253,16 @@ impl ShardDbSet {
     /// SPSC path gives today.
     ///
     /// A same-db swap is a no-op, matching `slice::swap`'s behaviour.
+    ///
+    /// Each slot keeps its `Database::db_index` ([`swap_contents`]): after
+    /// `SWAPDB 0 3` a write through db 0 publishes `@0`, as in redis.
     pub fn swap(&self, a: usize, b: usize) {
         if a == b {
             return;
         }
         // moon#1224: an in-flight snapshot epoch must hear of it first.
         crate::persistence::snapshot_cow::note_swapdb(a, b);
-        self.with_pair(a, b, |da, db| std::mem::swap(da, db));
+        self.with_pair(a, b, swap_contents);
     }
 
     /// OWNER ONLY — exclusive access to EVERY database at once, as a slice of
@@ -435,6 +438,25 @@ mod guard_depth {
     pub(super) fn held_mask() -> u64 {
         HELD.with(|h| h.get())
     }
+}
+
+/// `SWAPDB`'s exchange of two databases' CONTENTS, leaving each
+/// `Database::db_index` with its slot.
+///
+/// `db_index` is the logical db number keyspace notifications name
+/// (`__keyspace@<db>__:<key>`, `__keyevent@<db>__:<event>`) and nothing
+/// else reads it: after `SWAPDB 0 3` a command that selected db 0 writes db
+/// 0's slot, and redis 7.0.15 publishes `@0` for it. A bare `mem::swap`
+/// carried the index along with the data, so every event from either db
+/// named the other one — at every shard count, and for any command that
+/// names its event from the database (`del`, `set`, `expired` …).
+///
+/// Every path that swaps databases goes through here: the live swap
+/// ([`ShardDbSet::swap`], which the coordinator, the SPSC leg and replica
+/// apply share), AOF/WAL replay, and the legacy single-listener handler.
+pub fn swap_contents(a: &mut Database, b: &mut Database) {
+    std::mem::swap(a, b);
+    std::mem::swap(&mut a.db_index, &mut b.db_index);
 }
 
 /// The process-wide registry: one [`ShardDbSet`] per shard.

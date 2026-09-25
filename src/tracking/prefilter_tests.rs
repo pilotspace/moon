@@ -77,6 +77,9 @@ fn cap_eviction_keeps_the_counts_exact() {
 
 #[test]
 fn bcast_prefixes_are_counted_and_released() {
+    // A live BCAST registration makes every write take the lock, so this
+    // must not overlap `untracked_write_takes_no_global_table_lock`.
+    let _serial = prefilter::GLOBAL_COUNTERS_TEST_LOCK.lock();
     let mut t = TrackingTable::new_global();
     t.register_client(900_020, tx());
     let before = prefilter::prefix_count();
