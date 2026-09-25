@@ -393,7 +393,7 @@ shared 4-vCPU Linux container against HEAD `935c555` — re-measure on the GCE r
 - **Data loss: a cold key could be lost at the next restart, or come back with the wrong value** (moon#1231), when it was cold at an AOF rewrite, was then read back into memory or read-modify-written, and the orphan sweep later removed its spill file (reproduced on 143–179 of 200 keys). A spill file that a replayable AOF generation may still read is now kept until a later rewrite has committed, also when it is only briefly unreachable while the sweep runs. The cold-reclaim adoption no longer removes a compacted file whose survivors changed after the rewrite.
 - **Scripts over `maxmemory`** (moon#1241), as in redis 7.0.15:
   - Inside EVAL/EVALSHA, commands that can only free memory (DEL, UNLINK, HDEL, LPOP, EXPIRE, …) are no longer refused with `-OOM`; growing commands still are.
-  - A function registered with `allow-oom` runs any command over `maxmemory`; eviction still runs first.
+  - A function registered with `allow-oom` runs any command over `maxmemory`; eviction still runs first. A per-database `db_maxmemory` quota (a moon extension) still refuses its growing writes.
   - A function without `allow-oom` still has every write refused.
 - **Cold-tier housekeeping** (moon#1231, moon#1240, refs moon#1253):
   - A compacted output whose keys all changed while its listing was committing is reclaimed, instead of staying on disk until a restart.
