@@ -159,6 +159,18 @@ fn unreadable_file_is_counted_and_skipped_never_queued_for_unlink() {
     );
     let p = heap_path(tmp.path(), 2);
     std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o000)).unwrap();
+    // moon#1226: a process that bypasses file permissions — root, or CAP_DAC_OVERRIDE, as in
+    // the root containers the local gates use — still reads a mode-000 file, so the premise
+    // ("an unreadable file") cannot be set up here. Probe it directly instead of guessing from
+    // the uid, and skip rather than fail; unprivileged runners (the hosted CI legs) run it.
+    if std::fs::File::open(&p).is_ok() {
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o644)).unwrap();
+        eprintln!(
+            "skipped: this process reads a mode-000 file (root / CAP_DAC_OVERRIDE), so the \
+             unreadable-file premise cannot be created"
+        );
+        return;
+    }
     let r = ColdIndex::rebuild_from_manifest_per_db(tmp.path(), &m);
     std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o644)).unwrap();
     assert_eq!(r.report.files_unreadable, 1, "{:?}", r.report);

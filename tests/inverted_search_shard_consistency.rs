@@ -263,6 +263,8 @@ struct Reply {
     /// Returned hash fields per key, `__bm25_score` excluded (BM25 depends on
     /// per-shard length statistics, so it legitimately differs by shard count).
     fields: BTreeMap<String, BTreeMap<String, String>>,
+    /// `__bm25_score` per key, in reply order (`None` when a key carries none).
+    scores: Vec<Option<f64>>,
 }
 
 fn text(v: &redis::Value) -> Option<String> {
@@ -288,25 +290,67 @@ fn search(c: &mut redis::Connection, ns: &Ns, query: &str, offset: usize, count:
     };
     let mut keys = Vec::new();
     let mut fields = BTreeMap::new();
+    let mut scores = Vec::new();
     for pair in items[1..].chunks(2) {
         let key = text(&pair[0]).unwrap_or_else(|| panic!("{query:?}: key {:?}", pair[0]));
         let mut map = BTreeMap::new();
+        let mut score = None;
         if let Some(redis::Value::Array(kv)) = pair.get(1) {
             for f in kv.chunks(2) {
-                if let (Some(k), Some(v)) = (text(&f[0]), f.get(1).and_then(text))
-                    && k != "__bm25_score"
-                {
-                    map.insert(k, v);
+                if let (Some(k), Some(v)) = (text(&f[0]), f.get(1).and_then(text)) {
+                    if k == "__bm25_score" {
+                        score = v.parse::<f64>().ok();
+                    } else {
+                        map.insert(k, v);
+                    }
                 }
             }
         }
         fields.insert(key.clone(), map);
         keys.push(key);
+        scores.push(score);
     }
     Reply {
         total,
         keys,
         fields,
+        scores,
+    }
+}
+
+/// moon#1226: the key-SET checks cannot see a wrong merge ORDER. The reply is ranked by
+/// `__bm25_score` DESC at every shard count (the coordinator's merge sorts by it), and at one
+/// shard equal scores come in doc-id order — the fixture's insertion order, `ns.key(i)` by
+/// ascending `i` — so both are checked wherever the order is deterministic.
+fn assert_ranked(r: &Reply, ns: &Ns, label: &str, ties_in_insertion_order: bool) {
+    let idx = |k: &str| -> u32 {
+        k.strip_prefix(&ns.prefix)
+            .and_then(|n| n.parse().ok())
+            .unwrap_or_else(|| panic!("{label}: key {k} outside the fixture"))
+    };
+    for (w, (a, b)) in r
+        .keys
+        .windows(2)
+        .zip(r.scores.windows(2))
+        .map(|(k, s)| (k, (s[0], s[1])))
+    {
+        let (Some(a), Some(b)) = (a, b) else {
+            continue;
+        };
+        assert!(
+            a >= b,
+            "{label}: {} ({a}) ranked above {} ({b})",
+            w[0],
+            w[1]
+        );
+        if ties_in_insertion_order && a == b {
+            assert!(
+                idx(&w[0]) < idx(&w[1]),
+                "{label}: tie {} before {} is not doc-id order",
+                w[0],
+                w[1]
+            );
+        }
     }
 }
 
@@ -321,6 +365,9 @@ fn sorted(keys: &[String]) -> Vec<String> {
 /// (the coordinator re-pages the merged per-shard pages).
 fn assert_pages_partition(c: &mut redis::Connection, ns: &Ns, query: &str, want: &[String]) {
     const PAGE: usize = 7;
+    // moon#1226: the pages must also concatenate to the unpaged answer IN ORDER — re-paging
+    // may not reshuffle ties or scores.
+    let full = search(c, ns, query, 0, 1000).keys;
     let mut seen = Vec::new();
     let mut offset = 0;
     while offset < want.len() + PAGE {
@@ -349,6 +396,7 @@ fn assert_pages_partition(c: &mut redis::Connection, ns: &Ns, query: &str, want:
         want,
         "{query:?}: pages do not cover the answer"
     );
+    assert_eq!(seen, full, "{query:?}: pages reorder the answer");
 }
 
 /// Instrument check: how many of a 4-shard server's shards own at least one of
@@ -398,6 +446,8 @@ fn check(
         r4.fields, r1.fields,
         "{query:?}: returned fields differ, shards 1 vs 4"
     );
+    assert_ranked(&r1, ns, &format!("shards=1 {query:?}"), true);
+    assert_ranked(&r4, ns, &format!("shards=4 {query:?}"), false);
     1
 }
 
@@ -448,6 +498,12 @@ fn run_tag_matrix(c1: &mut redis::Connection, c4: &mut redis::Connection, ns: &N
         i.is_multiple_of(7) && has_label(i, "bug")
     });
     ran += check(c1, c4, ns, "@status:{nosuchvalue}", |_| false);
+    // moon#1226: pure BM25 queries — two score levels (`alpha w{i}` vs `alpha beta w{i}`
+    // lengths), so the order check sees long runs of ties.
+    ran += check(c1, c4, ns, "alpha", |i| i.is_multiple_of(2));
+    ran += check(c1, c4, ns, "beta | alpha", |i| {
+        i.is_multiple_of(2) || i.is_multiple_of(7)
+    });
     ran
 }
 
@@ -473,7 +529,25 @@ fn tag_filter_1_shard_vs_4_shard_identical() {
     let (s1, s4) = (start(1), start(4));
     let (mut c1, mut c4) = (seed(&s1, &ns), seed(&s4, &ns));
     let ran = run_tag_matrix(&mut c1, &mut c4, &ns);
-    assert_eq!(ran, 13, "every TAG comparison must have run");
+    assert_eq!(ran, 15, "every TAG comparison must have run");
+    // Instrument check for the moon#1226 order assertions: a BM25 reply carries a score on
+    // every key, with both ties and distinct levels — and a reply ranked the wrong way is
+    // caught.
+    for c in [&mut c1, &mut c4] {
+        let mut r = search(c, &ns, "alpha", 0, 1000);
+        assert!(r.scores.iter().all(Option::is_some), "scores present");
+        assert!(r.scores.windows(2).any(|w| w[0] == w[1]), "ties present");
+        assert!(r.scores.windows(2).any(|w| w[0] != w[1]), "levels present");
+        r.keys.reverse();
+        r.scores.reverse();
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            assert_ranked(&r, &ns, "reversed", false)
+        }));
+        assert!(
+            caught.is_err(),
+            "a reversed ranking must fail the order check"
+        );
+    }
 }
 
 /// Re-writing documents moves them between TAG values on whichever shard owns

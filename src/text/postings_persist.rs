@@ -202,13 +202,65 @@ impl Writer {
     }
 }
 
+/// The file's doc ids when the index has holes (moon#1220 item 3): `map[old]`
+/// is `old`'s rank among the live ids, so the file numbers its documents
+/// densely `0..live` in the same order. `None` — write the in-memory ids —
+/// when there are no holes (the common case: freed ids are reused) or, never
+/// expected, when some posting / TAG / NUMERIC entry names an id that is not
+/// live, where a renumbering could collide.
+///
+/// Ids freed by `FT.INVALIDATE_RANGE` or the boot deletion probe and not yet
+/// re-filled otherwise travelled into every `.tpost`: a restart then sized
+/// every dense per-document column (and the free-id set) by the highest id,
+/// and once the holes exceeded the density guard (`2 × docs + 64 Ki`) the
+/// file was REFUSED and the index rebuilt from the keyspace on every boot.
+/// The renumbering is monotone, so every order the index exposes — the
+/// `score DESC, doc_id ASC` tie order included — is unchanged, and a dense
+/// index re-encodes to the same bytes.
+fn dense_doc_ids(idx: &TextIndex) -> Option<Vec<u32>> {
+    let live = idx.doc_id_to_key.live();
+    let next = idx.next_doc_id();
+    if live.len() == u64::from(next) {
+        return None;
+    }
+    let all_live = idx
+        .field_postings
+        .iter()
+        .all(|store| store.iter().all(|(_, p)| p.doc_ids.is_subset(live)));
+    #[cfg(feature = "text-index")]
+    let all_live = all_live
+        && idx.doc_tag_entries.iter().all(|(d, _)| live.contains(d))
+        && idx
+            .doc_numeric_entries
+            .iter()
+            .all(|(d, _)| live.contains(d));
+    if !all_live {
+        return None;
+    }
+    let mut map = vec![u32::MAX; next as usize];
+    for (new, old) in live.iter().enumerate() {
+        if let Some(slot) = map.get_mut(old as usize) {
+            *slot = new as u32;
+        }
+    }
+    Some(map)
+}
+
 /// Serialize a live index. Pure CPU, no syscalls — this is the part that
 /// runs on the shard thread; the bytes go to `text::persist_writer`.
 ///
 /// Keys, term ids and postings are written in sorted order so the same
-/// index state always produces the same bytes (tests diff them).
+/// index state always produces the same bytes (tests diff them). Doc ids are
+/// written densely (see [`dense_doc_ids`]).
 #[must_use]
 pub fn encode_index(idx: &TextIndex) -> Vec<u8> {
+    let remap = dense_doc_ids(idx);
+    let file_id = |d: u32| {
+        remap
+            .as_deref()
+            .and_then(|m| m.get(d as usize).copied())
+            .unwrap_or(d)
+    };
     let mut w = Writer {
         buf: Vec::with_capacity(4096 + idx.resident_bytes() / 2),
     };
@@ -223,7 +275,10 @@ pub fn encode_index(idx: &TextIndex) -> Vec<u8> {
 
     w.bytes32(&idx.name);
     w.u8(idx.db_index);
-    w.u32(idx.next_doc_id());
+    w.u32(match remap {
+        Some(_) => idx.doc_id_to_key.live().len() as u32,
+        None => idx.next_doc_id(),
+    });
     let field_count = idx.text_fields.len();
     w.u16(field_count as u16);
 
@@ -232,7 +287,7 @@ pub fn encode_index(idx: &TextIndex) -> Vec<u8> {
     let doc_ids: Vec<u32> = idx.doc_id_to_key.keys().collect();
     w.u32(doc_ids.len() as u32);
     for &doc_id in &doc_ids {
-        w.u32(doc_id);
+        w.u32(file_id(doc_id));
         let key = idx
             .doc_id_to_key
             .get(&doc_id)
@@ -291,7 +346,7 @@ pub fn encode_index(idx: &TextIndex) -> Vec<u8> {
             w.u8(list.has_positions() as u8);
             w.u32(list.doc_ids.len() as u32);
             for d in &list.doc_ids {
-                w.u32(d);
+                w.u32(file_id(d));
             }
             for tf in list.tf_values() {
                 w.u32(tf);
@@ -313,7 +368,7 @@ pub fn encode_index(idx: &TextIndex) -> Vec<u8> {
         // (moon#1194 stores `(field index, value)` in memory).
         w.u32(idx.doc_tag_entries.len() as u32);
         for (doc_id, entries) in idx.doc_tag_entries.iter() {
-            w.u32(doc_id);
+            w.u32(file_id(doc_id));
             w.u16(entries.len() as u16);
             for (fi, value) in entries {
                 let field = idx
@@ -326,7 +381,7 @@ pub fn encode_index(idx: &TextIndex) -> Vec<u8> {
         }
         w.u32(idx.doc_numeric_entries.len() as u32);
         for (doc_id, entries) in idx.doc_numeric_entries.iter() {
-            w.u32(doc_id);
+            w.u32(file_id(doc_id));
             w.u16(entries.len() as u16);
             for (fi, value) in entries {
                 let field = idx
@@ -1178,9 +1233,18 @@ mod tests {
                 "{terms:?}"
             );
         }
+        // The file numbers documents densely (moon#1220 item 3): a live id is
+        // loaded as its rank among the live ids.
+        let file_id = |d: u32| live.live_docs().rank(d) as u32 - 1;
         for (term, p) in live.field_postings[0].iter() {
             let q = loaded.field_postings[0].get_posting(term).expect("term");
-            assert_eq!(p.doc_ids, q.doc_ids);
+            assert_eq!(
+                p.doc_ids
+                    .iter()
+                    .map(file_id)
+                    .collect::<roaring::RoaringBitmap>(),
+                q.doc_ids
+            );
             assert_eq!(
                 p.tf_values().collect::<Vec<_>>(),
                 q.tf_values().collect::<Vec<_>>()
@@ -1188,6 +1252,74 @@ mod tests {
             assert!(p.position_lists().eq(q.position_lists()));
         }
         assert_eq!(encode_index(&loaded), bytes, "re-encodes byte-identically");
+    }
+
+    /// moon#1220 item 3 red test: doc-id holes are compacted out when
+    /// `.tpost` is rewritten. 70,000 documents, then the oldest 69,900
+    /// removed (FT.INVALIDATE_RANGE-style): HEAD wrote the surviving ids
+    /// as-is, `next_doc_id` 70,000 for 100 documents — past the density guard
+    /// (2 × 100 + 65,536), so the file was REFUSED and every boot rebuilt the
+    /// index from the keyspace. The file now numbers the survivors 0..100 in
+    /// the same order; the installed index answers like the live one — same
+    /// keys, score bits and tie order — and re-encodes to the same bytes.
+    #[test]
+    fn tpost_rewrite_compacts_doc_id_holes() {
+        let mut live = TextIndex::new(
+            Bytes::from_static(b"holes"),
+            vec![Bytes::from_static(b"k:")],
+            vec![TextFieldDef::new(Bytes::from_static(b"body"))],
+            BM25Config::default(),
+        );
+        const N: u32 = 70_000;
+        const KEEP: u32 = 100;
+        for i in 0..N {
+            let key = format!("k:{i}");
+            let kh = xxhash_rust::xxh64::xxh64(key.as_bytes(), 0);
+            let body = format!("w{} w{} x{}", i % 13, i % 7, i % 3);
+            let args = frames(&[("body", body.as_str())]);
+            live.index_document_with_lsn(kh, key.as_bytes(), &args, 1 + u64::from(i));
+            live.record_content_checksum(kh, &args);
+        }
+        for d in 0..N - KEEP {
+            live.remove_doc_by_doc_id(d);
+        }
+        assert_eq!(
+            (live.num_docs(), live.next_doc_id()),
+            (KEEP, N),
+            "the survivors sit above 69,900 holes"
+        );
+        let bytes = encode_index(&live);
+        let p = decode(&bytes).expect("a compacted file passes the density guard");
+        assert_eq!(p.next_doc_id, KEEP);
+        let mut loaded = empty_like(&live);
+        loaded.install_recovered(p).expect("install");
+        assert_eq!(loaded.next_doc_id(), KEEP);
+        assert!(loaded.free_doc_ids().is_empty());
+        for terms in [
+            vec!["w0"],
+            vec!["w3", "x1"],
+            vec!["w12", "w6", "x0"],
+            vec!["x2"],
+        ] {
+            let q: Vec<String> = terms.iter().map(|t| (*t).to_owned()).collect();
+            let ranked = |idx: &TextIndex| {
+                idx.search_field(0, &q, None, None, 1_000)
+                    .into_iter()
+                    .map(|r| (r.key, r.score.to_bits()))
+                    .collect::<Vec<_>>()
+            };
+            let (a, b) = (ranked(&live), ranked(&loaded));
+            assert!(!a.is_empty(), "{terms:?}: fixture must match");
+            assert_eq!(a, b, "{terms:?}: keys, score bits and tie order");
+        }
+        assert_eq!(
+            encode_index(&loaded),
+            bytes,
+            "a dense index re-encodes identically"
+        );
+        // No holes: the in-memory ids are written unchanged.
+        let dense = sample_index();
+        assert!(dense_doc_ids(&dense).is_none());
     }
 
     /// Mirror of `posting::FLAT_MAX` (private there) for fixture sizing.

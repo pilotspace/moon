@@ -460,10 +460,12 @@ fn light_tq4a2_mvcc_scan_does_not_panic_and_matches_sync_scan() {
         for qi in [0usize, 17, 64] {
             let q = &data[qi];
             let mvcc = search_mvcc(&holder, q, 5);
+            // The holder's sync leg (exact-reranked like the MVCC one since
+            // moon#1226).
             let sync: Vec<(u32, u32)> = holder
                 .load()
                 .mutable
-                .brute_force_search(q, None, 5)
+                .brute_force_search_reranked(q, 5, None, SearchTuning::default().rerank_mult)
                 .iter()
                 .map(|r| (r.id.0, r.distance.to_bits()))
                 .collect();

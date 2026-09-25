@@ -7,7 +7,16 @@ use std::time::{Duration, Instant};
 use moon::text::posting::{PostingList, PostingStore};
 
 /// moon#1195. Six postings of 200K docs, bulk-loaded through the `.tpost` constructor.
+///
+/// moon#1226: a wall-clock ratio — skipped in unoptimised builds, where shared-runner noise and
+/// debug codegen swamp it (this file used to be duplicated as a lib test that ran in every debug
+/// CI leg). The deterministic guard for the same property is `posting::tests::assert_layout`'s
+/// run bounds (RUN_MAX entries / RUN_POS_MAX positions per run cap the memmove per upsert).
 #[test]
+#[cfg_attr(
+    debug_assertions,
+    ignore = "wall-clock ratio, meaningful only in an optimized build: cargo test --release --test perf_ws5b_text_upsert (moon#1226)"
+)]
 fn reindexing_the_oldest_doc_costs_the_same_as_the_newest() {
     const N: u32 = 200_000;
     const TERMS: u32 = 6;

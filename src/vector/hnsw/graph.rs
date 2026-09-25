@@ -19,6 +19,21 @@ pub const PREFETCH_MAX_CODE_LINES: usize = 16;
 /// Total lines per [`HnswGraph::prefetch_node`] call (code + sign rows).
 const PREFETCH_MAX_LINES: usize = 20;
 
+/// Cache lines the byte range `[addr, addr + len)` touches (moon#1228). A row
+/// that starts mid-line spans one line more than `len.div_ceil(64)` whenever
+/// `(addr & 63) + len` crosses the extra boundary: a 516 B code row (768d
+/// TQ4) starting past byte 60 of a line touches 10 lines, and `div_ceil`
+/// hinted 9 — the last one, read by every scored candidate, missed. Rows are
+/// `bfs_pos · bytes_per_code` apart, so most start mid-line.
+#[inline(always)]
+pub(crate) fn row_cache_lines(addr: usize, len: usize) -> usize {
+    if len == 0 {
+        0
+    } else {
+        ((addr & 63) + len).div_ceil(64)
+    }
+}
+
 #[cfg(test)]
 thread_local! {
     /// Test-only A/B switch: `true` makes `prefetch_node` issue HEAD's
@@ -262,8 +277,9 @@ impl HnswGraph {
     }
 
     /// Prefetch what scoring a beam candidate at `bfs_pos` reads next: its
-    /// whole TQ code row (all `ceil(bytes_per_code / 64)` cache lines, capped
-    /// at [`PREFETCH_MAX_CODE_LINES`]) and, when the beam scores with the
+    /// whole TQ code row (every cache line it touches — [`row_cache_lines`],
+    /// which counts the start offset too (moon#1228) — capped at
+    /// [`PREFETCH_MAX_CODE_LINES`]) and, when the beam scores with the
     /// 32-level LUT, its sub-centroid sign row (moon#1213).
     ///
     /// HEAD prefetched 2 lines of the candidate's OWN neighbour list plus the
@@ -307,7 +323,9 @@ impl HnswGraph {
                 n += 1;
             }
         } else {
-            for line in 0..bpc.div_ceil(64).min(PREFETCH_MAX_CODE_LINES) {
+            // `code + i·64` lies in the row's i-th line for any start offset,
+            // so hinting `row_cache_lines` of them covers the whole row.
+            for line in 0..row_cache_lines(code.addr(), bpc).min(PREFETCH_MAX_CODE_LINES) {
                 addrs[n] = code.wrapping_add(line * 64);
                 n += 1;
             }
@@ -315,7 +333,8 @@ impl HnswGraph {
                 let signs = sub_signs
                     .as_ptr()
                     .wrapping_add(bfs_pos as usize * sub_sign_bpv);
-                for line in 0..sub_sign_bpv.div_ceil(64).min(PREFETCH_MAX_LINES - n) {
+                let sign_lines = row_cache_lines(signs.addr(), sub_sign_bpv);
+                for line in 0..sign_lines.min(PREFETCH_MAX_LINES - n) {
                     addrs[n] = signs.wrapping_add(line * 64);
                     n += 1;
                 }
@@ -742,6 +761,36 @@ mod tests {
 
         let got = graph.tq_norm(0, &vectors_tq);
         assert!((got - norm_val).abs() < 1e-6);
+    }
+
+    #[test]
+    fn prefetch_hints_every_line_of_a_misaligned_row() {
+        // moon#1228: count the lines each row really touches, for every start
+        // offset within a line, at the code/sign row sizes the beam uses
+        // (TQ4 codes are padded/2 + 4 B; signs padded/8 B).
+        for len in [0usize, 1, 20, 36, 64, 65, 68, 132, 260, 516, 1028] {
+            for offset in 0..64usize {
+                let base = 64 * 1000 + offset;
+                let touched = (base..base + len)
+                    .map(|a| a / 64)
+                    .collect::<std::collections::BTreeSet<_>>();
+                assert_eq!(
+                    row_cache_lines(base, len),
+                    touched.len(),
+                    "row of {len} B at line offset {offset}"
+                );
+                // The hinted addresses `base + i·64` land on exactly those lines.
+                let hinted: std::collections::BTreeSet<_> = (0..row_cache_lines(base, len))
+                    .map(|i| (base + i * 64) / 64)
+                    .collect();
+                assert_eq!(hinted, touched, "row of {len} B at line offset {offset}");
+            }
+        }
+        // The issue's case: a 768d TQ4 row (516 B) starting more than 60 B
+        // into a line spans 10 lines.
+        assert_eq!(row_cache_lines(61, 516), 10);
+        assert_eq!(row_cache_lines(60, 516), 9);
+        assert_eq!(516usize.div_ceil(64), 9, "what HEAD hinted");
     }
 
     #[test]

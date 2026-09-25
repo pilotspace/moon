@@ -3409,6 +3409,15 @@ fn test_parse_filter_text_match_multiword() {
         bulk(b"FILTER"),
         bulk(b"@description:{machine learning}"),
     ];
+    // moon#1226: where no index can answer a full-text node (payload text
+    // index off, or a build without `text-index`) the parse refuses it.
+    if let Some(why) = crate::vector::filter::text_match_refusal::payload_text_unavailable() {
+        match parse_filter_clause(&args).into_option() {
+            Err(Frame::Error(msg)) => assert_eq!(&msg[..], why),
+            other => panic!("expected the refusal, got {other:?}"),
+        }
+        return;
+    }
     let filter = parse_filter_clause(&args).into_option().unwrap();
     assert!(
         filter.is_some(),
