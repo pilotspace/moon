@@ -175,7 +175,57 @@ fn head_as_of(
     filtered
 }
 
-fn head_eval_set(node: &QueryNode, idx: &TextIndex) -> RoaringBitmap {
+/// The TAG / NUMERIC truth, kept from the documents' own HSET arguments as the corpus is built
+/// (moon#1226): the oracle used to answer TAG and NUMERIC leaves through the LIVE
+/// `search_tag` / `search_numeric_range`, so a bug in those indexes could not be caught.
+#[derive(Default)]
+struct Model {
+    /// key -> (lower-cased, de-duplicated TAG values; NUMERIC value)
+    docs: HashMap<Vec<u8>, (Vec<Vec<u8>>, Option<f64>)>,
+}
+
+impl Model {
+    /// Apply one HSET's TAG / NUMERIC fields with the store's per-field upsert rule: a field
+    /// present in `args` replaces the document's previous value(s); an absent one keeps them.
+    fn hset(&mut self, key: &[u8], args: &[Frame]) {
+        let entry = self.docs.entry(key.to_vec()).or_default();
+        for pair in args.chunks_exact(2) {
+            let (Frame::BulkString(f), Frame::BulkString(v)) = (&pair[0], &pair[1]) else {
+                continue;
+            };
+            if f.eq_ignore_ascii_case(b"tag") {
+                let mut tags: Vec<Vec<u8>> = Vec::new();
+                for t in v.split(|&b| b == b',').filter(|t| !t.is_empty()) {
+                    let t = t.to_ascii_lowercase();
+                    if !tags.contains(&t) {
+                        tags.push(t);
+                    }
+                }
+                entry.0 = tags;
+            } else if f.eq_ignore_ascii_case(b"num") {
+                entry.1 = std::str::from_utf8(v).ok().and_then(|s| s.parse().ok());
+            }
+        }
+    }
+
+    fn docs_where(
+        &self,
+        idx: &TextIndex,
+        pred: impl Fn(&(Vec<Vec<u8>>, Option<f64>)) -> bool,
+    ) -> RoaringBitmap {
+        self.docs
+            .iter()
+            .filter(|(_, d)| pred(d))
+            .filter_map(|(key, _)| {
+                idx.key_hash_to_doc_id
+                    .get(&xxhash_rust::xxh64::xxh64(key, 0))
+                    .copied()
+            })
+            .collect()
+    }
+}
+
+fn head_eval_set(node: &QueryNode, idx: &TextIndex, model: &Model) -> RoaringBitmap {
     match node {
         QueryNode::Empty => RoaringBitmap::new(),
         QueryNode::MatchAll => idx.doc_id_to_key.keys().collect(),
@@ -187,14 +237,14 @@ fn head_eval_set(node: &QueryNode, idx: &TextIndex) -> RoaringBitmap {
             .into_iter()
             .map(|r| r.doc_id)
             .collect(),
+        // TAG / NUMERIC from the model, not the live indexes (moon#1226).
         QueryNode::Tag { field, values } => {
-            let mut bm = RoaringBitmap::new();
-            for value in values {
-                for doc_id in idx.search_tag(field, value) {
-                    bm.insert(doc_id);
-                }
-            }
-            bm
+            assert!(
+                field.eq_ignore_ascii_case(b"tag"),
+                "fixture has one TAG field"
+            );
+            let want: Vec<Vec<u8>> = values.iter().map(|v| v.to_ascii_lowercase()).collect();
+            model.docs_where(idx, |(tags, _)| tags.iter().any(|t| want.contains(t)))
         }
         QueryNode::Numeric {
             field,
@@ -203,30 +253,35 @@ fn head_eval_set(node: &QueryNode, idx: &TextIndex) -> RoaringBitmap {
             min_excl,
             max_excl,
         } => {
-            let mut bm = RoaringBitmap::new();
-            for doc_id in idx.search_numeric_range(field, *min, *max, *min_excl, *max_excl) {
-                bm.insert(doc_id);
-            }
-            bm
+            assert!(
+                field.eq_ignore_ascii_case(b"num"),
+                "fixture has one NUMERIC field"
+            );
+            model.docs_where(idx, |(_, num)| {
+                num.is_some_and(|v| {
+                    (if *min_excl { v > *min } else { v >= *min })
+                        && (if *max_excl { v < *max } else { v <= *max })
+                })
+            })
         }
         QueryNode::And(children) => {
             let mut iter = children.iter().filter(|c| !is_stop_word_only(c, idx));
             let Some(first) = iter.next() else {
                 return RoaringBitmap::new();
             };
-            let mut acc = head_eval_set(first, idx);
+            let mut acc = head_eval_set(first, idx, model);
             for child in iter {
                 if acc.is_empty() {
                     break;
                 }
-                acc &= &head_eval_set(child, idx);
+                acc &= &head_eval_set(child, idx, model);
             }
             acc
         }
         QueryNode::Or(children) => {
             let mut acc = RoaringBitmap::new();
             for child in children {
-                acc |= &head_eval_set(child, idx);
+                acc |= &head_eval_set(child, idx, model);
             }
             acc
         }
@@ -235,12 +290,13 @@ fn head_eval_set(node: &QueryNode, idx: &TextIndex) -> RoaringBitmap {
 
 fn head_eval_query_counted(
     idx: &TextIndex,
+    model: &Model,
     node: &QueryNode,
     global_df: Option<&HashMap<String, u32>>,
     global_n: Option<u32>,
     top_k: usize,
 ) -> (Vec<TextSearchResult>, usize) {
-    let set = head_eval_set(node, idx);
+    let set = head_eval_set(node, idx, model);
     if set.is_empty() {
         return (Vec::new(), 0);
     }
@@ -456,6 +512,7 @@ fn words(rng: &mut Rng, zipf: &Zipf, vocab: &[String], max: u64) -> String {
 
 struct Corpus {
     idx: TextIndex,
+    model: Model,
     vocab: Vec<String>,
     max_lsn: u64,
 }
@@ -463,6 +520,12 @@ struct Corpus {
 /// A 3-TEXT-field (title w=2.5, body w=1.0, notes NOINDEX) + TAG + NUMERIC index with inserts,
 /// upserts (full and partial — re-adding a doc mid-posting), and deletions.
 fn build_corpus(seed: u64, docs: usize, with_fst: bool) -> Corpus {
+    build_corpus_sized(seed, docs, with_fst, 40)
+}
+
+/// [`build_corpus`] with at most `max_body` body words per document (the >65K-doc corpus keeps
+/// documents short so the unoptimised build stays fast).
+fn build_corpus_sized(seed: u64, docs: usize, with_fst: bool, max_body: u64) -> Corpus {
     let mut rng = Rng(seed);
     let vocab = vocabulary(300);
     let zipf = Zipf::new(vocab.len());
@@ -481,38 +544,41 @@ fn build_corpus(seed: u64, docs: usize, with_fst: bool) -> Corpus {
     );
     let tags = ["red", "Green", "blue", "red,blue", "green,RED"];
     let mut lsn = 0u64;
-    let mut index_one = |idx: &mut TextIndex, rng: &mut Rng, d: usize, partial: bool| {
-        let key = format!("doc:{d}");
-        let key_hash = xxhash_rust::xxh64::xxh64(key.as_bytes(), 0);
-        let mut args = Vec::new();
-        if !partial || rng.below(2) == 0 {
-            if rng.below(5) != 0 {
+    let mut model = Model::default();
+    let mut index_one =
+        |idx: &mut TextIndex, model: &mut Model, rng: &mut Rng, d: usize, partial: bool| {
+            let key = format!("doc:{d}");
+            let key_hash = xxhash_rust::xxh64::xxh64(key.as_bytes(), 0);
+            let mut args = Vec::new();
+            if !partial || rng.below(2) == 0 {
+                if rng.below(5) != 0 {
+                    args.push(bulk("title"));
+                    args.push(bulk(&words(rng, &zipf, &vocab, 6)));
+                }
+                args.push(bulk("body"));
+                args.push(bulk(&words(rng, &zipf, &vocab, max_body)));
+            } else {
                 args.push(bulk("title"));
-                args.push(bulk(&words(rng, &zipf, &vocab, 6)));
+                args.push(bulk(&words(rng, &zipf, &vocab, 3)));
             }
-            args.push(bulk("body"));
-            args.push(bulk(&words(rng, &zipf, &vocab, 40)));
-        } else {
-            args.push(bulk("title"));
-            args.push(bulk(&words(rng, &zipf, &vocab, 3)));
-        }
-        if rng.below(4) != 0 {
-            args.push(bulk("tag"));
-            args.push(bulk(tags[rng.below(tags.len() as u64) as usize]));
-        }
-        if rng.below(3) != 0 {
-            args.push(bulk("num"));
-            args.push(bulk(&format!("{}", rng.below(100) as f64 / 4.0)));
-        }
-        lsn += 1 + rng.below(3);
-        // A quarter of the docs are pre-MVCC (lsn 0 = always visible).
-        let doc_lsn = if rng.below(4) == 0 { 0 } else { lsn };
-        idx.index_document_with_lsn(key_hash, key.as_bytes(), &args, doc_lsn);
-        idx.tag_index_document(key_hash, key.as_bytes(), &args);
-        idx.numeric_index_document(key_hash, key.as_bytes(), &args);
-    };
+            if rng.below(4) != 0 {
+                args.push(bulk("tag"));
+                args.push(bulk(tags[rng.below(tags.len() as u64) as usize]));
+            }
+            if rng.below(3) != 0 {
+                args.push(bulk("num"));
+                args.push(bulk(&format!("{}", rng.below(100) as f64 / 4.0)));
+            }
+            lsn += 1 + rng.below(3);
+            // A quarter of the docs are pre-MVCC (lsn 0 = always visible).
+            let doc_lsn = if rng.below(4) == 0 { 0 } else { lsn };
+            idx.index_document_with_lsn(key_hash, key.as_bytes(), &args, doc_lsn);
+            idx.tag_index_document(key_hash, key.as_bytes(), &args);
+            idx.numeric_index_document(key_hash, key.as_bytes(), &args);
+            model.hset(key.as_bytes(), &args);
+        };
     for d in 0..docs {
-        index_one(&mut idx, &mut rng, d, false);
+        index_one(&mut idx, &mut model, &mut rng, d, false);
     }
     if with_fst {
         idx.build_fst();
@@ -521,19 +587,23 @@ fn build_corpus(seed: u64, docs: usize, with_fst: bool) -> Corpus {
     for _ in 0..docs / 4 {
         let d = rng.below(docs as u64) as usize;
         let partial = rng.below(3) == 0;
-        index_one(&mut idx, &mut rng, d, partial);
+        index_one(&mut idx, &mut model, &mut rng, d, partial);
     }
     // Deletions.
     for _ in 0..docs / 20 {
         let d = rng.below(docs as u64) as u32;
+        if let Some(key) = idx.doc_id_to_key.get(&d).cloned() {
+            model.docs.remove(key.as_ref());
+        }
         idx.remove_doc_by_doc_id(d);
     }
     // Some post-FST terms (dual-path expansion).
     for d in docs..docs + docs / 10 {
-        index_one(&mut idx, &mut rng, d, false);
+        index_one(&mut idx, &mut model, &mut rng, d, false);
     }
     Corpus {
         idx,
+        model,
         vocab,
         max_lsn: lsn,
     }
@@ -542,7 +612,7 @@ fn build_corpus(seed: u64, docs: usize, with_fst: bool) -> Corpus {
 fn random_query(rng: &mut Rng, vocab: &[String]) -> String {
     let zipf = Zipf::new(vocab.len());
     let w = |rng: &mut Rng| vocab[zipf.sample(rng)].clone();
-    match rng.below(18) {
+    match rng.below(21) {
         0 => w(rng),
         1 => format!("{} {}", w(rng), w(rng)),
         2 => format!("{} | {}", w(rng), w(rng)),
@@ -565,6 +635,23 @@ fn random_query(rng: &mut Rng, vocab: &[String]) -> String {
         14 => format!("the {} a", w(rng)),
         15 => format!("{} zzzabsent", w(rng)),
         16 => format!("@title:{} @body:{}", w(rng), w(rng)),
+        // moon#1226: pure NUMERIC (incl. exclusive bounds) and TAG ∧ NUMERIC shapes.
+        17 | 18 => {
+            // Ordered bounds (an inverted range is a parse error), inclusive or exclusive.
+            let lo = rng.below(12);
+            let hi = lo + 1 + rng.below(20);
+            if rng.below(2) == 0 {
+                format!("@num:[{lo} {hi}]")
+            } else {
+                format!("@num:[({lo} ({hi}]")
+            }
+        }
+        19 => format!(
+            "@tag:{{{}}} @num:[{} {}]",
+            ["red", "blue", "GREEN"][rng.below(3) as usize],
+            rng.below(10),
+            10 + rng.below(15)
+        ),
         _ => format!("{} {} {}", w(rng), w(rng), w(rng)),
     }
 }
@@ -602,12 +689,13 @@ fn differential_eval_query_matches_head_on_random_corpora() {
             };
             assert_eq!(
                 idx.restrict_to_live(eval_set(&node, idx)),
-                head_eval_set(&node, idx) & idx.live_docs(),
+                head_eval_set(&node, idx, &corpus.model) & idx.live_docs(),
                 "membership of {q:?}"
             );
             for &k in &TOP_KS {
                 let (got, got_total) = eval_query_counted(idx, &node, None, None, k);
-                let (want, want_total) = head_eval_query_counted(idx, &node, None, None, k);
+                let (want, want_total) =
+                    head_eval_query_counted(idx, &corpus.model, &node, None, None, k);
                 assert_eq!(got_total, want_total, "{q:?} k={k}: total");
                 assert_same(&format!("{q:?} k={k}"), &got, &want);
                 compared += 1;
@@ -624,7 +712,8 @@ fn differential_eval_query_matches_head_on_random_corpora() {
             let gn = Some(idx.num_docs() * 4 + 3);
             for &k in &[3usize, usize::MAX / 2] {
                 let (got, got_total) = eval_query_counted(idx, &node, Some(&gdf), gn, k);
-                let (want, want_total) = head_eval_query_counted(idx, &node, Some(&gdf), gn, k);
+                let (want, want_total) =
+                    head_eval_query_counted(idx, &corpus.model, &node, Some(&gdf), gn, k);
                 assert_eq!(got_total, want_total, "DFS {q:?} k={k}: total");
                 assert_same(&format!("DFS {q:?} k={k}"), &got, &want);
             }
@@ -633,6 +722,97 @@ fn differential_eval_query_matches_head_on_random_corpora() {
     // A harness that compares nothing proves nothing (CONVENTIONS: assert a nonzero ran-count).
     assert!(compared > 2000, "compared only {compared} query/k pairs");
     assert!(nonempty > 1000, "only {nonempty} non-empty comparisons");
+}
+
+/// moon#1226: the same differential comparison over a corpus past one roaring container
+/// (> 65,536 ids): postings of the Zipf head are BITMAP containers (> 4,096 ids in the first
+/// 65,536), and every set operation of the evaluator crosses a container boundary. The
+/// 500-document corpora above only ever exercise array containers.
+#[test]
+fn differential_eval_query_matches_head_past_one_bitmap_container() {
+    let t0 = std::time::Instant::now();
+    let corpus = build_corpus_sized(71, 70_000, false, 6);
+    eprintln!("multi-container corpus built in {:?}", t0.elapsed());
+    let idx = &corpus.idx;
+    assert!(
+        idx.live_docs().max().is_some_and(|m| m > 65_536),
+        "ids must span two containers"
+    );
+    assert!(
+        idx.field_postings[1]
+            .iter()
+            .any(|(_, p)| p.doc_ids.rank(65_535) > 4_096),
+        "some body posting must hold a bitmap container"
+    );
+    let schema = QuerySchema::from_index(idx);
+    let mut rng = Rng(71 ^ 0xC0DE);
+    let (mut compared, mut nonempty) = (0usize, 0usize);
+    let t0 = std::time::Instant::now();
+    for _ in 0..45 {
+        let q = random_query(&mut rng, &corpus.vocab);
+        let Ok(node) = parse_query(q.as_bytes(), &schema) else {
+            continue;
+        };
+        assert_eq!(
+            idx.restrict_to_live(eval_set(&node, idx)),
+            head_eval_set(&node, idx, &corpus.model) & idx.live_docs(),
+            "membership of {q:?}"
+        );
+        // HEAD's page for k is a prefix of its full ranking (stable sort, then truncate):
+        // evaluate the oracle once per query.
+        let (want_all, want_total) =
+            head_eval_query_counted(idx, &corpus.model, &node, None, None, usize::MAX / 2);
+        for &k in &[1usize, 10, usize::MAX / 2] {
+            let (got, got_total) = eval_query_counted(idx, &node, None, None, k);
+            let want = &want_all[..k.min(want_all.len())];
+            assert_eq!(got_total, want_total, "{q:?} k={k}: total");
+            assert_same(&format!("{q:?} k={k}"), &got, want);
+            compared += 1;
+            nonempty += usize::from(!want.is_empty());
+        }
+    }
+    eprintln!("multi-container queries compared in {:?}", t0.elapsed());
+    assert!(compared > 90, "compared only {compared}");
+    assert!(nonempty > 45, "only {nonempty} non-empty comparisons");
+}
+
+/// moon#1226: the pure NUMERIC and TAG ∧ NUMERIC shapes, compared against the model on every
+/// corpus (the random mix above draws them too, but this pins that they are exercised and
+/// non-trivial — a harness that compares nothing proves nothing).
+#[test]
+fn differential_numeric_and_tag_numeric_shapes_match_the_model() {
+    let mut nonempty = 0usize;
+    for seed in [81u64, 82] {
+        let corpus = build_corpus(seed, 800, false);
+        let idx = &corpus.idx;
+        let schema = QuerySchema::from_index(idx);
+        let mut rng = Rng(seed);
+        for i in 0..90 {
+            let lo = rng.below(12);
+            let hi = lo + 1 + rng.below(20); // ordered: an inverted range does not parse
+            let q = match i % 3 {
+                0 => format!("@num:[{lo} {hi}]"),
+                1 => format!("@num:[({lo} ({hi}]"),
+                _ => format!(
+                    "@tag:{{{}}} @num:[{lo} {hi}]",
+                    ["red", "blue", "GREEN", "red|blue"][rng.below(4) as usize]
+                ),
+            };
+            let node = parse_query(q.as_bytes(), &schema).expect("parse");
+            let want = head_eval_set(&node, idx, &corpus.model) & idx.live_docs();
+            assert_eq!(idx.restrict_to_live(eval_set(&node, idx)), want, "{q:?}");
+            let (got, total) = eval_query_counted(idx, &node, None, None, 10);
+            let (exp, exp_total) =
+                head_eval_query_counted(idx, &corpus.model, &node, None, None, 10);
+            assert_eq!(total, exp_total, "{q:?}: total");
+            assert_same(&q, &got, &exp);
+            nonempty += usize::from(!want.is_empty());
+        }
+    }
+    assert!(
+        nonempty > 120,
+        "only {nonempty} non-empty NUMERIC / TAG∧NUMERIC comparisons"
+    );
 }
 
 #[test]
@@ -776,7 +956,8 @@ fn differential_term_at_a_time_matches_head() {
                 continue;
             };
             for &k in &[1usize, 10, usize::MAX / 2] {
-                let (want, want_total) = head_eval_query_counted(idx, &node, None, None, k);
+                let (want, want_total) =
+                    head_eval_query_counted(idx, &corpus.model, &node, None, None, k);
                 for force in modes {
                     let before = taat_folds();
                     let (got, got_total) =
@@ -797,7 +978,8 @@ fn differential_term_at_a_time_matches_head() {
                     gdf.insert(t.clone(), 1 + (t.len() as u32 * 5) % 17);
                 }
             }
-            let (want, want_total) = head_eval_query_counted(idx, &node, Some(&gdf), gn, 7);
+            let (want, want_total) =
+                head_eval_query_counted(idx, &corpus.model, &node, Some(&gdf), gn, 7);
             for force in modes {
                 let (got, got_total) =
                     with_forced_taat(force, || eval_query_counted(idx, &node, Some(&gdf), gn, 7));
@@ -882,7 +1064,11 @@ fn broad_term_single_pass_is_cheaper_than_head() {
     let (_, total) = eval_query_counted(idx, &node, None, None, 10);
     assert!(total > 500, "broad term must match many docs, got {total}");
     let live = best(&|| eval_query_counted(idx, &node, None, None, 10).0.len());
-    let head = best(&|| head_eval_query_counted(idx, &node, None, None, 10).0.len());
+    let head = best(&|| {
+        head_eval_query_counted(idx, &corpus.model, &node, None, None, 10)
+            .0
+            .len()
+    });
     assert!(
         live.as_secs_f64() * 1.3 < head.as_secs_f64(),
         "single pass {live:?} not clearly cheaper than HEAD two-pass {head:?}"
