@@ -251,11 +251,13 @@ fn a_completion_before_the_fold_hands_the_key_to_the_ledger() {
     assert_eq!(value(&mut db, b"k1"), None);
 }
 
-/// The superseded set is billed like the in-flight plane and fully credited
-/// back when its entries settle; a request that was never superseded settles
-/// as a no-op.
+/// The superseded set is counted APART from the moon#466 pending charge
+/// (`pending_spill_bytes`, which `used_memory` and admission see): a FLUSH
+/// still drops that charge to 0 as in redis. Its own count goes back to 0 as
+/// its entries settle; a request that was never superseded settles as a
+/// no-op.
 #[test]
-fn superseded_entries_are_billed_and_settle_to_zero() {
+fn superseded_entries_are_counted_apart_and_settle_to_zero() {
     let mut db = Database::new();
     in_flight(&mut db, b"k1", b"v1-old", 7);
     in_flight(&mut db, b"k3", b"v3", 7);
@@ -264,9 +266,13 @@ fn superseded_entries_are_billed_and_settle_to_zero() {
     // A re-eviction replaces k3's record: request 7 of k3 is superseded too.
     in_flight(&mut db, b"k3", b"v3-new", 9);
     assert_eq!(db.spill_superseded_len(), 2);
-    // k3's live record, plus two superseded key handles.
-    let handles = 2 * (2 + super::SPILL_SUPERSEDED_OVERHEAD);
-    assert_eq!(db.pending_spill_bytes(), (2 + 6) + handles);
+    assert_eq!(
+        db.pending_spill_bytes(),
+        2 + 6,
+        "only k3's live record is charged"
+    );
+    let entry = 2 + super::SPILL_SUPERSEDED_OVERHEAD;
+    assert_eq!(db.spill_superseded_bytes(), 2 * entry);
     db.spill_superseded_settle(&Bytes::from_static(b"k3"), 9);
     assert_eq!(
         db.spill_superseded_len(),
@@ -276,6 +282,15 @@ fn superseded_entries_are_billed_and_settle_to_zero() {
     db.spill_superseded_settle(&Bytes::from_static(b"k1"), 7);
     db.spill_superseded_settle(&Bytes::from_static(b"k3"), 7);
     assert!(db.spill_superseded_is_empty());
+    assert_eq!(db.spill_superseded_bytes(), 0);
     db.spill_inflight_clear(b"k3", 9);
     assert_eq!(db.pending_spill_bytes(), 0, "everything credited back");
+
+    // FLUSH: the records become superseded, the pending charge goes to 0.
+    in_flight(&mut db, b"k1", b"v1-old", 11);
+    db.clear();
+    assert_eq!(db.spill_superseded_len(), 1);
+    assert_eq!(db.pending_spill_bytes(), 0);
+    assert_eq!(db.estimated_memory(), 0, "used_memory reads 0 after FLUSH");
+    assert_eq!(db.spill_superseded_bytes(), entry);
 }

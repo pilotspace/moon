@@ -187,8 +187,9 @@ fn every_completion_outcome_settles_its_superseded_request() {
             assert_eq!(
                 db.pending_spill_bytes(),
                 baseline,
-                "every handle credited back"
+                "the pending charge is back to where it started"
             );
+            assert_eq!(db.spill_superseded_bytes(), 0, "every handle let go");
         });
     })
     .join()
