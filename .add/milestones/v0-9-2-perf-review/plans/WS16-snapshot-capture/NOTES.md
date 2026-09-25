@@ -254,8 +254,11 @@ flight).
     Tried and dropped: six 64 MiB values (cheaper FLUSHALL, deeper backlog) was LESS red.
   - `a_resync_mid_bgsave_fails_it_and_the_next_save_publishes` — the resync abort path
     (`note_table_replace`) end to end, walk held until the resync is in (it used to need
-    800K–3.2M keys and still missed up to three attempts: link up took 0.7–1.7 s during a save
-    vs ~40 ms idle). Documented as NOT an F1 regression. monoio only (PSYNC).
+    800K–3.2M keys and still missed up to three attempts: in a DEBUG build beside the other
+    tests, link up took 0.7–1.7 s during a save vs ~40 ms idle). Review 5: a release build
+    did not reproduce that. It was a debug-build and load artifact, not command dispatch
+    starving during a save (see the item 2b trade-off below). Documented as NOT an F1
+    regression. monoio only (PSYNC).
 - `perf_ws15_bgsave_status` forced its failed save with the same FLUSHALL. It now squats a
   directory on every shard's snapshot path, so the writer's final `rename` fails (EISDIR) —
   deterministic, no timing window; every status/LASTSAVE/dirty assertion is unchanged.
@@ -291,10 +294,39 @@ memory: `used_memory` never saw pre-images, the dedupe set or (new in 2a) frozen
   frozen tables (their `used_memory` at flush), and the first-wins key set, summed across
   shards; 0 when no save runs.
 
+### Review 5 — the latency trade-off, measured (release A/B); decision: KEEP the scaling
+The reviewer A/B'd release builds with and without the 2b budget scaling:
+
+| Load during one BGSAVE (release, `--shards 1`) | Without scaling | With scaling (WS16) |
+|---|---|---|
+| SET flood, light: write p99 | 804 µs | 1,818 µs |
+| SET flood, heavy: write p99 | 2,383 µs | 4,294 µs |
+| SET flood: write p99.9 | — | +25–80% |
+| SET flood: max latency | — | no worse |
+| SET flood: save duration | 2.26 s | 0.88 s (light) / 0.77 s (heavy): 2.6–2.9x sooner |
+| Reads only; and `--shards 4` | — | no regression |
+| Worst stall, 76 release saves | 39 ms (100 B values), 92 ms (64 KiB) | the same |
+
+**Trade-off.** Under a write flood on one shard, the scaled budget does up to 16x the
+entries and segments (4x the bytes) per tick while writers are ahead of the walk. Each tick
+is longer, so write p99 during the save roughly doubles and p99.9 rises 25–80%. The save
+ends 2.6–2.9x sooner, which shortens the window in which every write to a pending range
+costs a pre-image (the tombstone memory 2b exists to bound). Max latency and the worst
+stall are unchanged. Reads and multi-shard loads show no regression.
+
+**Decision (orchestrator): keep the scaling, document the trade-off.** CHANGELOG "Changed"
+bullet in SUMMARY.
+
+**Correction.** The 0.7–1.7 s replica-link delay during a save (F1 fixtures, above) did not
+reproduce in release. It was a debug-build and load artifact. The release worst stall
+(39 / 92 ms, both builds) is the measured bound. The two `perf_ws12_bgsave_split` comments
+that read like a starved dispatch now say what was observed: a debug build beside other
+tests.
+
 ### Risks / deferred
 - The Linux-perf-host measurement at pipelined insert rates (the issue's second half) is
-  DEFERRED: this box is a 4-vCPU shared container, and the numbers would not transfer.
-  The deterministic in-process flood test is the evidence here.
+  DEFERRED: this box is a 4-vCPU shared container, and the numbers would not transfer. The
+  release A/B above (review 5) covers latency and save duration on `--shards 1` and 4.
 
 ## moon#1250 (added by the orchestrator) — MQ writes never charged to used_memory
 

@@ -33,7 +33,20 @@ All six items are addressed, each in its own commit; NOTES.md has the table.
 ## Measurements
 - **Real-server capture tests** restore from the RDB file alone after SIGKILL. Overlap is observed, not assumed: every `shard-<id>.rrdshard.tmp` must exist before the writes; each round is pipelined with `INFO persistence`; a round counts only if the save is still running. On baseline, 24–485 rounds landed inside saves of 72–221 ms.
 - **MQ billing:** 2 consecutive green runs, with the numbers above.
-- **No throughput A/B.** When no BGSAVE is running, the only added cost is one thread-local `bool` load on MOVE/COPY/MQ/WS DROP/stream-wake writes and `Database::clear`.
+- **No BGSAVE running:** the only added cost is one thread-local `bool` load on MOVE/COPY/MQ/WS DROP/stream-wake writes and `Database::clear`.
+- **During a BGSAVE — the 2b trade-off (review 5, the reviewer's release A/B; decision: keep):**
+
+  | Load during one BGSAVE (release, `--shards 1`) | Without 2b scaling | With it (WS16) |
+  |---|---|---|
+  | SET flood, light: write p99 | 804 µs | 1,818 µs |
+  | SET flood, heavy: write p99 | 2,383 µs | 4,294 µs |
+  | SET flood: write p99.9 | — | +25–80% |
+  | SET flood: max latency | — | no worse |
+  | SET flood: save duration | 2.26 s | 0.88 / 0.77 s (2.6–2.9x sooner) |
+  | Reads only; and `--shards 4` | — | no regression |
+  | Worst stall, 76 release saves | 39 ms (100 B), 92 ms (64 KiB) | the same |
+
+  The scaled budget does more work per tick while writers are ahead of the walk. Write tails during the save roughly double; the save ends ~2.7x sooner, so pre-image memory is held for less time. The 0.7–1.7 s replica-link delay seen in the F1 fixtures was a debug-build and load artifact. It did not reproduce in release, where the worst stall across 76 saves was 39 ms (100 B values) and 92 ms (64 KiB), the same with and without the scaling.
 
 ## Cross-ownership edits
 - **`ea44ec0`, index arguments only:** handler_monoio/mod.rs and handler_sharded/mod.rs (MOVE, COPY); spsc_two_db.rs; shared.rs (both MULTI executors); replication/apply.rs; replay.rs; handler_single.rs.
@@ -106,7 +119,11 @@ All six items are addressed, each in its own commit; NOTES.md has the table.
 
   Each now captures the key's pre-save state first. Before, a key moved during a save could come back in both databases or in neither, and queues and streams came back with post-save messages and pending entries.
 - **Changed (moon#1228):** `FLUSHDB` and `SWAPDB` during a BGSAVE no longer fail the save. It completes with the keyspace as it was when the save started, as redis does, so a workload that flushes more often than one save takes can now save at all. A `FLUSHALL` still fails an in-flight save, as redis's does, and so does a replica full resync.
-- **Performance (moon#1228):** the BGSAVE walk's per-tick budget grows with the pre-image backlog, up to 16×. In an in-process insert flood the save went from 99 to 7 ticks, and peak pre-images from 73,708 to 7,369. New INFO persistence field `current_cow_size`; as in redis, it is not part of `used_memory`.
+- **Changed (moon#1228):** while writes outpace a BGSAVE, the save now does more work per tick, up to 16x the entries and segments and 4x the bytes, scaled by how far writers are ahead of it. Saves under a write flood finish sooner and hold less copy-on-write memory, at the cost of higher write tail latency while the save runs.
+  - Release build, `--shards 1`, SET flood: the save finished 2.6–2.9x sooner (2.26 s to 0.88 / 0.77 s).
+  - Write p99 during the save roughly doubled (804 to 1,818 µs light, 2,383 to 4,294 µs heavy), and p99.9 rose 25–80%. Max latency did not change.
+  - Read-only load and `--shards 4` show no regression.
+  - New INFO persistence field `current_cow_size`: the memory a running save holds for itself. As in redis, it is not part of `used_memory`.
 - **Fixed (moon#1250):** MQ writes are now charged to `used_memory`, the same way `XADD` is. This covers `MQ CREATE`, `PUSH`, `POP`, `ACK`, TXN `MQ.PUBLISH`, stream-wake group reads and replicated MQ records.
   - Over `maxmemory`, `MQ CREATE` and `MQ PUSH` are refused with `-OOM` under noeviction, or evict under an evicting policy.
   - Before, 20,000 pushes of 100 B added about 24 KB to `used_memory` for a 5.7 MB queue.
