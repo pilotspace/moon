@@ -2164,6 +2164,14 @@ pub(crate) async fn handle_connection_sharded_monoio<
             // connection-level command names. Cut per-command dispatch cost
             // from ~14 non-matching function calls to ~1 on SET/GET workloads.
             let cmd_len = cmd.len();
+            // moon#1198 item 3: the command's metadata, resolved ONCE. For any
+            // name outside the 24-entry fast table every `metadata::is_write`
+            // is a stack uppercase + UTF-8 check + phf probe, and this loop
+            // asked up to four times per command. `cmd` is not rebound below
+            // (only `cmd_args` is, by the workspace rewrite).
+            let cmd_meta = metadata::lookup(cmd);
+            let cmd_is_write =
+                cmd_meta.is_some_and(|m| m.flags.contains(metadata::CommandFlags::WRITE));
             // MONITOR feed for the two ACL-EXEMPT commands below.
             //
             // AUTH and HELLO carry Redis's NO_AUTH flag and are therefore
@@ -2484,7 +2492,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
             // Fail-safe by construction: an unknown command has no metadata and
             // an unmarked one has no bit, so both take the full chain. Only an
             // explicitly-marked command skips it.
-            let skip_name_gates = crate::command::metadata::lookup(cmd).is_some_and(|m| {
+            let skip_name_gates = cmd_meta.is_some_and(|m| {
                 m.flags
                     .contains(crate::command::metadata::CommandFlags::NO_INTERCEPT)
             }) && !conn.in_multi
@@ -2982,7 +2990,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
             // the reason is identical — there is no cross-shard undo log.
             let txn_multikey_write = ctx.num_shards > 1
                 && conn.in_cross_txn()
-                && metadata::is_write(cmd)
+                && cmd_is_write
                 && is_multi_key_command(cmd, cmd_args);
             if txn_multikey_write
                 && crate::server::conn::shared::single_owner_shard(cmd, cmd_args, ctx.num_shards)
@@ -3564,7 +3572,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                     // No DB clause or same-db: fall through to normal write path
                 }
 
-                if metadata::is_write(cmd) {
+                if cmd_is_write {
                     // WRITE PATH: eviction + dispatch via ShardSlice.
                     //
                     // Fast path: when neither maxmemory nor disk-offload is
@@ -4092,7 +4100,26 @@ pub(crate) async fn handle_connection_sharded_monoio<
                     // using the original synchronous cold-read path
                     // (`Database::promote_cold_if_present`), unchanged.
                     if cmd.eq_ignore_ascii_case(b"GET") {
-                        if let Some(key) = cmd_args.first().and_then(extract_bytes) {
+                        // moon#1198 item 2: the peek runs under the SHARED
+                        // guard first; only a key that is not hot (the rare
+                        // cold/mid-spill case) takes the exclusive guard the
+                        // promotion needs. The owner is the only mutator of
+                        // this db, so "hot" cannot change before
+                        // `dispatch_read` below. It used to take the exclusive
+                        // guard (and clone the key) for every non-inlined GET.
+                        let key_is_hot = match cmd_args.first() {
+                            Some(Frame::BulkString(k)) => {
+                                crate::shard::slice::with_shard_db_read(conn.selected_db, |db| {
+                                    db.is_hot(k.as_ref())
+                                })
+                            }
+                            _ => false,
+                        };
+                        if let Some(key) = cmd_args
+                            .first()
+                            .filter(|_| !key_is_hot)
+                            .and_then(extract_bytes)
+                        {
                             let peek_now_ms = ctx.cached_clock.ms();
                             let cold_loc =
                                 crate::shard::slice::with_shard_db(conn.selected_db, |db| {
@@ -4197,7 +4224,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
             // (tracking and response push handled inside read/write branches above)
             } else if let Some(target) = target_shard {
                 // TXN cross-shard guard: reject cross-shard writes in active TXN (no undo log).
-                if conn.in_cross_txn() && metadata::is_write(cmd) {
+                if conn.in_cross_txn() && cmd_is_write {
                     // #499: poison the txn — the rejected write is NOT part of the
                     // transaction, so TXN.COMMIT must refuse rather than commit the
                     // accepted subset behind a `+OK`.

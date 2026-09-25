@@ -3005,7 +3005,11 @@ pub(crate) fn try_inline_dispatch(
     // `budget` and `est` were already computed on this path; only the branch
     // below is new.
     let budget = shard_databases.elastic_budget(shard_id);
-    let est = crate::shard::slice::with_shard_db(selected_db, |db| db.estimated_memory());
+    // moon#1198 item 2: a field READ — the shared guard, not the exclusive
+    // one. Every exclusive hold is a window in which a foreign shard's
+    // `try_read` declines into a parked SPSC hop (cost model §8.3), and this
+    // SET takes the exclusive guard again below for the write itself.
+    let est = crate::shard::slice::with_shard_db_read(selected_db, |db| db.estimated_memory());
     let needs_eviction = !crate::storage::eviction::inline_write_can_skip_eviction(est, budget);
 
     // moon#660: THE safety condition. With a live `spill_sender`, generic
