@@ -17,6 +17,7 @@ mod lazy_free;
 /// bytes before they evict or refuse. Test-only.
 #[cfg(test)]
 mod lazy_free_pressure_tests;
+mod list_blocking;
 /// moon#942: the accessors' DashTable probe budget, asserted with a counter
 /// rather than a clock. Test-only; see the module docs for why.
 #[cfg(test)]
