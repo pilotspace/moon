@@ -101,6 +101,7 @@ pub(crate) fn handle_pending_snapshot(
             // the life of this snapshot. See `persistence::snapshot_cow`.
             // moon#1186: with the layout, so written segments are skipped.
             crate::persistence::snapshot_cow::arm_with_layout(segment_counts);
+            crate::storage::tiered::snapshot_hold::note_snapshot_started(); // moon#1260
             *snapshot_state = Some(state);
             *snapshot_reply_tx = Some(reply_tx);
         }
@@ -187,6 +188,7 @@ pub(crate) fn check_auto_save_trigger(
         start_snapshot_streaming(&mut state, shard_id);
         // moon#517: same arming as the explicit-BGSAVE path above.
         crate::persistence::snapshot_cow::arm_with_layout(segment_counts);
+        crate::storage::tiered::snapshot_hold::note_snapshot_started(); // moon#1260
         *snapshot_state = Some(state);
     }
 }
@@ -314,6 +316,7 @@ pub(crate) fn finalize_snapshot_success(
     }
     // moon#517: the file is closed — a pre-image has nowhere left to go.
     crate::persistence::snapshot_cow::disarm();
+    crate::storage::tiered::snapshot_hold::note_snapshot_finished(true); // moon#1260
     *snapshot_state = None;
 }
 
@@ -330,6 +333,7 @@ pub(crate) fn finalize_snapshot_error(
     }
     // moon#517: the file is closed — a pre-image has nowhere left to go.
     crate::persistence::snapshot_cow::disarm();
+    crate::storage::tiered::snapshot_hold::note_snapshot_finished(false); // moon#1260
     *snapshot_state = None;
 }
 
