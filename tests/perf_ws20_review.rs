@@ -273,175 +273,180 @@ fn moon_1277_an_rmw_replayed_after_the_ttl_does_not_resurrect_the_key_s4_rewrite
     rmw_logged_before_the_ttl_does_not_outlive_it(4, true);
 }
 
-/// Poll `cond` every 100 ms for up to `secs`; whether it held.
-fn wait_for(secs: u64, mut cond: impl FnMut() -> bool) -> bool {
-    let deadline = Instant::now() + Duration::from_secs(secs);
-    while Instant::now() < deadline {
-        if cond() {
-            return true;
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    cond()
-}
-
-fn int_reply(reply: &str) -> i64 {
-    reply.trim().trim_start_matches(':').parse().unwrap_or(-1)
-}
-
-/// `DBSIZE` of `db`, or -1 while the server refuses (a replica loading).
-fn dbsize(c: &mut Conn, db: usize) -> i64 {
-    let replies = c.pipeline(&[&["SELECT", &db.to_string()], &["DBSIZE"]]);
-    match replies.split_once("\r\n") {
-        Some(("+OK", size)) => int_reply(size),
-        _ => -1,
-    }
-}
-
-/// Spill files (`heap-*.mpf`) anywhere under `dir`.
-fn heap_files(dir: &Path) -> usize {
-    std::fs::read_dir(dir)
-        .map(|entries| {
-            entries
-                .flatten()
-                .map(|e| e.path())
-                .map(|p| {
-                    if p.is_dir() {
-                        heap_files(&p)
-                    } else {
-                        let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                        usize::from(name.starts_with("heap-") && name.ends_with(".mpf"))
-                    }
-                })
-                .sum()
-        })
-        .unwrap_or(0)
-}
-
-fn info_field(c: &mut Conn, section: &str, field: &str) -> Option<String> {
-    let info = c.send(&["INFO", section]);
-    info.lines()
-        .find_map(|l| l.strip_prefix(&format!("{field}:")))
-        .map(|v| v.trim().to_owned())
-}
-
-/// moon#1278 (REVIEW-WS20 F3, `rv20_replica_swapdb.py`): a replica spills
-/// under its own memory limit, and its spill files keep their db tags. It
-/// applied its master's `SWAPDB 0 1` as a plain swap (the master checked
-/// only ITS cold tier — it has none here), so after a failover, a rewrite
-/// and a kill -9 of the promoted replica its cold keys came back in db 0 as
-/// well. The replica must resync from scratch instead: every key in db 1,
-/// none in db 0, live and after the restart.
-///
-/// A replication master needs runtime-monoio (a tokio master refuses
-/// `PSYNC`), hence the gate; `MOON_REPL_MASTER_BIN=<monoio moon>` drives a
-/// replica built for the other runtime (`MOON_BIN`).
+/// moon#1278. A replication master needs runtime-monoio (a tokio master
+/// refuses `PSYNC`), hence the gate.
 #[cfg(feature = "runtime-monoio")]
-#[test]
-fn moon_1278_a_replica_resyncs_instead_of_swapping_over_its_cold_tier() {
-    const PROBES: usize = 200;
-    const FILLERS: usize = 16_000;
-    let total = (PROBES + FILLERS) as i64;
-    let (mtmp, rtmp) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
-    let master_bin = std::env::var_os("MOON_REPL_MASTER_BIN")
-        .map_or_else(common::find_moon_binary, std::path::PathBuf::from);
-    let (_master, mport) = spawn_bin(
-        master_bin,
-        mtmp.path(),
-        1,
-        &["--appendonly", "yes", "--disk-offload", "disable"],
-    );
-    let replica_args = [
-        "--appendonly",
-        "yes",
-        "--maxmemory",
-        "8388608",
-        "--maxmemory-policy",
-        "allkeys-lru",
-        "--disk-offload",
-        "enable",
-        "--cold-orphan-sweep-interval-secs",
-        "3600",
-    ];
-    let (mut replica, rport) = spawn(rtmp.path(), 1, &replica_args);
-    let mut r = Conn::open(rport);
-    let mport_s = mport.to_string();
-    assert!(
-        r.send(&["REPLICAOF", "127.0.0.1", &mport_s])
-            .starts_with("+OK")
-    );
-    assert!(
-        wait_for(60, || info_field(
-            &mut r,
-            "replication",
-            "master_link_status"
-        )
-        .as_deref()
-            == Some("up")),
-        "the replica never linked"
-    );
+mod replica_swapdb {
+    use super::*;
 
-    let mut m = Conn::open(mport);
-    let probe = "P".repeat(500);
-    let filler = "F".repeat(600);
-    let keys: Vec<String> = (0..PROBES)
-        .map(|i| format!("probe:{i}"))
-        .chain((0..FILLERS).map(|i| format!("filler:{i}")))
-        .collect();
-    for chunk in keys.chunks(1_000) {
-        let cmds: Vec<[&str; 3]> = chunk
-            .iter()
-            .map(|k| {
-                let v = if k.starts_with('p') { &probe } else { &filler };
-                ["SET", k.as_str(), v.as_str()]
-            })
-            .collect();
-        let refs: Vec<&[&str]> = cmds.iter().map(|c| c.as_slice()).collect();
-        m.pipeline(&refs);
+    /// Poll `cond` every 100 ms for up to `secs`; whether it held.
+    fn wait_for(secs: u64, mut cond: impl FnMut() -> bool) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(secs);
+        while Instant::now() < deadline {
+            if cond() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        cond()
     }
-    // Applied, and spilled on the replica (its own tier; the master has none).
-    assert!(
-        wait_for(120, || dbsize(&mut r, 0) == total
-            && heap_files(rtmp.path()) > 0),
-        "the replica never applied and spilled the writes (db 0 {}, {} spill files)",
-        dbsize(&mut r, 0),
-        heap_files(rtmp.path())
-    );
 
-    let full_syncs =
-        |m: &mut Conn| info_field(m, "stats", "sync_full").and_then(|v| v.parse::<u64>().ok());
-    let syncs_before = full_syncs(&mut m);
-    assert_eq!(m.send(&["SWAPDB", "0", "1"]), "+OK\r\n");
-    assert!(
-        wait_for(120, || dbsize(&mut r, 1) == total && dbsize(&mut r, 0) == 0),
-        "after the master's SWAPDB 0 1 the replica holds db 0 {} / db 1 {}",
-        dbsize(&mut r, 0),
-        dbsize(&mut r, 1)
-    );
+    fn int_reply(reply: &str) -> i64 {
+        reply.trim().trim_start_matches(':').parse().unwrap_or(-1)
+    }
 
-    let resynced = full_syncs(&mut m) > syncs_before;
-    // Failover: promote the replica, fold its state, crash it, restart it on
-    // its own data.
-    assert!(r.send(&["REPLICAOF", "NO", "ONE"]).starts_with("+OK"));
-    rewrite_and_wait(&mut r, rtmp.path(), 1);
-    drop(r);
-    replica.kill_now();
-    common::wait_for_port_down(rport);
-    let (_replica2, rport) = spawn(rtmp.path(), 1, &replica_args);
-    let mut r = Conn::open(rport);
-    let (db0, db1) = (dbsize(&mut r, 0), dbsize(&mut r, 1));
-    let probes_in = |c: &mut Conn, db: usize| {
-        assert!(c.send(&["SELECT", &db.to_string()]).starts_with("+OK"));
-        (0..PROBES)
-            .filter(|i| int_reply(&c.send(&["EXISTS", &format!("probe:{i}")])) == 1)
-            .count()
-    };
-    let (p0, p1) = (probes_in(&mut r, 0), probes_in(&mut r, 1));
-    assert_eq!(
-        (db0, p0, db1, p1, resynced),
-        (0, 0, total, PROBES, true),
-        "after the master's SWAPDB 0 1, a failover, BGREWRITEAOF and kill -9 of the \
-         replica: (db 0 keys, db 0 probes, db 1 keys, db 1 probes, the SWAPDB made the \
-         replica resync in full)"
-    );
+    /// `DBSIZE` of `db`, or -1 while the server refuses (a replica loading).
+    fn dbsize(c: &mut Conn, db: usize) -> i64 {
+        let replies = c.pipeline(&[&["SELECT", &db.to_string()], &["DBSIZE"]]);
+        match replies.split_once("\r\n") {
+            Some(("+OK", size)) => int_reply(size),
+            _ => -1,
+        }
+    }
+
+    /// Spill files (`heap-*.mpf`) anywhere under `dir`.
+    fn heap_files(dir: &Path) -> usize {
+        std::fs::read_dir(dir)
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .map(|e| e.path())
+                    .map(|p| {
+                        if p.is_dir() {
+                            heap_files(&p)
+                        } else {
+                            let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                            usize::from(name.starts_with("heap-") && name.ends_with(".mpf"))
+                        }
+                    })
+                    .sum()
+            })
+            .unwrap_or(0)
+    }
+
+    fn info_field(c: &mut Conn, section: &str, field: &str) -> Option<String> {
+        let info = c.send(&["INFO", section]);
+        info.lines()
+            .find_map(|l| l.strip_prefix(&format!("{field}:")))
+            .map(|v| v.trim().to_owned())
+    }
+
+    /// moon#1278 (REVIEW-WS20 F3, `rv20_replica_swapdb.py`): a replica spills
+    /// under its own memory limit, and its spill files keep their db tags. It
+    /// applied its master's `SWAPDB 0 1` as a plain swap (the master checked
+    /// only ITS cold tier — it has none here), so after a failover, a rewrite
+    /// and a kill -9 of the promoted replica its cold keys came back in db 0 as
+    /// well. The replica must resync from scratch instead: every key in db 1,
+    /// none in db 0, live and after the restart.
+    ///
+    /// `MOON_REPL_MASTER_BIN=<monoio moon>` drives a replica built for the
+    /// other runtime (`MOON_BIN`).
+    #[test]
+    fn moon_1278_a_replica_resyncs_instead_of_swapping_over_its_cold_tier() {
+        const PROBES: usize = 200;
+        const FILLERS: usize = 16_000;
+        let total = (PROBES + FILLERS) as i64;
+        let (mtmp, rtmp) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let master_bin = std::env::var_os("MOON_REPL_MASTER_BIN")
+            .map_or_else(common::find_moon_binary, std::path::PathBuf::from);
+        let (_master, mport) = spawn_bin(
+            master_bin,
+            mtmp.path(),
+            1,
+            &["--appendonly", "yes", "--disk-offload", "disable"],
+        );
+        let replica_args = [
+            "--appendonly",
+            "yes",
+            "--maxmemory",
+            "8388608",
+            "--maxmemory-policy",
+            "allkeys-lru",
+            "--disk-offload",
+            "enable",
+            "--cold-orphan-sweep-interval-secs",
+            "3600",
+        ];
+        let (mut replica, rport) = spawn(rtmp.path(), 1, &replica_args);
+        let mut r = Conn::open(rport);
+        let mport_s = mport.to_string();
+        assert!(
+            r.send(&["REPLICAOF", "127.0.0.1", &mport_s])
+                .starts_with("+OK")
+        );
+        assert!(
+            wait_for(60, || info_field(
+                &mut r,
+                "replication",
+                "master_link_status"
+            )
+            .as_deref()
+                == Some("up")),
+            "the replica never linked"
+        );
+
+        let mut m = Conn::open(mport);
+        let probe = "P".repeat(500);
+        let filler = "F".repeat(600);
+        let keys: Vec<String> = (0..PROBES)
+            .map(|i| format!("probe:{i}"))
+            .chain((0..FILLERS).map(|i| format!("filler:{i}")))
+            .collect();
+        for chunk in keys.chunks(1_000) {
+            let cmds: Vec<[&str; 3]> = chunk
+                .iter()
+                .map(|k| {
+                    let v = if k.starts_with('p') { &probe } else { &filler };
+                    ["SET", k.as_str(), v.as_str()]
+                })
+                .collect();
+            let refs: Vec<&[&str]> = cmds.iter().map(|c| c.as_slice()).collect();
+            m.pipeline(&refs);
+        }
+        // Applied, and spilled on the replica (its own tier; the master has none).
+        assert!(
+            wait_for(120, || dbsize(&mut r, 0) == total
+                && heap_files(rtmp.path()) > 0),
+            "the replica never applied and spilled the writes (db 0 {}, {} spill files)",
+            dbsize(&mut r, 0),
+            heap_files(rtmp.path())
+        );
+
+        let full_syncs =
+            |m: &mut Conn| info_field(m, "stats", "sync_full").and_then(|v| v.parse::<u64>().ok());
+        let syncs_before = full_syncs(&mut m);
+        assert_eq!(m.send(&["SWAPDB", "0", "1"]), "+OK\r\n");
+        assert!(
+            wait_for(120, || dbsize(&mut r, 1) == total && dbsize(&mut r, 0) == 0),
+            "after the master's SWAPDB 0 1 the replica holds db 0 {} / db 1 {}",
+            dbsize(&mut r, 0),
+            dbsize(&mut r, 1)
+        );
+
+        let resynced = full_syncs(&mut m) > syncs_before;
+        // Failover: promote the replica, fold its state, crash it, restart it on
+        // its own data.
+        assert!(r.send(&["REPLICAOF", "NO", "ONE"]).starts_with("+OK"));
+        rewrite_and_wait(&mut r, rtmp.path(), 1);
+        drop(r);
+        replica.kill_now();
+        common::wait_for_port_down(rport);
+        let (_replica2, rport) = spawn(rtmp.path(), 1, &replica_args);
+        let mut r = Conn::open(rport);
+        let (db0, db1) = (dbsize(&mut r, 0), dbsize(&mut r, 1));
+        let probes_in = |c: &mut Conn, db: usize| {
+            assert!(c.send(&["SELECT", &db.to_string()]).starts_with("+OK"));
+            (0..PROBES)
+                .filter(|i| int_reply(&c.send(&["EXISTS", &format!("probe:{i}")])) == 1)
+                .count()
+        };
+        let (p0, p1) = (probes_in(&mut r, 0), probes_in(&mut r, 1));
+        assert_eq!(
+            (db0, p0, db1, p1, resynced),
+            (0, 0, total, PROBES, true),
+            "after the master's SWAPDB 0 1, a failover, BGREWRITEAOF and kill -9 of the \
+             replica: (db 0 keys, db 0 probes, db 1 keys, db 1 probes, the SWAPDB made the \
+             replica resync in full)"
+        );
+    }
 }
