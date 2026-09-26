@@ -31,6 +31,16 @@ All options are available as command-line flags. Run `moon --help` for the full 
 | `--dir` | `.` | Directory for persistence files |
 | `--dbfilename` | `dump.rdb` | RDB snapshot filename |
 
+**Switching `--appendonly yes` → `no`: take a snapshot first.** With
+`--appendonly no`, boot loads the RDB snapshot and never replays an AOF (as in
+redis): nothing writes one in that mode, so an AOF on disk is older than the
+snapshot. The dataset then lives only in the AOF (`appendonlydir/` or a legacy
+`appendonly.aof`), and a restart under `no` without a snapshot boots **empty**;
+moon logs a WARN naming the AOF it did not load. Run `BGSAVE` (and wait for
+`rdb_bgsave_in_progress:0`) or `SHUTDOWN SAVE` while still under `yes`, then
+restart with `--appendonly no`. The other way round (`no` → `yes`), the
+snapshot loads and the AOF starts from it.
+
 ## Memory and eviction
 
 | Flag | Default | Description |

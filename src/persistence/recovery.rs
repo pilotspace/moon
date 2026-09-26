@@ -923,7 +923,7 @@ pub fn recover_shard_v3_pitr(
     // the reconcile can report whether a cut opened it.
     let mut aof_replayed = false;
     if let Some(dir) = v2_persistence_dir {
-        kv.note_unreplayed_aof(shard_id, &dir.join("appendonly.aof"));
+        kv.note_unreplayed_logs(shard_id, dir);
     }
     if kv_commands_replayed == 0 && kv.logs() {
         if let Some(v2_dir) = v2_persistence_dir {

@@ -346,6 +346,13 @@ moon --appendonly yes --appendfsync everysec \
 
 Recovery order: RDB snapshot, then WAL segments, then AOF tail.
 
+### Switching `--appendonly yes` → `no`
+
+Take a snapshot first (`BGSAVE`, or `SHUTDOWN SAVE`). Under `--appendonly no`
+boot loads only the RDB snapshot and ignores an AOF on disk (redis parity), so a
+dataset that lived only in the AOF boots empty. moon logs a WARN naming the AOF
+it did not load. See [configuration](configuration.md#persistence).
+
 ### AOF rewrite
 
 Trigger manual compaction:
