@@ -1101,11 +1101,11 @@ pub fn shard_snapshot_load<D: std::borrow::BorrowMut<Database>>(
     shard_snapshot_load_noting_expired(databases, path, &mut Vec::new())
 }
 
-/// [`shard_snapshot_load`], naming in `expired` each `(db, key)` skipped as expired (moon#1236).
+/// [`shard_snapshot_load`], handing back in `expired` each `(db, key, entry)` skipped as expired.
 pub fn shard_snapshot_load_noting_expired<D: std::borrow::BorrowMut<Database>>(
     databases: &mut [D],
     path: &Path,
-    expired: &mut Vec<(usize, Bytes)>,
+    expired: &mut Vec<(usize, Bytes, Entry)>,
 ) -> Result<usize, MoonError> {
     // moon#1232 review 5: booting from a snapshot is no keyspace change —
     // redis 7.0.15 starts with `rdb_changes_since_last_save:0`. Counted, every
@@ -1367,7 +1367,7 @@ pub fn shard_snapshot_load_noting_expired<D: std::borrow::BorrowMut<Database>>(
                 // Insert non-expired entries into the database
                 for (key, entry) in entries {
                     if entry.has_expiry() && entry.is_expired_at(now_ms) {
-                        expired.push((current_db, key));
+                        expired.push((current_db, key, entry));
                     } else if current_db < databases.len() {
                         databases[current_db].borrow_mut().set(&key, entry);
                         total_keys += 1;

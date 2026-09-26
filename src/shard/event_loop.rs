@@ -481,6 +481,7 @@ impl super::Shard {
         // the per-shard WAL. Resolved per drain cycle (Auto is dynamic on the
         // CDC registry); see wal_append_and_fanout for the rationale.
         let wal_kv_log_mode = server_config.wal_kv_log_mode();
+        shard_databases.seed_wal_kv_log(shard_id, wal_kv_log_mode, appendonly_enabled); // moon#1275
         if wal_kv_log_mode == crate::config::WalKvLogMode::Off && !appendonly_enabled {
             tracing::warn!(
                 shard_id,
@@ -1586,14 +1587,14 @@ impl super::Shard {
                             // snapshots too: the counter ignores calls at 0.
                             Some(false) => crate::command::persistence::bgsave_shard_done(false),
                             Some(true) => {
-                                crate::command::persistence::bgsave_shard_done(true);
-                                bgsave_checkpoint_requested = true;
-                                // moon#1260 review F1: release now, not at the next sweep.
+                                // moon#1260 F1: unlink first, then answer the save's waiters.
                                 timers::sweep_after_snapshot(
                                     &shard_databases, shard_id, disk_offload_dir.as_deref(),
                                     shard_manifest.as_mut(), cached_clock.ms(), aof_pool.as_ref(),
                                     &spill_file_id, orphan_sweep_interval_secs,
                                 );
+                                crate::command::persistence::bgsave_shard_done(true);
+                                bgsave_checkpoint_requested = true;
                             }
                             None => {}
                         }
@@ -2388,9 +2389,7 @@ impl super::Shard {
                     ) {
                         Some(false) => crate::command::persistence::bgsave_shard_done(false),
                         Some(true) => {
-                            crate::command::persistence::bgsave_shard_done(true);
-                            bgsave_checkpoint_requested = true;
-                            // moon#1260 review F1: release now, not at the next sweep.
+                            // moon#1260 F1: unlink first, then answer the save's waiters.
                             timers::sweep_after_snapshot(
                                 &shard_databases,
                                 shard_id,
@@ -2401,6 +2400,8 @@ impl super::Shard {
                                 &spill_file_id,
                                 orphan_sweep_interval_secs,
                             );
+                            crate::command::persistence::bgsave_shard_done(true);
+                            bgsave_checkpoint_requested = true;
                         }
                         None => {}
                     }

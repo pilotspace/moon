@@ -166,6 +166,9 @@ pub fn snapshot_fold_view(next_file_id: u64) -> FoldView {
 /// superseded, or a spill after it, outside the RPO — surfaced once the
 /// cold index was attached after the load, bringing the OLD value back.
 /// Call after the attach; drops those cold entries and returns how many.
+/// When KV logs replay over the snapshot (`KvSources::SnapshotAndLogs`) the
+/// entries were put back instead (`replay::clock::keep_expired_image_entries`)
+/// and nothing is left to drop.
 ///
 /// With an AOF nothing is dropped: the log replays after the snapshot and
 /// decides (a later `MOON.SPILLED` marker can authorize a newer slot).
@@ -175,14 +178,14 @@ pub fn snapshot_fold_view(next_file_id: u64) -> FoldView {
 /// a `DEL` included: the no-AOF cold plane records no removals.
 pub fn drop_cold_shadows_of_expired_image_keys(
     databases: &mut [crate::storage::db::Database],
-    expired: Vec<(usize, bytes::Bytes)>,
+    expired: Vec<(usize, bytes::Bytes, crate::storage::entry::Entry)>,
 ) -> usize {
     if !applies() {
         return 0;
     }
     expired
         .into_iter()
-        .filter(|(db, key)| {
+        .filter(|(db, key, _)| {
             databases
                 .get_mut(*db)
                 .and_then(|d| d.cold_index.as_mut())
@@ -339,10 +342,16 @@ mod tests {
             dbs
         };
         let expired = || {
+            let dead = || {
+                crate::storage::entry::Entry::new_string_with_expiry(
+                    bytes::Bytes::from_static(b"old"),
+                    1,
+                )
+            };
             vec![
-                (0, bytes::Bytes::from_static(b"k")),
-                (1, bytes::Bytes::from_static(b"k")),
-                (7, bytes::Bytes::from_static(b"k")),
+                (0, bytes::Bytes::from_static(b"k"), dead()),
+                (1, bytes::Bytes::from_static(b"k"), dead()),
+                (7, bytes::Bytes::from_static(b"k"), dead()),
             ]
         };
         let cold = |dbs: &[Database], key: &[u8]| {

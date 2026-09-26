@@ -387,6 +387,30 @@ fn the_wal_kv_log_flag_is_per_shard_and_off_until_published() {
     assert!(!shared.wal_kv_log(7), "out of range reads off");
 }
 
+/// REVIEW-FINAL-P5B item 3: the flag is seeded from the config at the shard's
+/// start, so a SWAPDB served before its first SPSC drain logs as configured.
+#[test]
+fn the_wal_kv_log_flag_is_seeded_from_the_config_before_the_first_drain() {
+    use crate::config::WalKvLogMode::{Auto, Off, On};
+    let (shared, _inits) =
+        crate::shard::shared_databases::ShardDatabases::new(vec![vec![Database::new()]]);
+    for (mode, appendonly, on) in [
+        (On, true, true),
+        (On, false, true),
+        (Off, true, false),
+        (Off, false, false),
+        (Auto, true, false),
+        (Auto, false, true),
+    ] {
+        shared.seed_wal_kv_log(0, mode, appendonly);
+        assert_eq!(
+            shared.wal_kv_log(0),
+            on,
+            "--wal-kv-log {mode:?}, appendonly {appendonly}"
+        );
+    }
+}
+
 /// REVIEW-WS20 F10: the refusal names the way out — per persistence mode —
 /// and keeps the `ERR …` shape clients match on.
 #[test]

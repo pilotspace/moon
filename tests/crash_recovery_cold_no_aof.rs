@@ -218,7 +218,13 @@ enum FlushSave {
 /// back — the last snapshot is empty and was taken after the flush. The
 /// hold stamped the flushed files at the sweep AFTER the save and kept them
 /// until a second snapshot, so the restart rebuilt them.
-fn run_no_aof_flush_scenario(suffix: &str, how: FlushSave) {
+///
+/// `sweep_secs`: 1 lets the regular sweep reclaim the files after the save;
+/// 3600 leaves ONLY the sweep the event loop runs right after a successful
+/// snapshot (`timers::sweep_after_snapshot`), which then must reclaim every
+/// file by itself (REVIEW-FINAL-P5B item 1: with 1 s the regular sweep hid a
+/// missing post-save sweep).
+fn run_no_aof_flush_scenario(suffix: &str, how: FlushSave, sweep_secs: u64) {
     let port = common::reserve_port();
     let dir = unique_dir(suffix);
     std::fs::create_dir_all(&dir).expect("create test dir");
@@ -227,7 +233,6 @@ fn run_no_aof_flush_scenario(suffix: &str, how: FlushSave) {
         FlushSave::FlushallSave => ["--save", "3600 1"],
         FlushSave::FlushThenBgsave => ["--save", ""],
     };
-    let sweep_secs = 1;
     let mut server = start_moon_with(port, &dir, sweep_secs, "no", &save);
     wait_for_port(port);
     let before = integer_reply(&redis_cmd(port, &["DBSIZE"])).unwrap_or(0);
@@ -250,7 +255,10 @@ fn run_no_aof_flush_scenario(suffix: &str, how: FlushSave) {
     let dbsize = integer_reply(&redis_cmd(port, &["DBSIZE"])).unwrap_or(-1);
     let back = probes_readable(port, &probe_value());
     server2.kill_now();
-    let wrong: Vec<String> = if back > 0 || dbsize != 0 {
+    // With no regular sweep in the window, the post-save sweep alone must
+    // have reclaimed every file.
+    let only_post_save = sweep_secs >= 3600;
+    let wrong: Vec<String> = if back > 0 || dbsize != 0 || (only_post_save && !reclaimed) {
         vec![format!("{back} probes back, DBSIZE {dbsize}")]
     } else {
         Vec::new()
@@ -258,10 +266,10 @@ fn run_no_aof_flush_scenario(suffix: &str, how: FlushSave) {
     finish(&dir, &wrong);
     assert!(
         wrong.is_empty(),
-        "FLUSHALL + a successful snapshot + kill -9 under --appendonly no brought back \
-         {back} of {PROBE_COUNT} probes (DBSIZE {dbsize}; {before} keys before the flush; \
-         heap files {at_flush} at the flush, {before_kill} before the kill, all reclaimed \
-         within 20 s: {reclaimed})"
+        "FLUSHALL + a successful snapshot + kill -9 under --appendonly no (orphan sweep every \
+         {sweep_secs} s) brought back {back} of {PROBE_COUNT} probes (DBSIZE {dbsize}; {before} \
+         keys before the flush; heap files {at_flush} at the flush, {before_kill} before the \
+         kill, all reclaimed within 20 s: {reclaimed})"
     );
 }
 
@@ -320,14 +328,34 @@ fn flushall_then_bgsave(port: u16) {
 #[test]
 #[ignore]
 fn no_aof_flushed_cold_keys_stay_flushed_after_the_flushall_save_and_crash() {
-    run_no_aof_flush_scenario("noaof-flush-save", FlushSave::FlushallSave);
+    run_no_aof_flush_scenario("noaof-flush-save", FlushSave::FlushallSave, 1);
 }
 
 /// moon#1260 review F1: FLUSHALL without save points, then a BGSAVE.
 #[test]
 #[ignore]
 fn no_aof_flushed_cold_keys_stay_flushed_after_a_bgsave_and_crash() {
-    run_no_aof_flush_scenario("noaof-flush-bgsave", FlushSave::FlushThenBgsave);
+    run_no_aof_flush_scenario("noaof-flush-bgsave", FlushSave::FlushThenBgsave, 1);
+}
+
+/// REVIEW-FINAL-P5B item 1 (`rvfb_f1_postsave_sweep.py`): the FLUSHALL save
+/// with no regular sweep in the window — the post-save sweep alone reclaims
+/// the flushed files.
+#[test]
+#[ignore]
+fn no_aof_the_flushall_save_itself_reclaims_the_flushed_files_before_a_crash() {
+    run_no_aof_flush_scenario("noaof-flush-save-postsave", FlushSave::FlushallSave, 3600);
+}
+
+/// REVIEW-FINAL-P5B item 1: FLUSHALL + BGSAVE, no regular sweep.
+#[test]
+#[ignore]
+fn no_aof_a_bgsave_itself_reclaims_the_flushed_files_before_a_crash() {
+    run_no_aof_flush_scenario(
+        "noaof-flush-bgsave-postsave",
+        FlushSave::FlushThenBgsave,
+        3600,
+    );
 }
 
 // ── moon#1236, the no-AOF quadrant (review F6) ────────────────────────────────

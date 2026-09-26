@@ -650,11 +650,6 @@ fn run_ttl_overwrite_scenario(suffix: &str, stop: Stop, rewrite: bool) {
         rewrite_and_wait(port, &dir);
     }
     std::thread::sleep(Duration::from_secs(SETTLE_SPILLS));
-    // No "setup finished before the TTL" assertion (REVIEW-WS20 F9: a slow
-    // box failed it). A TTL that passed before the kill is reaped live and
-    // its DEL logged, so every even probe must read absent either way; the
-    // message says which path ran.
-    let ttl_passed_live = overwritten_at.elapsed() >= Duration::from_millis(TTL_MS);
     // Stop now; restart only once the TTL has passed (plus a margin).
     if stop == Stop::Shutdown {
         let _ = Command::new("redis-cli")
@@ -666,6 +661,12 @@ fn run_ttl_overwrite_scenario(suffix: &str, stop: Stop, rewrite: bool) {
         }
     }
     server.kill_now();
+    // Did round 1 outlive the TTL? Then the live server reaped the probes and
+    // logged their DELs, and the restart past the TTL — the case under test —
+    // never happened (REVIEW-WS20 F9 dropped a hard "setup < TTL" assertion
+    // as a false red; passing instead was a silent false green).
+    let round1 = overwritten_at.elapsed();
+    let ttl_passed_live = round1 >= Duration::from_millis(TTL_MS);
     wait_for_port_down(port);
     let wait_until = Duration::from_millis(TTL_MS + 1_500);
     if let Some(rest) = wait_until.checked_sub(overwritten_at.elapsed()) {
@@ -699,6 +700,13 @@ fn run_ttl_overwrite_scenario(suffix: &str, stop: Stop, rewrite: bool) {
         wrong.len(),
         if rewrite { "BGREWRITEAOF + " } else { "" },
         wrong.first()
+    );
+    assert!(
+        !ttl_passed_live,
+        "INCONCLUSIVE, not a pass: round 1 ({:?} from the overwrite to the kill) outlived the \
+         {TTL_MS} ms TTL, so the probes expired on the live server and the restart past the \
+         TTL was never exercised. Rerun on a less loaded host.",
+        round1
     );
 }
 

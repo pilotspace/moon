@@ -353,7 +353,7 @@ impl Shard {
     /// fallback: partial recovery beats none), with a loud warning about
     /// its partial KV coverage.
     fn restore_from_persistence_v2(&mut self, persistence_dir: &str, kv: KvSources) -> usize {
-        use crate::persistence::snapshot::shard_snapshot_load;
+        use crate::persistence::snapshot::shard_snapshot_load_noting_expired;
 
         let dir = std::path::Path::new(persistence_dir);
         let mut total_keys = 0;
@@ -362,7 +362,9 @@ impl Shard {
         // follows this pass wipes it anyway (see `restore_from_persistence`).
         let snap_path = dir.join(format!("shard-{}.rrdshard", self.id));
         if snap_path.exists() && kv.snapshot() {
-            match shard_snapshot_load(&mut self.databases, &snap_path) {
+            let mut expired = Vec::new();
+            match shard_snapshot_load_noting_expired(&mut self.databases, &snap_path, &mut expired)
+            {
                 Ok(n) => {
                     info!("Shard {}: loaded {} keys from snapshot", self.id, n);
                     total_keys += n;
@@ -370,6 +372,12 @@ impl Shard {
                 Err(e) => {
                     tracing::error!("Shard {}: snapshot load failed: {}", self.id, e);
                 }
+            }
+            // Logs replay over it: keep what expired on the wall clock and let
+            // the replay's pinned clock judge it (moon#1277, replay::clock).
+            if kv.logs() {
+                let dbs = &mut self.databases;
+                crate::persistence::replay::clock::keep_expired_image_entries(dbs, &mut expired);
             }
         }
 

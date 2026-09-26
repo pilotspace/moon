@@ -30,22 +30,46 @@
 //!   before this change (and its expiry `DEL`, logged by the active expiry
 //!   shortly after the deadline, is in the log too).
 //!
-//! It is therefore never worse than the wall clock: the two differ only for
-//! deadlines that fell while the server was down, and for those the pinned
-//! clock is the right one. Deadlines computed during replay from the cached
-//! clock (a relative `HEXPIRE` of an old log) re-base to the log's time
-//! instead of the replay's, which is closer to the original deadline.
+//! With a truthful modification time it is never worse than the wall clock:
+//! the two differ only for deadlines that fell while the server was down, and
+//! for those the pinned clock is the right one.
 //!
-//! A modification time that lies (a restored backup, a clock stepped
-//! backwards) errs towards the wall clock when it is later — the safe
-//! direction — and is not trusted past the wall clock.
+//! No deadline is COMPUTED from the pinned clock by a current log: every
+//! relative expiry is logged as an absolute deadline — `EXPIRE`, `PEXPIRE`,
+//! `SETEX`, `PSETEX`, `SET … EX|PX`, `GETEX … EX|PX` as `PEXPIREAT` /
+//! `SET … PXAT` (`replication::expire_rewrite`), `HEXPIRE` / `HPEXPIRE` /
+//! `HGETEX … EX|PX` as `HPEXPIREAT` (`replication::effect_rewrite`). Only a
+//! log written before those rewrites (a verbatim `HEXPIRE`) has its relative
+//! deadlines re-based, to the log's time instead of the replay's.
+//!
+//! The modification time is trusted, and it can lie:
+//! - LATER than the last write (a copied or restored file, `touch`): the
+//!   judgment drifts towards the wall clock, the old behaviour (moon#1277's
+//!   symptom can come back); never past the wall clock.
+//! - EARLIER than the last write (the clock stepped back after the write, a
+//!   network or virtio filesystem whose server clock lags, `touch -d`): the
+//!   judgment predates records, so keys that expired while the server RAN
+//!   read alive to them — the replay behaves like expiry suppression, and a
+//!   key lazily expired and rewritten before its `DEL` was logged (moon#542)
+//!   replays onto its OLD value. REVIEW-FINAL-P5B measured 27-36 of 40 such
+//!   keys wrong with the mtime set an hour back (main: 0 of 40).
+//! The durable fix is a time record in the log itself (redis's
+//! `aof-timestamp-enabled`), a format change tracked as a follow-up.
 //!
 //! Pinned by every production replay of a command log: `aof::replay_aof`
 //! (the flat `appendonly.aof`), `aof_manifest::replay_multi_part` and
 //! `replay_per_shard` (the incremental files; a base is an image and judges
-//! nothing), and the Phase 4 WAL pass of `recovery::recover_shard_v3_pitr`.
+//! nothing), the Phase 4 WAL pass of `recovery::recover_shard_v3_pitr`, and
+//! the last-resort WAL replay (`wal_v3::replay::replay_wal_v3_dir_commands`).
 //! Not pinned: `replay_ordered_merge` (no production emitter yet) and the
 //! replica's apply of the master stream, which runs live on the wall clock.
+//!
+//! A snapshot the logs replay over (`KvSources::SnapshotAndLogs`) keeps its
+//! expired entries ([`keep_expired_image_entries`]): its loader skips them on
+//! the WALL clock, and a key dropped there would be absent for a record the
+//! pinned clock judges it alive to — moon#1277 again, one layer down. Kept,
+//! the replay judges them like any other key and the active expiry reaps the
+//! rest, as for an AOF base (moon#1236).
 
 use std::cell::Cell;
 use std::path::Path;
@@ -104,6 +128,22 @@ pub fn pin_replay_clock_to_wal_dir(wal_dir: &Path) -> ReplayClockGuard {
         .unwrap_or_default();
     let files: Vec<&Path> = segments.iter().map(std::path::PathBuf::as_path).collect();
     pin_replay_clock_to_files(&files)
+}
+
+/// Put back the entries a snapshot load skipped as expired
+/// (`snapshot::shard_snapshot_load_noting_expired`), for a snapshot the KV
+/// logs replay over (see the module doc), and empty `expired`. Booting is no
+/// keyspace change (moon#1232), so none is counted.
+pub fn keep_expired_image_entries(
+    databases: &mut [crate::storage::Database],
+    expired: &mut Vec<(usize, bytes::Bytes, crate::storage::entry::Entry)>,
+) {
+    let _quiet = crate::admin::metrics_setup::mute_keyspace_changes();
+    for (db, key, entry) in expired.drain(..) {
+        if let Some(db) = databases.get_mut(db) {
+            db.set(&key, entry);
+        }
+    }
 }
 
 /// The pinned judgment clock, if any.
