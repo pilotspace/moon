@@ -66,6 +66,33 @@ pub static MULTI_SHARD_AOF_REWRITE_UNSAFE: AtomicBool = AtomicBool::new(false);
 /// behaviour, where a shard with no directory reports the save failed.
 pub static SNAPSHOT_DIR_ABSENT: AtomicBool = AtomicBool::new(false);
 
+/// The directory snapshots go to, registered once by `main.rs` (moon#1267).
+static SNAPSHOT_DIR: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Register `--dir` as the snapshot directory. A shard started without a
+/// persistence directory (`--appendonly no`, `--save` omitted) writes a
+/// BGSAVE / `SHUTDOWN SAVE` snapshot here: redis writes `dump.rdb` whatever
+/// its save rules say, which only schedule automatic saves. The first
+/// registration wins.
+pub fn set_snapshot_dir(dir: &str) {
+    let _ = SNAPSHOT_DIR.set(dir.to_owned());
+}
+
+/// The registered snapshot directory, if any (`None` in harnesses that never
+/// register one — a save there fails as before).
+pub fn snapshot_dir() -> Option<&'static str> {
+    SNAPSHOT_DIR.get().map(String::as_str)
+}
+
+/// Where a shard writes its snapshot: its persistence directory, else the
+/// registered [`snapshot_dir`] (moon#1267), else nowhere.
+pub fn snapshot_dir_or(persistence_dir: &Option<String>) -> Option<&str> {
+    match persistence_dir {
+        Some(dir) => Some(dir.as_str()),
+        None => snapshot_dir(),
+    }
+}
+
 /// The reply to a save request on a server with no persistence directory.
 fn no_snapshot_dir_error() -> Frame {
     Frame::Error(Bytes::from_static(
