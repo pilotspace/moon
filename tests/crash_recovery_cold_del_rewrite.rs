@@ -25,6 +25,12 @@
 //! (APPEND) after its spill file's other keys were deleted, must survive the
 //! orphan sweep and a kill -9. RED on `ae21476` and on int/part3b (`5b14b82`).
 //!
+//! WS20 (after it): keyspace-level operations on cold keys — MOVE / COPY … DB
+//! (moon#1254), a TTL'd overwrite of a cold key (moon#1236), SWAPDB around
+//! cold keys (moon#1237) and, under `--appendonly no`, a read-promoted
+//! inherited cold key and the orphan sweep (moon#1260). RED on `ae21476` and
+//! on `4a96cd5f`.
+//!
 //! Run with (monoio default):
 //!   cargo build --release
 //!   MOON_BIN=target/release/moon cargo test --release \
@@ -72,6 +78,18 @@ fn unique_dir(suffix: &str) -> std::path::PathBuf {
 }
 
 fn start_moon(port: u16, dir: &std::path::Path, sweep_secs: u64) -> common::ServerGuard {
+    start_moon_with(port, dir, sweep_secs, "yes", &[])
+}
+
+/// [`start_moon`] with the `--appendonly` setting and extra arguments given
+/// (WS20: the `--appendonly no` + `--save` quadrant of moon#1260).
+fn start_moon_with(
+    port: u16,
+    dir: &std::path::Path,
+    sweep_secs: u64,
+    appendonly: &str,
+    extra: &[&str],
+) -> common::ServerGuard {
     let off_dir = dir.join("off");
     std::fs::create_dir_all(&off_dir).expect("create off dir");
     common::ServerGuard::new(
@@ -95,7 +113,7 @@ fn start_moon(port: u16, dir: &std::path::Path, sweep_secs: u64) -> common::Serv
                 // ("WAL skipped (appendonly=no)") — nothing replays, and cold
                 // resurrection there is the documented no-AOF RPO, not this bug.
                 "--appendonly",
-                "yes",
+                appendonly,
                 // 3600 holds the pre-sweep window open (a fully-deleted file
                 // stays manifest-Active); a short interval proves the sweep does
                 // not help a file that still backs live neighbours.
@@ -111,6 +129,7 @@ fn start_moon(port: u16, dir: &std::path::Path, sweep_secs: u64) -> common::Serv
                 "--dir",
             ])
             .arg(dir)
+            .args(extra)
             // Captured to a log file so a CI flake produces a real diagnostic
             // (never Stdio::null()).
             .stdout(
@@ -165,8 +184,19 @@ const RESTART_ATTEMPTS: usize = 6;
 /// Start moon, retrying the transient rebind EADDRINUSE self-shutdown race
 /// (see crash_recovery_disk_offload_no_aof.rs for the full rationale).
 fn start_moon_alive(port: u16, dir: &std::path::Path, sweep_secs: u64) -> common::ServerGuard {
+    start_moon_alive_with(port, dir, sweep_secs, "yes", &[])
+}
+
+/// [`start_moon_alive`] with [`start_moon_with`]'s knobs.
+fn start_moon_alive_with(
+    port: u16,
+    dir: &std::path::Path,
+    sweep_secs: u64,
+    appendonly: &str,
+    extra: &[&str],
+) -> common::ServerGuard {
     for attempt in 1..=RESTART_ATTEMPTS {
-        let mut child = start_moon(port, dir, sweep_secs);
+        let mut child = start_moon_with(port, dir, sweep_secs, appendonly, extra);
         let mut up = false;
         for _ in 0..80 {
             if let Ok(Some(_status)) = child.as_mut().try_wait() {
@@ -241,11 +271,25 @@ fn redis_get(port: u16, key: &str) -> Option<String> {
 
 /// Pipelined filler SETs to push memory past the offload threshold.
 fn write_filler(port: u16) {
+    write_filler_in_db(port, 0);
+}
+
+/// [`write_filler`] into database `db` (a `SELECT` first; its `+OK` is one
+/// more reply line to drain).
+fn write_filler_in_db(port: u16, db: usize) {
     let mut stream =
         std::net::TcpStream::connect(format!("127.0.0.1:{}", port)).expect("connect for filler");
     stream.set_write_timeout(Some(Duration::from_secs(30))).ok();
     let val = "F".repeat(FILLER_VALUE_LEN);
     let mut buf: Vec<u8> = Vec::with_capacity(64 * 1024);
+    let select = db.to_string();
+    let mut expected_replies = FILLER_COUNT;
+    if db != 0 {
+        buf.extend_from_slice(
+            format!("*2\r\n$6\r\nSELECT\r\n${}\r\n{}\r\n", select.len(), select).as_bytes(),
+        );
+        expected_replies += 1;
+    }
     for i in 0..FILLER_COUNT {
         let key = format!("filler:{}", i);
         let cmd = format!(
@@ -276,7 +320,7 @@ fn write_filler(port: u16) {
     stream.set_read_timeout(Some(Duration::from_secs(60))).ok();
     let mut replies = 0usize;
     let mut chunk = [0u8; 64 * 1024];
-    while replies < FILLER_COUNT {
+    while replies < expected_replies {
         let n = stream.read(&mut chunk).expect("filler replies");
         assert!(
             n > 0,
@@ -686,6 +730,16 @@ fn appended_value() -> String {
 /// Pipelined `DEL filler:i` for every filler, reading every reply (see
 /// `write_filler` for why the replies must be drained).
 fn del_fillers(port: u16) {
+    let deleted = del_fillers_counting(port);
+    assert!(
+        deleted * 10 >= FILLER_COUNT * 9,
+        "precondition failed: only {deleted} of {FILLER_COUNT} fillers existed to delete"
+    );
+}
+
+/// [`del_fillers`] without its precondition: how many existed. Under
+/// `--appendonly no` a restart keeps only the fillers that were cold.
+fn del_fillers_counting(port: u16) -> usize {
     let mut stream =
         std::net::TcpStream::connect(format!("127.0.0.1:{}", port)).expect("connect for DEL");
     stream.set_write_timeout(Some(Duration::from_secs(30))).ok();
@@ -730,10 +784,7 @@ fn del_fillers(port: u16) {
             replies += 1;
         }
     }
-    assert!(
-        deleted * 10 >= FILLER_COUNT * 9,
-        "precondition failed: only {deleted} of {FILLER_COUNT} fillers existed to delete"
-    );
+    deleted
 }
 
 /// A numeric field of the default `INFO` (None until published).
@@ -889,4 +940,517 @@ fn appended_cold_keys_keep_their_value_across_the_orphan_sweep_and_crash() {
 #[ignore]
 fn held_spill_files_are_released_after_the_next_rewrite() {
     run_promote_scenario("promote-release", Touch::Get, true);
+}
+
+// ── WS20: keyspace-level operations on cold keys ─────────────────────────────
+//
+// moon#1254 (MOVE / COPY … DB n of a cold key), moon#1236 (a cold key
+// overwritten hot WITH a TTL), moon#1237 (SWAPDB with cold keys) and moon#1260
+// (`--appendonly no`: a cold key inherited from an AOF run, read back into
+// RAM, then the orphan sweep). Same probes / filler / stop / restart shape
+// as the cases above.
+
+/// `redis-cli -n <db> <args>`, reply text checked for server errors.
+fn redis_cmd_db(port: u16, db: usize, args: &[&str]) -> String {
+    let out = Command::new("redis-cli")
+        .args(["-p", &port.to_string(), "-n", &db.to_string()])
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("redis-cli");
+    assert_no_error_reply(&args.join(" "), &out);
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+fn redis_get_db(port: u16, db: usize, key: &str) -> Option<String> {
+    let s = redis_cmd_db(port, db, &["GET", key]);
+    if s.is_empty() || s == "(nil)" {
+        None
+    } else {
+        Some(s)
+    }
+}
+
+fn integer_reply(s: &str) -> Option<i64> {
+    s.trim_start_matches("(integer) ").parse().ok()
+}
+
+/// Spill the probes (and fillers) the way every case above does.
+fn spill_probes(port: u16, dir: &std::path::Path) -> usize {
+    let val = probe_value();
+    for i in 0..PROBE_COUNT {
+        redis_set(port, &probe_key(i), &val);
+    }
+    write_filler(port);
+    std::thread::sleep(Duration::from_secs(SETTLE_AFTER_FILLER));
+    let heap_files = count_heap_files(dir);
+    assert!(
+        heap_files > 0,
+        "precondition failed: no heap-*.mpf files — filler did not force a spill"
+    );
+    heap_files
+}
+
+/// Stop round 1 as `stop` says and bring the server back on the same data.
+fn stop_and_restart(
+    port: u16,
+    dir: &std::path::Path,
+    server: &mut common::ServerGuard,
+    stop: Stop,
+) -> common::ServerGuard {
+    if stop == Stop::Shutdown {
+        let _ = Command::new("redis-cli")
+            .args(["-p", &port.to_string(), "SHUTDOWN"])
+            .output();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while Instant::now() < deadline && server.as_mut().try_wait().ok().flatten().is_none() {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+    server.kill_now();
+    wait_for_port_down(port);
+    start_moon_alive(port, dir, stop.sweep_secs())
+}
+
+fn finish(dir: &std::path::Path, wrong: &[String]) {
+    if wrong.is_empty() && std::env::var("MOON_TEST_KEEP").is_err() {
+        let _ = std::fs::remove_dir_all(dir);
+    } else {
+        eprintln!("preserved test dir for diagnosis: {}", dir.display());
+    }
+}
+
+// ── moon#1254 ────────────────────────────────────────────────────────────────
+
+/// Even probes are MOVEd to db 1, odd probes COPYed to db 2 (`COPY k k DB 2`),
+/// while most of them are cold. Every even probe must then live in db 1 only,
+/// every odd one in db 0 and db 2 — on the live server, and after an optional
+/// BGREWRITEAOF and a restart.
+fn run_move_copy_scenario(suffix: &str, stop: Stop, rewrite: bool) {
+    let port = common::reserve_port();
+    let dir = unique_dir(suffix);
+    std::fs::create_dir_all(&dir).expect("create test dir");
+    let mut server = start_moon(port, &dir, stop.sweep_secs());
+    wait_for_port(port);
+    let heap_files = spill_probes(port, &dir);
+    let val = probe_value();
+
+    let mut refused = 0usize;
+    for i in 0..PROBE_COUNT {
+        let key = probe_key(i);
+        let reply = if i % 2 == 0 {
+            redis_cmd(port, &["MOVE", &key, "1"])
+        } else {
+            redis_cmd(port, &["COPY", &key, &key, "DB", "2"])
+        };
+        if integer_reply(&reply) != Some(1) {
+            refused += 1;
+        }
+    }
+    let check = |phase: &str| -> Vec<String> {
+        let mut wrong = Vec::new();
+        for i in 0..PROBE_COUNT {
+            let key = probe_key(i);
+            let (want0, want1, want2) = if i % 2 == 0 {
+                (None, Some(val.as_str()), None)
+            } else {
+                (Some(val.as_str()), None, Some(val.as_str()))
+            };
+            let got = (
+                redis_get_db(port, 0, &key),
+                redis_get_db(port, 1, &key),
+                redis_get_db(port, 2, &key),
+            );
+            if (got.0.as_deref(), got.1.as_deref(), got.2.as_deref()) != (want0, want1, want2) {
+                wrong.push(format!(
+                    "{phase} {key}: db0 {} db1 {} db2 {}",
+                    got.0.is_some(),
+                    got.1.is_some(),
+                    got.2.is_some()
+                ));
+            }
+        }
+        wrong
+    };
+    let live_wrong = check("live");
+    if rewrite {
+        rewrite_and_wait(port, &dir);
+    }
+    std::thread::sleep(Duration::from_secs(SETTLE_AFTER_MUTATION));
+    let mut server2 = stop_and_restart(port, &dir, &mut server, stop);
+    let mut wrong = live_wrong;
+    wrong.extend(check("recovered"));
+    server2.kill_now();
+    finish(&dir, &wrong);
+    assert!(
+        wrong.is_empty() && refused == 0,
+        "MOVE/COPY … DB of cold probes: {refused} of {PROBE_COUNT} not answered :1, {} probe \
+         states wrong (live + after {}restart; heap files at the move: {heap_files}); first: {:?}",
+        wrong.len(),
+        if rewrite { "BGREWRITEAOF + " } else { "" },
+        wrong.first()
+    );
+}
+
+/// moon#1254: MOVE / COPY … DB of spilled keys, then BGREWRITEAOF + kill -9.
+#[test]
+#[ignore]
+fn moved_and_copied_cold_keys_keep_their_values_across_rewrite_and_crash() {
+    run_move_copy_scenario("move-rw", Stop::Kill9, true);
+}
+
+/// moon#1254: the same without a rewrite (the MOVE records replay).
+#[test]
+#[ignore]
+fn moved_and_copied_cold_keys_keep_their_values_across_crash() {
+    run_move_copy_scenario("move-norw", Stop::Kill9, false);
+}
+
+// ── moon#1236 ────────────────────────────────────────────────────────────────
+
+/// The even probes are overwritten hot WITH a TTL while cold (their old
+/// value stays on disk as a shadow). Round 1 ends before the TTL passes; the
+/// restart comes after it. Each even probe must read absent — never its OLD,
+/// pre-overwrite value — and each odd probe its original value.
+fn run_ttl_overwrite_scenario(suffix: &str, stop: Stop, rewrite: bool) {
+    const TTL_MS: u64 = 20_000;
+    let port = common::reserve_port();
+    let dir = unique_dir(suffix);
+    std::fs::create_dir_all(&dir).expect("create test dir");
+    let mut server = start_moon(port, &dir, stop.sweep_secs());
+    wait_for_port(port);
+    let heap_files = spill_probes(port, &dir);
+    let val = probe_value();
+    let new = overwrite_value();
+    let overwritten_at = Instant::now();
+    for i in (0..PROBE_COUNT).filter(|i| i % 2 == 0) {
+        redis_cmd(
+            port,
+            &["SET", &probe_key(i), &new, "PX", &TTL_MS.to_string()],
+        );
+    }
+    assert_eq!(
+        redis_get(port, &probe_key(0)).as_deref(),
+        Some(new.as_str()),
+        "precondition failed: the overwrite is not visible on the live server"
+    );
+    if rewrite {
+        rewrite_and_wait(port, &dir);
+    }
+    std::thread::sleep(Duration::from_secs(SETTLE_AFTER_MUTATION));
+    assert!(
+        overwritten_at.elapsed() < Duration::from_millis(TTL_MS),
+        "the TTL passed before round 1 ended; the case would not test the restart"
+    );
+    // Stop now; restart only once the TTL has passed (plus a margin).
+    if stop == Stop::Shutdown {
+        let _ = Command::new("redis-cli")
+            .args(["-p", &port.to_string(), "SHUTDOWN"])
+            .output();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while Instant::now() < deadline && server.as_mut().try_wait().ok().flatten().is_none() {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+    server.kill_now();
+    wait_for_port_down(port);
+    let wait_until = Duration::from_millis(TTL_MS + 1_500);
+    if let Some(rest) = wait_until.checked_sub(overwritten_at.elapsed()) {
+        std::thread::sleep(rest);
+    }
+    let mut server2 = start_moon_alive(port, &dir, stop.sweep_secs());
+    let mut wrong = Vec::new();
+    let mut old_back = 0usize;
+    for i in 0..PROBE_COUNT {
+        let key = probe_key(i);
+        let got = redis_get(port, &key);
+        let ok = if i % 2 == 0 {
+            if got.as_deref() == Some(val.as_str()) {
+                old_back += 1;
+            }
+            got.is_none()
+        } else {
+            got.as_deref() == Some(val.as_str())
+        };
+        if !ok {
+            wrong.push(key);
+        }
+    }
+    server2.kill_now();
+    finish(&dir, &wrong);
+    assert!(
+        wrong.is_empty(),
+        "{} probe(s) wrong after a TTL'd overwrite of cold keys and a {}restart past the TTL \
+         ({old_back} even probes came back with their OLD value; heap files: {heap_files}); \
+         first: {:?}",
+        wrong.len(),
+        if rewrite { "BGREWRITEAOF + " } else { "" },
+        wrong.first()
+    );
+}
+
+/// moon#1236: the reported shape — the rewrite puts the TTL'd value in the
+/// base, the restart comes after the TTL.
+#[test]
+#[ignore]
+fn cold_keys_overwritten_with_a_ttl_do_not_come_back_old_across_rewrite_and_crash() {
+    run_ttl_overwrite_scenario("ttlow-rw", Stop::Kill9, true);
+}
+
+#[test]
+#[ignore]
+fn cold_keys_overwritten_with_a_ttl_do_not_come_back_old_across_rewrite_and_clean_restart() {
+    run_ttl_overwrite_scenario("ttlow-rw-shutdown", Stop::Shutdown, true);
+}
+
+#[test]
+#[ignore]
+fn cold_keys_overwritten_with_a_ttl_do_not_come_back_old_across_crash() {
+    run_ttl_overwrite_scenario("ttlow-norw", Stop::Kill9, false);
+}
+
+#[test]
+#[ignore]
+fn cold_keys_overwritten_with_a_ttl_do_not_come_back_old_across_clean_restart() {
+    run_ttl_overwrite_scenario("ttlow-norw-shutdown", Stop::Shutdown, false);
+}
+
+// ── moon#1237 ────────────────────────────────────────────────────────────────
+
+/// `redis-cli <args>` whose reply may legitimately be an error (returned as
+/// text, not asserted).
+fn redis_cmd_unchecked(port: u16, args: &[&str]) -> String {
+    let out = Command::new("redis-cli")
+        .args(["-p", &port.to_string()])
+        .args(args)
+        .output()
+        .expect("redis-cli");
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// Which SWAPDB shape a case runs.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SwapShape {
+    /// The report: the probes are cold in db 0, then `SWAPDB 0 1`.
+    ColdThenSwap,
+    /// Found by WS20: `SWAPDB 0 1` while both dbs are empty, then the probes
+    /// are written and spilled in db 1 (the post-swap db).
+    SwapThenCold,
+}
+
+/// SWAPDB 0 1 around a cold tier, DEL of the even probes in the probes' db,
+/// optional BGREWRITEAOF, kill -9, restart. A SWAPDB refused because a db
+/// holds cold keys is an accepted answer (the probes then stay in db 0);
+/// either way every odd probe must be in exactly its db and no deleted
+/// probe may come back anywhere.
+fn run_swapdb_scenario(suffix: &str, shape: SwapShape, rewrite: bool) {
+    let port = common::reserve_port();
+    let dir = unique_dir(suffix);
+    std::fs::create_dir_all(&dir).expect("create test dir");
+    let stop = Stop::Kill9;
+    let mut server = start_moon(port, &dir, stop.sweep_secs());
+    wait_for_port(port);
+    let val = probe_value();
+    let (home, swap_reply, heap_files) = match shape {
+        SwapShape::ColdThenSwap => {
+            let heap_files = spill_probes(port, &dir);
+            let reply = redis_cmd_unchecked(port, &["SWAPDB", "0", "1"]);
+            let home = if reply == "OK" { 1 } else { 0 };
+            (home, reply, heap_files)
+        }
+        SwapShape::SwapThenCold => {
+            let reply = redis_cmd_unchecked(port, &["SWAPDB", "0", "1"]);
+            assert_eq!(reply, "OK", "SWAPDB of two EMPTY dbs must succeed");
+            for i in 0..PROBE_COUNT {
+                redis_cmd_db(port, 1, &["SET", &probe_key(i), &val]);
+            }
+            write_filler_in_db(port, 1);
+            std::thread::sleep(Duration::from_secs(SETTLE_AFTER_FILLER));
+            let heap_files = count_heap_files(&dir);
+            assert!(heap_files > 0, "precondition failed: nothing spilled");
+            (1, reply, heap_files)
+        }
+    };
+    for i in (0..PROBE_COUNT).filter(|i| i % 2 == 0) {
+        redis_cmd_db(port, home, &["DEL", &probe_key(i)]);
+    }
+    if rewrite {
+        rewrite_and_wait(port, &dir);
+    }
+    std::thread::sleep(Duration::from_secs(SETTLE_AFTER_MUTATION));
+    let mut server2 = stop_and_restart(port, &dir, &mut server, stop);
+    let other = 1 - home;
+    let mut wrong = Vec::new();
+    for i in 0..PROBE_COUNT {
+        let key = probe_key(i);
+        let in_home = redis_get_db(port, home, &key);
+        let in_other = redis_get_db(port, other, &key);
+        let ok = if i % 2 == 0 {
+            in_home.is_none() && in_other.is_none()
+        } else {
+            in_home.as_deref() == Some(val.as_str()) && in_other.is_none()
+        };
+        if !ok {
+            wrong.push(format!(
+                "{key}: db{home} {} db{other} {}",
+                in_home.is_some(),
+                in_other.is_some()
+            ));
+        }
+    }
+    server2.kill_now();
+    finish(&dir, &wrong);
+    assert!(
+        wrong.is_empty(),
+        "{} probe(s) in the wrong db or back from the dead after SWAPDB ({:?}), DEL, {}kill -9 \
+         and restart (home db {home}; heap files {heap_files}); first: {:?}",
+        wrong.len(),
+        swap_reply,
+        if rewrite { "BGREWRITEAOF, " } else { "" },
+        wrong.first()
+    );
+}
+
+/// moon#1237 as reported: cold keys in db 0, SWAPDB 0 1, DEL, rewrite, crash.
+#[test]
+#[ignore]
+fn swapdb_of_cold_keys_keeps_every_key_in_its_db_across_rewrite_and_crash() {
+    run_swapdb_scenario("swap-cold-rw", SwapShape::ColdThenSwap, true);
+}
+
+/// The same without the rewrite (the SWAPDB record replays).
+#[test]
+#[ignore]
+fn swapdb_of_cold_keys_keeps_every_key_in_its_db_across_crash() {
+    run_swapdb_scenario("swap-cold-norw", SwapShape::ColdThenSwap, false);
+}
+
+/// SWAPDB of empty dbs, then spills in the swapped db, then a crash with no
+/// rewrite: the replayed SWAPDB must not carry the later spills' cold entries
+/// into the other db.
+#[test]
+#[ignore]
+fn keys_spilled_after_a_swapdb_stay_in_their_db_across_crash() {
+    run_swapdb_scenario("swap-then-cold-norw", SwapShape::SwapThenCold, false);
+}
+
+#[test]
+#[ignore]
+fn keys_spilled_after_a_swapdb_stay_in_their_db_across_rewrite_and_crash() {
+    run_swapdb_scenario("swap-then-cold-rw", SwapShape::SwapThenCold, true);
+}
+
+// ── moon#1260 ────────────────────────────────────────────────────────────────
+
+/// BGSAVE and wait until it completed successfully (LASTSAVE has 1 s
+/// resolution, so the wait starts one second after the previous value).
+fn bgsave_and_wait(port: u16) {
+    let lastsave = || integer_reply(&redis_cmd(port, &["LASTSAVE"])).unwrap_or(0);
+    let before = lastsave();
+    std::thread::sleep(Duration::from_millis(1_100));
+    let reply = redis_cmd(port, &["BGSAVE"]);
+    assert!(!reply.is_empty(), "BGSAVE returned an empty reply");
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let info = redis_cmd(port, &["INFO", "persistence"]);
+        if info.contains("rdb_bgsave_in_progress:0") && lastsave() > before {
+            assert!(
+                info.contains("rdb_last_bgsave_status:ok"),
+                "BGSAVE failed: {info}"
+            );
+            return;
+        }
+        assert!(Instant::now() < deadline, "BGSAVE never completed: {info}");
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+/// `GET probe:i` for every probe; returns how many read `val`.
+fn probes_readable(port: u16, val: &str) -> usize {
+    (0..PROBE_COUNT)
+        .filter(|i| redis_get(port, &probe_key(*i)).as_deref() == Some(val))
+        .count()
+}
+
+/// The REVIEW4-WS19 `r4_no_aof_promoted_…` proof, at `MOON_TEST_COLD_DEL_SHARDS`.
+/// Phase 1 spills the probes under `--appendonly yes` and stops cleanly (under
+/// `--appendonly no` the connection gate drops instead of spilling, so a
+/// no-AOF server holds cold keys it inherited). Phase 2 runs the same dir
+/// with `--appendonly no --save`: BGSAVE (the hot table), DEL the fillers,
+/// GET every probe (read back into RAM, no log exists), let the orphan
+/// sweep run (`sweep_secs`), kill -9. Snapshot semantics: every probe was
+/// unchanged since the save, so every probe must come back.
+fn run_no_aof_promote_scenario(suffix: &str, sweep_secs: u64) {
+    let port = common::reserve_port();
+    let dir = unique_dir(suffix);
+    std::fs::create_dir_all(&dir).expect("create test dir");
+    // Phase 1 (`--appendonly yes`), clean stop.
+    {
+        let mut s1 = start_moon(port, &dir, 3600);
+        wait_for_port(port);
+        spill_probes(port, &dir);
+        let _ = Command::new("redis-cli")
+            .args(["-p", &port.to_string(), "SHUTDOWN", "NOSAVE"])
+            .output();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while Instant::now() < deadline && s1.as_mut().try_wait().ok().flatten().is_none() {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        s1.kill_now();
+        wait_for_port_down(port);
+    }
+    // Phase 2 (`--appendonly no` + save points, so BGSAVE has a directory).
+    let save = ["--save", "3600 100000000"];
+    let mut server = start_moon_with(port, &dir, sweep_secs, "no", &save);
+    wait_for_port(port);
+    redis_set(port, "hot:control", "H");
+    bgsave_and_wait(port);
+    let at_save = count_heap_files(&dir);
+    assert!(
+        del_fillers_counting(port) > 0,
+        "precondition failed: no inherited filler to delete"
+    );
+    let val = probe_value();
+    let readable = probes_readable(port, &val);
+    assert!(
+        readable > 0,
+        "precondition failed: no probe readable in phase 2"
+    );
+    std::thread::sleep(Duration::from_secs(6)); // several orphan sweeps
+    let before_kill = count_heap_files(&dir);
+    server.kill_now();
+    wait_for_port_down(port);
+    let mut server2 = start_moon_alive_with(port, &dir, sweep_secs, "no", &save);
+    let hot_ok = redis_get(port, "hot:control").as_deref() == Some("H");
+    let back = probes_readable(port, &val);
+    server2.kill_now();
+    let wrong: Vec<String> = if back < readable || !hot_ok {
+        vec![format!("{back} of {readable} back, hot control {hot_ok}")]
+    } else {
+        Vec::new()
+    };
+    finish(&dir, &wrong);
+    assert!(hot_ok, "the snapshot was not loaded (hot control missing)");
+    assert_eq!(
+        readable - back.min(readable),
+        0,
+        "probes unchanged since the last BGSAVE lost after GET, orphan sweeps and kill -9 \
+         under --appendonly no ({readable} readable before, {back} after; heap files {at_save} \
+         at the save, {before_kill} before the kill)"
+    );
+}
+
+/// moon#1260: GET-promoted inherited cold keys survive the sweep and a crash.
+#[test]
+#[ignore]
+fn no_aof_promoted_cold_keys_survive_the_orphan_sweep_and_crash() {
+    run_no_aof_promote_scenario("noaof-sweep", 1);
+}
+
+/// moon#1260 control: no sweep in the window, nothing is lost.
+#[test]
+#[ignore]
+fn no_aof_promoted_cold_keys_survive_a_crash_without_a_sweep() {
+    run_no_aof_promote_scenario("noaof-nosweep", 3600);
 }

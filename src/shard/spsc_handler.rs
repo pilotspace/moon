@@ -2370,6 +2370,8 @@ pub(crate) fn handle_shard_message_shared(
                 );
             }
 
+            // moon#1237: a spill since the coordinator's check is logged.
+            crate::storage::db::note_swap_with_cold_footprint(shard_id, a, b);
             // Perform the in-place swap via ShardSlice (thread-local, no locks needed).
             crate::shard::slice::with_shard(|s| {
                 if a != b {

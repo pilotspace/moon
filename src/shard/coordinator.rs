@@ -3903,6 +3903,8 @@ pub async fn coordinate_swapdb(
         // flip to per-shard emission.
         let repl_record = serialized.clone();
         let apply_local = move || {
+            // moon#1237: a spill since the refusal check is logged.
+            crate::storage::db::note_swap_with_cold_footprint(my_shard, a, b);
             crate::shard::slice::with_shard(|s| {
                 if a != b {
                     s.databases.swap(a, b);
