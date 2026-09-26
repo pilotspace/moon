@@ -50,6 +50,7 @@ pub static malloc_conf: MallocConfPtr = MallocConfPtr(
 
 use std::path::PathBuf;
 
+use moon::command::persistence::signal;
 use moon::config::ServerConfig;
 use moon::config::conf_file::merge_conf_argv;
 use moon::persistence::aof::{self, AofMessage, AofWriterPool, FsyncPolicy};
@@ -774,8 +775,8 @@ fn main() -> anyhow::Result<()> {
     {
         let sigint_token = cancel_token.clone();
         ctrlc::set_handler(move || {
-            info!("Shutdown signal received");
-            sigint_token.cancel();
+            // moon#1263: saves first with save points (like plain SHUTDOWN).
+            signal::on_signal(signal::ShutdownSignal::Int, &sigint_token);
         })
         .map_err(|e| anyhow::anyhow!("failed to set Ctrl+C handler: {e}"))?;
     }
@@ -823,9 +824,10 @@ fn main() -> anyhow::Result<()> {
                             continue;
                         }
                         if sig == libc::SIGTERM {
-                            info!("Shutdown signal received");
-                            sigterm_token.cancel();
-                            return;
+                            // moon#1263: saves first with save points; the
+                            // server keeps running if that save fails, and a
+                            // later SIGTERM retries — so keep waiting.
+                            signal::on_signal(signal::ShutdownSignal::Term, &sigterm_token);
                         }
                     }
                 }
@@ -2195,6 +2197,9 @@ fn main() -> anyhow::Result<()> {
 
         shard_handles.push(handle);
     }
+    // moon#1263: every shard serves — a SIGTERM / SIGINT now saves first.
+    let (save_points, cancel) = (config.save.as_deref(), cancel_token.clone());
+    signal::arm(snapshot_trigger_tx.clone(), num_shards, save_points, cancel);
 
     let listener_cancel = cancel_token.clone();
 

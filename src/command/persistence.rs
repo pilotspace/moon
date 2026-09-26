@@ -12,6 +12,8 @@ use crate::persistence::rdb;
 use crate::protocol::Frame;
 use crate::storage::Database;
 
+pub mod signal;
+
 /// Type alias for the per-database RwLock container.
 type SharedDatabases = Arc<Vec<parking_lot::RwLock<Database>>>;
 
