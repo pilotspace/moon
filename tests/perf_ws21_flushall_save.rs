@@ -242,40 +242,52 @@ fn flushall_follows_config_set_save() {
 /// rules turned off by `CONFIG SET save ""`, they exit without a final save
 /// (a key written after the last snapshot is not in it).
 #[test]
-fn shutdown_and_sigterm_follow_config_set_save() {
-    for how in ["SHUTDOWN", "SIGTERM"] {
-        let dir = common::unique_test_dir(&format!("ws21-f10-{how}"));
-        std::fs::create_dir_all(&dir).unwrap();
-        let (mut server, port) = spawn(&dir, 1, Some(RULES));
-        let mut c = Conn::open(port);
-        fill_and_save(&mut c);
-        assert_eq!(c.send(&["SET", "late", "v"]), "+OK\r\n");
-        assert_eq!(c.send(&["CONFIG", "SET", "save", ""]), "+OK\r\n");
-        if how == "SHUTDOWN" {
-            c.sock.write_all(&encode(&["SHUTDOWN"])).unwrap();
-        } else {
-            let kill = std::process::Command::new("kill")
-                .args(["-TERM", &server.id().to_string()])
-                .status()
-                .unwrap();
-            assert!(kill.success());
-        }
-        let deadline = Instant::now() + Duration::from_secs(30);
-        while server.as_mut().try_wait().unwrap().is_none() {
-            assert!(Instant::now() < deadline, "{how}: never exited");
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        drop(c);
-        common::wait_for_port_down(port);
+fn shutdown_follows_config_set_save() {
+    stop_follows_config_set_save("SHUTDOWN");
+}
 
-        let (_server, port) = spawn(&dir, 1, Some(RULES));
-        let mut c = Conn::open(port);
-        let late = c.send(&["EXISTS", "late"]);
-        let back = dbsize(&mut c);
-        drop(c);
-        drop(_server);
-        let _ = std::fs::remove_dir_all(&dir);
-        assert_eq!(back, KEYS, "{how}: the snapshot before it is on disk");
-        assert_eq!(late, ":0\r\n", "{how} saved although CONFIG SET save \"\"");
+/// The SIGTERM leg of the rule above. Unix only, like the other signal
+/// suites (`perf_ws21_signal_save`, `perf_ws21_aof_drain`): Windows has no
+/// SIGTERM, and its `kill` (Git for Windows' MSYS build) cannot see a
+/// native Win32 pid.
+#[cfg(unix)]
+#[test]
+fn sigterm_follows_config_set_save() {
+    stop_follows_config_set_save("SIGTERM");
+}
+
+fn stop_follows_config_set_save(how: &str) {
+    let dir = common::unique_test_dir(&format!("ws21-f10-{how}"));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (mut server, port) = spawn(&dir, 1, Some(RULES));
+    let mut c = Conn::open(port);
+    fill_and_save(&mut c);
+    assert_eq!(c.send(&["SET", "late", "v"]), "+OK\r\n");
+    assert_eq!(c.send(&["CONFIG", "SET", "save", ""]), "+OK\r\n");
+    if how == "SHUTDOWN" {
+        c.sock.write_all(&encode(&["SHUTDOWN"])).unwrap();
+    } else {
+        let kill = std::process::Command::new("kill")
+            .args(["-TERM", &server.id().to_string()])
+            .status()
+            .unwrap();
+        assert!(kill.success());
     }
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while server.as_mut().try_wait().unwrap().is_none() {
+        assert!(Instant::now() < deadline, "{how}: never exited");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    drop(c);
+    common::wait_for_port_down(port);
+
+    let (_server, port) = spawn(&dir, 1, Some(RULES));
+    let mut c = Conn::open(port);
+    let late = c.send(&["EXISTS", "late"]);
+    let back = dbsize(&mut c);
+    drop(c);
+    drop(_server);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(back, KEYS, "{how}: the snapshot before it is on disk");
+    assert_eq!(late, ":0\r\n", "{how} saved although CONFIG SET save \"\"");
 }

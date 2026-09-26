@@ -433,6 +433,7 @@ shared 4-vCPU Linux container against HEAD `935c555` — re-measure on the GCE r
 - **Tests:**
   - Six integration tests no longer fail on a slow or stalled host, as seen on hosted Windows runners (moon#1065, moon#1273). They poll for the condition they need instead of relying on fixed sleeps, round counts, or 50–300 ms windows. Cold-tier fillers retry an AOF backpressure refusal.
   - `scripts/test-consistency.sh` no longer hangs in the moon#1235 race rows: a bare `wait` also waited for the script's own servers.
+  - `perf_ws21_flushall_save`: the SIGTERM leg of the `CONFIG SET save` test is now its own Unix-only test, like the other signal suites. Windows has no SIGTERM, and its `kill` cannot see a native pid, so the Windows leg of main's CI went red after part 5.
 
 - **A BGSAVE records each key as it was when the save started, even when that key changes before the save writes it** (moon#1228).
   - Before, a key changed by any of these could be saved in its later state:
