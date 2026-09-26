@@ -26,8 +26,8 @@
 //! orphan sweep and a kill -9. RED on `ae21476` and on int/part3b (`5b14b82`).
 //!
 //! WS20 (after it): keyspace-level operations on cold keys — MOVE / COPY … DB
-//! (moon#1254) and a TTL'd overwrite of a cold key (moon#1236). RED on
-//! `ae21476` and on `4a96cd5f`.
+//! (moon#1254), a TTL'd overwrite of a cold key (moon#1236) and SWAPDB around
+//! cold keys (moon#1237). RED on `ae21476` and on `4a96cd5f`.
 //!
 //! Run with (monoio default):
 //!   cargo build --release
@@ -1205,4 +1205,129 @@ fn cold_keys_overwritten_with_a_ttl_do_not_come_back_old_across_crash() {
 #[ignore]
 fn cold_keys_overwritten_with_a_ttl_do_not_come_back_old_across_clean_restart() {
     run_ttl_overwrite_scenario("ttlow-norw-shutdown", Stop::Shutdown, false);
+}
+
+// ── moon#1237 ────────────────────────────────────────────────────────────────
+
+/// `redis-cli <args>` whose reply may legitimately be an error (returned as
+/// text, not asserted).
+fn redis_cmd_unchecked(port: u16, args: &[&str]) -> String {
+    let out = Command::new("redis-cli")
+        .args(["-p", &port.to_string()])
+        .args(args)
+        .output()
+        .expect("redis-cli");
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// Which SWAPDB shape a case runs.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SwapShape {
+    /// The report: the probes are cold in db 0, then `SWAPDB 0 1`.
+    ColdThenSwap,
+    /// Found by WS20: `SWAPDB 0 1` while both dbs are empty, then the probes
+    /// are written and spilled in db 1 (the post-swap db).
+    SwapThenCold,
+}
+
+/// SWAPDB 0 1 around a cold tier, DEL of the even probes in the probes' db,
+/// optional BGREWRITEAOF, kill -9, restart. A SWAPDB refused because a db
+/// holds cold keys is an accepted answer (the probes then stay in db 0);
+/// either way every odd probe must be in exactly its db and no deleted
+/// probe may come back anywhere.
+fn run_swapdb_scenario(suffix: &str, shape: SwapShape, rewrite: bool) {
+    let port = common::reserve_port();
+    let dir = unique_dir(suffix);
+    std::fs::create_dir_all(&dir).expect("create test dir");
+    let stop = Stop::Kill9;
+    let mut server = start_moon(port, &dir, stop.sweep_secs());
+    wait_for_port(port);
+    let val = probe_value();
+    let (home, swap_reply, heap_files) = match shape {
+        SwapShape::ColdThenSwap => {
+            let heap_files = spill_probes(port, &dir);
+            let reply = redis_cmd_unchecked(port, &["SWAPDB", "0", "1"]);
+            let home = if reply == "OK" { 1 } else { 0 };
+            (home, reply, heap_files)
+        }
+        SwapShape::SwapThenCold => {
+            let reply = redis_cmd_unchecked(port, &["SWAPDB", "0", "1"]);
+            assert_eq!(reply, "OK", "SWAPDB of two EMPTY dbs must succeed");
+            for i in 0..PROBE_COUNT {
+                redis_cmd_db(port, 1, &["SET", &probe_key(i), &val]);
+            }
+            write_filler_in_db(port, 1);
+            std::thread::sleep(Duration::from_secs(SETTLE_AFTER_FILLER));
+            let heap_files = count_heap_files(&dir);
+            assert!(heap_files > 0, "precondition failed: nothing spilled");
+            (1, reply, heap_files)
+        }
+    };
+    for i in (0..PROBE_COUNT).filter(|i| i % 2 == 0) {
+        redis_cmd_db(port, home, &["DEL", &probe_key(i)]);
+    }
+    if rewrite {
+        rewrite_and_wait(port, &dir);
+    }
+    std::thread::sleep(Duration::from_secs(SETTLE_AFTER_MUTATION));
+    let mut server2 = stop_and_restart(port, &dir, &mut server, stop);
+    let other = 1 - home;
+    let mut wrong = Vec::new();
+    for i in 0..PROBE_COUNT {
+        let key = probe_key(i);
+        let in_home = redis_get_db(port, home, &key);
+        let in_other = redis_get_db(port, other, &key);
+        let ok = if i % 2 == 0 {
+            in_home.is_none() && in_other.is_none()
+        } else {
+            in_home.as_deref() == Some(val.as_str()) && in_other.is_none()
+        };
+        if !ok {
+            wrong.push(format!(
+                "{key}: db{home} {} db{other} {}",
+                in_home.is_some(),
+                in_other.is_some()
+            ));
+        }
+    }
+    server2.kill_now();
+    finish(&dir, &wrong);
+    assert!(
+        wrong.is_empty(),
+        "{} probe(s) in the wrong db or back from the dead after SWAPDB ({:?}), DEL, {}kill -9 \
+         and restart (home db {home}; heap files {heap_files}); first: {:?}",
+        wrong.len(),
+        swap_reply,
+        if rewrite { "BGREWRITEAOF, " } else { "" },
+        wrong.first()
+    );
+}
+
+/// moon#1237 as reported: cold keys in db 0, SWAPDB 0 1, DEL, rewrite, crash.
+#[test]
+#[ignore]
+fn swapdb_of_cold_keys_keeps_every_key_in_its_db_across_rewrite_and_crash() {
+    run_swapdb_scenario("swap-cold-rw", SwapShape::ColdThenSwap, true);
+}
+
+/// The same without the rewrite (the SWAPDB record replays).
+#[test]
+#[ignore]
+fn swapdb_of_cold_keys_keeps_every_key_in_its_db_across_crash() {
+    run_swapdb_scenario("swap-cold-norw", SwapShape::ColdThenSwap, false);
+}
+
+/// SWAPDB of empty dbs, then spills in the swapped db, then a crash with no
+/// rewrite: the replayed SWAPDB must not carry the later spills' cold entries
+/// into the other db.
+#[test]
+#[ignore]
+fn keys_spilled_after_a_swapdb_stay_in_their_db_across_crash() {
+    run_swapdb_scenario("swap-then-cold-norw", SwapShape::SwapThenCold, false);
+}
+
+#[test]
+#[ignore]
+fn keys_spilled_after_a_swapdb_stay_in_their_db_across_rewrite_and_crash() {
+    run_swapdb_scenario("swap-then-cold-rw", SwapShape::SwapThenCold, true);
 }

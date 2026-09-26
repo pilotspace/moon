@@ -424,9 +424,11 @@ impl CommandReplayEngine for DispatchReplayEngine {
                     let (lo, hi) = if a < b { (a, b) } else { (b, a) };
                     // Split the slice to get two non-overlapping mutable references.
                     // Each slot keeps its `db_index` (the db its keyspace
-                    // events name), as the live SWAPDB does.
+                    // events name), as the live SWAPDB does; the cold entries
+                    // of files spilled after this record stay in their slot
+                    // (moon#1237, `storage::db::swap_replayed`).
                     let (left, right) = databases.split_at_mut(lo + 1);
-                    crate::shard::db_plane::swap_contents(&mut left[lo], &mut right[hi - lo - 1]);
+                    crate::storage::db::swap_replayed(&mut left[lo], &mut right[hi - lo - 1]);
                     // moon#1232 (REVIEW7 R1): one keyspace change, as redis
                     // 7.0.15 counts a SWAPDB it replays from its AOF. Counted
                     // like the funnels every other replayed write goes

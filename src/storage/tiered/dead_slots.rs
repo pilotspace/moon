@@ -282,6 +282,30 @@ impl DeadSlots {
         dropped
     }
 
+    /// Take the entries of every file `moves` selects into a new ledger — a
+    /// replayed SWAPDB carries the slots of the files that were already part
+    /// of the swapped database with it (moon#1237). Totals are unchanged: the
+    /// entries only change ledgers.
+    pub fn split_off_files(&mut self, moves: impl Fn(u64) -> bool) -> DeadSlots {
+        let mut out = DeadSlots::default();
+        let files: Vec<u64> = self.by_file.keys().copied().filter(|f| moves(*f)).collect();
+        for file_id in files {
+            let Some(file) = self.by_file.remove(&file_id) else {
+                continue;
+            };
+            self.len -= file.slots.len();
+            self.resident_bytes = self.resident_bytes.saturating_sub(file.bytes);
+            out.len += file.slots.len();
+            out.resident_bytes += file.bytes;
+            for slot in file.slots.iter().filter(|slot| slot.ttl_ms != 0) {
+                out.earliest_ttl = out.earliest_ttl.min(slot.ttl_ms);
+            }
+            out.by_file.insert(file_id, file);
+        }
+        // `self.earliest_ttl` stays a lower bound: `prune_expired` re-derives it.
+        out
+    }
+
     /// Fold another ledger into this one (recovery merges per-db indexes).
     /// Entries move as they are: whether to record them was decided when
     /// they were recorded, and the process totals already count them (the

@@ -654,6 +654,13 @@ pub(super) async fn try_handle_swapdb(
         return true;
     }
 
+    // moon#1237: refused while a swapped db has cold-tier data on any shard.
+    let cold = crate::storage::db::swapdb_cold_refusal(a, b, ctx.shard_id, ctx.num_shards);
+    if let Some(refused) = cold {
+        responses.push(refused);
+        return true;
+    }
+
     let response = crate::shard::coordinator::coordinate_swapdb(
         a,
         b,

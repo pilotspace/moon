@@ -42,7 +42,7 @@ mod superseded_spill_tests;
 #[cfg(test)]
 mod ws1_tests;
 
-pub use cold_replay_gate::{ReplayColdGate, ReplayColdReconcile, close_replay_generation};
+pub use cold_replay_gate::*;
 pub(crate) use incr::IncrOutcome;
 pub(crate) use kv_ops::{ExpiredRemoval, KeyDeletion};
 pub use lazy_free::{
@@ -478,11 +478,11 @@ pub struct Database {
     /// AOF-authority replay; decides which cold files the value-giving read
     /// paths may see. `None` outside replay and for legacy generations.
     replay_cold_gate: Option<ReplayColdGate>,
-    /// moon#965: a `MOON.SPILLED` marker was replayed in this generation, so
-    /// the log is #902-era and `finish_replay_cold_reconcile` must use the
-    /// hot-wins resolution even without a `MOON.COLDCUT` head. Reset by
+    /// moon#965 / moon#1237: the `MOON.SPILLED` markers replayed in this
+    /// generation (whether any was — the log is #902-era, so the close is
+    /// hot-wins — and, without a cut, which files). Reset by
     /// `finish_replay_cold_reconcile` when it closes the generation.
-    replay_saw_cold_marker: bool,
+    replay_markers: cold_replay_gate::ReplayMarkers,
     /// Hot-key detection sketch, fed by sampled dispatch observations.
     hot_keys: crate::storage::hotkey::HotKeySketch,
     /// Keys whose async spill is IN FLIGHT: enqueued to the spill thread,
@@ -699,7 +699,7 @@ impl Database {
             cold_fault: std::sync::atomic::AtomicU8::new(0),
             cold_shard_dir: None,
             replay_cold_gate: None,
-            replay_saw_cold_marker: false,
+            replay_markers: Default::default(),
             hot_keys: crate::storage::hotkey::HotKeySketch::new(),
             spill_inflight: std::collections::HashMap::new(),
             spill_inflight_bytes: 0,
@@ -737,7 +737,7 @@ impl Database {
             cold_fault: std::sync::atomic::AtomicU8::new(0),
             cold_shard_dir: None,
             replay_cold_gate: None,
-            replay_saw_cold_marker: false,
+            replay_markers: Default::default(),
             hot_keys: crate::storage::hotkey::HotKeySketch::new(),
             spill_inflight: std::collections::HashMap::new(),
             spill_inflight_bytes: 0,
