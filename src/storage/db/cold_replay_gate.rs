@@ -200,6 +200,14 @@ impl Database {
         }
     }
 
+    /// Pin the clock expiry is judged by during an AOF replay to the log's
+    /// last-write time (moon#1277, `persistence::replay::clock`). The live
+    /// event loop overwrites it with the wall clock on its first refresh.
+    #[inline]
+    pub fn set_replay_clock_ms(&mut self, ms: u64) {
+        self.cached_now_ms = ms;
+    }
+
     /// Whether an AOF-authority replay gate is currently installed.
     #[inline]
     pub fn replay_cold_gate_active(&self) -> bool {

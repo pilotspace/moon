@@ -24,6 +24,8 @@ use crate::storage::db::HashTtlCond;
 
 /// The bounded streaming reader the RESP log replays use (moon#1160).
 pub(crate) mod chunks;
+/// The expiry-judgment clock of a replay (moon#1277).
+pub mod clock;
 
 /// Parse a Frame as an unsigned integer (BulkString or Integer).
 #[inline]
@@ -340,6 +342,34 @@ impl DispatchReplayEngine {
 
 impl CommandReplayEngine for DispatchReplayEngine {
     fn replay_command(
+        &self,
+        databases: &mut [Database],
+        cmd: &[u8],
+        args: &[Frame],
+        selected_db: &mut usize,
+    ) -> ReplayRoute {
+        // moon#1277: judge expiry by the log's time, not the replay's — and
+        // hand the databases back on the wall clock after every record, so
+        // nothing after the replay (a foreign read of an idle shard, before
+        // its owner refreshes) sees the pinned time.
+        let Some(ms) = clock::pinned_replay_clock_ms() else {
+            return self.replay_one(databases, cmd, args, selected_db);
+        };
+        databases
+            .iter_mut()
+            .for_each(|db| db.set_replay_clock_ms(ms));
+        let route = self.replay_one(databases, cmd, args, selected_db);
+        let now = crate::storage::entry::current_time_ms();
+        databases
+            .iter_mut()
+            .for_each(|db| db.set_replay_clock_ms(now));
+        route
+    }
+}
+
+impl DispatchReplayEngine {
+    /// One replayed record (the body of [`CommandReplayEngine::replay_command`]).
+    fn replay_one(
         &self,
         databases: &mut [Database],
         cmd: &[u8],

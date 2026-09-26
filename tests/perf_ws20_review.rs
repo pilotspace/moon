@@ -1,6 +1,8 @@
 //! WS20 review round: real-server regression tests cheap enough for every PR.
 //!
 //! - moon#1275: a SWAPDB made a tokio `--shards 1` restart skip the AOF.
+//! - moon#1277: a TTL-preserving read-modify-write replayed after its key's
+//!   deadline built a new persistent key.
 //!
 //! Pin the binary for a specific runtime:
 //! `MOON_BIN=<moon> cargo test --test perf_ws20_review`.
@@ -10,6 +12,7 @@
 mod common;
 
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 use common::{Conn, ServerGuard};
 
@@ -98,4 +101,165 @@ fn moon_1275_a_swapdb_does_not_make_a_restart_skip_the_aof_s1() {
 #[test]
 fn moon_1275_a_swapdb_does_not_make_a_restart_skip_the_aof_s4() {
     swapdb_survives_a_crash(4, "enable");
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+}
+
+/// Whether `dir` holds a base with seq > 1 (a completed rewrite).
+fn has_compacted_base(dir: &Path) -> bool {
+    std::fs::read_dir(dir).is_ok_and(|files| {
+        files.flatten().any(|f| {
+            let name = f.file_name().to_string_lossy().to_string();
+            name.strip_prefix("moon.aof.")
+                .and_then(|r| r.strip_suffix(".base.rdb"))
+                .and_then(|seq| seq.parse::<u64>().ok())
+                .is_some_and(|seq| seq > 1)
+        })
+    })
+}
+
+/// AOF generations cut by a completed rewrite: per-shard dirs, the top-level
+/// multi-part dir, or the tokio `--shards 1` flat file with its preamble.
+fn compacted_bases(dir: &Path) -> usize {
+    let aof_dir = dir.join("appendonlydir");
+    let per_shard = std::fs::read_dir(&aof_dir)
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter(|s| s.path().is_dir() && has_compacted_base(&s.path()))
+                .count()
+        })
+        .unwrap_or(0);
+    let flat = std::fs::read(dir.join("appendonly.aof")).is_ok_and(|b| b.starts_with(b"MOON"));
+    per_shard + usize::from(has_compacted_base(&aof_dir)) + usize::from(flat)
+}
+
+fn rewrite_and_wait(c: &mut Conn, dir: &Path, shards: usize) {
+    assert!(!c.send(&["BGREWRITEAOF"]).starts_with('-'));
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let idle = c
+            .send(&["INFO", "persistence"])
+            .contains("aof_rewrite_in_progress:0");
+        let done = compacted_bases(dir);
+        // The per-shard layout cuts one base per shard, the others one.
+        if idle && (done == shards || done == 1) {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "BGREWRITEAOF did not complete within 60s ({done} bases)"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// moon#1277: keys with a TTL, then a TTL-preserving read-modify-write on
+/// each (APPEND, INCR, HSET, SETRANGE) logged while they were alive, then a
+/// kill -9 and a restart AFTER the TTL. The replay judged expiry by the wall
+/// clock: every RMW replayed onto an absent key and built a NEW key with no
+/// TTL, which came back with a wrong value and never expired. Every key must
+/// be gone, as with redis. With `rewrite`, the SETs are in the AOF base and
+/// the RMWs in the incremental file.
+fn rmw_logged_before_the_ttl_does_not_outlive_it(shards: usize, rewrite: bool) {
+    const TTL_MS: u64 = 3_000;
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let dir = tmp.path();
+    let args = [
+        "--appendonly",
+        "yes",
+        "--appendfsync",
+        "always",
+        "--disk-offload",
+        "enable",
+    ];
+    let (mut server, port) = spawn(dir, shards, &args);
+    let mut c = Conn::open(port);
+    // With a `rewrite` the TTL has to outlive BGREWRITEAOF, so the deadline
+    // is set after it: `PEXPIREAT` on keys the base already holds.
+    let keys = ["s", "n", "h", "r"];
+    assert!(
+        c.send(&["SET", "s", "v", "PX", "600000"])
+            .starts_with("+OK")
+    );
+    assert!(
+        c.send(&["SET", "n", "5", "PX", "600000"])
+            .starts_with("+OK")
+    );
+    assert_eq!(c.send(&["HSET", "h", "f", "1"]), ":1\r\n");
+    assert_eq!(c.send(&["PEXPIRE", "h", "600000"]), ":1\r\n");
+    assert!(
+        c.send(&["SET", "r", "abc", "PX", "600000"])
+            .starts_with("+OK")
+    );
+    // The control: a persistent key, so a pass means the log WAS replayed.
+    assert!(c.send(&["SET", "p", "v"]).starts_with("+OK"));
+    if rewrite {
+        rewrite_and_wait(&mut c, dir, shards);
+    }
+    let deadline_ms = now_ms() + TTL_MS;
+    let at = deadline_ms.to_string();
+    for k in keys {
+        assert_eq!(c.send(&["PEXPIREAT", k, &at]), ":1\r\n", "PEXPIREAT {k}");
+    }
+    let rmw = [
+        c.send(&["APPEND", "s", "x"]),
+        c.send(&["INCR", "n"]),
+        c.send(&["HSET", "h", "g", "2"]),
+        c.send(&["SETRANGE", "r", "1", "Z"]),
+    ];
+    assert_eq!(c.send(&["APPEND", "p", "x"]), ":2\r\n");
+    let live: Vec<String> = keys.iter().map(|k| c.send(&["PTTL", k])).collect();
+    assert_eq!(
+        rmw,
+        [":2\r\n", ":6\r\n", ":1\r\n", ":3\r\n"].map(str::to_owned),
+        "the RMWs must land on the live keys (a slow setup outran the {TTL_MS} ms TTL: \
+         PTTLs {live:?})"
+    );
+    drop(c);
+    server.kill_now();
+    common::wait_for_port_down(port);
+    while now_ms() <= deadline_ms + 200 {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    let (_server2, port) = spawn(dir, shards, &args);
+    let mut c = Conn::open(port);
+    let back: Vec<(&str, String, String)> = keys
+        .iter()
+        .map(|k| (*k, c.send(&["TYPE", k]), c.send(&["PTTL", k])))
+        .filter(|(_, t, _)| t != "+none\r\n")
+        .collect();
+    let control = bulk(&c.send(&["GET", "p"]));
+    assert!(
+        back.is_empty() && control.as_deref() == Some("vx"),
+        "--shards {shards}, rewrite {rewrite}: every key's TTL passed before the restart, \
+         yet these came back (key, TYPE, PTTL): {back:?}; the persistent control \
+         reads {control:?} (\"vx\" once the log is replayed)"
+    );
+}
+
+#[test]
+fn moon_1277_an_rmw_replayed_after_the_ttl_does_not_resurrect_the_key_s1() {
+    rmw_logged_before_the_ttl_does_not_outlive_it(1, false);
+}
+
+#[test]
+fn moon_1277_an_rmw_replayed_after_the_ttl_does_not_resurrect_the_key_s1_rewrite() {
+    rmw_logged_before_the_ttl_does_not_outlive_it(1, true);
+}
+
+#[test]
+fn moon_1277_an_rmw_replayed_after_the_ttl_does_not_resurrect_the_key_s4() {
+    rmw_logged_before_the_ttl_does_not_outlive_it(4, false);
+}
+
+#[test]
+fn moon_1277_an_rmw_replayed_after_the_ttl_does_not_resurrect_the_key_s4_rewrite() {
+    rmw_logged_before_the_ttl_does_not_outlive_it(4, true);
 }
