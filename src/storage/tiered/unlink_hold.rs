@@ -148,6 +148,17 @@ impl UnlinkHold {
         }
     }
 
+    /// Hold `file_ids` with `stamp`, without a decision (moon#1260 review
+    /// F1): a snapshot is starting, and every file already zero-ref must be
+    /// released by THAT snapshot's success, however late the next orphan
+    /// sweep runs. The first stamp of a file already held stands.
+    pub fn hold_stamped(&mut self, file_ids: impl IntoIterator<Item = u64>, stamp: u64) {
+        for file_id in file_ids {
+            let s = *self.held.entry(file_id).or_insert(stamp);
+            self.max_stamp = self.max_stamp.max(Some(s));
+        }
+    }
+
     /// Take `file_ids` out of the held set — the reclaim's adoption unlinks a
     /// file whose every live slot now has a durable copy below the committed
     /// cut, wherever it is queued. Returns the ones that were held.
