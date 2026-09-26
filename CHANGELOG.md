@@ -38,6 +38,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **BEHAVIOUR CHANGE — SWAPDB is refused while either database has cold-tier data** (moon#1237). This covers spilled keys, and spill files not yet reclaimed, on any shard. Error: `ERR SWAPDB is not allowed while either database has keys or unreclaimed spill files in the disk-offload cold tier; after deleting or reading back its cold keys, run BGREWRITEAOF (appendonly yes) or BGSAVE (appendonly no) and retry`.
+  - If another shard holds a database through the whole bounded check (a few ms), SWAPDB answers `ERR SWAPDB could not check the disk-offload cold tier of every shard, try again` and swaps nothing.
+  - Redis never refuses SWAPDB. The alternative, re-tagging spill files at swap time, cannot be made crash-consistent with the logged SWAPDB record without a format change.
+  - A replica whose own cold tier holds either database answers its master's SWAPDB with a full resync (moon#1278).
+- **BEHAVIOUR CHANGE — with `--appendonly no`, boot loads the snapshot and replays no KV log over it** (moon#1267, redis parity).
+  - It no longer replays a legacy `appendonly.aof` in `--dir`, nor WAL v3 records left by an earlier `--appendonly yes` run. Nothing writes those logs in that mode, so they were older than the snapshot, and replaying them reverted keys (50 of 50 in a reproduction).
+  - This applies with or without `--save`, and in both `--disk-offload` modes. The cold tier and its manifest still recover.
+  - Switching `appendonly yes` → `no`: run `BGSAVE` (or `SHUTDOWN SAVE`) under `yes` first. Without a snapshot, the server boots empty, as redis does, and logs a WARN naming the AOF it did not load (`appendonlydir/` or `appendonly.aof`).
+- **BEHAVIOUR CHANGE — snapshots always go to and load from `--dir`, whatever the save rules** (moon#1267). `BGSAVE`, `SHUTDOWN SAVE` and boot recovery now work with `--appendonly no` and no `--save`. Before, they were refused and an existing snapshot was ignored. As in redis, save rules only schedule automatic saves.
+- **BEHAVIOUR CHANGE — SIGTERM and SIGINT save first when save points are set** (moon#1263), as a plain `SHUTDOWN` does.
+  - They wait for a save that is already running.
+  - With `--appendonly yes` plus save points, this also writes a final snapshot, which takes time proportional to the dataset.
+  - There is no deadline. While the save makes no progress for 20 s, the server logs redis's shutdown error lines and keeps the stop armed; it exits once the save is on disk.
+  - If the save fails, the server logs it and keeps running, as redis 7 does. A second SIGINT exits with status 1, skipping the save but still writing the acknowledged AOF records. `SHUTDOWN ABORT` cancels.
+  - Size the supervisor's stop timeout to the final save plus 60 s for the AOF drain: systemd `TimeoutStopSec` (default 90 s), Docker `--stop-timeout`, Kubernetes `terminationGracePeriodSeconds`. See docs/production-guide.md, "Graceful shutdown and stop timeouts".
+- **BEHAVIOUR CHANGE — `SHUTDOWN` and `FLUSHALL` wait for their save while it makes progress** (moon#1263). They give up only after 20 s without progress: `SHUTDOWN` then answers `-ERR SHUTDOWN failed: background save made no progress for 20 s, check logs` and keeps running, and `FLUSHALL` logs the failed save and still answers `+OK`, as redis does. Before, one fixed 20 s deadline failed any longer save.
+- **BEHAVIOUR CHANGE — `FLUSHALL` with save points saves the empty dataset before it replies** (moon#1264, redis parity). This also covers `ASYNC`, `FLUSHALL` in `MULTI`, and `FLUSHALL` from a script.
+  - It blocks the calling connection and its pipeline for one save: about 17–24 ms on a test host. Other connections are not blocked.
+  - The save points used are the current ones, so `CONFIG SET save` applies here, as it does for `SHUTDOWN` and signals.
+  - A replica applying its master's `FLUSHALL`, and the admin console's flush, do not save.
+- **BEHAVIOUR CHANGE — a graceful exit waits for the AOF writers to write and fsync their queues** (moon#1274). This covers SIGTERM, SIGINT and `SHUTDOWN`. A `BGREWRITEAOF` still in flight at the stop is aborted, and the old generation stays authoritative. The wait is bounded at 60 s; a writer still running after that is named in the log, and the exit status is non-zero.
+- **BEHAVIOUR CHANGE — AOF replay judges key expiry by when the log was last written** (moon#1277): its newest file's mtime, capped at the wall clock. It no longer uses the clock at restart.
+- **BEHAVIOUR CHANGE — an AOF base is loaded with its expired keys** (moon#1236), as redis loads an AOF preamble. Active expiry then reaps them, logging their `DEL`s. Until then they count in `DBSIZE` and in memory.
+  - Measured: 200k expired keys in a base showed `DBSIZE` 199k and 49 MB right after boot. They were reaped in about 95 s and added 5.29 MB of `DEL` records to the AOF.
+  - Under `--maxmemory` with `noeviction`, writes can answer `-OOM` until the reap finishes.
+- **BEHAVIOUR CHANGE — with `--appendonly no`, an unreferenced spill file is removed only after the next successful snapshot that started after it emptied** (moon#1260). It is removed right after that snapshot, and counted in `cold_files_pending_unlink` until then. Without save rules, only a manual `BGSAVE` or `SHUTDOWN SAVE` releases such files, and until then SWAPDB is refused on their databases.
+- **`SHUTDOWN ABORT`** (moon#1264):
+  - It now cancels a `SHUTDOWN`, SIGTERM or SIGINT that is still saving. It answers `+OK`, the shutdown does not happen, and the waiting client gets `-ERR Errors trying to SHUTDOWN. Check logs.`.
+  - With nothing in progress it answers `-ERR No shutdown in progress.`; the trailing period is new.
+  - `ABORT` combined with another modifier is a syntax error. A repeated modifier, such as `NOSAVE NOSAVE`, is accepted.
+
 - **BEHAVIOUR CHANGE — FLUSHDB and SWAPDB during a BGSAVE no longer fail the save** (moon#1228). It completes with the keyspace as it was when the save started, as redis's forked child does, so a workload that flushes more often than a save takes can now save at all.
   - The save holds a flushed database's start-of-save rows until it writes them; INFO `current_cow_size` reports them. Rows written after the save began are trimmed away over the following ticks, at most 512 row operations per tick (a collection costs one more per 64 elements), so the memory held is bounded by that database's size when the save began. What the save lets go of is freed off the shard thread. Release build: a 2M-row database grown by 6M rows and flushed during a save kept PING at p99.9 0.9–1.5 ms and max 9–14 ms over the whole save (main's plain FLUSHDB of the same table: 174–193 ms).
   - FLUSHALL still fails an in-flight save, as redis's does, and so does a replica full resync.
@@ -371,6 +402,34 @@ shared 4-vCPU Linux container against HEAD `935c555` — re-measure on the GCE r
   and reads in chunks on a CDC read pool (a poll at a ~1M-record tail 5.8 s → 0.17 ms).
 
 ### Fixed
+
+- **Data loss on a graceful exit with the default `--appendonly yes`** (moon#1274). SIGTERM (`systemctl stop`), SIGINT or `SHUTDOWN` lost acknowledged writes still queued for the AOF writers: all 300 of 300 at `--shards 1`. Shutdown now stops the shards, then lets every AOF writer write its queue and fsync before exiting, as redis's `prepareForShutdown` does.
+- **Data loss on SIGTERM/SIGINT with save points and `--appendonly no`** (moon#1263). Every write since the last automatic save was lost. The server now saves first; see Changed.
+- **Data loss: a per-shard AOF writer that started late deleted other shards' in-progress rewrite files** (moon#1271). The rewrite then aborted, or it committed a manifest that named deleted files, and those shards' keys were gone after the next restart: 165 of 200 in a forced reproduction. Loading the AOF manifest no longer deletes anything; stale rewrite files are swept at boot only.
+- **Data loss: `MOVE` of a cold-tier key** (moon#1254). A key that was spilled, or whose spill was in flight, was deleted from both databases, and `MOVE` answered `:0`. Reproduced on 69–95 of 200 cold keys. The key is now read back and moved. A `MOVE` or `COPY … DB n` of a cold key whose data cannot be read answers `-IOERR`.
+- **Data resurrection: a cold key overwritten with a TTL came back with its old value after a restart past the TTL** (moon#1236):
+  - after an AOF rewrite: 46–89 of 100 keys;
+  - with `--appendonly no` after a snapshot: 77–95 of 100.
+
+  A snapshot boot now drops the cold copy of every key it holds as expired, and an AOF base keeps its expired keys (see Changed).
+- **Data resurrection: AOF replay after a downtime longer than a key's TTL** (moon#1277). A TTL-preserving write logged while the key was alive (`APPEND`, `INCR`, `HSET`, `SETRANGE`, …) was replayed onto an absent key. The key came back with a wrong value and no TTL: 4 of 4 keys, on both runtimes, at `--shards` 1 and 4.
+- **SWAPDB with cold keys** (moon#1237):
+  - After an AOF rewrite and a restart, cold keys reappeared in their old database, and keys deleted after the swap came back.
+  - A restart without a rewrite moved every key spilled after a SWAPDB into the other database.
+  - A replayed SWAPDB now moves only the cold data that existed at that point in the log.
+- **SWAPDB on a replica with its own cold tier** (moon#1278): after a failover and a restart, its cold keys came back in the old database.
+- **Data loss on tokio `--shards 1` with `--appendonly yes`** (moon#1275). Any SWAPDB followed by kill -9 lost every key: the swap's WAL record made recovery skip `appendonly.aof`.
+- **Data loss with `--appendonly no`** (moon#1260):
+  - A cold key inherited from an AOF run was lost after it was read, the orphan sweep ran and the process was killed: 179 of 179.
+  - Cold keys deleted before a snapshot came back after a kill -9 that followed it (a regression inside this release, caught in review).
+- **A key evicted while a BGSAVE ran was missing from the snapshot** (moon#1257). All of the 9,952 (`--shards 1`) and 13,404 (`--shards 4`) keys evicted during a held save were missing.
+  - Eviction now hands the removed value itself to the save, as the key's pre-save state. It is not copied, and it is freed off the shard thread once written.
+  - With no save running, the cost is one flag check per victim.
+  - During a save, the evicted value's memory is released once the save has written it; `current_cow_size` reports it until then.
+- **`SHUTDOWN ABORT` could answer `+OK` while the server still exited** (moon#1264). The abort and the commit are now decided under one lock.
+- **Tests:**
+  - Six integration tests no longer fail on a slow or stalled host, as seen on hosted Windows runners (moon#1065, moon#1273). They poll for the condition they need instead of relying on fixed sleeps, round counts, or 50–300 ms windows. Cold-tier fillers retry an AOF backpressure refusal.
+  - `scripts/test-consistency.sh` no longer hangs in the moon#1235 race rows: a bare `wait` also waited for the script's own servers.
 
 - **A BGSAVE records each key as it was when the save started, even when that key changes before the save writes it** (moon#1228).
   - Before, a key changed by any of these could be saved in its later state:
