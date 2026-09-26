@@ -25,6 +25,7 @@
 
 mod common;
 
+use std::io::Write;
 use std::time::{Duration, Instant};
 
 use common::{Conn, ServerGuard};
@@ -240,37 +241,54 @@ fn bgsave_status_recovers_after_a_failed_save_shards_4() {
     failed_then_clean_save(4);
 }
 
-/// With no persistence directory (`--appendonly no`, no `--save`) no shard
-/// can write a snapshot. BGSAVE and `SHUTDOWN SAVE` are refused up front with
-/// an error (PR #1233 review) — not "Background saving started" for a save
-/// that then fails (`rdb_last_bgsave_status:err`, and `SHUTDOWN SAVE`
-/// refused with "background save error"), and not a save stuck in progress
-/// forever (moon#1230). Nothing is marked in progress, the last status stays
-/// `ok`, the server stays up, and a later BGSAVE is refused the same way.
+/// With `--appendonly no` and no `--save` the shards used to have no
+/// persistence directory, so BGSAVE and `SHUTDOWN SAVE` were refused up
+/// front (PR #1233 review) rather than started for a save that must fail
+/// (moon#1230). moon#1267: the snapshot directory is now always `--dir`, as
+/// redis writes `dump.rdb` whatever its save rules, so both run and succeed —
+/// nothing stuck in progress, the status `ok`. (The up-front refusal for a
+/// server with no directory at all stays, unit-tested in
+/// `command::persistence`; the shipped server always has one.)
 #[test]
-fn bgsave_without_a_persistence_dir_is_refused_up_front() {
+fn bgsave_without_save_rules_runs_and_succeeds() {
     for shards in [1usize, 4] {
         let dir = common::unique_test_dir(&format!("ws15-1230-nodir-s{shards}"));
         std::fs::create_dir_all(&dir).unwrap();
-        let (_server, port) = spawn(&dir, shards, &[]);
+        let (mut server, port) = spawn(&dir, shards, &[]);
         let mut c = Conn::open(port);
         c.send(&["SET", "k", "v"]);
         for attempt in 0..2 {
             let reply = c.send(&["BGSAVE"]);
             assert!(
-                reply.starts_with("-ERR background save unavailable"),
-                "--shards {shards} attempt {attempt}: BGSAVE must be refused up front: {reply:?}"
+                reply.starts_with("+Background saving started"),
+                "--shards {shards} attempt {attempt}: BGSAVE refused: {reply:?}"
             );
-            assert_eq!(info_field(&mut c, "rdb_bgsave_in_progress"), "0");
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while info_field(&mut c, "rdb_bgsave_in_progress") != "0" {
+                assert!(
+                    Instant::now() < deadline,
+                    "--shards {shards}: stuck in progress"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
             assert_eq!(info_field(&mut c, "rdb_last_bgsave_status"), "ok");
         }
-        let reply = c.send(&["SHUTDOWN", "SAVE"]);
+        let _ = c.sock.write_all(&common::encode(&["SHUTDOWN", "SAVE"]));
+        let mut rest = Vec::new();
+        let _ = std::io::Read::read_to_end(&mut c.sock, &mut rest);
         assert!(
-            reply.starts_with("-ERR background save unavailable"),
-            "--shards {shards}: SHUTDOWN SAVE must be refused with the same error: {reply:?}"
+            rest.is_empty(),
+            "SHUTDOWN SAVE answered {:?}",
+            String::from_utf8_lossy(&rest)
         );
-        assert_eq!(c.send(&["PING"]), "+PONG\r\n", "the server stays up");
-        assert!(c.send(&["GET", "k"]).contains('v'));
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while server.as_mut().try_wait().unwrap().is_none() {
+            assert!(
+                Instant::now() < deadline,
+                "--shards {shards}: SHUTDOWN SAVE never exited"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
