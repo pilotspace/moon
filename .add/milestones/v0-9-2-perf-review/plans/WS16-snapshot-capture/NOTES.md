@@ -781,7 +781,7 @@ The PR head (82e3064e) was merged first (fa9a5dc1). One commit per item:
 | 3 the walk and an abort dropped frozen tables inline | 17da0f6e | see below |
 | 4 `UNTRIMMED_EXCESS` was stale after the walk released a table | 29b3e1ee | see below |
 | 5 tests: assert the bill error; the fixed 1.5 s wait | 4c4e0c80 | see below |
-| 6 `moon-snapdrop` duplicated the lazy-free dropper | (item 6) | refactor + docs, no behaviour change |
+| 6 `moon-snapdrop` duplicated the lazy-free dropper | ed3ad086 | refactor + docs, no behaviour change |
 
 ### Item 1 — the lazy-free charge follows the table into the epoch
 
@@ -963,3 +963,91 @@ over what it drops.
   senders pace it: the lazy-free and trim budgets per tick, and a released table is one
   send.
 - The helper's affinity test (`lazy_free::tests`) passes unchanged.
+
+### Re-measurement of findings 1-3 (release-fast, pinned)
+
+All runs use the reviewer's scripts, with their temp dir moved to this agent's scratchpad.
+This branch at ed3ad086 is `/home/user/wt/bin/ws16-r7-final-rf`; it is compared with
+`REVIEW7-main-rf` and `REVIEW7-head-rf`.
+
+**Finding 1** (`review7_a4_flushdb_latency.py`, 5M-field hash, two runs of each scenario).
+`seq` is the reviewer's case: UNLINK, then a held BGSAVE, then FLUSHDB.
+
+| scenario | this branch | main | head |
+|---|---|---|---|
+| seq: FLUSHDB | 0.13 / 0.23 ms | 0.48 / 0.17 ms | 258.8 / 242.5 ms |
+| seq: worst PING | 1.7 / 3.0 ms | 3.5 / 1.5 ms | 259.2 / 243.0 ms |
+| control (no save): FLUSHDB | 0.17 / 0.12 ms | 0.11 / 0.19 ms | 0.20 / 0.14 ms |
+| armed (UNLINK during the save, pipelined with FLUSHDB) | 610 / 674 ms | 699 / 632 ms | 790 / 857 ms |
+
+- `armed` is the pre-existing deep clone of an UNLINKed value's pre-image; the reviewer is
+  filing it.
+- In `seq`, `current_cow_size` 0.3 s after the FLUSHDB is 440 MB on this branch, against
+  134 B on head. The UNLINKed hash is still allocated while the lazy free drains it (~1.25 s
+  for 5M fields), and the frozen bill counts it until each credit lands. Head freed it
+  inside the FLUSHDB.
+
+**Finding 2** (`review7_trim_value_budget.py`, 600 post-epoch hashes), worst PING gap:
+
+| | 4,000 fields | 4,100 fields |
+|---|---|---|
+| this branch, 8 / 16 runs | 0.8, 2.2, 2.2, 3.5, 3.8, 3.9, 5.1 ms; one 17.8 ms † | 1.3-6.6 ms, median 2.2 ms; one 56.0 ms † |
+| main | 82.7, 82.8, 94.6, 97.6, 134.6 ms; one 851.7 ms † | 74.5, 79.2, 85.0, 89.3, 103.2, 148.0 ms |
+| head (item 2) | 74.0, 75.4, 105.6 ms | 33.5, 35.8, 47.8 ms |
+
+† These came from one batch of alternating runs, in which main also showed 852 ms and
+135-148 ms (above its usual 75-103 ms). Eighteen further runs of this branch, in two later
+batches on a quiet box, stayed at or below 6.6 ms.
+
+**Finding 3** (`review7_frozen_release.py`, 2M rows, held save, then the hold released),
+worst PING gap while the walk finishes:
+
+| | with FLUSHDB | without |
+|---|---|---|
+| this branch | 1.86 / 4.41 / 1.78 ms | 9.45 / 2.38 / 2.20 ms |
+| head | 41.5 / 59.1 / 43.8 ms | 9.68 / 10.86 / 3.21 ms |
+| main | its FLUSHDB fails the save (status err) and frees the rows inside it | 3.17 / 2.10 / 1.28 ms |
+
+A plain FLUSHDB of 2M rows (`review7_flush_plain.py`, no save) takes 36.7 / 39.0 ms on this
+branch and 37.4 / 42.6 ms on main: unchanged.
+
+**The CHANGELOG line** ("a FLUSHDB of a 2M-row database grown by 6M rows kept PING under
+10 ms"), re-measured over the WHOLE save. The review-6 probe covered only the trim, while
+the walk stayed held. The new probe (`scratchpad/r7probe/probe2.py`) adds the release and
+the walk. Case: 2M epoch-start rows, 6M post-epoch, FLUSHDB, 14 s of trim, then release.
+
+| build | FLUSHDB | PING p99.9 | PING max | walk + finalize, and its worst PING |
+|---|---|---|---|---|
+| this branch, run 1 | 0.2 ms | 1.45 ms | 14.1 ms | 4.11 s, 5.4 ms |
+| this branch, run 2 | 0.2 ms | 0.90 ms | 9.3 ms | 4.19 s, 6.9 ms |
+| this branch, run 3 | 0.2 ms | 0.96 ms | 12.0 ms | 4.13 s, 6.0 ms |
+| head | 0.3 ms | 7.16 ms | 90.6 ms | 4.16 s, 85.9 ms |
+| main, plain FLUSHDB of the same table (no save) | 174.1 / 183.1 ms | — | 174.1 / 183.1 ms | — |
+
+So "under 10 ms" overstated it: the max is 9-14 ms, and head was far worse (90.6 ms)
+because of findings 2 and 3.
+
+## Gate run after review 7 (code ed3ad086; the NOTES/SUMMARY commit follows)
+
+- `cargo fmt --check` is clean. audit-unsafe, audit-unwrap, audit-test-tempdirs and
+  audit-encoding-limits PASS.
+- clippy `--all-targets -D warnings` is clean on monoio and on
+  `--no-default-features --features runtime-tokio,jemalloc`.
+- Every cargo run passed `--config 'profile.dev.package.moon.debug=false'`, which keeps
+  moon's units apart from WS19's in the shared target (item 2 explains why).
+- Lib tests:
+  - `cargo test --lib` monoio, full: 6,705 passed, 15 ignored.
+  - tokio, touched modules (`persistence::`, `storage::db`, `shard::persistence_tick`,
+    `shard::mq_exec`, `blocking::stream_wake`, `command::stream`, `command::server_admin`,
+    `storage::eviction`): 1,293 passed, 2 ignored.
+  - `prop_tests` at 200 seeds: bill error 0 over 9,994 checks. That run had 100 seeds with
+    tiny budgets, 4,140 mid-trim observations, 28 rebuilds, 37 rebuild waits and 198 flushes
+    with a lazy-free value pending.
+- Integration, monoio (`MOON_BIN=/home/user/wt/bin/ws16-r7-final-monoio`):
+  - perf_ws16_bgsave_capture 8/8 (with the adopted proof: FLUSHDB 620 µs);
+  - perf_ws16_bgsave_prop 2/2, perf_ws16_mq_billing 10/10;
+  - perf_ws12_bgsave_split 5/5, perf_ws15_bgsave_status 3/3.
+- Integration, tokio (`MOON_BIN=/home/user/wt/bin/ws16-r7-final-tokio`):
+  - perf_ws16_bgsave_capture 8/8, perf_ws16_bgsave_prop 2/2;
+  - perf_ws16_mq_billing 6/6 + 4 ignored (they need a replica);
+  - perf_ws12_bgsave_split 4/4 + 1 ignored, perf_ws15_bgsave_status 3/3.
