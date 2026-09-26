@@ -514,3 +514,62 @@ and pinned with `MOON_BIN` (`ws21fix-debug`, `ws21fix-debug-tokio`; `ws21fix-rel
   - monoio: `perf_ws19_save_rules` 14, `perf_ws12_bgsave_split` 5, `perf_ws15_bgsave_status` 3,
     `sigterm_shutdown` 7, `aof_auto_rewrite` / `aof_toplevel_multishard_refusal` `--ignored` 5+2;
   - both runtimes: `shutdown_integration --ignored` 4.
+
+## Round 3 (REVIEW-FINAL-P5A) — branch `perf/ws21-round3` from `4fd00213`
+
+### A1: a rewrite at shutdown
+- **Mechanism, confirmed.** The fold helper pushes `AofFold { reply_tx }` into shard N's SPSC ring and polls `reply_rx`. After the shards stop, the ring outlives them because the pool holds the producer. `reply_tx` sits in it undropped, so `try_recv` returns `Empty` forever and the other writers wait in `await_outcome`. Before, `stop_writers` gave up at 60 s and main exited 0.
+- **Fix.** `aof/rewrite/fold_reply.rs::request_fold_snapshot` is now the one fold request used by `do_rewrite_per_shard`, `do_rewrite_sharded` and `rewrite_aof_sharded_sync`.
+  - A stopped shard drops its `HeapCons`, which releases the ring's read hold (ringbuf 0.5, `Frozen::drop` → `hold_read(false)`), so `prod.read_is_held()` turns false.
+  - The push refuses a ring nobody reads.
+  - The wait ends once the reader is gone, after one more `try_recv` for a reply sent just before the exit.
+  - The fold then errors. `ShardDoneGuard` marks the rewrite failed, the terminal writer publishes `old_seq`, and the parked writers roll back to the old incr, where `finish_framed` drains their channels and spill buffers.
+  - A `Shutdown` swallowed by those drains is re-sent every 500 ms.
+- **Why not a global "shards stopped" flag.** The read hold is exact per shard. It also covers a fold pushed after the stop, and the embedded server and in-process tests share nothing global.
+- **`stop_writers`.** It takes its bound, cancels the writers' token when the bound runs out, and grants a 2 s grace. It returns `Err(names)` for the writers still running, and main turns that into a non-zero exit.
+- **Measured red (build of 4fd00213):** 60.01 s for BGREWRITEAOF + immediate SIGTERM (s1, s4, tokio s4); late writer 59.5 s with 227/300 lost and exit 0. **Green:** under 1 s, 0 lost.
+
+### A2: the second SIGINT
+- `signal::insist` sets `INSISTED` and cancels the server. The normal exit then runs: shards stop and `stop_writers` drains. `hurry = signal::insisted` cuts the bound to `HURRY_BOUND` (2 s) plus the grace, and main exits 1.
+- The token cancel also releases a writer held by `MOON_TEST_AOF_WRITER_HOLD`; its hold loop checks the token. This is how proof 2c drains all 300 records within about 2 s.
+- A SIGINT while a stop is already draining also insists.
+- **Red:** 84/300 lost on monoio, 300/300 on tokio. **Green:** 0 lost, status 1.
+
+### A3: progress after the walk
+- `snapshot_stream::run_helper` reports every chunk it writes. `publish` reports the footer, the fsync, the rename and the directory fsync.
+- The test counter is thread-local (`take_local_save_progress_for_test`), because the global counter is shared with parallel tests.
+- **Residual:** one fsync longer than 20 s is still a stall to SHUTDOWN / FLUSHALL. redis bounds its final fsync with `rdb-save-incremental-fsync` (4 MB); that is the follow-up if it ever matters.
+
+### A4: finalize error
+- `finalize_snapshot_error` calls `abort()` before dropping the state. `abort` is idempotent: it logs once and its overflow drain is empty the second time.
+- The test counts `Discard::Value` sent to `moon-snapdrop` (a new test counter). The first red probe was invalid because rustfmt had re-wrapped the line, so the removal missed. The redone probe gave 0 → 1.
+
+### A5 and A6
+- `KvSources::note_unreplayed_logs` WARNs once, from shard 0, for `appendonly.aof` and `appendonlydir/moon.aof.manifest` under `--appendonly no`, and names the remedy.
+- Docs: `docs/configuration.md` (Persistence), and in `docs/production-guide.md` the sections "Switching …" and "Graceful shutdown and stop timeouts" (systemd, Docker and Kubernetes timeouts: the dataset's save time plus 60 s). `packaging/moon.service` has a commented `TimeoutStopSec`.
+
+### A7
+- `broadcast_shutdown` first sends `try_send` to every writer, then `send_deadline` only to the full ones. Red: writer 1 had no `Shutdown` after 300 ms behind a full writer 0. Green: immediate.
+
+### Files over the cap
+None grew:
+- rewrite.rs 2026 → 1907;
+- pool.rs 3195 → 3195;
+- main.rs 2608 → 2608;
+- persistence_tick.rs 3532 → 3532;
+- recovery.rs 2499 → 2499.
+
+### Round-3 gates (at `767ae796`)
+- fmt and the audits (unsafe, unwrap, test-tempdirs plus self-test, encoding-limits plus self-test): clean.
+- clippy `--all-targets -D warnings` on monoio and tokio: clean. The first clippy run caught a needless borrow in rewrite.rs, fixed before the commit. The tokio `check --all-targets` is clean.
+- Lib tests (`command::persistence`, `persistence::{aof, snapshot, snapshot_cow, snapshot_stream, recovery}`, `shard::{persistence_tick, tests}`, `storage::eviction`): monoio 455/0, tokio 458/0.
+- Green on both runtimes (debug builds of `767ae796`):
+  - `perf_ws21_aof_drain` 11;
+  - `perf_ws21_signal_save` 7;
+  - `perf_ws21_shutdown_abort` 3 (+1 ignored);
+  - `perf_ws21_flushall_save` 10;
+  - `perf_ws21_stale_log_boot` 6;
+  - `perf_ws21_aof_writer_start` 1;
+  - reviewer proofs `rvf_p5a_rewrite_at_shutdown` 1 and `rvf_p5a_stuck_final_save` 3;
+  - `rvf_p5a_embedded_stop` 1 (tokio).
+- Also green on monoio: `aof_auto_rewrite` 5, `aof_toplevel_multishard_refusal` 2 and `crash_matrix_per_shard_bgrewriteaof` 2 (all `--ignored`), and `sigterm_shutdown` 7 (both runtimes).
