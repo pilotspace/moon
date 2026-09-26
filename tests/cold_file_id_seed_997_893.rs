@@ -48,6 +48,12 @@
 //! it is covered by the injected-error unit tests in
 //! `src/storage/tiered/file_id_seed.rs`.
 //!
+//! The fillers wait for what they need — a spill registered in the
+//! manifest — up to [`slow_host::CONDITION_DEADLINE`], not for a round count,
+//! and re-send a write moon refused for AOF backpressure (moon#1065): a
+//! Windows runner stall failed `torn_manifest_create_does_not_block_startup_1_shard`
+//! 2 tries of 3 on the refusal.
+//!
 //! Run with:
 //!   cargo test --release --test cold_file_id_seed_997_893
 //!   cargo test --release --no-default-features --features runtime-tokio,jemalloc \
@@ -68,6 +74,7 @@ use moon::persistence::manifest::{FileEntry, FileStatus, ShardManifest, StorageT
 use moon::persistence::page::PageType;
 use moon::storage::tiered::kv_spill::{SpillEntry, build_kv_spill_batch, write_kv_spill_batch};
 
+use common::slow_host::{self, WriteStats};
 use common::{Conn, ServerGuard, find_moon_binary, wait_for_port_down};
 
 /// Small enough that filler crosses it quickly, large enough that the reads
@@ -75,7 +82,9 @@ use common::{Conn, ServerGuard, find_moon_binary, wait_for_port_down};
 const MAXMEMORY_BYTES: usize = 8 * 1024 * 1024;
 const FILLER_VALUE_LEN: usize = 1024;
 const FILLER_PER_ROUND: usize = 100;
-const MAX_FILLER_ROUNDS: usize = 1000;
+/// Filler rounds at full speed; past them more filler cannot help, the spill
+/// has to land, and [`fill_until`] continues at a trickle (moon#1065).
+const FULL_SPEED_ROUNDS: usize = 1000;
 const CORPUS_VALUE_LEN: usize = 300;
 
 // ===========================================================================
@@ -310,20 +319,54 @@ fn get(c: &mut Conn, key: &str) -> Option<String> {
     Some(body.trim_end_matches("\r\n").to_string())
 }
 
-fn write_filler(c: &mut Conn, round: usize) {
+/// One pipeline of filler. `-OOM` is a legitimate answer under pressure;
+/// an AOF backpressure refusal is re-sent after a backoff (moon#1065). Both
+/// are counted in `stats`; any other error is a hard failure.
+fn write_filler(c: &mut Conn, round: usize, dir: &Path, stats: &mut WriteStats) {
     let val = "f".repeat(FILLER_VALUE_LEN);
-    let keys: Vec<String> = (0..FILLER_PER_ROUND)
-        .map(|i| format!("filler:{round:05}:{i:03}"))
+    let cmds: Vec<Vec<String>> = (0..FILLER_PER_ROUND)
+        .map(|i| {
+            vec![
+                "SET".to_string(),
+                format!("filler:{round:05}:{i:03}"),
+                val.clone(),
+            ]
+        })
         .collect();
-    let cmds: Vec<Vec<&str>> = keys.iter().map(|k| vec!["SET", k.as_str(), &val]).collect();
-    let refs: Vec<&[&str]> = cmds.iter().map(|c| c.as_slice()).collect();
-    let replies = c.pipeline(&refs);
-    for line in replies.split("\r\n").filter(|l| l.starts_with('-')) {
+    let deadline = Instant::now() + slow_host::CONDITION_DEADLINE;
+    slow_host::write_all(c, &cmds, FILLER_PER_ROUND, stats, deadline, dir);
+}
+
+/// Write filler rounds until `done()` holds, up to
+/// [`slow_host::CONDITION_DEADLINE`]; on timeout fail with `what`, the
+/// filler's counts and the server's INFO and log. Every tenth round pauses
+/// 300 ms for spill completions to land; past [`FULL_SPEED_ROUNDS`], or after
+/// a round the server could absorb none of, every round does (a stalled
+/// spill writer is not helped by a flood).
+fn fill_until(
+    c: &mut Conn,
+    dir: &Path,
+    what: &str,
+    stats: &mut WriteStats,
+    mut done: impl FnMut() -> bool,
+) {
+    let start = Instant::now();
+    let mut round = 0;
+    while !done() {
         assert!(
-            line.contains("OOM") || line.contains("backpressure"),
-            "filler SET answered an unexpected error: {line:?}"
+            start.elapsed() < slow_host::CONDITION_DEADLINE,
+            "{what} within {:?} ({round} filler rounds, {stats}){}",
+            start.elapsed(),
+            slow_host::diagnostics(slow_host::peer_port(c), dir)
         );
+        let applied_before = stats.accepted;
+        write_filler(c, round, dir, stats);
+        round += 1;
+        if round % 10 == 0 || round >= FULL_SPEED_ROUNDS || stats.accepted == applied_before {
+            std::thread::sleep(Duration::from_millis(300));
+        }
     }
+    eprintln!("filler: {round} rounds in {:?} ({stats})", start.elapsed());
 }
 
 /// Every Active manifest entry of `shard`, as `(file_id, file_type)`.
@@ -429,25 +472,20 @@ fn vector_segment_id_reuse(mode: Mode) {
 
     // Drive spills until EVERY shard has written at least one spill file of
     // its own (an Active KvLeaf the corpus did not create).
-    let deadline = Instant::now() + Duration::from_secs(120);
-    let mut round = 0;
-    loop {
-        write_filler(&mut c, round);
-        round += 1;
-        settle_if(round % 10 == 0);
-        let all_spilled = (0..shards).all(|s| {
-            active_entries(&dir, s)
-                .iter()
-                .any(|&(id, t)| t == PageType::KvLeaf as u8 && !CORPUS_HEAP_IDS.contains(&id))
-        });
-        if all_spilled {
-            break;
-        }
-        assert!(
-            round < MAX_FILLER_ROUNDS && Instant::now() < deadline,
-            "not every shard spilled within the filler budget — eviction is not tiering keys"
-        );
-    }
+    let mut stats = WriteStats::default();
+    fill_until(
+        &mut c,
+        &dir,
+        "not every shard spilled — eviction is not tiering keys",
+        &mut stats,
+        || {
+            (0..shards).all(|s| {
+                active_entries(&dir, s)
+                    .iter()
+                    .any(|&(id, t)| t == PageType::KvLeaf as u8 && !CORPUS_HEAP_IDS.contains(&id))
+            })
+        },
+    );
     settle();
 
     // Rewrite the AOF so the cold plane is the ONLY copy of every spilled
@@ -560,12 +598,6 @@ fn vector_segment_id_reuse(mode: Mode) {
         tombstoned_by_recovery
     );
     drop(server);
-}
-
-fn settle_if(yes: bool) {
-    if yes {
-        std::thread::sleep(Duration::from_millis(300));
-    }
 }
 
 #[test]
@@ -724,20 +756,22 @@ fn torn_manifest_create(shards: usize) {
 
     // The manifest works again: spills register in it.
     let mut c = Conn::open(server.port);
-    let deadline = Instant::now() + Duration::from_secs(120);
-    let mut round = 0;
-    while !(0..shards).all(|s| {
-        active_entries(&dir, s)
-            .iter()
-            .any(|&(_, t)| t == PageType::KvLeaf as u8)
-    }) {
-        write_filler(&mut c, round);
-        round += 1;
-        assert!(
-            round < MAX_FILLER_ROUNDS && Instant::now() < deadline,
-            "no shard registered a spill file in its re-created manifest"
-        );
-    }
+    let mut stats = WriteStats::default();
+    fill_until(
+        &mut c,
+        &dir,
+        "no shard registered a spill file in its re-created manifest",
+        &mut stats,
+        || {
+            (0..shards).all(|s| {
+                active_entries(&dir, s)
+                    .iter()
+                    .any(|&(_, t)| t == PageType::KvLeaf as u8)
+            })
+        },
+    );
+    // Not load-bearing: `cold` below is read from the manifest after it, so
+    // it only lets more completions land and puts more keys under test.
     settle();
     let cold = durable_cold_keys(&dir, shards);
     let server = server.crash_and_restart();
@@ -751,6 +785,8 @@ fn torn_manifest_create(shards: usize) {
         absent.iter().take(3).collect::<Vec<_>>()
     );
     drop(server);
+    // Passed: the data dir is evidence only on failure.
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -848,8 +884,9 @@ fn unreadable_cold_dir(shards: usize) {
     let mut c = Conn::open(port);
     let deadline = Instant::now() + Duration::from_secs(60);
     let mut round = 0;
+    let mut stats = WriteStats::default();
     let clobbered = loop {
-        write_filler(&mut c, round);
+        write_filler(&mut c, round, &dir, &mut stats);
         round += 1;
         let changed: Vec<&PathBuf> = originals
             .iter()
@@ -860,7 +897,7 @@ fn unreadable_cold_dir(shards: usize) {
             break format!("{changed:?}");
         }
         let spilled_past_corpus = data_dirs.iter().all(|d| d.join("heap-000004.mpf").exists());
-        if spilled_past_corpus || round >= MAX_FILLER_ROUNDS || Instant::now() >= deadline {
+        if spilled_past_corpus || round >= FULL_SPEED_ROUNDS || Instant::now() >= deadline {
             break String::new();
         }
     };
