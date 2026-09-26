@@ -1381,18 +1381,25 @@ fn probes_readable(port: u16, val: &str) -> usize {
 /// GET every probe (read back into RAM, no log exists), let the orphan
 /// sweep run (`sweep_secs`), kill -9. Snapshot semantics: every probe was
 /// unchanged since the save, so every probe must come back.
-fn run_no_aof_promote_scenario(suffix: &str, sweep_secs: u64) {
+fn run_no_aof_promote_scenario(suffix: &str, sweep_secs: u64, save_points: bool) {
     let port = common::reserve_port();
     let dir = unique_dir(suffix);
     std::fs::create_dir_all(&dir).expect("create test dir");
     // Phase 1 (`--appendonly yes`), clean stop, its AOF removed.
     inherit_cold_probes(port, &dir);
-    // Phase 2 (`--appendonly no` + save points, so BGSAVE has a directory).
-    let save = ["--save", "3600 100000000"];
-    let mut server = start_moon_with(port, &dir, sweep_secs, "no", &save);
+    // Phase 2 (`--appendonly no`, with save points and a BGSAVE, or with no
+    // `--save` at all and no save: REVIEW-WS20 F2).
+    let save: &[&str] = if save_points {
+        &["--save", "3600 100000000"]
+    } else {
+        &[]
+    };
+    let mut server = start_moon_with(port, &dir, sweep_secs, "no", save);
     wait_for_port(port);
-    redis_set(port, "hot:control", "H");
-    bgsave_and_wait(port);
+    if save_points {
+        redis_set(port, "hot:control", "H");
+        bgsave_and_wait(port);
+    }
     let at_save = count_heap_files(&dir);
     assert!(
         del_fillers_counting(port) > 0,
@@ -1408,8 +1415,8 @@ fn run_no_aof_promote_scenario(suffix: &str, sweep_secs: u64) {
     let before_kill = count_heap_files(&dir);
     server.kill_now();
     wait_for_port_down(port);
-    let mut server2 = start_moon_alive_with(port, &dir, sweep_secs, "no", &save);
-    let hot_ok = redis_get(port, "hot:control").as_deref() == Some("H");
+    let mut server2 = start_moon_alive_with(port, &dir, sweep_secs, "no", save);
+    let hot_ok = !save_points || redis_get(port, "hot:control").as_deref() == Some("H");
     let back = probes_readable(port, &val);
     server2.kill_now();
     let wrong: Vec<String> = if back < readable || !hot_ok {
@@ -1422,7 +1429,7 @@ fn run_no_aof_promote_scenario(suffix: &str, sweep_secs: u64) {
     assert_eq!(
         readable - back.min(readable),
         0,
-        "probes unchanged since the last BGSAVE lost after GET, orphan sweeps and kill -9 \
+        "probes unchanged since the last save (or boot) lost after GET, orphan sweeps and kill -9 \
          under --appendonly no ({readable} readable before, {back} after; heap files {at_save} \
          at the save, {before_kill} before the kill)"
     );
@@ -1432,14 +1439,22 @@ fn run_no_aof_promote_scenario(suffix: &str, sweep_secs: u64) {
 #[test]
 #[ignore]
 fn no_aof_promoted_cold_keys_survive_the_orphan_sweep_and_crash() {
-    run_no_aof_promote_scenario("noaof-sweep", 1);
+    run_no_aof_promote_scenario("noaof-sweep", 1, true);
+}
+
+/// REVIEW-WS20 F2: the same with `--appendonly no` and NO save points (the
+/// hold applies there too since moon#1267; main unlinked the files).
+#[test]
+#[ignore]
+fn no_aof_no_save_promoted_cold_keys_survive_the_orphan_sweep_and_crash() {
+    run_no_aof_promote_scenario("noaof-nosave-sweep", 1, false);
 }
 
 /// moon#1260 control: no sweep in the window, nothing is lost.
 #[test]
 #[ignore]
 fn no_aof_promoted_cold_keys_survive_a_crash_without_a_sweep() {
-    run_no_aof_promote_scenario("noaof-nosweep", 3600);
+    run_no_aof_promote_scenario("noaof-nosweep", 3600, true);
 }
 
 /// Phase 1 of the no-AOF cases: spill the probes under `--appendonly yes`

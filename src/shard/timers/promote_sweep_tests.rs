@@ -371,25 +371,7 @@ fn a_file_spilled_after_the_latest_cut_is_unlinked_at_once() {
     .expect("test thread");
 }
 
-/// Without an AOF writer AND without a place to write snapshots there is
-/// nothing to protect and nothing could ever release a hold: files go as soon
-/// as their last key does, as before.
-#[test]
-fn without_an_aof_or_a_snapshot_directory_nothing_is_held() {
-    std::thread::spawn(|| {
-        let _no_dir = crate::storage::tiered::snapshot_hold::force_no_snapshot_dir();
-        let mut live = Live::start();
-        for (k, _) in keys("k", 10) {
-            assert_eq!(run("DEL", &[&k]), Frame::Integer(1));
-        }
-        live.sweep(false);
-        assert!(!heap(&live.dir, OLD).exists() && !listed(&live.manifest, OLD));
-    })
-    .join()
-    .expect("test thread");
-}
-
-/// moon#1260: without an AOF (but with snapshots), a key cold in `OLD` and
+/// moon#1260: without an AOF (with or without save points), a key cold in `OLD` and
 /// read back into RAM has no durable copy but `OLD` until a snapshot captures
 /// it hot. The sweep used to unlink `OLD` once its last key left, and a kill
 /// -9 then lost `k08`/`k09`, unchanged since the last save. Held now, and

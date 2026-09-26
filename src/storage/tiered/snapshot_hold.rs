@@ -39,10 +39,15 @@
 //!
 //! State is per shard thread: the snapshot lifecycle hooks
 //! (`shard::persistence_tick`) and the orphan sweep (`shard::timers`) both run
-//! on the shard's own thread, on both runtimes. Only a process with a place
-//! to write snapshots gets the hold (`SNAPSHOT_DIR_ABSENT` false): with no
-//! snapshot possible nothing could ever release a held file, and a restart
-//! does not load hot data anyway.
+//! on the shard's own thread, on both runtimes.
+//!
+//! Every process without an AOF gets the hold, with or without save points
+//! (REVIEW-WS20 F2): since moon#1267 a snapshot can always be written
+//! (`BGSAVE` / `SHUTDOWN SAVE` go to `--dir` whatever the save rules say),
+//! and the cold tier is rebuilt at every boot, so a promoted key's file is
+//! its durable copy in every no-AOF configuration. Without save points only
+//! a manual `BGSAVE` or `SHUTDOWN SAVE` releases held files (and a database
+//! with held files refuses SWAPDB until then, moon#1237).
 
 use std::cell::Cell;
 
@@ -141,26 +146,21 @@ pub fn note_snapshot_finished(ok: bool) {
     });
 }
 
-/// The hold view for a no-AOF process, or `None` when no snapshot can be
-/// written (no persistence directory): then files go as before.
-pub fn snapshot_fold_view(next_file_id: u64) -> Option<FoldView> {
-    if crate::command::persistence::SNAPSHOT_DIR_ABSENT.load(std::sync::atomic::Ordering::Relaxed)
-        || no_snapshot_dir_forced()
-    {
-        return None;
-    }
+/// The hold view for a no-AOF process (the orphan sweep's, see the module
+/// doc).
+#[must_use]
+pub fn snapshot_fold_view(next_file_id: u64) -> FoldView {
     let s = COUNTERS.with(Cell::get);
-    Some(FoldView {
+    FoldView {
         epoch: s.events,
         committed_floor: s.committed,
         next_file_id,
         hold_all: s.in_progress,
-    })
+    }
 }
 
 #[cfg(test)]
 thread_local! {
-    static NO_SNAPSHOT_DIR: Cell<bool> = const { Cell::new(false) };
     /// Test-only [`applies`]: off unless a test opts in (the process-wide
     /// AOF flag depends on which other tests ran).
     static FORCE_APPLIES: Cell<bool> = const { Cell::new(false) };
@@ -173,36 +173,6 @@ pub(crate) fn force_applies(on: bool) {
 }
 
 #[cfg(test)]
-fn no_snapshot_dir_forced() -> bool {
-    NO_SNAPSHOT_DIR.with(Cell::get)
-}
-
-#[cfg(not(test))]
-#[inline]
-fn no_snapshot_dir_forced() -> bool {
-    false
-}
-
-/// Test-only: behave, on this thread, as a process started with no
-/// persistence directory (`SNAPSHOT_DIR_ABSENT` is process-global, and a
-/// parallel test's BGSAVE must not see it flip) until the guard drops.
-#[cfg(test)]
-pub(crate) fn force_no_snapshot_dir() -> NoSnapshotDirGuard {
-    NO_SNAPSHOT_DIR.with(|c| c.set(true));
-    NoSnapshotDirGuard
-}
-
-#[cfg(test)]
-pub(crate) struct NoSnapshotDirGuard;
-
-#[cfg(test)]
-impl Drop for NoSnapshotDirGuard {
-    fn drop(&mut self) {
-        NO_SNAPSHOT_DIR.with(|c| c.set(false));
-    }
-}
-
-#[cfg(test)]
 mod tests {
     use super::*;
     use crate::storage::tiered::unlink_hold::UnlinkHold;
@@ -212,18 +182,18 @@ mod tests {
     fn a_zero_ref_file_waits_for_a_snapshot_that_starts_after_it() {
         let mut h = UnlinkHold::default();
         // Boot: file 5 existed (inherited), the counter is at 10.
-        h.observe(snapshot_fold_view(10).expect("view"));
+        h.observe(snapshot_fold_view(10));
         assert!(h.admit(vec![5]).unlink.is_empty(), "held: no snapshot yet");
 
         // A snapshot that started BEFORE the next decision only... starts.
         note_snapshot_started();
-        h.observe(snapshot_fold_view(12).expect("view"));
+        h.observe(snapshot_fold_view(12));
         assert!(
             h.admit(vec![11]).unlink.is_empty(),
             "a file minted before the snapshot's start is held too"
         );
         note_snapshot_finished(true);
-        h.observe(snapshot_fold_view(12).expect("view"));
+        h.observe(snapshot_fold_view(12));
         assert_eq!(
             h.admit(vec![]).unlink,
             vec![5],
@@ -234,11 +204,11 @@ mod tests {
         // A failed snapshot releases nothing; a later good one does.
         note_snapshot_started();
         note_snapshot_finished(false);
-        h.observe(snapshot_fold_view(12).expect("view"));
+        h.observe(snapshot_fold_view(12));
         assert!(h.admit(vec![]).unlink.is_empty());
         note_snapshot_started();
         note_snapshot_finished(true);
-        h.observe(snapshot_fold_view(12).expect("view"));
+        h.observe(snapshot_fold_view(12));
         assert_eq!(h.admit(vec![]).unlink, vec![11]);
         assert!(h.is_empty());
     }
@@ -262,7 +232,7 @@ mod tests {
         };
         ci.insert(bytes::Bytes::from_static(b"k"), loc);
         // Boot: the first sweep observes a view and has nothing to decide.
-        ci.hold.observe(snapshot_fold_view(10).expect("view"));
+        ci.hold.observe(snapshot_fold_view(10));
         assert!(ci.hold.admit(Vec::new()).unlink.is_empty());
         // FLUSHALL / DEL empties file 5: queued zero-ref.
         assert!(ci.remove(b"k"));
@@ -272,7 +242,7 @@ mod tests {
         note_snapshot_started();
         note_snapshot_finished(true);
         // The next sweep (the event loop runs one right after the save).
-        ci.hold.observe(snapshot_fold_view(10).expect("view"));
+        ci.hold.observe(snapshot_fold_view(10));
         let queued = std::mem::take(&mut ci.pending_unlink);
         let first = ci.hold.admit(queued).unlink;
         assert!(
@@ -287,27 +257,27 @@ mod tests {
     #[test]
     fn a_file_that_goes_zero_ref_during_a_snapshot_is_held_past_it() {
         let mut h = UnlinkHold::default();
-        h.observe(snapshot_fold_view(10).expect("view"));
+        h.observe(snapshot_fold_view(10));
         assert_eq!(
             h.admit(vec![10]).unlink,
             vec![10],
             "minted after the boot view"
         );
         note_snapshot_started();
-        h.observe(snapshot_fold_view(20).expect("view"));
+        h.observe(snapshot_fold_view(20));
         assert!(
             h.admit(vec![15]).unlink.is_empty(),
             "held while the snapshot runs"
         );
         note_snapshot_finished(true);
-        h.observe(snapshot_fold_view(20).expect("view"));
+        h.observe(snapshot_fold_view(20));
         assert!(
             h.admit(vec![]).unlink.is_empty(),
             "that snapshot started before it"
         );
         note_snapshot_started();
         note_snapshot_finished(true);
-        h.observe(snapshot_fold_view(20).expect("view"));
+        h.observe(snapshot_fold_view(20));
         assert_eq!(h.admit(vec![]).unlink, vec![15]);
     }
 }
