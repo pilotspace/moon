@@ -60,10 +60,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - A replica applying its master's `FLUSHALL`, and the admin console's flush, do not save.
 - **BEHAVIOUR CHANGE — a graceful exit waits for the AOF writers to write and fsync their queues** (moon#1274). This covers SIGTERM, SIGINT and `SHUTDOWN`. A `BGREWRITEAOF` still in flight at the stop is aborted, and the old generation stays authoritative. The wait is bounded at 60 s; a writer still running after that is named in the log, and the exit status is non-zero.
 - **BEHAVIOUR CHANGE — AOF replay judges key expiry by when the log was last written** (moon#1277): its newest file's mtime, capped at the wall clock. It no longer uses the clock at restart.
+  - If the log's mtime is earlier than its last write (the clock stepped back during a run, or a network filesystem whose server clock runs behind), replay can keep keys that had expired, and a key written again after a lazy expiry can come back with a wrong value. A logged time record is tracked in moon#1283.
 - **BEHAVIOUR CHANGE — an AOF base is loaded with its expired keys** (moon#1236), as redis loads an AOF preamble. Active expiry then reaps them, logging their `DEL`s. Until then they count in `DBSIZE` and in memory.
   - Measured: 200k expired keys in a base showed `DBSIZE` 199k and 49 MB right after boot. They were reaped in about 95 s and added 5.29 MB of `DEL` records to the AOF.
   - Under `--maxmemory` with `noeviction`, writes can answer `-OOM` until the reap finishes.
-- **BEHAVIOUR CHANGE — with `--appendonly no`, an unreferenced spill file is removed only after the next successful snapshot that started after it emptied** (moon#1260). It is removed right after that snapshot, and counted in `cold_files_pending_unlink` until then. Without save rules, only a manual `BGSAVE` or `SHUTDOWN SAVE` releases such files, and until then SWAPDB is refused on their databases.
+- **BEHAVIOUR CHANGE — with `--appendonly no`, an unreferenced spill file is removed only after the next successful snapshot that started after it emptied** (moon#1260). It is removed right after that snapshot, and counted in `cold_files_pending_unlink` until then.
+  - Without save rules, only a manual `BGSAVE` or `SHUTDOWN SAVE` releases such files, and until then SWAPDB is refused on their databases.
+  - As with any snapshot-only setup, a restart returns to the last snapshot. So with `--appendonly no` and no save rules, a `DEL` or `FLUSHALL` of cold keys inherited from an earlier run is undone by any restart, a clean `SHUTDOWN` included, until a `BGSAVE` succeeds.
 - **`SHUTDOWN ABORT`** (moon#1264):
   - It now cancels a `SHUTDOWN`, SIGTERM or SIGINT that is still saving. It answers `+OK`, the shutdown does not happen, and the waiting client gets `-ERR Errors trying to SHUTDOWN. Check logs.`.
   - With nothing in progress it answers `-ERR No shutdown in progress.`; the trailing period is new.
@@ -411,7 +414,7 @@ shared 4-vCPU Linux container against HEAD `935c555` — re-measure on the GCE r
   - after an AOF rewrite: 46–89 of 100 keys;
   - with `--appendonly no` after a snapshot: 77–95 of 100.
 
-  A snapshot boot now drops the cold copy of every key it holds as expired, and an AOF base keeps its expired keys (see Changed).
+  A snapshot boot now drops the cold copy of every key it holds as expired, and an AOF base keeps its expired keys (see Changed). With `--appendonly no`, the drop is not yet durable: after a later snapshot and a crash, the old value can return. That is the no-AOF cold-deletion gap tracked in moon#1281.
 - **Data resurrection: AOF replay after a downtime longer than a key's TTL** (moon#1277). A TTL-preserving write logged while the key was alive (`APPEND`, `INCR`, `HSET`, `SETRANGE`, …) was replayed onto an absent key. The key came back with a wrong value and no TTL: 4 of 4 keys, on both runtimes, at `--shards` 1 and 4.
 - **SWAPDB with cold keys** (moon#1237):
   - After an AOF rewrite and a restart, cold keys reappeared in their old database, and keys deleted after the swap came back.
