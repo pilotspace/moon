@@ -87,32 +87,6 @@ jobs:
         run: |
           cargo test --release --test crash_matrix_cross_plane -- --ignored --test-threads=1 \
             2>&1 | tee crash-matrix-nightly.log
-      # moon#1215 (P0): a cold-tier key DELeted before an AOF rewrite must not
-      # come back after a restart. The recovery-level half runs per-PR as lib
-      # tests; this real-server half (kill -9 and clean SHUTDOWN, DEL / FLUSHDB
-      # / overwrite / TTL cases) is #[ignore]d like the other crash suites, so
-      # the nightly is its gate. The binary is monoio (default features), so
-      # `--shards 4` runs the per-shard fold and `--shards 1` the TopLevel
-      # manifest fold. The tokio flat-file fold (`--shards 1` on tokio) has
-      # no real-server leg here; only its lib tests cover it.
-      # moon#1253: the same, for a key whose spill was still IN FLIGHT when it
-      # was deleted, flushed or overwritten (no settle before the mutation).
-      # moon#1260 / moon#1236: the `--appendonly no` cases (a promoted,
-      # flushed or TTL-overwritten inherited cold key and a kill -9).
-      - name: Cold-tier DEL survives rewrite + restart (moon#1215), --shards 4 and 1
-        if: success() || failure()
-        run: |
-          cargo build --release --bin moon --test crash_recovery_cold_del_rewrite \
-            --test crash_recovery_cold_del_inflight_1253 --test crash_recovery_cold_no_aof
-          export MOON_BIN="$CARGO_TARGET_DIR/release/moon"
-          for s in 4 1; do
-            for t in crash_recovery_cold_del_rewrite crash_recovery_cold_del_inflight_1253 \
-              crash_recovery_cold_no_aof; do
-              MOON_TEST_COLD_DEL_SHARDS=$s cargo test --release --test "$t" \
-                -- --ignored --test-threads=1 2>&1 | tee -a crash-matrix-nightly.log
-              test "${PIPESTATUS[0]}" -eq 0 || exit 1
-            done
-          done
       - name: Collect spawned-server logs on failure
         if: failure()
         run: |
@@ -126,6 +100,69 @@ jobs:
         with:
           name: crash-matrix-nightly-failure-${{ github.run_id }}
           path: /tmp/crash-matrix-artifacts
+          retention-days: 14
+
+  # ── Cold-tier crash suites (nightly) ─────────────────────────────────
+  # moon#1215 (P0): a cold-tier key DELeted before an AOF rewrite must not
+  # come back after a restart. The recovery-level half runs per-PR as lib
+  # tests; this real-server half (kill -9 and clean SHUTDOWN, DEL / FLUSHDB
+  # / overwrite / TTL cases) is #[ignore]d like the other crash suites, so
+  # the nightly is its gate. The binary is monoio (default features), so
+  # `--shards 4` runs the per-shard fold and `--shards 1` the TopLevel
+  # manifest fold. The tokio flat-file fold (`--shards 1` on tokio) has
+  # no real-server leg here; only its lib tests cover it.
+  # moon#1253: the same, for a key whose spill was still IN FLIGHT when it
+  # was deleted, flushed or overwritten (no settle before the mutation).
+  # moon#1260 / moon#1236: the `--appendonly no` cases (a promoted,
+  # flushed or TTL-overwritten inherited cold key and a kill -9).
+  #
+  # Its own job (it ran as a step of `nightly`, whose 30 min it outgrew):
+  # measured 2026-09-26, debug builds, per shard count — del_rewrite
+  # 443-520 s, no_aof ~100 s + ~50 s for its two post-save cases (tokio
+  # ~215 s), del_inflight_1253 ~10 s — about 21 min of test time for both
+  # shard counts, dominated by settle sleeps and TTL waits (a release build
+  # saves little of it), plus the release build. 60 min is ~1.7x that.
+  cold-tier:
+    name: Cold-tier crash suites (nightly, --shards 4 and 1)
+    if: github.event.schedule == '17 3 * * *' || (github.event_name == 'workflow_dispatch' && inputs.mode == 'nightly')
+    runs-on: [self-hosted, moon-dev]
+    timeout-minutes: 60
+    env:
+      CARGO_TARGET_DIR: /home/tindang/ci-target/crash-matrix
+      MOON_DISK_FREE_MIN_PCT: "0"
+      CARGO_BUILD_JOBS: "6"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.94.1
+      - name: Build release binary + the cold-tier suites
+        run: |
+          cargo build --release --bin moon --test crash_recovery_cold_del_rewrite \
+            --test crash_recovery_cold_del_inflight_1253 --test crash_recovery_cold_no_aof
+      - name: Cold-tier DEL survives rewrite + restart (moon#1215), --shards 4 and 1
+        run: |
+          export MOON_BIN="$CARGO_TARGET_DIR/release/moon"
+          touch "$RUNNER_TEMP/cold-tier-start"  # failed cases' preserved dirs are newer
+          for s in 4 1; do
+            for t in crash_recovery_cold_del_rewrite crash_recovery_cold_del_inflight_1253 \
+              crash_recovery_cold_no_aof; do
+              MOON_TEST_COLD_DEL_SHARDS=$s cargo test --release --test "$t" \
+                -- --ignored --test-threads=1 2>&1 | tee -a cold-tier-nightly.log
+              test "${PIPESTATUS[0]}" -eq 0 || exit 1
+            done
+          done
+      - name: Collect preserved test dirs on failure
+        if: failure()
+        run: |
+          mkdir -p /tmp/cold-tier-artifacts
+          cp cold-tier-nightly.log /tmp/cold-tier-artifacts/ || true
+          find /tmp -maxdepth 1 -name 'moon-cold-del-rw-*' -newer "$RUNNER_TEMP/cold-tier-start" \
+            -exec cp -r {} /tmp/cold-tier-artifacts/ \; 2>/dev/null || true
+      - name: Upload failure artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cold-tier-nightly-failure-${{ github.run_id }}
+          path: /tmp/cold-tier-artifacts
           retention-days: 14
 
   # ── Recall canaries (nightly) ────────────────────────────────────────
