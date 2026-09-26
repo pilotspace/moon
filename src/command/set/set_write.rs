@@ -878,6 +878,8 @@ pub fn smove(db: &mut Database, args: &[Frame]) -> Frame {
         db.charge_memory(set_member_cost(&member));
     }
     db.adjust_memory(dst_table_before, dst_table_after);
+    // moon#1232: redis counts the removal, and the add when it added.
+    crate::admin::metrics_setup::record_keyspace_changes(1 + u64::from(inserted));
 
     Frame::Integer(1)
 }

@@ -210,7 +210,7 @@ fn replay_two_db(
             Err(e) => e,
             Ok((_key, dst_db)) if dst_db == src_db => Frame::Integer(0),
             Ok((key, dst_db)) => ksmv::with_two_slice_dbs(databases, src_db, dst_db, |src, dst| {
-                ksmv::move_core(src, dst, &key)
+                ksmv::move_core(src, src_db, dst, dst_db, &key)
             }),
         };
         return Some(resp);
@@ -218,7 +218,15 @@ fn replay_two_db(
     let resp = match ksmv::parse_copy_db_args(args, src_db, db_count)? {
         Err(e) => e,
         Ok(ca) => ksmv::with_two_slice_dbs(databases, src_db, ca.dst_db, |src, dst| {
-            ksmv::copy_core(src, dst, &ca.src_key, &ca.dst_key, ca.replace)
+            ksmv::copy_core(
+                src,
+                src_db,
+                dst,
+                ca.dst_db,
+                &ca.src_key,
+                &ca.dst_key,
+                ca.replace,
+            )
         }),
     };
     Some(resp)
@@ -419,6 +427,12 @@ impl CommandReplayEngine for DispatchReplayEngine {
                     // events name), as the live SWAPDB does.
                     let (left, right) = databases.split_at_mut(lo + 1);
                     crate::shard::db_plane::swap_contents(&mut left[lo], &mut right[hi - lo - 1]);
+                    // moon#1232 (REVIEW7 R1): one keyspace change, as redis
+                    // 7.0.15 counts a SWAPDB it replays from its AOF. Counted
+                    // like the funnels every other replayed write goes
+                    // through, so a muted replay (the graph WAL scan into
+                    // throwaway databases) counts nothing.
+                    crate::admin::metrics_setup::record_keyspace_change();
                 }
                 _ => {
                     // Out-of-range or same-index — silently skip (same as Redis).
@@ -582,6 +596,24 @@ mod tests {
             Some(b"val_a".as_ref()),
             "db-1 should have key_a after SWAPDB replay"
         );
+    }
+
+    /// moon#1232 (REVIEW7 R1): a replayed SWAPDB counts one keyspace change, as
+    /// redis 7.0.15 counts it when it loads its AOF (measured: SET, SWAPDB,
+    /// SET replayed at boot -> `rdb_changes_since_last_save:3`).
+    #[test]
+    fn replay_swapdb_counts_one_change() {
+        use crate::admin::metrics_setup::keyspace_changes_on_this_thread as mine;
+        let engine = DispatchReplayEngine::new();
+        let mut databases = vec![make_db_with_key(b"a", b"1"), Database::new()];
+        let mut selected = 0usize;
+        let args = framevec![
+            Frame::BulkString(bytes::Bytes::from_static(b"0")),
+            Frame::BulkString(bytes::Bytes::from_static(b"1")),
+        ];
+        let before = mine();
+        engine.replay_command(&mut databases, b"SWAPDB", &args, &mut selected);
+        assert_eq!(mine() - before, 1);
     }
 
     // ── EXPIRE<=0 replay / propagation guard ──────────────────────────────────

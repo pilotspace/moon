@@ -332,3 +332,74 @@ fn an_expired_in_flight_record_is_not_published_behind_a_recreated_key() {
     .join()
     .expect("shard thread");
 }
+
+/// Refs moon#1253: a superseded request whose completion never arrives
+/// (dropped at shutdown, say) stayed in the set for good. The spill thread's
+/// watermark prunes it once a later request's completion has been sent and
+/// applied; a request still queued stays.
+#[test]
+fn a_superseded_request_whose_completion_never_arrives_is_pruned_by_the_watermark() {
+    std::thread::spawn(|| {
+        init_shard(ShardSlice::new(make_init(0, 1)));
+        let tmp = tempfile::tempdir().unwrap();
+        let mut shard_manifest =
+            Some(ShardManifest::create(&tmp.path().join("shard-0.manifest")).unwrap());
+        with_shard_db(0, |db| {
+            db.cold_index = Some(crate::storage::tiered::cold_index::ColdIndex::new());
+        });
+        let mut sink = ColdMarkerSink {
+            aof_pool: None,
+            wal_writer: None,
+            shard_id: 0,
+            wal_kv_log: false,
+        };
+        // Request 5's completion never comes; request 20 is still queued.
+        in_flight_then_deleted(b"lost", 5);
+        in_flight_then_deleted(b"queued", 20);
+        assert_eq!(superseded(), 2);
+
+        // Request 7 goes through a real spill thread.
+        let st = crate::storage::tiered::spill_thread::SpillThread::new(0);
+        in_flight(b"spilled", 7);
+        st.sender()
+            .send(SpillRequest {
+                key: bytes::Bytes::from_static(b"spilled"),
+                db_index: 0,
+                value_bytes: bytes::Bytes::from_static(b"v"),
+                value_type: ValueType::String,
+                flags: 0,
+                ttl_ms: None,
+                file_id: 7,
+                shard_dir: tmp.path().to_path_buf(),
+            })
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while st.done_below() < 8 {
+            assert!(std::time::Instant::now() < deadline, "no flush in 5 s");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let bytes_before = with_shard_db(0, |db| db.spill_superseded_bytes());
+        drain_and_apply(&st, &mut shard_manifest, &mut sink, 1, 0);
+        with_shard_db(0, |db| {
+            assert_eq!(db.spill_superseded_len(), 1, "only request 20 is left");
+            let left: Vec<_> = db.spill_superseded_keys_live_at(0).cloned().collect();
+            assert_eq!(left, vec![bytes::Bytes::from_static(b"queued")]);
+            let after = db.spill_superseded_bytes();
+            assert!(
+                after > 0 && after < bytes_before,
+                "the pruned entry's bytes are credited"
+            );
+        });
+        let _ = st.shutdown();
+
+        // A dead spill thread: nothing it had will ever complete.
+        let dead = crate::storage::tiered::spill_thread::SpillThread::exited_for_test();
+        drain_and_apply(&dead, &mut shard_manifest, &mut sink, 1, 0);
+        with_shard_db(0, |db| {
+            assert!(db.spill_superseded_is_empty());
+            assert_eq!(db.spill_superseded_bytes(), 0);
+        });
+    })
+    .join()
+    .unwrap();
+}

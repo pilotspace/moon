@@ -22,6 +22,7 @@ pub mod introspect;
 pub mod key;
 pub mod key_extra;
 pub mod keyspace;
+pub(crate) mod keyspace_changes;
 pub mod list;
 pub mod metadata;
 pub mod module_cmd;
@@ -44,6 +45,7 @@ use bytes::Bytes;
 
 use crate::protocol::Frame;
 use crate::storage::Database;
+use keyspace_changes::{Rule, counted};
 
 /// Result of command dispatch.
 pub enum DispatchResult {
@@ -267,13 +269,13 @@ fn dispatch_inner_unchecked(
         (4, b'h') => {
             // HSET HGET HDEL HLEN HTTL
             if cmd.eq_ignore_ascii_case(b"HSET") {
-                return resp(hash::hset(db, args));
+                return resp(counted(db, args, Rule::Pairs, hash::hset));
             }
             if cmd.eq_ignore_ascii_case(b"HGET") {
                 return resp(hash::hget(db, args));
             }
             if cmd.eq_ignore_ascii_case(b"HDEL") {
-                return resp(hash::hdel(db, args));
+                return resp(counted(db, args, Rule::Int, hash::hdel));
             }
             if cmd.eq_ignore_ascii_case(b"HLEN") {
                 return resp(hash::hlen(db, args));
@@ -300,16 +302,16 @@ fn dispatch_inner_unchecked(
         (4, b'l') => {
             // LPOP LLEN LSET LREM LPOS
             if cmd.eq_ignore_ascii_case(b"LPOP") {
-                return resp(list::lpop(db, args));
+                return resp(counted(db, args, Rule::Popped, list::lpop));
             }
             if cmd.eq_ignore_ascii_case(b"LLEN") {
                 return resp(list::llen(db, args));
             }
             if cmd.eq_ignore_ascii_case(b"LSET") {
-                return resp(list::lset(db, args));
+                return resp(counted(db, args, Rule::One, list::lset));
             }
             if cmd.eq_ignore_ascii_case(b"LREM") {
-                return resp(list::lrem(db, args));
+                return resp(counted(db, args, Rule::Int, list::lrem));
             }
             if cmd.eq_ignore_ascii_case(b"LPOS") {
                 return resp(list::lpos(db, args));
@@ -352,7 +354,7 @@ fn dispatch_inner_unchecked(
         (4, b'r') => {
             // RPOP
             if cmd.eq_ignore_ascii_case(b"RPOP") {
-                return resp(list::rpop(db, args));
+                return resp(counted(db, args, Rule::Popped, list::rpop));
             }
             // ROLE — answered HERE rather than at the connection layer so a
             // queued ROLE inside MULTI works: EXEC replays the queue through
@@ -380,13 +382,13 @@ fn dispatch_inner_unchecked(
                 return resp(key::scan(db, args));
             }
             if cmd.eq_ignore_ascii_case(b"SADD") {
-                return resp(set::sadd(db, args));
+                return resp(counted(db, args, Rule::Int, set::sadd));
             }
             if cmd.eq_ignore_ascii_case(b"SREM") {
-                return resp(set::srem(db, args));
+                return resp(counted(db, args, Rule::Int, set::srem));
             }
             if cmd.eq_ignore_ascii_case(b"SPOP") {
-                return resp(set::spop(db, args));
+                return resp(counted(db, args, Rule::Popped, set::spop));
             }
             if cmd.eq_ignore_ascii_case(b"SORT") {
                 return resp(key_extra::sort(db, args));
@@ -404,25 +406,25 @@ fn dispatch_inner_unchecked(
         (4, b'x') => {
             // XADD XLEN XDEL XACK
             if cmd.eq_ignore_ascii_case(b"XADD") {
-                return resp(stream::xadd(db, args));
+                return resp(counted(db, args, Rule::One, stream::xadd));
             }
             if cmd.eq_ignore_ascii_case(b"XLEN") {
                 return resp(stream::xlen(db, args));
             }
             if cmd.eq_ignore_ascii_case(b"XDEL") {
-                return resp(stream::xdel(db, args));
+                return resp(counted(db, args, Rule::Int, stream::xdel));
             }
             if cmd.eq_ignore_ascii_case(b"XACK") {
-                return resp(stream::xack(db, args));
+                return resp(counted(db, args, Rule::Int, stream::xack));
             }
         }
         (4, b'z') => {
             // ZADD ZREM
             if cmd.eq_ignore_ascii_case(b"ZADD") {
-                return resp(sorted_set::zadd(db, args));
+                return resp(counted(db, args, Rule::ByHandler, sorted_set::zadd));
             }
             if cmd.eq_ignore_ascii_case(b"ZREM") {
-                return resp(sorted_set::zrem(db, args));
+                return resp(counted(db, args, Rule::Int, sorted_set::zrem));
             }
         }
         // 5-letter commands
@@ -447,7 +449,7 @@ fn dispatch_inner_unchecked(
         (5, b'h') => {
             // HMSET HMGET HKEYS HVALS HSCAN HPTTL
             if cmd.eq_ignore_ascii_case(b"HMSET") {
-                return resp(hash::hmset(db, args));
+                return resp(counted(db, args, Rule::Pairs, hash::hmset));
             }
             if cmd.eq_ignore_ascii_case(b"HMGET") {
                 return resp(hash::hmget(db, args));
@@ -468,28 +470,28 @@ fn dispatch_inner_unchecked(
         (5, b'l') => {
             // LPUSH LTRIM LMOVE
             if cmd.eq_ignore_ascii_case(b"LPUSH") {
-                return resp(list::lpush(db, args));
+                return resp(counted(db, args, Rule::Pushed, list::lpush));
             }
             if cmd.eq_ignore_ascii_case(b"LTRIM") {
-                return resp(list::ltrim(db, args));
+                return resp(counted(db, args, Rule::ByHandler, list::ltrim));
             }
             if cmd.eq_ignore_ascii_case(b"LMOVE") {
-                return resp(list::lmove(db, args));
+                return resp(counted(db, args, Rule::One, list::lmove));
             }
             if cmd.eq_ignore_ascii_case(b"LMPOP") {
-                return resp(list::lmpop(db, args));
+                return resp(counted(db, args, Rule::MultiPopped, list::lmpop));
             }
         }
         (5, b'p') => {
             // PFADD
             if cmd.eq_ignore_ascii_case(b"PFADD") {
-                return resp(hll::pfadd(db, args));
+                return resp(counted(db, args, Rule::ByHandler, hll::pfadd));
             }
         }
         (5, b'r') => {
             // RPUSH
             if cmd.eq_ignore_ascii_case(b"RPUSH") {
-                return resp(list::rpush(db, args));
+                return resp(counted(db, args, Rule::Pushed, list::rpush));
             }
         }
         (5, b's') => {
@@ -520,7 +522,7 @@ fn dispatch_inner_unchecked(
                 b'm' => {
                     // SMOVE
                     if cmd.eq_ignore_ascii_case(b"SMOVE") {
-                        return resp(set::smove(db, args));
+                        return resp(counted(db, args, Rule::ByHandler, set::smove));
                     }
                 }
                 b's' => {
@@ -535,7 +537,7 @@ fn dispatch_inner_unchecked(
         (5, b'x') => {
             // XTRIM XREAD XINFO
             if cmd.eq_ignore_ascii_case(b"XTRIM") {
-                return resp(stream::xtrim(db, args));
+                return resp(counted(db, args, Rule::Int, stream::xtrim));
             }
             if cmd.eq_ignore_ascii_case(b"XREAD") {
                 return resp(stream::xread(db, args));
@@ -559,7 +561,7 @@ fn dispatch_inner_unchecked(
                 return resp(sorted_set::zdiff(db, args));
             }
             if cmd.eq_ignore_ascii_case(b"ZMPOP") {
-                return resp(sorted_set::zmpop(db, args));
+                return resp(counted(db, args, Rule::MultiPopped, sorted_set::zmpop));
             }
         }
         (5, b't') => {
@@ -602,7 +604,7 @@ fn dispatch_inner_unchecked(
         (6, b'g') => {
             // GEOADD GEOPOS GETBIT GETSET GETDEL
             if cmd.eq_ignore_ascii_case(b"GEOADD") {
-                return resp(geo::geoadd(db, args));
+                return resp(counted(db, args, Rule::ByHandler, geo::geoadd));
             }
             if cmd.eq_ignore_ascii_case(b"GEOPOS") {
                 return resp(geo::geopos(db, args));
@@ -620,10 +622,10 @@ fn dispatch_inner_unchecked(
         (6, b'h') => {
             // HSETNX HGETEX
             if cmd.eq_ignore_ascii_case(b"HSETNX") {
-                return resp(hash::hsetnx(db, args));
+                return resp(counted(db, args, Rule::Positive, hash::hsetnx));
             }
             if cmd.eq_ignore_ascii_case(b"HGETEX") {
-                return resp(hash::hgetex(db, args));
+                return resp(counted(db, args, Rule::HGetEx, hash::hgetex));
             }
         }
         (6, b'i') => {
@@ -641,7 +643,7 @@ fn dispatch_inner_unchecked(
                 return resp(list::lindex(db, args));
             }
             if cmd.eq_ignore_ascii_case(b"LPUSHX") {
-                return resp(list::lpushx(db, args));
+                return resp(counted(db, args, Rule::PushedIfExists, list::lpushx));
             }
             if cmd.eq_ignore_ascii_case(b"LOLWUT") {
                 return resp(Frame::BulkString(Bytes::from_static(
@@ -679,10 +681,10 @@ fn dispatch_inner_unchecked(
                 return resp(connection::readyz());
             }
             if cmd.eq_ignore_ascii_case(b"RENAME") {
-                return resp(key::rename(db, args));
+                return resp(counted(db, args, Rule::Rename, key::rename));
             }
             if cmd.eq_ignore_ascii_case(b"RPUSHX") {
-                return resp(list::rpushx(db, args));
+                return resp(counted(db, args, Rule::PushedIfExists, list::rpushx));
             }
         }
         (6, b's') => {
@@ -739,16 +741,16 @@ fn dispatch_inner_unchecked(
         (6, b'x') => {
             // XRANGE XGROUP XCLAIM XSETID
             if cmd.eq_ignore_ascii_case(b"XSETID") {
-                return resp(stream::xsetid(db, args));
+                return resp(counted(db, args, Rule::One, stream::xsetid));
             }
             if cmd.eq_ignore_ascii_case(b"XRANGE") {
                 return resp(stream::xrange(db, args));
             }
             if cmd.eq_ignore_ascii_case(b"XGROUP") {
-                return resp(stream::xgroup(db, args));
+                return resp(counted(db, args, Rule::XGroup, stream::xgroup));
             }
             if cmd.eq_ignore_ascii_case(b"XCLAIM") {
-                return resp(stream::xclaim(db, args));
+                return resp(counted(db, args, Rule::Claimed, stream::xclaim));
             }
         }
         (6, b'z') => {
@@ -809,19 +811,19 @@ fn dispatch_inner_unchecked(
                 return resp(hash::hexists(db, args));
             }
             if cmd.eq_ignore_ascii_case(b"HINCRBY") {
-                return resp(hash::hincrby(db, args));
+                return resp(counted(db, args, Rule::One, hash::hincrby));
             }
             if cmd.eq_ignore_ascii_case(b"HEXPIRE") {
-                return resp(hash::hexpire(db, args));
+                return resp(counted(db, args, Rule::FieldCodes, hash::hexpire));
             }
             if cmd.eq_ignore_ascii_case(b"HGETDEL") {
-                return resp(hash::hgetdel(db, args));
+                return resp(counted(db, args, Rule::NonNull, hash::hgetdel));
             }
         }
         (7, b'l') => {
             // LINSERT
             if cmd.eq_ignore_ascii_case(b"LINSERT") {
-                return resp(list::linsert(db, args));
+                return resp(counted(db, args, Rule::Positive, list::linsert));
             }
         }
         (7, b'p') => {
@@ -860,13 +862,13 @@ fn dispatch_inner_unchecked(
         (7, b'z') => {
             // ZINCRBY ZPOPMIN ZPOPMAX ZMSCORE
             if cmd.eq_ignore_ascii_case(b"ZINCRBY") {
-                return resp(sorted_set::zincrby(db, args));
+                return resp(counted(db, args, Rule::ZIncr, sorted_set::zincrby));
             }
             if cmd.eq_ignore_ascii_case(b"ZPOPMIN") {
-                return resp(sorted_set::zpopmin(db, args));
+                return resp(counted(db, args, Rule::PoppedPairs, sorted_set::zpopmin));
             }
             if cmd.eq_ignore_ascii_case(b"ZPOPMAX") {
-                return resp(sorted_set::zpopmax(db, args));
+                return resp(counted(db, args, Rule::PoppedPairs, sorted_set::zpopmax));
             }
             if cmd.eq_ignore_ascii_case(b"ZMSCORE") {
                 return resp(sorted_set::zmscore(db, args));
@@ -903,7 +905,7 @@ fn dispatch_inner_unchecked(
         (8, b'r') => {
             // RENAMENX
             if cmd.eq_ignore_ascii_case(b"RENAMENX") {
-                return resp(key::renamenx(db, args));
+                return resp(counted(db, args, Rule::Positive, key::renamenx));
             }
         }
         (8, b's') => {
@@ -934,10 +936,10 @@ fn dispatch_inner_unchecked(
         (8, b'h') => {
             // HPEXPIRE HPERSIST
             if cmd.eq_ignore_ascii_case(b"HPEXPIRE") {
-                return resp(hash::hpexpire(db, args));
+                return resp(counted(db, args, Rule::FieldCodes, hash::hpexpire));
             }
             if cmd.eq_ignore_ascii_case(b"HPERSIST") {
-                return resp(hash::hpersist(db, args));
+                return resp(counted(db, args, Rule::FieldCodes, hash::hpersist));
             }
         }
         (8, b'x') => {
@@ -956,7 +958,7 @@ fn dispatch_inner_unchecked(
         (9, b'h') => {
             // HEXPIREAT
             if cmd.eq_ignore_ascii_case(b"HEXPIREAT") {
-                return resp(hash::hexpireat(db, args));
+                return resp(counted(db, args, Rule::FieldCodes, hash::hexpireat));
             }
         }
         (9, b'g') => {
@@ -983,7 +985,7 @@ fn dispatch_inner_unchecked(
             // Redis, never removed, and still the method every major client
             // exposes — it belongs beside the LMOVE arm at (5, b'l').
             if cmd.eq_ignore_ascii_case(b"RPOPLPUSH") {
-                return resp(list::rpoplpush(db, args));
+                return resp(counted(db, args, Rule::One, list::rpoplpush));
             }
         }
         (9, b's') => {
@@ -1014,7 +1016,7 @@ fn dispatch_inner_unchecked(
                 return resp(hash::hrandfield(db, args));
             }
             if cmd.eq_ignore_ascii_case(b"HPEXPIREAT") {
-                return resp(hash::hpexpireat(db, args));
+                return resp(counted(db, args, Rule::FieldCodes, hash::hpexpireat));
             }
         }
         (10, b'e') => {
@@ -1038,10 +1040,10 @@ fn dispatch_inner_unchecked(
         (10, b'x') => {
             // XREADGROUP XAUTOCLAIM
             if cmd.eq_ignore_ascii_case(b"XREADGROUP") {
-                return resp(stream::xreadgroup(db, args));
+                return resp(counted(db, args, Rule::Streams, stream::xreadgroup));
             }
             if cmd.eq_ignore_ascii_case(b"XAUTOCLAIM") {
-                return resp(stream::xautoclaim(db, args));
+                return resp(counted(db, args, Rule::AutoClaimed, stream::xautoclaim));
             }
         }
         (10, b'z') => {
@@ -1050,7 +1052,11 @@ fn dispatch_inner_unchecked(
                 return resp(sorted_set::zintercard(db, args));
             }
             if cmd.eq_ignore_ascii_case(b"ZDIFFSTORE") {
-                return resp(sorted_set::zdiffstore(db, args));
+                return resp(keyspace_changes::counted_store(
+                    db,
+                    args,
+                    sorted_set::zdiffstore,
+                ));
             }
         }
         // 11-letter commands
@@ -1087,13 +1093,25 @@ fn dispatch_inner_unchecked(
         (11, b'z') => {
             // ZUNIONSTORE ZINTERSTORE
             if cmd.eq_ignore_ascii_case(b"ZUNIONSTORE") {
-                return resp(sorted_set::zunionstore(db, args));
+                return resp(keyspace_changes::counted_store(
+                    db,
+                    args,
+                    sorted_set::zunionstore,
+                ));
             }
             if cmd.eq_ignore_ascii_case(b"ZINTERSTORE") {
-                return resp(sorted_set::zinterstore(db, args));
+                return resp(keyspace_changes::counted_store(
+                    db,
+                    args,
+                    sorted_set::zinterstore,
+                ));
             }
             if cmd.eq_ignore_ascii_case(b"ZRANGESTORE") {
-                return resp(sorted_set::zrangestore(db, args));
+                return resp(keyspace_changes::counted_store(
+                    db,
+                    args,
+                    sorted_set::zrangestore,
+                ));
             }
             if cmd.eq_ignore_ascii_case(b"ZRANDMEMBER") {
                 return resp(sorted_set::zrandmember(db, args));
@@ -1113,7 +1131,7 @@ fn dispatch_inner_unchecked(
         (12, b'h') => {
             // HINCRBYFLOAT HPEXPIRETIME
             if cmd.eq_ignore_ascii_case(b"HINCRBYFLOAT") {
-                return resp(hash::hincrbyfloat(db, args));
+                return resp(counted(db, args, Rule::One, hash::hincrbyfloat));
             }
             if cmd.eq_ignore_ascii_case(b"HPEXPIRETIME") {
                 return resp(hash::hpexpiretime(db, args));
@@ -1139,7 +1157,7 @@ fn dispatch_inner_unchecked(
                 return resp(sorted_set::zrevrangebylex(db, args));
             }
             if cmd.eq_ignore_ascii_case(b"ZREMRANGEBYLEX") {
-                return resp(sorted_set::zremrangebylex(db, args));
+                return resp(counted(db, args, Rule::Int, sorted_set::zremrangebylex));
             }
         }
         (14, b'g') => {
@@ -1155,14 +1173,14 @@ fn dispatch_inner_unchecked(
                 return resp(sorted_set::zrevrangebyscore(db, args));
             }
             if cmd.eq_ignore_ascii_case(b"ZREMRANGEBYSCORE") {
-                return resp(sorted_set::zremrangebyscore(db, args));
+                return resp(counted(db, args, Rule::Int, sorted_set::zremrangebyscore));
             }
         }
         // 15-letter commands
         (15, b'z') => {
             // ZREMRANGEBYRANK
             if cmd.eq_ignore_ascii_case(b"ZREMRANGEBYRANK") {
-                return resp(sorted_set::zremrangebyrank(db, args));
+                return resp(counted(db, args, Rule::Int, sorted_set::zremrangebyrank));
             }
         }
         // 17-letter commands

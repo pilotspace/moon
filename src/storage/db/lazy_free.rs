@@ -48,7 +48,12 @@
 //!
 //! `Database::clear` and `recalculate_memory` rebuild `used_memory` from the
 //! hot table alone; they first mark every queued item uncharged so the drain
-//! cannot credit bytes the rebuild already dropped from the ledger.
+//! cannot credit bytes the rebuild already dropped from the ledger. When a
+//! FLUSHDB hands its table to a BGSAVE epoch (moon#1228), the ledger's bytes
+//! — the queued values' remaining charges included — become that frozen
+//! table's bill, so `clear` REDIRECTS the queued charges there instead
+//! ([`Charge::Frozen`]): the drain credits the frozen bill as it frees, one
+//! O(1) add per credit, and nothing is freed inside the FLUSHDB (review 7).
 
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
@@ -189,16 +194,25 @@ fn release_shell(work: Work, weight: usize) {
 fn shell_dropper() -> Option<&'static flume::Sender<Work>> {
     static DROPPER: std::sync::OnceLock<Option<flume::Sender<Work>>> = std::sync::OnceLock::new();
     DROPPER
-        .get_or_init(|| spawn_shell_dropper("moon-lazyfree"))
+        .get_or_init(|| spawn_dropper("moon-lazyfree"))
         .as_ref()
 }
 
-/// Start a shell-dropping thread named `name`; `None` if the OS refused.
-/// Split from [`shell_dropper`] so a test can start one from a thread it
-/// controls — the process-wide one is spawned once, by whichever shard
-/// thread happens to need it first.
-fn spawn_shell_dropper(name: &str) -> Option<flume::Sender<Work>> {
-    let (tx, rx) = flume::unbounded::<Work>();
+/// Start a thread named `name` that drops whatever is sent to it; `None` if
+/// the OS refused. Split from [`shell_dropper`] so a test can start one from
+/// a thread it controls — the process-wide one is spawned once, by whichever
+/// shard thread happens to need it first. Shared with the snapshot's
+/// `moon-snapdrop` (`persistence::snapshot::frozen`, moon#1228 review 7).
+///
+/// The channel is unbounded: the sender is a shard thread, which must never
+/// block on it. What is in flight is memory already credited — out of
+/// `used_memory` (a lazily freed shell) and out of `current_cow_size` (a
+/// frozen table's removed rows, or a table the epoch released) — but not
+/// yet returned to the allocator. Nothing counts it, and only the senders
+/// pace it: the lazy-free and trim budgets per tick, and a released table
+/// is one send.
+pub(crate) fn spawn_dropper<T: Send + 'static>(name: &str) -> Option<flume::Sender<T>> {
+    let (tx, rx) = flume::unbounded::<T>();
     let label = name.to_string();
     std::thread::Builder::new()
         .name(name.to_string())
@@ -212,8 +226,8 @@ fn spawn_shell_dropper(name: &str) -> Option<flume::Sender<Work>> {
             // for the very frees it exists to take off it. A no-op off Linux,
             // with `MOON_NO_AUX_PIN=1`, or when there is no non-shard core.
             crate::shard::numa::pin_current_aux_thread(&label);
-            while let Ok(shell) = rx.recv() {
-                drop(shell);
+            while let Ok(item) = rx.recv() {
+                drop(item);
             }
         })
         .ok()
@@ -224,9 +238,10 @@ fn spawn_shell_dropper(name: &str) -> Option<flume::Sender<Work>> {
 #[derive(Default)]
 pub(crate) struct LazyFreeQueue {
     items: VecDeque<Item>,
-    /// Queued items whose bytes are still counted in `used_memory` — what a
-    /// memory gate can win back by draining (moon#1221 review F1). O(1) to
-    /// ask; an eviction victim (already credited) never counts.
+    /// Queued items whose bytes are still counted in `used_memory`
+    /// ([`Charge::Ledger`]) — what a memory gate can win back by draining
+    /// (moon#1221 review F1). O(1) to ask; an eviction victim (already
+    /// credited) and a frozen table's value never count.
     charged_items: usize,
 }
 
@@ -241,6 +256,20 @@ impl Drop for LazyFreeQueue {
     }
 }
 
+/// Where a queued value's credits go as the drain frees it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Charge {
+    /// Still counted in `used_memory`: credited there.
+    Ledger,
+    /// Counted in the bill of a table a FLUSHDB froze into a BGSAVE epoch
+    /// (moon#1228 review 7): credited to it, through
+    /// `snapshot_cow::credit_frozen`.
+    Frozen(crate::persistence::snapshot_cow::FrozenCharge),
+    /// Already credited (an eviction victim) or forgotten (the ledger was
+    /// rebuilt without it): nothing to credit.
+    Credited,
+}
+
 struct Item {
     work: Work,
     /// Element count at enqueue — decides where the emptied shell is freed.
@@ -249,8 +278,8 @@ struct Item {
     /// boxes, and the tables charged from capacity — everything the ledger
     /// bills that is not per element.
     tail_credit: usize,
-    /// Whether these bytes are still counted in `used_memory`.
-    charged: bool,
+    /// Where these bytes are still counted, if anywhere.
+    charge: Charge,
     /// `entry_overhead` computed the slow way at enqueue (debug/test only,
     /// and only for values up to [`DEBUG_VERIFY_MAX_ELEMENTS`]).
     #[cfg(debug_assertions)]
@@ -492,7 +521,11 @@ impl Database {
             work,
             weight,
             tail_credit: entry_fixed + fixed,
-            charged,
+            charge: if charged {
+                Charge::Ledger
+            } else {
+                Charge::Credited
+            },
             #[cfg(debug_assertions)]
             expected,
             #[cfg(debug_assertions)]
@@ -545,7 +578,11 @@ impl Database {
         }
         debug_assert_eq!(
             self.lazy_free.charged_items,
-            self.lazy_free.items.iter().filter(|i| i.charged).count(),
+            self.lazy_free
+                .items
+                .iter()
+                .filter(|i| i.charge == Charge::Ledger)
+                .count(),
             "lazy-free charged-item count drifted from the queue"
         );
         start.saturating_sub(self.used_memory)
@@ -577,18 +614,29 @@ impl Database {
             if done {
                 credit += item.tail_credit;
             }
-            if item.charged {
-                self.used_memory = self.used_memory.saturating_sub(credit);
-                #[cfg(debug_assertions)]
-                {
-                    item.credited += credit;
+            match item.charge {
+                Charge::Ledger => {
+                    self.used_memory = self.used_memory.saturating_sub(credit);
                 }
+                // moon#1228 review 7: the bytes moved to a frozen table's
+                // bill with the FLUSHDB; one thread-local add.
+                Charge::Frozen(frozen) => {
+                    crate::persistence::snapshot_cow::credit_frozen(frozen, credit as u64);
+                }
+                Charge::Credited => {}
+            }
+            #[cfg(debug_assertions)]
+            if item.charge != Charge::Credited {
+                item.credited += credit;
             }
             if !done {
                 break;
             }
+            // Exact for a frozen table's value too: its credits before the
+            // FLUSHDB went to the ledger, the rest to the frozen bill, and
+            // together they are the value's `entry_overhead`.
             #[cfg(debug_assertions)]
-            if item.charged
+            if item.charge != Charge::Credited
                 && let Some(expected) = item.expected
             {
                 debug_assert_eq!(
@@ -600,7 +648,7 @@ impl Database {
                 );
             }
             if let Some(done_item) = self.lazy_free.items.pop_front() {
-                if done_item.charged {
+                if done_item.charge == Charge::Ledger {
                     self.lazy_free.charged_items = self.lazy_free.charged_items.saturating_sub(1);
                 }
                 release_shell(done_item.work, done_item.weight);
@@ -612,10 +660,30 @@ impl Database {
     }
 
     /// The ledger is about to be rebuilt from the hot table alone (`clear`,
-    /// `recalculate_memory`): nothing still queued may be credited again.
+    /// `recalculate_memory`): nothing still queued may be credited to it
+    /// again. A value already credited to a frozen table keeps crediting
+    /// that table — its bytes were never in this ledger since.
     pub(super) fn lazy_free_forget_charges(&mut self) {
         for item in &mut self.lazy_free.items {
-            item.charged = false;
+            if item.charge == Charge::Ledger {
+                item.charge = Charge::Credited;
+            }
+        }
+        self.lazy_free.charged_items = 0;
+    }
+
+    /// A FLUSHDB just froze this database's table into a BGSAVE epoch with
+    /// the ledger as its bill (moon#1228 review 7): the queued values'
+    /// remaining charges are in that bill now, so the drain credits them
+    /// there. O(queued items); nothing is freed.
+    pub(super) fn lazy_free_redirect_charges(
+        &mut self,
+        frozen: crate::persistence::snapshot_cow::FrozenCharge,
+    ) {
+        for item in &mut self.lazy_free.items {
+            if item.charge == Charge::Ledger {
+                item.charge = Charge::Frozen(frozen);
+            }
         }
         self.lazy_free.charged_items = 0;
     }
@@ -785,7 +853,7 @@ mod tests {
             if mine.as_deref() != Some("0") {
                 return Err(format!("cannot pin the test thread (affinity {mine:?})"));
             }
-            let tx = super::spawn_shell_dropper(NAME).expect("spawn the helper");
+            let tx = super::spawn_dropper::<super::Work>(NAME).expect("spawn the helper");
             // The helper re-pins itself as the first act of its closure,
             // after `spawn` returned: poll until it has, or give up.
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);

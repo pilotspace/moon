@@ -593,18 +593,10 @@ fn apply_ws_drop(
     // Every db exclusively guarded for the whole sweep: dropping a workspace
     // must not be observable half-done (db 0 swept, db 7 not), which is the
     // atomicity this loop had for free while the slice was single-threaded.
-    s.databases.with_all(|dbs| {
-        for db in dbs.iter_mut() {
-            let keys_to_delete: Vec<Vec<u8>> = db
-                .keys()
-                .filter(|k| k.as_bytes().starts_with(&prefix_bytes[..]))
-                .map(|k| k.as_bytes().to_vec())
-                .collect();
-            for key in &keys_to_delete {
-                db.remove(key);
-            }
-        }
-    });
+    // `sweep_prefix` is the one sweep body the master's paths run too, so a
+    // replica's own armed BGSAVE captures each key before it goes (moon#1228).
+    s.databases
+        .with_all(|dbs| crate::workspace::sweep_prefix(dbs, &prefix_bytes));
     true
 }
 
@@ -948,6 +940,10 @@ fn apply_swapdb(
     ) {
         (Some(a), Some(b)) if a != b && a < db_count && b < db_count => {
             databases.swap(a, b);
+            // moon#1232 (REVIEW7 R1): one keyspace change, as redis 7.0.15
+            // counts a replicated SWAPDB — counted like the funnels a
+            // replicated SET goes through.
+            crate::admin::metrics_setup::record_keyspace_change();
             Some((a, b))
         }
         (Some(a), Some(b)) if a == b => None, // same-index: no-op, matches Redis
@@ -986,7 +982,7 @@ fn apply_two_db(
             Ok((key, dst)) => databases.with_pair(db_idx, dst, |src, dstdb| {
                 src.refresh_now();
                 dstdb.refresh_now();
-                ksmv::move_core(src, dstdb, &key)
+                ksmv::move_core(src, db_idx, dstdb, dst, &key)
             }),
         };
         return Some(resp);
@@ -999,7 +995,15 @@ fn apply_two_db(
         Ok(ca) => databases.with_pair(db_idx, ca.dst_db, |src, dst| {
             src.refresh_now();
             dst.refresh_now();
-            ksmv::copy_core(src, dst, &ca.src_key, &ca.dst_key, ca.replace)
+            ksmv::copy_core(
+                src,
+                db_idx,
+                dst,
+                ca.dst_db,
+                &ca.src_key,
+                &ca.dst_key,
+                ca.replace,
+            )
         }),
     };
     Some(resp)
@@ -1051,12 +1055,19 @@ pub(crate) fn load_snapshot(
         // ones are not yet in. That window did not exist while the slice was
         // single-threaded; splitting this into two `with_all` calls would
         // create it.
-        let loaded = s.databases.with_all(|dbs| {
-            for db in dbs.iter_mut() {
-                db.clear();
-            }
-            redis_rdb::load_rdb(dbs, rdb)
-        })?;
+        //
+        // moon#1232 review 5: neither the discarded local keys nor the loaded
+        // ones are a keyspace change — redis 7.0.15 leaves a replica's
+        // `rdb_changes_since_last_save` unchanged across a full sync.
+        let loaded = {
+            let _quiet = crate::admin::metrics_setup::mute_keyspace_changes();
+            s.databases.with_all(|dbs| {
+                for db in dbs.iter_mut() {
+                    db.clear();
+                }
+                redis_rdb::load_rdb(dbs, rdb)
+            })?
+        };
         install_snapshot_index_defs(s, vec_defs.as_deref(), text_defs.as_deref());
         // v0.7 graph replication: install the master's whole graph store
         // (authoritative replace — an EMPTY blob drops replica-local graphs;
@@ -1818,6 +1829,22 @@ mod tests {
         assert!(set_has_marker(&dbs, 2, 0), "db2 must now hold db0's data");
         assert!(set_has_marker(&dbs, 1, 1), "db1 untouched");
         assert!(set_has_marker(&dbs, 3, 3), "db3 untouched");
+    }
+
+    /// moon#1232 (REVIEW7 R1): a replicated SWAPDB is one keyspace change on
+    /// the replica, as in redis 7.0.15 (measured: replica count 1 -> 2 across
+    /// the master's SET then SWAPDB); a replicated SET already counted.
+    #[test]
+    fn apply_swapdb_counts_one_change() {
+        use crate::admin::metrics_setup::keyspace_changes_on_this_thread as mine;
+        let dbs = db_set_with_markers(2);
+        let args = [
+            Frame::BulkString(Bytes::from_static(b"0")),
+            Frame::BulkString(Bytes::from_static(b"1")),
+        ];
+        let before = mine();
+        assert_eq!(apply_swapdb(b"SWAPDB", &args, &dbs), Some((0, 1)));
+        assert_eq!(mine() - before, 1);
     }
 
     #[test]

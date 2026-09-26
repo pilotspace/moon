@@ -118,6 +118,22 @@ fn test_snapshot_round_trip_string() {
     }
 }
 
+/// moon#1232 review 5: loading a snapshot is no keyspace change (redis
+/// 7.0.15 boots with `rdb_changes_since_last_save:0`).
+#[test]
+fn a_snapshot_load_counts_no_keyspace_change() {
+    use crate::admin::metrics_setup::keyspace_changes_on_this_thread as mine;
+    let (_dir, path) = snap_path();
+    let mut dbs = vec![Database::new()];
+    dbs[0].set_string(b"k1", Bytes::from_static(b"v1"));
+    dbs[0].set_string(b"k2", Bytes::from_static(b"v2"));
+    shard_snapshot_save(0, 1, &dbs, &path).unwrap();
+    let mut loaded = vec![Database::new()];
+    let before = mine();
+    assert_eq!(shard_snapshot_load(&mut loaded, &path).unwrap(), 2);
+    assert_eq!(mine() - before, 0);
+}
+
 #[test]
 fn test_snapshot_round_trip_all_types() {
     let (_dir, path) = snap_path();

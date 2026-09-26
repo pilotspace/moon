@@ -712,6 +712,9 @@ pub fn load_rdb<D: std::borrow::BorrowMut<Database>>(
     databases: &mut [D],
     data: &[u8],
 ) -> anyhow::Result<usize> {
+    // moon#1232 review 5: loading a dataset is no keyspace change (redis
+    // 7.0.15 counts none of it), so the `set` funnel below is muted.
+    let _quiet = crate::admin::metrics_setup::mute_keyspace_changes();
     if data.len() < 9 + 1 + 8 {
         bail!("RDB data too short: {} bytes", data.len());
     }
@@ -1405,6 +1408,22 @@ mod tests {
         write_rdb(&databases, &mut buf);
 
         assert!(buf.contains(&RDB_TYPE_ZSET_2));
+    }
+
+    /// moon#1232 review 5: loading an RDB (a replica's full sync) is no
+    /// keyspace change.
+    #[test]
+    fn an_rdb_load_counts_no_keyspace_change() {
+        use crate::admin::metrics_setup::keyspace_changes_on_this_thread as mine;
+        let mut db = Database::new();
+        db.set(b"k1", Entry::new_string(Bytes::from_static(b"v1")));
+        db.set(b"k2", Entry::new_string(Bytes::from_static(b"v2")));
+        let mut buf = Vec::new();
+        write_rdb(&[db], &mut buf);
+        let mut load_dbs = vec![Database::new()];
+        let before = mine();
+        assert_eq!(load_rdb(&mut load_dbs, &buf).unwrap(), 2);
+        assert_eq!(mine() - before, 0);
     }
 
     #[test]

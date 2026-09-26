@@ -98,6 +98,8 @@ pub fn bgsave_start(db: SharedDatabases, dir: String, dbfilename: String) -> Fra
             b"ERR Background save already in progress",
         ));
     }
+    // moon#1232: changes made after this point are not in the snapshot.
+    crate::admin::metrics_setup::mark_save_started();
 
     // Clone snapshot: lock each db individually with read lock
     let snapshot: Vec<
@@ -207,12 +209,14 @@ fn bgsave_start_sharded_with(
         return no_snapshot_dir_error();
     }
     if SAVE_IN_PROGRESS.swap(true, Ordering::SeqCst) {
-        return Frame::Error(Bytes::from_static(
-            b"ERR Background save already in progress",
-        ));
+        return Frame::Error(Bytes::from_static(SAVE_ALREADY_IN_PROGRESS_ERR));
     }
 
     BGSAVE_CURRENT_FAILED.store(false, Ordering::SeqCst);
+    // moon#1232: before any shard picks the epoch up, so every change counted
+    // here is in some shard's snapshot (a change between this and a shard's
+    // pickup is saved AND stays counted: a spare save, never a lost one).
+    crate::admin::metrics_setup::mark_save_started();
     let epoch = SNAPSHOT_EPOCH.fetch_add(1, Ordering::SeqCst) + 1;
     BGSAVE_SHARDS_REMAINING.store(num_shards as u64, Ordering::SeqCst);
 
@@ -426,12 +430,32 @@ pub(crate) fn bgrewriteaof_start_sharded_with_flag(
 ///
 /// Clones all entries under read locks (same as BGSAVE), then serializes
 /// synchronously. Not supported in sharded mode -- use BGSAVE instead.
+///
+/// Claims [`SAVE_IN_PROGRESS`] for its whole run, as BGSAVE does (PR #1268
+/// review): the legacy single-listener server runs connections on several
+/// threads, and a SAVE that only read the flag let a second SAVE, or a
+/// BGSAVE, start alongside it — each `mark_save_started()` overwrote the
+/// other's mark, and the earlier save's completion then counted writes its
+/// snapshot does not hold as saved.
 pub fn handle_save(db: &SharedDatabases, dir: &str, dbfilename: &str) -> Frame {
-    if SAVE_IN_PROGRESS.load(Ordering::SeqCst) {
+    if SAVE_IN_PROGRESS
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
         return Frame::Error(Bytes::from_static(
             b"ERR Background save already in progress",
         ));
     }
+    /// Releases the claim on every exit, a panic included.
+    struct Claim;
+    impl Drop for Claim {
+        fn drop(&mut self) {
+            SAVE_IN_PROGRESS.store(false, Ordering::SeqCst);
+        }
+    }
+    let _claim = Claim;
+    // moon#1232: see `bgsave_start`.
+    crate::admin::metrics_setup::mark_save_started();
 
     // Clone snapshot: lock each db individually with read lock (same pattern as bgsave_start)
     let snapshot: Vec<
@@ -535,6 +559,145 @@ pub const SHUTDOWN_SAVE_POLL_MS: u64 = 5;
 /// (or a client with a bounded read timeout) isn't left hanging.
 pub const SHUTDOWN_SAVE_TIMEOUT_MS: u64 = 10_000;
 
+/// What a save start answers while another save runs.
+const SAVE_ALREADY_IN_PROGRESS_ERR: &[u8] = b"ERR Background save already in progress";
+
+/// How many times SHUTDOWN's save defers to a save someone else started
+/// before giving up.
+const SHUTDOWN_SAVE_ATTEMPTS: usize = 3;
+
+/// ONE deadline for everything SHUTDOWN's save does — waiting out the saves
+/// someone else started and running its own — however many it defers to:
+/// two [`SHUTDOWN_SAVE_TIMEOUT_MS`], room for a running save and then this
+/// one. (Review 5: each wait used to get its own 10 s bound, so three
+/// deferrals plus the save could hold SHUTDOWN for 40 s.)
+pub const SHUTDOWN_SAVE_DEADLINE_MS: u64 = 2 * SHUTDOWN_SAVE_TIMEOUT_MS;
+
+/// SHUTDOWN's save in sharded / monoio mode: a cooperative per-shard BGSAVE,
+/// polled to completion with `sleep` (the caller's runtime timer).
+///
+/// A save already running — an auto-save, or a client's BGSAVE — is not a
+/// reason to refuse (moon#1232 review): redis's `prepareForShutdown` kills
+/// the saving child and saves synchronously, and SHUTDOWN never fails
+/// because a save is in progress. A cooperative snapshot cannot be killed
+/// safely mid-shard, so this waits for it (bounded like its own save) and
+/// then saves again: the running snapshot predates the writes made since it
+/// started, and a SHUTDOWN save must hold them.
+///
+/// `Err` carries the reply that refuses the SHUTDOWN (the server stays up):
+/// a save that failed, or that did not finish by the one overall deadline
+/// ([`SHUTDOWN_SAVE_DEADLINE_MS`] from the call, observed at the next poll),
+/// or one that could not start (no persistence directory). No save is
+/// started once the deadline has passed.
+pub async fn shutdown_save<S, F>(
+    snapshot_trigger: &crate::runtime::channel::WatchSender<u64>,
+    num_shards: usize,
+    sleep: S,
+) -> Result<(), Frame>
+where
+    S: Fn(std::time::Duration) -> F,
+    F: std::future::Future<Output = ()>,
+{
+    shutdown_save_within(
+        snapshot_trigger,
+        num_shards,
+        sleep,
+        std::time::Instant::now,
+        std::time::Duration::from_millis(SHUTDOWN_SAVE_DEADLINE_MS),
+    )
+    .await
+}
+
+/// [`shutdown_save`] with its clock and overall budget passed in (tests run
+/// it on a virtual clock the `sleep` advances).
+async fn shutdown_save_within<S, F, N>(
+    snapshot_trigger: &crate::runtime::channel::WatchSender<u64>,
+    num_shards: usize,
+    sleep: S,
+    now: N,
+    budget: std::time::Duration,
+) -> Result<(), Frame>
+where
+    S: Fn(std::time::Duration) -> F,
+    F: std::future::Future<Output = ()>,
+    N: Fn() -> std::time::Instant,
+{
+    let poll = std::time::Duration::from_millis(SHUTDOWN_SAVE_POLL_MS);
+    let deadline = now() + budget;
+    let timed_out = || {
+        Frame::Error(Bytes::from_static(
+            b"ERR SHUTDOWN failed: background save timed out, check logs",
+        ))
+    };
+    let mut deferred = 0;
+    loop {
+        // PR #1268 review: a save someone else started may end in the poll
+        // that crosses the deadline. Starting ours then would be answered
+        // "timed out" at once and keep running in the background, so no save
+        // starts past the deadline. (Our OWN save that completes in that
+        // poll counts: it is durable — the bound is the deadline plus one
+        // poll.)
+        if now() >= deadline {
+            return Err(timed_out());
+        }
+        match bgsave_start_sharded(snapshot_trigger, num_shards) {
+            Frame::Error(e) if e.as_ref() == SAVE_ALREADY_IN_PROGRESS_ERR => {
+                // Someone else's save is running: wait for it, then save.
+                if deferred == SHUTDOWN_SAVE_ATTEMPTS {
+                    return Err(Frame::Error(Bytes::from_static(
+                        b"ERR SHUTDOWN failed: other background saves kept starting, check logs",
+                    )));
+                }
+                deferred += 1;
+                wait_for_save(&sleep, &now, poll, deadline)
+                    .await
+                    .map_err(|()| timed_out())?;
+            }
+            // This save cannot run at all (no persistence directory):
+            // answer what BGSAVE would.
+            Frame::Error(e) => return Err(Frame::Error(e)),
+            _ => {
+                wait_for_save(&sleep, &now, poll, deadline)
+                    .await
+                    .map_err(|()| timed_out())?;
+                return save_outcome();
+            }
+        }
+    }
+}
+
+/// Poll until no save is in progress, `Err` once `deadline` has passed.
+async fn wait_for_save<S, F, N>(
+    sleep: &S,
+    now: &N,
+    poll: std::time::Duration,
+    deadline: std::time::Instant,
+) -> Result<(), ()>
+where
+    S: Fn(std::time::Duration) -> F,
+    F: std::future::Future<Output = ()>,
+    N: Fn() -> std::time::Instant,
+{
+    while SAVE_IN_PROGRESS.load(Ordering::SeqCst) {
+        if now() >= deadline {
+            return Err(());
+        }
+        sleep(poll).await;
+    }
+    Ok(())
+}
+
+/// The outcome of the save SHUTDOWN just waited for.
+fn save_outcome() -> Result<(), Frame> {
+    if BGSAVE_LAST_STATUS.load(Ordering::Relaxed) {
+        Ok(())
+    } else {
+        Err(Frame::Error(Bytes::from_static(
+            b"ERR SHUTDOWN failed: background save error, check logs",
+        )))
+    }
+}
+
 /// Decide whether SHUTDOWN's `Default` mode should perform a synchronous
 /// save, mirroring Redis: save iff at least one RDB save point is
 /// configured.
@@ -576,6 +739,193 @@ mod tests {
         // Note: other tests may have modified this, so just verify the static exists
         // and is an AtomicU64 that can be loaded.
         let _ = LAST_SAVE_TIME.load(Ordering::Relaxed);
+    }
+
+    /// Review 5: SHUTDOWN's save has ONE deadline. Someone else's save ends
+    /// just before it and SHUTDOWN's own save then never finishes: the call
+    /// gives up at the deadline, not a fresh bound after the deferral (which
+    /// let three deferrals and the save hold SHUTDOWN for 4 x 10 s).
+    #[test]
+    fn shutdown_save_has_one_deadline_across_deferrals() {
+        use std::task::{Context, Poll, Waker};
+        let _guard = BGSAVE_TEST_LOCK.lock();
+        let (tx, _rx) = crate::runtime::channel::watch(0u64);
+        // REVIEW7 R3: on a virtual clock the sleeps advance — no wall-clock
+        // bound, so machine load cannot fail it — with the real deadline.
+        let budget = std::time::Duration::from_millis(SHUTDOWN_SAVE_DEADLINE_MS);
+        let poll = std::time::Duration::from_millis(SHUTDOWN_SAVE_POLL_MS);
+        let start = std::time::Instant::now();
+        let clock = std::cell::Cell::new(start);
+        // Another save runs, and ends at 80% of the budget.
+        SAVE_IN_PROGRESS.store(true, Ordering::SeqCst);
+        let other_ended = std::cell::Cell::new(false);
+        let sleep = |d: std::time::Duration| {
+            clock.set(clock.get() + d);
+            if !other_ended.get() && clock.get() - start >= budget * 4 / 5 {
+                other_ended.set(true);
+                SAVE_IN_PROGRESS.store(false, Ordering::SeqCst);
+            }
+            std::future::ready(())
+        };
+        let mut fut = std::pin::pin!(shutdown_save_within(&tx, 1, sleep, || clock.get(), budget));
+        let reply = match fut.as_mut().poll(&mut Context::from_waker(Waker::noop())) {
+            Poll::Ready(r) => r,
+            Poll::Pending => panic!("every sleep is ready at once"),
+        };
+        let elapsed = clock.get() - start;
+        // SHUTDOWN's own save started and never completed: end it.
+        assert!(other_ended.get() && SAVE_IN_PROGRESS.load(Ordering::SeqCst));
+        bgsave_shard_done(true);
+        assert!(
+            matches!(&reply, Err(Frame::Error(e)) if e.as_ref().ends_with(b"timed out, check logs")),
+            "{reply:?}"
+        );
+        assert!(
+            elapsed <= budget + poll,
+            "gave up after {elapsed:?} (virtual), one deadline is {budget:?}"
+        );
+    }
+
+    /// PR #1268 review (CodeRabbit): SAVE claimed nothing — it only READ
+    /// `SAVE_IN_PROGRESS` — so a second SAVE, or a BGSAVE starting while it
+    /// ran, could each `mark_save_started()` over the other's mark, and the
+    /// earlier save's completion then advanced the "saved" mark past writes
+    /// its snapshot does not hold. SAVE now claims the flag for its whole
+    /// run and releases it on every exit.
+    #[test]
+    fn a_save_claims_the_in_progress_flag_for_its_whole_run() {
+        let _guard = BGSAVE_TEST_LOCK.lock();
+        SAVE_IN_PROGRESS.store(false, Ordering::SeqCst);
+        let db: SharedDatabases = Arc::new(vec![parking_lot::RwLock::new(Database::new())]);
+        db[0].write().set_string(b"k", Bytes::from_static(b"v"));
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().to_string_lossy().into_owned();
+
+        // Hold the database's write lock: the SAVE blocks in its snapshot
+        // read, mid-run — deterministically, whatever the machine's load.
+        let held = db[0].write();
+        let saver = {
+            let (db, dir) = (Arc::clone(&db), dir.clone());
+            std::thread::spawn(move || handle_save(&db, &dir, "dump.rdb"))
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut claimed = false;
+        while !claimed && std::time::Instant::now() < deadline {
+            claimed = SAVE_IN_PROGRESS.load(Ordering::SeqCst);
+            std::thread::yield_now();
+        }
+        drop(held);
+        let reply = saver.join().expect("saver");
+        assert!(matches!(reply, Frame::SimpleString(_)), "{reply:?}");
+        assert!(
+            claimed,
+            "the SAVE ran without claiming SAVE_IN_PROGRESS: a concurrent save could start"
+        );
+        assert!(
+            !SAVE_IN_PROGRESS.load(Ordering::SeqCst),
+            "released on success"
+        );
+
+        // A save already running refuses the SAVE and keeps the other's claim.
+        SAVE_IN_PROGRESS.store(true, Ordering::SeqCst);
+        assert!(matches!(
+            handle_save(&db, &dir, "dump.rdb"),
+            Frame::Error(_)
+        ));
+        assert!(
+            SAVE_IN_PROGRESS.load(Ordering::SeqCst),
+            "not ours to release"
+        );
+        SAVE_IN_PROGRESS.store(false, Ordering::SeqCst);
+
+        // A failed save releases the flag too.
+        let missing = tmp
+            .path()
+            .join("no-such-dir")
+            .to_string_lossy()
+            .into_owned();
+        assert!(matches!(
+            handle_save(&db, &missing, "dump.rdb"),
+            Frame::Error(_)
+        ));
+        assert!(
+            !SAVE_IN_PROGRESS.load(Ordering::SeqCst),
+            "released on failure"
+        );
+    }
+
+    /// PR #1268 review (CodeRabbit): a save someone else started that ends
+    /// only after SHUTDOWN's deadline has passed (within the poll that
+    /// crossed it) must not let SHUTDOWN start its OWN save past the
+    /// deadline: that save would be refused as timed out at once, yet keep
+    /// running in the background. Virtual clock, real deadline.
+    #[test]
+    fn no_shutdown_save_starts_after_the_deadline() {
+        use std::task::{Context, Poll, Waker};
+        let _guard = BGSAVE_TEST_LOCK.lock();
+        let (tx, _rx) = crate::runtime::channel::watch(0u64);
+        let budget = std::time::Duration::from_millis(SHUTDOWN_SAVE_DEADLINE_MS);
+        let start = std::time::Instant::now();
+        let clock = std::cell::Cell::new(start);
+        // Another save runs, and ends in the poll that crosses the deadline.
+        SAVE_IN_PROGRESS.store(true, Ordering::SeqCst);
+        let sleep = |d: std::time::Duration| {
+            clock.set(clock.get() + d);
+            if clock.get() - start >= budget {
+                SAVE_IN_PROGRESS.store(false, Ordering::SeqCst);
+            }
+            std::future::ready(())
+        };
+        let mut fut = std::pin::pin!(shutdown_save_within(&tx, 1, sleep, || clock.get(), budget));
+        let reply = match fut.as_mut().poll(&mut Context::from_waker(Waker::noop())) {
+            Poll::Ready(r) => r,
+            Poll::Pending => panic!("every sleep is ready at once"),
+        };
+        let started_late = SAVE_IN_PROGRESS.load(Ordering::SeqCst);
+        if started_late {
+            bgsave_shard_done(true);
+        }
+        assert!(
+            matches!(&reply, Err(Frame::Error(e)) if e.as_ref().ends_with(b"timed out, check logs")),
+            "{reply:?}"
+        );
+        assert!(
+            !started_late,
+            "SHUTDOWN started its own save after its deadline had passed"
+        );
+    }
+
+    /// The other half of the same review point, decided the other way:
+    /// SHUTDOWN's OWN save that completes in the poll that crosses the
+    /// deadline counts. The snapshot is durable; answering "timed out" would
+    /// keep the server up and make the operator's retry write it again. The
+    /// bound is the deadline plus one poll.
+    #[test]
+    fn a_shutdown_save_that_completes_at_the_deadline_counts() {
+        use std::task::{Context, Poll, Waker};
+        let _guard = BGSAVE_TEST_LOCK.lock();
+        SAVE_IN_PROGRESS.store(false, Ordering::SeqCst);
+        let (tx, _rx) = crate::runtime::channel::watch(0u64);
+        let budget = std::time::Duration::from_millis(SHUTDOWN_SAVE_DEADLINE_MS);
+        let poll = std::time::Duration::from_millis(SHUTDOWN_SAVE_POLL_MS);
+        let start = std::time::Instant::now();
+        let clock = std::cell::Cell::new(start);
+        let done = std::cell::Cell::new(false);
+        let sleep = |d: std::time::Duration| {
+            clock.set(clock.get() + d);
+            if !done.get() && clock.get() - start >= budget {
+                done.set(true);
+                bgsave_shard_done(true);
+            }
+            std::future::ready(())
+        };
+        let mut fut = std::pin::pin!(shutdown_save_within(&tx, 1, sleep, || clock.get(), budget));
+        let reply = match fut.as_mut().poll(&mut Context::from_waker(Waker::noop())) {
+            Poll::Ready(r) => r,
+            Poll::Pending => panic!("every sleep is ready at once"),
+        };
+        assert!(done.get() && reply.is_ok(), "{reply:?}");
+        assert!(clock.get() - start <= budget + poll);
     }
 
     /// Run one sharded save over `shards` shards whose outcomes are
@@ -687,6 +1037,40 @@ mod tests {
         ));
         bgsave_shard_done(true);
         assert!(!SAVE_IN_PROGRESS.load(Ordering::SeqCst));
+    }
+
+    /// moon#1232: a change made while a save runs is not in that save's
+    /// snapshot, so the save's success must leave it counted (redis:
+    /// `dirty -= dirty_before_bgsave`). Before, completion marked every
+    /// change counted by then as saved, and a `--save` rule never re-armed
+    /// for writes that landed during a save.
+    ///
+    /// Deterministic under parallel tests: other threads' changes can only
+    /// raise both readings, and the mark must stay at least five below the
+    /// count read after this thread's five changes.
+    #[test]
+    fn changes_made_while_a_save_runs_stay_counted() {
+        use crate::admin::metrics_setup::{keyspace_change_marks_for_test, record_keyspace_change};
+        let _guard = BGSAVE_TEST_LOCK.lock();
+        SAVE_IN_PROGRESS.store(false, Ordering::SeqCst);
+        BGSAVE_SHARDS_REMAINING.store(0, Ordering::SeqCst);
+        let (tx, _rx) = crate::runtime::channel::watch(0u64);
+        assert!(matches!(
+            bgsave_start_sharded_with(&tx, 1, false),
+            Frame::SimpleString(_)
+        ));
+        for _ in 0..5 {
+            record_keyspace_change();
+        }
+        let (counted, _) = keyspace_change_marks_for_test();
+        bgsave_shard_done(true);
+        assert!(BGSAVE_LAST_STATUS.load(Ordering::SeqCst));
+        let (_, saved_mark) = keyspace_change_marks_for_test();
+        assert!(
+            saved_mark + 5 <= counted,
+            "the five changes made during the save were marked saved \
+             (mark {saved_mark}, counted {counted})"
+        );
     }
 
     /// A sharded auto-save starts as a COUNTED save (moon#1230): it arms the

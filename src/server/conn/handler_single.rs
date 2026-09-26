@@ -982,6 +982,10 @@ pub async fn handle_connection(
                                     b"ERR value is not an integer or out of range",
                                 )),
                             };
+                            // moon#1232 review 5: one change, as in redis 7.0.15.
+                            if matches!(resp, Frame::SimpleString(_)) {
+                                crate::admin::metrics_setup::record_keyspace_changes(1);
+                            }
                             responses.push(resp);
                             continue;
                         }
@@ -2895,7 +2899,7 @@ pub async fn handle_connection(
                                             let r = crate::command::keyspace::move_cmd::with_two_dbs_locked(
                                                 db.as_slice(), src_db, dst_db,
                                                 |src, dst| {
-                                                    let r = crate::command::keyspace::move_cmd::move_core(src, dst, &key);
+                                                    let r = crate::command::keyspace::move_cmd::move_core(src, src_db, dst, dst_db, &key);
                                                     // moon#1099: logged while both dbs are
                                                     // held. task #35: MOVE persists against
                                                     // its SOURCE db (src_db ==
@@ -2933,7 +2937,7 @@ pub async fn handle_connection(
                                                 let r = crate::command::keyspace::move_cmd::with_two_dbs_locked(
                                                     db.as_slice(), src_db, ca.dst_db,
                                                     |src, dst| {
-                                                        let r = crate::command::keyspace::move_cmd::copy_core(src, dst, &ca.src_key, &ca.dst_key, ca.replace);
+                                                        let r = crate::command::keyspace::move_cmd::copy_core(src, src_db, dst, ca.dst_db, &ca.src_key, &ca.dst_key, ca.replace);
                                                         // moon#1099: logged while both dbs
                                                         // are held. task #35: COPY ... DB n
                                                         // persists against its SOURCE db,

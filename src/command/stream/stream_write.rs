@@ -163,7 +163,16 @@ pub fn xadd(db: &mut Database, args: &[Frame]) -> Frame {
                 if s_str.ends_with("-*") {
                     let ms = parsed.ms;
                     let seq = if ms == last_id.ms {
-                        last_id.seq + 1
+                        // At the last sequence of `ms` there is no next ID
+                        // there: redis's refusal (moon#1228 review 6, N2 —
+                        // the plain `+ 1` panicked a debug build's shard and
+                        // wrapped to `<ms>-0` in a release one).
+                        let Some(next) = last_id.seq.checked_add(1) else {
+                            return Frame::Error(Bytes::from_static(
+                                b"ERR The ID specified in XADD is equal or smaller than the target stream top item",
+                            ));
+                        };
+                        next
                     } else if ms > last_id.ms {
                         0
                     } else {

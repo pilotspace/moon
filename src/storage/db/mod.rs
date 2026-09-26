@@ -2,6 +2,8 @@ use bytes::Bytes;
 use std::collections::HashMap;
 
 mod accessors;
+mod bulk_load;
+mod cold_promote;
 mod cold_replay_gate;
 /// moon#1221 review INTEG-5: writes to compact collections record one access.
 #[cfg(test)]
@@ -14,6 +16,7 @@ mod incr;
 /// answered absent or re-created. Test-only.
 #[cfg(test)]
 mod inflight_expiry_1255_tests;
+mod keyspace_scan;
 mod kv_ops;
 /// moon#1190: per-database lazy-free queue, drained on the shard tick.
 mod lazy_free;
@@ -46,6 +49,7 @@ pub use lazy_free::{
     LAZY_FREE_THRESHOLD, LAZY_FREE_TICK_BUDGET, lazy_free_pending_anywhere,
     lazy_free_queued_on_this_thread, lazy_free_resync_this_thread,
 };
+pub(crate) use lazy_free::{lazy_free_weight, spawn_dropper};
 
 pub use super::db_read::{HashRef, ListRef, SetRef, SortedSetRef, StreamRef};
 pub use accessors::{EntryView, SetHandle};
@@ -57,7 +61,9 @@ use super::entry::{CachedClock, Entry, RedisValue, current_secs, current_time_ms
 pub use crate::storage::encoding_limits::{EncodingLimits, Shape};
 
 /// Estimate per-entry overhead: key length + value memory + struct overhead.
-fn entry_overhead(key: &[u8], entry: &Entry) -> usize {
+/// What `used_memory` charges for a row — also how a snapshot bills the rows
+/// a flushed table keeps (moon#1228).
+pub(crate) fn entry_overhead(key: &[u8], entry: &Entry) -> usize {
     entry_overhead_len(key.len(), entry)
 }
 
@@ -551,7 +557,9 @@ pub struct Database {
     /// head `DEL` (`persistence::aof::fold_stream`).
     ///
     /// Bounded by the spills in flight: an entry is settled by its request's
-    /// completion, whatever the outcome (`spill_superseded_settle`).
+    /// completion, whatever the outcome (`spill_superseded_settle`), and one
+    /// whose completion never comes is pruned by the spill thread's
+    /// watermark (`spill_superseded_prune_below`, `spill_superseded_clear`).
     spill_superseded: std::collections::HashMap<(bytes::Bytes, u64), Option<u64>>,
     /// Bytes the [`Self::spill_superseded`] entries hold: key handles plus
     /// map slots. Deliberately NOT part of [`Self::pending_spill_bytes`], the
@@ -891,6 +899,39 @@ impl Database {
             return true;
         }
         false
+    }
+
+    /// Forget every superseded request whose id is below `done_below`, the
+    /// spill thread's watermark read BEFORE the completion drain that was
+    /// just applied (refs moon#1253): each of them had its completion sent
+    /// before that read, so either the drain settled it or its completion
+    /// was dropped and never comes — its file was never listed, and the
+    /// orphan sweep reclaims it. Returns how many were forgotten.
+    pub fn spill_superseded_prune_below(&mut self, done_below: u64) -> usize {
+        if self.spill_superseded.is_empty() {
+            return 0;
+        }
+        let before = self.spill_superseded.len();
+        let mut credit = 0usize;
+        self.spill_superseded.retain(|(key, req_id), _| {
+            let done = *req_id < done_below;
+            if done {
+                credit += key.len() + SPILL_SUPERSEDED_OVERHEAD;
+            }
+            !done
+        });
+        self.spill_superseded_bytes = self.spill_superseded_bytes.saturating_sub(credit);
+        before - self.spill_superseded.len()
+    }
+
+    /// Forget every superseded request: the spill thread died, so no
+    /// completion will arrive and none of their files gets listed (refs
+    /// moon#1253). Returns how many were forgotten.
+    pub fn spill_superseded_clear(&mut self) -> usize {
+        let n = self.spill_superseded.len();
+        self.spill_superseded.clear();
+        self.spill_superseded_bytes = 0;
+        n
     }
 
     /// Keys whose superseded in-flight slot can still come back at `now_ms`
@@ -1401,6 +1442,15 @@ impl Database {
     /// to chase memory that cannot drop yet.
     pub fn estimated_memory(&self) -> usize {
         self.used_memory.saturating_add(self.spill_inflight_bytes)
+    }
+
+    /// The `used_memory` ledger alone: what the table's rows are billed,
+    /// without [`Self::estimated_memory`]'s spill-in-flight bytes (which the
+    /// table does not hold). A snapshot records it per database when it
+    /// starts, to bound what a FLUSHDB may hand it (moon#1228).
+    #[inline]
+    pub(crate) fn ledger_bytes(&self) -> usize {
+        self.used_memory
     }
 
     /// Resident bytes attributed to this database (alias for `estimated_memory`,

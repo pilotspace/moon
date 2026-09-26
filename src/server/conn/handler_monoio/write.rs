@@ -255,20 +255,10 @@ pub(super) async fn try_handle_ws_command(
                                         // guard ascending and holds them for the
                                         // whole sweep — same all-or-nothing view
                                         // the `&mut [Database]` walk had.
+                                        // moon#1228: the shared sweep captures
+                                        // each key for an armed BGSAVE first.
                                         s.databases.with_all(|dbs| {
-                                            for db in dbs.iter_mut() {
-                                                let keys_to_delete: Vec<Vec<u8>> = db
-                                                    .keys()
-                                                    .filter(|k| {
-                                                        k.as_bytes()
-                                                            .starts_with(prefix_bytes.as_ref())
-                                                    })
-                                                    .map(|k| k.as_bytes().to_vec())
-                                                    .collect();
-                                                for key in &keys_to_delete {
-                                                    db.remove(key);
-                                                }
-                                            }
+                                            crate::workspace::sweep_prefix(dbs, &prefix_bytes)
                                         });
                                     });
                                 } else {
@@ -679,8 +669,11 @@ async fn mq_hop_or_local(
     command: std::sync::Arc<crate::protocol::Frame>,
 ) -> crate::protocol::Frame {
     if owner == ctx.shard_id {
-        // Self-short-circuit: run directly on this shard's slice.
-        crate::shard::mq_exec::execute_mq_on_owner(db_index, key_prefix, command)
+        // Self-short-circuit: run directly on this shard's slice. moon#1250:
+        // with the write path's own maxmemory / per-db-quota gate.
+        crate::shard::mq_exec::execute_mq_on_owner(db_index, key_prefix, command, &mut |db, idx| {
+            super::run_write_eviction_gate(ctx, db, idx, b"MQ")
+        })
     } else {
         // Cross-shard hop via MqCommand SPSC message (GraphCommand precedent).
         let (reply_tx, reply_rx) = crate::runtime::channel::oneshot();

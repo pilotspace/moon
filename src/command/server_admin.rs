@@ -98,8 +98,8 @@ pub fn flushall(db: &mut Database, args: &[Frame]) -> Frame {
 /// could not see.
 ///
 /// `selected` is the database `dispatch` already cleared, so it is skipped.
-/// Re-clearing it would be harmless, but skipping keeps one flush to one
-/// `record_keyspace_change` per database.
+/// Re-clearing it would be harmless (an empty database counts no change,
+/// moon#1232), but skipping saves the walk.
 ///
 /// `Database::clear` is what makes this complete rather than cosmetic: it
 /// drops the cold-tier index and the in-flight spill record as well as the

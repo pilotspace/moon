@@ -1767,6 +1767,8 @@ impl super::Shard {
                             shard_dir,
                             shard_manifest.as_mut(),
                             cached_clock.ms(),
+                            aof_pool.as_ref(),
+                            &spill_file_id,
                         );
                     }
                 }
@@ -2682,6 +2684,8 @@ impl super::Shard {
                         shard_dir,
                         shard_manifest.as_mut(),
                         cached_clock.ms(),
+                        aof_pool.as_ref(),
+                        &spill_file_id,
                     );
                 }
 

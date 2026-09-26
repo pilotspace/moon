@@ -1819,14 +1819,23 @@ pub(crate) fn handle_shard_message_shared(
             };
             let mut reg = blocking_registry.borrow_mut();
             reg.register(db_index, key.clone(), entry);
-            // Check if data is already available (race: data arrived before registration).
+            // Check if data is already available (race: data arrived before
+            // registration, or the client's shard could not see it). A serve
+            // of this waiter here is the command served at once and counts as
+            // its non-blocking twin (moon#1232 review 5).
             crate::shard::slice::with_shard_db(db_index, |guard| {
                 if guard.exists(&key) {
-                    crate::blocking::wakeup::try_wake_list_waiter(&mut reg, guard, db_index, &key);
-                    crate::blocking::wakeup::try_wake_zset_waiter(&mut reg, guard, db_index, &key);
-                    crate::blocking::wakeup::try_wake_stream_waiter(
-                        &mut reg, guard, db_index, &key,
-                    );
+                    crate::blocking::wakeup::serve_at_registration(wait_id, || {
+                        crate::blocking::wakeup::try_wake_list_waiter(
+                            &mut reg, guard, db_index, &key,
+                        );
+                        crate::blocking::wakeup::try_wake_zset_waiter(
+                            &mut reg, guard, db_index, &key,
+                        );
+                        crate::blocking::wakeup::try_wake_stream_waiter(
+                            &mut reg, guard, db_index, &key,
+                        );
+                    });
                 }
             });
         }
@@ -2394,8 +2403,44 @@ pub(crate) fn handle_shard_message_shared(
                 command,
                 reply_tx,
             } = *payload;
-            let response =
-                crate::shard::mq_exec::execute_mq_on_owner(db_index, key_prefix, command);
+            // moon#1250: the owner's maxmemory / per-db-quota gate, as the
+            // routed write arms run it (with their plain-drop DEL records).
+            let mut reason_del_budget = crate::persistence::aof::AOF_REASON_DEL_BACKPRESSURE_BOUND;
+            let response = crate::shard::mq_exec::execute_mq_on_owner(
+                db_index,
+                key_prefix,
+                command,
+                &mut |db, idx| {
+                    if !evict_active {
+                        return Ok(());
+                    }
+                    spsc_eviction_gate(
+                        b"MQ",
+                        db,
+                        idx,
+                        shard_databases,
+                        shard_id,
+                        runtime_config,
+                        spill_sender,
+                        spill_file_id,
+                        disk_offload_dir,
+                        &mut |key| {
+                            crate::replication::reason_del::record_reason_del(
+                                key,
+                                idx,
+                                wal_writer,
+                                repl_backlog,
+                                replica_txs,
+                                repl_state,
+                                shard_id,
+                                aof_pool,
+                                wal_kv_log,
+                                &mut reason_del_budget,
+                            );
+                        },
+                    )
+                },
+            );
             // Ignore send failure: receiver dropped means the client disconnected.
             let _ = reply_tx.send(response);
         }
@@ -2413,24 +2458,10 @@ pub(crate) fn handle_shard_message_shared(
             // directly in txn.rs). Payloads are collected inside the
             // closure (encoding is a pure function call) and emitted after
             // it returns.
+            // moon#1228: the shared body captures each queue's pre-image
+            // for an armed BGSAVE before pushing.
             let payloads: Vec<Vec<u8>> = crate::shard::slice::with_shard_db(db_index, |db| {
-                let mut payloads = Vec::with_capacity(intents.len());
-                for intent in &intents {
-                    if let Ok(Some(stream)) = db.get_stream_mut(&intent.queue_key) {
-                        if stream.durable {
-                            let msg_id = stream.next_auto_id();
-                            payloads.push(crate::mq::wal::encode_mq_push(
-                                db_index as u32,
-                                &intent.queue_key,
-                                msg_id.ms,
-                                msg_id.seq,
-                                &intent.fields,
-                            ));
-                            stream.add(msg_id, intent.fields.clone());
-                        }
-                    }
-                }
-                payloads
+                crate::shard::mq_exec::materialize_mq_intents(db, db_index, &intents)
             });
             for payload in payloads {
                 crate::shard::mq_exec::wal_append_on_slice(
@@ -2462,22 +2493,13 @@ pub(crate) fn handle_shard_message_shared(
             // admin-rare operation (create/drop a tenant); see
             // docs/guides/isolation.md's "WS DROP" cost-note for the
             // large-keyspace / large---databases caveat.
+            //
+            // moon#1228: `sweep_prefix` captures each key's pre-image for an
+            // armed BGSAVE epoch before deleting it (the three sweep copies
+            // this replaced captured nothing).
             let deleted_count = crate::shard::slice::with_shard(|s| {
-                s.databases.with_all(|dbs| {
-                    let mut total = 0u64;
-                    for db in dbs.iter_mut() {
-                        let keys_to_delete: Vec<Vec<u8>> = db
-                            .keys()
-                            .filter(|k| k.as_bytes().starts_with(prefix.as_ref()))
-                            .map(|k| k.as_bytes().to_vec())
-                            .collect();
-                        total += keys_to_delete.len() as u64;
-                        for key in &keys_to_delete {
-                            db.remove(key);
-                        }
-                    }
-                    total
-                })
+                s.databases
+                    .with_all(|dbs| crate::workspace::sweep_prefix(dbs, &prefix))
             });
             // Ignore send failure: caller logs the count but the drop already
             // completed; losing the ack is harmless.

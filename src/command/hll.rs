@@ -103,17 +103,20 @@ pub fn pfadd(db: &mut Database, args: &[Frame]) -> Frame {
         }
     };
 
-    let mut changed = created;
+    // moon#1232: redis `dirty += updated` — the creation, plus one per
+    // element that changed a register.
+    let mut updated = u64::from(created);
     for arg in &args[1..] {
         if let Some(elem) = extract_bytes(arg) {
             if hll.add(elem) {
-                changed = true;
+                updated += 1;
             }
         }
     }
 
-    if changed {
+    if updated != 0 {
         store_hll(db, key_owned, hll);
+        crate::admin::metrics_setup::record_keyspace_changes(updated);
         Frame::Integer(1)
     } else {
         Frame::Integer(0)

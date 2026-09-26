@@ -372,29 +372,121 @@ fn total_commands_sum() -> u64 {
 // reason (a single line would bounce across every shard core at write rate);
 // the increment is one relaxed fetch_add on the thread's own line.
 //
-// Counted at the storage funnels (`Database::set` / `remove` / `get_mut` /
-// `clear` / `set_expiry`), not at dispatch: dispatch does not know whether a
-// command mutated, and a phf flags lookup on the hot path is exactly the cost
-// this codebase's perf invariants forbid. `get_mut` hands out mutable access
-// that the caller may or may not use, so the count can run slightly HIGH.
-// That direction is deliberate: over-counting says "changes pending" and
-// triggers a save that was not needed, while under-counting would tell a
-// backup script the dataset was clean when it was not.
+// What counts is redis 7.0.15's `server.dirty` (moon#1232 review), measured
+// command by command against that oracle:
+//
+// * String writes are counted at the storage funnels (`Database::set` /
+//   `remove` / `clear` / `set_expiry`, the INCR and in-place string paths),
+//   and only when the funnel CHANGED something: `DEL` / `EXPIRE` of a missing
+//   key count 0, as in redis.
+// * Collection writes are counted by the command, by redis's per-command
+//   rule (`command::keyspace_changes`): `HSET` counts its field-value pairs,
+//   `SADD` the members it added, `ZADD` added + rescored, `LPOP` the elements
+//   it popped. Their own storage-funnel calls (an emptied key's removal, a
+//   `*STORE`'s write) run under [`mute_keyspace_changes`] so a command is
+//   counted once, by its rule.
+// * The server's own housekeeping is not a change: active and lazy expiry,
+//   maxmemory eviction, a cold read's promotion into RAM and the spill
+//   thread's rehydrates run muted. A read never counts.
+//
+// No phf flags lookup is added to the hot path: the rule is chosen by the
+// dispatch arm the command already matched, and the mute is one thread-local
+// `Cell` the funnels read next to the slot they already read.
 static KEYSPACE_CHANGE_COUNTERS: [PaddedCounter; COMMAND_COUNTER_SLOTS] =
     [PADDED_COUNTER_ZERO; COMMAND_COUNTER_SLOTS];
 /// Value of the change counter when the last save completed. `rdb_changes_
 /// since_last_save` is the difference; a save that completes concurrently with
 /// writes can only make the difference smaller, never negative (saturating).
 static KEYSPACE_CHANGES_AT_LAST_SAVE: AtomicU64 = AtomicU64::new(0);
+/// Value of the change counter when the save now running STARTED
+/// ([`mark_save_started`]) — redis's `dirty_before_bgsave`.
+static KEYSPACE_CHANGES_AT_SAVE_START: AtomicU64 = AtomicU64::new(0);
 
-/// Record one keyspace mutation. Hot path: one relaxed add, no allocation.
+thread_local! {
+    /// Depth of [`mute_keyspace_changes`] guards live on this thread. Nonzero
+    /// silences the storage funnels ([`record_keyspace_change`]), never a
+    /// command's own count ([`record_keyspace_changes`]).
+    static KEYSPACE_CHANGE_MUTE: core::cell::Cell<u32> = const { core::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only per-thread shadow of what this thread added to the global
+    /// counter: lib tests run in parallel, so a delta of the global sum is not
+    /// attributable to the test reading it.
+    static KEYSPACE_CHANGES_THIS_THREAD: core::cell::Cell<u64> = const { core::cell::Cell::new(0) };
+}
+
 #[inline]
-pub fn record_keyspace_change() {
+fn add_keyspace_changes(n: u64) {
     COMMAND_COUNTER_SLOT.with(|&slot| {
         KEYSPACE_CHANGE_COUNTERS[slot]
             .0
-            .fetch_add(1, Ordering::Relaxed);
+            .fetch_add(n, Ordering::Relaxed);
     });
+    #[cfg(test)]
+    KEYSPACE_CHANGES_THIS_THREAD.with(|c| c.set(c.get() + n));
+}
+
+/// Record one keyspace mutation from a STORAGE FUNNEL. Hot path: one
+/// thread-local load and one relaxed add, no allocation. Silent while a
+/// [`mute_keyspace_changes`] guard is live on this thread.
+#[inline]
+pub fn record_keyspace_change() {
+    if KEYSPACE_CHANGE_MUTE.with(core::cell::Cell::get) != 0 {
+        return;
+    }
+    add_keyspace_changes(1);
+}
+
+/// [`record_keyspace_change`] for a funnel that changes `n` keys at once
+/// (`FLUSHDB` counts the keys it removed, as redis does).
+#[inline]
+pub fn record_keyspace_change_by(n: u64) {
+    if n == 0 || KEYSPACE_CHANGE_MUTE.with(core::cell::Cell::get) != 0 {
+        return;
+    }
+    add_keyspace_changes(n);
+}
+
+/// Record `n` keyspace changes a COMMAND made, by its redis rule. Counted
+/// whether or not the funnels are muted: this is the count the mute makes
+/// room for.
+#[inline]
+pub fn record_keyspace_changes(n: u64) {
+    if n != 0 {
+        add_keyspace_changes(n);
+    }
+}
+
+/// Silences [`record_keyspace_change`] on this thread until dropped. Nests.
+#[must_use = "the funnels are muted only while the guard lives"]
+pub struct KeyspaceChangeMute {
+    _not_send: core::marker::PhantomData<*const ()>,
+}
+
+impl Drop for KeyspaceChangeMute {
+    #[inline]
+    fn drop(&mut self) {
+        KEYSPACE_CHANGE_MUTE.with(|m| m.set(m.get().saturating_sub(1)));
+    }
+}
+
+/// Mute the storage funnels' change count for a scope: a collection command
+/// whose count its rule gives, or server housekeeping (expiry, eviction, a
+/// cold read's promotion) that redis does not count at all.
+#[inline]
+pub fn mute_keyspace_changes() -> KeyspaceChangeMute {
+    KEYSPACE_CHANGE_MUTE.with(|m| m.set(m.get() + 1));
+    KeyspaceChangeMute {
+        _not_send: core::marker::PhantomData,
+    }
+}
+
+/// Test-only: what THIS thread has added to the change counter so far.
+#[cfg(test)]
+pub(crate) fn keyspace_changes_on_this_thread() -> u64 {
+    KEYSPACE_CHANGES_THIS_THREAD.with(core::cell::Cell::get)
 }
 
 /// Exact sum across all slots. Read paths only (INFO).
@@ -410,12 +502,37 @@ pub fn rdb_changes_since_last_save() -> u64 {
     keyspace_changes_sum().saturating_sub(KEYSPACE_CHANGES_AT_LAST_SAVE.load(Ordering::Relaxed))
 }
 
-/// Mark a save as complete: subsequent changes count from here.
+/// Mark a save as started: its snapshot holds the changes counted so far.
+///
+/// Called when SAVE / BGSAVE (and the auto-save, which starts a BGSAVE)
+/// begins, before any shard takes its snapshot.
+pub fn mark_save_started() {
+    KEYSPACE_CHANGES_AT_SAVE_START.store(keyspace_changes_sum(), Ordering::Relaxed);
+}
+
+/// Mark a save as complete: the changes counted when it STARTED are now
+/// saved; the ones made while it ran are not (the snapshot predates them)
+/// and stay counted, as redis's `dirty -= dirty_before_bgsave` keeps them
+/// (moon#1232 — they now re-arm a `--save` rule instead of being forgotten).
 ///
 /// Called on SAVE / BGSAVE success, never on failure — a failed save left the
-/// dataset unpersisted, so the pending-change count must survive it.
+/// dataset unpersisted, so the pending-change count must survive it. A save
+/// that did not go through [`mark_save_started`] leaves the count higher,
+/// never lower: `fetch_max` never moves the mark back.
 pub fn mark_save_completed() {
-    KEYSPACE_CHANGES_AT_LAST_SAVE.store(keyspace_changes_sum(), Ordering::Relaxed);
+    KEYSPACE_CHANGES_AT_LAST_SAVE.fetch_max(
+        KEYSPACE_CHANGES_AT_SAVE_START.load(Ordering::Relaxed),
+        Ordering::Relaxed,
+    );
+}
+
+/// Test-only: `(changes counted so far, the mark of the last completed save)`.
+#[cfg(test)]
+pub(crate) fn keyspace_change_marks_for_test() -> (u64, u64) {
+    (
+        keyspace_changes_sum(),
+        KEYSPACE_CHANGES_AT_LAST_SAVE.load(Ordering::Relaxed),
+    )
 }
 
 // ── EC9: replica sync counters (INFO `sync_full` / `sync_partial_*`) ─────

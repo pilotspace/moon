@@ -32,10 +32,35 @@ use crate::storage::Database;
 ///
 /// Returns `:1` on success, `:0` on no-op (key absent or collision in dst).
 ///
+/// `src_idx` / `dst_idx` are the shard-local indexes of `src` and `dst`
+/// (`databases[src_idx]`, `databases[dst_idx]`).
+///
 /// # Preconditions
 /// - `src` and `dst` are two **distinct** databases from the same shard
 /// - The caller holds exclusive (write) access to both
-pub fn move_core(src: &mut Database, dst: &mut Database, key: &[u8]) -> Frame {
+pub fn move_core(
+    src: &mut Database,
+    src_idx: usize,
+    dst: &mut Database,
+    dst_idx: usize,
+    key: &[u8],
+) -> Frame {
+    // moon#1228: an armed snapshot epoch needs the key's state in BOTH
+    // databases before it leaves one and lands in the other.
+    crate::persistence::snapshot_cow::capture_two_db(src, src_idx, Some(key), dst, dst_idx, key);
+    // moon#1232: a MOVE is ONE keyspace change in redis, and a refused one is
+    // none — its remove-and-put-back must not count two.
+    let reply = {
+        let _quiet = crate::admin::metrics_setup::mute_keyspace_changes();
+        move_core_uncounted(src, dst, key)
+    };
+    if matches!(reply, Frame::Integer(1)) {
+        crate::admin::metrics_setup::record_keyspace_changes(1);
+    }
+    reply
+}
+
+fn move_core_uncounted(src: &mut Database, dst: &mut Database, key: &[u8]) -> Frame {
     // Key must exist in src (lazy expiry applied inside `remove`)
     let entry = match src.remove(key) {
         Some(e) => e,
@@ -63,16 +88,24 @@ pub fn move_core(src: &mut Database, dst: &mut Database, key: &[u8]) -> Frame {
 ///
 /// Returns `:1` on success, `:0` on collision when `replace` is false.
 ///
+/// `src_idx` / `dst_idx` are the shard-local indexes of `src` and `dst`
+/// (`databases[src_idx]`, `databases[dst_idx]`).
+///
 /// # Preconditions
 /// - `src` and `dst` are two **distinct** databases from the same shard
 /// - The caller holds exclusive (write) access to both
 pub fn copy_core(
     src: &mut Database,
+    src_idx: usize,
     dst: &mut Database,
+    dst_idx: usize,
     src_key: &[u8],
     dst_key: &[u8],
     replace: bool,
 ) -> Frame {
+    // moon#1228: an armed snapshot epoch needs the destination key's state
+    // before the copy lands (the source is only read).
+    crate::persistence::snapshot_cow::capture_two_db(src, src_idx, None, dst, dst_idx, dst_key);
     // Source must exist
     let entry = match src.get(src_key) {
         Some(e) => e.clone(),
@@ -284,12 +317,22 @@ impl TwoDbOp {
         }
     }
 
-    /// Run the command against its source and destination databases.
+    /// Run the command against its source database (`databases[src_idx]`)
+    /// and its destination database (`databases[self.dst_db()]`).
     /// `:1` means the keyspace changed; anything else wrote nothing.
-    pub fn apply(&self, src: &mut Database, dst: &mut Database) -> Frame {
+    pub fn apply(&self, src: &mut Database, src_idx: usize, dst: &mut Database) -> Frame {
+        let dst_idx = self.dst_db();
         match self {
-            TwoDbOp::Move { key, .. } => move_core(src, dst, key),
-            TwoDbOp::Copy(ca) => copy_core(src, dst, &ca.src_key, &ca.dst_key, ca.replace),
+            TwoDbOp::Move { key, .. } => move_core(src, src_idx, dst, dst_idx, key),
+            TwoDbOp::Copy(ca) => copy_core(
+                src,
+                src_idx,
+                dst,
+                dst_idx,
+                &ca.src_key,
+                &ca.dst_key,
+                ca.replace,
+            ),
         }
     }
 }
@@ -428,7 +471,7 @@ mod tests {
         let mut dst = make_db();
         set_str(&mut src, "k", "v");
 
-        let frame = move_core(&mut src, &mut dst, b"k");
+        let frame = move_core(&mut src, 0, &mut dst, 1, b"k");
         assert_eq!(frame, Frame::Integer(1));
         assert!(!src.exists(b"k"), "key must be removed from src");
         assert!(dst.exists(b"k"), "key must be present in dst");
@@ -438,7 +481,7 @@ mod tests {
     fn test_move_core_key_missing_in_src() {
         let mut src = make_db();
         let mut dst = make_db();
-        let frame = move_core(&mut src, &mut dst, b"missing");
+        let frame = move_core(&mut src, 0, &mut dst, 1, b"missing");
         assert_eq!(frame, Frame::Integer(0));
     }
 
@@ -449,7 +492,7 @@ mod tests {
         set_str(&mut src, "k", "src-val");
         set_str(&mut dst, "k", "dst-val");
 
-        let frame = move_core(&mut src, &mut dst, b"k");
+        let frame = move_core(&mut src, 0, &mut dst, 1, b"k");
         assert_eq!(frame, Frame::Integer(0));
         assert!(src.exists(b"k"), "src key must be restored on collision");
         assert!(dst.exists(b"k"), "dst key must survive");
@@ -463,7 +506,7 @@ mod tests {
         let mut dst = make_db();
         set_str(&mut src, "src", "hello");
 
-        let frame = copy_core(&mut src, &mut dst, b"src", b"dst", false);
+        let frame = copy_core(&mut src, 0, &mut dst, 1, b"src", b"dst", false);
         assert_eq!(frame, Frame::Integer(1));
         assert!(src.exists(b"src"), "src must still exist after copy");
         assert!(dst.exists(b"dst"), "dst must have the copied value");
@@ -473,7 +516,7 @@ mod tests {
     fn test_copy_core_missing_src() {
         let mut src = make_db();
         let mut dst = make_db();
-        let frame = copy_core(&mut src, &mut dst, b"missing", b"dst", false);
+        let frame = copy_core(&mut src, 0, &mut dst, 1, b"missing", b"dst", false);
         assert_eq!(frame, Frame::Integer(0));
     }
 
@@ -484,7 +527,7 @@ mod tests {
         set_str(&mut src, "src", "new");
         set_str(&mut dst, "dst", "old");
 
-        let frame = copy_core(&mut src, &mut dst, b"src", b"dst", false);
+        let frame = copy_core(&mut src, 0, &mut dst, 1, b"src", b"dst", false);
         assert_eq!(frame, Frame::Integer(0));
     }
 
@@ -495,7 +538,7 @@ mod tests {
         set_str(&mut src, "src", "new");
         set_str(&mut dst, "dst", "old");
 
-        let frame = copy_core(&mut src, &mut dst, b"src", b"dst", true);
+        let frame = copy_core(&mut src, 0, &mut dst, 1, b"src", b"dst", true);
         assert_eq!(frame, Frame::Integer(1));
         assert!(dst.exists(b"dst"));
     }
@@ -716,10 +759,10 @@ mod tests {
         let mv = resolve_two_db(b"MOVE", &[bulk("m"), bulk("1")], 0, 16)
             .unwrap()
             .unwrap();
-        assert_eq!(mv.apply(&mut src, &mut dst), Frame::Integer(1));
+        assert_eq!(mv.apply(&mut src, 0, &mut dst), Frame::Integer(1));
         assert!(!src.exists(b"m") && dst.exists(b"m"));
         // A second MOVE finds the source empty: a no-op.
-        assert_eq!(mv.apply(&mut src, &mut dst), Frame::Integer(0));
+        assert_eq!(mv.apply(&mut src, 0, &mut dst), Frame::Integer(0));
 
         let cp = resolve_two_db(
             b"COPY",
@@ -729,10 +772,10 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert_eq!(cp.apply(&mut src, &mut dst), Frame::Integer(1));
+        assert_eq!(cp.apply(&mut src, 0, &mut dst), Frame::Integer(1));
         assert!(src.exists(b"c") && dst.exists(b"c2") && !src.exists(b"c2"));
         // Without REPLACE a second copy collides.
-        assert_eq!(cp.apply(&mut src, &mut dst), Frame::Integer(0));
+        assert_eq!(cp.apply(&mut src, 0, &mut dst), Frame::Integer(0));
     }
 
     // ── with_two_dbs_locked ─────────────────────────────────────────────────────
@@ -742,7 +785,7 @@ mod tests {
         let dbs: Vec<RwLock<Database>> = (0..4).map(|_| RwLock::new(make_db())).collect();
         with_two_dbs_locked(&dbs, 0, 2, |src, dst| {
             set_str(src, "x", "hello");
-            let frame = move_core(src, dst, b"x");
+            let frame = move_core(src, 0, dst, 2, b"x");
             assert_eq!(frame, Frame::Integer(1));
         });
     }
@@ -752,7 +795,7 @@ mod tests {
         let dbs: Vec<RwLock<Database>> = (0..4).map(|_| RwLock::new(make_db())).collect();
         with_two_dbs_locked(&dbs, 3, 1, |src, dst| {
             set_str(src, "y", "world");
-            let frame = move_core(src, dst, b"y");
+            let frame = move_core(src, 3, dst, 1, b"y");
             assert_eq!(frame, Frame::Integer(1));
         });
     }
@@ -764,7 +807,7 @@ mod tests {
         let mut dbs: Vec<Database> = (0..4).map(|_| make_db()).collect();
         set_str(&mut dbs[0], "z", "val");
         with_two_slice_dbs(&mut dbs, 0, 2, |src, dst| {
-            let frame = move_core(src, dst, b"z");
+            let frame = move_core(src, 0, dst, 2, b"z");
             assert_eq!(frame, Frame::Integer(1));
         });
         assert!(!dbs[0].exists(b"z"));
@@ -776,7 +819,7 @@ mod tests {
         let mut dbs: Vec<Database> = (0..4).map(|_| make_db()).collect();
         set_str(&mut dbs[3], "w", "val");
         with_two_slice_dbs(&mut dbs, 3, 1, |src, dst| {
-            let frame = move_core(src, dst, b"w");
+            let frame = move_core(src, 3, dst, 1, b"w");
             assert_eq!(frame, Frame::Integer(1));
         });
         assert!(!dbs[3].exists(b"w"));

@@ -131,6 +131,63 @@ pub(crate) fn flush_all_agents() -> io::Result<()> {
     Ok(())
 }
 
+/// The outcome of a manifest commit that did not wait for its fsync
+/// ([`ShardManifest::commit_acked`](super::manifest::ShardManifest::commit_acked),
+/// moon#1240). Poll it from a later tick; it resolves exactly once.
+#[derive(Debug)]
+pub(crate) struct CommitAck(AckState);
+
+#[derive(Debug)]
+enum AckState {
+    /// Resolved when it was created (an inline persist, or a hand-off that
+    /// failed); `None` once polled out.
+    Ready(Option<io::Result<()>>),
+    /// Waiting for the manifest-sync thread.
+    Waiting(flume::Receiver<io::Result<()>>),
+}
+
+impl CommitAck {
+    pub(crate) fn ready(result: io::Result<()>) -> Self {
+        Self(AckState::Ready(Some(result)))
+    }
+
+    pub(crate) fn waiting(rx: flume::Receiver<io::Result<()>>) -> Self {
+        Self(AckState::Waiting(rx))
+    }
+
+    /// `None` while the commit is still in flight, `Some(outcome)` once it is
+    /// known — `Ok` means this snapshot (or a newer one) is durable. Never
+    /// blocks. Resolves once: a later poll answers an error.
+    pub(crate) fn poll(&mut self) -> Option<io::Result<()>> {
+        let outcome = match &mut self.0 {
+            AckState::Ready(outcome) => outcome
+                .take()
+                .unwrap_or_else(|| Err(io::Error::other("manifest commit ack already consumed"))),
+            AckState::Waiting(rx) => match rx.try_recv() {
+                Ok(outcome) => outcome,
+                Err(flume::TryRecvError::Empty) => return None,
+                Err(flume::TryRecvError::Disconnected) => {
+                    Err(io::Error::other("manifest-sync thread died before ack"))
+                }
+            },
+        };
+        self.0 = AckState::Ready(None);
+        Some(outcome)
+    }
+
+    /// Block until the outcome is known (tests).
+    #[cfg(test)]
+    pub(crate) fn wait(mut self) -> io::Result<()> {
+        if let AckState::Waiting(rx) = &self.0 {
+            return rx
+                .recv()
+                .map_err(|_| io::Error::other("manifest-sync thread died before ack"))?;
+        }
+        self.poll()
+            .unwrap_or_else(|| Err(io::Error::other("manifest commit ack already consumed")))
+    }
+}
+
 impl std::fmt::Debug for ManifestSyncAgent {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ManifestSyncAgent")
@@ -209,6 +266,19 @@ impl ManifestSyncAgent {
 
     /// Commit and block until the snapshot (or a newer one) is durable.
     pub(crate) fn commit_durable(&self, root: ManifestRoot) -> io::Result<()> {
+        self.commit_acked(root)?
+            .recv()
+            .map_err(|_| io::Error::other("manifest-sync thread died before ack"))?
+    }
+
+    /// Commit without blocking and hand back the ack, which resolves once the
+    /// snapshot (or a newer one) is durable — or failed. The durable commit
+    /// is this plus a blocking `recv`; a caller that must not stall (the cold
+    /// reclaim's adoption, moon#1240) polls it instead.
+    pub(crate) fn commit_acked(
+        &self,
+        root: ManifestRoot,
+    ) -> io::Result<flume::Receiver<io::Result<()>>> {
         let (ack_tx, ack_rx) = flume::bounded::<io::Result<()>>(1);
         {
             let mut s = self.shared.lock();
@@ -216,9 +286,7 @@ impl ManifestSyncAgent {
             s.acks.push(ack_tx);
         }
         self.notify()?;
-        ack_rx
-            .recv()
-            .map_err(|_| io::Error::other("manifest-sync thread died before ack"))?
+        Ok(ack_rx)
     }
 
     /// Remove this agent's entry from [`AGENT_REGISTRY`]. Idempotent.
@@ -420,6 +488,64 @@ mod tests {
             .lock()
             .unwrap();
         super::flush_all_agents().expect("idle barrier must succeed");
+    }
+
+    /// moon#1240: an acked commit returns at once, even behind a slow
+    /// persist, and its ack resolves only once the snapshot is on disk.
+    #[test]
+    fn acked_commit_does_not_block_and_resolves_once_durable() {
+        #[allow(clippy::unwrap_used)] // test-only; poisoning would already be a failed test
+        let _registry = super::super::manifest::TEST_AGENT_REGISTRY_LOCK
+            .lock()
+            .unwrap();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("shard-8.manifest");
+        let mut m = ShardManifest::create(&path).expect("create");
+        m.enable_deferred_sync(8);
+
+        // REVIEW7 R3: no wall-clock bound a loaded machine can miss. The
+        // persist sleeps `DELAY` before it writes, so an ack is resolved no
+        // earlier than `DELAY` after `t0`: a `commit_acked` that waited for
+        // it returns at `>= DELAY`, and a poll made before `DELAY` has passed
+        // must find it unresolved.
+        const DELAY: Duration = Duration::from_millis(2_000);
+        m.set_inject_sync_delay_ms(DELAY.as_millis() as u64);
+        let t0 = Instant::now();
+        m.add_file(make_entry(3)).unwrap();
+        let mut ack = m.commit_acked();
+        let elapsed = t0.elapsed();
+        assert!(
+            elapsed < DELAY,
+            "an acked commit must not wait for the persist (took {elapsed:?})"
+        );
+        let early = ack.poll();
+        if t0.elapsed() < DELAY {
+            assert!(early.is_none(), "not durable yet");
+        }
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let outcome = match early {
+            Some(outcome) => outcome,
+            None => loop {
+                if let Some(outcome) = ack.poll() {
+                    break outcome;
+                }
+                assert!(Instant::now() < deadline, "the ack never resolved");
+                std::thread::sleep(Duration::from_millis(5));
+            },
+        };
+        assert!(outcome.is_ok(), "{outcome:?}");
+        assert!(t0.elapsed() >= DELAY);
+        assert!(ack.poll().is_some_and(|o| o.is_err()), "resolves once");
+        m.set_inject_sync_delay_ms(0);
+        let reopened = ShardManifest::open(&path).expect("reopen");
+        assert_eq!(reopened.files().len(), 1, "durable when the ack said so");
+
+        // A failed persist resolves the ack with the error.
+        m.set_inject_persist_error(true);
+        m.add_file(make_entry(4)).unwrap();
+        assert!(m.commit_acked().wait().is_err());
+        m.set_inject_persist_error(false);
+        m.shutdown_deferred();
     }
 
     #[test]

@@ -2355,7 +2355,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                                     // assert cannot fire here.
                                     let reply = crate::shard::slice::with_shard(|s| {
                                         s.databases.with_pair(src_db, dst_db, |src, dst| {
-                                            ksmv::move_core(src, dst, &key)
+                                            ksmv::move_core(src, src_db, dst, dst_db, &key)
                                         })
                                     });
                                     wake_target = Some((dst_db, key));
@@ -2450,7 +2450,9 @@ pub(crate) async fn handle_connection_sharded_inner<
                                             s.databases.with_pair(src_db, ca.dst_db, |src, dst| {
                                                 ksmv::copy_core(
                                                     src,
+                                                    src_db,
                                                     dst,
+                                                    ca.dst_db,
                                                     &ca.src_key,
                                                     &ca.dst_key,
                                                     ca.replace,

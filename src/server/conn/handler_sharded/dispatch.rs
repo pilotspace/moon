@@ -452,33 +452,14 @@ pub(super) async fn try_handle_shutdown(
         }
     };
     if should_save {
-        match persistence::bgsave_start_sharded(&ctx.snapshot_trigger_tx, ctx.num_shards) {
-            Frame::Error(e) => {
-                responses.push(Frame::Error(e));
-                return ShutdownOutcome::Rejected;
-            }
-            _ => {}
-        }
-        let start = std::time::Instant::now();
-        loop {
-            if !persistence::SAVE_IN_PROGRESS.load(std::sync::atomic::Ordering::SeqCst) {
-                break;
-            }
-            if start.elapsed().as_millis() as u64 > persistence::SHUTDOWN_SAVE_TIMEOUT_MS {
-                responses.push(Frame::Error(Bytes::from_static(
-                    b"ERR SHUTDOWN failed: background save timed out, check logs",
-                )));
-                return ShutdownOutcome::Rejected;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(
-                persistence::SHUTDOWN_SAVE_POLL_MS,
-            ))
-            .await;
-        }
-        if !persistence::BGSAVE_LAST_STATUS.load(std::sync::atomic::Ordering::Relaxed) {
-            responses.push(Frame::Error(Bytes::from_static(
-                b"ERR SHUTDOWN failed: background save error, check logs",
-            )));
+        // moon#1232 review: a save already running (an auto-save, say) is
+        // waited for and followed by this one, never a refusal — see
+        // `persistence::shutdown_save`.
+        if let Err(reply) =
+            persistence::shutdown_save(&ctx.snapshot_trigger_tx, ctx.num_shards, tokio::time::sleep)
+                .await
+        {
+            responses.push(reply);
             return ShutdownOutcome::Rejected;
         }
     }
@@ -656,7 +637,10 @@ pub(super) async fn try_handle_swapdb(
         return true;
     }
 
+    // Still one change in redis 7.0.15 (moon#1232 review 5), like any
+    // SWAPDB that succeeds.
     if a == b {
+        crate::admin::metrics_setup::record_keyspace_changes(1);
         responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
         return true;
     }
@@ -686,6 +670,10 @@ pub(super) async fn try_handle_swapdb(
     // key parked on in either may now hold data. Remote shards serve their
     // own waiters from the `SwapDb` arm.
     if !matches!(response, Frame::Error(_)) {
+        // moon#1232 review 5: one keyspace change, as redis 7.0.15 counts a
+        // SWAPDB — without it a `--save` rule never persisted a lone swap
+        // under RDB-only persistence. Once per command, on this leg only.
+        crate::admin::metrics_setup::record_keyspace_changes(1);
         crate::blocking::wakeup::wake_swapped_dbs(&ctx.blocking_registry, a, b);
     }
     responses.push(response);

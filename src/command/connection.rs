@@ -493,6 +493,7 @@ fn info_raw(db: &Database, facts: &InstanceFacts) -> String {
     };
     sections.push_str(&format!(
         "loading:{}\r\n\
+         current_cow_size:{}\r\n\
          rdb_changes_since_last_save:{}\r\n\
          rdb_bgsave_in_progress:{}\r\n\
          rdb_last_save_time:{}\r\n\
@@ -518,11 +519,16 @@ fn info_raw(db: &Database, facts: &InstanceFacts) -> String {
          spill_completion_superseded:{}\r\n\
          spill_completion_id_rejected:{}\r\n\
          spill_completion_marker_withdrawn:{}\r\n\
-         spill_last_heartbeat_ms:{}\r\n",
+         spill_last_heartbeat_ms:{}\r\n\
+         spill_thread_alive:{}\r\n",
         // moon#744: was a hardcoded `loading:0`. `any_shard_loading()` is a
         // process-wide counter precisely so INFO can answer this from a thread
         // that is not the recovering shard's -- nothing had ever read it.
         u8::from(crate::shard::loading::any_shard_loading()),
+        // moon#1228: bytes an in-flight save holds only for its own sake
+        // (pre-images, tables a flush handed over) — redis's field for its
+        // fork's COW memory; deliberately not in `used_memory`.
+        crate::persistence::snapshot_cow::current_cow_size(),
         // Keyspace mutations since the last COMPLETED save — the "is a save
         // worth doing" signal a backup script reads. A failed save does not
         // reset it: the dataset is still unpersisted.
@@ -595,6 +601,9 @@ fn info_raw(db: &Database, facts: &InstanceFacts) -> String {
         crate::storage::tiered::spill_thread::spill_completion_id_rejected_total(),
         crate::storage::tiered::spill_thread::spill_completion_marker_withdrawn_total(),
         crate::storage::tiered::spill_thread::spill_last_heartbeat_ms(),
+        // Refs moon#1265: 0 once any shard's spill thread was found dead; it
+        // is not respawned, so that shard spills and compacts nothing more.
+        u8::from(crate::storage::tiered::spill_thread::spill_threads_alive()),
     ));
     sections.push_str("\r\n");
 
