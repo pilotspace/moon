@@ -267,6 +267,8 @@ pub(crate) enum ApplyOutcome {
     /// spawned off a shard thread (a wiring bug); caller must drop the
     /// stream.
     NoShardSlice,
+    /// A `SWAPDB` over this replica's cold tier (moon#1278): resync in full.
+    FullResync,
 }
 
 impl ApplyOutcome {
@@ -361,6 +363,9 @@ pub(crate) fn apply_local(
             Some(ok) => ApplyOutcome::from_poison_bool(ok),
             None => ApplyOutcome::NoShardSlice,
         };
+    }
+    if cmd.eq_ignore_ascii_case(b"SWAPDB") && crate::storage::db::replica_swap_resyncs(args) {
+        return ApplyOutcome::FullResync;
     }
     let mut wake = ReplicaWake::None;
     let result = crate::shard::slice::try_with_shard(|s| -> bool {

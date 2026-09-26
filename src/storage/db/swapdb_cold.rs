@@ -172,6 +172,41 @@ pub fn swapdb_cold_refusal(
     None
 }
 
+/// moon#1278: whether a replica must not apply its master's `SWAPDB a b`
+/// (`args`) over `set`, its own shard's databases, and resync from scratch
+/// instead. The master's check covered the MASTER's cold tier only; a replica
+/// spills under its own memory limit, and its spill files keep their db tags
+/// just as the master's would (moon#1237): swapped, its cold keys came back
+/// in the OLD database after a rewrite and a restart (REVIEW-WS20 F3). A full
+/// resync is always right: the master's image already holds the swap, and
+/// loading it clears this replica's cold tier (`Database::clear`). Arguments
+/// the apply would skip (unparsable, out of range, `a == b`) need nothing.
+#[must_use]
+pub fn replica_swap_needs_full_resync(
+    set: &crate::shard::db_plane::ShardDbSet,
+    args: &[Frame],
+) -> bool {
+    let idx = |f: Option<&Frame>| match f? {
+        Frame::BulkString(b) => std::str::from_utf8(b).ok()?.parse::<usize>().ok(),
+        Frame::Integer(n) => usize::try_from(*n).ok(),
+        _ => None,
+    };
+    match (idx(args.first()), idx(args.get(1))) {
+        (Some(a), Some(b)) if a != b && a.max(b) < set.db_count() => {
+            set.read(a).has_cold_footprint() || set.read(b).has_cold_footprint()
+        }
+        _ => false,
+    }
+}
+
+/// [`replica_swap_needs_full_resync`] on this thread's shard (`false`
+/// without one) — the replica apply's check (`replication::apply`).
+#[must_use]
+pub fn replica_swap_resyncs(args: &[Frame]) -> bool {
+    crate::shard::slice::try_with_shard(|s| replica_swap_needs_full_resync(&s.databases, args))
+        == Some(true)
+}
+
 /// [`swapdb_cold_refusal`] for the single-listener handler (`handler_single`,
 /// the embedded server), whose databases sit behind their own locks.
 #[must_use]

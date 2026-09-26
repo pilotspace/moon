@@ -399,3 +399,36 @@ fn the_cold_refusal_names_the_remedy_per_persistence_mode() {
     );
     assert!(!msg.contains('\n') && !msg.contains('\r'), "{msg:?}");
 }
+
+/// moon#1278: a replica resyncs in full instead of applying its master's
+/// SWAPDB when either database has a cold footprint on its shard; clean
+/// databases, `a == b` and unusable arguments apply (or skip) as before.
+#[test]
+fn a_replica_resyncs_instead_of_swapping_over_its_cold_tier() {
+    use crate::protocol::Frame;
+    let mut cold = Database::new();
+    let mut ci = ColdIndex::new();
+    ci.insert(Bytes::from_static(b"k"), loc(5));
+    cold.cold_index = Some(ci);
+    let sets =
+        crate::shard::db_plane::build_sets(vec![vec![Database::new(), cold, Database::new()]]);
+    let set = &sets[0];
+    let args = |a: &'static [u8], b: Frame| vec![Frame::BulkString(Bytes::from_static(a)), b];
+    let needs = |args: Vec<Frame>| super::replica_swap_needs_full_resync(set, &args);
+    let bulk = |b: &'static [u8]| Frame::BulkString(Bytes::from_static(b));
+    assert!(needs(args(b"0", bulk(b"1"))), "db 1 is cold");
+    assert!(
+        needs(args(b"1", Frame::Integer(2))),
+        "either side, integer args"
+    );
+    assert!(!needs(args(b"0", bulk(b"2"))), "two clean databases swap");
+    assert!(!needs(args(b"1", bulk(b"1"))), "a == b is a no-op");
+    assert!(
+        !needs(args(b"1", bulk(b"9"))),
+        "out of range: the apply skips it"
+    );
+    assert!(
+        !needs(args(b"x", bulk(b"1"))),
+        "unparsable: the apply skips it"
+    );
+}

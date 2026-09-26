@@ -70,8 +70,9 @@ use crate::storage::tiered::cold_index::ColdLocation;
 #[path = "swapdb_cold.rs"]
 mod swapdb_cold;
 pub use swapdb_cold::{
-    ERR_SWAPDB_BUSY, ERR_SWAPDB_COLD, note_swap_with_cold_footprint, swap_refused_for_cold,
-    swap_replayed, swapdb_cold_refusal,
+    ERR_SWAPDB_BUSY, ERR_SWAPDB_COLD, note_swap_with_cold_footprint,
+    replica_swap_needs_full_resync, replica_swap_resyncs, swap_refused_for_cold, swap_replayed,
+    swapdb_cold_refusal,
 };
 
 /// The `MOON.SPILLED` markers one database has replayed in its open

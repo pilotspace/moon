@@ -422,8 +422,9 @@ reclaims them and the swap is allowed. Waiting for the automatic rewrite can
 take a long time. If another shard holds a database for the whole bounded
 check (about 20,000 yields, a few ms), the reply is
 `ERR SWAPDB could not check the disk-offload cold tier of every shard, try again`
-and nothing is swapped. A replica still applies its master's `SWAPDB`
-(moon#1278).
+and nothing is swapped. A replica whose own cold tier holds either database
+does not apply its master's `SWAPDB`: it drops the link and resyncs in full
+(moon#1278), which costs a full transfer per such swap.
 
 ### jemalloc tuning
 
