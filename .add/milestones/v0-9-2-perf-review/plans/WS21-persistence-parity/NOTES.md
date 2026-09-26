@@ -90,12 +90,16 @@ Binaries used for red runs:
   write; the test mirrors `persistence_tick::apply_completion_vec`'s failure branch
   (`spill_inflight_clear` + `set(rehydrate(..))`) after the walk passed. Red: 725 of the spilled
   keys missing from the file.
-- Reachability on restart: the async sink runs only under `--appendonly yes`
-  (`EvictionSink::AsyncSpill` routes `appendonly no` to `evict_batch_durable`, which keeps the
-  hot value on a failed write). With `appendonly yes` the AOF (manifest authority on monoio and
-  multi-shard tokio; legacy `appendonly.aof` replayed after the snapshot on tokio `--shards 1`)
-  holds the key's write. So the gap was a file that is not a point-in-time image — visible to a
-  restore from the RRDSHARD file alone and to moon#1185's fold — not a key lost at restart.
+- Reachability on restart (reworded in the review round, F9): the async sink is chosen from the
+  RUNTIME `appendonly` (`EvictionSink::AsyncSpill`; `appendonly no` routes to
+  `evict_batch_durable`, which keeps the hot value on a failed write). When the server STARTED
+  with `appendonly yes`, the AOF (manifest authority on monoio and multi-shard tokio; legacy
+  `appendonly.aof` replayed after the snapshot on tokio `--shards 1`) holds the key's write, so
+  the gap was a file that is not a point-in-time image, not a key lost at restart. But
+  `CONFIG SET appendonly yes` on a server started with `no` flips the sink with no AOF writer
+  behind it: there, before this fix, a failed async spill during a save WAS a restart-loss path
+  (the key missing from the snapshot, and no AOF to hold it). The capture closes it in every
+  configuration: the victim's pre-image is taken before it leaves the table.
 
 ### Risks
 - During a save, evicted values stay resident as pre-images until the walk writes their range
@@ -331,3 +335,182 @@ per run, `--appendonly no --disk-offload disable`.
 - **moon#1264 (b):** 0.9 · 0.92 · 0.9 · 0.9 · 0.9 · 0.9. Plain / EXEC / script on both runtimes;
   replica apply and the admin console not covered (listed); cost measured (one BGSAVE, ~17–24 ms).
 - **Item 6:** 1.0 · 0.95 · 1.0 · 1.0 · 0.95 · 0.95 (mutation-proved).
+
+## Review round (REVIEW-WS21: MERGE-AFTER-FIXES) — branch `perf/ws21-review-fixes` from `d49a2a98`
+
+Every item has a red → green test; one issue per commit. Binaries were built from this worktree
+and pinned with `MOON_BIN` (`ws21fix-debug`, `ws21fix-debug-tokio`; `ws21fix-relfast` for M1).
+
+### F1 (moon#1257): eviction during a save moved, not cloned
+- Before: `victim::remove` captured by `capture_key` (a deep `entry.clone()` on the shard thread),
+  then removed the key and lazily freed the original. That is two copies of a 1M-field hash, and
+  the clone took 198–255 ms.
+- Now: remove first, then `snapshot_cow::capture_removed(slot, key, entry)`
+  (`snapshot_cow/capture.rs`). If the epoch still needs the key's epoch-start state and has none
+  yet (first capture wins), the removed `Entry` itself becomes the pre-image (`Removed::Held`),
+  and no lazy-free item is queued for it. Otherwise it returns `Removed::Dispose(entry)`, and the
+  caller frees it as before.
+- A held pre-image is released off-thread by `frozen::dispose` when the walk writes it
+  (`advance_segment_inner`), when a later capture is discarded (`capture_cow`), and on `abort`
+  and on `snapshot_cow::clear` (disarm). Dropping a 1M-field hash inline there would move the
+  stall rather than remove it.
+- Red: `a_large_victim_is_moved_into_its_pre_image_not_cloned` fails with the old
+  capture-then-remove (1 clone; it would also have had 1 lazy-free item). Green, as are
+  `a_victim_captured_earlier_is_freed_as_usual`, all 7 `eviction_capture_tests`, and
+  `perf_ws21_eviction_bgsave` on both runtimes.
+- M1: see SUMMARY. The worst PING gap is 22–51 ms at 1M fields (main 28–37) and 99 ms at 3M
+  (main 49); it was 198–255 ms and 459 ms. RSS is flat across the eviction. `current_cow_size` is
+  152 MB, which is the held epoch-start value; a fork-based redis keeps those pages too.
+- Residual: `capture_cow` walks the moved value once to size it for `current_cow_size`
+  (`pre_image_bytes` → `estimate_memory`), on the next drain tick. When that walk lands in the
+  same gap as the removal's own ledger walk, the gap is ~45 ms instead of ~23 ms. The follow-up
+  is to carry the removal's credited size (`used_memory` delta) into the pre-image. It was left
+  out because it changes the `PENDING` element type and `capture_cow`, and `snapshot.rs` is at
+  its line cap.
+
+### F2 (moon#1264 a): SHUTDOWN ABORT vs commit is one decision
+- Before, abort and commit were separate atomics, and `aborted()` was checked only before each
+  5 ms poll. An ABORT landing in the poll where the save completed answered `+OK` for a shutdown
+  that then exited.
+- Now `shutdown_abort::Pending` lives under a `parking_lot::Mutex<Window>`. `commit()` (the
+  save is on disk) and `abort()` (it takes every shutdown still pending) are decided under that
+  one lock, so only the winner replies. An ABORT after the commit answers "No shutdown in
+  progress."
+- The reviewer's proof became `an_abort_that_answered_ok_stops_the_shutdown_whose_save_just_completed`,
+  red without `commit()`. `review_ws21_abort_race` (copied and run) is green.
+
+### F3 (moon#1267): `appendonly no` boots from the snapshot only
+- `Shard::restore_from_persistence` makes one decision, `KvSources::for_boot`, from
+  `kv_authority_elsewhere` and the shard's `runtime_config.appendonly`. This touched no caller
+  signature: main.rs, embedded.rs, and the 7 test callers of `recover_shard_v3_with_fallback`
+  are unchanged.
+- `SnapshotOnly` loads the snapshot. It skips:
+  - the v2 legacy `appendonly.aof` and the WAL v3 last-resort replay;
+  - the v3 Phase 4 `Command` records (the set `Elsewhere` already skips);
+  - Phase 4b.
+- It keeps the manifest, cold index, warm segments, FPI, `last_lsn`, CLOG and the cold
+  reconcile.
+- Why: with `appendonly no` nothing writes a KV log (no AOF writer, and "WAL skipped
+  (appendonly=no)"), so a log on disk predates the snapshot. redis ignores the AOF then.
+- Scope note (orchestrator): the decision point is `restore_from_persistence` / `_v2`. The v3
+  gate in `recover_shard_v3_pitr` takes the same enum because the default `--disk-offload
+  enable` reproduces the bug through Phase 4 / 4b: `stale_wal_offload_enabled` and
+  `legacy_aof_offload_enabled_*` were red. `rdb::load` and `shard_snapshot_load` are called
+  exactly as before. recovery.rs stayed at 2499 lines.
+- Red on the pre-F3 binary:
+  - legacy aof: 50/50 keys reverted, with offload off, with offload off plus `--save` rules,
+    and with offload on;
+  - WAL v3 from a `--wal-kv-log on` run: 37/50 with offload off and with offload on.
+- Green now. The appendonly-no cold crash suites stay green (`disk_offload_no_aof`,
+  `cold_multidb`, `orphan_sweep_readiness`, `--ignored`).
+- `cold_index_rebuild_silent_drops_875` fails 4/4, identically on `main-4a96cd5f-rel`. It runs
+  as root, which ignores `chmod 000`, so this is environmental.
+
+### F4 (moon#1263): stall, not deadline; a signal's stop stays armed
+- Options weighed:
+  - (a) a longer fixed deadline: any number is a dataset size, so it is wrong again later;
+  - (b) exit once a running save completes, without our own save: that loses writes since
+    the save began;
+  - (c) no bound at all: a wedged shard would then hang SHUTDOWN forever;
+  - (d) a stall bound, which is what was implemented.
+- The design has two parts:
+  - `SAVE_PROGRESS` moves on every shard walk advance (`snapshot_cow::note_progress`), save
+    start and shard finish.
+  - SHUTDOWN and FLUSHALL (`Patience::UntilStalled(20 s)`) wait as long as the save progresses,
+    and fail after 20 s with no progress, keeping the server up (as for a failed save). A signal
+    (`Patience::Forever`) never gives up: every 20 s without progress it logs redis's two
+    shutdown error lines plus "The stop stays armed", and it exits when the save is on disk.
+    It defers to other saves without a limit; SHUTDOWN still stops after 3.
+- Why a signal differs from SHUTDOWN: SHUTDOWN has a client to answer, and it can retry. A
+  signal's only outcomes are "exit when saved" or "silently keep running". redis has no
+  deadline on either; SHUTDOWN's stall bound is the one concession to a wedged shard.
+- Before, one 20 s deadline covered everything: a save of more than about 4 GB failed SHUTDOWN
+  and dropped the SIGTERM.
+- The old WS19 virtual-clock tests were rewritten for the stall rule (`save_wait_tests.rs`, 4).
+- The reviewer's `review_ws21_sigterm_deadline` was run with its port changed to 7521, which is
+  in my range. It is red on the pre-F4 binary ("gave up after 20.017 s … still running 15 s
+  later") and green on the fix. It is kept as `a_sigterm_outlasting_the_stall_limit_stays_armed`.
+
+### moon#1274: AOF writers drained before exit
+- Before:
+  - `broadcast_shutdown` used `try_send` and ran BEFORE the shards stopped;
+  - the writers' token was `cancel_token.child_token()`, which in `runtime::cancel` is the SAME
+    token, so the tokio writers left at the SIGTERM;
+  - only the shards were joined.
+- Now, in main.rs:
+  - the shards are joined first;
+  - then `aof::writer_stop::stop_writers` sends `Shutdown` via `send_deadline` (behind
+    everything queued) and waits `is_finished`, re-sending every 500 ms because a rewrite
+    overflow drain can swallow it;
+  - after that it joins the writers.
+- The writers have their own token, cancelled only after 60 s (logged). The tokio selects are
+  `biased`. The legacy non-sharded listener keeps try_send semantics (deadline = now).
+- `perf_ws21_aof_drain` (7 tests: SIGTERM, SIGINT and SHUTDOWN at s1 and s4, plus a held-writer
+  SIGTERM) is red on the pre-fix monoio binary: 300/300 lost at s1 for SIGTERM and SIGINT, and
+  the held case exited within 300 ms. It is green 3/3 on monoio and 3/3 on tokio.
+- Residual: `embedded.rs` keeps its own order (cancel, join the shards, drop the pool, join the
+  writer). Its writer token is still a child of `cancel`. With `biased` it now writes what is
+  queued before leaving, but a shard still producing after the cancel can race it.
+
+### F5, F6
+- F5: `perf_ws21_shutdown_abort` polls `SHUTDOWN ABORT` until it answers `+OK`. Before the
+  shutdown is pending, ABORT answers "No shutdown in progress." and cancels nothing, which
+  `an_abort_with_no_shutdown_pending_cancels_nothing_later` pins. The server must stay alive
+  throughout; the bound is 30 s. The "still alive after N ms" checks stay; F7 judged them
+  acceptable.
+- F6: the held-writer rewrite still runs under everysec. The server is SIGKILLed right after the
+  commit, and the post-commit keys are written by a restart under `--appendfsync always`
+  before the second SIGKILL.
+
+### F10: the runtime save config
+- `persistence::save_points_now(&RwLock<RuntimeConfig>)` is used by:
+  - FLUSHALL, where `save_after_flushall` / `save_after_txn_flushes` now take a bool;
+  - bare SHUTDOWN on both runtimes;
+  - signals, where `signal::arm` keeps the live config and decides when the signal lands.
+- The lock is read briefly and never held across an await.
+- Residuals, both documented:
+  - a replica applying FLUSHALL does not save, because it applies per shard with no all-flushed
+    point to save from;
+  - the auto-save timer still uses the startup rules.
+- Red on the pre-F10 binary: the FLUSHALL still saved after `CONFIG SET save ""`, and SHUTDOWN
+  saved the late key. Green on both runtimes.
+
+### Snapshot start/finish/abort paths touched (for WS20's `snapshot_hold` hooks)
+- No new shard-level snapshot start, finish or abort. Every save these paths run starts through
+  `bgsave_start_sharded` (src/command/persistence.rs:232). It reaches the shards by the watch
+  trigger, into the existing `persistence_tick::handle_pending_snapshot` /
+  `check_auto_save_trigger`, whose WS20 hooks cover it. `finalize_snapshot_*` is unchanged.
+- Restructured, all process-side waiters in src/command/persistence/save_wait.rs:
+  - `shutdown_save` :146;
+  - `shutdown_save_until_done` :169;
+  - `save_and_wait` :232;
+  - `save_after_flushall` :331.
+  A waiter that gives up on a stall leaves the shard snapshot running as an ordinary BGSAVE; it
+  does not abort it.
+- Touched inside the epoch, with no lifecycle change:
+  - `SnapshotState::abort` (src/persistence/snapshot.rs:597) disposes the pre-images;
+  - `capture_cow` (:545);
+  - `advance_segment_inner` (:884);
+  - `snapshot_cow::clear` (src/persistence/snapshot_cow.rs:403, via `disarm` :322);
+  - `note_progress` (:309) bumps `SAVE_PROGRESS`.
+
+### Review-round gates (at `a14827df`, the last code commit)
+- `cargo fmt --check`; the audits (unsafe, unwrap, test-tempdirs incl. self-test,
+  encoding-limits incl. self-test): clean.
+- `cargo clippy --all-targets -D warnings` on monoio and on tokio: clean. The tokio
+  `check --all-targets` is clean.
+- Lib tests (`command::persistence`, `persistence::{snapshot, snapshot_cow, recovery, aof}`,
+  `storage::eviction`, `storage::db::lazy_free`, `shard::tests`): monoio 410/0, tokio 413/0.
+- Integration suites, green on BOTH runtimes:
+  - `perf_ws21_aof_drain` 7;
+  - `perf_ws21_aof_writer_start` 1;
+  - `perf_ws21_eviction_bgsave` 2;
+  - `perf_ws21_flushall_save` 10;
+  - `perf_ws21_shutdown_abort` 3 (+1 ignored);
+  - `perf_ws21_signal_save` 7;
+  - `perf_ws21_snapshot_without_save_rules` 9;
+  - `perf_ws21_stale_log_boot` 5.
+- Also green:
+  - monoio: `perf_ws19_save_rules` 14, `perf_ws12_bgsave_split` 5, `perf_ws15_bgsave_status` 3,
+    `sigterm_shutdown` 7, `aof_auto_rewrite` / `aof_toplevel_multishard_refusal` `--ignored` 5+2;
+  - both runtimes: `shutdown_integration --ignored` 4.
