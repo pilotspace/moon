@@ -1063,20 +1063,15 @@ fn main() -> anyhow::Result<()> {
     // Create watch channel for snapshot triggers (auto-save and BGSAVE)
     let (snapshot_trigger_tx, snapshot_trigger_rx) = moon::runtime::channel::watch(0u64);
 
-    // Persistence directory for per-shard WAL and snapshots.
-    // Only set when persistence is actually enabled (appendonly=yes or save rules exist)
-    // to avoid creating WAL writers that fsync on every tick for no benefit.
-    let persistence_dir = if config.appendonly == "yes" || config.save.is_some() {
-        Some(config.dir.clone())
-    } else {
-        None
-    };
-    // With no directory no shard can write a snapshot: BGSAVE / SHUTDOWN SAVE
-    // answer an immediate error instead of starting a save that must fail.
-    moon::command::persistence::SNAPSHOT_DIR_ABSENT.store(
-        persistence_dir.is_none(),
-        std::sync::atomic::Ordering::Relaxed,
-    );
+    // Persistence directory for the per-shard WAL, graph/vector/MQ state and
+    // snapshots: set with `--appendonly yes` or any `--save` (even `""`). The
+    // WAL writer itself needs `appendonly yes` (event loop). moon#1267: the
+    // RDB snapshot does not depend on it — redis loads `dump.rdb` and takes
+    // BGSAVE / SHUTDOWN SAVE whatever the save rules — so its directory is
+    // always `--dir`, and boot always loads a snapshot found there.
+    let persistence_dir =
+        (config.appendonly == "yes" || config.save.is_some()).then(|| config.dir.clone());
+    moon::command::persistence::set_snapshot_dir(&config.dir);
 
     // Create replication state -- load persisted repl_id or generate new one.
     let (repl_id, repl_id2) =
@@ -1417,23 +1412,18 @@ fn main() -> anyhow::Result<()> {
                 config.initial_keyspace_hint,
                 config.to_runtime_config(),
             );
-            // Recover whenever there is something to recover. Disk-offload cold
-            // recovery (v3: heap reload + rebuild_from_manifest) is INDEPENDENT of
-            // AOF, but `persistence_dir` is intentionally None under appendonly=no
-            // (to avoid per-tick WAL fsync writers). Gating recovery on it alone
-            // silently dropped ALL cold data on restart under --appendonly no +
-            // disk-offload (cold read-through 0/200; "v3 recovery complete" never
-            // logged). Fire recovery when an offload base exists too; the v3 path
-            // reads the offload manifest, and the dir arg is used only by the v2
-            // fallback (a no-op when no appendonly.aof/snapshot exists).
-            if persistence_dir.is_some() || disk_offload_base.is_some() {
-                let recover_dir = persistence_dir.as_deref().unwrap_or(config.dir.as_str());
-                shard.restore_from_persistence(
-                    recover_dir,
-                    disk_offload_base.as_deref(),
-                    aof_manifest_is_kv_authority,
-                );
-            }
+            // Always recover (moon#1267): a snapshot in `--dir` loads whatever
+            // the save rules, as redis loads `dump.rdb` — `--save` omitted used
+            // to skip this (with no offload base) and boot empty. Gating on
+            // `persistence_dir` alone also dropped ALL cold data under
+            // --appendonly no + disk-offload (cold read-through 0/200). The v3
+            // path reads the offload manifest; the dir feeds the v2 path (a
+            // no-op when no snapshot / appendonly.aof / WAL is there).
+            shard.restore_from_persistence(
+                persistence_dir.as_deref().unwrap_or(config.dir.as_str()),
+                disk_offload_base.as_deref(),
+                aof_manifest_is_kv_authority,
+            );
             // Initialize cold_index + cold_shard_dir for disk offload
             if let Some(ref offload_base) = disk_offload_base {
                 let shard_dir = offload_base.join(format!("shard-{}", id));

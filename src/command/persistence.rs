@@ -57,13 +57,17 @@ static BGSAVE_CURRENT_FAILED: AtomicBool = AtomicBool::new(false);
 /// `bgrewriteaof_start_sharded` before dispatching the rewrite message.
 pub static MULTI_SHARD_AOF_REWRITE_UNSAFE: AtomicBool = AtomicBool::new(false);
 
-/// Set once in `main.rs` when the shards run with NO persistence directory
-/// (`--appendonly no` and no `--save`: `main` passes them `None`), so no
-/// shard can write a snapshot. `BGSAVE` and `SHUTDOWN SAVE` then answer an
-/// immediate error instead of "Background saving started" followed by a save
-/// every shard fails (PR #1233 review of moon#1230). `false` by default:
-/// callers that never record it (tests, embedded harnesses) keep the old
-/// behaviour, where a shard with no directory reports the save failed.
+/// Set when the server has NO directory a snapshot can go to: `BGSAVE` and
+/// `SHUTDOWN SAVE` then answer an immediate error instead of "Background
+/// saving started" followed by a save every shard fails (PR #1233 review of
+/// moon#1230). `false` by default: callers that never record it (tests,
+/// embedded harnesses) keep the old behaviour, where a shard with no
+/// directory reports the save failed.
+///
+/// moon#1267: `main.rs` no longer sets it. It used to whenever the shards had
+/// no persistence directory (`--appendonly no` with `--save` omitted), which
+/// refused every manual save; the snapshot directory is now always `--dir`
+/// ([`set_snapshot_dir`]).
 pub static SNAPSHOT_DIR_ABSENT: AtomicBool = AtomicBool::new(false);
 
 /// The directory snapshots go to, registered once by `main.rs` (moon#1267).
