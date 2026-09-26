@@ -394,6 +394,29 @@ Trigger manual compaction:
 BGREWRITEAOF
 ```
 
+### Key expiry during AOF replay
+
+A restart after a key's TTL passed must not revive it, yet the writes logged
+while it was alive must replay onto it. moon judges expiry during replay by
+the time the log was last written: the newest modification time (mtime) of
+the AOF files being replayed (and of the WAL segments), capped at the wall
+clock (moon#1277). Keep those mtimes truthful:
+
+- An mtime LATER than the last write (a file copied without preserving it)
+  only brings back the pre-moon#1277 behaviour for keys whose TTL passed
+  during the downtime.
+- An mtime EARLIER than the last write — the system clock stepped back after
+  the write, a network or virtio filesystem whose server clock lags, or
+  `touch -d` / a restore tool that resets it — makes keys that expired while
+  the server ran look alive to the replay. A key that was read as expired,
+  then rewritten before its expiry `DEL` reached the log, then replays onto
+  its OLD value (measured with the mtime set an hour back: 27–36 of 40 such
+  keys, against 0 on a build that judged by the wall clock).
+
+Restore AOF files with their original mtimes (`cp -p`, `rsync -t`, `tar`).
+A time record inside the log (like redis's `aof-timestamp-enabled`) would
+remove the dependency; it is a format change tracked separately.
+
 ### Persistence volume in Docker
 
 Always mount a named volume or host directory for `/data`:

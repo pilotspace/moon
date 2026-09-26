@@ -161,6 +161,7 @@ pub fn replay_wal_v3_dir_commands(
         return Ok(counts);
     }
 
+    let _clock = crate::persistence::replay::clock::pin_replay_clock_to_wal_dir(wal_dir);
     let mut selected_db = 0usize;
     let on_command = &mut |record: &WalRecord| {
         replay_kv_record(record, databases, engine, &mut selected_db, &mut counts);

@@ -286,6 +286,12 @@ pub fn recover_shard_v3_pitr(
                     tracing::error!("Shard {}: snapshot load failed: {}", shard_id, e);
                 }
             }
+            if kv.logs() {
+                crate::persistence::replay::clock::keep_expired_image_entries(
+                    databases,
+                    &mut snapshot_expired,
+                );
+            }
         }
     }
 
