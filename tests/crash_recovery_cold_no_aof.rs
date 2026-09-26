@@ -103,7 +103,16 @@ fn run_no_aof_promote_scenario(suffix: &str, sweep_secs: u64, save_points: bool)
         readable > 0,
         "precondition failed: no probe readable in phase 2"
     );
-    std::thread::sleep(Duration::from_secs(6)); // several orphan sweeps
+    // Every inherited key is now deleted or back in RAM, so every inherited
+    // file is zero-ref. Kill only once the sweep has DECIDED on all of them
+    // (REVIEW-WS20 F9: a fixed 6 s sleep let a regressed binary pass under
+    // load): each one held (`cold_files_pending_unlink` counts held files)
+    // or unlinked. The no-sweep control kills at once.
+    let decided = sweep_secs >= 3600
+        || wait_until(60, || {
+            let heap = count_heap_files(&dir);
+            heap == 0 || info_u64(port, "cold_files_pending_unlink") == Some(heap as u64)
+        });
     let before_kill = count_heap_files(&dir);
     server.kill_now();
     wait_for_port_down(port);
@@ -123,7 +132,8 @@ fn run_no_aof_promote_scenario(suffix: &str, sweep_secs: u64, save_points: bool)
         0,
         "probes unchanged since the last save (or boot) lost after GET, orphan sweeps and kill -9 \
          under --appendonly no ({readable} readable before, {back} after; heap files {at_save} \
-         at the save, {before_kill} before the kill)"
+         at the save, {before_kill} before the kill; the sweep decided on every file: \
+         {decided})"
     );
 }
 

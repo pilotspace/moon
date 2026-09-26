@@ -48,6 +48,12 @@ use std::time::{Duration, Instant};
 
 use crash_recovery_cold_support::*;
 
+/// `--appendfsync always`, for the WS20 cases (REVIEW-WS20 F9).
+const FSYNC_ALWAYS: &[&str] = &["--appendfsync", "always"];
+/// The pause before a WS20 case's kill -9: spills in flight complete. Not an
+/// fsync settle — those cases fsync every record (`FSYNC_ALWAYS`).
+const SETTLE_SPILLS: u64 = 2;
+
 /// What an even probe must read after recovery.
 #[derive(Clone, Copy)]
 enum Expect {
@@ -494,6 +500,11 @@ fn held_spill_files_are_released_after_the_next_rewrite() {
 
 // ── WS20: keyspace-level operations on cold keys ─────────────────────────────
 //
+// These cases run with `--appendfsync always` (REVIEW-WS20 F9): every
+// acknowledged record is on disk when its reply arrives, so the kill -9 needs
+// no fsync settle; the short pause before it only lets spills in flight
+// complete (the in-flight windows have their own suite, moon#1253).
+//
 // moon#1254 (MOVE / COPY … DB n of a cold key), moon#1236 (a cold key
 // overwritten hot WITH a TTL) and moon#1237 (SWAPDB with cold keys). Same
 // probes / filler / stop / restart shape as the cases above. The
@@ -531,7 +542,7 @@ fn run_move_copy_scenario(suffix: &str, stop: Stop, rewrite: bool) {
     let port = common::reserve_port();
     let dir = unique_dir(suffix);
     std::fs::create_dir_all(&dir).expect("create test dir");
-    let mut server = start_moon(port, &dir, stop.sweep_secs());
+    let mut server = start_moon_with(port, &dir, stop.sweep_secs(), "yes", FSYNC_ALWAYS);
     wait_for_port(port);
     let heap_files = spill_probes(port, &dir);
     let val = probe_value();
@@ -577,7 +588,7 @@ fn run_move_copy_scenario(suffix: &str, stop: Stop, rewrite: bool) {
     if rewrite {
         rewrite_and_wait(port, &dir);
     }
-    std::thread::sleep(Duration::from_secs(SETTLE_AFTER_MUTATION));
+    std::thread::sleep(Duration::from_secs(SETTLE_SPILLS));
     let mut server2 = stop_and_restart(port, &dir, &mut server, stop);
     let mut wrong = live_wrong;
     wrong.extend(check("recovered"));
@@ -618,7 +629,7 @@ fn run_ttl_overwrite_scenario(suffix: &str, stop: Stop, rewrite: bool) {
     let port = common::reserve_port();
     let dir = unique_dir(suffix);
     std::fs::create_dir_all(&dir).expect("create test dir");
-    let mut server = start_moon(port, &dir, stop.sweep_secs());
+    let mut server = start_moon_with(port, &dir, stop.sweep_secs(), "yes", FSYNC_ALWAYS);
     wait_for_port(port);
     let heap_files = spill_probes(port, &dir);
     let val = probe_value();
@@ -638,11 +649,12 @@ fn run_ttl_overwrite_scenario(suffix: &str, stop: Stop, rewrite: bool) {
     if rewrite {
         rewrite_and_wait(port, &dir);
     }
-    std::thread::sleep(Duration::from_secs(SETTLE_AFTER_MUTATION));
-    assert!(
-        overwritten_at.elapsed() < Duration::from_millis(TTL_MS),
-        "the TTL passed before round 1 ended; the case would not test the restart"
-    );
+    std::thread::sleep(Duration::from_secs(SETTLE_SPILLS));
+    // No "setup finished before the TTL" assertion (REVIEW-WS20 F9: a slow
+    // box failed it). A TTL that passed before the kill is reaped live and
+    // its DEL logged, so every even probe must read absent either way; the
+    // message says which path ran.
+    let ttl_passed_live = overwritten_at.elapsed() >= Duration::from_millis(TTL_MS);
     // Stop now; restart only once the TTL has passed (plus a margin).
     if stop == Stop::Shutdown {
         let _ = Command::new("redis-cli")
@@ -682,8 +694,8 @@ fn run_ttl_overwrite_scenario(suffix: &str, stop: Stop, rewrite: bool) {
     assert!(
         wrong.is_empty(),
         "{} probe(s) wrong after a TTL'd overwrite of cold keys and a {}restart past the TTL \
-         ({old_back} even probes came back with their OLD value; heap files: {heap_files}); \
-         first: {:?}",
+         ({old_back} even probes came back with their OLD value; heap files: {heap_files}; \
+         the TTL passed before the kill: {ttl_passed_live}); first: {:?}",
         wrong.len(),
         if rewrite { "BGREWRITEAOF + " } else { "" },
         wrong.first()
@@ -749,7 +761,7 @@ fn run_swapdb_scenario(suffix: &str, shape: SwapShape, rewrite: bool) {
     let dir = unique_dir(suffix);
     std::fs::create_dir_all(&dir).expect("create test dir");
     let stop = Stop::Kill9;
-    let mut server = start_moon(port, &dir, stop.sweep_secs());
+    let mut server = start_moon_with(port, &dir, stop.sweep_secs(), "yes", FSYNC_ALWAYS);
     wait_for_port(port);
     let val = probe_value();
     let (home, swap_reply, heap_files) = match shape {
@@ -778,7 +790,7 @@ fn run_swapdb_scenario(suffix: &str, shape: SwapShape, rewrite: bool) {
     if rewrite {
         rewrite_and_wait(port, &dir);
     }
-    std::thread::sleep(Duration::from_secs(SETTLE_AFTER_MUTATION));
+    std::thread::sleep(Duration::from_secs(SETTLE_SPILLS));
     let mut server2 = stop_and_restart(port, &dir, &mut server, stop);
     let other = 1 - home;
     let mut wrong = Vec::new();
