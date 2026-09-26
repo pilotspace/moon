@@ -307,6 +307,8 @@ pub(crate) fn note_walk(snap: &SnapshotState) {
 /// be called AFTER the tick's [`drain_into`] and advance, never between
 /// them: a pre-image is filtered against the cursor it was captured under.
 pub(crate) fn note_progress(current_db: usize, cursor: u64) {
+    // A save wait's stall watch (review F4): this shard's walk moved.
+    crate::command::persistence::note_save_progress();
     PROGRESS.with(|p| {
         if let Some(progress) = p.borrow_mut().as_mut() {
             progress.current_db = current_db;

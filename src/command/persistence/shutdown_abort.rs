@@ -2,8 +2,8 @@
 //!
 //! A `SHUTDOWN` with a save (save points configured, or `SHUTDOWN SAVE`), and
 //! a SIGTERM / SIGINT with save points (moon#1263), wait for a save already
-//! running and then run their own before the server exits — up to one 20 s
-//! deadline ([`super::SHUTDOWN_SAVE_DEADLINE_MS`]). That is the window redis
+//! running and then run their own before the server exits (`save_wait`:
+//! while the save progresses, and a signal's for good). That is the window redis
 //! 7 calls "a shutdown in progress": `SHUTDOWN ABORT` from another client
 //! cancels it, answers `+OK`, and the waiting `SHUTDOWN` gets
 //! `-ERR Errors trying to SHUTDOWN. Check logs.`; the server stays up. With no

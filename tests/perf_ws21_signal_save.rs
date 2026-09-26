@@ -272,3 +272,63 @@ fn a_failed_final_save_keeps_the_server_running() {
     assert_eq!(missing(&mut c, "k", 50), 0);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Review F4 (the reviewer's `review_ws21_sigterm_deadline`, kept): a
+/// SIGTERM whose wait outlasts the stall limit — here a BGSAVE held for
+/// longer than 20 s — logs redis's shutdown errors but is NOT dropped: once
+/// the save completes, the final save runs and the server exits 0 with the
+/// key on disk. redis has no deadline on a signal's final save.
+///
+/// Red before the fix: it gave up after 20.01 s, and the server was still
+/// running 15 s after the held save completed.
+#[test]
+fn a_sigterm_outlasting_the_stall_limit_stays_armed() {
+    let dir = common::unique_test_dir("ws21-f4-sigterm-stall");
+    std::fs::create_dir_all(&dir).unwrap();
+    let (mut server, port) = spawn(&dir, 1, Some(RULES));
+    let mut c = Conn::open(port);
+    set_keys(&mut c, "k", 20);
+    std::fs::write(dir.join("snapshot.hold"), b"held").unwrap();
+    assert!(
+        c.send(&["BGSAVE"])
+            .starts_with("+Background saving started")
+    );
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !dir.join("shard-0.rrdshard.tmp").exists() {
+        assert!(Instant::now() < deadline, "the BGSAVE never armed");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    drop(c);
+
+    let sigterm_at = Instant::now();
+    signal(&server, "-TERM");
+    while !server_log(&dir).contains("Errors trying to shut down the server") {
+        assert!(
+            server.as_mut().try_wait().unwrap().is_none(),
+            "exited while the save was held"
+        );
+        assert!(
+            sigterm_at.elapsed() < Duration::from_secs(40),
+            "no stall report 40 s into a held save"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let reported = sigterm_at.elapsed();
+    assert!(
+        server_log(&dir).contains("The stop stays armed"),
+        "the stall report does not say the stop stays armed"
+    );
+
+    // The slow save completes: the stop is still honoured.
+    std::fs::remove_file(dir.join("snapshot.hold")).unwrap();
+    let status = wait_exit(&mut server, Duration::from_secs(15)).unwrap_or_else(|| {
+        panic!("the SIGTERM was dropped: reported a stall after {reported:?}, and 15 s after the save completed the server is still up")
+    });
+    assert!(status.success(), "exit status {status:?}");
+    common::wait_for_port_down(port);
+
+    let (_server, port) = spawn(&dir, 1, Some(RULES));
+    let mut c = Conn::open(port);
+    assert_eq!(missing(&mut c, "k", 20), 0);
+    let _ = std::fs::remove_dir_all(&dir);
+}

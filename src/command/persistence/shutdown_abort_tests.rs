@@ -29,7 +29,7 @@ fn text(frame: &Frame) -> String {
 /// poll (from 1), as another client would between two polls.
 fn run_shutdown(on_sleep: impl Fn(usize)) -> Result<(), Frame> {
     let (tx, _rx) = crate::runtime::channel::watch(0u64);
-    let budget = Duration::from_millis(SHUTDOWN_SAVE_DEADLINE_MS);
+    let patience = Patience::UntilStalled(Duration::from_millis(SAVE_STALL_MS));
     let clock = Cell::new(Instant::now());
     let polls = Cell::new(0usize);
     let sleep = |d: Duration| {
@@ -38,7 +38,11 @@ fn run_shutdown(on_sleep: impl Fn(usize)) -> Result<(), Frame> {
         on_sleep(polls.get());
         std::future::ready(())
     };
-    let mut fut = std::pin::pin!(shutdown_save_within(&tx, 1, sleep, || clock.get(), budget));
+    let observe = Observe {
+        now: &|| clock.get(),
+        progress: &|| 0,
+    };
+    let mut fut = std::pin::pin!(shutdown_save_within(&tx, 1, sleep, &observe, patience));
     match fut.as_mut().poll(&mut Context::from_waker(Waker::noop())) {
         Poll::Ready(r) => r,
         Poll::Pending => panic!("every sleep is ready at once"),
