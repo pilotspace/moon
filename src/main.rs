@@ -854,8 +854,9 @@ fn main() -> anyhow::Result<()> {
     //        - `num_shards == 1` (always TopLevel; per-shard fan-out has no
     //          meaning when there is one shard)
     //
-    // A *corrupt* manifest is fatal — `AofManifest::load` returning `Err(_)`
-    // must NOT silently fall back to TopLevel, because the next write would
+    // The ONE orphan-sweeping load (moon#1271): no writer or rewrite exists
+    // yet. A *corrupt* manifest is fatal — a load returning `Err(_)` must NOT
+    // silently fall back to TopLevel, because the next write would
     // create a fresh manifest overwriting the reference to the real base RDB
     // and lose data. This mirrors the replay block at L514–526.
     //
@@ -866,15 +867,13 @@ fn main() -> anyhow::Result<()> {
     // behavior under default configurations stays byte-identical to step 2f-α.
     use moon::persistence::aof_manifest::{AofLayout, AofManifest};
     let existing_manifest: Option<AofManifest> = if config.appendonly == "yes" {
-        let base_dir = PathBuf::from(&config.dir);
-        match AofManifest::load(&base_dir) {
+        match AofManifest::load_and_sweep_orphans(&PathBuf::from(&config.dir)) {
             Ok(opt) => opt,
             Err(e) => {
                 eprintln!(
                     "REFUSING TO START: AOF manifest at {}/appendonlydir/ is corrupt: {}. \
                      Inspect manually before deleting; overwriting silently loses data.",
-                    base_dir.display(),
-                    e
+                    config.dir, e
                 );
                 std::process::exit(2);
             }
