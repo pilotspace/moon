@@ -26,8 +26,10 @@
 //! orphan sweep and a kill -9. RED on `ae21476` and on int/part3b (`5b14b82`).
 //!
 //! WS20 (after it): keyspace-level operations on cold keys — MOVE / COPY … DB
-//! (moon#1254), a TTL'd overwrite of a cold key (moon#1236) and SWAPDB around
-//! cold keys (moon#1237). RED on `ae21476` and on `4a96cd5f`.
+//! (moon#1254), a TTL'd overwrite of a cold key (moon#1236), SWAPDB around
+//! cold keys (moon#1237) and, under `--appendonly no`, a read-promoted
+//! inherited cold key and the orphan sweep (moon#1260). RED on `ae21476` and
+//! on `4a96cd5f`.
 //!
 //! Run with (monoio default):
 //!   cargo build --release
@@ -728,6 +730,16 @@ fn appended_value() -> String {
 /// Pipelined `DEL filler:i` for every filler, reading every reply (see
 /// `write_filler` for why the replies must be drained).
 fn del_fillers(port: u16) {
+    let deleted = del_fillers_counting(port);
+    assert!(
+        deleted * 10 >= FILLER_COUNT * 9,
+        "precondition failed: only {deleted} of {FILLER_COUNT} fillers existed to delete"
+    );
+}
+
+/// [`del_fillers`] without its precondition: how many existed. Under
+/// `--appendonly no` a restart keeps only the fillers that were cold.
+fn del_fillers_counting(port: u16) -> usize {
     let mut stream =
         std::net::TcpStream::connect(format!("127.0.0.1:{}", port)).expect("connect for DEL");
     stream.set_write_timeout(Some(Duration::from_secs(30))).ok();
@@ -772,10 +784,7 @@ fn del_fillers(port: u16) {
             replies += 1;
         }
     }
-    assert!(
-        deleted * 10 >= FILLER_COUNT * 9,
-        "precondition failed: only {deleted} of {FILLER_COUNT} fillers existed to delete"
-    );
+    deleted
 }
 
 /// A numeric field of the default `INFO` (None until published).
@@ -1330,4 +1339,118 @@ fn keys_spilled_after_a_swapdb_stay_in_their_db_across_crash() {
 #[ignore]
 fn keys_spilled_after_a_swapdb_stay_in_their_db_across_rewrite_and_crash() {
     run_swapdb_scenario("swap-then-cold-rw", SwapShape::SwapThenCold, true);
+}
+
+// ── moon#1260 ────────────────────────────────────────────────────────────────
+
+/// BGSAVE and wait until it completed successfully (LASTSAVE has 1 s
+/// resolution, so the wait starts one second after the previous value).
+fn bgsave_and_wait(port: u16) {
+    let lastsave = || integer_reply(&redis_cmd(port, &["LASTSAVE"])).unwrap_or(0);
+    let before = lastsave();
+    std::thread::sleep(Duration::from_millis(1_100));
+    let reply = redis_cmd(port, &["BGSAVE"]);
+    assert!(!reply.is_empty(), "BGSAVE returned an empty reply");
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let info = redis_cmd(port, &["INFO", "persistence"]);
+        if info.contains("rdb_bgsave_in_progress:0") && lastsave() > before {
+            assert!(
+                info.contains("rdb_last_bgsave_status:ok"),
+                "BGSAVE failed: {info}"
+            );
+            return;
+        }
+        assert!(Instant::now() < deadline, "BGSAVE never completed: {info}");
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+/// `GET probe:i` for every probe; returns how many read `val`.
+fn probes_readable(port: u16, val: &str) -> usize {
+    (0..PROBE_COUNT)
+        .filter(|i| redis_get(port, &probe_key(*i)).as_deref() == Some(val))
+        .count()
+}
+
+/// The REVIEW4-WS19 `r4_no_aof_promoted_…` proof, at `MOON_TEST_COLD_DEL_SHARDS`.
+/// Phase 1 spills the probes under `--appendonly yes` and stops cleanly (under
+/// `--appendonly no` the connection gate drops instead of spilling, so a
+/// no-AOF server holds cold keys it inherited). Phase 2 runs the same dir
+/// with `--appendonly no --save`: BGSAVE (the hot table), DEL the fillers,
+/// GET every probe (read back into RAM, no log exists), let the orphan
+/// sweep run (`sweep_secs`), kill -9. Snapshot semantics: every probe was
+/// unchanged since the save, so every probe must come back.
+fn run_no_aof_promote_scenario(suffix: &str, sweep_secs: u64) {
+    let port = common::reserve_port();
+    let dir = unique_dir(suffix);
+    std::fs::create_dir_all(&dir).expect("create test dir");
+    // Phase 1 (`--appendonly yes`), clean stop.
+    {
+        let mut s1 = start_moon(port, &dir, 3600);
+        wait_for_port(port);
+        spill_probes(port, &dir);
+        let _ = Command::new("redis-cli")
+            .args(["-p", &port.to_string(), "SHUTDOWN", "NOSAVE"])
+            .output();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while Instant::now() < deadline && s1.as_mut().try_wait().ok().flatten().is_none() {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        s1.kill_now();
+        wait_for_port_down(port);
+    }
+    // Phase 2 (`--appendonly no` + save points, so BGSAVE has a directory).
+    let save = ["--save", "3600 100000000"];
+    let mut server = start_moon_with(port, &dir, sweep_secs, "no", &save);
+    wait_for_port(port);
+    redis_set(port, "hot:control", "H");
+    bgsave_and_wait(port);
+    let at_save = count_heap_files(&dir);
+    assert!(
+        del_fillers_counting(port) > 0,
+        "precondition failed: no inherited filler to delete"
+    );
+    let val = probe_value();
+    let readable = probes_readable(port, &val);
+    assert!(
+        readable > 0,
+        "precondition failed: no probe readable in phase 2"
+    );
+    std::thread::sleep(Duration::from_secs(6)); // several orphan sweeps
+    let before_kill = count_heap_files(&dir);
+    server.kill_now();
+    wait_for_port_down(port);
+    let mut server2 = start_moon_alive_with(port, &dir, sweep_secs, "no", &save);
+    let hot_ok = redis_get(port, "hot:control").as_deref() == Some("H");
+    let back = probes_readable(port, &val);
+    server2.kill_now();
+    let wrong: Vec<String> = if back < readable || !hot_ok {
+        vec![format!("{back} of {readable} back, hot control {hot_ok}")]
+    } else {
+        Vec::new()
+    };
+    finish(&dir, &wrong);
+    assert!(hot_ok, "the snapshot was not loaded (hot control missing)");
+    assert_eq!(
+        readable - back.min(readable),
+        0,
+        "probes unchanged since the last BGSAVE lost after GET, orphan sweeps and kill -9 \
+         under --appendonly no ({readable} readable before, {back} after; heap files {at_save} \
+         at the save, {before_kill} before the kill)"
+    );
+}
+
+/// moon#1260: GET-promoted inherited cold keys survive the sweep and a crash.
+#[test]
+#[ignore]
+fn no_aof_promoted_cold_keys_survive_the_orphan_sweep_and_crash() {
+    run_no_aof_promote_scenario("noaof-sweep", 1);
+}
+
+/// moon#1260 control: no sweep in the window, nothing is lost.
+#[test]
+#[ignore]
+fn no_aof_promoted_cold_keys_survive_a_crash_without_a_sweep() {
+    run_no_aof_promote_scenario("noaof-nosweep", 3600);
 }

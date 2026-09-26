@@ -541,6 +541,7 @@ fn held_files_pressure_is_signalled_apart_from_compactions() {
         epoch: 1,
         committed_floor: 0,
         next_file_id: OLD + 1,
+        hold_all: false,
     });
     ci.sweep_known_orphans(Vec::new(), &dir, Some(&mut manifest))
         .expect("sweep");
@@ -619,6 +620,7 @@ fn an_output_whose_survivors_all_change_during_the_ack_is_reclaimed() {
         epoch: 5,
         committed_floor: 1,
         next_file_id: 100,
+        hold_all: false,
     });
     ci.sweep_known_orphans(Vec::new(), &dir, Some(&mut manifest))
         .expect("sweep");
@@ -632,6 +634,7 @@ fn an_output_whose_survivors_all_change_during_the_ack_is_reclaimed() {
             epoch: e,
             committed_floor: e,
             next_file_id: 100,
+            hold_all: false,
         });
         ci.sweep_known_orphans(Vec::new(), &dir, Some(&mut manifest))
             .expect("sweep");
@@ -685,6 +688,7 @@ fn a_listed_file_gone_from_disk_is_retired_at_the_first_sweep() {
         epoch: 1,
         committed_floor: 0,
         next_file_id: 100,
+        hold_all: false,
     });
     ci.sweep_known_orphans(Vec::new(), &dir, Some(&mut manifest))
         .expect("sweep");

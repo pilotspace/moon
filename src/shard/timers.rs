@@ -406,8 +406,11 @@ pub const COLD_ORPHAN_SWEEP_INTERVAL_SECS: u64 = 300;
 /// shard's fold epoch, committed floor and spill-file counter
 /// (`spill_file_id`), read right before the decision on this thread — and a
 /// file a replayable generation may still read is held until a committed fold
-/// covers it (`storage::tiered::unlink_hold`). Without one, files go as soon
-/// as their last key does, as before. In a TopLevel layout with more than one
+/// covers it (`storage::tiered::unlink_hold`). Without one, a process that
+/// can write snapshots holds them until a snapshot that started after the
+/// decision has succeeded (moon#1260, `storage::tiered::snapshot_hold`); with
+/// no snapshot directory either, files go as soon as their last key does, as
+/// before. In a TopLevel layout with more than one
 /// shard — which no shipped configuration builds — no committed fold covers
 /// this shard, so held files are never released (see the guard below).
 pub(crate) fn run_cold_orphan_sweep(
@@ -437,10 +440,12 @@ pub(crate) fn run_cold_orphan_sweep(
             || shard_databases.num_shards() <= 1
     });
     // Read at each decision, never cached across one: see `unlink_hold`.
-    let fold_view = || {
-        aof_pool.map(|pool| {
+    // Without an AOF the view comes from this shard's snapshots (moon#1260,
+    // `storage::tiered::snapshot_hold`), when it can write any.
+    let fold_view = || match aof_pool {
+        Some(pool) => {
             let overflow = pool.overflow_for(shard_id);
-            crate::storage::tiered::unlink_hold::FoldView {
+            Some(crate::storage::tiered::unlink_hold::FoldView {
                 epoch: overflow.stamp().0,
                 committed_floor: if floor_covers_this_shard {
                     overflow.committed_floor().0
@@ -448,8 +453,10 @@ pub(crate) fn run_cold_orphan_sweep(
                     crate::persistence::aof::FoldEpoch::INITIAL.0
                 },
                 next_file_id: spill_file_id.get(),
-            }
-        })
+                hold_all: false,
+            })
+        }
+        None => crate::storage::tiered::snapshot_hold::snapshot_fold_view(spill_file_id.get()),
     };
 
     let db_count = shard_databases.db_count();
