@@ -233,6 +233,7 @@ pub fn recover_shard_v3_pitr(
     // for legacy v1 or unstamped v2 files). Skipping forces full WAL
     // replay up to the target -- slower but correct.
     let snap_path = shard_dir.join(format!("shard-{}.rrdshard", shard_id));
+    let mut snapshot_expired = Vec::new(); // moon#1236: dropped from the cold index below
     if snap_path.exists() && kv_authority_elsewhere {
         info!(
             "Shard {}: snapshot load skipped — the multi-part AOF is the KV authority \
@@ -279,7 +280,8 @@ pub fn recover_shard_v3_pitr(
         };
 
         if snapshot_ok {
-            match crate::persistence::snapshot::shard_snapshot_load(databases, &snap_path) {
+            use crate::persistence::snapshot::shard_snapshot_load_noting_expired as load;
+            match load(databases, &snap_path, &mut snapshot_expired) {
                 Ok(n) => {
                     info!("Shard {}: loaded {} keys from snapshot", shard_id, n);
                 }
@@ -519,6 +521,10 @@ pub fn recover_shard_v3_pitr(
                         }
                     }
                 }
+                crate::storage::tiered::snapshot_hold::drop_cold_shadows_of_expired_image_keys(
+                    databases,
+                    snapshot_expired,
+                );
                 // Crash-orphan sweep (task #55): heap files written but never
                 // registered in the manifest (crash between spill write and
                 // manifest commit) leak disk forever otherwise. Manifest opened
