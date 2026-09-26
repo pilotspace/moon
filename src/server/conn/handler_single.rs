@@ -911,7 +911,7 @@ pub async fn handle_connection(
                                         Frame::Error(Bytes::from_static(
                                             b"ERR cannot SWAPDB during BGREWRITEAOF",
                                         ))
-                                    } else if crate::storage::db::swap_refused_for_cold(db, a, b) {
+                                    } else if crate::storage::db::swap_refused_for_cold(&db, a, b) {
                                         Frame::Error(Bytes::from_static(crate::storage::db::ERR_SWAPDB_COLD))
                                     } else {
                                         // WAL must be durable BEFORE the swap (no rollback
