@@ -377,3 +377,103 @@ fn a_deleted_cold_key_whose_ttl_passed_needs_no_del_and_stays_dead() {
         Some(&b"v2"[..])
     );
 }
+
+// ── moon#1236: a cold key overwritten hot WITH a TTL ─────────────────────────
+
+/// [`fold`] with the fold instant given (so a TTL can be alive at the fold
+/// and passed by the time recovery runs, without sleeping).
+fn fold_at(db: &Database, watermark: u64, now_ms: u64) -> Vec<u8> {
+    let (sink, image) = fold_image_channel();
+    stream_fold_image(&[db], now_ms, sink);
+    let mut aof = Vec::new();
+    let (_, deletes) = write_fold_image(image, &mut aof, "moon#1236 test").expect("fold image");
+    aof.extend_from_slice(&generation_head(watermark, &deletes, false));
+    aof
+}
+
+/// The live overwrite: `SET k1 new PXAT <deadline>` over the cold `k1` (a
+/// blind write's `Inserted` arm leaves the old slot as a shadow).
+fn overwrite_with_ttl(live: &mut Database, deadline_ms: u64) {
+    live.set(
+        b"k1",
+        Entry::new_string_with_expiry(Bytes::from_static(b"new"), deadline_ms),
+    );
+    assert!(
+        live.cold_index.as_ref().unwrap().lookup(b"k1").is_some(),
+        "fixture: the overwrite leaves the cold shadow"
+    );
+}
+
+/// moon#1236: the rewrite puts `k1 = new` (TTL still ahead) in the base; the
+/// restart comes after the TTL. The loader used to skip the expired entry,
+/// and the rebuilt index then served k1's OLD value from file 5.
+#[test]
+fn a_cold_key_overwritten_with_a_ttl_does_not_come_back_old_after_a_rewrite() {
+    let (_live_dir, mut live) = live_with_both_cold(SHARED_FILE);
+    let deadline = crate::storage::entry::current_time_ms() - 1_000;
+    overwrite_with_ttl(&mut live, deadline);
+    let image = fold_at(&live, 6, deadline - 10_000);
+    let (_dir, mut db) = recover(SHARED_FILE, &image);
+    assert_eq!(
+        string_value(&mut db, b"k1"),
+        None,
+        "k1's TTL'd overwrite expired during the downtime; its OLD value must not come back"
+    );
+    assert_eq!(string_value(&mut db, b"k2").as_deref(), Some(&b"v2"[..]));
+}
+
+/// ... and across the NEXT rewrite and restart too: the recovered server
+/// dropped the shadow (hot wins at replay close), which records the slot in
+/// the ledger, so its own fold deletes k1 in the new head.
+#[test]
+fn a_cold_key_overwritten_with_a_ttl_stays_gone_across_a_second_rewrite() {
+    let (_live_dir, mut live) = live_with_both_cold(SHARED_FILE);
+    let deadline = crate::storage::entry::current_time_ms() - 1_000;
+    overwrite_with_ttl(&mut live, deadline);
+    let (_dir1, restarted) = recover(SHARED_FILE, &fold_at(&live, 6, deadline - 10_000));
+    let (_dir2, mut db) = recover(SHARED_FILE, &fold(&restarted, 6));
+    assert_eq!(string_value(&mut db, b"k1"), None, "second rewrite");
+    assert_eq!(string_value(&mut db, b"k2").as_deref(), Some(&b"v2"[..]));
+}
+
+/// Control (the no-rewrite shape): the replayed `SET k1 new PXAT <past>` is
+/// inserted expired and the end-of-replay resolution is hot-wins.
+#[test]
+fn a_cold_key_overwritten_with_a_ttl_does_not_come_back_old_without_a_rewrite() {
+    let deadline = (crate::storage::entry::current_time_ms() - 1_000).to_string();
+    let mut aof = serialize_cold_cut(1).to_vec();
+    aof.extend_from_slice(&resp(&[b"SET", b"k1", b"v1"]));
+    aof.extend_from_slice(&resp(&[b"SET", b"k2", b"v2"]));
+    aof.extend_from_slice(&resp(&[b"MOON.SPILLED", b"5", b"k1", b"k2"]));
+    aof.extend_from_slice(&resp(&[
+        b"SET",
+        b"k1",
+        b"new",
+        b"PXAT",
+        deadline.as_bytes(),
+    ]));
+    let (_dir, mut db) = recover(SHARED_FILE, &aof);
+    assert_eq!(string_value(&mut db, b"k1"), None);
+    assert_eq!(string_value(&mut db, b"k2").as_deref(), Some(&b"v2"[..]));
+}
+
+/// The base entry is expired at load, but the key was PERSISTed after the
+/// fold and then spilled into a file minted after the cut (file 7, its
+/// marker in the incr): the live value is that slot, and loading the expired
+/// base entry must not hide it (nor may anything tombstone it).
+#[test]
+fn a_slot_spilled_after_the_rewrite_wins_over_an_expired_base_entry() {
+    const FILES: &[(u64, &[Kv<'static>])] = &[
+        (5, &[("k1", "v1", None), ("k2", "v2", None)]),
+        (7, &[("k1", "new", None)]),
+    ];
+    let (_live_dir, mut live) = live_with_both_cold(SHARED_FILE);
+    let deadline = crate::storage::entry::current_time_ms() - 1_000;
+    overwrite_with_ttl(&mut live, deadline);
+    let mut image = fold_at(&live, 6, deadline - 10_000);
+    image.extend_from_slice(&resp(&[b"PERSIST", b"k1"]));
+    image.extend_from_slice(&resp(&[b"MOON.SPILLED", b"7", b"k1"]));
+    let (_dir, mut db) = recover(FILES, &image);
+    assert_eq!(string_value(&mut db, b"k1").as_deref(), Some(&b"new"[..]));
+    assert_eq!(string_value(&mut db, b"k2").as_deref(), Some(&b"v2"[..]));
+}

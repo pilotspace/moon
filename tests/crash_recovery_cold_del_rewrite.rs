@@ -26,7 +26,8 @@
 //! orphan sweep and a kill -9. RED on `ae21476` and on int/part3b (`5b14b82`).
 //!
 //! WS20 (after it): keyspace-level operations on cold keys — MOVE / COPY … DB
-//! (moon#1254). RED on `ae21476` and on `4a96cd5f`.
+//! (moon#1254) and a TTL'd overwrite of a cold key (moon#1236). RED on
+//! `ae21476` and on `4a96cd5f`.
 //!
 //! Run with (monoio default):
 //!   cargo build --release
@@ -1095,4 +1096,113 @@ fn moved_and_copied_cold_keys_keep_their_values_across_rewrite_and_crash() {
 #[ignore]
 fn moved_and_copied_cold_keys_keep_their_values_across_crash() {
     run_move_copy_scenario("move-norw", Stop::Kill9, false);
+}
+
+// ── moon#1236 ────────────────────────────────────────────────────────────────
+
+/// The even probes are overwritten hot WITH a TTL while cold (their old
+/// value stays on disk as a shadow). Round 1 ends before the TTL passes; the
+/// restart comes after it. Each even probe must read absent — never its OLD,
+/// pre-overwrite value — and each odd probe its original value.
+fn run_ttl_overwrite_scenario(suffix: &str, stop: Stop, rewrite: bool) {
+    const TTL_MS: u64 = 20_000;
+    let port = common::reserve_port();
+    let dir = unique_dir(suffix);
+    std::fs::create_dir_all(&dir).expect("create test dir");
+    let mut server = start_moon(port, &dir, stop.sweep_secs());
+    wait_for_port(port);
+    let heap_files = spill_probes(port, &dir);
+    let val = probe_value();
+    let new = overwrite_value();
+    let overwritten_at = Instant::now();
+    for i in (0..PROBE_COUNT).filter(|i| i % 2 == 0) {
+        redis_cmd(
+            port,
+            &["SET", &probe_key(i), &new, "PX", &TTL_MS.to_string()],
+        );
+    }
+    assert_eq!(
+        redis_get(port, &probe_key(0)).as_deref(),
+        Some(new.as_str()),
+        "precondition failed: the overwrite is not visible on the live server"
+    );
+    if rewrite {
+        rewrite_and_wait(port, &dir);
+    }
+    std::thread::sleep(Duration::from_secs(SETTLE_AFTER_MUTATION));
+    assert!(
+        overwritten_at.elapsed() < Duration::from_millis(TTL_MS),
+        "the TTL passed before round 1 ended; the case would not test the restart"
+    );
+    // Stop now; restart only once the TTL has passed (plus a margin).
+    if stop == Stop::Shutdown {
+        let _ = Command::new("redis-cli")
+            .args(["-p", &port.to_string(), "SHUTDOWN"])
+            .output();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while Instant::now() < deadline && server.as_mut().try_wait().ok().flatten().is_none() {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+    server.kill_now();
+    wait_for_port_down(port);
+    let wait_until = Duration::from_millis(TTL_MS + 1_500);
+    if let Some(rest) = wait_until.checked_sub(overwritten_at.elapsed()) {
+        std::thread::sleep(rest);
+    }
+    let mut server2 = start_moon_alive(port, &dir, stop.sweep_secs());
+    let mut wrong = Vec::new();
+    let mut old_back = 0usize;
+    for i in 0..PROBE_COUNT {
+        let key = probe_key(i);
+        let got = redis_get(port, &key);
+        let ok = if i % 2 == 0 {
+            if got.as_deref() == Some(val.as_str()) {
+                old_back += 1;
+            }
+            got.is_none()
+        } else {
+            got.as_deref() == Some(val.as_str())
+        };
+        if !ok {
+            wrong.push(key);
+        }
+    }
+    server2.kill_now();
+    finish(&dir, &wrong);
+    assert!(
+        wrong.is_empty(),
+        "{} probe(s) wrong after a TTL'd overwrite of cold keys and a {}restart past the TTL \
+         ({old_back} even probes came back with their OLD value; heap files: {heap_files}); \
+         first: {:?}",
+        wrong.len(),
+        if rewrite { "BGREWRITEAOF + " } else { "" },
+        wrong.first()
+    );
+}
+
+/// moon#1236: the reported shape — the rewrite puts the TTL'd value in the
+/// base, the restart comes after the TTL.
+#[test]
+#[ignore]
+fn cold_keys_overwritten_with_a_ttl_do_not_come_back_old_across_rewrite_and_crash() {
+    run_ttl_overwrite_scenario("ttlow-rw", Stop::Kill9, true);
+}
+
+#[test]
+#[ignore]
+fn cold_keys_overwritten_with_a_ttl_do_not_come_back_old_across_rewrite_and_clean_restart() {
+    run_ttl_overwrite_scenario("ttlow-rw-shutdown", Stop::Shutdown, true);
+}
+
+#[test]
+#[ignore]
+fn cold_keys_overwritten_with_a_ttl_do_not_come_back_old_across_crash() {
+    run_ttl_overwrite_scenario("ttlow-norw", Stop::Kill9, false);
+}
+
+#[test]
+#[ignore]
+fn cold_keys_overwritten_with_a_ttl_do_not_come_back_old_across_clean_restart() {
+    run_ttl_overwrite_scenario("ttlow-norw-shutdown", Stop::Shutdown, false);
 }
