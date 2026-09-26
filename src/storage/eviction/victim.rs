@@ -11,24 +11,34 @@
 //! key after the walk had passed it, so the file never held it at all.
 //!
 //! [`remove`] is the ONE way the eviction paths take a victim out: it
-//! captures, then removes. Disarmed (no save running) the capture is one
-//! thread-local `bool` load.
+//! removes, then hands the removed entry to the armed epoch as the key's
+//! pre-image — MOVED, never deep-cloned (review F1). Disarmed (no save
+//! running) that hand-over is one thread-local `bool` load.
 
+pub(super) use crate::persistence::snapshot_cow::Removed;
+use crate::persistence::snapshot_cow::capture_removed;
 use crate::storage::Database;
-use crate::storage::entry::Entry;
 
-/// Remove eviction victim `key` from `db`, capturing its pre-image for an
-/// armed snapshot epoch first (moon#1257).
+/// Remove eviction victim `key` from `db`. `None`: nothing was hot. Otherwise
+/// [`Removed::Held`] when the armed epoch keeps the removed entry as the
+/// key's epoch-start state (the caller must not free it; the walk releases
+/// it, off the shard thread when large), or [`Removed::Dispose`] with the
+/// entry for the caller to free as usual.
+///
+/// The removed entry IS the key's state right before the eviction, so as the
+/// epoch's first capture of the key it is exactly the pre-image a copy would
+/// have taken — without the copy: a 1M-field hash victim cost 198–255 ms of
+/// shard-thread cloning and was resident twice (the clone, and the original
+/// on the lazy-free queue) before review F1.
 ///
 /// The capture is filed under `db.db_index`, which is the shard slot `db`
 /// lives in: the shard stamps it when it builds its databases
 /// (`shard::Shard`), `swap_contents` keeps each slot's index across a SWAPDB
-/// (#1242), and `rdb::load*` carries it into a replacement table. That is
-/// exactly the slot [`crate::persistence::snapshot_cow::capture_write_pre_image`]
-/// asks for, so no caller has to thread an index through `EvictionRun` —
-/// and none can pass the wrong one.
+/// (#1242), and `rdb::load*` carries it into a replacement table — exactly
+/// the slot the epoch's capture asks for, so no caller threads an index
+/// through `EvictionRun` and none can pass a wrong one.
 #[inline]
-pub(super) fn remove(db: &mut Database, key: &[u8]) -> Option<Entry> {
-    crate::persistence::snapshot_cow::capture_write_pre_image(db, db.db_index, key);
-    db.remove(key)
+pub(super) fn remove(db: &mut Database, key: &[u8]) -> Option<Removed> {
+    let entry = db.remove(key)?;
+    Some(capture_removed(db.db_index, key, entry))
 }
