@@ -1,5 +1,6 @@
 #[cfg(test)]
 mod cold_del_rewrite_tests;
+mod cold_footprint;
 pub mod cold_index;
 #[cfg(test)]
 mod cold_index_rebuild_tests;
@@ -19,6 +20,7 @@ pub(crate) mod reclaim_io;
 #[cfg(test)]
 mod replay_older_copy_tests;
 pub mod segment_handle;
+pub mod snapshot_hold;
 pub mod spill_thread;
 pub mod unlink_hold;
 pub mod warm_tier;

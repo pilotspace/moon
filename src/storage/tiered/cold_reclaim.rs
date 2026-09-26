@@ -190,6 +190,13 @@ impl ReclaimState {
         self.pending.len()
     }
 
+    /// No compaction is in flight, pending adoption or being adopted — none
+    /// can list a file for this database (a SWAPDB check, moon#1237).
+    #[inline]
+    pub fn is_idle(&self) -> bool {
+        self.pending.is_empty() && self.in_flight.is_empty() && self.adopting.is_empty()
+    }
+
     /// Whether `file_id` is being compacted or adopted.
     fn is_busy(&self, file_id: u64) -> bool {
         self.in_flight.contains(&file_id)

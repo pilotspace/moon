@@ -514,6 +514,15 @@ async fn stream_commands_read_loop(
                          stream"
                     ));
                 }
+                // moon#1278: offset 0 makes the reconnect send `PSYNC ? -1`.
+                ApplyOutcome::FullResync => {
+                    let rs = cfg.repl_state.read();
+                    rs.master_repl_offset.store(0, Ordering::Relaxed);
+                    return Err(anyhow::anyhow!(
+                        "replication stream: SWAPDB over this replica's disk-offload cold tier \
+                         — dropping the link for a full resync (moon#1278)"
+                    ));
+                }
             }
         }
         if outcome.consumed > 0 {
@@ -928,6 +937,15 @@ async fn stream_commands_read_loop(
                     return Err(anyhow::anyhow!(
                         "replica has no ShardSlice on this thread — cannot apply replication \
                          stream"
+                    ));
+                }
+                // moon#1278: offset 0 makes the reconnect send `PSYNC ? -1`.
+                ApplyOutcome::FullResync => {
+                    let rs = cfg.repl_state.read();
+                    rs.master_repl_offset.store(0, Ordering::Relaxed);
+                    return Err(anyhow::anyhow!(
+                        "replication stream: SWAPDB over this replica's disk-offload cold tier \
+                         — dropping the link for a full resync (moon#1278)"
                     ));
                 }
             }

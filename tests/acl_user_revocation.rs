@@ -100,12 +100,23 @@ fn spawn_moon(tag: &str, shards: &str) -> Option<Moon> {
         }
         std::thread::sleep(Duration::from_millis(100));
     }
-    eprintln!("skipping: moon did not become ready on port {port}");
-    None
+    // Not a skip: a server that accepts but never answers PING is a failure,
+    // and returning `None` here passed the test without running it.
+    panic!("moon accepted on port {port} but never answered PING within 30 s");
 }
+
+/// How long [`Resp::cmd`] waits for one complete reply before failing.
+///
+/// `cmd` used to collect whatever arrived within a fixed 300 ms and return
+/// it, complete or not. On main's Windows run for `4a96cd5f` a runner stall
+/// delayed the first reply past that window, so `ACL SETUSER` read as `""`
+/// and the test failed 3 tries of 3 (moon#1273). It now reads exactly one
+/// complete RESP reply, bounded by the same budget as `common::Conn`.
+const REPLY_BUDGET: Duration = Duration::from_secs(20);
 
 struct Resp {
     stream: TcpStream,
+    /// Bytes read but not yet returned as a reply.
     buf: Vec<u8>,
 }
 
@@ -121,23 +132,49 @@ impl Resp {
         }
     }
 
+    /// Send one command and return its reply: exactly one complete RESP
+    /// reply (`common::framed_len`), however long the server takes within
+    /// [`REPLY_BUDGET`]. If the server closes the connection first, what
+    /// arrived (possibly nothing) is returned, so the caller's assertion
+    /// names the defect — a self-`ACL DELUSER` torn down before its reply
+    /// reads as `""`, as it always did.
     fn cmd(&mut self, args: &[&str]) -> String {
-        self.buf.clear();
         let mut out = format!("*{}\r\n", args.len()).into_bytes();
         for a in args {
             out.extend_from_slice(format!("${}\r\n{a}\r\n", a.len()).as_bytes());
         }
         self.stream.write_all(&out).expect("write");
-        let deadline = Instant::now() + Duration::from_millis(300);
+        let start = Instant::now();
         let mut chunk = [0u8; 8192];
-        while Instant::now() < deadline {
+        loop {
+            if let Some(n) = common::framed_len(&self.buf, 1) {
+                let reply = String::from_utf8_lossy(&self.buf[..n]).into_owned();
+                self.buf.drain(..n);
+                return reply;
+            }
+            assert!(
+                start.elapsed() < REPLY_BUDGET,
+                "no complete reply to {:?} within {:?}; got {} bytes: {:?}",
+                &args[..args.len().min(2)],
+                start.elapsed(),
+                self.buf.len(),
+                String::from_utf8_lossy(&self.buf)
+            );
             match self.stream.read(&mut chunk) {
                 Ok(0) => break,
                 Ok(n) => self.buf.extend_from_slice(&chunk[..n]),
-                Err(_) => {}
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) => {}
+                // ECONNRESET and friends: the peer is gone, as for `Ok(0)`.
+                Err(_) => break,
             }
         }
-        String::from_utf8_lossy(&self.buf).into_owned()
+        let partial = String::from_utf8_lossy(&self.buf).into_owned();
+        self.buf.clear();
+        partial
     }
 
     /// True once this session is dead — either the peer already tore the
@@ -152,7 +189,7 @@ impl Resp {
     /// teardown Redis clients see on every platform; on unix the socket is
     /// already shut down, so the poke fails immediately and costs nothing.
     fn is_closed(&mut self) -> bool {
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + REPLY_BUDGET;
         let mut chunk = [0u8; 4096];
         while Instant::now() < deadline {
             if self.stream.write_all(b"*1\r\n$4\r\nPING\r\n").is_err() {

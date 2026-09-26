@@ -545,13 +545,16 @@ impl SnapshotState {
     pub fn capture_cow(&mut self, db_index: usize, key: Bytes, pre_image: PreImage) {
         let hash = crate::storage::dashtable::hash_key(&key);
         if !self.is_hash_pending(db_index, hash) {
-            return;
+            return pre_image.into_iter().for_each(frozen::dispose);
         }
-        if let std::collections::btree_map::Entry::Vacant(slot) =
-            self.overflow[db_index].entry((hash, key))
-        {
-            self.overflow_bytes += pre_image_bytes(&slot.key().1, &pre_image);
-            slot.insert(pre_image);
+        use std::collections::btree_map::Entry::{Occupied, Vacant};
+        match self.overflow[db_index].entry((hash, key)) {
+            Vacant(slot) => {
+                self.overflow_bytes += pre_image_bytes(&slot.key().1, &pre_image);
+                slot.insert(pre_image);
+            }
+            // A large one (moon#1257 review F1) is freed off the shard thread.
+            Occupied(_) => pre_image.into_iter().for_each(frozen::dispose),
         }
     }
 
@@ -601,7 +604,10 @@ impl SnapshotState {
             );
             self.aborted = Some(why);
         }
-        self.overflow.iter_mut().for_each(BTreeMap::clear);
+        let maps = self.overflow.iter_mut().map(std::mem::take);
+        maps.flat_map(BTreeMap::into_values)
+            .flatten()
+            .for_each(frozen::dispose);
         self.overflow_bytes = 0;
         // Nothing will be written any more: release the detached tables,
         // off the shard thread (review 7).
@@ -955,6 +961,8 @@ impl SnapshotState {
             }
             entry_count += 1;
         }
+        // Written: a large pre-image (moon#1257 review F1) is freed off-thread.
+        pre_images.into_values().flatten().for_each(frozen::dispose);
 
         // Per-segment CRC32 covers the entry data
         let data_end = self.output_buf.len();
@@ -1079,82 +1087,6 @@ pub fn shard_snapshot_save_with_lsn(
     state.finalize()
 }
 
-/// Peek at a snapshot file's header without fully loading it.
-///
-/// Returns the version, shard_id, epoch, last_lsn, and created_at_unix_ms.
-/// Used by P3 recovery to enumerate available snapshots and pick the one
-/// with the highest `last_lsn` that is still `<= target_lsn`.
-///
-/// Does NOT verify the global CRC32 — that's only meaningful when the full
-/// payload is being loaded. Header bytes are integrity-checked by the magic
-/// + version validation; corrupt headers return `Corrupted` errors.
-pub fn read_snapshot_metadata(path: &Path) -> Result<SnapshotMeta, MoonError> {
-    use std::io::Read;
-    let mut file = std::fs::File::open(path).map_err(|e| SnapshotError::Io {
-        path: path.to_path_buf(),
-        source: e,
-    })?;
-    // v2 preamble is 35 bytes — read up to that.
-    let mut buf = [0u8; 35];
-    let n = file.read(&mut buf).map_err(|e| SnapshotError::Io {
-        path: path.to_path_buf(),
-        source: e,
-    })?;
-    if n < 19 {
-        return Err(SnapshotError::Corrupted {
-            detail: format!("snapshot header truncated: {} bytes", n),
-        }
-        .into());
-    }
-    if &buf[0..8] != SHARD_RDB_MAGIC {
-        return Err(SnapshotError::Corrupted {
-            detail: "invalid RRDSHARD magic header".into(),
-        }
-        .into());
-    }
-    let version = buf[8];
-    if version != SHARD_RDB_VERSION_V1
-        && version != SHARD_RDB_VERSION_V2
-        && version != SHARD_RDB_VERSION_V3
-    {
-        return Err(SnapshotError::VersionMismatch {
-            expected: SHARD_RDB_VERSION as u32,
-            actual: version as u32,
-        }
-        .into());
-    }
-    let shard_id = u16::from_le_bytes([buf[9], buf[10]]);
-    let epoch = u64::from_le_bytes([
-        buf[11], buf[12], buf[13], buf[14], buf[15], buf[16], buf[17], buf[18],
-    ]);
-    // V2 and V3 share the same preamble layout (LSN + timestamp after epoch).
-    let (last_lsn, created_at_unix_ms) =
-        if version == SHARD_RDB_VERSION_V2 || version == SHARD_RDB_VERSION_V3 {
-            if n < 35 {
-                return Err(SnapshotError::Corrupted {
-                    detail: format!("v2 snapshot header truncated: {} bytes", n),
-                }
-                .into());
-            }
-            let lsn = u64::from_le_bytes([
-                buf[19], buf[20], buf[21], buf[22], buf[23], buf[24], buf[25], buf[26],
-            ]);
-            let ts = u64::from_le_bytes([
-                buf[27], buf[28], buf[29], buf[30], buf[31], buf[32], buf[33], buf[34],
-            ]);
-            (lsn, ts)
-        } else {
-            (0u64, 0u64)
-        };
-    Ok(SnapshotMeta {
-        version,
-        shard_id,
-        epoch,
-        last_lsn,
-        created_at_unix_ms,
-    })
-}
-
 /// Load a per-shard snapshot file and populate databases. Returns total keys loaded.
 ///
 /// Reads RRDSHARD format with per-segment CRC32 verification.
@@ -1165,6 +1097,15 @@ pub fn read_snapshot_metadata(path: &Path) -> Result<SnapshotMeta, MoonError> {
 pub fn shard_snapshot_load<D: std::borrow::BorrowMut<Database>>(
     databases: &mut [D],
     path: &Path,
+) -> Result<usize, MoonError> {
+    shard_snapshot_load_noting_expired(databases, path, &mut Vec::new())
+}
+
+/// [`shard_snapshot_load`], handing back in `expired` each `(db, key, entry)` skipped as expired.
+pub fn shard_snapshot_load_noting_expired<D: std::borrow::BorrowMut<Database>>(
+    databases: &mut [D],
+    path: &Path,
+    expired: &mut Vec<(usize, Bytes, Entry)>,
 ) -> Result<usize, MoonError> {
     // moon#1232 review 5: booting from a snapshot is no keyspace change —
     // redis 7.0.15 starts with `rdb_changes_since_last_save:0`. Counted, every
@@ -1426,9 +1367,8 @@ pub fn shard_snapshot_load<D: std::borrow::BorrowMut<Database>>(
                 // Insert non-expired entries into the database
                 for (key, entry) in entries {
                     if entry.has_expiry() && entry.is_expired_at(now_ms) {
-                        continue;
-                    }
-                    if current_db < databases.len() {
+                        expired.push((current_db, key, entry));
+                    } else if current_db < databases.len() {
                         databases[current_db].borrow_mut().set(&key, entry);
                         total_keys += 1;
                     }
@@ -1460,6 +1400,9 @@ pub fn shard_snapshot_load<D: std::borrow::BorrowMut<Database>>(
 
 pub(crate) mod frozen;
 
+mod meta;
+pub use meta::read_snapshot_metadata;
+
 #[cfg(test)]
 mod tests;
 
@@ -1486,3 +1429,6 @@ mod capture_gap_tests;
 
 #[cfg(test)]
 mod cow_budget_tests;
+
+#[cfg(test)]
+mod eviction_capture_tests;

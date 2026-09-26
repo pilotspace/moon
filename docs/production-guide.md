@@ -346,6 +346,46 @@ moon --appendonly yes --appendfsync everysec \
 
 Recovery order: RDB snapshot, then WAL segments, then AOF tail.
 
+### Graceful shutdown and stop timeouts
+
+A graceful stop — `SIGTERM` (`systemctl stop`, `docker stop`, a Kubernetes pod
+deletion), `SIGINT` or `SHUTDOWN` — does two things before the process exits:
+
+1. **The final RDB save**, when save points are configured (`--save`, or
+   `CONFIG SET save`): a `SIGTERM`/`SIGINT` waits for a save already running,
+   then saves once more. There is no deadline on it, because a large dataset
+   must not turn a stop into "keep running". Every 20 s without progress it logs
+   `Errors trying to shut down the server` and that the stop stays armed. A
+   failed save keeps the server running (redis parity); a second `SIGINT` exits
+   at once without the save (status 1), and `SHUTDOWN ABORT` cancels.
+2. **The AOF drain** (`--appendonly yes`): after the shards stop, every AOF
+   writer writes what is still queued and fsyncs. The wait is bounded at 60 s
+   (plus a 2 s grace); after that the process exits non-zero and logs the
+   writers it abandoned. A second `SIGINT` cuts the wait to about 2 s.
+
+The supervisor's stop timeout must cover both, or it `SIGKILL`s the save or the
+drain half-way: the unsaved writes are then lost, as on a crash. Size it to the
+final save of your dataset (roughly the time a `BGSAVE` takes: time one, from
+`BGSAVE` until `INFO persistence` shows `rdb_bgsave_in_progress:0`) **plus
+60 s**:
+
+| Supervisor | Default | Setting |
+|---|---|---|
+| systemd | `TimeoutStopSec=90s` | `TimeoutStopSec=` in the `[Service]` section (`packaging/moon.service`) |
+| Docker | 10 s | `docker stop -t <s>`, `docker run --stop-timeout <s>`, Compose `stop_grace_period` |
+| Kubernetes | 30 s | `terminationGracePeriodSeconds` in the pod spec |
+
+For example, a dataset whose `BGSAVE` takes 2 minutes needs
+`TimeoutStopSec=180` (120 s + 60 s). With `--appendonly yes` and no save
+points, the 60 s drain bound alone is the minimum.
+
+### Switching `--appendonly yes` → `no`
+
+Take a snapshot first (`BGSAVE`, or `SHUTDOWN SAVE`). Under `--appendonly no`
+boot loads only the RDB snapshot and ignores an AOF on disk (redis parity), so a
+dataset that lived only in the AOF boots empty. moon logs a WARN naming the AOF
+it did not load. See [configuration](configuration.md#persistence).
+
 ### AOF rewrite
 
 Trigger manual compaction:
@@ -353,6 +393,29 @@ Trigger manual compaction:
 ```
 BGREWRITEAOF
 ```
+
+### Key expiry during AOF replay
+
+A restart after a key's TTL passed must not revive it, yet the writes logged
+while it was alive must replay onto it. moon judges expiry during replay by
+the time the log was last written: the newest modification time (mtime) of
+the AOF files being replayed (and of the WAL segments), capped at the wall
+clock (moon#1277). Keep those mtimes truthful:
+
+- An mtime LATER than the last write (a file copied without preserving it)
+  only brings back the pre-moon#1277 behaviour for keys whose TTL passed
+  during the downtime.
+- An mtime EARLIER than the last write — the system clock stepped back after
+  the write, a network or virtio filesystem whose server clock lags, or
+  `touch -d` / a restore tool that resets it — makes keys that expired while
+  the server ran look alive to the replay. A key that was read as expired,
+  then rewritten before its expiry `DEL` reached the log, then replays onto
+  its OLD value (measured with the mtime set an hour back: 27–36 of 40 such
+  keys, against 0 on a build that judged by the wall clock).
+
+Restore AOF files with their original mtimes (`cp -p`, `rsync -t`, `tar`).
+A time record inside the log (like redis's `aof-timestamp-enabled`) would
+remove the dependency; it is a format change tracked separately.
 
 ### Persistence volume in Docker
 
@@ -411,6 +474,36 @@ moon --maxmemory 8589934592 --maxmemory-policy allkeys-lfu \
 ```
 
 Reads from the cold tier use async read-through with full crash recovery.
+
+`SWAPDB` is refused while either database has keys in the cold tier or spill
+files not yet reclaimed (a spill file records the database it was spilled
+from, and a swap cannot re-tag it crash-consistently). To swap such a
+database, delete its cold keys (or read them back into RAM), then run
+`BGREWRITEAOF` (`--appendonly yes`) or `BGSAVE` (`--appendonly no`): once
+that fold or snapshot covers the emptied files, the next orphan sweep
+reclaims them and the swap is allowed. Waiting for the automatic rewrite can
+take a long time. If another shard holds a database for the whole bounded
+check (about 20,000 yields, a few ms), the reply is
+`ERR SWAPDB could not check the disk-offload cold tier of every shard, try again`
+and nothing is swapped. A replica whose own cold tier holds either database
+does not apply its master's `SWAPDB`: it drops the link and resyncs in full
+(moon#1278), which costs a full transfer per such swap.
+
+**Without an AOF (`--appendonly no`)**, a restart returns to the last snapshot
+plus the cold tier on disk, and the cold tier records no removals:
+
+- A spill file is removed only after a successful snapshot that started after
+  its last key left (moon#1260), because until then it may be the only copy
+  of a key read back into RAM. With no save rules (the default under
+  `--appendonly no`) nothing takes that snapshot: a `DEL` or `FLUSHALL` of
+  cold keys is undone by ANY restart — a clean `SHUTDOWN` included — until
+  a manual `BGSAVE` (or `SHUTDOWN SAVE`). Measured: 96 of 200 deleted keys
+  back after a plain `SHUTDOWN`. That is consistent with the snapshot, but
+  visible; run `BGSAVE` after deleting cold data you want gone.
+- A cold key deleted, or overwritten with a TTL that then passes, can come
+  back after a LATER snapshot and a crash if its spill file still holds other
+  live keys: the rebuild re-indexes the dead slot (moon#1281). Use
+  `--appendonly yes` where deletes of cold data must be durable.
 
 ### jemalloc tuning
 

@@ -280,6 +280,25 @@ fn an_allow_oom_function_does_not_write_past_a_db_quota() {
     );
     let set = c.send(&["FCALL", "qset", "1", "grown"]);
     let del_fn = c.send(&["FCALL", "qdel", "1", &keys.pop().unwrap()]);
+    // PR #1268 review (CodeRabbit): the DEL above may have brought db 1 back
+    // under its quota, and an EVAL DEL there proves no bypass. Re-fill db 1
+    // past the quota and check a small SET is refused before the EVAL DEL.
+    let mut refill = 0;
+    loop {
+        let key = format!("r:{refill}");
+        let reply = c.send(&["SET", &key, &value]);
+        if !reply.starts_with("+OK") {
+            assert!(
+                reply.contains("db maxmemory exceeded"),
+                "SET {key}: {reply}"
+            );
+            break;
+        }
+        keys.push(key);
+        refill += 1;
+        assert!(refill < 1_000, "db 1 never went back over its quota");
+    }
+    let small_set = c.send(&["SET", "probe", "v"]);
     let del_eval = c.send(&[
         "EVAL",
         "return redis.call('DEL', KEYS[1])",
@@ -293,5 +312,9 @@ fn an_allow_oom_function_does_not_write_past_a_db_quota() {
         "an allow-oom SET past db 1's quota answered {set:?}"
     );
     assert_eq!(del_fn.trim(), ":1", "an allow-oom DEL over the quota");
+    assert!(
+        small_set.contains("db maxmemory exceeded"),
+        "fixture: db 1 was not over its quota before the EVAL DEL ({small_set:?})"
+    );
     assert_eq!(del_eval.trim(), ":1", "an EVAL DEL over the quota");
 }

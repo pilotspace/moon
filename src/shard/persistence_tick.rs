@@ -101,6 +101,7 @@ pub(crate) fn handle_pending_snapshot(
             // the life of this snapshot. See `persistence::snapshot_cow`.
             // moon#1186: with the layout, so written segments are skipped.
             crate::persistence::snapshot_cow::arm_with_layout(segment_counts);
+            super::timers::note_snapshot_started(shard_databases); // moon#1260
             *snapshot_state = Some(state);
             *snapshot_reply_tx = Some(reply_tx);
         }
@@ -139,13 +140,13 @@ pub(crate) fn check_auto_save_trigger(
             crate::command::persistence::bgsave_shard_done(false);
             return;
         }
-        let Some(dir) = persistence_dir else {
-            // No persistence directory (`--appendonly no` without `--save`):
-            // nowhere to write. Report the failure instead of leaving the
-            // save in progress forever (moon#1230).
+        // moon#1267: a shard with no persistence directory saves to `--dir`.
+        let Some(dir) = crate::command::persistence::snapshot_dir_or(persistence_dir) else {
+            // Nowhere to write (a harness registered no directory): report the
+            // failure instead of leaving the save in progress forever (moon#1230).
             tracing::warn!(
-                "Shard {}: snapshot epoch {} not written — no persistence directory \
-                 (--appendonly no and no --save); the save is reported failed",
+                "Shard {}: snapshot epoch {} not written — no snapshot directory \
+                 is registered; the save is reported failed",
                 shard_id,
                 new_epoch
             );
@@ -187,6 +188,7 @@ pub(crate) fn check_auto_save_trigger(
         start_snapshot_streaming(&mut state, shard_id);
         // moon#517: same arming as the explicit-BGSAVE path above.
         crate::persistence::snapshot_cow::arm_with_layout(segment_counts);
+        super::timers::note_snapshot_started(shard_databases); // moon#1260
         *snapshot_state = Some(state);
     }
 }
@@ -295,11 +297,9 @@ pub(crate) fn advance_snapshot_segment(
 
 /// Handle successful snapshot finalization: send reply.
 ///
-/// WAL v2's per-snapshot `truncate_after_snapshot(epoch)` had no v3
-/// equivalent -- v3 retention is LSN-driven (`WalWriterV3::recycle_aggressive`
-/// / `recycle_segments_before`, invoked from autovacuum Pass C and the
-/// checkpoint protocol) and runs independently of legacy RRDSHARD snapshot
-/// epochs, so this handler no longer touches the WAL writer at all.
+/// WAL v2's per-snapshot `truncate_after_snapshot(epoch)` has no v3 equivalent:
+/// v3 retention is LSN-driven (`WalWriterV3::recycle_*`, from autovacuum Pass C
+/// and the checkpoint protocol), so this handler never touches the WAL writer.
 pub(crate) fn finalize_snapshot_success(
     snapshot_state: &mut Option<SnapshotState>,
     snapshot_reply_tx: &mut Option<channel::OneshotSender<Result<(), String>>>,
@@ -314,6 +314,7 @@ pub(crate) fn finalize_snapshot_success(
     }
     // moon#517: the file is closed — a pre-image has nowhere left to go.
     crate::persistence::snapshot_cow::disarm();
+    crate::storage::tiered::snapshot_hold::note_snapshot_finished(true); // moon#1260
     *snapshot_state = None;
 }
 
@@ -328,8 +329,11 @@ pub(crate) fn finalize_snapshot_error(
     if let Some(tx) = snapshot_reply_tx.take() {
         let _ = tx.send(Err(format!("finalize failed: {}", error)));
     }
-    // moon#517: the file is closed — a pre-image has nowhere left to go.
+    // moon#517 + round 3 A4: the file is closed; held pre-images and tables go off-thread.
+    let abort = |snap: &mut SnapshotState| snap.abort("finalize failed");
+    snapshot_state.iter_mut().for_each(abort);
     crate::persistence::snapshot_cow::disarm();
+    crate::storage::tiered::snapshot_hold::note_snapshot_finished(false); // moon#1260
     *snapshot_state = None;
 }
 

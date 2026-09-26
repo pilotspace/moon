@@ -862,23 +862,9 @@ pub(crate) fn do_rewrite_per_shard(
     //      but before the shard built the snapshot — same as the old mid-drain.
     //   4. Snapshot is replied after all prior mutations are applied; no
     //      command can mutate the shard while it is building the snapshot.
-    let (reply_tx, reply_rx) =
-        crate::runtime::channel::oneshot::<crate::shard::dispatch::AofFoldSnapshot>();
-    {
-        let mut prod = fold_producer.lock();
-        prod.try_push(crate::shard::dispatch::ShardMessage::AofFold { reply_tx })
-            .map_err(|_| AofError::RewriteFailed {
-                detail: format!(
-                    "do_rewrite_per_shard: shard {} AofFold SPSC ring full — fold aborted",
-                    shard_id
-                ),
-            })?;
-    }
-    fold_notifier.notify_one();
 
-    // Phase 4: collect the cooperative snapshot (blocks until the shard replies).
-    // Use recv_blocking since do_rewrite_per_shard runs on a dedicated std::thread
-    // (the per-shard AOF writer), not inside an async executor.
+    // Phases 2 + 4: push AofFold, collect the cooperative snapshot (blocks until
+    // the shard replies; this runs on the per-shard AOF writer's own std::thread).
     //
     // C4 ordering invariant (exactly-once guarantee — frozen contract §3 C4):
     //   Every command the shard processed BEFORE building its snapshot had already
@@ -891,38 +877,9 @@ pub(crate) fn do_rewrite_per_shard(
     //   they would land in the NEW incr and be replayed on top of a base that
     //   already contains them → double-apply on recovery (observed: 2016 of
     //   272988 INCRs survived restart in test_ssm4a_fold_4shard_experimental).
-    // Wait for the shard event loop to build and reply with the snapshot.
-    // Poll with try_recv + sleep so we can log a warning if the reply is slow
-    // (helps diagnose starvation of the fold consumer under high write load).
-    let fold_snapshot = {
-        let wait_start = std::time::Instant::now();
-        let mut warned = false;
-        loop {
-            match reply_rx.try_recv() {
-                Ok(snap) => break snap,
-                Err(flume::TryRecvError::Empty) => {
-                    if !warned && wait_start.elapsed() >= std::time::Duration::from_millis(500) {
-                        warned = true;
-                        warn!(
-                            "do_rewrite_per_shard: shard {} waiting for AofFold snapshot ({:.1}s elapsed) — \
-                             shard event loop may be stalled or fold consumer not draining",
-                            shard_id,
-                            wait_start.elapsed().as_secs_f64()
-                        );
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(1));
-                }
-                Err(flume::TryRecvError::Disconnected) => {
-                    return Err(AofError::RewriteFailed {
-                        detail: format!(
-                            "do_rewrite_per_shard: shard {} AofFold reply channel dropped (shard shut down?)",
-                            shard_id
-                        ),
-                    }.into());
-                }
-            }
-        }
-    };
+    // A shard that stopped never replies: the wait ends then (moon#1274 A1).
+    let who = format!("do_rewrite_per_shard: shard {shard_id}");
+    let fold_snapshot = fold_reply::request_fold_snapshot(fold_producer, fold_notifier, &who)?;
     let pending_aof_count = fold_snapshot.pending_aof_count;
     info!(
         "F6 shard {} snapshot received: image streaming, {} pre-snapshot pending ({:.1}ms total)",
@@ -1232,49 +1189,8 @@ pub(crate) fn do_rewrite_sharded(
     // Send AofFold to shard 0 and block on the cooperative snapshot reply.
     // The shard event loop processes AofFold atomically between commands —
     // same mutual exclusion the old RwLock write guards provided.
-    let (reply_tx, reply_rx) =
-        crate::runtime::channel::oneshot::<crate::shard::dispatch::AofFoldSnapshot>();
-    {
-        let mut prod = fold_producer.lock();
-        prod.try_push(crate::shard::dispatch::ShardMessage::AofFold { reply_tx })
-            .map_err(|_| AofError::RewriteFailed {
-                detail: "do_rewrite_sharded (TopLevel): AofFold SPSC ring full — fold aborted"
-                    .to_string(),
-            })?;
-    }
-    fold_notifier.notify_one();
-
-    // Poll for the cooperative snapshot (blocks until shard 0 replies).
-    // Runs on the dedicated AOF writer thread (not inside an async executor),
-    // so recv_blocking / sleep are safe.
-    let fold_snapshot = {
-        let wait_start = std::time::Instant::now();
-        let mut warned = false;
-        loop {
-            match reply_rx.try_recv() {
-                Ok(snap) => break snap,
-                Err(flume::TryRecvError::Empty) => {
-                    if !warned && wait_start.elapsed() >= std::time::Duration::from_millis(500) {
-                        warned = true;
-                        warn!(
-                            "do_rewrite_sharded (TopLevel): waiting for AofFold snapshot \
-                             ({:.1}s elapsed) — shard 0 event loop may be stalled",
-                            wait_start.elapsed().as_secs_f64()
-                        );
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(1));
-                }
-                Err(flume::TryRecvError::Disconnected) => {
-                    return Err(AofError::RewriteFailed {
-                        detail: "do_rewrite_sharded (TopLevel): AofFold reply channel dropped \
-                                 (shard 0 shut down?)"
-                            .to_string(),
-                    }
-                    .into());
-                }
-            }
-        }
-    };
+    let who = "do_rewrite_sharded (TopLevel)";
+    let fold_snapshot = fold_reply::request_fold_snapshot(fold_producer, fold_notifier, who)?;
     let pending_aof_count = fold_snapshot.pending_aof_count;
     info!(
         "TopLevel fold snapshot received: image streaming, {} pre-snapshot pending ({:.1}ms)",
@@ -1527,45 +1443,9 @@ pub(crate) fn rewrite_aof_sharded_sync(
         _fold_t0.elapsed().as_secs_f64() * 1000.0
     );
 
-    // Phases 2-3: AofFold cooperative snapshot.
-    let (reply_tx, reply_rx) =
-        crate::runtime::channel::oneshot::<crate::shard::dispatch::AofFoldSnapshot>();
-    {
-        let mut prod = fold_producer.lock();
-        prod.try_push(crate::shard::dispatch::ShardMessage::AofFold { reply_tx })
-            .map_err(|_| AofError::RewriteFailed {
-                detail: "rewrite_aof_sharded_sync (tokio): AofFold SPSC ring full".to_string(),
-            })?;
-    }
-    fold_notifier.notify_one();
-
-    let fold_snapshot = {
-        let wait_start = std::time::Instant::now();
-        let mut warned = false;
-        loop {
-            match reply_rx.try_recv() {
-                Ok(snap) => break snap,
-                Err(flume::TryRecvError::Empty) => {
-                    if !warned && wait_start.elapsed() >= std::time::Duration::from_millis(500) {
-                        warned = true;
-                        warn!(
-                            "rewrite_aof_sharded_sync (tokio): waiting for AofFold snapshot \
-                             ({:.1}s) — shard 0 may be stalled",
-                            wait_start.elapsed().as_secs_f64()
-                        );
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(1));
-                }
-                Err(flume::TryRecvError::Disconnected) => {
-                    return Err(AofError::RewriteFailed {
-                        detail: "rewrite_aof_sharded_sync (tokio): AofFold reply channel dropped"
-                            .to_string(),
-                    }
-                    .into());
-                }
-            }
-        }
-    };
+    // Phases 2-3: AofFold cooperative snapshot (ends if shard 0 stopped, A1).
+    let who = "rewrite_aof_sharded_sync (tokio)";
+    let fold_snapshot = fold_reply::request_fold_snapshot(fold_producer, fold_notifier, who)?;
     // D1 fix: capture pending_aof_count to bound the mid-drain (C4-DRAIN-BOUND).
     // The shard reports exactly how many AOF messages were enqueued before it
     // built the snapshot. Draining more would consume post-snapshot appends that
@@ -2021,6 +1901,7 @@ mod fold_tests {
 
 #[cfg(test)]
 mod flat_file_fold_tests;
+mod fold_reply;
 
 #[cfg(test)]
 mod rewrite_stall_1158_tests;

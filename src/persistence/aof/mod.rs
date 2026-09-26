@@ -777,13 +777,13 @@ pub mod auto_rewrite;
 mod encode;
 /// Streamed base image for the rewrite fold (moon#1185).
 pub mod fold_stream;
-/// Group-commit batching seam (coalesce concurrent pending writes into one
-/// fsync under `appendfsync=always`). `pub` so the §4 red suite can pin the pure
-/// seam (collect/commit) against the public API.
+/// Group-commit batching seam (coalesce concurrent pending writes into one fsync
+/// under `appendfsync=always`). `pub` so the §4 red suite can pin the pure seam.
 pub mod group_commit;
 mod pool;
 pub mod rewrite;
 pub mod rewrite_overflow;
+pub mod writer_stop;
 mod writer_task;
 
 pub use pool::{AofWriterPool, BoundedRefusal};
@@ -1041,6 +1041,7 @@ pub fn replay_aof(
     path: &Path,
     engine: &dyn CommandReplayEngine,
 ) -> Result<usize, MoonError> {
+    let _clock = crate::persistence::replay::clock::pin_replay_clock_to_files(&[path]);
     replay_aof_with_resync(databases, path, engine, aof_best_effort_resync_enabled())
 }
 

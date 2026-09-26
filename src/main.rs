@@ -50,6 +50,7 @@ pub static malloc_conf: MallocConfPtr = MallocConfPtr(
 
 use std::path::PathBuf;
 
+use moon::command::persistence::signal;
 use moon::config::ServerConfig;
 use moon::config::conf_file::merge_conf_argv;
 use moon::persistence::aof::{self, AofMessage, AofWriterPool, FsyncPolicy};
@@ -774,8 +775,8 @@ fn main() -> anyhow::Result<()> {
     {
         let sigint_token = cancel_token.clone();
         ctrlc::set_handler(move || {
-            info!("Shutdown signal received");
-            sigint_token.cancel();
+            // moon#1263: saves first with save points (like plain SHUTDOWN).
+            signal::on_signal(signal::ShutdownSignal::Int, &sigint_token);
         })
         .map_err(|e| anyhow::anyhow!("failed to set Ctrl+C handler: {e}"))?;
     }
@@ -823,9 +824,10 @@ fn main() -> anyhow::Result<()> {
                             continue;
                         }
                         if sig == libc::SIGTERM {
-                            info!("Shutdown signal received");
-                            sigterm_token.cancel();
-                            return;
+                            // moon#1263: saves first with save points; the
+                            // server keeps running if that save fails, and a
+                            // later SIGTERM retries — so keep waiting.
+                            signal::on_signal(signal::ShutdownSignal::Term, &sigterm_token);
                         }
                     }
                 }
@@ -854,8 +856,9 @@ fn main() -> anyhow::Result<()> {
     //        - `num_shards == 1` (always TopLevel; per-shard fan-out has no
     //          meaning when there is one shard)
     //
-    // A *corrupt* manifest is fatal — `AofManifest::load` returning `Err(_)`
-    // must NOT silently fall back to TopLevel, because the next write would
+    // The ONE orphan-sweeping load (moon#1271): no writer or rewrite exists
+    // yet. A *corrupt* manifest is fatal — a load returning `Err(_)` must NOT
+    // silently fall back to TopLevel, because the next write would
     // create a fresh manifest overwriting the reference to the real base RDB
     // and lose data. This mirrors the replay block at L514–526.
     //
@@ -866,15 +869,13 @@ fn main() -> anyhow::Result<()> {
     // behavior under default configurations stays byte-identical to step 2f-α.
     use moon::persistence::aof_manifest::{AofLayout, AofManifest};
     let existing_manifest: Option<AofManifest> = if config.appendonly == "yes" {
-        let base_dir = PathBuf::from(&config.dir);
-        match AofManifest::load(&base_dir) {
+        match AofManifest::load_and_sweep_orphans(&PathBuf::from(&config.dir)) {
             Ok(opt) => opt,
             Err(e) => {
                 eprintln!(
                     "REFUSING TO START: AOF manifest at {}/appendonlydir/ is corrupt: {}. \
                      Inspect manually before deleting; overwriting silently loses data.",
-                    base_dir.display(),
-                    e
+                    config.dir, e
                 );
                 std::process::exit(2);
             }
@@ -934,6 +935,7 @@ fn main() -> anyhow::Result<()> {
     let mut toplevel_pool_fold_notifier: Option<std::sync::Arc<moon::runtime::channel::Notify>> =
         None;
 
+    let (aof_writer_token, mut aof_writers) = (CancellationToken::new(), Vec::new()); // moon#1274
     let mut aof_pool: Option<std::sync::Arc<AofWriterPool>> = if config.appendonly == "yes" {
         let fsync = FsyncPolicy::from_str(&config.appendfsync);
         // PerShard writers required when num_shards >= 2 AND we'll have a
@@ -956,11 +958,11 @@ fn main() -> anyhow::Result<()> {
             let mut senders = Vec::with_capacity(num_shards);
             for sid in 0..num_shards {
                 let (tx, rx) = channel::mpsc_bounded::<AofMessage>(10_000);
-                let aof_token = cancel_token.child_token();
+                let aof_token = aof_writer_token.clone();
                 let base_dir = base_dir.clone();
                 let thread_name = format!("aof-writer-{sid}");
                 let thread_name_inner = thread_name.clone();
-                std::thread::Builder::new()
+                let writer = std::thread::Builder::new()
                     .name(thread_name)
                     .spawn(move || {
                         // O5: escape the shard-core mask this thread would
@@ -974,6 +976,7 @@ fn main() -> anyhow::Result<()> {
                         );
                     })
                     .expect("failed to spawn per-shard AOF writer thread");
+                aof_writers.push(writer);
                 senders.push(tx);
             }
             info!(
@@ -991,7 +994,7 @@ fn main() -> anyhow::Result<()> {
             ))
         } else {
             let (tx, rx) = channel::mpsc_bounded::<AofMessage>(10_000);
-            let aof_token = cancel_token.child_token();
+            let aof_token = aof_writer_token.clone();
             let aof_file_path = PathBuf::from(&config.dir).join(&config.appendfilename);
 
             // C4 TopLevel: create fold channels for shard 0 here (before the
@@ -1007,9 +1010,8 @@ fn main() -> anyhow::Result<()> {
             // fold channels for the writer task
             let writer_fold_channels = Some((tl_fold_producer.clone(), tl_fold_notifier.clone()));
 
-            // Legacy single-writer thread. Each shard clones the outer
-            // `aof_pool` Arc; sender lifetime is governed by the pool's Drop.
-            std::thread::Builder::new()
+            // Legacy single-writer thread; each shard clones the outer `aof_pool` Arc.
+            let writer = std::thread::Builder::new()
                 .name("aof-writer".to_string())
                 .spawn(move || {
                     // O5: escape the shard-core mask this thread would
@@ -1027,6 +1029,7 @@ fn main() -> anyhow::Result<()> {
                     );
                 })
                 .expect("failed to spawn AOF writer thread");
+            aof_writers.push(writer);
             info!("AOF enabled (TopLevel, fsync: {:?})", fsync);
 
             // Stash consumer + pool-side channels for wiring in the blocks below.
@@ -1064,20 +1067,13 @@ fn main() -> anyhow::Result<()> {
     // Create watch channel for snapshot triggers (auto-save and BGSAVE)
     let (snapshot_trigger_tx, snapshot_trigger_rx) = moon::runtime::channel::watch(0u64);
 
-    // Persistence directory for per-shard WAL and snapshots.
-    // Only set when persistence is actually enabled (appendonly=yes or save rules exist)
-    // to avoid creating WAL writers that fsync on every tick for no benefit.
-    let persistence_dir = if config.appendonly == "yes" || config.save.is_some() {
-        Some(config.dir.clone())
-    } else {
-        None
-    };
-    // With no directory no shard can write a snapshot: BGSAVE / SHUTDOWN SAVE
-    // answer an immediate error instead of starting a save that must fail.
-    moon::command::persistence::SNAPSHOT_DIR_ABSENT.store(
-        persistence_dir.is_none(),
-        std::sync::atomic::Ordering::Relaxed,
-    );
+    // Persistence directory for the per-shard WAL, graph/vector/MQ state and
+    // snapshots: set with `--appendonly yes` or any `--save` (even `""`); the
+    // WAL writer itself needs `appendonly yes`. moon#1267: the RDB snapshot
+    // does not — its directory is always `--dir`, loaded at every boot.
+    let persistence_dir =
+        (config.appendonly == "yes" || config.save.is_some()).then(|| config.dir.clone());
+    moon::command::persistence::set_snapshot_dir(&config.dir);
 
     // Create replication state -- load persisted repl_id or generate new one.
     let (repl_id, repl_id2) =
@@ -1418,23 +1414,18 @@ fn main() -> anyhow::Result<()> {
                 config.initial_keyspace_hint,
                 config.to_runtime_config(),
             );
-            // Recover whenever there is something to recover. Disk-offload cold
-            // recovery (v3: heap reload + rebuild_from_manifest) is INDEPENDENT of
-            // AOF, but `persistence_dir` is intentionally None under appendonly=no
-            // (to avoid per-tick WAL fsync writers). Gating recovery on it alone
-            // silently dropped ALL cold data on restart under --appendonly no +
-            // disk-offload (cold read-through 0/200; "v3 recovery complete" never
-            // logged). Fire recovery when an offload base exists too; the v3 path
-            // reads the offload manifest, and the dir arg is used only by the v2
-            // fallback (a no-op when no appendonly.aof/snapshot exists).
-            if persistence_dir.is_some() || disk_offload_base.is_some() {
-                let recover_dir = persistence_dir.as_deref().unwrap_or(config.dir.as_str());
-                shard.restore_from_persistence(
-                    recover_dir,
-                    disk_offload_base.as_deref(),
-                    aof_manifest_is_kv_authority,
-                );
-            }
+            // Always recover (moon#1267): a snapshot in `--dir` loads whatever
+            // the save rules, as redis loads `dump.rdb` — `--save` omitted used
+            // to skip this (with no offload base) and boot empty. Gating on
+            // `persistence_dir` alone also dropped ALL cold data under
+            // --appendonly no + disk-offload (cold read-through 0/200). The v3
+            // path reads the offload manifest; the dir feeds the v2 path (a
+            // no-op when no snapshot / appendonly.aof / WAL is there).
+            shard.restore_from_persistence(
+                persistence_dir.as_deref().unwrap_or(config.dir.as_str()),
+                disk_offload_base.as_deref(),
+                aof_manifest_is_kv_authority,
+            );
             // Initialize cold_index + cold_shard_dir for disk offload
             if let Some(ref offload_base) = disk_offload_base {
                 let shard_dir = offload_base.join(format!("shard-{}", id));
@@ -2206,6 +2197,9 @@ fn main() -> anyhow::Result<()> {
 
         shard_handles.push(handle);
     }
+    // moon#1263: every shard serves — a SIGTERM / SIGINT now saves first.
+    let (runtime, cancel) = (runtime_config_shared.clone(), cancel_token.clone());
+    signal::arm(snapshot_trigger_tx.clone(), num_shards, runtime, cancel);
 
     let listener_cancel = cancel_token.clone();
 
@@ -2384,25 +2378,25 @@ fn main() -> anyhow::Result<()> {
         });
     }
 
-    // After listener exits, send AOF shutdown to every writer and cancel all shards.
-    // Under TopLevel this is one send; under PerShard (step 2f-β) this fans out to
-    // every per-shard writer thread via `broadcast_shutdown`.
-    if let Some(ref pool) = aof_pool {
-        pool.broadcast_shutdown();
-    }
     cancel_token.cancel();
     for handle in shard_handles {
-        // A shard panic normally aborts via the panic hook above; if one
-        // still surfaces here (hook replaced, non-unwind edge), say so
-        // instead of silently swallowing it.
+        // A shard panic normally aborts via the panic hook; say so if one surfaces here.
         if let Err(e) = handle.join() {
             tracing::error!("shard thread panicked during shutdown: {e:?}");
         }
     }
+    // moon#1274: no shard left to append — the AOF writers drain, fsync and exit, then we do.
+    if let Some(ref pool) = aof_pool {
+        let (bound, token) = (aof::writer_stop::STOP_BOUND, &aof_writer_token);
+        aof::writer_stop::stop_writers(pool, aof_writers, token, bound, &signal::insisted)
+            .map_err(|w| anyhow::anyhow!("AOF writer(s) {w:?} abandoned at shutdown"))?;
+    }
+    if signal::insisted() {
+        anyhow::bail!("a second SIGINT: stopped without the final save");
+    }
 
     if let Some(err) = listener_failure.lock().take() {
-        // Shutdown ran to completion above (AOF flushed, shards joined), so the
-        // data path is clean; only the exit STATUS changes.
+        // Shutdown ran to completion (AOF flushed, shards joined): only the exit STATUS changes.
         tracing::error!("Server shut down after a fatal listener failure: {err}");
         return Err(anyhow::anyhow!("listener failed: {err}"));
     }

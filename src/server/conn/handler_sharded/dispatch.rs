@@ -447,9 +447,7 @@ pub(super) async fn try_handle_shutdown(
     let should_save = match mode {
         ShutdownSaveMode::Save => true,
         ShutdownSaveMode::NoSave => false,
-        ShutdownSaveMode::Default => {
-            persistence::shutdown_default_should_save(ctx.config.save.as_deref())
-        }
+        ShutdownSaveMode::Default => persistence::save_points_now(&ctx.runtime_config),
     };
     if should_save {
         // moon#1232 review: a save already running (an auto-save, say) is
@@ -651,6 +649,13 @@ pub(super) async fn try_handle_swapdb(
         responses.push(Frame::Error(Bytes::from_static(
             b"ERR cannot SWAPDB during BGREWRITEAOF",
         )));
+        return true;
+    }
+
+    // moon#1237: refused while a swapped db has cold-tier data on any shard.
+    let cold = crate::storage::db::swapdb_cold_refusal(a, b, ctx.shard_id, ctx.num_shards);
+    if let Some(refused) = cold {
+        responses.push(refused);
         return true;
     }
 

@@ -16,6 +16,7 @@ use crate::storage::tiered::kv_serde;
 use crate::storage::tiered::kv_spill;
 use crate::storage::tiered::spill_thread::SpillRequest;
 
+mod victim;
 /// Maximum number of victim candidates we will judge in a single
 /// `find_victim_*` call (`sample_victim`). Matches a generous upper bound on
 /// the user-tunable `maxmemory-samples` (Redis default 5; we accept up to 16).
@@ -1543,7 +1544,7 @@ fn evict_batch_durable(
         // write plus a manifest commit for a cold entry nothing will reclaim.
         if expiring_too_soon_to_spill(entry, now_ms) {
             let before = db.estimated_memory();
-            db.remove(key.as_bytes());
+            victim::remove(db, key.as_bytes());
             crate::admin::metrics_setup::record_expiring_spill_skipped();
             crate::admin::metrics_setup::record_eviction();
             report_plain_drop(on_plain_drop, key.as_bytes());
@@ -1624,11 +1625,10 @@ fn evict_batch_durable(
         }
 
         for entry in completion.entries {
-            // `Database::remove` ALSO clears any cold copy of the key (D1:
-            // DEL must not resurrect a stale cold entry via read-through) --
-            // so the ColdIndex insert MUST come AFTER remove, never before,
-            // or `remove` wipes out the very entry being added.
-            db.remove(&entry.key);
+            // `Database::remove` ALSO clears any cold copy of the key (D1: DEL must
+            // not resurrect a stale cold entry via read-through) -- so the ColdIndex
+            // insert MUST come AFTER remove, or `remove` wipes out the entry added.
+            victim::remove(db, &entry.key);
             if let Some(ref mut ci) = db.cold_index {
                 ci.insert(
                     entry.key,
@@ -1690,7 +1690,7 @@ fn evict_one_async_spill(
         // moon#553: about to expire — skip the queue/pwrite/manifest round
         // trip entirely and reclaim the RAM now.
         if expiring_too_soon_to_spill(entry, db.now_ms()) {
-            db.remove(key.as_bytes());
+            victim::remove(db, key.as_bytes());
             crate::admin::metrics_setup::record_expiring_spill_skipped();
             crate::admin::metrics_setup::record_eviction();
             report_plain_drop(on_plain_drop, key.as_bytes());
@@ -1740,7 +1740,7 @@ fn evict_one_async_spill(
         // itself. Both calls run synchronously on the shard thread with no
         // `.await` between them, so no reader can catch the key between
         // planes.
-        db.remove(key.as_bytes());
+        victim::remove(db, key.as_bytes());
 
         // NOTE: we still do NOT insert a tentative cold_index entry here.
         // Under batching the (page_idx, slot_idx) are unknown at evict time;
@@ -1769,7 +1769,7 @@ fn evict_one_async_spill(
         crate::admin::metrics_setup::record_key_spilled();
     } else {
         // Entry disappeared (race with expiry), just remove
-        db.remove(key.as_bytes());
+        victim::remove(db, key.as_bytes());
     }
 
     true
@@ -1833,15 +1833,15 @@ pub(crate) fn evict_one_with_spill(
     // divergence this issue is about. Same gate on `on_plain_drop`: no
     // dual-plane DEL record for a key this call did not delete.
     //
-    // moon#1190: the ledger credit stays synchronous (`remove` walks the
-    // value — this loop needs it to know when to stop), but a large victim's
-    // DROP goes to the lazy-free drain instead of stalling the write that
-    // triggered the eviction.
-    let removed = match db.remove(key.as_bytes()) {
-        Some(entry) => {
+    // moon#1190: the ledger credit stays synchronous (`remove` walks the value — this
+    // loop needs it to know when to stop), but a large victim's DROP goes to the lazy-free
+    // drain instead of stalling the write, unless a save holds it (moon#1257 review F1).
+    let removed = match victim::remove(db, key.as_bytes()) {
+        Some(victim::Removed::Dispose(entry)) => {
             db.lazy_free_or_drop(key.len(), entry, false);
             true
         }
+        Some(victim::Removed::Held) => true,
         None => false,
     };
     if removed {

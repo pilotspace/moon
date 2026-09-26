@@ -70,6 +70,7 @@ pub use scatter_hybrid::scatter_hybrid_search;
 use tracing::info;
 
 use crate::config::RuntimeConfig;
+use crate::persistence::recovery::KvSources;
 use crate::persistence::replay::DispatchReplayEngine;
 use crate::pubsub::PubSubRegistry;
 use crate::storage::Database;
@@ -229,14 +230,19 @@ impl Shard {
     /// replay the multi-part AOF right after this returns (main.rs), so no
     /// hot-keyspace load here can survive — snapshot, WAL KV records, and
     /// the legacy `appendonly.aof` / legacy-mode WAL fallbacks are skipped.
-    /// The cold index, warm vector segments, FPI repair and the WAL's
-    /// `last_lsn` still recover (see `recover_shard_v3_pitr`).
+    /// Otherwise `runtime_config.appendonly` decides (moon#1267 review F3):
+    /// with `no` only the snapshot loads, as redis ignores the AOF then —
+    /// nothing in that mode writes a KV log, so one on disk is stale. The
+    /// cold index, warm vector segments, FPI repair and the WAL's `last_lsn`
+    /// recover in every case ([`KvSources`], `recover_shard_v3_pitr`).
     pub fn restore_from_persistence(
         &mut self,
         persistence_dir: &str,
         disk_offload_dir: Option<&std::path::Path>,
         kv_authority_elsewhere: bool,
     ) -> usize {
+        let appendonly = self.runtime_config.appendonly != "no";
+        let kv = KvSources::for_boot(kv_authority_elsewhere, appendonly);
         // If disk-offload was enabled, use v3 recovery protocol.
         //
         // The throwaway DispatchReplayEngine below intercepts graph commands
@@ -248,13 +254,14 @@ impl Shard {
         if let Some(offload_dir) = disk_offload_dir {
             let shard_dir = offload_dir.join(format!("shard-{}", self.id));
             if shard_dir.exists() {
-                match crate::persistence::recovery::recover_shard_v3_with_fallback(
+                match crate::persistence::recovery::recover_shard_v3_pitr(
                     &mut self.databases,
                     self.id,
                     &shard_dir,
                     &DispatchReplayEngine::new(),
                     Some(std::path::Path::new(persistence_dir)),
-                    kv_authority_elsewhere,
+                    None,
+                    kv,
                 ) {
                     Ok(result) => {
                         info!(
@@ -322,11 +329,12 @@ impl Shard {
         }
 
         // Existing v2 path (unchanged)
-        self.restore_from_persistence_v2(persistence_dir, kv_authority_elsewhere)
+        self.restore_from_persistence_v2(persistence_dir, kv)
     }
 
     /// Legacy recovery path: snapshot load + appendonly.aof (authority) /
-    /// WAL v3 (last-resort, AOF-absent-only) replay.
+    /// WAL v3 (last-resort, AOF-absent-only) replay — the replay only with
+    /// [`KvSources::SnapshotAndLogs`] (not under `--appendonly no`).
     ///
     /// Pre-1.0 WAL-v3-only format freeze: the per-shard WAL v2 rung
     /// (`shard-N.wal`) was removed and is no longer replayed by this build —
@@ -344,12 +352,8 @@ impl Shard {
     /// replayed ONLY when no `appendonly.aof` exists at all (disaster
     /// fallback: partial recovery beats none), with a loud warning about
     /// its partial KV coverage.
-    fn restore_from_persistence_v2(
-        &mut self,
-        persistence_dir: &str,
-        kv_authority_elsewhere: bool,
-    ) -> usize {
-        use crate::persistence::snapshot::shard_snapshot_load;
+    fn restore_from_persistence_v2(&mut self, persistence_dir: &str, kv: KvSources) -> usize {
+        use crate::persistence::snapshot::shard_snapshot_load_noting_expired;
 
         let dir = std::path::Path::new(persistence_dir);
         let mut total_keys = 0;
@@ -357,8 +361,10 @@ impl Shard {
         // Load per-shard snapshot -- unless the multi-part AOF replay that
         // follows this pass wipes it anyway (see `restore_from_persistence`).
         let snap_path = dir.join(format!("shard-{}.rrdshard", self.id));
-        if snap_path.exists() && !kv_authority_elsewhere {
-            match shard_snapshot_load(&mut self.databases, &snap_path) {
+        if snap_path.exists() && kv.snapshot() {
+            let mut expired = Vec::new();
+            match shard_snapshot_load_noting_expired(&mut self.databases, &snap_path, &mut expired)
+            {
                 Ok(n) => {
                     info!("Shard {}: loaded {} keys from snapshot", self.id, n);
                     total_keys += n;
@@ -366,6 +372,12 @@ impl Shard {
                 Err(e) => {
                     tracing::error!("Shard {}: snapshot load failed: {}", self.id, e);
                 }
+            }
+            // Logs replay over it: keep what expired on the wall clock and let
+            // the replay's pinned clock judge it (moon#1277, replay::clock).
+            if kv.logs() {
+                let dbs = &mut self.databases;
+                crate::persistence::replay::clock::keep_expired_image_entries(dbs, &mut expired);
             }
         }
 
@@ -390,12 +402,16 @@ impl Shard {
         // AOF is the recovery authority (see doc comment: WAL v3 KV coverage
         // is intentionally partial post-#211, so it must never shadow the AOF).
         let aof_path = dir.join("appendonly.aof");
-        if kv_authority_elsewhere {
+        if kv == KvSources::Elsewhere {
             info!(
                 "Shard {}: legacy snapshot/appendonly.aof/WAL replay skipped — the \
                  multi-part AOF is the KV authority and is replayed after this pass",
                 self.id
             );
+        } else if !kv.logs() {
+            // `--appendonly no` (moon#1267 review F3): neither log is written
+            // in this mode, so one on disk predates the snapshot just loaded.
+            kv.note_unreplayed_logs(self.id, dir);
         } else if aof_path.exists() {
             let mut aof_replayed = false;
             match crate::persistence::aof::replay_aof(
@@ -868,7 +884,8 @@ mod tests {
 
         let config = RuntimeConfig::default();
         let mut shard = Shard::new(0, 1, 1, config);
-        let total = shard.restore_from_persistence_v2(dir.to_str().unwrap(), false);
+        let total =
+            shard.restore_from_persistence_v2(dir.to_str().unwrap(), KvSources::SnapshotAndLogs);
 
         assert_eq!(
             total, 1,
@@ -906,7 +923,8 @@ mod tests {
 
         let config = RuntimeConfig::default();
         let mut shard = Shard::new(0, 1, 1, config);
-        let total = shard.restore_from_persistence_v2(dir.to_str().unwrap(), false);
+        let total =
+            shard.restore_from_persistence_v2(dir.to_str().unwrap(), KvSources::SnapshotAndLogs);
 
         assert_eq!(
             total, 3,
@@ -929,7 +947,8 @@ mod tests {
 
         let config = RuntimeConfig::default();
         let mut shard = Shard::new(0, 1, 1, config);
-        let total = shard.restore_from_persistence_v2(dir.to_str().unwrap(), false);
+        let total =
+            shard.restore_from_persistence_v2(dir.to_str().unwrap(), KvSources::SnapshotAndLogs);
 
         assert_eq!(
             total, 2,
@@ -954,7 +973,8 @@ mod tests {
 
         let config = RuntimeConfig::default();
         let mut shard = Shard::new(0, 1, 1, config);
-        let total = shard.restore_from_persistence_v2(dir.to_str().unwrap(), false);
+        let total =
+            shard.restore_from_persistence_v2(dir.to_str().unwrap(), KvSources::SnapshotAndLogs);
 
         assert_eq!(
             total, 1,

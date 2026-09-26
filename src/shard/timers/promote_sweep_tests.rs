@@ -371,17 +371,123 @@ fn a_file_spilled_after_the_latest_cut_is_unlinked_at_once() {
     .expect("test thread");
 }
 
-/// Without an AOF writer there is no fold to protect and none could ever
-/// release a hold: files go as soon as their last key does, as before.
+/// moon#1260: without an AOF (with or without save points), a key cold in `OLD` and
+/// read back into RAM has no durable copy but `OLD` until a snapshot captures
+/// it hot. The sweep used to unlink `OLD` once its last key left, and a kill
+/// -9 then lost `k08`/`k09`, unchanged since the last save. Held now, and
+/// released only by a snapshot that STARTED after the decision — one already
+/// running when the file went zero-ref does not count.
 #[test]
-fn without_an_aof_writer_nothing_is_held() {
+fn without_an_aof_a_promoted_key_keeps_its_file_until_a_later_snapshot() {
+    use crate::storage::tiered::snapshot_hold::{note_snapshot_finished, note_snapshot_started};
+    std::thread::spawn(|| {
+        let mut live = Live::start();
+        for (k, _) in keys("k", 8) {
+            assert_eq!(run("DEL", &[&k]), Frame::Integer(1));
+        }
+        // A snapshot is already running when the probes are read back.
+        note_snapshot_started();
+        for k in ["k08", "k09"] {
+            assert!(matches!(run("GET", &[k]), Frame::BulkString(_)), "GET {k}");
+        }
+        live.sweep(false);
+        assert!(
+            heap(&live.dir, OLD).exists() && listed(&live.manifest, OLD) && live.held(OLD),
+            "file {OLD} is the promoted keys' only durable copy: it must be held, not unlinked"
+        );
+        note_snapshot_finished(true);
+        live.sweep(false);
+        assert!(
+            heap(&live.dir, OLD).exists() && live.held(OLD),
+            "that snapshot started before the promotion: it may lack k08/k09"
+        );
+        note_snapshot_started();
+        note_snapshot_finished(false);
+        live.sweep(false);
+        assert!(
+            heap(&live.dir, OLD).exists(),
+            "a FAILED snapshot releases nothing"
+        );
+        note_snapshot_started();
+        note_snapshot_finished(true);
+        live.sweep(false);
+        assert!(
+            !heap(&live.dir, OLD).exists() && !listed(&live.manifest, OLD),
+            "a snapshot that started after the promotion captured both keys hot"
+        );
+    })
+    .join()
+    .expect("test thread");
+}
+
+/// moon#1260 review F1: without an AOF, a file whose keys were all deleted
+/// (DEL, FLUSHALL) BEFORE a snapshot started is released by that snapshot's
+/// success — the snapshot already excludes those keys. The orphan sweep
+/// used to see the file only after the save, stamp it with the post-save
+/// epoch and hold it until a SECOND snapshot, so a kill -9 in between
+/// brought the deleted keys back from the still-listed file (REVIEW-WS20:
+/// 81/200 at s1, 183/200 at s4, 200/200 on tokio; main 0).
+#[test]
+fn without_an_aof_a_file_emptied_before_a_snapshot_is_released_by_it() {
+    use crate::storage::tiered::snapshot_hold::{force_applies, note_snapshot_finished};
+    std::thread::spawn(|| {
+        force_applies(true);
+        let mut live = Live::start();
+        // Boot: the first sweep sees the view; OLD still backs ten keys.
+        live.sweep(false);
+        assert!(heap(&live.dir, OLD).exists());
+        for (k, _) in keys("k", 10) {
+            assert_eq!(run("DEL", &[&k]), Frame::Integer(1));
+        }
+        // The FLUSHALL save, or a BGSAVE, starts and succeeds before the
+        // next interval sweep: the shard's start hook, then its finish.
+        super::note_snapshot_started(&live.shared);
+        note_snapshot_finished(true);
+        // The event loop sweeps right after a successful snapshot.
+        super::sweep_after_snapshot(
+            &live.shared,
+            0,
+            Some(&live.dir),
+            Some(&mut live.manifest),
+            crate::storage::entry::current_time_ms(),
+            None,
+            &live.counter,
+            1,
+        );
+        assert!(
+            !heap(&live.dir, OLD).exists() && !listed(&live.manifest, OLD),
+            "file {OLD} backs only keys deleted before a snapshot that succeeded, yet it \
+             is still held (held: {}); a kill -9 now brings the deleted keys back",
+            live.held(OLD)
+        );
+    })
+    .join()
+    .expect("test thread");
+}
+
+/// The same with an AOF writer: the start hook holds nothing (folds govern)
+/// and the post-snapshot sweep does not run.
+#[test]
+fn with_an_aof_the_snapshot_hooks_touch_nothing() {
     std::thread::spawn(|| {
         let mut live = Live::start();
         for (k, _) in keys("k", 10) {
             assert_eq!(run("DEL", &[&k]), Frame::Integer(1));
         }
-        live.sweep(false);
-        assert!(!heap(&live.dir, OLD).exists() && !listed(&live.manifest, OLD));
+        super::note_snapshot_started(&live.shared);
+        assert!(!live.held(OLD), "the start hook is off with an AOF");
+        super::sweep_after_snapshot(
+            &live.shared,
+            0,
+            Some(&live.dir),
+            Some(&mut live.manifest),
+            crate::storage::entry::current_time_ms(),
+            Some(&live.pool),
+            &live.counter,
+            1,
+        );
+        assert!(heap(&live.dir, OLD).exists(), "no sweep ran");
+        crate::storage::tiered::snapshot_hold::note_snapshot_finished(false);
     })
     .join()
     .expect("test thread");

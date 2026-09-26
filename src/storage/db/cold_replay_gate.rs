@@ -67,6 +67,47 @@ use bytes::Bytes;
 use super::Database;
 use crate::storage::tiered::cold_index::ColdLocation;
 
+#[path = "swapdb_cold.rs"]
+mod swapdb_cold;
+pub use swapdb_cold::{
+    ERR_SWAPDB_BUSY, ERR_SWAPDB_COLD, note_swap_with_cold_footprint,
+    replica_swap_needs_full_resync, replica_swap_resyncs, swap_refused_for_cold, swap_replayed,
+    swapdb_cold_refusal,
+};
+
+/// The `MOON.SPILLED` markers one database has replayed in its open
+/// generation.
+#[derive(Debug, Default)]
+pub struct ReplayMarkers {
+    /// A marker was replayed: the log is #902-era, and
+    /// `finish_replay_cold_reconcile` must use the hot-wins resolution even
+    /// without a `MOON.COLDCUT` head (moon#965).
+    saw: bool,
+    /// Files whose marker replayed while NO gate is installed — in a gated
+    /// generation the gate itself records them. A replayed SWAPDB moves only
+    /// the cold entries of files that existed at that point of the log
+    /// (moon#1237), and without a cut this set is how it knows.
+    files: HashSet<u64>,
+}
+
+impl ReplayMarkers {
+    #[inline]
+    pub(super) fn saw(&self) -> bool {
+        self.saw
+    }
+
+    #[inline]
+    pub(super) fn set_saw(&mut self, saw: bool) {
+        self.saw = saw;
+    }
+
+    /// Whether `file_id`'s marker replayed in this (ungated) generation.
+    #[inline]
+    pub(super) fn marked(&self, file_id: u64) -> bool {
+        self.files.contains(&file_id)
+    }
+}
+
 /// Which cold files an AOF-authority replay may read values from.
 #[derive(Debug, Clone, Default)]
 pub struct ReplayColdGate {
@@ -160,6 +201,14 @@ impl Database {
         }
     }
 
+    /// Pin the clock expiry is judged by during an AOF replay to the log's
+    /// last-write time (moon#1277, `persistence::replay::clock`). The live
+    /// event loop overwrites it with the wall clock on its first refresh.
+    #[inline]
+    pub fn set_replay_clock_ms(&mut self, ms: u64) {
+        self.cached_now_ms = ms;
+    }
+
     /// Whether an AOF-authority replay gate is currently installed.
     #[inline]
     pub fn replay_cold_gate_active(&self) -> bool {
@@ -172,7 +221,7 @@ impl Database {
     /// replayed (moon#965). `false` for a pre-#902 log and outside replay.
     #[inline]
     pub fn replay_generation_open(&self) -> bool {
-        self.replay_cold_gate.is_some() || self.replay_saw_cold_marker
+        self.replay_cold_gate.is_some() || self.replay_markers.saw
     }
 
     /// The gate, for tests and diagnostics.
@@ -240,7 +289,7 @@ impl Database {
         file_id: u64,
         keys: impl IntoIterator<Item = &'k [u8]>,
     ) -> usize {
-        self.replay_saw_cold_marker = true;
+        self.replay_markers.saw = true;
         let mut dropped = 0usize;
         for key in keys {
             let current = self.cold_index.as_ref().and_then(|ci| ci.lookup(key));
@@ -248,8 +297,13 @@ impl Database {
                 dropped += 1;
             }
         }
-        if let Some(gate) = self.replay_cold_gate.as_mut() {
-            gate.authorized.insert(file_id);
+        match self.replay_cold_gate.as_mut() {
+            Some(gate) => {
+                gate.authorized.insert(file_id);
+            }
+            None => {
+                self.replay_markers.files.insert(file_id);
+            }
         }
         dropped
     }
@@ -282,7 +336,7 @@ impl Database {
     ///   [`Self::demote_replayed_cold_shadows`], unchanged.
     pub fn finish_replay_cold_reconcile(&mut self) -> ReplayColdReconcile {
         let gate = self.replay_cold_gate.take();
-        let saw_marker = std::mem::take(&mut self.replay_saw_cold_marker);
+        let saw_marker = std::mem::take(&mut self.replay_markers).saw;
         // moon#1140: the older copies only served gated reads; none remain.
         if let Some(ci) = self.cold_index.as_mut() {
             ci.release_older_copies();

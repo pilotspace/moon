@@ -20,7 +20,7 @@ use bytes::Bytes;
 /// (`Database::scan_hot_page` maps `hash_key(key) >> 16`) — both planes
 /// feed one merged hash-ordered page walk.
 #[inline]
-fn scan_h48(key: &[u8]) -> u64 {
+pub(super) fn scan_h48(key: &[u8]) -> u64 {
     crate::storage::dashtable::hash_key(key) >> 16
 }
 
@@ -155,7 +155,7 @@ pub struct ColdIndex {
     /// tombstone commit, see [`Self::drain_pending_unlink`]), queued in
     /// `pending_unlink` by the rebuild. Consumed by the first drain: only
     /// these may skip the moon#1231 hold. Empty outside recovery.
-    missing_at_rebuild: Vec<u64>,
+    pub(super) missing_at_rebuild: Vec<u64>,
     /// Running total of approximate resident bytes charged by [`Self::insert`]
     /// / [`Self::remove`] / the sweep methods' direct removals / [`Self::clear_all`]
     /// (K4 accounting spine, kernel-m2-brief-2026-07-12 stage 2).
@@ -168,7 +168,7 @@ pub struct ColdIndex {
     /// up to tens of millions of entries; an O(n) walk every 100ms shard
     /// tick would regress the workload this index exists for. See
     /// [`Self::resident_bytes`] for the read side.
-    resident_bytes: usize,
+    pub(super) resident_bytes: usize,
     /// Copies of a key that a rebuild found in OLDER files than the one the
     /// key now points at, newest first. Recovery-only: filled by
     /// [`Self::rebuild_from_manifest_per_db`] and released when the AOF
@@ -210,7 +210,7 @@ pub struct ColdIndex {
 const COLD_ENTRY_OVERHEAD: usize = std::mem::size_of::<ColdLocation>() + 48;
 
 #[inline]
-fn cold_entry_cost(key_len: usize) -> usize {
+pub(super) fn cold_entry_cost(key_len: usize) -> usize {
     key_len + COLD_ENTRY_OVERHEAD
 }
 

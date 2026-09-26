@@ -68,8 +68,7 @@ pub struct AofWriterPool {
     fold_producers: Option<
         Vec<Arc<parking_lot::Mutex<ringbuf::HeapProd<crate::shard::dispatch::ShardMessage>>>>,
     >,
-    /// C4: per-shard Notify handles that wake the shard event loops after
-    /// an AofFold push.  Parallel to `fold_producers`.
+    /// C4: per-shard Notify handles that wake the shard event loops after an AofFold push.
     fold_notifiers: Option<Vec<Arc<crate::runtime::channel::Notify>>>,
 }
 
@@ -81,11 +80,10 @@ impl AofWriterPool {
         Self::top_level_with_policy(sender, FsyncPolicy::EverySec, DEFAULT_AOF_FSYNC_TIMEOUT)
     }
 
-    /// Same as [`Self::top_level`] but with an explicit fsync policy. The
-    /// policy controls whether [`Self::try_send_append_durable`] takes the
-    /// fast (fire-and-forget) or rendezvous (`AppendSync`) path.
-    /// `fsync_timeout` bounds the `Always` ack await (F2); `Duration::ZERO`
-    /// = unbounded.
+    /// [`Self::top_level`] with an explicit fsync policy, which picks the fast
+    /// (fire-and-forget) or rendezvous (`AppendSync`) path of
+    /// [`Self::try_send_append_durable`]. `fsync_timeout` bounds the `Always`
+    /// ack await (F2); `Duration::ZERO` = unbounded.
     pub fn top_level_with_policy(
         sender: channel::MpscSender<AofMessage>,
         fsync_policy: FsyncPolicy,
@@ -113,9 +111,8 @@ impl AofWriterPool {
         Self::per_shard_with_policy(senders, FsyncPolicy::EverySec, DEFAULT_AOF_FSYNC_TIMEOUT)
     }
 
-    /// Same as [`Self::per_shard`] but with an explicit fsync policy.
-    /// `fsync_timeout` bounds the `Always` ack await (F2); `Duration::ZERO`
-    /// = unbounded.
+    /// [`Self::per_shard`] with an explicit fsync policy. `fsync_timeout`
+    /// bounds the `Always` ack await (F2); `Duration::ZERO` = unbounded.
     pub fn per_shard_with_policy(
         senders: Vec<channel::MpscSender<AofMessage>>,
         fsync_policy: FsyncPolicy,
@@ -1507,24 +1504,27 @@ impl AofWriterPool {
         Ok(())
     }
 
-    /// Broadcast `Shutdown` to every writer. Used by orchestrated shutdown
-    /// paths in `main.rs`/`embedded.rs`. Each writer drains its channel and
-    /// fsyncs before exiting.
-    pub fn broadcast_shutdown(&self) {
+    /// Queue `Shutdown` behind each writer's backlog (moon#1274, `aof::writer_stop`):
+    /// `try_send` to all first, then wait until `until` on the full ones only (A7).
+    pub fn broadcast_shutdown(&self, until: std::time::Instant) {
+        let mut full = Vec::new();
         for s in &self.senders {
-            let _ = s.try_send(AofMessage::Shutdown);
+            if let Err(flume::TrySendError::Full(msg)) = s.try_send(AofMessage::Shutdown) {
+                full.push((s, msg));
+            }
+        }
+        for (s, msg) in full {
+            let _ = s.send_deadline(msg, until);
         }
     }
 
-    /// Number of underlying writer senders. 1 for TopLevel, num_shards for
-    /// PerShard.
+    /// Number of underlying writer senders: 1 for TopLevel, num_shards for PerShard.
     #[inline]
     pub fn num_writers(&self) -> usize {
         self.senders.len()
     }
 
-    /// Reports the pool's layout. Useful for places that need to refuse
-    /// PerShard-incompatible legacy code paths with a clear error.
+    /// The pool's layout (to refuse PerShard-incompatible legacy paths clearly).
     #[inline]
     pub fn layout(&self) -> crate::persistence::aof_manifest::AofLayout {
         self.layout
@@ -2391,7 +2391,7 @@ mod pool_tests {
         let (tx2, rx2) = channel::mpsc_bounded::<AofMessage>(2);
         let pool = AofWriterPool::per_shard(vec![tx0, tx1, tx2]);
 
-        pool.broadcast_shutdown();
+        pool.broadcast_shutdown(std::time::Instant::now());
 
         for (i, rx) in [&rx0, &rx1, &rx2].iter().enumerate() {
             assert!(

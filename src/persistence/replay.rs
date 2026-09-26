@@ -24,6 +24,8 @@ use crate::storage::db::HashTtlCond;
 
 /// The bounded streaming reader the RESP log replays use (moon#1160).
 pub(crate) mod chunks;
+/// The expiry-judgment clock of a replay (moon#1277).
+pub mod clock;
 
 /// Parse a Frame as an unsigned integer (BulkString or Integer).
 #[inline]
@@ -346,6 +348,34 @@ impl CommandReplayEngine for DispatchReplayEngine {
         args: &[Frame],
         selected_db: &mut usize,
     ) -> ReplayRoute {
+        // moon#1277: judge expiry by the log's time, not the replay's — and
+        // hand the databases back on the wall clock after every record, so
+        // nothing after the replay (a foreign read of an idle shard, before
+        // its owner refreshes) sees the pinned time.
+        let Some(ms) = clock::pinned_replay_clock_ms() else {
+            return self.replay_one(databases, cmd, args, selected_db);
+        };
+        databases
+            .iter_mut()
+            .for_each(|db| db.set_replay_clock_ms(ms));
+        let route = self.replay_one(databases, cmd, args, selected_db);
+        let now = crate::storage::entry::current_time_ms();
+        databases
+            .iter_mut()
+            .for_each(|db| db.set_replay_clock_ms(now));
+        route
+    }
+}
+
+impl DispatchReplayEngine {
+    /// One replayed record (the body of [`CommandReplayEngine::replay_command`]).
+    fn replay_one(
+        &self,
+        databases: &mut [Database],
+        cmd: &[u8],
+        args: &[Frame],
+        selected_db: &mut usize,
+    ) -> ReplayRoute {
         // moon#902: replay-only cold-plane cut records (`MOON.COLDCUT`,
         // `MOON.SPILLED`) act on the databases directly and never reach
         // dispatch — a client sending one gets "unknown command".
@@ -424,9 +454,11 @@ impl CommandReplayEngine for DispatchReplayEngine {
                     let (lo, hi) = if a < b { (a, b) } else { (b, a) };
                     // Split the slice to get two non-overlapping mutable references.
                     // Each slot keeps its `db_index` (the db its keyspace
-                    // events name), as the live SWAPDB does.
+                    // events name), as the live SWAPDB does; the cold entries
+                    // of files spilled after this record stay in their slot
+                    // (moon#1237, `storage::db::swap_replayed`).
                     let (left, right) = databases.split_at_mut(lo + 1);
-                    crate::shard::db_plane::swap_contents(&mut left[lo], &mut right[hi - lo - 1]);
+                    crate::storage::db::swap_replayed(&mut left[lo], &mut right[hi - lo - 1]);
                     // moon#1232 (REVIEW7 R1): one keyspace change, as redis
                     // 7.0.15 counts a SWAPDB it replays from its AOF. Counted
                     // like the funnels every other replayed write goes

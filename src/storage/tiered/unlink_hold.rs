@@ -53,6 +53,10 @@ pub struct FoldView {
     pub committed_floor: u64,
     /// The shard's spill-file counter: every file id minted so far is below it.
     pub next_file_id: u64,
+    /// Hold every zero-ref file this decision sees, whatever its id — a
+    /// snapshot is being written right now (the no-AOF view, moon#1260:
+    /// [`super::snapshot_hold`]). Always `false` for an AOF fold view.
+    pub hold_all: bool,
 }
 
 /// Per-database hold state, kept inside `ColdIndex`.
@@ -120,7 +124,7 @@ impl UnlinkHold {
         };
         let mut unlink = Vec::new();
         for file_id in queued {
-            if file_id >= self.hold_below {
+            if file_id >= self.hold_below && !view.hold_all {
                 unlink.push(file_id);
             } else {
                 // The first stamp stands: it is the earlier, longer hold.
@@ -141,6 +145,17 @@ impl UnlinkHold {
         Admitted {
             unlink,
             requeue: Vec::new(),
+        }
+    }
+
+    /// Hold `file_ids` with `stamp`, without a decision (moon#1260 review
+    /// F1): a snapshot is starting, and every file already zero-ref must be
+    /// released by THAT snapshot's success, however late the next orphan
+    /// sweep runs. The first stamp of a file already held stands.
+    pub fn hold_stamped(&mut self, file_ids: impl IntoIterator<Item = u64>, stamp: u64) {
+        for file_id in file_ids {
+            let s = *self.held.entry(file_id).or_insert(stamp);
+            self.max_stamp = self.max_stamp.max(Some(s));
         }
     }
 
@@ -227,6 +242,7 @@ mod tests {
             epoch,
             committed_floor,
             next_file_id,
+            hold_all: false,
         }
     }
 

@@ -4070,9 +4070,14 @@ for NSHARDS in 1 4 12; do
     RACE_MIXED=0
     for t in $(seq 1 20); do
         body="return 'r1235-$NSHARDS-$t'"
+        # Wait on these two PIDs only: a bare `wait` also waits for the
+        # moon and redis-server this script started in the background, which
+        # never exit, so the whole run hung here.
         redis-cli -p "$PORT_RUST" SCRIPT LOAD "$body" >/dev/null 2>&1 &
+        race_a=$!
         redis-cli -p "$PORT_RUST" SCRIPT FLUSH >/dev/null 2>&1 &
-        wait
+        race_b=$!
+        wait "$race_a" "$race_b"
         sha=$(redis-cli -p "$PORT_REDIS" SCRIPT LOAD "$body" 2>/dev/null)  # the oracle hashes (no sha1sum on macOS)
         ran=0
         for i in $(seq 1 12); do
@@ -4085,8 +4090,10 @@ for NSHARDS in 1 4 12; do
     for t in $(seq 1 20); do
         lib=$'#!lua name=r1235lib'"$t"$'\nredis.register_function(\'r1235f'"$t"$'\', function(keys, args) return 1 end)\n'
         redis-cli -p "$PORT_RUST" FUNCTION LOAD "$lib" >/dev/null 2>&1 &
+        race_a=$!
         redis-cli -p "$PORT_RUST" FUNCTION FLUSH >/dev/null 2>&1 &
-        wait
+        race_b=$!
+        wait "$race_a" "$race_b"
         ran=0
         for i in $(seq 1 12); do
             [[ "$(redis-cli -p "$PORT_RUST" FCALL "r1235f$t" 1 "r1235k$i" 2>&1)" == 1 ]] && ran=$((ran + 1))

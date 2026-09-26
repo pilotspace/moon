@@ -114,8 +114,8 @@ pub fn init(persistence_dir: &Path, appendfilename: &str) {
 /// - the manifest is unreadable: 0 and a warning. Recovery already treats a
 ///   corrupt manifest as fatal before this runs, so this arm is defensive.
 ///
-/// `AofManifest::load` also re-runs its best-effort orphan sweep; recovery
-/// ran the same sweep moments earlier, so at boot it is a no-op.
+/// `AofManifest::load` deletes nothing (moon#1271): only main.rs's boot load
+/// runs the orphan sweep.
 pub fn measure_base_size_at(persistence_dir: &Path, legacy_file: &Path) -> u64 {
     fn file_len(path: &Path) -> u64 {
         match std::fs::metadata(path) {

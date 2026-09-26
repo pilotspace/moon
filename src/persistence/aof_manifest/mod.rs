@@ -41,6 +41,7 @@ use tracing::{error, info, warn};
 
 use crate::persistence::fsync::fsync_directory;
 
+mod orphans;
 mod shard_replay;
 mod shard_rewrite;
 
@@ -322,7 +323,8 @@ impl AofManifest {
         Ok(manifest)
     }
 
-    /// Load manifest from disk.
+    /// Load manifest from disk. A pure read that deletes nothing (moon#1271):
+    /// the orphan sweep is [`Self::load_and_sweep_orphans`], for boot only.
     ///
     /// Returns:
     /// - `Ok(None)` — manifest file does not exist (fresh install or legacy single-file AOF)
@@ -372,15 +374,6 @@ impl AofManifest {
                 ));
             }
         };
-
-        // Best-effort orphan cleanup: delete stray base/incr files from aborted
-        // rewrites. A crash between advance() steps 1-3 leaves a new base RDB on
-        // disk that the active manifest never references. Without this sweep,
-        // repeated crashes during rewrite can fill the disk with zombie files.
-        //
-        // Safe to call here: parse_* verified the manifest has all required
-        // records, so cleanup_orphans won't delete the active files.
-        manifest.cleanup_orphans();
 
         Ok(Some(manifest))
     }
@@ -602,72 +595,6 @@ impl AofManifest {
             layout: AofLayout::PerShard,
             shards,
         })
-    }
-
-    /// Delete any base/incr files in `appendonlydir/` that do not match the
-    /// current sequence. Best-effort — logs but does not propagate errors.
-    ///
-    /// For `PerShard` layout, also recurses into every `shard-N/` subdirectory
-    /// and removes stale/tmp files there. Aborted BGREWRITEAOF runs leave
-    /// `.rdb.tmp` files in the shard subdirs that otherwise accumulate forever.
-    fn cleanup_orphans(&self) {
-        match self.layout {
-            AofLayout::TopLevel => {
-                self.cleanup_orphans_dir(&self.aof_dir(), self.seq);
-            }
-            AofLayout::PerShard => {
-                // Top-level appendonlydir/ holds only the manifest — no data files
-                // to clean up there. All data lives in shard-N/ subdirs.
-                for shard in &self.shards {
-                    self.cleanup_orphans_shard(shard.shard_id);
-                }
-            }
-        }
-    }
-
-    /// Scan a single shard's directory for orphan base/incr/tmp files that do
-    /// not correspond to the current manifest sequence. Best-effort.
-    fn cleanup_orphans_shard(&self, shard_id: u16) {
-        self.cleanup_orphans_dir(&self.shard_dir(shard_id), self.seq);
-    }
-
-    /// Core orphan sweep: scan `dir` and remove any `moon.aof.*` files whose
-    /// sequence is not `keep_seq`. Skips the manifest file itself.
-    fn cleanup_orphans_dir(&self, dir: &Path, keep_seq: u64) {
-        let entries = match std::fs::read_dir(dir) {
-            Ok(e) => e,
-            Err(_) => return,
-        };
-        let current_base = format!("moon.aof.{}.base.rdb", keep_seq);
-        let current_incr = format!("moon.aof.{}.incr.aof", keep_seq);
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            let name_str = match name.to_str() {
-                Some(s) => s,
-                None => continue,
-            };
-            // Keep manifest, current base, current incr. Delete any other moon.aof.*.
-            if name_str == MANIFEST_NAME || name_str == current_base || name_str == current_incr {
-                continue;
-            }
-            let is_moon_aof = name_str.starts_with("moon.aof.")
-                && (name_str.ends_with(".base.rdb")
-                    || name_str.ends_with(".incr.aof")
-                    || name_str.ends_with(".rdb.tmp")
-                    || name_str.ends_with(".tmp"));
-            if !is_moon_aof {
-                continue;
-            }
-            let path = entry.path();
-            match std::fs::remove_file(&path) {
-                Ok(()) => info!("AOF orphan cleanup: removed {}", path.display()),
-                Err(e) => warn!(
-                    "AOF orphan cleanup: failed to remove {}: {}",
-                    path.display(),
-                    e
-                ),
-            }
-        }
     }
 
     /// Write the manifest file atomically (write tmp + rename).

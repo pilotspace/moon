@@ -64,8 +64,9 @@ enum Discard {
 /// the helper cannot be started or is gone.
 fn discard(item: Discard) {
     #[cfg(test)]
-    if matches!(item, Discard::Table(_)) {
-        TABLES_FOR_TEST.with(|c| c.set(c.get() + 1));
+    match item {
+        Discard::Table(_) => TABLES_FOR_TEST.with(|c| c.set(c.get() + 1)),
+        Discard::Value(_) => VALUES_FOR_TEST.with(|c| c.set(c.get() + 1)),
     }
     static DROPPER: std::sync::OnceLock<Option<flume::Sender<Discard>>> =
         std::sync::OnceLock::new();
@@ -76,11 +77,12 @@ fn discard(item: Discard) {
     }
 }
 
-/// Free a row the trim removed: off the shard thread if UNLINK would free
-/// it lazily (more than `LAZY_FREE_THRESHOLD` elements), inline otherwise —
+/// Free a row the trim removed, or a pre-image the walk wrote or discarded
+/// (moon#1257 review F1): off the shard thread if UNLINK would free it
+/// lazily (more than `LAZY_FREE_THRESHOLD` elements), inline otherwise —
 /// an O(1) free. (Review 7: the cut was 4,096 elements, so a drain freed up
 /// to 512 collections of 4,095 elements inline.)
-fn dispose(entry: Entry) {
+pub(crate) fn dispose(entry: Entry) {
     if lazy_free_weight(&entry).is_some() {
         discard(Discard::Value(entry));
     } else {
@@ -102,6 +104,14 @@ thread_local! {
         const { std::cell::Cell::new((0, 0)) };
     /// Test-only: tables this thread handed to the helper.
     static TABLES_FOR_TEST: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Test-only: values (large pre-images, trimmed rows) handed to it.
+    static VALUES_FOR_TEST: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Test-only: values this thread handed to `moon-snapdrop` since the last call.
+#[cfg(test)]
+pub(crate) fn take_values_discarded_for_test() -> usize {
+    VALUES_FOR_TEST.with(|c| c.replace(0))
 }
 
 /// Test-only: tables this thread handed to `moon-snapdrop` since the last

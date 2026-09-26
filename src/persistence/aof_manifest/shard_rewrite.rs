@@ -409,8 +409,10 @@ mod tests {
             "active incr must exist before cleanup"
         );
 
-        // Reload the manifest — this triggers cleanup_orphans.
-        let _reloaded = AofManifest::load(&dir).expect("load").expect("present");
+        // The boot load — the one that runs cleanup_orphans (moon#1271).
+        let _reloaded = AofManifest::load_and_sweep_orphans(&dir)
+            .expect("load")
+            .expect("present");
 
         assert!(
             !orphan_tmp.exists(),

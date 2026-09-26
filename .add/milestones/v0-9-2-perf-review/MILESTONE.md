@@ -35,6 +35,8 @@ Out: the RESET/ACL privilege-retention finding (security — handled privately p
 | 2 | WS15-durability-followups | storage-durability-engineer · ci-test-integrity-engineer | #1215(P0) #1223(P1) #1230 |
 | 2 | WS16-snapshot-capture (part 4, base int/part3b) | storage-durability-engineer · ci-test-integrity-engineer | #1228(capture gaps, epoch liveness) #1185(incremental fold) |
 | 2 | WS19-cold-durability (part 4, base int/part3b) | storage-durability-engineer · ci-test-integrity-engineer | #1231 #1232 #1240 #1241 |
+| 2 | WS20-cold-keyspace (part 5, base main 4a96cd5f) | storage-durability-engineer · ci-test-integrity-engineer | #1254 #1236 #1237 #1260 |
+| 2 | WS21-persistence-parity (part 5, base main 4a96cd5f) | storage-durability-engineer · ci-test-integrity-engineer | #1271 #1257 #1267 #1263 #1264 |
 | 2 | WS17-vector-text-residuals | performance-engineer · ci-test-integrity-engineer | #1226(vector/text/graph items, file splits, root-test skip) #1228(vector items) #1220(item 3) #1222 |
 | 3 | WS14-ci-verification | ci-test-integrity-engineer | merged-tree gates, test-consistency.sh / test-commands.sh vs redis, re-measure the review's 📏 numbers |
 

@@ -285,6 +285,7 @@ impl<W: Write> RdbStreamWriter<W> {
 /// Mid-stream corruption (individual entry parse failures, unsupported type tags)
 /// is handled with log+skip: the corrupted entry is skipped and loading continues.
 /// Header, version, and checksum failures remain hard errors since the whole file is suspect.
+/// An expired entry is LOADED, not skipped (an AOF base: see `rdb_expired_load_tests`).
 pub fn load(databases: &mut [Database], path: &Path) -> Result<usize, MoonError> {
     let data = std::fs::read(path).map_err(|e| RdbError::Io {
         path: path.to_path_buf(),
@@ -400,9 +401,7 @@ pub fn load(databases: &mut [Database], path: &Path) -> Result<usize, MoonError>
             type_tag => {
                 match read_entry_zero_copy(&mut cursor, type_tag, now_secs, has_hash_ttl_trailer) {
                     Ok((key, entry)) => {
-                        if entry.has_expiry() && entry.is_expired_at(now_ms) {
-                            continue;
-                        }
+                        // Expired too (moon#1236): hidden by reads, reaped by expiry.
                         if current_db < db_count {
                             temp_dbs[current_db].insert_for_load(key, entry);
                             total_keys += 1;
@@ -1039,9 +1038,7 @@ pub fn load_from_bytes(
             type_tag => {
                 match read_entry_zero_copy(&mut cursor, type_tag, now_secs, has_hash_ttl_trailer) {
                     Ok((key, entry)) => {
-                        if entry.has_expiry() && entry.is_expired_at(now_ms) {
-                            continue;
-                        }
+                        // Expired too (moon#1236): see [`load`].
                         if current_db < db_count {
                             temp_dbs[current_db].insert_for_load(key, entry);
                             total_keys += 1;
@@ -1811,3 +1808,6 @@ mod tests {
         assert!(read_entry_zero_copy(&mut cursor2, TYPE_STREAM, 0, false).is_ok());
     }
 }
+#[cfg(test)]
+#[path = "rdb_expired_load_tests.rs"]
+mod rdb_expired_load_tests;

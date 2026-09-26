@@ -20,6 +20,8 @@ use crate::persistence::manifest::{FileStatus, ShardManifest, StorageTier};
 use crate::persistence::page::PageType;
 use crate::persistence::wal_v3::record::{WalRecord, WalRecordType};
 use crate::persistence::wal_v3::replay::{replay_wal_v3_dir, replay_wal_v3_dir_until};
+mod kv_sources;
+pub use kv_sources::KvSources;
 
 /// Result of a v3 recovery operation.
 #[derive(Debug, Default)]
@@ -128,7 +130,7 @@ pub fn recover_shard_v3_with_fallback(
         engine,
         v2_persistence_dir,
         None,
-        kv_authority_elsewhere,
+        KvSources::for_boot(kv_authority_elsewhere, true),
     )
 }
 
@@ -147,18 +149,13 @@ pub fn recover_shard_v3_with_fallback(
 /// `recovery_target_lsn = None` reproduces the classic crash-recovery
 /// behavior (load snapshot, replay all WAL past redo_lsn).
 ///
-/// `kv_authority_elsewhere = true` says the caller will WIPE every database
-/// and replay the multi-part AOF after this pass (main.rs's `db.clear()` +
-/// `replay_multi_part`/`replay_per_shard` block). Everything this pass
-/// would load into the hot keyspace — the snapshot, the WAL's KV `Command`
-/// records, the Phase 4b legacy `appendonly.aof` / legacy-mode WAL fallback
-/// and its hot-shadow demote — is then discarded, so it is skipped. What is
-/// NOT in the AOF still recovers unchanged: the cold index, warm vector
-/// segments, orphan classification, FPI torn-page repair, the WAL's
-/// `last_lsn`, and CLOG rollback. Measured on a 2.2M-key instance the
-/// skipped work was 13.8 s of snapshot load, a second full walk of the same
-/// WAL directory as a "legacy-mode" fallback, and a 650k-key hot
-/// materialise-then-demote round trip — all thrown away.
+/// `kv` ([`KvSources`]) picks the hot-keyspace sources: the snapshot unless
+/// `Elsewhere` (the caller wipes the keyspace and replays the multi-part
+/// AOF; on a 2.2M-key instance this pass discarded 13.8 s of snapshot load),
+/// and the WAL's `Command` records plus the Phase 4b legacy fallback only
+/// with `SnapshotAndLogs` (with `--appendonly no` they are stale, moon#1267
+/// review F3). Not KV history, so always recovered: the cold index, warm
+/// vector segments, orphan classification, FPI repair, `last_lsn`, CLOG.
 pub fn recover_shard_v3_pitr(
     databases: &mut [crate::storage::Database],
     shard_id: usize,
@@ -166,7 +163,7 @@ pub fn recover_shard_v3_pitr(
     engine: &dyn crate::persistence::replay::CommandReplayEngine,
     v2_persistence_dir: Option<&Path>,
     recovery_target_lsn: Option<u64>,
-    kv_authority_elsewhere: bool,
+    kv: KvSources,
 ) -> Result<RecoveryResult, crate::error::MoonError> {
     let mut result = RecoveryResult::default();
 
@@ -233,14 +230,15 @@ pub fn recover_shard_v3_pitr(
     // for legacy v1 or unstamped v2 files). Skipping forces full WAL
     // replay up to the target -- slower but correct.
     let snap_path = shard_dir.join(format!("shard-{}.rrdshard", shard_id));
-    if snap_path.exists() && kv_authority_elsewhere {
+    let mut snapshot_expired = Vec::new(); // moon#1236: dropped from the cold index below
+    if snap_path.exists() && !kv.snapshot() {
         info!(
             "Shard {}: snapshot load skipped — the multi-part AOF is the KV authority \
              and is replayed after this pass (loading it here was discarded)",
             shard_id
         );
     }
-    if snap_path.exists() && !kv_authority_elsewhere {
+    if snap_path.exists() && kv.snapshot() {
         let snapshot_ok = if let Some(target) = recovery_target_lsn {
             match crate::persistence::snapshot::read_snapshot_metadata(&snap_path) {
                 Ok(meta) => {
@@ -279,13 +277,20 @@ pub fn recover_shard_v3_pitr(
         };
 
         if snapshot_ok {
-            match crate::persistence::snapshot::shard_snapshot_load(databases, &snap_path) {
+            use crate::persistence::snapshot::shard_snapshot_load_noting_expired as load;
+            match load(databases, &snap_path, &mut snapshot_expired) {
                 Ok(n) => {
                     info!("Shard {}: loaded {} keys from snapshot", shard_id, n);
                 }
                 Err(e) => {
                     tracing::error!("Shard {}: snapshot load failed: {}", shard_id, e);
                 }
+            }
+            if kv.logs() {
+                crate::persistence::replay::clock::keep_expired_image_entries(
+                    databases,
+                    &mut snapshot_expired,
+                );
             }
         }
     }
@@ -519,6 +524,10 @@ pub fn recover_shard_v3_pitr(
                         }
                     }
                 }
+                crate::storage::tiered::snapshot_hold::drop_cold_shadows_of_expired_image_keys(
+                    databases,
+                    snapshot_expired,
+                );
                 // Crash-orphan sweep (task #55): heap files written but never
                 // registered in the manifest (crash between spill write and
                 // manifest commit) leak disk forever otherwise. Manifest opened
@@ -589,13 +598,14 @@ pub fn recover_shard_v3_pitr(
     let mut kv_records_db_out_of_range = 0usize;
     let wal_dir = shard_dir.join("wal-v3");
     if wal_dir.exists() {
+        let _clock = crate::persistence::replay::clock::pin_replay_clock_to_wal_dir(&wal_dir);
         let mut selected_db = 0usize;
         let on_command = &mut |record: &WalRecord| {
             match record.record_type {
                 WalRecordType::Command => {
-                    if kv_authority_elsewhere {
-                        // The AOF replays this write after this pass; applying
-                        // it here would only be wiped (see the fn docs).
+                    if !kv.logs() {
+                        // The multi-part AOF replays this write after this
+                        // pass, or it is stale (`--appendonly no`): fn docs.
                         kv_commands_skipped += 1;
                         return;
                     }
@@ -843,9 +853,8 @@ pub fn recover_shard_v3_pitr(
                 );
                 if kv_commands_skipped > 0 {
                     info!(
-                        "Shard {}: skipped {} WAL v3 KV command record(s) — the multi-part \
-                         AOF is the KV authority and is replayed after this pass",
-                        shard_id, kv_commands_skipped
+                        "Shard {shard_id}: skipped {kv_commands_skipped} WAL v3 command(s) — {}",
+                        kv.why_no_logs()
                     );
                 }
                 if kv_records_db_out_of_range > 0 {
@@ -915,18 +924,21 @@ pub fn recover_shard_v3_pitr(
     // both would double-apply non-idempotent commands). Resolving that needs
     // an AOF-first redesign of Phase 4, tracked in the roadmap.
     //
-    // `kv_authority_elsewhere`: the multi-part AOF is replayed by the caller
-    // after this pass, over a wiped keyspace. Neither rung below may run
-    // then — the legacy-mode rung in particular re-walks the SAME `wal-v3/`
-    // directory Phase 4 just replayed (when `v2_dir == shard_dir`'s parent)
-    // and materialises every key it finds into hot RAM, only for it to be
-    // demoted right below and then wiped. A 2.2M-key instance logged
+    // `!kv.logs()`: neither rung runs. `--appendonly no` wrote neither (they
+    // are stale, moon#1267 review F3); with the multi-part AOF replayed after
+    // this pass over a wiped keyspace, the legacy-mode rung would re-walk the
+    // SAME `wal-v3/` directory Phase 4 just replayed (when `v2_dir ==
+    // shard_dir`'s parent) and materialise every key into hot RAM, only for
+    // it to be demoted right below and then wiped. A 2.2M-key instance logged
     // "no appendonly.aof found — replayed 2397677 records from legacy-mode
     // WAL v3" on every boot while holding a perfectly good manifest AOF.
     // moon#914 (b): set when the AOF below replayed at least one record, so
     // the reconcile can report whether a cut opened it.
     let mut aof_replayed = false;
-    if kv_commands_replayed == 0 && !kv_authority_elsewhere {
+    if let Some(dir) = v2_persistence_dir {
+        kv.note_unreplayed_logs(shard_id, dir);
+    }
+    if kv_commands_replayed == 0 && kv.logs() {
         if let Some(v2_dir) = v2_persistence_dir {
             let aof_path = v2_dir.join("appendonly.aof");
             if aof_path.exists() {
@@ -1024,7 +1036,7 @@ pub fn recover_shard_v3_pitr(
     // call (the task #56 demote for a pre-#902 log, unchanged); dbs 1..N are
     // closed only when their generation is open, so a pre-#902 log sees no
     // new cold-wins demote there.
-    if !kv_authority_elsewhere && let Some((db0, rest)) = databases.split_first_mut() {
+    if let (true, Some((db0, rest))) = (kv.snapshot(), databases.split_first_mut()) {
         let mut r = db0.finish_replay_cold_reconcile();
         let rest = crate::storage::db::close_replay_generation(rest);
         r.gated |= rest.gated;
@@ -1128,6 +1140,7 @@ mod tests {
     use super::*;
     use crate::persistence::wal_v3::record::write_wal_v3_record;
     use crate::storage::Database;
+    const LOGS: KvSources = KvSources::SnapshotAndLogs;
 
     /// Build a minimal v3 segment header.
     fn make_v3_header(shard_id: u16) -> Vec<u8> {
@@ -1314,7 +1327,7 @@ mod tests {
         let mut databases = vec![Database::new()];
         let engine = crate::persistence::replay::DispatchReplayEngine::new();
         let result =
-            recover_shard_v3_pitr(&mut databases, 0, &shard_dir, &engine, None, Some(5), false)
+            recover_shard_v3_pitr(&mut databases, 0, &shard_dir, &engine, None, Some(5), LOGS)
                 .unwrap();
 
         assert_eq!(
@@ -1356,8 +1369,8 @@ mod tests {
         let mut dbs_classic = vec![Database::new()];
         let engine = crate::persistence::replay::DispatchReplayEngine::new();
 
-        let pitr = recover_shard_v3_pitr(&mut dbs_pitr, 0, &shard_dir, &engine, None, None, false)
-            .unwrap();
+        let pitr =
+            recover_shard_v3_pitr(&mut dbs_pitr, 0, &shard_dir, &engine, None, None, LOGS).unwrap();
         // Use a fresh shard dir for the classic side so its control file
         // doesn't reflect the PITR side's state.
         let shard_dir2 = tmp.path().join("shard-0-classic");

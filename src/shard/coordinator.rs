@@ -3858,14 +3858,18 @@ pub async fn coordinate_swapdb(
         ]);
         let serialized = crate::persistence::aof::serialize_command(&wal_frame);
 
-        // WAL v3 — see "Local-leg AOF/recovery gap" doc above: kept for
-        // parity with other record types on this channel, but no longer the
-        // sole durability plane.
-        if !shard_databases.try_wal_append_required(
-            my_shard,
-            crate::persistence::wal_v3::record::WalRecordType::Command,
-            serialized.clone(),
-        ) {
+        // WAL v3 — see "Local-leg AOF/recovery gap" doc above: no longer the
+        // sole durability plane. Gated on `--wal-kv-log` exactly like the
+        // SPSC arm's record (moon#1275): written unconditionally, it was the
+        // only KV record in a tokio `--shards 1` WAL, which recovery then
+        // took for the KV authority and never replayed the AOF.
+        if shard_databases.wal_kv_log(my_shard)
+            && !shard_databases.try_wal_append_required(
+                my_shard,
+                crate::persistence::wal_v3::record::WalRecordType::Command,
+                serialized.clone(),
+            )
+        {
             return Frame::Error(bytes::Bytes::from_static(
                 b"ERR SWAPDB aborted: WAL enqueue failed (persistence backpressure)",
             ));
@@ -3903,6 +3907,8 @@ pub async fn coordinate_swapdb(
         // flip to per-shard emission.
         let repl_record = serialized.clone();
         let apply_local = move || {
+            // moon#1237: a spill since the refusal check is logged.
+            crate::storage::db::note_swap_with_cold_footprint(my_shard, a, b);
             crate::shard::slice::with_shard(|s| {
                 if a != b {
                     s.databases.swap(a, b);

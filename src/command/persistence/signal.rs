@@ -1,0 +1,247 @@
+//! SIGTERM / SIGINT with save points: save the dataset, then exit (moon#1263).
+//!
+//! `systemctl stop` / `launchctl stop` send SIGTERM; Ctrl-C sends SIGINT. Both
+//! used to cancel the server at once, so with RDB-only persistence
+//! (`--appendonly no`, save points set) every write since the last automatic
+//! save was lost on a routine stop. redis's `prepareForShutdown` treats both
+//! signals like a plain `SHUTDOWN`: with save points configured it writes a
+//! final snapshot first, and exits only once it is on disk.
+//!
+//! Here a signal takes the path of `SHUTDOWN` with no argument
+//! ([`super::shutdown_save_until_done`]): wait for a save already running
+//! (auto-save or BGSAVE), then save every shard, and only then cancel the
+//! server. The signal thread never blocks: the save runs on its own thread.
+//!
+//! As in redis 7.0.15:
+//! - no save points: exit at once, no save (unchanged);
+//! - the final save fails: log it and KEEP RUNNING ("Error trying to save the
+//!   DB, can't exit"), so the operator can fix the disk and stop the server
+//!   again; the next SIGTERM / SIGINT retries;
+//! - a second SIGINT while the final save runs: exit without it ("You
+//!   insist... exiting now", status 1); a second SIGTERM is logged.
+//!
+//! "Without the save" is not "without what was acknowledged" (round 3, A2):
+//! the second SIGINT used to `exit(1)` on the spot, skipping the moon#1274
+//! AOF drain, and with `--appendonly yes` lost acknowledged records still
+//! queued for the writers (84 of 300 in the review). redis's insist exit
+//! loses nothing it acknowledged. Now it only skips the RDB save: it cancels
+//! the server, which takes the normal exit path — shards stop, the AOF
+//! writers drain and fsync, for at most `aof::writer_stop::HURRY_BOUND` plus
+//! its grace ([`insisted`] shortens that wait) — and exits with status 1.
+//!
+//! No deadline (review F4): redis saves synchronously however long it takes,
+//! so a large dataset must not turn a stop into "keep running". Every
+//! [`super::SAVE_STALL_MS`] without progress the wait logs redis's shutdown
+//! errors and that the stop stays armed; the server exits once the save is
+//! on disk. (It used to give up after one 20 s deadline and drop the stop.)
+//!
+//! `SHUTDOWN ABORT` cancels a signal's final save like a `SHUTDOWN`'s
+//! (moon#1264): the server keeps running.
+//!
+//! A signal that arrives before [`arm`] (the server is still booting) stops it
+//! at once, as before: the dataset is not loaded yet, and a save then would
+//! replace a good snapshot with a partial one.
+
+use std::future::Future;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
+
+use tracing::{error, info, warn};
+
+use crate::config::RuntimeConfig;
+use crate::protocol::Frame;
+use crate::runtime::cancel::CancellationToken;
+use crate::runtime::channel::WatchSender;
+
+/// The signal that asked the server to stop.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShutdownSignal {
+    /// SIGTERM (`systemctl stop`, `kill`).
+    Term,
+    /// SIGINT (Ctrl-C).
+    Int,
+}
+
+impl ShutdownSignal {
+    fn name(self) -> &'static str {
+        match self {
+            ShutdownSignal::Term => "SIGTERM",
+            ShutdownSignal::Int => "SIGINT",
+        }
+    }
+}
+
+/// What a signal needs to save: registered once the shards serve.
+struct Armed {
+    snapshot_trigger: WatchSender<u64>,
+    num_shards: usize,
+    /// The live config: save points are read when the signal lands (review
+    /// F10 — `CONFIG SET save` applies, as it does in redis).
+    runtime: Arc<parking_lot::RwLock<RuntimeConfig>>,
+    shutdown: CancellationToken,
+}
+
+static ARMED: OnceLock<Armed> = OnceLock::new();
+
+/// A signal-initiated final save is running.
+static SAVING: AtomicBool = AtomicBool::new(false);
+
+/// A second SIGINT insisted on stopping now (round 3, A2).
+static INSISTED: AtomicBool = AtomicBool::new(false);
+
+/// Has a second SIGINT insisted on stopping now? `main.rs` then exits with
+/// status 1, and the AOF writers' drain waits 2 s at most.
+pub fn insisted() -> bool {
+    INSISTED.load(Ordering::Acquire)
+}
+
+/// redis's "You insist... exiting now": stop without the final save, taking
+/// the normal exit path (the AOF drain included).
+fn insist(shutdown: &CancellationToken) {
+    INSISTED.store(true, Ordering::Release);
+    error!(
+        "SIGINT received again: You insist... exiting now, without the final snapshot \
+         (acknowledged AOF records are still written)"
+    );
+    shutdown.cancel();
+}
+
+/// Called once by `main.rs` after the shard threads are spawned: from here a
+/// shutdown signal saves first when save points are configured at that
+/// moment ([`super::save_points_now`], the rule plain `SHUTDOWN` follows).
+pub fn arm(
+    snapshot_trigger: WatchSender<u64>,
+    num_shards: usize,
+    runtime: Arc<parking_lot::RwLock<RuntimeConfig>>,
+    shutdown: CancellationToken,
+) {
+    let _ = ARMED.set(Armed {
+        snapshot_trigger,
+        num_shards,
+        runtime,
+        shutdown,
+    });
+}
+
+/// Handle one SIGTERM / SIGINT. `shutdown` is the server's token, cancelled
+/// directly when no save is due. Returns at once: a save runs on a
+/// `shutdown-save` thread, which cancels the server once the save is on
+/// disk.
+pub fn on_signal(signal: ShutdownSignal, shutdown: &CancellationToken) {
+    let Some(armed) = ARMED.get().filter(|a| super::save_points_now(&a.runtime)) else {
+        if signal == ShutdownSignal::Int && shutdown.is_cancelled() {
+            // Already stopping (the AOF drain): hurry it.
+            return insist(shutdown);
+        }
+        info!("{} received: shutting down", signal.name());
+        shutdown.cancel();
+        return;
+    };
+    if SAVING.swap(true, Ordering::AcqRel) {
+        if signal == ShutdownSignal::Int {
+            return insist(shutdown);
+        }
+        warn!("SIGTERM received while the final snapshot is being saved; still saving");
+        return;
+    }
+    info!(
+        "{} received: saving the final snapshot before exiting",
+        signal.name()
+    );
+    let spawned = std::thread::Builder::new()
+        .name("shutdown-save".to_string())
+        .spawn(move || save_then_exit(armed));
+    if let Err(e) = spawned {
+        // No thread to save on: save here rather than exit unsaved.
+        warn!("cannot spawn the shutdown-save thread ({e}); saving on the signal thread");
+        save_then_exit(armed);
+    }
+}
+
+/// The final save; the server is cancelled only once it is on disk.
+fn save_then_exit(armed: &Armed) {
+    match save_blocking(&armed.snapshot_trigger, armed.num_shards) {
+        Ok(()) => {
+            info!("final snapshot saved; shutting down");
+            armed.shutdown.cancel();
+        }
+        // `SHUTDOWN ABORT` (moon#1264) cancelled it: keep running, as redis
+        // does after "Shutdown manually aborted".
+        Err(Frame::Error(e)) if e.as_ref() == super::SHUTDOWN_ABORTED_ERR => {
+            warn!("the signal's shutdown was aborted; the server keeps running");
+            SAVING.store(false, Ordering::Release);
+        }
+        Err(reply) => {
+            let why = match &reply {
+                Frame::Error(e) => String::from_utf8_lossy(e).into_owned(),
+                _ => String::new(),
+            };
+            error!("Error trying to save the DB, can't exit: {why}");
+            error!("Errors trying to shut down the server. Check the logs for more information.");
+            SAVING.store(false, Ordering::Release);
+        }
+    }
+}
+
+/// [`super::shutdown_save_until_done`] on the calling OS thread: its polls
+/// sleep that thread (`std::thread::sleep`), so every await resolves at once.
+fn save_blocking(snapshot_trigger: &WatchSender<u64>, num_shards: usize) -> Result<(), Frame> {
+    let sleep = |d| {
+        std::thread::sleep(d);
+        std::future::ready(())
+    };
+    block_on_ready(super::shutdown_save_until_done(
+        snapshot_trigger,
+        num_shards,
+        sleep,
+        &still_saving,
+    ))
+}
+
+/// Once per stall period of the final save: redis's shutdown errors, and
+/// what happens next — the stop is NOT dropped.
+fn still_saving(stalled: std::time::Duration) {
+    error!(
+        "Error trying to save the DB, can't exit yet: the final save has made no progress \
+         for {} s",
+        stalled.as_secs()
+    );
+    error!("Errors trying to shut down the server. Check the logs for more information.");
+    warn!(
+        "The stop stays armed: the server exits once the save is on disk \
+         (SIGINT again exits now, unsaved; SHUTDOWN ABORT cancels)"
+    );
+}
+
+/// Drive a future whose awaits all resolve at once to completion on this
+/// thread. A `Pending` (none of this module's futures returns one) yields
+/// and polls again rather than spinning hot.
+fn block_on_ready<F: Future>(fut: F) -> F::Output {
+    let mut fut = std::pin::pin!(fut);
+    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+    loop {
+        if let std::task::Poll::Ready(out) = fut.as_mut().poll(&mut cx) {
+            return out;
+        }
+        std::thread::yield_now();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn block_on_ready_drives_a_sleeping_future_to_completion() {
+        let started = std::time::Instant::now();
+        let out = block_on_ready(async {
+            for _ in 0..3 {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+                std::future::ready(()).await;
+            }
+            7
+        });
+        assert_eq!(out, 7);
+        assert!(started.elapsed() >= std::time::Duration::from_millis(3));
+    }
+}

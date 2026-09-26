@@ -61,18 +61,34 @@ pub fn move_core(
 }
 
 fn move_core_uncounted(src: &mut Database, dst: &mut Database, key: &[u8]) -> Frame {
-    // Key must exist in src (lazy expiry applied inside `remove`)
+    // Collision check first: the key must NOT exist in dst (hot, in flight or
+    // cold — `exists` needs no disk read). A refused MOVE leaves the source
+    // exactly as it was: nothing is promoted, nothing is removed.
+    if dst.exists(key) {
+        return Frame::Integer(0);
+    }
+
+    // moon#1254: a key that lives in the cold tier (spilled, or its spill
+    // still in flight) must be made hot before it is moved. `remove` drops
+    // the cold entry and the in-flight record but returns only a HOT entry,
+    // so a cold key used to vanish from BOTH databases while MOVE answered
+    // `:0` and logged nothing. Same promotion `get` performs; a cold key
+    // whose bytes cannot be read is refused with `-IOERR` (moon#875), its
+    // index entry kept, never answered as "no such key".
+    let now_ms = src.now_ms();
+    if !src.promote_cold_if_present(key, now_ms) {
+        if src.take_cold_fault().is_some() {
+            return Database::cold_fault_error();
+        }
+        return Frame::Integer(0);
+    }
+
+    // The key is hot in src now. (A hot entry whose TTL has passed moves as
+    // it is — pre-existing, not changed here; see the WS20 NOTES.)
     let entry = match src.remove(key) {
         Some(e) => e,
         None => return Frame::Integer(0),
     };
-
-    // Collision check: key must NOT exist in dst
-    if dst.exists(key) {
-        // Restore the entry to src — the move did not happen
-        src.set(key, entry);
-        return Frame::Integer(0);
-    }
 
     // Move: insert into dst, TTL is carried inside the Entry value
     dst.set(key, entry);
@@ -106,10 +122,19 @@ pub fn copy_core(
     // moon#1228: an armed snapshot epoch needs the destination key's state
     // before the copy lands (the source is only read).
     crate::persistence::snapshot_cow::capture_two_db(src, src_idx, None, dst, dst_idx, dst_key);
-    // Source must exist
+    // Source must exist. `get` promotes a cold or in-flight source, so the
+    // copy reads its real value; an indexed source whose bytes cannot be read
+    // is `-IOERR`, not "no such key" (moon#1254 / moon#875). COPY … DB n runs
+    // outside `dispatch`, whose cold-fault gate would otherwise have left the
+    // flag behind for the NEXT command on this database.
     let entry = match src.get(src_key) {
         Some(e) => e.clone(),
-        None => return Frame::Integer(0),
+        None => {
+            if src.take_cold_fault().is_some() {
+                return Database::cold_fault_error();
+            }
+            return Frame::Integer(0);
+        }
     };
 
     // Same src and dst key in different dbs is allowed; same key same db is
@@ -826,3 +851,7 @@ mod tests {
         assert!(dbs[1].exists(b"w"));
     }
 }
+
+#[cfg(test)]
+#[path = "move_cold_tests.rs"]
+mod move_cold_tests;
