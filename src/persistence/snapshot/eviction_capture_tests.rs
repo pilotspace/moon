@@ -372,3 +372,28 @@ fn a_victim_captured_earlier_is_freed_as_usual() {
     assert_eq!(big, vec![5_000], "the epoch-start image, not the HSET's");
     dbs[0].drain_lazy_free_elements(usize::MAX);
 }
+
+/// Round 3 A4: a save that fails after an eviction handed it a large
+/// pre-image frees that pre-image off the shard thread, as the walk or an
+/// abort would — not inline when the failed save's state is dropped.
+///
+/// Red before: `finalize_snapshot_error` dropped the state without
+/// `abort`, so nothing reached `moon-snapdrop` (0 values).
+#[test]
+fn a_failed_save_frees_a_held_victim_off_the_shard_thread() {
+    let (mut dbs, config) = big_victim_fixture();
+    let mut epoch = Epoch::begin(&dbs);
+    evict_to_budget(&mut dbs[0], &config, EvictionRun::plain()).expect("evicts to budget");
+    assert!(dbs[0].data().get(b"big").is_none(), "fixture: big stayed");
+    epoch.drain(); // the moved victim reaches the state's overflow
+    let _ = frozen::take_values_discarded_for_test();
+    let mut state = epoch.state.take();
+    let mut reply = None;
+    crate::shard::persistence_tick::finalize_snapshot_error(&mut state, &mut reply, 0, "injected");
+    assert!(state.is_none());
+    assert_eq!(
+        frozen::take_values_discarded_for_test(),
+        1,
+        "the held victim was freed inline on the shard thread"
+    );
+}

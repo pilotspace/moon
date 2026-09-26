@@ -87,14 +87,14 @@ Scores are in the order Completeness · Clarity · Practicality · Optimization 
 | 1264b | .90 · .92 · .90 · .90 · .90 · .90 |
 | item 6 | 1.0 · .95 · 1.0 · 1.0 · .95 · .95 |
 
-## CHANGELOG bullets (amended in the review round, F8)
+## CHANGELOG bullets (amended in the review round, F8, and in round 3)
 - **Fixed (data loss, moon#1271):** a per-shard AOF writer that finished starting after a `BGREWRITEAOF` had been dispatched deleted the other shards' in-progress rewrite files. The rewrite then aborted, or it committed a manifest naming deleted files, and those shards' keys were gone after the next restart (165 of 200 in a forced reproduction). Loading the AOF manifest no longer deletes anything; stale rewrite files are swept at boot only.
 - **Fixed (moon#1257):** a key evicted while a BGSAVE ran was missing from the snapshot, so the snapshot was not the point-in-time image the save started from. In a reproduction, all 9,952 (`--shards 1`) and 13,404 (`--shards 4`) keys evicted during a held save were missing. Eviction now hands the removed value itself to the save as the key's pre-save state; it is not copied, and it is freed off the shard thread once written. With no save running, the cost is one flag check per victim. During a save, an evicted value's memory is released when the save has written it, not at eviction; `INFO current_cow_size` reports it.
 - **Fixed (redis parity, moon#1267):** with `--appendonly no` and no `--save`, `BGSAVE` and `SHUTDOWN SAVE` were refused with "background save unavailable", and a snapshot in `--dir` was ignored at boot. Snapshots now always go to and load from `--dir`, whatever the save rules; as in redis, the rules only schedule automatic saves.
-- **Changed (redis parity, moon#1267 review):** with `--appendonly no`, boot loads the snapshot and no longer replays a KV log over it: neither a legacy `appendonly.aof` in `--dir` nor WAL v3 records left by an earlier `--appendonly yes` run. Nothing writes those logs in that mode, so they were older than the snapshot and replaying them reverted keys. This applies to every `--appendonly no` configuration, with or without `--save` rules and in both `--disk-offload` modes. The cold tier and the offload manifest still recover.
-- **Fixed (data loss, moon#1263):** SIGTERM (`systemctl stop`) and SIGINT with save points exited without saving, losing every write since the last automatic save under `--appendonly no`. They now save first, as a plain `SHUTDOWN` does, waiting for a save already running; with `--appendonly yes` plus save points this also writes a final snapshot, which takes time proportional to the dataset. There is no deadline: while the save makes no progress for 20 s the server logs it and keeps the stop armed, and it exits once the save is on disk. As in redis 7, if that save fails the server logs it and keeps running; a second SIGINT exits at once, and `SHUTDOWN ABORT` cancels.
+- **Changed (redis parity, moon#1267 review):** with `--appendonly no`, boot loads the snapshot and no longer replays a KV log over it: neither a legacy `appendonly.aof` in `--dir` nor WAL v3 records left by an earlier `--appendonly yes` run. Nothing writes those logs in that mode, so they were older than the snapshot and replaying them reverted keys. This applies to every `--appendonly no` configuration, with or without `--save` rules and in both `--disk-offload` modes. The cold tier and the offload manifest still recover. **Before switching `--appendonly yes` → `no`, run `BGSAVE` (or `SHUTDOWN SAVE`) under `yes`**: a dataset that lived only in the AOF otherwise boots empty. moon logs a WARN naming the AOF it did not load, whether `appendonlydir/` or `appendonly.aof`.
+- **Fixed (data loss, moon#1263):** SIGTERM (`systemctl stop`) and SIGINT with save points exited without saving, losing every write since the last automatic save under `--appendonly no`. They now save first, as a plain `SHUTDOWN` does, waiting for a save already running; with `--appendonly yes` plus save points this also writes a final snapshot, which takes time proportional to the dataset. There is no deadline: while the save makes no progress for 20 s the server logs it and keeps the stop armed, and it exits once the save is on disk. As in redis 7, if that save fails the server logs it and keeps running. A second SIGINT exits without the save (status 1) but still writes the acknowledged AOF records, and `SHUTDOWN ABORT` cancels. Size the supervisor's stop timeout (systemd `TimeoutStopSec`, default 90 s; Docker; Kubernetes) to the final save plus 60 s for the AOF drain. See docs/production-guide.md, "Graceful shutdown and stop timeouts".
 - **Changed (moon#1263 review):** `SHUTDOWN` and `FLUSHALL` wait for their save for as long as it makes progress, and fail only after 20 s without progress (`-ERR SHUTDOWN failed: background save made no progress for 20 s, check logs`). Previously one 20 s deadline failed any longer save.
-- **Fixed (data loss, moon#1274):** with `--appendonly yes` (the default) and `appendfsync everysec`, SIGTERM, SIGINT or `SHUTDOWN` lost acknowledged writes still queued for the AOF writers (all of them at `--shards 1`). Shutdown now stops the shards first, then lets every AOF writer write its queue and fsync before the process exits, as redis's `prepareForShutdown` does.
+- **Fixed (data loss, moon#1274):** with `--appendonly yes` (the default) and `appendfsync everysec`, SIGTERM, SIGINT or `SHUTDOWN` lost acknowledged writes still queued for the AOF writers (all of them at `--shards 1`). Shutdown now stops the shards first, then lets every AOF writer write its queue and fsync before the process exits, as redis's `prepareForShutdown` does. A `BGREWRITEAOF` still in flight at the stop is aborted; the old generation stays authoritative. The drain is bounded at 60 s; a writer still running after that is named in the log and the exit status is non-zero.
 - **Fixed (redis parity, moon#1264):** `SHUTDOWN ABORT` now cancels a `SHUTDOWN`, SIGTERM or SIGINT that is still saving. It answers `+OK` (and then the shutdown never happens), and the waiting client gets `-ERR Errors trying to SHUTDOWN. Check logs.`. With nothing in progress it answers `-ERR No shutdown in progress.` (the period is new). `ABORT` with another modifier is a syntax error; a repeated modifier such as `NOSAVE NOSAVE` is accepted.
 - **Fixed (redis parity, moon#1264):** with save points, `FLUSHALL` (also `ASYNC`, in `MULTI`, or from a script) saves the empty dataset before it replies, so a crash right after it no longer restores the flushed keys. It blocks the calling connection and its pipeline for one save, about 17–24 ms on a test host. The save points are the ones configured now, so `CONFIG SET save` applies, as it does for `SHUTDOWN` and signals. A replica applying the master's `FLUSHALL` and the admin console's flush do not save.
 
@@ -171,4 +171,40 @@ cf8945eb fix(shutdown): bound save waits by a stall, not a deadline; a signal's 
 572aff0c fix(recovery): with appendonly no, boot loads the snapshot and replays no stale KV log (moon#1267)
 5955d642 fix(shutdown): decide SHUTDOWN ABORT vs commit under one lock (moon#1264)
 82ea1c21 fix(eviction): move a victim evicted during a save into its pre-image, not a clone (moon#1257)
+```
+
+## Round 3 (REVIEW-FINAL-P5A: MERGE-AFTER-FIXES)
+Branch `perf/ws21-round3` from `4fd00213`. The "before" binaries are debug builds of `4fd00213` (`ws21r3-pre-debug[-tokio]`), and the "after" binaries are builds of this branch. Both were built in this worktree and pinned with `MOON_BIN`. The reviewer's proofs ran with their ports moved to 7522–7526. They stay untracked.
+
+| item | verdict | commit | before → after |
+|---|---|---|---|
+| A1 (SHOULD): a rewrite dispatched before the stop wedges the exit | **FIXED**: a fold whose shard stopped fails at once (the ring's read hold is gone), the rewrite aborts, and the writers drain into the old incr. An abandoned writer is named and the exit is non-zero. | `6e7f060c` | `perf_ws21_aof_drain`: BGREWRITEAOF + immediate SIGTERM took 60.01 s at s1 and s4 (tokio s4 too); the late-writer case took 59.5 s and lost 227/300. After: < 1 s, 0 lost, both runtimes. `rvf_p5a_rewrite_at_shutdown`: 59.5 s / 227 lost / exit 0 → 0.53 s / 0 lost. |
+| A2 (SHOULD): a second SIGINT's `exit(1)` skips the AOF drain | **FIXED**: it skips only the RDB save and takes the normal exit (drain cut to about 2 s), status 1 | `93bddf1b` | proof 2c (`rvf_p5a_stuck_final_save`, plus the new `a_second_sigint_skips_the_save_but_keeps_the_aof_records`): 84/300 lost (tokio 300/300) → 0; exit 1 in about 2 s |
+| A3 (NIT): F4 progress flat after the walk | **FIXED**: the stream writer reports every 256 KiB chunk and each publish step | `2890551d` | unit test: 0/10 → 10/10. Residual: a single fsync longer than 20 s |
+| A4 (NIT): a failed save frees a held victim inline | **FIXED**: `finalize_snapshot_error` calls `abort()` first | `6bebfc13` | unit test: 0 values sent to `moon-snapdrop` → 1 |
+| A5 (NIT): `yes` → `no` boots empty with no log | **FIXED**: a WARN names the unloaded `appendonlydir/` or `appendonly.aof`; the docs say to BGSAVE before switching | `4993d3e9` | `switching_to_appendonly_no_names_the_unloaded_multi_part_aof`: no WARN → WARN |
+| A6 (NIT, docs): systemd `TimeoutStopSec=90s` | **DONE**: production guide section and a commented unit line | `bbb24848` | — |
+| A7 (NIT): sequential `broadcast_shutdown` | **FIXED**: `try_send` to all, then wait only on the full channels | `767ae796` | unit test: writer 1 without `Shutdown` after 300 ms → immediate |
+
+`rvf_p5a_embedded_stop` (tokio, in-process) is green.
+
+**Round-3 risks**
+1. **A1 relies on a stopped shard dropping its ring consumer.** The consumer lives in the shard's `consumers`, which is dropped when its thread exits; main joins the shards before the drain. A shard that exits without dropping it would bring the 60 s wait back, now with a non-zero exit and the writer named.
+2. **The graceful exit status is non-zero** when a writer is abandoned or after a second SIGINT (1, redis parity). A supervisor that restarts on failure will act on that.
+3. **Signal waits and the stop timeout.** A signal's final save still has no deadline, and the drain can add 62 s. The stop timeout must cover both (A6).
+4. **Residuals:**
+   - a single fsync longer than 20 s reads as a stall to SHUTDOWN / FLUSHALL;
+   - `embedded.rs` has its own stop order (its drain was checked green);
+   - a replica applying FLUSHALL does not save;
+   - the auto-save timer uses the startup rules.
+
+**Round-3 commits (`git log --oneline 4fd00213..HEAD`, code and docs):**
+```
+767ae796 fix(aof): broadcast_shutdown reaches every writer with room before waiting on a full one (moon#1274)
+bbb24848 docs(ops): size the stop timeout to the final save plus the 60 s AOF drain (moon#1263, moon#1274)
+4993d3e9 fix(recovery): warn when appendonly no leaves an AOF unloaded; document BGSAVE before switching (moon#1267)
+6bebfc13 fix(persistence): a failed save releases its held pre-images off the shard thread (moon#1257)
+2890551d fix(persistence): the snapshot stream writer's tail and publish count as save progress (moon#1263)
+93bddf1b fix(shutdown): a second SIGINT skips the final save, not the AOF drain (moon#1274)
+6e7f060c fix(aof): a rewrite fold whose shard stopped fails at once, not after 60 s; abandoned writers exit non-zero (moon#1274)
 ```

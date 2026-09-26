@@ -12,6 +12,12 @@ ExecStart=/usr/bin/moon /etc/moon/moon.conf
 ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=5s
+# A graceful stop runs the final RDB save (with save points; no deadline) and
+# then drains the AOF writers (up to 60 s). systemd SIGKILLs after
+# TimeoutStopSec (default 90s), losing what was not yet written. Size it to the
+# final save of your dataset plus 60 s (docs/production-guide.md, "Graceful
+# shutdown and stop timeouts"), e.g.:
+#TimeoutStopSec=180
 
 # Security hardening
 NoNewPrivileges=yes

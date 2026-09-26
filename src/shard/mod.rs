@@ -403,7 +403,7 @@ impl Shard {
         } else if !kv.logs() {
             // `--appendonly no` (moon#1267 review F3): neither log is written
             // in this mode, so one on disk predates the snapshot just loaded.
-            kv.note_unreplayed_aof(self.id, &aof_path);
+            kv.note_unreplayed_logs(self.id, dir);
         } else if aof_path.exists() {
             let mut aof_replayed = false;
             match crate::persistence::aof::replay_aof(

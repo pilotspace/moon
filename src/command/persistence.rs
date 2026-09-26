@@ -18,6 +18,8 @@ pub mod signal;
 
 pub(crate) use save_wait::note_save_progress;
 #[cfg(test)]
+pub(crate) use save_wait::take_local_save_progress_for_test;
+#[cfg(test)]
 use save_wait::{Observe, Patience, shutdown_save_within};
 pub use save_wait::{
     SAVE_STALL_MS, SHUTDOWN_SAVE_POLL_MS, save_after_flushall, save_after_txn_flushes,

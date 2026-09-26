@@ -291,6 +291,9 @@ fn run_helper(
                             failed.store(true, Ordering::Release);
                             break;
                         }
+                        // A save wait's stall watch (round 3, A3): the tail
+                        // written after the walk is progress too.
+                        crate::command::persistence::note_save_progress();
                     }
                 }
                 in_flight.fetch_sub(block.len(), Ordering::AcqRel);
@@ -346,16 +349,55 @@ fn publish(
     tmp_path: &std::path::Path,
     file_path: &std::path::Path,
 ) -> Result<(), String> {
+    // Each step is progress for a save wait's stall watch (round 3, A3).
+    let progress = crate::command::persistence::note_save_progress;
     let crc = hasher.finalize();
     f.write_all(&crc.to_le_bytes())
         .map_err(|e| format!("{}: {e}", tmp_path.display()))?;
+    progress();
     f.sync_all()
         .map_err(|e| format!("{}: {e}", tmp_path.display()))?;
+    progress();
     drop(f);
     std::fs::rename(tmp_path, file_path).map_err(|e| format!("{}: {e}", file_path.display()))?;
+    progress();
     if let Some(parent) = file_path.parent() {
         crate::persistence::fsync::fsync_directory(parent)
             .map_err(|e| format!("{}: {e}", parent.display()))?;
     }
+    progress();
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Round 3 A3: the stream writer's work counts as save progress — every
+    /// chunk it writes, then the footer, the fsync, the rename and the
+    /// directory fsync — so a SHUTDOWN / FLUSHALL waiting for the save does
+    /// not see a long tail or a slow publish as a stall. Red before: 0.
+    #[test]
+    fn the_writer_tail_and_the_publish_are_save_progress() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("shard-0.rrdshard");
+        let (tx, rx) = flume::unbounded();
+        let (done_tx, done_rx) = flume::unbounded();
+        let block = vec![7u8; SNAPSHOT_STREAM_CHUNK + 1]; // two chunks each
+        let in_flight = Arc::new(AtomicUsize::new(3 * block.len()));
+        for _ in 0..3 {
+            tx.send(StreamMsg::Data(block.clone())).expect("queue");
+        }
+        tx.send(StreamMsg::Finish).expect("queue");
+        let _ = crate::command::persistence::take_local_save_progress_for_test();
+        let flag = || Arc::new(AtomicBool::new(false));
+        run_helper(path.clone(), rx, done_tx, in_flight, flag(), flag());
+        assert_eq!(done_rx.recv().expect("outcome"), Ok(()));
+        assert!(path.exists());
+        assert_eq!(
+            crate::command::persistence::take_local_save_progress_for_test(),
+            6 + 4,
+            "6 chunks, then footer, fsync, rename, directory fsync"
+        );
+    }
 }

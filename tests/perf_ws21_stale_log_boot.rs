@@ -233,3 +233,57 @@ fn stale_wal_offload_disabled() {
 fn stale_wal_offload_enabled() {
     a_stale_wal_is_not_replayed_over_the_snapshot(true);
 }
+
+/// Round 3 A5: switching `--appendonly yes` → `no` WITHOUT a snapshot boots
+/// empty — by design (F3: the log is not loaded under `no`) — and now says
+/// so: a WARN names the multi-part AOF left unloaded and the remedy (BGSAVE
+/// under `yes` first). Before, only a legacy `appendonly.aof` was logged,
+/// and only at INFO.
+#[test]
+fn switching_to_appendonly_no_names_the_unloaded_multi_part_aof() {
+    let dir = common::unique_test_dir("ws21-r3-a5");
+    std::fs::create_dir_all(&dir).unwrap();
+    let yes = Boot {
+        shards: 4,
+        appendonly: true,
+        offload: false,
+        save: None,
+        extra: &[],
+    };
+    let (mut server, port) = spawn(&dir, &yes);
+    let mut c = Conn::open(port);
+    set_all(&mut c, "v");
+    c.sock
+        .write_all(&common::encode(&["SHUTDOWN", "NOSAVE"]))
+        .unwrap();
+    drop(c);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while server.as_mut().try_wait().unwrap().is_none() {
+        assert!(Instant::now() < deadline, "the first run never exited");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        dir.join("appendonlydir/moon.aof.manifest").exists(),
+        "fixture: no manifest"
+    );
+
+    let no = Boot {
+        appendonly: false,
+        ..yes
+    };
+    let (server, port) = spawn(&dir, &no);
+    let mut c = Conn::open(port);
+    let dbsize = c.send(&["DBSIZE"]);
+    drop(c);
+    kill(server);
+    let log = std::fs::read_to_string(dir.join("server.err")).unwrap_or_default();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(dbsize, ":0\r\n", "fixture: a snapshot existed");
+    let warned = log
+        .lines()
+        .any(|l| l.contains("WARN") && l.contains("appendonlydir") && l.contains("NOT loaded"));
+    assert!(
+        warned,
+        "no WARN names the multi-part AOF left unloaded under --appendonly no"
+    );
+}

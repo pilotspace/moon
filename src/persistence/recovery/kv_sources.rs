@@ -3,7 +3,7 @@
 
 use std::path::Path;
 
-use tracing::info;
+use tracing::warn;
 
 /// What `Shard::restore_from_persistence` — the v3 disk-offload path and the
 /// legacy v2 path alike — loads into the hot keyspace. Recovery that is not
@@ -58,15 +58,24 @@ impl KvSources {
         }
     }
 
-    /// Say so when a legacy `appendonly.aof` is left unreplayed because of
-    /// `--appendonly no` (the operator may expect it to load, as it did).
-    pub fn note_unreplayed_aof(self, shard_id: usize, aof: &Path) {
-        if self == Self::SnapshotOnly && aof.exists() {
-            info!(
-                "Shard {shard_id}: {} not replayed — {}",
-                aof.display(),
-                self.why_no_logs()
-            );
+    /// Say so when `--appendonly no` leaves a KV log in `dir` unreplayed: a
+    /// legacy `appendonly.aof`, or a multi-part `appendonlydir/` left by an
+    /// `--appendonly yes` run (round 3, A5: switching `yes` → `no` without a
+    /// snapshot boots EMPTY, and said nothing). Once, from shard 0.
+    pub fn note_unreplayed_logs(self, shard_id: usize, dir: &Path) {
+        if self != Self::SnapshotOnly || shard_id != 0 {
+            return;
+        }
+        let multi_part = dir.join("appendonlydir").join("moon.aof.manifest");
+        for log in [dir.join("appendonly.aof"), multi_part] {
+            if log.exists() {
+                warn!(
+                    "{} is NOT loaded: {}. Switching --appendonly yes -> no? Run BGSAVE (or \
+                     SHUTDOWN SAVE) under `yes` first, so the snapshot holds the dataset",
+                    log.display(),
+                    self.why_no_logs()
+                );
+            }
         }
     }
 }

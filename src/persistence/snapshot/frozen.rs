@@ -64,8 +64,9 @@ enum Discard {
 /// the helper cannot be started or is gone.
 fn discard(item: Discard) {
     #[cfg(test)]
-    if matches!(item, Discard::Table(_)) {
-        TABLES_FOR_TEST.with(|c| c.set(c.get() + 1));
+    match item {
+        Discard::Table(_) => TABLES_FOR_TEST.with(|c| c.set(c.get() + 1)),
+        Discard::Value(_) => VALUES_FOR_TEST.with(|c| c.set(c.get() + 1)),
     }
     static DROPPER: std::sync::OnceLock<Option<flume::Sender<Discard>>> =
         std::sync::OnceLock::new();
@@ -103,6 +104,14 @@ thread_local! {
         const { std::cell::Cell::new((0, 0)) };
     /// Test-only: tables this thread handed to the helper.
     static TABLES_FOR_TEST: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Test-only: values (large pre-images, trimmed rows) handed to it.
+    static VALUES_FOR_TEST: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Test-only: values this thread handed to `moon-snapdrop` since the last call.
+#[cfg(test)]
+pub(crate) fn take_values_discarded_for_test() -> usize {
+    VALUES_FOR_TEST.with(|c| c.replace(0))
 }
 
 /// Test-only: tables this thread handed to `moon-snapdrop` since the last

@@ -51,14 +51,30 @@ pub const SAVE_STALL_MS: u64 = 20_000;
 /// started before giving up. (A signal defers as often as it takes.)
 const SHUTDOWN_SAVE_ATTEMPTS: usize = 3;
 
-/// Every sign of a save moving: a shard's walk advancing, a save starting, a
-/// shard finishing. A wait sees a stall as this standing still.
+/// Every sign of a save moving: a shard's walk advancing, its stream writer
+/// writing a block, the footer / fsync / rename of the publish (round 3,
+/// A3), a save starting, a shard finishing. A wait sees a stall as this
+/// standing still.
 static SAVE_PROGRESS: AtomicU64 = AtomicU64::new(0);
 
-/// A save made progress (called by the shards, and by save start / finish).
+#[cfg(test)]
+thread_local! {
+    /// Progress this thread reported (tests: the global is shared).
+    static LOCAL_PROGRESS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Progress reported from this thread since the last call (tests).
+#[cfg(test)]
+pub(crate) fn take_local_save_progress_for_test() -> u64 {
+    LOCAL_PROGRESS.with(|c| c.replace(0))
+}
+
+/// A save made progress (the shards, their stream writers, save start / finish).
 #[inline]
 pub(crate) fn note_save_progress() {
     SAVE_PROGRESS.fetch_add(1, Ordering::Relaxed);
+    #[cfg(test)]
+    LOCAL_PROGRESS.with(|c| c.set(c.get() + 1));
 }
 
 fn save_progress() -> u64 {
