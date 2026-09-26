@@ -412,6 +412,20 @@ moon --maxmemory 8589934592 --maxmemory-policy allkeys-lfu \
 
 Reads from the cold tier use async read-through with full crash recovery.
 
+`SWAPDB` is refused while either database has keys in the cold tier or spill
+files not yet reclaimed (a spill file records the database it was spilled
+from, and a swap cannot re-tag it crash-consistently). To swap such a
+database, delete its cold keys (or read them back into RAM), then run
+`BGREWRITEAOF` (`--appendonly yes`) or `BGSAVE` (`--appendonly no`): once
+that fold or snapshot covers the emptied files, the next orphan sweep
+reclaims them and the swap is allowed. Waiting for the automatic rewrite can
+take a long time. If another shard holds a database for the whole bounded
+check (about 20,000 yields, a few ms), the reply is
+`ERR SWAPDB could not check the disk-offload cold tier of every shard, try again`
+and nothing is swapped. A replica whose own cold tier holds either database
+does not apply its master's `SWAPDB`: it drops the link and resyncs in full
+(moon#1278), which costs a full transfer per such swap.
+
 ### jemalloc tuning
 
 Moon ships with jemalloc by default. The allocator is pre-tuned for the thread-per-core architecture. Key environment variables for advanced tuning:

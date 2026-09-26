@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use parking_lot::{Mutex, MutexGuard};
 use smallvec::SmallVec;
@@ -8,6 +8,8 @@ use crate::persistence::wal_v3::record::WalRecordType;
 use crate::storage::Database;
 use crate::workspace::wal::{decode_workspace_create, decode_workspace_drop};
 use crate::workspace::{WorkspaceId, WorkspaceMetadata, WorkspaceRegistry};
+
+mod wal_kv_log;
 
 /// Published per-shard store-memory counters (C5 / M4).
 ///
@@ -192,6 +194,9 @@ pub struct ShardDatabases {
     pub store_memory_per_shard: Box<[Arc<ShardStoreMemory>]>,
     /// Per-shard cold-tier stats, published by the cold orphan sweep (moon#656).
     pub cold_per_shard: Box<[Arc<ShardColdStats>]>,
+    /// Per-shard `--wal-kv-log` decision of the latest SPSC drain cycle
+    /// (moon#1275; accessors in `shared_databases/wal_kv_log.rs`).
+    wal_kv_log: Box<[AtomicBool]>,
 }
 
 impl ShardDatabases {
@@ -247,6 +252,7 @@ impl ShardDatabases {
             elastic_budgets: elastic_budgets.clone(),
             store_memory_per_shard: store_memory_per_shard.clone(),
             cold_per_shard,
+            wal_kv_log: (0..num_shards).map(|_| AtomicBool::new(false)).collect(),
         });
 
         // Move the databases into the L4 shared read plane, then hand each

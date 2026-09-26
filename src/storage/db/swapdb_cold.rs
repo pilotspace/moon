@@ -26,8 +26,17 @@ use crate::storage::Database;
 use crate::storage::tiered::cold_index::ColdIndex;
 
 /// The reply to a SWAPDB refused because a swapped database holds cold data.
-pub const ERR_SWAPDB_COLD: &[u8] =
-    b"ERR SWAPDB is not allowed while either database has keys in the disk-offload cold tier";
+///
+/// It names the way out (REVIEW-WS20 F10): the refusal lasts while a
+/// database has cold keys OR spill files not yet reclaimed. After its cold
+/// keys are deleted (a FLUSHDB/FLUSHALL included) or read back into RAM,
+/// their files are held until a fold — `BGREWRITEAOF` with
+/// `--appendonly yes` — or a snapshot — `BGSAVE` without an AOF — covers
+/// them (moon#1231, moon#1260), then the next orphan sweep reclaims them;
+/// the automatic rewrite may not run for a long time (64 MB, 100% growth).
+pub const ERR_SWAPDB_COLD: &[u8] = b"ERR SWAPDB is not allowed while either database has keys \
+or unreclaimed spill files in the disk-offload cold tier; after deleting or reading back its \
+cold keys, run BGREWRITEAOF (appendonly yes) or BGSAVE (appendonly no) and retry";
 
 /// The reply when a shard's databases could not be inspected in time (the
 /// owner held a database for the whole bounded wait). Nothing was swapped.
@@ -37,6 +46,13 @@ pub const ERR_SWAPDB_BUSY: &[u8] =
 /// How many non-blocking attempts [`swapdb_cold_refusal`] makes per foreign
 /// database before it gives up (each followed by a `yield_now`): the owner
 /// holds a database only for one command or one maintenance chunk.
+///
+/// REVIEW-WS20 F11: while a foreign database stays busy, the check SPINS on
+/// the connection's shard thread — up to this many `yield_now`s (measured
+/// ~7.5 ms on a 4-vCPU box), serving nothing else meanwhile — and then
+/// answers [`ERR_SWAPDB_BUSY`]. Safe (nothing is logged or swapped), bounded,
+/// and SWAPDB is rare; a refusal under that contention is the price of
+/// never parking a shard thread on another shard's lock.
 const FOREIGN_READ_ATTEMPTS: usize = 20_000;
 
 impl Database {
@@ -120,6 +136,11 @@ pub fn swap_replayed(a: &mut Database, b: &mut Database) {
 /// The check and the swaps are not one atomic step across shards: a shard
 /// that spills a key of `a` or `b` between this check and its own swap still
 /// swaps (see [`note_swap_with_cold_footprint`]).
+///
+/// The foreign reads go through the process-wide shared read plane
+/// (`db_plane::shard_dbs`), installed once per process: a SECOND server in
+/// the same process (embedded tests only) reads the FIRST server's databases
+/// here (REVIEW-WS20 F11).
 #[must_use]
 pub fn swapdb_cold_refusal(
     a: usize,
@@ -151,6 +172,41 @@ pub fn swapdb_cold_refusal(
     None
 }
 
+/// moon#1278: whether a replica must not apply its master's `SWAPDB a b`
+/// (`args`) over `set`, its own shard's databases, and resync from scratch
+/// instead. The master's check covered the MASTER's cold tier only; a replica
+/// spills under its own memory limit, and its spill files keep their db tags
+/// just as the master's would (moon#1237): swapped, its cold keys came back
+/// in the OLD database after a rewrite and a restart (REVIEW-WS20 F3). A full
+/// resync is always right: the master's image already holds the swap, and
+/// loading it clears this replica's cold tier (`Database::clear`). Arguments
+/// the apply would skip (unparsable, out of range, `a == b`) need nothing.
+#[must_use]
+pub fn replica_swap_needs_full_resync(
+    set: &crate::shard::db_plane::ShardDbSet,
+    args: &[Frame],
+) -> bool {
+    let idx = |f: Option<&Frame>| match f? {
+        Frame::BulkString(b) => std::str::from_utf8(b).ok()?.parse::<usize>().ok(),
+        Frame::Integer(n) => usize::try_from(*n).ok(),
+        _ => None,
+    };
+    match (idx(args.first()), idx(args.get(1))) {
+        (Some(a), Some(b)) if a != b && a.max(b) < set.db_count() => {
+            set.read(a).has_cold_footprint() || set.read(b).has_cold_footprint()
+        }
+        _ => false,
+    }
+}
+
+/// [`replica_swap_needs_full_resync`] on this thread's shard (`false`
+/// without one) — the replica apply's check (`replication::apply`).
+#[must_use]
+pub fn replica_swap_resyncs(args: &[Frame]) -> bool {
+    crate::shard::slice::try_with_shard(|s| replica_swap_needs_full_resync(&s.databases, args))
+        == Some(true)
+}
+
 /// [`swapdb_cold_refusal`] for the single-listener handler (`handler_single`,
 /// the embedded server), whose databases sit behind their own locks.
 #[must_use]
@@ -171,11 +227,28 @@ fn foreign_footprint(set: &crate::shard::db_plane::ShardDbSet, db: usize) -> Opt
 }
 
 /// At a shard's own swap: say so, loudly, if a swapped database acquired a
-/// cold footprint after [`swapdb_cold_refusal`] cleared it (a spill in the
-/// window between the check and this shard's swap). The swap still happens —
-/// every other shard has swapped, and the hot data must stay consistent —
-/// and the keys spilled in that window are exposed to moon#1237 until their
-/// files are reclaimed. Owner thread, before the swap.
+/// cold footprint after [`swapdb_cold_refusal`] cleared it. The swap still
+/// happens — every other shard has swapped, and the hot data must stay
+/// consistent. Owner thread, before the swap.
+///
+/// The window between the check and this shard's swap is one SPSC hop (at
+/// `--shards 1`, only while the AOF append awaits); REVIEW-WS20 F4 traced
+/// two variants (not reproduced: 0 hits in 3,914 racing swaps at s4):
+/// - (a) a spill that COMPLETES in the window: its file keeps the pre-swap
+///   db tag, so after an AOF rewrite and a restart its keys reappear in the
+///   other database (moon#1237) until the file is reclaimed;
+/// - (b) a spill IN FLIGHT at the swap: its completion is routed by slot to
+///   the other `Database`, which has no in-flight record for it, and is
+///   dropped as a ghost; the swapped-away record stays in `spill_inflight`
+///   for good (a little memory, and that database refuses SWAPDB until a
+///   restart), and a kill -9 before a fold leaves the unmarked slot to
+///   `finish_replay_cold_reconcile`, which keeps it: a phantom copy in the
+///   old database.
+///
+/// Closing both needs a per-shard "swap pending (a, b)" prepare, set on
+/// every shard before the check, under which eviction skips victims of `a`
+/// and `b` and the check also waits for their in-flight spills to drain; a
+/// cross-shard protocol step, left out of WS20 (see the WS20 NOTES).
 pub fn note_swap_with_cold_footprint(shard_id: usize, a: usize, b: usize) {
     if a == b {
         return;

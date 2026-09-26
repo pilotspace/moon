@@ -406,11 +406,10 @@ pub const COLD_ORPHAN_SWEEP_INTERVAL_SECS: u64 = 300;
 /// shard's fold epoch, committed floor and spill-file counter
 /// (`spill_file_id`), read right before the decision on this thread — and a
 /// file a replayable generation may still read is held until a committed fold
-/// covers it (`storage::tiered::unlink_hold`). Without one, a process that
-/// can write snapshots holds them until a snapshot that started after the
-/// decision has succeeded (moon#1260, `storage::tiered::snapshot_hold`); with
-/// no snapshot directory either, files go as soon as their last key does, as
-/// before. In a TopLevel layout with more than one
+/// covers it (`storage::tiered::unlink_hold`). Without one, a file is held
+/// until a snapshot that started after it went zero-ref has succeeded
+/// (moon#1260, `storage::tiered::snapshot_hold`), with or without save points.
+/// In a TopLevel layout with more than one
 /// shard — which no shipped configuration builds — no committed fold covers
 /// this shard, so held files are never released (see the guard below).
 pub(crate) fn run_cold_orphan_sweep(
@@ -441,7 +440,7 @@ pub(crate) fn run_cold_orphan_sweep(
     });
     // Read at each decision, never cached across one: see `unlink_hold`.
     // Without an AOF the view comes from this shard's snapshots (moon#1260,
-    // `storage::tiered::snapshot_hold`), when it can write any.
+    // `storage::tiered::snapshot_hold`).
     let fold_view = || match aof_pool {
         Some(pool) => {
             let overflow = pool.overflow_for(shard_id);
@@ -456,7 +455,9 @@ pub(crate) fn run_cold_orphan_sweep(
                 hold_all: false,
             })
         }
-        None => crate::storage::tiered::snapshot_hold::snapshot_fold_view(spill_file_id.get()),
+        None => Some(crate::storage::tiered::snapshot_hold::snapshot_fold_view(
+            spill_file_id.get(),
+        )),
     };
 
     let db_count = shard_databases.db_count();
@@ -581,6 +582,60 @@ pub(crate) fn run_cold_orphan_sweep(
             "cold_expired_sweep: shard sweep complete",
         );
     }
+}
+
+/// A snapshot of this shard is starting (moon#1260 review F1). Without an AOF,
+/// every zero-ref spill file already queued for unlink is held first with the
+/// epoch BEFORE the start, so this snapshot's success releases it — the
+/// snapshot already excludes the keys those files backed. Then the start is
+/// counted. Owner thread, no database guard held.
+pub(crate) fn note_snapshot_started(shard_databases: &Arc<ShardDatabases>) {
+    use crate::storage::tiered::snapshot_hold;
+    if snapshot_hold::applies() {
+        let stamp = snapshot_hold::epoch_before_start();
+        for db_idx in 0..shard_databases.db_count() {
+            crate::shard::slice::with_shard_db(db_idx, |db| {
+                if let Some(ci) = db.cold_index.as_mut() {
+                    ci.hold_queued_before_snapshot(stamp);
+                }
+            });
+        }
+    }
+    snapshot_hold::note_snapshot_started();
+}
+
+/// A snapshot of this shard just finished successfully (moon#1260 review
+/// F1): without an AOF, sweep now, so the files it released go at once
+/// instead of at the next interval — until they are unlinked, a crash brings
+/// back keys the snapshot already excludes. With an AOF (folds govern), with
+/// the sweep disabled (`--cold-orphan-sweep-interval-secs 0`) or without a
+/// cold tier, nothing.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn sweep_after_snapshot(
+    shard_databases: &Arc<ShardDatabases>,
+    shard_id: usize,
+    shard_dir: Option<&std::path::Path>,
+    manifest: Option<&mut crate::persistence::manifest::ShardManifest>,
+    now_ms: u64,
+    aof_pool: Option<&Arc<crate::persistence::aof::AofWriterPool>>,
+    spill_file_id: &std::cell::Cell<u64>,
+    sweep_interval_secs: u64,
+) {
+    let Some(shard_dir) = shard_dir else {
+        return;
+    };
+    if aof_pool.is_some() || sweep_interval_secs == 0 {
+        return;
+    }
+    run_cold_orphan_sweep(
+        shard_databases,
+        shard_id,
+        shard_dir,
+        manifest,
+        now_ms,
+        None,
+        spill_file_id,
+    );
 }
 
 /// Publish one shard's cold-tier shape into the shared per-shard slot read by

@@ -135,7 +135,8 @@ Red references:
   bases it re-saves filter expired entries at write time. Harmless.
 - `listener.rs` legacy `dump.rdb` load: same loader, not reachable from
   `main` (only `run_sharded` is). Would now reap instead of skip.
-- NOT fixed, named: the no-AOF quadrant. `--appendonly no --save` boots from
+- **Review round: fixed (F6, `16cd41c7` + `95621f76`, see "Review round"
+  below).** As first shipped — NOT fixed, named: the no-AOF quadrant. `--appendonly no --save` boots from
   the per-shard snapshot (`snapshot.rs` ~1428 skips expired entries, WS21's
   file) and attaches the cold index afterwards (`recovery.rs`), with no
   replay-close resolution. A cold key overwritten with a TTL, snapshotted,
@@ -322,10 +323,12 @@ Red references:
     (thread-local): the hooks and the sweep run on the shard's own thread on
     both runtimes; per-shard success is the right signal because each shard
     loads its own snapshot file at boot.
-  - Only when snapshots can be written (`SNAPSHOT_DIR_ABSENT` false: `--save`
-    given). With neither an AOF nor a persistence dir a restart loads no hot
-    data at all and nothing could ever release a hold: unchanged (files go at
-    once).
+  - ~~Only when snapshots can be written (`SNAPSHOT_DIR_ABSENT` false:
+    `--save` given).~~ **Stale (REVIEW-WS20 F2):** since moon#1267 main.rs
+    never sets `SNAPSHOT_DIR_ABSENT`, so the hold applies with `--appendonly
+    no` with or without `--save`; the dead gate and its test are gone
+    (`95812d99`). Without save points only a manual `BGSAVE` or `SHUTDOWN
+    SAVE` releases held files.
 
 ### Crash windows
 | window | durable state | recovery | ok? |
@@ -345,11 +348,18 @@ Red references:
   save for held-file pressure (the AOF path has one, WS19 item 4) —
   `auto_save.rs` is WS21's. Without an AOF new files are rare (the pressure
   cascade only), so the held set is bounded by the cold tier at boot.
-- Deleted keys in a held file come back after a crash before the next
-  snapshot: consistent with snapshot semantics (they existed at the last
-  save, cold). A key written, spilled and deleted after the last save can
-  come back only if its file was held — i.e. minted before the latest
-  snapshot start or while one ran.
+- ~~Deleted keys in a held file come back after a crash before the next
+  snapshot.~~ **Wrong as shipped (REVIEW-WS20 F1, BLOCKING):** a file
+  emptied by DEL/FLUSHALL was stamped at the next ORPHAN SWEEP, so a
+  snapshot taken in between (the FLUSHALL save, a BGSAVE) released nothing,
+  and the deleted keys came back after a crash until a SECOND snapshot.
+  Fixed in the review round (`c6380c47`, `ccb6129e`): the snapshot-start
+  hook holds every queued zero-ref file with the pre-start epoch, and the
+  shard sweeps right after a successful snapshot. Now: a file emptied
+  before snapshot S starts is released as soon as S succeeds; one emptied
+  while S runs waits for the next successful snapshot. Keys deleted from a
+  file that still backs live keys are a different, pre-existing gap: the
+  no-AOF cold plane records no removals (review-round finding N2).
 - `INFO cold_files_pending_unlink` counts held files; a db with held files
   refuses SWAPDB (moon#1237's footprint) until they are released.
 
@@ -414,7 +424,7 @@ probe states wrong. The no-AOF case is NOT red on tokio s1 (0 lost: that
 layout's reads did not empty the files in this scenario), red on tokio s4
 (14 of 163 lost), green after the fix on both.
 
-### NEW FINDING (pre-existing, not fixed, not owned): tokio `--shards 1` + disk offload loses the whole AOF after any SWAPDB and a kill -9
+### NEW FINDING (pre-existing; filed as moon#1275, FIXED in the review round by `b3b029d3`): tokio `--shards 1` + disk offload loses the whole AOF after any SWAPDB and a kill -9
 - Probe (scratch `probe_tokio_swap_wal.py`, no maxmemory, nothing spilled):
   `SET a 1; SWAPDB 0 1; SET b 2 (db0); SET c 3 (db1)`, kill -9, restart →
   every key absent, on the tokio build of `4a96cd5f` AND on this branch; the
@@ -446,3 +456,196 @@ layout's reads did not empty the files in this scenario), red on tokio s4
   replication::` 4273 / 0.
 - lib, tokio, same filter: 4046 passed / 0 failed; the binary lists this
   branch's 24 new lib tests.
+
+## Review round (REVIEW-WS20: MERGE-AFTER-FIXES, F1 BLOCKING)
+
+Branch `perf/ws20-review-fixes` from `86cd20e8` (the merge `db2e1f65` + the
+orchestrator's SUMMARY commit). Red binaries: debug builds of `86cd20e8`
+(`ws20r-red-86cd20e8-{monoio,tokio}`), `main-4a96cd5f-rel`. Green: debug
+builds of each fix commit, and `ws20r-final-{monoio,tokio}` at `a4307d0e`.
+
+### F1 (BLOCKING) — the no-AOF hold released a file emptied before a snapshot only at the SECOND one
+- Mechanism (confirmed): `UnlinkHold::admit` stamps a held file with the
+  view epoch at the SWEEP's decision. A file emptied by DEL/FLUSHALL
+  reaches the hold at the next sweep; the FLUSHALL save or a BGSAVE in
+  between already excludes its keys, but its start epoch is not above the
+  stamp, so it released nothing. Until a second snapshot started after that
+  sweep (never, with save rules and no further writes), a kill -9 rebuilt
+  the flushed keys from the files.
+- Fix: `ColdIndex::hold_queued_before_snapshot(stamp)` — at snapshot START
+  (`timers::note_snapshot_started`, called from both start sites in
+  `persistence_tick`), every db's queued zero-ref files enter the hold
+  stamped with the epoch BEFORE the start (`UnlinkHold::hold_stamped`); a
+  file missing at the boot rebuild keeps its fast path. After
+  `note_snapshot_finished(true)` the event loop runs
+  `timers::sweep_after_snapshot` (both runtimes), so those files go at
+  once. No-op with an AOF.
+- Red → green: unit `review_ws20_a_file_emptied_before_a_snapshot_is_
+  released_by_it` (the reviewer's proof, permanent) and timers
+  `without_an_aof_a_file_emptied_before_a_snapshot_is_released_by_it`; real
+  server `crash_recovery_cold_no_aof::no_aof_flushed_*` (FLUSHALL with save
+  rules; FLUSHALL + BGSAVE pipelined on one connection so the save starts
+  before a sweep — a separate BGSAVE after a 1.1 s LASTSAVE wait let a sweep
+  run first and passed on the red binary): probes back out of 200 on
+  `86cd20e8` (FLUSHALL save / BGSAVE) — monoio s1 141 / 119, s4 184 / 188;
+  tokio s1 187 / 171, s4 167 / 146; 0 after, on all four.
+- tokio s1 needed `drop_phase1_aof`: see finding N1.
+
+### F2 — the hold applies without `--save` too
+Since moon#1267 `SNAPSHOT_DIR_ABSENT` is never set: the `None` branch and
+`without_an_aof_or_a_snapshot_directory_nothing_is_held` modelled a config
+that no longer exists. Removed (`95812d99`); `snapshot_fold_view` returns a
+view unconditionally; docs say "with or without save points";
+`no_aof_no_save_promoted_*` pins it (red on main: files unlinked).
+
+### F3 → moon#1278 — FIXED
+The replica apply refuses a `SWAPDB` whose databases have a cold footprint
+on its shard (`swapdb_cold::replica_swap_needs_full_resync`) and returns
+`ApplyOutcome::FullResync`; both replica loops zero the offset and drop the
+link, so the reconnect sends `PSYNC ? -1`; `load_snapshot` clears the
+replica's cold tier (`Database::clear` → `clear_all`) and loads the
+master's post-swap image. Cost: one full transfer per such swap.
+Replication is single-shard (`replica_supported`), and a master must run
+monoio. Red → green: `perf_ws20_review::replica_swapdb::moon_1278_*`
+(unit twin in `swapdb_cold_tests`): `(db0 keys, db0 probes, db1 keys, db1
+probes, full resync)` = `(4407, 165, 11848, 35, false)` on `86cd20e8`
+monoio, `(5376, 92, 16200, 200, false)` for a `86cd20e8` tokio replica under
+a monoio master (`MOON_REPL_MASTER_BIN`); `(0, 0, 16200, 200, true)` after,
+both.
+
+### F4 — check-to-swap race, in-flight variant: DOCUMENTED, residual
+`note_swap_with_cold_footprint` docs name both variants: (a) a spill that
+completes in the window keeps the pre-swap tag; (b) a spill in flight at
+the swap completes into the other Database as a ghost, the swapped-away
+in-flight record stays (memory; that db refuses SWAPDB until a restart),
+and a kill -9 before a fold leaves a phantom copy in the old db
+(`finish_replay_cold_reconcile` keeps the unmarked slot). Not reproduced
+(reviewer: 0 in 3,914 racing swaps). Design for the fix: a per-shard
+"swap pending (a, b)" prepare, broadcast before the check, under which
+eviction skips victims of `a`/`b` and the check waits for their in-flight
+spills; cleared after the swap (or the refusal). A cross-shard protocol
+step (coordinator + eviction, WS21's `eviction.rs`), so left out.
+
+### F5 → moon#1277 — FIXED, with a design deviation
+- Reproduced: 4/4 keys back with PTTL -1 at s1/s4 on both runtimes (redis
+  0/4).
+- Prescribed: suppress lazy expiry while loading. Rejected: redis is exact
+  there only because it logs an expiry's `DEL` BEFORE the command that
+  observed it. moon defers that `DEL` to the active-expiry tick (moon#542),
+  so a write that saw a just-expired key live (an `INCR` right after a
+  rate-limit window, `SET … NX` on a lock that lapsed) is logged with no
+  `DEL` ahead of it; suppression would replay it onto the OLD value.
+- Chosen: `persistence::replay::clock` pins the expiry-judgment clock of a
+  replay to the newest mtime of the log being replayed, capped at the wall
+  clock; `DispatchReplayEngine::replay_command` sets every db's cached clock
+  to it for the record and hands the databases back on the wall clock
+  after it. Every record was written no later than that mtime, so a key
+  alive at the log's last write is alive for every record, and one expired
+  before it is judged expired exactly as before: never worse than the wall
+  clock. Pinned at `aof::replay_aof` (flat file), `replay_multi_part` and
+  `replay_per_shard` (the incr files; a base judges nothing), and the Phase
+  4 WAL pass (newest `*.wal`).
+- Red → green: lib `replay::clock` (red with the pin disabled: `s` = `x`
+  TTL 0, `n` = `1` TTL 0); real server `perf_ws20_review::moon_1277_*` at
+  s1/s4 with and without a BGREWRITEAOF (control: a persistent key must
+  replay), red 4/4 on `86cd20e8` both runtimes, green after; WAL-only
+  recovery (`--wal-kv-log on`, AOF removed) at s4: cross-shard keys back
+  persistent on `86cd20e8`, none after.
+- Residuals: an mtime that lies later than the log (a copied file) errs to
+  the wall clock (the old behaviour); the replica's live apply judges on the
+  wall clock (a replica lagging across a deadline can still build a fresh
+  key from a master RMW; redis never expires keys for master-stream
+  commands); `replay_ordered_merge` is unpinned (no production emitter).
+
+### F6 — #1236's no-AOF quadrant: FIXED
+`snapshot::shard_snapshot_load_noting_expired` names each `(db, key)` the
+loader skipped as expired (`shard_snapshot_load` keeps its signature, so
+`restore_from_persistence_v2` is untouched); Phase 3 of
+`recover_shard_v3_pitr` hands them, after the cold attach, to
+`snapshot_hold::drop_cold_shadows_of_expired_image_keys`, a no-op with an
+AOF (the log replays afterwards and a later marker may authorize a newer
+slot). It drops a pre-snapshot copy the image superseded or a post-snapshot
+spill (outside the no-AOF RPO). Red → green:
+`crash_recovery_cold_no_aof::no_aof_cold_keys_overwritten_with_a_ttl_*`
+(new): even probes back OLD on `86cd20e8` monoio s1 77, s4 95, tokio s1
+84, s4 93; 0 after on all four; unit twin in `snapshot_hold`. Limit: once a
+LATER snapshot no longer names the key, a crash brings the slot back if the
+file still backs other keys — finding N2, the same as a plain `DEL`.
+
+### F7 — the #1236 boot cost: documented (SUMMARY / CHANGELOG)
+Reviewer's numbers: 200k keys expired in the base → DBSIZE 199k and 49 MB
+right after boot, reaped in ~95 s, +5.29 MB of DEL records in the AOF, and
+with `--maxmemory 32mb noeviction` writes answer `-OOM` until reaped.
+
+### F8, F9 — test flakes
+- F8 (`6f6ed4c4`): `rdb_expired_load_tests` TTL 30 ms → 1 s, waiting on the
+  clock. With a 50 ms delay injected before the save: old red (left 1,
+  right 2), new green.
+- F9 (`1eb5b28e`): the no-AOF promote case waits until the sweep has
+  DECIDED on every emptied file (`cold_files_pending_unlink` == files on
+  disk, or none left) instead of `sleep(6)` — still red on
+  `main-4a96cd5f-rel` (121 → 0, every file unlinked); the WS20 AOF cases run
+  `--appendfsync always` (the 2 s pause left only lets spills complete); the
+  TTL cases' "setup < 20 s" assertion is gone (a TTL that passes live is
+  reaped with its DEL logged: absent either way).
+- The crash suite had grown to 1629 lines: split (`ad3edc6d`) into
+  `crash_recovery_cold_del_rewrite.rs` (AOF), `crash_recovery_cold_no_aof.rs`
+  and the shared `crash_recovery_cold_support/`; `crash-matrix.yml` runs
+  the new suite at s4 and s1 too.
+
+### F10, F11 — SWAPDB refusal text and the bounded spin
+`ERR SWAPDB is not allowed while either database has keys or unreclaimed
+spill files in the disk-offload cold tier; after deleting or reading back
+its cold keys, run BGREWRITEAOF (appendonly yes) or BGSAVE (appendonly no)
+and retry` (unit-pinned). The foreign check spins up to 20,000 `yield_now`
+on the connection's shard thread (~7.5 ms) and answers `ERR SWAPDB could
+not check the disk-offload cold tier of every shard, try again`; a second
+in-process server reads the first one's registry (embedded tests only).
+Both documented in code and `docs/production-guide.md`.
+
+### moon#1275 — FIXED (`b3b029d3`)
+`ShardDatabases::publish_wal_kv_log` / `wal_kv_log(shard)`: the SPSC drain
+publishes the per-shard `--wal-kv-log` decision, and `coordinate_swapdb`'s
+local leg writes its WAL record only when it is on. Audit: every other WAL
+v3 write outside the SPSC arms is a graph, workspace or transaction record.
+Red → green: `perf_ws20_review::moon_1275_*` (tokio s1 `86cd20e8`: every key
+lost) and the two tokio s1 `keys_spilled_after_a_swapdb_*` crash cases (101
+and 98 probe states wrong → green).
+
+### New findings (pre-existing; for filing)
+- **N1 — tokio `--shards 1 --appendonly no` replays a leftover
+  `appendonly.aof` at every boot** (redis ignores the file then).
+  `probe_tokio_stale_aof.py`: `SET a; SET b` under `--appendonly yes`,
+  clean stop, restart with `--appendonly no --save ""` (the keys load from
+  the stale AOF), FLUSHALL + BGSAVE, kill -9, restart → both keys back on
+  tokio s1 (replayed again: nothing logs the FLUSHALL); monoio: 0. It also masked the F1 cases on that layout (DBSIZE
+  16200 with the fix), hence `drop_phase1_aof` in the no-AOF suite.
+- **N2 — without an AOF, cold-key removals are not durable.** A snapshot
+  holds the hot keyspace only and the cold plane records no removals, so
+  `DEL` of a cold key whose file still backs other keys, then BGSAVE, then
+  kill -9 brings it back: 46/100 on `main-4a96cd5f-rel`, 36/100 on this
+  branch (`probe_noaof_del.py`). Needs a durable no-AOF tombstone set (e.g.
+  the snapshot carrying each db's dead cold keys, applied after the cold
+  attach — the F6 hook is the place).
+- Over-cap files grown by wiring only: `recovery.rs` 2499 → 2506 (#1277 one
+  line, F6 six), `event_loop.rs` 3279 → 3296 (F1's post-snapshot sweep,
+  both runtimes), `shared_databases.rs` 2728 → 2734 (#1275's field; its
+  accessors live in `shared_databases/wal_kv_log.rs`, `67230735`),
+  `replication/apply.rs` 1898 → 1903, `coordinator.rs` 4487 → 4491,
+  `spsc_handler.rs` 4981 → 4983, `aof/mod.rs` 1989 → 1990; `snapshot.rs`
+  stays 1499.
+
+### Gates (final code `67230735`)
+fmt, audit-unsafe (no new `unsafe`), audit-unwrap, audit-test-tempdirs,
+audit-encoding-limits, clippy `--all-targets -D warnings` on both
+runtimes, tokio `check --all-targets`: clean. Lib (storage persistence
+shard replication server command scripting): monoio 4294/0, tokio 4067/0.
+`perf_ws20_review`: monoio 7/7, tokio 6/6 (+ tokio replica under a monoio
+master). `crash_recovery_cold_del_rewrite --ignored` 21/21 and
+`crash_recovery_cold_no_aof --ignored` 6/6 at s1 and s4 on both runtimes
+(binaries of `a4307d0e`; `67230735` is an accessor move, re-verified by
+the lib and review suites and the tokio s1 SWAPDB crash cases). Replication
+(`--ignored`) and AOF/TTL replay regression suites green; the one tokio
+failure (`cold_tier_aof_double_apply_902::writes_to_a_cold_key_after_a_
+rewrite_survive_kill9`, `#[ignore]`) is red on `86cd20e8` too — it reads a
+manifest the flat-file layout does not have.

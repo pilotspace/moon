@@ -205,6 +205,8 @@ pub(crate) fn drain_spsc_shared(
     // only changes where a victim goes, and there is no victim without a
     // limit. See `eviction::write_gate_active`.
     let evict_active = crate::storage::eviction::write_gate_active();
+    // moon#1275: the SWAPDB local leg gates its WAL record on the same flag.
+    shard_databases.publish_wal_kv_log(shard_id, wal_kv_log);
 
     // Collect all messages first, then run the command legs under single borrow.
     //

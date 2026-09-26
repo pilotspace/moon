@@ -97,14 +97,17 @@ jobs:
       # no real-server leg here; only its lib tests cover it.
       # moon#1253: the same, for a key whose spill was still IN FLIGHT when it
       # was deleted, flushed or overwritten (no settle before the mutation).
+      # moon#1260 / moon#1236: the `--appendonly no` cases (a promoted,
+      # flushed or TTL-overwritten inherited cold key and a kill -9).
       - name: Cold-tier DEL survives rewrite + restart (moon#1215), --shards 4 and 1
         if: success() || failure()
         run: |
           cargo build --release --bin moon --test crash_recovery_cold_del_rewrite \
-            --test crash_recovery_cold_del_inflight_1253
+            --test crash_recovery_cold_del_inflight_1253 --test crash_recovery_cold_no_aof
           export MOON_BIN="$CARGO_TARGET_DIR/release/moon"
           for s in 4 1; do
-            for t in crash_recovery_cold_del_rewrite crash_recovery_cold_del_inflight_1253; do
+            for t in crash_recovery_cold_del_rewrite crash_recovery_cold_del_inflight_1253 \
+              crash_recovery_cold_no_aof; do
               MOON_TEST_COLD_DEL_SHARDS=$s cargo test --release --test "$t" \
                 -- --ignored --test-threads=1 2>&1 | tee -a crash-matrix-nightly.log
               test "${PIPESTATUS[0]}" -eq 0 || exit 1

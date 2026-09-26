@@ -1041,6 +1041,7 @@ pub fn replay_aof(
     path: &Path,
     engine: &dyn CommandReplayEngine,
 ) -> Result<usize, MoonError> {
+    let _clock = crate::persistence::replay::clock::pin_replay_clock_to_files(&[path]);
     replay_aof_with_resync(databases, path, engine, aof_best_effort_resync_enabled())
 }
 

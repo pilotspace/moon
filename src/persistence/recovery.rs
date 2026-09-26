@@ -230,6 +230,7 @@ pub fn recover_shard_v3_pitr(
     // for legacy v1 or unstamped v2 files). Skipping forces full WAL
     // replay up to the target -- slower but correct.
     let snap_path = shard_dir.join(format!("shard-{}.rrdshard", shard_id));
+    let mut snapshot_expired = Vec::new(); // moon#1236: dropped from the cold index below
     if snap_path.exists() && !kv.snapshot() {
         info!(
             "Shard {}: snapshot load skipped — the multi-part AOF is the KV authority \
@@ -276,7 +277,8 @@ pub fn recover_shard_v3_pitr(
         };
 
         if snapshot_ok {
-            match crate::persistence::snapshot::shard_snapshot_load(databases, &snap_path) {
+            use crate::persistence::snapshot::shard_snapshot_load_noting_expired as load;
+            match load(databases, &snap_path, &mut snapshot_expired) {
                 Ok(n) => {
                     info!("Shard {}: loaded {} keys from snapshot", shard_id, n);
                 }
@@ -516,6 +518,10 @@ pub fn recover_shard_v3_pitr(
                         }
                     }
                 }
+                crate::storage::tiered::snapshot_hold::drop_cold_shadows_of_expired_image_keys(
+                    databases,
+                    snapshot_expired,
+                );
                 // Crash-orphan sweep (task #55): heap files written but never
                 // registered in the manifest (crash between spill write and
                 // manifest commit) leak disk forever otherwise. Manifest opened
@@ -586,6 +592,7 @@ pub fn recover_shard_v3_pitr(
     let mut kv_records_db_out_of_range = 0usize;
     let wal_dir = shard_dir.join("wal-v3");
     if wal_dir.exists() {
+        let _clock = crate::persistence::replay::clock::pin_replay_clock_to_wal_dir(&wal_dir);
         let mut selected_db = 0usize;
         let on_command = &mut |record: &WalRecord| {
             match record.record_type {

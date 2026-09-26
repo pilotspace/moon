@@ -27,15 +27,31 @@
 //!   written and promoted back after it is in neither the image nor any file
 //!   once that file goes.
 //!
+//! - (review F1) a file that went zero-ref BEFORE a snapshot started must be
+//!   released by that snapshot, not by one that starts after the next orphan
+//!   sweep: the snapshot already excludes the keys it backed (deleted or
+//!   flushed — a FLUSHALL's own save, or a BGSAVE, runs before the sweep
+//!   sees the file). So the start hook holds every queued zero-ref file with
+//!   the epoch BEFORE the start ([`ColdIndex::hold_queued_before_snapshot`]),
+//!   and the shard sweeps right after a successful snapshot
+//!   (`shard::timers::sweep_after_snapshot`), so those files go at once
+//!   instead of bringing the deleted keys back after a crash.
+//!
 //! State is per shard thread: the snapshot lifecycle hooks
 //! (`shard::persistence_tick`) and the orphan sweep (`shard::timers`) both run
-//! on the shard's own thread, on both runtimes. Only a process with a place
-//! to write snapshots gets the hold (`SNAPSHOT_DIR_ABSENT` false): with no
-//! snapshot possible nothing could ever release a held file, and a restart
-//! does not load hot data anyway.
+//! on the shard's own thread, on both runtimes.
+//!
+//! Every process without an AOF gets the hold, with or without save points
+//! (REVIEW-WS20 F2): since moon#1267 a snapshot can always be written
+//! (`BGSAVE` / `SHUTDOWN SAVE` go to `--dir` whatever the save rules say),
+//! and the cold tier is rebuilt at every boot, so a promoted key's file is
+//! its durable copy in every no-AOF configuration. Without save points only
+//! a manual `BGSAVE` or `SHUTDOWN SAVE` releases held files (and a database
+//! with held files refuses SWAPDB until then, moon#1237).
 
 use std::cell::Cell;
 
+use super::cold_index::ColdIndex;
 use super::unlink_hold::FoldView;
 
 /// Snapshot lifecycle counters of the current shard thread.
@@ -61,7 +77,49 @@ thread_local! {
     };
 }
 
+/// Whether this process uses the snapshot hold: it has no AOF writer (an AOF
+/// process holds by folds, [`super::unlink_hold`]). Every AOF writer pool is
+/// created at boot, before any shard runs (`dead_slots::enable_ledger`).
+#[must_use]
+pub fn applies() -> bool {
+    #[cfg(test)]
+    {
+        FORCE_APPLIES.with(Cell::get)
+    }
+    #[cfg(not(test))]
+    {
+        !super::dead_slots::aof_consumer_present()
+    }
+}
+
+/// The epoch before the next start: the stamp of a file already zero-ref
+/// when a snapshot starts (released once that snapshot succeeds).
+#[must_use]
+pub fn epoch_before_start() -> u64 {
+    COUNTERS.with(|c| c.get().events)
+}
+
+impl ColdIndex {
+    /// A snapshot is about to start (moon#1260 review F1): hold every queued
+    /// zero-ref file with `stamp` ([`epoch_before_start`]), so the
+    /// snapshot's success releases it. A file the boot rebuild found missing
+    /// keeps its fast path (nothing to protect).
+    pub fn hold_queued_before_snapshot(&mut self, stamp: u64) {
+        if self.pending_unlink.is_empty() {
+            return;
+        }
+        let missing = &self.missing_at_rebuild;
+        let (keep, hold): (Vec<u64>, Vec<u64>) = std::mem::take(&mut self.pending_unlink)
+            .into_iter()
+            .partition(|f| missing.contains(f));
+        self.pending_unlink = keep;
+        self.hold.hold_stamped(hold, stamp);
+    }
+}
+
 /// A snapshot of this shard started (BGSAVE, an auto-save, SHUTDOWN SAVE).
+/// Call [`ColdIndex::hold_queued_before_snapshot`] on every database first
+/// (`shard::timers::note_snapshot_started` does both).
 pub fn note_snapshot_started() {
     COUNTERS.with(|c| {
         let mut s = c.get();
@@ -88,56 +146,62 @@ pub fn note_snapshot_finished(ok: bool) {
     });
 }
 
-/// The hold view for a no-AOF process, or `None` when no snapshot can be
-/// written (no persistence directory): then files go as before.
-pub fn snapshot_fold_view(next_file_id: u64) -> Option<FoldView> {
-    if crate::command::persistence::SNAPSHOT_DIR_ABSENT.load(std::sync::atomic::Ordering::Relaxed)
-        || no_snapshot_dir_forced()
-    {
-        return None;
-    }
+/// The hold view for a no-AOF process (the orphan sweep's, see the module
+/// doc).
+#[must_use]
+pub fn snapshot_fold_view(next_file_id: u64) -> FoldView {
     let s = COUNTERS.with(Cell::get);
-    Some(FoldView {
+    FoldView {
         epoch: s.events,
         committed_floor: s.committed,
         next_file_id,
         hold_all: s.in_progress,
-    })
+    }
+}
+
+/// moon#1236, the no-AOF quadrant (REVIEW-WS20 F6): without an AOF the boot
+/// snapshot is the KV authority, and a key it holds but skipped as expired
+/// (`snapshot::shard_snapshot_load_noting_expired`) is ABSENT. Its cold slot
+/// — a copy spilled before the snapshot, which the image's value
+/// superseded, or a spill after it, outside the RPO — surfaced once the
+/// cold index was attached after the load, bringing the OLD value back.
+/// Call after the attach; drops those cold entries and returns how many.
+///
+/// With an AOF nothing is dropped: the log replays after the snapshot and
+/// decides (a later `MOON.SPILLED` marker can authorize a newer slot).
+/// Idempotent across crashes while that snapshot is the latest. A later one
+/// no longer names the key, so a crash after it brings the slot back if its
+/// file still backs other keys — like any cold key removed without an AOF,
+/// a `DEL` included: the no-AOF cold plane records no removals.
+pub fn drop_cold_shadows_of_expired_image_keys(
+    databases: &mut [crate::storage::db::Database],
+    expired: Vec<(usize, bytes::Bytes)>,
+) -> usize {
+    if !applies() {
+        return 0;
+    }
+    expired
+        .into_iter()
+        .filter(|(db, key)| {
+            databases
+                .get_mut(*db)
+                .and_then(|d| d.cold_index.as_mut())
+                .is_some_and(|ci| ci.remove(key))
+        })
+        .count()
 }
 
 #[cfg(test)]
 thread_local! {
-    static NO_SNAPSHOT_DIR: Cell<bool> = const { Cell::new(false) };
+    /// Test-only [`applies`]: off unless a test opts in (the process-wide
+    /// AOF flag depends on which other tests ran).
+    static FORCE_APPLIES: Cell<bool> = const { Cell::new(false) };
 }
 
+/// Test-only: this thread behaves as a process with no AOF writer.
 #[cfg(test)]
-fn no_snapshot_dir_forced() -> bool {
-    NO_SNAPSHOT_DIR.with(Cell::get)
-}
-
-#[cfg(not(test))]
-#[inline]
-fn no_snapshot_dir_forced() -> bool {
-    false
-}
-
-/// Test-only: behave, on this thread, as a process started with no
-/// persistence directory (`SNAPSHOT_DIR_ABSENT` is process-global, and a
-/// parallel test's BGSAVE must not see it flip) until the guard drops.
-#[cfg(test)]
-pub(crate) fn force_no_snapshot_dir() -> NoSnapshotDirGuard {
-    NO_SNAPSHOT_DIR.with(|c| c.set(true));
-    NoSnapshotDirGuard
-}
-
-#[cfg(test)]
-pub(crate) struct NoSnapshotDirGuard;
-
-#[cfg(test)]
-impl Drop for NoSnapshotDirGuard {
-    fn drop(&mut self) {
-        NO_SNAPSHOT_DIR.with(|c| c.set(false));
-    }
+pub(crate) fn force_applies(on: bool) {
+    FORCE_APPLIES.with(|c| c.set(on));
 }
 
 #[cfg(test)]
@@ -150,18 +214,18 @@ mod tests {
     fn a_zero_ref_file_waits_for_a_snapshot_that_starts_after_it() {
         let mut h = UnlinkHold::default();
         // Boot: file 5 existed (inherited), the counter is at 10.
-        h.observe(snapshot_fold_view(10).expect("view"));
+        h.observe(snapshot_fold_view(10));
         assert!(h.admit(vec![5]).unlink.is_empty(), "held: no snapshot yet");
 
         // A snapshot that started BEFORE the next decision only... starts.
         note_snapshot_started();
-        h.observe(snapshot_fold_view(12).expect("view"));
+        h.observe(snapshot_fold_view(12));
         assert!(
             h.admit(vec![11]).unlink.is_empty(),
             "a file minted before the snapshot's start is held too"
         );
         note_snapshot_finished(true);
-        h.observe(snapshot_fold_view(12).expect("view"));
+        h.observe(snapshot_fold_view(12));
         assert_eq!(
             h.admit(vec![]).unlink,
             vec![5],
@@ -172,13 +236,52 @@ mod tests {
         // A failed snapshot releases nothing; a later good one does.
         note_snapshot_started();
         note_snapshot_finished(false);
-        h.observe(snapshot_fold_view(12).expect("view"));
+        h.observe(snapshot_fold_view(12));
         assert!(h.admit(vec![]).unlink.is_empty());
         note_snapshot_started();
         note_snapshot_finished(true);
-        h.observe(snapshot_fold_view(12).expect("view"));
+        h.observe(snapshot_fold_view(12));
         assert_eq!(h.admit(vec![]).unlink, vec![11]);
         assert!(h.is_empty());
+    }
+
+    /// REVIEW-WS20 F1 unit proof, made permanent at the index level: a file
+    /// whose keys were all deleted before a snapshot started must be released
+    /// by that snapshot's success. The reviewer's first shape queued the file
+    /// only at the sweep AFTER the save (stamp = post-save epoch), which held
+    /// it until a SECOND snapshot; the start hook now holds it pre-start.
+    #[test]
+    fn review_ws20_a_file_emptied_before_a_snapshot_is_released_by_it() {
+        use crate::persistence::kv_page::ValueType;
+        use crate::storage::tiered::cold_index::ColdLocation;
+        let mut ci = ColdIndex::new();
+        let loc = ColdLocation {
+            file_id: 5,
+            page_idx: 0,
+            slot_idx: 0,
+            ttl_ms: None,
+            value_type: ValueType::String,
+        };
+        ci.insert(bytes::Bytes::from_static(b"k"), loc);
+        // Boot: the first sweep observes a view and has nothing to decide.
+        ci.hold.observe(snapshot_fold_view(10));
+        assert!(ci.hold.admit(Vec::new()).unlink.is_empty());
+        // FLUSHALL / DEL empties file 5: queued zero-ref.
+        assert!(ci.remove(b"k"));
+        // Its save (moon#1264), or a BGSAVE, starts and succeeds before the
+        // next sweep. The start hook holds the queued file pre-start.
+        ci.hold_queued_before_snapshot(epoch_before_start());
+        note_snapshot_started();
+        note_snapshot_finished(true);
+        // The next sweep (the event loop runs one right after the save).
+        ci.hold.observe(snapshot_fold_view(10));
+        let queued = std::mem::take(&mut ci.pending_unlink);
+        let first = ci.hold.admit(queued).unlink;
+        assert!(
+            first.contains(&5),
+            "file 5 is still held after a successful snapshot that already excludes \
+             its deleted keys (first={first:?}); a kill -9 now brings them back"
+        );
     }
 
     /// While a snapshot runs, even a file minted after its start is held (its
@@ -186,27 +289,90 @@ mod tests {
     #[test]
     fn a_file_that_goes_zero_ref_during_a_snapshot_is_held_past_it() {
         let mut h = UnlinkHold::default();
-        h.observe(snapshot_fold_view(10).expect("view"));
+        h.observe(snapshot_fold_view(10));
         assert_eq!(
             h.admit(vec![10]).unlink,
             vec![10],
             "minted after the boot view"
         );
         note_snapshot_started();
-        h.observe(snapshot_fold_view(20).expect("view"));
+        h.observe(snapshot_fold_view(20));
         assert!(
             h.admit(vec![15]).unlink.is_empty(),
             "held while the snapshot runs"
         );
         note_snapshot_finished(true);
-        h.observe(snapshot_fold_view(20).expect("view"));
+        h.observe(snapshot_fold_view(20));
         assert!(
             h.admit(vec![]).unlink.is_empty(),
             "that snapshot started before it"
         );
         note_snapshot_started();
         note_snapshot_finished(true);
-        h.observe(snapshot_fold_view(20).expect("view"));
+        h.observe(snapshot_fold_view(20));
         assert_eq!(h.admit(vec![]).unlink, vec![15]);
+    }
+
+    /// moon#1236 review F6: without an AOF, a key the boot snapshot skipped
+    /// as expired loses its cold slot (`k`, db 0); a key it did not name
+    /// (`other`) and a db without a cold index are untouched. With an AOF
+    /// nothing is dropped (the log decides).
+    #[test]
+    fn a_key_the_snapshot_held_as_expired_loses_its_cold_shadow_without_an_aof() {
+        use crate::persistence::kv_page::ValueType;
+        use crate::storage::db::Database;
+        use crate::storage::tiered::cold_index::ColdLocation;
+        let dbs = || {
+            let mut ci = ColdIndex::new();
+            for (slot, key) in [b"k".as_slice(), b"other"].into_iter().enumerate() {
+                let loc = ColdLocation {
+                    file_id: 5,
+                    page_idx: 0,
+                    slot_idx: slot as u16,
+                    ttl_ms: None,
+                    value_type: ValueType::String,
+                };
+                ci.insert(bytes::Bytes::copy_from_slice(key), loc);
+            }
+            let mut dbs = vec![Database::new(), Database::new()];
+            dbs[0].cold_index = Some(ci);
+            dbs
+        };
+        let expired = || {
+            vec![
+                (0, bytes::Bytes::from_static(b"k")),
+                (1, bytes::Bytes::from_static(b"k")),
+                (7, bytes::Bytes::from_static(b"k")),
+            ]
+        };
+        let cold = |dbs: &[Database], key: &[u8]| {
+            dbs[0]
+                .cold_index
+                .as_ref()
+                .is_some_and(|ci| ci.lookup(key).is_some())
+        };
+
+        force_applies(true);
+        let mut no_aof = dbs();
+        assert_eq!(
+            drop_cold_shadows_of_expired_image_keys(&mut no_aof, expired()),
+            1
+        );
+        assert!(
+            !cold(&no_aof, b"k"),
+            "the expired image key's slot is dropped"
+        );
+        assert!(
+            cold(&no_aof, b"other"),
+            "a key the image did not name keeps its slot"
+        );
+
+        force_applies(false);
+        let mut with_aof = dbs();
+        assert_eq!(
+            drop_cold_shadows_of_expired_image_keys(&mut with_aof, expired()),
+            0
+        );
+        assert!(cold(&with_aof, b"k"), "with an AOF the log decides");
     }
 }

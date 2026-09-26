@@ -70,8 +70,9 @@ use crate::storage::tiered::cold_index::ColdLocation;
 #[path = "swapdb_cold.rs"]
 mod swapdb_cold;
 pub use swapdb_cold::{
-    ERR_SWAPDB_BUSY, ERR_SWAPDB_COLD, note_swap_with_cold_footprint, swap_refused_for_cold,
-    swap_replayed, swapdb_cold_refusal,
+    ERR_SWAPDB_BUSY, ERR_SWAPDB_COLD, note_swap_with_cold_footprint,
+    replica_swap_needs_full_resync, replica_swap_resyncs, swap_refused_for_cold, swap_replayed,
+    swapdb_cold_refusal,
 };
 
 /// The `MOON.SPILLED` markers one database has replayed in its open
@@ -198,6 +199,14 @@ impl Database {
                 });
             }
         }
+    }
+
+    /// Pin the clock expiry is judged by during an AOF replay to the log's
+    /// last-write time (moon#1277, `persistence::replay::clock`). The live
+    /// event loop overwrites it with the wall clock on its first refresh.
+    #[inline]
+    pub fn set_replay_clock_ms(&mut self, ms: u64) {
+        self.cached_now_ms = ms;
     }
 
     /// Whether an AOF-authority replay gate is currently installed.

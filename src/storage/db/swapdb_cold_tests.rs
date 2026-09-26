@@ -369,3 +369,66 @@ fn swapdb_is_refused_while_either_database_has_cold_data() {
         "either order"
     );
 }
+
+/// moon#1275: the SWAPDB local leg writes its WAL v3 record only when the
+/// shard's SPSC drain published `--wal-kv-log` on (the same flag its SPSC arm
+/// uses); unpublished, it is off.
+#[test]
+fn the_wal_kv_log_flag_is_per_shard_and_off_until_published() {
+    let (shared, _inits) = crate::shard::shared_databases::ShardDatabases::new(vec![
+        vec![Database::new()],
+        vec![Database::new()],
+    ]);
+    assert!(!shared.wal_kv_log(0) && !shared.wal_kv_log(1));
+    shared.publish_wal_kv_log(1, true);
+    assert!(!shared.wal_kv_log(0) && shared.wal_kv_log(1));
+    shared.publish_wal_kv_log(1, false);
+    assert!(!shared.wal_kv_log(1));
+    assert!(!shared.wal_kv_log(7), "out of range reads off");
+}
+
+/// REVIEW-WS20 F10: the refusal names the way out — per persistence mode —
+/// and keeps the `ERR …` shape clients match on.
+#[test]
+fn the_cold_refusal_names_the_remedy_per_persistence_mode() {
+    let msg = std::str::from_utf8(super::ERR_SWAPDB_COLD).expect("utf8");
+    assert!(msg.starts_with("ERR SWAPDB "), "{msg}");
+    assert!(
+        msg.contains("BGREWRITEAOF (appendonly yes)") && msg.contains("BGSAVE (appendonly no)"),
+        "the refusal must say how to clear it: {msg}"
+    );
+    assert!(!msg.contains('\n') && !msg.contains('\r'), "{msg:?}");
+}
+
+/// moon#1278: a replica resyncs in full instead of applying its master's
+/// SWAPDB when either database has a cold footprint on its shard; clean
+/// databases, `a == b` and unusable arguments apply (or skip) as before.
+#[test]
+fn a_replica_resyncs_instead_of_swapping_over_its_cold_tier() {
+    use crate::protocol::Frame;
+    let mut cold = Database::new();
+    let mut ci = ColdIndex::new();
+    ci.insert(Bytes::from_static(b"k"), loc(5));
+    cold.cold_index = Some(ci);
+    let sets =
+        crate::shard::db_plane::build_sets(vec![vec![Database::new(), cold, Database::new()]]);
+    let set = &sets[0];
+    let args = |a: &'static [u8], b: Frame| vec![Frame::BulkString(Bytes::from_static(a)), b];
+    let needs = |args: Vec<Frame>| super::replica_swap_needs_full_resync(set, &args);
+    let bulk = |b: &'static [u8]| Frame::BulkString(Bytes::from_static(b));
+    assert!(needs(args(b"0", bulk(b"1"))), "db 1 is cold");
+    assert!(
+        needs(args(b"1", Frame::Integer(2))),
+        "either side, integer args"
+    );
+    assert!(!needs(args(b"0", bulk(b"2"))), "two clean databases swap");
+    assert!(!needs(args(b"1", bulk(b"1"))), "a == b is a no-op");
+    assert!(
+        !needs(args(b"1", bulk(b"9"))),
+        "out of range: the apply skips it"
+    );
+    assert!(
+        !needs(args(b"x", bulk(b"1"))),
+        "unparsable: the apply skips it"
+    );
+}
