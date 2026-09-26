@@ -481,6 +481,7 @@ impl super::Shard {
         // the per-shard WAL. Resolved per drain cycle (Auto is dynamic on the
         // CDC registry); see wal_append_and_fanout for the rationale.
         let wal_kv_log_mode = server_config.wal_kv_log_mode();
+        shard_databases.seed_wal_kv_log(shard_id, wal_kv_log_mode, appendonly_enabled); // moon#1275
         if wal_kv_log_mode == crate::config::WalKvLogMode::Off && !appendonly_enabled {
             tracing::warn!(
                 shard_id,

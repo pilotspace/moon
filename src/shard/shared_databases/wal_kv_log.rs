@@ -6,8 +6,24 @@
 use std::sync::atomic::Ordering;
 
 use super::ShardDatabases;
+use crate::config::WalKvLogMode;
 
 impl ShardDatabases {
+    /// Seed shard `shard_id`'s flag from the config when its event loop
+    /// starts, before it serves a connection (REVIEW-FINAL-P5B item 3): until
+    /// the first SPSC drain published, a SWAPDB served there read `false`
+    /// and wrote no WAL record with `--wal-kv-log on`. The seed is the
+    /// decision that drain makes with no CDC subscriber, and none can be
+    /// attached before the shard serves: `Auto` logs only without an AOF.
+    pub fn seed_wal_kv_log(&self, shard_id: usize, mode: WalKvLogMode, appendonly: bool) {
+        let on = match mode {
+            WalKvLogMode::On => true,
+            WalKvLogMode::Off => false,
+            WalKvLogMode::Auto => !appendonly,
+        };
+        self.publish_wal_kv_log(shard_id, on);
+    }
+
     /// Record this shard's `--wal-kv-log` decision (moon#1275): whether KV
     /// command records go to its WAL v3. Set by every SPSC drain cycle,
     /// which already computes it; a store only when it changed.
