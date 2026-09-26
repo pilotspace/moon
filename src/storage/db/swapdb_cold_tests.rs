@@ -369,3 +369,20 @@ fn swapdb_is_refused_while_either_database_has_cold_data() {
         "either order"
     );
 }
+
+/// moon#1275: the SWAPDB local leg writes its WAL v3 record only when the
+/// shard's SPSC drain published `--wal-kv-log` on (the same flag its SPSC arm
+/// uses); unpublished, it is off.
+#[test]
+fn the_wal_kv_log_flag_is_per_shard_and_off_until_published() {
+    let (shared, _inits) = crate::shard::shared_databases::ShardDatabases::new(vec![
+        vec![Database::new()],
+        vec![Database::new()],
+    ]);
+    assert!(!shared.wal_kv_log(0) && !shared.wal_kv_log(1));
+    shared.publish_wal_kv_log(1, true);
+    assert!(!shared.wal_kv_log(0) && shared.wal_kv_log(1));
+    shared.publish_wal_kv_log(1, false);
+    assert!(!shared.wal_kv_log(1));
+    assert!(!shared.wal_kv_log(7), "out of range reads off");
+}

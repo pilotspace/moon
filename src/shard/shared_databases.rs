@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use parking_lot::{Mutex, MutexGuard};
 use smallvec::SmallVec;
@@ -192,6 +192,10 @@ pub struct ShardDatabases {
     pub store_memory_per_shard: Box<[Arc<ShardStoreMemory>]>,
     /// Per-shard cold-tier stats, published by the cold orphan sweep (moon#656).
     pub cold_per_shard: Box<[Arc<ShardColdStats>]>,
+    /// Per-shard `--wal-kv-log` decision of the latest SPSC drain cycle
+    /// (moon#1275), for the connection-side legs that write a KV record to
+    /// the WAL themselves (the SWAPDB local leg). `false` until published.
+    wal_kv_log: Box<[AtomicBool]>,
 }
 
 impl ShardDatabases {
@@ -247,6 +251,7 @@ impl ShardDatabases {
             elastic_budgets: elastic_budgets.clone(),
             store_memory_per_shard: store_memory_per_shard.clone(),
             cold_per_shard,
+            wal_kv_log: (0..num_shards).map(|_| AtomicBool::new(false)).collect(),
         });
 
         // Move the databases into the L4 shared read plane, then hand each
@@ -338,6 +343,29 @@ impl ShardDatabases {
     #[inline]
     pub fn db_count(&self) -> usize {
         self.db_count
+    }
+
+    /// Record this shard's `--wal-kv-log` decision (moon#1275): whether KV
+    /// command records go to its WAL v3. Set by every SPSC drain cycle,
+    /// which already computes it; a store only when it changed.
+    #[inline]
+    pub fn publish_wal_kv_log(&self, shard_id: usize, on: bool) {
+        if let Some(flag) = self.wal_kv_log.get(shard_id)
+            && flag.load(Ordering::Relaxed) != on
+        {
+            flag.store(on, Ordering::Relaxed);
+        }
+    }
+
+    /// Whether KV command records go to shard `shard_id`'s WAL v3 (see
+    /// [`Self::publish_wal_kv_log`]). A KV record written there otherwise
+    /// makes a tokio `--shards 1` recovery take the WAL for the KV authority
+    /// and never replay the AOF (moon#1275).
+    #[inline]
+    pub fn wal_kv_log(&self, shard_id: usize) -> bool {
+        self.wal_kv_log
+            .get(shard_id)
+            .is_some_and(|f| f.load(Ordering::Relaxed))
     }
 
     /// Get the per-shard memory publisher `Arc`.
