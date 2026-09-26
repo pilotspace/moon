@@ -7,11 +7,10 @@
 //! signals like a plain `SHUTDOWN`: with save points configured it writes a
 //! final snapshot first, and exits only once it is on disk.
 //!
-//! Here a signal takes the same path as `SHUTDOWN` with no argument
-//! ([`super::shutdown_save`]): wait for a save already running (auto-save or
-//! BGSAVE), then save every shard, within the one overall deadline
-//! ([`super::SHUTDOWN_SAVE_DEADLINE_MS`]), and only then cancel the server.
-//! The signal thread never blocks: the save runs on its own thread.
+//! Here a signal takes the path of `SHUTDOWN` with no argument
+//! ([`super::shutdown_save_until_done`]): wait for a save already running
+//! (auto-save or BGSAVE), then save every shard, and only then cancel the
+//! server. The signal thread never blocks: the save runs on its own thread.
 //!
 //! As in redis 7.0.15:
 //! - no save points: exit at once, no save (unchanged);
@@ -21,6 +20,12 @@
 //! - a second SIGINT while the final save runs: exit at once, unsaved
 //!   ("You insist... exiting now"); a second SIGTERM is logged.
 //!
+//! No deadline (review F4): redis saves synchronously however long it takes,
+//! so a large dataset must not turn a stop into "keep running". Every
+//! [`super::SAVE_STALL_MS`] without progress the wait logs redis's shutdown
+//! errors and that the stop stays armed; the server exits once the save is
+//! on disk. (It used to give up after one 20 s deadline and drop the stop.)
+//!
 //! `SHUTDOWN ABORT` cancels a signal's final save like a `SHUTDOWN`'s
 //! (moon#1264): the server keeps running.
 //!
@@ -29,11 +34,12 @@
 //! replace a good snapshot with a partial one.
 
 use std::future::Future;
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use tracing::{error, info, warn};
 
+use crate::config::RuntimeConfig;
 use crate::protocol::Frame;
 use crate::runtime::cancel::CancellationToken;
 use crate::runtime::channel::WatchSender;
@@ -60,8 +66,9 @@ impl ShutdownSignal {
 struct Armed {
     snapshot_trigger: WatchSender<u64>,
     num_shards: usize,
-    /// Save points are configured (`--save` with at least one rule).
-    save: bool,
+    /// The live config: save points are read when the signal lands (review
+    /// F10 — `CONFIG SET save` applies, as it does in redis).
+    runtime: Arc<parking_lot::RwLock<RuntimeConfig>>,
     shutdown: CancellationToken,
 }
 
@@ -71,19 +78,18 @@ static ARMED: OnceLock<Armed> = OnceLock::new();
 static SAVING: AtomicBool = AtomicBool::new(false);
 
 /// Called once by `main.rs` after the shard threads are spawned: from here a
-/// shutdown signal saves first when `save_points` has a rule
-/// ([`super::shutdown_default_should_save`], the rule plain `SHUTDOWN`
-/// follows).
+/// shutdown signal saves first when save points are configured at that
+/// moment ([`super::save_points_now`], the rule plain `SHUTDOWN` follows).
 pub fn arm(
     snapshot_trigger: WatchSender<u64>,
     num_shards: usize,
-    save_points: Option<&str>,
+    runtime: Arc<parking_lot::RwLock<RuntimeConfig>>,
     shutdown: CancellationToken,
 ) {
     let _ = ARMED.set(Armed {
         snapshot_trigger,
         num_shards,
-        save: super::shutdown_default_should_save(save_points),
+        runtime,
         shutdown,
     });
 }
@@ -93,7 +99,7 @@ pub fn arm(
 /// `shutdown-save` thread, which cancels the server once the save is on
 /// disk.
 pub fn on_signal(signal: ShutdownSignal, shutdown: &CancellationToken) {
-    let Some(armed) = ARMED.get().filter(|a| a.save) else {
+    let Some(armed) = ARMED.get().filter(|a| super::save_points_now(&a.runtime)) else {
         info!("{} received: shutting down", signal.name());
         shutdown.cancel();
         return;
@@ -146,13 +152,34 @@ fn save_then_exit(armed: &Armed) {
     }
 }
 
-/// [`super::shutdown_save`] on the calling OS thread: its polls sleep that
-/// thread (`std::thread::sleep`), so every await resolves at once.
+/// [`super::shutdown_save_until_done`] on the calling OS thread: its polls
+/// sleep that thread (`std::thread::sleep`), so every await resolves at once.
 fn save_blocking(snapshot_trigger: &WatchSender<u64>, num_shards: usize) -> Result<(), Frame> {
-    block_on_ready(super::shutdown_save(snapshot_trigger, num_shards, |d| {
+    let sleep = |d| {
         std::thread::sleep(d);
         std::future::ready(())
-    }))
+    };
+    block_on_ready(super::shutdown_save_until_done(
+        snapshot_trigger,
+        num_shards,
+        sleep,
+        &still_saving,
+    ))
+}
+
+/// Once per stall period of the final save: redis's shutdown errors, and
+/// what happens next — the stop is NOT dropped.
+fn still_saving(stalled: std::time::Duration) {
+    error!(
+        "Error trying to save the DB, can't exit yet: the final save has made no progress \
+         for {} s",
+        stalled.as_secs()
+    );
+    error!("Errors trying to shut down the server. Check the logs for more information.");
+    warn!(
+        "The stop stays armed: the server exits once the save is on disk \
+         (SIGINT again exits now, unsaved; SHUTDOWN ABORT cancels)"
+    );
 }
 
 /// Drive a future whose awaits all resolve at once to completion on this

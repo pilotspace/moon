@@ -34,22 +34,19 @@ pub(crate) async fn after_script_flush(flushall_everywhere: bool, ctx: &Connecti
 
 /// After a `FLUSHALL` reached every shard.
 async fn after_flushall(ctx: &ConnectionContext) {
-    persistence::save_after_flushall(
-        &ctx.snapshot_trigger_tx,
-        ctx.num_shards,
-        ctx.config.save.as_deref(),
-    )
-    .await;
+    let save = persistence::save_points_now(&ctx.runtime_config);
+    persistence::save_after_flushall(&ctx.snapshot_trigger_tx, ctx.num_shards, save).await;
 }
 
 /// After an `EXEC` broadcast its body's flushes (`exec_flushes`: result
 /// index, command, db).
 pub(crate) async fn after_txn(exec_flushes: &[(usize, Frame, usize)], ctx: &ConnectionContext) {
+    let save = persistence::save_points_now(&ctx.runtime_config);
     persistence::save_after_txn_flushes(
         exec_flushes,
         &ctx.snapshot_trigger_tx,
         ctx.num_shards,
-        ctx.config.save.as_deref(),
+        save,
     )
     .await;
 }

@@ -133,10 +133,23 @@ fn flush(c: &mut Conn, how: Flush) {
 /// Flush, SIGKILL at once, restart: how many keys came back, and INFO's
 /// `rdb_changes_since_last_save` right after the flush.
 fn keys_after_flush_and_crash(shards: usize, save: Option<&str>, how: Flush) -> (usize, String) {
+    keys_after_flush_and_crash_with(shards, save, None, how)
+}
+
+/// [`keys_after_flush_and_crash`], with `CONFIG SET save <set_save>` first.
+fn keys_after_flush_and_crash_with(
+    shards: usize,
+    save: Option<&str>,
+    set_save: Option<&str>,
+    how: Flush,
+) -> (usize, String) {
     let dir = common::unique_test_dir(&format!("ws21-1264b-s{shards}"));
     std::fs::create_dir_all(&dir).unwrap();
     let (mut server, port) = spawn(&dir, shards, save);
     let mut c = Conn::open(port);
+    if let Some(rules) = set_save {
+        assert_eq!(c.send(&["CONFIG", "SET", "save", rules]), "+OK\r\n");
+    }
     fill_and_save(&mut c);
     flush(&mut c, how);
     let changes = info_field(&mut c, "rdb_changes_since_last_save");
@@ -208,4 +221,61 @@ fn flushall_without_save_points_does_not_save() {
         back, KEYS,
         "a FLUSHALL without save points wrote a snapshot"
     );
+}
+
+/// Review F10: the save points that count are the ones configured NOW, as
+/// in redis. `CONFIG SET save ""` turns the FLUSHALL save off; setting rules
+/// on a server started without any turns it on. Red before: FLUSHALL read
+/// the startup `--save`.
+#[test]
+fn flushall_follows_config_set_save() {
+    let (back, _) = keys_after_flush_and_crash_with(1, Some(RULES), Some(""), Flush::Plain);
+    assert_eq!(back, KEYS, "CONFIG SET save \"\": the FLUSHALL still saved");
+    let (back, _) = keys_after_flush_and_crash_with(4, None, Some(RULES), Flush::Plain);
+    assert_eq!(
+        back, 0,
+        "CONFIG SET save <rules>: the FLUSHALL did not save"
+    );
+}
+
+/// Review F10, the same rule for a bare SHUTDOWN and a SIGTERM: with the
+/// rules turned off by `CONFIG SET save ""`, they exit without a final save
+/// (a key written after the last snapshot is not in it).
+#[test]
+fn shutdown_and_sigterm_follow_config_set_save() {
+    for how in ["SHUTDOWN", "SIGTERM"] {
+        let dir = common::unique_test_dir(&format!("ws21-f10-{how}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (mut server, port) = spawn(&dir, 1, Some(RULES));
+        let mut c = Conn::open(port);
+        fill_and_save(&mut c);
+        assert_eq!(c.send(&["SET", "late", "v"]), "+OK\r\n");
+        assert_eq!(c.send(&["CONFIG", "SET", "save", ""]), "+OK\r\n");
+        if how == "SHUTDOWN" {
+            c.sock.write_all(&encode(&["SHUTDOWN"])).unwrap();
+        } else {
+            let kill = std::process::Command::new("kill")
+                .args(["-TERM", &server.id().to_string()])
+                .status()
+                .unwrap();
+            assert!(kill.success());
+        }
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while server.as_mut().try_wait().unwrap().is_none() {
+            assert!(Instant::now() < deadline, "{how}: never exited");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        drop(c);
+        common::wait_for_port_down(port);
+
+        let (_server, port) = spawn(&dir, 1, Some(RULES));
+        let mut c = Conn::open(port);
+        let late = c.send(&["EXISTS", "late"]);
+        let back = dbsize(&mut c);
+        drop(c);
+        drop(_server);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(back, KEYS, "{how}: the snapshot before it is on disk");
+        assert_eq!(late, ":0\r\n", "{how} saved although CONFIG SET save \"\"");
+    }
 }

@@ -76,11 +76,12 @@ fn discard(item: Discard) {
     }
 }
 
-/// Free a row the trim removed: off the shard thread if UNLINK would free
-/// it lazily (more than `LAZY_FREE_THRESHOLD` elements), inline otherwise —
+/// Free a row the trim removed, or a pre-image the walk wrote or discarded
+/// (moon#1257 review F1): off the shard thread if UNLINK would free it
+/// lazily (more than `LAZY_FREE_THRESHOLD` elements), inline otherwise —
 /// an O(1) free. (Review 7: the cut was 4,096 elements, so a drain freed up
 /// to 512 collections of 4,095 elements inline.)
-fn dispose(entry: Entry) {
+pub(crate) fn dispose(entry: Entry) {
     if lazy_free_weight(&entry).is_some() {
         discard(Discard::Value(entry));
     } else {

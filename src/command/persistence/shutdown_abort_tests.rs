@@ -29,7 +29,7 @@ fn text(frame: &Frame) -> String {
 /// poll (from 1), as another client would between two polls.
 fn run_shutdown(on_sleep: impl Fn(usize)) -> Result<(), Frame> {
     let (tx, _rx) = crate::runtime::channel::watch(0u64);
-    let budget = Duration::from_millis(SHUTDOWN_SAVE_DEADLINE_MS);
+    let patience = Patience::UntilStalled(Duration::from_millis(SAVE_STALL_MS));
     let clock = Cell::new(Instant::now());
     let polls = Cell::new(0usize);
     let sleep = |d: Duration| {
@@ -38,7 +38,11 @@ fn run_shutdown(on_sleep: impl Fn(usize)) -> Result<(), Frame> {
         on_sleep(polls.get());
         std::future::ready(())
     };
-    let mut fut = std::pin::pin!(shutdown_save_within(&tx, 1, sleep, || clock.get(), budget));
+    let observe = Observe {
+        now: &|| clock.get(),
+        progress: &|| 0,
+    };
+    let mut fut = std::pin::pin!(shutdown_save_within(&tx, 1, sleep, &observe, patience));
     match fut.as_mut().poll(&mut Context::from_waker(Waker::noop())) {
         Poll::Ready(r) => r,
         Poll::Pending => panic!("every sleep is ready at once"),
@@ -150,4 +154,52 @@ fn an_abort_with_no_shutdown_pending_cancels_nothing_later() {
         }
     });
     assert_eq!(reply.map_err(|f| text(&f)), Ok(()));
+}
+
+/// Review F2: the SHUTDOWN's own save completes and, in that same poll,
+/// another client's ABORT lands. Abort and commit are one decision: the
+/// ABORT answered `+OK`, so the SHUTDOWN must not exit.
+///
+/// Red before the fix (REVIEW-WS21 `review_ws21_abort_race`): the ABORT
+/// answered `+OK` and the SHUTDOWN returned `Ok(())` — the server exited.
+#[test]
+fn an_abort_that_answered_ok_stops_the_shutdown_whose_save_just_completed() {
+    let _guard = BGSAVE_TEST_LOCK.lock();
+    SAVE_IN_PROGRESS.store(false, Ordering::SeqCst);
+    let abort_reply = RefCell::new(None);
+    let reply = run_shutdown(|poll| {
+        if poll == 1 {
+            // The shard finishes the SHUTDOWN's own save during this sleep...
+            bgsave_shard_done(true);
+            // ...and a second client's SHUTDOWN ABORT arrives before the poll.
+            *abort_reply.borrow_mut() = Some(parse_shutdown_args(&args(&["ABORT"])));
+        }
+    });
+    let abort_reply = abort_reply.into_inner().expect("the abort ran");
+    assert_eq!(text(&abort_reply.expect_err("ABORT")), "+OK");
+    assert_eq!(
+        reply.map_err(|f| text(&f)),
+        Err("-ERR Errors trying to SHUTDOWN. Check logs.".to_string()),
+        "SHUTDOWN ABORT answered +OK, yet the SHUTDOWN it cancelled went ahead"
+    );
+    assert_eq!(shutdown_abort::pending_for_test(), 0);
+}
+
+/// The other order: the SHUTDOWN commits first; an ABORT after that finds
+/// no shutdown in progress (the server is exiting), and never `+OK`.
+#[test]
+fn an_abort_after_the_commit_finds_no_shutdown_in_progress() {
+    let _guard = BGSAVE_TEST_LOCK.lock();
+    SAVE_IN_PROGRESS.store(false, Ordering::SeqCst);
+    let reply = run_shutdown(|poll| {
+        if poll == 1 {
+            bgsave_shard_done(true);
+        }
+    });
+    assert_eq!(reply.map_err(|f| text(&f)), Ok(()));
+    assert_eq!(shutdown_abort::pending_for_test(), 0);
+    assert_eq!(
+        parse_shutdown_args(&args(&["ABORT"])).map_err(|f| text(&f)),
+        Err("-ERR No shutdown in progress.".to_string())
+    );
 }

@@ -13,7 +13,7 @@
 
 use bytes::Bytes;
 
-use super::epoch_harness::{Divergence, Epoch, diverge, string_keyspace};
+use super::epoch_harness::{Divergence, Epoch, Record, diverge, string_keyspace, string_of};
 use super::*;
 use crate::config::RuntimeConfig;
 use crate::persistence::snapshot_cow;
@@ -251,4 +251,124 @@ fn eviction_with_no_save_running_captures_nothing() {
     evict_to_budget(&mut dbs[0], &config, EvictionRun::plain()).expect("evicts");
     assert!(snapshot_cow::pending_for_test().is_empty());
     assert!(snapshot_cow::pending_tombstones_for_test().is_empty());
+}
+
+/// A hash of `fields` fields (well past `LAZY_FREE_THRESHOLD`).
+fn big_hash(fields: usize) -> Entry {
+    let mut h = std::collections::HashMap::new();
+    for i in 0..fields {
+        h.insert(
+            Bytes::from(format!("field-{i:06}")),
+            Bytes::from_static(b"value-bytes-0123456789"),
+        );
+    }
+    let mut e = Entry::new_string(Bytes::new());
+    e.value = crate::storage::compact_value::CompactValue::from_redis_value(
+        crate::storage::entry::RedisValue::Hash(Box::new(h)),
+    );
+    e
+}
+
+/// The file's `big` record(s) as field counts, and its other records.
+fn split_big(records: Vec<Record>) -> (Vec<usize>, Vec<Record>) {
+    let (big, rest): (Vec<_>, Vec<_>) = records.into_iter().partition(|(_, k, _)| k == "big");
+    let lens = big
+        .iter()
+        .map(|(_, _, e)| match e.value.as_redis_value() {
+            crate::storage::compact_value::RedisValueRef::Hash(m) => m.len(),
+            _ => panic!("big loaded as a non-hashtable value"),
+        })
+        .collect();
+    (lens, rest)
+}
+
+/// `db` with 300 small strings and a 5,000-field hash `big`, the only key
+/// with a TTL, and a budget one byte under its memory: `volatile-lru`
+/// evicts exactly `big`.
+fn big_victim_fixture() -> (Vec<Database>, RuntimeConfig) {
+    let mut dbs = slots(1);
+    preload(&mut dbs[0], "s", 300);
+    dbs[0].set(b"big", big_hash(5_000));
+    let now = dbs[0].now_ms();
+    dbs[0].set_expiry(b"big", now + 3_600_000);
+    let config = RuntimeConfig {
+        maxmemory: dbs[0].estimated_memory() - 1,
+        maxmemory_policy: "volatile-lru".to_string(),
+        appendonly: "no".to_string(),
+        num_shards: 1,
+        ..RuntimeConfig::default()
+    };
+    (dbs, config)
+}
+
+/// Review F1: evicting a large collection during a save MOVES the removed
+/// entry into the pre-image. No deep clone on the shard thread, no second
+/// copy on the lazy-free queue, the ledger still credited at once — and the
+/// file still holds the victim, exactly once, as it was at epoch start.
+///
+/// Red before the fix: one clone (the victim was captured by copy, then
+/// removed) and one lazy-free item (the original, freed separately).
+#[test]
+fn a_large_victim_is_moved_into_its_pre_image_not_cloned() {
+    let (mut dbs, config) = big_victim_fixture();
+    let mut expected = string_keyspace(&dbs[..0]);
+    for (k, e) in dbs[0].data().iter() {
+        if k.as_bytes() != b"big" {
+            expected.insert((0, k.as_bytes().to_vec()), string_of(e));
+        }
+    }
+    let epoch = Epoch::begin(&dbs);
+    let clones = snapshot_cow::pre_image_clones_for_test();
+    let before = dbs[0].estimated_memory();
+
+    evict_to_budget(&mut dbs[0], &config, EvictionRun::plain()).expect("evicts to budget");
+
+    assert!(dbs[0].data().get(b"big").is_none(), "fixture: big stayed");
+    assert_eq!(dbs[0].data().len(), 300, "fixture: only big is volatile");
+    assert_eq!(
+        snapshot_cow::pre_image_clones_for_test() - clones,
+        0,
+        "the victim was deep-cloned into its pre-image"
+    );
+    assert_eq!(
+        dbs[0].lazy_free_len(),
+        0,
+        "the victim is held by the snapshot AND queued for lazy free"
+    );
+    assert!(
+        before - dbs[0].estimated_memory() > 5_000 * 32,
+        "the ledger was not credited: {before} -> {}",
+        dbs[0].estimated_memory()
+    );
+    let held: Vec<_> = snapshot_cow::pending_for_test()
+        .into_iter()
+        .map(|(db, k, _)| (db, k))
+        .collect();
+    assert_eq!(held, vec![(0, Bytes::from_static(b"big"))]);
+
+    let (big, rest) = split_big(epoch.finish(&dbs));
+    assert_eq!(big, vec![5_000], "the victim's epoch-start image, once");
+    assert_eq!(diverge(&expected, &rest), Divergence::default());
+}
+
+/// First capture wins: a victim a write already captured this epoch is not
+/// held again. The eviction frees it as it always did (lazily, it is large),
+/// and the file holds the FIRST capture — the epoch-start value, not the
+/// one the write made.
+#[test]
+fn a_victim_captured_earlier_is_freed_as_usual() {
+    let (mut dbs, config) = big_victim_fixture();
+    let epoch = Epoch::begin(&dbs);
+    let clones = snapshot_cow::pre_image_clones_for_test();
+    super::epoch_harness::run(&mut dbs, 0, &[b"HSET", b"big", b"new-field", b"x"]);
+    assert_eq!(snapshot_cow::pre_image_clones_for_test() - clones, 1);
+
+    evict_to_budget(&mut dbs[0], &config, EvictionRun::plain()).expect("evicts to budget");
+
+    assert!(dbs[0].data().get(b"big").is_none(), "fixture: big stayed");
+    assert_eq!(snapshot_cow::pre_image_clones_for_test() - clones, 1);
+    assert_eq!(dbs[0].lazy_free_len(), 1, "the victim went to lazy free");
+    let (big, _) = split_big(epoch.finish(&dbs));
+    assert_eq!(big, vec![5_000], "the epoch-start image, not the HSET's");
+    dbs[0].drain_lazy_free_elements(usize::MAX);
 }

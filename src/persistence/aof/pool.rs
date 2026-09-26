@@ -1507,12 +1507,12 @@ impl AofWriterPool {
         Ok(())
     }
 
-    /// Broadcast `Shutdown` to every writer. Used by orchestrated shutdown
-    /// paths in `main.rs`/`embedded.rs`. Each writer drains its channel and
-    /// fsyncs before exiting.
-    pub fn broadcast_shutdown(&self) {
+    /// Queue `Shutdown` behind everything in every writer's channel, waiting
+    /// for room until `until` (`aof::writer_stop`, moon#1274). Each writer
+    /// writes what precedes it, fsyncs, and exits.
+    pub fn broadcast_shutdown(&self, until: std::time::Instant) {
         for s in &self.senders {
-            let _ = s.try_send(AofMessage::Shutdown);
+            let _ = s.send_deadline(AofMessage::Shutdown, until);
         }
     }
 
@@ -2391,7 +2391,7 @@ mod pool_tests {
         let (tx2, rx2) = channel::mpsc_bounded::<AofMessage>(2);
         let pool = AofWriterPool::per_shard(vec![tx0, tx1, tx2]);
 
-        pool.broadcast_shutdown();
+        pool.broadcast_shutdown(std::time::Instant::now());
 
         for (i, rx) in [&rx0, &rx1, &rx2].iter().enumerate() {
             assert!(

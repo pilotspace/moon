@@ -545,13 +545,16 @@ impl SnapshotState {
     pub fn capture_cow(&mut self, db_index: usize, key: Bytes, pre_image: PreImage) {
         let hash = crate::storage::dashtable::hash_key(&key);
         if !self.is_hash_pending(db_index, hash) {
-            return;
+            return pre_image.into_iter().for_each(frozen::dispose);
         }
-        if let std::collections::btree_map::Entry::Vacant(slot) =
-            self.overflow[db_index].entry((hash, key))
-        {
-            self.overflow_bytes += pre_image_bytes(&slot.key().1, &pre_image);
-            slot.insert(pre_image);
+        use std::collections::btree_map::Entry::{Occupied, Vacant};
+        match self.overflow[db_index].entry((hash, key)) {
+            Vacant(slot) => {
+                self.overflow_bytes += pre_image_bytes(&slot.key().1, &pre_image);
+                slot.insert(pre_image);
+            }
+            // A large one (moon#1257 review F1) is freed off the shard thread.
+            Occupied(_) => pre_image.into_iter().for_each(frozen::dispose),
         }
     }
 
@@ -601,7 +604,10 @@ impl SnapshotState {
             );
             self.aborted = Some(why);
         }
-        self.overflow.iter_mut().for_each(BTreeMap::clear);
+        let maps = self.overflow.iter_mut().map(std::mem::take);
+        maps.flat_map(BTreeMap::into_values)
+            .flatten()
+            .for_each(frozen::dispose);
         self.overflow_bytes = 0;
         // Nothing will be written any more: release the detached tables,
         // off the shard thread (review 7).
@@ -955,6 +961,8 @@ impl SnapshotState {
             }
             entry_count += 1;
         }
+        // Written: a large pre-image (moon#1257 review F1) is freed off-thread.
+        pre_images.into_values().flatten().for_each(frozen::dispose);
 
         // Per-segment CRC32 covers the entry data
         let data_end = self.output_buf.len();

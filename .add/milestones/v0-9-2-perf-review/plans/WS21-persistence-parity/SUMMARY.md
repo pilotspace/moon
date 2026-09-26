@@ -87,13 +87,16 @@ Scores are in the order Completeness · Clarity · Practicality · Optimization 
 | 1264b | .90 · .92 · .90 · .90 · .90 · .90 |
 | item 6 | 1.0 · .95 · 1.0 · 1.0 · .95 · .95 |
 
-## CHANGELOG bullets
+## CHANGELOG bullets (amended in the review round, F8)
 - **Fixed (data loss, moon#1271):** a per-shard AOF writer that finished starting after a `BGREWRITEAOF` had been dispatched deleted the other shards' in-progress rewrite files. The rewrite then aborted, or it committed a manifest naming deleted files, and those shards' keys were gone after the next restart (165 of 200 in a forced reproduction). Loading the AOF manifest no longer deletes anything; stale rewrite files are swept at boot only.
-- **Fixed (moon#1257):** a key evicted while a BGSAVE ran was missing from the snapshot, so the snapshot was not the point-in-time image the save started from. In a reproduction, every one of the 10,000–13,000 keys evicted during a held save was missing. Eviction now keeps the key's pre-save state for the save; with no save running, the cost is one flag check per victim.
-- **Fixed (redis parity, moon#1267):** without `--save` (the default), `BGSAVE` and `SHUTDOWN SAVE` were refused with "background save unavailable". With `--disk-offload disable`, a snapshot in `--dir` was also ignored at boot. Snapshots now always go to and load from `--dir`, whatever the save rules; as in redis, the rules only schedule automatic saves.
-- **Fixed (data loss, moon#1263):** SIGTERM (`systemctl stop`) and SIGINT with save points and `--appendonly no` exited without saving, losing every write since the last automatic save. They now save first, as a plain `SHUTDOWN` does, waiting for a save already running. As in redis 7, if that save fails the server logs it and keeps running; a second SIGINT exits at once.
-- **Fixed (redis parity, moon#1264):** `SHUTDOWN ABORT` now cancels a `SHUTDOWN`, SIGTERM or SIGINT that is still saving. It answers `+OK`, and the waiting client gets `-ERR Errors trying to SHUTDOWN. Check logs.`. With nothing in progress it answers `-ERR No shutdown in progress.`. `ABORT` with another modifier is a syntax error.
-- **Fixed (redis parity, moon#1264):** with save points, `FLUSHALL` (also `ASYNC`, in `MULTI`, or from a script) saves the empty dataset before it replies, so a crash right after it no longer restores the flushed keys. It now takes one save, about 17–24 ms on a test host.
+- **Fixed (moon#1257):** a key evicted while a BGSAVE ran was missing from the snapshot, so the snapshot was not the point-in-time image the save started from. In a reproduction, all 9,952 (`--shards 1`) and 13,404 (`--shards 4`) keys evicted during a held save were missing. Eviction now hands the removed value itself to the save as the key's pre-save state; it is not copied, and it is freed off the shard thread once written. With no save running, the cost is one flag check per victim. During a save, an evicted value's memory is released when the save has written it, not at eviction; `INFO current_cow_size` reports it.
+- **Fixed (redis parity, moon#1267):** with `--appendonly no` and no `--save`, `BGSAVE` and `SHUTDOWN SAVE` were refused with "background save unavailable", and a snapshot in `--dir` was ignored at boot. Snapshots now always go to and load from `--dir`, whatever the save rules; as in redis, the rules only schedule automatic saves.
+- **Changed (redis parity, moon#1267 review):** with `--appendonly no`, boot loads the snapshot and no longer replays a KV log over it: neither a legacy `appendonly.aof` in `--dir` nor WAL v3 records left by an earlier `--appendonly yes` run. Nothing writes those logs in that mode, so they were older than the snapshot and replaying them reverted keys. This applies to every `--appendonly no` configuration, with or without `--save` rules and in both `--disk-offload` modes. The cold tier and the offload manifest still recover.
+- **Fixed (data loss, moon#1263):** SIGTERM (`systemctl stop`) and SIGINT with save points exited without saving, losing every write since the last automatic save under `--appendonly no`. They now save first, as a plain `SHUTDOWN` does, waiting for a save already running; with `--appendonly yes` plus save points this also writes a final snapshot, which takes time proportional to the dataset. There is no deadline: while the save makes no progress for 20 s the server logs it and keeps the stop armed, and it exits once the save is on disk. As in redis 7, if that save fails the server logs it and keeps running; a second SIGINT exits at once, and `SHUTDOWN ABORT` cancels.
+- **Changed (moon#1263 review):** `SHUTDOWN` and `FLUSHALL` wait for their save for as long as it makes progress, and fail only after 20 s without progress (`-ERR SHUTDOWN failed: background save made no progress for 20 s, check logs`). Previously one 20 s deadline failed any longer save.
+- **Fixed (data loss, moon#1274):** with `--appendonly yes` (the default) and `appendfsync everysec`, SIGTERM, SIGINT or `SHUTDOWN` lost acknowledged writes still queued for the AOF writers (all of them at `--shards 1`). Shutdown now stops the shards first, then lets every AOF writer write its queue and fsync before the process exits, as redis's `prepareForShutdown` does.
+- **Fixed (redis parity, moon#1264):** `SHUTDOWN ABORT` now cancels a `SHUTDOWN`, SIGTERM or SIGINT that is still saving. It answers `+OK` (and then the shutdown never happens), and the waiting client gets `-ERR Errors trying to SHUTDOWN. Check logs.`. With nothing in progress it answers `-ERR No shutdown in progress.` (the period is new). `ABORT` with another modifier is a syntax error; a repeated modifier such as `NOSAVE NOSAVE` is accepted.
+- **Fixed (redis parity, moon#1264):** with save points, `FLUSHALL` (also `ASYNC`, in `MULTI`, or from a script) saves the empty dataset before it replies, so a crash right after it no longer restores the flushed keys. It blocks the calling connection and its pipeline for one save, about 17–24 ms on a test host. The save points are the ones configured now, so `CONFIG SET save` applies, as it does for `SHUTDOWN` and signals. A replica applying the master's `FLUSHALL` and the admin console's flush do not save.
 
 ## Commits (`git log --oneline b230d011..a52ef0c7`)
 ```
@@ -112,4 +115,60 @@ af57e5a8 feat(persistence): a registry for the snapshot directory (moon#1267)
 e87f99db fix(eviction): capture a victim's pre-image before a BGSAVE loses it (moon#1257)
 a378418e docs(aof): the size monitor's manifest load no longer sweeps orphans (moon#1271)
 a54541c5 fix(aof): a manifest load no longer sweeps a rewrite in flight (moon#1271)
+```
+
+## Review round (REVIEW-WS21: MERGE-AFTER-FIXES)
+Branch `perf/ws21-review-fixes` from `d49a2a98`. Binaries were built from this worktree and pinned with `MOON_BIN`: `ws21fix-debug`, `ws21fix-debug-tokio`, and `ws21fix-relfast` for M1. NOTES has the designs and file:line references.
+
+| item | verdict | commit | red → green |
+|---|---|---|---|
+| F1 (moon#1257): the victim was cloned during a save | **FIXED** (moved, not cloned) | `82ea1c21` | `a_large_victim_is_moved_into_its_pre_image_not_cloned` is red with capture-then-remove (1 clone). Green, with `eviction_capture_tests` 7/7 and `perf_ws21_eviction_bgsave` on both runtimes. |
+| F2 (moon#1264 a): ABORT `+OK` while exiting | **FIXED** (one lock decides) | `5955d642` | The reviewer's proof became a unit test, red without `commit()`. The copied `review_ws21_abort_race` is green. |
+| F3 (moon#1267): stale AOF/WAL replayed with `appendonly no` | **FIXED** (`KvSources::SnapshotOnly`) | `572aff0c` | `perf_ws21_stale_log_boot` (5) is red on the pre-fix binary: 50/50 reverted from the legacy AOF (offload off, off+save, on); 37/50 from the WAL (offload off, on). Green on both runtimes. |
+| F4 (moon#1263): fixed 20 s deadline | **FIXED** (stall bound; a signal's stop stays armed) | `cf8945eb` | `review_ws21_sigterm_deadline` (port 7521) is red on the pre-fix binary ("gave up after 20.017 s … still running 15 s later") and green now. Kept as `a_sigterm_outlasting_the_stall_limit_stays_armed`, plus 4 `save_wait_tests`. |
+| moon#1274: SIGTERM lost queued AOF writes | **FIXED** | `201be8d1` | `perf_ws21_aof_drain` (7: TERM/INT/SHUTDOWN × s1/s4 + held writer) is red on the pre-fix monoio binary (300/300 lost at s1). Green 3/3 runs on monoio and on tokio. |
+| F5, F6: flaky sleeps | **FIXED** | `3d2c93cd` | Poll ABORT until `+OK`; the SIGKILL phase runs under `appendfsync always`. Green on both runtimes. |
+| F10: startup save config | **FIXED** for FLUSHALL, SHUTDOWN and signals. Replica FLUSHALL is a **residual** (documented). | `a14827df` | `flushall_follows_config_set_save` and `shutdown_and_sigterm_follow_config_set_save` are red on the pre-fix binary and green on both runtimes. |
+| F8, F9: docs | done | (this commit) | CHANGELOG bullets amended above. The NOTES async-spill claim is reworded: `CONFIG SET appendonly yes` made it a restart-loss path, which the capture closes. |
+
+**M1: a 1M-field victim during a held save.** `--shards 1`, volatile-lru, `maxmemory` halved, PING loop. Release-fast build of `a14827df` (B) vs `main-4a96cd5f-rel` (A), interleaved B A ×5; box load 2.4–3.9.
+
+| victim | build | worst PING gap | `current_cow_size` | RSS across the eviction |
+|---|---|---|---|---|
+| 1M | before (review, head) | 198–255 ms | 128 MB | +victim transiently |
+| 1M | fix | 22.2, 51.3, 46.6, 45.2, 42.7 ms | 152 MB (the held epoch-start value) | flat, 196 → 196 MB |
+| 1M | main | 35.1, 36.8, 28.1, 30.2, 28.3 ms | ~0 (victim missing from the file) | 193 → 60 MB |
+| 3M | before (review) | 459 ms | 384 MB | — |
+| 3M | fix / main | 99.3 / 49.0 ms | 456 MB / 0 | flat 422 / 419 → 157 MB |
+
+The remaining gap over main is one O(n) size estimate (`pre_image_bytes`) of the moved value on the next drain. The follow-up is to carry the removal's credited size into the pre-image. An earlier build of the same F1 logic measured the same range: 23–49 ms.
+
+**Review-round risks**
+1. **Behaviour changes** (CHANGELOG above):
+   - `appendonly no` never replays a KV log at boot;
+   - SHUTDOWN and FLUSHALL wait while a save progresses, with no fixed cap;
+   - a signal never gives up on its final save;
+   - graceful exit now waits for the AOF writers, up to 60 s before giving up with a log line;
+   - `CONFIG SET save` now drives FLUSHALL, SHUTDOWN and signals.
+2. **Hot path:** `snapshot_cow::note_progress` does one relaxed `fetch_add` per shard per snapshot tick (only while a save runs). Eviction with no save running is still one TLS bool.
+3. **Residuals:**
+   - the F1 size-estimate walk;
+   - a replica applying FLUSHALL does not save;
+   - the auto-save timer ignores `CONFIG SET save`;
+   - `embedded.rs` keeps its writer as a child of `cancel` (it is `biased` now).
+4. **WS20 overlap:**
+   - no new shard-level snapshot start, finish or abort; every save starts via `bgsave_start_sharded` into the WS20-hooked `persistence_tick` sites;
+   - `rdb::load` is untouched;
+   - `handler_{monoio,sharded}/dispatch.rs` change 1 line each, in SHUTDOWN, far from WS20's SWAPDB hunk.
+5. **Environmental:** `cold_index_rebuild_silent_drops_875` fails 4/4 identically on main, because root ignores `chmod 000`.
+
+**Review-round commits (`git log --oneline d49a2a98..HEAD`, code):**
+```
+a14827df fix(persistence): FLUSHALL, SHUTDOWN and signals save per the runtime save config (moon#1264)
+3d2c93cd test(persistence): poll for a pending shutdown; SIGKILL phase under appendfsync always (moon#1264, moon#1271)
+201be8d1 fix(aof): drain, fsync and join the AOF writers before a graceful exit (moon#1274)
+cf8945eb fix(shutdown): bound save waits by a stall, not a deadline; a signal's stop stays armed (moon#1263)
+572aff0c fix(recovery): with appendonly no, boot loads the snapshot and replays no stale KV log (moon#1267)
+5955d642 fix(shutdown): decide SHUTDOWN ABORT vs commit under one lock (moon#1264)
+82ea1c21 fix(eviction): move a victim evicted during a save into its pre-image, not a clone (moon#1257)
 ```

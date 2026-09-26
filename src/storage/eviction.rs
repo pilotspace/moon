@@ -1833,15 +1833,15 @@ pub(crate) fn evict_one_with_spill(
     // divergence this issue is about. Same gate on `on_plain_drop`: no
     // dual-plane DEL record for a key this call did not delete.
     //
-    // moon#1190: the ledger credit stays synchronous (`remove` walks the
-    // value — this loop needs it to know when to stop), but a large victim's
-    // DROP goes to the lazy-free drain instead of stalling the write that
-    // triggered the eviction.
+    // moon#1190: the ledger credit stays synchronous (`remove` walks the value — this
+    // loop needs it to know when to stop), but a large victim's DROP goes to the lazy-free
+    // drain instead of stalling the write, unless a save holds it (moon#1257 review F1).
     let removed = match victim::remove(db, key.as_bytes()) {
-        Some(entry) => {
+        Some(victim::Removed::Dispose(entry)) => {
             db.lazy_free_or_drop(key.len(), entry, false);
             true
         }
+        Some(victim::Removed::Held) => true,
         None => false,
     };
     if removed {
