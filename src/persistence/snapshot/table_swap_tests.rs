@@ -452,6 +452,119 @@ fn one_drain_trims_at_most_the_budget() {
     assert_eq!(string_keyspace(&recovered), string_keyspace(&dbs));
 }
 
+/// Review 7, item 2: the budget counted a removed collection as one row
+/// operation whatever its size, and only values of 4,096+ elements were
+/// freed off the shard thread — one drain of 512 removed 1,000-field hashes
+/// charged and freed 512,000 elements inline (release server, 600 x 4,000
+/// fields: PING gaps of 74-85 ms). A collection now costs `1 + elements /
+/// 64` operations, and every lazily freeable one (> 64 elements) is freed
+/// by the helper thread.
+#[test]
+fn a_drain_trims_a_bounded_number_of_collection_elements() {
+    use crate::persistence::snapshot::frozen::{TRIM_BUDGET, take_trim_elements_for_test};
+    use crate::storage::db::LAZY_FREE_THRESHOLD;
+    const HASHES: usize = 64;
+    const FIELDS: usize = 1_000;
+    let mut dbs = vec![Database::new(), Database::new()];
+    preload(&mut dbs[0], "a", 100);
+    preload(&mut dbs[1], "b", 50);
+    let start_bill = dbs[1].ledger_bytes() as u64;
+    let expected = string_keyspace(&dbs);
+    let mut epoch = Epoch::begin(&dbs);
+    let mut tail = Tail::new();
+    let fields: Vec<Vec<u8>> = (0..FIELDS)
+        .flat_map(|f| [format!("f{f:05}").into_bytes(), b"value".to_vec()])
+        .collect();
+    for h in 0..HASHES {
+        let key = format!("hash:{h}");
+        let mut parts: Vec<&[u8]> = vec![b"HSET", key.as_bytes()];
+        parts.extend(fields.iter().map(Vec::as_slice));
+        live(&mut dbs, &mut tail, 1, &parts);
+    }
+    live(&mut dbs, &mut tail, 1, &[b"FLUSHDB"]);
+    let _ = take_trim_elements_for_test();
+    let (mut charged, mut inline, mut worst) = (0, 0, 0);
+    loop {
+        epoch.drain();
+        let (c, i) = take_trim_elements_for_test();
+        (charged, inline, worst) = (charged + c, inline + i, worst.max(c));
+        let state = epoch.state.as_ref().expect("epoch");
+        if state.frozen_trimmed_for_test(1) != Some(false) {
+            break;
+        }
+    }
+    assert_eq!(
+        charged,
+        HASHES * FIELDS,
+        "setup: the trim removed every hash"
+    );
+    assert!(
+        worst <= TRIM_BUDGET * LAZY_FREE_THRESHOLD + FIELDS,
+        "one drain charged {worst} collection elements (budget {TRIM_BUDGET} operations)"
+    );
+    assert_eq!(
+        inline, 0,
+        "the trim freed {inline} collection elements inline"
+    );
+    let held = epoch.state.as_ref().expect("epoch").cow_bytes();
+    assert!(
+        held <= start_bill,
+        "trimmed: {held} B held, epoch-start {start_bill} B"
+    );
+    let records = epoch.try_finish(&dbs).expect("the save must complete");
+    assert_eq!(diverge(&expected, &records), Default::default());
+    let recovered = recover(2, records, &tail);
+    assert_eq!(string_keyspace(&recovered), string_keyspace(&dbs));
+}
+
+/// Review 7, item 3: once the walk has written a database whose table a
+/// FLUSHDB froze, the table was dropped inline, on the shard thread (release
+/// server, 2M rows: a 34-40 ms stall as the walk left that database, 4.5 ms
+/// without the FLUSHDB). It goes to the `moon-snapdrop` helper now.
+#[test]
+fn the_walk_releases_a_frozen_table_off_the_shard_thread() {
+    use crate::persistence::snapshot::frozen::take_tables_discarded_for_test;
+    let mut dbs = vec![Database::new(), Database::new()];
+    preload(&mut dbs[0], "a", 100);
+    preload(&mut dbs[1], "b", 2000);
+    let expected = string_keyspace(&dbs);
+    let mut epoch = Epoch::begin(&dbs);
+    let _ = run(&mut dbs, 1, &[b"FLUSHDB"]);
+    epoch.drain_until_trimmed(1);
+    let _ = take_tables_discarded_for_test();
+    let records = epoch.try_finish(&dbs).expect("the save must complete");
+    assert_eq!(
+        take_tables_discarded_for_test(),
+        1,
+        "the walk dropped db 1's frozen table inline"
+    );
+    assert_eq!(diverge(&expected, &records), Default::default());
+}
+
+/// Review 7, item 3: an aborted save dropped every frozen table inline.
+#[test]
+fn an_aborted_save_releases_its_frozen_tables_off_the_shard_thread() {
+    use crate::persistence::snapshot::frozen::take_tables_discarded_for_test;
+    let mut dbs = vec![Database::new(), Database::new(), Database::new()];
+    preload(&mut dbs[1], "b", 2000);
+    preload(&mut dbs[2], "c", 2000);
+    let mut epoch = Epoch::begin(&dbs);
+    let _ = run(&mut dbs, 1, &[b"FLUSHDB"]);
+    let _ = run(&mut dbs, 2, &[b"FLUSHDB"]);
+    epoch.drain_until_trimmed(1);
+    epoch.drain_until_trimmed(2);
+    let _ = take_tables_discarded_for_test();
+    apply(&mut dbs, 0, &[b"FLUSHALL"]);
+    epoch.drain();
+    assert!(epoch.state.as_ref().expect("epoch").aborted().is_some());
+    assert_eq!(
+        take_tables_discarded_for_test(),
+        2,
+        "the abort dropped the frozen tables inline"
+    );
+    assert!(epoch.try_finish(&dbs).is_err());
+}
+
 /// Review 6 (S1), measurement only: the trim's cost per drain and in drains,
 /// against main's FLUSHDB (a drop). Run in a release build:
 /// `MOON_TEST_TRIM_N=<rows> cargo test --profile release-fast --lib trim_cost -- --ignored --nocapture`.
@@ -722,15 +835,62 @@ fn a_grown_flush_while_another_grown_table_is_trimming_fails_the_save() {
     }
 }
 
-/// Review 6 (N1, the reviewer's proof): an UNLINKed large collection stays
-/// CHARGED to `used_memory` until the lazy-free drain frees it (moon#1190).
-/// A FLUSHDB before that drain handed the epoch `table_bytes` = the ledger
-/// WITH that charge while the table no longer held the row, and the trim then
-/// restored the pre-image and added its bytes a second time: the frozen bill
-/// (INFO `current_cow_size`) over-reported by the lazily-freed value for the
-/// rest of the save, above the database's epoch-start bill.
+/// Review 7, item 4: the untrimmed excess the S2 rule weighs was published
+/// by the drain, BEFORE the tick's walk ran. A walk that finished a
+/// database released its frozen table, trim unfinished; the published
+/// excess still counted it until the next drain, so a grown flush later in
+/// that tick failed the save although no other grown table was held.
 #[test]
-fn a_lazy_free_charge_is_not_billed_to_the_frozen_table() {
+fn a_table_the_walk_released_is_not_weighed_against_a_later_flush() {
+    use crate::persistence::snapshot::frozen::set_trim_budget_for_test;
+    // One row a drain: db 1's trim outlasts the walk over db 1.
+    set_trim_budget_for_test(Some(1));
+    let mut dbs: Vec<Database> = (0..3).map(|_| Database::new()).collect();
+    preload(&mut dbs[1], "d1", 200);
+    preload(&mut dbs[2], "d2", 200);
+    let expected = string_keyspace(&dbs);
+    let mut epoch = Epoch::begin(&dbs);
+    let mut tail = Tail::new();
+    let value = vec![b'x'; 8 << 10];
+    let grow = |dbs: &mut Vec<Database>, tail: &mut Tail, db: usize| {
+        for j in 0..1200u32 {
+            let k = format!("g{db}:{j}");
+            live(dbs, tail, db, &[b"SET", k.as_bytes(), &value]);
+        }
+        live(dbs, tail, db, &[b"FLUSHDB"]);
+    };
+    grow(&mut dbs, &mut tail, 1);
+    epoch.drain();
+    // The walk writes db 1 from its frozen table and releases it, trimmed
+    // or not; the flush of db 2 comes right after that tick's advance.
+    while epoch.state.as_ref().expect("epoch").current_db_index() <= 1 {
+        assert!(!epoch.tick(&dbs));
+    }
+    assert_eq!(
+        epoch.state.as_ref().expect("epoch").untrimmed_excess(),
+        0,
+        "setup: db 1's table is released"
+    );
+    grow(&mut dbs, &mut tail, 2);
+    let outcome = epoch.try_finish(&dbs);
+    set_trim_budget_for_test(None);
+    let records = outcome.expect("one grown table was held: the save must complete");
+    assert_eq!(diverge(&expected, &records), Default::default());
+    let recovered = recover(3, records, &tail);
+    assert_eq!(string_keyspace(&recovered), string_keyspace(&dbs));
+}
+
+/// Review 6 (N1) and review 7: an UNLINKed large collection stays CHARGED to
+/// `used_memory` until the lazy-free drain frees it (moon#1190), and a
+/// FLUSHDB hands the epoch that ledger as the frozen table's bill. Review 5
+/// billed the charge on top of the pre-image the trim restores, for the
+/// whole save (bill 551,044 B vs rows 278,817 B). Review 6 freed the value
+/// INSIDE the FLUSHDB to drop the charge — the very stall moon#1190 exists to
+/// avoid (231-244 ms for a 5M-field hash, release). Now the FLUSHDB leaves
+/// the value queued, the queue credits the frozen bill as it frees it, and
+/// once it is done the bill is exactly what the table's rows hold.
+#[test]
+fn a_lazy_free_charge_is_credited_to_the_frozen_table_not_freed_inline() {
     let mut dbs = vec![Database::new(), Database::new()];
     for i in 0..50 {
         let k = format!("k{i}");
@@ -748,17 +908,67 @@ fn a_lazy_free_charge_is_not_billed_to_the_frozen_table() {
         "setup: the UNLINKed hash waits in the lazy-free queue, still charged"
     );
     let _ = run(&mut dbs, 1, &[b"FLUSHDB"]);
+    assert_eq!(
+        dbs[1].lazy_free_len(),
+        1,
+        "the FLUSHDB freed the UNLINKed hash inline (review 6's reclaim)"
+    );
     epoch.drain_until_trimmed(1);
+    // The shard tick's lazy-free drain frees it; the next drain credits the
+    // frozen bill with what it freed.
+    let _ = dbs[1].drain_lazy_free_elements(usize::MAX);
+    assert_eq!(dbs[1].lazy_free_len(), 0);
+    epoch.drain();
     let state = epoch.state.as_ref().expect("epoch");
     let (bill, rows) = state.frozen_bill_and_rows_for_test(1).expect("frozen");
     let _ = epoch.try_finish(&dbs);
     assert_eq!(
         bill, rows,
-        "the frozen bill must be what its rows hold (epoch-start bill {start_bill} B)"
+        "once the lazy free is done the frozen bill is what its rows hold (epoch-start bill \
+         {start_bill} B)"
     );
     assert!(
         bill <= start_bill,
         "{bill} B frozen, epoch-start {start_bill} B"
+    );
+}
+
+/// Review 7: a value whose charge moved to a frozen table's bill may still
+/// be draining when that save ends. Its credits belong to that save's table
+/// alone: a later save, which may freeze the same database again, must not
+/// take them off its own bill (each arming has its own serial).
+#[test]
+fn a_value_freed_after_its_save_ended_credits_no_later_save() {
+    let mut dbs = vec![Database::new(), Database::new()];
+    for f in 0..2000 {
+        let f = format!("field-{f:06}");
+        let _ = run(&mut dbs, 1, &[b"HSET", b"big", f.as_bytes(), b"some-value"]);
+    }
+    let mut first = Epoch::begin(&dbs);
+    let _ = run(&mut dbs, 1, &[b"UNLINK", b"big"]);
+    let _ = run(&mut dbs, 1, &[b"FLUSHDB"]);
+    first.try_finish(&dbs).expect("the first save completes");
+    assert_eq!(dbs[1].lazy_free_len(), 1, "setup: still draining");
+
+    for i in 0..300 {
+        let k = format!("k{i}");
+        let _ = run(&mut dbs, 1, &[b"SET", k.as_bytes(), b"v"]);
+    }
+    let mut second = Epoch::begin(&dbs);
+    let _ = run(&mut dbs, 1, &[b"FLUSHDB"]);
+    second.drain_until_trimmed(1);
+    let _ = dbs[1].drain_lazy_free_elements(usize::MAX);
+    second.drain();
+    let (bill, rows) = second
+        .state
+        .as_ref()
+        .expect("epoch")
+        .frozen_bill_and_rows_for_test(1)
+        .expect("frozen");
+    let _ = second.try_finish(&dbs);
+    assert_eq!(
+        bill, rows,
+        "the first save's credits reached the second save's bill"
     );
 }
 

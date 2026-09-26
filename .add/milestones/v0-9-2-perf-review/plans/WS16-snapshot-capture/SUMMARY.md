@@ -59,6 +59,23 @@ Fix A held under the reviewer's property tests (2,000 lib seeds, 80 real-server 
 - **N3:** `06c7e3dd`. A POP of an empty queue creates no consumer, so master, replica and replay agree. The reviewer's B/F agreement test is adopted with it.
 - **P1:** `cba154c5`. Documents that the RRDSHARD file holds hot keys only.
 
+## Review 7 (MERGE-AFTER-FIXES)
+The PR head (82e3064e) was merged first (`fa9a5dc1`). Every item is addressed, one commit each; NOTES.md has the table, the red → green evidence and the release-fast re-measurement.
+- **1 (N1 regression):** `a453de8c`. The review's full design, not the stopgap.
+  - Review 6's `Database::clear` reclaim freed charged lazy-free values inside the FLUSHDB: 242-259 ms for an UNLINKed 5M-field hash.
+  - Now a queued value's charge follows the table into the epoch (`Charge::Frozen`), and the lazy-free drain credits the frozen bill as it frees the value. That costs O(1) per credit, and nothing is freed inside FLUSHDB.
+  - Release-fast: 0.13 / 0.23 ms here against main's 0.48 / 0.17 ms.
+  - The stopgap would have over-billed the frozen table for the whole save, and the S2 rule weighs that bill.
+- **2:** `0d3c5e2d`. The trim counts `1 + elements / 64` operations per collection it charges, and hands every collection above `LAZY_FREE_THRESHOLD` to `moon-snapdrop`.
+  - 600 hashes of 4,000 fields: worst PING 0.8-5.1 ms (head 74-106 ms, main's FLUSHDB 83-135 ms).
+  - The "under ~0.7 ms per drain" comment now holds, except for one collection larger than the whole budget.
+- **3:** `17da0f6e`. The walk and an abort release frozen tables to `moon-snapdrop`. 2M rows, FLUSHDB during a save: 1.8-4.4 ms as the walk finishes (head 41-59 ms).
+- **4:** `29b3e1ee`. `snapshot_cow::note_walk` re-publishes the untrimmed excess after the advance: in the persistence tick (one line) and in the harness.
+- **5:** `4c4e0c80`.
+  - `prop_tests` asserts bill error 0. The workload now really lazy-frees: its 100-field hashes had been listpacks.
+  - The `perf_ws16_mq_billing` 1.5 s wait stays, documented: no observable condition says the per-shard WAL v3 is written.
+- **6:** `ed3ad086`. One `spawn_dropper<T>` for both helpers. The unbounded channel and the uncounted in-flight bytes are documented.
+
 ## Measurements
 - **Real-server capture tests** restore from the RDB file alone after SIGKILL. Overlap is observed, not assumed: every `shard-<id>.rrdshard.tmp` must exist before the writes; each round is pipelined with `INFO persistence`; a round counts only if the save is still running. On baseline, 24–485 rounds landed inside saves of 72–221 ms.
 - **MQ billing:** 2 consecutive green runs, with the numbers above.
@@ -93,6 +110,10 @@ Fix A held under the reviewer's property tests (2,000 lib seeds, 80 real-server 
   - `103e996c` re-exports `lazy_free_weight` pub(crate) from storage/db/mod.rs.
   - `66e06764` touches `Database::clear` in kv_ops.rs (3 lines: reclaim charged lazy-free items when a save is armed).
   - `f837ad19` touches `command/stream/stream_write.rs` (`XADD <ms>-*`).
+- **Review 7:**
+  - `a453de8c` touches `Database::clear` in kv_ops.rs: review 6's reclaim is replaced by `lazy_free_redirect_charges`.
+  - `29b3e1ee` adds one line to `persistence_tick.rs::advance_snapshot_segment` (WS19's file): `snapshot_cow::note_walk`, after `note_progress`.
+  - `ed3ad086` re-exports `spawn_dropper` pub(crate) from storage/db/mod.rs.
 - **`396dc1e`:**
   - The MQ local legs of both write.rs files pass the write gate (`handler_sharded::write::mq_write_gate`).
   - spsc_handler.rs's `MqCommand` arm gates through `spsc_eviction_gate`.
@@ -104,7 +125,10 @@ Fix A held under the reviewer's property tests (2,000 lib seeds, 80 real-server 
    - **Now (review 5):** the drains trim a flushed table to its epoch-start rows, so the save holds at most the epoch-start bills of the databases it has not written.
    - **Review 6:** the trim is budgeted, 512 row operations per drain. The bound holds once it is done: after ceil(work / 512) drains, where work = keys written since the save began + rows below the cursor + the kept rows if the table is rebuilt.
      - The reviewer's 8 x 10K-row case takes about 20-40 drains per table.
-     - A 2M + 6M-row table takes about 12 s (release), during which PING stays at p99.9 1.0 ms and max 9.2 ms. Main's FLUSHDB stalls 193 ms on that table; the unbudgeted trim took 4.33 s.
+     - A 2M + 6M-row table takes about 12 s (release), with the unbudgeted trim at 4.33 s. Main's FLUSHDB stalls 174-193 ms on that table.
+     - Over the WHOLE save, walk and release included (review 7), PING stays at p99.9 0.9-1.45 ms and max 9.3-14.1 ms. Review 6 measured the trim alone, at max 9.2 ms.
+     - Review 7 also fixed two stalls that measurement missed: collection-valued rows (74-106 ms) and the frozen table dropped inline at the walk's end (41-59 ms for 2M rows).
+   - **A value UNLINKed before a FLUSHDB during a save** stays in `current_cow_size` until the lazy free has freed it (review 7). It is still allocated, and each credit lowers the bill. 0.3 s after the flush of an UNLINKed 5M-field hash, the figure is 440 MB.
    - **Until its trim's steps 1-2 are done,** a grown table holds its post-epoch rows. A flush of another GROWN database meanwhile fails the save once their post-epoch bytes together pass 8 MiB (review 6, S2): within one tick (a pipeline, MULTI, a script or two clients) or during the trim. A flush of a database that did not grow never fails it. It used to, whenever a grown table was waiting: a plain `SELECT 1; FLUSHDB; SELECT 2; FLUSHDB` pipeline returned `status err`.
 2. **Merged with main (part 3b):** `persistence_tick.rs` and `kv_ops.rs::clear` auto-merged as the review expected. The gates below ran on the merged tree.
 3. **Slot identity is by `Database` address,** recorded at arm time. This holds because slots are boxed and SWAPDB swaps contents, not addresses. An unidentifiable flush aborts the save as before; it never freezes the wrong table.
@@ -121,6 +145,16 @@ Fix A held under the reviewer's property tests (2,000 lib seeds, 80 real-server 
    - the TXN.ABORT undo needs a decision;
    - ~~the replica MQ PEL bytes are untracked~~: review 4 called it a replica-only under-count; it was an over-credit on replay AND on the replica. Fixed in review 5 (moon#1261);
    - `Database.db_index` went stale after SWAPDB (fixed by FIX3B-CM in #1242, now merged).
+
+## Test results after review 7 (code `ed3ad086`; this commit is docs)
+- **Lint and checks:** fmt and the four audits PASS. clippy `--all-targets -D warnings` is clean on monoio and tokio.
+- **Lib tests:**
+  - full monoio 6,705 passed;
+  - tokio, the touched modules: 1,293 passed;
+  - the property test at 200 seeds: bill error 0 over 9,994 checks, and 198 flushes with a lazy-free value pending.
+- **Integration, monoio (`/home/user/wt/bin/ws16-r7-final-monoio`):** perf_ws16_bgsave_capture 8/8 (the adopted proof included), perf_ws16_bgsave_prop 2/2, perf_ws16_mq_billing 10/10, perf_ws12 5/5, perf_ws15 3/3.
+- **Integration, tokio (`/home/user/wt/bin/ws16-r7-final-tokio`):** perf_ws16_bgsave_capture 8/8, perf_ws16_bgsave_prop 2/2, perf_ws16_mq_billing 6/6 + 4 ignored, perf_ws12 4/4 + 1 ignored, perf_ws15 3/3.
+- **Release-fast re-measurement** of findings 1-3 against `REVIEW7-main-rf` (binary `/home/user/wt/bin/ws16-r7-final-rf`): in NOTES.
 
 ## Test results after review 6 (production code `06c7e3dd`; P1 and this commit are docs)
 - **Lint and checks:** fmt and the four audits PASS. clippy `--all-targets -D warnings` is clean on monoio and tokio.
@@ -199,7 +233,9 @@ Fix A held under the reviewer's property tests (2,000 lib seeds, 80 real-server 
   - `MQ POP`/`ACK` churn keeps the charge exact. A POP's released surplus used to stay charged, so `used_memory` drifted up.
 - **Fixed (moon#1261):** after a restart's WAL replay and on a replica, `MQ` queues are billed as on the master. Replayed or replicated POPs never charged their pending entries while ACKs credited them, so a churned queue's bill drained toward 0: 28,421 B against 124,097 B live.
 - **Fixed (moon#1228):** during a BGSAVE, the memory held for a flushed database is bounded by that database's size when the save began.
-  - Rows written after the save began are trimmed away over the following ticks, at a bounded cost per tick. FLUSHDB of a 2M-row database grown by 6M rows kept PING under 10 ms.
+  - Rows written after the save began are trimmed away over the following ticks, at a bounded cost per tick: 512 row operations, with a collection costing one more per 64 elements. What the save lets go of is freed off the shard thread.
+  - Release build: a 2M-row database grown by 6M rows and flushed during a save kept PING at p99.9 0.9–1.5 ms and max 9–14 ms over the whole save. Main's plain FLUSHDB of the same table takes 174–193 ms.
+  - 600 post-save hashes of 4,000 fields: max 1–5 ms, against 83–135 ms.
   - A queued lazy-free value is no longer counted twice in `current_cow_size`.
 - **Fixed:** `XADD key <ms>-*` when the stream's top ID already has the last possible sequence for `<ms>` now answers "ERR The ID specified in XADD is equal or smaller than the target stream top item". A debug build used to crash; a release build wrapped.
 - **Fixed:** at the last possible stream ID, `XADD *` and `MQ PUSH` answer an error instead of crashing a debug build.

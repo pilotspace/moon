@@ -578,3 +578,71 @@ fn flushdb_after_post_epoch_inserts_holds_only_the_epoch_start_rows() {
         assert_eq!(dbsize(&mut c2, db), 0, "db {db} was empty at epoch start");
     }
 }
+
+/// moon#1228 review 7 (the reviewer's proof, adopted): with a BGSAVE armed,
+/// review 6's `Database::clear` reclaimed every charged lazy-free value
+/// before billing the flushed table — an UNLINKed multi-million-field hash
+/// was freed INSIDE the FLUSHDB, the stall moon#1190's lazy free exists to
+/// avoid. Release-fast, 5M fields: 231-244 ms, against 0.1-0.4 ms on main.
+/// The queue now credits the frozen table's bill as it frees the value; the
+/// FLUSHDB of a database holding one small key must answer at once.
+#[test]
+fn flushdb_during_a_save_does_not_free_an_unlinked_hash_inline() {
+    const FIELDS: usize = 2_000_000;
+    // A FLUSHDB of a database holding one small key. Main: 0.1-0.4 ms.
+    const BUDGET: Duration = Duration::from_millis(50);
+    let dir = common::unique_test_dir("ws16-flushdb-unlinked");
+    let _cleanup = DirGuard(dir.clone());
+    let (_server, port) = spawn_with_maxmemory(&dir, 1, "0");
+    let mut c = Conn::open(port);
+    let mut batch = 0usize;
+    let mut i = 0usize;
+    while i < FIELDS {
+        let end = (i + 1000).min(FIELDS);
+        let mut parts: Vec<String> = vec!["HSET".into(), "big".into()];
+        for j in i..end {
+            parts.push(format!("f{j:09}"));
+            parts.push(format!("v{j}"));
+        }
+        let refs: Vec<&str> = parts.iter().map(String::as_str).collect();
+        c.sock.write_all(&encode(&refs)).unwrap();
+        batch += 1;
+        i = end;
+        if batch == 64 {
+            let r = c.read_replies_within(batch, Duration::from_secs(120));
+            assert!(!r.contains('-'), "HSET refused: {r:.200}");
+            batch = 0;
+        }
+    }
+    if batch > 0 {
+        c.read_replies_within(batch, Duration::from_secs(120));
+    }
+    assert_eq!(c.send(&["HLEN", "big"]).trim(), format!(":{FIELDS}"));
+    assert!(c.send(&["SET", "small", "x"]).starts_with("+OK"));
+
+    // UNLINK (O(1): queued for the lazy-free drain, still charged), a held
+    // BGSAVE, then FLUSHDB while the value is still queued. (UNLINK BEFORE
+    // the save: an UNLINK during it captures the value's pre-image, a deep
+    // clone — a separate, pre-existing cost, not what this test measures.)
+    assert_eq!(c.send(&["UNLINK", "big"]).trim(), ":1");
+    std::fs::write(hold_file(&dir), b"").expect("create the hold file");
+    assert!(c.send(&["BGSAVE"]).contains("Background saving started"));
+    assert!(wait_until_armed(&dir, 1, &mut c), "the held save ended");
+    let t = Instant::now();
+    assert!(c.send(&["FLUSHDB"]).starts_with("+OK"));
+    let took = t.elapsed();
+    std::fs::remove_file(hold_file(&dir)).expect("release the hold");
+    eprintln!("FLUSHDB during the save, {FIELDS}-field hash UNLINKed just before: {took:?}");
+    assert!(
+        took < BUDGET,
+        "FLUSHDB took {took:?} (budget {BUDGET:?}): it freed the UNLINKed {FIELDS}-field \
+         hash inline"
+    );
+    wait_bgsave_done(&mut c);
+    assert_eq!(last_bgsave_status(&mut c), "ok", "the save must complete");
+    let info = c.send(&["INFO", "persistence"]);
+    assert!(
+        info.lines().any(|l| l.trim() == "current_cow_size:0"),
+        "no save in flight: current_cow_size must be 0: {info:.300}"
+    );
+}

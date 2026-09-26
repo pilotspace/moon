@@ -18,6 +18,20 @@
 
 mod common;
 
+/// Before a kill -9 whose restart replays the WAL: let the shard's WAL tick
+/// write what the test just did. A fixed wait, not a condition (review 7):
+/// the MQ records go to the per-shard WAL v3, which nothing observable
+/// reports as written. INFO persistence covers the AOF only
+/// (`aof_current_size` stays put while MQ PUSHes land in
+/// `shard-0/wal-v3/`). `DEBUG RECLAMATION` has `wal_current_lsn`, the next
+/// LSN to assign (it moves before the buffer is written), and
+/// `wal_total_bytes`, segment file sizes: waiting for them to stop growing
+/// is a timing guess too. The tick writes within ~1 ms; 1.5 s is the
+/// margin.
+fn wait_for_the_wal_tick() {
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+}
+
 use common::{Conn, ServerGuard};
 
 fn spawn(dir: &std::path::Path, shards: usize) -> (ServerGuard, u16) {
@@ -307,8 +321,7 @@ fn a_restart_bills_a_churned_queue_as_the_live_server_did() {
     let mut c = Conn::open(port);
     churn(&mut c);
     let before = memory_usage(&mut c, "q");
-    // The WAL tick has written everything.
-    std::thread::sleep(std::time::Duration::from_millis(1500));
+    wait_for_the_wal_tick();
     server.kill_now();
     common::wait_for_port_down(port);
     let (server2, port2) = spawn_with(&dir, 1, "yes");
@@ -415,7 +428,7 @@ fn a_pop_surplus_release_agrees_on_master_replica_and_restart() {
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
 
-    std::thread::sleep(std::time::Duration::from_millis(1500));
+    wait_for_the_wal_tick();
     master.kill_now();
     common::wait_for_port_down(mport);
     let (master2, mport2) = spawn_with(&dir.join("m"), 1, "yes");
@@ -512,7 +525,7 @@ fn an_empty_pop_changes_nothing_on_master_replica_or_replay() {
     let mem = |c: &mut Conn| c.send(&["MEMORY", "USAGE", "e"]);
     let (cm, cr) = (consumers(&mut m), consumers(&mut r));
     let (mm, mr) = (mem(&mut m), mem(&mut r));
-    std::thread::sleep(std::time::Duration::from_millis(1500));
+    wait_for_the_wal_tick();
     master.kill_now();
     common::wait_for_port_down(mport);
     let (master2, mport2) = spawn_with(&base.join("m"), 1, "yes");
@@ -692,8 +705,7 @@ fn master_replica_and_replay_agree_on_every_queue_state_and_bill() {
         full_pel.len()
     );
     let (on_master, on_replica) = wait_same(&mut m, &mut r, &qs);
-    // Replay: the WAL tick writes within ~1 ms; give it a margin, then kill -9.
-    std::thread::sleep(std::time::Duration::from_millis(1500));
+    wait_for_the_wal_tick();
     master.kill_now();
     common::wait_for_port_down(mport);
     let (master2, mport2) = spawn_with(&base.join("m"), 1, "yes");

@@ -333,17 +333,21 @@ impl Database {
         // completes with the pre-flush image instead of aborting); otherwise
         // `note_cleared_table` drops it, as this assignment used to. The
         // table's bill is `used_memory` (not `estimated_memory`: the
-        // spill-in-flight bytes are not in the table) — without the charges
-        // of values UNLINK queued for lazy free (moon#1190), which are not
-        // in the table either: with a save armed they are reclaimed first
-        // (moon#1228 review 6, N1: the frozen bill carried them for the whole
-        // save, on top of the pre-images the trim restores). That is the
-        // lazy-free drain's owed work, done here instead of in later ticks.
-        if crate::persistence::snapshot_cow::is_armed() && self.lazy_free_reclaimable() {
-            let _ = self.reclaim_lazy_free(usize::MAX);
-        }
+        // spill-in-flight bytes are not in the table). That still counts the
+        // remaining charges of values UNLINK queued for lazy free
+        // (moon#1190): when the table is frozen, the queue credits them to
+        // its bill as it frees them (moon#1228 review 7) — never freed here,
+        // inside the FLUSHDB (review 6's reclaim did, 231-244 ms for an
+        // UNLINKed 5M-field hash, against 0.1-0.4 ms on main).
         let old = std::mem::replace(&mut self.data, DashTable::new());
-        crate::persistence::snapshot_cow::note_cleared_table(self, old, self.used_memory as u64);
+        let frozen = crate::persistence::snapshot_cow::note_cleared_table(
+            self,
+            old,
+            self.used_memory as u64,
+        );
+        if let Some(frozen) = frozen {
+            self.lazy_free_redirect_charges(frozen);
+        }
         // moon#1190: the ledger restarts at 0; values still being freed must
         // not be credited against it again.
         self.lazy_free_forget_charges();

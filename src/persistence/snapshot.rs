@@ -603,10 +603,13 @@ impl SnapshotState {
         }
         self.overflow.iter_mut().for_each(BTreeMap::clear);
         self.overflow_bytes = 0;
-        // Nothing will be written any more: release the detached tables.
+        // Nothing will be written any more: release the detached tables,
+        // off the shard thread (review 7).
         for source in &mut self.sources {
-            if matches!(source, Source::Frozen(..)) {
-                *source = Source::Written;
+            if matches!(source, Source::Frozen(..))
+                && let Source::Frozen(frozen) = std::mem::replace(source, Source::Written)
+            {
+                frozen.release();
             }
         }
     }
@@ -715,8 +718,8 @@ impl SnapshotState {
 
     /// Run `f` over the current database's epoch-start table: the frozen
     /// table when a flush detached it, else `db` (which the caller borrowed
-    /// from [`Self::source_db_index`]). A frozen table is released once its
-    /// database is fully written.
+    /// from [`Self::source_db_index`]). A frozen table is released, off the
+    /// shard thread, once its database is fully written.
     fn with_current_table<R>(
         &mut self,
         db: &Database,
@@ -731,6 +734,8 @@ impl SnapshotState {
                 let out = f(self, &frozen.table);
                 if self.current_db == cur && self.aborted.is_none() {
                     self.sources[cur] = Source::Frozen(frozen);
+                } else {
+                    frozen.release();
                 }
                 out
             }

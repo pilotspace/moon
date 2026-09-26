@@ -769,3 +769,285 @@ Notes:
   - perf_ws16_bgsave_capture 7/7, perf_ws16_bgsave_prop 2/2, perf_ws16_mq_billing 6/6 + 4
     ignored (they need a replica);
   - mq_integration 17/17, workspace_integration 13/13 + 1 ignored.
+
+## Review 7 (MERGE-AFTER-FIXES) — what changed
+
+The PR head (82e3064e) was merged first (fa9a5dc1). One commit per item:
+
+| item | commit | red → green |
+|---|---|---|
+| 1 FLUSHDB freed queued lazy-free values inline (review 6's N1 reclaim) | a453de8c | see below |
+| 2 the trim budget counted a collection as one row; only 4,096+ elements were offloaded | 0d3c5e2d | see below |
+| 3 the walk and an abort dropped frozen tables inline | 17da0f6e | see below |
+| 4 `UNTRIMMED_EXCESS` was stale after the walk released a table | 29b3e1ee | see below |
+| 5 tests: assert the bill error; the fixed 1.5 s wait | 4c4e0c80 | see below |
+| 6 `moon-snapdrop` duplicated the lazy-free dropper | ed3ad086 | refactor + docs, no behaviour change |
+
+### Item 1 — the lazy-free charge follows the table into the epoch
+
+Review 6's N1 fix called `reclaim_lazy_free(usize::MAX)` in `Database::clear` while a save
+was armed. That freed every charged queued value inside the FLUSHDB, and FLUSHALL's per-db
+clears and a replica resync took the same path.
+
+**Chosen: the reviewer's full design, not the stopgap.** The stopgap (drop the reclaim and
+document the over-report) would bill the frozen table for values that are no longer in it
+until the save ends. With the S2 rule weighing untrimmed excess, that over-report could fail
+a later save. The redirect costs O(1) per credit, frees nothing inside FLUSHDB, and leaves
+the bill exact once the lazy free finishes.
+
+- `lazy_free::Item.charged: bool` became `charge: Charge { Ledger, Frozen(FrozenCharge),
+  Credited }`.
+- `note_cleared_table` returns the frozen slot, a `FrozenCharge { serial, db }`, when it
+  queues the freeze. `clear` then calls `lazy_free_redirect_charges`, which moves every
+  `Ledger` item to `Frozen`.
+- The drain credits `Frozen` items through `snapshot_cow::credit_frozen`, a thread-local
+  push. `drain_into` applies the credits to `frozen.bill` (saturating) after the table
+  events and before `trim_frozen`.
+- Each arm takes a new serial. A credit for a disarmed or later epoch is dropped, and disarm
+  clears the queue.
+- The debug exactness assertion now covers `Frozen` items too.
+
+Red → green:
+- Lib, `a_lazy_free_charge_is_credited_to_the_frozen_table_not_freed_inline`: with the
+  reclaim, `lazy_free_len()` is 0 right after the FLUSHDB (red: "left: 0"). With the
+  redirect it is 1, and after the drain `bill == rows <= start_bill`.
+- Lib, `a_value_freed_after_its_save_ended_credits_no_later_save`: without the serial check
+  a second epoch's bill is credited 39,790 B it never took (red: "left: 0, right: 39790").
+  With the check it is green.
+- Server, `flushdb_during_a_save_does_not_free_an_unlinked_hash_inline` (the reviewer's
+  proof, adopted). Setup: a 2M-field hash is UNLINKed, then a held BGSAVE runs, then FLUSHDB;
+  the budget is 50 ms. The test uses `spawn_listening` ports, and the UNLINK comes before
+  the save, as in the reviewer's proof.
+
+  | binary | FLUSHDB |
+  |---|---|
+  | REVIEW7-head-rf | 117.2 ms (red) |
+  | REVIEW7-main-rf | 317 µs |
+  | this fix, debug | 723 µs (green) |
+
+  On main the test goes on to fail its "save completes" assertion: main aborts the save on
+  FLUSHDB.
+- An UNLINK *during* the save deep-clones the value's pre-image. That cost is pre-existing
+  (the reviewer is filing it) and this test does not measure it.
+
+### Item 2 — the trim budget weighs collections
+
+Before, a removed collection cost the budget one operation whatever its size, and only values
+of 4,096+ elements went to `moon-snapdrop`. Both fixes the reviewer offered are applied,
+because each bounds a different cost:
+
+- **Offload:** every collection UNLINK would free lazily (more than `LAZY_FREE_THRESHOLD` =
+  64 elements) is freed on the helper thread. Smaller ones are listpacks or intsets, whose
+  free is O(1).
+- **Weigh:** a row costs `1 + elements / 64` operations, for the post-epoch row and for the
+  pre-image restored in its place. The charge (`entry_overhead`) walks every element even
+  when the free is offloaded. With 4,100-field hashes, which were already offloaded, head
+  still stalled 34-48 ms on that walk.
+
+A row or segment that does not fit waits for the next drain, and that drain takes it even
+if it alone exceeds the budget. A single collection of more than ~32K elements is therefore
+walked whole by one drain, at about 17 ns an element. The `TRIM_BUDGET` doc now says so,
+replacing its old "under ~0.7 ms per drain" claim.
+
+Red → green, lib test `a_drain_trims_a_bounded_number_of_collection_elements` (64 post-epoch
+hashes of 1,000 fields, then FLUSHDB):
+- Red on head: "one drain charged 64000 collection elements".
+- Mutation, weights kept and the 4,096 offload cut restored: "the trim freed 64000
+  collection elements inline".
+- Green: at most `512 x 64` elements charged per drain, 0 freed inline.
+
+Release-fast server, the reviewer's `review7_trim_value_budget.py` (600 post-epoch hashes,
+held save, FLUSHDB, then the trim), worst PING gap over three runs each:
+
+| build | 4,000 fields | 4,100 fields |
+|---|---|---|
+| this fix (`ws16-r7-2-rf`) | 1.23 / 2.46 / 2.00 ms | 6.23 / 1.80 / 3.20 ms |
+| REVIEW7-head-rf | 105.6 / 75.4 / 74.0 ms | 47.8 / 33.5 / 35.8 ms |
+| REVIEW7-main-rf (its FLUSHDB aborts the save and frees inline) | 82.8 / 82.7 / 94.6 ms | 79.2 / 103.2 / 74.5 ms |
+
+The FLUSHDB itself answers in 0.23-0.41 ms on this fix.
+
+Tooling note: the shared `CARGO_TARGET_DIR` gives this worktree's and WS19's `moon` units
+the same file names, because cargo hashes a path package relative to its workspace root.
+One cargo run here executed WS19's lib-test binary (93 tests, without this branch's). Every
+build and check since then passes `--config 'profile.dev.package.moon.debug=false'`, which
+gives moon's units their own names and leaves the dependencies shared.
+
+### Item 3 — frozen tables are released off the shard thread
+
+`Frozen::release` hands the table to `moon-snapdrop`, along with a rebuild's target if the
+table was mid-rebuild. Two sites call it:
+- `with_current_table`, when the walk leaves the database (or the save aborted inside the
+  step);
+- `abort`, for every frozen source.
+
+Red → green, lib tests `the_walk_releases_a_frozen_table_off_the_shard_thread` and
+`an_aborted_save_releases_its_frozen_tables_off_the_shard_thread`. They count the tables
+handed to the helper with a test-only counter. Red: "left: 0, right: 1" and "left: 0,
+right: 2".
+
+Release numbers are in the re-measurement section below.
+
+Left as is, because main behaves the same:
+- tables a FLUSHDB or FLUSHALL drops inside its own command: an already-written database,
+  an aborted epoch, or the S2 abort;
+- the `Freeze` events `abort_epoch` discards within the same tick.
+
+Main drops those tables inline in that same command.
+
+### Item 4 — the untrimmed excess is re-published after the walk
+
+The S2 rule weighs a grown flush against `WAITING_EXCESS + UNTRIMMED_EXCESS`. The drain
+published `UNTRIMMED_EXCESS`, but the walk runs after the drain, and it can release a table
+whose trim has not finished (item 3's release site). A grown flush later in that tick then
+counted a table the epoch no longer held.
+
+The fix is a new `snapshot_cow::note_walk(snap)`, which re-publishes the excess. It is
+called:
+- after the advance in `persistence_tick::advance_snapshot_segment` (WS19's file, one line
+  next to `note_progress`);
+- after the advance in the epoch harness;
+- by `drain_into`, in place of its inline publish.
+
+Red → green, lib test `a_table_the_walk_released_is_not_weighed_against_a_later_flush`:
+- Setup: trim budget 1, so db 1's trim outlasts the walk. db 1 grows by 1,200 x 8 KiB and is
+  flushed; the walk passes db 1; db 2 then grows by the same amount and is flushed.
+- Red: "snapshot aborted: FLUSHDB detached databases that grew during the save faster than
+  the snapshot could trim them".
+- Green: the save completes with the epoch-start image, and file + tail equals live.
+
+`snapshot_cow.rs` is exactly 1,500 lines after this commit: three doc comments were
+shortened to make room.
+
+### Item 5 — tests
+
+`prop_tests` now asserts `max_bill_error == 0`. The assertion alone passed trivially,
+because the workload never lazy-freed anything: its "big" hashes had 100 fields, which stay
+a listpack (`hash-max-listpack-entries` is 128), and a listpack is freed inline. So:
+- The big hashes now have 200 fields.
+- Half the FLUSHDBs UNLINK one of the database's big hashes first.
+- A `lazy_free_tick` stands in for the shard tick's lazy-free drain. It runs whole before
+  every drain and tick, and partially (0-299 elements) before one op in eight.
+- A new coverage counter, `flushes_with_lazy_free_pending`, must be non-zero from 8 seeds up;
+  16 seeds give 18.
+
+Red → green, 16 seeds unless noted:
+- 200 seeds with the 200-field hashes but no harness drain: red, `max_bill_error` 24,232
+  (one hash's charge left in a bill).
+- Mutation A, the harness never drains: red, 24,232, with 160 flushes finding a queued
+  value.
+- Mutation B, no redirect in `Database::clear`: red, 24,232.
+- Green: 200 seeds give bill error 0 over 10,013 checks.
+
+`perf_ws16_mq_billing`'s 1.5 s wait before kill -9 stays, now named
+`wait_for_the_wal_tick` and documented. There is no observable condition to wait on:
+- The MQ records go to the per-shard WAL v3 (`shard-0/wal-v3/`). Probed on the release
+  build: `aof_current_size` stayed at 96 B across 50 MQ PUSHes.
+- INFO persistence reports only the AOF.
+- `DEBUG RECLAMATION` has `wal_current_lsn`, the next LSN to assign, which moves before the
+  buffer is written.
+- Its `wal_total_bytes` is segment file sizes; waiting for it to stop growing is a timing
+  guess too.
+
+### Item 6 — one dropper helper
+
+`lazy_free::spawn_shell_dropper` became `storage::db::spawn_dropper<T>`, which is generic
+over what it drops.
+- `moon-lazyfree` (shells) and `moon-snapdrop` (the trim's values and released tables) are
+  each spawned by it: the same aux-core re-pin, the same `recv` loop.
+- They remain two threads, one per item type. A shared thread would need a `Box<dyn Send>`
+  per send.
+- Its doc now covers the unbounded channel and the uncounted in-flight bytes. The sender is
+  a shard thread and must never block. What is in flight is already credited: it is out of
+  `used_memory` or `current_cow_size`, but not yet back with the allocator. Only the
+  senders pace it: the lazy-free and trim budgets per tick, and a released table is one
+  send.
+- The helper's affinity test (`lazy_free::tests`) passes unchanged.
+
+### Re-measurement of findings 1-3 (release-fast, pinned)
+
+All runs use the reviewer's scripts, with their temp dir moved to this agent's scratchpad.
+This branch at ed3ad086 is `/home/user/wt/bin/ws16-r7-final-rf`; it is compared with
+`REVIEW7-main-rf` and `REVIEW7-head-rf`.
+
+**Finding 1** (`review7_a4_flushdb_latency.py`, 5M-field hash, two runs of each scenario).
+`seq` is the reviewer's case: UNLINK, then a held BGSAVE, then FLUSHDB.
+
+| scenario | this branch | main | head |
+|---|---|---|---|
+| seq: FLUSHDB | 0.13 / 0.23 ms | 0.48 / 0.17 ms | 258.8 / 242.5 ms |
+| seq: worst PING | 1.7 / 3.0 ms | 3.5 / 1.5 ms | 259.2 / 243.0 ms |
+| control (no save): FLUSHDB | 0.17 / 0.12 ms | 0.11 / 0.19 ms | 0.20 / 0.14 ms |
+| armed (UNLINK during the save, pipelined with FLUSHDB) | 610 / 674 ms | 699 / 632 ms | 790 / 857 ms |
+
+- `armed` is the pre-existing deep clone of an UNLINKed value's pre-image; the reviewer is
+  filing it.
+- In `seq`, `current_cow_size` 0.3 s after the FLUSHDB is 440 MB on this branch, against
+  134 B on head. The UNLINKed hash is still allocated while the lazy free drains it (~1.25 s
+  for 5M fields), and the frozen bill counts it until each credit lands. Head freed it
+  inside the FLUSHDB.
+
+**Finding 2** (`review7_trim_value_budget.py`, 600 post-epoch hashes), worst PING gap:
+
+| | 4,000 fields | 4,100 fields |
+|---|---|---|
+| this branch, 8 / 16 runs | 0.8, 2.2, 2.2, 3.5, 3.8, 3.9, 5.1 ms; one 17.8 ms † | 1.3-6.6 ms, median 2.2 ms; one 56.0 ms † |
+| main | 82.7, 82.8, 94.6, 97.6, 134.6 ms; one 851.7 ms † | 74.5, 79.2, 85.0, 89.3, 103.2, 148.0 ms |
+| head (item 2) | 74.0, 75.4, 105.6 ms | 33.5, 35.8, 47.8 ms |
+
+† These came from one batch of alternating runs, in which main also showed 852 ms and
+135-148 ms (above its usual 75-103 ms). Eighteen further runs of this branch, in two later
+batches on a quiet box, stayed at or below 6.6 ms.
+
+**Finding 3** (`review7_frozen_release.py`, 2M rows, held save, then the hold released),
+worst PING gap while the walk finishes:
+
+| | with FLUSHDB | without |
+|---|---|---|
+| this branch | 1.86 / 4.41 / 1.78 ms | 9.45 / 2.38 / 2.20 ms |
+| head | 41.5 / 59.1 / 43.8 ms | 9.68 / 10.86 / 3.21 ms |
+| main | its FLUSHDB fails the save (status err) and frees the rows inside it | 3.17 / 2.10 / 1.28 ms |
+
+A plain FLUSHDB of 2M rows (`review7_flush_plain.py`, no save) takes 36.7 / 39.0 ms on this
+branch and 37.4 / 42.6 ms on main: unchanged.
+
+**The CHANGELOG line** ("a FLUSHDB of a 2M-row database grown by 6M rows kept PING under
+10 ms"), re-measured over the WHOLE save. The review-6 probe covered only the trim, while
+the walk stayed held. The new probe (`scratchpad/r7probe/probe2.py`) adds the release and
+the walk. Case: 2M epoch-start rows, 6M post-epoch, FLUSHDB, 14 s of trim, then release.
+
+| build | FLUSHDB | PING p99.9 | PING max | walk + finalize, and its worst PING |
+|---|---|---|---|---|
+| this branch, run 1 | 0.2 ms | 1.45 ms | 14.1 ms | 4.11 s, 5.4 ms |
+| this branch, run 2 | 0.2 ms | 0.90 ms | 9.3 ms | 4.19 s, 6.9 ms |
+| this branch, run 3 | 0.2 ms | 0.96 ms | 12.0 ms | 4.13 s, 6.0 ms |
+| head | 0.3 ms | 7.16 ms | 90.6 ms | 4.16 s, 85.9 ms |
+| main, plain FLUSHDB of the same table (no save) | 174.1 / 183.1 ms | — | 174.1 / 183.1 ms | — |
+
+So "under 10 ms" overstated it: the max is 9-14 ms, and head was far worse (90.6 ms)
+because of findings 2 and 3.
+
+## Gate run after review 7 (code ed3ad086; the NOTES/SUMMARY commit follows)
+
+- `cargo fmt --check` is clean. audit-unsafe, audit-unwrap, audit-test-tempdirs and
+  audit-encoding-limits PASS.
+- clippy `--all-targets -D warnings` is clean on monoio and on
+  `--no-default-features --features runtime-tokio,jemalloc`.
+- Every cargo run passed `--config 'profile.dev.package.moon.debug=false'`, which keeps
+  moon's units apart from WS19's in the shared target (item 2 explains why).
+- Lib tests:
+  - `cargo test --lib` monoio, full: 6,705 passed, 15 ignored.
+  - tokio, touched modules (`persistence::`, `storage::db`, `shard::persistence_tick`,
+    `shard::mq_exec`, `blocking::stream_wake`, `command::stream`, `command::server_admin`,
+    `storage::eviction`): 1,293 passed, 2 ignored.
+  - `prop_tests` at 200 seeds: bill error 0 over 9,994 checks. That run had 100 seeds with
+    tiny budgets, 4,140 mid-trim observations, 28 rebuilds, 37 rebuild waits and 198 flushes
+    with a lazy-free value pending.
+- Integration, monoio (`MOON_BIN=/home/user/wt/bin/ws16-r7-final-monoio`):
+  - perf_ws16_bgsave_capture 8/8 (with the adopted proof: FLUSHDB 620 µs);
+  - perf_ws16_bgsave_prop 2/2, perf_ws16_mq_billing 10/10;
+  - perf_ws12_bgsave_split 5/5, perf_ws15_bgsave_status 3/3.
+- Integration, tokio (`MOON_BIN=/home/user/wt/bin/ws16-r7-final-tokio`):
+  - perf_ws16_bgsave_capture 8/8, perf_ws16_bgsave_prop 2/2;
+  - perf_ws16_mq_billing 6/6 + 4 ignored (they need a replica);
+  - perf_ws12_bgsave_split 4/4 + 1 ignored, perf_ws15_bgsave_status 3/3.
