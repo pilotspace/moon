@@ -649,3 +649,128 @@ the lib and review suites and the tokio s1 SWAPDB crash cases). Replication
 failure (`cold_tier_aof_double_apply_902::writes_to_a_cold_key_after_a_
 rewrite_survive_kill9`, `#[ignore]`) is red on `86cd20e8` too — it reads a
 manifest the flat-file layout does not have.
+
+## Round 3 (REVIEW-FINAL-P5B)
+
+Branch `perf/ws20-round3` from `f1decf64` (pilotspace/moon#1282 head: main
++ all of part 5). Proofs: `/home/user/wt/handoff/review_final_p5b_proofs/`.
+
+### Item 1: the F1 cases could not see a missing post-save sweep
+`run_no_aof_flush_scenario` ran a 1 s orphan sweep, and the regular sweep
+reclaims the flushed files right after the save anyway. It now takes the
+interval. Two new cases run at 3600 s, where only
+`timers::sweep_after_snapshot` can reclaim anything. In those cases a file
+still on disk 20 s after the save is a failure by itself.
+
+Red: `f1decf64` with both event-loop call sites removed (mutant). Probes
+back out of 200:
+
+| runtime | shards | FLUSHALL save | BGSAVE | heap files, flush → kill |
+|---|---|---|---|---|
+| monoio | 1 | 183 | 172 | 27 → 27 |
+| monoio | 4 | 183 | 190 | 37 → 37, 34 → 34 |
+| tokio | 1 | 189 | 159 | unchanged |
+| tokio | 4 | 183 | 182 | unchanged |
+
+Green: `f1decf64` itself, 2/2 at s1/s4 on both runtimes.
+
+### Item 2: the save counted done before the sweep
+On both runtimes, `bgsave_shard_done(true)` (the last shard clears
+`SAVE_IN_PROGRESS`, which `save_wait::save_after_flushall`, `LASTSAVE` and
+`rdb_bgsave_in_progress` watch) ran before the post-save sweep. A FLUSHALL
+reply could therefore leave while a shard was still unlinking. The sweep
+now runs first.
+
+The per-shard `snapshot_reply_tx` (SnapshotBegin) is still answered inside
+`finalize_snapshot_success`, before the sweep. It is not a save waiter of
+FLUSHALL or BGSAVE status, and moving it means restructuring WS21's
+`persistence_tick.rs`, so it stays.
+
+`rvfb_f1_reply_race.py` did not hit the window on `f1decf64` (0 of 4
+rounds at s4), so the evidence for this item is the ordering itself.
+
+### Item 3: seed the wal-kv-log flag
+`ShardDatabases::seed_wal_kv_log`, called when the shard's event loop
+starts and before it serves a connection. It stores the first drain's
+decision with no CDC subscriber: on → true, off → false, auto → no AOF.
+It is not seeded at `ShardDatabases::new`, because that has no config and
+~20 callers.
+
+### Item 4: the replay clock
+- **(a)** `replay_wal_v3_dir_commands` now pins its newest segment. That
+  covers both of its callers: `recovery.rs` Phase 4b and `shard/mod.rs`.
+- **(b)** Under `KvSources::SnapshotAndLogs` it could matter, so I aligned
+  it instead of documenting it:
+  - the logs can be a partial history over the snapshot: WAL KV records
+    after it, or an AOF started when `--appendonly` was switched to yes;
+  - a key whose TTL passed during the downtime was dropped at load on the
+    wall clock, yet was alive to the pinned clock that judged an RMW
+    logged over it.
+
+  The fix:
+  - `shard_snapshot_load_noting_expired` hands back `(db, key, entry)`
+    (`snapshot.rs`: same line count);
+  - `replay::clock::keep_expired_image_entries` puts the entries back when
+    logs follow (v3 Phase 3 and the v2 path), with keyspace-change counting
+    muted;
+  - without logs they go, and F6 drops their cold shadows.
+
+  Lib test (v2 path): red `("x", 0)`, green `("vx", deadline)`.
+- **(c)** No current log computes a deadline:
+  - `expire_rewrite` logs every key-level relative form as absolute;
+  - `effect_rewrite` logs `HEXPIRE`, `HPEXPIRE` and `HGETEX EX|PX` as
+    `HPEXPIREAT`.
+
+  Only a pre-rewrite log re-bases. The doc is corrected.
+- **Finding 1**, documented in `clock.rs` and in the production guide ("Key
+  expiry during AOF replay"). An mtime EARLIER than the last write (the
+  clock stepped back, a lagging network/virtio FS, `touch -d`) makes replay
+  behave like suppression: a key lazily expired and rewritten before its
+  DEL was logged comes back OLD (27–36/40; wall clock 0/40). An mtime LATER
+  than the last write drifts back to the pre-#1277 behaviour. The durable
+  fix is a logged time record, a format change the orchestrator files as a
+  follow-up.
+
+### Item 5: the TTL cases
+Round 1's duration is measured at the kill. If it outlived the TTL, the
+case fails with "INCONCLUSIVE, not a pass", after the correctness check, so
+a wrong probe still reports as wrong.
+
+Evidence, TTL 1.5 s (round 1 took 2.78 s): it passed before this change and
+fails as inconclusive now. At 0.5 s both versions fail, because a
+0.5 s-TTL probe is already absent when the harness reads it back live.
+
+### Item 6: crash-matrix
+New job `cold-tier`: nightly schedule and dispatch mode, `moon-dev`,
+60 min. `nightly` keeps the cross-plane matrix at 30 min. The job layout is
+in SUMMARY Round 3.
+
+Measured debug timings per shard count:
+
+| suite | time |
+|---|---|
+| del_rewrite | 443–520 s |
+| no_aof | ~100 s, + ~50 s for the two new cases (tokio ~215 s) |
+| inflight_1253 | 7.7–10.3 s |
+
+### Item 7: findings 2 and 3
+Both are in the SUMMARY and in the production guide.
+- **Finding 2:** without an AOF, #1236 is fixed at the first boot only. One
+  more BGSAVE and kill -9, and the rebuild re-indexes the dead slot (44/100
+  monoio s1, 88/100 tokio s1; main 37/100). This is moon#1281 / N2.
+- **Finding 3:** with no save rules, any restart, a clean SHUTDOWN
+  included, undoes a DEL or FLUSHALL of cold keys until a manual BGSAVE
+  (96/200; main 0).
+
+### Not examined
+`cold_file_id_reuse_1067` (moon#1279, red on main `4a96cd5f`): none of this
+round's changes touch it, and I ran no probes of it. I did not start the
+background tasks the restart notice names ("Rerun the 1067 kill9 test…").
+
+### Gates (final code `664a4df5`)
+- **Static checks**, all clean: fmt, audit-unsafe, audit-unwrap, audit-test-tempdirs, audit-encoding-limits, clippy `--all-targets -D warnings` on both runtimes, and tokio `check --all-targets`.
+- **Lib tests** (storage, persistence, shard, replication, server, command, scripting): monoio 4312 passed / 0 failed; tokio 4085 / 0.
+  - The monoio lib run finished just before the container restart. The tokio lib run was interrupted by the restart and re-run afterwards. The code did not change in between.
+- **`perf_ws20_review`:** monoio 7/7, tokio 6/6, and a tokio replica under a monoio master 1/1.
+- **`crash_recovery_cold_no_aof --ignored`:** 8/8 at s1 and s4 on both runtimes. Times: monoio 124–134 s, tokio 240–249 s.
+- **`crash_recovery_cold_del_rewrite --ignored`:** monoio s1 21/21 in 441 s.
