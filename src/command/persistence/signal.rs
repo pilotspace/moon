@@ -21,6 +21,9 @@
 //! - a second SIGINT while the final save runs: exit at once, unsaved
 //!   ("You insist... exiting now"); a second SIGTERM is logged.
 //!
+//! `SHUTDOWN ABORT` cancels a signal's final save like a `SHUTDOWN`'s
+//! (moon#1264): the server keeps running.
+//!
 //! A signal that arrives before [`arm`] (the server is still booting) stops it
 //! at once, as before: the dataset is not loaded yet, and a save then would
 //! replace a good snapshot with a partial one.
@@ -124,6 +127,12 @@ fn save_then_exit(armed: &Armed) {
         Ok(()) => {
             info!("final snapshot saved; shutting down");
             armed.shutdown.cancel();
+        }
+        // `SHUTDOWN ABORT` (moon#1264) cancelled it: keep running, as redis
+        // does after "Shutdown manually aborted".
+        Err(Frame::Error(e)) if e.as_ref() == super::SHUTDOWN_ABORTED_ERR => {
+            warn!("the signal's shutdown was aborted; the server keeps running");
+            SAVING.store(false, Ordering::Release);
         }
         Err(reply) => {
             let why = match &reply {
