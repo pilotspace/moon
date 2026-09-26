@@ -346,6 +346,39 @@ moon --appendonly yes --appendfsync everysec \
 
 Recovery order: RDB snapshot, then WAL segments, then AOF tail.
 
+### Graceful shutdown and stop timeouts
+
+A graceful stop — `SIGTERM` (`systemctl stop`, `docker stop`, a Kubernetes pod
+deletion), `SIGINT` or `SHUTDOWN` — does two things before the process exits:
+
+1. **The final RDB save**, when save points are configured (`--save`, or
+   `CONFIG SET save`): a `SIGTERM`/`SIGINT` waits for a save already running,
+   then saves once more. There is no deadline on it, because a large dataset
+   must not turn a stop into "keep running". Every 20 s without progress it logs
+   `Errors trying to shut down the server` and that the stop stays armed. A
+   failed save keeps the server running (redis parity); a second `SIGINT` exits
+   at once without the save (status 1), and `SHUTDOWN ABORT` cancels.
+2. **The AOF drain** (`--appendonly yes`): after the shards stop, every AOF
+   writer writes what is still queued and fsyncs. The wait is bounded at 60 s
+   (plus a 2 s grace); after that the process exits non-zero and logs the
+   writers it abandoned. A second `SIGINT` cuts the wait to about 2 s.
+
+The supervisor's stop timeout must cover both, or it `SIGKILL`s the save or the
+drain half-way: the unsaved writes are then lost, as on a crash. Size it to the
+final save of your dataset (roughly the time a `BGSAVE` takes: time one, from
+`BGSAVE` until `INFO persistence` shows `rdb_bgsave_in_progress:0`) **plus
+60 s**:
+
+| Supervisor | Default | Setting |
+|---|---|---|
+| systemd | `TimeoutStopSec=90s` | `TimeoutStopSec=` in the `[Service]` section (`packaging/moon.service`) |
+| Docker | 10 s | `docker stop -t <s>`, `docker run --stop-timeout <s>`, Compose `stop_grace_period` |
+| Kubernetes | 30 s | `terminationGracePeriodSeconds` in the pod spec |
+
+For example, a dataset whose `BGSAVE` takes 2 minutes needs
+`TimeoutStopSec=180` (120 s + 60 s). With `--appendonly yes` and no save
+points, the 60 s drain bound alone is the minimum.
+
 ### Switching `--appendonly yes` → `no`
 
 Take a snapshot first (`BGSAVE`, or `SHUTDOWN SAVE`). Under `--appendonly no`
