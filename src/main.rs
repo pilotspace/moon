@@ -1068,11 +1068,9 @@ fn main() -> anyhow::Result<()> {
     let (snapshot_trigger_tx, snapshot_trigger_rx) = moon::runtime::channel::watch(0u64);
 
     // Persistence directory for the per-shard WAL, graph/vector/MQ state and
-    // snapshots: set with `--appendonly yes` or any `--save` (even `""`). The
-    // WAL writer itself needs `appendonly yes` (event loop). moon#1267: the
-    // RDB snapshot does not depend on it — redis loads `dump.rdb` and takes
-    // BGSAVE / SHUTDOWN SAVE whatever the save rules — so its directory is
-    // always `--dir`, and boot always loads a snapshot found there.
+    // snapshots: set with `--appendonly yes` or any `--save` (even `""`); the
+    // WAL writer itself needs `appendonly yes`. moon#1267: the RDB snapshot
+    // does not — its directory is always `--dir`, loaded at every boot.
     let persistence_dir =
         (config.appendonly == "yes" || config.save.is_some()).then(|| config.dir.clone());
     moon::command::persistence::set_snapshot_dir(&config.dir);
@@ -2382,21 +2380,20 @@ fn main() -> anyhow::Result<()> {
 
     cancel_token.cancel();
     for handle in shard_handles {
-        // A shard panic normally aborts via the panic hook above; if one
-        // still surfaces here (hook replaced, non-unwind edge), say so
-        // instead of silently swallowing it.
+        // A shard panic normally aborts via the panic hook; say so if one surfaces here.
         if let Err(e) = handle.join() {
             tracing::error!("shard thread panicked during shutdown: {e:?}");
         }
     }
     // moon#1274: no shard left to append — the AOF writers drain, fsync and exit, then we do.
     if let Some(ref pool) = aof_pool {
-        aof::writer_stop::stop_writers(pool, aof_writers, &aof_writer_token);
+        let (bound, token) = (aof::writer_stop::STOP_BOUND, &aof_writer_token);
+        aof::writer_stop::stop_writers(pool, aof_writers, token, bound)
+            .map_err(|w| anyhow::anyhow!("AOF writer(s) {w:?} abandoned at shutdown"))?;
     }
 
     if let Some(err) = listener_failure.lock().take() {
-        // Shutdown ran to completion above (AOF flushed, shards joined), so the
-        // data path is clean; only the exit STATUS changes.
+        // Shutdown ran to completion (AOF flushed, shards joined): only the exit STATUS changes.
         tracing::error!("Server shut down after a fatal listener failure: {err}");
         return Err(anyhow::anyhow!("listener failed: {err}"));
     }

@@ -104,15 +104,28 @@ fn wait_exit(server: &mut ServerGuard, budget: Duration) -> std::process::ExitSt
     }
 }
 
-/// Acknowledge `KEYS` SETs (pipelined), then stop the server at once.
-fn write_then_stop(dir: &Path, shards: usize, how: Stop, hold: Option<&Path>) {
-    let (mut server, port) = spawn(dir, shards, hold);
-    let mut c = Conn::open(port);
-    let keys: Vec<String> = (0..KEYS).map(|i| format!("k:{i}")).collect();
+/// Acknowledge `KEYS` SETs of `prefix:*` (pipelined).
+fn set_all(c: &mut Conn, prefix: &str) {
+    let keys: Vec<String> = (0..KEYS).map(|i| format!("{prefix}:{i}")).collect();
     let cmds: Vec<[&str; 3]> = keys.iter().map(|k| ["SET", k.as_str(), "v"]).collect();
     let cmds: Vec<&[&str]> = cmds.iter().map(|c| &c[..]).collect();
     let replies = c.pipeline(&cmds);
     assert_eq!(replies.matches("+OK\r\n").count(), KEYS, "{replies}");
+}
+
+/// How long the server took to exit (status 0 required), bounded at 90 s.
+fn exit_took(server: &mut ServerGuard) -> Duration {
+    let t = Instant::now();
+    let status = wait_exit(server, Duration::from_secs(90));
+    assert!(status.success(), "exit status {status:?}");
+    t.elapsed()
+}
+
+/// Acknowledge `KEYS` SETs (pipelined), then stop the server at once.
+fn write_then_stop(dir: &Path, shards: usize, how: Stop, hold: Option<&Path>) {
+    let (mut server, port) = spawn(dir, shards, hold);
+    let mut c = Conn::open(port);
+    set_all(&mut c, "k");
     stop(&server, &mut c, how);
     if let Some(hold) = hold {
         std::thread::sleep(Duration::from_millis(300));
@@ -127,20 +140,28 @@ fn write_then_stop(dir: &Path, shards: usize, how: Stop, hold: Option<&Path>) {
     drop(c);
 }
 
-/// Keys missing after a restart.
-fn missing_after_restart(dir: &Path, shards: usize) -> usize {
+/// Keys `prefix:*` missing after a restart, per prefix.
+fn missing_after_restart_of(dir: &Path, shards: usize, prefixes: &[&str]) -> Vec<usize> {
     let (_server, port) = spawn(dir, shards, None);
     let mut c = Conn::open(port);
-    (0..KEYS)
-        .filter(|i| c.send(&["GET", &format!("k:{i}")]) != "$1\r\nv\r\n")
-        .count()
+    let mut missing = |prefix: &str| {
+        (0..KEYS)
+            .filter(|i| c.send(&["GET", &format!("{prefix}:{i}")]) != "$1\r\nv\r\n")
+            .count()
+    };
+    prefixes.iter().map(|p| missing(p)).collect()
+}
+
+/// Keys `prefix:*` missing after a restart.
+fn missing_after_restart(dir: &Path, shards: usize, prefix: &str) -> usize {
+    missing_after_restart_of(dir, shards, &[prefix])[0]
 }
 
 fn every_write_survives(shards: usize, how: Stop) {
     let dir = common::unique_test_dir(&format!("ws21-1274-s{shards}-{how:?}"));
     std::fs::create_dir_all(&dir).unwrap();
     write_then_stop(&dir, shards, how, None);
-    let lost = missing_after_restart(&dir, shards);
+    let lost = missing_after_restart(&dir, shards, "k");
     let _ = std::fs::remove_dir_all(&dir);
     assert_eq!(
         lost, 0,
@@ -185,10 +206,80 @@ fn a_sigterm_waits_for_a_late_aof_writer() {
     let hold = dir.join("writer.hold");
     std::fs::write(&hold, b"held").unwrap();
     write_then_stop(&dir, 4, Stop::Term, Some(&hold));
-    let lost = missing_after_restart(&dir, 4);
+    let lost = missing_after_restart(&dir, 4, "k");
     let _ = std::fs::remove_dir_all(&dir);
     assert_eq!(
         lost, 0,
         "{lost} of {KEYS} acknowledged writes lost (shard 1's writer was late)"
+    );
+}
+
+/// Round 3 A1: a `BGREWRITEAOF` that is dispatched when the stop lands. The
+/// fold asks each shard for a cooperative snapshot; a shard that stopped
+/// first never answered, the writers waited out the whole 60 s drain bound,
+/// and the exit then came with status 0. A fold whose shard is gone now
+/// fails at once: the rewrite aborts, the old generation stays
+/// authoritative, and the writers drain into it.
+fn a_sigterm_right_after_bgrewriteaof(shards: usize) {
+    let dir = common::unique_test_dir(&format!("ws21-r3-a1-s{shards}"));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (mut server, port) = spawn(&dir, shards, None);
+    let mut c = Conn::open(port);
+    set_all(&mut c, "k");
+    let r = c.send(&["BGREWRITEAOF"]);
+    assert!(r.starts_with('+'), "BGREWRITEAOF: {r}");
+    stop(&server, &mut c, Stop::Term);
+    let took = exit_took(&mut server);
+    drop(c);
+    let lost = missing_after_restart(&dir, shards, "k");
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        took < Duration::from_secs(10) && lost == 0,
+        "--shards {shards}: exit took {took:?}, {lost} of {KEYS} acknowledged writes lost"
+    );
+}
+
+#[test]
+fn a_sigterm_right_after_bgrewriteaof_exits_promptly_single_shard() {
+    a_sigterm_right_after_bgrewriteaof(1);
+}
+
+#[test]
+fn a_sigterm_right_after_bgrewriteaof_exits_promptly_four_shards() {
+    a_sigterm_right_after_bgrewriteaof(4);
+}
+
+/// Round 3 A1, the reviewer's case: shard 1's writer is late, so the other
+/// three fold and park at the rewrite barrier; more writes are acknowledged;
+/// SIGTERM; shard 1's writer is released only after the shards stopped and
+/// pushes its fold into a ring nobody reads. Before: exit after 60 s, status
+/// 0, 227 of 300 post-rewrite writes lost.
+#[test]
+fn a_sigterm_with_a_fold_its_shard_never_served() {
+    let dir = common::unique_test_dir("ws21-r3-a1-late");
+    std::fs::create_dir_all(&dir).unwrap();
+    let hold = dir.join("writer.hold");
+    std::fs::write(&hold, b"held").unwrap();
+    let (mut server, port) = spawn(&dir, 4, Some(&hold));
+    let mut c = Conn::open(port);
+    set_all(&mut c, "k");
+    let r = c.send(&["BGREWRITEAOF"]);
+    assert!(r.starts_with('+'), "BGREWRITEAOF: {r}");
+    // Writers 0, 2 and 3 fold and park at the barrier, waiting for writer 1.
+    std::thread::sleep(Duration::from_millis(800));
+    set_all(&mut c, "p");
+    stop(&server, &mut c, Stop::Term);
+    // The shards stop; only then does shard 1's late writer read its channel.
+    std::thread::sleep(Duration::from_millis(500));
+    std::fs::remove_file(&hold).unwrap();
+    let took = exit_took(&mut server);
+    drop(c);
+    let lost = missing_after_restart_of(&dir, 4, &["k", "p"]);
+    let (lost_k, lost_p) = (lost[0], lost[1]);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        took < Duration::from_secs(10) && lost_k == 0 && lost_p == 0,
+        "exit took {took:?} after the late writer's release; lost {lost_k} + {lost_p} of \
+         {KEYS} + {KEYS} acknowledged writes"
     );
 }
