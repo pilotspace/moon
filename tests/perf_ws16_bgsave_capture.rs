@@ -586,11 +586,54 @@ fn flushdb_after_post_epoch_inserts_holds_only_the_epoch_start_rows() {
 /// avoid. Release-fast, 5M fields: 231-244 ms, against 0.1-0.4 ms on main.
 /// The queue now credits the frozen table's bill as it frees the value; the
 /// FLUSHDB of a database holding one small key must answer at once.
+///
+/// Judged against this host, not a wall clock (moon#1273): an absolute 50 ms
+/// budget failed a loaded Windows runner WITH the fix (85 ms). Each round
+/// queues an equal hash in each of databases 1..=[`SAMPLES`] (UNLINK in the
+/// same write as the held BGSAVE — an UNLINK during a save captures a deep
+/// pre-image, a separate cost), and each sample is ONE write of
+/// `SELECT db; MEMORY STATS; FLUSHDB`, read three ways:
+///
+/// - **Still queued?** `MEMORY STATS` is the database's ledger, read in the
+///   same batch right before the FLUSHDB: an UNLINKed value stays charged
+///   there until the drain frees it. Under half a hash, the drain got there
+///   first and the sample measures nothing: not judged.
+/// - **Time**, against a synchronous `DEL` of an equal hash on the same
+///   server (the inline free itself): at least 1/[`INLINE_FREE_RATIO`] of it
+///   is SLOW. Debug monoio, 1M fields: `DEL` 108-138 ms; FLUSHDB 0.1-1.1 ms
+///   with the fix and 56-381 ms with review 6's reclaim restored.
+/// - **Billed?** With the fix the hash's charge moves into the frozen
+///   table's bill, so `current_cow_size` rises by about one hash within a
+///   tick (measured 0.99-1.00 of it); with the inline free it does not.
+///
+/// Why the first check: the lazy-free drain runs in slices on the shard's
+/// 1 ms tick, and an interval that missed ticks (a busy or descheduled shard
+/// thread; tokio's default `MissedTickBehavior::Burst`; the catch-up after a
+/// stall) fires them back to back. A queued hash is then freed in one piece
+/// ahead of the FLUSHDB, which waits for it — measured on tokio with the
+/// whole file running: FLUSHDBs of 150-340 ms behind an already-drained
+/// queue, the shape of the Windows failure. Timing alone reads that as an
+/// inline free, and after a stall it also let the reverted build pass (the
+/// burst had emptied every other queue).
+///
+/// A queued, fast, billed sample passes. [`SLOW_TO_FAIL`] queued, slow
+/// samples fail ("freed inline"): a stall can spoil one round, an inline free
+/// makes every sample slow. [`ROUNDS`] rounds with neither fail as
+/// unjudgeable.
 #[test]
 fn flushdb_during_a_save_does_not_free_an_unlinked_hash_inline() {
-    const FIELDS: usize = 2_000_000;
-    // A FLUSHDB of a database holding one small key. Main: 0.1-0.4 ms.
-    const BUDGET: Duration = Duration::from_millis(50);
+    const FIELDS: usize = 1_000_000;
+    /// FLUSHDB samples per round, one per database 1..=SAMPLES.
+    const SAMPLES: usize = 2;
+    const ROUNDS: usize = 3;
+    /// Queued, slow samples that fail the test: more than one round's worth,
+    /// since a stall's catch-up burst can spoil every sample of its round
+    /// (on tokio the burst also runs between the commands of one write).
+    const SLOW_TO_FAIL: usize = SAMPLES + 1;
+    /// A FLUSHDB is slow at 1/this of a synchronous `DEL` of an equal hash:
+    /// 7x below the inline free's measured 0.92, about 100x above the fixed
+    /// FLUSHDB (at most 0.0013).
+    const INLINE_FREE_RATIO: u32 = 8;
     let dir = common::unique_test_dir("ws16-flushdb-unlinked");
     let _cleanup = DirGuard(dir.clone());
     let (_server, port) = spawn_with_maxmemory(&dir, 1, "0");
@@ -618,31 +661,176 @@ fn flushdb_during_a_save_does_not_free_an_unlinked_hash_inline() {
         c.read_replies_within(batch, Duration::from_secs(120));
     }
     assert_eq!(c.send(&["HLEN", "big"]).trim(), format!(":{FIELDS}"));
-    assert!(c.send(&["SET", "small", "x"]).starts_with("+OK"));
 
-    // UNLINK (O(1): queued for the lazy-free drain, still charged), a held
-    // BGSAVE, then FLUSHDB while the value is still queued. (UNLINK BEFORE
-    // the save: an UNLINK during it captures the value's pre-image, a deep
-    // clone — a separate, pre-existing cost, not what this test measures.)
-    assert_eq!(c.send(&["UNLINK", "big"]).trim(), ":1");
-    std::fs::write(hold_file(&dir), b"").expect("create the hold file");
-    assert!(c.send(&["BGSAVE"]).contains("Background saving started"));
-    assert!(wait_until_armed(&dir, 1, &mut c), "the held save ended");
-    let t = Instant::now();
-    assert!(c.send(&["FLUSHDB"]).starts_with("+OK"));
-    let took = t.elapsed();
-    std::fs::remove_file(hold_file(&dir)).expect("release the hold");
-    eprintln!("FLUSHDB during the save, {FIELDS}-field hash UNLINKed just before: {took:?}");
+    // The control: a synchronous DEL of an equal hash frees it inline. The
+    // fastest of two is kept (a stall can only lengthen one). The first copy
+    // also weighs one hash in `used_memory`.
+    let without = settled_used_memory(&mut c);
+    let mut hash_charge = 0;
+    let mut inline_free = Duration::MAX;
+    for k in 0..2 {
+        assert_eq!(c.send(&["COPY", "big", "ctl"]).trim(), ":1");
+        if k == 0 {
+            hash_charge = settled_used_memory(&mut c) - without;
+        }
+        let t = Instant::now();
+        assert_eq!(c.send(&["DEL", "ctl"]).trim(), ":1");
+        inline_free = inline_free.min(t.elapsed());
+    }
+    let mut ping = Duration::MAX;
+    for _ in 0..5 {
+        let t = Instant::now();
+        assert!(c.send(&["PING"]).starts_with("+PONG"));
+        ping = ping.min(t.elapsed());
+    }
     assert!(
-        took < BUDGET,
-        "FLUSHDB took {took:?} (budget {BUDGET:?}): it freed the UNLINKed {FIELDS}-field \
-         hash inline"
+        inline_free > ping * 20 && hash_charge > 0,
+        "the control is not an inline free: DEL of a {FIELDS}-field hash took {inline_free:?} \
+         ({hash_charge} B charged), a PING {ping:?} — the test cannot tell an inline free from \
+         a lazy one"
     );
-    wait_bgsave_done(&mut c);
-    assert_eq!(last_bgsave_status(&mut c), "ok", "the save must complete");
+
+    let mut samples: Vec<String> = Vec::new();
+    let mut slow = 0usize;
+    for round in 1..=ROUNDS {
+        for db in 1..=SAMPLES {
+            let db = db.to_string();
+            let reply = c.send_within(&["COPY", "big", "q", "DB", &db], Duration::from_secs(120));
+            assert_eq!(reply.trim(), ":1", "round {round}: COPY to db {db}");
+        }
+        // A COPY holds the shard thread for 0.1-0.4 s: let the ticks it
+        // missed fire while nothing is queued.
+        let _ = settled_used_memory(&mut c);
+        let mut setup = Vec::new();
+        for db in 1..=SAMPLES {
+            let db = db.to_string();
+            setup.extend_from_slice(&encode(&["SELECT", &db]));
+            setup.extend_from_slice(&encode(&["SET", "small", "x"]));
+            setup.extend_from_slice(&encode(&["UNLINK", "q"]));
+        }
+        setup.extend_from_slice(&encode(&["SELECT", "0"]));
+        setup.extend_from_slice(&encode(&["BGSAVE"]));
+        let _ = std::fs::remove_file(dir.join("shard-0.rrdshard.tmp"));
+        std::fs::write(hold_file(&dir), b"").expect("create the hold file");
+        c.sock.write_all(&setup).unwrap();
+        let r = c.read_replies(SAMPLES * 3 + 2);
+        assert!(
+            r.matches(":1\r\n").count() == SAMPLES && r.contains("Background saving started"),
+            "round {round}: UNLINK and BGSAVE: {r:?}"
+        );
+        assert!(wait_until_armed(&dir, 1, &mut c), "the held save ended");
+        for db in 1..=SAMPLES {
+            let cow_before = info_int(&mut c, "persistence", "current_cow_size");
+            let mut batch = Vec::new();
+            batch.extend_from_slice(&encode(&["SELECT", &db.to_string()]));
+            batch.extend_from_slice(&encode(&["MEMORY", "STATS"]));
+            batch.extend_from_slice(&encode(&["FLUSHDB"]));
+            let t = Instant::now();
+            c.sock.write_all(&batch).unwrap();
+            let raw = c.read_replies(3);
+            let took = t.elapsed();
+            let replies = common::slow_host::split_replies(&raw);
+            assert!(
+                replies.len() == 3 && replies[2].starts_with("+OK"),
+                "round {round} db {db}: SELECT, MEMORY STATS, FLUSHDB: {raw:?}"
+            );
+            let queued = ledger_bytes(replies[1]);
+            let (rise, verdict) = if queued * 2 < hash_charge {
+                (
+                    0,
+                    "not judged: the drain had freed the hash before the FLUSHDB",
+                )
+            } else if took * INLINE_FREE_RATIO >= inline_free {
+                slow += 1;
+                (0, "SLOW")
+            } else {
+                let rise = cow_rise(&mut c, cow_before, hash_charge / 2);
+                if rise * 2 >= hash_charge {
+                    (rise, "queued, fast, billed")
+                } else {
+                    (rise, "queued, fast, NOT billed to the frozen table")
+                }
+            };
+            samples.push(format!(
+                "round {round} db {db}: {queued} B queued, FLUSHDB {took:?}, current_cow_size \
+                 +{rise} B: {verdict}"
+            ));
+        }
+        std::fs::remove_file(hold_file(&dir)).expect("release the hold");
+        wait_bgsave_done(&mut c);
+        assert_eq!(last_bgsave_status(&mut c), "ok", "the save must complete");
+        assert!(c.send(&["SELECT", "0"]).starts_with("+OK"));
+        eprintln!(
+            "FLUSHDB during the save, {FIELDS}-field hash UNLINKed just before \
+             (synchronous DEL of an equal hash: {inline_free:?}, one hash charges \
+             {hash_charge} B): {samples:#?}"
+        );
+        if samples.iter().any(|s| s.ends_with("queued, fast, billed")) {
+            break;
+        }
+        assert!(
+            slow < SLOW_TO_FAIL,
+            "{slow} FLUSHDBs of a database whose hash was still queued took at least \
+             1/{INLINE_FREE_RATIO} of the {inline_free:?} a synchronous DEL of an equal hash \
+             takes: the FLUSHDB freed the UNLINKed {FIELDS}-field hash inline. Samples: \
+             {samples:#?}"
+        );
+        assert!(
+            round < ROUNDS,
+            "no FLUSHDB in {ROUNDS} rounds could be judged queued, fast and billed: {samples:#?}"
+        );
+    }
     let info = c.send(&["INFO", "persistence"]);
     assert!(
         info.lines().any(|l| l.trim() == "current_cow_size:0"),
         "no save in flight: current_cow_size must be 0: {info:.300}"
     );
+}
+
+/// `used_memory` once two readings 100 ms apart agree: it is published by
+/// the shard's eviction tick, so a reading straight after a write can be
+/// stale.
+fn settled_used_memory(c: &mut Conn) -> i64 {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut last = info_int(c, "memory", "used_memory");
+    loop {
+        std::thread::sleep(Duration::from_millis(100));
+        let now = info_int(c, "memory", "used_memory");
+        if now == last || Instant::now() >= deadline {
+            return now;
+        }
+        last = now;
+    }
+}
+
+/// How far `current_cow_size` rose above `before` within 100 ms of a
+/// FLUSHDB (it is published every drain, one tick after the flush), polled
+/// until it reaches `enough`.
+fn cow_rise(c: &mut Conn, before: i64, enough: i64) -> i64 {
+    let start = Instant::now();
+    let mut rise = 0;
+    while start.elapsed() < Duration::from_millis(100) {
+        rise = rise.max(info_int(c, "persistence", "current_cow_size") - before);
+        if rise >= enough {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    rise
+}
+
+/// The `used_memory` of a `MEMORY STATS` reply: the selected database's
+/// ledger, read synchronously (not the tick-published figure INFO has).
+fn ledger_bytes(reply: &str) -> i64 {
+    let mut lines = reply.split("\r\n");
+    while let Some(l) = lines.next() {
+        if l == "used_memory" {
+            return lines
+                .next()
+                .and_then(|v| v.strip_prefix(':'))
+                .and_then(|v| v.parse().ok())
+                .unwrap_or_else(|| panic!("MEMORY STATS: {reply:?}"));
+        }
+    }
+    panic!("MEMORY STATS has no used_memory: {reply:?}")
 }
