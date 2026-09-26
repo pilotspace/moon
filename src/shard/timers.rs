@@ -609,7 +609,10 @@ pub(crate) fn note_snapshot_started(shard_databases: &Arc<ShardDatabases>) {
 /// instead of at the next interval — until they are unlinked, a crash brings
 /// back keys the snapshot already excludes. With an AOF (folds govern), with
 /// the sweep disabled (`--cold-orphan-sweep-interval-secs 0`) or without a
-/// cold tier, nothing.
+/// cold tier, nothing. The event loop calls it BEFORE
+/// `bgsave_shard_done(true)`: the save's waiters (a FLUSHALL with save points,
+/// `rdb_bgsave_in_progress`, `LASTSAVE`) see it done only once every shard
+/// has unlinked what it released (REVIEW-FINAL-P5B item 2).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn sweep_after_snapshot(
     shard_databases: &Arc<ShardDatabases>,
