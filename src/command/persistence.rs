@@ -675,7 +675,9 @@ where
         budget,
         Some(&pending),
     )
-    .await
+    .await?;
+    // Review F2: saved — exit, unless an abort took this shutdown first.
+    pending.commit()
 }
 
 /// Why a wait for a save stopped before it ended.
