@@ -3994,8 +3994,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
 
                     // D-2: broadcast the flush to every other shard (outside
                     // the with_shard closure: this awaits). Any failed leg
-                    // turns the reply into an explicit partial-flush error,
-                    // never silent +OK.
+                    // turns the reply into an explicit partial-flush error.
                     //
                     // moon#1084: only now, with this shard's record logged
                     // above. The broadcast awaits, and a write another client
@@ -4027,12 +4026,13 @@ pub(crate) async fn handle_connection_sharded_monoio<
                                 }
                             }
                         }
-                        // CLIENT TRACKING: a flush drops every cached key —
-                        // push the RESP3 flush invalidation (invalidate + Null)
-                        // to all tracking clients. Process-global table: one
-                        // hook at the originating connection covers all shards.
+                        // CLIENT TRACKING: a flush drops every cached key — push the
+                        // RESP3 flush invalidation to all tracking clients (one hook at
+                        // the originating connection covers all shards). moon#1264: a
+                        // FLUSHALL with save points then saves before it replies.
                         if flushed_everywhere {
                             crate::tracking::invalidation::invalidate_flush(&ctx.tracking_table);
+                            crate::server::conn::flush_save::after_flush(cmd, ctx).await;
                         }
                     }
                     // Suppress downstream effects on AOF failure — the

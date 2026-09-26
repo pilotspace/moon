@@ -787,6 +787,67 @@ fn save_outcome() -> Result<(), Frame> {
     }
 }
 
+/// `FLUSHALL` with save points saves the empty dataset before it replies
+/// (moon#1264), as redis's `flushallCommand` does: `flushAllDataAndResetRDB`
+/// runs a synchronous `rdbSave` whenever save points are configured, so the
+/// snapshot on disk matches the empty keyspace at once. Without it the
+/// previous snapshot stayed until a rule fired, and a crash in between
+/// brought every flushed key back.
+///
+/// Called by the connection that issued the flush once EVERY shard is
+/// flushed (a plain `FLUSHALL`, an `EXEC` that ran one, a script that
+/// called one), on both runtimes. Waits for a save already running first —
+/// the flush aborted it (moon#1228: FLUSHALL fails an unfinished epoch, as
+/// redis kills its child) — within SHUTDOWN's one deadline. As in redis, a
+/// save that fails is logged and the flush still answers `+OK`; the
+/// previous snapshot then stays on disk. `SHUTDOWN ABORT` does not apply.
+pub async fn save_after_flushall(
+    snapshot_trigger: &crate::runtime::channel::WatchSender<u64>,
+    num_shards: usize,
+    save_points: Option<&str>,
+) {
+    use crate::runtime::traits::RuntimeTimer;
+    if !shutdown_default_should_save(save_points) {
+        return;
+    }
+    let outcome = save_and_wait_within(
+        snapshot_trigger,
+        num_shards,
+        crate::runtime::TimerImpl::sleep,
+        std::time::Instant::now,
+        std::time::Duration::from_millis(SHUTDOWN_SAVE_DEADLINE_MS),
+        None,
+    )
+    .await;
+    if let Err(Frame::Error(e)) = outcome {
+        error!(
+            "FLUSHALL: saving the flushed dataset failed ({}); the previous snapshot \
+             is still on disk until the next successful save",
+            String::from_utf8_lossy(&e)
+        );
+    }
+}
+
+/// [`save_after_flushall`] for an `EXEC` whose body flushed: `exec_flushes`
+/// is its `(result index, command, db)` list of successful flushes.
+pub async fn save_after_txn_flushes(
+    exec_flushes: &[(usize, Frame, usize)],
+    snapshot_trigger: &crate::runtime::channel::WatchSender<u64>,
+    num_shards: usize,
+    save_points: Option<&str>,
+) {
+    let flushall = exec_flushes.iter().any(|(_, command, _)| match command {
+        Frame::Array(parts) => matches!(
+            parts.first(),
+            Some(Frame::BulkString(name)) if name.eq_ignore_ascii_case(b"FLUSHALL")
+        ),
+        _ => false,
+    });
+    if flushall {
+        save_after_flushall(snapshot_trigger, num_shards, save_points).await;
+    }
+}
+
 /// Decide whether SHUTDOWN's `Default` mode should perform a synchronous
 /// save, mirroring Redis: save iff at least one RDB save point is
 /// configured.

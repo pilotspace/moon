@@ -791,6 +791,9 @@ pub(super) async fn try_handle_multi_exec(
                                     &ctx.spsc_notifiers,
                                 )
                                 .await;
+                                // moon#1264: a FLUSHALL in the body saves.
+                                crate::server::conn::flush_save::after_txn(&r.exec_flushes, ctx)
+                                    .await;
                                 responses.push(routed_result);
                             }
                             None => {
@@ -954,6 +957,9 @@ pub(super) async fn try_handle_multi_exec(
                 &ctx.spsc_notifiers,
             )
             .await;
+            // moon#1264: with save points, a FLUSHALL in the body saves the
+            // flushed dataset before EXEC replies, as redis does.
+            crate::server::conn::flush_save::after_txn(&exec_flushes, ctx).await;
             responses.push(result);
         }
         return true;

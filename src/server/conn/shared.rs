@@ -3181,6 +3181,8 @@ pub(crate) async fn finish_script_flush(
         return response;
     };
     let mut response = response;
+    // moon#1264: a FLUSHALL with save points saves before the script replies.
+    let mut save = which == crate::scripting::pending_flush::PendingFlush::All;
     if ctx.num_shards > 1
         && let Err(err) = crate::shard::coordinator::coordinate_flush_broadcast(
             &crate::scripting::pending_flush::broadcast_frame(which),
@@ -3196,21 +3198,19 @@ pub(crate) async fn finish_script_flush(
         .await
     {
         response = err;
+        save = false;
     }
-    // Unconditional, and neither of the two things it could have been gated on
-    // would have been right:
-    //
+    // Unconditional; neither thing it could have been gated on would be right:
     //   * NOT on the script's own reply. `pending` is armed only by a flush
-    //     that already SUCCEEDED, so the keys are gone by the time we get
-    //     here. A script that flushed and then returned an error — `return
-    //     redis.error_reply('x')`, or any Lua runtime error after the flush —
-    //     would leave every tracking client caching keys that no longer exist.
+    //     that already SUCCEEDED, so the keys are gone by now. A script that
+    //     flushed and then returned an error (`redis.error_reply`, any Lua
+    //     runtime error) would leave tracking clients caching deleted keys.
     //   * NOT on the broadcast either. A failed leg means the flush was
     //     PARTIAL, not absent: this shard's keys are still gone. Skipping the
-    //     invalidation there trades a correctness bug (clients serve deleted
-    //     keys) for a performance one (clients re-fetch keys that survived on
-    //     another shard), which is the wrong direction.
+    //     invalidation trades a correctness bug (clients serve deleted keys)
+    //     for a performance one (re-fetching keys that survived elsewhere).
     crate::tracking::invalidation::invalidate_flush(&ctx.tracking_table);
+    super::flush_save::after_script_flush(save, ctx).await;
     response
 }
 
