@@ -2200,8 +2200,8 @@ fn main() -> anyhow::Result<()> {
         shard_handles.push(handle);
     }
     // moon#1263: every shard serves — a SIGTERM / SIGINT now saves first.
-    let (save_points, cancel) = (config.save.as_deref(), cancel_token.clone());
-    signal::arm(snapshot_trigger_tx.clone(), num_shards, save_points, cancel);
+    let (runtime, cancel) = (runtime_config_shared.clone(), cancel_token.clone());
+    signal::arm(snapshot_trigger_tx.clone(), num_shards, runtime, cancel);
 
     let listener_cancel = cancel_token.clone();
 

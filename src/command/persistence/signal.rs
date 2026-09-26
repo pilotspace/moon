@@ -34,11 +34,12 @@
 //! replace a good snapshot with a partial one.
 
 use std::future::Future;
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use tracing::{error, info, warn};
 
+use crate::config::RuntimeConfig;
 use crate::protocol::Frame;
 use crate::runtime::cancel::CancellationToken;
 use crate::runtime::channel::WatchSender;
@@ -65,8 +66,9 @@ impl ShutdownSignal {
 struct Armed {
     snapshot_trigger: WatchSender<u64>,
     num_shards: usize,
-    /// Save points are configured (`--save` with at least one rule).
-    save: bool,
+    /// The live config: save points are read when the signal lands (review
+    /// F10 — `CONFIG SET save` applies, as it does in redis).
+    runtime: Arc<parking_lot::RwLock<RuntimeConfig>>,
     shutdown: CancellationToken,
 }
 
@@ -76,19 +78,18 @@ static ARMED: OnceLock<Armed> = OnceLock::new();
 static SAVING: AtomicBool = AtomicBool::new(false);
 
 /// Called once by `main.rs` after the shard threads are spawned: from here a
-/// shutdown signal saves first when `save_points` has a rule
-/// ([`super::shutdown_default_should_save`], the rule plain `SHUTDOWN`
-/// follows).
+/// shutdown signal saves first when save points are configured at that
+/// moment ([`super::save_points_now`], the rule plain `SHUTDOWN` follows).
 pub fn arm(
     snapshot_trigger: WatchSender<u64>,
     num_shards: usize,
-    save_points: Option<&str>,
+    runtime: Arc<parking_lot::RwLock<RuntimeConfig>>,
     shutdown: CancellationToken,
 ) {
     let _ = ARMED.set(Armed {
         snapshot_trigger,
         num_shards,
-        save: super::shutdown_default_should_save(save_points),
+        runtime,
         shutdown,
     });
 }
@@ -98,7 +99,7 @@ pub fn arm(
 /// `shutdown-save` thread, which cancels the server once the save is on
 /// disk.
 pub fn on_signal(signal: ShutdownSignal, shutdown: &CancellationToken) {
-    let Some(armed) = ARMED.get().filter(|a| a.save) else {
+    let Some(armed) = ARMED.get().filter(|a| super::save_points_now(&a.runtime)) else {
         info!("{} received: shutting down", signal.name());
         shutdown.cancel();
         return;

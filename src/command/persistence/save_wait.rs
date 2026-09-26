@@ -35,7 +35,7 @@ use tracing::error;
 
 use super::{
     BGSAVE_LAST_STATUS, SAVE_ALREADY_IN_PROGRESS_ERR, SAVE_IN_PROGRESS, bgsave_start_sharded,
-    shutdown_abort, shutdown_default_should_save,
+    shutdown_abort,
 };
 use crate::protocol::Frame;
 
@@ -313,7 +313,8 @@ fn save_outcome() -> Result<(), Frame> {
     }
 }
 
-/// `FLUSHALL` with save points saves the empty dataset before it replies
+/// `FLUSHALL` with save points (`save`: configured now, review F10 —
+/// [`super::save_points_now`]) saves the empty dataset before it replies
 /// (moon#1264), as redis's `flushallCommand` does: `flushAllDataAndResetRDB`
 /// runs a synchronous `rdbSave` whenever save points are configured, so the
 /// snapshot on disk matches the empty keyspace at once. Without it the
@@ -330,10 +331,10 @@ fn save_outcome() -> Result<(), Frame> {
 pub async fn save_after_flushall(
     snapshot_trigger: &crate::runtime::channel::WatchSender<u64>,
     num_shards: usize,
-    save_points: Option<&str>,
+    save: bool,
 ) {
     use crate::runtime::traits::RuntimeTimer;
-    if !shutdown_default_should_save(save_points) {
+    if !save {
         return;
     }
     let wait = Wait {
@@ -358,7 +359,7 @@ pub async fn save_after_txn_flushes(
     exec_flushes: &[(usize, Frame, usize)],
     snapshot_trigger: &crate::runtime::channel::WatchSender<u64>,
     num_shards: usize,
-    save_points: Option<&str>,
+    save: bool,
 ) {
     let flushall = exec_flushes.iter().any(|(_, command, _)| match command {
         Frame::Array(parts) => matches!(
@@ -368,6 +369,6 @@ pub async fn save_after_txn_flushes(
         _ => false,
     });
     if flushall {
-        save_after_flushall(snapshot_trigger, num_shards, save_points).await;
+        save_after_flushall(snapshot_trigger, num_shards, save).await;
     }
 }

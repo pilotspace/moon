@@ -447,9 +447,7 @@ pub(super) async fn try_handle_shutdown(
     let should_save = match mode {
         ShutdownSaveMode::Save => true,
         ShutdownSaveMode::NoSave => false,
-        ShutdownSaveMode::Default => {
-            persistence::shutdown_default_should_save(ctx.config.save.as_deref())
-        }
+        ShutdownSaveMode::Default => persistence::save_points_now(&ctx.runtime_config),
     };
     if should_save {
         // moon#1232 review: a save already running (an auto-save, say) is

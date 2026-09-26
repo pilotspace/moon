@@ -610,6 +610,13 @@ pub fn shutdown_default_should_save(save_points: Option<&str>) -> bool {
     save_points.is_some_and(|s| !s.trim().is_empty())
 }
 
+/// [`shutdown_default_should_save`] for the save points configured NOW
+/// (review F10): `CONFIG SET save ""` turns off the save a `FLUSHALL`, a
+/// bare `SHUTDOWN` or a signal makes, as in redis (`server.saveparamslen`).
+pub fn save_points_now(runtime: &parking_lot::RwLock<crate::config::RuntimeConfig>) -> bool {
+    shutdown_default_should_save(runtime.read().save.as_deref())
+}
+
 /// LASTSAVE command: returns Unix timestamp of last successful save.
 pub fn handle_lastsave() -> Frame {
     let ts = LAST_SAVE_TIME.load(Ordering::Relaxed);
