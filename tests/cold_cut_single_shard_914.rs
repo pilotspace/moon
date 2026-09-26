@@ -39,6 +39,12 @@
 //! Each leg asserts cold data files existed at the kill point, so a run that
 //! spilled nothing cannot pass. `--disk-free-min-pct 0` is REQUIRED: the
 //! disk-free guard silently guts a crash test on a nearly-full volume.
+//!
+//! Nothing here sleeps and hopes (moon#1065): "eviction has spilled", "the
+//! respill landed" and "the AOF holds the last acknowledged write" are each
+//! polled on disk up to [`slow_host::CONDITION_DEADLINE`], and a timeout
+//! prints the server's INFO counters and `server.err`. The fixed one-second
+//! version failed 3 tries of 3 on a stalled Windows runner.
 
 #![cfg(any(feature = "runtime-monoio", feature = "runtime-tokio"))]
 #![allow(clippy::unwrap_used)]
@@ -47,6 +53,8 @@ mod common;
 
 use std::process::{Child, Command};
 use std::time::{Duration, Instant};
+
+use common::slow_host;
 
 const PROBES: usize = 24;
 const FILLER_COUNT: usize = 200;
@@ -87,7 +95,12 @@ fn start_moon(dir: &std::path::Path, extra: &[&str]) -> (Child, u16) {
 }
 
 fn count_cold_files(dir: &std::path::Path) -> usize {
-    fn walk(p: &std::path::Path, acc: &mut usize) {
+    cold_files(dir).len()
+}
+
+/// Every cold data file under `dir` right now.
+fn cold_files(dir: &std::path::Path) -> std::collections::BTreeSet<std::path::PathBuf> {
+    fn walk(p: &std::path::Path, acc: &mut std::collections::BTreeSet<std::path::PathBuf>) {
         if let Ok(rd) = std::fs::read_dir(p) {
             for e in rd.flatten() {
                 let path = e.path();
@@ -98,12 +111,12 @@ fn count_cold_files(dir: &std::path::Path) -> usize {
                     .and_then(|n| n.to_str())
                     .is_some_and(|n| n.starts_with("heap-") && n.ends_with(".mpf"))
                 {
-                    *acc += 1;
+                    acc.insert(path);
                 }
             }
         }
     }
-    let mut acc = 0;
+    let mut acc = std::collections::BTreeSet::new();
     walk(dir, &mut acc);
     acc
 }
@@ -225,11 +238,23 @@ fn write_all(c: &mut common::Conn, fams: &[&str]) {
     }
 }
 
-fn drive_filler(c: &mut common::Conn, tag: &str) {
+/// The filler wave, one `SET` at a time. A write refused for AOF
+/// backpressure is re-sent after a backoff and counted in `stats`
+/// (moon#1065): before, the replies were discarded, so a refusal left the
+/// wave short and surfaced much later as "nothing spilled".
+fn drive_filler(
+    c: &mut common::Conn,
+    tag: &str,
+    dir: &std::path::Path,
+    stats: &mut slow_host::WriteStats,
+) {
     let value = "f".repeat(FILLER_LEN);
-    for i in 0..FILLER_COUNT {
-        c.send(&["SET", &format!("filler:{tag}:{i}"), &value]);
-    }
+    let cmds: Vec<Vec<String>> = (0..FILLER_COUNT)
+        .map(|i| vec!["SET".into(), format!("filler:{tag}:{i}"), value.clone()])
+        .collect();
+    let deadline = Instant::now() + slow_host::CONDITION_DEADLINE;
+    slow_host::write_all(c, &cmds, 1, stats, deadline, dir);
+    eprintln!("filler {tag}: {stats}");
 }
 
 /// Every present probe must hold its expected value. Returns (present,
@@ -273,17 +298,16 @@ fn bgrewriteaof_and_wait(c: &mut common::Conn, dir: &std::path::Path) {
     let before = std::fs::read_to_string(&manifest).ok();
     let reply = c.send(&["BGREWRITEAOF"]);
     assert!(reply.starts_with('+'), "BGREWRITEAOF refused: {reply:?}");
-    let deadline = Instant::now() + Duration::from_secs(30);
-    while Instant::now() < deadline {
-        if rewrite_landed(dir, before.as_deref()) {
-            // The tokio writer renames the rewritten file into place, then
-            // reopens it; give it a beat before the next append.
-            std::thread::sleep(Duration::from_millis(200));
-            return;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    panic!("BGREWRITEAOF did not land under {}", dir.display());
+    slow_host::wait_until(
+        &format!("BGREWRITEAOF to land under {}", dir.display()),
+        slow_host::CONDITION_DEADLINE,
+        slow_host::peer_port(c),
+        dir,
+        || rewrite_landed(dir, before.as_deref()),
+    );
+    // The tokio writer renames the rewritten file into place, then reopens
+    // it; give it a beat before the next append.
+    std::thread::sleep(Duration::from_millis(200));
 }
 
 fn kill_cycles(leg: &str, extra: &[&str]) {
@@ -302,8 +326,16 @@ fn kill_cycles(leg: &str, extra: &[&str]) {
             "{leg}: pre-crash sanity: {}",
             bad.join("; ")
         );
-        drive_filler(&mut c, "0");
-        std::thread::sleep(Duration::from_secs(1));
+        let mut stats = slow_host::WriteStats::default();
+        drive_filler(&mut c, "0", &dir, &mut stats);
+        slow_host::wait_until(
+            &format!("{leg}: a cold data file on disk before the first SIGKILL"),
+            slow_host::CONDITION_DEADLINE,
+            port,
+            &dir,
+            || count_cold_files(&dir) > 0,
+        );
+        slow_host::wait_aof_holds_last(&stats, port, &dir);
     }
 
     for cycle in 1..=3 {
@@ -495,25 +527,31 @@ fn post_rewrite(leg: &str, fams: &[&str], respill: bool, lose_markers: bool) {
     {
         let mut c = common::Conn::open(port);
         write_all(&mut c, fams);
-        drive_filler(&mut c, "0");
-        std::thread::sleep(Duration::from_secs(1));
-        assert!(
-            count_cold_files(&dir) > 0,
-            "{leg}: nothing spilled before the rewrite"
+        let mut stats = slow_host::WriteStats::default();
+        drive_filler(&mut c, "0", &dir, &mut stats);
+        slow_host::wait_until(
+            &format!("{leg}: a cold data file on disk before the rewrite (nothing spilled yet)"),
+            slow_host::CONDITION_DEADLINE,
+            port,
+            &dir,
+            || count_cold_files(&dir) > 0,
         );
 
         bgrewriteaof_and_wait(&mut c, &dir);
 
+        let mut last_write: Vec<String> = Vec::new();
         for i in 0..PROBES {
             for fam in fams {
                 let key = format!("{fam}:{i}");
-                match *fam {
-                    "l" => c.send(&["RPUSH", &key, "f"]),
-                    "n" => c.send(&["INCRBY", &key, "1"]),
-                    "ap" => c.send(&["APPEND", &key, "!"]),
-                    "s" => c.send(&["SET", &key, "v2"]),
+                let parts: [&str; 3] = match *fam {
+                    "l" => ["RPUSH", &key, "f"],
+                    "n" => ["INCRBY", &key, "1"],
+                    "ap" => ["APPEND", &key, "!"],
+                    "s" => ["SET", &key, "v2"],
                     other => panic!("no post-rewrite write for family {other}"),
                 };
+                c.send(&parts);
+                last_write = parts.iter().map(|p| (*p).to_string()).collect();
             }
         }
         let (_, bad) = audit(&mut c, fams, post_rewrite_expected);
@@ -523,21 +561,38 @@ fn post_rewrite(leg: &str, fams: &[&str], respill: bool, lose_markers: bool) {
             bad.join("; ")
         );
         if respill {
-            drive_filler(&mut c, "1");
+            // The respill is what this leg is about: wait until it has
+            // produced a cold file the pre-rewrite spill did not.
+            let before = cold_files(&dir);
+            let mut stats = slow_host::WriteStats::default();
+            drive_filler(&mut c, "1", &dir, &mut stats);
+            slow_host::wait_until(
+                &format!("{leg}: the post-rewrite respill to write a new cold data file"),
+                slow_host::CONDITION_DEADLINE,
+                port,
+                &dir,
+                || !cold_files(&dir).is_subset(&before),
+            );
+            if let Some(last) = stats.last_accepted {
+                last_write = last;
+            }
         }
-        std::thread::sleep(Duration::from_secs(1));
+        // Every acknowledged post-rewrite write must be in the AOF before the
+        // SIGKILL, or the audit below measures the kill, not the recovery.
+        slow_host::wait_aof_holds(&last_write, port, &dir);
         if lose_markers {
             // Wait for a respill of a probe key to be logged: dropping it
             // below is what this leg is about, so it must exist first.
-            let deadline = Instant::now() + Duration::from_secs(30);
-            while probe_markers_on_disk(&dir, fams) == 0 {
-                assert!(
-                    Instant::now() < deadline,
-                    "{leg}: no post-rewrite MOON.SPILLED naming a probe key reached the AOF \
-                     — nothing was respilled, the run would be vacuous"
-                );
-                std::thread::sleep(Duration::from_millis(50));
-            }
+            slow_host::wait_until(
+                &format!(
+                    "{leg}: a post-rewrite MOON.SPILLED naming a probe key in the AOF — \
+                     without one nothing was respilled and the run would be vacuous"
+                ),
+                slow_host::CONDITION_DEADLINE,
+                port,
+                &dir,
+                || probe_markers_on_disk(&dir, fams) > 0,
+            );
         }
     }
     let cold_files = count_cold_files(&dir);

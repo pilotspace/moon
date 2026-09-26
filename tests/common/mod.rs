@@ -23,6 +23,8 @@
 //! Not every helper is used by every suite that includes this module.
 #![allow(dead_code)]
 
+pub mod slow_host;
+
 use std::collections::HashSet;
 use std::io::{Read, Write};
 use std::net::TcpStream;

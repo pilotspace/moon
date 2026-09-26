@@ -32,6 +32,13 @@
 //!   key that lives only in the older file is read alongside, so a pass can
 //!   never come from the older file being ignored altogether.
 //!
+//! The lifecycle test waits for what it needs on disk — the key's copies,
+//! and their manifest entries — up to [`slow_host::CONDITION_DEADLINE`],
+//! never for a fixed round count or a fixed sleep, and re-sends a filler
+//! write moon refused for AOF backpressure (moon#1065). A Windows runner
+//! stall failed the fixed versions 3 tries of 3: 1000 rounds went by with the
+//! spill writer stalled, and the filler asserted on the refusal.
+//!
 //! Run with:
 //!   MOON_BIN=/path/to/moon cargo test --release \
 //!     --test cold_index_duplicate_resolution_983
@@ -46,6 +53,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
+use common::slow_host::{self, WriteStats};
 use common::{Conn, ServerGuard, find_moon_binary, wait_for_port_down};
 
 /// Small enough that the filler crosses it quickly, large enough that the
@@ -56,10 +64,13 @@ const VALUE_LEN: usize = 256;
 const FILLER_VALUE_LEN: usize = 1024;
 /// Filler keys per pipeline before re-checking the disk.
 const FILLER_PER_ROUND: usize = 100;
-/// Upper bound on filler rounds per phase — ~100 MiB through an 8 MiB
-/// budget. Far more than a spill needs; hitting it means eviction is not
-/// tiering keys at all and the test must say so rather than spin.
-const MAX_FILLER_ROUNDS: usize = 1000;
+/// Filler rounds per phase at full speed — ~100 MiB through an 8 MiB budget,
+/// far more than a spill needs. Past it more filler cannot help: the key is
+/// evicted and its spill has to land, which a stalled spill writer delays
+/// (moon#1065 — the old hard cap of 1000 rounds went by in seconds with the
+/// writer stalled, every write answered `-OOM`). The filler then continues at
+/// a trickle until [`slow_host::CONDITION_DEADLINE`].
+const FULL_SPEED_ROUNDS: usize = 1000;
 /// The key under test. Unique enough that a raw byte search of the heap
 /// files cannot match a filler key or a value.
 const KEY: &str = "k983:respilled:key";
@@ -212,18 +223,17 @@ fn get(c: &mut Conn, key: &str) -> Option<String> {
     parse_get(&c.send(&["GET", key]))
 }
 
-/// Did the server ACCEPT the write? `-OOM` and AOF backpressure are
-/// legitimate answers under pressure and mean the write did not happen; any
-/// other error is a hard failure.
-fn accepted(reply: &str, what: &str) -> bool {
-    if reply.starts_with('-') {
-        assert!(
-            reply.contains("OOM") || reply.contains("backpressure"),
-            "{what} answered an unexpected error: {reply:?}"
-        );
-        return false;
-    }
-    true
+/// `SET key value`, which the test needs APPLIED: an AOF backpressure
+/// refusal is re-sent (moon#1065), and `-OOM` fails the test, as it did.
+fn set_applied(c: &mut Conn, key: &str, value: &str, dir: &Path, what: &str) {
+    let mut stats = WriteStats::default();
+    let cmd = vec!["SET".to_string(), key.to_string(), value.to_string()];
+    let deadline = Instant::now() + slow_host::CONDITION_DEADLINE;
+    slow_host::write_all(c, &[cmd], 1, &mut stats, deadline, dir);
+    assert_eq!(
+        stats.accepted, 1,
+        "{what} must be applied or the test measures nothing ({stats})"
+    );
 }
 
 /// A value whose first bytes name the generation, padded past the inline
@@ -236,20 +246,23 @@ fn value_for(generation: &str) -> String {
     s
 }
 
-/// Write one pipeline of filler. Returns how many the server accepted.
-fn write_filler(c: &mut Conn, phase: usize, round: usize) -> usize {
+/// Write one pipeline of filler. `-OOM` is a legitimate answer under
+/// pressure (the write did not happen); an AOF backpressure refusal is
+/// re-sent after a backoff (moon#1065). Both are counted in `stats`; any
+/// other error is a hard failure.
+fn write_filler(c: &mut Conn, phase: usize, round: usize, dir: &Path, stats: &mut WriteStats) {
     let val = "f".repeat(FILLER_VALUE_LEN);
-    let keys: Vec<String> = (0..FILLER_PER_ROUND)
-        .map(|i| format!("filler:{phase}:{round:04}:{i:03}"))
+    let cmds: Vec<Vec<String>> = (0..FILLER_PER_ROUND)
+        .map(|i| {
+            vec![
+                "SET".to_string(),
+                format!("filler:{phase}:{round:04}:{i:03}"),
+                val.clone(),
+            ]
+        })
         .collect();
-    let cmds: Vec<Vec<&str>> = keys.iter().map(|k| vec!["SET", k.as_str(), &val]).collect();
-    let cmd_refs: Vec<&[&str]> = cmds.iter().map(|c| c.as_slice()).collect();
-    let replies = c.pipeline(&cmd_refs);
-    replies
-        .split("\r\n")
-        .filter(|l| !l.is_empty())
-        .filter(|l| accepted(l, "filler SET"))
-        .count()
+    let deadline = Instant::now() + slow_host::CONDITION_DEADLINE;
+    slow_host::write_all(c, &cmds, FILLER_PER_ROUND, stats, deadline, dir);
 }
 
 // ===========================================================================
@@ -257,9 +270,9 @@ fn write_filler(c: &mut Conn, phase: usize, round: usize) -> usize {
 // ===========================================================================
 
 /// Every heap file under `<off>/shard-*/data/` whose raw bytes contain
-/// `needle`. Keys are stored verbatim in `KvLeafPage` slots, so this counts
-/// the on-disk COPIES of a key without depending on any in-process index —
-/// the same files the rebuild will read.
+/// `needle`. Keys are stored verbatim in `KvLeafPage` slots, so this finds
+/// the on-disk copies of a key without depending on any in-process index.
+/// See [`registered_copies`] for the ones the rebuild will read.
 fn heap_files_holding(off: &Path, needle: &[u8]) -> Vec<PathBuf> {
     let mut hits = Vec::new();
     let Ok(shards) = std::fs::read_dir(off) else {
@@ -287,36 +300,91 @@ fn heap_files_holding(off: &Path, needle: &[u8]) -> Vec<PathBuf> {
     hits
 }
 
-/// Keep writing filler until `KEY` has at least `copies` on-disk copies.
-/// Bounded: a phase that never tiers the key is a harness failure, reported
-/// as such, never an infinite loop.
-fn fill_until_copies(c: &mut Conn, off: &Path, phase: usize, copies: usize) -> Vec<PathBuf> {
-    let deadline = Instant::now() + Duration::from_secs(120);
-    for round in 0..MAX_FILLER_ROUNDS {
-        write_filler(c, phase, round);
-        let hits = heap_files_holding(off, KEY.as_bytes());
+/// Keep writing filler until `KEY` has at least `copies` registered on-disk
+/// copies ([`registered_copies`]).
+/// Bounded by [`slow_host::CONDITION_DEADLINE`], not a round count: a phase
+/// that never tiers the key is a harness failure, reported with the filler's
+/// counts and the server's INFO and log, never an infinite loop.
+fn fill_until_copies(
+    c: &mut Conn,
+    dir: &Path,
+    phase: usize,
+    copies: usize,
+    stats: &mut WriteStats,
+) -> Vec<PathBuf> {
+    let off = offload_dir(dir);
+    let start = Instant::now();
+    let mut round = 0;
+    loop {
+        let applied_before = stats.accepted;
+        write_filler(c, phase, round, dir, stats);
+        round += 1;
+        let hits = registered_copies(&off);
         if hits.len() >= copies {
+            eprintln!(
+                "phase {phase}: {KEY} has {} registered on-disk copies after {round} filler \
+                 rounds, {:?} ({stats})",
+                hits.len(),
+                start.elapsed()
+            );
             return hits;
         }
-        assert!(
-            Instant::now() < deadline,
-            "phase {phase}: {KEY} did not reach {copies} on-disk copies within 120s \
-             (have {}) — eviction is not tiering the key",
-            hits.len()
-        );
+        if start.elapsed() >= slow_host::CONDITION_DEADLINE {
+            panic!(
+                "phase {phase}: {KEY} did not reach {copies} registered on-disk copies within \
+                 {:?} (have {}, and {} heap files hold its bytes; {round} filler rounds, \
+                 {stats}) — eviction is not tiering the key{}",
+                start.elapsed(),
+                hits.len(),
+                heap_files_holding(&off, KEY.as_bytes()).len(),
+                slow_host::diagnostics(slow_host::peer_port(c), dir)
+            );
+        }
+        // Past the full-speed budget, or when the server could absorb none
+        // of the round, more filler only floods a stalled disk: trickle.
+        if round >= FULL_SPEED_ROUNDS || stats.accepted == applied_before {
+            std::thread::sleep(Duration::from_millis(100));
+        }
     }
-    panic!(
-        "phase {phase}: {KEY} did not reach {copies} on-disk copies after \
-         {MAX_FILLER_ROUNDS} filler rounds — eviction is not tiering the key"
-    );
 }
 
-/// Let the background spill completions for whatever was just written land
-/// in the manifest and the cold index. The spill thread flushes on a 100 ms
-/// latency guard and the shard applies completions on its eviction tick, so
-/// one second is an order of magnitude of headroom.
-fn settle() {
-    std::thread::sleep(Duration::from_secs(1));
+/// The manifest of the shard directory holding `heap` (`<off>/shard-N/data/
+/// heap-ID.mpf`) lists `heap` as an Active file — the spill completion has
+/// landed, so a restart rebuilds the cold index with it.
+fn registered_active(heap: &Path) -> bool {
+    use moon::persistence::manifest::{FileStatus, ShardManifest};
+    let Some(id) = heap.file_name().and_then(|n| n.to_str()).and_then(|n| {
+        n.strip_prefix("heap-")?
+            .strip_suffix(".mpf")?
+            .parse::<u64>()
+            .ok()
+    }) else {
+        return false;
+    };
+    let Some(shard_dir) = heap.parent().and_then(Path::parent) else {
+        return false;
+    };
+    let Some(shard) = shard_dir.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    ShardManifest::open(&shard_dir.join(format!("{shard}.manifest"))).is_ok_and(|m| {
+        m.files()
+            .iter()
+            .any(|e| e.file_id == id && e.status == FileStatus::Active)
+    })
+}
+
+/// The copies of `KEY` the restart's cold-index rebuild will read: heap files
+/// holding it that their manifest lists as Active, i.e. whose spill
+/// completion has landed (a fixed one-second sleep stood for that). A spill
+/// whose completion was withdrawn — its `MOON.SPILLED` marker met AOF
+/// backpressure — leaves an unregistered file holding the key's bytes that
+/// the rebuild ignores and the orphan sweep removes: not a copy (moon#1065).
+fn registered_copies(off: &Path) -> Vec<PathBuf> {
+    heap_files_holding(off, KEY.as_bytes())
+        .into_iter()
+        .filter(|h| registered_active(h))
+        .collect()
 }
 
 // ===========================================================================
@@ -325,26 +393,21 @@ fn settle() {
 
 fn respilled_key_lifecycle(shards: usize) {
     let dir = common::unique_test_dir(&format!("cold-dup-983-life-s{shards}"));
-    let off = offload_dir(&dir);
     let server = spawn(&dir, shards);
     let mut c = Conn::open(server.port);
+    let mut stats = WriteStats::default();
 
     let v1 = value_for("v1-first-spill");
     let v2 = value_for("v2-after-overwrite");
 
     // Generation 1: write, then push it out to the cold tier.
-    assert!(accepted(&c.send(&["SET", KEY, &v1]), "SET v1"));
-    let first = fill_until_copies(&mut c, &off, 1, 1);
-    settle();
+    set_applied(&mut c, KEY, &v1, &dir, "SET v1");
+    let first = fill_until_copies(&mut c, &dir, 1, 1, &mut stats);
 
     // Overwrite while the first copy stays on disk (its file also holds
     // filler keys, so nothing reclaims it), then push the new value out too.
-    assert!(
-        accepted(&c.send(&["SET", KEY, &v2]), "SET v2"),
-        "the overwrite must be accepted or the test measures nothing"
-    );
-    let both = fill_until_copies(&mut c, &off, 2, 2);
-    settle();
+    set_applied(&mut c, KEY, &v2, &dir, "the overwrite SET v2");
+    let both = fill_until_copies(&mut c, &dir, 2, 2, &mut stats);
 
     // Non-vacuity: two DISTINCT files hold the key before the crash, and the
     // first one is still among them (not reclaimed, not rewritten).
@@ -364,6 +427,11 @@ fn respilled_key_lifecycle(shards: usize) {
         c.send(&["EXISTS", KEY]).starts_with(":1"),
         "key must exist live before the crash"
     );
+
+    // The SIGKILL must not lose an acknowledged write the checks below count
+    // on: wait for the AOF writer to have written the last one.
+    slow_host::wait_aof_holds_last(&stats, server.port, &dir);
+    eprintln!("filler over both phases: {stats}");
 
     let server = server.crash_and_restart();
     let mut c = Conn::open(server.port);
@@ -386,6 +454,8 @@ fn respilled_key_lifecycle(shards: usize) {
         f.as_deref().map(|v| &v[..v.len().min(24)])
     );
     drop(server);
+    // Passed: the data dir is evidence only on failure.
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
