@@ -26,8 +26,17 @@ use crate::storage::Database;
 use crate::storage::tiered::cold_index::ColdIndex;
 
 /// The reply to a SWAPDB refused because a swapped database holds cold data.
-pub const ERR_SWAPDB_COLD: &[u8] =
-    b"ERR SWAPDB is not allowed while either database has keys in the disk-offload cold tier";
+///
+/// It names the way out (REVIEW-WS20 F10): the refusal lasts while a
+/// database has cold keys OR spill files not yet reclaimed. After its cold
+/// keys are deleted (a FLUSHDB/FLUSHALL included) or read back into RAM,
+/// their files are held until a fold — `BGREWRITEAOF` with
+/// `--appendonly yes` — or a snapshot — `BGSAVE` without an AOF — covers
+/// them (moon#1231, moon#1260), then the next orphan sweep reclaims them;
+/// the automatic rewrite may not run for a long time (64 MB, 100% growth).
+pub const ERR_SWAPDB_COLD: &[u8] = b"ERR SWAPDB is not allowed while either database has keys \
+or unreclaimed spill files in the disk-offload cold tier; after deleting or reading back its \
+cold keys, run BGREWRITEAOF (appendonly yes) or BGSAVE (appendonly no) and retry";
 
 /// The reply when a shard's databases could not be inspected in time (the
 /// owner held a database for the whole bounded wait). Nothing was swapped.
@@ -37,6 +46,13 @@ pub const ERR_SWAPDB_BUSY: &[u8] =
 /// How many non-blocking attempts [`swapdb_cold_refusal`] makes per foreign
 /// database before it gives up (each followed by a `yield_now`): the owner
 /// holds a database only for one command or one maintenance chunk.
+///
+/// REVIEW-WS20 F11: while a foreign database stays busy, the check SPINS on
+/// the connection's shard thread — up to this many `yield_now`s (measured
+/// ~7.5 ms on a 4-vCPU box), serving nothing else meanwhile — and then
+/// answers [`ERR_SWAPDB_BUSY`]. Safe (nothing is logged or swapped), bounded,
+/// and SWAPDB is rare; a refusal under that contention is the price of
+/// never parking a shard thread on another shard's lock.
 const FOREIGN_READ_ATTEMPTS: usize = 20_000;
 
 impl Database {
@@ -120,6 +136,11 @@ pub fn swap_replayed(a: &mut Database, b: &mut Database) {
 /// The check and the swaps are not one atomic step across shards: a shard
 /// that spills a key of `a` or `b` between this check and its own swap still
 /// swaps (see [`note_swap_with_cold_footprint`]).
+///
+/// The foreign reads go through the process-wide shared read plane
+/// (`db_plane::shard_dbs`), installed once per process: a SECOND server in
+/// the same process (embedded tests only) reads the FIRST server's databases
+/// here (REVIEW-WS20 F11).
 #[must_use]
 pub fn swapdb_cold_refusal(
     a: usize,

@@ -386,3 +386,16 @@ fn the_wal_kv_log_flag_is_per_shard_and_off_until_published() {
     assert!(!shared.wal_kv_log(1));
     assert!(!shared.wal_kv_log(7), "out of range reads off");
 }
+
+/// REVIEW-WS20 F10: the refusal names the way out — per persistence mode —
+/// and keeps the `ERR …` shape clients match on.
+#[test]
+fn the_cold_refusal_names_the_remedy_per_persistence_mode() {
+    let msg = std::str::from_utf8(super::ERR_SWAPDB_COLD).expect("utf8");
+    assert!(msg.starts_with("ERR SWAPDB "), "{msg}");
+    assert!(
+        msg.contains("BGREWRITEAOF (appendonly yes)") && msg.contains("BGSAVE (appendonly no)"),
+        "the refusal must say how to clear it: {msg}"
+    );
+    assert!(!msg.contains('\n') && !msg.contains('\r'), "{msg:?}");
+}
