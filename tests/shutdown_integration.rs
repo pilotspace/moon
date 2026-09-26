@@ -245,14 +245,19 @@ fn shutdown_save_failure_keeps_server_up() {
     let mut guard = ServerGuard(Some(child));
     wait_ready(port);
 
-    // Make the data dir unwritable so the forced RDB save inside
-    // `SHUTDOWN SAVE` fails -- Redis parity: a save that fails must reply
-    // an error and NOT exit the process.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o500))
-            .expect("chmod read-only");
+    // Make the forced RDB save inside `SHUTDOWN SAVE` fail -- Redis parity:
+    // a save that fails must reply an error and NOT exit the process. A
+    // directory squats on the snapshot path (both layouts: `--dir` and, with
+    // the default disk offload, its `shard-0/`), so the writer's final rename
+    // fails, as in `perf_ws15_bgsave_status`. moon#1267: a chmod-0500 dir no
+    // longer did it — root ignores the mode, and before moon#1267 this server
+    // (no `--save`) refused the save up front, never reaching the disk.
+    let squatters = [
+        dir.path().join("shard-0.rrdshard"),
+        dir.path().join("shard-0").join("shard-0.rrdshard"),
+    ];
+    for squatter in &squatters {
+        std::fs::create_dir_all(squatter.join("x")).expect("squat the snapshot path");
     }
 
     let mut c = Conn::open(port);
@@ -262,13 +267,8 @@ fn shutdown_save_failure_keeps_server_up() {
         "SHUTDOWN SAVE against an unwritable dir must reply an error, got: {reply}"
     );
 
-    // Restore permissions before the guard's Drop tries to SIGKILL + the
-    // tempdir cleanup tries to remove files under it.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))
-            .expect("chmod restore");
+    for squatter in &squatters {
+        std::fs::remove_dir_all(squatter).expect("remove the squatter");
     }
 
     // Server must still be up and answering.
