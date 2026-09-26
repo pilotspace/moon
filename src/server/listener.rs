@@ -332,11 +332,11 @@ pub async fn run_with_shutdown(
             _ = token.cancelled() => {
                 info!("Server shutting down");
                 // Fan out shutdown to every AOF writer (single writer under TopLevel,
-                // one-per-shard under PerShard — step 2f-β). `broadcast_shutdown`
-                // is `try_send`-based so the writer must be draining; under tokio
-                // listener it always is.
+                // one-per-shard under PerShard — step 2f-β). A deadline of now:
+                // `try_send`, never a blocking send on this runtime thread; the
+                // writer is draining under this tokio listener.
                 if let Some(ref pool) = aof_pool {
-                    pool.broadcast_shutdown();
+                    pool.broadcast_shutdown(std::time::Instant::now());
                 }
                 break;
             }

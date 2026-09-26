@@ -790,17 +790,17 @@ pub async fn aof_writer_task(
         #[cfg(feature = "runtime-tokio")]
         {
             // Bounded recv (EverySec durability): wake at least every
-            // `idle_wait.current()` (50ms floor, escalates to 1s while
-            // truly idle — see `IdleWait` docs; tighter than the old fixed
-            // 200ms right after activity, far looser once idle) even when
-            // idle so the flush
-            // deadline check after this select! is honored within its 1s
-            // bound. A long-lived `interval.tick()` select arm is
-            // fairness-starvable under sustained writes and unreliable when idle
-            // (see the per-shard writer below, which hit exactly that) — the
-            // bounded recv cannot starve. flume's recv future is drop-safe on
-            // the Elapsed branch (no message consumed on timeout).
+            // `idle_wait.current()` (50ms floor, escalates to 1s while truly
+            // idle — see `IdleWait` docs) even when idle so the flush deadline
+            // check after this select! is honored within its 1s bound. A
+            // long-lived `interval.tick()` select arm is fairness-starvable
+            // under sustained writes and unreliable when idle (see the
+            // per-shard writer below) — the bounded recv cannot starve.
+            // flume's recv future is drop-safe on the Elapsed branch (no
+            // message consumed on timeout). `biased`: a cancel exits only
+            // once the queued records are written (moon#1274).
             let recv_result = tokio::select! {
+                biased;
                 r = tokio::time::timeout(
                     idle_wait.current(),
                     rx.recv_async(),
@@ -1322,13 +1322,13 @@ pub async fn per_shard_aof_writer_task(
 
         loop {
             tokio::select! {
+                biased;
                 // Bounded recv (EverySec durability): wake at least every
-                // `idle_wait.current()` (50ms floor, escalates to 1s while
-                // idle — see `IdleWait`) even when idle so the flush deadline
-                // after this select! is honored within its 1s bound. flume's
-                // recv future is drop-safe on the Elapsed branch (no message
-                // consumed on timeout); the Ok(Ok(msg)) path below captures
-                // the message with no loss.
+                // `idle_wait.current()` (50ms floor, 1s while idle, see
+                // `IdleWait`) so the flush deadline after this select! holds
+                // its 1s bound. flume's recv future is drop-safe on Elapsed;
+                // Ok(Ok(msg)) below captures the message with no loss.
+                // `biased`: a cancel exits once the queue is written (#1274).
                 r = tokio::time::timeout(
                     idle_wait.current(),
                     rx.recv_async(),

@@ -935,6 +935,7 @@ fn main() -> anyhow::Result<()> {
     let mut toplevel_pool_fold_notifier: Option<std::sync::Arc<moon::runtime::channel::Notify>> =
         None;
 
+    let (aof_writer_token, mut aof_writers) = (CancellationToken::new(), Vec::new()); // moon#1274
     let mut aof_pool: Option<std::sync::Arc<AofWriterPool>> = if config.appendonly == "yes" {
         let fsync = FsyncPolicy::from_str(&config.appendfsync);
         // PerShard writers required when num_shards >= 2 AND we'll have a
@@ -957,11 +958,11 @@ fn main() -> anyhow::Result<()> {
             let mut senders = Vec::with_capacity(num_shards);
             for sid in 0..num_shards {
                 let (tx, rx) = channel::mpsc_bounded::<AofMessage>(10_000);
-                let aof_token = cancel_token.child_token();
+                let aof_token = aof_writer_token.clone();
                 let base_dir = base_dir.clone();
                 let thread_name = format!("aof-writer-{sid}");
                 let thread_name_inner = thread_name.clone();
-                std::thread::Builder::new()
+                let writer = std::thread::Builder::new()
                     .name(thread_name)
                     .spawn(move || {
                         // O5: escape the shard-core mask this thread would
@@ -975,6 +976,7 @@ fn main() -> anyhow::Result<()> {
                         );
                     })
                     .expect("failed to spawn per-shard AOF writer thread");
+                aof_writers.push(writer);
                 senders.push(tx);
             }
             info!(
@@ -992,7 +994,7 @@ fn main() -> anyhow::Result<()> {
             ))
         } else {
             let (tx, rx) = channel::mpsc_bounded::<AofMessage>(10_000);
-            let aof_token = cancel_token.child_token();
+            let aof_token = aof_writer_token.clone();
             let aof_file_path = PathBuf::from(&config.dir).join(&config.appendfilename);
 
             // C4 TopLevel: create fold channels for shard 0 here (before the
@@ -1008,9 +1010,8 @@ fn main() -> anyhow::Result<()> {
             // fold channels for the writer task
             let writer_fold_channels = Some((tl_fold_producer.clone(), tl_fold_notifier.clone()));
 
-            // Legacy single-writer thread. Each shard clones the outer
-            // `aof_pool` Arc; sender lifetime is governed by the pool's Drop.
-            std::thread::Builder::new()
+            // Legacy single-writer thread; each shard clones the outer `aof_pool` Arc.
+            let writer = std::thread::Builder::new()
                 .name("aof-writer".to_string())
                 .spawn(move || {
                     // O5: escape the shard-core mask this thread would
@@ -1028,6 +1029,7 @@ fn main() -> anyhow::Result<()> {
                     );
                 })
                 .expect("failed to spawn AOF writer thread");
+            aof_writers.push(writer);
             info!("AOF enabled (TopLevel, fsync: {:?})", fsync);
 
             // Stash consumer + pool-side channels for wiring in the blocks below.
@@ -2378,12 +2380,6 @@ fn main() -> anyhow::Result<()> {
         });
     }
 
-    // After listener exits, send AOF shutdown to every writer and cancel all shards.
-    // Under TopLevel this is one send; under PerShard (step 2f-β) this fans out to
-    // every per-shard writer thread via `broadcast_shutdown`.
-    if let Some(ref pool) = aof_pool {
-        pool.broadcast_shutdown();
-    }
     cancel_token.cancel();
     for handle in shard_handles {
         // A shard panic normally aborts via the panic hook above; if one
@@ -2392,6 +2388,10 @@ fn main() -> anyhow::Result<()> {
         if let Err(e) = handle.join() {
             tracing::error!("shard thread panicked during shutdown: {e:?}");
         }
+    }
+    // moon#1274: no shard left to append — the AOF writers drain, fsync and exit, then we do.
+    if let Some(ref pool) = aof_pool {
+        aof::writer_stop::stop_writers(pool, aof_writers, &aof_writer_token);
     }
 
     if let Some(err) = listener_failure.lock().take() {
