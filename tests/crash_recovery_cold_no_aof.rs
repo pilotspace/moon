@@ -319,3 +319,77 @@ fn no_aof_flushed_cold_keys_stay_flushed_after_the_flushall_save_and_crash() {
 fn no_aof_flushed_cold_keys_stay_flushed_after_a_bgsave_and_crash() {
     run_no_aof_flush_scenario("noaof-flush-bgsave", FlushSave::FlushThenBgsave);
 }
+
+// ── moon#1236, the no-AOF quadrant (review F6) ────────────────────────────────
+
+/// moon#1236 without an AOF (`probe1236_noaof.py`): the even probes, cold
+/// (inherited), are overwritten hot WITH a TTL, a BGSAVE captures the new
+/// values, kill -9, and the restart comes after the TTL. The snapshot is the
+/// KV authority: its loader skips the expired entries, and the cold index
+/// attached after it surfaced every even probe's OLD spill slot. Each even
+/// probe must read absent; the odd probes (the cold tier's control) keep
+/// their value.
+fn run_no_aof_ttl_overwrite_scenario(suffix: &str) {
+    const TTL_MS: u64 = 15_000;
+    let port = common::reserve_port();
+    let dir = unique_dir(suffix);
+    std::fs::create_dir_all(&dir).expect("create test dir");
+    inherit_cold_probes(port, &dir);
+    let save = ["--save", "3600 100000000"];
+    let mut server = start_moon_with(port, &dir, 3600, "no", &save);
+    wait_for_port(port);
+    let val = probe_value();
+    let odd_before = (1..PROBE_COUNT)
+        .step_by(2)
+        .filter(|i| redis_get(port, &probe_key(*i)).as_deref() == Some(val.as_str()))
+        .count();
+    assert!(odd_before > 0, "precondition failed: nothing inherited");
+    let new = overwrite_value();
+    let overwritten_at = Instant::now();
+    for i in (0..PROBE_COUNT).step_by(2) {
+        redis_cmd(
+            port,
+            &["SET", &probe_key(i), &new, "PX", &TTL_MS.to_string()],
+        );
+    }
+    bgsave_and_wait(port);
+    let saved_after = overwritten_at.elapsed();
+    server.kill_now();
+    wait_for_port_down(port);
+    if let Some(rest) = Duration::from_millis(TTL_MS + 1_500).checked_sub(overwritten_at.elapsed())
+    {
+        std::thread::sleep(rest);
+    }
+    let mut server2 = start_moon_alive_with(port, &dir, 3600, "no", &save);
+    let even_back: Vec<(usize, String)> = (0..PROBE_COUNT)
+        .step_by(2)
+        .filter_map(|i| redis_get(port, &probe_key(i)).map(|v| (i, v)))
+        .collect();
+    let old_back = even_back.iter().filter(|(_, v)| *v == val).count();
+    let odd_after = (1..PROBE_COUNT)
+        .step_by(2)
+        .filter(|i| redis_get(port, &probe_key(*i)).as_deref() == Some(val.as_str()))
+        .count();
+    server2.kill_now();
+    let wrong: Vec<String> = even_back
+        .iter()
+        .map(|(i, _)| probe_key(*i))
+        .chain((odd_after < odd_before).then(|| format!("{odd_after}/{odd_before} odd")))
+        .collect();
+    finish(&dir, &wrong);
+    assert!(
+        wrong.is_empty(),
+        "--appendonly no: a TTL'd overwrite of inherited cold keys, a BGSAVE {saved_after:?} \
+         after it, kill -9 and a restart past the {TTL_MS} ms TTL brought {} even probe(s) \
+         back ({old_back} with the OLD value); odd probes {odd_after} of {odd_before}",
+        even_back.len()
+    );
+}
+
+/// moon#1236 review F6: the snapshot boot must not surface a cold shadow of
+/// a key it holds as expired.
+#[test]
+#[ignore]
+fn no_aof_cold_keys_overwritten_with_a_ttl_do_not_come_back_old_after_a_bgsave_and_crash() {
+    run_no_aof_ttl_overwrite_scenario("noaof-ttlow");
+}

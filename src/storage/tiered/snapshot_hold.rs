@@ -159,6 +159,38 @@ pub fn snapshot_fold_view(next_file_id: u64) -> FoldView {
     }
 }
 
+/// moon#1236, the no-AOF quadrant (REVIEW-WS20 F6): without an AOF the boot
+/// snapshot is the KV authority, and a key it holds but skipped as expired
+/// (`snapshot::shard_snapshot_load_noting_expired`) is ABSENT. Its cold slot
+/// — a copy spilled before the snapshot, which the image's value
+/// superseded, or a spill after it, outside the RPO — surfaced once the
+/// cold index was attached after the load, bringing the OLD value back.
+/// Call after the attach; drops those cold entries and returns how many.
+///
+/// With an AOF nothing is dropped: the log replays after the snapshot and
+/// decides (a later `MOON.SPILLED` marker can authorize a newer slot).
+/// Idempotent across crashes while that snapshot is the latest. A later one
+/// no longer names the key, so a crash after it brings the slot back if its
+/// file still backs other keys — like any cold key removed without an AOF,
+/// a `DEL` included: the no-AOF cold plane records no removals.
+pub fn drop_cold_shadows_of_expired_image_keys(
+    databases: &mut [crate::storage::db::Database],
+    expired: Vec<(usize, bytes::Bytes)>,
+) -> usize {
+    if !applies() {
+        return 0;
+    }
+    expired
+        .into_iter()
+        .filter(|(db, key)| {
+            databases
+                .get_mut(*db)
+                .and_then(|d| d.cold_index.as_mut())
+                .is_some_and(|ci| ci.remove(key))
+        })
+        .count()
+}
+
 #[cfg(test)]
 thread_local! {
     /// Test-only [`applies`]: off unless a test opts in (the process-wide
@@ -279,5 +311,68 @@ mod tests {
         note_snapshot_finished(true);
         h.observe(snapshot_fold_view(20));
         assert_eq!(h.admit(vec![]).unlink, vec![15]);
+    }
+
+    /// moon#1236 review F6: without an AOF, a key the boot snapshot skipped
+    /// as expired loses its cold slot (`k`, db 0); a key it did not name
+    /// (`other`) and a db without a cold index are untouched. With an AOF
+    /// nothing is dropped (the log decides).
+    #[test]
+    fn a_key_the_snapshot_held_as_expired_loses_its_cold_shadow_without_an_aof() {
+        use crate::persistence::kv_page::ValueType;
+        use crate::storage::db::Database;
+        use crate::storage::tiered::cold_index::ColdLocation;
+        let dbs = || {
+            let mut ci = ColdIndex::new();
+            for (slot, key) in [b"k".as_slice(), b"other"].into_iter().enumerate() {
+                let loc = ColdLocation {
+                    file_id: 5,
+                    page_idx: 0,
+                    slot_idx: slot as u16,
+                    ttl_ms: None,
+                    value_type: ValueType::String,
+                };
+                ci.insert(bytes::Bytes::copy_from_slice(key), loc);
+            }
+            let mut dbs = vec![Database::new(), Database::new()];
+            dbs[0].cold_index = Some(ci);
+            dbs
+        };
+        let expired = || {
+            vec![
+                (0, bytes::Bytes::from_static(b"k")),
+                (1, bytes::Bytes::from_static(b"k")),
+                (7, bytes::Bytes::from_static(b"k")),
+            ]
+        };
+        let cold = |dbs: &[Database], key: &[u8]| {
+            dbs[0]
+                .cold_index
+                .as_ref()
+                .is_some_and(|ci| ci.lookup(key).is_some())
+        };
+
+        force_applies(true);
+        let mut no_aof = dbs();
+        assert_eq!(
+            drop_cold_shadows_of_expired_image_keys(&mut no_aof, expired()),
+            1
+        );
+        assert!(
+            !cold(&no_aof, b"k"),
+            "the expired image key's slot is dropped"
+        );
+        assert!(
+            cold(&no_aof, b"other"),
+            "a key the image did not name keeps its slot"
+        );
+
+        force_applies(false);
+        let mut with_aof = dbs();
+        assert_eq!(
+            drop_cold_shadows_of_expired_image_keys(&mut with_aof, expired()),
+            0
+        );
+        assert!(cold(&with_aof, b"k"), "with an AOF the log decides");
     }
 }
