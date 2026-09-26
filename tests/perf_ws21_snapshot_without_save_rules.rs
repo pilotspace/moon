@@ -34,6 +34,9 @@ enum Save {
     Empty,
     /// No `--save` argument at all (the default).
     Omitted,
+    /// No `--save`, and the default `--disk-offload enable` (the snapshot
+    /// then lives in the offload tree, `<dir>/shard-N/`).
+    OmittedOffload,
 }
 
 fn spawn(dir: &Path, shards: usize, save: Save) -> (ServerGuard, u16) {
@@ -49,7 +52,11 @@ fn spawn(dir: &Path, shards: usize, save: Save) -> (ServerGuard, u16) {
             "--appendonly",
             "no",
             "--disk-offload",
-            "disable",
+            if matches!(save, Save::OmittedOffload) {
+                "enable"
+            } else {
+                "disable"
+            },
             "--maxmemory",
             "0",
             "--disk-free-min-pct",
@@ -61,7 +68,7 @@ fn spawn(dir: &Path, shards: usize, save: Save) -> (ServerGuard, u16) {
         match save {
             Save::Rules => args.extend(["--save".to_string(), "3600 1".to_string()]),
             Save::Empty => args.extend(["--save".to_string(), String::new()]),
-            Save::Omitted => {}
+            Save::Omitted | Save::OmittedOffload => {}
         }
         std::process::Command::new(&bin)
             .args(&args)
@@ -191,8 +198,9 @@ fn bgsave_works_without_save_rules(shards: usize, save: Save) {
     fill(&mut c);
     bgsave(&mut c);
     for s in 0..shards {
+        let name = format!("shard-{s}.rrdshard");
         assert!(
-            dir.join(format!("shard-{s}.rrdshard")).exists(),
+            dir.join(&name).exists() || dir.join(format!("shard-{s}")).join(&name).exists(),
             "shard {s} wrote no snapshot"
         );
     }
@@ -274,6 +282,13 @@ fn bgsave_works_with_save_omitted_single_shard() {
 #[test]
 fn bgsave_works_with_save_omitted_four_shards() {
     bgsave_works_without_save_rules(4, Save::Omitted);
+}
+
+/// The default configuration: no `--save`, disk offload on. Boot already
+/// loaded a snapshot there (the offload recovery), but BGSAVE was refused.
+#[test]
+fn bgsave_works_with_save_omitted_and_disk_offload_four_shards() {
+    bgsave_works_without_save_rules(4, Save::OmittedOffload);
 }
 
 #[test]
