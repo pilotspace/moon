@@ -31,21 +31,29 @@ use super::{load, load_from_bytes, save, save_to_bytes};
 use crate::storage::Database;
 use crate::storage::entry::{Entry, current_time_ms};
 
-/// Save `live` (alive now) and `dying` (TTL 30 ms ahead), then wait until
-/// `dying`'s TTL has passed: the image holds an entry that expired after the
-/// save, exactly like an AOF base read after a downtime.
-fn db_with_a_dying_key() -> Vec<Database> {
+/// `dying`'s TTL: long enough that the save (which drops an entry already
+/// expired when it is written) never outruns it — REVIEW-WS20 F8, the 30 ms
+/// it replaced failed whenever the save took longer.
+const TTL_MS: u64 = 1_000;
+
+/// Save `live` (alive now) and `dying` (TTL [`TTL_MS`] ahead), then wait
+/// until `dying`'s TTL has passed: the image holds an entry that expired
+/// after the save, exactly like an AOF base read after a downtime.
+fn db_with_a_dying_key() -> (Vec<Database>, u64) {
+    let deadline = current_time_ms() + TTL_MS;
     let mut dbs = vec![Database::new()];
     dbs[0].set(b"live", Entry::new_string(Bytes::from_static(b"yes")));
     dbs[0].set(
         b"dying",
-        Entry::new_string_with_expiry(Bytes::from_static(b"soon"), current_time_ms() + 30),
+        Entry::new_string_with_expiry(Bytes::from_static(b"soon"), deadline),
     );
-    dbs
+    (dbs, deadline)
 }
 
-fn wait_past_the_ttl() {
-    std::thread::sleep(std::time::Duration::from_millis(80));
+fn wait_past(deadline: u64) {
+    while current_time_ms() <= deadline {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
 }
 
 fn assert_loaded_and_hidden(db: &mut Database) {
@@ -64,8 +72,9 @@ fn assert_loaded_and_hidden(db: &mut Database) {
 fn load_keeps_an_entry_that_expired_after_the_save() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("base.rdb");
-    save(&db_with_a_dying_key(), &path).expect("save");
-    wait_past_the_ttl();
+    let (dbs, deadline) = db_with_a_dying_key();
+    save(&dbs, &path).expect("save");
+    wait_past(deadline);
     let mut loaded = vec![Database::new()];
     assert_eq!(load(&mut loaded, &path).expect("load"), 2);
     assert_loaded_and_hidden(&mut loaded[0]);
@@ -73,8 +82,9 @@ fn load_keeps_an_entry_that_expired_after_the_save() {
 
 #[test]
 fn load_from_bytes_keeps_an_entry_that_expired_after_the_save() {
-    let bytes = save_to_bytes(&db_with_a_dying_key()).expect("save");
-    wait_past_the_ttl();
+    let (dbs, deadline) = db_with_a_dying_key();
+    let bytes = save_to_bytes(&dbs).expect("save");
+    wait_past(deadline);
     let mut loaded = vec![Database::new()];
     let (keys, consumed) = load_from_bytes(&mut loaded, &bytes).expect("load");
     assert_eq!((keys, consumed), (2, bytes.len()));
