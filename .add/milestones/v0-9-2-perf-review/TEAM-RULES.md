@@ -10,6 +10,7 @@ does not OOM, fill the disk, or corrupt each other's work.
 - Four agents build concurrently in the shared target: expect lock waits; the rules in §2 are what keep that safe.
 - WS15 port range: 7320–7339. WS16: 7360–7379. WS17: 7340–7359.
 - Part 4 (base `int/part3b` @ `4115798`): WS16 7360–7379, WS19 7500–7519. Part-3b reviewers: 7520–7579.
+- Part 5 (base main `4a96cd5f`): WS20 7500–7519 (target `/home/user/wt/target`), WS21 7520–7539 (PRIVATE target `/home/user/wt/target-gate`). "Red" means red on `4a96cd5f`; pre-existing bugs also red on `/home/user/wt/bin/baseline-ae21476`.
 - Known environment-only failure, NOT yours: `storage::tiered::cold_index_rebuild_tests::unreadable_file_is_counted_and_skipped_never_queued_for_unlink`
   fails because the container runs as root (chmod 000 is still readable). Do not "fix" it — unless your PLAN.md assigns
   it (WS17 item 7: a test-only skip when euid is 0, with a note; no production change).
