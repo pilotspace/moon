@@ -1486,3 +1486,6 @@ mod capture_gap_tests;
 
 #[cfg(test)]
 mod cow_budget_tests;
+
+#[cfg(test)]
+mod eviction_capture_tests;

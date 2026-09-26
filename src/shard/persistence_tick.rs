@@ -139,13 +139,13 @@ pub(crate) fn check_auto_save_trigger(
             crate::command::persistence::bgsave_shard_done(false);
             return;
         }
-        let Some(dir) = persistence_dir else {
-            // No persistence directory (`--appendonly no` without `--save`):
-            // nowhere to write. Report the failure instead of leaving the
-            // save in progress forever (moon#1230).
+        // moon#1267: a shard with no persistence directory saves to `--dir`.
+        let Some(dir) = crate::command::persistence::snapshot_dir_or(persistence_dir) else {
+            // Nowhere to write (a harness registered no directory): report the
+            // failure instead of leaving the save in progress forever (moon#1230).
             tracing::warn!(
-                "Shard {}: snapshot epoch {} not written — no persistence directory \
-                 (--appendonly no and no --save); the save is reported failed",
+                "Shard {}: snapshot epoch {} not written — no snapshot directory \
+                 is registered; the save is reported failed",
                 shard_id,
                 new_epoch
             );

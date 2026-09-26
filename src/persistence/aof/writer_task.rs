@@ -1176,17 +1176,16 @@ pub async fn per_shard_aof_writer_task(
     fsync: FsyncPolicy,
     cancel: CancellationToken,
 ) {
+    test_hooks::hold_writer_start(shard_id, &cancel);
     #[cfg(feature = "runtime-tokio")]
     {
         use crate::persistence::aof_manifest::{AofLayout, AofManifest};
         use tokio::io::AsyncWriteExt;
 
-        // Wait for main.rs recovery to create/load the manifest.
-        //
-        // task #27 fix: load-before-cancel-check, same rationale as the
-        // TopLevel loop above — a manifest that now exists must not be
-        // missed just because a shutdown signal landed in the same instant
-        // (see that loop's comment for the reproduction).
+        // Wait for main.rs recovery to create the manifest. task #27 fix:
+        // load-before-cancel-check, same rationale as the TopLevel loop above
+        // — a manifest that now exists must not be missed just because a
+        // shutdown signal landed in the same instant (see that loop).
         let manifest_wait_start = Instant::now();
         const MANIFEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
         let manifest = loop {
@@ -2093,6 +2092,7 @@ pub async fn per_shard_aof_writer_task(
 
 #[cfg(all(test, feature = "runtime-tokio"))]
 mod buf_tests;
+mod test_hooks;
 
 #[cfg(test)]
 mod idle_wait_tests {

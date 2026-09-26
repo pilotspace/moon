@@ -11,6 +11,7 @@ mod blocking_tests;
 pub mod blocking_txn;
 pub mod core;
 pub(crate) mod fanout;
+pub(crate) mod flush_save;
 #[cfg(feature = "runtime-monoio")]
 pub mod handler_monoio;
 #[cfg(feature = "runtime-tokio")]

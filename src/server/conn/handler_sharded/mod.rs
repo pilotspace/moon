@@ -2963,14 +2963,14 @@ pub(crate) async fn handle_connection_sharded_inner<
                                     }
                                 }
                                 // CLIENT TRACKING: a flush drops every cached
-                                // key — push the RESP3 flush invalidation
-                                // (invalidate + Null) to all tracking clients.
-                                // The table is process-global, so one hook at
-                                // the originating connection covers all shards.
+                                // key — push the RESP3 flush invalidation to all
+                                // tracking clients (one hook at the originating
+                                // connection covers all shards). moon#1264: a
+                                // FLUSHALL with save points then saves first.
                                 if flushed_everywhere {
-                                    crate::tracking::invalidation::invalidate_flush(
-                                        &ctx.tracking_table,
-                                    );
+                                    let table = &ctx.tracking_table;
+                                    crate::tracking::invalidation::invalidate_flush(table);
+                                    crate::server::conn::flush_save::after_flush(cmd, ctx).await;
                                 }
                             }
                             if aof_failed {

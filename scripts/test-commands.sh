@@ -2624,6 +2624,11 @@ if should_run "persistence"; then
     assert_moon "BGSAVE"               "Background saving started" BGSAVE
     sleep 1
 
+    # moon#1264: SHUTDOWN ABORT with no shutdown in progress, and ABORT with
+    # another modifier, answer as redis 7.0.15 does. Neither stops a server.
+    assert_match "SHUTDOWN ABORT (none in progress)" SHUTDOWN ABORT
+    assert_match "SHUTDOWN ABORT NOSAVE (syntax)"    SHUTDOWN ABORT NOSAVE
+
     # SHUTDOWN [NOSAVE|SAVE] is intentionally NOT exercised in this section:
     # it terminates the server process this whole script shares across every
     # other category, which would abort the run. Coverage lives in
