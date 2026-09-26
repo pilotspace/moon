@@ -192,11 +192,28 @@ fn foreign_footprint(set: &crate::shard::db_plane::ShardDbSet, db: usize) -> Opt
 }
 
 /// At a shard's own swap: say so, loudly, if a swapped database acquired a
-/// cold footprint after [`swapdb_cold_refusal`] cleared it (a spill in the
-/// window between the check and this shard's swap). The swap still happens —
-/// every other shard has swapped, and the hot data must stay consistent —
-/// and the keys spilled in that window are exposed to moon#1237 until their
-/// files are reclaimed. Owner thread, before the swap.
+/// cold footprint after [`swapdb_cold_refusal`] cleared it. The swap still
+/// happens — every other shard has swapped, and the hot data must stay
+/// consistent. Owner thread, before the swap.
+///
+/// The window between the check and this shard's swap is one SPSC hop (at
+/// `--shards 1`, only while the AOF append awaits); REVIEW-WS20 F4 traced
+/// two variants (not reproduced: 0 hits in 3,914 racing swaps at s4):
+/// - (a) a spill that COMPLETES in the window: its file keeps the pre-swap
+///   db tag, so after an AOF rewrite and a restart its keys reappear in the
+///   other database (moon#1237) until the file is reclaimed;
+/// - (b) a spill IN FLIGHT at the swap: its completion is routed by slot to
+///   the other `Database`, which has no in-flight record for it, and is
+///   dropped as a ghost; the swapped-away record stays in `spill_inflight`
+///   for good (a little memory, and that database refuses SWAPDB until a
+///   restart), and a kill -9 before a fold leaves the unmarked slot to
+///   `finish_replay_cold_reconcile`, which keeps it: a phantom copy in the
+///   old database.
+///
+/// Closing both needs a per-shard "swap pending (a, b)" prepare, set on
+/// every shard before the check, under which eviction skips victims of `a`
+/// and `b` and the check also waits for their in-flight spills to drain; a
+/// cross-shard protocol step, left out of WS20 (see the WS20 NOTES).
 pub fn note_swap_with_cold_footprint(shard_id: usize, a: usize, b: usize) {
     if a == b {
         return;
