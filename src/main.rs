@@ -2388,8 +2388,11 @@ fn main() -> anyhow::Result<()> {
     // moon#1274: no shard left to append — the AOF writers drain, fsync and exit, then we do.
     if let Some(ref pool) = aof_pool {
         let (bound, token) = (aof::writer_stop::STOP_BOUND, &aof_writer_token);
-        aof::writer_stop::stop_writers(pool, aof_writers, token, bound)
+        aof::writer_stop::stop_writers(pool, aof_writers, token, bound, &signal::insisted)
             .map_err(|w| anyhow::anyhow!("AOF writer(s) {w:?} abandoned at shutdown"))?;
+    }
+    if signal::insisted() {
+        anyhow::bail!("a second SIGINT: stopped without the final save");
     }
 
     if let Some(err) = listener_failure.lock().take() {

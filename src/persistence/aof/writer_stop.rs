@@ -17,7 +17,8 @@
 //! (`RewriteOverflow`) into the incr before the writer reads on — that drain
 //! can swallow the `Shutdown`, so it is re-sent until the writer is gone.
 //! The writers have their own token (not the server's), cancelled only once
-//! the wait runs out ([`STOP_BOUND`]). The cancel releases a writer that
+//! the wait runs out: [`STOP_BOUND`], or [`HURRY_BOUND`] once `hurry` says so
+//! (a second SIGINT, redis's "You insist"). The cancel releases a writer that
 //! has not started yet and ends the tokio writers' loops after they write
 //! what is queued; they get [`GRACE`] more. A writer still running then is
 //! ABANDONED: [`stop_writers`] names it and returns `Err`, and the process
@@ -37,6 +38,9 @@ use crate::runtime::cancel::CancellationToken;
 /// How long the exit waits for the writers to drain and fsync.
 pub const STOP_BOUND: Duration = Duration::from_secs(60);
 
+/// The wait once the operator insists (a second SIGINT).
+pub const HURRY_BOUND: Duration = Duration::from_secs(2);
+
 /// What the writers get after their token is cancelled.
 pub const GRACE: Duration = Duration::from_secs(2);
 
@@ -45,15 +49,18 @@ const RESEND_EVERY: Duration = Duration::from_millis(500);
 
 /// Drain, fsync and join every AOF writer. Call once every producer (every
 /// shard thread) has stopped; `token` is the writers' own. Waits up to
-/// `bound` ([`STOP_BOUND`] in production). `Err` names the writers abandoned.
+/// `bound` ([`STOP_BOUND`] in production), or [`HURRY_BOUND`] from the
+/// moment `hurry` turns true. `Err` names the writers abandoned.
 pub fn stop_writers(
     pool: &AofWriterPool,
     writers: Vec<JoinHandle<()>>,
     token: &CancellationToken,
     bound: Duration,
+    hurry: &dyn Fn() -> bool,
 ) -> Result<(), Vec<String>> {
     let started = Instant::now();
-    let deadline = started + bound;
+    let mut deadline = started + bound;
+    let mut hurried = false;
     let mut cancelled_at: Option<Instant> = None;
     pool.broadcast_shutdown(deadline.min(started + RESEND_EVERY));
     let mut sent = Instant::now();
@@ -62,6 +69,10 @@ pub fn stop_writers(
             break;
         }
         let now = Instant::now();
+        if !hurried && hurry() {
+            hurried = true;
+            deadline = deadline.min(now + HURRY_BOUND);
+        }
         match cancelled_at {
             None if now >= deadline => {
                 warn!(
@@ -201,7 +212,7 @@ mod tests {
     fn writers_drain_their_queue_before_the_exit() {
         let r = rig(false);
         r.start.store(true, Ordering::SeqCst);
-        let out = stop_writers(&r.pool, r.writers, &r.token, STOP_BOUND);
+        let out = stop_writers(&r.pool, r.writers, &r.token, STOP_BOUND, &|| false);
         assert_eq!(out, Ok(()));
         assert_eq!(r.written.load(Ordering::SeqCst), 6);
         assert!(!r.token.is_cancelled());
@@ -212,7 +223,13 @@ mod tests {
     #[test]
     fn a_late_writer_is_released_by_the_cancel_and_drains() {
         let r = rig(false);
-        let out = stop_writers(&r.pool, r.writers, &r.token, Duration::from_millis(50));
+        let out = stop_writers(
+            &r.pool,
+            r.writers,
+            &r.token,
+            Duration::from_millis(50),
+            &|| false,
+        );
         assert_eq!(out, Ok(()));
         assert_eq!(r.written.load(Ordering::SeqCst), 6);
         assert!(r.token.is_cancelled());
@@ -226,9 +243,20 @@ mod tests {
         r.start.store(true, Ordering::SeqCst);
         let bound = Duration::from_millis(50);
         let t = Instant::now();
-        let out = stop_writers(&r.pool, r.writers, &r.token, bound);
+        let out = stop_writers(&r.pool, r.writers, &r.token, bound, &|| false);
         r.wedged.store(false, Ordering::SeqCst);
         assert_eq!(out, Err(vec!["test-aof-writer-1".to_string()]));
         assert!(t.elapsed() < Duration::from_secs(2), "{:?}", t.elapsed());
+    }
+
+    /// A2: `hurry` (a second SIGINT) cuts the 60 s bound to HURRY_BOUND.
+    #[test]
+    fn hurry_cuts_the_wait() {
+        let r = rig(false);
+        let t = Instant::now();
+        let out = stop_writers(&r.pool, r.writers, &r.token, STOP_BOUND, &|| true);
+        assert_eq!(out, Ok(()));
+        assert!(t.elapsed() < HURRY_BOUND + GRACE, "{:?}", t.elapsed());
+        assert_eq!(r.written.load(Ordering::SeqCst), 6);
     }
 }

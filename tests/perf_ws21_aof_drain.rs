@@ -33,6 +33,18 @@ use common::{Conn, ServerGuard};
 const KEYS: usize = 300;
 
 fn spawn(dir: &Path, shards: usize, hold: Option<&Path>) -> (ServerGuard, u16) {
+    spawn_saving(dir, shards, hold, "", None)
+}
+
+/// [`spawn`] with save points `save`, and the final save held while
+/// `snapshot_hold` exists.
+fn spawn_saving(
+    dir: &Path,
+    shards: usize,
+    hold: Option<&Path>,
+    save: &str,
+    snapshot_hold: Option<&Path>,
+) -> (ServerGuard, u16) {
     let bin = common::find_moon_binary();
     let (child, port) = common::spawn_listening(|port| {
         let mut cmd = std::process::Command::new(&bin);
@@ -50,7 +62,7 @@ fn spawn(dir: &Path, shards: usize, hold: Option<&Path>) -> (ServerGuard, u16) {
             "--auto-aof-rewrite-percentage",
             "0",
             "--save",
-            "",
+            save,
             "--disk-offload",
             "disable",
             "--maxmemory",
@@ -63,6 +75,9 @@ fn spawn(dir: &Path, shards: usize, hold: Option<&Path>) -> (ServerGuard, u16) {
         .stderr(common::server_stderr(dir));
         if let Some(hold) = hold {
             cmd.env("MOON_TEST_AOF_WRITER_HOLD", format!("1:{}", hold.display()));
+        }
+        if let Some(hold) = snapshot_hold {
+            cmd.env("MOON_TEST_SNAPSHOT_HOLD_FILE", hold);
         }
         cmd.spawn()
             .expect("spawn moon (build it first, or set MOON_BIN)")
@@ -281,5 +296,48 @@ fn a_sigterm_with_a_fold_its_shard_never_served() {
         took < Duration::from_secs(10) && lost_k == 0 && lost_p == 0,
         "exit took {took:?} after the late writer's release; lost {lost_k} + {lost_p} of \
          {KEYS} + {KEYS} acknowledged writes"
+    );
+}
+
+/// Round 3 A2 (the reviewer's proof 2c): with `--appendonly yes` and save
+/// points, a SIGINT starts the final save (held here: it never finishes), and
+/// a second SIGINT insists — redis's "You insist... exiting now". It skips
+/// the RDB save, not the AOF: before, its `exit(1)` bypassed the moon#1274
+/// writer drain and lost the records still queued for a late writer (84 of
+/// 300). Exit status 1 as in redis, within a few seconds.
+#[test]
+fn a_second_sigint_skips_the_save_but_keeps_the_aof_records() {
+    let dir = common::unique_test_dir("ws21-r3-a2");
+    std::fs::create_dir_all(&dir).unwrap();
+    let (snap_hold, writer_hold) = (dir.join("snapshot.hold"), dir.join("writer.hold"));
+    std::fs::write(&snap_hold, b"held").unwrap();
+    std::fs::write(&writer_hold, b"held").unwrap();
+    let rules = "3600 1000000";
+    let (mut server, port) = spawn_saving(&dir, 4, Some(&writer_hold), rules, Some(&snap_hold));
+    let mut c = Conn::open(port);
+    set_all(&mut c, "k");
+    stop(&server, &mut c, Stop::Int);
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(
+        server.as_mut().try_wait().unwrap().is_none(),
+        "the first SIGINT did not wait for its final save"
+    );
+    stop(&server, &mut c, Stop::Int);
+    let t = Instant::now();
+    let status = wait_exit(&mut server, Duration::from_secs(30));
+    let took = t.elapsed();
+    drop(c);
+    std::fs::remove_file(&snap_hold).unwrap();
+    std::fs::remove_file(&writer_hold).unwrap();
+    let lost = missing_after_restart(&dir, 4, "k");
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(status.code(), Some(1), "redis's insist exit status");
+    assert!(
+        took < Duration::from_secs(10),
+        "the second SIGINT took {took:?}"
+    );
+    assert_eq!(
+        lost, 0,
+        "{lost} of {KEYS} acknowledged writes lost by the second SIGINT"
     );
 }

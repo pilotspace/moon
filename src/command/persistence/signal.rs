@@ -17,8 +17,17 @@
 //! - the final save fails: log it and KEEP RUNNING ("Error trying to save the
 //!   DB, can't exit"), so the operator can fix the disk and stop the server
 //!   again; the next SIGTERM / SIGINT retries;
-//! - a second SIGINT while the final save runs: exit at once, unsaved
-//!   ("You insist... exiting now"); a second SIGTERM is logged.
+//! - a second SIGINT while the final save runs: exit without it ("You
+//!   insist... exiting now", status 1); a second SIGTERM is logged.
+//!
+//! "Without the save" is not "without what was acknowledged" (round 3, A2):
+//! the second SIGINT used to `exit(1)` on the spot, skipping the moon#1274
+//! AOF drain, and with `--appendonly yes` lost acknowledged records still
+//! queued for the writers (84 of 300 in the review). redis's insist exit
+//! loses nothing it acknowledged. Now it only skips the RDB save: it cancels
+//! the server, which takes the normal exit path — shards stop, the AOF
+//! writers drain and fsync, for at most `aof::writer_stop::HURRY_BOUND` plus
+//! its grace ([`insisted`] shortens that wait) — and exits with status 1.
 //!
 //! No deadline (review F4): redis saves synchronously however long it takes,
 //! so a large dataset must not turn a stop into "keep running". Every
@@ -77,6 +86,26 @@ static ARMED: OnceLock<Armed> = OnceLock::new();
 /// A signal-initiated final save is running.
 static SAVING: AtomicBool = AtomicBool::new(false);
 
+/// A second SIGINT insisted on stopping now (round 3, A2).
+static INSISTED: AtomicBool = AtomicBool::new(false);
+
+/// Has a second SIGINT insisted on stopping now? `main.rs` then exits with
+/// status 1, and the AOF writers' drain waits 2 s at most.
+pub fn insisted() -> bool {
+    INSISTED.load(Ordering::Acquire)
+}
+
+/// redis's "You insist... exiting now": stop without the final save, taking
+/// the normal exit path (the AOF drain included).
+fn insist(shutdown: &CancellationToken) {
+    INSISTED.store(true, Ordering::Release);
+    error!(
+        "SIGINT received again: You insist... exiting now, without the final snapshot \
+         (acknowledged AOF records are still written)"
+    );
+    shutdown.cancel();
+}
+
 /// Called once by `main.rs` after the shard threads are spawned: from here a
 /// shutdown signal saves first when save points are configured at that
 /// moment ([`super::save_points_now`], the rule plain `SHUTDOWN` follows).
@@ -100,15 +129,17 @@ pub fn arm(
 /// disk.
 pub fn on_signal(signal: ShutdownSignal, shutdown: &CancellationToken) {
     let Some(armed) = ARMED.get().filter(|a| super::save_points_now(&a.runtime)) else {
+        if signal == ShutdownSignal::Int && shutdown.is_cancelled() {
+            // Already stopping (the AOF drain): hurry it.
+            return insist(shutdown);
+        }
         info!("{} received: shutting down", signal.name());
         shutdown.cancel();
         return;
     };
     if SAVING.swap(true, Ordering::AcqRel) {
         if signal == ShutdownSignal::Int {
-            // redis: "You insist... exiting now."
-            error!("SIGINT received again while saving the final snapshot: exiting now, unsaved");
-            std::process::exit(1);
+            return insist(shutdown);
         }
         warn!("SIGTERM received while the final snapshot is being saved; still saving");
         return;
