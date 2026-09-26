@@ -36,7 +36,7 @@ use common::{Conn, ServerGuard};
 const SHARDS: usize = 4;
 const HELD_SHARD: usize = 1;
 
-fn spawn(dir: &Path, hold: Option<&Path>) -> (ServerGuard, u16) {
+fn spawn(dir: &Path, hold: Option<&Path>, fsync: &str) -> (ServerGuard, u16) {
     let bin = common::find_moon_binary();
     let (child, port) = common::spawn_listening(|port| {
         let mut cmd = std::process::Command::new(&bin);
@@ -49,10 +49,11 @@ fn spawn(dir: &Path, hold: Option<&Path>) -> (ServerGuard, u16) {
             &SHARDS.to_string(),
             "--appendonly",
             "yes",
-            // A write for the held shard's writer queues in its channel
-            // instead of waiting for an fsync that cannot happen yet.
+            // `everysec` while a writer is held: a write for it queues in
+            // its channel instead of waiting for an fsync that cannot
+            // happen yet. `always` for the SIGKILL phase (review F6).
             "--appendfsync",
-            "everysec",
+            fsync,
             // The only rewrite is the test's own.
             "--auto-aof-rewrite-percentage",
             "0",
@@ -145,7 +146,7 @@ fn a_late_writer_start_leaves_a_per_shard_rewrite_committed_and_complete() {
     let hold = dir.join("hold-writer-1");
     std::fs::write(&hold, b"held").unwrap();
 
-    let (mut server, port) = spawn(&dir, Some(&hold));
+    let (mut server, port) = spawn(&dir, Some(&hold), "everysec");
     let mut c = Conn::open(port);
     // Main's recovery creates the seq 1 manifest; every writer but shard 1's
     // then starts.
@@ -206,15 +207,22 @@ fn a_late_writer_start_leaves_a_per_shard_rewrite_committed_and_complete() {
         }
     }
 
-    // Keys written after the commit land in the seq 2 incr files.
-    set_keys(&mut c, "after", 200);
-    // everysec: the writers flush their tail within a second.
-    std::thread::sleep(Duration::from_millis(1500));
+    // A crash right after the commit: its generation is on disk.
     drop(c);
     server.kill_now();
     common::wait_for_port_down(port);
 
-    let (_server, port) = spawn(&dir, None);
+    // Keys written after the commit land in the seq 2 incr files. Review
+    // F6: under `always` every acknowledged SET is fsynced, so the SIGKILL
+    // below cannot race the everysec flush (the moon#1063 / #1266 class).
+    let (mut server, port) = spawn(&dir, None, "always");
+    let mut c = Conn::open(port);
+    set_keys(&mut c, "after", 200);
+    drop(c);
+    server.kill_now();
+    common::wait_for_port_down(port);
+
+    let (_server, port) = spawn(&dir, None, "everysec");
     let mut c = Conn::open(port);
     assert_keys(&mut c, "before", 200);
     assert_keys(&mut c, "after", 200);

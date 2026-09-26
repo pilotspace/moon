@@ -105,6 +105,29 @@ fn hold_a_save(dir: &Path, shards: usize, c: &mut Conn) {
     }
 }
 
+/// Review F5: poll for the shutdown to be pending — observable as ABORT
+/// answering `+OK` (until then it answers "No shutdown in progress." and
+/// cancels nothing) — instead of assuming a fixed sleep covers it.
+fn abort_once_pending(server: &mut ServerGuard, c: &mut Conn) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        assert!(
+            alive(server),
+            "the shutdown did not wait for the running save"
+        );
+        match c.send(&["SHUTDOWN", "ABORT"]).as_str() {
+            "+OK\r\n" => return,
+            NONE_IN_PROGRESS => {}
+            other => panic!("SHUTDOWN ABORT: {other:?}"),
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the shutdown never became pending"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
 fn release_the_save(dir: &Path, c: &mut Conn) {
     std::fs::remove_file(dir.join("snapshot.hold")).unwrap();
     let deadline = Instant::now() + Duration::from_secs(60);
@@ -125,13 +148,7 @@ fn abort_cancels_a_waiting_shutdown(shards: usize) {
     // Client A's SHUTDOWN waits for the held save.
     let mut waiting = Conn::open(port);
     waiting.sock.write_all(&encode(&["SHUTDOWN"])).unwrap();
-    std::thread::sleep(Duration::from_millis(300));
-    assert!(
-        alive(&mut server),
-        "the SHUTDOWN did not wait for the running save"
-    );
-
-    assert_eq!(control.send(&["SHUTDOWN", "ABORT"]), "+OK\r\n");
+    abort_once_pending(&mut server, &mut control);
     assert_eq!(waiting.read_replies(1), ABORTED);
     assert_eq!(control.send(&["SHUTDOWN", "ABORT"]), NONE_IN_PROGRESS);
     assert_eq!(control.send(&["PING"]), "+PONG\r\n");
@@ -178,12 +195,7 @@ fn shutdown_abort_cancels_a_sigterm_shutdown() {
         .status()
         .unwrap();
     assert!(status.success());
-    std::thread::sleep(Duration::from_millis(300));
-    assert!(
-        alive(&mut server),
-        "SIGTERM did not wait for the running save"
-    );
-    assert_eq!(control.send(&["SHUTDOWN", "ABORT"]), "+OK\r\n");
+    abort_once_pending(&mut server, &mut control);
 
     release_the_save(&dir, &mut control);
     std::thread::sleep(Duration::from_millis(300));
