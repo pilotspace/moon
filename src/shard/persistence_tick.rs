@@ -297,11 +297,9 @@ pub(crate) fn advance_snapshot_segment(
 
 /// Handle successful snapshot finalization: send reply.
 ///
-/// WAL v2's per-snapshot `truncate_after_snapshot(epoch)` had no v3
-/// equivalent -- v3 retention is LSN-driven (`WalWriterV3::recycle_aggressive`
-/// / `recycle_segments_before`, invoked from autovacuum Pass C and the
-/// checkpoint protocol) and runs independently of legacy RRDSHARD snapshot
-/// epochs, so this handler no longer touches the WAL writer at all.
+/// WAL v2's per-snapshot `truncate_after_snapshot(epoch)` has no v3 equivalent:
+/// v3 retention is LSN-driven (`WalWriterV3::recycle_*`, from autovacuum Pass C
+/// and the checkpoint protocol), so this handler never touches the WAL writer.
 pub(crate) fn finalize_snapshot_success(
     snapshot_state: &mut Option<SnapshotState>,
     snapshot_reply_tx: &mut Option<channel::OneshotSender<Result<(), String>>>,
@@ -331,7 +329,9 @@ pub(crate) fn finalize_snapshot_error(
     if let Some(tx) = snapshot_reply_tx.take() {
         let _ = tx.send(Err(format!("finalize failed: {}", error)));
     }
-    // moon#517: the file is closed — a pre-image has nowhere left to go.
+    // moon#517 + round 3 A4: the file is closed; held pre-images and tables go off-thread.
+    let abort = |snap: &mut SnapshotState| snap.abort("finalize failed");
+    snapshot_state.iter_mut().for_each(abort);
     crate::persistence::snapshot_cow::disarm();
     crate::storage::tiered::snapshot_hold::note_snapshot_finished(false); // moon#1260
     *snapshot_state = None;
