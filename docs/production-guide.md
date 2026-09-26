@@ -489,6 +489,22 @@ and nothing is swapped. A replica whose own cold tier holds either database
 does not apply its master's `SWAPDB`: it drops the link and resyncs in full
 (moon#1278), which costs a full transfer per such swap.
 
+**Without an AOF (`--appendonly no`)**, a restart returns to the last snapshot
+plus the cold tier on disk, and the cold tier records no removals:
+
+- A spill file is removed only after a successful snapshot that started after
+  its last key left (moon#1260), because until then it may be the only copy
+  of a key read back into RAM. With no save rules (the default under
+  `--appendonly no`) nothing takes that snapshot: a `DEL` or `FLUSHALL` of
+  cold keys is undone by ANY restart — a clean `SHUTDOWN` included — until
+  a manual `BGSAVE` (or `SHUTDOWN SAVE`). Measured: 96 of 200 deleted keys
+  back after a plain `SHUTDOWN`. That is consistent with the snapshot, but
+  visible; run `BGSAVE` after deleting cold data you want gone.
+- A cold key deleted, or overwritten with a TTL that then passes, can come
+  back after a LATER snapshot and a crash if its spill file still holds other
+  live keys: the rebuild re-indexes the dead slot (moon#1281). Use
+  `--appendonly yes` where deletes of cold data must be durable.
+
 ### jemalloc tuning
 
 Moon ships with jemalloc by default. The allocator is pre-tuned for the thread-per-core architecture. Key environment variables for advanced tuning:
