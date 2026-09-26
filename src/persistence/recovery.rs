@@ -589,6 +589,7 @@ pub fn recover_shard_v3_pitr(
     let mut kv_records_db_out_of_range = 0usize;
     let wal_dir = shard_dir.join("wal-v3");
     if wal_dir.exists() {
+        let _clock = crate::persistence::replay::clock::pin_replay_clock_to_wal_dir(&wal_dir);
         let mut selected_db = 0usize;
         let on_command = &mut |record: &WalRecord| {
             match record.record_type {

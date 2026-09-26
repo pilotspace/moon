@@ -107,6 +107,9 @@ pub fn replay_multi_part(
     if incr_path.exists() {
         let file = std::fs::File::open(&incr_path)?;
         if file.metadata()?.len() > 0 {
+            // moon#1277: judge expiry by the time the log was last written.
+            let _clock =
+                crate::persistence::replay::clock::pin_replay_clock_to_files(&[&incr_path]);
             // Pure RESP — no RDB preamble detection needed.
             let count = replay_incr_resp(databases, file, engine)?;
             info!(
@@ -530,6 +533,10 @@ pub fn replay_per_shard(
                         })
                     })?;
                     if !data.is_empty() {
+                        // moon#1277: judge expiry by the log's last write.
+                        let _clock = crate::persistence::replay::clock::pin_replay_clock_to_files(
+                            &[&incr_path],
+                        );
                         let (count, max_lsn) = replay_incr_framed(
                             sid,
                             *databases,
