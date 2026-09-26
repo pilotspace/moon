@@ -259,4 +259,22 @@ mod tests {
         assert!(t.elapsed() < HURRY_BOUND + GRACE, "{:?}", t.elapsed());
         assert_eq!(r.written.load(Ordering::SeqCst), 6);
     }
+
+    /// Round 3 A7: a full channel (a wedged writer) does not delay the
+    /// others' `Shutdown` — they get it before the wait on the full one.
+    #[test]
+    fn broadcast_shutdown_does_not_wait_on_a_full_channel_first() {
+        let (tx0, _rx0) = channel::mpsc_bounded::<AofMessage>(1);
+        tx0.try_send(AofMessage::Shutdown).expect("fill writer 0");
+        let (tx1, rx1) = channel::mpsc_bounded::<AofMessage>(2);
+        let pool = AofWriterPool::per_shard(vec![tx0, tx1]);
+        let until = std::time::Instant::now() + std::time::Duration::from_millis(600);
+        let sender = std::thread::spawn(move || pool.broadcast_shutdown(until));
+        let got = rx1.recv_timeout(std::time::Duration::from_millis(300));
+        sender.join().expect("broadcast");
+        assert!(
+            matches!(got, Ok(AofMessage::Shutdown)),
+            "writer 1's Shutdown waited behind writer 0's full channel"
+        );
+    }
 }
