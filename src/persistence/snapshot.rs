@@ -207,7 +207,7 @@ pub struct SnapshotState {
     /// database's cursor; an advance splits the written range off the front
     /// (moved, never cloned). First capture of a key wins (moon#517): it is
     /// the only one taken before ANY write of this epoch touched the key.
-    overflow: Vec<BTreeMap<(u64, Bytes), PreImage>>,
+    overflow: Vec<BTreeMap<(u64, Bytes), (PreImage, u64)>>,
     /// [`pre_image_bytes`] of everything in `overflow` (moon#1228).
     overflow_bytes: u64,
     /// Shard ID for the snapshot file header.
@@ -558,6 +558,18 @@ impl SnapshotState {
     /// its epoch-start bytes; keeping the copy would also break the
     /// "nothing below the cursor" invariant the range take relies on).
     pub fn capture_cow(&mut self, db_index: usize, key: Bytes, pre_image: PreImage) {
+        self.capture_cow_sized(db_index, key, pre_image, None);
+    }
+
+    /// [`Self::capture_cow`] with the pre-image's size when the capturer
+    /// already knows it ([`pre_image_bytes`] walks a collection otherwise).
+    pub fn capture_cow_sized(
+        &mut self,
+        db_index: usize,
+        key: Bytes,
+        pre_image: PreImage,
+        bytes: Option<u64>,
+    ) {
         let hash = crate::storage::dashtable::hash_key(&key);
         if !self.is_hash_pending(db_index, hash) {
             return pre_image.into_iter().for_each(frozen::dispose);
@@ -565,8 +577,9 @@ impl SnapshotState {
         use std::collections::btree_map::Entry::{Occupied, Vacant};
         match self.overflow[db_index].entry((hash, key)) {
             Vacant(slot) => {
-                self.overflow_bytes += pre_image_bytes(&slot.key().1, &pre_image);
-                slot.insert(pre_image);
+                let bytes = bytes.unwrap_or_else(|| pre_image_bytes(&slot.key().1, &pre_image));
+                self.overflow_bytes += bytes;
+                slot.insert((pre_image, bytes));
             }
             // A large one (moon#1257 review F1) is freed off the shard thread.
             Occupied(_) => pre_image.into_iter().for_each(frozen::dispose),
@@ -621,7 +634,7 @@ impl SnapshotState {
         }
         let maps = self.overflow.iter_mut().map(std::mem::take);
         maps.flat_map(BTreeMap::into_values)
-            .flatten()
+            .filter_map(|(pre_image, _)| pre_image)
             .for_each(frozen::dispose);
         self.overflow_bytes = 0;
         // Nothing will be written any more: release the detached tables,
@@ -888,10 +901,14 @@ impl SnapshotState {
                 std::mem::replace(map, rest)
             }
         };
-        let bytes: u64 = taken
-            .iter()
-            .map(|((_, k), pre)| pre_image_bytes(k, pre))
-            .sum();
+        let mut bytes = 0u64;
+        let taken: BTreeMap<(u64, Bytes), PreImage> = taken
+            .into_iter()
+            .map(|(k, (pre, b))| {
+                bytes += b;
+                (k, pre)
+            })
+            .collect();
         self.overflow_bytes = self.overflow_bytes.saturating_sub(bytes);
         taken
     }
@@ -1469,3 +1486,6 @@ mod cow_budget_tests;
 
 #[cfg(test)]
 mod eviction_capture_tests;
+
+#[cfg(test)]
+mod removal_move_tests;

@@ -30,6 +30,8 @@ pub(crate) fn parse_int(frame: &Frame) -> Option<i64> {
 ///
 /// Removes the specified keys. Returns the number of keys that were removed.
 pub fn del(db: &mut Database, args: &[Frame]) -> Frame {
+    // moon#1269: where a save files the entries this DEL removes.
+    let slot = crate::persistence::snapshot_cow::take_removal_slot(db.db_index);
     if args.is_empty() {
         return err_wrong_args("DEL");
     }
@@ -39,12 +41,21 @@ pub fn del(db: &mut Database, args: &[Frame]) -> Frame {
             // Counting variant: a spilled (cold-only) key logically exists
             // and must count as removed (D1); an expired one does not
             // (moon#1234, see `settle_deletion`).
-            let outcome = match db.remove_counting_cold(key) {
+            let (live, hot) = db.remove_counting_cold_costed(key);
+            let outcome = match (live, &hot) {
                 (true, _) => KeyDeletion::Live,
                 // A hot entry came out but did not count: its TTL had passed.
                 (false, Some(_)) => KeyDeletion::Expired,
                 (false, None) => KeyDeletion::Absent,
             };
+            // moon#1269: during a save the removed entry becomes the key's
+            // epoch-start pre-image by MOVE (the dispatch hook skipped the
+            // copy for DEL); otherwise it is dropped here as before.
+            if let Some((entry, cost)) = hot {
+                drop(crate::persistence::snapshot_cow::capture_removed_sized(
+                    slot, key, entry, cost,
+                ));
+            }
             if settle_deletion(outcome, key, db.db_index) {
                 count += 1;
             }
@@ -1067,6 +1078,8 @@ pub fn renamenx(db: &mut Database, args: &[Frame]) -> Frame {
 /// Removes the specified keys. Like DEL but reclaims memory asynchronously
 /// for large collections.
 pub fn unlink(db: &mut Database, args: &[Frame]) -> Frame {
+    // moon#1269: where a save files the entries this UNLINK removes.
+    let slot = crate::persistence::snapshot_cow::take_removal_slot(db.db_index);
     if args.is_empty() {
         return err_wrong_args("UNLINK");
     }
@@ -1079,7 +1092,7 @@ pub fn unlink(db: &mut Database, args: &[Frame]) -> Frame {
             // queue — no ledger walk and no drop inside the command, on
             // either runtime (monoio used to drop inline; tokio's
             // `spawn_blocking` still walked the value first).
-            let outcome = db.unlink_key(key);
+            let outcome = db.unlink_key_capturing(key, slot);
             if settle_deletion(outcome, key, db.db_index) {
                 count += 1;
             }

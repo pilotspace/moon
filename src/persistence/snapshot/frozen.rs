@@ -22,7 +22,7 @@
 //! written since the epoch began + the rows below the cursor at the flush +
 //! (for a rebuild) the rows kept.
 
-use super::{SnapshotState, Source, Table, pre_image_bytes, segment_block};
+use super::{SnapshotState, Source, Table, segment_block};
 use crate::storage::compact_key::CompactKey;
 use crate::storage::dashtable::hash_key;
 use crate::storage::db::{LAZY_FREE_THRESHOLD, entry_overhead, lazy_free_weight};
@@ -318,7 +318,8 @@ impl SnapshotState {
         while used < budget {
             match &mut frozen.trim {
                 Trim::PreImages { below } => {
-                    let Some(((_, key), pre_image)) = self.overflow[db].first_key_value() else {
+                    let Some(((_, key), (pre_image, _))) = self.overflow[db].first_key_value()
+                    else {
                         // The walk may have passed more of the database in
                         // progress meanwhile, taking the pre-images there
                         // itself: the post-epoch rows of those keys are
@@ -342,12 +343,10 @@ impl SnapshotState {
                     if used > 0 && used + cost > budget {
                         break; // the next drain takes this row
                     }
-                    let Some(((_, key), pre_image)) = self.overflow[db].pop_first() else {
+                    let Some(((_, key), (pre_image, bytes))) = self.overflow[db].pop_first() else {
                         break;
                     };
-                    self.overflow_bytes = self
-                        .overflow_bytes
-                        .saturating_sub(pre_image_bytes(&key, &pre_image));
+                    self.overflow_bytes = self.overflow_bytes.saturating_sub(bytes);
                     if let Some(post) = frozen.table.remove(&key) {
                         frozen.bill = frozen.bill.saturating_sub(charge(&key, &post));
                         dispose(post);

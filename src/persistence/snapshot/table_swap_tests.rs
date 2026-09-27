@@ -900,9 +900,12 @@ fn a_lazy_free_charge_is_credited_to_the_frozen_table_not_freed_inline() {
         let f = format!("field-{f:06}");
         let _ = run(&mut dbs, 1, &[b"HSET", b"big", f.as_bytes(), b"some-value"]);
     }
+    // moon#1269: an UNLINK DURING the save hands a still-pending value to
+    // the epoch by move instead of queueing it; the lazy-free charge this
+    // test is about comes from an UNLINK just before the save.
+    let _ = run(&mut dbs, 1, &[b"UNLINK", b"big"]);
     let start_bill = dbs[1].ledger_bytes() as u64;
     let mut epoch = Epoch::begin(&dbs);
-    let _ = run(&mut dbs, 1, &[b"UNLINK", b"big"]);
     assert!(
         dbs[1].lazy_free_reclaimable(),
         "setup: the UNLINKed hash waits in the lazy-free queue, still charged"
@@ -944,8 +947,10 @@ fn a_value_freed_after_its_save_ended_credits_no_later_save() {
         let f = format!("field-{f:06}");
         let _ = run(&mut dbs, 1, &[b"HSET", b"big", f.as_bytes(), b"some-value"]);
     }
-    let mut first = Epoch::begin(&dbs);
+    // moon#1269: UNLINKed before the save, so it is queued (an UNLINK of
+    // a pending key during the save is held by the epoch instead).
     let _ = run(&mut dbs, 1, &[b"UNLINK", b"big"]);
+    let mut first = Epoch::begin(&dbs);
     let _ = run(&mut dbs, 1, &[b"FLUSHDB"]);
     first.try_finish(&dbs).expect("the first save completes");
     assert_eq!(dbs[1].lazy_free_len(), 1, "setup: still draining");

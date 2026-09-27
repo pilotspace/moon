@@ -72,7 +72,13 @@ mod capture;
 use capture::capture_key;
 #[cfg(test)]
 pub(crate) use capture::pre_image_clones_for_test;
-pub(crate) use capture::{Removed, capture_removed};
+pub(crate) use capture::{Removed, capture_removed, capture_removed_sized, capture_removed_then};
+
+/// One queued capture: `(epoch db, key, pre-image, its size when the capturer
+/// already knows it)`. The size spares the drain an O(elements) re-walk of a
+/// large value (moon#1269: a removal credits the value's bytes as it hands
+/// it over, and that figure is reused here).
+type Captured = (usize, Bytes, PreImage, Option<u64>);
 
 thread_local! {
     /// Is a snapshot in flight on this shard? The whole capture path is one
@@ -81,7 +87,7 @@ thread_local! {
     /// Pre-images captured since the last drain: `(db_index, key, state)`,
     /// where `state` is the key's entry or `None` if it did not exist
     /// (moon#1216: absence is part of the epoch-start keyspace too).
-    static PENDING: RefCell<Vec<(usize, Bytes, PreImage)>> = const { RefCell::new(Vec::new()) };
+    static PENDING: RefCell<Vec<Captured>> = const { RefCell::new(Vec::new()) };
     /// First-wins dedupe set: every key whose pre-image was captured this
     /// EPOCH, one set per database. Held for the whole snapshot (moon#1186)
     /// — it used to be cleared on every drain, so a hot key was deep-cloned
@@ -340,7 +346,7 @@ pub(crate) fn pending_for_test() -> Vec<(usize, Bytes, Entry)> {
     PENDING.with(|p| {
         p.borrow()
             .iter()
-            .filter_map(|(db, k, e)| e.as_ref().map(|e| (*db, k.clone(), e.clone())))
+            .filter_map(|(db, k, e, _)| e.as_ref().map(|e| (*db, k.clone(), e.clone())))
             .collect()
     })
 }
@@ -351,8 +357,8 @@ pub(crate) fn pending_tombstones_for_test() -> Vec<(usize, Bytes)> {
     PENDING.with(|p| {
         p.borrow()
             .iter()
-            .filter(|(_, _, e)| e.is_none())
-            .map(|(db, k, _)| (*db, k.clone()))
+            .filter(|(_, _, e, _)| e.is_none())
+            .map(|(db, k, _, _)| (*db, k.clone()))
             .collect()
     })
 }
@@ -406,10 +412,11 @@ fn clear() {
     let queued = PENDING.with(|p| std::mem::take(&mut *p.borrow_mut()));
     queued
         .into_iter()
-        .filter_map(|(_, _, pre_image)| pre_image)
+        .filter_map(|(_, _, pre_image, _)| pre_image)
         .for_each(crate::persistence::snapshot::frozen::dispose);
     PENDING_KEYS.with(|k| k.borrow_mut().clear());
     DEDUPE_BYTES.with(|b| b.set(0));
+    REMOVAL_SLOT.with(|c| c.set(None));
     publish_cow_size(0);
     PROGRESS.with(|p| *p.borrow_mut() = None);
     ABORT.with(|a| a.set(None));
@@ -766,6 +773,17 @@ pub(crate) fn capture_dispatch_pre_image(
 /// key, the pre-moon#1217 contract.
 fn capture_written_keys(db: &Database, db_index: usize, cmd: &[u8], args: &[Frame]) {
     use crate::acl::keyspec::{KeyPositions, KeyRole, command_key_positions};
+    // moon#1269: DEL / UNLINK only remove, and `command::key::{del, unlink}`
+    // hand every hot entry they take out to the epoch as its pre-image by
+    // MOVE (`capture_removed`). A copy here would deep-clone the whole value
+    // on the shard thread only for the command to discard the original — a
+    // 5M-field hash UNLINKed during a save stalled the shard ~1 s. A key with
+    // no hot entry needs nothing: the image holds hot keys only, and an
+    // absent key's epoch-start state is already "absent".
+    if removes_only(cmd) {
+        REMOVAL_SLOT.with(|c| c.set(Some(db_index)));
+        return;
+    }
     match command_key_positions(cmd, args) {
         KeyPositions::At(positions) | KeyPositions::AtPlusComputed(positions) => {
             for at in positions.iter().filter(|at| at.role == KeyRole::Write) {
@@ -784,6 +802,29 @@ fn capture_written_keys(db: &Database, db_index: usize, cmd: &[u8], args: &[Fram
             }
         }
     }
+}
+
+thread_local! {
+    /// The epoch database a DEL / UNLINK the dispatch hook just let through
+    /// must file its removed entries under (moon#1269): the index the hook
+    /// was given, handed to the command it precedes. Taken once at the
+    /// command's entry ([`take_removal_slot`]), so it never outlives it.
+    static REMOVAL_SLOT: Cell<Option<usize>> = const { Cell::new(None) };
+}
+
+/// The slot a removal command's captures go under (moon#1269): the one the
+/// dispatch hook recorded for it, else the database's own stamped index.
+/// Always call once, at the command's entry: it clears the record.
+#[inline]
+pub(crate) fn take_removal_slot(fallback: usize) -> usize {
+    REMOVAL_SLOT.with(Cell::take).unwrap_or(fallback)
+}
+
+/// Commands that only REMOVE their keys, whose removed entries are captured
+/// by move at the removal (moon#1269) instead of by copy before dispatch.
+#[inline]
+fn removes_only(cmd: &[u8]) -> bool {
+    cmd.eq_ignore_ascii_case(b"DEL") || cmd.eq_ignore_ascii_case(b"UNLINK")
 }
 
 /// Capture the pre-image for a write whose key is already parsed — the
@@ -882,8 +923,7 @@ pub(crate) fn capture_two_db(
 pub(crate) fn drain_into(snap: &mut SnapshotState) {
     apply_queued_abort(snap);
     if !PENDING.with(|p| p.borrow().is_empty()) {
-        let captured: Vec<(usize, Bytes, PreImage)> =
-            PENDING.with(|p| std::mem::take(&mut *p.borrow_mut()));
+        let captured: Vec<Captured> = PENDING.with(|p| std::mem::take(&mut *p.borrow_mut()));
         // PENDING_KEYS is NOT reset here (moon#1186): first-wins holds for
         // the whole epoch, so a hot key is cloned once, not once per tick.
         drain_captured(snap, captured);
@@ -938,9 +978,9 @@ fn apply_table_events(snap: &mut SnapshotState) {
 /// pending is a function of its hash and the cursor alone (moon#1216), so a
 /// split between the capture and this drain — which moves the key to a new
 /// segment — cannot misfile or drop its pre-image.
-fn drain_captured(snap: &mut SnapshotState, captured: Vec<(usize, Bytes, PreImage)>) {
-    for (db_index, key, pre_image) in captured {
-        snap.capture_cow(db_index, key, pre_image);
+fn drain_captured(snap: &mut SnapshotState, captured: Vec<Captured>) {
+    for (db_index, key, pre_image, bytes) in captured {
+        snap.capture_cow_sized(db_index, key, pre_image, bytes);
     }
 }
 
@@ -1016,7 +1056,7 @@ mod tests {
             let _ = crate::command::dispatch(&mut dbs[0], b"INCR", &args, &mut selected, 16);
         }
         let queued = PENDING.with(|p| p.borrow().clone());
-        let order: Vec<bool> = queued.iter().map(|(_, _, e)| e.is_some()).collect();
+        let order: Vec<bool> = queued.iter().map(|(_, _, e, _)| e.is_some()).collect();
         assert_eq!(
             order,
             vec![false, true],
@@ -1090,11 +1130,13 @@ mod tests {
                 0,
                 seg0_key.clone(),
                 Some(dbs[0].data().get(&seg0_key).unwrap().clone()),
+                None,
             ),
             (
                 0,
                 seg1_key.clone(),
                 Some(dbs[0].data().get(&seg1_key).unwrap().clone()),
+                None,
             ),
         ];
         drain_captured(&mut state, captured);

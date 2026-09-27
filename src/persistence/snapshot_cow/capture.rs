@@ -56,7 +56,7 @@ fn captured(db_index: usize, key: &[u8]) -> bool {
 }
 
 /// Queue `entry` as `key`'s pre-image and enter it in the epoch dedupe set.
-fn record_entry(db_index: usize, owned: Bytes, entry: Entry) {
+fn record_entry(db_index: usize, owned: Bytes, entry: Entry, bytes: Option<u64>) {
     PENDING_KEYS.with(|k| {
         let mut sets = k.borrow_mut();
         if sets.len() <= db_index {
@@ -68,7 +68,7 @@ fn record_entry(db_index: usize, owned: Bytes, entry: Entry) {
         }
     });
     let pre_image: PreImage = Some(entry);
-    PENDING.with(|p| p.borrow_mut().push((db_index, owned, pre_image)));
+    PENDING.with(|p| p.borrow_mut().push((db_index, owned, pre_image, bytes)));
 }
 
 /// Out-of-line slow path: record the key's current state, first write wins.
@@ -97,12 +97,12 @@ pub(super) fn capture_key(db: &Database, slot: usize, key: &[u8]) {
         // `SnapshotState::capture_cow` keeps the FIRST capture of a key, so a
         // later write of the now-present key (which does enter the set, once)
         // can only queue a copy the drain discards.
-        PENDING.with(|p| p.borrow_mut().push((db_index, owned, None)));
+        PENDING.with(|p| p.borrow_mut().push((db_index, owned, None, None)));
         return;
     };
     #[cfg(test)]
     CLONES.with(|c| c.set(c.get() + 1));
-    record_entry(db_index, owned, entry.clone());
+    record_entry(db_index, owned, entry.clone(), None);
 }
 
 /// What became of an entry handed to [`capture_removed`].
@@ -134,6 +134,42 @@ pub(crate) fn capture_removed(slot: usize, key: &[u8], entry: Entry) -> Removed 
     capture_removed_slow(slot, key, entry)
 }
 
+/// [`capture_removed`] for a caller that has NOT yet credited the removed
+/// entry's bytes (the lazy `UNLINK` path, which leaves them charged for the
+/// lazy-free drain to credit as it frees): `on_hold` runs on the entry just
+/// before the epoch takes it, so the caller can credit it then, and returns
+/// the bytes it credited — reused as the pre-image's size (moon#1269).
+#[inline]
+pub(crate) fn capture_removed_then(
+    slot: usize,
+    key: &[u8],
+    entry: Entry,
+    on_hold: impl FnOnce(&Entry) -> usize,
+) -> Removed {
+    if !is_armed() {
+        return Removed::Dispose(entry);
+    }
+    let Some(db_index) = target(slot, key) else {
+        return Removed::Dispose(entry);
+    };
+    if captured(db_index, key) {
+        return Removed::Dispose(entry);
+    }
+    // The caller's credit (key + value + slot overhead) plus the ordered-map
+    // slot is the pre-image's size: no second walk at the drain.
+    let bytes = on_hold(&entry) as u64 + 64;
+    record_entry(db_index, Bytes::copy_from_slice(key), entry, Some(bytes));
+    Removed::Held
+}
+
+/// [`capture_removed`] when the caller already knows the entry's size (the
+/// `entry_overhead` it just credited): the drain then does not walk it again
+/// (moon#1269).
+#[inline]
+pub(crate) fn capture_removed_sized(slot: usize, key: &[u8], entry: Entry, cost: usize) -> Removed {
+    capture_removed_then(slot, key, entry, |_| cost)
+}
+
 fn capture_removed_slow(slot: usize, key: &[u8], entry: Entry) -> Removed {
     let Some(db_index) = target(slot, key) else {
         return Removed::Dispose(entry);
@@ -141,6 +177,6 @@ fn capture_removed_slow(slot: usize, key: &[u8], entry: Entry) -> Removed {
     if captured(db_index, key) {
         return Removed::Dispose(entry);
     }
-    record_entry(db_index, Bytes::copy_from_slice(key), entry);
+    record_entry(db_index, Bytes::copy_from_slice(key), entry, None);
     Removed::Held
 }
