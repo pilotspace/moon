@@ -521,6 +521,12 @@ shared 4-vCPU Linux container against HEAD `935c555` — re-measure on the GCE r
   corrupt file cannot use up the restart budget; INFO
   `cold_reclaim_files_given_up` counts every reclaim give-up. The restart
   budget runs on a monotonic clock: a wall-clock step no longer refills it.
+  A death during a cold-reclaim job no longer spends that budget: it respawns
+  after 100 ms uncharged, against a reclaim budget of its own (8 per 10
+  minutes) whose exhaustion disables cold reclaim on that shard until restart
+  (one WARN, INFO `cold_reclaim_disabled`, gauge
+  `moon_cold_reclaim_disabled_shards`) while the shard keeps spilling — so
+  neither a few corrupt spill files nor a systematic reclaim bug degrade it.
 
 - **Data loss on a graceful exit with the default `--appendonly yes`** (moon#1274). SIGTERM (`systemctl stop`), SIGINT or `SHUTDOWN` lost acknowledged writes still queued for the AOF writers: all 300 of 300 at `--shards 1`. Shutdown now stops the shards, then lets every AOF writer write its queue and fsync before exiting, as redis's `prepareForShutdown` does.
 - **Data loss on SIGTERM/SIGINT with save points and `--appendonly no`** (moon#1263). Every write since the last automatic save was lost. The server now saves first; see Changed.
