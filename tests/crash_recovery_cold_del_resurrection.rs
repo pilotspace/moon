@@ -293,6 +293,24 @@ fn write_filler(port: u16) {
         stream.write_all(&buf).expect("filler tail write");
     }
     stream.flush().ok();
+    // Read every reply before the socket is dropped (the fix
+    // `crash_recovery_cold_support::write_filler_in_db` already carries):
+    // closing a socket with unread replies sends an RST, and on Linux the
+    // server then discards the pipelined SETs it had not read yet — nothing
+    // spilled and both cases failed their "no heap-*.mpf" precondition on
+    // every Linux run, so this suite tested nothing there.
+    use std::io::Read;
+    stream.set_read_timeout(Some(Duration::from_secs(60))).ok();
+    let mut replies = 0usize;
+    let mut chunk = [0u8; 64 * 1024];
+    while replies < FILLER_COUNT {
+        let n = stream.read(&mut chunk).expect("filler replies");
+        assert!(
+            n > 0,
+            "server closed the filler connection after {replies} replies"
+        );
+        replies += chunk[..n].iter().filter(|&&b| b == b'\n').count();
+    }
 }
 
 fn count_heap_files(dir: &std::path::Path) -> usize {

@@ -14,7 +14,8 @@
 //! | `AfterPublish` | `BGSAVE` completed | absent |
 //! | `DuringSweep` | `BGSAVE` completed + 0-2.5 s (the post-save sweep, its unlinks and manifest commit) | absent |
 //! | `SecondGeneration` | `BGSAVE`, kill, restart, `BGSAVE`, kill | absent |
-//! | `WholeFilesSweep` | every probe AND filler deleted (whole files go zero-ref), `BGSAVE`, 0-2.5 s (the post-save sweep's unlinks and manifest tombstone commit) | every probe absent |
+//! | `WholeFilesSweep` | every probe AND filler deleted (whole files go zero-ref), `BGSAVE` completed, 0-2.5 s | every probe absent; the post-save sweep DID unlink files before the kill |
+//! | `WholeFilesDuringSave` | the same deletes, `BGSAVE` + 0-60 ms: the kill lands in the save's publish or in the post-save sweep's unlinks and manifest tombstone commit, which run before the save reports done | old or new snapshot per shard: each probe absent or ORIGINAL |
 //!
 //! Every point: every ODD probe comes back with its value (nothing lost), and
 //! no probe ever reads a value it never had.
@@ -22,7 +23,7 @@
 //!   MOON_BIN=target/release/moon cargo test --release \
 //!     --test crash_matrix_cold_graves_1281 -- --ignored --test-threads 1
 //! Knobs: `MOON_TEST_COLD_DEL_SHARDS` (1 or 4, default 4),
-//! `MOON_TEST_MATRIX_RUNS` (iterations, default 24: four per kill point), `MOON_TEST_SEED`.
+//! `MOON_TEST_MATRIX_RUNS` (iterations, default 28: four per kill point), `MOON_TEST_SEED`.
 //!
 //! Requires: built release binary, `redis-cli` on PATH.
 
@@ -48,15 +49,21 @@ enum KillPoint {
     /// no unlink or manifest commit ever ran in the kill window. Here whole
     /// files go zero-ref and the post-save sweep unlinks them.
     WholeFilesSweep,
+    /// Review round 2 (R2-3): the post-save sweep finishes before BGSAVE
+    /// reports done, so `WholeFilesSweep` always killed after it. This point
+    /// kills inside the save, where the unlinks and the manifest tombstone
+    /// commit happen.
+    WholeFilesDuringSave,
 }
 
-const POINTS: [KillPoint; 6] = [
+const POINTS: [KillPoint; 7] = [
     KillPoint::NoSave,
     KillPoint::DuringSave,
     KillPoint::AfterPublish,
     KillPoint::DuringSweep,
     KillPoint::SecondGeneration,
     KillPoint::WholeFilesSweep,
+    KillPoint::WholeFilesDuringSave,
 ];
 
 const SAVE: [&str; 2] = ["--save", "3600 100000000"];
@@ -173,7 +180,10 @@ fn iteration(pristine: &Path, point: KillPoint, rng: &mut Rng, i: usize) -> (usi
         before.iter().any(|(_, v)| *v == val),
         "precondition failed: no probe inherited"
     );
-    let whole = point == KillPoint::WholeFilesSweep;
+    let whole = matches!(
+        point,
+        KillPoint::WholeFilesSweep | KillPoint::WholeFilesDuringSave
+    );
     let evens: Vec<String> = (0..PROBE_COUNT)
         .step_by(if whole { 1 } else { 2 })
         .map(probe_key)
@@ -200,6 +210,10 @@ fn iteration(pristine: &Path, point: KillPoint, rng: &mut Rng, i: usize) -> (usi
         KillPoint::WholeFilesSweep => {
             bgsave_and_wait(port);
             std::thread::sleep(Duration::from_millis(rng.below(2_500)));
+        }
+        KillPoint::WholeFilesDuringSave => {
+            redis_cmd(port, &["BGSAVE"]);
+            std::thread::sleep(Duration::from_millis(rng.below(60)));
         }
         KillPoint::SecondGeneration => {
             bgsave_and_wait(port);
@@ -249,6 +263,12 @@ fn iteration(pristine: &Path, point: KillPoint, rng: &mut Rng, i: usize) -> (usi
             | KillPoint::WholeFilesSweep
     );
     let resurrected = if must_stay_deleted { evens_back } else { 0 };
+    if point == KillPoint::WholeFilesSweep && files_before > 0 && files_at_kill >= files_before {
+        wrong.push(format!(
+            "the post-save sweep unlinked nothing ({files_before} heap files before, \
+             {files_at_kill} at the kill): the point did not exercise the unlink window"
+        ));
+    }
     let bad = resurrected > 0 || !wrong.is_empty();
     let keep: Vec<String> = if bad {
         vec![format!("{point:?}")]
@@ -265,7 +285,7 @@ fn cold_deletes_survive_every_kill_point_without_an_aof() {
     let runs: usize = std::env::var("MOON_TEST_MATRIX_RUNS")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(24);
+        .unwrap_or(28);
     let seed: u64 = std::env::var("MOON_TEST_SEED")
         .ok()
         .and_then(|v| v.parse().ok())

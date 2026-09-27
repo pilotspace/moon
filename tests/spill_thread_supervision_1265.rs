@@ -125,6 +125,38 @@ fn set_range(port: u16, range: std::ops::Range<usize>) -> usize {
     oom
 }
 
+/// [`set_range`], then retry each refused key (100 ms apart, up to 10 s):
+/// the keys still refused at the end. A burst right after a respawn may
+/// outrun the new thread for a moment on a loaded host (WS25 risk 1: death
+/// and recovery are observed on the shard's tick); what moon#1265 fixed is
+/// the PERMANENT `-OOM` of a shard whose spill thread was gone.
+fn set_range_settling(port: u16, range: std::ops::Range<usize>) -> (usize, usize) {
+    let first = set_range(port, range.clone());
+    if first == 0 {
+        return (0, 0);
+    }
+    let mut c = Conn::open(port);
+    let mut left: Vec<usize> = range
+        .filter(|i| {
+            c.send(&["EXISTS", &format!("k:{i}")])
+                .trim_start_matches(':')
+                .trim()
+                != "1"
+        })
+        .collect();
+    for _ in 0..100 {
+        if left.is_empty() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+        left.retain(|i| {
+            !c.send(&["SET", &format!("k:{i}"), &value(*i)])
+                .starts_with('+')
+        });
+    }
+    (first, left.len())
+}
+
 fn info_u64(c: &mut Conn, field: &str) -> u64 {
     let info = c.send(&["INFO", "persistence"]);
     info.lines()
@@ -191,10 +223,10 @@ fn a_spill_thread_panic_mid_flight_is_survived() {
     // Eviction spills again on the respawned thread.
     let batches = info_u64(&mut c, "spill_batches_flushed");
     let third = FILL + 4_000..FILL + 8_000;
+    let (refused, still) = set_range_settling(port, third.clone());
     assert_eq!(
-        set_range(port, third.clone()),
-        0,
-        "no -OOM after the respawn"
+        still, 0,
+        "writes still refused after the respawn settled ({refused} refused at first)"
     );
     wait_for(&mut c, "a post-respawn spill", 30, |c| {
         info_u64(c, "spill_batches_flushed") > batches
