@@ -93,6 +93,7 @@ pub(super) fn after_drain(
     tracing::debug!(
         shard_id,
         panic = death.panic.as_deref().unwrap_or("none"),
+        in_reclaim = death.in_reclaim,
         "spill thread death handled"
     );
     Some(done)

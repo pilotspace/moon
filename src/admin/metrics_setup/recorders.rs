@@ -218,6 +218,15 @@ pub fn set_spill_threads_degraded(shards: u64) {
     gauge!("moon_spill_threads_degraded").set(shards as f64);
 }
 
+/// Publish how many shards had their cold reclaim disabled (moon#1265).
+#[inline]
+pub fn set_cold_reclaim_disabled_shards(shards: u64) {
+    if !METRICS_INITIALIZED.load(Ordering::Relaxed) {
+        return;
+    }
+    gauge!("moon_cold_reclaim_disabled_shards").set(shards as f64);
+}
+
 // ── Persistence metrics ─────────────────────────────────────────────────
 
 /// Record an AOF fsync duration.

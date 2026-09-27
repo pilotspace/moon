@@ -33,6 +33,21 @@
 //!
 //! `Degraded` is terminal for the process: the shard stops spilling (its
 //! evictions take the no-spill path) until a restart.
+//!
+//! # Reclaim deaths (moon#1265 review round 3)
+//!
+//! The spill thread also runs the cold reclaim's disk jobs (moon#1240). A
+//! death while one of them ran ([`RestartSupervisor::on_reclaim_death`]) is a
+//! fault of that optional duty, not of spilling, so it is kept off the
+//! restart budget: its respawn comes after the base backoff, is not counted
+//! in the window, and leaves the backoff streak alone. Otherwise every
+//! poisoned reclaim file (given up at its second death) would spend two of
+//! the five respawns, and three such files would degrade spilling for good.
+//! Reclaim deaths have a budget of their own instead —
+//! [`RestartPolicy::max_reclaim_deaths`] per window — and spending it
+//! DISABLES the shard's cold reclaim for the process
+//! ([`RestartSupervisor::reclaim_disabled`]), which ends a systematic
+//! reclaim bug's crash loop while the shard keeps spilling.
 
 use std::collections::VecDeque;
 
@@ -50,17 +65,29 @@ pub(crate) struct RestartPolicy {
     /// A thread that ran this long before it died starts a new backoff
     /// streak (its death is not part of a crash loop).
     pub(crate) healthy_run_ms: u64,
+    /// Reclaim deaths allowed inside one `window_ms`; the one that reaches
+    /// this disables the shard's cold reclaim.
+    pub(crate) max_reclaim_deaths: usize,
 }
 
 impl RestartPolicy {
     /// 100 ms doubling to 30 s, 5 respawns per 10 minutes, and a minute of
     /// uptime resets the streak.
+    ///
+    /// 8 reclaim deaths per 10 minutes. A poisoned file costs two (it is
+    /// given up at its second), so three bad files (6) — the review's case —
+    /// plus two transient reclaim deaths keep the reclaim running; a
+    /// systematic reclaim bug, where every job panics, reaches 8 in under a
+    /// second of 100 ms respawns and then stops, having cost 8 thread
+    /// restarts (each one base backoff of queued spills, their in-flight
+    /// payloads rehydrated) instead of a crash loop.
     pub(crate) const DEFAULT: Self = Self {
         base_backoff_ms: 100,
         max_backoff_ms: 30_000,
         max_restarts: 5,
         window_ms: 10 * 60 * 1000,
         healthy_run_ms: 60 * 1000,
+        max_reclaim_deaths: 8,
     };
 }
 
@@ -96,6 +123,13 @@ pub(crate) struct RestartSupervisor {
     streak: u32,
     /// The latest `now_ms` seen: the machine's clock never runs backwards.
     latest_ms: u64,
+    /// Whether the pending respawn counts against the budget (`false` after
+    /// a reclaim death).
+    respawn_charged: bool,
+    /// Times of the reclaim deaths inside the window.
+    reclaim_deaths: VecDeque<u64>,
+    /// The reclaim-death budget is spent: no reclaim job is sent any more.
+    reclaim_disabled: bool,
 }
 
 impl RestartSupervisor {
@@ -106,6 +140,9 @@ impl RestartSupervisor {
             attempts: VecDeque::with_capacity(policy.max_restarts + 1),
             streak: 0,
             latest_ms: now_ms,
+            respawn_charged: true,
+            reclaim_deaths: VecDeque::with_capacity(policy.max_reclaim_deaths + 1),
+            reclaim_disabled: false,
         }
     }
 
@@ -132,6 +169,32 @@ impl RestartSupervisor {
         self.decide(now_ms)
     }
 
+    /// The running thread died (observed at `now_ms`) while it ran a
+    /// cold-reclaim job: see the module doc. Never degrades; respawns after
+    /// the base backoff, uncharged. Counts the death against the reclaim
+    /// budget, and disables the reclaim when it is spent.
+    pub(crate) fn on_reclaim_death(&mut self, now_ms: u64) -> Verdict {
+        let now_ms = self.observe(now_ms);
+        let horizon = now_ms.saturating_sub(self.policy.window_ms);
+        while self.reclaim_deaths.front().is_some_and(|&t| t < horizon) {
+            self.reclaim_deaths.pop_front();
+        }
+        self.reclaim_deaths.push_back(now_ms);
+        if self.reclaim_deaths.len() >= self.policy.max_reclaim_deaths {
+            self.reclaim_disabled = true;
+        }
+        let due_ms = now_ms.saturating_add(self.policy.base_backoff_ms);
+        self.phase = Phase::Backoff { due_ms };
+        self.respawn_charged = false;
+        Verdict::RespawnAt(due_ms)
+    }
+
+    /// The reclaim-death budget is spent (terminal for the process).
+    #[inline]
+    pub(crate) fn reclaim_disabled(&self) -> bool {
+        self.reclaim_disabled
+    }
+
     /// Whether a respawn is due at `now_ms`. A due time further ahead than
     /// the longest backoff means the clock went backwards: due now, rather
     /// than leaving the shard without a spill thread for the size of the jump.
@@ -144,17 +207,22 @@ impl RestartSupervisor {
         }
     }
 
-    /// A respawn was attempted at `now_ms` and the thread started.
+    /// A respawn was attempted at `now_ms` and the thread started. Counted
+    /// against the budget unless it followed a reclaim death.
     pub(crate) fn on_respawned(&mut self, now_ms: u64) {
         let now_ms = self.observe(now_ms);
-        self.attempts.push_back(now_ms);
+        if std::mem::replace(&mut self.respawn_charged, true) {
+            self.attempts.push_back(now_ms);
+        }
         self.phase = Phase::Running { since_ms: now_ms };
     }
 
     /// A respawn was attempted at `now_ms` and the thread could not be
-    /// started. The attempt counts against the budget like a successful one.
+    /// started. The attempt counts against the budget like a successful one,
+    /// whatever the death was: a spawn failure is the spill thread's own.
     pub(crate) fn on_spawn_failed(&mut self, now_ms: u64) -> Verdict {
         let now_ms = self.observe(now_ms);
+        self.respawn_charged = true;
         self.attempts.push_back(now_ms);
         self.decide(now_ms)
     }
@@ -189,6 +257,7 @@ impl RestartSupervisor {
         self.streak = self.streak.saturating_add(1);
         let due_ms = now_ms.saturating_add(backoff);
         self.phase = Phase::Backoff { due_ms };
+        self.respawn_charged = true;
         Verdict::RespawnAt(due_ms)
     }
 }
@@ -300,6 +369,77 @@ mod tests {
         assert_eq!(s.attempts_in_window(1_000), 1);
         assert_eq!(s.attempts_in_window(1_000_000 + P.window_ms - 1), 1);
         assert_eq!(s.attempts_in_window(1_000_000 + P.window_ms + 1), 0);
+    }
+
+    /// moon#1265 review round 3: reclaim deaths never touch the restart
+    /// budget or the streak — any number of them, interleaved with spill
+    /// deaths, and the spill deaths still degrade at exactly the sixth.
+    #[test]
+    fn reclaim_deaths_are_off_the_restart_budget_and_the_streak() {
+        let mut s = RestartSupervisor::new(P, 0);
+        let mut now = 0u64;
+        let mut spill_backoffs = Vec::new();
+        for i in 0..5 {
+            for _ in 0..2 {
+                assert_eq!(s.on_reclaim_death(now), Verdict::RespawnAt(now + 100));
+                assert!(s.respawn_due(now + 100));
+                now += 100;
+                s.on_respawned(now);
+                now += 1;
+            }
+            match s.on_death(now) {
+                Verdict::RespawnAt(due) => spill_backoffs.push(due - now),
+                Verdict::Degrade => panic!("degraded at spill death {i}"),
+            }
+            now += spill_backoffs[i];
+            s.on_respawned(now);
+            now += 1;
+        }
+        assert_eq!(spill_backoffs, vec![100, 200, 400, 800, 1_600]);
+        assert_eq!(s.attempts_in_window(now), 5, "only the spill respawns");
+        assert_eq!(s.on_death(now), Verdict::Degrade);
+    }
+
+    /// The reclaim-death budget: the eighth inside the window disables the
+    /// reclaim (the thread is still respawned), and deaths spread wider than
+    /// the window never do.
+    #[test]
+    fn the_eighth_reclaim_death_in_the_window_disables_the_reclaim() {
+        let mut s = RestartSupervisor::new(P, 0);
+        for i in 0..P.max_reclaim_deaths as u64 {
+            assert!(!s.reclaim_disabled(), "disabled before death {i}");
+            let now = i * 200;
+            assert_eq!(s.on_reclaim_death(now), Verdict::RespawnAt(now + 100));
+            s.on_respawned(now + 100);
+        }
+        assert!(s.reclaim_disabled());
+        assert_eq!(
+            s.attempts_in_window(2_000),
+            0,
+            "spilling's budget untouched"
+        );
+        assert!(matches!(s.phase(), Phase::Running { .. }));
+
+        let mut s = RestartSupervisor::new(P, 0);
+        let mut now = 0;
+        for _ in 0..50 {
+            now += P.window_ms / 4;
+            s.on_reclaim_death(now);
+            s.on_respawned(now + 100);
+        }
+        assert!(!s.reclaim_disabled(), "4 per window at most");
+    }
+
+    /// A failed respawn after a reclaim death is the spill thread's own
+    /// failure: charged.
+    #[test]
+    fn a_failed_spawn_after_a_reclaim_death_is_charged() {
+        let mut s = RestartSupervisor::new(P, 0);
+        assert_eq!(s.on_reclaim_death(0), Verdict::RespawnAt(100));
+        assert_eq!(s.on_spawn_failed(100), Verdict::RespawnAt(200));
+        assert_eq!(s.attempts_in_window(200), 1);
+        s.on_respawned(200);
+        assert_eq!(s.attempts_in_window(200), 2);
     }
 
     /// moon#1265 review: readings that go backwards never shrink the budget

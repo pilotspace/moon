@@ -100,7 +100,9 @@ pub(super) fn run(
     // not given up, so the next incarnation compacts them — except the one
     // whose job the thread was running as it died, the second time that
     // happens to it (review: a file that panics the thread deterministically
-    // would otherwise crash every respawn and degrade the shard's spilling).
+    // would otherwise crash every respawn). Such deaths do not spend the
+    // spill thread's restart budget but the reclaim's own, which disables
+    // the reclaim below once spent (review round 3).
     let spill_thread = if dead {
         let culprit = spill_thread.and_then(SpillThread::take_reclaim_culprit);
         for db_index in 0..db_count {
@@ -186,7 +188,10 @@ pub(super) fn run(
             }
         });
     }
-    let Some(st) = spill_thread else {
+    // moon#1265 review round 3: a shard whose reclaim jobs spent the
+    // reclaim-death budget starts no compaction any more (adoption of those
+    // already written still runs above).
+    let Some(st) = spill_thread.filter(|st| !st.reclaim_disabled()) else {
         return;
     };
     if !over {

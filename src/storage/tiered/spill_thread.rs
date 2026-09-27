@@ -252,8 +252,8 @@ pub(crate) mod supervisor;
 
 pub(crate) use supervision::{Respawn, record_spill_thread_rehydrated};
 pub use supervision::{
-    spill_thread_rehydrated_total, spill_thread_restarts_total, spill_threads_alive,
-    spill_threads_degraded,
+    cold_reclaim_disabled_shards, spill_thread_rehydrated_total, spill_thread_restarts_total,
+    spill_threads_alive, spill_threads_degraded,
 };
 
 /// Request sent from event loop to background spill thread.
@@ -907,12 +907,13 @@ impl SpillThread {
     /// Queue a cold-reclaim job (moon#1240). Never blocks: the job comes back
     /// when the queue is full or no thread is running to serve it (moon#1265:
     /// a job queued for a dead thread would outlive the abandonment of its
-    /// compaction).
+    /// compaction), or once this shard's reclaim is disabled (moon#1265
+    /// review round 3: its jobs spent the reclaim-death budget).
     pub(crate) fn try_submit_reclaim(
         &self,
         job: super::reclaim_io::ReclaimJob,
     ) -> Result<(), super::reclaim_io::ReclaimJob> {
-        if self.is_dead() {
+        if self.is_dead() || self.reclaim_disabled() {
             return Err(job);
         }
         self.reclaim_tx.try_send(job).map_err(|e| e.into_inner())

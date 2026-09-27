@@ -16,7 +16,7 @@
 //! | reclaim jobs queued / taken | the channel / died with it | dropped; the shard abandons their compactions |
 //! | files it wrote but never announced | disk, unlisted | left for the startup orphan sweep |
 //! | the file-id counter | the shard | untouched: no id is minted twice (moon#1067) |
-//! | the reclaim job it was running | shared `Arc` mark | the shard's culprit: its file is given up on a second such death |
+//! | the reclaim job it was running | shared `Arc` mark | the shard's culprit: its file is given up on a second such death, and the death is charged to the reclaim's budget, not the restart budget |
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -31,6 +31,9 @@ static SPILL_THREADS_DOWN: AtomicU64 = AtomicU64::new(0);
 static SPILL_THREAD_RESTARTS: AtomicU64 = AtomicU64::new(0);
 /// Shards whose restart budget is spent (INFO `spill_thread_degraded`).
 static SPILL_THREADS_DEGRADED: AtomicU64 = AtomicU64::new(0);
+/// Shards whose cold reclaim is disabled because reclaim jobs kept killing
+/// their spill thread (INFO `cold_reclaim_disabled`, moon#1265 review round 3).
+static COLD_RECLAIM_DISABLED: AtomicU64 = AtomicU64::new(0);
 /// In-flight payloads put back in RAM because the thread carrying their
 /// request died (INFO `spill_thread_rehydrated`).
 static SPILL_THREAD_REHYDRATED: AtomicU64 = AtomicU64::new(0);
@@ -51,6 +54,14 @@ pub fn spill_thread_restarts_total() -> u64 {
 #[inline]
 pub fn spill_threads_degraded() -> u64 {
     SPILL_THREADS_DEGRADED.load(Ordering::Relaxed)
+}
+
+/// Shards whose cold reclaim is disabled for the process (INFO
+/// `cold_reclaim_disabled`): their reclaim jobs spent the reclaim-death
+/// budget. They keep spilling.
+#[inline]
+pub fn cold_reclaim_disabled_shards() -> u64 {
+    COLD_RECLAIM_DISABLED.load(Ordering::Relaxed)
 }
 
 /// Cumulative in-flight payloads rehydrated after a spill-thread death.
@@ -120,6 +131,11 @@ impl Worker {
 
     /// Shutdown: the handle to join, and the gauges this shard held.
     pub(super) fn retire_for_shutdown(&mut self) -> Option<std::thread::JoinHandle<()>> {
+        if self.supervisor.reclaim_disabled() {
+            let _ = COLD_RECLAIM_DISABLED.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                Some(n.saturating_sub(1))
+            });
+        }
         match self.supervisor.phase() {
             Phase::Running { .. } if self.handle.as_ref().is_some_and(|h| !h.is_finished()) => {}
             Phase::Running { .. } => {
@@ -145,6 +161,9 @@ pub(crate) struct Death {
     pub(crate) verdict: Verdict,
     /// The panic message, when the thread panicked.
     pub(crate) panic: Option<String>,
+    /// The thread died running a cold-reclaim job (moon#1265 review round
+    /// 3): the death was kept off the restart budget.
+    pub(crate) in_reclaim: bool,
 }
 
 /// What [`SpillThread::respawn_if_due`] did.
@@ -182,6 +201,12 @@ impl SpillThread {
             std::sync::atomic::fence(Ordering::Acquire);
         }
         dead
+    }
+
+    /// Whether this shard's cold reclaim is disabled (moon#1265 review round
+    /// 3): the reclaim tick sends it no job any more.
+    pub(crate) fn reclaim_disabled(&self) -> bool {
+        self.worker.lock().supervisor.reclaim_disabled()
     }
 
     /// Whether this shard's restart budget is spent (it spills no more).
@@ -222,13 +247,48 @@ impl SpillThread {
             .exit
             .take()
             .or_else(|| escaped.then(|| "a panic outside catch_unwind".to_string()));
-        let verdict = w.supervisor.on_death(now_ms);
+        // moon#1265 review round 3: a death inside a cold-reclaim job is the
+        // reclaim's fault, charged to its own budget, not to spilling's. The
+        // mark is read, not taken: the reclaim tick takes it on this same
+        // dead spell to give the file up. The join above ordered the dead
+        // thread's last store before this load.
+        let in_reclaim = self.reclaim_running.load(Ordering::Relaxed) != NO_RECLAIM_JOB;
+        let was_disabled = w.supervisor.reclaim_disabled();
+        let verdict = if in_reclaim {
+            w.supervisor.on_reclaim_death(now_ms)
+        } else {
+            w.supervisor.on_death(now_ms)
+        };
+        let reclaim_disabled_now = !was_disabled && w.supervisor.reclaim_disabled();
         let attempts = w.supervisor.attempts_in_window(now_ms);
         drop(w);
         gauge_down(1);
         crate::admin::metrics_setup::record_spill_thread_death();
         let panic_msg = panic.as_deref().unwrap_or("exited without a panic");
+        if reclaim_disabled_now {
+            COLD_RECLAIM_DISABLED.fetch_add(1, Ordering::Relaxed);
+            crate::admin::metrics_setup::set_cold_reclaim_disabled_shards(
+                cold_reclaim_disabled_shards(),
+            );
+            tracing::warn!(
+                shard_id = self.shard_id,
+                last_death = %panic_msg,
+                reclaim_deaths = RestartPolicy::DEFAULT.max_reclaim_deaths,
+                "cold reclaim DISABLED on this shard until the server restarts: its jobs killed \
+                 the spill thread too often (moon#1265). Spilling continues; mostly-dead spill \
+                 files are no longer compacted, so their dead slots stay in the ledger. INFO \
+                 cold_reclaim_disabled counts such shards"
+            );
+        }
         match verdict {
+            Verdict::RespawnAt(due_ms) if in_reclaim => tracing::error!(
+                shard_id = self.shard_id,
+                panic = %panic_msg,
+                respawn_in_ms = due_ms.saturating_sub(now_ms),
+                "spill thread died in a cold-reclaim job; the shard respawns it without charging \
+                 its restart budget (moon#1265). Until then its queued spills wait, and what \
+                 the dead thread held goes back to RAM"
+            ),
             Verdict::RespawnAt(due_ms) => tracing::error!(
                 shard_id = self.shard_id,
                 panic = %panic_msg,
@@ -240,7 +300,11 @@ impl SpillThread {
             ),
             Verdict::Degrade => self.note_degraded(panic_msg, attempts),
         }
-        Some(Death { verdict, panic })
+        Some(Death {
+            verdict,
+            panic,
+            in_reclaim,
+        })
     }
 
     fn note_degraded(&self, why: &str, attempts: usize) {

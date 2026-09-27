@@ -2570,6 +2570,9 @@ mod review_r2b_tests;
 mod review_r3_tests;
 
 #[cfg(test)]
+mod reclaim_death_budget_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::persistence::checkpoint::CheckpointTrigger;

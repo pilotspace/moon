@@ -179,10 +179,13 @@ pub struct ReclaimState {
     /// moon#1265 review: files whose reclaim job was running when a spill
     /// thread died. A second such death gives the file up — a file that
     /// panics the thread deterministically (a corrupt spill file, moon#1240)
-    /// would otherwise kill every respawn and spend the restart budget,
-    /// degrading the shard's spilling for good. One death is forgiven: it
-    /// may have been transient, so the file is retried once. Left when the
-    /// file compacts or is given up; otherwise one id per such death.
+    /// would otherwise kill every respawn. Such deaths are kept off the
+    /// spill thread's restart budget and charged to the reclaim's own
+    /// (`spill_thread::supervisor`, review round 3), which disables the
+    /// shard's reclaim — never its spilling — once spent. One death is
+    /// forgiven: it may have been transient, so the file is retried once.
+    /// Left when the file compacts or is given up; otherwise one id per such
+    /// death.
     suspects: HashSet<u64>,
     bytes: usize,
     /// Whether this database counts in [`HELD_FILES_PRESSURE`] (see
