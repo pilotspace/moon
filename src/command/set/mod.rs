@@ -1,6 +1,7 @@
 mod set_algebra;
 mod set_read;
 mod set_write;
+mod sscan_cursor;
 
 use crate::protocol::Frame;
 

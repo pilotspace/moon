@@ -953,6 +953,11 @@ if should_run "set"; then
     # ascending order on both.
     rcli SADD {s}:ints 3 1 2 >/dev/null 2>&1; mcli SADD {s}:ints 3 1 2 >/dev/null 2>&1
     assert_match "SSCAN COUNT 1 (intset: one call)" SSCAN {s}:ints 0 COUNT 1
+    # Wave-1 review NITs: numeric (not byte) order on an intset, and a `-1`
+    # cursor accepted as redis's strtoul accepts it.
+    rcli SADD {s}:ints10 10 2 1 >/dev/null 2>&1; mcli SADD {s}:ints10 10 2 1 >/dev/null 2>&1
+    assert_match "SSCAN intset numeric order" SSCAN {s}:ints10 0
+    assert_match "SSCAN cursor -1"     SSCAN {s}:ints10 -1
 fi
 
 # ===========================================================================

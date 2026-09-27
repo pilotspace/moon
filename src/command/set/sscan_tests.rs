@@ -207,3 +207,245 @@ fn a_compact_set_is_returned_whole_in_one_call() {
     assert_eq!(next.as_ref(), b"0");
     assert_eq!(items.len(), 20);
 }
+
+// ---------------------------------------------------------------------------
+// moon#1287 wave-1 review F1: whole-value replacement mid-scan
+// ---------------------------------------------------------------------------
+
+use super::sscan_cursor::test_hooks;
+
+fn cursor_u64(c: &Bytes) -> u64 {
+    std::str::from_utf8(c).unwrap().parse().unwrap()
+}
+
+/// Full scan with `mutate(db, page_no)` run between the calls; returns
+/// (members returned, calls, whether any cursor was a hash-mode one).
+fn scan_all(
+    db: &mut Database,
+    count: &[u8],
+    mut mutate: impl FnMut(&mut Database, usize),
+) -> (HashSet<Bytes>, usize, bool) {
+    let mut returned = HashSet::new();
+    let mut cursor = Bytes::from_static(b"0");
+    let mut calls = 0;
+    let mut hash_mode = false;
+    loop {
+        let (next, items) = scan_page(db, &cursor, &[b"COUNT", count]);
+        calls += 1;
+        returned.extend(items);
+        if next.as_ref() == b"0" {
+            break;
+        }
+        hash_mode |= test_hooks::is_hash_mode(cursor_u64(&next));
+        cursor = next;
+        mutate(db, calls);
+        assert!(calls < 100_000, "the scan does not terminate");
+    }
+    (returned, calls, hash_mode)
+}
+
+/// Every cursor stays below 2^63 (clients that parse a signed 64-bit
+/// integer), and a quiet scan never leaves position mode.
+#[test]
+fn a_quiet_scan_stays_in_position_mode_with_small_cursors() {
+    let mut db = Database::new();
+    fill(&mut db, 5_000);
+    let mut cursor = Bytes::from_static(b"0");
+    loop {
+        let (next, _) = scan_page(&mut db, &cursor, &[b"COUNT", b"37"]);
+        if next.as_ref() == b"0" {
+            break;
+        }
+        let c = cursor_u64(&next);
+        assert!(c < 1 << 63, "cursor {c} does not fit an i64");
+        assert!(!test_hooks::is_hash_mode(c), "a quiet scan fell back");
+        cursor = next;
+    }
+}
+
+/// A set REBUILT between every pair of calls (the review's SUNIONSTORE
+/// rewrite, repeated) is still scanned completely, and the scan terminates
+/// in about `HASH_MODE_PAGES` calls — a restart-on-rewrite design would
+/// never finish.
+#[test]
+fn a_set_rebuilt_between_every_call_is_scanned_whole_and_terminates() {
+    let n = 20_000;
+    let mut db = Database::new();
+    fill(&mut db, n);
+    let (returned, calls, hash_mode) = scan_all(&mut db, b"10", |db, _| {
+        assert_eq!(
+            sunionstore(db, &[bs(b"s"), bs(b"s")]),
+            Frame::Integer(n as i64)
+        );
+    });
+    assert!(hash_mode, "the rewrite must be detected");
+    let missed = (0..n).map(member).filter(|m| !returned.contains(m)).count();
+    assert_eq!(missed, 0, "members present for the whole scan were skipped");
+    assert!(
+        calls <= super::sscan_cursor::HASH_MODE_PAGES + 2,
+        "{calls} calls: hash mode pages by max(COUNT, N / HASH_MODE_PAGES)"
+    );
+}
+
+/// Every whole-value replacement that keeps the membership — SINTERSTORE,
+/// SDIFFSTORE, RENAME onto the key, COPY ... REPLACE onto the key — once,
+/// mid-scan, among random SREM / SPOP / SADD.
+#[test]
+fn every_member_present_for_the_whole_scan_survives_any_replacement() {
+    type Rewrite = fn(&mut Database);
+    let rewrites: [(&str, Rewrite); 4] = [
+        ("SINTERSTORE s s s", |db| {
+            sinterstore(db, &[bs(b"s"), bs(b"s"), bs(b"s")]);
+        }),
+        ("SDIFFSTORE s s nothing", |db| {
+            sdiffstore(db, &[bs(b"s"), bs(b"s"), bs(b"nothing")]);
+        }),
+        ("SUNIONSTORE t s + RENAME t s", |db| {
+            sunionstore(db, &[bs(b"t"), bs(b"s")]);
+            crate::command::key::rename(db, &[bs(b"t"), bs(b"s")]);
+        }),
+        ("SUNIONSTORE t s + COPY t s REPLACE", |db| {
+            sunionstore(db, &[bs(b"t"), bs(b"s")]);
+            crate::command::key_extra::copy(db, &[bs(b"t"), bs(b"s"), bs(b"REPLACE")]);
+        }),
+    ];
+    for (name, rewrite) in rewrites {
+        for seed in 0..8u64 {
+            let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+            let mut db = Database::new();
+            let initial = rng.random_range(600..4_000);
+            fill(&mut db, initial);
+            let mut removed: HashSet<Bytes> = HashSet::new();
+            let mut next_new = initial;
+            let rewrite_at = rng.random_range(1..6usize);
+            let count = rng.random_range(5..80usize).to_string();
+            let (returned, _, _) = scan_all(&mut db, count.as_bytes(), |db, page| {
+                if page == rewrite_at {
+                    rewrite(db);
+                }
+                for _ in 0..rng.random_range(0..6) {
+                    match rng.random_range(0..3) {
+                        0 => {
+                            let m = member(rng.random_range(0..initial));
+                            srem(db, &[bs(b"s"), Frame::BulkString(m.clone())]);
+                            removed.insert(m);
+                        }
+                        1 => {
+                            if let Frame::BulkString(m) = spop(db, &[bs(b"s")]) {
+                                removed.insert(m);
+                            }
+                        }
+                        _ => {
+                            sadd(db, &[bs(b"s"), Frame::BulkString(member(next_new))]);
+                            next_new += 1;
+                        }
+                    }
+                }
+            });
+            let missed: Vec<Bytes> = (0..initial)
+                .map(member)
+                .filter(|m| !removed.contains(m) && !returned.contains(m))
+                .collect();
+            assert!(
+                missed.is_empty(),
+                "{name}, seed {seed}: {} member(s) present for the whole scan never returned, \
+                 e.g. {:?}",
+                missed.len(),
+                &missed[..missed.len().min(3)]
+            );
+        }
+    }
+}
+
+/// Hash mode never splits members that share a hash across two pages, and
+/// makes progress when a whole page is one hash (forced with a coarse hash:
+/// 8 buckets for 1000 members, COUNT 5).
+#[test]
+fn hash_mode_ties_straddling_a_page_are_all_returned() {
+    let set: crate::storage::entry::SetValue = (0..1_000).map(member).collect();
+    for buckets in [8u64, 1, 997] {
+        let coarse = move |m: &[u8]| xxhash_rust::xxh64::xxh64(m, 7) % buckets;
+        let mut below = None;
+        let mut returned = HashSet::new();
+        let mut calls = 0;
+        loop {
+            let (next, items) = test_hooks::hash_page_by(&set, below, 5, coarse);
+            returned.extend(items);
+            calls += 1;
+            assert!(calls < 5_000, "{buckets} buckets: no progress");
+            match next {
+                None => break,
+                Some(n) => below = Some(n),
+            }
+        }
+        assert_eq!(returned.len(), 1_000, "{buckets} buckets: members skipped");
+    }
+}
+
+/// A value decoded fresh from the cold tier on every call has a new layout
+/// each time: it scans in hash mode from the first call, whole.
+#[test]
+fn an_unstable_layout_scans_in_hash_mode_from_the_start() {
+    let set: crate::storage::entry::SetValue = (0..3_000).map(member).collect();
+    let mut cursor = 0u64;
+    let mut returned = HashSet::new();
+    loop {
+        // A fresh instance per call, as a cold decode produces.
+        let fresh: crate::storage::entry::SetValue = set.iter().cloned().collect();
+        let Frame::Array(outer) = test_hooks::sscan_page_unstable(&fresh, cursor, 10) else {
+            panic!()
+        };
+        let (Frame::BulkString(c), Frame::Array(items)) = (&outer[0], &outer[1]) else {
+            panic!()
+        };
+        for f in items.iter() {
+            if let Frame::BulkString(b) = f {
+                returned.insert(b.clone());
+            }
+        }
+        cursor = cursor_u64(c);
+        if cursor == 0 {
+            break;
+        }
+        assert!(test_hooks::is_hash_mode(cursor));
+    }
+    assert_eq!(returned.len(), 3_000);
+}
+
+/// redis 7.0.15 answers an intset in ascending numeric order and accepts
+/// `-1` (strtoul) as a cursor; moon answered `1 10 2 3` and
+/// `ERR invalid cursor`.
+#[test]
+fn intset_order_is_numeric_and_a_minus_one_cursor_is_accepted() {
+    let mut db = Database::new();
+    for v in ["10", "2", "3", "1", "100", "-5"] {
+        sadd(&mut db, &[bs(b"s"), bs(v.as_bytes())]);
+    }
+    assert_eq!(encoding(&mut db), "intset");
+    let (next, items) = scan_page(&mut db, b"0", &[]);
+    assert_eq!(next.as_ref(), b"0");
+    let got: Vec<&[u8]> = items.iter().map(|b| b.as_ref()).collect();
+    assert_eq!(got, [&b"-5"[..], b"1", b"2", b"3", b"10", b"100"]);
+    let (next, items) = scan_page(&mut db, b"-1", &[]);
+    assert_eq!(next.as_ref(), b"0");
+    assert_eq!(items.len(), 6);
+    // On the full encoding `-1` is a foreign cursor: a hash-mode walk from
+    // the top, which still terminates and returns every member.
+    let mut db = Database::new();
+    fill(&mut db, 2_000);
+    let mut cursor = Bytes::from_static(b"-1");
+    let mut returned = HashSet::new();
+    loop {
+        let (next, items) = scan_page(&mut db, &cursor, &[b"COUNT", b"50"]);
+        returned.extend(items);
+        if next.as_ref() == b"0" {
+            break;
+        }
+        cursor = next;
+    }
+    assert_eq!(returned.len(), 2_000);
+    let Frame::Error(e) = sscan(&mut db, &[bs(b"s"), bs(b" 1")]) else {
+        panic!("a leading space must be refused")
+    };
+    assert_eq!(e.as_ref(), b"ERR invalid cursor");
+}

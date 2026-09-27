@@ -67,6 +67,54 @@ fn not_an_integer() -> Frame {
     ))
 }
 
+/// Parse a SCAN-family cursor exactly as redis 7.0.15's
+/// `parseScanCursorOrReply` does: `strtoul(arg, &end, 10)`, refused when the
+/// argument starts with whitespace, when anything but the end of the C string
+/// follows the number, or on overflow (`ERANGE`). So a sign is accepted and a
+/// `-` wraps (`-1` is `18446744073709551615`, accepted by redis — moon used to
+/// answer `ERR invalid cursor`), an EMPTY argument is cursor 0 (strtoul
+/// converts nothing and stops at the terminator), leading zeros are fine, and
+/// the argument ends at its first NUL byte as a C string does. `None` means
+/// `ERR invalid cursor`.
+///
+/// Verified against redis-server 7.0.15 (`SSCAN s <cursor>`): accepted `-1`,
+/// `+0`, `-0`, `""`, `007`, `18446744073709551615`,
+/// `-18446744073709551615`; refused `" 1"`, `"1 "`, `+`, `-`, `+-1`, `0x1`,
+/// `abc`, `18446744073709551616`, `-18446744073709551616`.
+pub fn parse_scan_cursor(raw: &[u8]) -> Option<u64> {
+    let raw = match raw.iter().position(|&b| b == 0) {
+        Some(nul) => &raw[..nul],
+        None => raw,
+    };
+    let Some(&first) = raw.first() else {
+        return Some(0);
+    };
+    // C `isspace`: space, \t, \n, \v, \f, \r.
+    if matches!(first, b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r') {
+        return None;
+    }
+    let (negative, digits) = match first {
+        b'-' => (true, &raw[1..]),
+        b'+' => (false, &raw[1..]),
+        _ => (false, raw),
+    };
+    if digits.is_empty() {
+        return None;
+    }
+    let mut value: u64 = 0;
+    for &b in digits {
+        if !b.is_ascii_digit() {
+            return None;
+        }
+        value = value.checked_mul(10)?.checked_add(u64::from(b - b'0'))?;
+    }
+    Some(if negative {
+        value.wrapping_neg()
+    } else {
+        value
+    })
+}
+
 /// Parse the options that follow the cursor.
 ///
 /// `rest` is the argument slice AFTER the key (if any) and the cursor — the
@@ -160,6 +208,42 @@ pub fn parse_scan_options<'a>(kind: ScanKind, rest: &'a [Frame]) -> Result<ScanO
 
 #[cfg(test)]
 mod tests {
+    /// The cursor grammar of redis 7.0.15's `parseScanCursorOrReply`
+    /// (strtoul), transcribed from a live `SSCAN s <cursor>` sweep.
+    #[test]
+    fn scan_cursor_parses_like_redis_strtoul() {
+        use super::parse_scan_cursor as p;
+        assert_eq!(p(b"0"), Some(0));
+        assert_eq!(p(b"42"), Some(42));
+        assert_eq!(p(b"007"), Some(7));
+        assert_eq!(p(b"+0"), Some(0));
+        assert_eq!(p(b"-0"), Some(0));
+        assert_eq!(p(b""), Some(0));
+        assert_eq!(p(b"-1"), Some(u64::MAX));
+        assert_eq!(p(b"18446744073709551615"), Some(u64::MAX));
+        assert_eq!(p(b"-18446744073709551615"), Some(1));
+        assert_eq!(p(b"5\0junk"), Some(5), "a C string ends at its NUL");
+        for bad in [
+            &b" 1"[..],
+            b"1 ",
+            b"\t1",
+            b"+",
+            b"-",
+            b"+-1",
+            b"0x1",
+            b"abc",
+            b"18446744073709551616",
+            b"-18446744073709551616",
+        ] {
+            assert_eq!(
+                p(bad),
+                None,
+                "{:?} must be refused",
+                String::from_utf8_lossy(bad)
+            );
+        }
+    }
+
     use super::*;
 
     fn args(items: &[&str]) -> Vec<Frame> {

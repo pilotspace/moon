@@ -229,7 +229,7 @@ pub fn hvals(db: &mut Database, args: &[Frame]) -> Frame {
 /// snapshot — O(N log N) per page — and a field removed BEFORE the cursor
 /// shifts every later rank down, so a field present for the whole scan can
 /// be skipped. SSCAN fixed both with a descending position cursor over its
-/// `IndexSet` (`set_read::sscan_positions`); the full hash encoding is a
+/// `IndexSet` (`set::sscan_cursor`); the full hash encoding is a
 /// `std::collections::HashMap`, whose iteration order is not stable across a
 /// resize and which exposes no bucket index, so the same cursor needs the
 /// `IndexMap` representation moon#1171 proposes (with `swap_remove` on
