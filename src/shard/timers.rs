@@ -42,6 +42,10 @@ pub(crate) fn run_active_expiry(
     // could even resurrect ordering hazards). The RSS gauge update below still
     // runs on either role.
     is_replica: bool,
+    // moon#1280: `tick_cadence::catch_up_scale` of the time since the previous
+    // sweep — 1 on schedule, up to `EXPIRY_CATCH_UP_MAX_SCALE` for the one
+    // catch-up sweep after a stall (which skipped the cycles in between).
+    budget_scale: u32,
 ) {
     if !is_replica {
         let db_count = shard_databases.db_count();
@@ -50,33 +54,37 @@ pub(crate) fn run_active_expiry(
         let mut reason_del_budget = crate::persistence::aof::AOF_REASON_DEL_BACKPRESSURE_BOUND;
         for i in 0..db_count {
             crate::shard::slice::with_shard_db(i, |db| {
-                crate::server::expiration::expire_cycle_direct(db, &mut |key| {
-                    // moon#1086: an expired stream may have a group reader
-                    // parked on it.
-                    crate::blocking::wakeup::note_unsignalled_removal();
-                    // Cache-invalidation consumers subscribe to this to drop
-                    // their copy. Queued here and delivered by the shard
-                    // loop's own drain — there is no connection to attribute
-                    // an expiry to.
-                    crate::notify::notify_keyspace_event(
-                        crate::notify::NotifyFlags::EXPIRED,
-                        "expired",
-                        key,
-                        i,
-                    );
-                    crate::replication::reason_del::record_reason_del(
-                        key,
-                        i,
-                        wal_writer,
-                        repl_backlog,
-                        replica_txs,
-                        repl_state,
-                        shard_id,
-                        aof_pool,
-                        wal_kv_log,
-                        &mut reason_del_budget,
-                    );
-                });
+                crate::server::expiration::expire_cycle_direct_scaled(
+                    db,
+                    &mut |key| {
+                        // moon#1086: an expired stream may have a group reader
+                        // parked on it.
+                        crate::blocking::wakeup::note_unsignalled_removal();
+                        // Cache-invalidation consumers subscribe to this to drop
+                        // their copy. Queued here and delivered by the shard
+                        // loop's own drain — there is no connection to attribute
+                        // an expiry to.
+                        crate::notify::notify_keyspace_event(
+                            crate::notify::NotifyFlags::EXPIRED,
+                            "expired",
+                            key,
+                            i,
+                        );
+                        crate::replication::reason_del::record_reason_del(
+                            key,
+                            i,
+                            wal_writer,
+                            repl_backlog,
+                            replica_txs,
+                            repl_state,
+                            shard_id,
+                            aof_pool,
+                            wal_kv_log,
+                            &mut reason_del_budget,
+                        );
+                    },
+                    budget_scale,
+                );
             });
         }
     }
@@ -372,6 +380,70 @@ pub(crate) fn fire_pending_mq_triggers(
 /// Default interval for cold-tier orphan sweep (5 minutes).
 pub const COLD_ORPHAN_SWEEP_INTERVAL_SECS: u64 = 300;
 
+/// The unlink hold's view of this shard right now (moon#1231 / moon#1260):
+/// the AOF fold state with a writer, the snapshot lifecycle without one.
+fn fold_view_now(
+    shard_id: usize,
+    aof_pool: Option<&Arc<crate::persistence::aof::AofWriterPool>>,
+    floor_covers_this_shard: bool,
+    next_file_id: u64,
+) -> crate::storage::tiered::unlink_hold::FoldView {
+    match aof_pool {
+        Some(pool) => {
+            let overflow = pool.overflow_for(shard_id);
+            crate::storage::tiered::unlink_hold::FoldView {
+                epoch: overflow.stamp().0,
+                committed_floor: if floor_covers_this_shard {
+                    overflow.committed_floor().0
+                } else {
+                    crate::persistence::aof::FoldEpoch::INITIAL.0
+                },
+                next_file_id,
+                hold_all: false,
+            }
+        }
+        None => crate::storage::tiered::snapshot_hold::snapshot_fold_view(next_file_id),
+    }
+}
+
+/// moon#1279: give every cold index its FIRST unlink-hold view at shard
+/// start, before the event loop runs, on both runtimes.
+///
+/// The first view fixes the hold's baseline (`UnlinkHold::observe`): every
+/// file with an id below the spill counter AT THAT VIEW is treated as one a
+/// replayable generation (or, without an AOF, the last snapshot) may still
+/// read, and is held until a committed fold (or snapshot) covers it. The
+/// baseline is meant to be the counter at BOOT — the inherited files. It was
+/// set by the first orphan sweep instead: tokio's sweep interval ticks at
+/// t=0, monoio's counter-driven sweep runs one interval later (1 s in the
+/// tests, 60 s by default), so on monoio every file spilled in the first
+/// interval after each boot was held as if inherited — and with no fold ever
+/// due (no growth, no ledger pressure) never released. `INFO` showed them as
+/// `cold_files_pending_unlink` forever (`cold_file_id_reuse_1067`, 3/3 red).
+/// Observing here makes the baseline the boot counter on both runtimes,
+/// whatever the sweep cadence. The view is not kept for a decision
+/// (`end_decision`): every sweep still reads its own fresh one.
+pub(crate) fn observe_boot_fold_view(
+    shard_databases: &Arc<super::shared_databases::ShardDatabases>,
+    shard_id: usize,
+    aof_pool: Option<&Arc<crate::persistence::aof::AofWriterPool>>,
+    next_file_id: u64,
+) {
+    let floor_covers_this_shard = aof_pool.is_none_or(|pool| {
+        pool.layout() != crate::persistence::aof_manifest::AofLayout::TopLevel
+            || shard_databases.num_shards() <= 1
+    });
+    let view = fold_view_now(shard_id, aof_pool, floor_covers_this_shard, next_file_id);
+    for db_idx in 0..shard_databases.db_count() {
+        crate::shard::slice::with_shard_db(db_idx, |db| {
+            if let Some(ci) = db.cold_index.as_mut() {
+                ci.observe_fold(view);
+                ci.end_fold_decision();
+            }
+        });
+    }
+}
+
 /// Run a cold-tier orphan sweep across all databases for a single shard.
 ///
 /// Iterates each database's cold index and removes entries whose key is now
@@ -441,23 +513,13 @@ pub(crate) fn run_cold_orphan_sweep(
     // Read at each decision, never cached across one: see `unlink_hold`.
     // Without an AOF the view comes from this shard's snapshots (moon#1260,
     // `storage::tiered::snapshot_hold`).
-    let fold_view = || match aof_pool {
-        Some(pool) => {
-            let overflow = pool.overflow_for(shard_id);
-            Some(crate::storage::tiered::unlink_hold::FoldView {
-                epoch: overflow.stamp().0,
-                committed_floor: if floor_covers_this_shard {
-                    overflow.committed_floor().0
-                } else {
-                    crate::persistence::aof::FoldEpoch::INITIAL.0
-                },
-                next_file_id: spill_file_id.get(),
-                hold_all: false,
-            })
-        }
-        None => Some(crate::storage::tiered::snapshot_hold::snapshot_fold_view(
+    let fold_view = || {
+        Some(fold_view_now(
+            shard_id,
+            aof_pool,
+            floor_covers_this_shard,
             spill_file_id.get(),
-        )),
+        ))
     };
 
     let db_count = shard_databases.db_count();
@@ -589,19 +651,36 @@ pub(crate) fn run_cold_orphan_sweep(
 /// epoch BEFORE the start, so this snapshot's success releases it — the
 /// snapshot already excludes the keys those files backed. Then the start is
 /// counted. Owner thread, no database guard held.
-pub(crate) fn note_snapshot_started(shard_databases: &Arc<ShardDatabases>) {
+///
+/// Returns the snapshot's cold-graves trailer (moon#1281): every dead slot
+/// the cold indexes' grave records hold at this instant, encoded for the
+/// snapshot to carry (`persistence::snapshot::cold_graves`). Without an AOF
+/// that is every dead slot; with one only the graves a boot carried forward.
+/// Empty without a cold tier or with no grave — the snapshot is then
+/// byte-identical to the pre-moon#1281 format.
+#[must_use]
+pub(crate) fn note_snapshot_started(shard_databases: &Arc<ShardDatabases>) -> Vec<u8> {
     use crate::storage::tiered::snapshot_hold;
-    if snapshot_hold::applies() {
-        let stamp = snapshot_hold::epoch_before_start();
-        for db_idx in 0..shard_databases.db_count() {
-            crate::shard::slice::with_shard_db(db_idx, |db| {
-                if let Some(ci) = db.cold_index.as_mut() {
+    let mut graves = crate::persistence::snapshot::cold_graves::Encoder::default();
+    let hold = snapshot_hold::applies();
+    let stamp = snapshot_hold::epoch_before_start();
+    for db_idx in 0..shard_databases.db_count() {
+        crate::shard::slice::with_shard_db(db_idx, |db| {
+            if let Some(ci) = db.cold_index.as_mut() {
+                if hold {
                     ci.hold_queued_before_snapshot(stamp);
                 }
-            });
-        }
+                // Also with an AOF (moon#1281 round 2, R2-1): an AOF process
+                // records no new graves, but still carries those its boot
+                // dropped on a no-AOF snapshot's word; a layout that loads
+                // the snapshot under its log (tokio `--shards 1`) must not
+                // lose them at the next BGSAVE. Empty = no trailer.
+                ci.encode_graves_into(&mut graves);
+            }
+        });
     }
     snapshot_hold::note_snapshot_started();
+    graves.finish()
 }
 
 /// A snapshot of this shard just finished successfully (moon#1260 review

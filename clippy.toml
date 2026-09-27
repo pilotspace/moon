@@ -1,0 +1,12 @@
+# moon#1280: every periodic interval must skip missed ticks, never burst them.
+# The raw runtime constructors default to MissedTickBehavior::Burst, so a
+# stalled shard replays every missed tick back to back. Use
+# `crate::runtime::interval::{tokio_interval, monoio_interval}` or
+# `crate::runtime::TimerImpl::interval`, which set Skip.
+disallowed-methods = [
+    { path = "tokio::time::interval", reason = "moon#1280: use crate::runtime::interval::tokio_interval (skips missed ticks)" },
+    { path = "tokio::time::interval_at", reason = "moon#1280: use crate::runtime::interval::tokio_interval (skips missed ticks)" },
+    # `allow-invalid`: monoio is absent from the tokio leg's dependency graph.
+    { path = "monoio::time::interval", reason = "moon#1280: use crate::runtime::interval::monoio_interval (skips missed ticks)", allow-invalid = true },
+    { path = "monoio::time::interval_at", reason = "moon#1280: use crate::runtime::interval::monoio_interval (skips missed ticks)", allow-invalid = true },
+]

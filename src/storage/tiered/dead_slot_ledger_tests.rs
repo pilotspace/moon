@@ -129,7 +129,7 @@ fn no_path_records_without_an_aof_consumer() {
     ci.insert(Bytes::from_static(b"c"), loc(1, 2));
     assert!(ci.remove(b"a"));
     ci.insert(Bytes::from_static(b"b"), loc(2, 0));
-    ci.note_dead_slot(3, Bytes::from_static(b"ghost"), None);
+    ci.note_dead_slot_in(3, Bytes::from_static(b"ghost"), None);
     ci.clear_all();
     assert!(ci.dead_slots().is_empty());
     assert_eq!(ci.dead_slots().resident_bytes(), 0);
@@ -192,7 +192,7 @@ fn a_file_already_gone_forgets_its_slots() {
 #[test]
 fn a_ghost_slot_is_recorded_on_request() {
     let mut ci = ColdIndex::new();
-    ci.note_dead_slot(9, Bytes::from_static(b"ghost"), None);
+    ci.note_dead_slot_in(9, Bytes::from_static(b"ghost"), None);
     assert!(ci.dead_slots().file_has_dead_slots(9));
     assert_eq!(ci.len(), 0, "a ghost is never an entry");
 }

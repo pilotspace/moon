@@ -101,7 +101,8 @@ pub(crate) fn handle_pending_snapshot(
             // the life of this snapshot. See `persistence::snapshot_cow`.
             // moon#1186: with the layout, so written segments are skipped.
             crate::persistence::snapshot_cow::arm_with_layout(segment_counts);
-            super::timers::note_snapshot_started(shard_databases); // moon#1260
+            // moon#1260 hold + moon#1281 cold graves, in this same section.
+            state.set_cold_graves_trailer(super::timers::note_snapshot_started(shard_databases));
             *snapshot_state = Some(state);
             *snapshot_reply_tx = Some(reply_tx);
         }
@@ -188,7 +189,8 @@ pub(crate) fn check_auto_save_trigger(
         start_snapshot_streaming(&mut state, shard_id);
         // moon#517: same arming as the explicit-BGSAVE path above.
         crate::persistence::snapshot_cow::arm_with_layout(segment_counts);
-        super::timers::note_snapshot_started(shard_databases); // moon#1260
+        // moon#1260 hold + moon#1281 cold graves, in this same section.
+        state.set_cold_graves_trailer(super::timers::note_snapshot_started(shard_databases));
         *snapshot_state = Some(state);
     }
 }
@@ -235,6 +237,25 @@ pub(crate) fn drive_snapshot_finalize(
             Some(false)
         }
     }
+}
+
+/// [`advance_snapshot_segment`] for a tick that owes the walk `scale` ticks'
+/// budget (moon#1280 review MAJOR-1: it fired late). The scale is combined
+/// with the walk's own backlog scale by MAX under the moon#1228 cap
+/// (`SnapshotState::set_catch_up_scale`), so a late tick walks at most what a
+/// backlogged tick always could (~1.6 ms) — round 3 measured the first cut,
+/// which multiplied the two, doubling PING p90 during a BGSAVE under a write
+/// flood. True once the walk is done.
+pub(crate) fn advance_snapshot_segments(
+    snapshot_state: &mut Option<SnapshotState>,
+    shard_databases: &Arc<ShardDatabases>,
+    shard_id: usize,
+    scale: u32,
+) -> bool {
+    if let Some(snap) = snapshot_state.as_mut() {
+        snap.set_catch_up_scale(scale);
+    }
+    advance_snapshot_segment(snapshot_state, shard_databases, shard_id)
 }
 
 /// Advance snapshot one segment and check if done (synchronous part).
@@ -748,6 +769,12 @@ pub(crate) fn run_eviction_tick(
         spill_thread,
         cascade_ledger_bytes,
     );
+    // moon#1265: after the reclaim tick saw this tick's liveness (it
+    // abandons a dead thread's compactions first), respawn a spill thread
+    // whose backoff is over.
+    if let Some(st) = spill_thread {
+        spill_supervise::respawn_if_due(st, shard_databases.db_count(), shard_id);
+    }
     if server_config.disk_offload_enabled()
         && should_run_pressure_cascade(
             runtime_config,
@@ -886,21 +913,19 @@ fn drain_and_apply(
     let done_below = spill_thread.done_below();
     let completions = spill_thread.drain_completions();
     apply_completion_vec(completions, shard_manifest, marker_sink);
-    prune_superseded(spill_thread.take_prune(done_below, was_dead), db_count);
-    // Refs moon#1265: one error line and INFO `spill_thread_alive:0`.
-    spill_thread.report_death_once(was_dead, shard_id);
+    prune_superseded(spill_thread.take_prune(done_below), db_count);
+    // moon#1265: a thread seen dead before the drain has had everything it
+    // sent applied; reconcile what died with it and schedule its respawn.
+    spill_supervise::after_drain(spill_thread, was_dead, db_count, shard_id);
 }
 
 /// Bound the superseded sets (refs moon#1253): a request whose completion
-/// never arrives — dropped at shutdown, or its spill thread dead — would stay
-/// in its database's set for good. Runs only when the spill thread's
-/// watermark moved (or it died), and touches only non-empty sets.
-fn prune_superseded(
-    prune: Option<crate::storage::tiered::spill_thread::SupersededPrune>,
-    db_count: usize,
-) {
-    use crate::storage::tiered::spill_thread::SupersededPrune;
-    let Some(prune) = prune else {
+/// never arrives — dropped at shutdown — would stay in its database's set for
+/// good. Runs only when the spill thread's watermark moved, and touches only
+/// non-empty sets. (A request that died with its spill thread is forgotten by
+/// the reconcile, `spill_supervise`, moon#1265.)
+fn prune_superseded(prune_below: Option<u64>, db_count: usize) {
+    let Some(done_below) = prune_below else {
         return;
     };
     for db_index in 0..db_count {
@@ -908,10 +933,7 @@ fn prune_superseded(
             if db.spill_superseded_is_empty() {
                 return;
             }
-            let pruned = match prune {
-                SupersededPrune::Below(done_below) => db.spill_superseded_prune_below(done_below),
-                SupersededPrune::All => db.spill_superseded_clear(),
-            };
+            let pruned = db.spill_superseded_prune_below(done_below);
             if pruned > 0 {
                 tracing::debug!(
                     db = db_index,
@@ -1221,7 +1243,25 @@ fn apply_completion_vec(
         // file is published for its other keys, those slots are on disk in a
         // listed file and a rebuild would index them: the cold index's
         // dead-slot ledger must know, so an AOF rewrite can keep them dead.
-        let mut ghosts: Vec<(usize, bytes::Bytes, Option<u64>)> = Vec::new();
+        // The slot's location rides along: without an AOF the snapshot
+        // records dead slots by location (moon#1281).
+        let ghost_at = |page_idx: u32,
+                        slot_idx: u16,
+                        ttl_ms: Option<u64>,
+                        value_type: crate::persistence::kv_page::ValueType| {
+            crate::storage::tiered::cold_index::ColdLocation {
+                file_id,
+                page_idx,
+                slot_idx,
+                ttl_ms,
+                value_type,
+            }
+        };
+        let mut ghosts: Vec<(
+            usize,
+            bytes::Bytes,
+            crate::storage::tiered::cold_index::ColdLocation,
+        )> = Vec::new();
         for entry in c.entries {
             let (publishable, stranded) =
                 crate::shard::slice::with_shard_db(entry.db_index, |db| {
@@ -1249,7 +1289,13 @@ fn apply_completion_vec(
                     None => groups.push((entry.db_index, vec![entry])),
                 }
             } else {
-                ghosts.push((entry.db_index, entry.key, entry.ttl_ms));
+                let at = ghost_at(
+                    entry.page_idx,
+                    entry.slot_idx,
+                    entry.ttl_ms,
+                    entry.value_type,
+                );
+                ghosts.push((entry.db_index, entry.key, at));
             }
         }
 
@@ -1272,7 +1318,10 @@ fn apply_completion_vec(
                 for entry in &entries {
                     rehydrate_unpublished_spill(entry, file_id);
                 }
-                ghosts.extend(entries.iter().map(|e| (db_index, e.key.clone(), e.ttl_ms)));
+                ghosts.extend(entries.iter().map(|e| {
+                    let at = ghost_at(e.page_idx, e.slot_idx, e.ttl_ms, e.value_type);
+                    (db_index, e.key.clone(), at)
+                }));
                 continue;
             }
             published_any = true;
@@ -1299,12 +1348,36 @@ fn apply_completion_vec(
         }
         if withdrawn_any {
             crate::storage::tiered::spill_thread::record_spill_completion_marker_withdrawn();
-            if !published_any {
-                // Nothing points at the file: leave it out of the manifest so
-                // no restart can index it, and the startup orphan sweep
-                // (unmanifested `heap-*.mpf`) reclaims it.
-                continue;
+        }
+        if !published_any {
+            // Nothing points at the file — every key was withdrawn, or every
+            // key was superseded (deleted, overwritten, promoted) while the
+            // spill was in flight. Leave it out of the manifest so no restart
+            // can index its slots. moon#1279 (the Windows/tokio variant):
+            // the all-superseded case used to LIST it, with only ghost slots
+            // no index entry references; it never went zero-ref, so no sweep
+            // ever queued it (`cold_files_dead` stuck at 1). No `MOON.SPILLED`
+            // marker names it (markers go out per published group), so it is
+            // unlinked now; the startup orphan sweep catches a failed unlink.
+            if let Some(shard_dir) = shard_manifest
+                .as_ref()
+                .and_then(|m| m.path().parent().map(std::path::Path::to_path_buf))
+            {
+                let path = shard_dir
+                    .join("data")
+                    .join(format!("heap-{file_id:06}.mpf"));
+                if let Err(e) = std::fs::remove_file(&path)
+                    && e.kind() != std::io::ErrorKind::NotFound
+                {
+                    tracing::warn!(
+                        file_id,
+                        err = %e,
+                        "spill completion: could not remove a spill file none of whose keys \
+                         was published; the startup orphan sweep removes it"
+                    );
+                }
             }
+            continue;
         }
         if let Some(ref mut manifest) = *shard_manifest {
             // Cannot refuse: `has_entry` was checked above and nothing in
@@ -1313,10 +1386,10 @@ fn apply_completion_vec(
                 tracing::error!(file_id, error = %e, "Spill completion: manifest add_file refused");
             } else {
                 manifest_dirty = true;
-                for (db_index, key, ttl_ms) in ghosts {
+                for (db_index, key, at) in ghosts {
                     crate::shard::slice::with_shard_db(db_index, |db| {
                         if let Some(ci) = db.cold_index.as_mut() {
-                            ci.note_dead_slot(file_id, key, ttl_ms);
+                            ci.note_dead_slot(key, at);
                         }
                     });
                 }
@@ -1577,12 +1650,14 @@ pub(crate) fn handle_memory_pressure(
                                 .budget(budget)
                                 .ledger(0)
                                 .report(
-                                    // task #34 (Wave A): only the no-manifest,
-                                    // `--appendonly no` plain-drop fallback
-                                    // inside this function ever calls this sink
-                                    // (the async-spill and durable-batch
-                                    // branches leave a cold/AOF-recoverable
-                                    // copy and never invoke it).
+                                    // task #34 (Wave A): only the plain-drop
+                                    // fallbacks inside this function call this
+                                    // sink — no manifest under `--appendonly
+                                    // no`, or a degraded shard's closed spill
+                                    // channel (moon#1265); the async-spill and
+                                    // durable-batch branches leave a
+                                    // cold/AOF-recoverable copy and never
+                                    // invoke it.
                                     &mut |key| {
                                         crate::replication::reason_del::record_reason_del(
                                             key,
@@ -2464,7 +2539,11 @@ pub(crate) fn handle_checkpoint_tick(
 #[cfg(test)]
 mod checkpoint_tick_tests;
 
+#[cfg(test)]
+mod superseded_spill_tests;
+
 mod cold_reclaim_tick;
+mod spill_supervise;
 
 #[cfg(test)]
 mod cascade_ledger_tests;
@@ -2480,6 +2559,18 @@ mod reclaim_offload_tests;
 
 #[cfg(test)]
 mod superseded_settle_tests;
+
+#[cfg(test)]
+mod spill_supervise_tests;
+
+#[cfg(test)]
+mod review_r2b_tests;
+
+#[cfg(test)]
+mod review_r3_tests;
+
+#[cfg(test)]
+mod reclaim_death_budget_tests;
 
 #[cfg(test)]
 mod tests {

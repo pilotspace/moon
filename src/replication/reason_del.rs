@@ -57,11 +57,11 @@
 //! a script's `SPOP` / `XADD … '*'` re-rolls on replay exactly like the
 //! connection form) — instead of a synthetic `DEL`.
 //!
-//! moon#517: `record_effect_write` is the one entry point here that is NOT
-//! monoio-only. Its AOF leg runs on every runtime (see
-//! `record_bytes_conn`); only the replication leg stays gated. The
-//! `record_reason_del*` flavors keep their whole-function gate because
-//! every one of their call sites is itself monoio-only.
+//! moon#517: `record_effect_write` and (round-2b review MAJOR-3)
+//! `record_reason_del_conn` run on every runtime: their AOF leg is a channel
+//! send to the writer pool (see `record_bytes_conn`); only the replication
+//! leg stays monoio-gated. The tokio write gates and the script bridge rely
+//! on this for every evicted key.
 
 use bytes::Bytes;
 
@@ -170,11 +170,12 @@ fn record_reason_del_dropped(key: &[u8]) {
 /// Connection-handler-context DEL emission (inline fast-path SET eviction
 /// gate, generic per-command write-eviction gate). See module docs.
 ///
-/// Monoio-only: both call sites (`server::conn::blocking::try_inline_dispatch`,
-/// `server::conn::handler_monoio::run_write_eviction_gate`) are
-/// `#[cfg(feature = "runtime-monoio")]`-gated — master-side PSYNC is
-/// monoio-only (CLAUDE.md), so a tokio-runtime build never needs this leg.
-#[cfg(feature = "runtime-monoio")]
+/// Available on BOTH runtimes (round-2b review MAJOR-3, as moon#517 did for
+/// [`record_effect_write`]): the replication leg inside
+/// [`record_bytes_conn`] is monoio-only, but the AOF leg is not — the tokio
+/// write gates (`handler_sharded` per-command arm, `mq_write_gate`) used to
+/// drop eviction victims without a `DEL`, so an AOF restart replayed every
+/// evicted key back.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn record_reason_del_conn(
     repl_state: &Option<std::sync::Arc<parking_lot::RwLock<ReplicationState>>>,
@@ -212,8 +213,8 @@ pub(crate) fn record_reason_del_conn(
 /// path in moon uses.
 ///
 /// Available on BOTH runtimes (moon#517). It used to be
-/// `#[cfg(feature = "runtime-monoio")]`-gated like
-/// [`record_reason_del_conn`], with the bridge discarding the effect
+/// `#[cfg(feature = "runtime-monoio")]`-gated (as
+/// [`record_reason_del_conn`] also was), with the bridge discarding the effect
 /// entirely off monoio — but that gate confused two independent legs. The
 /// replication leg genuinely is monoio-only (it pushes through
 /// `shard::self_msg`, and master-side PSYNC does not exist under tokio); the

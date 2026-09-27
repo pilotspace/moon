@@ -23,6 +23,66 @@ AOF logs every write operation to per-shard WAL files. This is the recommended p
 | `everysec` | Fsync every second | Good balance (recommended) |
 | `no` | OS-controlled flush | Highest throughput, risk of data loss |
 
+### When the AOF writer falls behind (backpressure)
+
+Each shard hands its AOF records to a writer thread through a bounded queue.
+If the disk is slow -- a stalled fsync, a saturated device, a paused VM -- the
+queue fills. What a write does then depends on `appendfsync`:
+
+- **`everysec` / `no`**: the write waits for room in the queue for up to
+  `--aof-fsync-timeout-ms` (default 2000 ms; `0` waits forever). If the writer
+  is still backlogged when the bound elapses, the write is **refused** with
+
+  ```text
+  -MOONERR AOF backpressure: write applied in memory but not queued for persistence; the AOF writer is backlogged
+  ```
+
+  The same refusal is returned right away when a rewrite is in progress and
+  its overflow buffer is full. Redis does not refuse here: it writes on
+  without waiting for the slow fsync and counts `aof_delayed_fsync`. Moon
+  refuses because acknowledging a record the writer never received could
+  lose an acked write on restart. Moon never answers `+OK` for such a write.
+- **`always`**: the write waits for its fsync for up to
+  `--aof-fsync-timeout-ms`, and a write that is not confirmed in time answers
+  `-ERR AOF fsync failed; write not durable`, as it did before. Writes whose
+  batch fsync barrier (MULTI/EXEC, scripts, pipelined batches) cannot even be
+  queued because the writer is backlogged answer
+
+  ```text
+  -MOONERR AOF backpressure: write applied in memory and queued, but not confirmed durable; the AOF writer is backlogged
+  ```
+
+  Their records did reach the writer and will be fsynced with the backlog;
+  only the confirmation is missing. They count in the same
+  `aof_append_backpressure_refusals`.
+
+What the backpressure refusal means:
+
+- **Nothing failed on disk.** No fsync ran or failed. A real write or fsync
+  error answers `-ERR AOF fsync failed; write not durable` and sets
+  `aof_fsync_failures` / `aof_last_fsync_status:err`. The refusal changes
+  neither. (Before moon#1272 the refusal used the fsync-failure text.)
+- **The write is applied in memory, but its record is not in the AOF.** A
+  later read sees it. A restart before the next AOF rewrite would not replay
+  it, so `aof_last_write_status` reads `err` until a rewrite folds it into the
+  new base. Retry only idempotent writes (`SET` of a fixed value, `DEL`): a
+  retried `INCR` would be applied twice. (A client can very rarely get this
+  reply for a record that did reach the writer at the moment of the timeout.
+  That is the safe direction: the client sees an error, never a false `+OK`.)
+- **It is counted.** INFO `persistence` field `aof_append_backpressure_refusals`
+  and Prometheus `moon_aof_append_backpressure_refusals_total` count every such
+  refusal. The server logs one `WARN` line (`AOF writer backlogged ...`) when a
+  stall begins and at most one summary every 10 s while it lasts.
+
+A write routed to another shard is checked for room in that shard's AOF queue
+*before* it runs (moon#769). If there is no room within the bound, it is
+refused unapplied with `-MOONERR AOF backpressure: command not executed, ...;
+retry` and counted in `aof_backpressure_refused`. That write is safe to retry.
+
+A non-zero `aof_append_backpressure_refusals` means the disk cannot keep up
+with the write rate. Look at device latency, or give the writer more time with
+`--aof-fsync-timeout-ms`.
+
 ### Per-shard WAL advantage
 
 Unlike Redis's single global AOF file, Moon writes a separate WAL per shard. This eliminates the global serialization bottleneck:

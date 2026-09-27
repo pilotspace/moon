@@ -1059,6 +1059,16 @@ pub fn evict_to_budget(
                         // evicting policies plain-drop, `noeviction` OOMs.
                         None => evict_one_with_spill(db, config, &policy, None, on_plain_drop),
                     }
+                } else if sender.is_disconnected() {
+                    // moon#1265: the shard's spill thread spent its restart
+                    // budget and the shard is degraded (its channel is
+                    // closed), or the shard is shutting down. Nothing can be
+                    // spilled: the no-spill path — evicting policies
+                    // plain-drop, `noeviction` OOMs (above). Without this,
+                    // every `try_send` fails and even an evicting policy
+                    // answers -OOM for good. (A thread merely awaiting its
+                    // respawn keeps the channel open: its queue waits.)
+                    evict_one_with_spill(db, config, &policy, None, on_plain_drop)
                 } else {
                     evict_one_async_spill(
                         db,

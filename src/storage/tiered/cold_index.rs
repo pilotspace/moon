@@ -190,6 +190,10 @@ pub struct ColdIndex {
     /// [`Self::drain_pending_unlink`] forgets a file's entries once the file
     /// is gone. The AOF rewrite fold reads it to keep deleted keys deleted.
     pub(super) dead: super::dead_slots::DeadSlots,
+    /// The same slots by location, for a process WITHOUT an AOF: what each
+    /// snapshot carries as its cold-graves trailer (moon#1281). Recorded at
+    /// the same sites as `dead`, through [`Self::note_dead`].
+    pub(super) graves: super::slot_graves::SlotGraves,
     /// Mostly-dead files compacted into new, not-yet-listed spill files,
     /// waiting for a committed AOF fold before they are adopted and the old
     /// files unlinked — the ledger's bound (see [`super::cold_reclaim`]).
@@ -290,6 +294,10 @@ pub struct ColdRebuildReport {
     pub entries_recovered: u64,
     /// Slots inside valid pages that did not decode.
     pub entries_rejected: u64,
+    /// Slots the loaded snapshot's cold-graves trailer names as dead
+    /// (moon#1281): dropped before each key's newest copy is chosen. Not a
+    /// loss — the snapshot proves these keys were gone.
+    pub entries_tombstoned: u64,
 }
 
 impl ColdRebuildReport {
@@ -370,6 +378,7 @@ impl ColdIndex {
             resident_bytes: 0,
             older_copies: HashMap::new(),
             dead: super::dead_slots::DeadSlots::default(),
+            graves: super::slot_graves::SlotGraves::default(),
             reclaim: super::cold_reclaim::ReclaimState::default(),
             hold: super::unlink_hold::UnlinkHold::default(),
         }
@@ -395,8 +404,49 @@ impl ColdIndex {
     /// a spill completion that published `file_id` for OTHER keys while this
     /// one was superseded or withdrawn (a ghost slot, moon#1215). `ttl_ms` is
     /// the slot's own absolute TTL, as written.
-    pub fn note_dead_slot(&mut self, file_id: u64, key: Bytes, ttl_ms: Option<u64>) {
-        self.dead.note(file_id, key, ttl_ms);
+    pub fn note_dead_slot(&mut self, key: Bytes, location: ColdLocation) {
+        self.note_dead(key, &location);
+    }
+
+    /// Append this index's no-AOF dead slots, by file, to `out`: what a
+    /// snapshot starting now carries as its cold-graves trailer (moon#1281).
+    pub fn collect_graves_into(&self, out: &mut Vec<(u64, Vec<u64>)>) {
+        self.graves.collect_into(out);
+    }
+
+    /// Write this index's no-AOF dead slots into the snapshot trailer being
+    /// built at snapshot start (moon#1281; no intermediate copy).
+    pub fn encode_graves_into(&self, enc: &mut crate::persistence::snapshot::cold_graves::Encoder) {
+        self.graves.encode_into(enc);
+    }
+
+    /// The no-AOF dead-slot record (moon#1281; tests, diagnostics).
+    #[inline]
+    pub fn slot_graves(&self) -> &super::slot_graves::SlotGraves {
+        &self.graves
+    }
+
+    /// Test shim for the pre-moon#1281 signature: a ghost slot at page 0,
+    /// slot 0 of `file_id` (only the ledger's key matters to those tests).
+    #[cfg(test)]
+    pub(crate) fn note_dead_slot_in(&mut self, file_id: u64, key: Bytes, ttl_ms: Option<u64>) {
+        let location = ColdLocation {
+            file_id,
+            page_idx: 0,
+            slot_idx: 0,
+            ttl_ms,
+            value_type: crate::persistence::kv_page::ValueType::String,
+        };
+        self.note_dead(key, &location);
+    }
+
+    /// Record one dead slot in both records: the AOF fold's key ledger and the
+    /// no-AOF snapshot's location record (each a no-op in the other mode).
+    #[inline]
+    fn note_dead(&mut self, key: Bytes, location: &ColdLocation) {
+        self.graves
+            .note(location.file_id, location.page_idx, location.slot_idx);
+        self.dead.note(location.file_id, key, location.ttl_ms);
     }
 
     /// The copies of `key` a rebuild found behind its current entry, newest
@@ -420,8 +470,7 @@ impl ColdIndex {
             for location in copies {
                 // The slot stays on disk and outlives this release: once the
                 // key's newer copy goes, it would be the one a rebuild finds.
-                self.dead
-                    .note(location.file_id, key.clone(), location.ttl_ms);
+                self.note_dead(key.clone(), &location);
                 if self.ref_dec(location.file_id) {
                     self.pending_unlink.push(location.file_id);
                 }
@@ -442,8 +491,7 @@ impl ColdIndex {
             return;
         };
         for location in copies {
-            self.dead
-                .note(location.file_id, owned.clone(), location.ttl_ms);
+            self.note_dead(owned.clone(), &location);
             if self.ref_dec(location.file_id) {
                 self.pending_unlink.push(location.file_id);
             }
@@ -498,7 +546,7 @@ impl ColdIndex {
         if let Some(old) = self.map.insert((h, key.clone()), location) {
             if old.file_id != new_file {
                 // The superseded slot stays in its file (moon#1215).
-                self.dead.note(old.file_id, key, old.ttl_ms);
+                self.note_dead(key, &old);
                 if self.ref_dec(old.file_id) {
                     self.pending_unlink.push(old.file_id);
                 }
@@ -526,7 +574,7 @@ impl ColdIndex {
     /// never read as a value again ([`Self::remove_raw_unrecorded`]).
     fn remove_raw(&mut self, key: &[u8]) -> Option<ColdLocation> {
         let (owned, location) = self.remove_raw_unrecorded(key)?;
-        self.dead.note(location.file_id, owned, location.ttl_ms);
+        self.note_dead(owned, &location);
         Some(location)
     }
 
@@ -572,12 +620,11 @@ impl ColdIndex {
         // Every slot stays on disk until the sweep unlinks its file; a
         // rewrite before that must still delete each key (moon#1215).
         for ((_, key), location) in std::mem::take(&mut self.map) {
-            self.dead.note(location.file_id, key, location.ttl_ms);
+            self.note_dead(key, &location);
         }
         for (key, copies) in std::mem::take(&mut self.older_copies) {
             for location in copies {
-                self.dead
-                    .note(location.file_id, key.clone(), location.ttl_ms);
+                self.note_dead(key.clone(), &location);
             }
         }
         self.resident_bytes = 0;
@@ -617,6 +664,7 @@ impl ColdIndex {
             self.older_copies.entry(key).or_default().extend(copies);
         }
         self.dead.merge(other.dead);
+        self.graves.merge(other.graves);
         self.hold.merge(other.hold);
         // Zero-ref files the other index queued (a rebuild queues the listed
         // files it found missing): the drain re-checks references before it
@@ -668,6 +716,12 @@ impl ColdIndex {
     /// [`super::unlink_hold`] for the rule it enables.
     pub fn observe_fold(&mut self, view: super::unlink_hold::FoldView) {
         self.hold.observe(view);
+    }
+
+    /// Drop the view [`Self::observe_fold`] recorded without deciding
+    /// anything: no later unlink decision may use it (moon#1279's boot view).
+    pub fn end_fold_decision(&mut self) {
+        self.hold.end_decision();
     }
 
     /// Whether `file_id` is held until a committed fold covers it (moon#1231).
@@ -1095,9 +1149,13 @@ impl ColdIndex {
             // Delete the DataFile (idempotent — missing = already gone).
             match std::fs::remove_file(&file_path) {
                 // Gone from disk: its dead slots cannot come back (moon#1215).
-                Ok(()) => self.dead.forget_file(file_id),
+                Ok(()) => {
+                    self.dead.forget_file(file_id);
+                    self.graves.forget_file(file_id);
+                }
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                     self.dead.forget_file(file_id);
+                    self.graves.forget_file(file_id);
                 }
                 Err(e) => {
                     tracing::warn!(
@@ -1144,350 +1202,9 @@ impl ColdIndex {
 
         Ok(bytes_reclaimed)
     }
-
-    /// Rebuild the cold index from all heap DataFiles in a shard directory.
-    ///
-    /// Scans manifest for KvLeaf entries, reads each DataFile, and populates
-    /// the index. Called during v3 recovery.
-    pub fn rebuild_from_manifest(
-        shard_dir: &Path,
-        manifest: &crate::persistence::manifest::ShardManifest,
-    ) -> Self {
-        let mut merged = Self::new();
-        for (_db, index) in Self::rebuild_from_manifest_per_db(shard_dir, manifest).per_db {
-            merged.merge(index);
-        }
-        merged
-    }
-
-    /// Rebuild one cold index PER LOGICAL DATABASE from the manifest's
-    /// KvLeaf files (#139). Each spill file is attributed wholesale via
-    /// `FileEntry::db_index` — the spill path guarantees single-db files
-    /// (flush chunks cut at db boundaries), and manifests from before the
-    /// field existed read as db 0, matching their actual (db-blind,
-    /// attach-to-db0) provenance. Returns `(db_index, index)` pairs for
-    /// every db that has at least one recovered entry (or a missing file
-    /// queued for manifest retirement), plus the [`ColdRebuildReport`].
-    ///
-    /// Nothing is skipped silently (moon#875): every file, page or entry
-    /// this cannot recover is counted in the report by cause, and the first
-    /// [`REBUILD_DETAIL_LOG_CAP`] of each cause are logged here with the
-    /// `file_id` (and page) so an operator can find the damage. The caller
-    /// owns the one-line summary. See [`ColdRebuildReport`] for what each
-    /// class means and why none of them aborts the rebuild.
-    pub fn rebuild_from_manifest_per_db(
-        shard_dir: &Path,
-        manifest: &crate::persistence::manifest::ShardManifest,
-    ) -> ColdRebuild {
-        use crate::persistence::manifest::FileStatus;
-        use crate::persistence::page::{PAGE_4K, PageType};
-
-        let mut report = ColdRebuildReport::default();
-        // Files the manifest lists as Active whose bytes are gone (NotFound),
-        // per db, queued onto the rebuilt index's `pending_unlink` so the
-        // next orphan sweep retires the manifest entry.
-        let mut missing_per_db: Vec<(usize, Vec<u64>)> = Vec::new();
-
-        // Pass 1 — decode every Active KvLeaf file into a flat per-db pair
-        // vector. Manifest order is merely the order the files are READ in;
-        // it decides nothing (moon#983 — see `ColdLocation::recency_key` for
-        // why it cannot be trusted to). Nothing is inserted into a `BTreeMap`
-        // here: an ordered map fed one random-ordered key at a time pays an
-        // O(log n) descent plus node splits per key, and that insert loop
-        // measured 75% of this whole function's wall time on a real 466,912-
-        // entry / 114 MiB spill corpus (file I/O was 13%, the page copy 2%,
-        // the CRC32C verify 3%, entry decode 8%). Pass 2 replaces it with one
-        // sort + one bulk load.
-        //
-        // The cost of that is a transient: this vector holds every recovered
-        // pair (~80 B each) until its db's map is built, on top of the map
-        // itself. Recovery is single-threaded and pre-accept, so the peak is
-        // this shard's alone — but it IS proportional to the cold index, so
-        // see the measured RSS note in `from_pairs_newest_wins`.
-        let mut per_db: Vec<(usize, Vec<((u64, Bytes), ColdLocation)>)> = Vec::new();
-        let data_dir = shard_dir.join("data");
-
-        for entry in manifest.files() {
-            if entry.status == FileStatus::Active && entry.file_type == PageType::KvLeaf as u8 {
-                let db = entry.db_index as usize;
-                let pairs = match per_db.iter_mut().find(|(d, _)| *d == db) {
-                    Some((_, p)) => p,
-                    None => {
-                        per_db.push((db, Vec::new()));
-                        #[allow(clippy::unwrap_used)] // pushed on the previous line
-                        let last = per_db.last_mut().unwrap();
-                        &mut last.1
-                    }
-                };
-                let heap_path = data_dir.join(format!("heap-{:06}.mpf", entry.file_id));
-                let file_id = entry.file_id;
-                report.files_attempted += 1;
-                // Read raw bytes and iterate by absolute chunk index.
-                // `read_datafile` skips overflow pages (returns only KvLeaf pages),
-                // so its enumerate index ≠ file-absolute page index in multi-page files.
-                // We must use the raw chunk index to produce a correct `page_idx`.
-                let raw = match std::fs::read(&heap_path) {
-                    Ok(b) => b,
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                        report.files_missing += 1;
-                        if report.files_missing <= REBUILD_DETAIL_LOG_CAP {
-                            tracing::warn!(
-                                file_id,
-                                db,
-                                path = %heap_path.display(),
-                                "cold recovery: manifest lists an Active heap file that is not \
-                                 on disk; its keys (if any were live) now read as absent. Benign \
-                                 if the orphan sweep or the cold reclaim's adoption unlinked it \
-                                 and a crash lost the manifest tombstone that followed (nothing \
-                                 lost; this boot's DEGRADED summary then counts it too); \
-                                 otherwise the file was removed externally. Queued so the first \
-                                 sweep retires the manifest entry"
-                            );
-                        }
-                        match missing_per_db.iter_mut().find(|(d, _)| *d == db) {
-                            Some((_, ids)) => ids.push(file_id),
-                            None => missing_per_db.push((db, vec![file_id])),
-                        }
-                        continue;
-                    }
-                    Err(e) => {
-                        report.files_unreadable += 1;
-                        if report.files_unreadable <= REBUILD_DETAIL_LOG_CAP {
-                            tracing::error!(
-                                file_id,
-                                db,
-                                path = %heap_path.display(),
-                                err = %e,
-                                "cold recovery: heap file could not be read; every key in it \
-                                 (up to 256) now reads as ABSENT until the file is readable and \
-                                 the server restarts. The index entry is skipped, not tombstoned"
-                            );
-                        }
-                        continue;
-                    }
-                };
-                report.files_read += 1;
-                if entry.byte_size > 0 && (raw.len() as u64) < entry.byte_size {
-                    report.files_short += 1;
-                    report.short_file_bytes += entry.byte_size - raw.len() as u64;
-                    if report.files_short <= REBUILD_DETAIL_LOG_CAP {
-                        tracing::error!(
-                            file_id,
-                            db,
-                            path = %heap_path.display(),
-                            on_disk = raw.len(),
-                            manifest = entry.byte_size,
-                            "cold recovery: heap file is shorter than its manifest entry; the \
-                             keys in the missing tail now read as ABSENT"
-                        );
-                    }
-                }
-                let mut chunks = raw.chunks_exact(PAGE_4K);
-                for (page_idx, chunk) in chunks.by_ref().enumerate() {
-                    report.pages_scanned += 1;
-                    let verdict = classify_page(chunk);
-                    match verdict {
-                        PageVerdict::Leaf => {}
-                        PageVerdict::Overflow => {
-                            report.pages_overflow += 1;
-                            continue;
-                        }
-                        PageVerdict::BadHeader
-                        | PageVerdict::ForeignType
-                        | PageVerdict::BadChecksum => {
-                            report.pages_rejected += 1;
-                            if report.pages_rejected <= REBUILD_DETAIL_LOG_CAP {
-                                tracing::error!(
-                                    file_id,
-                                    db,
-                                    path = %heap_path.display(),
-                                    page_idx,
-                                    reason = ?verdict,
-                                    "cold recovery: heap page rejected (corrupt); every key in \
-                                     it now reads as ABSENT"
-                                );
-                            }
-                            continue;
-                        }
-                    }
-                    let mut buf = [0u8; PAGE_4K];
-                    buf.copy_from_slice(chunk);
-                    // `classify_page` already proved type + CRC; `from_bytes`
-                    // re-checks them, cheaply enough for a boot path.
-                    let Some(page) = crate::persistence::kv_page::KvLeafPage::from_bytes(buf)
-                    else {
-                        continue;
-                    };
-                    for slot_idx in 0..page.slot_count() {
-                        let Some(kv) = page.get(slot_idx) else {
-                            report.entries_rejected += 1;
-                            if report.entries_rejected <= REBUILD_DETAIL_LOG_CAP {
-                                tracing::error!(
-                                    file_id,
-                                    db,
-                                    path = %heap_path.display(),
-                                    page_idx,
-                                    slot_idx,
-                                    "cold recovery: slot in a valid heap page did not decode \
-                                     (unknown value type — a downgrade?); that key now reads \
-                                     as ABSENT"
-                                );
-                            }
-                            continue;
-                        };
-                        report.entries_recovered += 1;
-                        let key = Bytes::from(kv.key);
-                        pairs.push((
-                            (scan_h48(&key), key),
-                            ColdLocation {
-                                file_id,
-                                page_idx: page_idx as u32,
-                                slot_idx,
-                                ttl_ms: kv.ttl_ms,
-                                value_type: kv.value_type,
-                            },
-                        ));
-                    }
-                }
-                let tail = chunks.remainder().len() as u64;
-                if tail > 0 {
-                    report.partial_page_bytes += tail;
-                    tracing::error!(
-                        file_id,
-                        db,
-                        path = %heap_path.display(),
-                        bytes = tail,
-                        "cold recovery: heap file ends in a partial page; the writer never \
-                         produces one, so the file was damaged after it was written. The \
-                         keys in that page now read as ABSENT"
-                    );
-                }
-            }
-        }
-
-        // Pass 2 — bulk-load each db's pairs into its ordered map, resolving
-        // every duplicated key to its newest on-disk copy. A db that recovered
-        // nothing but has missing files to retire still gets an (empty) index
-        // so the queue has somewhere to live.
-        for (db, _) in &missing_per_db {
-            if !per_db.iter().any(|(d, _)| d == db) {
-                per_db.push((*db, Vec::new()));
-            }
-        }
-        let per_db = per_db
-            .into_iter()
-            .map(|(db, pairs)| {
-                let mut index = Self::from_pairs_newest_wins(pairs);
-                if let Some((_, ids)) = missing_per_db.iter().find(|(d, _)| *d == db) {
-                    index.pending_unlink.extend_from_slice(ids);
-                    index.missing_at_rebuild.extend_from_slice(ids);
-                }
-                (db, index)
-            })
-            .collect();
-        ColdRebuild { per_db, report }
-    }
-
-    /// Build an index from `((scan_h48(key), key), location)` pairs in ANY
-    /// order, resolving a key present more than once to the copy with the
-    /// highest [`ColdLocation::recency_key`] — the copy written last.
-    ///
-    /// This is the same answer the live path arrives at: a re-spill runs
-    /// through [`Self::insert`] after its predecessor, so the later
-    /// `file_id` overwrites the earlier one. The live path gets that order
-    /// for free from time; recovery reads files in manifest order, which is
-    /// push order and is NOT guaranteed to be recency order (moon#983). So
-    /// the winner is chosen here, explicitly, from the location itself —
-    /// never from where its file happened to sit in the input.
-    ///
-    /// Mechanically: sort by key ascending and recency DESCENDING, then keep
-    /// the first of each equal-key run. The survivor is the newest copy by
-    /// construction, the sorted, duplicate-free vector bulk-loads into the
-    /// `BTreeMap` in one bottom-up pass (`FromIterator` re-sorts, but a
-    /// sorted input is its fast path), and nothing depends on which of two
-    /// equal keys a collection type happens to keep.
-    ///
-    /// The derived state is recomputed from the finished map rather than
-    /// maintained incrementally:
-    /// - `file_refs` — one live-entry count per `file_id`, by definition equal
-    ///   to a walk of the final map.
-    /// - `resident_bytes` — [`Self::insert`] charges [`cold_entry_cost`] once
-    ///   per *distinct* key (an overwrite is free), i.e. the same sum.
-    /// - `pending_unlink` — a file lands here exactly when every copy it holds
-    ///   lost to a newer one, i.e. exactly when it is mentioned by the input
-    ///   but referenced by no surviving map entry. The *set* is identical to
-    ///   what a per-key insert loop would queue; the order within it is not
-    ///   specified by either path (it only sequences a later orphan sweep's
-    ///   unlinks).
-    fn from_pairs_newest_wins(mut pairs: Vec<((u64, Bytes), ColdLocation)>) -> Self {
-        if pairs.is_empty() {
-            return Self::new();
-        }
-
-        // Every file_id the input mentions, in first-appearance order.
-        let mut seen_files: Vec<u64> = Vec::new();
-        let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
-        for (_, loc) in &pairs {
-            if seen.insert(loc.file_id) {
-                seen_files.push(loc.file_id);
-            }
-        }
-
-        // Key ascending, then newest copy FIRST — so the dedup below, which
-        // keeps the first of each run, keeps the newest.
-        pairs.sort_unstable_by(|a, b| {
-            a.0.cmp(&b.0)
-                .then_with(|| b.1.recency_key().cmp(&a.1.recency_key()))
-        });
-        // Keep the first (newest) of each equal-key run in the map; the rest
-        // are the older copies a gated replay may still need (moon#1140).
-        let mut older_copies: HashMap<Bytes, Vec<ColdLocation>> = HashMap::new();
-        let mut newest: Vec<((u64, Bytes), ColdLocation)> = Vec::with_capacity(pairs.len());
-        for (key, loc) in pairs {
-            match newest.last() {
-                Some((prev, _)) if *prev == key => {
-                    older_copies.entry(key.1).or_default().push(loc);
-                }
-                _ => newest.push((key, loc)),
-            }
-        }
-
-        let map: BTreeMap<(u64, Bytes), ColdLocation> = newest.into_iter().collect();
-
-        let mut file_refs: HashMap<u64, u32> = HashMap::with_capacity(seen_files.len());
-        let mut resident_bytes = 0usize;
-        for ((_, key), loc) in &map {
-            *file_refs.entry(loc.file_id).or_insert(0) += 1;
-            resident_bytes += cold_entry_cost(key.len());
-        }
-        // A retained copy is a referrer too: a gated replay may read it, so
-        // its file must not be unlinked underneath that read. The reference
-        // is given back by `release_older_copies`, which queues the file then
-        // if nothing else holds it. `resident_bytes` is deliberately NOT
-        // charged — it accounts one cost per distinct key, and these keys are
-        // already counted by the map entry in front of them.
-        for location in older_copies.values().flatten() {
-            *file_refs.entry(location.file_id).or_insert(0) += 1;
-        }
-
-        let pending_unlink: Vec<u64> = seen_files
-            .into_iter()
-            .filter(|f| !file_refs.contains_key(f))
-            .collect();
-
-        Self {
-            map,
-            file_refs,
-            pending_unlink,
-            missing_at_rebuild: Vec::new(),
-            resident_bytes,
-            older_copies,
-            dead: super::dead_slots::DeadSlots::default(),
-            reclaim: super::cold_reclaim::ReclaimState::default(),
-            hold: super::unlink_hold::UnlinkHold::default(),
-        }
-    }
 }
 
 #[cfg(test)]
 mod tests;
+
+mod rebuild;

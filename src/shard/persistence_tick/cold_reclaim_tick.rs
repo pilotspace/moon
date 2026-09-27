@@ -15,6 +15,7 @@ use std::sync::Arc;
 
 use crate::persistence::aof::AofWriterPool;
 use crate::persistence::manifest::ShardManifest;
+use crate::storage::tiered::cold_reclaim::CulpritOutcome;
 use crate::storage::tiered::reclaim_io::{ReclaimDone, ReclaimJob};
 use crate::storage::tiered::spill_thread::SpillThread;
 
@@ -74,8 +75,11 @@ pub(super) fn run(
     let overflow = pool.overflow_for(shard_id);
     let committed = overflow.committed_floor().0;
     let db_count = shard_databases.db_count();
-    // Refs moon#1265: sampled before the answers are drained, so everything a
+    // moon#1265: sampled before the answers are drained, so everything a
     // dead thread sent is applied below before its other jobs are abandoned.
+    // "Dead" is any tick with no thread running: just died, in backoff before
+    // its respawn (which runs after this tick, `spill_supervise`), or
+    // degraded.
     let dead = spill_thread.is_some_and(SpillThread::is_dead);
 
     // 1. Apply what the spill thread finished: a read becomes a write job
@@ -89,14 +93,41 @@ pub(super) fn run(
             });
         }
     }
-    // Refs moon#1265: a dead spill thread answers nothing more. Abandon what
-    // it still held and start nothing new on it; it is not respawned (the
-    // death is logged and in INFO, `spill_thread_alive:0`).
+    // moon#1265: a dead spill thread answers nothing more. Abandon what it
+    // still held (its queued jobs are dropped by the shard's reconcile; a
+    // write it finished unannounced is an unlisted file the startup orphan
+    // sweep removes) and start nothing new until the respawn. The files are
+    // not given up, so the next incarnation compacts them — except the one
+    // whose job the thread was running as it died, the second time that
+    // happens to it (review: a file that panics the thread deterministically
+    // would otherwise crash every respawn). Such deaths do not spend the
+    // spill thread's restart budget but the reclaim's own, which disables
+    // the reclaim below once spent (review round 3).
     let spill_thread = if dead {
+        let culprit = spill_thread.and_then(SpillThread::take_reclaim_culprit);
         for db_index in 0..db_count {
             crate::shard::slice::with_shard_db(db_index, |db| {
-                if let Some(ci) = db.cold_index.as_mut() {
-                    ci.abandon_compactions_in_flight();
+                let Some(ci) = db.cold_index.as_mut() else {
+                    return;
+                };
+                match ci.abandon_compactions_after_thread_death(culprit) {
+                    CulpritOutcome::NotHere => {}
+                    CulpritOutcome::Suspected(file_id) => tracing::info!(
+                        shard_id,
+                        db = db_index,
+                        file_id,
+                        "cold reclaim: the spill thread died compacting this file; it is \
+                         retried once, and given up if it kills the thread again (moon#1265)"
+                    ),
+                    CulpritOutcome::GivenUp(file_id) => tracing::warn!(
+                        shard_id,
+                        db = db_index,
+                        file_id,
+                        "cold reclaim: file given up — its compaction killed the spill thread \
+                         twice. It stays as it is (its keys readable, its dead slots in the \
+                         ledger) and is not compacted again until restart (INFO \
+                         cold_reclaim_files_given_up, moon#1265)"
+                    ),
                 }
             });
         }
@@ -157,7 +188,10 @@ pub(super) fn run(
             }
         });
     }
-    let Some(st) = spill_thread else {
+    // moon#1265 review round 3: a shard whose reclaim jobs spent the
+    // reclaim-death budget starts no compaction any more (adoption of those
+    // already written still runs above).
+    let Some(st) = spill_thread.filter(|st| !st.reclaim_disabled()) else {
         return;
     };
     if !over {

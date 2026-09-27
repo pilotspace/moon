@@ -191,6 +191,42 @@ pub fn record_key_spilled() {
     counter!("moon_spilled_keys_total").increment(1);
 }
 
+/// Record one spill-thread death observed by its shard (moon#1265).
+#[inline]
+pub fn record_spill_thread_death() {
+    if !METRICS_INITIALIZED.load(Ordering::Relaxed) {
+        return;
+    }
+    counter!("moon_spill_thread_deaths_total").increment(1);
+}
+
+/// Record one spill-thread respawn (moon#1265).
+#[inline]
+pub fn record_spill_thread_restart() {
+    if !METRICS_INITIALIZED.load(Ordering::Relaxed) {
+        return;
+    }
+    counter!("moon_spill_thread_restarts_total").increment(1);
+}
+
+/// Publish how many shards stopped spilling for good (moon#1265).
+#[inline]
+pub fn set_spill_threads_degraded(shards: u64) {
+    if !METRICS_INITIALIZED.load(Ordering::Relaxed) {
+        return;
+    }
+    gauge!("moon_spill_threads_degraded").set(shards as f64);
+}
+
+/// Publish how many shards had their cold reclaim disabled (moon#1265).
+#[inline]
+pub fn set_cold_reclaim_disabled_shards(shards: u64) {
+    if !METRICS_INITIALIZED.load(Ordering::Relaxed) {
+        return;
+    }
+    gauge!("moon_cold_reclaim_disabled_shards").set(shards as f64);
+}
+
 // ── Persistence metrics ─────────────────────────────────────────────────
 
 /// Record an AOF fsync duration.
@@ -200,6 +236,18 @@ pub fn record_aof_fsync(duration_us: u64) {
         return;
     }
     histogram!("moon_aof_fsync_duration_microseconds").record(duration_us as f64);
+}
+
+/// Record one AOF append refused because the writer was backlogged
+/// (moon#1272) — the Prometheus mirror of INFO
+/// `aof_append_backpressure_refusals`. Cold path: reached only after a
+/// producer waited `--aof-fsync-timeout-ms` (or hit the rewrite overflow cap).
+#[inline]
+pub fn record_aof_append_backpressure_refusal() {
+    if !METRICS_INITIALIZED.load(Ordering::Relaxed) {
+        return;
+    }
+    counter!("moon_aof_append_backpressure_refusals_total").increment(1);
 }
 
 /// Record a WAL segment rotation.

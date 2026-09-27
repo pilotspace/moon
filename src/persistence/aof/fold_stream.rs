@@ -434,8 +434,6 @@ pub(crate) fn for_each_in_flight_base_entry(
 /// own pass for the expired shadows — for a fold that does not stream its
 /// base through [`stream_fold_image`] (the legacy cloning
 /// `do_rewrite_single`).
-// Only the monoio-only `do_rewrite_single` folds without streaming.
-#[cfg_attr(not(feature = "runtime-monoio"), allow(dead_code))]
 pub(crate) fn fold_cold_deletes(dbs: &[&Database], now_ms: u64) -> ColdDeletes {
     let mut out = ColdDeletes::default();
     for (db_idx, db) in dbs.iter().enumerate() {
@@ -458,6 +456,19 @@ pub(crate) fn fold_cold_deletes(dbs: &[&Database], now_ms: u64) -> ColdDeletes {
         });
     }
     out
+}
+
+/// The `DEL`s a FRESH AOF generation's head must carry (moon#1281 round 2,
+/// R2-1): a boot that loaded a no-AOF snapshot and dropped its dead spill
+/// slots seeded the dead-slot ledger with them, but only a fold's head ever
+/// wrote that ledger out — and a generation created at boot has had no
+/// fold. Its `MOON.COLDCUT` authorizes every listed spill file, so without
+/// these deletes the next AOF-led boot re-indexes the slots. The same
+/// selection as a fold's head: live keys (hot, in flight, or cold elsewhere)
+/// are filtered out.
+pub fn fresh_generation_deletes(dbs: &[Database], now_ms: u64) -> ColdDeletes {
+    let refs: Vec<&Database> = dbs.iter().collect();
+    fold_cold_deletes(&refs, now_ms)
 }
 
 /// How often a writer waiting on a slow image logs that it is still waiting.
@@ -833,7 +844,7 @@ mod tests {
         // `respilled` moved to file 2 (alive there); `twice` was also dead in
         // file 3 — one DEL.
         ci.insert(Bytes::from_static(b"respilled"), cold_loc(2));
-        ci.note_dead_slot(3, Bytes::from_static(b"twice"), None);
+        ci.note_dead_slot_in(3, Bytes::from_static(b"twice"), None);
         // A live cold key with no dead slot, and a stale shadow behind a hot
         // key whose value expired.
         ci.insert(Bytes::from_static(b"cold"), cold_loc(4));
@@ -921,7 +932,7 @@ mod tests {
             let mut ci = crate::storage::tiered::cold_index::ColdIndex::new();
             ci.insert(Bytes::from_static(b"anchor"), cold_loc(1));
             for i in 0..count {
-                ci.note_dead_slot(1, Bytes::from(format!("dead:{i:05}")), None);
+                ci.note_dead_slot_in(1, Bytes::from(format!("dead:{i:05}")), None);
             }
             dbs[db_idx].cold_index = Some(ci);
         }

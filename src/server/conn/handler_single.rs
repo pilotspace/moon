@@ -1293,8 +1293,12 @@ pub async fn handle_connection(
                             // the guard; this is the ONE fsync barrier (group
                             // commit) and the patch of any slot whose record
                             // failed.
-                            let aof_write_failed = aof_log.settle(&mut responses).await;
-                            if aof_write_failed {
+                            // moon#1272: a writer-backlog refusal patches
+                            // only its own slot (`AOF_BACKLOG_ERR`) and the
+                            // batch flushes as usual; only a gone writer or
+                            // a failed `always` barrier ends the connection.
+                            let settled = aof_log.settle(&mut responses).await;
+                            if settled == crate::server::conn::single_aof_log::Settled::NotDurable {
                                 // Discard buffered +OK responses — the writes are not
                                 // durable. Log at warn level so operators can correlate
                                 // with disk I/O errors.
@@ -2217,7 +2221,10 @@ pub async fn handle_connection(
                                         let records = store.drain_wal();
                                         (resp, records)
                                     };
-                                    let mut graph_aof_failed = false;
+                                    // moon#1272: the reply text of the first
+                                    // failure — writer backlog and write/fsync
+                                    // failure answer differently.
+                                    let mut graph_aof_err: Option<&'static [u8]> = None;
                                     let mut graph_barrier_needed = false;
                                     // #455: read once, before any enqueue can
                                     // park — no await since the graph mutation.
@@ -2246,7 +2253,11 @@ pub async fn handle_connection(
                                             {
                                                 Ok(true) => graph_barrier_needed = true,
                                                 Ok(false) => {}
-                                                Err(_) => graph_aof_failed = true,
+                                                Err(ack) => {
+                                                    graph_aof_err.get_or_insert(
+                                                        crate::persistence::aof::append_refusal_reply(ack),
+                                                    );
+                                                }
                                             }
                                         }
                                         if let Some(ref counter) = change_counter {
@@ -2255,15 +2266,15 @@ pub async fn handle_connection(
                                     }
                                     if graph_barrier_needed {
                                         if let Some(ref pool) = aof_pool {
-                                            if pool.fsync_barrier(0).await.is_err() {
-                                                graph_aof_failed = true;
+                                            if let Err(ack) = pool.fsync_barrier(0).await {
+                                                graph_aof_err.get_or_insert(
+                                                    crate::persistence::aof::barrier_refusal_reply(ack),
+                                                );
                                             }
                                         }
                                     }
-                                    if graph_aof_failed {
-                                        responses.push(Frame::Error(bytes::Bytes::from_static(
-                                            crate::persistence::aof::AOF_FSYNC_ERR,
-                                        )));
+                                    if let Some(err) = graph_aof_err {
+                                        responses.push(Frame::Error(bytes::Bytes::from_static(err)));
                                     } else {
                                         responses.push(response);
                                     }

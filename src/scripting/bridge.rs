@@ -229,7 +229,9 @@ impl LuaEvictionCtx {
             if capture_txn_del(db_index, key) {
                 return;
             }
-            #[cfg(feature = "runtime-monoio")]
+            // Both runtimes (round-3 review MAJOR-1): tokio used to drop the
+            // DEL here, so an AOF restart replayed every key a script's write
+            // had evicted.
             crate::replication::reason_del::record_reason_del_conn(
                 &inner.repl_state,
                 inner.shard_id,
@@ -238,10 +240,6 @@ impl LuaEvictionCtx {
                 db_index,
                 key,
             );
-            #[cfg(not(feature = "runtime-monoio"))]
-            {
-                let _ = key;
-            }
         };
         let global_result = if let Some(sender) = &inner.spill_sender {
             let mut fid = inner.spill_file_id.get();

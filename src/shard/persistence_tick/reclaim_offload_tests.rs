@@ -36,8 +36,8 @@ use crate::storage::Database;
 use crate::storage::tiered::kv_spill::{SpillEntry, build_kv_spill_batch, write_kv_spill_batch};
 use crate::storage::tiered::spill_thread::SpillThread;
 
-const OLD: u64 = 5;
-const FIRST_NEW: u64 = 20;
+pub(super) const OLD: u64 = 5;
+pub(super) const FIRST_NEW: u64 = 20;
 /// The injected manifest fsync.
 const SYNC_DELAY_MS: u64 = 300;
 /// A tick that did not wait for that fsync is far below it.
@@ -59,13 +59,13 @@ fn resp(parts: &[&[u8]]) -> Vec<u8> {
     out
 }
 
-fn heap(shard_dir: &Path, file_id: u64) -> PathBuf {
+pub(super) fn heap(shard_dir: &Path, file_id: u64) -> PathBuf {
     shard_dir
         .join("data")
         .join(format!("heap-{file_id:06}.mpf"))
 }
 
-fn listed(manifest: &ShardManifest, file_id: u64) -> bool {
+pub(super) fn listed(manifest: &ShardManifest, file_id: u64) -> bool {
     manifest
         .files()
         .iter()
@@ -74,7 +74,7 @@ fn listed(manifest: &ShardManifest, file_id: u64) -> bool {
 
 /// Spill file `OLD` holding the ten keys, listed; then the live db recovered
 /// from their log (keys cold in `OLD`), with k00..k07 deleted (ledger).
-fn fixture(root: &Path, shard_dir: &Path) -> Database {
+pub(super) fn fixture(root: &Path, shard_dir: &Path) -> Database {
     std::fs::create_dir_all(shard_dir).expect("dir");
     let mut manifest = ShardManifest::create(&shard_dir.join("shard-0.manifest")).expect("m");
     let kvs = keys();
@@ -134,7 +134,7 @@ fn fixture(root: &Path, shard_dir: &Path) -> Database {
     db
 }
 
-fn file_of(key: &str) -> Option<u64> {
+pub(super) fn file_of(key: &str) -> Option<u64> {
     with_shard_db(0, |db| {
         db.cold_index
             .as_ref()
@@ -143,7 +143,7 @@ fn file_of(key: &str) -> Option<u64> {
     })
 }
 
-fn count(f: impl Fn(&crate::storage::tiered::cold_index::ColdIndex) -> usize) -> usize {
+pub(super) fn count(f: impl Fn(&crate::storage::tiered::cold_index::ColdIndex) -> usize) -> usize {
     with_shard_db(0, |db| db.cold_index.as_ref().map_or(0, f))
 }
 

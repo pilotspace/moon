@@ -11,8 +11,10 @@
 //! `MOON_TEST_AOF_FSYNC_STALL_MS` holds the writer before each everysec
 //! proactive fsync, and `--aof-fsync-timeout-ms 100` makes the generic LOCAL
 //! leg give up waiting long before the stall ends: the write is applied, its
-//! record is dropped, and the client gets `ERR AOF fsync failed`. That is the
-//! drop this status reports.
+//! record is dropped, and the client gets `MOONERR AOF backpressure: write
+//! applied in memory but not queued for persistence; the AOF writer is
+//! backlogged` (moon#1272; it used to read `ERR AOF fsync failed`). That is
+//! the drop this status reports.
 //!
 //! At `--shards 4` a write for a key another shard owns is a ROUTED leg, and
 //! since moon#769 the owning shard admits it against its writer BEFORE

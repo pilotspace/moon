@@ -9,11 +9,13 @@
 //! This module holds the pure decision state machine: after
 //! [`IdleParkState::ENTER_STREAK`] consecutive provably-no-op 1ms ticks, the
 //! loop stretches its park to [`IDLE_PARK_MS`] (10ms). The stretched period
-//! is chosen so that NO chore cadence changes: every sub-timer dispatch is
-//! `counter % {10,100,1000,5000}`, all multiples of 10, and idle entry is
-//! gated on a `counter % 10 == 0` boundary — stepping the counter by 10 per
-//! idle tick therefore hits every chore boundary exactly as the 1ms walk
-//! did. BLPOP timeout expiry (the tightest cadence, 10ms) is unaffected.
+//! equals the tightest chore cadence (BLPOP timeout expiry, 10ms), so no
+//! chore's timing changes materially: since moon#1280 every sub-timer is due
+//! by monotonic elapsed time (`shard::tick_cadence`), and a 10ms park makes
+//! a chore at most one park late. (Before, the chores were
+//! `counter % {10,100,1000,5000}` and idle entry was gated on a
+//! `counter % 10 == 0` boundary so a 10-stepped counter hit every boundary;
+//! the aligned gate is kept, harmlessly, to phase idle entry as before.)
 //!
 //! What DOES change while parked idle, by design and documented in the
 //! issue: the shard's cached clock refreshes every 10ms instead of every
@@ -42,9 +44,9 @@
 //! Escape hatch: `MOON_IDLE_PARK=0` pins the loop to the fixed 1ms period
 //! (same-binary A/B knob, mirroring the other `MOON_*` diagnostics).
 
-/// Stretched park period while idle, in milliseconds. Must divide every
-/// counter-based chore cadence (10/100/1000/5000) and equal the tightest
-/// one (block-timeout, 10ms) so no chore's timing changes while idle.
+/// Stretched park period while idle, in milliseconds. Equal to the tightest
+/// chore cadence (block-timeout, 10ms) so no chore runs later than one
+/// cadence while idle.
 pub(crate) const IDLE_PARK_MS: u64 = 10;
 
 /// Pure state machine deciding when the shard loop may stretch its park.

@@ -22,8 +22,9 @@ pub struct MonoioInterval(pub(crate) monoio::time::Interval);
 impl RuntimeTimer for MonoioTimer {
     type Interval = MonoioInterval;
 
+    /// Skips missed ticks (moon#1280) — see [`crate::runtime::interval`].
     fn interval(period: Duration) -> Self::Interval {
-        MonoioInterval(monoio::time::interval(period))
+        MonoioInterval(crate::runtime::interval::monoio_interval(period))
     }
 
     fn sleep(duration: Duration) -> Pin<Box<dyn Future<Output = ()>>> {

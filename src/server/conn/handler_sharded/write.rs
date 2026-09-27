@@ -317,6 +317,18 @@ fn mq_write_gate(
     use crate::storage::eviction::{EvictionRun, evict_to_budget};
     let rt = ctx.runtime_config.read();
     let budget = ctx.shard_databases.elastic_budget(ctx.shard_id);
+    // Plain-dropped victims are DELs on the AOF and the replica stream
+    // (round-2b review MAJOR-3), as on the monoio gates.
+    let mut report_eviction_del = |key: &[u8]| {
+        crate::replication::reason_del::record_reason_del_conn(
+            &ctx.repl_state,
+            ctx.shard_id,
+            ctx.num_shards,
+            ctx.aof_pool.as_ref(),
+            db_index,
+            key,
+        );
+    };
     if let Some(ref sender) = ctx.spill_sender {
         let mut fid = ctx.spill_file_id.get();
         let dir = ctx
@@ -326,12 +338,20 @@ fn mq_write_gate(
         let res = evict_to_budget(
             db,
             &rt,
-            EvictionRun::async_spill(sender, dir, &mut fid, db_index, None).budget(budget),
+            EvictionRun::async_spill(sender, dir, &mut fid, db_index, None)
+                .budget(budget)
+                .report(&mut report_eviction_del),
         );
         ctx.spill_file_id.set(ctx.spill_file_id.get().max(fid));
         res?;
     } else {
-        evict_to_budget(db, &rt, EvictionRun::plain().budget(budget))?;
+        evict_to_budget(
+            db,
+            &rt,
+            EvictionRun::plain()
+                .budget(budget)
+                .report(&mut report_eviction_del),
+        )?;
     }
     crate::storage::db_quota::check_db_maxmemory_for_command(db, db_index, &rt, b"MQ")
 }
@@ -729,11 +749,12 @@ pub(super) async fn try_handle_multi_exec(
                                 // under everysec/no.
                                 if r.wrote {
                                     if let Some(ref pool) = ctx.aof_pool {
-                                        if pool.fsync_barrier(s).await.is_err() {
+                                        if let Err(ack) = pool.fsync_barrier(s).await {
                                             exec_publishes.clear();
-                                            responses.push(Frame::Error(Bytes::from_static(
-                                                crate::persistence::aof::AOF_FSYNC_ERR,
-                                            )));
+                                            // moon#1272: backlog is not a failed fsync.
+                                            responses.push(
+                                                crate::persistence::aof::barrier_refusal_frame(ack),
+                                            );
                                             return true;
                                         }
                                     }
@@ -881,8 +902,7 @@ pub(super) async fn try_handle_multi_exec(
             // suspend unless the writer channel is full; only the barrier waits.
             let persisted =
                 crate::server::conn::shared::persist_txn_aof(ctx, aof_entries, false, fold_stamp)
-                    .await
-                    .is_ok();
+                    .await;
             // moon#606: raise the wakes the body recorded. A producer queued
             // inside MULTI reaches none of the live write path's hooks, so
             // without this a `MULTI ; LPUSH k v ; EXEC` left a client blocked
@@ -896,7 +916,7 @@ pub(super) async fn try_handle_multi_exec(
             // reported as an error, not rolled back), so a waiter left asleep
             // would answer null for a key that demonstrably has data.
             crate::blocking::wakeup::wake_recorded(&ctx.blocking_registry, exec_wakes.drain(..));
-            if !persisted {
+            if let Err(refusal) = persisted {
                 conn.command_queue.clear();
                 // Durability could not be guaranteed: report the error and
                 // suppress any queued PUBLISH fan-out — the client sees EXEC
@@ -904,9 +924,9 @@ pub(super) async fn try_handle_multi_exec(
                 // Its queued intercepts do not run either, exactly as on the
                 // owner-routed path above when the owner's append is lost.
                 exec_publishes.clear();
-                responses.push(Frame::Error(Bytes::from_static(
-                    crate::persistence::aof::AOF_FSYNC_ERR,
-                )));
+                // moon#1272: writer backlog (`AOF_BACKLOG_ERR`) is told apart
+                // from a write/fsync failure (`AOF_FSYNC_ERR`).
+                responses.push(Frame::Error(Bytes::from_static(refusal)));
                 return true;
             }
             // moon#639: fill the slots the executor left for connection-level

@@ -441,7 +441,7 @@ fn without_an_aof_a_file_emptied_before_a_snapshot_is_released_by_it() {
         }
         // The FLUSHALL save, or a BGSAVE, starts and succeeds before the
         // next interval sweep: the shard's start hook, then its finish.
-        super::note_snapshot_started(&live.shared);
+        let _ = super::note_snapshot_started(&live.shared);
         note_snapshot_finished(true);
         // The event loop sweeps right after a successful snapshot.
         super::sweep_after_snapshot(
@@ -474,7 +474,7 @@ fn with_an_aof_the_snapshot_hooks_touch_nothing() {
         for (k, _) in keys("k", 10) {
             assert_eq!(run("DEL", &[&k]), Frame::Integer(1));
         }
-        super::note_snapshot_started(&live.shared);
+        let _ = super::note_snapshot_started(&live.shared);
         assert!(!live.held(OLD), "the start hook is off with an AOF");
         super::sweep_after_snapshot(
             &live.shared,
@@ -597,4 +597,67 @@ fn a_top_level_fold_releases_nothing_on_another_shard() {
     })
     .join()
     .expect("test thread");
+}
+
+/// moon#1279 (review F4), through the real functions: a file spilled AFTER
+/// boot and emptied before the first orphan sweep. With the boot view the
+/// shard now takes before its loop (`observe_boot_fold_view`), the hold's
+/// baseline is the boot counter and the first sweep unlinks the file. The
+/// control — no boot view, the first view taken by that sweep (monoio's
+/// first sweep ran one interval after boot) — holds it as if inherited, and
+/// with no fold due nothing ever released it.
+#[test]
+fn a_file_spilled_after_boot_is_not_held_as_if_inherited() {
+    for boot_view in [true, false] {
+        // `Live::start` installs the shard slice: one per thread.
+        std::thread::spawn(move || boot_view_case(boot_view))
+            .join()
+            .expect("case thread");
+    }
+}
+
+fn boot_view_case(boot_view: bool) {
+    {
+        let mut live = Live::start();
+        if boot_view {
+            super::observe_boot_fold_view(&live.shared, 0, Some(&live.pool), live.counter.get());
+        }
+        // After boot: spill `n00` into a new file (the counter moves past
+        // it), then DEL it — the file is zero-ref before any sweep ran.
+        let fresh = live.counter.get();
+        spill(&live.dir, &mut live.manifest, fresh, &keys("n", 1));
+        live.counter.set(fresh + 1);
+        with_shard_db(0, |db| {
+            let ci = db.cold_index.as_mut().expect("cold index");
+            ci.insert(
+                Bytes::from_static(b"n00"),
+                crate::storage::tiered::cold_index::ColdLocation {
+                    file_id: fresh,
+                    page_idx: 0,
+                    slot_idx: 0,
+                    ttl_ms: None,
+                    value_type: ValueType::String,
+                },
+            );
+            assert!(ci.remove(b"n00"));
+        });
+        live.sweep(true);
+        if boot_view {
+            assert!(
+                !live.held(fresh),
+                "boot view: the post-boot file is not held"
+            );
+            assert!(
+                !heap(&live.dir, fresh).exists(),
+                "boot view: the first sweep unlinks the emptied post-boot file"
+            );
+        } else {
+            assert!(
+                live.held(fresh),
+                "control: without the boot view the first sweep's baseline covers it"
+            );
+            assert!(heap(&live.dir, fresh).exists());
+        }
+        drop(live.tmp);
+    }
 }

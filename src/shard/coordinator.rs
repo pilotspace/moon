@@ -495,7 +495,8 @@ async fn run_on_owner(
 /// fsync and could fail a no-op with `AOF_FSYNC_ERR`). Sets
 /// `*local_barrier_pending` when the append rides group commit under
 /// `appendfsync=always` (the handler owes ONE `fsync_barrier(my_shard)` per
-/// batch). Returns `AOF_FSYNC_ERR` when the append never reached the writer.
+/// batch). Returns `append_refusal_reply(ack)` when the append never reached
+/// the writer (moon#1272: backlog and write failure answer different texts).
 // Mirrors run_on_owner's routing params + the persistence context; bundling
 // them into a struct would obscure the 1:1 correspondence with run_on_owner.
 #[allow(clippy::too_many_arguments)]
@@ -548,9 +549,7 @@ async fn run_on_owner_persist(
         .await
         {
             Ok(needs_barrier) => *local_barrier_pending |= needs_barrier,
-            Err(()) => {
-                return Frame::Error(Bytes::from_static(crate::persistence::aof::AOF_FSYNC_ERR));
-            }
+            Err(ack) => return crate::persistence::aof::append_refusal_frame(ack),
         }
     }
     resp
@@ -612,7 +611,7 @@ async fn run_local_persist(
     .await
     {
         Ok(needs_barrier) => *local_barrier_pending |= needs_barrier,
-        Err(()) => return Frame::Error(Bytes::from_static(crate::persistence::aof::AOF_FSYNC_ERR)),
+        Err(ack) => return crate::persistence::aof::append_refusal_frame(ack),
     }
     resp
 }
@@ -643,8 +642,10 @@ type ReplStateRef<'a> =
 ///     just the local keys (never the full scattered command — `my_shard` does
 ///     not own the remote keys and replay would misapply them on this shard).
 ///
-/// Returns `Err(())` when the append never reached the writer so the caller
-/// surfaces `AOF_FSYNC_ERR` instead of a false `+OK` (design-for-failure).
+/// Returns `Err(ack)` when the append never reached the writer so the caller
+/// surfaces `append_refusal_reply(ack)` — `AOF_BACKLOG_ERR` for writer
+/// backlog (moon#1272), `AOF_FSYNC_ERR` for a write failure — instead of a
+/// false `+OK` (design-for-failure).
 ///
 /// # Replication (moon#815)
 ///
@@ -682,7 +683,7 @@ async fn persist_local_leg(
     db: usize,
     serialized: Bytes,
     fold_stamp: crate::persistence::aof::FoldEpoch,
-) -> Result<bool, ()> {
+) -> Result<bool, crate::persistence::aof::AofAck> {
     let repl_active = crate::replication::state::fanout_active_for(repl_state);
     if !repl_active && aof_pool.is_none() {
         return Ok(false);
@@ -708,13 +709,10 @@ async fn persist_local_leg(
     let Some(pool) = aof_pool else {
         return Ok(false);
     };
-    match pool
-        .send_append_group(my_shard, lsn, db, serialized, fold_stamp)
+    // The refusal reason is kept: writer backlog and write/fsync failure
+    // answer different texts (moon#1272, `append_refusal_reply`).
+    pool.send_append_group(my_shard, lsn, db, serialized, fold_stamp)
         .await
-    {
-        Ok(needs_barrier) => Ok(needs_barrier),
-        Err(_) => Err(()),
-    }
 }
 
 /// The AOF fold epoch of `my_shard`'s writer, or the initial epoch when AOF is
@@ -1631,7 +1629,7 @@ async fn coordinate_mset(
                 *local_barrier_pending |= needs_barrier;
                 resp
             }
-            Err(()) => Frame::Error(Bytes::from_static(crate::persistence::aof::AOF_FSYNC_ERR)),
+            Err(ack) => crate::persistence::aof::append_refusal_frame(ack),
         };
     }
 
@@ -1642,7 +1640,7 @@ async fn coordinate_mset(
     let pending_shards =
         send_owner_legs(groups, my_shard, db_index, dispatch_tx, spsc_notifiers).await;
 
-    let mut local_append_failed = false;
+    let mut local_append_refusal: Option<crate::persistence::aof::AofAck> = None;
     // An error from the local slice (as the all-local fast path above
     // checks): nothing was written, so nothing is logged and the slice does
     // not count as applied.
@@ -1678,7 +1676,7 @@ async fn coordinate_mset(
         // leg has been dispatched and drained, as before.
         match persist_local_group(aof_pool, repl_state, my_shard, db_index, &local_group).await {
             Ok(needs_barrier) => *local_barrier_pending |= needs_barrier,
-            Err(()) => local_append_failed = true,
+            Err(ack) => local_append_refusal = Some(ack),
         }
     }
 
@@ -1710,8 +1708,8 @@ async fn coordinate_mset(
         }
     }
 
-    if local_append_failed {
-        return Frame::Error(Bytes::from_static(crate::persistence::aof::AOF_FSYNC_ERR));
+    if let Some(ack) = local_append_refusal {
+        return crate::persistence::aof::append_refusal_frame(ack);
     }
     if let Some(err) = leg_err {
         return refused_leg_error(err, applied_parts > 0);
@@ -1804,7 +1802,7 @@ async fn persist_local_group(
     my_shard: usize,
     db_index: usize,
     group: &[Frame],
-) -> Result<bool, ()> {
+) -> Result<bool, crate::persistence::aof::AofAck> {
     if aof_pool.is_none() && !crate::replication::state::fanout_active_for(repl_state) {
         return Ok(false);
     }
@@ -1915,11 +1913,7 @@ async fn coordinate_msetnx(
             .await
             {
                 Ok(needs_barrier) => *local_barrier_pending |= needs_barrier,
-                Err(()) => {
-                    return Frame::Error(Bytes::from_static(
-                        crate::persistence::aof::AOF_FSYNC_ERR,
-                    ));
-                }
+                Err(ack) => return crate::persistence::aof::append_refusal_frame(ack),
             }
         }
         resp
@@ -1999,11 +1993,7 @@ async fn coordinate_multi_del_or_exists(
                 .await
             {
                 Ok(needs_barrier) => *local_barrier_pending |= needs_barrier,
-                Err(()) => {
-                    return Frame::Error(Bytes::from_static(
-                        crate::persistence::aof::AOF_FSYNC_ERR,
-                    ));
-                }
+                Err(ack) => return crate::persistence::aof::append_refusal_frame(ack),
             }
         }
         return resp;
@@ -2038,15 +2028,13 @@ async fn coordinate_multi_del_or_exists(
                     .await
                 {
                     Ok(needs_barrier) => *local_barrier_pending |= needs_barrier,
-                    Err(()) => {
+                    Err(ack) => {
                         // Drain the dispatched legs first: their owners apply
                         // them whether or not this shard answers.
                         for reply_rx in pending_shards {
                             let _ = recv_reply_bounded(reply_rx).await;
                         }
-                        return Frame::Error(Bytes::from_static(
-                            crate::persistence::aof::AOF_FSYNC_ERR,
-                        ));
+                        return crate::persistence::aof::append_refusal_frame(ack);
                     }
                 }
             }
@@ -3922,11 +3910,10 @@ pub async fn coordinate_swapdb(
                 .await
             {
                 Ok(((), needs_barrier)) => {
-                    if needs_barrier && pool.fsync_barrier(my_shard).await.is_err() {
-                        local_durability_err = Some(Frame::Error(bytes::Bytes::from_static(
-                            b"ERR SWAPDB durability unconfirmed on this shard \
-                              (fsync barrier failed after the swap was already applied)",
-                        )));
+                    if needs_barrier && let Err(ack) = pool.fsync_barrier(my_shard).await {
+                        local_durability_err = Some(
+                            crate::persistence::aof::swapdb_barrier_refusal_frame(ack, true),
+                        );
                     }
                 }
                 // The record was never accepted and nothing was swapped.
@@ -3970,13 +3957,12 @@ pub async fn coordinate_swapdb(
         match rx.recv().await {
             Ok(()) => {
                 if let Some(pool) = aof_pool
-                    && pool.fsync_barrier(target).await.is_err()
+                    && let Err(ack) = pool.fsync_barrier(target).await
                     && leg_err.is_none()
                 {
-                    leg_err = Some(Frame::Error(bytes::Bytes::from_static(
-                        b"ERR SWAPDB durability unconfirmed on a remote shard \
-                          (fsync barrier failed after the swap was already applied)",
-                    )));
+                    leg_err = Some(crate::persistence::aof::swapdb_barrier_refusal_frame(
+                        ack, false,
+                    ));
                 }
             }
             Err(_) => {

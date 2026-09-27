@@ -452,9 +452,9 @@ fn routed_and_script_captures_cover_every_written_key() {
     snapshot_cow::disarm();
     assert_eq!(got, want, "cow_intercept");
 
-    // Script `redis.call`.
+    // Script `redis.call`: the same walker, every written key.
     snapshot_cow::arm();
-    let call = frames(&[b"DEL", b"a", b"b", b"c", b"d"]);
+    let call = frames(&[b"MSET", b"a", b"1", b"b", b"1", b"c", b"1", b"d", b"1"]);
     snapshot_cow::capture_command_pre_image(&db, 0, &call);
     let got = keys_of(
         snapshot_cow::pending_for_test(),
@@ -462,6 +462,26 @@ fn routed_and_script_captures_cover_every_written_key() {
     );
     snapshot_cow::disarm();
     assert_eq!(got, want, "script redis.call");
+
+    // moon#1269: a script's `DEL` copies nothing up front — the command
+    // hands each hot entry it removes to the epoch by MOVE. `a b c` exist
+    // (their entries are captured), `d` is absent (nothing to capture: the
+    // image holds only what existed).
+    snapshot_cow::arm();
+    let call = frames(&[b"DEL", b"a", b"b", b"c", b"d"]);
+    snapshot_cow::capture_command_pre_image(&db, 0, &call);
+    assert!(
+        snapshot_cow::pending_for_test().is_empty(),
+        "DEL copied a value it is about to remove"
+    );
+    let reply = crate::command::key::del(&mut db, &call[1..]);
+    assert_eq!(reply, Frame::Integer(3));
+    let got = keys_of(
+        snapshot_cow::pending_for_test(),
+        snapshot_cow::pending_tombstones_for_test(),
+    );
+    snapshot_cow::disarm();
+    assert_eq!(got, want[..3].to_vec(), "script DEL: moved at the removal");
 }
 
 /// A BLMOVE parked on an empty source is served by the WAKER when a later

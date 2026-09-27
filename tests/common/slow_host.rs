@@ -12,8 +12,9 @@
 //! 2. **A write moon refused under AOF backpressure is retried**, with
 //!    backoff, and counted. Under `appendfsync everysec` a write waits at most
 //!    `--aof-fsync-timeout-ms` for room in the writer's channel and is then
-//!    refused with the `-ERR AOF fsync failed; write not durable` text,
-//!    although no fsync ran (moon#1272). A filler that discards its replies
+//!    refused with a `-MOONERR AOF backpressure: ...` reply (before moon#1272
+//!    it read `-ERR AOF fsync failed; write not durable`, although no fsync
+//!    ran). A filler that discards its replies
 //!    turns that into a missing key or a missing spill much later; one that
 //!    asserts on it fails on a slow disk. The count is reported, never
 //!    swallowed.
@@ -61,11 +62,14 @@ pub fn pipeline_budget(writes: usize) -> Duration {
         .saturating_add(STALL_MARGIN)
 }
 
-/// The text of moon's AOF backpressure refusal (moon#1272). The same text
-/// also reports a real fsync failure; the two cannot be told apart from the
-/// reply, which is why a persisting refusal fails the caller at its deadline
-/// instead of being retried forever.
-pub const AOF_REFUSAL: &str = "AOF fsync failed; write not durable";
+/// The leading text of every moon AOF backpressure refusal: the generic
+/// leg's `--aof-fsync-timeout-ms` refusal (`AOF_BACKLOG_ERR`, moon#1272), the
+/// SPSC/inline 5 ms bound (`AOF_APPEND_LOST_ERR`) and moon#769's routed
+/// refusal. A real fsync failure (`-ERR AOF fsync failed; write not durable`)
+/// no longer matches, so it is never retried as if it were backpressure. A
+/// refusal that persists still fails the caller at its deadline instead of
+/// being retried forever.
+pub const AOF_REFUSAL: &str = "MOONERR AOF backpressure";
 
 /// Split a buffer holding complete top-level RESP replies into those replies.
 pub fn split_replies(buf: &str) -> Vec<&str> {
@@ -151,7 +155,7 @@ pub fn write_all(
             assert_eq!(replies.len(), pending.len(), "framing: {raw:.300}");
             let mut refused = Vec::new();
             for (cmd, reply) in pending.iter().zip(&replies) {
-                if reply.starts_with('-') && reply.contains(AOF_REFUSAL) {
+                if reply.starts_with('-') && reply[1..].starts_with(AOF_REFUSAL) {
                     stats.aof_refused += 1;
                     refused.push(*cmd);
                 } else if reply.starts_with("-OOM") {

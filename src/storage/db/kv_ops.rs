@@ -412,6 +412,18 @@ impl Database {
     /// deletes it before DEL looks). The removed hot entry, when present, is
     /// also returned — `DEL` tells an expired one by it.
     pub fn remove_counting_cold(&mut self, key: &[u8]) -> (bool, Option<Entry>) {
+        let (live, hot) = self.remove_counting_cold_costed(key);
+        (live, hot.map(|(entry, _)| entry))
+    }
+
+    /// [`Self::remove_counting_cold`], also returning the bytes the removed
+    /// hot entry was credited with (`entry_overhead`): `DEL` hands it to a
+    /// save as the pre-image's size, so the value is not walked a second
+    /// time (moon#1269).
+    pub(crate) fn remove_counting_cold_costed(
+        &mut self,
+        key: &[u8],
+    ) -> (bool, Option<(Entry, usize)>) {
         let now_ms = self.cached_now_ms;
         let cold_alive = self
             .cold_index
@@ -422,8 +434,8 @@ impl Database {
         // existing: the write was acked and nothing has deleted it yet.
         let inflight_alive = self.spill_inflight_alive(key, now_ms);
         let had_cold = self.remove_cold_only(key);
-        let hot = self.remove_hot(key);
-        let hot_alive = hot.as_ref().is_some_and(|e| !e.is_expired_at(now_ms));
+        let hot = self.remove_hot_costed(key);
+        let hot_alive = hot.as_ref().is_some_and(|(e, _)| !e.is_expired_at(now_ms));
         let live = hot_alive || (had_cold && cold_alive) || inflight_alive;
         // moon#1232: only a LIVE key's removal is a change. An absent key is
         // none, and an expired one is expiry's reap, which redis does not
@@ -448,6 +460,13 @@ impl Database {
     /// [`Self::unlink`], classified: a hot copy whose TTL had passed is
     /// reaped through the same lazy-free path, as [`KeyDeletion::Expired`].
     pub(crate) fn unlink_key(&mut self, key: &[u8]) -> KeyDeletion {
+        self.unlink_key_capturing(key, self.db_index)
+    }
+
+    /// [`Self::unlink_key`], a save's pre-image of the removed entry filed
+    /// under epoch database `slot` (moon#1269; the UNLINK command passes the
+    /// index its dispatch hook was given).
+    pub(crate) fn unlink_key_capturing(&mut self, key: &[u8], slot: usize) -> KeyDeletion {
         let now_ms = self.cached_now_ms;
         let cold_alive = self
             .cold_index
@@ -456,7 +475,7 @@ impl Database {
             .is_some_and(|loc| loc.ttl_ms.is_none_or(|ttl| now_ms <= ttl));
         let inflight_alive = self.spill_inflight_alive(key, now_ms);
         let had_cold = self.remove_cold_only(key);
-        let hot = self.remove_hot_lazily(key);
+        let hot = self.remove_hot_lazily_capturing(key, Some(slot));
         if hot == Some(false) || (had_cold && cold_alive) || inflight_alive {
             // moon#1232: as `remove_counting_cold` — only a live key counts.
             crate::admin::metrics_setup::record_keyspace_change();
@@ -487,12 +506,37 @@ impl Database {
     /// stale-early pairs self-heal, see `hash_expiry_index`).
     /// `None` when no hot entry, else whether it had expired (moon#1234).
     fn remove_hot_lazily(&mut self, key: &[u8]) -> Option<bool> {
+        self.remove_hot_lazily_capturing(key, None)
+    }
+
+    /// [`Self::remove_hot_lazily`]; with `capture` = the epoch slot (UNLINK, moon#1269) a save
+    /// that still needs the key's epoch-start state takes the removed entry
+    /// as its pre-image by MOVE — the dispatch hook skipped the deep copy.
+    /// Its bytes are then credited here (a read-only walk, no allocation)
+    /// instead of by the lazy-free drain, which never sees it; the snapshot
+    /// frees it off the shard thread once written.
+    fn remove_hot_lazily_capturing(&mut self, key: &[u8], capture: Option<usize>) -> Option<bool> {
         let entry = self.data.remove(key)?;
         let expired = entry.is_expired_at(self.cached_now_ms);
         if entry.has_expiry() {
             self.expiry_index_remove(entry.expires_at_ms(), key);
         }
         self.forget_removed_hash_ttl(key, &entry);
+        let entry = if let Some(slot) = capture {
+            let mut credit = 0usize;
+            match crate::persistence::snapshot_cow::capture_removed_then(slot, key, entry, |e| {
+                credit = super::entry_overhead_len(key.len(), e);
+                credit
+            }) {
+                crate::persistence::snapshot_cow::Removed::Held => {
+                    self.used_memory = self.used_memory.saturating_sub(credit);
+                    return Some(expired);
+                }
+                crate::persistence::snapshot_cow::Removed::Dispose(e) => e,
+            }
+        } else {
+            entry
+        };
         self.lazy_free_or_drop(key.len(), entry, true);
         Some(expired)
     }
@@ -573,8 +617,14 @@ impl Database {
 
     #[inline]
     pub(super) fn remove_hot(&mut self, key: &[u8]) -> Option<Entry> {
+        self.remove_hot_costed(key).map(|(entry, _)| entry)
+    }
+
+    /// [`Self::remove_hot`], also returning the bytes credited.
+    fn remove_hot_costed(&mut self, key: &[u8]) -> Option<(Entry, usize)> {
         if let Some(entry) = self.data.remove(key) {
-            self.used_memory = self.used_memory.saturating_sub(entry_overhead(key, &entry));
+            let cost = entry_overhead(key, &entry);
+            self.used_memory = self.used_memory.saturating_sub(cost);
             // moon#541: unindex — the removed entry knows its own pair.
             if entry.has_expiry() {
                 self.expiry_index_remove(entry.expires_at_ms(), key);
@@ -582,7 +632,7 @@ impl Database {
             // moon#543: same for the hash-field index (best-effort; one
             // `is_empty` load when no field TTL exists anywhere).
             self.hash_expiry_index_forget(key, &entry);
-            Some(entry)
+            Some((entry, cost))
         } else {
             None
         }

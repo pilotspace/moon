@@ -21,8 +21,9 @@ pub struct TokioInterval(pub(crate) tokio::time::Interval);
 impl RuntimeTimer for TokioTimer {
     type Interval = TokioInterval;
 
+    /// Skips missed ticks (moon#1280) — see [`crate::runtime::interval`].
     fn interval(period: Duration) -> Self::Interval {
-        TokioInterval(tokio::time::interval(period))
+        TokioInterval(crate::runtime::interval::tokio_interval(period))
     }
 
     fn sleep(duration: Duration) -> Pin<Box<dyn Future<Output = ()>>> {

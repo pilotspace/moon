@@ -1781,9 +1781,9 @@ pub(crate) async fn handle_connection_sharded_inner<
                                 &blocking_response,
                                 ctx.num_shards,
                             )
-                        && pool.fsync_barrier(owner).await.is_err()
+                        && let Err(ack) = pool.fsync_barrier(owner).await
                     {
-                        blocking_response = Frame::Error(Bytes::from_static(aof::AOF_FSYNC_ERR));
+                        blocking_response = aof::barrier_refusal_frame(ack);
                     }
                         let blocking_response = apply_resp3_conversion(
                             cmd,
@@ -2365,7 +2365,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                             // AOF only on actual success (:1). Matches handler_single
                             // — `:0` (key absent) is a no-op and must not log.
                             // H1: durable path awaits fsync under appendfsync=always.
-                            let mut aof_failed = false;
+                            let mut aof_refusal: Option<crate::persistence::aof::AofAck> = None;
                             if matches!(response, Frame::Integer(1)) {
                                 if let Some(ref bytes) = aof_bytes {
                                     if let Some(ref pool) = ctx.aof_pool {
@@ -2387,7 +2387,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                                                 local_leg_write_idxs.push(responses.len())
                                             }
                                             Ok(false) => {}
-                                            Err(_) => aof_failed = true,
+                                            Err(ack) => aof_refusal = Some(ack),
                                         }
                                     }
                                 }
@@ -2403,8 +2403,9 @@ pub(crate) async fn handle_connection_sharded_inner<
                                     &response,
                                 );
                             }
-                            responses.push(if aof_failed {
-                                Frame::Error(Bytes::from_static(aof::AOF_FSYNC_ERR))
+                            responses.push(if let Some(ack) = aof_refusal {
+                                // moon#1272: writer backlog is not an fsync failure.
+                                aof::append_refusal_frame(ack)
                             } else {
                                 response
                             });
@@ -2466,7 +2467,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                                 // AOF only on actual success (:1). Matches handler_single
                                 // — `:0` (key absent / dst exists w/o REPLACE) is a no-op.
                                 // H1: durable path awaits fsync under appendfsync=always.
-                                let mut aof_failed = false;
+                                let mut aof_refusal: Option<crate::persistence::aof::AofAck> = None;
                                 if matches!(response, Frame::Integer(1)) {
                                     if let Some(ref bytes) = aof_bytes {
                                         if let Some(ref pool) = ctx.aof_pool {
@@ -2488,7 +2489,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                                                     local_leg_write_idxs.push(responses.len())
                                                 }
                                                 Ok(false) => {}
-                                                Err(_) => aof_failed = true,
+                                                Err(ack) => aof_refusal = Some(ack),
                                             }
                                         }
                                     }
@@ -2502,8 +2503,9 @@ pub(crate) async fn handle_connection_sharded_inner<
                                         &response,
                                     );
                                 }
-                                responses.push(if aof_failed {
-                                    Frame::Error(Bytes::from_static(aof::AOF_FSYNC_ERR))
+                                responses.push(if let Some(ack) = aof_refusal {
+                                    // moon#1272: writer backlog is not an fsync failure.
+                                    aof::append_refusal_frame(ack)
                                 } else {
                                     response
                                 });
@@ -2575,6 +2577,21 @@ pub(crate) async fn handle_connection_sharded_inner<
                                     // db write lock, so they cannot race the persistence-tick
                                     // cascade on the same key.
                                     let budget = ctx.shard_databases.elastic_budget(ctx.shard_id);
+                                    // Every plain-dropped victim is a DEL on the AOF and the
+                                    // replica stream, as on monoio's `run_write_eviction_gate`
+                                    // (round-2b review MAJOR-3: without it the AOF replayed
+                                    // every evicted key back after a restart).
+                                    let sel_db = conn.selected_db;
+                                    let mut report_eviction_del = |key: &[u8]| {
+                                        crate::replication::reason_del::record_reason_del_conn(
+                                            &ctx.repl_state,
+                                            ctx.shard_id,
+                                            ctx.num_shards,
+                                            ctx.aof_pool.as_ref(),
+                                            sel_db,
+                                            key,
+                                        );
+                                    };
                                     let evict_result = if let Some(ref sender) = ctx.spill_sender {
                                         let mut fid = ctx.spill_file_id.get();
                                         let dir = ctx
@@ -2591,12 +2608,19 @@ pub(crate) async fn handle_connection_sharded_inner<
                                                 conn.selected_db,
                                                 None,
                                             )
-                                            .budget(budget),
+                                            .budget(budget)
+                                            .report(&mut report_eviction_del),
                                         );
                                         ctx.spill_file_id.set(ctx.spill_file_id.get().max(fid));
                                         res
                                     } else {
-                                        evict_to_budget(db, &rt, EvictionRun::plain().budget(budget))
+                                        evict_to_budget(
+                                            db,
+                                            &rt,
+                                            EvictionRun::plain()
+                                                .budget(budget)
+                                                .report(&mut report_eviction_del),
+                                        )
                                     };
                                     // WS6 fix (HIGH, adversarial review 2026-07-08): a
                                     // command that can only shrink memory (HDEL, SREM,
@@ -2907,10 +2931,10 @@ pub(crate) async fn handle_connection_sharded_inner<
                                     {
                                         Ok(true) => aof_barrier_pending = true,
                                         Ok(false) => {}
-                                        Err(_) => {
-                                            response = Frame::Error(Bytes::from_static(
-                                                aof::AOF_FSYNC_ERR,
-                                            ));
+                                        Err(ack) => {
+                                            // moon#1272: `ChannelFull` (writer backlog) answers
+                                            // `AOF_BACKLOG_ERR`, a write/fsync failure `AOF_FSYNC_ERR`.
+                                            response = aof::append_refusal_frame(ack);
                                             aof_failed = true;
                                             break;
                                         }
@@ -3383,11 +3407,11 @@ pub(crate) async fn handle_connection_sharded_inner<
                         // durable storage. Under EverySec/No this is a zero-cost noop.
                         if !write_resp_idxs.is_empty() {
                             if let Some(ref pool) = ctx.aof_pool {
-                                if pool.fsync_barrier(target).await.is_err() {
+                                if let Err(ack) = pool.fsync_barrier(target).await {
+                                    // moon#1272: a backlogged writer is not a failed fsync.
+                                    let err = aof::barrier_refusal_reply(ack);
                                     for idx in write_resp_idxs {
-                                        responses[idx] = Frame::Error(
-                                            Bytes::from_static(aof::AOF_FSYNC_ERR),
-                                        );
+                                        responses[idx] = Frame::Error(Bytes::from_static(err));
                                     }
                                 }
                             }

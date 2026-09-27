@@ -27,6 +27,27 @@ impl AofManifest {
     /// shard-1 write fails after shard-0 succeeded), all already-created shard
     /// base RDB files are deleted before returning the error.
     pub fn initialize_multi(dir: &Path, num_shards: u16) -> std::io::Result<Self> {
+        // Per-shard empty RDB. Single Database::default() inside a 1-element
+        // slice matches `initialize()`'s empty-RDB shape for each shard.
+        let empty_dbs: [crate::storage::Database; 0] = [];
+        let empty_rdb = crate::persistence::rdb::save_to_bytes(&empty_dbs)
+            .map_err(|e| std::io::Error::other(format!("empty RDB serialize: {e}")))?;
+        Self::initialize_multi_with_bases(dir, num_shards, |_| Ok(empty_rdb.clone()))
+    }
+
+    /// [`Self::initialize_multi`] with each shard's base RDB supplied by
+    /// `base_for` instead of an empty one: the PerShard twin of
+    /// [`Self::initialize_with_base`]. A boot that loaded state from a
+    /// snapshot and has no manifest yet (the `--appendonly no` -> `yes`
+    /// switch) must capture that state as the generation's base, or the next
+    /// boot — which replays base + incr only — loses every key the snapshot
+    /// held (moon#1281 review round 2, R2-2). Same idempotency pre-flight and
+    /// rollback as `initialize_multi`.
+    pub fn initialize_multi_with_bases(
+        dir: &Path,
+        num_shards: u16,
+        mut base_for: impl FnMut(u16) -> std::io::Result<Vec<u8>>,
+    ) -> std::io::Result<Self> {
         if num_shards == 0 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -60,12 +81,6 @@ impl AofManifest {
             ));
         }
 
-        // Per-shard empty RDB. Single Database::default() inside a 1-element
-        // slice matches `initialize()`'s empty-RDB shape for each shard.
-        let empty_dbs: [crate::storage::Database; 0] = [];
-        let empty_rdb = crate::persistence::rdb::save_to_bytes(&empty_dbs)
-            .map_err(|e| std::io::Error::other(format!("empty RDB serialize: {e}")))?;
-
         // Track which shard directories were successfully created so we can
         // roll them back on partial failure.
         let mut created_shards: Vec<u16> = Vec::with_capacity(num_shards as usize);
@@ -77,9 +92,10 @@ impl AofManifest {
 
                 let base_path = manifest.shard_base_path(shard_id);
                 let tmp_path = base_path.with_extension("rdb.tmp");
+                let base_rdb = base_for(shard_id)?;
                 {
                     let mut f = std::fs::File::create(&tmp_path)?;
-                    f.write_all(&empty_rdb)?;
+                    f.write_all(&base_rdb)?;
                     f.sync_data()?;
                 }
                 std::fs::rename(&tmp_path, &base_path)?;
@@ -673,5 +689,42 @@ mod tests {
             "manifest file must contain 'version 2' (PerShard v2 header); got:\n{}",
             content
         );
+    }
+
+    /// moon#1281 review round 2 (R2-2): each shard's supplied base is what
+    /// lands on disk, so the next boot's base + incr replay sees the state
+    /// the generation was opened on.
+    #[test]
+    fn initialize_multi_with_bases_writes_each_shards_base() {
+        let dir = temp_dir();
+        let bases: Vec<Vec<u8>> = (0..3u16)
+            .map(|sid| {
+                let mut db = crate::storage::Database::new();
+                db.set_string(
+                    format!("k{sid}").as_bytes(),
+                    bytes::Bytes::from_static(b"v"),
+                );
+                crate::persistence::rdb::save_to_bytes(std::slice::from_ref(&db)).expect("rdb")
+            })
+            .collect();
+        let m = AofManifest::initialize_multi_with_bases(&dir, 3, |sid| {
+            Ok(bases[usize::from(sid)].clone())
+        })
+        .expect("initialize_multi_with_bases");
+        for sid in 0..3u16 {
+            let bytes = fs::read(m.shard_base_path(sid)).expect("base");
+            let mut loaded = vec![crate::storage::Database::new()];
+            let (keys, _) =
+                crate::persistence::rdb::load_from_bytes(&mut loaded, &bytes).expect("load");
+            assert_eq!(keys, 1, "shard {sid}");
+            assert!(
+                loaded[0].get(format!("k{sid}").as_bytes()).is_some(),
+                "shard {sid}"
+            );
+        }
+        let err = AofManifest::initialize_multi_with_bases(&dir, 3, |_| Ok(Vec::new()))
+            .expect_err("a second initialization must refuse");
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        fs::remove_dir_all(&dir).ok();
     }
 }

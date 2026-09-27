@@ -29,9 +29,11 @@ pub fn spawn_metrics_publisher() {
     use crate::admin::sse_stream::{MetricEvent, get_metrics_sender};
 
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_millis(1000));
+        let mut interval =
+            crate::runtime::interval::tokio_interval(std::time::Duration::from_millis(1000));
         let mut prev_ops: u64 = 0;
         let start = std::time::Instant::now();
+        let mut prev_at = start;
 
         loop {
             interval.tick().await;
@@ -42,8 +44,16 @@ pub fn spawn_metrics_publisher() {
             };
 
             let total_ops = total_commands_sum();
-            let ops_per_sec = total_ops.saturating_sub(prev_ops);
+            // moon#1280: a rate over the time that actually elapsed. After a
+            // stall the one (skipped-to) tick covers several seconds; the
+            // raw delta would report them as one second's worth.
+            let now = std::time::Instant::now();
+            let ops_per_sec = crate::admin::metrics_setup::rate_per_sec(
+                total_ops.saturating_sub(prev_ops),
+                now - prev_at,
+            );
             prev_ops = total_ops;
+            prev_at = now;
 
             let event = MetricEvent {
                 event: "server_stats",
@@ -79,7 +89,8 @@ pub fn spawn_metrics_publisher() {
 /// DOCTOR uses.
 pub fn spawn_moon_memory_publisher() {
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(15));
+        let mut interval =
+            crate::runtime::interval::tokio_interval(std::time::Duration::from_secs(15));
 
         loop {
             interval.tick().await;

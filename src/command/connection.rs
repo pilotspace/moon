@@ -438,9 +438,12 @@ fn info_raw(db: &Database, facts: &InstanceFacts) -> String {
     // operator must be able to see how much of it is ledger. Summed over
     // every shard and database; two relaxed loads.
     let (cold_dead_slots, cold_dead_slot_bytes) = crate::storage::tiered::dead_slots::totals();
+    // moon#1281 review F7: the no-AOF dead-slot record (8 B per slot).
+    let (cold_grave_slots, cold_grave_bytes) = crate::storage::tiered::slot_graves::totals();
     let _ = write!(
         sections,
-        "cold_dead_slots:{cold_dead_slots}\r\ncold_dead_slot_bytes:{cold_dead_slot_bytes}\r\n"
+        "cold_dead_slots:{cold_dead_slots}\r\ncold_dead_slot_bytes:{cold_dead_slot_bytes}\r\n\
+         cold_grave_slots:{cold_grave_slots}\r\ncold_grave_bytes:{cold_grave_bytes}\r\n"
     );
 
     // Allocator counters, Redis's `allocator_*` field names so existing
@@ -507,6 +510,7 @@ fn info_raw(db: &Database, facts: &InstanceFacts) -> String {
          aof_backpressure_dropped:{}\r\n\
          aof_backpressure_stalls:{}\r\n\
          aof_backpressure_refused:{}\r\n\
+         aof_append_backpressure_refusals:{}\r\n\
          aof_last_fsync_status:{}\r\n\
          aof_fsync_failures:{}\r\n\
          aof_last_append_status:{}\r\n\
@@ -520,7 +524,12 @@ fn info_raw(db: &Database, facts: &InstanceFacts) -> String {
          spill_completion_id_rejected:{}\r\n\
          spill_completion_marker_withdrawn:{}\r\n\
          spill_last_heartbeat_ms:{}\r\n\
-         spill_thread_alive:{}\r\n",
+         spill_thread_alive:{}\r\n\
+         spill_thread_restarts:{}\r\n\
+         spill_thread_degraded:{}\r\n\
+         spill_thread_rehydrated:{}\r\n\
+         cold_reclaim_files_given_up:{}\r\n\
+         cold_reclaim_disabled:{}\r\n",
         // moon#744: was a hardcoded `loading:0`. `any_shard_loading()` is a
         // process-wide counter precisely so INFO can answer this from a thread
         // that is not the recovering shard's -- nothing had ever read it.
@@ -576,6 +585,11 @@ fn info_raw(db: &Database, facts: &InstanceFacts) -> String {
         crate::persistence::aof::AOF_BACKPRESSURE_STALLS.load(std::sync::atomic::Ordering::Relaxed),
         crate::persistence::aof::AOF_BACKPRESSURE_REFUSED
             .load(std::sync::atomic::Ordering::Relaxed),
+        // moon#1272: writes refused because the AOF writer stayed backlogged
+        // past `--aof-fsync-timeout-ms` (or the rewrite overflow cap) — NOT
+        // fsync failures, which are counted in `aof_fsync_failures`.
+        crate::persistence::aof::AOF_APPEND_BACKPRESSURE_REFUSALS
+            .load(std::sync::atomic::Ordering::Relaxed),
         if crate::persistence::aof::aof_last_fsync_ok() {
             "ok"
         } else {
@@ -601,9 +615,22 @@ fn info_raw(db: &Database, facts: &InstanceFacts) -> String {
         crate::storage::tiered::spill_thread::spill_completion_id_rejected_total(),
         crate::storage::tiered::spill_thread::spill_completion_marker_withdrawn_total(),
         crate::storage::tiered::spill_thread::spill_last_heartbeat_ms(),
-        // Refs moon#1265: 0 once any shard's spill thread was found dead; it
-        // is not respawned, so that shard spills and compacts nothing more.
+        // moon#1265: 0 while any shard's spill thread is down (dead and not
+        // yet respawned, or degraded); respawns so far; shards whose restart
+        // budget is spent (they spill nothing more until a restart); and the
+        // in-flight payloads a death put back into RAM.
         u8::from(crate::storage::tiered::spill_thread::spill_threads_alive()),
+        crate::storage::tiered::spill_thread::spill_thread_restarts_total(),
+        crate::storage::tiered::spill_thread::spill_threads_degraded(),
+        crate::storage::tiered::spill_thread::spill_thread_rehydrated_total(),
+        // Spill files the cold reclaim will not compact again in this
+        // process: unreadable, undecodable, a failed write, or (moon#1265
+        // review) a compaction that killed the spill thread twice.
+        crate::storage::tiered::cold_reclaim::files_given_up_total(),
+        // Shards whose cold reclaim is off until a restart: their reclaim
+        // jobs kept killing the spill thread (moon#1265 review round 3). They
+        // still spill.
+        crate::storage::tiered::spill_thread::cold_reclaim_disabled_shards(),
     ));
     sections.push_str("\r\n");
 
@@ -706,7 +733,9 @@ fn info_raw(db: &Database, facts: &InstanceFacts) -> String {
          spsc_notify_wakes:{}\r\n\
          spsc_drain_renotify:{}\r\n\
          spsc_notify_skipped:{}\r\n\
-         ft_search_cooperative_yields_total:{}\r\n",
+         ft_search_cooperative_yields_total:{}\r\n\
+         shard_tick_late_total:{}\r\n\
+         shard_tick_burst_max:{}\r\n",
         crate::admin::metrics_setup::total_commands_processed(),
         crate::admin::metrics_setup::total_connections_received(),
         crate::admin::metrics_setup::total_dispatch_cross_spsc(),
@@ -721,6 +750,11 @@ fn info_raw(db: &Database, facts: &InstanceFacts) -> String {
         crate::admin::metrics_setup::spsc_drain_renotify(),
         crate::admin::metrics_setup::spsc_notify_skipped(),
         crate::admin::metrics_setup::ft_search_cooperative_yields(),
+        // moon#1280: periodic ticks that fired >5 ms late, and the most ticks
+        // one stall fired back to back (the worst catch-up burst; 1 per
+        // stall with missed ticks skipped).
+        crate::shard::tick_cadence::tick_late_total(),
+        crate::shard::tick_cadence::tick_burst_max(),
     );
     // Fields stock monitoring agents read. Backed by real counters — a field
     // Moon cannot answer truthfully is omitted rather than reported as a

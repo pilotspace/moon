@@ -721,15 +721,37 @@ pub fn record_net_bytes(input: u64, output: u64) {
     }
 }
 
-/// Sample the ops-per-second rate. Call once per second from a chore tick.
+/// Sample the ops-per-second rate. Called from shard 0's 1 s chore with the
+/// milliseconds elapsed since that chore's previous run.
 ///
 /// Deliberately a sampled delta rather than a per-command rate computation:
 /// the alternative would put a timestamp read on the dispatch path for a
 /// field nobody reads more than once a second.
-pub fn sample_ops_per_sec() {
+///
+/// moon#1280: the delta is divided by the time that actually elapsed, not
+/// assumed to span one second — after a stall the chore's single catch-up
+/// run covers the whole stall. (Before moon#1280 nothing called this at all,
+/// so `instantaneous_ops_per_sec` read 0 forever.)
+pub fn sample_ops_per_sec(elapsed_ms: u64) {
     let total = total_commands_processed();
     let prev = OPS_LAST_SAMPLE.swap(total, Ordering::Relaxed);
-    OPS_PER_SEC.store(total.saturating_sub(prev), Ordering::Relaxed);
+    OPS_PER_SEC.store(
+        rate_per_sec(
+            total.saturating_sub(prev),
+            std::time::Duration::from_millis(elapsed_ms),
+        ),
+        Ordering::Relaxed,
+    );
+}
+
+/// `delta` events over `elapsed`, as a per-second rate. A window shorter
+/// than 1 ms (a degenerate sample) reports the raw delta.
+pub(crate) fn rate_per_sec(delta: u64, elapsed: std::time::Duration) -> u64 {
+    let ms = elapsed.as_millis() as u64;
+    if ms == 0 {
+        return delta;
+    }
+    ((delta as u128 * 1000) / ms as u128).min(u64::MAX as u128) as u64
 }
 
 /// Test-only probe (moon#774): the addresses of the words *this thread's*
@@ -759,6 +781,18 @@ pub(crate) fn hot_counter_slot_addrs() -> [usize; 5] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// moon#1280: a rate is the delta over the time that actually elapsed —
+    /// a 3 s window (one catch-up sample after a stall) is not one second.
+    #[test]
+    fn rate_per_sec_divides_by_the_elapsed_window() {
+        use std::time::Duration;
+        assert_eq!(rate_per_sec(1000, Duration::from_secs(1)), 1000);
+        assert_eq!(rate_per_sec(3000, Duration::from_secs(3)), 1000);
+        assert_eq!(rate_per_sec(500, Duration::from_millis(500)), 1000);
+        assert_eq!(rate_per_sec(7, Duration::ZERO), 7, "degenerate window");
+        assert_eq!(rate_per_sec(u64::MAX, Duration::from_millis(1)), u64::MAX);
+    }
 
     // ── moon#774: per-command observability counters must not false-share ──
     //

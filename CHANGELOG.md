@@ -269,6 +269,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Performance
 
+- **A stalled shard no longer replays every missed periodic tick** (moon#1280).
+  Every interval now skips missed ticks (both runtimes; `clippy.toml` forbids
+  the raw constructors), the monoio chores are due by elapsed time instead of
+  tick counts, and active expiry scales its one catch-up sweep (capped at 4×).
+  After a 3 s SIGSTOP with a queued lazy-free backlog the first PING waits
+  ~0.7 ms instead of 177-207 ms (monoio) or 23-40 ms (tokio); a 3 s stall
+  fires 1-2 back-to-back ticks instead of ~3,000. The per-tick duties (the
+  lazy-free drain, the snapshot walk) owe a late tick the milliseconds it
+  missed (at most 32 ticks' budget in one tick), so a loop saturated by long
+  commands frees and saves at its idle pace instead of one slice per round.
+  New INFO
+  `shard_tick_late_total` and `shard_tick_burst_max`.
+  `instantaneous_ops_per_sec` now reports a real rate (it read 0).
+
+- **`DEL` / `UNLINK` of a large value during a save no longer copy it first**
+  (moon#1269). The copy-on-write capture deep-cloned the value of every key a
+  write touched before the command ran — for a removal, a copy of something
+  about to be freed, O(elements) on the shard thread. The removed entry is now
+  the snapshot's pre-image, moved, and its size rides along so the save does
+  not walk it again. UNLINK of a 5M-field hash mid-save: 586-676 ms → 69-83 ms
+  on monoio, 852-1624 ms → 65-80 ms on tokio (worst PING gap on another
+  connection 807-898 ms → 70-83 ms on monoio); DEL 876-2392 ms → 75-101 ms. An
+  in-place write to a large collection (HSET of one field) still copies it.
+
 - **Cold-tier reclaim runs off the shard thread** (moon#1240): it no longer reads, writes or fsyncs spill files, or waits for manifest fsyncs, on the shard thread. Same-host A/B: PING p99 during cold-delete churn −23%, p99.9 about 3× lower. Holding the spill files of a large cold tier after a FLUSHALL no longer costs O(N²) on the shard thread, and the per-tick "does a held file need a rewrite" check is O(1).
 - **The moon#1232 change counting costs no measurable throughput**: release A/B at `--shards 1`, SET/HSET/LPUSH/SADD/ZADD at pipeline 1 and 16, every row within ±3% of main or faster, CPU per op unchanged.
 2026-09 performance review fix wave, part 3b (index moon#1199). Evidence is in
@@ -405,6 +429,104 @@ shared 4-vCPU Linux container against HEAD `935c555` — re-measure on the GCE r
   and reads in chunks on a CDC read pool (a poll at a ~1M-record tail 5.8 s → 0.17 ms).
 
 ### Fixed
+
+- **Without an AOF, a deleted cold key came back after `BGSAVE` + kill -9**
+  (moon#1281). The durable state is the last snapshot plus every listed spill
+  file, and a spill file is unlinked only when its last live key leaves it, so
+  a cold key deleted (or overwritten, flushed, read back and deleted) before a
+  successful save was re-indexed from its slot at boot: 100% of the deleted
+  cold probes came back on both runtimes at `--shards 1` and 4, and the
+  moon#1236 second-crash variant returned 61-96 of 100 OLD values. Each
+  no-AOF snapshot now records the spill slots that were already dead when it
+  started, as a trailer after its EOF marker (older readers stop at EOF and
+  load the file unchanged; the format version is not bumped), and the boot
+  drops exactly those slots before it resolves each key's newest copy — a
+  dead newer slot can no longer shadow a live older one — then carries them
+  into the next snapshot, also for a listed file this boot could not read.
+  The graves apply whenever the snapshot is the KV base, so a no-AOF directory
+  booted with `--appendonly yes` keeps its deletes too. A kill -9 matrix
+  (before, during and after the save, across the post-save sweep's unlinks
+  and manifest commit, and a second generation; 24 runs × both runtimes ×
+  `--shards 1` and 4) brings back none. New INFO `cold_grave_slots`,
+  `cold_grave_bytes`; new fuzz target `snapshot_cold_graves`.
+  A deletion is durable no later than the next successful snapshot.
+
+- **monoio never reclaimed spill files emptied in the first minute after a
+  boot** (moon#1279). The unlink hold takes its baseline from the first view
+  it observes; only the orphan sweep took views, and monoio's first sweep runs
+  one interval after boot (tokio's at t=0), so every file spilled in that
+  interval was held as if inherited, waiting for an AOF fold that never came
+  (`cold_files_pending_unlink` stuck, disk growing under delete churn). The
+  shard now observes the boot view before its loop on both runtimes. Also: a
+  spill every key of which was superseded while in flight is no longer listed
+  in the manifest with only ghost slots (it stayed `cold_files_dead` forever);
+  its file is unlinked at once.
+
+- **A write refused because the AOF writer was backlogged reported a disk
+  fault** (moon#1272). Under `appendfsync everysec`/`no`, a write that waits
+  `--aof-fsync-timeout-ms` for room in its shard's writer queue (or finds a
+  rewrite's overflow full) is refused, and answered `-ERR AOF fsync failed;
+  write not durable` though no fsync ran or failed. It now answers
+  `-MOONERR AOF backpressure: write applied in memory but not queued for
+  persistence; the AOF writer is backlogged`, is counted in INFO
+  `aof_append_backpressure_refusals` and `/metrics`
+  `moon_aof_append_backpressure_refusals_total`, and is logged once per stall;
+  `aof_fsync_failures` and `aof_last_fsync_status` no longer move for it. The
+  policy is unchanged and documented in `docs/guides/persistence.md`: moon
+  refuses rather than acknowledging a record its writer never received; the
+  write stands in memory, so retry only idempotent writes. Under
+  `appendfsync always`, writes whose batch fsync barrier cannot be queued for
+  the same backlog answer `-MOONERR AOF backpressure: write applied in memory
+  and queued, but not confirmed durable; the AOF writer is backlogged` and are
+  counted the same way. A real write or fsync failure still answers
+  `-ERR AOF fsync failed; write not durable`.
+
+- **`scripts/test-consistency.sh` and `scripts/test-commands.sh` died silently
+  with redis-cli older than 7.4 and leaked servers that corrupted the next run**
+  (moon#1276). `redis-cli -t` exists only in 7.4+; on 7.0.x the run ended under
+  `set -e` with no summary and left its auxiliary moon running, which the next
+  run then shared through `SO_REUSEPORT`. Both scripts now bound every probe
+  with `timeout`/`gtimeout` (a whole-command bound; `-t` bounds only the
+  connect and is the fallback, or they warn loudly), track and kill every
+  auxiliary server on exit, refuse a port that is already taken, name the line
+  of a `set -e` death, and no longer `pkill` their own command line. A header
+  names the oracle version the expected values assume (redis 7.2+/8.x).
+
+- **Under the tokio runtime, keys evicted by `maxmemory` came back after an
+  AOF restart.** The tokio write gates (the per-command gate, the MQ write
+  gate and the script bridge's gate for `redis.call` writes) dropped eviction
+  victims without appending a `DEL`, so the AOF
+  replayed them: 29,172 of 29,175 evicted keys returned in the new
+  `plain_evictions_are_not_resurrected_by_the_aof` test (8 MB `allkeys-lru`,
+  `--appendonly yes`). They now log a `DEL` per victim, as the monoio gates
+  always did; a degraded spill thread (moon#1265) drops through the same sink.
+
+- **A panicked cold-tier spill thread was never restarted** (moon#1265): one
+  panic (a corrupt spill file read by the cold reclaim, say) left writes under
+  memory pressure answering `-OOM` and in-flight payloads pinned in RAM until
+  a restart. The thread now runs under `catch_unwind` and the shard respawns
+  it on its tick with bounded exponential backoff (100 ms → 30 s) on the same
+  channels; queued requests keep their file ids, payloads the dead thread held
+  go back to RAM and are re-spilled, and the moon#1253 superseded sets are
+  rebuilt from what is still queued, so no in-flight key is lost or
+  resurrected (checked with the panic injected into the moon#1253 crash suite
+  on both runtimes). After 5 respawns in 10 minutes the shard is declared
+  degraded: it stops spilling (evicting policies drop, `noeviction` answers
+  OOM), keeps serving RAM and existing cold files, and warns. New INFO
+  `spill_thread_restarts`, `spill_thread_degraded`, `spill_thread_rehydrated`
+  (`spill_thread_alive` now means "no shard's thread is down right now"); new
+  metrics `moon_spill_thread_deaths_total`, `moon_spill_thread_restarts_total`,
+  `moon_spill_threads_degraded`. A cold-reclaim file that kills the thread twice
+  is given up (left on disk and still readable, not compacted again), so one
+  corrupt file cannot use up the restart budget; INFO
+  `cold_reclaim_files_given_up` counts every reclaim give-up. The restart
+  budget runs on a monotonic clock: a wall-clock step no longer refills it.
+  A death during a cold-reclaim job no longer spends that budget: it respawns
+  after 100 ms uncharged, against a reclaim budget of its own (8 per 10
+  minutes) whose exhaustion disables cold reclaim on that shard until restart
+  (one WARN, INFO `cold_reclaim_disabled`, gauge
+  `moon_cold_reclaim_disabled_shards`) while the shard keeps spilling — so
+  neither a few corrupt spill files nor a systematic reclaim bug degrade it.
 
 - **Data loss on a graceful exit with the default `--appendonly yes`** (moon#1274). SIGTERM (`systemctl stop`), SIGINT or `SHUTDOWN` lost acknowledged writes still queued for the AOF writers: all 300 of 300 at `--shards 1`. Shutdown now stops the shards, then lets every AOF writer write its queue and fsync before exiting, as redis's `prepareForShutdown` does.
 - **Data loss on SIGTERM/SIGINT with save points and `--appendonly no`** (moon#1263). Every write since the last automatic save was lost. The server now saves first; see Changed.

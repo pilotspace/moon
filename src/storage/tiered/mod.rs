@@ -1,6 +1,8 @@
 #[cfg(test)]
 mod cold_del_rewrite_tests;
 mod cold_footprint;
+#[cfg(test)]
+mod cold_graves_tests;
 pub mod cold_index;
 #[cfg(test)]
 mod cold_index_rebuild_tests;
@@ -19,7 +21,10 @@ pub mod orphan_reservation;
 pub(crate) mod reclaim_io;
 #[cfg(test)]
 mod replay_older_copy_tests;
+#[cfg(test)]
+mod review_ws22_tests;
 pub mod segment_handle;
+pub mod slot_graves;
 pub mod snapshot_hold;
 pub mod spill_thread;
 pub mod unlink_hold;

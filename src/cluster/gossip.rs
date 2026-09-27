@@ -608,7 +608,7 @@ pub async fn run_gossip_ticker(
     vote_tx: SharedVoteTx,
     repl_state: std::sync::Arc<parking_lot::RwLock<crate::replication::state::ReplicationState>>,
 ) {
-    let mut tick = tokio::time::interval(Duration::from_millis(100));
+    let mut tick = crate::runtime::interval::tokio_interval(Duration::from_millis(100));
     let mut election_spawned = false;
     // Bound outstanding PING probes: a dead/partitioned peer must not leak a
     // new connect+read task every 100ms. `ping_in_flight` allows at most one

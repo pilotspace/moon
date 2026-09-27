@@ -35,7 +35,7 @@ pub async fn run_active_expiration(
     // still applies. `None` (no replication configured) always sweeps.
     is_replica_mirror: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 ) {
-    let mut interval = tokio::time::interval(Duration::from_millis(100));
+    let mut interval = crate::runtime::interval::tokio_interval(Duration::from_millis(100));
 
     loop {
         tokio::select! {
@@ -114,6 +114,13 @@ const LAZY_FREE_LEGACY_BUDGET: Duration = Duration::from_millis(2);
 /// time, a large value there took the whole budget tick after tick while db
 /// 15's queue — perhaps the one holding the memory a gate needs — waited.
 pub fn drain_lazy_free_tick(db_count: usize) -> bool {
+    drain_lazy_free_tick_scaled(db_count, 1)
+}
+
+/// [`drain_lazy_free_tick`] with `scale` ticks' budget (moon#1280 review
+/// MAJOR-1: a late tick owes the drain the milliseconds it skipped, capped by
+/// `shard::tick_cadence::PER_TICK_CATCH_UP_MAX_SCALE`).
+pub fn drain_lazy_free_tick_scaled(db_count: usize, scale: u32) -> bool {
     if !crate::storage::db::lazy_free_pending_anywhere() {
         return false;
     }
@@ -133,7 +140,7 @@ pub fn drain_lazy_free_tick(db_count: usize) -> bool {
         s.next_db.set((start + 1) % db_count);
         start
     });
-    let deadline = Instant::now() + crate::storage::db::LAZY_FREE_TICK_BUDGET;
+    let deadline = Instant::now() + crate::storage::db::LAZY_FREE_TICK_BUDGET * scale.max(1);
     let mut pending = false;
     for k in 0..db_count {
         let i = (start + k) % db_count;
@@ -181,6 +188,19 @@ thread_local! {
 /// (replicas run the identical reaper against the identical TTLs, a bounded
 /// divergence documented in CHANGELOG rather than wired up here).
 pub fn expire_cycle_direct(db: &mut Database, on_removed: &mut dyn FnMut(&[u8])) {
+    expire_cycle_direct_scaled(db, on_removed, 1);
+}
+
+/// [`expire_cycle_direct`] with its per-cycle budget multiplied by
+/// `budget_scale` (moon#1280): the shard loop's one catch-up cycle after a
+/// stall owes the work of every 100 ms cycle the stall skipped, and passes
+/// `tick_cadence::catch_up_scale` of the elapsed time — at least 1, capped
+/// by the caller. Scales the 1 ms time budget and the hash-sweep key cap.
+pub fn expire_cycle_direct_scaled(
+    db: &mut Database,
+    on_removed: &mut dyn FnMut(&[u8]),
+    budget_scale: u32,
+) {
     // moon#542: delete-and-emit the keys the LAZY paths discovered expired
     // since the last tick. Runs before the latch fast-path — the queue check
     // is one branch on an empty Vec, and a lazily-hidden key implies the
@@ -217,7 +237,7 @@ pub fn expire_cycle_direct(db: &mut Database, on_removed: &mut dyn FnMut(&[u8]))
         }
         return;
     }
-    expire_cycle(db, on_removed);
+    expire_cycle_scaled(db, on_removed, budget_scale);
 }
 
 /// True when [`expire_cycle`] would provably remove nothing (moon#552) — the
@@ -297,9 +317,18 @@ fn drain_lazy_expired(db: &mut Database, on_removed: &mut dyn FnMut(&[u8])) {
 /// `maybe_has_expiring_keys` is cleared only when **both** sweeps have
 /// nothing left, so a database with hash-field TTLs but no whole-key TTLs
 /// is not incorrectly short-circuited on the next tick.
+#[cfg(test)]
 fn expire_cycle(db: &mut Database, on_removed: &mut dyn FnMut(&[u8])) {
+    expire_cycle_scaled(db, on_removed, 1);
+}
+
+/// [`expire_cycle`] with the 1 ms budget and [`HASH_SWEEP_MAX_KEYS_PER_TICK`]
+/// multiplied by `budget_scale` (≥ 1; see [`expire_cycle_direct_scaled`]).
+fn expire_cycle_scaled(db: &mut Database, on_removed: &mut dyn FnMut(&[u8]), budget_scale: u32) {
+    let budget_scale = budget_scale.max(1);
     let start = Instant::now();
-    let budget = Duration::from_millis(1);
+    let budget = Duration::from_millis(1) * budget_scale;
+    let hash_key_cap = HASH_SWEEP_MAX_KEYS_PER_TICK.saturating_mul(budget_scale);
 
     // ── Sweep 1: deadline-ordered whole-key expiry (moon#541) ───────────────
     //
@@ -382,7 +411,7 @@ fn expire_cycle(db: &mut Database, on_removed: &mut dyn FnMut(&[u8])) {
         }
         db.rearm_hash_expiry(ts, &key);
         visited += 1;
-        if visited >= HASH_SWEEP_MAX_KEYS_PER_TICK || start.elapsed() >= budget {
+        if visited >= hash_key_cap || start.elapsed() >= budget {
             break;
         }
     }

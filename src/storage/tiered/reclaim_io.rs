@@ -58,6 +58,18 @@ pub(crate) enum ReclaimJob {
     },
 }
 
+impl ReclaimJob {
+    /// The file being compacted (the one a `Read` reads, the old file a
+    /// `Write` replaces).
+    #[inline]
+    pub(crate) fn file_id(&self) -> u64 {
+        match self {
+            Self::Read { file_id, .. } => *file_id,
+            Self::Write { old_file, .. } => *old_file,
+        }
+    }
+}
+
 /// What the spill thread hands back.
 pub(crate) enum ReclaimDone {
     Read {

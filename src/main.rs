@@ -1543,6 +1543,23 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
+    /// moon#1281 round 2 (R2-1): the `DEL`s a fresh AOF generation opened at
+    /// this boot must carry — the dead spill slots the boot dropped on a
+    /// no-AOF snapshot's word, seeded into shard `sid`'s dead-slot ledger. A
+    /// generation created here has had no fold, and its `MOON.COLDCUT`
+    /// authorizes every listed spill file.
+    fn fresh_deletes(shards: &[Shard], sid: u16) -> moon::persistence::cold_records::ColdDeletes {
+        shards
+            .get(usize::from(sid))
+            .map(|s| {
+                moon::persistence::aof::fold_stream::fresh_generation_deletes(
+                    &s.databases,
+                    moon::storage::entry::current_time_ms(),
+                )
+            })
+            .unwrap_or_default()
+    }
+
     // moon#902: the `MOON.COLDCUT` watermark for a freshly initialized AOF
     // generation — the shard's next cold file id, i.e. exactly the seed the
     // event loop's `spill_file_id` counter starts from (the same proven
@@ -1819,8 +1836,14 @@ fn main() -> anyhow::Result<()> {
                         .with_context(|| "failed to serialize legacy state for AOF base")?;
                     let fresh = AofManifest::initialize_with_base(&base_dir, &rdb_bytes)
                         .with_context(|| "failed to initialize AOF manifest with base")?;
+                    // The fresh head's DELs come from the dead-slot ledger, which lives in
+                    // the cold index: re-attach the wiring first (moon#1281 round 2b).
+                    reattach_cold_wiring(&mut shards, &mut preserved_cold_wiring);
                     fresh
-                        .seed_cold_cut(|sid| cold_file_watermark(&spill_seeds, sid))
+                        .seed_generation_head(
+                            |sid| cold_file_watermark(&spill_seeds, sid),
+                            |sid| fresh_deletes(&shards, sid),
+                        )
                         .with_context(|| "failed to seed the AOF cold-plane cut (moon#902)")?;
                     info!(
                         "First-upgrade: captured legacy state as AOF base seq 1 ({} bytes)",
@@ -1848,10 +1871,34 @@ fn main() -> anyhow::Result<()> {
                 // when the loaded manifest's layout is PerShard, so without
                 // this branch a multi-shard --appendonly yes deployment would
                 // silently fall back to TopLevel and lose data on restart.
-                let fresh = AofManifest::initialize_multi(&base_dir, shard_count_u16)
-                    .with_context(|| "failed to initialize PerShard AOF manifest")?;
+                // moon#1281 review round 2 (R2-2): state loaded from a snapshot
+                // (the `--appendonly no` -> `yes` switch) becomes each shard's
+                // base, as `initialize_with_base` does at `--shards 1`; with an
+                // empty base the next boot, which replays base + incr only,
+                // drops every key the snapshot held.
+                let loaded = shards
+                    .iter()
+                    .any(|s| s.databases.iter().any(|db| db.len() > 0));
+                let fresh = if loaded {
+                    AofManifest::initialize_multi_with_bases(&base_dir, shard_count_u16, |sid| {
+                        let dbs = shards
+                            .get(usize::from(sid))
+                            .map_or(&[][..], |s| s.databases.as_slice());
+                        moon::persistence::rdb::save_to_bytes(dbs)
+                            .map_err(|e| std::io::Error::other(format!("shard {sid} base: {e}")))
+                    })
+                } else {
+                    AofManifest::initialize_multi(&base_dir, shard_count_u16)
+                }
+                .with_context(|| "failed to initialize PerShard AOF manifest")?;
+                // The fresh head's DELs come from the dead-slot ledger, which lives in
+                // the cold index: re-attach the wiring first (moon#1281 round 2b).
+                reattach_cold_wiring(&mut shards, &mut preserved_cold_wiring);
                 fresh
-                    .seed_cold_cut(|sid| cold_file_watermark(&spill_seeds, sid))
+                    .seed_generation_head(
+                        |sid| cold_file_watermark(&spill_seeds, sid),
+                        |sid| fresh_deletes(&shards, sid),
+                    )
                     .with_context(|| "failed to seed the AOF cold-plane cut (moon#902)")?;
                 info!(
                     "Initialized PerShard AOF manifest for {} shards at {}",
@@ -1864,8 +1911,14 @@ fn main() -> anyhow::Result<()> {
                 {
                     let fresh = AofManifest::initialize(&base_dir)
                         .with_context(|| "failed to initialize AOF manifest")?;
+                    // The fresh head's DELs come from the dead-slot ledger, which lives in
+                    // the cold index: re-attach the wiring first (moon#1281 round 2b).
+                    reattach_cold_wiring(&mut shards, &mut preserved_cold_wiring);
                     fresh
-                        .seed_cold_cut(|sid| cold_file_watermark(&spill_seeds, sid))
+                        .seed_generation_head(
+                            |sid| cold_file_watermark(&spill_seeds, sid),
+                            |sid| fresh_deletes(&shards, sid),
+                        )
                         .with_context(|| "failed to seed the AOF cold-plane cut (moon#902)")?;
                 }
                 // tokio --shards 1 fresh: no manifest (v2 single-file recovery
@@ -1890,10 +1943,13 @@ fn main() -> anyhow::Result<()> {
         // before this fix) is left alone — see `seed_cold_cut_if_fresh`.
         #[cfg(not(feature = "runtime-monoio"))]
         if num_shards == 1 {
+            // Its head's DELs read the ledger in the cold index (moon#1281 round 2b).
+            reattach_cold_wiring(&mut shards, &mut preserved_cold_wiring);
             let aof_path = base_dir.join(&config.appendfilename);
-            let seeded = moon::persistence::cold_records::seed_cold_cut_if_fresh(
+            let seeded = moon::persistence::cold_records::seed_generation_head_if_fresh(
                 &aof_path,
                 cold_file_watermark(&spill_seeds, 0),
+                fresh_deletes(&shards, 0),
             )
             .with_context(|| {
                 format!(
