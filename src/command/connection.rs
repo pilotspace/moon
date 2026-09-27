@@ -507,6 +507,7 @@ fn info_raw(db: &Database, facts: &InstanceFacts) -> String {
          aof_backpressure_dropped:{}\r\n\
          aof_backpressure_stalls:{}\r\n\
          aof_backpressure_refused:{}\r\n\
+         aof_append_backpressure_refusals:{}\r\n\
          aof_last_fsync_status:{}\r\n\
          aof_fsync_failures:{}\r\n\
          aof_last_append_status:{}\r\n\
@@ -575,6 +576,11 @@ fn info_raw(db: &Database, facts: &InstanceFacts) -> String {
         // applying, and those refused unapplied when it never caught up.
         crate::persistence::aof::AOF_BACKPRESSURE_STALLS.load(std::sync::atomic::Ordering::Relaxed),
         crate::persistence::aof::AOF_BACKPRESSURE_REFUSED
+            .load(std::sync::atomic::Ordering::Relaxed),
+        // moon#1272: writes refused because the AOF writer stayed backlogged
+        // past `--aof-fsync-timeout-ms` (or the rewrite overflow cap) — NOT
+        // fsync failures, which are counted in `aof_fsync_failures`.
+        crate::persistence::aof::AOF_APPEND_BACKPRESSURE_REFUSALS
             .load(std::sync::atomic::Ordering::Relaxed),
         if crate::persistence::aof::aof_last_fsync_ok() {
             "ok"

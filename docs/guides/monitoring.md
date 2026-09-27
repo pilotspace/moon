@@ -105,6 +105,13 @@ Moon exposes standard Redis-compatible INFO metrics through the Prometheus endpo
 - **`moon_spilled_keys_total`** (INFO: `spilled_keys`) -- keys **moved from RAM
   to disk** under maxmemory pressure, with `--disk-offload enable`.
 - **`moon_expired_keys_total`** -- keys removed by expiration
+- **`moon_aof_append_backpressure_refusals_total`** (INFO:
+  `aof_append_backpressure_refusals`) -- writes refused because the AOF writer
+  was **backlogged** (its queue stayed full for `--aof-fsync-timeout-ms`), not
+  because an fsync failed; those clients got `-MOONERR AOF backpressure: ...`.
+  A disk that is failing shows in `aof_fsync_failures` /
+  `aof_last_fsync_status:err` instead. See
+  [Persistence -- when the AOF writer falls behind](persistence.md#when-the-aof-writer-falls-behind-backpressure).
 
 ### `evicted_keys` vs `spilled_keys` (moon#585)
 

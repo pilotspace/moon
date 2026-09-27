@@ -3422,7 +3422,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                     // H1 fix: durable path under `appendfsync=always`
                     // awaits the writer's fsync ack before responding to
                     // the client.
-                    let mut aof_failed = false;
+                    let mut aof_refusal: Option<crate::persistence::aof::AofAck> = None;
                     if matches!(response, Frame::Integer(1)) {
                         // v0.7 local-leg live replication — same contract as
                         // the main write leg: record (backlog+offset, sync)
@@ -3461,7 +3461,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                                     // fsync per pipelined command.
                                     Ok(true) => local_leg_write_idxs.push(responses.len()),
                                     Ok(false) => {}
-                                    Err(_) => aof_failed = true,
+                                    Err(ack) => aof_refusal = Some(ack),
                                 }
                             }
                         }
@@ -3477,8 +3477,9 @@ pub(crate) async fn handle_connection_sharded_monoio<
                             &response,
                         );
                     }
-                    responses.push(if aof_failed {
-                        Frame::Error(bytes::Bytes::from_static(aof::AOF_FSYNC_ERR))
+                    responses.push(if let Some(ack) = aof_refusal {
+                        // moon#1272: writer backlog is not an fsync failure.
+                        aof::append_refusal_frame(ack)
                     } else {
                         response
                     });
@@ -3534,7 +3535,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                         // AOF only on actual success (:1). Matches handler_single
                         // — `:0` (key absent / dst exists w/o REPLACE) is a no-op.
                         // H1: durable path awaits fsync under appendfsync=always.
-                        let mut aof_failed = false;
+                        let mut aof_refusal: Option<crate::persistence::aof::AofAck> = None;
                         if matches!(response, Frame::Integer(1)) {
                             // v0.7 local-leg live replication — same contract
                             // as the main write leg (record backlog+offset
@@ -3569,7 +3570,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                                         // Same one-barrier-per-batch contract as MOVE.
                                         Ok(true) => local_leg_write_idxs.push(responses.len()),
                                         Ok(false) => {}
-                                        Err(_) => aof_failed = true,
+                                        Err(ack) => aof_refusal = Some(ack),
                                     }
                                 }
                             }
@@ -3583,8 +3584,9 @@ pub(crate) async fn handle_connection_sharded_monoio<
                                 &response,
                             );
                         }
-                        responses.push(if aof_failed {
-                            Frame::Error(bytes::Bytes::from_static(aof::AOF_FSYNC_ERR))
+                        responses.push(if let Some(ack) = aof_refusal {
+                            // moon#1272: writer backlog is not an fsync failure.
+                            aof::append_refusal_frame(ack)
                         } else {
                             response
                         });
@@ -3964,10 +3966,10 @@ pub(crate) async fn handle_connection_sharded_monoio<
                                 {
                                     Ok(true) => aof_barrier_pending = true,
                                     Ok(false) => {}
-                                    Err(_) => {
-                                        response = Frame::Error(bytes::Bytes::from_static(
-                                            aof::AOF_FSYNC_ERR,
-                                        ));
+                                    Err(ack) => {
+                                        // moon#1272: `ChannelFull` (writer backlog) answers
+                                        // `AOF_BACKLOG_ERR`, a write/fsync failure `AOF_FSYNC_ERR`.
+                                        response = aof::append_refusal_frame(ack);
                                         aof_failed = true;
                                     }
                                 }

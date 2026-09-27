@@ -39,8 +39,11 @@ use std::time::{Duration, Instant};
 const LOST_ERR: &str =
     "MOONERR AOF backpressure: write applied in memory but not queued for persistence";
 const REFUSED_ERR_PREFIX: &str = "MOONERR AOF backpressure: command not executed";
-/// The generic local leg's reply once `--aof-fsync-timeout-ms` elapses.
-const GENERIC_TIMEOUT_ERR: &str = "ERR AOF fsync failed; write not durable";
+/// The generic local leg's reply once `--aof-fsync-timeout-ms` elapses
+/// (`persistence/aof::AOF_BACKLOG_ERR`, moon#1272 — it used to be the
+/// fsync-failure text although no fsync failed).
+const GENERIC_TIMEOUT_ERR: &str = "MOONERR AOF backpressure: write applied in memory but not queued for persistence; \
+     the AOF writer is backlogged";
 
 const SHARDS: &str = "4";
 const BURST: usize = 10_000;

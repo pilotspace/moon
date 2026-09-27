@@ -945,8 +945,11 @@ pub(crate) fn execute_transaction_sharded(
 /// the body are owned by `ctx.shard_id` (Phase A rejects foreign-owned bodies),
 /// so that is the correct AOF target.
 ///
-/// Returns `Err(())` if any append or the barrier fails — the caller surfaces
-/// `AOF_FSYNC_ERR` instead of acking a durability it can't guarantee. A no-op
+/// Returns `Err(reply)` if any append or the barrier fails — the caller
+/// answers EXEC with that error text instead of acking a durability it can't
+/// guarantee: [`crate::persistence::aof::AOF_BACKLOG_ERR`] when an append was
+/// refused for writer backlog (moon#1272), `AOF_FSYNC_ERR` for a write/fsync
+/// failure or a failed `always` barrier. A no-op
 /// (returns `Ok`) when AOF is disabled (`aof_pool` is `None`) or the body wrote
 /// nothing.
 ///
@@ -971,7 +974,7 @@ pub(crate) async fn persist_txn_aof(
     aof_entries: Vec<(usize, Bytes)>,
     repl_recorded: bool,
     fold_stamp: crate::persistence::aof::FoldEpoch,
-) -> Result<(), ()> {
+) -> Result<(), &'static [u8]> {
     if aof_entries.is_empty() {
         return Ok(());
     }
@@ -991,12 +994,12 @@ pub(crate) async fn persist_txn_aof(
         {
             Ok(true) => barrier_pending = true,
             Ok(false) => {}
-            Err(_) => return Err(()),
+            Err(ack) => return Err(crate::persistence::aof::append_refusal_reply(ack)),
         }
     }
     // appendfsync=always: one barrier confirms the whole body is on disk.
     if barrier_pending && pool.fsync_barrier(ctx.shard_id).await.is_err() {
-        return Err(());
+        return Err(crate::persistence::aof::AOF_FSYNC_ERR);
     }
     Ok(())
 }

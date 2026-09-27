@@ -35,7 +35,12 @@ type SharedDatabases = Arc<Vec<parking_lot::RwLock<Database>>>;
 
 /// Canonical AOF fsync failure error string sent to the client as a
 /// `Frame::Error` when `appendfsync=always` and the writer task does not
-/// confirm durability before the response.
+/// confirm durability before the response, or when the AOF writer failed a
+/// write or is gone ([`AofAck::WriteFailed`] / [`AofAck::FsyncFailed`]).
+///
+/// NOT for a writer that is merely backlogged ([`AofAck::ChannelFull`]):
+/// that refusal answers [`AOF_BACKLOG_ERR`] — no fsync ran or failed
+/// (moon#1272). Map a refused append with [`append_refusal_reply`].
 ///
 /// All handler variants (handler_single, handler_monoio, handler_sharded)
 /// MUST use this constant so operators see a consistent error regardless of
@@ -76,9 +81,10 @@ pub enum AofAck {
     FsyncFailed,
     /// The writer channel was full at the time of the send — the entry
     /// was **not** enqueued. This is a backpressure signal: the writer
-    /// is unable to keep up with the current write rate. Callers MUST
-    /// treat this as a hard failure (same as `WriteFailed`) under
-    /// `appendfsync=always`; for `everysec`/`no` it is logged and counted.
+    /// is unable to keep up with the current write rate (or a rewrite
+    /// fold's overflow buffer is at its cap). Callers MUST NOT ack the
+    /// write; they answer [`AOF_BACKLOG_ERR`] (via [`append_refusal_reply`]),
+    /// never the fsync-failure text — no fsync ran (moon#1272).
     ChannelFull,
 }
 
@@ -781,12 +787,17 @@ pub mod fold_stream;
 /// under `appendfsync=always`). `pub` so the §4 red suite can pin the pure seam.
 pub mod group_commit;
 mod pool;
+mod refusal;
 pub mod rewrite;
 pub mod rewrite_overflow;
 pub mod writer_stop;
 mod writer_task;
 
 pub use pool::{AofWriterPool, BoundedRefusal};
+pub(crate) use refusal::note_append_backpressure_refusal;
+pub use refusal::{
+    AOF_APPEND_BACKPRESSURE_REFUSALS, AOF_BACKLOG_ERR, append_refusal_frame, append_refusal_reply,
+};
 pub use rewrite::generate_rewrite_commands;
 // `rewrite_aof` is defined only under the tokio runtime; gate its re-export to match.
 #[cfg(feature = "runtime-tokio")]

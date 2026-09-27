@@ -202,6 +202,18 @@ pub fn record_aof_fsync(duration_us: u64) {
     histogram!("moon_aof_fsync_duration_microseconds").record(duration_us as f64);
 }
 
+/// Record one AOF append refused because the writer was backlogged
+/// (moon#1272) — the Prometheus mirror of INFO
+/// `aof_append_backpressure_refusals`. Cold path: reached only after a
+/// producer waited `--aof-fsync-timeout-ms` (or hit the rewrite overflow cap).
+#[inline]
+pub fn record_aof_append_backpressure_refusal() {
+    if !METRICS_INITIALIZED.load(Ordering::Relaxed) {
+        return;
+    }
+    counter!("moon_aof_append_backpressure_refusals_total").increment(1);
+}
+
 /// Record a WAL segment rotation.
 #[inline]
 pub fn record_wal_rotation() {

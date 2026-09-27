@@ -87,8 +87,11 @@ use std::time::{Duration, Instant};
 const INLINE_BACKPRESSURE_ERR: &str =
     "MOONERR AOF backpressure: write applied in memory but not queued for persistence";
 /// The generic leg's refusal once `--aof-fsync-timeout-ms` elapses
-/// (`persistence/aof::AOF_FSYNC_ERR`).
-const GENERIC_TIMEOUT_ERR: &str = "ERR AOF fsync failed; write not durable";
+/// (`persistence/aof::AOF_BACKLOG_ERR`, moon#1272 — it used to be the
+/// fsync-failure text although no fsync failed). Same leading text as the
+/// inline refusal; the suffix tells the two bounds apart.
+const GENERIC_TIMEOUT_ERR: &str = "MOONERR AOF backpressure: write applied in memory but not queued for persistence; \
+     the AOF writer is backlogged";
 
 // ---------------------------------------------------------------------------
 // Fixture

@@ -272,6 +272,14 @@ impl AofWriterPool {
         self.fsync_policy
     }
 
+    /// `--aof-fsync-timeout-ms`: the bound on a durable-path producer's wait
+    /// for writer room (everysec/no) or its fsync ack (always). `ZERO` =
+    /// unbounded.
+    #[inline]
+    pub fn fsync_timeout(&self) -> Duration {
+        self.fsync_timeout
+    }
+
     /// Policy-aware AOF append. For `FsyncPolicy::Always`, this awaits
     /// `AppendSync` and returns `Ok(())` only after `sync_data()` confirms
     /// the entry is on durable storage — closing the H1 in-flight loss
@@ -440,13 +448,26 @@ impl AofWriterPool {
                 AppendNow::Enqueued => {
                     return Ok((apply(), matches!(self.fsync_policy, FsyncPolicy::Always)));
                 }
-                AppendNow::Refused(ack) => return Err(ack),
+                AppendNow::Refused(ack) => {
+                    if ack.is_backpressure() {
+                        // moon#1272: the rewrite overflow cap — counted and
+                        // logged as writer backlog, not as an fsync failure.
+                        super::note_append_backpressure_refusal(
+                            shard_id,
+                            "append refused before apply (rewrite overflow cap)",
+                            Duration::ZERO,
+                        );
+                    }
+                    return Err(ack);
+                }
                 AppendNow::WouldBlock => {
                     if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
-                        warn!(
-                            "AOF writer channel full (shard {}): append refused after {:?}; \
-                             the mutation was not applied",
-                            shard_id, self.fsync_timeout
+                        // moon#1272: counted + rate-limited WARN (one per
+                        // stall), not one line per refused command.
+                        super::note_append_backpressure_refusal(
+                            shard_id,
+                            "append refused before apply (the mutation was not applied)",
+                            self.fsync_timeout,
                         );
                         return Err(AofAck::ChannelFull);
                     }
@@ -1048,6 +1069,11 @@ impl AofWriterPool {
                 Err(SpillReject::Disarmed(returned)) => msg = returned,
                 Err(SpillReject::CapExceeded) => {
                     super::record_append_dropped(self.overflow_for(shard_id), 1);
+                    super::note_append_backpressure_refusal(
+                        shard_id,
+                        "append dropped (rewrite overflow cap reached)",
+                        Duration::ZERO,
+                    );
                     return Err(AofAck::ChannelFull);
                 }
             }
@@ -1067,6 +1093,11 @@ impl AofWriterPool {
             Err(SpillReject::Disarmed(returned)) => msg = returned,
             Err(SpillReject::CapExceeded) => {
                 super::record_append_dropped(self.overflow_for(shard_id), 1);
+                super::note_append_backpressure_refusal(
+                    shard_id,
+                    "append dropped (rewrite overflow cap reached)",
+                    Duration::ZERO,
+                );
                 return Err(AofAck::ChannelFull);
             }
         }
@@ -1077,6 +1108,9 @@ impl AofWriterPool {
         // the safe failure direction: the client receives an error and can
         // retry an idempotent write; we never ack a write that was NOT
         // enqueued. Standard ack-timeout semantics — not silent loss.
+        // moon#1272: the refusal is reported as writer BACKLOG
+        // (`AOF_BACKLOG_ERR`, `aof_append_backpressure_refusals`), never as
+        // an fsync failure; the rare race above over-counts it by one too.
         let send_fut = self.sender(shard_id).send_async(msg);
         let timeout = self.fsync_timeout;
         if timeout.is_zero() {
@@ -1106,12 +1140,12 @@ impl AofWriterPool {
         }
         if outcome == Err(AofAck::ChannelFull) {
             super::record_append_dropped(self.overflow_for(shard_id), 1);
-            warn!(
-                "AOF writer channel full (shard {}): everysec append dropped after {:?} \
-                 backpressure bound; backpressure_dropped={}",
+            // One WARN per stall (then a sparse summary), not one per write:
+            // a stalled disk under load used to log a line per refused SET.
+            super::note_append_backpressure_refusal(
                 shard_id,
+                "everysec append dropped (write applied in memory, not queued)",
                 timeout,
-                AOF_BACKPRESSURE_DROPPED.load(std::sync::atomic::Ordering::Relaxed),
             );
         }
         outcome
