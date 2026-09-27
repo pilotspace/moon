@@ -29,6 +29,14 @@ jobs:
       - name: Run crash matrix tests
         run: cargo test --release --no-default-features --features runtime-tokio,jemalloc --test durability_tests
         timeout-minutes: 10
+      # moon#1285: TXN.ABORT must survive kill -9 (tokio leg: KV + vector;
+      # graph and the replica leg skip themselves without the `graph` feature).
+      - name: Run TXN.ABORT durability tests
+        run: >-
+          MOON_BIN=target/release/moon
+          cargo test --release --no-default-features --features runtime-tokio,jemalloc
+          --test txn_abort_durability_1285 -- --ignored --test-threads=1
+        timeout-minutes: 10
       - name: Run jepsen-lite tests
         run: cargo test --release --no-default-features --features runtime-tokio,jemalloc --test jepsen_lite
         timeout-minutes: 10
@@ -52,6 +60,13 @@ jobs:
         run: cargo build --release
       - name: Run per-shard AOF crash matrix
         run: cargo test --release --test crash_matrix_per_shard_aof -- --ignored
+        timeout-minutes: 10
+      # moon#1285: TXN.ABORT must survive kill -9 and reach a replica
+      # (monoio: every plane, --shards 1 and 4, plus the replica leg).
+      - name: Run TXN.ABORT durability tests
+        run: >-
+          MOON_BIN=target/release/moon
+          cargo test --release --test txn_abort_durability_1285 -- --ignored --test-threads=1
         timeout-minutes: 10
 
   replication:
