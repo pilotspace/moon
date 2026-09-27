@@ -123,13 +123,13 @@ fn tick_until_done(
     }
 }
 
-/// Wait out the backoff on the shard clock (the thread-local cache is unset
-/// on a test thread, so this is the wall clock) and respawn.
+/// Wait out the backoff on the spill thread's monotonic supervision clock
+/// and respawn.
 fn respawn_now(st: &SpillThread) {
     use crate::storage::tiered::spill_thread::Respawn;
     let deadline = Instant::now() + Duration::from_secs(35);
     loop {
-        match st.respawn_if_due(crate::storage::entry::current_time_ms()) {
+        match st.respawn_if_due(st.clock_ms()) {
             Respawn::Respawned => return,
             Respawn::NotDue => {}
             other => panic!("respawn: {other:?}"),

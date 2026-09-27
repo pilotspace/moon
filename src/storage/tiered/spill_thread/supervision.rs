@@ -103,19 +103,18 @@ pub(super) struct Worker {
 }
 
 impl Worker {
+    /// `now_ms`: [`SpillThread::clock_ms`] as the first incarnation starts.
     pub(super) fn new(
         handle: std::thread::JoinHandle<()>,
         exit: ExitSlot,
         ends: ThreadEnds,
+        now_ms: u64,
     ) -> Self {
         Self {
             handle: Some(handle),
             exit,
             ends: Some(ends),
-            supervisor: RestartSupervisor::new(
-                RestartPolicy::DEFAULT,
-                crate::storage::entry::current_time_ms(),
-            ),
+            supervisor: RestartSupervisor::new(RestartPolicy::DEFAULT, now_ms),
         }
     }
 
@@ -191,6 +190,15 @@ impl SpillThread {
         self.worker.lock().supervisor.phase() == Phase::Degraded
     }
 
+    /// Milliseconds on this shard's supervision clock: monotonic, from the
+    /// moment this `SpillThread` was created. What the shard passes as
+    /// `now_ms` to [`Self::take_death`] and [`Self::respawn_if_due`] — never
+    /// the cached wall clock, whose steps would reset the restart budget
+    /// (moon#1265 review).
+    pub(crate) fn clock_ms(&self) -> u64 {
+        u64::try_from(self.clock_epoch.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+
     /// Given [`Self::is_dead`] as sampled BEFORE the caller drained and
     /// applied the completions: the first time a running incarnation is
     /// seen dead, reap it, decide (respawn at a due time, or degrade),
@@ -249,7 +257,8 @@ impl SpillThread {
         );
     }
 
-    /// Respawn the thread if its backoff is over (shard clock `now_ms`).
+    /// Respawn the thread if its backoff is over (`now_ms`:
+    /// [`Self::clock_ms`], as for [`Self::take_death`]).
     /// A failed spawn counts against the budget like a death; when it spends
     /// it, the shard is degraded and the caller must reconcile as for a
     /// degrading death.

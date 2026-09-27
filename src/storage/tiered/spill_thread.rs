@@ -586,6 +586,8 @@ pub struct SpillThread {
     done_below: Arc<AtomicU64>,
     /// The watermark the shard last pruned its superseded sets with.
     pruned_below: AtomicU64,
+    /// Origin of the monotonic supervision clock ([`Self::clock_ms`]).
+    clock_epoch: std::time::Instant,
     /// The file whose cold-reclaim job the thread is running right now, or
     /// [`NO_RECLAIM_JOB`]. Set before a job and cleared after its answer is
     /// sent, so a thread that dies mid-job leaves it pointing at the job
@@ -653,6 +655,7 @@ impl SpillThread {
         let stop_flag = Arc::new(AtomicBool::new(false));
         let done_below = Arc::new(AtomicU64::new(0));
         let reclaim_running = Arc::new(AtomicU64::new(NO_RECLAIM_JOB));
+        let clock_epoch = std::time::Instant::now();
 
         #[allow(clippy::expect_used)]
         // Startup: spill thread is critical infrastructure — spawn failure is fatal
@@ -672,10 +675,11 @@ impl SpillThread {
             completion_rx,
             reclaim_tx,
             reclaim_done_rx,
-            worker: parking_lot::Mutex::new(supervision::Worker::new(handle, exit, ends)),
+            worker: parking_lot::Mutex::new(supervision::Worker::new(handle, exit, ends, 0)),
             stop_flag,
             done_below,
             pruned_below: AtomicU64::new(0),
+            clock_epoch,
             reclaim_running,
             fault,
         }

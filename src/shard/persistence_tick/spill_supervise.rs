@@ -84,7 +84,9 @@ pub(super) fn after_drain(
     db_count: usize,
     shard_id: usize,
 ) -> Option<Reconciled> {
-    let now_ms = crate::storage::entry::current_time_ms();
+    // The monotonic supervision clock, not the cached wall clock: a wall
+    // step would reset the restart budget (moon#1265 review).
+    let now_ms = st.clock_ms();
     let death = st.take_death(was_dead, now_ms)?;
     let restart = matches!(death.verdict, Verdict::RespawnAt(_));
     let done = reconcile(st, db_count, shard_id, restart);
@@ -100,7 +102,7 @@ pub(super) fn after_drain(
 /// and spends the budget degrades the shard, which reconciles like a
 /// degrading death.
 pub(super) fn respawn_if_due(st: &SpillThread, db_count: usize, shard_id: usize) {
-    let now_ms = crate::storage::entry::current_time_ms();
+    let now_ms = st.clock_ms();
     if st.respawn_if_due(now_ms) == Respawn::Failed(Verdict::Degrade) {
         reconcile(st, db_count, shard_id, false);
     }

@@ -81,7 +81,7 @@ fn a_poisoned_reclaim_job_does_not_degrade_spilling() {
             if was_dead {
                 quiet_since = Instant::now();
             }
-            match st.respawn_if_due(crate::storage::entry::current_time_ms()) {
+            match st.respawn_if_due(st.clock_ms()) {
                 Respawn::Respawned => respawns += 1,
                 Respawn::NotDue => {}
                 Respawn::Failed(v) => panic!("respawn failed: {v:?}"),

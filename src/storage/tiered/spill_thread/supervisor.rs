@@ -3,9 +3,24 @@
 //!
 //! A plain state machine owned by the shard thread (behind the
 //! `SpillThread`'s worker lock): no atomics, no clock of its own. Every
-//! transition takes `now_ms` from the caller, which reads the shard-cached
-//! clock on its tick, and nothing here sleeps — a backoff is a due time the
-//! tick compares against, never a wait on the shard thread.
+//! transition takes `now_ms` from the caller, and nothing here sleeps — a
+//! backoff is a due time the tick compares against, never a wait on the
+//! shard thread.
+//!
+//! # Time
+//!
+//! `now_ms` must be MONOTONIC: the shard passes `SpillThread::clock_ms`, an
+//! `Instant`-based clock (moon#1265 review). It used to be the shard's cached
+//! wall clock, and a wall-clock step erased the restart budget: a step back
+//! made every attempt look "in the future" and forgotten, a step forward of
+//! a window aged them all out — either way a crash loop got 5 fresh respawns
+//! instead of degrading. As a second line of defence the machine never lets
+//! time run backwards itself: a reading below the latest one counts as no
+//! time passing (`RestartSupervisor::observe`), so the attempts inside the
+//! window are never dropped by a backwards reading. The one place a raw
+//! reading is still believed is [`RestartSupervisor::respawn_due`]: a due
+//! time further ahead than the longest backoff is due now, so a backwards
+//! reading can never leave the shard without a spill thread either.
 //!
 //! ```text
 //!              death, budget left                 due, spawn ok
@@ -55,7 +70,7 @@ pub(crate) enum Phase {
     /// A thread was started at `since_ms` (it may have died since: the shard
     /// observes that and calls [`RestartSupervisor::on_death`]).
     Running { since_ms: u64 },
-    /// Dead; respawn once the shard clock reaches `due_ms`.
+    /// Dead; respawn once the supervision clock reaches `due_ms`.
     Backoff { due_ms: u64 },
     /// The budget is spent: no thread, and none will be started.
     Degraded,
@@ -64,7 +79,7 @@ pub(crate) enum Phase {
 /// What the shard does about a death.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Verdict {
-    /// Respawn at this shard-clock time.
+    /// Respawn at this supervision-clock time.
     RespawnAt(u64),
     /// Stop spilling for good.
     Degrade,
@@ -75,10 +90,12 @@ pub(crate) enum Verdict {
 pub(crate) struct RestartSupervisor {
     policy: RestartPolicy,
     phase: Phase,
-    /// Shard-clock times of the respawn attempts inside the current window.
+    /// Supervision-clock times of the respawn attempts inside the window.
     attempts: VecDeque<u64>,
     /// Deaths in the current backoff streak (the backoff's exponent).
     streak: u32,
+    /// The latest `now_ms` seen: the machine's clock never runs backwards.
+    latest_ms: u64,
 }
 
 impl RestartSupervisor {
@@ -88,7 +105,15 @@ impl RestartSupervisor {
             phase: Phase::Running { since_ms: now_ms },
             attempts: VecDeque::with_capacity(policy.max_restarts + 1),
             streak: 0,
+            latest_ms: now_ms,
         }
+    }
+
+    /// `now_ms`, or the latest reading if it is below it: a clock read that
+    /// goes backwards is no time passing (see the module doc).
+    fn observe(&mut self, now_ms: u64) -> u64 {
+        self.latest_ms = self.latest_ms.max(now_ms);
+        self.latest_ms
     }
 
     #[inline]
@@ -98,6 +123,7 @@ impl RestartSupervisor {
 
     /// The running thread died (observed at `now_ms`).
     pub(crate) fn on_death(&mut self, now_ms: u64) -> Verdict {
+        let now_ms = self.observe(now_ms);
         if let Phase::Running { since_ms } = self.phase
             && now_ms.saturating_sub(since_ms) >= self.policy.healthy_run_ms
         {
@@ -120,6 +146,7 @@ impl RestartSupervisor {
 
     /// A respawn was attempted at `now_ms` and the thread started.
     pub(crate) fn on_respawned(&mut self, now_ms: u64) {
+        let now_ms = self.observe(now_ms);
         self.attempts.push_back(now_ms);
         self.phase = Phase::Running { since_ms: now_ms };
     }
@@ -127,23 +154,23 @@ impl RestartSupervisor {
     /// A respawn was attempted at `now_ms` and the thread could not be
     /// started. The attempt counts against the budget like a successful one.
     pub(crate) fn on_spawn_failed(&mut self, now_ms: u64) -> Verdict {
+        let now_ms = self.observe(now_ms);
         self.attempts.push_back(now_ms);
         self.decide(now_ms)
     }
 
     /// Respawn attempts inside the window ending at `now_ms`.
     pub(crate) fn attempts_in_window(&mut self, now_ms: u64) -> usize {
+        let now_ms = self.observe(now_ms);
         self.forget_before(now_ms);
         self.attempts.len()
     }
 
+    /// Drop the attempts older than the window. `now_ms` is observed: no
+    /// attempt is ever stamped after it.
     fn forget_before(&mut self, now_ms: u64) {
         let horizon = now_ms.saturating_sub(self.policy.window_ms);
-        while self
-            .attempts
-            .front()
-            .is_some_and(|&t| t < horizon || t > now_ms)
-        {
+        while self.attempts.front().is_some_and(|&t| t < horizon) {
             self.attempts.pop_front();
         }
     }
@@ -268,8 +295,22 @@ mod tests {
         assert!(!s.respawn_due(1_000_050));
         assert!(s.respawn_due(1_000), "a due time an hour ahead is due now");
         s.on_respawned(1_000);
-        // The respawn stamped before the jump is not counted twice or kept
-        // forever: it lies in the future of the new clock and is forgotten.
+        // The respawn counts once, stamped at the latest reading, and stays
+        // in the window however far back the reading went.
         assert_eq!(s.attempts_in_window(1_000), 1);
+        assert_eq!(s.attempts_in_window(1_000_000 + P.window_ms - 1), 1);
+        assert_eq!(s.attempts_in_window(1_000_000 + P.window_ms + 1), 0);
+    }
+
+    /// moon#1265 review: readings that go backwards never shrink the budget
+    /// spent — neither one step back after a crash loop nor a death seen
+    /// "before" the attempts it follows.
+    #[test]
+    fn backwards_readings_keep_every_attempt_in_the_window() {
+        let mut s = RestartSupervisor::new(P, 1_000_000);
+        let (_, now) = crash_loop(&mut s, 1_000_000, 5);
+        assert_eq!(s.attempts_in_window(now - 60_000), 5);
+        assert_eq!(s.attempts_in_window(0), 5);
+        assert_eq!(s.on_death(0), Verdict::Degrade);
     }
 }
