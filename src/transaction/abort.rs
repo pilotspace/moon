@@ -169,9 +169,10 @@ pub fn abort_cross_store_txn(txn: CrossStoreTxn) -> AbortLog {
                     .mutable
                     .mark_deleted_by_key_hash_after_lsn(intent.point_id, txn_snapshot_lsn);
                 if count == 0 {
-                    // Not a leak since moon#1285: step 4 tombstones the key in
-                    // every tier (a compaction may have moved the entry out of
-                    // the mutable segment) before re-deriving it.
+                    // Not a leak since moon#1285: step 4 re-derives the key,
+                    // which tombstones every live copy in every tier (a
+                    // compaction may have moved the entry out of the mutable
+                    // segment).
                     tracing::debug!(
                         txn_id,
                         index_name = ?intent.index_name,
@@ -193,7 +194,9 @@ pub fn abort_cross_store_txn(txn: CrossStoreTxn) -> AbortLog {
     //    also tombstoned the key's previous vector (non-transactional
     //    append on the monoio path) and a TXN `DEL` tombstoned it outright,
     //    so without this the aborted-to hash was searchable nowhere. The
-    //    same rebuild is what a replica runs for the `DEL` / `RESTORE` it
+    //    rebuild goes through the HSET path, whose MVCC tombstone keeps the
+    //    pre-transaction version visible to `FT.SEARCH … AS_OF` earlier
+    //    snapshots. It is what a replica runs for the `DEL` / `RESTORE` it
     //    receives and what a restart's dedup rescan converges to.
     // ------------------------------------------------------------------
     if !undone_keys.is_empty() {

@@ -172,11 +172,16 @@ pub(crate) fn run_post_write_hooks(
 /// value the key holds NOW in `db` (moon#1285).
 ///
 /// For a writer that replaced the key's value wholesale outside `HSET`:
-/// `RESTORE` (live, replicated or replayed) and `TXN.ABORT`'s restore. Every
-/// vector copy of the key is tombstoned in every tier first — the value it
-/// came from is gone — and a live hash is then re-indexed exactly as an
-/// `HSET` of all its fields would index it. A key that is absent, expired or
-/// not a hash ends with no vector document, as after a `DEL`.
+/// `RESTORE` (live, replicated or replayed) and `TXN.ABORT`'s restore.
+///
+/// - A live hash is re-indexed exactly as an `HSET` of all its (unexpired)
+///   fields: the HSET path tombstones the key's previous vector MVCC-style,
+///   at the new insert's LSN, so `FT.SEARCH … AS_OF` a point before this
+///   write still sees the previous version (a `DEL`-style tombstone would
+///   erase it from every snapshot). An index whose vector field the hash
+///   does not carry drops the key, as an `HDEL` of that field would.
+/// - A key that is absent, expired or not a hash loses its documents, as
+///   after a `DEL`.
 ///
 /// Free when no index exists on the shard (two length loads); otherwise one
 /// prefix lookup per store before anything is built.
@@ -191,19 +196,33 @@ pub(crate) fn reindex_key_from_keyspace(
         return;
     }
     let db_tag = db_index as u8;
-    if vector_store
-        .find_matching_index_names_for_db(key, db_tag)
-        .is_empty()
+    let vector_indexes = vector_store.find_matching_index_names_for_db(key, db_tag);
+    if vector_indexes.is_empty()
         && text_store
             .find_matching_index_names_for_db(key, db_tag)
             .is_empty()
     {
         return;
     }
-    vector_store.mark_deleted_for_key_for_db(key, db_tag);
     let Some(args) = hash_as_hset_args(db, key) else {
+        vector_store.mark_deleted_for_key_for_db(key, db_tag);
         return;
     };
+    for name in &vector_indexes {
+        let carries_vector = vector_store.get_index(name).is_some_and(|idx| {
+            idx.meta.vector_fields.first().is_some_and(|f| {
+                crate::shard::spsc_handler::find_vector_blob(
+                    &args,
+                    &f.field_name,
+                    f.dimension as usize,
+                )
+                .is_some()
+            })
+        });
+        if !carries_vector {
+            vector_store.mark_deleted_for_key_in_index(name, key);
+        }
+    }
     let _ = crate::shard::spsc_handler::auto_index_hset_public(
         vector_store,
         text_store,
