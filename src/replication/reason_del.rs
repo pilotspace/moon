@@ -177,6 +177,19 @@ fn record_reason_del_dropped(key: &[u8]) {
 /// drop eviction victims without a `DEL`, so an AOF restart replayed every
 /// evicted key back.
 #[allow(clippy::too_many_arguments)]
+///
+/// `aof_budget` is the caller's SHARED backpressure budget for the whole
+/// eviction run (moon#1294), exactly as for [`record_reason_del`] (#454
+/// review P2.8): every gate mints ONE
+/// [`crate::persistence::aof::AOF_REASON_DEL_BACKPRESSURE_BOUND`] per
+/// `evict_to_budget` call and threads it through its report sink. These
+/// gates run while holding the db write lock and the `RuntimeConfig` read
+/// lock, so a per-key bound let one write that evicted k victims against a
+/// full AOF channel block the shard for k × 500 ms. Once the budget is spent
+/// the remaining victims of that run fail fast into
+/// [`crate::persistence::aof::AOF_REASON_DEL_DROPPED`] (fail-loud: counted,
+/// logged, `aof_last_append_status:err`).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn record_reason_del_conn(
     repl_state: &Option<std::sync::Arc<parking_lot::RwLock<ReplicationState>>>,
     shard_id: usize,
@@ -184,6 +197,7 @@ pub(crate) fn record_reason_del_conn(
     aof_pool: Option<&std::sync::Arc<AofWriterPool>>,
     db: usize,
     key: &[u8],
+    aof_budget: &mut std::time::Duration,
 ) {
     // Task #34 review (defect 2): see `conn_has_work` doc comment. Skip the
     // `serialize_del` allocation entirely when neither leg has any work.
@@ -197,6 +211,7 @@ pub(crate) fn record_reason_del_conn(
         aof_pool,
         db,
         serialize_del(key),
+        aof_budget,
     );
 }
 
@@ -248,8 +263,20 @@ pub(crate) fn record_effect_write(
     // replay exactly like the same command sent from a connection would.
     // No record means the reply proves the inner command wrote nothing;
     // several (moon#1130) are recorded one by one, in order.
+    // One bound per effect: a script's own write is one client-visible
+    // command, not a sweep (the per-run sharing of moon#1294 applies to the
+    // eviction victims its gate reports, see `scripting::bridge`).
+    let mut budget = crate::persistence::aof::AOF_REASON_DEL_BACKPRESSURE_BOUND;
     for serialized in crate::persistence::aof::serialize_effect_for_log(&frame, reply) {
-        record_bytes_conn(repl_state, shard_id, num_shards, aof_pool, db, serialized);
+        record_bytes_conn(
+            repl_state,
+            shard_id,
+            num_shards,
+            aof_pool,
+            db,
+            serialized,
+            &mut budget,
+        );
     }
 }
 
@@ -287,6 +314,7 @@ fn record_bytes_conn(
     aof_pool: Option<&std::sync::Arc<AofWriterPool>>,
     db: usize,
     bytes: Bytes,
+    budget: &mut std::time::Duration,
 ) {
     // Cheap first gate (one Relaxed load): skip the replication leg entirely
     // until a replica has ever begun attaching — mirrors
@@ -299,9 +327,9 @@ fn record_bytes_conn(
     let _ = (repl_state, num_shards);
     if let Some(pool) = aof_pool {
         // #452.4: escalated bound + fail-loud accounting — see
-        // `record_reason_del`'s comment for the resurrection rationale.
-        let mut budget = crate::persistence::aof::AOF_REASON_DEL_BACKPRESSURE_BOUND;
-        if !pool.send_append_bounded_blocking(shard_id, 0, db, bytes.clone(), &mut budget) {
+        // `record_reason_del`'s comment for the resurrection rationale. The
+        // bound is the caller's (moon#1294): shared by a whole eviction run.
+        if !pool.send_append_bounded_blocking(shard_id, 0, db, bytes.clone(), budget) {
             record_reason_del_dropped(&bytes);
         }
     }
@@ -559,6 +587,75 @@ mod tests {
             "an exhausted sweep budget must fail fast, not re-block per key (took {:?})",
             t0.elapsed()
         );
+    }
+
+    /// moon#1294: the connection-context flavor shares ONE budget across an
+    /// eviction run exactly as the shard-loop flavor does (#454 P2.8). The
+    /// write gates call it under the db write lock + RuntimeConfig read
+    /// lock; a fresh 500 ms bound per victim let one write that evicted k
+    /// keys against a full AOF channel block the shard k × 500 ms. Red on
+    /// ce65400 (no budget parameter: every call minted its own bound).
+    #[test]
+    fn reason_del_conn_budget_is_shared_across_an_eviction_run() {
+        let (tx, _rx) =
+            crate::runtime::channel::mpsc_bounded::<crate::persistence::aof::AofMessage>(1);
+        let pool = std::sync::Arc::new(crate::persistence::aof::AofWriterPool::top_level(tx));
+        assert!(pool.try_send_append(0, 0, 0, Bytes::from_static(b"fill")));
+
+        let before = crate::persistence::aof::AOF_REASON_DEL_DROPPED
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let mut run_budget = std::time::Duration::from_millis(20);
+        let t0 = std::time::Instant::now();
+        record_reason_del_conn(&None, 0, 1, Some(&pool), 0, b"victim-1", &mut run_budget);
+        assert_eq!(
+            run_budget,
+            std::time::Duration::ZERO,
+            "a fully-blocked emission must consume the whole run budget"
+        );
+        let first = t0.elapsed();
+        assert!(
+            first >= std::time::Duration::from_millis(15),
+            "the first victim must wait for the writer (took {first:?})"
+        );
+        // Ten more victims of the same run: each fails fast.
+        let t1 = std::time::Instant::now();
+        for i in 0..10u8 {
+            record_reason_del_conn(&None, 0, 1, Some(&pool), 0, &[b'k', i], &mut run_budget);
+        }
+        assert!(
+            t1.elapsed() < std::time::Duration::from_millis(15),
+            "an exhausted run budget must fail fast, not re-block per victim (took {:?})",
+            t1.elapsed()
+        );
+        let after = crate::persistence::aof::AOF_REASON_DEL_DROPPED
+            .load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            after >= before + 11,
+            "every victim past the budget is counted as a dropped reason-DEL \
+             (before={before}, after={after})"
+        );
+    }
+
+    /// moon#1294: a budget that is NOT exhausted is not charged by an
+    /// emission that enqueued immediately — a healthy writer costs nothing.
+    #[test]
+    fn reason_del_conn_fast_path_leaves_the_budget_untouched() {
+        let (tx, rx) =
+            crate::runtime::channel::mpsc_bounded::<crate::persistence::aof::AofMessage>(16);
+        let pool = std::sync::Arc::new(crate::persistence::aof::AofWriterPool::top_level(tx));
+        let mut run_budget = crate::persistence::aof::AOF_REASON_DEL_BACKPRESSURE_BOUND;
+        for i in 0..8u8 {
+            record_reason_del_conn(&None, 0, 1, Some(&pool), 0, &[b'k', i], &mut run_budget);
+        }
+        assert_eq!(
+            run_budget,
+            crate::persistence::aof::AOF_REASON_DEL_BACKPRESSURE_BOUND
+        );
+        let mut n = 0;
+        while rx.try_recv().is_ok() {
+            n += 1;
+        }
+        assert_eq!(n, 8, "every victim's DEL reached the writer channel");
     }
 
     /// `conn_has_work` (defect 2's connection-context gate): an AOF pool

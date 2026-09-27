@@ -2582,6 +2582,10 @@ pub(crate) async fn handle_connection_sharded_inner<
                                     // (round-2b review MAJOR-3: without it the AOF replayed
                                     // every evicted key back after a restart).
                                     let sel_db = conn.selected_db;
+                                    // moon#1294: ONE AOF backpressure bound per
+                                    // eviction run, shared by every victim.
+                                    let mut aof_budget =
+                                        crate::persistence::aof::AOF_REASON_DEL_BACKPRESSURE_BOUND;
                                     let mut report_eviction_del = |key: &[u8]| {
                                         crate::replication::reason_del::record_reason_del_conn(
                                             &ctx.repl_state,
@@ -2590,6 +2594,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                                             ctx.aof_pool.as_ref(),
                                             sel_db,
                                             key,
+                                            &mut aof_budget,
                                         );
                                     };
                                     let evict_result = if let Some(ref sender) = ctx.spill_sender {

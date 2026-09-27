@@ -318,7 +318,9 @@ fn mq_write_gate(
     let rt = ctx.runtime_config.read();
     let budget = ctx.shard_databases.elastic_budget(ctx.shard_id);
     // Plain-dropped victims are DELs on the AOF and the replica stream
-    // (round-2b review MAJOR-3), as on the monoio gates.
+    // (round-2b review MAJOR-3), as on the monoio gates — under ONE AOF
+    // backpressure bound for the whole run (moon#1294).
+    let mut aof_budget = crate::persistence::aof::AOF_REASON_DEL_BACKPRESSURE_BOUND;
     let mut report_eviction_del = |key: &[u8]| {
         crate::replication::reason_del::record_reason_del_conn(
             &ctx.repl_state,
@@ -327,6 +329,7 @@ fn mq_write_gate(
             ctx.aof_pool.as_ref(),
             db_index,
             key,
+            &mut aof_budget,
         );
     };
     if let Some(ref sender) = ctx.spill_sender {

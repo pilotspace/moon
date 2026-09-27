@@ -303,6 +303,11 @@ fn run_write_eviction_gate(
 ) -> Result<(), Frame> {
     let rt = ctx.runtime_config.read();
     let budget = ctx.shard_databases.elastic_budget(ctx.shard_id);
+    // moon#1294: ONE AOF backpressure bound for this whole eviction run,
+    // shared by every victim's reason-DEL — this gate holds the db write
+    // lock and the RuntimeConfig read lock, so a per-victim bound could
+    // block the shard victims × 500 ms on a full AOF channel.
+    let mut aof_budget = crate::persistence::aof::AOF_REASON_DEL_BACKPRESSURE_BOUND;
     let global_result = if let Some(ref sender) = ctx.spill_sender {
         let mut fid = ctx.spill_file_id.get();
         let dir = ctx
@@ -322,6 +327,7 @@ fn run_write_eviction_gate(
                         ctx.aof_pool.as_ref(),
                         sel_db,
                         key,
+                        &mut aof_budget,
                     );
                 }),
         );
@@ -344,6 +350,7 @@ fn run_write_eviction_gate(
                     ctx.aof_pool.as_ref(),
                     sel_db,
                     key,
+                    &mut aof_budget,
                 );
             }),
         )

@@ -223,6 +223,10 @@ impl LuaEvictionCtx {
         }
         let rt = inner.runtime_config.read();
         let budget = inner.shard_databases.elastic_budget(inner.shard_id);
+        // moon#1294: ONE AOF backpressure bound for this eviction run,
+        // shared by every victim's reason-DEL (a per-victim bound let one
+        // `redis.call` that evicted k keys block the shard k × 500 ms).
+        let mut aof_budget = crate::persistence::aof::AOF_REASON_DEL_BACKPRESSURE_BOUND;
         let mut on_plain_drop = |key: &[u8]| {
             // moon#894: same body-order rule as `emit_effect`.
             #[cfg(feature = "runtime-monoio")]
@@ -239,6 +243,7 @@ impl LuaEvictionCtx {
                 inner.aof_pool.as_ref(),
                 db_index,
                 key,
+                &mut aof_budget,
             );
         };
         let global_result = if let Some(sender) = &inner.spill_sender {

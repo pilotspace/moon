@@ -3144,6 +3144,9 @@ pub(crate) fn try_inline_dispatch(
     {
         if needs_eviction {
             let rt = runtime_config.read();
+            // moon#1294: ONE AOF backpressure bound for this eviction run,
+            // shared by every victim's reason-DEL.
+            let mut aof_budget = crate::persistence::aof::AOF_REASON_DEL_BACKPRESSURE_BOUND;
             let oom = crate::shard::slice::with_shard_db(selected_db, |db| {
                 crate::storage::eviction::evict_to_budget(
                     db,
@@ -3169,6 +3172,7 @@ pub(crate) fn try_inline_dispatch(
                                     aof_pool.as_ref(),
                                     selected_db,
                                     key,
+                                    &mut aof_budget,
                                 );
                             },
                         ),
