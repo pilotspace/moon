@@ -50,8 +50,19 @@ fn resp(parts: &[&str]) -> Vec<u8> {
     out
 }
 
-/// Pipeline `WRITES` `EVAL`s (one key each) and drain every reply.
-fn pipelined_evals(port: u16) -> usize {
+/// How each write reaches the owner shard's script bridge.
+#[derive(Clone, Copy)]
+enum Via {
+    /// `EVAL` routed as `ShardMessage::Execute`.
+    Eval,
+    /// `MULTI / EVAL / EXEC`, the body routed as `ShardMessage::TxnExecute`.
+    MultiEval,
+    /// `FCALL` routed as `ShardMessage::Execute`.
+    Fcall,
+}
+
+/// Pipeline `WRITES` script writes (one key each) and drain every reply.
+fn pipelined_writes(port: u16, via: Via) -> usize {
     let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
     s.set_read_timeout(Some(Duration::from_secs(120))).ok();
     let val = "E".repeat(600);
@@ -60,13 +71,26 @@ fn pipelined_evals(port: u16) -> usize {
         let mut buf = Vec::with_capacity(chunk.len() * 700);
         for i in chunk {
             let key = format!("eval:{i}");
-            buf.extend_from_slice(&resp(&["EVAL", SCRIPT, "1", &key, &val]));
+            match via {
+                Via::Eval => buf.extend_from_slice(&resp(&["EVAL", SCRIPT, "1", &key, &val])),
+                Via::MultiEval => {
+                    buf.extend_from_slice(&resp(&["MULTI"]));
+                    buf.extend_from_slice(&resp(&["EVAL", SCRIPT, "1", &key, &val]));
+                    buf.extend_from_slice(&resp(&["EXEC"]));
+                }
+                Via::Fcall => buf.extend_from_slice(&resp(&["FCALL", "ws30set", "1", &key, &val])),
+            }
         }
         s.write_all(&buf).expect("write");
+        // +OK / +QUEUED / *1 / +OK per transaction; one line per script.
+        let per = match via {
+            Via::MultiEval => 4,
+            Via::Eval | Via::Fcall => 1,
+        };
         let mut got = Vec::new();
         let mut lines = 0usize;
         let mut tmp = [0u8; 65536];
-        while lines < chunk.len() {
+        while lines < chunk.len() * per {
             let n = s.read(&mut tmp).expect("read");
             assert!(n > 0, "server closed the connection");
             got.extend_from_slice(&tmp[..n]);
@@ -83,11 +107,37 @@ fn pipelined_evals(port: u16) -> usize {
 #[test]
 #[ignore = "real-server suite: MOON_BIN pinned"]
 fn routed_eval_tiers_every_victim_without_an_aof() {
+    run_routed(Via::Eval, "rv-w1-eval-1290");
+}
+
+/// WS30 sibling: a script queued in MULTI whose body is routed to the owner
+/// shard (`TxnExecute`) runs inside the same drain. Before the lend it
+/// plain-dropped 1868 (monoio) / 1989 (tokio) of 16000 at `--shards 4`.
+#[test]
+#[ignore = "real-server suite: MOON_BIN pinned"]
+fn routed_multi_eval_tiers_every_victim_without_an_aof() {
+    run_routed(Via::MultiEval, "rv-w1-multi-eval-1290");
+}
+
+/// WS30 sibling: a routed `FCALL` (the Functions arm of the same drain).
+#[test]
+#[ignore = "real-server suite: MOON_BIN pinned"]
+fn routed_fcall_tiers_every_victim_without_an_aof() {
+    run_routed(Via::Fcall, "rv-w1-fcall-1290");
+}
+
+fn run_routed(via: Via, label: &str) {
     let port = common::reserve_port();
-    let dir = unique_dir("rv-w1-eval-1290");
+    let dir = unique_dir(label);
     std::fs::create_dir_all(&dir).expect("create test dir");
     let mut server = start_moon_alive_with(port, &dir, 3600, "no", &SAVE);
-    let errors = pipelined_evals(port);
+    if let Via::Fcall = via {
+        let lib = "#!lua name=ws30lib\nredis.register_function('ws30set', \
+                   function(keys, args) return redis.call('SET', keys[1], args[1]) end)";
+        let reply = redis_cmd(port, &["FUNCTION", "LOAD", lib]);
+        assert!(reply.contains("ws30lib"), "FUNCTION LOAD: {reply}");
+    }
+    let errors = pipelined_writes(port, via);
     std::thread::sleep(Duration::from_secs(2));
     let evicted = info_u64(port, "evicted_keys").unwrap_or(u64::MAX);
     let spilled = info_u64(port, "spilled_keys").unwrap_or(0);

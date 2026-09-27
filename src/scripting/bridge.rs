@@ -253,8 +253,10 @@ impl LuaEvictionCtx {
                 .as_deref()
                 .unwrap_or(std::path::Path::new("."));
             // moon#1290 N6: tier durably without an AOF. A script the event
-            // loop runs itself (a cross-shard leg) finds the manifest held
-            // and keeps the no-manifest path (`shard::manifest_cell`).
+            // loop runs itself (a routed EVAL/FCALL, a script in a routed
+            // MULTI body) finds the cell held by the drain, which LENDS its
+            // manifest for the run (`shard::manifest_cell::lend`, wave-1
+            // review F2) — without the lend its victims were plain-dropped.
             let res = crate::shard::manifest_cell::with_manifest(|manifest| {
                 evict_to_budget(
                     db,
