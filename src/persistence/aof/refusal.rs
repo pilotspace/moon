@@ -150,6 +150,31 @@ pub fn barrier_refusal_frame(ack: AofAck) -> Frame {
     Frame::Error(Bytes::from_static(barrier_refusal_reply(ack)))
 }
 
+/// SWAPDB's reply when the fsync barrier after its already-applied swap was
+/// refused with `ack` on the `local` shard or a remote one: a writer backlog
+/// (moon#1272) is not an fsync failure. Static bytes, no allocation.
+pub fn swapdb_barrier_refusal_frame(ack: AofAck, local: bool) -> Frame {
+    let text: &'static [u8] = match (ack.is_backpressure(), local) {
+        (true, true) => {
+            b"ERR SWAPDB durability unconfirmed on this shard (fsync barrier not queued: \
+              the AOF writer is backlogged; the swap was already applied)"
+        }
+        (true, false) => {
+            b"ERR SWAPDB durability unconfirmed on a remote shard (fsync barrier not queued: \
+              the AOF writer is backlogged; the swap was already applied)"
+        }
+        (false, true) => {
+            b"ERR SWAPDB durability unconfirmed on this shard \
+              (fsync barrier failed after the swap was already applied)"
+        }
+        (false, false) => {
+            b"ERR SWAPDB durability unconfirmed on a remote shard \
+              (fsync barrier failed after the swap was already applied)"
+        }
+    };
+    Frame::Error(Bytes::from_static(text))
+}
+
 /// What the stall logger does for one refusal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum StallLog {
@@ -390,5 +415,19 @@ mod tests {
             stall_log_step(50_000, 50_000, 50_000 + quiet),
             StallLog::Began
         );
+    }
+
+    #[test]
+    fn swapdb_barrier_refusal_names_the_backlog_not_an_fsync_failure() {
+        let text = |f: Frame| match f {
+            Frame::Error(b) => String::from_utf8_lossy(&b).into_owned(),
+            other => panic!("expected an error frame, got {other:?}"),
+        };
+        let backlog = text(swapdb_barrier_refusal_frame(AofAck::ChannelFull, true));
+        assert!(backlog.contains("AOF writer is backlogged"), "{backlog}");
+        assert!(!backlog.contains("fsync barrier failed"), "{backlog}");
+        assert!(text(swapdb_barrier_refusal_frame(AofAck::ChannelFull, false)).contains("remote"));
+        let failed = text(swapdb_barrier_refusal_frame(AofAck::FsyncFailed, true));
+        assert!(failed.contains("fsync barrier failed"), "{failed}");
     }
 }

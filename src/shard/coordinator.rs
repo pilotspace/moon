@@ -3910,11 +3910,10 @@ pub async fn coordinate_swapdb(
                 .await
             {
                 Ok(((), needs_barrier)) => {
-                    if needs_barrier && pool.fsync_barrier(my_shard).await.is_err() {
-                        local_durability_err = Some(Frame::Error(bytes::Bytes::from_static(
-                            b"ERR SWAPDB durability unconfirmed on this shard \
-                              (fsync barrier failed after the swap was already applied)",
-                        )));
+                    if needs_barrier && let Err(ack) = pool.fsync_barrier(my_shard).await {
+                        local_durability_err = Some(
+                            crate::persistence::aof::swapdb_barrier_refusal_frame(ack, true),
+                        );
                     }
                 }
                 // The record was never accepted and nothing was swapped.
@@ -3958,13 +3957,12 @@ pub async fn coordinate_swapdb(
         match rx.recv().await {
             Ok(()) => {
                 if let Some(pool) = aof_pool
-                    && pool.fsync_barrier(target).await.is_err()
+                    && let Err(ack) = pool.fsync_barrier(target).await
                     && leg_err.is_none()
                 {
-                    leg_err = Some(Frame::Error(bytes::Bytes::from_static(
-                        b"ERR SWAPDB durability unconfirmed on a remote shard \
-                          (fsync barrier failed after the swap was already applied)",
-                    )));
+                    leg_err = Some(crate::persistence::aof::swapdb_barrier_refusal_frame(
+                        ack, false,
+                    ));
                 }
             }
             Err(_) => {

@@ -798,6 +798,7 @@ pub(crate) use refusal::note_append_backpressure_refusal;
 pub use refusal::{
     AOF_APPEND_BACKPRESSURE_REFUSALS, AOF_BACKLOG_ERR, AOF_BARRIER_BACKLOG_ERR,
     append_refusal_frame, append_refusal_reply, barrier_refusal_frame, barrier_refusal_reply,
+    swapdb_barrier_refusal_frame,
 };
 pub use rewrite::generate_rewrite_commands;
 // `rewrite_aof` is defined only under the tokio runtime; gate its re-export to match.
