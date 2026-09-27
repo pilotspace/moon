@@ -2836,6 +2836,26 @@ pub(crate) async fn handle_connection_sharded_inner<
                                     );
                                 });
                             }
+                            // moon#1285: RESTORE replaces a whole value — rebuild the
+                            // key's documents from what it holds now (also the
+                            // replay half of TXN.ABORT's restore).
+                            if !matches!(response, Frame::Error(_))
+                                && cmd.eq_ignore_ascii_case(b"RESTORE")
+                            {
+                                if let Some(key) = cmd_args.first().and_then(|f| extract_bytes(f)) {
+                                    let db_index = conn.selected_db;
+                                    crate::shard::slice::with_shard(|s| {
+                                        let guard = s.databases.read(db_index);
+                                        crate::shard::write_hooks::reindex_key_from_keyspace(
+                                            &mut s.vector_store,
+                                            &mut s.text_store,
+                                            &guard,
+                                            &key,
+                                            db_index,
+                                        );
+                                    });
+                                }
+                            }
                             // R4: HDEL of an indexed VECTOR field tombstones the vector
                             // in exactly the affected indexes (whole-key deletion is the
                             // DEL/UNLINK arm above; non-vector-field HDELs are no-ops).

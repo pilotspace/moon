@@ -3773,6 +3773,22 @@ pub(crate) async fn handle_connection_sharded_monoio<
                             crate::shard::mq_exec::auto_drop_mq_streams(s, cmd_args, sel_db);
                         }
 
+                        // moon#1285: RESTORE replaces a whole value — rebuild
+                        // the key's documents from what it holds now (also
+                        // the replica/replay half of TXN.ABORT's restore).
+                        if !is_error && cmd.eq_ignore_ascii_case(b"RESTORE") {
+                            if let Some(Frame::BulkString(key)) = cmd_args.first() {
+                                let guard = s.databases.read(sel_db);
+                                crate::shard::write_hooks::reindex_key_from_keyspace(
+                                    &mut s.vector_store,
+                                    &mut s.text_store,
+                                    &guard,
+                                    key,
+                                    sel_db,
+                                );
+                            }
+                        }
+
                         // R4: HDEL of an indexed vector field tombstones it.
                         if !is_error && cmd.eq_ignore_ascii_case(b"HDEL") {
                             crate::shard::spsc_handler::auto_hdel_vectors(

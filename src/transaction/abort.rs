@@ -58,6 +58,7 @@
 //! idempotent no-op, and there is no `unwrap()` / `expect()` in the helper.
 
 use bytes::Bytes;
+use smallvec::SmallVec;
 
 use crate::transaction::CrossStoreTxn;
 use crate::transaction::kv_compensation::{self, CompensatingRecord};
@@ -117,8 +118,10 @@ pub fn abort_cross_store_txn(txn: CrossStoreTxn) -> AbortLog {
     //    compensating record(s).
     // ------------------------------------------------------------------
     let plan = kv_compensation::first_per_key(txn.kv_undo);
+    let mut undone_keys: SmallVec<[(usize, Bytes); 8]> = SmallVec::with_capacity(plan.len());
     log.kv.reserve(plan.len());
     for (db, record) in plan {
+        undone_keys.push((db, kv_compensation::record_key(&record).clone()));
         crate::shard::slice::with_shard_db(db, |d| {
             kv_compensation::undo_one(d, db, record, &mut log.kv);
         });
@@ -166,11 +169,14 @@ pub fn abort_cross_store_txn(txn: CrossStoreTxn) -> AbortLog {
                     .mutable
                     .mark_deleted_by_key_hash_after_lsn(intent.point_id, txn_snapshot_lsn);
                 if count == 0 {
-                    tracing::warn!(
+                    // Not a leak since moon#1285: step 4 tombstones the key in
+                    // every tier (a compaction may have moved the entry out of
+                    // the mutable segment) before re-deriving it.
+                    tracing::debug!(
                         txn_id,
                         index_name = ?intent.index_name,
                         point_id = intent.point_id,
-                        "txn abort: mark_deleted_by_key_hash_after_lsn matched zero entries (rollback may leak)",
+                        "txn abort: no mutable entry after the snapshot lsn for this intent",
                     );
                 }
             }
@@ -181,7 +187,32 @@ pub fn abort_cross_store_txn(txn: CrossStoreTxn) -> AbortLog {
     }
 
     // ------------------------------------------------------------------
-    // 4. Side-table cleanup — release KV write-intents so other readers
+    // 4. Index re-derivation (moon#1285) — the vector/text documents of
+    //    every key the KV undo restored are rebuilt from the restored value.
+    //    Step 3 only tombstones what the transaction APPENDED; a TXN `HSET`
+    //    also tombstoned the key's previous vector (non-transactional
+    //    append on the monoio path) and a TXN `DEL` tombstoned it outright,
+    //    so without this the aborted-to hash was searchable nowhere. The
+    //    same rebuild is what a replica runs for the `DEL` / `RESTORE` it
+    //    receives and what a restart's dedup rescan converges to.
+    // ------------------------------------------------------------------
+    if !undone_keys.is_empty() {
+        crate::shard::slice::with_shard(|s| {
+            for (db, key) in &undone_keys {
+                let guard = s.databases.read(*db);
+                crate::shard::write_hooks::reindex_key_from_keyspace(
+                    &mut s.vector_store,
+                    &mut s.text_store,
+                    &guard,
+                    key,
+                    *db,
+                );
+            }
+        });
+    }
+
+    // ------------------------------------------------------------------
+    // 5. Side-table cleanup — release KV write-intents so other readers
     //    see this transaction's keys again, and discard any deferred
     //    HNSW insertions queued for this txn (prevents phantom neighbors
     //    from showing up post-compaction on a txn that never committed).
