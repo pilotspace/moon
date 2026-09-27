@@ -812,7 +812,9 @@ pub fn spawn_admin_server(
                 {
                     let handle = state.prometheus_handle.clone();
                     tokio::spawn(async move {
-                        let mut tick = tokio::time::interval(std::time::Duration::from_secs(5));
+                        let mut tick = crate::runtime::interval::tokio_interval(
+                            std::time::Duration::from_secs(5),
+                        );
                         loop {
                             tick.tick().await;
                             handle.run_upkeep();

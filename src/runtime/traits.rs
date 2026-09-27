@@ -15,6 +15,10 @@ pub trait RuntimeTimer {
     type Interval: RuntimeInterval;
 
     /// Create a repeating interval that ticks every `period`.
+    ///
+    /// Contract (moon#1280): missed ticks are SKIPPED, never burst — after a
+    /// stall of any length the interval fires at most one catch-up tick and
+    /// then returns to its period-aligned grid. See [`crate::runtime::interval`].
     fn interval(period: Duration) -> Self::Interval;
 
     /// Sleep for the given duration.

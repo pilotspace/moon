@@ -63,7 +63,8 @@ impl RateLimiter {
             // satisfy that. If invoked outside a runtime we silently skip.
             if tokio::runtime::Handle::try_current().is_ok() {
                 tokio::spawn(async move {
-                    let mut ticker = tokio::time::interval(Duration::from_secs(60));
+                    let mut ticker =
+                        crate::runtime::interval::tokio_interval(Duration::from_secs(60));
                     loop {
                         ticker.tick().await;
                         let Some(l) = weak.upgrade() else {

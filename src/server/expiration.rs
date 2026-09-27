@@ -35,7 +35,7 @@ pub async fn run_active_expiration(
     // still applies. `None` (no replication configured) always sweeps.
     is_replica_mirror: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 ) {
-    let mut interval = tokio::time::interval(Duration::from_millis(100));
+    let mut interval = crate::runtime::interval::tokio_interval(Duration::from_millis(100));
 
     loop {
         tokio::select! {

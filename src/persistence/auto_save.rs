@@ -56,7 +56,7 @@ pub async fn run_auto_save(
     cancel: CancellationToken,
 ) {
     #[cfg(feature = "runtime-tokio")]
-    let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+    let mut interval = crate::runtime::interval::tokio_interval(std::time::Duration::from_secs(1));
     let mut last_save = Instant::now();
 
     loop {
@@ -221,7 +221,7 @@ pub async fn run_auto_save_sharded(
     snapshot_trigger: crate::runtime::channel::WatchSender<u64>,
 ) {
     #[cfg(feature = "runtime-tokio")]
-    let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+    let mut interval = crate::runtime::interval::tokio_interval(std::time::Duration::from_secs(1));
     let mut last_attempt = Instant::now();
     let started_unix = unix_now_secs();
 
