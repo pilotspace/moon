@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# moon#1276: portable redis-cli timeouts (`cli_bounded`), auxiliary-server
+# tracking (`aux_start` / `aux_kill_all`) and a loud ERR trap -- see the library.
+# shellcheck source=lib/harness-guard.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/harness-guard.sh"
+harness_install_err_trap "test-commands.sh"
+
 # moon: `grep -q` exits on the FIRST match, closing the pipe. Under
 # `set -o pipefail` that SIGPIPEs the writer, so the PIPELINE reports failure
 # even though grep succeeded -- turning any assertion whose output is longer
@@ -25,6 +31,23 @@ qgrep() { local _in; _in=$(cat); grep "$@" <<< "$_in" > /dev/null; }
 #   ./scripts/test-commands.sh --skip-bench     # Skip redis-benchmark throughput
 #   ./scripts/test-commands.sh --bench-only     # Only redis-benchmark throughput
 #   ./scripts/test-commands.sh --moon-only      # Test moon without Redis comparison
+#
+# Ports (all overridable from the environment): PORT_REDIS (6399), PORT_RUST
+# (6400), the eviction leg's PORT_EVICT (PORT_RUST+530) and NUMERIC-07's
+# PORT_N7_1 / PORT_N7_4 (6411 / 6414). Every auxiliary server is tracked and
+# killed by the EXIT trap, and a leg refuses to start one on a port that
+# already accepts connections (moon#1276).
+#
+# ORACLE VERSION. The expected values assume a redis 7.2+/8.x oracle (what
+# `brew install redis` gives). redis-cli 7.2+ is not required: without `-t`
+# the calls are bounded with `timeout`/`gtimeout` instead (moon#1276). Against
+# redis 7.0.15 rows differ because moon follows 7.2+ behaviour, not because
+# of moon bugs: listpack set/list encodings, ZRANK ... WITHSCORE, the NOPERM
+# text "User <name> has no permissions ...", the COMMAND GETKEYS keyless
+# text, hash-field-expiry tracking, DEBUG DIGEST values, and the moon#981
+# '-@all +get +set' ACL GETUSER row (flaky on 7.0: dict-order rendering under
+# a per-process random seed). The run prints the oracle's version at startup
+# and warns below 7.2.
 ###############################################################################
 
 # Overridable like the sibling `test-consistency.sh`: these ports are often
@@ -105,11 +128,17 @@ cleanup() {
     # return 1 whenever a PID is unset, which would report a clean run as a
     # failure (and a failed run as whatever the last kill happened to return).
     local rc=$?
+    # The run is over: a failing command in here (or this trap's own
+    # non-zero return) is not a mid-run death, so the ERR report is off.
+    trap - ERR
     log "Cleaning up..."
+    # moon#1276: first every auxiliary server a leg left running when the run
+    # died inside it -- by exact PID, before anything else can fail.
+    aux_kill_all
     [[ -n "${RUST_PID:-}" ]] && kill "$RUST_PID" 2>/dev/null; wait "$RUST_PID" 2>/dev/null || true
     [[ -n "${REDIS_PID:-}" ]] && kill "$REDIS_PID" 2>/dev/null; wait "$REDIS_PID" 2>/dev/null || true
     pkill -f "redis-server.*${PORT_REDIS}" 2>/dev/null || true
-    pkill -f "moon.*${PORT_RUST}" 2>/dev/null || true
+    kill_port_servers "$RUST_BINARY" "$PORT_RUST"
     [[ -n "${MOON_DATA_DIR:-}" ]] && rm -rf "$MOON_DATA_DIR"
     return "$rc"
 }
@@ -583,6 +612,8 @@ require_free_port() {
     return 0
 }
 require_free_port "$PORT_RUST" "moon"
+harness_probe_redis_cli
+harness_note_oracle_version
 # A plain `[[ ... ]] && cmd` would be the same trap: false test, status 1,
 # `set -e` ends the run. Use an if.
 if [[ "$MOON_ONLY" == "false" ]]; then
@@ -3777,27 +3808,37 @@ if should_run "vector"; then
     # repo root and report a cross-shard "match" that came from disk.
     N7_DIR1=$(mktemp -d "${TMPDIR:-/tmp}/moon-n7-1.XXXXXX")
     N7_DIR2=$(mktemp -d "${TMPDIR:-/tmp}/moon-n7-4.XXXXXX")
-    "$RUST_BINARY" --port 6411 --shards 1 --protected-mode no --dir "$N7_DIR1" --disk-free-min-pct 0 > /tmp/moon-6411.log 2>&1 &
-    N7_PID1=$!
-    "$RUST_BINARY" --port 6414 --shards 4 --protected-mode no --dir "$N7_DIR2" --disk-free-min-pct 0 > /tmp/moon-6414.log 2>&1 &
-    N7_PID2=$!
-    sleep 2
-    for PORT in 6411 6414; do
-        redis-cli -p $PORT FT.CREATE nidx ON HASH PREFIX 1 n: SCHEMA status TAG score NUMERIC > /dev/null 2>&1 || true
-        for i in $(seq 0 19); do
-            redis-cli -p $PORT HSET n:$i status open score $i > /dev/null 2>&1 || true
-        done
-    done
-    sleep 1
-    N1=$(redis-cli -p 6411 FT.SEARCH nidx '@score:[5 15]' LIMIT 0 100 2>&1 | grep '^n:' | sort || true)
-    N4=$(redis-cli -p 6414 FT.SEARCH nidx '@score:[5 15]' LIMIT 0 100 2>&1 | grep '^n:' | sort || true)
-    if [ "$N1" = "$N4" ] && [ -n "$N1" ]; then
-        COUNT_N=$(echo "$N1" | wc -l | tr -d ' ')
-        PASS=$((PASS + 1)); echo "  PASS: NUMERIC-07 1-shard and 4-shard return identical keys for @score:[5 15] (count=$COUNT_N)"
+    PORT_N7_1="${PORT_N7_1:-6411}"
+    PORT_N7_4="${PORT_N7_4:-6414}"
+    # moon#1276: tracked for the EXIT trap (a death below used to leak both)
+    # and refused on a taken port; a refusal skips the row as a FAIL.
+    aux_start "$PORT_N7_1" "/tmp/moon-$PORT_N7_1.log" "$RUST_BINARY" --port "$PORT_N7_1" \
+        --shards 1 --protected-mode no --dir "$N7_DIR1" --disk-free-min-pct 0 || true
+    N7_PID1="$AUX_LAST_PID"
+    aux_start "$PORT_N7_4" "/tmp/moon-$PORT_N7_4.log" "$RUST_BINARY" --port "$PORT_N7_4" \
+        --shards 4 --protected-mode no --dir "$N7_DIR2" --disk-free-min-pct 0 || true
+    N7_PID2="$AUX_LAST_PID"
+    if [[ -z "$N7_PID1" ]] || [[ -z "$N7_PID2" ]]; then
+        # A taken port would make this row compare servers it does not own.
+        FAIL=$((FAIL + 1)); echo "  FAIL: NUMERIC-07 skipped -- port $PORT_N7_1 or $PORT_N7_4 is already taken"
     else
-        FAIL=$((FAIL + 1)); echo "  FAIL: NUMERIC-07 cross-shard mismatch"
-        echo "1-shard: $N1"
-        echo "4-shard: $N4"
+        for PORT in "$PORT_N7_1" "$PORT_N7_4"; do
+            redis-cli -p $PORT FT.CREATE nidx ON HASH PREFIX 1 n: SCHEMA status TAG score NUMERIC > /dev/null 2>&1 || true
+            for i in $(seq 0 19); do
+                redis-cli -p $PORT HSET n:$i status open score $i > /dev/null 2>&1 || true
+            done
+        done
+        sleep 1
+        N1=$(redis-cli -p "$PORT_N7_1" FT.SEARCH nidx '@score:[5 15]' LIMIT 0 100 2>&1 | grep '^n:' | sort || true)
+        N4=$(redis-cli -p "$PORT_N7_4" FT.SEARCH nidx '@score:[5 15]' LIMIT 0 100 2>&1 | grep '^n:' | sort || true)
+        if [ "$N1" = "$N4" ] && [ -n "$N1" ]; then
+            COUNT_N=$(echo "$N1" | wc -l | tr -d ' ')
+            PASS=$((PASS + 1)); echo "  PASS: NUMERIC-07 1-shard and 4-shard return identical keys for @score:[5 15] (count=$COUNT_N)"
+        else
+            FAIL=$((FAIL + 1)); echo "  FAIL: NUMERIC-07 cross-shard mismatch"
+            echo "1-shard: $N1"
+            echo "4-shard: $N4"
+        fi
     fi
     # `|| true`: pkill exits 1 when nothing matched, and under
     # `set -euo pipefail` that killed the run outright -- on a clean machine
@@ -3805,8 +3846,8 @@ if should_run "vector"; then
     # NUMERIC-07, so MQ, txn_kv, eviction and the RESULT SUMMARY never ran.
     # Kill exactly the two servers this row started. The old name-based pkill
     # silently missed any `MOON_BIN` not literally named `moon` and leaked both.
-    kill "$N7_PID1" "$N7_PID2" 2>/dev/null || true
-    wait "$N7_PID1" "$N7_PID2" 2>/dev/null || true
+    aux_stop "$N7_PID1"
+    aux_stop "$N7_PID2"
 
     echo "  ft_aggregate: done"
 fi
@@ -4608,79 +4649,88 @@ if should_run "eviction"; then
     echo ""
     echo "=== Eviction (volatile-ttl) ==="
 
-    PORT_EVICT=$((PORT_RUST + 530))
+    PORT_EVICT="${PORT_EVICT:-$((PORT_RUST + 530))}"
     EVICT_DIR=$(mktemp -d /tmp/moon-cmd-evict.XXXXXX)
-    ecli() { redis-cli -t 5 -p "$PORT_EVICT" "$@"; }
+    # `cli_bounded`, not `redis-cli -t`: `-t` exists only in redis-cli 7.2+,
+    # and on 7.0.x the first `ecli SET` below ended the run silently here,
+    # leaking this server (moon#1276). `|| true` inside: a hung or dead
+    # server must make the rows below FAIL, not end the run under `set -e`.
+    ecli() { cli_bounded 5 -p "$PORT_EVICT" "$@" || true; }
 
-    "$RUST_BINARY" --port "$PORT_EVICT" --shards 1 --dir "$EVICT_DIR" \
-        --protected-mode no --disk-free-min-pct 0 --appendonly no \
-        --disk-offload disable --maxmemory-policy volatile-ttl >/dev/null 2>&1 &
-    EVICT_PID=$!
-    for _ in $(seq 1 50); do
-        ecli PING >/dev/null 2>&1 && break
-        sleep 0.1
-    done
-
-    # EVICT-01: volatile-ttl evicts the GLOBALLY nearest deadline. Five 64KB
-    # volatile values against a 256KB cap needs a couple of victims, and the
-    # soonest-expiring key must be among the first to go -- not a random
-    # volatile one. The budget is absolute, not derived from `used_memory`:
-    # the memory ledger is published on a chore tick, so a read taken
-    # immediately after the writes can still answer 0.
-    TOTAL=$((TOTAL + 1))
-    EV_VAL=$(head -c 65536 </dev/zero | tr '\0' 'z')
-    for i in 1 2 3 4; do
-        ecli SET "ev:far:$i" "$EV_VAL" EX 3600 >/dev/null 2>&1
-    done
-    ecli SET ev:soonest "$EV_VAL" EX 60 >/dev/null 2>&1
-    ecli CONFIG SET maxmemory 262144 >/dev/null 2>&1 || true
-    ecli SET ev:trigger v >/dev/null 2>&1 || true
-    EV_SOONEST=$(ecli EXISTS ev:soonest 2>&1)
-    EV_SURVIVORS=$(ecli EXISTS ev:far:1 ev:far:2 ev:far:3 ev:far:4 2>&1)
-    if [[ "$EV_SOONEST" == "0" ]] && [[ "$EV_SURVIVORS" =~ ^[1-4]$ ]]; then
-        PASS=$((PASS + 1)); echo "  PASS: volatile-ttl evicts the nearest deadline first ($EV_SURVIVORS far keys kept)"
+    # moon#1276: tracked for the EXIT trap and refused on a taken port. A
+    # refusal (or a server that never answers) FAILs the rows below.
+    EVICT_START=0
+    aux_start "$PORT_EVICT" /dev/null "$RUST_BINARY" --port "$PORT_EVICT" --shards 1 \
+        --dir "$EVICT_DIR" --protected-mode no --disk-free-min-pct 0 --appendonly no \
+        --disk-offload disable --maxmemory-policy volatile-ttl || EVICT_START=$?
+    EVICT_PID="$AUX_LAST_PID"
+    if [[ "$EVICT_START" == 1 ]]; then
+        # Port taken by a server this run does not own: every row below would
+        # measure THAT server. Skip them, loudly.
+        TOTAL=$((TOTAL + 4)); FAIL=$((FAIL + 4))
+        echo "  FAIL: EVICT-01..04 skipped -- port $PORT_EVICT is already taken"
     else
-        FAIL=$((FAIL + 1)); echo "  FAIL: volatile-ttl victim order wrong: EXISTS ev:soonest=$EV_SOONEST, far survivors=$EV_SURVIVORS"
-    fi
 
-    # EVICT-02: liveness. A shard thread spinning inside evict_to_budget
-    # never answers again; `-t 5` turns that into a FAIL, not a hung suite.
-    TOTAL=$((TOTAL + 1))
-    EV_ALIVE=$(ecli PING 2>&1)
-    if [[ "$EV_ALIVE" == "PONG" ]]; then
-        PASS=$((PASS + 1)); echo "  PASS: server stays responsive through volatile-ttl eviction"
-    else
-        FAIL=$((FAIL + 1)); echo "  FAIL: server stopped answering after volatile-ttl eviction: '$EV_ALIVE'"
-    fi
+        # EVICT-01: volatile-ttl evicts the GLOBALLY nearest deadline. Five 64KB
+        # volatile values against a 256KB cap needs a couple of victims, and the
+        # soonest-expiring key must be among the first to go -- not a random
+        # volatile one. The budget is absolute, not derived from `used_memory`:
+        # the memory ledger is published on a chore tick, so a read taken
+        # immediately after the writes can still answer 0.
+        TOTAL=$((TOTAL + 1))
+        EV_VAL=$(head -c 65536 </dev/zero | tr '\0' 'z')
+        for i in 1 2 3 4; do
+            ecli SET "ev:far:$i" "$EV_VAL" EX 3600 >/dev/null 2>&1
+        done
+        ecli SET ev:soonest "$EV_VAL" EX 60 >/dev/null 2>&1
+        ecli CONFIG SET maxmemory 262144 >/dev/null 2>&1 || true
+        ecli SET ev:trigger v >/dev/null 2>&1 || true
+        EV_SOONEST=$(ecli EXISTS ev:soonest 2>&1)
+        EV_SURVIVORS=$(ecli EXISTS ev:far:1 ev:far:2 ev:far:3 ev:far:4 2>&1)
+        if [[ "$EV_SOONEST" == "0" ]] && [[ "$EV_SURVIVORS" =~ ^[1-4]$ ]]; then
+            PASS=$((PASS + 1)); echo "  PASS: volatile-ttl evicts the nearest deadline first ($EV_SURVIVORS far keys kept)"
+        else
+            FAIL=$((FAIL + 1)); echo "  FAIL: volatile-ttl victim order wrong: EXISTS ev:soonest=$EV_SOONEST, far survivors=$EV_SURVIVORS"
+        fi
 
-    # EVICT-03: moon#599 accounting -- with no cold tier every victim LEAVES
-    # the keyspace, so evicted_keys moves and spilled_keys does not.
-    TOTAL=$((TOTAL + 1))
-    EV_INFO=$(ecli INFO 2>/dev/null | tr -d '\r')
-    EV_EVICTED=$(echo "$EV_INFO" | awk -F: '/^evicted_keys:/ {print $2}')
-    EV_SPILLED=$(echo "$EV_INFO" | awk -F: '/^spilled_keys:/ {print $2}')
-    if [[ "$EV_EVICTED" =~ ^[0-9]+$ ]] && ((EV_EVICTED > 0)) && [[ "$EV_SPILLED" == "0" ]]; then
-        PASS=$((PASS + 1)); echo "  PASS: evicted_keys=$EV_EVICTED, spilled_keys=0 (nothing tiered without disk-offload)"
-    else
-        FAIL=$((FAIL + 1)); echo "  FAIL: evicted_keys='$EV_EVICTED' spilled_keys='$EV_SPILLED'"
-    fi
+        # EVICT-02: liveness. A shard thread spinning inside evict_to_budget
+        # never answers again; `cli_bounded 5` turns that into a FAIL, not a hung suite.
+        TOTAL=$((TOTAL + 1))
+        EV_ALIVE=$(ecli PING 2>&1)
+        if [[ "$EV_ALIVE" == "PONG" ]]; then
+            PASS=$((PASS + 1)); echo "  PASS: server stays responsive through volatile-ttl eviction"
+        else
+            FAIL=$((FAIL + 1)); echo "  FAIL: server stopped answering after volatile-ttl eviction: '$EV_ALIVE'"
+        fi
 
-    # EVICT-04: noeviction refuses instead of evicting -- or spinning. The
-    # cap is tightened below what is already resident so the write is over
-    # budget by construction.
-    TOTAL=$((TOTAL + 1))
-    ecli CONFIG SET maxmemory-policy noeviction >/dev/null 2>&1 || true
-    ecli CONFIG SET maxmemory 65536 >/dev/null 2>&1 || true
-    EV_OOM=$(ecli SET ev:refused "$EV_VAL" 2>&1)
-    if echo "$EV_OOM" | qgrep -qi "OOM"; then
-        PASS=$((PASS + 1)); echo "  PASS: noeviction over budget returns OOM"
-    else
-        FAIL=$((FAIL + 1)); echo "  FAIL: noeviction should return OOM, got: $EV_OOM"
-    fi
+        # EVICT-03: moon#599 accounting -- with no cold tier every victim LEAVES
+        # the keyspace, so evicted_keys moves and spilled_keys does not.
+        TOTAL=$((TOTAL + 1))
+        EV_INFO=$(ecli INFO 2>/dev/null | tr -d '\r')
+        EV_EVICTED=$(echo "$EV_INFO" | awk -F: '/^evicted_keys:/ {print $2}')
+        EV_SPILLED=$(echo "$EV_INFO" | awk -F: '/^spilled_keys:/ {print $2}')
+        if [[ "$EV_EVICTED" =~ ^[0-9]+$ ]] && ((EV_EVICTED > 0)) && [[ "$EV_SPILLED" == "0" ]]; then
+            PASS=$((PASS + 1)); echo "  PASS: evicted_keys=$EV_EVICTED, spilled_keys=0 (nothing tiered without disk-offload)"
+        else
+            FAIL=$((FAIL + 1)); echo "  FAIL: evicted_keys='$EV_EVICTED' spilled_keys='$EV_SPILLED'"
+        fi
 
-    kill "$EVICT_PID" 2>/dev/null || true
-    wait "$EVICT_PID" 2>/dev/null || true
-    pkill -f "moon.*${PORT_EVICT}" 2>/dev/null || true
+        # EVICT-04: noeviction refuses instead of evicting -- or spinning. The
+        # cap is tightened below what is already resident so the write is over
+        # budget by construction.
+        TOTAL=$((TOTAL + 1))
+        ecli CONFIG SET maxmemory-policy noeviction >/dev/null 2>&1 || true
+        ecli CONFIG SET maxmemory 65536 >/dev/null 2>&1 || true
+        EV_OOM=$(ecli SET ev:refused "$EV_VAL" 2>&1)
+        if echo "$EV_OOM" | qgrep -qi "OOM"; then
+            PASS=$((PASS + 1)); echo "  PASS: noeviction over budget returns OOM"
+        else
+            FAIL=$((FAIL + 1)); echo "  FAIL: noeviction should return OOM, got: $EV_OOM"
+        fi
+
+    fi
+    aux_stop "$EVICT_PID"
+    kill_port_servers "$RUST_BINARY" "$PORT_EVICT"
     rm -rf "$EVICT_DIR"
 
     echo "  eviction: done"

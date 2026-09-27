@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# moon#1276: portable redis-cli timeouts (`cli_bounded`), auxiliary-server tracking
+# (`aux_start` / `aux_kill_all`) and a loud ERR trap -- see the library.
+# shellcheck source=lib/harness-guard.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/harness-guard.sh"
+harness_install_err_trap "test-consistency.sh"
+
 # moon: `grep -q` exits on the FIRST match, closing the pipe. Under
 # `set -o pipefail` that SIGPIPEs the writer, so the PIPELINE reports failure
 # even though grep succeeded -- turning any assertion whose output is longer
@@ -18,6 +24,27 @@ qgrep() { local _in; _in=$(cat); grep "$@" <<< "$_in" > /dev/null; }
 #
 # Usage:
 #   ./scripts/test-consistency.sh [--shards N] [--skip-build] [--port-rust N]
+#
+# Ports (all overridable from the environment): PORT_REDIS (6399), PORT_RUST
+# (6400) and the auxiliary servers' PORT_SHUTDOWN (PORT_RUST+500), PORT_EVICT
+# (+520), PORT_SLOWLOG (+530), PORT_XSHARD (+531). Every auxiliary server is
+# tracked and killed by the EXIT trap, and a leg refuses to start one on a
+# port that already accepts connections (moon#1276).
+#
+# ORACLE VERSION. The expected values assume a redis 7.2+/8.x oracle (what
+# `brew install redis` gives). redis-cli 7.2+ is not required: without `-t`
+# the calls are bounded with `timeout`/`gtimeout` instead (moon#1276). Against
+# redis 7.0.15 about 80 rows differ because moon follows 7.2+ behaviour, not
+# because of moon bugs:
+#   - listpack encodings for small sets and lists (OBJECT ENCODING);
+#   - ZRANK/ZREVRANK ... WITHSCORE (added in 7.2);
+#   - the NOPERM text "User <name> has no permissions to ...";
+#   - the COMMAND GETKEYS text for a keyless command;
+#   - hash-field-expiry (HEXPIRE family) and its tracking rows;
+#   - DEBUG DIGEST values;
+#   - the moon#981 '-@all +get +set' ACL GETUSER row is FLAKY on 7.0: it
+#     renders per-command rules in dict order under a per-process random seed.
+# The run prints the oracle's version at startup and warns below 7.2.
 ###############################################################################
 
 PORT_REDIS="${PORT_REDIS:-6399}"
@@ -56,10 +83,16 @@ log() { echo "[$(date '+%H:%M:%S')] $*"; }
 
 cleanup() {
     local rc=$?
+    # The run is over: a failing command in here (or this trap's own
+    # non-zero return) is not a mid-run death, so the ERR report is off.
+    trap - ERR
+    # moon#1276: first every auxiliary server a leg left running when the
+    # run died inside it -- by exact PID, before anything else can fail.
+    aux_kill_all
     [[ -n "${RUST_PID:-}" ]] && kill "$RUST_PID" 2>/dev/null; wait "$RUST_PID" 2>/dev/null || true
     [[ -n "${REDIS_PID:-}" ]] && kill "$REDIS_PID" 2>/dev/null; wait "$REDIS_PID" 2>/dev/null || true
     pkill -f "redis-server.*${PORT_REDIS}" 2>/dev/null || true
-    pkill -f "moon.*${PORT_RUST}" 2>/dev/null || true
+    kill_port_servers "$RUST_BINARY" "$PORT_RUST"
     [[ -n "${MOON_DATA_DIR:-}" ]] && rm -rf "$MOON_DATA_DIR"
     # Without this the trap's own last command decides the script's exit
     # status, so an abort mid-run reports success.
@@ -122,6 +155,9 @@ if [[ "$SKIP_BUILD" == false ]]; then
     log "Building..."
     RUSTFLAGS="-C target-cpu=native" cargo build --release --features text-index 2>&1 | tail -2
 fi
+
+harness_probe_redis_cli
+harness_note_oracle_version
 
 log "Starting Redis on :$PORT_REDIS ..."
 # `--enable-debug-command yes` is needed for the moon#636 DEBUG DIGEST rows:
@@ -3864,7 +3900,7 @@ if [[ -n "${RUST_PID:-}" ]]; then
     wait "$RUST_PID" 2>/dev/null || true
     RUST_PID=""
 fi
-pkill -f "moon.*${PORT_RUST}" 2>/dev/null || true
+kill_port_servers "$RUST_BINARY" "$PORT_RUST"
 sleep 0.3
 
 # Helper: start moon on PORT_RUST with given shard count, wait for it.
@@ -3890,7 +3926,7 @@ stop_moon() {
         wait "$RUST_PID" 2>/dev/null || true
         RUST_PID=""
     fi
-    pkill -f "moon.*${PORT_RUST}" 2>/dev/null || true
+    kill_port_servers "$RUST_BINARY" "$PORT_RUST"
     sleep 0.3
 }
 
@@ -4880,18 +4916,31 @@ fi
 echo ""
 echo "=== SHUTDOWN [NOSAVE|SAVE] ==="
 
-PORT_SHUTDOWN=$((PORT_RUST + 500))
+PORT_SHUTDOWN="${PORT_SHUTDOWN:-$((PORT_RUST + 500))}"
 SHUTDOWN_DIR=$(mktemp -d /tmp/moon-shutdown-dir.XXXXXX)
+
+# moon#1276: `aux_start` tracks the PID for the EXIT trap and refuses a port
+# that is already taken (a leaked server would split this leg's connections).
+# A refusal is a FAIL row and a skipped leg, never a run that dies here.
+shutdown_leg_start() {
+    local aof="$1"
+    aux_start "$PORT_SHUTDOWN" /dev/null "$RUST_BINARY" --port "$PORT_SHUTDOWN" --shards 1 \
+        --dir "$SHUTDOWN_DIR" --appendonly "$aof" --disk-free-min-pct 0 || true
+    SHUTDOWN_PID="$AUX_LAST_PID"
+    [[ -n "$SHUTDOWN_PID" ]]
+}
+# The server exits on SHUTDOWN and is reaped here, so it is forgotten, not
+# killed: the trap must never signal a recycled PID.
+shutdown_leg_reap() {
+    wait "$SHUTDOWN_PID" 2>/dev/null || true
+    aux_forget "$SHUTDOWN_PID"
+}
 
 # NOSAVE: exits promptly, appendonly=no so no durability is expected -- this
 # only checks the process actually terminates instead of erroring forever.
-"$RUST_BINARY" --port "$PORT_SHUTDOWN" --shards 1 --dir "$SHUTDOWN_DIR" \
-    --appendonly no --disk-free-min-pct 0 >/dev/null 2>&1 &
-SHUTDOWN_PID=$!
-for _ in $(seq 1 50); do
-    redis-cli -p "$PORT_SHUTDOWN" PING >/dev/null 2>&1 && break
-    sleep 0.1
-done
+if ! shutdown_leg_start no; then
+    FAIL=$((FAIL + 1)); echo "  FAIL: SHUTDOWN leg skipped: port $PORT_SHUTDOWN is taken"
+else
 redis-cli -p "$PORT_SHUTDOWN" SHUTDOWN NOSAVE >/dev/null 2>&1 || true
 SHUTDOWN_EXITED=false
 for _ in $(seq 1 50); do
@@ -4904,43 +4953,38 @@ else
     FAIL=$((FAIL + 1)); echo "  FAIL: SHUTDOWN NOSAVE did not exit within 5s"
     kill -9 "$SHUTDOWN_PID" 2>/dev/null || true
 fi
-wait "$SHUTDOWN_PID" 2>/dev/null || true
+shutdown_leg_reap
+fi
 rm -rf "$SHUTDOWN_DIR"
 
 # appendonly=yes: SHUTDOWN must flush the AOF durably -- write, shut down,
 # restart, and confirm the key survived (no kill-9 tail loss on a clean exit).
 SHUTDOWN_DIR=$(mktemp -d /tmp/moon-shutdown-dir.XXXXXX)
-"$RUST_BINARY" --port "$PORT_SHUTDOWN" --shards 1 --dir "$SHUTDOWN_DIR" \
-    --appendonly yes --disk-free-min-pct 0 >/dev/null 2>&1 &
-SHUTDOWN_PID=$!
-for _ in $(seq 1 50); do
-    redis-cli -p "$PORT_SHUTDOWN" PING >/dev/null 2>&1 && break
-    sleep 0.1
-done
-redis-cli -p "$PORT_SHUTDOWN" SET shutdown:durable hello >/dev/null 2>&1
+if ! shutdown_leg_start yes; then
+    FAIL=$((FAIL + 1)); echo "  FAIL: SHUTDOWN durability leg skipped: port $PORT_SHUTDOWN is taken"
+else
+redis-cli -p "$PORT_SHUTDOWN" SET shutdown:durable hello >/dev/null 2>&1 || true
 redis-cli -p "$PORT_SHUTDOWN" SHUTDOWN NOSAVE >/dev/null 2>&1 || true
 for _ in $(seq 1 50); do
     kill -0 "$SHUTDOWN_PID" 2>/dev/null || break
     sleep 0.1
 done
-wait "$SHUTDOWN_PID" 2>/dev/null || true
+# Still alive after 5 s: stop it so the restart below cannot share the port.
+aux_stop "$SHUTDOWN_PID"
 
-"$RUST_BINARY" --port "$PORT_SHUTDOWN" --shards 1 --dir "$SHUTDOWN_DIR" \
-    --appendonly yes --disk-free-min-pct 0 >/dev/null 2>&1 &
-SHUTDOWN_PID=$!
-for _ in $(seq 1 50); do
-    redis-cli -p "$PORT_SHUTDOWN" PING >/dev/null 2>&1 && break
-    sleep 0.1
-done
-SHUTDOWN_RESTORED=$(redis-cli -p "$PORT_SHUTDOWN" GET shutdown:durable 2>&1)
+if ! shutdown_leg_start yes; then
+    FAIL=$((FAIL + 1)); echo "  FAIL: SHUTDOWN durability restart skipped: port $PORT_SHUTDOWN is taken"
+else
+SHUTDOWN_RESTORED=$(redis-cli -p "$PORT_SHUTDOWN" GET shutdown:durable 2>&1 || true)
 if [[ "$SHUTDOWN_RESTORED" == "hello" ]]; then
     PASS=$((PASS + 1)); echo "  PASS: SHUTDOWN flushes AOF durably (appendonly=yes survives restart)"
 else
     FAIL=$((FAIL + 1)); echo "  FAIL: SHUTDOWN did not persist AOF durably: got '$SHUTDOWN_RESTORED'"
 fi
-kill "$SHUTDOWN_PID" 2>/dev/null || true
-wait "$SHUTDOWN_PID" 2>/dev/null || true
-pkill -f "moon.*${PORT_SHUTDOWN}" 2>/dev/null || true
+aux_stop "$SHUTDOWN_PID"
+fi
+fi
+kill_port_servers "$RUST_BINARY" "$PORT_SHUTDOWN"
 rm -rf "$SHUTDOWN_DIR"
 
 # ===========================================================================
@@ -4973,7 +5017,7 @@ rm -rf "$SHUTDOWN_DIR"
 echo ""
 echo "=== moon#600: volatile-ttl eviction liveness ==="
 
-PORT_EVICT=$((PORT_RUST + 520))
+PORT_EVICT="${PORT_EVICT:-$((PORT_RUST + 520))}"
 EVICT_WRITES=6000
 # ~1KB values against a 4mb cap: eviction must run hard, and every key
 # carries a far-future TTL so every key is a legal volatile-ttl victim and
@@ -4986,14 +5030,17 @@ run_volatile_ttl_eviction_leg() {
     local dir
     dir=$(mktemp -d /tmp/moon-evict-dir.XXXXXX)
 
-    "$RUST_BINARY" --port "$PORT_EVICT" --shards 1 --dir "$dir" \
-        --disk-free-min-pct 0 --maxmemory 4mb --maxmemory-policy volatile-ttl \
-        "$@" >/dev/null 2>&1 &
-    local pid=$!
-    for _ in $(seq 1 50); do
-        redis-cli -p "$PORT_EVICT" PING >/dev/null 2>&1 && break
-        sleep 0.1
-    done
+    # moon#1276: tracked for the EXIT trap; refused on a taken port.
+    if ! aux_start "$PORT_EVICT" /dev/null "$RUST_BINARY" --port "$PORT_EVICT" --shards 1 \
+        --dir "$dir" --disk-free-min-pct 0 --maxmemory 4mb --maxmemory-policy volatile-ttl \
+        "$@"; then
+        FAIL=$((FAIL + 1))
+        echo "  FAIL: moon#600 [$leg]: leg skipped -- its server on port $PORT_EVICT did not start cleanly"
+        aux_stop "$AUX_LAST_PID"
+        rm -rf "$dir"
+        return 0
+    fi
+    local pid="$AUX_LAST_PID"
 
     local pipe errs
     pipe=$(for i in $(seq 1 "$EVICT_WRITES"); do
@@ -5004,15 +5051,16 @@ run_volatile_ttl_eviction_leg() {
         "0" "${errs:-unknown}"
 
     # Liveness. A shard thread spinning inside evict_to_budget never answers
-    # again; `-t 3` bounds the wait so a regression FAILS instead of hanging.
+    # again; `cli_bounded 3` bounds the wait so a regression FAILS instead of
+    # hanging, and `|| true` so it FAILS instead of ending the run.
     local alive
-    alive=$(redis-cli -t 3 -p "$PORT_EVICT" PING 2>&1)
+    alive=$(cli_bounded 3 -p "$PORT_EVICT" PING 2>&1 || true)
     assert_eq "moon#600 [$leg]: server still answers after volatile-ttl eviction" \
         "PONG" "$alive"
 
     local dbsize evicted spilled info
-    dbsize=$(redis-cli -t 3 -p "$PORT_EVICT" DBSIZE 2>&1)
-    info=$(redis-cli -t 3 -p "$PORT_EVICT" INFO 2>/dev/null | tr -d '\r')
+    dbsize=$(cli_bounded 3 -p "$PORT_EVICT" DBSIZE 2>&1 || true)
+    info=$(cli_bounded 3 -p "$PORT_EVICT" INFO 2>/dev/null | tr -d '\r' || true)
     evicted=$(echo "$info" | awk -F: '/^evicted_keys:/ {print $2}')
     spilled=$(echo "$info" | awk -F: '/^spilled_keys:/ {print $2}')
 
@@ -5063,13 +5111,12 @@ run_volatile_ttl_eviction_leg() {
         # not do it today (it answers 0 for a tiered key -- tracked separately,
         # it is not what moon#600 is about). GET is the read-through path.
         local tiered_read
-        tiered_read=$(redis-cli -t 3 -p "$PORT_EVICT" GET evict:1 2>&1)
+        tiered_read=$(cli_bounded 3 -p "$PORT_EVICT" GET evict:1 2>&1 || true)
         assert_eq "moon#600 [$leg]: a tiered key is still readable" "$EVICT_VAL" "$tiered_read"
     fi
 
-    kill "$pid" 2>/dev/null || true
-    wait "$pid" 2>/dev/null || true
-    pkill -f "moon.*${PORT_EVICT}" 2>/dev/null || true
+    aux_stop "$pid"
+    kill_port_servers "$RUST_BINARY" "$PORT_EVICT"
     rm -rf "$dir"
 }
 
@@ -5099,7 +5146,7 @@ echo "=== moon#636: DEBUG DIGEST parity ==="
 
 # Guard both ends. `assert_both` would happily record a connection error as
 # moon's answer, so prove each server ANSWERS before comparing them.
-dg_redis_probe="$(redis-cli -t 3 -p "$PORT_REDIS" DEBUG DIGEST 2>&1 | tr -d '\r' || true)"
+dg_redis_probe="$(cli_bounded 3 -p "$PORT_REDIS" DEBUG DIGEST 2>&1 | tr -d '\r' || true)"
 if ! [[ "$dg_redis_probe" =~ ^[0-9a-f]{40}$ ]]; then
     # DEBUG gated off ("not allowed"), an older redis ("unknown command"), or
     # a server that is simply not there ("Could not connect"). Every row below
@@ -5121,8 +5168,8 @@ else
     # moon#685 gave the Lua path the same reach, so the workaround is gone
     # and the rows below exercise the real command again.
     dg_clear_every_db() {
-        redis-cli -t 3 -p "$PORT_REDIS" FLUSHALL >/dev/null 2>&1 || true
-        redis-cli -t 3 -p "$PORT_RUST"  FLUSHALL >/dev/null 2>&1 || true
+        cli_bounded 3 -p "$PORT_REDIS" FLUSHALL >/dev/null 2>&1 || true
+        cli_bounded 3 -p "$PORT_RUST"  FLUSHALL >/dev/null 2>&1 || true
     }
 
     # One key of every type the digest walks, plus a TTL and a FIXED stream id
@@ -5156,7 +5203,7 @@ else
             return
         fi
         local alive
-        alive="$(redis-cli -t 3 -p "$PORT_RUST" PING 2>&1 | tr -d '\r' || true)"
+        alive="$(cli_bounded 3 -p "$PORT_RUST" PING 2>&1 | tr -d '\r' || true)"
         if [[ "$alive" != "PONG" ]]; then
             FAIL=$((FAIL + 1))
             echo "  FAIL: [shards=$nshards] moon is not answering ($alive)"
@@ -5169,9 +5216,9 @@ else
 
         # It must be a FUNCTION of the data, not a constant that happens to agree.
         local dg_before dg_after dg_restored dg_revlist
-        dg_before="$(redis-cli -t 3 -p "$PORT_RUST" DEBUG DIGEST 2>&1 | tr -d '\r' || true)"
+        dg_before="$(cli_bounded 3 -p "$PORT_RUST" DEBUG DIGEST 2>&1 | tr -d '\r' || true)"
         both SET dg:str hello2
-        dg_after="$(redis-cli -t 3 -p "$PORT_RUST" DEBUG DIGEST 2>&1 | tr -d '\r' || true)"
+        dg_after="$(cli_bounded 3 -p "$PORT_RUST" DEBUG DIGEST 2>&1 | tr -d '\r' || true)"
         if [[ "$dg_before" == "$dg_after" ]]; then
             FAIL=$((FAIL + 1))
             echo "  FAIL: [shards=$nshards] DEBUG DIGEST did not change when a value changed"
@@ -5183,7 +5230,7 @@ else
 
         # ...and it must come BACK, or it is drifting rather than fingerprinting.
         both SET dg:str hello
-        dg_restored="$(redis-cli -t 3 -p "$PORT_RUST" DEBUG DIGEST 2>&1 | tr -d '\r' || true)"
+        dg_restored="$(cli_bounded 3 -p "$PORT_RUST" DEBUG DIGEST 2>&1 | tr -d '\r' || true)"
         assert_eq "[shards=$nshards] DEBUG DIGEST returns to its earlier value" \
             "$dg_before" "$dg_restored"
 
@@ -5195,7 +5242,7 @@ else
         # ...but a list is NOT a set.
         both DEL dg:list
         both RPUSH dg:list c b a
-        dg_revlist="$(redis-cli -t 3 -p "$PORT_RUST" DEBUG DIGEST 2>&1 | tr -d '\r' || true)"
+        dg_revlist="$(cli_bounded 3 -p "$PORT_RUST" DEBUG DIGEST 2>&1 | tr -d '\r' || true)"
         if [[ "$dg_revlist" == "$dg_restored" ]]; then
             FAIL=$((FAIL + 1))
             echo "  FAIL: [shards=$nshards] DEBUG DIGEST ignored list ORDER (lists are not sets)"
@@ -5206,8 +5253,8 @@ else
 
         # A key in another database must move the digest: the db index is
         # folded into the dataset digest, not just the keys.
-        redis-cli -t 3 -p "$PORT_REDIS" -n 3 SET dg:db3 v >/dev/null 2>&1 || true
-        redis-cli -t 3 -p "$PORT_RUST"  -n 3 SET dg:db3 v >/dev/null 2>&1 || true
+        cli_bounded 3 -p "$PORT_REDIS" -n 3 SET dg:db3 v >/dev/null 2>&1 || true
+        cli_bounded 3 -p "$PORT_RUST"  -n 3 SET dg:db3 v >/dev/null 2>&1 || true
         assert_both "[shards=$nshards] DEBUG DIGEST spans every database" DEBUG DIGEST
 
         # Empty dataset is redis's all-zero sentinel, not an error. The db3
@@ -5218,7 +5265,7 @@ else
         assert_both "[shards=$nshards] DEBUG DIGEST of an empty dataset" DEBUG DIGEST
         assert_eq "[shards=$nshards] empty digest is the all-zero sentinel" \
             "0000000000000000000000000000000000000000" \
-            "$(redis-cli -t 3 -p "$PORT_RUST" DEBUG DIGEST 2>&1 | tr -d '\r' || true)"
+            "$(cli_bounded 3 -p "$PORT_RUST" DEBUG DIGEST 2>&1 | tr -d '\r' || true)"
     }
 
     run_digest_leg 1
@@ -5264,12 +5311,12 @@ f925_seed() {
             mset+=("f925:$p:$i" v)
         done
     done
-    redis-cli -t 5 -p "$PORT_REDIS" "${mset[@]}" >/dev/null 2>&1 || true
-    redis-cli -t 5 -p "$PORT_RUST"  "${mset[@]}" >/dev/null 2>&1 || true
+    cli_bounded 5 -p "$PORT_REDIS" "${mset[@]}" >/dev/null 2>&1 || true
+    cli_bounded 5 -p "$PORT_RUST"  "${mset[@]}" >/dev/null 2>&1 || true
 }
 
 f925_dbsize() {
-    redis-cli -t 5 -p "$1" DBSIZE 2>&1 | tr -d '\r' || true
+    cli_bounded 5 -p "$1" DBSIZE 2>&1 | tr -d '\r' || true
 }
 
 run_flush_modifier_leg() {
@@ -5302,9 +5349,9 @@ run_flush_modifier_leg() {
         assert_eq "[shards=$nshards] moon#925 seeded $F925_KEYS keys before '$form'" \
             "$F925_KEYS" "$seeded"
 
-        ack="$(redis-cli -t 5 -p "$PORT_RUST" "${argv[@]}" 2>&1 | tr -d '\r' || true)"
+        ack="$(cli_bounded 5 -p "$PORT_RUST" "${argv[@]}" 2>&1 | tr -d '\r' || true)"
         assert_eq "[shards=$nshards] moon#925 '$form' answered OK" "OK" "$ack"
-        redis-cli -t 5 -p "$PORT_REDIS" "${argv[@]}" >/dev/null 2>&1 || true
+        cli_bounded 5 -p "$PORT_REDIS" "${argv[@]}" >/dev/null 2>&1 || true
 
         # The assertion that matters: nothing survives. Against redis as the
         # oracle AND against the literal 0, because a redis that also answered
@@ -5322,7 +5369,7 @@ run_flush_modifier_leg() {
             local p i
             for p in a m z; do
                 for i in $(seq 0 19); do
-                    redis-cli -t 5 -p "$PORT_RUST" DEL "f925:$p:$i" >/dev/null 2>&1 || true
+                    cli_bounded 5 -p "$PORT_RUST" DEL "f925:$p:$i" >/dev/null 2>&1 || true
                 done
             done
         fi
@@ -5351,7 +5398,7 @@ done
 # 1-in-16 per connection, so a fresh connection per command never samples and
 # would make every row here pass or fail for the wrong reason. 64 repeats = 4
 # samples per family.
-PORT_SLOWLOG=$((PORT_RUST + 530))
+PORT_SLOWLOG="${PORT_SLOWLOG:-$((PORT_RUST + 530))}"
 
 # `slowlog_cmd_stats PORT CMD` -> "seen=yes|no nonzero=yes|no" for CMD's
 # entries. redis-cli's non-tty SLOWLOG GET is flat: id, ts, duration, argv...,
@@ -5376,14 +5423,17 @@ slowlog_cmd_stats() {
 run_slowlog_latency_leg() {
     local dir
     dir=$(mktemp -d /tmp/moon-slowlog-dir.XXXXXX)
-    "$RUST_BINARY" --port "$PORT_SLOWLOG" --shards 1 --dir "$dir" \
-        --disk-free-min-pct 0 --appendonly no \
-        --slowlog-log-slower-than 0 --slowlog-max-len 1024 >/dev/null 2>&1 &
-    local pid=$!
-    for _ in $(seq 1 50); do
-        redis-cli -p "$PORT_SLOWLOG" PING >/dev/null 2>&1 && break
-        sleep 0.1
-    done
+    # moon#1276: tracked for the EXIT trap; refused on a taken port.
+    if ! aux_start "$PORT_SLOWLOG" /dev/null "$RUST_BINARY" --port "$PORT_SLOWLOG" --shards 1 \
+        --dir "$dir" --disk-free-min-pct 0 --appendonly no \
+        --slowlog-log-slower-than 0 --slowlog-max-len 1024; then
+        FAIL=$((FAIL + 1))
+        echo "  FAIL: moon#941/#963: SLOWLOG leg skipped -- its server on port $PORT_SLOWLOG did not start cleanly"
+        aux_stop "$AUX_LAST_PID"
+        rm -rf "$dir"
+        return 0
+    fi
+    local pid="$AUX_LAST_PID"
 
     # The oracle at the same threshold, with a ring big enough to hold every
     # command below (redis logs ALL of them, not 1-in-16).
@@ -5395,9 +5445,9 @@ run_slowlog_latency_leg() {
     members=$(seq -s ' ' 1 3000)
     for p in "$PORT_REDIS" "$PORT_SLOWLOG"; do
         # shellcheck disable=SC2086
-        redis-cli -p "$p" -r 64 SADD slowlog:w $members >/dev/null 2>&1
-        redis-cli -p "$p" -r 64 SET slowlog:k v >/dev/null 2>&1
-        redis-cli -p "$p" -r 64 GET slowlog:k >/dev/null 2>&1
+        redis-cli -p "$p" -r 64 SADD slowlog:w $members >/dev/null 2>&1 || true
+        redis-cli -p "$p" -r 64 SET slowlog:k v >/dev/null 2>&1 || true
+        redis-cli -p "$p" -r 64 GET slowlog:k >/dev/null 2>&1 || true
     done
 
     # moon#941: the slow WRITE is logged, and with a real duration. A 3000
@@ -5424,8 +5474,7 @@ run_slowlog_latency_leg() {
     redis-cli -p "$PORT_REDIS" SLOWLOG RESET >/dev/null 2>&1 || true
     redis-cli -p "$PORT_REDIS" DEL slowlog:w slowlog:k >/dev/null 2>&1 || true
 
-    kill "$pid" 2>/dev/null || true
-    wait "$pid" 2>/dev/null || true
+    aux_stop "$pid"
     rm -rf "$dir"
 }
 
@@ -5441,7 +5490,7 @@ run_slowlog_latency_leg
 # random shard, so ~3/4 of the reads are routed). redis is the oracle for
 # "N commands sent -> N counted"; the window is read over separate
 # connections, so INFO's own accounting is allowed to add at most 2.
-PORT_XSHARD=$((PORT_RUST + 531))
+PORT_XSHARD="${PORT_XSHARD:-$((PORT_RUST + 531))}"
 
 # `commands_processed PORT` -> total_commands_processed from INFO stats.
 commands_processed() {
@@ -5471,13 +5520,16 @@ count_window() {
 run_cross_shard_count_leg() {
     local dir
     dir=$(mktemp -d /tmp/moon-xshard-dir.XXXXXX)
-    "$RUST_BINARY" --port "$PORT_XSHARD" --shards 4 --dir "$dir" \
-        --disk-free-min-pct 0 --appendonly no >/dev/null 2>&1 &
-    local pid=$!
-    for _ in $(seq 1 50); do
-        redis-cli -p "$PORT_XSHARD" PING >/dev/null 2>&1 && break
-        sleep 0.1
-    done
+    # moon#1276: tracked for the EXIT trap; refused on a taken port.
+    if ! aux_start "$PORT_XSHARD" /dev/null "$RUST_BINARY" --port "$PORT_XSHARD" --shards 4 \
+        --dir "$dir" --disk-free-min-pct 0 --appendonly no; then
+        FAIL=$((FAIL + 1))
+        echo "  FAIL: moon#982: leg skipped -- its server on port $PORT_XSHARD did not start cleanly"
+        aux_stop "$AUX_LAST_PID"
+        rm -rf "$dir"
+        return 0
+    fi
+    local pid="$AUX_LAST_PID"
 
     assert_eq "moon#982: 400 SMEMBERS over 16 keys are all counted at --shards 4 (oracle: redis)" \
         "$(count_window "$PORT_REDIS")" \
@@ -5485,8 +5537,7 @@ run_cross_shard_count_leg() {
 
     # shellcheck disable=SC2046
     redis-cli -p "$PORT_REDIS" DEL $(seq -f 'xshard:s%g' 1 16) >/dev/null 2>&1 || true
-    kill "$pid" 2>/dev/null || true
-    wait "$pid" 2>/dev/null || true
+    aux_stop "$pid"
     rm -rf "$dir"
 }
 
@@ -6154,7 +6205,7 @@ RUST_PID=$!
 if wait_for_port "$PORT_REDIS" && wait_for_port "$PORT_RUST"; then
     # The `commands` value of ACL GETUSER: the line after the `commands` key.
     f981_commands() {
-        redis-cli -t 5 -p "$1" ACL GETUSER rt 2>&1 | tr -d '\r' \
+        cli_bounded 5 -p "$1" ACL GETUSER rt 2>&1 | tr -d '\r' \
             | awk 'f { print; exit } /^commands$/ { f = 1 }' || true
     }
     # The command-rule tail of the user's line in the ACL file. Redis also
@@ -6193,7 +6244,7 @@ if wait_for_port "$PORT_REDIS" && wait_for_port "$PORT_RUST"; then
     # credential fixes must survive the file (a rotated-out password stays
     # dead, a wrong one stays refused).
     f970_field() {
-        redis-cli -t 5 -p "$1" ACL GETUSER rk 2>&1 | tr -d '\r' \
+        cli_bounded 5 -p "$1" ACL GETUSER rk 2>&1 | tr -d '\r' \
             | awk -v f="$2" 'g { print; exit } $0 == f { g = 1 }' || true
     }
     for f970_spec in \

@@ -87,6 +87,7 @@ across Moon + Redis 8.x + Qdrant and emits `BENCHMARK-REPORT.md`.
 |---|---|
 | `test-commands.sh` | Command-coverage smoke test |
 | `test-consistency.sh` | Redis-vs-Moon consistency suite (ground truth) |
+| `lib/harness-guard.sh` | Sourced by the two above: portable redis-cli timeouts (redis-cli < 7.2 has no `-t`), auxiliary-server PID tracking for the EXIT trap, loud `set -e` deaths (moon#1276) |
 | `test-client-compat.sh` | Raw-RESP diff vs a real redis-server (RESP2+RESP3, type/shape/value) |
 
 ## Git / workflow helpers
