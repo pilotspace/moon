@@ -13,7 +13,9 @@ use std::path::{Path, PathBuf};
 use bytes::Bytes;
 
 use super::cold_index::ColdIndex;
-use super::cold_reclaim::{awaiting_fold, held_files_pressure};
+use super::cold_reclaim::{
+    CulpritOutcome, awaiting_fold, files_given_up_total, held_files_pressure,
+};
 use crate::persistence::aof::fold_stream::{
     fold_image_channel, stream_fold_image, write_fold_image,
 };
@@ -249,6 +251,94 @@ fn a_file_whose_live_slots_do_not_all_decode_is_skipped_for_good() {
     assert!(!heap(&dir, NEW).exists());
     assert!(ci.reclaim_candidates(4).is_empty(), "not retried");
     assert_eq!(ci.lookup(b"k08").map(|l| l.file_id), Some(OLD));
+}
+
+/// moon#1265 review: the file whose job a dying spill thread was running is
+/// retried once and given up on its second such death. The other
+/// compactions on the dead thread are only abandoned — in flight at both
+/// deaths, but queued behind the culprit, not running — and a suspect that
+/// then compacts is cleared. Giving up changes nothing anyone reads.
+#[test]
+fn a_file_that_kills_the_spill_thread_twice_is_given_up_and_no_other() {
+    const OTHER: u64 = 6;
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let dir = tmp.path().join("shard-0");
+    std::fs::create_dir_all(&dir).expect("dir");
+    let mut manifest = ShardManifest::create(&dir.join("shard-0.manifest")).expect("manifest");
+    let others: Vec<(String, String)> = (0..10)
+        .map(|i| (format!("o{i:02}"), format!("w{i:02}")))
+        .collect();
+    spill(&dir, &mut manifest, OLD, &keys(10));
+    spill(&dir, &mut manifest, OTHER, &others);
+    let mut ci = ColdIndex::rebuild_from_manifest(&dir, &manifest);
+    for (k, _) in keys(10)
+        .iter()
+        .chain(others.iter())
+        .filter(|(k, _)| !matches!(&k[1..], "08" | "09"))
+    {
+        assert!(ci.remove(k.as_bytes()));
+    }
+    let mut both = ci.reclaim_candidates(4);
+    both.sort_unstable();
+    assert_eq!(both, vec![OLD, OTHER]);
+    let ledger = ci.dead_slots().len();
+    let given_up = files_given_up_total();
+
+    // First death, running OLD's job with OTHER's queued behind it.
+    assert!(ci.start_compaction(OLD) && ci.start_compaction(OTHER));
+    assert_eq!(
+        ci.abandon_compactions_after_thread_death(Some(OLD)),
+        CulpritOutcome::Suspected(OLD)
+    );
+    assert_eq!(
+        ci.compactions_in_flight(),
+        0,
+        "every job it held is abandoned"
+    );
+    assert_eq!(ci.reclaim_candidates(4).len(), 2, "both retried");
+
+    // Deaths that are nobody's here: outside any reclaim job, or in a job
+    // this index has no compaction for (its index was replaced meanwhile).
+    assert!(ci.start_compaction(OLD));
+    assert_eq!(
+        ci.abandon_compactions_after_thread_death(None),
+        CulpritOutcome::NotHere
+    );
+    assert_eq!(
+        ci.abandon_compactions_after_thread_death(Some(OLD)),
+        CulpritOutcome::NotHere,
+        "OLD is no longer in flight"
+    );
+
+    // Second death running OLD's job: given up. OTHER, in flight at both
+    // deaths, is not.
+    assert!(ci.start_compaction(OLD) && ci.start_compaction(OTHER));
+    assert_eq!(
+        ci.abandon_compactions_after_thread_death(Some(OLD)),
+        CulpritOutcome::GivenUp(OLD)
+    );
+    assert_eq!(ci.reclaim_candidates(4), vec![OTHER]);
+    assert!(files_given_up_total() > given_up, "counted");
+    assert_eq!(ci.reclaim_suspects(), 0, "a given-up file is no suspect");
+    // Nothing anyone reads changed: OLD still serves its survivors, and its
+    // dead slots are still in the ledger.
+    for k in ["k08", "k09"] {
+        assert_eq!(ci.lookup(k.as_bytes()).map(|l| l.file_id), Some(OLD));
+    }
+    assert_eq!(ci.dead_slots().len(), ledger);
+    assert!(heap(&dir, OLD).exists());
+
+    // A suspect that compacts was innocent: its suspicion is cleared.
+    assert!(ci.start_compaction(OTHER));
+    assert_eq!(
+        ci.abandon_compactions_after_thread_death(Some(OTHER)),
+        CulpritOutcome::Suspected(OTHER)
+    );
+    assert_eq!(ci.reclaim_suspects(), 1);
+    let mut next = NEW;
+    ci.compact_file(OTHER, 0, &dir, &mut next, 0)
+        .expect("compact");
+    assert_eq!(ci.reclaim_suspects(), 0);
 }
 
 // ── Recovery level: production fold + production recovery ──────────────────

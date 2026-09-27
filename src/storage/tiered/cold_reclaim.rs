@@ -74,7 +74,7 @@
 
 use std::collections::HashSet;
 use std::path::Path;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use bytes::Bytes;
 
@@ -98,6 +98,20 @@ static AWAITING_FOLD: AtomicUsize = AtomicUsize::new(0);
 /// its files — and the ledger bytes write admission is charged — are never
 /// released.
 static HELD_FILES_PRESSURE: AtomicUsize = AtomicUsize::new(0);
+
+/// Files the reclaim gave up on, process-wide (INFO
+/// `cold_reclaim_files_given_up`): unreadable, a live slot that did not
+/// decode, a failed or unexpected write, or — moon#1265 review — a job that
+/// killed the spill thread twice. Each stays as it is on disk (its live keys
+/// readable, its dead slots in the ledger) and is not compacted again by
+/// this process.
+static FILES_GIVEN_UP: AtomicU64 = AtomicU64::new(0);
+
+/// Files the reclaim gave up on, process-wide (see [`FILES_GIVEN_UP`]).
+#[inline]
+pub fn files_given_up_total() -> u64 {
+    FILES_GIVEN_UP.load(Ordering::Relaxed)
+}
 
 /// How many compactions wait for a committed fold, process-wide.
 #[inline]
@@ -162,6 +176,14 @@ pub struct ReclaimState {
     /// decode): never retried by this process, so a damaged file cannot turn
     /// every tick into a failing read. Tiny: one id per such file.
     skip: HashSet<u64>,
+    /// moon#1265 review: files whose reclaim job was running when a spill
+    /// thread died. A second such death gives the file up — a file that
+    /// panics the thread deterministically (a corrupt spill file, moon#1240)
+    /// would otherwise kill every respawn and spend the restart budget,
+    /// degrading the shard's spilling for good. One death is forgiven: it
+    /// may have been transient, so the file is retried once. Left when the
+    /// file compacts or is given up; otherwise one id per such death.
+    suspects: HashSet<u64>,
     bytes: usize,
     /// Whether this database counts in [`HELD_FILES_PRESSURE`] (see
     /// [`ColdIndex::note_held_files_pressure`]).
@@ -197,12 +219,33 @@ impl ReclaimState {
         self.pending.is_empty() && self.in_flight.is_empty() && self.adopting.is_empty()
     }
 
+    /// Never compact `file_id` again in this process (see [`FILES_GIVEN_UP`]).
+    fn give_up(&mut self, file_id: u64) {
+        self.suspects.remove(&file_id);
+        if self.skip.insert(file_id) {
+            FILES_GIVEN_UP.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     /// Whether `file_id` is being compacted or adopted.
     fn is_busy(&self, file_id: u64) -> bool {
         self.in_flight.contains(&file_id)
             || self.pending.iter().any(|p| p.old_file == file_id)
             || self.adopting.iter().any(|a| a.old_files.contains(&file_id))
     }
+}
+
+/// What [`ColdIndex::abandon_compactions_after_thread_death`] did with the
+/// file whose job the dead spill thread was running.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CulpritOutcome {
+    /// No culprit, or not a compaction of this index (the index was replaced
+    /// meanwhile, or the file belongs to another database).
+    NotHere,
+    /// Its first such death: this file is suspected, and retried.
+    Suspected(u64),
+    /// Its second: this file is given up on, never retried by this process.
+    GivenUp(u64),
 }
 
 /// What an adoption step did.
@@ -325,12 +368,47 @@ impl ColdIndex {
         n
     }
 
+    /// [`Self::abandon_compactions_in_flight`], on the tick that first sees
+    /// the spill thread dead, with `culprit`: the file whose job it was
+    /// running when it died, if any (`SpillThread::take_reclaim_culprit`).
+    /// A culprit this index has in flight is suspected on its first such
+    /// death and given up on its second (moon#1265 review, see
+    /// `ReclaimState::suspects`); the other compactions in flight are only
+    /// abandoned — they were queued behind it, not running. Giving up is
+    /// [`Self::abandon_compaction`]`(file, true)`: nothing on disk or in the
+    /// index changes, so the file's live keys stay readable from it and its
+    /// dead slots stay in the ledger until those keys leave it.
+    pub fn abandon_compactions_after_thread_death(
+        &mut self,
+        culprit: Option<u64>,
+    ) -> CulpritOutcome {
+        let outcome = match culprit {
+            Some(id) if self.reclaim.in_flight.contains(&id) => {
+                if self.reclaim.suspects.insert(id) {
+                    CulpritOutcome::Suspected(id)
+                } else {
+                    self.reclaim.give_up(id);
+                    CulpritOutcome::GivenUp(id)
+                }
+            }
+            _ => CulpritOutcome::NotHere,
+        };
+        self.abandon_compactions_in_flight();
+        outcome
+    }
+
+    /// Files suspected of having killed a spill thread once (tests).
+    #[cfg(test)]
+    pub(crate) fn reclaim_suspects(&self) -> usize {
+        self.reclaim.suspects.len()
+    }
+
     /// A compaction ends without output (its job could not be sent, or found
     /// nothing to do). `give_up`: never try this file again in this process.
     pub fn abandon_compaction(&mut self, file_id: u64, give_up: bool) {
         self.reclaim.in_flight.remove(&file_id);
         if give_up {
-            self.reclaim.skip.insert(file_id);
+            self.reclaim.give_up(file_id);
         }
     }
 
@@ -419,7 +497,7 @@ impl ColdIndex {
             Ok(completions) => completions,
             Err(why) => {
                 if known {
-                    self.reclaim.skip.insert(old_file);
+                    self.reclaim.give_up(old_file);
                 }
                 return Err(why);
             }
@@ -438,7 +516,7 @@ impl ColdIndex {
         let entries: usize = completions.iter().map(|c| c.entries.len()).sum();
         if entries != moved.len() {
             discard_all(&completions);
-            self.reclaim.skip.insert(old_file);
+            self.reclaim.give_up(old_file);
             return Err("the spill writer returned a different number of entries".into());
         }
         let mut from = moved.into_iter();
@@ -480,9 +558,11 @@ impl ColdIndex {
         }
         if reordered {
             discard_all(&completions);
-            self.reclaim.skip.insert(old_file);
+            self.reclaim.give_up(old_file);
             return Err("the spill writer reordered its entries".into());
         }
+        // Compacted: whatever death it was suspected of was not its doing.
+        self.reclaim.suspects.remove(&old_file);
         self.reclaim.bytes += bytes;
         self.reclaim.pending.push(PendingCompaction {
             old_file,
@@ -523,7 +603,7 @@ impl ColdIndex {
         let read = slots.bytes_read;
         let Some(plan) = self.plan_compaction(file_id, db_index, slots, shard_dir, next_file_id)?
         else {
-            self.reclaim.skip.insert(file_id);
+            self.reclaim.give_up(file_id);
             return Err("no live key left (the orphan sweep's file)".to_string());
         };
         let written = write_outputs(plan.requests, shard_dir);

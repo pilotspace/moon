@@ -527,7 +527,8 @@ fn info_raw(db: &Database, facts: &InstanceFacts) -> String {
          spill_thread_alive:{}\r\n\
          spill_thread_restarts:{}\r\n\
          spill_thread_degraded:{}\r\n\
-         spill_thread_rehydrated:{}\r\n",
+         spill_thread_rehydrated:{}\r\n\
+         cold_reclaim_files_given_up:{}\r\n",
         // moon#744: was a hardcoded `loading:0`. `any_shard_loading()` is a
         // process-wide counter precisely so INFO can answer this from a thread
         // that is not the recovering shard's -- nothing had ever read it.
@@ -621,6 +622,10 @@ fn info_raw(db: &Database, facts: &InstanceFacts) -> String {
         crate::storage::tiered::spill_thread::spill_thread_restarts_total(),
         crate::storage::tiered::spill_thread::spill_threads_degraded(),
         crate::storage::tiered::spill_thread::spill_thread_rehydrated_total(),
+        // Spill files the cold reclaim will not compact again in this
+        // process: unreadable, undecodable, a failed write, or (moon#1265
+        // review) a compaction that killed the spill thread twice.
+        crate::storage::tiered::cold_reclaim::files_given_up_total(),
     ));
     sections.push_str("\r\n");
 

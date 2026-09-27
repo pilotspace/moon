@@ -16,12 +16,13 @@
 //! | reclaim jobs queued / taken | the channel / died with it | dropped; the shard abandons their compactions |
 //! | files it wrote but never announced | disk, unlisted | left for the startup orphan sweep |
 //! | the file-id counter | the shard | untouched: no id is minted twice (moon#1067) |
+//! | the reclaim job it was running | shared `Arc` mark | the shard's culprit: its file is given up on a second such death |
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::supervisor::{Phase, RestartPolicy, RestartSupervisor, Verdict};
-use super::{SpillRequest, SpillThread, ThreadEnds};
+use super::{NO_RECLAIM_JOB, SpillRequest, SpillThread, ThreadEnds};
 
 /// Shards whose spill thread is down right now: dead and not yet respawned,
 /// in backoff, or degraded (INFO `spill_thread_alive` is 0 while any is).
@@ -263,11 +264,17 @@ impl SpillThread {
         let Some(ends) = w.ends.clone() else {
             return Respawn::NotDue;
         };
+        // The dead incarnation's culprit was the reclaim tick's to take on
+        // the ticks it was seen dead; never let it outlive them into a
+        // later death of the new incarnation.
+        self.reclaim_running
+            .store(NO_RECLAIM_JOB, Ordering::Relaxed);
         match Self::spawn_incarnation(
             self.shard_id,
             ends,
             self.stop_flag.clone(),
             self.done_below.clone(),
+            self.reclaim_running.clone(),
             self.fault.clone(),
         ) {
             Ok((handle, exit)) => {
@@ -301,6 +308,19 @@ impl SpillThread {
                 Respawn::Failed(verdict)
             }
         }
+    }
+
+    /// The file whose cold-reclaim job the thread was running when it died
+    /// (moon#1265 review), taken: the next call answers `None`. `None` too
+    /// while a thread is running — the mark is then a job in progress, not
+    /// a culprit — and when the thread died outside any reclaim job.
+    pub(crate) fn take_reclaim_culprit(&self) -> Option<u64> {
+        if !self.is_dead() {
+            return None;
+        }
+        // Ordered after the dead thread's store by `is_dead`'s fence.
+        let id = self.reclaim_running.swap(NO_RECLAIM_JOB, Ordering::Relaxed);
+        (id != NO_RECLAIM_JOB).then_some(id)
     }
 
     /// Take every spill request still queued for the thread, in order.

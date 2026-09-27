@@ -15,6 +15,7 @@ use std::sync::Arc;
 
 use crate::persistence::aof::AofWriterPool;
 use crate::persistence::manifest::ShardManifest;
+use crate::storage::tiered::cold_reclaim::CulpritOutcome;
 use crate::storage::tiered::reclaim_io::{ReclaimDone, ReclaimJob};
 use crate::storage::tiered::spill_thread::SpillThread;
 
@@ -95,13 +96,36 @@ pub(super) fn run(
     // moon#1265: a dead spill thread answers nothing more. Abandon what it
     // still held (its queued jobs are dropped by the shard's reconcile; a
     // write it finished unannounced is an unlisted file the startup orphan
-    // sweep removes) and start nothing new until the respawn: the files are
-    // not given up, so the next incarnation compacts them.
+    // sweep removes) and start nothing new until the respawn. The files are
+    // not given up, so the next incarnation compacts them — except the one
+    // whose job the thread was running as it died, the second time that
+    // happens to it (review: a file that panics the thread deterministically
+    // would otherwise crash every respawn and degrade the shard's spilling).
     let spill_thread = if dead {
+        let culprit = spill_thread.and_then(SpillThread::take_reclaim_culprit);
         for db_index in 0..db_count {
             crate::shard::slice::with_shard_db(db_index, |db| {
-                if let Some(ci) = db.cold_index.as_mut() {
-                    ci.abandon_compactions_in_flight();
+                let Some(ci) = db.cold_index.as_mut() else {
+                    return;
+                };
+                match ci.abandon_compactions_after_thread_death(culprit) {
+                    CulpritOutcome::NotHere => {}
+                    CulpritOutcome::Suspected(file_id) => tracing::info!(
+                        shard_id,
+                        db = db_index,
+                        file_id,
+                        "cold reclaim: the spill thread died compacting this file; it is \
+                         retried once, and given up if it kills the thread again (moon#1265)"
+                    ),
+                    CulpritOutcome::GivenUp(file_id) => tracing::warn!(
+                        shard_id,
+                        db = db_index,
+                        file_id,
+                        "cold reclaim: file given up — its compaction killed the spill thread \
+                         twice. It stays as it is (its keys readable, its dead slots in the \
+                         ledger) and is not compacted again until restart (INFO \
+                         cold_reclaim_files_given_up, moon#1265)"
+                    ),
                 }
             });
         }

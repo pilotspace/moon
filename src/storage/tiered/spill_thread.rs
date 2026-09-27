@@ -586,6 +586,13 @@ pub struct SpillThread {
     done_below: Arc<AtomicU64>,
     /// The watermark the shard last pruned its superseded sets with.
     pruned_below: AtomicU64,
+    /// The file whose cold-reclaim job the thread is running right now, or
+    /// [`NO_RECLAIM_JOB`]. Set before a job and cleared after its answer is
+    /// sent, so a thread that dies mid-job leaves it pointing at the job
+    /// that killed it (moon#1265 review: a poisoned reclaim file must not
+    /// crash every respawn). Shared by every incarnation; read only once the
+    /// thread is dead ([`Self::take_reclaim_culprit`]).
+    reclaim_running: Arc<AtomicU64>,
     /// Test-only panic injection (`MOON_TEST_SPILL_PANIC_FILE`); `None` in
     /// production.
     fault: Option<Arc<fault::PanicPlan>>,
@@ -607,6 +614,10 @@ struct ThreadEnds {
 /// Reclaim jobs queued for one spill thread at most. The shard sends with
 /// `try_send` and keeps only a few in flight, so this only bounds a bug.
 const RECLAIM_QUEUE_CAP: usize = 64;
+
+/// [`SpillThread::reclaim_running`] when no reclaim job runs (no file id is
+/// ever this large: ids come from the shard's counter, one per file).
+const NO_RECLAIM_JOB: u64 = u64::MAX;
 
 impl SpillThread {
     /// Spawn a new background spill thread for the given shard.
@@ -641,6 +652,7 @@ impl SpillThread {
         };
         let stop_flag = Arc::new(AtomicBool::new(false));
         let done_below = Arc::new(AtomicU64::new(0));
+        let reclaim_running = Arc::new(AtomicU64::new(NO_RECLAIM_JOB));
 
         #[allow(clippy::expect_used)]
         // Startup: spill thread is critical infrastructure — spawn failure is fatal
@@ -649,6 +661,7 @@ impl SpillThread {
             ends.clone(),
             stop_flag.clone(),
             done_below.clone(),
+            reclaim_running.clone(),
             fault.clone(),
         )
         .expect("failed to spawn spill thread");
@@ -663,6 +676,7 @@ impl SpillThread {
             stop_flag,
             done_below,
             pruned_below: AtomicU64::new(0),
+            reclaim_running,
             fault,
         }
     }
@@ -681,6 +695,7 @@ impl SpillThread {
         ends: ThreadEnds,
         stop_flag: Arc<AtomicBool>,
         done_below: Arc<AtomicU64>,
+        reclaim_running: Arc<AtomicU64>,
         fault: Option<Arc<fault::PanicPlan>>,
     ) -> std::io::Result<(std::thread::JoinHandle<()>, supervision::ExitSlot)> {
         let exit = supervision::ExitSlot::default();
@@ -695,7 +710,13 @@ impl SpillThread {
                     // the first act, before anything else runs.
                     crate::shard::numa::pin_current_aux_thread(&format!("spill-{shard_id}"));
                     fault::check(fault.as_deref(), fault::PanicPoint::Start);
-                    Self::run(ends, stop_flag, &done_below, fault.as_deref());
+                    Self::run(
+                        ends,
+                        stop_flag,
+                        &done_below,
+                        &reclaim_running,
+                        fault.as_deref(),
+                    );
                 }));
                 if let Err(payload) = outcome {
                     exit_bg.record_panic(payload.as_ref());
@@ -714,6 +735,7 @@ impl SpillThread {
         ends: ThreadEnds,
         stop_flag: Arc<AtomicBool>,
         done_below: &AtomicU64,
+        reclaim_running: &AtomicU64,
         fault: Option<&fault::PanicPlan>,
     ) {
         let ThreadEnds {
@@ -776,13 +798,19 @@ impl SpillThread {
             // Polled once per iteration, so a job waits at most one 100 ms
             // `recv_timeout`; a shutdown drops unserved jobs (their outputs,
             // if any, are unlisted files the startup orphan sweep removes).
+            //
+            // Each job is bracketed by `reclaim_running` (moon#1265 review):
+            // a panic inside it leaves the job's file there for the shard,
+            // which gives the file up once it has killed two incarnations.
             while let Ok(job) = reclaim_rx.try_recv() {
                 let write = matches!(job, super::reclaim_io::ReclaimJob::Write { .. });
+                reclaim_running.store(job.file_id(), Ordering::Relaxed);
                 let done = super::reclaim_io::run_job(job);
                 if write {
                     fault::check(fault, fault::PanicPoint::ReclaimWrite);
                 }
                 let _ = reclaim_done_tx.send(done);
+                reclaim_running.store(NO_RECLAIM_JOB, Ordering::Relaxed);
             }
 
             match request_rx.recv_timeout(std::time::Duration::from_millis(100)) {

@@ -14,7 +14,8 @@
 //! - no file id is minted twice (moon#1067): the requeued request keeps its
 //!   id, nothing reuses the dead batch's;
 //! - a reclaim write in flight at the panic loses no key, leaks no listed
-//!   file, and the compaction succeeds after the respawn;
+//!   file, and the compaction succeeds after the respawn; one that kills the
+//!   thread twice is given up, readable as it was, and spilling stays up;
 //! - a crash loop degrades the shard: every payload goes back to RAM, the
 //!   channel closes, and eviction takes the no-spill path.
 
@@ -455,6 +456,94 @@ fn a_reclaim_write_in_flight_at_the_panic_loses_no_key_and_leaks_no_listed_file(
                 .any(|p| p.ends_with(format!("heap-{FIRST_NEW:06}.mpf"))),
             "left for the orphan sweep: {orphans:?}"
         );
+        let _ = st.shutdown();
+    })
+    .join()
+    .unwrap();
+}
+
+/// moon#1265 review (MAJOR-2): a reclaim file whose job kills the spill
+/// thread every time. The first death retries it; the second gives it up,
+/// and the respawned thread then stays up — no third death, no degrade. The
+/// file stays exactly as it was: listed, serving its survivors, its dead
+/// slots in the ledger.
+#[test]
+fn a_reclaim_file_that_kills_the_thread_twice_is_given_up_and_stays_readable() {
+    std::thread::spawn(|| {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let shard_dir = tmp.path().join("shard-0");
+        let live = fixture(tmp.path(), &shard_dir);
+        let (shared, mut inits) =
+            crate::shard::shared_databases::ShardDatabases::new(vec![vec![Database::new()]]);
+        init_shard(ShardSlice::new(inits.remove(0)));
+        with_shard_db(0, |db| *db = live);
+        let mut manifest =
+            Some(ShardManifest::open(&shard_dir.join("shard-0.manifest")).expect("manifest"));
+        let st = SpillThread::with_fault(0, Some(PanicPlan::times(PanicPoint::ReclaimWrite, 2)));
+        let (tx, _rx) = crate::runtime::channel::mpsc_bounded::<AofMessage>(16);
+        let pool = AofWriterPool::top_level(tx);
+        let runtime_config = Arc::new(parking_lot::RwLock::new(
+            crate::config::RuntimeConfig::default(),
+        ));
+        let mut next = FIRST_NEW;
+        let tick = |manifest: &mut Option<ShardManifest>, next: &mut u64| {
+            drain_and_apply(&st, manifest, &mut sink(), 1, 0);
+            cold_reclaim_tick::run(
+                &shared,
+                0,
+                &runtime_config,
+                manifest,
+                next,
+                Some(&shard_dir),
+                Some(&pool),
+                Some(&st),
+                usize::MAX,
+            );
+        };
+        let ledger = count(|ci| ci.dead_slots().len());
+        let given_up = crate::storage::tiered::cold_reclaim::files_given_up_total();
+
+        for death in 1..=2 {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !st.is_dead() {
+                assert!(Instant::now() < deadline, "death {death} never came");
+                tick(&mut manifest, &mut next);
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            tick(&mut manifest, &mut next);
+            assert_eq!(count(|ci| ci.compactions_in_flight()), 0, "abandoned");
+            let candidates = count(|ci| ci.reclaim_candidates(usize::MAX).len());
+            if death == 1 {
+                assert_eq!(candidates, 1, "one death is forgiven: retried");
+                assert_eq!(count(|ci| ci.reclaim_suspects()), 1);
+            } else {
+                assert_eq!(candidates, 0, "two deaths: given up");
+                assert!(
+                    crate::storage::tiered::cold_reclaim::files_given_up_total() > given_up
+                );
+            }
+            respawn_now(&st);
+        }
+
+        // The respawned thread gets no job, so it stays up.
+        let settle = Instant::now() + Duration::from_millis(500);
+        while Instant::now() < settle {
+            tick(&mut manifest, &mut next);
+            assert!(!st.is_dead(), "a third death: the file was not given up");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!st.is_degraded());
+        assert_eq!(count(|ci| ci.pending_compactions()), 0);
+        assert_eq!(count(|ci| ci.dead_slots().len()), ledger, "the ledger as before");
+        assert!(listed(manifest.as_ref().expect("manifest"), OLD));
+        for (k, v) in [("k08", "v08"), ("k09", "v09")] {
+            assert_eq!(file_of(k), Some(OLD), "{k} still indexed in its file");
+            let got = with_shard_db(0, |db| db.get_cold_value(k.as_bytes(), 0));
+            assert!(
+                matches!(&got, Some(crate::storage::entry::RedisValue::String(b)) if b.as_ref() == v.as_bytes()),
+                "{k} readable from the given-up file: {got:?}"
+            );
+        }
         let _ = st.shutdown();
     })
     .join()
