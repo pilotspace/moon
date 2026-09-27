@@ -430,6 +430,24 @@ shared 4-vCPU Linux container against HEAD `935c555` — re-measure on the GCE r
 
 ### Fixed
 
+- **`TXN.ABORT` is durable and replicated on both runtimes** (moon#1285,
+  moon#1185 option b). An aborted write used to come back after a kill -9
+  restart (both runtimes) and stayed on replicas: the forward writes reached the
+  AOF and the replica stream, the rollback only memory. The abort now logs
+  compensating records stamped with the fold epoch — `DEL` for an undone insert,
+  `RESTORE … REPLACE ABSTTL` (plus `HPEXPIREAT` per field deadline) for an undone
+  update or delete — and moves each replaced value into an in-flight BGSAVE's
+  pre-image, so the image stays point-in-time. A `SELECT` inside a transaction
+  no longer makes the abort restore into the wrong database. Vector / text
+  documents of restored keys are rebuilt live and on replicas (`RESTORE` now
+  updates FT indexes, keeping `FT.SEARCH … AS_OF` history). Graph rollbacks were
+  never logged at all; they are now WAL-logged and replicated, with three new
+  WAL records (`GRAPH.DELPROP`, `GRAPH.UNDELETENODE`, `GRAPH.UNDELETEEDGE`;
+  fuzz target `graph_wal_replay`). `TXN.ABORT` answers the AOF's refusal instead
+  of `+OK` when its records cannot be queued (the rollback is applied either
+  way). Cost: the abort DUMPs each restored value, O(value) on the shard thread
+  (a 200k-field hash: ~11 ms more).
+
 - **Without an AOF, a deleted cold key came back after `BGSAVE` + kill -9**
   (moon#1281). The durable state is the last snapshot plus every listed spill
   file, and a spill file is unlinked only when its last live key leaves it, so
