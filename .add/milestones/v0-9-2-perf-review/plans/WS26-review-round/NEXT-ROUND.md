@@ -21,3 +21,9 @@ The maintainer picked all four areas, run as **durability and perf workstreams i
 - Every MAJOR+ fix gets a red→green test. Timing-based tests state their bound and margin.
 - Copy binaries out in the same command that built them, and verify each with a `strings` marker. Two worktrees produced byte-identical "different" builds this round.
 - The consistency suite needs `pip install redis`. Compare against the base binary test by test, not by absolute counts.
+
+## Additions (2026-09-27, after wave 1 integration)
+- **moon#1290 cost decision:** keep the no-loss durable tiering and raise the no-AOF batch to 1024 entries / 1 MiB floor (`94296bb`). Measured gain +25–55% rps; the cost is more disk held by dead slots.
+- **Wave 2 adds:**
+  - **moon#1297, no-AOF block reclaim:** compact mostly-dead spill files without an AOF, adopting `F'` after the next successful snapshot. This removes the disk cost of the bigger batches. It is durability-sensitive, so it needs crash tests at every kill point.
+  - **moon#1298, expiry time-bucket wheel (evaluate):** memory per TTL key vs the sorted `ExpiryPair` index, plus drain and `SET … EX` throughput. Ship only if it wins on memory with no throughput loss.
