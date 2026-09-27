@@ -9,12 +9,13 @@
 //! due keys left and drains it from the 1 ms tick in duty-capped slices
 //! (`server::expire_adaptive`).
 //!
-//! Here: 200K keys `PX 300`, all expired before the first sweep can reach
-//! them, on an otherwise idle server (so the monoio idle park is live and
-//! must be held off while the backlog drains). DBSIZE counts expired-but-
+//! Here: 200K keys `PX 3000`, the server SIGSTOPped until all of them are
+//! past their deadline, then resumed on an otherwise idle server (so the
+//! monoio idle park is live and must be held off while the backlog drains). DBSIZE counts expired-but-
 //! present keys, as redis's does.
 //!
-//! Red on ce65400 (release-fast): ~7.7K keys/s → ~26 s for 200K keys.
+//! Red on ce65400 (release-fast): 191K keys took 14.9 s (12.9K keys/s); the
+//! fix drains 200K in ~0.41 s on both runtimes.
 //!
 //! `MOON_BIN=<moon> cargo test --test active_expiry_backlog_drain_1288 -- --include-ignored`
 
@@ -69,21 +70,40 @@ fn dbsize(c: &mut Conn) -> usize {
 #[ignore = "real-server suite: MOON_BIN pinned"]
 fn an_expired_backlog_drains_at_an_adaptive_rate() {
     let dir = common::unique_test_dir("i1288");
-    let (_guard, port) = spawn(&dir);
+    let (guard, port) = spawn(&dir);
     let mut c = Conn::open(port);
     assert_eq!(c.send(&["SET", "live", "1"]), "+OK\r\n");
+    let loaded_at = Instant::now();
     for chunk in (0..KEYS).collect::<Vec<_>>().chunks(1_000) {
         let keys: Vec<String> = chunk.iter().map(|i| format!("k:{i}")).collect();
         let cmds: Vec<[&str; 5]> = keys
             .iter()
-            .map(|k| ["SET", k.as_str(), "v", "PX", "300"])
+            .map(|k| ["SET", k.as_str(), "v", "PX", "3000"])
             .collect();
         let refs: Vec<&[&str]> = cmds.iter().map(|c| c.as_slice()).collect();
         let replies = c.pipeline(&refs);
         assert_eq!(replies.matches("+OK").count(), chunk.len());
     }
-    // Every key is past its deadline from here on.
-    std::thread::sleep(Duration::from_millis(400));
+    // Stop the server until every key is past its deadline: on SIGCONT the
+    // whole population is one expired backlog (a stall resuming, as in the
+    // issue), not a trickle the regular cycle keeps up with.
+    let pid = guard.id().to_string();
+    let signal = |sig: &str| {
+        let ok = std::process::Command::new("kill")
+            .args([sig, &pid])
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok, "kill {sig} failed");
+    };
+    signal("-STOP");
+    let elapsed = loaded_at.elapsed();
+    assert!(
+        elapsed < Duration::from_millis(2_500),
+        "vacuity guard: loading took {elapsed:?}, so keys expired before the stall"
+    );
+    std::thread::sleep(Duration::from_millis(3_500) - elapsed);
+    signal("-CONT");
     let start_size = dbsize(&mut c);
     assert!(
         start_size > KEYS / 2,
