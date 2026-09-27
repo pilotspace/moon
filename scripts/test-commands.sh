@@ -948,7 +948,11 @@ if should_run "set"; then
     assert_moon_ok "SMEMBERS"          SMEMBERS {s}:A
     assert_moon_ok "SSCAN"             SSCAN {s}:A 0
     # moon#1287: a compact set answers in one call, cursor 0, whatever COUNT.
-    assert_match "SSCAN COUNT 1 (one-member set)" SSCAN {s}:one 0 COUNT 1
+    # An intset on every oracle (a small STRING set is listpack only from
+    # redis 7.2; 7.0 pages it as a hashtable), and its members come back in
+    # ascending order on both.
+    rcli SADD {s}:ints 3 1 2 >/dev/null 2>&1; mcli SADD {s}:ints 3 1 2 >/dev/null 2>&1
+    assert_match "SSCAN COUNT 1 (intset: one call)" SSCAN {s}:ints 0 COUNT 1
 fi
 
 # ===========================================================================

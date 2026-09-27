@@ -60,7 +60,7 @@ const FAST_EXPIRY_AOF_HEADROOM: usize = 2_048;
 /// The adaptive fast expiry cycle (moon#1288): called from BOTH runtimes'
 /// 1 ms periodic tick. While this shard has an expired backlog (latched by a
 /// cycle that ran out of budget with due keys left), spend one duty-capped
-/// slice on it — see `server::expiration`'s adaptive-expiry notes for the
+/// slice on it — see the `server::expire_adaptive` module docs for the
 /// token bucket that caps it at `EXPIRE_FAST_DUTY_PCT`% of the shard and
 /// `EXPIRE_FAST_SLICE_MAX` per tick.
 ///
