@@ -61,5 +61,12 @@ fmt --check; clippy --all-targets -D warnings on both feature sets; `cargo test 
 5. `shutdown()` in backoff flushes nothing still queued (AOF-backed, as in a crash).
 6. No loom model: single-owner machine under a mutex; death detection keeps the existing `is_finished` + `Acquire` fence.
 
+## Review round 2b (report: `../WS26-review-round/REVIEW-round2b.md`; fixes by a follow-up agent on `perf/ws25b`, integrated by cherry-pick)
+- **MAJOR-2:** one poisoned reclaim job degraded the shard in ~3 s (every death burned budget). `be2a30f`: the spill thread records the reclaim file it is running (`SpillThread::reclaim_running`, shared across incarnations); the first death with a file running makes it a suspect (retried once), the second gives it up through the existing skip set (`ColdIndex::abandon_compactions_after_thread_death`). An innocent file in flight at both deaths is not given up. New INFO `cold_reclaim_files_given_up` (counts every give-up). Tests: `spill_supervise_tests::a_reclaim_file_that_kills_the_thread_twice_is_given_up_and_stays_readable`, `cold_reclaim_tests::a_file_that_kills_the_spill_thread_twice_is_given_up_and_no_other`, reviewer's `review_r2b_tests` (red before).
+- **MINOR-1:** the restart budget ran on the wall clock; a step back refilled it. `61ee9de`: `SpillThread::clock_ms()` (monotonic) feeds the supervisor; transitions use the max reading seen.
+- **MAJOR-3 (tokio; pre-existing root cause):** the tokio write gates plain-dropped victims without a DEL, so an AOF restart replayed them (29,172 of 29,175 evicted keys back; degraded case 4,861/25,116). `cc26019`: both tokio gates report through `record_reason_del_conn`, now ungated (AOF leg on both runtimes, replication leg monoio-only). 0 back after, both runtimes.
+- **Test integrity:** `a_spill_thread_panic_mid_flight_is_survived` discarded the second range's `-OOM` refusals and then required those keys; with two suites sharing core 0 it reported 310–1,675 "lost" keys that the AOF showed were never acked. `843cd4f` settles the range first; 8/8 with two concurrent copies.
+- Left open: a poisoned file still costs two deaths of the 5/10 min budget; a per-job `catch_unwind` around reclaim I/O would remove that.
+
 ## Self-evaluation (0–1)
 Completeness 0.92 · Clarity 0.9 · Practicality 0.92 · Optimization 0.9 · Edge cases 0.9 · Self-evaluation 0.9

@@ -28,5 +28,9 @@ No performance claim: only refusal paths changed (static bytes, one relaxed `fet
 2. `persist_txn_aof` → `Result<(), &'static [u8]>`, `persist_local_leg` → `Result<bool, AofAck>`: a new caller must map with `append_refusal_reply`.
 3. Scripts source `scripts/lib/harness-guard.sh`; `set -E` + ERR trap; new auxiliary servers must use `aux_start`; `kill_port_servers` needs the exact argv[0].
 
+## Review round 2b (report: `../WS26-review-round/REVIEW-round2b.md`)
+- **MINOR-3 (moon#1272):** the `appendfsync always` fsync barrier still answered "fsync failed" on writer backlog (11 sites). `0ad8b17` + `4c8a16d`: a barrier refusal for backlog answers the new `AOF_BARRIER_BACKLOG_ERR` ("write applied in memory and queued, but not confirmed durable"; same `MOONERR AOF backpressure` prefix), counts in `aof_append_backpressure_refusals`, and is not counted as a dropped record. Unit test `pool_tests::fsync_barrier_always_on_full_channel_is_a_backpressure_refusal`.
+- **MINOR-2 (moon#1276):** `redis-cli -t` is a connect timeout only and arrived in 7.4, not 7.2. `387402b`: the guard prefers `timeout`/`gtimeout` (whole-command bound), falls back to `-t` with a NOTE. Verified: a listener that accepts and never answers is cut at 2 s (rc 124).
+
 ## Self-evaluation (0–1)
 Completeness 0.92 · Clarity 0.92 · Practicality 0.93 · Optimization 0.92 · Edge cases 0.90 · Self-evaluation 0.91

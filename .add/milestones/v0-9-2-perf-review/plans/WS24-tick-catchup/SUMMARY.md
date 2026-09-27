@@ -64,5 +64,9 @@ runtime/{interval.rs (new), mod.rs, traits.rs, tokio_impl.rs, monoio_impl.rs}; s
 - One `Instant::now()` per fast-path tick (not per key; not while idle-parked).
 - Any new monoio chore must use `Cadence`; any raw interval now fails clippy.
 
+## Review round 2b (report: `../WS26-review-round/REVIEW-round2b.md`)
+- **MAJOR-1:** with `Skip`, a saturated loop fires the 1 ms tick less often, and the once-per-tick duties (lazy-free slice, snapshot segment advance) lost duty in proportion: the reviewer's flood test measured the lazy-free drain ~10x slower. `4d271f0`: `TickLateness::observe` returns the milliseconds since the previous fire, capped at 8; both duties scale by it on both runtimes. `tests/review_r2b_lazy_free_under_flood_1280.rs`: flooded/idle ratio 2.08 (monoio s1, Linux container), green on both runtimes.
+- **MINOR-4 (pre-existing):** active expiry drains an expired backlog at ~7K keys/s regardless of #1280 → filed moon#1288.
+
 ## Self-evaluation (0–1)
 Completeness 0.92 · Clarity 0.92 · Practicality 0.93 · Optimization 0.90 · Edge cases 0.90 · Self-evaluation 0.90
