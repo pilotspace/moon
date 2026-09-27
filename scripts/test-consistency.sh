@@ -5059,9 +5059,14 @@ run_volatile_ttl_eviction_leg() {
     assert_eq "moon#600 [$leg]: server still answers after volatile-ttl eviction" \
         "PONG" "$alive"
 
+    # All three from ONE INFO reply: after the writes stop, a background
+    # eviction can still land (one more victim ~1 s later), and a DBSIZE read
+    # separately from evicted_keys then sums to EVICT_WRITES + 1 on any build
+    # (seen once in the 2026-09 review round, reproduced on 273e6bc).
     local dbsize evicted spilled info
-    dbsize=$(cli_bounded 3 -p "$PORT_EVICT" DBSIZE 2>&1 || true)
     info=$(cli_bounded 3 -p "$PORT_EVICT" INFO 2>/dev/null | tr -d '\r' || true)
+    dbsize=$(echo "$info" | awk -F'[:=,]' '/^db0:/ {print $3}')
+    dbsize="${dbsize:-0}"
     evicted=$(echo "$info" | awk -F: '/^evicted_keys:/ {print $2}')
     spilled=$(echo "$info" | awk -F: '/^spilled_keys:/ {print $2}')
 
