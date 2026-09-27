@@ -801,6 +801,36 @@ redis_sm=$(redis-cli -p "$PORT_REDIS" SMEMBERS s:test 2>&1 | sort)
 rust_sm=$(redis-cli -p "$PORT_RUST" SMEMBERS s:test 2>&1 | sort)
 assert_eq "SMEMBERS (sorted)" "$redis_sm" "$rust_sm"
 
+# moon#1287: SSCAN. A compact (listpack/intset) set answers in ONE call with
+# cursor 0 whatever COUNT says, as redis does. Member order is unspecified on
+# both, so the cursor line and the sorted members are compared separately.
+both DEL s:scan:small s:scan:big
+both SADD s:scan:small a b c d e f g
+redis_ss=$(redis-cli -p "$PORT_REDIS" SSCAN s:scan:small 0 COUNT 2 2>&1)
+rust_ss=$(redis-cli -p "$PORT_RUST" SSCAN s:scan:small 0 COUNT 2 2>&1)
+assert_eq "SSCAN compact set: one call, cursor 0" "$(head -1 <<<"$redis_ss")" "$(head -1 <<<"$rust_ss")"
+assert_eq "SSCAN compact set: every member (sorted)" \
+    "$(tail -n +2 <<<"$redis_ss" | sort)" "$(tail -n +2 <<<"$rust_ss" | sort)"
+# A full-encoding set scanned to completion with COUNT 100: the union of the
+# pages is exactly the set (moon pages it by position since moon#1287).
+sscan_all() {
+    local port=$1 key=$2 cur=0 out="" reply n=0
+    while :; do
+        reply=$(redis-cli -p "$port" SSCAN "$key" "$cur" COUNT 100 2>&1)
+        cur=$(head -1 <<<"$reply")
+        out+=$(tail -n +2 <<<"$reply")$'\n'
+        n=$((n + 1))
+        [[ "$cur" == 0 || $n -gt 100000 ]] && break
+    done
+    sed '/^$/d' <<<"$out" | sort -u
+}
+# shellcheck disable=SC2046
+both SADD s:scan:big $(seq -f 'm%g' 1 1000)
+assert_both "SSCAN full set: encoding" OBJECT ENCODING s:scan:big
+assert_eq "SSCAN full set: union of all pages (sorted)" \
+    "$(sscan_all "$PORT_REDIS" s:scan:big)" "$(sscan_all "$PORT_RUST" s:scan:big)"
+assert_eq "SSCAN full set: 1000 members returned" "1000" "$(sscan_all "$PORT_RUST" s:scan:big | wc -l | tr -d ' ')"
+
 # ===========================================================================
 # 9. Sorted Set operations
 # ===========================================================================

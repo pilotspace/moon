@@ -485,37 +485,83 @@ pub fn sscan_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
     };
     let match_pattern = opts.pattern;
     let count = opts.count;
-    let members: Vec<Bytes> = match db.get_set_ref_if_alive(key, now_ms) {
-        Ok(Some(sref)) => {
-            let mut v = sref.members();
-            v.sort();
-            v
+    match db.get_set_ref_if_alive(key, now_ms) {
+        // moon#1287: the full encoding pages by POSITION, O(COUNT) per call.
+        Ok(Some(crate::storage::db_read::SetRef::Hash(set))) => {
+            sscan_positions(set, cursor, count, match_pattern)
         }
-        Ok(None) => vec![],
-        Err(e) => return e,
-    };
-    let total = members.len();
-    let mut results = Vec::new();
-    let mut pos = cursor;
-    let mut checked = 0;
-    while pos < total && checked < count {
-        let member = &members[pos];
-        pos += 1;
-        checked += 1;
-        if let Some(pattern) = match_pattern {
-            if !glob_match(pattern, member) {
-                continue;
+        Ok(Some(crate::storage::db_read::SetRef::Owned(set))) => {
+            sscan_positions(&set, cursor, count, match_pattern)
+        }
+        // Compact encodings (intset / listpack, a few hundred members at
+        // most) answer in ONE call with cursor 0, whatever the cursor and
+        // COUNT — redis does the same for them. A small set never has a
+        // scan cursor in flight, so none can be misread after the set grows
+        // into the full encoding mid-scan.
+        Ok(Some(small)) => {
+            let mut members = small.members();
+            members.sort_unstable();
+            let mut results = Vec::with_capacity(members.len());
+            for member in members {
+                if match_pattern.is_none_or(|p| glob_match(p, &member)) {
+                    results.push(Frame::BulkString(member));
+                }
+            }
+            scan_reply(0, results)
+        }
+        Ok(None) => scan_reply(0, Vec::new()),
+        Err(e) => e,
+    }
+}
+
+/// One SSCAN page over the full (`IndexSet`) encoding (moon#1287).
+///
+/// The cursor counts the positions still to visit: the page walks DOWN from
+/// position `cursor - 1` (`len - 1` for the initial cursor 0) and answers
+/// the lowest position it did not reach — `0` once position 0 is done.
+/// O(COUNT) per call; the old path materialized and sorted the whole set on
+/// every call (O(N log N) per page, O(N² log N / COUNT) per full scan).
+///
+/// The SCAN guarantee — every member present for the whole scan is returned
+/// at least once — holds because nothing moves a member UP: SREM / SPOP /
+/// SMOVE `swap_remove`, which moves the LAST member down into the hole, and
+/// SADD appends at the end. A member not yet visited sits below the cursor
+/// and can only move further down, so it is still ahead of the walk; one
+/// already visited may move below the cursor and be returned again
+/// (allowed), and one added mid-scan lands above it (may be missed —
+/// allowed). redis gets the same property from its reverse-binary cursor.
+/// A cursor past the end (the set shrank) clamps to the length: every
+/// position below it is still unvisited.
+fn sscan_positions(
+    set: &crate::storage::entry::SetValue,
+    cursor: usize,
+    count: usize,
+    pattern: Option<&[u8]>,
+) -> Frame {
+    let len = set.len();
+    let end = if cursor == 0 { len } else { cursor.min(len) };
+    let start = end.saturating_sub(count.max(1));
+    let mut results = Vec::with_capacity(end - start);
+    if let Some(page) = set.as_slice().get_range(start..end) {
+        for member in page.iter().rev() {
+            if pattern.is_none_or(|p| glob_match(p, member)) {
+                results.push(Frame::BulkString(member.clone()));
             }
         }
-        results.push(Frame::BulkString(member.clone()));
     }
-    let next_cursor = if pos >= total {
+    scan_reply(start, results)
+}
+
+/// `[cursor, [items...]]` — the SSCAN reply shape.
+fn scan_reply(next_cursor: usize, results: Vec<Frame>) -> Frame {
+    let cursor = if next_cursor == 0 {
         Bytes::from_static(b"0")
     } else {
-        Bytes::from(pos.to_string())
+        let mut buf = itoa::Buffer::new();
+        Bytes::copy_from_slice(buf.format(next_cursor).as_bytes())
     };
     Frame::Array(framevec![
-        Frame::BulkString(next_cursor),
+        Frame::BulkString(cursor),
         Frame::Array(results.into()),
     ])
 }

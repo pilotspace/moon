@@ -223,6 +223,18 @@ pub fn hvals(db: &mut Database, args: &[Frame]) -> Frame {
 /// HSCAN key cursor [MATCH pattern] [COUNT count]
 ///
 /// Incrementally iterates hash fields using a cursor. Expired fields are omitted.
+///
+/// KNOWN LIMITATION (moon#1287, deferred to moon#1171): every call
+/// materializes and sorts the whole hash and pages by rank in that sorted
+/// snapshot — O(N log N) per page — and a field removed BEFORE the cursor
+/// shifts every later rank down, so a field present for the whole scan can
+/// be skipped. SSCAN fixed both with a descending position cursor over its
+/// `IndexSet` (`set_read::sscan_positions`); the full hash encoding is a
+/// `std::collections::HashMap`, whose iteration order is not stable across a
+/// resize and which exposes no bucket index, so the same cursor needs the
+/// `IndexMap` representation moon#1171 proposes (with `swap_remove` on
+/// HDEL). Compact (listpack) hashes are bounded by
+/// `hash-max-listpack-entries` and are not affected by the cost.
 pub fn hscan(db: &mut Database, args: &[Frame]) -> Frame {
     if args.len() < 2 {
         return err_wrong_args("HSCAN");
@@ -495,7 +507,8 @@ pub fn hexists_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
     }
 }
 
-/// HSCAN (read-only).
+/// HSCAN (read-only). Same known limitation as [`hscan`] (moon#1287 →
+/// moon#1171).
 pub fn hscan_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
     if args.len() < 2 {
         return err_wrong_args("HSCAN");

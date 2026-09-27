@@ -947,6 +947,8 @@ if should_run "set"; then
     assert_match "SRANDMEMBER -3 (one member)" SRANDMEMBER {s}:one -3
     assert_moon_ok "SMEMBERS"          SMEMBERS {s}:A
     assert_moon_ok "SSCAN"             SSCAN {s}:A 0
+    # moon#1287: a compact set answers in one call, cursor 0, whatever COUNT.
+    assert_match "SSCAN COUNT 1 (one-member set)" SSCAN {s}:one 0 COUNT 1
 fi
 
 # ===========================================================================
