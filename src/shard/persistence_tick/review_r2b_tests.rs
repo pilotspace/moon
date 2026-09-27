@@ -110,3 +110,37 @@ fn a_poisoned_reclaim_job_does_not_degrade_spilling() {
     .join()
     .unwrap();
 }
+
+/// Review round 2b (moon#1265, MINOR): the restart budget is kept on the
+/// shard's cached WALL clock, and `forget_before` drops every attempt stamped
+/// in the "future". A wall clock stepped back (NTP step, VM restore) therefore
+/// erases the crash-loop history: a sixth death inside the same 10 minutes of
+/// real time respawns instead of degrading, and every further step-back
+/// grants 5 more. The supervisor is pure and clock-injected, so a monotonic
+/// clock (the shard's `tick_cadence::LoopClock`) would close this.
+#[test]
+fn a_wall_clock_step_back_does_not_reset_the_restart_budget() {
+    use crate::storage::tiered::spill_thread::supervisor::{
+        RestartPolicy, RestartSupervisor, Verdict,
+    };
+    let mut s = RestartSupervisor::new(RestartPolicy::DEFAULT, 1_000_000);
+    let mut now = 1_000_000u64;
+    for _ in 0..5 {
+        match s.on_death(now) {
+            Verdict::RespawnAt(due) => {
+                now = due;
+                s.on_respawned(now);
+                now += 1;
+            }
+            Verdict::Degrade => panic!("degraded before the budget was spent"),
+        }
+    }
+    // Five respawns in ~3 s of real time. The wall clock now steps back by a
+    // minute, and the thread dies a sixth time, a moment later in real time.
+    let stepped_back = now - 60_000;
+    assert_eq!(
+        s.on_death(stepped_back),
+        Verdict::Degrade,
+        "a 60 s wall-clock step back erased 5 respawns from the 10-minute budget"
+    );
+}
