@@ -52,10 +52,8 @@ fn a_poisoned_reclaim_job_does_not_degrade_spilling() {
             Some(ShardManifest::open(&shard_dir.join("shard-0.manifest")).expect("manifest"));
         // The poison: every reclaim WRITE of this shard panics (the fixture
         // has exactly one compactable file, so this is "one bad file").
-        let st = SpillThread::with_fault(
-            0,
-            Some(PanicPlan::times(PanicPoint::ReclaimWrite, 1_000)),
-        );
+        let st =
+            SpillThread::with_fault(0, Some(PanicPlan::times(PanicPoint::ReclaimWrite, 1_000)));
         let (tx, _rx) = crate::runtime::channel::mpsc_bounded::<AofMessage>(16);
         let pool = AofWriterPool::top_level(tx);
         let runtime_config = Arc::new(parking_lot::RwLock::new(
