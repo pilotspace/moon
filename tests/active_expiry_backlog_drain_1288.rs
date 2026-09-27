@@ -101,7 +101,10 @@ fn an_expired_backlog_drains_at_an_adaptive_rate() {
         start_size - size,
         (start_size - size) as f64 / took.as_secs_f64()
     );
-    assert_eq!(size, 1, "the backlog never cleared: {size} keys left after {took:?}");
+    assert_eq!(
+        size, 1,
+        "the backlog never cleared: {size} keys left after {took:?}"
+    );
     assert!(
         took < MAX_DRAIN,
         "{start_size} expired keys took {took:?} to drain (> {MAX_DRAIN:?}): active \
