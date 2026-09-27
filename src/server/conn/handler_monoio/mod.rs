@@ -271,24 +271,21 @@ pub enum MonoioHandlerResult {
 /// and runs the spill-aware evictor when disk offload is wired, the plain
 /// budget evictor otherwise. Returns the evictor's OOM frame verbatim.
 ///
-/// Task #34 review (defect 1 follow-through): this gate has no
-/// `ShardManifest` handle (only the tick-driven memory-pressure cascade in
-/// `persistence_tick.rs` does), so it passes `manifest: None` to
-/// [`EvictionRun::async_spill`] below.
+/// moon#1290 N6: the gate borrows the shard's `ShardManifest`
+/// (`shard::manifest_cell`) for [`EvictionRun::async_spill`] below. The
+/// `EvictionSink::AsyncSpill` arm of `evict_to_budget` routes on whether an
+/// AOF writer backs this process:
 ///
-/// What that costs depends on `appendonly`, and ONLY on it — see the
-/// `EvictionSink::AsyncSpill` arm of `evict_to_budget`:
-///
-///   * `--appendonly yes`: no cost. The arm ignores the manifest entirely and
-///     calls `evict_one_async_spill`, handing every victim to the
-///     `SpillThread`; the AOF is the durability backstop. Victims are SPILLED
-///     and stay cold-readable. (moon#660 measured this: `spilled_keys` climbs
-///     while `evicted_keys` stays near zero — `tests/inline_write_spill_gate_660.rs`.)
-///   * `--appendonly no`: with no manifest AND no AOF backstop a durable spill
-///     is impossible here, so the arm falls back to
-///     `evict_one_with_spill(.., None, ..)` — evicting policies PLAIN-DROP,
-///     `noeviction` OOMs. The cap is still enforced; the tick-driven cascade
-///     with its manifest picks up durable spilling within 100ms.
+///   * with one: the manifest is not used; every victim goes to the
+///     `SpillThread` and the AOF is the durability backstop. Victims are
+///     SPILLED and stay cold-readable (moon#660,
+///     `tests/inline_write_spill_gate_660.rs`).
+///   * without one: a durable batched spill through the manifest
+///     (`evict_batch_durable`) before any victim leaves RAM. Before moon#1290
+///     this gate passed `None` here and every victim was PLAIN-DROPPED (5.4K
+///     of 16.2K keys in the repro). Only with no manifest at all (the event
+///     loop holding it, which a connection task never sees) does it still
+///     fall back to the plain drop — `noeviction` OOMs.
 ///
 /// This wrapper previously used the non-reporting variant (hardcoded no-op
 /// sink), so plain-drops taken on that second path never reached
@@ -314,23 +311,27 @@ fn run_write_eviction_gate(
             .disk_offload_dir
             .as_deref()
             .unwrap_or(std::path::Path::new("."));
-        let res = evict_to_budget(
-            db,
-            &rt,
-            EvictionRun::async_spill(sender, dir, &mut fid, sel_db, None)
-                .budget(budget)
-                .report(&mut |key| {
-                    crate::replication::reason_del::record_reason_del_conn(
-                        &ctx.repl_state,
-                        ctx.shard_id,
-                        ctx.num_shards,
-                        ctx.aof_pool.as_ref(),
-                        sel_db,
-                        key,
-                        &mut aof_budget,
-                    );
-                }),
-        );
+        // moon#1290 N6: the shard's manifest, so a no-AOF victim is tiered
+        // durably (`evict_batch_durable`) instead of plain-dropped.
+        let res = crate::shard::manifest_cell::with_manifest(|manifest| {
+            evict_to_budget(
+                db,
+                &rt,
+                EvictionRun::async_spill(sender, dir, &mut fid, sel_db, manifest)
+                    .budget(budget)
+                    .report(&mut |key| {
+                        crate::replication::reason_del::record_reason_del_conn(
+                            &ctx.repl_state,
+                            ctx.shard_id,
+                            ctx.num_shards,
+                            ctx.aof_pool.as_ref(),
+                            sel_db,
+                            key,
+                            &mut aof_budget,
+                        );
+                    }),
+            )
+        });
         ctx.spill_file_id.set(ctx.spill_file_id.get().max(fid));
         res
     } else {

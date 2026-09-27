@@ -338,13 +338,16 @@ fn mq_write_gate(
             .disk_offload_dir
             .as_deref()
             .unwrap_or(std::path::Path::new("."));
-        let res = evict_to_budget(
-            db,
-            &rt,
-            EvictionRun::async_spill(sender, dir, &mut fid, db_index, None)
-                .budget(budget)
-                .report(&mut report_eviction_del),
-        );
+        // moon#1290 N6: tier durably without an AOF (`shard::manifest_cell`).
+        let res = crate::shard::manifest_cell::with_manifest(|manifest| {
+            evict_to_budget(
+                db,
+                &rt,
+                EvictionRun::async_spill(sender, dir, &mut fid, db_index, manifest)
+                    .budget(budget)
+                    .report(&mut report_eviction_del),
+            )
+        });
         ctx.spill_file_id.set(ctx.spill_file_id.get().max(fid));
         res?;
     } else {

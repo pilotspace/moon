@@ -687,7 +687,7 @@ impl super::Shard {
         // Per-shard manifest for tracking segment files and checkpoint state.
         // Used by both checkpoint protocol (handle_checkpoint_tick) and warm
         // tier transitions (check_warm_transitions).
-        let mut shard_manifest: Option<crate::persistence::manifest::ShardManifest> =
+        let shard_manifest_owned: Option<crate::persistence::manifest::ShardManifest> =
             if server_config.disk_offload_enabled() {
                 let shard_dir = server_config
                     .effective_disk_offload_dir()
@@ -725,9 +725,14 @@ impl super::Shard {
         // stalls behind them). Move the file-I/O half onto the per-shard
         // manifest-sync thread: durable commits keep their blocking ack,
         // spill-completion commits become deferred sends.
-        if let Some(ref mut m) = shard_manifest {
+        // moon#1290 N6: shared with this thread's write-path eviction gates
+        // (`shard::manifest_cell`) — every use below borrows it for one call.
+        let shard_manifest: crate::shard::manifest_cell::SharedManifest =
+            std::rc::Rc::new(std::cell::RefCell::new(shard_manifest_owned));
+        if let Some(ref mut m) = *shard_manifest.borrow_mut() {
             m.enable_deferred_sync(shard_id);
         }
+        crate::shard::manifest_cell::register(&shard_manifest);
         // Task #55: background reclaim of crash-orphaned heap files that
         // recovery only CLASSIFIED (see `Shard::restore_from_persistence` /
         // `persistence::recovery::recover_shard_v3_pitr`). Classification is
@@ -1369,7 +1374,7 @@ impl super::Shard {
                         &repl_offsets, shard_id, &script_cache_rc, Some(&shard_lua_rt), &cached_clock,
                         &mut pending_migrations,
                         &mut pending_cdc_subscribes,
-                        &mut shard_manifest,
+                        &mut shard_manifest.borrow_mut(),
                         server_config.mvcc_committed_prune_margin,
                         server_config.graph_merge_max_segments,
                         server_config.graph_dead_edge_trigger,
@@ -1521,7 +1526,7 @@ impl super::Shard {
                         &repl_offsets, shard_id, &script_cache_rc, Some(&shard_lua_rt), &cached_clock,
                         &mut pending_migrations,
                         &mut pending_cdc_subscribes,
-                        &mut shard_manifest,
+                        &mut shard_manifest.borrow_mut(),
                         server_config.mvcc_committed_prune_margin,
                         server_config.graph_merge_max_segments,
                         server_config.graph_dead_edge_trigger,
@@ -1660,7 +1665,7 @@ impl super::Shard {
                                 // moon#1260 F1: unlink first, then answer the save's waiters.
                                 timers::sweep_after_snapshot(
                                     &shard_databases, shard_id, disk_offload_dir.as_deref(),
-                                    shard_manifest.as_mut(), cached_clock.ms(), aof_pool.as_ref(),
+                                    shard_manifest.borrow_mut().as_mut(), cached_clock.ms(), aof_pool.as_ref(),
                                     &spill_file_id, orphan_sweep_interval_secs,
                                 );
                                 crate::command::persistence::bgsave_shard_done(true);
@@ -1704,7 +1709,7 @@ impl super::Shard {
 
                     // Checkpoint protocol tick (disk-offload only)
                     if let (Some(ckpt_mgr), Some(page_cache_inst), Some(wal_v3), Some(manifest), Some(ctrl), Some(ctrl_path)) =
-                        (&mut checkpoint_manager, &page_cache, &mut wal_writer, &mut shard_manifest, &mut control_file, &control_file_path)
+                        (&mut checkpoint_manager, &page_cache, &mut wal_writer, &mut *shard_manifest.borrow_mut(), &mut control_file, &control_file_path)
                     {
                         // BGSAVE-triggered forced checkpoint (bypasses trigger conditions)
                         if bgsave_checkpoint_requested && !ckpt_mgr.is_active() {
@@ -1778,7 +1783,7 @@ impl super::Shard {
                     // P6: ceiling-trigger — runs at 1s cadence to avoid the
                     // read_dir syscall overhead of wal.stats() on every 1ms tick.
                     if let (Some(ckpt_mgr), Some(page_cache_inst), Some(wal_v3), Some(manifest), Some(ctrl), Some(ctrl_path)) =
-                        (&mut checkpoint_manager, &page_cache, &mut wal_writer, &mut shard_manifest, &mut control_file, &control_file_path)
+                        (&mut checkpoint_manager, &page_cache, &mut wal_writer, &mut *shard_manifest.borrow_mut(), &mut control_file, &control_file_path)
                     {
                         if persistence_tick::maybe_force_checkpoint_on_wal_overflow(
                             ckpt_mgr,
@@ -1806,7 +1811,7 @@ impl super::Shard {
                     // enabled) is precomputed at shard init — no per-tick
                     // format!/join.
                     if let Some(shard_dir) = disk_offload_dir.as_deref() {
-                        if let Some(ref mut manifest) = shard_manifest {
+                        if let Some(ref mut manifest) = *shard_manifest.borrow_mut() {
                             crate::shard::slice::with_shard(|s| {
                                 persistence_tick::check_warm_transitions(
                                     &s.vector_store,
@@ -1849,7 +1854,7 @@ impl super::Shard {
                             &shard_databases,
                             shard_id,
                             shard_dir,
-                            shard_manifest.as_mut(),
+                            shard_manifest.borrow_mut().as_mut(),
                             cached_clock.ms(),
                             aof_pool.as_ref(),
                             &spill_file_id,
@@ -1900,7 +1905,7 @@ impl super::Shard {
                 _ = eviction_interval.0.tick() => {
                     persistence_tick::run_eviction_tick(
                         spill_thread.as_ref(),
-                        &mut shard_manifest,
+                        &mut shard_manifest.borrow_mut(),
                         &shard_databases,
                         shard_id,
                         &server_config,
@@ -1945,7 +1950,7 @@ impl super::Shard {
                             &mut s.vector_store,
                             #[cfg(feature = "graph")]
                             &mut s.graph_store,
-                            shard_manifest.as_mut(),
+                            shard_manifest.borrow_mut().as_mut(),
                             wal_writer.as_mut(),
                             control_file.as_ref(),
                             wal_bounds.max_bytes,
@@ -1990,7 +1995,7 @@ impl super::Shard {
                     }
                     persistence_tick::drain_and_shutdown_spill(
                         &mut spill_thread,
-                        &mut shard_manifest,
+                        &mut shard_manifest.borrow_mut(),
                         &shard_databases,
                         shard_id,
                         &mut persistence_tick::ColdMarkerSink {
@@ -2002,7 +2007,7 @@ impl super::Shard {
                     );
                     // Trigger final checkpoint before shutdown (design S9)
                     if let (Some(ckpt_mgr), Some(page_cache_inst), Some(wal_v3), Some(manifest), Some(ctrl), Some(ctrl_path)) =
-                        (&mut checkpoint_manager, &page_cache, &mut wal_writer, &mut shard_manifest, &mut control_file, &control_file_path)
+                        (&mut checkpoint_manager, &page_cache, &mut wal_writer, &mut *shard_manifest.borrow_mut(), &mut control_file, &control_file_path)
                     {
                         persistence_tick::force_checkpoint(persistence_tick::ForcedCheckpoint::Shutdown, ckpt_mgr, page_cache_inst, wal_v3, manifest, ctrl, ctrl_path, shard_id, server_config.manifest_tombstone_retain_epochs, server_config.manifest_tombstone_retain_secs, &mut persistence_tick::graph_checkpoint_hook(persistence_dir.as_deref(), shard_id));
                     }
@@ -2039,9 +2044,10 @@ impl super::Shard {
                     }
                     // Task #59: flush pending deferred manifest commits and
                     // stop the manifest-sync thread before the loop exits.
-                    if let Some(ref mut m) = shard_manifest {
+                    if let Some(ref mut m) = *shard_manifest.borrow_mut() {
                         m.shutdown_deferred();
                     }
+                    crate::shard::manifest_cell::unregister();
                     break;
                 }
             }
@@ -2182,7 +2188,7 @@ impl super::Shard {
                     }
                     persistence_tick::drain_and_shutdown_spill(
                         &mut spill_thread,
-                        &mut shard_manifest,
+                        &mut shard_manifest.borrow_mut(),
                         &shard_databases,
                         shard_id,
                         &mut persistence_tick::ColdMarkerSink {
@@ -2203,7 +2209,7 @@ impl super::Shard {
                         &mut checkpoint_manager,
                         &page_cache,
                         &mut wal_writer,
-                        &mut shard_manifest,
+                        &mut *shard_manifest.borrow_mut(),
                         &mut control_file,
                         &control_file_path,
                     ) {
@@ -2238,9 +2244,10 @@ impl super::Shard {
                     }
                     // Task #59: flush pending deferred manifest commits and
                     // stop the manifest-sync thread before the loop exits.
-                    if let Some(ref mut m) = shard_manifest {
+                    if let Some(ref mut m) = *shard_manifest.borrow_mut() {
                         m.shutdown_deferred();
                     }
+                    crate::shard::manifest_cell::unregister();
                     break;
                 }
 
@@ -2335,7 +2342,7 @@ impl super::Shard {
                     &cached_clock,
                     &mut pending_migrations,
                     &mut pending_cdc_subscribes,
-                    &mut shard_manifest,
+                    &mut shard_manifest.borrow_mut(),
                     server_config.mvcc_committed_prune_margin,
                     server_config.graph_merge_max_segments,
                     server_config.graph_dead_edge_trigger,
@@ -2497,7 +2504,7 @@ impl super::Shard {
                                 &shard_databases,
                                 shard_id,
                                 disk_offload_dir.as_deref(),
-                                shard_manifest.as_mut(),
+                                shard_manifest.borrow_mut().as_mut(),
                                 cached_clock.ms(),
                                 aof_pool.as_ref(),
                                 &spill_file_id,
@@ -2547,7 +2554,7 @@ impl super::Shard {
                     &mut checkpoint_manager,
                     &page_cache,
                     &mut wal_writer,
-                    &mut shard_manifest,
+                    &mut *shard_manifest.borrow_mut(),
                     &mut control_file,
                     &control_file_path,
                 ) {
@@ -2621,7 +2628,7 @@ impl super::Shard {
                     );
                     persistence_tick::run_eviction_tick(
                         spill_thread.as_ref(),
-                        &mut shard_manifest,
+                        &mut shard_manifest.borrow_mut(),
                         &shard_databases,
                         shard_id,
                         &server_config,
@@ -2726,7 +2733,7 @@ impl super::Shard {
                         &mut checkpoint_manager,
                         &page_cache,
                         &mut wal_writer,
-                        &mut shard_manifest,
+                        &mut *shard_manifest.borrow_mut(),
                         &mut control_file,
                         &control_file_path,
                     ) {
@@ -2756,7 +2763,7 @@ impl super::Shard {
                     // enabled) is precomputed at shard init — no per-tick
                     // format!/join.
                     if let Some(shard_dir) = disk_offload_dir.as_deref() {
-                        if let Some(ref mut manifest) = shard_manifest {
+                        if let Some(ref mut manifest) = *shard_manifest.borrow_mut() {
                             crate::shard::slice::with_shard(|s| {
                                 persistence_tick::check_warm_transitions(
                                     &s.vector_store,
@@ -2793,7 +2800,7 @@ impl super::Shard {
                             &mut s.vector_store,
                             #[cfg(feature = "graph")]
                             &mut s.graph_store,
-                            shard_manifest.as_mut(),
+                            shard_manifest.borrow_mut().as_mut(),
                             wal_writer.as_mut(),
                             control_file.as_ref(),
                             wal_bounds.max_bytes,
@@ -2821,7 +2828,7 @@ impl super::Shard {
                         &shard_databases,
                         shard_id,
                         shard_dir,
-                        shard_manifest.as_mut(),
+                        shard_manifest.borrow_mut().as_mut(),
                         cached_clock.ms(),
                         aof_pool.as_ref(),
                         &spill_file_id,

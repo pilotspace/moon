@@ -252,13 +252,18 @@ impl LuaEvictionCtx {
                 .disk_offload_dir
                 .as_deref()
                 .unwrap_or(std::path::Path::new("."));
-            let res = evict_to_budget(
-                db,
-                &rt,
-                EvictionRun::async_spill(sender, dir, &mut fid, db_index, None)
-                    .budget(budget)
-                    .report(&mut on_plain_drop),
-            );
+            // moon#1290 N6: tier durably without an AOF. A script the event
+            // loop runs itself (a cross-shard leg) finds the manifest held
+            // and keeps the no-manifest path (`shard::manifest_cell`).
+            let res = crate::shard::manifest_cell::with_manifest(|manifest| {
+                evict_to_budget(
+                    db,
+                    &rt,
+                    EvictionRun::async_spill(sender, dir, &mut fid, db_index, manifest)
+                        .budget(budget)
+                        .report(&mut on_plain_drop),
+                )
+            });
             inner.spill_file_id.set(inner.spill_file_id.get().max(fid));
             res
         } else {

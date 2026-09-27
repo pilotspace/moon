@@ -63,6 +63,10 @@ pub(super) fn spsc_eviction_gate(
     spill_sender: Option<&flume::Sender<SpillRequest>>,
     spill_file_id: &Rc<Cell<u64>>,
     disk_offload_dir: Option<&std::path::Path>,
+    // moon#1290 N6: the shard's manifest (the event loop's, passed down by
+    // `drain_spsc_shared`), so a no-AOF victim is tiered durably instead of
+    // plain-dropped.
+    manifest: Option<&mut crate::persistence::manifest::ShardManifest>,
     // task #34 (Wave A): fires once per plain-dropped (non-spill) victim so
     // the caller can emit a dual-plane DEL record. Callers build this from
     // `record_reason_del` (event-loop-context flavor) — `drain_spsc_shared`
@@ -77,18 +81,14 @@ pub(super) fn spsc_eviction_gate(
     let global_result = if let Some(sender) = spill_sender {
         let mut fid = spill_file_id.get();
         let dir = disk_offload_dir.unwrap_or(std::path::Path::new("."));
-        // Task #34 review (defect 1 follow-through): this gate has no
-        // `ShardManifest` handle either (same reasoning as
-        // `run_write_eviction_gate`'s doc comment) — a cross-shard write
-        // past `maxmemory` under `--disk-offload enable` reliably takes the
-        // "no manifest reachable" plain-drop fallback. Previously called the
-        // non-reporting wrapper (hardcoded no-op sink), silently dropping
-        // `on_plain_drop` on the floor for this branch even though the
-        // caller already threads a real one for the sibling branch below.
+        // moon#1290 N6: before the manifest was passed here, a cross-shard
+        // write past `maxmemory` under `--appendonly no --disk-offload
+        // enable` took the "no manifest reachable" plain-drop fallback for
+        // every victim (3.7K of 5.4K drops at --shards 4 in the repro).
         let res = evict_to_budget(
             db,
             &rt,
-            EvictionRun::async_spill(sender, dir, &mut fid, db_idx, None)
+            EvictionRun::async_spill(sender, dir, &mut fid, db_idx, manifest)
                 .budget(budget)
                 .report(on_plain_drop),
         );
@@ -978,6 +978,7 @@ pub(crate) fn handle_shard_message_shared(
                             spill_sender,
                             spill_file_id,
                             disk_offload_dir,
+                            shard_manifest.as_mut(),
                         )
                     });
                     if let Some(crate::shard::spsc_two_db::TwoDbOutcome {
@@ -1055,6 +1056,7 @@ pub(crate) fn handle_shard_message_shared(
                                     spill_sender,
                                     spill_file_id,
                                     disk_offload_dir,
+                                    shard_manifest.as_mut(),
                                     // task #34 (Wave A): cross-shard write leg.
                                     &mut |key| {
                                         crate::replication::reason_del::record_reason_del(
@@ -1222,6 +1224,7 @@ pub(crate) fn handle_shard_message_shared(
                             spill_sender,
                             spill_file_id,
                             disk_offload_dir,
+                            shard_manifest.as_mut(),
                         ) {
                             let mut aof_ok = true;
                             if matches!(response, crate::protocol::Frame::Integer(1))
@@ -1293,6 +1296,7 @@ pub(crate) fn handle_shard_message_shared(
                                 spill_sender,
                                 spill_file_id,
                                 disk_offload_dir,
+                                shard_manifest.as_mut(),
                                 // task #34 (Wave A): cross-shard write leg.
                                 &mut |key| {
                                     crate::replication::reason_del::record_reason_del(
@@ -1463,6 +1467,7 @@ pub(crate) fn handle_shard_message_shared(
                             spill_sender,
                             spill_file_id,
                             disk_offload_dir,
+                            shard_manifest.as_mut(),
                         ) {
                             let mut aof_ok = true;
                             if matches!(response, crate::protocol::Frame::Integer(1))
@@ -1534,6 +1539,7 @@ pub(crate) fn handle_shard_message_shared(
                                 spill_sender,
                                 spill_file_id,
                                 disk_offload_dir,
+                                shard_manifest.as_mut(),
                                 // task #34 (Wave A): cross-shard write leg.
                                 &mut |key| {
                                     crate::replication::reason_del::record_reason_del(
@@ -2428,6 +2434,7 @@ pub(crate) fn handle_shard_message_shared(
                         spill_sender,
                         spill_file_id,
                         disk_offload_dir,
+                        shard_manifest.as_mut(),
                         &mut |key| {
                             crate::replication::reason_del::record_reason_del(
                                 key,

@@ -2603,18 +2603,23 @@ pub(crate) async fn handle_connection_sharded_inner<
                                             .disk_offload_dir
                                             .as_deref()
                                             .unwrap_or(std::path::Path::new("."));
-                                        let res = evict_to_budget(
-                                            db,
-                                            &rt,
-                                            EvictionRun::async_spill(
-                                                sender,
-                                                dir,
-                                                &mut fid,
-                                                conn.selected_db,
-                                                None,
-                                            )
-                                            .budget(budget)
-                                            .report(&mut report_eviction_del),
+                                        // moon#1290 N6: tier durably without an AOF.
+                                        let res = crate::shard::manifest_cell::with_manifest(
+                                            |manifest| {
+                                                evict_to_budget(
+                                                    db,
+                                                    &rt,
+                                                    EvictionRun::async_spill(
+                                                        sender,
+                                                        dir,
+                                                        &mut fid,
+                                                        conn.selected_db,
+                                                        manifest,
+                                                    )
+                                                    .budget(budget)
+                                                    .report(&mut report_eviction_del),
+                                                )
+                                            },
                                         );
                                         ctx.spill_file_id.set(ctx.spill_file_id.get().max(fid));
                                         res
