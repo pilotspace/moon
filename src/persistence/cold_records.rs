@@ -6,8 +6,8 @@
 //!
 //! * `MOON.COLDCUT <watermark>` — first record of every AOF generation. Cold
 //!   files with `file_id < watermark` were sealed before this generation's
-//!   base was cut. Written by `AofManifest::seed_cold_cut` on
-//!   `initialize*`, and by every rewrite as the head of the new incr.
+//!   base was cut. Written by `UncommittedGeneration::seed_cold_cut` when a
+//!   boot opens a generation, and by every rewrite as the head of the new incr.
 //! * `MOON.SPILLED <file_id> key [key …]` — appended (AOF only, never to
 //!   the replication stream: file ids are shard-local) when a spill
 //!   completion publishes those keys into the cold index.
@@ -183,7 +183,7 @@ pub fn frame_unoffset(resp: &[u8]) -> Vec<u8> {
 /// moon#914: open a legacy single-file AOF generation with its
 /// `MOON.COLDCUT <watermark>` head — the layout `runtime-tokio` with
 /// `--shards 1` uses, which has no `AofManifest` and therefore never runs
-/// `AofManifest::seed_cold_cut`.
+/// `UncommittedGeneration::seed_cold_cut`.
 ///
 /// Writes the head only when the file is absent or EMPTY, i.e. when no
 /// record of this generation exists yet, so it is always the first record.

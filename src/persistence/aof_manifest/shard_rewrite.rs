@@ -27,12 +27,20 @@ impl AofManifest {
     /// shard-1 write fails after shard-0 succeeded), all already-created shard
     /// base RDB files are deleted before returning the error.
     pub fn initialize_multi(dir: &Path, num_shards: u16) -> std::io::Result<Self> {
-        // Per-shard empty RDB. Single Database::default() inside a 1-element
-        // slice matches `initialize()`'s empty-RDB shape for each shard.
+        Self::prepare_multi(dir, num_shards)?.commit()
+    }
+
+    /// [`Self::initialize_multi`] up to, not including, the manifest commit
+    /// (moon#1293; see [`Self::prepare_multi_with_bases`]).
+    pub fn prepare_multi(
+        dir: &Path,
+        num_shards: u16,
+    ) -> std::io::Result<super::UncommittedGeneration> {
+        // Per-shard empty RDB, `initialize()`'s empty-RDB shape for each shard.
         let empty_dbs: [crate::storage::Database; 0] = [];
         let empty_rdb = crate::persistence::rdb::save_to_bytes(&empty_dbs)
             .map_err(|e| std::io::Error::other(format!("empty RDB serialize: {e}")))?;
-        Self::initialize_multi_with_bases(dir, num_shards, |_| Ok(empty_rdb.clone()))
+        Self::prepare_multi_with_bases(dir, num_shards, |_| Ok(empty_rdb.clone()))
     }
 
     /// [`Self::initialize_multi`] with each shard's base RDB supplied by
@@ -42,12 +50,27 @@ impl AofManifest {
     /// switch) must capture that state as the generation's base, or the next
     /// boot — which replays base + incr only — loses every key the snapshot
     /// held (moon#1281 review round 2, R2-2). Same idempotency pre-flight and
-    /// rollback as `initialize_multi`.
+    /// rollback as `initialize_multi`. A boot that opens a replay generation
+    /// uses [`Self::prepare_multi_with_bases`] + head + commit (moon#1293).
     pub fn initialize_multi_with_bases(
         dir: &Path,
         num_shards: u16,
-        mut base_for: impl FnMut(u16) -> std::io::Result<Vec<u8>>,
+        base_for: impl FnMut(u16) -> std::io::Result<Vec<u8>>,
     ) -> std::io::Result<Self> {
+        Self::prepare_multi_with_bases(dir, num_shards, base_for)?.commit()
+    }
+
+    /// [`Self::initialize_multi_with_bases`] up to, not including, the
+    /// manifest commit: every shard's base and empty incr are on disk, and
+    /// [`super::UncommittedGeneration::seed_generation_head`] writes the
+    /// heads before [`super::UncommittedGeneration::commit`] (moon#1293).
+    /// The `AlreadyExists` pre-flight still keys on the manifest, so a crash
+    /// before the commit is redone from scratch by the next boot.
+    pub fn prepare_multi_with_bases(
+        dir: &Path,
+        num_shards: u16,
+        mut base_for: impl FnMut(u16) -> std::io::Result<Vec<u8>>,
+    ) -> std::io::Result<super::UncommittedGeneration> {
         if num_shards == 0 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -120,9 +143,7 @@ impl AofManifest {
             }
             return Err(e);
         }
-
-        manifest.write_manifest()?;
-        Ok(manifest)
+        Ok(super::UncommittedGeneration::new(manifest))
     }
     /// Initialize a v2 multi-shard manifest only if one does not already exist.
     ///

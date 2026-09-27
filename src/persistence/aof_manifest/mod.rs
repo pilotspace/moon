@@ -41,12 +41,15 @@ use tracing::{error, info, warn};
 
 use crate::persistence::fsync::fsync_directory;
 
+mod generation;
 mod orphans;
 mod shard_replay;
 mod shard_rewrite;
+pub(crate) mod test_hooks;
 
 // Re-export the relocated public replay API so external paths
 // (`crate::persistence::aof_manifest::replay_*`) keep resolving (issue #143).
+pub use generation::UncommittedGeneration;
 pub use shard_replay::{OrderedEntry, replay_multi_part, replay_ordered_merge, replay_per_shard};
 
 const MANIFEST_NAME: &str = "moon.aof.manifest";
@@ -210,146 +213,24 @@ impl AofManifest {
         }
     }
 
-    /// Create the `appendonlydir/` and write the initial manifest.
-    ///
-    /// Prefer [`Self::initialize_with_base`] when the in-memory databases
-    /// already contain state (e.g. first upgrade from legacy single-file AOF
-    /// or per-shard WAL) — otherwise subsequent boots cannot reconstruct that
-    /// state because there is no base RDB for `replay_multi_part` to load.
-    ///
-    /// B4 fix: even on fresh install (no prior state), materialize an EMPTY
-    /// base RDB so the `(base + incr)` invariant always holds. Without this,
-    /// the recovery path refuses to replay incr-only state and the server
-    /// fails to restart after a graceful shutdown that only wrote incr.
+    /// Create the `appendonlydir/` and write the initial manifest, with an
+    /// EMPTY base (B4). Prefer [`Self::initialize_with_base`] when the
+    /// databases already hold state. A boot that opens a replay generation
+    /// must use [`Self::prepare`] + head + commit instead: this commits
+    /// before any head can be written (moon#1293, [`UncommittedGeneration`]).
     pub fn initialize(dir: &Path) -> std::io::Result<Self> {
-        let manifest = Self {
-            dir: dir.to_path_buf(),
-            seq: 1,
-            layout: AofLayout::TopLevel,
-            shards: vec![AofShardManifest {
-                shard_id: 0,
-                max_lsn: 0,
-            }],
-        };
-        std::fs::create_dir_all(manifest.aof_dir())?;
-
-        // Serialize an empty database vector to an empty base RDB so the
-        // (base + incr) invariant holds from the first boot.
-        let empty_dbs: [crate::storage::Database; 0] = [];
-        let empty_rdb = crate::persistence::rdb::save_to_bytes(&empty_dbs)
-            .map_err(|e| std::io::Error::other(format!("empty RDB serialize: {e}")))?;
-        let base_path = manifest.base_path();
-        let tmp_path = base_path.with_extension("rdb.tmp");
-        {
-            let mut f = std::fs::File::create(&tmp_path)?;
-            f.write_all(&empty_rdb)?;
-            f.sync_data()?;
-        }
-        std::fs::rename(&tmp_path, &base_path)?;
-        fsync_parent_best_effort(&base_path);
-
-        // Create the empty incr file so the writer has a target.
-        std::fs::File::create(manifest.incr_path())?;
-
-        manifest.write_manifest()?;
-        Ok(manifest)
-    }
-
-    /// moon#902: write `MOON.COLDCUT <watermark>` as the head of every incr
-    /// file of a freshly initialized generation (`initialize`,
-    /// `initialize_with_base`, `initialize_multi`). `watermark_for_shard`
-    /// answers the shard's next cold file id — every cold file that already
-    /// exists is below it and therefore a valid base for this generation.
-    /// Call immediately after initialization, before any writer opens the
-    /// incr; the record is fsynced so it is never a torn head.
-    pub fn seed_cold_cut(&self, watermark_for_shard: impl Fn(u16) -> u64) -> std::io::Result<()> {
-        self.seed_generation_head(watermark_for_shard, |_| {
-            crate::persistence::cold_records::ColdDeletes::default()
-        })
-    }
-
-    /// [`Self::seed_cold_cut`] with the `DEL`s the fresh generation's head
-    /// must carry, per shard (moon#1281 round 2: the dead spill slots a boot
-    /// dropped on a no-AOF snapshot's word —
-    /// `aof::fold_stream::fresh_generation_deletes`). The head is written and
-    /// fsynced before any client write can be acknowledged, like a fold's.
-    pub fn seed_generation_head(
-        &self,
-        watermark_for_shard: impl Fn(u16) -> u64,
-        mut deletes_for_shard: impl FnMut(u16) -> crate::persistence::cold_records::ColdDeletes,
-    ) -> std::io::Result<()> {
-        use crate::persistence::cold_records::write_generation_head_to;
-        let write = |path: PathBuf,
-                     watermark: u64,
-                     deletes: crate::persistence::cold_records::ColdDeletes,
-                     framed: bool|
-         -> std::io::Result<()> {
-            let mut f = std::fs::OpenOptions::new().append(true).open(&path)?;
-            let mut buf = std::io::BufWriter::new(&mut f);
-            write_generation_head_to(&mut buf, watermark, deletes, framed)?;
-            buf.flush()?;
-            drop(buf);
-            f.sync_data()
-        };
-        match self.layout {
-            AofLayout::TopLevel => write(
-                self.incr_path(),
-                watermark_for_shard(0),
-                deletes_for_shard(0),
-                false,
-            ),
-            AofLayout::PerShard => {
-                for shard in &self.shards {
-                    let sid = shard.shard_id;
-                    write(
-                        self.shard_incr_path(sid),
-                        watermark_for_shard(sid),
-                        deletes_for_shard(sid),
-                        true,
-                    )?;
-                }
-                Ok(())
-            }
-        }
+        Self::prepare(dir)?.commit()
     }
 
     /// Create the `appendonlydir/` and write an initial manifest with a base RDB
     /// capturing the current in-memory state.
     ///
-    /// Used on first upgrade from legacy persistence formats: after
-    /// `restore_from_persistence` has loaded state from the per-shard WAL or
-    /// `appendonly.aof`, this call materializes that state as the seq 1 base
-    /// RDB. Without a base, on the next boot the multi-part replay path would
-    /// clear the databases and then fail (missing base with non-empty incr)
-    /// or silently restart from empty state.
+    /// Materializes state loaded from a legacy format (per-shard WAL,
+    /// `appendonly.aof`) as the seq 1 base RDB; without one the next boot's
+    /// multi-part replay would clear the databases and fail or restart empty.
+    /// Boots use [`Self::prepare_with_base`] (moon#1293).
     pub fn initialize_with_base(dir: &Path, rdb_bytes: &[u8]) -> std::io::Result<Self> {
-        let manifest = Self {
-            dir: dir.to_path_buf(),
-            seq: 1,
-            layout: AofLayout::TopLevel,
-            shards: vec![AofShardManifest {
-                shard_id: 0,
-                max_lsn: 0,
-            }],
-        };
-        std::fs::create_dir_all(manifest.aof_dir())?;
-
-        // Write base RDB atomically: tmp file + fsync + rename.
-        let base_path = manifest.base_path();
-        let tmp_path = base_path.with_extension("rdb.tmp");
-        {
-            let mut f = std::fs::File::create(&tmp_path)?;
-            f.write_all(rdb_bytes)?;
-            f.sync_data()?;
-        }
-        std::fs::rename(&tmp_path, &base_path)?;
-        fsync_parent_best_effort(&base_path);
-
-        // Create empty incr file so the writer has something to append to.
-        std::fs::File::create(manifest.incr_path())?;
-
-        manifest.write_manifest()?;
-        Ok(manifest)
+        Self::prepare_with_base(dir, rdb_bytes)?.commit()
     }
 
     /// Load manifest from disk. A pure read that deletes nothing (moon#1271):
