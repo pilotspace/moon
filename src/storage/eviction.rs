@@ -1631,6 +1631,19 @@ fn evict_batch_durable(
                  appendonly=no; retaining hot values (spill file may be orphaned; \
                  the orphan sweep reclaims it)"
             );
+            // moon#1291 F9: `add_file` left the entry in the in-memory root, so
+            // the next successful commit would list this file although none of
+            // its slots is a key's entry — and a key DELeted while hot (no cold
+            // entry, so no grave) would come back from it at the next boot.
+            // Retire the entry (the next commit writes it as a Tombstone), and,
+            // in case the failed commit reached the disk anyway, record every
+            // slot as a grave for the next snapshot's trailer.
+            manifest.remove_file(file_id, crate::persistence::page::PageType::KvLeaf);
+            if let Some(ref mut ci) = db.cold_index {
+                for entry in &completion.entries {
+                    ci.note_unpublished_slot(file_id, entry.page_idx, entry.slot_idx);
+                }
+            }
             continue;
         }
 
@@ -4095,5 +4108,7 @@ mod tests {
     }
 }
 
+#[cfg(test)]
+mod commit_failure_tests;
 #[cfg(test)]
 mod ledger_admission_tests;

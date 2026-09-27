@@ -236,3 +236,34 @@ fn a_snapshot_carries_its_graves_after_eof_and_still_loads_its_keys() {
     let b = std::fs::read(&without).unwrap().len();
     assert!(a > b, "the trailer is on disk");
 }
+
+/// moon#1291 F8: a snapshot loaded by a boot with a smaller `--databases`
+/// skips the databases it has no room for — and still returns the graves
+/// trailer after EOF. Aborting at the first out-of-range selector lost the
+/// trailer, so that boot re-indexed every dead slot of every db.
+#[test]
+fn a_smaller_databases_count_skips_the_extra_dbs_and_keeps_the_graves() {
+    use crate::persistence::snapshot::{SnapshotState, shard_snapshot_load_with_graves};
+    use crate::storage::db::Database;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut db0 = Database::new();
+    db0.set_string(b"hot0", Bytes::from_static(b"v"));
+    let mut db1 = Database::new();
+    db1.set_string(b"hot1", Bytes::from_static(b"v"));
+    let dbs = vec![db0, db1, Database::new()];
+    let path = tmp.path().join("three.rrdshard");
+    let mut state = SnapshotState::new(0, 1, &dbs, path.clone());
+    state.set_cold_graves_trailer(cold_graves::encode(&[(7, vec![pack_slot(1, 2)])]));
+    while !state.advance_one_segment(&dbs) {}
+    state.finalize().unwrap();
+
+    let mut out = vec![Database::new()];
+    let mut expired = Vec::new();
+    let mut graves = None;
+    let n = shard_snapshot_load_with_graves(&mut out, &path, &mut expired, &mut graves)
+        .expect("a db past --databases is skipped, not a load failure");
+    assert_eq!(n, 1, "db 0 loads; dbs 1 and 2 are skipped");
+    assert!(out[0].get(b"hot0").is_some() && out[0].get(b"hot1").is_none());
+    let g = graves.expect("the trailer after EOF is still read");
+    assert!(g.contains(7, 1, 2));
+}
