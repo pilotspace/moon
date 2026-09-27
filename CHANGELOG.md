@@ -275,7 +275,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   tick counts, and active expiry scales its one catch-up sweep (capped at 4×).
   After a 3 s SIGSTOP with a queued lazy-free backlog the first PING waits
   ~0.7 ms instead of 177-207 ms (monoio) or 23-40 ms (tokio); a 3 s stall
-  fires 1-2 back-to-back ticks instead of ~3,000. New INFO
+  fires 1-2 back-to-back ticks instead of ~3,000. The per-tick duties (the
+  lazy-free drain, the snapshot walk) owe a late tick the milliseconds it
+  missed (at most 32 ticks' budget in one tick), so a loop saturated by long
+  commands frees and saves at its idle pace instead of one slice per round.
+  New INFO
   `shard_tick_late_total` and `shard_tick_burst_max`.
   `instantaneous_ops_per_sec` now reports a real rate (it read 0).
 

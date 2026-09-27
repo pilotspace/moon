@@ -239,25 +239,23 @@ pub(crate) fn drive_snapshot_finalize(
     }
 }
 
-/// [`advance_snapshot_segment`] up to `scale` times (moon#1280 review
-/// MAJOR-1): a late tick owes the walk the ticks it skipped, capped by
-/// `tick_cadence::PER_TICK_CATCH_UP_MAX_SCALE`. Each step keeps its own
-/// byte/segment budget and writer-backlog check. True once the walk is done.
+/// [`advance_snapshot_segment`] for a tick that owes the walk `scale` ticks'
+/// budget (moon#1280 review MAJOR-1: it fired late). The scale is combined
+/// with the walk's own backlog scale by MAX under the moon#1228 cap
+/// (`SnapshotState::set_catch_up_scale`), so a late tick walks at most what a
+/// backlogged tick always could (~1.6 ms) — round 3 measured the first cut,
+/// which multiplied the two, doubling PING p90 during a BGSAVE under a write
+/// flood. True once the walk is done.
 pub(crate) fn advance_snapshot_segments(
     snapshot_state: &mut Option<SnapshotState>,
     shard_databases: &Arc<ShardDatabases>,
     shard_id: usize,
     scale: u32,
 ) -> bool {
-    for _ in 0..scale.max(1) {
-        if snapshot_state.is_none() {
-            return false;
-        }
-        if advance_snapshot_segment(snapshot_state, shard_databases, shard_id) {
-            return true;
-        }
+    if let Some(snap) = snapshot_state.as_mut() {
+        snap.set_catch_up_scale(scale);
     }
-    false
+    advance_snapshot_segment(snapshot_state, shard_databases, shard_id)
 }
 
 /// Advance snapshot one segment and check if done (synchronous part).

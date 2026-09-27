@@ -1612,13 +1612,17 @@ impl super::Shard {
                         wal_writer.as_ref().map(|w| w.current_lsn().saturating_sub(1)).unwrap_or(0),
                     );
 
-                    // Advance the snapshot one tick's budget per owed tick.
-                    if persistence_tick::advance_snapshot_segments(
+                    // Advance the snapshot, owing a late tick its missed budget.
+                    let snapshot_walked = persistence_tick::advance_snapshot_segments(
                         &mut snapshot_state,
                         &shard_databases,
                         shard_id,
                         per_tick_scale,
-                    ) {
+                    );
+                    // The scaled duties (lazy free above, this walk) are done:
+                    // the next tick's scale counts from here.
+                    tick_lateness.duties_done(std::time::Instant::now());
+                    if snapshot_walked {
                         // moon#1186: the file is written, fsynced and renamed
                         // on the snapshot's writer thread; the tick polls.
                         match persistence_tick::drive_snapshot_finalize(
@@ -2819,6 +2823,12 @@ impl super::Shard {
                     shard_databases.db_count(),
                     per_tick_scale,
                 );
+                // The scaled duties (the walk above, this drain) are done: the
+                // next tick's scale counts from here (the chores in between
+                // run on their own elapsed cadence).
+                if tick_deadline.is_some() {
+                    tick_lateness.duties_done(std::time::Instant::now());
+                }
                 let quiet = wal_writer
                     .as_ref()
                     .is_none_or(|w| w.buffered_bytes() == 0 && !w.flush_backing_off())

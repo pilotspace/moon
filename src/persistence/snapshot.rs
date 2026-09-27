@@ -240,6 +240,12 @@ pub struct SnapshotState {
     /// Test-only: pin the per-tick budget to its constant (pre-moon#1228)
     /// value, the control of the convergence tests.
     fixed_budget: bool,
+    /// How many 1 ms ticks' budget the current tick owes the walk because it
+    /// fired late (moon#1280, `shard::tick_cadence::TickLateness::observe`).
+    /// Combined with the backlog scale by MAX, under the same
+    /// [`MAX_TICK_BUDGET_SCALE`] cap: a late tick walks at most as far as a
+    /// backlogged one always could (~1.6 ms), never 8 x 16 budgets.
+    catch_up_scale: u32,
     /// Test-only: row operations the last drain's trim did (review 6).
     #[cfg(test)]
     trim_ops_last_drain: usize,
@@ -335,9 +341,16 @@ impl SnapshotState {
             aborted: None,
             sources: (0..num_databases).map(Source::Live).collect(),
             fixed_budget: false,
+            catch_up_scale: 1,
             #[cfg(test)]
             trim_ops_last_drain: 0,
         }
+    }
+
+    /// The ticks' budget the next [`Self::advance_budgeted_db`] owes a late
+    /// tick (moon#1280; see the `catch_up_scale` field).
+    pub(crate) fn set_catch_up_scale(&mut self, scale: u32) {
+        self.catch_up_scale = scale.max(1);
     }
 
     /// Test-only: pin [`Self::advance_budgeted_db`] to the constant per-tick
@@ -832,6 +845,7 @@ impl SnapshotState {
             1
         } else {
             tick_budget_scale(self.pending_pre_images())
+                .max(self.catch_up_scale.min(MAX_TICK_BUDGET_SCALE))
         };
         let entry_budget = TICK_ENTRY_BUDGET * scale;
         let segment_budget = TICK_SEGMENT_BUDGET * scale;

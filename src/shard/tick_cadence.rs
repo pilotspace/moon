@@ -184,10 +184,19 @@ pub(crate) struct TickLateness {
 /// round runs long (back-to-back ~25 ms EVALs) otherwise gave them one
 /// slice per round instead of one per millisecond — measured 10-21x slower
 /// frees of ~380 MB of UNLINKed values than an idle loop, and a BGSAVE
-/// 0.75 s -> 4.1 s. 8 slices (2 ms of lazy free) bounds what one tick can
-/// add to a command's latency while keeping them near 1/period; Burst
-/// replayed every missed tick.
-pub(crate) const PER_TICK_CATCH_UP_MAX_SCALE: u32 = 8;
+/// 0.75 s -> 4.1 s.
+///
+/// A tick owes exactly the milliseconds it missed (counted from the end of
+/// the previous tick's duties, [`TickLateness::duties_done`]), so the
+/// lazy-free drain keeps its idle duty (250 µs per 1 ms) under saturation.
+/// The cap bounds what ONE tick can add after a very long round or a stall:
+/// at most 32 slices (8 ms of lazy free), a quarter at most of the round of
+/// 32 ms or more that earned it. A first cap of 8 (2 ms) held a 25 ms round
+/// to ~8% duty, 4.9x slower under host contention (round 3). The snapshot
+/// walk takes the scale by MAX with its backlog scale under its own 16x cap
+/// (~1.6 ms), never multiplied. Burst replayed every missed tick (a 3 s
+/// stall: ~3,000 of them back to back).
+pub(crate) const PER_TICK_CATCH_UP_MAX_SCALE: u32 = 32;
 
 impl TickLateness {
     pub(crate) fn new() -> Self {
@@ -207,6 +216,17 @@ impl TickLateness {
         self.prev_fired = Some(now);
         self.observe_lateness(deadline, now);
         scale
+    }
+
+    /// The scaled per-tick duties finished at `now`: the next tick's scale
+    /// counts from here, not from this tick's fire, so a tick's own catch-up
+    /// work is never billed to the next one as missed time (round 3: counted
+    /// from the fire, the duties inflated their own share by a third).
+    #[inline]
+    pub(crate) fn duties_done(&mut self, now: Instant) {
+        if self.prev_fired.is_some() {
+            self.prev_fired = Some(now);
+        }
     }
 
     fn observe_lateness(&mut self, deadline: Instant, now: Instant) {
@@ -466,10 +486,22 @@ mod tests {
         assert_eq!(t.observe(ms(1), ms(1)), 1, "on time");
         assert_eq!(
             t.observe(ms(2), ms(26)),
-            PER_TICK_CATCH_UP_MAX_SCALE,
-            "25 ms round: capped"
+            25,
+            "25 ms round: owes every millisecond it missed"
         );
         assert_eq!(t.observe(ms(27), ms(30)), 4, "4 ms since the previous tick");
         assert_eq!(t.observe(ms(31), ms(31)), 1);
+        assert_eq!(
+            t.observe(ms(32), ms(3_031)),
+            PER_TICK_CATCH_UP_MAX_SCALE,
+            "a 3 s stall: capped, never a burst"
+        );
+        // The capped tick's own duties took 8 ms: not missed time.
+        t.duties_done(ms(3_039));
+        assert_eq!(
+            t.observe(ms(3_032), ms(3_040)),
+            1,
+            "counted from the end of the previous tick's duties"
+        );
     }
 }
