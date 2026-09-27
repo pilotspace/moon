@@ -2047,7 +2047,7 @@ pub(super) async fn try_handle_blocking<
         && let Err(ack) = pool.fsync_barrier(owner).await
     {
         // moon#1272: a backlogged writer is not a failed fsync.
-        blocking_response = crate::persistence::aof::append_refusal_frame(ack);
+        blocking_response = crate::persistence::aof::barrier_refusal_frame(ack);
     }
 
     // moon#559 / moon#462: this is an INTERCEPT — it short-circuits the

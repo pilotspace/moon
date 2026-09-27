@@ -470,16 +470,20 @@ shared 4-vCPU Linux container against HEAD `935c555` — re-measure on the GCE r
   `aof_fsync_failures` and `aof_last_fsync_status` no longer move for it. The
   policy is unchanged and documented in `docs/guides/persistence.md`: moon
   refuses rather than acknowledging a record its writer never received; the
-  write stands in memory, so retry only idempotent writes. A real write or
-  fsync failure, and every `appendfsync always` failure, still answers
+  write stands in memory, so retry only idempotent writes. Under
+  `appendfsync always`, writes whose batch fsync barrier cannot be queued for
+  the same backlog answer `-MOONERR AOF backpressure: write applied in memory
+  and queued, but not confirmed durable; the AOF writer is backlogged` and are
+  counted the same way. A real write or fsync failure still answers
   `-ERR AOF fsync failed; write not durable`.
 
 - **`scripts/test-consistency.sh` and `scripts/test-commands.sh` died silently
-  with redis-cli older than 7.2 and leaked servers that corrupted the next run**
-  (moon#1276). `redis-cli -t` exists only in 7.2+; on 7.0.x the run ended under
+  with redis-cli older than 7.4 and leaked servers that corrupted the next run**
+  (moon#1276). `redis-cli -t` exists only in 7.4+; on 7.0.x the run ended under
   `set -e` with no summary and left its auxiliary moon running, which the next
-  run then shared through `SO_REUSEPORT`. Both scripts now probe for `-t` and
-  fall back to `timeout`/`gtimeout` (or warn loudly), track and kill every
+  run then shared through `SO_REUSEPORT`. Both scripts now bound every probe
+  with `timeout`/`gtimeout` (a whole-command bound; `-t` bounds only the
+  connect and is the fallback, or they warn loudly), track and kill every
   auxiliary server on exit, refuse a port that is already taken, name the line
   of a `set -e` death, and no longer `pkill` their own command line. A header
   names the oracle version the expected values assume (redis 7.2+/8.x).

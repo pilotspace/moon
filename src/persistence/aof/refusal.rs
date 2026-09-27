@@ -123,6 +123,33 @@ pub fn append_refusal_frame(ack: AofAck) -> Frame {
     Frame::Error(Bytes::from_static(append_refusal_reply(ack)))
 }
 
+/// Reply for an `appendfsync always` write whose record the writer DID take
+/// but whose fsync barrier could not be queued: the writer channel stayed
+/// full (moon#1272 review round 2b). The record will be written and fsynced
+/// with the backlog, so "not queued" ([`AOF_BACKLOG_ERR`]) would be false;
+/// durability was simply not confirmed. Same `MOONERR AOF backpressure`
+/// prefix, so one matcher catches every backlog refusal.
+pub const AOF_BARRIER_BACKLOG_ERR: &[u8] = b"MOONERR AOF backpressure: write applied in memory \
+and queued, but not confirmed durable; the AOF writer is backlogged";
+
+/// The reply text for writes whose `appendfsync always` fsync barrier was
+/// refused with `ack`: [`AofAck::ChannelFull`] → [`AOF_BARRIER_BACKLOG_ERR`],
+/// anything else → [`AOF_FSYNC_ERR`].
+#[inline]
+pub fn barrier_refusal_reply(ack: AofAck) -> &'static [u8] {
+    if ack.is_backpressure() {
+        AOF_BARRIER_BACKLOG_ERR
+    } else {
+        AOF_FSYNC_ERR
+    }
+}
+
+/// [`barrier_refusal_reply`] as an error frame.
+#[inline]
+pub fn barrier_refusal_frame(ack: AofAck) -> Frame {
+    Frame::Error(Bytes::from_static(barrier_refusal_reply(ack)))
+}
+
 /// What the stall logger does for one refusal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum StallLog {

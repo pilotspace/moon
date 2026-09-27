@@ -170,7 +170,7 @@ impl<'a> SingleAofLog<'a> {
                 } else {
                     Settled::Backlogged
                 };
-                let err = crate::persistence::aof::append_refusal_reply(ack);
+                let err = crate::persistence::aof::barrier_refusal_reply(ack);
                 for &idx in &self.barrier_idxs {
                     if let Some(slot) = responses.get_mut(idx) {
                         *slot = Frame::Error(Bytes::from_static(err));

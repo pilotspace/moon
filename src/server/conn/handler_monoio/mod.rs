@@ -4825,7 +4825,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                     if let Some(ref pool) = ctx.aof_pool {
                         if let Err(ack) = pool.fsync_barrier(target).await {
                             // moon#1272: a backlogged writer is not a failed fsync.
-                            let err = aof::append_refusal_reply(ack);
+                            let err = aof::barrier_refusal_reply(ack);
                             for idx in write_resp_idxs {
                                 responses[idx] = Frame::Error(Bytes::from_static(err));
                             }

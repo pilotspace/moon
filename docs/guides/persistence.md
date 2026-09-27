@@ -44,7 +44,17 @@ queue fills. What a write does then depends on `appendfsync`:
   lose an acked write on restart. Moon never answers `+OK` for such a write.
 - **`always`**: the write waits for its fsync for up to
   `--aof-fsync-timeout-ms`, and a write that is not confirmed in time answers
-  `-ERR AOF fsync failed; write not durable`, as it did before.
+  `-ERR AOF fsync failed; write not durable`, as it did before. Writes whose
+  batch fsync barrier (MULTI/EXEC, scripts, pipelined batches) cannot even be
+  queued because the writer is backlogged answer
+
+  ```text
+  -MOONERR AOF backpressure: write applied in memory and queued, but not confirmed durable; the AOF writer is backlogged
+  ```
+
+  Their records did reach the writer and will be fsynced with the backlog;
+  only the confirmation is missing. They count in the same
+  `aof_append_backpressure_refusals`.
 
 What the backpressure refusal means:
 

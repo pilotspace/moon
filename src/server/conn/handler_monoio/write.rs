@@ -880,7 +880,7 @@ pub(super) async fn try_handle_multi_exec(
                                             exec_publishes.clear();
                                             // moon#1272: backlog is not a failed fsync.
                                             responses.push(
-                                                crate::persistence::aof::append_refusal_frame(ack),
+                                                crate::persistence::aof::barrier_refusal_frame(ack),
                                             );
                                             return true;
                                         }

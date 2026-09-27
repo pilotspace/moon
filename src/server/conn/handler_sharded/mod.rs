@@ -1783,7 +1783,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                             )
                         && let Err(ack) = pool.fsync_barrier(owner).await
                     {
-                        blocking_response = aof::append_refusal_frame(ack);
+                        blocking_response = aof::barrier_refusal_frame(ack);
                     }
                         let blocking_response = apply_resp3_conversion(
                             cmd,
@@ -3387,7 +3387,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                             if let Some(ref pool) = ctx.aof_pool {
                                 if let Err(ack) = pool.fsync_barrier(target).await {
                                     // moon#1272: a backlogged writer is not a failed fsync.
-                                    let err = aof::append_refusal_reply(ack);
+                                    let err = aof::barrier_refusal_reply(ack);
                                     for idx in write_resp_idxs {
                                         responses[idx] = Frame::Error(Bytes::from_static(err));
                                     }

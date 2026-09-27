@@ -2268,7 +2268,7 @@ pub async fn handle_connection(
                                         if let Some(ref pool) = aof_pool {
                                             if let Err(ack) = pool.fsync_barrier(0).await {
                                                 graph_aof_err.get_or_insert(
-                                                    crate::persistence::aof::append_refusal_reply(ack),
+                                                    crate::persistence::aof::barrier_refusal_reply(ack),
                                                 );
                                             }
                                         }

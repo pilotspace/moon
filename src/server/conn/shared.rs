@@ -948,8 +948,9 @@ pub(crate) fn execute_transaction_sharded(
 /// Returns `Err(reply)` if any append or the barrier fails — the caller
 /// answers EXEC with that error text instead of acking a durability it can't
 /// guarantee: [`crate::persistence::aof::AOF_BACKLOG_ERR`] when an append was
-/// refused for writer backlog (moon#1272), `AOF_FSYNC_ERR` for a write/fsync
-/// failure or a failed `always` barrier. A no-op
+/// refused for writer backlog (moon#1272), `AOF_BARRIER_BACKLOG_ERR` for an
+/// `always` barrier refused for backlog, `AOF_FSYNC_ERR` for a write/fsync
+/// failure or a failed barrier. A no-op
 /// (returns `Ok`) when AOF is disabled (`aof_pool` is `None`) or the body wrote
 /// nothing.
 ///
@@ -1000,7 +1001,7 @@ pub(crate) async fn persist_txn_aof(
     // appendfsync=always: one barrier confirms the whole body is on disk.
     if barrier_pending && let Err(ack) = pool.fsync_barrier(ctx.shard_id).await {
         // moon#1272 review: a backlogged writer is not a failed fsync.
-        return Err(crate::persistence::aof::append_refusal_reply(ack));
+        return Err(crate::persistence::aof::barrier_refusal_reply(ack));
     }
     Ok(())
 }
@@ -4916,7 +4917,8 @@ pub(crate) fn script_write_joins_barrier(wrote: bool, response: &Frame) -> bool 
 ///
 /// A no-op when the script wrote nothing, when its reply is already an
 /// error, or when AOF is off; `fsync_barrier` itself is a no-op under
-/// `everysec`/`no`. On barrier failure the reply becomes `AOF_FSYNC_ERR`:
+/// `everysec`/`no`. On barrier failure the reply becomes `AOF_FSYNC_ERR`
+/// (`AOF_BARRIER_BACKLOG_ERR` when the barrier was refused for backlog):
 /// the write is applied on the owner but its durability is unconfirmed,
 /// and the client must not be told otherwise.
 pub(crate) async fn confirm_routed_script_write(
@@ -4933,7 +4935,7 @@ pub(crate) async fn confirm_routed_script_write(
     };
     if let Err(ack) = pool.fsync_barrier(owner).await {
         // moon#1272 review: a backlogged writer is not a failed fsync.
-        return crate::persistence::aof::append_refusal_frame(ack);
+        return crate::persistence::aof::barrier_refusal_frame(ack);
     }
     reply
 }
@@ -4951,7 +4953,8 @@ pub(crate) async fn confirm_routed_script_write(
 /// response vec is replaced (PR #213 review finding).
 ///
 /// Always drains `idxs`. On barrier failure every recorded response is
-/// overwritten with `AOF_FSYNC_ERR` — never a false `+OK`.
+/// overwritten with `barrier_refusal_reply` (`AOF_FSYNC_ERR`, or the backlog
+/// text when the barrier was refused for backlog) — never a false `+OK`.
 ///
 /// moon#831: script arms (`EVAL`/`EVALSHA`/`FCALL`) that wrote join the same
 /// set — see [`script_write_joins_barrier`].
@@ -4965,11 +4968,12 @@ pub async fn resolve_local_leg_barrier(
         return;
     }
     if let Some(pool) = aof_pool {
-        if pool.fsync_barrier(shard_id).await.is_err() {
+        if let Err(ack) = pool.fsync_barrier(shard_id).await {
+            // moon#1272 review round 2b: a backlog refusal is not an fsync failure.
+            let err = crate::persistence::aof::barrier_refusal_reply(ack);
             for idx in idxs.iter() {
                 if let Some(slot) = responses.get_mut(*idx) {
-                    *slot =
-                        Frame::Error(Bytes::from_static(crate::persistence::aof::AOF_FSYNC_ERR));
+                    *slot = Frame::Error(Bytes::from_static(err));
                 }
             }
         }

@@ -2785,12 +2785,13 @@ mod pool_tests {
     // -----------------------------------------------------------------------
     // moon#1272 round 2b: an `appendfsync always` barrier refused because the
     // writer is backlogged is a backpressure refusal (counted as one, answered
-    // with the backlog reply), never "fsync failed".
+    // with the barrier backlog reply), never "fsync failed".
     // -----------------------------------------------------------------------
     #[test]
     fn fsync_barrier_always_on_full_channel_is_a_backpressure_refusal() {
         use crate::persistence::aof::{
-            AOF_APPEND_BACKPRESSURE_REFUSALS, AOF_BACKLOG_ERR, append_refusal_reply,
+            AOF_APPEND_BACKPRESSURE_REFUSALS, AOF_BARRIER_BACKLOG_ERR, AOF_FSYNC_ERR,
+            barrier_refusal_reply,
         };
         let (tx0, _rx0) = channel::mpsc_bounded::<AofMessage>(1);
         tx0.try_send(AofMessage::Shutdown).expect("pre-fill");
@@ -2808,7 +2809,8 @@ mod pool_tests {
         };
         assert_eq!(ack, AofAck::ChannelFull);
         assert!(ack.is_backpressure());
-        assert_eq!(append_refusal_reply(ack), AOF_BACKLOG_ERR);
+        assert_eq!(barrier_refusal_reply(ack), AOF_BARRIER_BACKLOG_ERR);
+        assert_ne!(barrier_refusal_reply(ack), AOF_FSYNC_ERR);
         assert!(
             AOF_APPEND_BACKPRESSURE_REFUSALS.load(std::sync::atomic::Ordering::Relaxed) > before,
             "the refused barrier must count as a backpressure refusal"
