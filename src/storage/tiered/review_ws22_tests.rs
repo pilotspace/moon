@@ -171,10 +171,10 @@ fn review_trailer_build_cost_at_1m_graves() {
         let dec_t = t.elapsed();
         eprintln!(
             "graves={n} files={files}: collect+encode best {:?} ({} B trailer, {} B RAM \
-             by resident_bytes()); encode+decode(boot) {:?}, decoded {}",
+             (8 B per slot)); encode+decode(boot) {:?}, decoded {}",
             best,
             bytes,
-            ci.slot_graves().resident_bytes(),
+            ci.slot_graves().len() * 8,
             dec_t,
             dec.len()
         );

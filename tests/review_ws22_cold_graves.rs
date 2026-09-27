@@ -1,7 +1,7 @@
 //! Adversarial review of moon#1281 (WS22 review 1). Black-box, real server.
 //!
 //! 1. `review_no_aof_snapshot_then_appendonly_yes_restart_keeps_cold_dels`
-//!    (RED on 5b5593d): the cold-graves trailer is applied at boot only when
+//!    (RED on 5b5593d, green since the review-round fix): the cold-graves trailer is applied at boot only when
 //!    the BOOTING process has no AOF writer (`snapshot_hold::applies()`), not
 //!    when the LOADED snapshot is the KV authority. A dir written by a no-AOF
 //!    process (snapshot with a trailer + spill files) booted with
@@ -9,11 +9,9 @@
 //!    the snapshot's hot keys load, its graves are thrown away, and every
 //!    cold key deleted before that snapshot is back. The copy booted with
 //!    `--appendonly no` is the control (same bytes, one flag).
-//! 2. `review_crash_matrix_during_sweep_unlinks_nothing` (GREEN, evidence):
-//!    the matrix's `DuringSweep` point claims to cover "the post-save sweep,
-//!    its unlinks and manifest commit", but DELeting only the EVEN probes
-//!    leaves every spill file with live neighbours: nothing goes zero-ref,
-//!    nothing is unlinked, no tombstone is committed.
+//! 2. (Removed after the fix: the evidence test that the matrix's
+//!    `DuringSweep` point unlinked nothing. `crash_matrix_cold_graves_1281`
+//!    now has a `WholeFilesSweep` point whose sweep does unlink and commit.)
 //! 3. `review_no_aof_graves_never_drop_a_live_respilled_key` (GREEN, guard):
 //!    the live-key-loss direction. Probes whose original slot became a grave
 //!    (read-promoted, or overwritten) and that were then re-spilled by the
@@ -108,8 +106,14 @@ fn write_new_keys(port: u16, prefix: &str, count: usize) {
     for i in 0..count {
         let key = format!("{prefix}:{i}");
         buf.extend_from_slice(
-            format!("*3\r\n$3\r\nSET\r\n${}\r\n{}\r\n${}\r\n{}\r\n", key.len(), key, val.len(), val)
-                .as_bytes(),
+            format!(
+                "*3\r\n$3\r\nSET\r\n${}\r\n{}\r\n${}\r\n{}\r\n",
+                key.len(),
+                key,
+                val.len(),
+                val
+            )
+            .as_bytes(),
         );
         if buf.len() >= 64 * 1024 {
             stream.write_all(&buf).expect("write");
@@ -205,39 +209,6 @@ fn review_no_aof_snapshot_then_appendonly_yes_restart_keeps_cold_dels() {
 
 #[test]
 #[ignore]
-fn review_crash_matrix_during_sweep_unlinks_nothing() {
-    let port = common::reserve_port();
-    let dir = unique_dir("rv22-sweep");
-    std::fs::create_dir_all(&dir).expect("create test dir");
-    inherit_cold_probes(port, &dir);
-    let mut server = start_moon_alive_with(port, &dir, 1, "no", &SAVE);
-    let files_before = count_heap_files(&dir);
-    let evens: Vec<String> = (0..PROBE_COUNT).step_by(2).map(probe_key).collect();
-    let mut del: Vec<&str> = vec!["DEL"];
-    del.extend(evens.iter().map(String::as_str));
-    redis_cmd(port, &del);
-    bgsave_and_wait(port);
-    // The matrix's `DuringSweep` window is 0-2.5 s; give the sweep 5 s.
-    std::thread::sleep(Duration::from_secs(5));
-    let files_after = count_heap_files(&dir);
-    let pending = info_u64(port, "cold_files_pending_unlink").unwrap_or(u64::MAX);
-    server.kill_now();
-    wait_for_port_down(port);
-    finish(&dir, &[]);
-    eprintln!(
-        "heap files before {files_before}, after DEL evens + BGSAVE + 5 s {files_after}, \
-         cold_files_pending_unlink {pending}"
-    );
-    assert!(files_before > 0);
-    assert_eq!(
-        (files_after, pending),
-        (files_before, 0),
-        "the DuringSweep point unlinked or queued something after all"
-    );
-}
-
-#[test]
-#[ignore]
 fn review_no_aof_graves_never_drop_a_live_respilled_key() {
     let port = common::reserve_port();
     let dir = unique_dir("rv22-respill");
@@ -292,10 +263,7 @@ fn review_no_aof_graves_never_drop_a_live_respilled_key() {
     if dbsize_after != dbsize_at_kill {
         wrong.push(format!("DBSIZE {dbsize_at_kill} -> {dbsize_after}"));
     }
-    for i in 0..PROBE_COUNT {
-        if !present[i] {
-            continue;
-        }
+    for (i, _) in present.iter().enumerate().filter(|(_, p)| **p) {
         let want = if i % 2 == 1 { &val } else { &new };
         let got = redis_get(port, &probe_key(i));
         if got.as_deref() != Some(want.as_str()) {
