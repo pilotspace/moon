@@ -1328,12 +1328,36 @@ fn apply_completion_vec(
         }
         if withdrawn_any {
             crate::storage::tiered::spill_thread::record_spill_completion_marker_withdrawn();
-            if !published_any {
-                // Nothing points at the file: leave it out of the manifest so
-                // no restart can index it, and the startup orphan sweep
-                // (unmanifested `heap-*.mpf`) reclaims it.
-                continue;
+        }
+        if !published_any {
+            // Nothing points at the file — every key was withdrawn, or every
+            // key was superseded (deleted, overwritten, promoted) while the
+            // spill was in flight. Leave it out of the manifest so no restart
+            // can index its slots. moon#1279 (the Windows/tokio variant):
+            // the all-superseded case used to LIST it, with only ghost slots
+            // no index entry references; it never went zero-ref, so no sweep
+            // ever queued it (`cold_files_dead` stuck at 1). No `MOON.SPILLED`
+            // marker names it (markers go out per published group), so it is
+            // unlinked now; the startup orphan sweep catches a failed unlink.
+            if let Some(shard_dir) = shard_manifest
+                .as_ref()
+                .and_then(|m| m.path().parent().map(std::path::Path::to_path_buf))
+            {
+                let path = shard_dir
+                    .join("data")
+                    .join(format!("heap-{file_id:06}.mpf"));
+                if let Err(e) = std::fs::remove_file(&path)
+                    && e.kind() != std::io::ErrorKind::NotFound
+                {
+                    tracing::warn!(
+                        file_id,
+                        err = %e,
+                        "spill completion: could not remove a spill file none of whose keys \
+                         was published; the startup orphan sweep removes it"
+                    );
+                }
             }
+            continue;
         }
         if let Some(ref mut manifest) = *shard_manifest {
             // Cannot refuse: `has_entry` was checked above and nothing in
@@ -2492,6 +2516,9 @@ pub(crate) fn handle_checkpoint_tick(
 
 #[cfg(test)]
 mod checkpoint_tick_tests;
+
+#[cfg(test)]
+mod superseded_spill_tests;
 
 mod cold_reclaim_tick;
 
