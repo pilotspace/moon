@@ -105,6 +105,11 @@ Moon exposes standard Redis-compatible INFO metrics through the Prometheus endpo
 - **`moon_spilled_keys_total`** (INFO: `spilled_keys`) -- keys **moved from RAM
   to disk** under maxmemory pressure, with `--disk-offload enable`.
 - **`moon_expired_keys_total`** -- keys removed by expiration
+- INFO `expired_time_cap_reached_count` / `expire_cycle_cpu_milliseconds`
+  (redis names, moon#1288) -- active-expiry cycles that ran out of time with
+  expired keys still due, and the cumulative time the cycles spent. A climbing
+  cap count means an expired backlog is being drained by the adaptive fast
+  cycle (at most 25% of a shard, at most 1 ms per 1 ms tick).
 - **`moon_aof_append_backpressure_refusals_total`** (INFO:
   `aof_append_backpressure_refusals`) -- writes refused because the AOF writer
   was **backlogged** (its queue stayed full for `--aof-fsync-timeout-ms`), not

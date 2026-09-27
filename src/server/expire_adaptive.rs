@@ -34,6 +34,38 @@ pub const EXPIRE_FAST_SLICE_MAX: Duration = Duration::from_millis(1);
 /// A fast slice is not worth its clock reads below this much credit.
 const EXPIRE_FAST_SLICE_MIN: Duration = Duration::from_micros(50);
 
+/// INFO `expired_time_cap_reached_count` (redis parity): expiry cycles, slow
+/// or fast, that stopped on their time budget with due keys still left.
+/// Bumped once per such cycle — never per key.
+static TIME_CAP_REACHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// INFO `expire_cycle_cpu_milliseconds` (redis parity): cumulative time the
+/// active expiry cycles (slow and fast) spent, in microseconds.
+static CYCLE_CPU_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Account one finished expiry cycle (slow or fast): its wall time, and
+/// whether it stopped on its budget with due work left.
+pub fn record_expire_cycle(spent: Duration, time_cap_reached: bool) {
+    use std::sync::atomic::Ordering::Relaxed;
+    CYCLE_CPU_US.fetch_add(
+        u64::try_from(spent.as_micros()).unwrap_or(u64::MAX),
+        Relaxed,
+    );
+    if time_cap_reached {
+        TIME_CAP_REACHED.fetch_add(1, Relaxed);
+    }
+}
+
+/// INFO `expired_time_cap_reached_count`.
+pub fn expired_time_cap_reached_count() -> u64 {
+    TIME_CAP_REACHED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// INFO `expire_cycle_cpu_milliseconds`.
+pub fn expire_cycle_cpu_milliseconds() -> u64 {
+    CYCLE_CPU_US.load(std::sync::atomic::Ordering::Relaxed) / 1_000
+}
+
 /// Per-shard-thread state of the adaptive fast expiry cycle (moon#1288).
 struct ActiveExpireState {
     /// Some database of this shard ended its last cycle with due work left.

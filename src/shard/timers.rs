@@ -138,8 +138,10 @@ pub(crate) fn run_active_expiry_fast(
             )
         });
     }
-    fast::charge_fast_expire_slice(start.elapsed());
+    let spent = start.elapsed();
+    fast::charge_fast_expire_slice(spent);
     fast::note_expire_backlog(backlog);
+    fast::record_expire_cycle(spent, backlog);
     backlog
 }
 
@@ -179,6 +181,7 @@ pub(crate) fn run_active_expiry(
     budget_scale: u32,
 ) {
     if !is_replica {
+        let cycle_start = std::time::Instant::now();
         let db_count = shard_databases.db_count();
         // #454 P2.8: ONE shared backpressure bound for this entire sweep
         // (per-key minting could stall the shard bound x victim-count).
@@ -209,6 +212,7 @@ pub(crate) fn run_active_expiry(
         // moon#1288: due work left after the budget -> the 1 ms tick's fast
         // cycle drains it (`run_active_expiry_fast`).
         crate::server::expire_adaptive::note_expire_backlog(backlog);
+        crate::server::expire_adaptive::record_expire_cycle(cycle_start.elapsed(), backlog);
     } else {
         crate::server::expire_adaptive::note_expire_backlog(false);
     }

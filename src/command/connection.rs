@@ -765,6 +765,8 @@ fn info_raw(db: &Database, facts: &InstanceFacts) -> String {
         "keyspace_hits:{}\r\n\
          keyspace_misses:{}\r\n\
          expired_keys:{}\r\n\
+         expired_time_cap_reached_count:{}\r\n\
+         expire_cycle_cpu_milliseconds:{}\r\n\
          evicted_keys:{}\r\n\
          spilled_keys:{}\r\n\
          rejected_connections:{}\r\n\
@@ -779,6 +781,9 @@ fn info_raw(db: &Database, facts: &InstanceFacts) -> String {
         crate::admin::metrics_setup::keyspace_hits(),
         crate::admin::metrics_setup::keyspace_misses(),
         crate::admin::metrics_setup::expired_keys(),
+        // moon#1288: the adaptive active-expiry cycle (redis parity names).
+        crate::server::expire_adaptive::expired_time_cap_reached_count(),
+        crate::server::expire_adaptive::expire_cycle_cpu_milliseconds(),
         crate::admin::metrics_setup::evicted_keys(),
         // moon#585: keys the disk-offload tier moved out of RAM. NOT
         // evictions — they are still in `DBSIZE` and still readable. This is

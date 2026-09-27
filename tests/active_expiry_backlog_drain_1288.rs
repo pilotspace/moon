@@ -111,5 +111,15 @@ fn an_expired_backlog_drains_at_an_adaptive_rate() {
          expiry is not adapting its duty to the backlog"
     );
     assert_eq!(c.send(&["GET", "live"]), "$1\r\n1\r\n");
+    // The adaptive cycle is observable (redis's INFO names).
+    let info = c.send(&["INFO", "stats"]);
+    let stat = |name: &str| -> u64 {
+        info.lines()
+            .find_map(|l| l.strip_prefix(&format!("{name}:")))
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or_else(|| panic!("INFO stats has no numeric {name}"))
+    };
+    assert!(stat("expired_time_cap_reached_count") >= 1);
+    assert!(stat("expire_cycle_cpu_milliseconds") >= 1);
     let _ = std::fs::remove_dir_all(&dir);
 }
