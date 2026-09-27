@@ -1836,6 +1836,9 @@ fn main() -> anyhow::Result<()> {
                         .with_context(|| "failed to serialize legacy state for AOF base")?;
                     let fresh = AofManifest::initialize_with_base(&base_dir, &rdb_bytes)
                         .with_context(|| "failed to initialize AOF manifest with base")?;
+                    // The fresh head's DELs come from the dead-slot ledger, which lives in
+                    // the cold index: re-attach the wiring first (moon#1281 round 2b).
+                    reattach_cold_wiring(&mut shards, &mut preserved_cold_wiring);
                     fresh
                         .seed_generation_head(
                             |sid| cold_file_watermark(&spill_seeds, sid),
@@ -1868,8 +1871,29 @@ fn main() -> anyhow::Result<()> {
                 // when the loaded manifest's layout is PerShard, so without
                 // this branch a multi-shard --appendonly yes deployment would
                 // silently fall back to TopLevel and lose data on restart.
-                let fresh = AofManifest::initialize_multi(&base_dir, shard_count_u16)
-                    .with_context(|| "failed to initialize PerShard AOF manifest")?;
+                // moon#1281 review round 2 (R2-2): state loaded from a snapshot
+                // (the `--appendonly no` -> `yes` switch) becomes each shard's
+                // base, as `initialize_with_base` does at `--shards 1`; with an
+                // empty base the next boot, which replays base + incr only,
+                // drops every key the snapshot held.
+                let loaded = shards
+                    .iter()
+                    .any(|s| s.databases.iter().any(|db| db.len() > 0));
+                let fresh = if loaded {
+                    AofManifest::initialize_multi_with_bases(&base_dir, shard_count_u16, |sid| {
+                        let dbs = shards
+                            .get(usize::from(sid))
+                            .map_or(&[][..], |s| s.databases.as_slice());
+                        moon::persistence::rdb::save_to_bytes(dbs)
+                            .map_err(|e| std::io::Error::other(format!("shard {sid} base: {e}")))
+                    })
+                } else {
+                    AofManifest::initialize_multi(&base_dir, shard_count_u16)
+                }
+                .with_context(|| "failed to initialize PerShard AOF manifest")?;
+                // The fresh head's DELs come from the dead-slot ledger, which lives in
+                // the cold index: re-attach the wiring first (moon#1281 round 2b).
+                reattach_cold_wiring(&mut shards, &mut preserved_cold_wiring);
                 fresh
                     .seed_generation_head(
                         |sid| cold_file_watermark(&spill_seeds, sid),
@@ -1887,6 +1911,9 @@ fn main() -> anyhow::Result<()> {
                 {
                     let fresh = AofManifest::initialize(&base_dir)
                         .with_context(|| "failed to initialize AOF manifest")?;
+                    // The fresh head's DELs come from the dead-slot ledger, which lives in
+                    // the cold index: re-attach the wiring first (moon#1281 round 2b).
+                    reattach_cold_wiring(&mut shards, &mut preserved_cold_wiring);
                     fresh
                         .seed_generation_head(
                             |sid| cold_file_watermark(&spill_seeds, sid),
@@ -1916,6 +1943,8 @@ fn main() -> anyhow::Result<()> {
         // before this fix) is left alone — see `seed_cold_cut_if_fresh`.
         #[cfg(not(feature = "runtime-monoio"))]
         if num_shards == 1 {
+            // Its head's DELs read the ledger in the cold index (moon#1281 round 2b).
+            reattach_cold_wiring(&mut shards, &mut preserved_cold_wiring);
             let aof_path = base_dir.join(&config.appendfilename);
             let seeded = moon::persistence::cold_records::seed_generation_head_if_fresh(
                 &aof_path,
