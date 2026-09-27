@@ -422,4 +422,42 @@ mod tests {
         assert!(h.is_held(1) && !h.is_held(2) && !h.is_held(3));
         assert_eq!(h.len(), 1);
     }
+
+    /// moon#1279: the hold's baseline is the FIRST view it observes. The shard
+    /// now observes a boot view before its loop; a file spilled after boot and
+    /// emptied before the first sweep is then unlinked at that sweep. Without
+    /// the boot view (monoio's first sweep came one interval late) the same file
+    /// was held as if inherited — forever, with no fold due.
+    #[test]
+    fn the_first_view_fixes_the_hold_baseline_so_the_boot_view_must_come_first() {
+        let view = |next_file_id| FoldView {
+            epoch: 1,
+            committed_floor: 0,
+            next_file_id,
+            hold_all: false,
+        };
+        // Boot at counter 10, then files 10..15 are spilled and 12 empties.
+        let mut booted = UnlinkHold::default();
+        booted.observe(view(10));
+        booted.end_decision();
+        booted.observe(view(16)); // the first sweep
+        assert_eq!(booted.admit(vec![12]).unlink, vec![12]);
+        assert_eq!(booted.admit(vec![]).unlink, Vec::<u64>::new());
+
+        // The control: no boot view, the first view comes at the sweep.
+        let mut late = UnlinkHold::default();
+        late.observe(view(16));
+        assert!(
+            late.admit(vec![12]).unlink.is_empty(),
+            "held as if inherited"
+        );
+        assert!(late.is_held(12));
+
+        // An inherited file (below the boot counter) is still held.
+        let mut inherited = UnlinkHold::default();
+        inherited.observe(view(10));
+        inherited.end_decision();
+        inherited.observe(view(16));
+        assert!(inherited.admit(vec![7]).unlink.is_empty());
+    }
 }

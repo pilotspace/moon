@@ -670,6 +670,12 @@ impl ColdIndex {
         self.hold.observe(view);
     }
 
+    /// Drop the view [`Self::observe_fold`] recorded without deciding
+    /// anything: no later unlink decision may use it (moon#1279's boot view).
+    pub fn end_fold_decision(&mut self) {
+        self.hold.end_decision();
+    }
+
     /// Whether `file_id` is held until a committed fold covers it (moon#1231).
     pub fn is_unlink_held(&self, file_id: u64) -> bool {
         self.hold.is_held(file_id)

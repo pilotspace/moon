@@ -837,6 +837,16 @@ impl super::Shard {
         // it through `file_id_seed::allocate_from` — there is no second copy
         // to fall behind it (moon#997 review).
         spill_file_id.set(spill_seed);
+        // moon#1279: the unlink hold's baseline is the counter at boot, on
+        // both runtimes — not wherever the first orphan sweep happens to run.
+        if server_config.disk_offload_enabled() {
+            timers::observe_boot_fold_view(
+                &shard_databases,
+                shard_id,
+                aof_pool.as_ref(),
+                spill_seed,
+            );
+        }
         if spill_seed > 1 {
             info!(
                 "Shard {}: cold file_id counter seeded at {} (above every spill file, \
