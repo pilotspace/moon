@@ -107,6 +107,8 @@ mod algebra_tests;
 #[cfg(test)]
 mod smove_cold_fault_tests;
 #[cfg(test)]
+mod sscan_rewrite_review_tests;
+#[cfg(test)]
 mod sscan_tests;
 
 #[cfg(test)]
