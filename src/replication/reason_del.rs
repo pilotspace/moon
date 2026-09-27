@@ -176,7 +176,6 @@ fn record_reason_del_dropped(key: &[u8]) {
 /// write gates (`handler_sharded` per-command arm, `mq_write_gate`) used to
 /// drop eviction victims without a `DEL`, so an AOF restart replayed every
 /// evicted key back.
-#[allow(clippy::too_many_arguments)]
 ///
 /// `aof_budget` is the caller's SHARED backpressure budget for the whole
 /// eviction run (moon#1294), exactly as for [`record_reason_del`] (#454

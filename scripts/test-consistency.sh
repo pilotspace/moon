@@ -801,11 +801,13 @@ redis_sm=$(redis-cli -p "$PORT_REDIS" SMEMBERS s:test 2>&1 | sort)
 rust_sm=$(redis-cli -p "$PORT_RUST" SMEMBERS s:test 2>&1 | sort)
 assert_eq "SMEMBERS (sorted)" "$redis_sm" "$rust_sm"
 
-# moon#1287: SSCAN. A compact (listpack/intset) set answers in ONE call with
-# cursor 0 whatever COUNT says, as redis does. Member order is unspecified on
-# both, so the cursor line and the sorted members are compared separately.
+# moon#1287: SSCAN. A compact (intset/listpack) set answers in ONE call with
+# cursor 0 whatever COUNT says, as redis does. An integer set, so it is an
+# intset on every oracle (a small STRING set is listpack only from redis 7.2;
+# 7.0 pages it as a hashtable). Member order is unspecified on both, so the
+# cursor line and the sorted members are compared separately.
 both DEL s:scan:small s:scan:big
-both SADD s:scan:small a b c d e f g
+both SADD s:scan:small 1 2 3 4 5 6 7
 redis_ss=$(redis-cli -p "$PORT_REDIS" SSCAN s:scan:small 0 COUNT 2 2>&1)
 rust_ss=$(redis-cli -p "$PORT_RUST" SSCAN s:scan:small 0 COUNT 2 2>&1)
 assert_eq "SSCAN compact set: one call, cursor 0" "$(head -1 <<<"$redis_ss")" "$(head -1 <<<"$rust_ss")"
