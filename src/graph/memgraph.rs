@@ -693,9 +693,14 @@ impl MemGraph {
     /// Phase 174 FIX-01: Un-soft-delete all incident edges of `node` that
     /// were cascade-deleted at `lsn` by `remove_node`. Restores `deleted_lsn`
     /// to `u64::MAX` and increments `live_edge_count` for each restored edge.
-    pub fn undelete_edges_at_lsn(&mut self, node: NodeKey, lsn: u64) {
+    ///
+    /// Returns the edges it restored (moon#1285: `TXN.ABORT` logs them by id
+    /// in its `GRAPH.UNDELETENODE` record — WAL replay removes with LSN 0, so
+    /// "the edges deleted at the node's LSN" cannot be recomputed there).
+    pub fn undelete_edges_at_lsn(&mut self, node: NodeKey, lsn: u64) -> SmallVec<[EdgeKey; 8]> {
+        let mut restored = SmallVec::new();
         let Some(n) = self.nodes.get(&node) else {
-            return;
+            return restored;
         };
         let edge_keys: SmallVec<[EdgeKey; 16]> = n
             .outgoing
@@ -708,9 +713,35 @@ impl MemGraph {
                 if edge.deleted_lsn == lsn {
                     edge.deleted_lsn = u64::MAX;
                     self.live_edge_count += 1;
+                    restored.push(ek);
                 }
             }
         }
+        restored
+    }
+
+    /// Un-soft-delete ONE edge, whatever LSN deleted it. `false` when the
+    /// edge is unknown or already live (idempotent). The `TXN.ABORT`
+    /// `UndeleteEdge` undo and its WAL replay (`GRAPH.UNDELETEEDGE`, moon#1285).
+    pub fn undelete_edge(&mut self, key: EdgeKey) -> bool {
+        let Some(edge) = self.edges.get_mut(&key) else {
+            return false;
+        };
+        if edge.deleted_lsn == u64::MAX {
+            return false;
+        }
+        edge.deleted_lsn = u64::MAX;
+        self.live_edge_count += 1;
+        true
+    }
+
+    /// Remove an edge property (the edge twin of
+    /// [`Self::remove_node_property`]; edges carry no property index).
+    /// Returns the removed value, if any.
+    pub fn remove_edge_property(&mut self, key: EdgeKey, pid: u16) -> Option<PropertyValue> {
+        let props = self.edges.get_mut(&key)?.properties.as_mut()?;
+        let at = props.iter().position(|(k, _)| *k == pid)?;
+        Some(props.remove(at).1)
     }
 
     /// Resident bytes used by the in-memory adjacency maps (nodes + edges).

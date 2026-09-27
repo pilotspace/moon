@@ -238,6 +238,14 @@ pub fn apply_graph_rollback(
     graph_undo: &[crate::transaction::GraphUndoOp],
     graph_intents: &[crate::transaction::GraphIntent],
 ) -> Vec<Vec<u8>> {
+    use crate::graph::wal;
+    use slotmap::Key as _;
+    // moon#1285: one WAL record per step that changed the graph, in apply
+    // order. The forward writes are already in the WAL (and, single-shard, in
+    // the replication stream); without these a restart or a replica replays
+    // the aborted graph writes. Appended to `wal_pending` at the end so
+    // `drain_wal` marks the store dirty like any live mutation.
+    let mut records: Vec<Vec<u8>> = Vec::new();
     // 2a. Phase 174 FIX-01: reverse SET/DELETE/MERGE mutations in LIFO order
     //     BEFORE removing created entities (2b). This ensures property
     //     restores on existing nodes happen before any newly-created nodes
@@ -259,6 +267,27 @@ pub fn apply_graph_rollback(
                     );
                     continue;
                 };
+                let present = if *is_node {
+                    graph
+                        .write_buf
+                        .get_node(NodeKey::from(slotmap::KeyData::from_ffi(*entity_id)))
+                        .is_some()
+                } else {
+                    graph
+                        .write_buf
+                        .get_edge(EdgeKey::from(slotmap::KeyData::from_ffi(*entity_id)))
+                        .is_some_and(|e| e.properties.is_some())
+                };
+                if present {
+                    records.push(match old_value {
+                        Some(val) => wal::serialize_set_prop(
+                            graph_name, *entity_id, *is_node, *prop_key, val,
+                        ),
+                        None => {
+                            wal::serialize_del_prop(graph_name, *entity_id, *is_node, *prop_key)
+                        }
+                    });
+                }
                 if *is_node {
                     let nk = NodeKey::from(slotmap::KeyData::from_ffi(*entity_id));
                     // `set_node_property`/`remove_node_property` are the
@@ -327,10 +356,17 @@ pub fn apply_graph_rollback(
                 // naive `deleted_lsn = u64::MAX` flip without re-indexing
                 // would leave the node live but permanently invisible to
                 // `MATCH {prop: val}` index probes.
-                graph.write_buf.undelete_node(nk, *delete_lsn);
+                let node_restored = graph.write_buf.undelete_node(nk, *delete_lsn);
                 // Un-soft-delete incident edges that were cascade-deleted
                 // at the same LSN by remove_node.
-                graph.write_buf.undelete_edges_at_lsn(nk, *delete_lsn);
+                let edges = graph.write_buf.undelete_edges_at_lsn(nk, *delete_lsn);
+                if node_restored || !edges.is_empty() {
+                    let edge_ids: SmallVec<[u64; 8]> =
+                        edges.iter().map(|ek| ek.data().as_ffi()).collect();
+                    records.push(wal::serialize_undelete_node(
+                        graph_name, *node_id, &edge_ids,
+                    ));
+                }
                 // Task #32: undelete always changes query-visible state --
                 // invalidate this graph's cached query results.
                 graph.touch();
@@ -348,14 +384,11 @@ pub fn apply_graph_rollback(
                     continue;
                 };
                 let ek = EdgeKey::from(slotmap::KeyData::from_ffi(*edge_id));
-                if let Some(edge) = graph.write_buf.get_edge_mut(ek) {
-                    if edge.deleted_lsn != u64::MAX {
-                        edge.deleted_lsn = u64::MAX;
-                        graph.write_buf.inc_live_edge_count();
-                        // Task #32: only a REAL flip (edge was actually
-                        // deleted) changes query-visible state.
-                        graph.touch();
-                    }
+                if graph.write_buf.undelete_edge(ek) {
+                    records.push(wal::serialize_undelete_edge(graph_name, *edge_id));
+                    // Task #32: only a REAL flip (edge was actually
+                    // deleted) changes query-visible state.
+                    graph.touch();
                 }
             }
         }
@@ -391,6 +424,10 @@ pub fn apply_graph_rollback(
                         "txn abort: remove_node returned false (already deleted or invalid key)",
                     );
                 } else {
+                    records.push(wal::serialize_remove_node(
+                        &intent.graph_name,
+                        intent.entity_id,
+                    ));
                     // Task #32: a create-intent rollback removes an entity
                     // that a cached query may have already returned rows
                     // for -- invalidate.
@@ -406,12 +443,17 @@ pub fn apply_graph_rollback(
                         "txn abort: remove_edge returned false (already deleted or invalid key)",
                     );
                 } else {
+                    records.push(wal::serialize_remove_edge(
+                        &intent.graph_name,
+                        intent.entity_id,
+                    ));
                     graph.touch();
                 }
             }
         }
     }
 
+    gs.wal_pending.extend(records);
     gs.drain_wal()
 }
 
@@ -714,5 +756,233 @@ mod tests {
             "rollback of a DELETE must re-index the node's properties, \
              not just flip deleted_lsn"
         );
+    }
+
+    /// Split a RESP array of bulk strings (a graph WAL record) into
+    /// `(command, args)` the way replay and replica apply do.
+    fn parts(record: &[u8]) -> (Vec<u8>, Vec<Vec<u8>>) {
+        let mut buf = bytes::BytesMut::from(record);
+        let frame = crate::protocol::parse(&mut buf, &crate::protocol::ParseConfig::default())
+            .expect("well-formed record")
+            .expect("complete record");
+        let crate::protocol::Frame::Array(items) = frame else {
+            panic!("record is not an array")
+        };
+        let mut all: Vec<Vec<u8>> = items
+            .iter()
+            .map(|f| match f {
+                crate::protocol::Frame::BulkString(b) => b.to_vec(),
+                other => panic!("not a bulk string: {other:?}"),
+            })
+            .collect();
+        let cmd = all.remove(0);
+        (cmd, all)
+    }
+
+    /// Live nodes `(id, sorted props)` and live edges `(id, src, dst)`.
+    type GraphView = (Vec<(u64, Vec<(u16, PropertyValue)>)>, Vec<(u64, u64, u64)>);
+
+    fn view(gs: &GraphStore) -> GraphView {
+        let g = gs.get_graph(b"g").expect("graph");
+        let mut nodes: Vec<_> = g
+            .write_buf
+            .iter_nodes()
+            .map(|(k, n)| {
+                let mut props: Vec<(u16, PropertyValue)> = n.properties.iter().cloned().collect();
+                props.sort_by_key(|(k, _)| *k);
+                (k.data().as_ffi(), props)
+            })
+            .collect();
+        nodes.sort_by_key(|(id, _)| *id);
+        let mut edges: Vec<_> = g
+            .write_buf
+            .iter_edges()
+            .map(|(k, e)| {
+                (
+                    k.data().as_ffi(),
+                    e.src.data().as_ffi(),
+                    e.dst.data().as_ffi(),
+                )
+            })
+            .collect();
+        edges.sort();
+        (nodes, edges)
+    }
+
+    /// moon#1285: the rollback's WAL records, replayed after the forward
+    /// records (restart replay AND a replica's one-record-at-a-time apply),
+    /// land exactly the graph the live abort left — created node removed,
+    /// SET restored, SET-added property removed, DELETE (and the edge it
+    /// cascaded to) undone.
+    #[test]
+    fn rollback_records_replay_to_the_live_aborted_to_graph() {
+        use crate::graph::replay::GraphReplayCollector;
+        use crate::graph::wal;
+
+        let mut gs = GraphStore::new();
+        gs.create_graph(Bytes::from("g"), 1_000, 0)
+            .expect("create ok");
+        let mut forward: Vec<Vec<u8>> = vec![wal::serialize_graph_create(b"g")];
+        let graph = gs.get_graph_mut(b"g").expect("graph");
+        let a = graph.write_buf.add_node(smallvec![0], id_props(1), None, 1);
+        let b = graph.write_buf.add_node(smallvec![0], id_props(2), None, 1);
+        let e = graph
+            .write_buf
+            .add_edge(a, b, 3, 1.0, None, 1)
+            .expect("edge");
+        for (nk, id) in [(a, 1), (b, 2)] {
+            forward.push(wal::serialize_add_node(
+                b"g",
+                nk.data().as_ffi(),
+                &[0],
+                &id_props(id),
+                None,
+            ));
+        }
+        forward.push(wal::serialize_add_edge(
+            b"g",
+            e.data().as_ffi(),
+            a.data().as_ffi(),
+            b.data().as_ffi(),
+            3,
+            1.0,
+            None,
+        ));
+        let before = view(&gs);
+
+        // The transaction, applied live and WAL-logged as the executor does.
+        let graph = gs.get_graph_mut(b"g").expect("graph");
+        let c = graph.write_buf.add_node(smallvec![0], id_props(3), None, 5);
+        forward.push(wal::serialize_add_node(
+            b"g",
+            c.data().as_ffi(),
+            &[0],
+            &id_props(3),
+            None,
+        ));
+        graph
+            .write_buf
+            .set_node_property(a, 0, PropertyValue::Int(9));
+        forward.push(wal::serialize_set_prop(
+            b"g",
+            a.data().as_ffi(),
+            true,
+            0,
+            &PropertyValue::Int(9),
+        ));
+        graph
+            .write_buf
+            .set_node_property(a, 5, PropertyValue::Int(7));
+        forward.push(wal::serialize_set_prop(
+            b"g",
+            a.data().as_ffi(),
+            true,
+            5,
+            &PropertyValue::Int(7),
+        ));
+        assert!(graph.write_buf.remove_node(b, 10));
+        forward.push(wal::serialize_remove_node(b"g", b.data().as_ffi()));
+
+        let undo = vec![
+            GraphUndoOp::RestoreProperty {
+                graph_name: Bytes::from("g"),
+                entity_id: a.data().as_ffi(),
+                is_node: true,
+                prop_key: 0,
+                old_value: Some(PropertyValue::Int(1)),
+            },
+            GraphUndoOp::RestoreProperty {
+                graph_name: Bytes::from("g"),
+                entity_id: a.data().as_ffi(),
+                is_node: true,
+                prop_key: 5,
+                old_value: None,
+            },
+            GraphUndoOp::UndeleteNode {
+                graph_name: Bytes::from("g"),
+                node_id: b.data().as_ffi(),
+                delete_lsn: 10,
+            },
+        ];
+        let intents = [crate::transaction::GraphIntent {
+            graph_name: Bytes::from("g"),
+            entity_id: c.data().as_ffi(),
+            is_node: true,
+        }];
+        let records = apply_graph_rollback(&mut gs, 1, &undo, &intents);
+        let live = view(&gs);
+        assert_eq!(
+            live, before,
+            "the live abort restores the pre-transaction graph"
+        );
+        assert_eq!(records.len(), 4, "one record per effective rollback step");
+
+        // Restart: every record collected, then replayed in phases.
+        let mut collector = GraphReplayCollector::new();
+        for record in forward.iter().chain(records.iter()) {
+            let (cmd, args) = parts(record);
+            let refs: Vec<&[u8]> = args.iter().map(Vec::as_slice).collect();
+            assert!(
+                collector.collect_command(&cmd, &refs),
+                "{:?}",
+                String::from_utf8_lossy(&cmd)
+            );
+        }
+        let mut restarted = GraphStore::new();
+        collector.replay_into(&mut restarted);
+        assert_eq!(view(&restarted), live, "restart replay");
+
+        // Replica: each record applied on its own, in stream order.
+        let mut replica = GraphStore::new();
+        for record in forward.iter().chain(records.iter()) {
+            let (cmd, args) = parts(record);
+            let refs: Vec<&[u8]> = args.iter().map(Vec::as_slice).collect();
+            let mut one = GraphReplayCollector::new();
+            assert!(one.collect_command(&cmd, &refs));
+            one.replay_into(&mut replica);
+        }
+        assert_eq!(view(&replica), live, "replica apply");
+    }
+
+    /// A later DELETE of a node the abort undeleted must stay deleted after
+    /// replay: removes and undeletes replay in WAL order, not by kind.
+    #[test]
+    fn a_delete_after_an_undelete_replays_in_wal_order() {
+        use crate::graph::replay::GraphReplayCollector;
+        use crate::graph::wal;
+        let id = 4_294_967_297u64; // slotmap ffi id of index 1, version 1
+        let log = [
+            wal::serialize_graph_create(b"g"),
+            wal::serialize_add_node(b"g", id, &[0], &id_props(1), None),
+            wal::serialize_remove_node(b"g", id),
+            wal::serialize_undelete_node(b"g", id, &[]),
+            wal::serialize_remove_node(b"g", id),
+        ];
+        let mut collector = GraphReplayCollector::new();
+        for record in &log {
+            let (cmd, args) = parts(record);
+            let refs: Vec<&[u8]> = args.iter().map(Vec::as_slice).collect();
+            assert!(collector.collect_command(&cmd, &refs));
+        }
+        let mut gs = GraphStore::new();
+        collector.replay_into(&mut gs);
+        assert_eq!(view(&gs).0.len(), 0, "the last word was a DELETE");
+    }
+
+    /// Malformed rollback records are refused whole, never half-applied.
+    #[test]
+    fn malformed_rollback_records_are_refused() {
+        use crate::graph::replay::GraphReplayCollector;
+        let mut c = GraphReplayCollector::new();
+        // count disagrees with the ids that follow
+        assert!(!c.collect_command(b"GRAPH.UNDELETENODE", &[b"g", b"1", b"2", b"7"]));
+        assert!(!c.collect_command(b"GRAPH.UNDELETENODE", &[b"g", b"1", b"1", b"x"]));
+        assert!(!c.collect_command(b"GRAPH.UNDELETENODE", &[b"g", b"1"]));
+        assert!(!c.collect_command(b"GRAPH.DELPROP", &[b"g", b"Q", b"1", b"2"]));
+        assert!(!c.collect_command(b"GRAPH.DELPROP", &[b"g", b"N", b"1", b"70000"]));
+        assert!(!c.collect_command(b"GRAPH.UNDELETEEDGE", &[b"g"]));
+        assert_eq!(c.command_count(), 0);
+        assert!(c.collect_command(b"graph.undeleteedge", &[b"g", b"5"]));
+        assert!(GraphReplayCollector::is_graph_command(b"GRAPH.DELPROP"));
     }
 }
