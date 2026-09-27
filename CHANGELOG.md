@@ -455,6 +455,35 @@ shared 4-vCPU Linux container against HEAD `935c555` — re-measure on the GCE r
 
 ### Fixed
 
+- **A crash while a boot opened a fresh AOF generation could bring back cold
+  keys deleted before the switch to `--appendonly yes`** (moon#1293). The
+  manifest committed before each incr file's `MOON.COLDCUT` head (and its cold
+  `DEL`s) was written, so a crash between the two left a headless generation
+  that the next boot replayed ungated: 88–167 of 88–167 deleted probes came back
+  across both runtimes at `--shards` 1 and 4. Every head is now written and
+  fsynced (with its directory entry) before the manifest commits; a crash before
+  the commit leaves no manifest and the next boot redoes the initialization.
+
+- **Cold-key graves survive a smaller `--databases` and a failed spill commit**
+  (moon#1291). Restarting a no-AOF server with fewer databases aborted the
+  snapshot load before its graves trailer, so every deleted cold key of the
+  dropped databases came back at the next restart with the original count
+  (129–173 probes per run); out-of-range databases are now skipped and their
+  graves carried forward. A failed manifest commit during a no-AOF durable
+  spill no longer leaves the file listed with slots neither indexed nor graved.
+
+- **With `--appendonly no --disk-offload enable`, eviction lost keys instead of
+  tiering them** (moon#1290). The connection write gates and the cross-shard
+  gate had no manifest to spill durably with and plain-dropped victims: 3.3–5.4K
+  of 16.2K keys were gone in the repro, with no error to the client. They now
+  tier every victim durably (0 lost, including after BGSAVE + kill -9). The
+  async-spill route is chosen by whether an AOF writer exists, not by the
+  `CONFIG SET appendonly` string. Cost: without an AOF each spill batch is
+  fsynced and committed on the shard thread, so a write flood over `maxmemory`
+  runs at the durable spill rate (monoio `--shards 4`: ~150–160K rps with the
+  1024-entry / 1 MiB batches, where it used to run 315–559K rps while dropping
+  keys); AOF-backed tiering is unaffected (~170–195K rps).
+
 - **`TXN.ABORT` is durable and replicated on both runtimes** (moon#1285,
   moon#1185 option b). An aborted write used to come back after a kill -9
   restart (both runtimes) and stayed on replicas: the forward writes reached the
