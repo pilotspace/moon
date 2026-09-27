@@ -2577,6 +2577,21 @@ pub(crate) async fn handle_connection_sharded_inner<
                                     // db write lock, so they cannot race the persistence-tick
                                     // cascade on the same key.
                                     let budget = ctx.shard_databases.elastic_budget(ctx.shard_id);
+                                    // Every plain-dropped victim is a DEL on the AOF and the
+                                    // replica stream, as on monoio's `run_write_eviction_gate`
+                                    // (round-2b review MAJOR-3: without it the AOF replayed
+                                    // every evicted key back after a restart).
+                                    let sel_db = conn.selected_db;
+                                    let mut report_eviction_del = |key: &[u8]| {
+                                        crate::replication::reason_del::record_reason_del_conn(
+                                            &ctx.repl_state,
+                                            ctx.shard_id,
+                                            ctx.num_shards,
+                                            ctx.aof_pool.as_ref(),
+                                            sel_db,
+                                            key,
+                                        );
+                                    };
                                     let evict_result = if let Some(ref sender) = ctx.spill_sender {
                                         let mut fid = ctx.spill_file_id.get();
                                         let dir = ctx
@@ -2593,12 +2608,19 @@ pub(crate) async fn handle_connection_sharded_inner<
                                                 conn.selected_db,
                                                 None,
                                             )
-                                            .budget(budget),
+                                            .budget(budget)
+                                            .report(&mut report_eviction_del),
                                         );
                                         ctx.spill_file_id.set(ctx.spill_file_id.get().max(fid));
                                         res
                                     } else {
-                                        evict_to_budget(db, &rt, EvictionRun::plain().budget(budget))
+                                        evict_to_budget(
+                                            db,
+                                            &rt,
+                                            EvictionRun::plain()
+                                                .budget(budget)
+                                                .report(&mut report_eviction_del),
+                                        )
                                     };
                                     // WS6 fix (HIGH, adversarial review 2026-07-08): a
                                     // command that can only shrink memory (HDEL, SREM,

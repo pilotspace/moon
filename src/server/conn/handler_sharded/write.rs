@@ -317,6 +317,18 @@ fn mq_write_gate(
     use crate::storage::eviction::{EvictionRun, evict_to_budget};
     let rt = ctx.runtime_config.read();
     let budget = ctx.shard_databases.elastic_budget(ctx.shard_id);
+    // Plain-dropped victims are DELs on the AOF and the replica stream
+    // (round-2b review MAJOR-3), as on the monoio gates.
+    let mut report_eviction_del = |key: &[u8]| {
+        crate::replication::reason_del::record_reason_del_conn(
+            &ctx.repl_state,
+            ctx.shard_id,
+            ctx.num_shards,
+            ctx.aof_pool.as_ref(),
+            db_index,
+            key,
+        );
+    };
     if let Some(ref sender) = ctx.spill_sender {
         let mut fid = ctx.spill_file_id.get();
         let dir = ctx
@@ -326,12 +338,20 @@ fn mq_write_gate(
         let res = evict_to_budget(
             db,
             &rt,
-            EvictionRun::async_spill(sender, dir, &mut fid, db_index, None).budget(budget),
+            EvictionRun::async_spill(sender, dir, &mut fid, db_index, None)
+                .budget(budget)
+                .report(&mut report_eviction_del),
         );
         ctx.spill_file_id.set(ctx.spill_file_id.get().max(fid));
         res?;
     } else {
-        evict_to_budget(db, &rt, EvictionRun::plain().budget(budget))?;
+        evict_to_budget(
+            db,
+            &rt,
+            EvictionRun::plain()
+                .budget(budget)
+                .report(&mut report_eviction_del),
+        )?;
     }
     crate::storage::db_quota::check_db_maxmemory_for_command(db, db_index, &rt, b"MQ")
 }
