@@ -5,12 +5,15 @@
 #
 # Three things both oracle harnesses got wrong, fixed once here:
 #
-# 1. `redis-cli -t <secs>` exists only in redis-cli 7.2+. On 7.0.x it prints
-#    "Unrecognized option or bad number of args for: '-t'" and exits 1, and
-#    under `set -euo pipefail` a `x=$(redis-cli -t 3 ...)` then ended the run
-#    SILENTLY mid-section. `cli_bounded <secs> ...` probes once and falls back to
-#    `timeout`/`gtimeout` (a whole-command bound -- strictly stronger than
-#    `-t`), or to no bound at all with a loud warning.
+# 1. `redis-cli -t <secs>` exists only in redis-cli 7.4+, and it bounds the
+#    CONNECT only: a server that accepts but never answers still hangs the
+#    call (review round 2 of moon#1276, read off the 7.2.5 / 7.4.0 / 8.0.0
+#    sources). On 7.0.x it prints "Unrecognized option or bad number of args
+#    for: '-t'" and exits 1, and under `set -euo pipefail` a
+#    `x=$(redis-cli -t 3 ...)` then ended the run SILENTLY mid-section.
+#    `cli_bounded <secs> ...` prefers `timeout`/`gtimeout` (a whole-command
+#    bound), falls back to `-t` (connect only, with a note), or to no bound at
+#    all with a loud warning.
 # 2. An auxiliary moon (eviction, SLOWLOG, cross-shard, SHUTDOWN, NUMERIC-07
 #    legs) was stopped only at the end of its own leg, and the EXIT trap knew
 #    only the main pair. A death mid-leg leaked it; moon binds with
@@ -36,7 +39,7 @@
 # treats `"${a[@]}"` of an empty array as unbound under `set -u`).
 ###############################################################################
 
-# native | timeout | none -- how `cli_bounded` bounds a redis-cli call.
+# timeout | native | none -- how `cli_bounded` bounds a redis-cli call.
 REDIS_CLI_TIMEOUT_MODE=""
 # `timeout` or `gtimeout` (and whether it takes `-k`) when the mode is timeout.
 REDIS_CLI_TIMEOUT_BIN=""
@@ -48,15 +51,8 @@ REDIS_CLI_TIMEOUT_KILL=false
 # the ARGUMENT. Neither touches a server.
 harness_probe_redis_cli() {
     local out bin
-    out=$(redis-cli -t 1 -p 1 PING 2>&1 || true)
-    case "$out" in
-        *[Uu]nrecognized\ option*)
-            ;;
-        *)
-            REDIS_CLI_TIMEOUT_MODE=native
-            return 0
-            ;;
-    esac
+    # A whole-command bound first: it also catches a server that accepts the
+    # connection and never answers, which `-t` (connect only) does not.
     for bin in timeout gtimeout; do
         if command -v "$bin" >/dev/null 2>&1 && "$bin" 5 true >/dev/null 2>&1; then
             REDIS_CLI_TIMEOUT_MODE=timeout
@@ -64,19 +60,28 @@ harness_probe_redis_cli() {
             if "$bin" -k 1 5 true >/dev/null 2>&1; then
                 REDIS_CLI_TIMEOUT_KILL=true
             fi
-            echo "NOTE: $(redis-cli --version 2>/dev/null) has no '-t' (added in 7.2);" \
-                "bounding redis-cli calls with '$bin' instead." >&2
             return 0
         fi
     done
+    out=$(redis-cli -t 1 -p 1 PING 2>&1 || true)
+    case "$out" in
+        *[Uu]nrecognized\ option*)
+            ;;
+        *)
+            REDIS_CLI_TIMEOUT_MODE=native
+            echo "NOTE: neither 'timeout' nor 'gtimeout' (brew install coreutils) is on PATH;" \
+                "bounding redis-cli calls with its own '-t', which bounds the CONNECT only." >&2
+            return 0
+            ;;
+    esac
     REDIS_CLI_TIMEOUT_MODE=none
     {
         echo "WARNING: ****************************************************************"
-        echo "WARNING: $(redis-cli --version 2>/dev/null) has no '-t' (added in 7.2), and neither"
-        echo "WARNING: 'timeout' (GNU coreutils) nor 'gtimeout' (brew install coreutils) is on"
-        echo "WARNING: PATH. redis-cli calls run UNBOUNDED: a server that stops answering (the"
+        echo "WARNING: neither 'timeout' (GNU coreutils) nor 'gtimeout' (brew install coreutils)"
+        echo "WARNING: is on PATH, and $(redis-cli --version 2>/dev/null) has no '-t' (7.4+)."
+        echo "WARNING: redis-cli calls run UNBOUNDED: a server that stops answering (the"
         echo "WARNING: liveness rows exist to catch exactly that) HANGS this run instead of"
-        echo "WARNING: failing it. Install redis 7.2+ or coreutils."
+        echo "WARNING: failing it. Install coreutils."
         echo "WARNING: ****************************************************************"
     } >&2
 }

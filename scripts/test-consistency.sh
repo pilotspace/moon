@@ -32,8 +32,9 @@ qgrep() { local _in; _in=$(cat); grep "$@" <<< "$_in" > /dev/null; }
 # port that already accepts connections (moon#1276).
 #
 # ORACLE VERSION. The expected values assume a redis 7.2+/8.x oracle (what
-# `brew install redis` gives). redis-cli 7.2+ is not required: without `-t`
-# the calls are bounded with `timeout`/`gtimeout` instead (moon#1276). Against
+# `brew install redis` gives). No redis-cli version is required: calls are
+# bounded with `timeout`/`gtimeout` (redis-cli's own `-t`, 7.4+, bounds only
+# the connect and is the fallback) (moon#1276). Against
 # redis 7.0.15 about 80 rows differ because moon follows 7.2+ behaviour, not
 # because of moon bugs:
 #   - listpack encodings for small sets and lists (OBJECT ENCODING);

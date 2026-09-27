@@ -39,8 +39,9 @@ qgrep() { local _in; _in=$(cat); grep "$@" <<< "$_in" > /dev/null; }
 # already accepts connections (moon#1276).
 #
 # ORACLE VERSION. The expected values assume a redis 7.2+/8.x oracle (what
-# `brew install redis` gives). redis-cli 7.2+ is not required: without `-t`
-# the calls are bounded with `timeout`/`gtimeout` instead (moon#1276). Against
+# `brew install redis` gives). No redis-cli version is required: calls are
+# bounded with `timeout`/`gtimeout` (redis-cli's own `-t`, 7.4+, bounds only
+# the connect and is the fallback) (moon#1276). Against
 # redis 7.0.15 rows differ because moon follows 7.2+ behaviour, not because
 # of moon bugs: listpack set/list encodings, ZRANK ... WITHSCORE, the NOPERM
 # text "User <name> has no permissions ...", the COMMAND GETKEYS keyless
@@ -4651,7 +4652,7 @@ if should_run "eviction"; then
 
     PORT_EVICT="${PORT_EVICT:-$((PORT_RUST + 530))}"
     EVICT_DIR=$(mktemp -d /tmp/moon-cmd-evict.XXXXXX)
-    # `cli_bounded`, not `redis-cli -t`: `-t` exists only in redis-cli 7.2+,
+    # `cli_bounded`, not `redis-cli -t`: `-t` exists only in redis-cli 7.4+,
     # and on 7.0.x the first `ecli SET` below ended the run silently here,
     # leaking this server (moon#1276). `|| true` inside: a hung or dead
     # server must make the rows below FAIL, not end the run under `set -e`.
