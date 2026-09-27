@@ -82,8 +82,14 @@ pub(super) async fn try_handle_txn_commit(
                         rejected,
                         txn.first_rejected_cmd.as_deref(),
                     );
-                    let _ = Box::pin(crate::server::conn::txn_abort::abort_logged(
-                        ctx, *txn, None,
+                    // A refusal is counted by the pool and logged by
+                    // `abort_logged` (moon#1285 review MINOR 5); the client is
+                    // answered the commit error either way.
+                    let _refused = Box::pin(crate::server::conn::txn_abort::abort_logged(
+                        ctx,
+                        *txn,
+                        None,
+                        crate::server::conn::txn_abort::AbortCause::DirtyCommit,
                     ))
                     .await;
                     responses.push(err);
@@ -292,7 +298,10 @@ pub(super) async fn try_handle_txn_abort(
                 // state machine out of the per-connection future; the alloc
                 // only happens when TXN.ABORT actually executes.
                 let logged = Box::pin(crate::server::conn::txn_abort::abort_logged(
-                    ctx, *txn, None,
+                    ctx,
+                    *txn,
+                    None,
+                    crate::server::conn::txn_abort::AbortCause::Explicit,
                 ))
                 .await;
                 // moon#1285: the rollback is applied either way; a refused

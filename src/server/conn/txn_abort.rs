@@ -22,6 +22,30 @@ use bytes::Bytes;
 use crate::server::conn::core::ConnectionContext;
 use crate::transaction::CrossStoreTxn;
 
+/// Why a transaction is being rolled back — decides who learns that the
+/// rollback's AOF records were refused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AbortCause {
+    /// `TXN.ABORT`: the client is answered the refusal instead of `+OK`.
+    Explicit,
+    /// A `TXN.COMMIT` refused for rejected ops (#499): the client is
+    /// answered the commit error, which says nothing about the rollback's
+    /// durability.
+    DirtyCommit,
+    /// Disconnect cleanup: there is no client left to tell.
+    Disconnect,
+}
+
+impl AbortCause {
+    fn as_str(self) -> &'static str {
+        match self {
+            AbortCause::Explicit => "TXN.ABORT",
+            AbortCause::DirtyCommit => "TXN.COMMIT rollback (rejected ops)",
+            AbortCause::Disconnect => "disconnect rollback",
+        }
+    }
+}
+
 /// Records one command in the replication stream under a database —
 /// `handler_monoio::ft::record_local_write_db` on the runtime that serves
 /// replicas.
@@ -32,12 +56,19 @@ pub(crate) type ReplicationRecorder = fn(&ConnectionContext, usize, Bytes);
 /// `replication_fanout_active`); the tokio runtime passes `None`.
 ///
 /// `Err(reply)` when the AOF refused the records or their barrier — the
-/// keyspace IS rolled back either way; the caller reports that the abort's
-/// durability could not be guaranteed.
+/// keyspace IS rolled back either way. A refusal is never silent (wave-1
+/// review MINOR 5): the pool counts it where it happens
+/// (`aof_append_backpressure_refusals` / `aof_backpressure_dropped` for a
+/// backlogged or dead writer, `aof_fsync_failures` for a failed fsync), and
+/// this logs it with its `cause` — at WARN for an explicit `TXN.ABORT`, whose
+/// client is answered the refusal, and at ERROR for a dirty-commit or
+/// disconnect rollback, where no client learns of it and the master's AOF
+/// lacks records its replicas already received.
 pub(crate) async fn abort_logged(
     ctx: &ConnectionContext,
     txn: CrossStoreTxn,
     replicate: Option<ReplicationRecorder>,
+    cause: AbortCause,
 ) -> Result<(), &'static [u8]> {
     let txn_id = txn.txn_id;
     let graph_db = txn.db_index;
@@ -85,11 +116,24 @@ pub(crate) async fn abort_logged(
     )
     .await;
     if let Err(reply) = persisted {
-        tracing::error!(
-            txn_id,
-            reply = %String::from_utf8_lossy(reply),
-            "TXN.ABORT: the rollback is applied but its AOF records were refused"
-        );
+        let reply = String::from_utf8_lossy(reply);
+        if cause == AbortCause::Explicit {
+            tracing::warn!(
+                txn_id,
+                cause = cause.as_str(),
+                reply = %reply,
+                "TXN rollback applied but its AOF records were refused; the client was answered the refusal"
+            );
+        } else {
+            tracing::error!(
+                txn_id,
+                cause = cause.as_str(),
+                reply = %reply,
+                "TXN rollback applied but its AOF records were refused and NO client was told: \
+                 a restart may replay the rolled-back writes, and replicas received records \
+                 this AOF lacks"
+            );
+        }
     }
     persisted
 }

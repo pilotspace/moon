@@ -3768,8 +3768,13 @@ pub(crate) async fn handle_connection_sharded_inner<
         // Box::pin (c10k future diet): this ~5.4 KB rollback state machine
         // otherwise sits inline in EVERY connection future; boxing costs one
         // alloc on the leaked-txn teardown path only.
-        let _ = Box::pin(crate::server::conn::txn_abort::abort_logged(
-            ctx, *txn, None,
+        // A refusal is counted by the pool and logged by `abort_logged`
+        // (moon#1285 review MINOR 5); there is no client left to tell.
+        let _refused = Box::pin(crate::server::conn::txn_abort::abort_logged(
+            ctx,
+            *txn,
+            None,
+            crate::server::conn::txn_abort::AbortCause::Disconnect,
         ))
         .await;
     }
