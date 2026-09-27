@@ -207,7 +207,17 @@ fn a_spill_thread_panic_mid_flight_is_survived() {
     std::fs::write(panic_file(&dir), "after-write once").unwrap();
     let second = FILL..FILL + 4_000;
     let deleted: Vec<usize> = second.clone().filter(|i| i % 3 == 0).collect();
-    let _ = set_range(port, second.clone());
+    // Writes that land while the thread is down may be refused with -OOM
+    // (the dead thread's payloads are pinned in RAM until the reconcile):
+    // an acknowledged write is what must survive, so retry the refused ones
+    // before judging. Discarding the refusals here read as ~300-1,700 "lost"
+    // keys whenever the burst overlapped the death (seen with two suites
+    // sharing core 0; none of them had reached the AOF — never acked).
+    let (refused2, still2) = set_range_settling(port, second.clone());
+    assert_eq!(
+        still2, 0,
+        "second range still refused after the respawn settled ({refused2} refused at first)"
+    );
     for chunk in deleted.chunks(50) {
         let keys: Vec<String> = chunk.iter().map(|i| format!("k:{i}")).collect();
         let mut args = vec!["DEL"];
