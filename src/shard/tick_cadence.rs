@@ -174,7 +174,20 @@ pub(crate) struct TickLateness {
     burst: u64,
     /// The previous tick's scheduled deadline.
     prev_deadline: Option<Instant>,
+    /// When the previous tick fired (the per-tick duties' catch-up scale).
+    prev_fired: Option<Instant>,
 }
+
+/// Cap on how many 1 ms ticks' budget the per-tick duties (the lazy-free
+/// drain, the snapshot walk) take in one tick that fires late (moon#1280
+/// review round 2, MAJOR-1): with missed ticks skipped, a loop whose every
+/// round runs long (back-to-back ~25 ms EVALs) otherwise gave them one
+/// slice per round instead of one per millisecond — measured 10-21x slower
+/// frees of ~380 MB of UNLINKed values than an idle loop, and a BGSAVE
+/// 0.75 s -> 4.1 s. 8 slices (2 ms of lazy free) bounds what one tick can
+/// add to a command's latency while keeping them near 1/period; Burst
+/// replayed every missed tick.
+pub(crate) const PER_TICK_CATCH_UP_MAX_SCALE: u32 = 8;
 
 impl TickLateness {
     pub(crate) fn new() -> Self {
@@ -182,8 +195,21 @@ impl TickLateness {
     }
 
     /// Record one fired periodic tick scheduled for `deadline`, firing at `now`.
+    /// Returns how many 1 ms ticks' budget the per-tick duties owe this tick:
+    /// the milliseconds since the previous tick fired, at least 1, at most
+    /// [`PER_TICK_CATCH_UP_MAX_SCALE`].
     #[inline]
-    pub(crate) fn observe(&mut self, deadline: Instant, now: Instant) {
+    pub(crate) fn observe(&mut self, deadline: Instant, now: Instant) -> u32 {
+        let scale = self.prev_fired.map_or(1, |prev| {
+            let elapsed = now.saturating_duration_since(prev).as_millis() as u64;
+            catch_up_scale(elapsed, 1, PER_TICK_CATCH_UP_MAX_SCALE)
+        });
+        self.prev_fired = Some(now);
+        self.observe_lateness(deadline, now);
+        scale
+    }
+
+    fn observe_lateness(&mut self, deadline: Instant, now: Instant) {
         let late = now.saturating_duration_since(deadline) > LATE_TICK_THRESHOLD;
         // Replayed: scheduled right after a predecessor that itself fired
         // late (the burst is non-empty only then), rather than re-scheduled
@@ -427,5 +453,23 @@ mod tests {
         assert_eq!(c.autovacuum.poll(30_000), Some(30_000));
         let c = ChoreCadences::new(0, 1_000, 1, 300);
         assert_eq!(c.orphan.map(|o| o.next_due_ms()), Some(300_000));
+    }
+
+    /// moon#1280 review MAJOR-1: a late tick owes the per-tick duties the
+    /// ticks it skipped, capped; an on-time tick owes exactly one.
+    #[test]
+    fn a_late_tick_scales_the_per_tick_duties_up_to_the_cap() {
+        let t0 = Instant::now();
+        let ms = |n: u64| t0 + std::time::Duration::from_millis(n);
+        let mut t = TickLateness::new();
+        assert_eq!(t.observe(ms(0), ms(0)), 1, "first tick");
+        assert_eq!(t.observe(ms(1), ms(1)), 1, "on time");
+        assert_eq!(
+            t.observe(ms(2), ms(26)),
+            PER_TICK_CATCH_UP_MAX_SCALE,
+            "25 ms round: capped"
+        );
+        assert_eq!(t.observe(ms(27), ms(30)), 4, "4 ms since the previous tick");
+        assert_eq!(t.observe(ms(31), ms(31)), 1);
     }
 }

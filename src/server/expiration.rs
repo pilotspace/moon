@@ -114,6 +114,13 @@ const LAZY_FREE_LEGACY_BUDGET: Duration = Duration::from_millis(2);
 /// time, a large value there took the whole budget tick after tick while db
 /// 15's queue — perhaps the one holding the memory a gate needs — waited.
 pub fn drain_lazy_free_tick(db_count: usize) -> bool {
+    drain_lazy_free_tick_scaled(db_count, 1)
+}
+
+/// [`drain_lazy_free_tick`] with `scale` ticks' budget (moon#1280 review
+/// MAJOR-1: a late tick owes the drain the milliseconds it skipped, capped by
+/// `shard::tick_cadence::PER_TICK_CATCH_UP_MAX_SCALE`).
+pub fn drain_lazy_free_tick_scaled(db_count: usize, scale: u32) -> bool {
     if !crate::storage::db::lazy_free_pending_anywhere() {
         return false;
     }
@@ -133,7 +140,7 @@ pub fn drain_lazy_free_tick(db_count: usize) -> bool {
         s.next_db.set((start + 1) % db_count);
         start
     });
-    let deadline = Instant::now() + crate::storage::db::LAZY_FREE_TICK_BUDGET;
+    let deadline = Instant::now() + crate::storage::db::LAZY_FREE_TICK_BUDGET * scale.max(1);
     let mut pending = false;
     for k in 0..db_count {
         let i = (start + k) % db_count;

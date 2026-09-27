@@ -239,6 +239,27 @@ pub(crate) fn drive_snapshot_finalize(
     }
 }
 
+/// [`advance_snapshot_segment`] up to `scale` times (moon#1280 review
+/// MAJOR-1): a late tick owes the walk the ticks it skipped, capped by
+/// `tick_cadence::PER_TICK_CATCH_UP_MAX_SCALE`. Each step keeps its own
+/// byte/segment budget and writer-backlog check. True once the walk is done.
+pub(crate) fn advance_snapshot_segments(
+    snapshot_state: &mut Option<SnapshotState>,
+    shard_databases: &Arc<ShardDatabases>,
+    shard_id: usize,
+    scale: u32,
+) -> bool {
+    for _ in 0..scale.max(1) {
+        if snapshot_state.is_none() {
+            return false;
+        }
+        if advance_snapshot_segment(snapshot_state, shard_databases, shard_id) {
+            return true;
+        }
+    }
+    false
+}
+
 /// Advance snapshot one segment and check if done (synchronous part).
 ///
 /// Returns `true` if the snapshot is complete and ready for finalization

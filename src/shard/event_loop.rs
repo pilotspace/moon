@@ -1478,11 +1478,17 @@ impl super::Shard {
                 // Periodic 1ms timer for WAL flush, snapshot advance, io_uring poll
                 tick_deadline = periodic_interval.0.tick() => {
                     cached_clock.update();
-                    tick_lateness.observe(tick_deadline.into_std(), std::time::Instant::now());
+                    // moon#1280 review MAJOR-1: a late tick owes the per-tick
+                    // duties the milliseconds it skipped (capped).
+                    let per_tick_scale =
+                        tick_lateness.observe(tick_deadline.into_std(), std::time::Instant::now());
                     // moon#1190: lazy-free drain (see the monoio tick below).
                     // Its pending flag feeds only the monoio idle park; this
                     // loop never stretches its 1 ms period.
-                    let _ = crate::server::expiration::drain_lazy_free_tick(shard_databases.db_count());
+                    let _ = crate::server::expiration::drain_lazy_free_tick_scaled(
+                        shard_databases.db_count(),
+                        per_tick_scale,
+                    );
 
                     let mut pending_snapshot = None;
                     // No outer with_shard — each arm takes its own flat borrow.
@@ -1606,11 +1612,12 @@ impl super::Shard {
                         wal_writer.as_ref().map(|w| w.current_lsn().saturating_sub(1)).unwrap_or(0),
                     );
 
-                    // Advance snapshot one segment per tick (cooperative)
-                    if persistence_tick::advance_snapshot_segment(
+                    // Advance the snapshot one tick's budget per owed tick.
+                    if persistence_tick::advance_snapshot_segments(
                         &mut snapshot_state,
                         &shard_databases,
                         shard_id,
+                        per_tick_scale,
                     ) {
                         // moon#1186: the file is written, fsynced and renamed
                         // on the snapshot's writer thread; the tick polls.
@@ -2422,9 +2429,12 @@ impl super::Shard {
                 // moon#1280: one monotonic clock read per timer tick drives the
                 // lateness stats and every chore cadence below.
                 let tick_now = std::time::Instant::now();
-                if let Some(deadline) = tick_deadline {
-                    tick_lateness.observe(deadline.into_std(), tick_now);
-                }
+                // moon#1280 review MAJOR-1: a late tick owes the per-tick
+                // duties the milliseconds it skipped (capped). The idle park's
+                // one-shot is no timer tick: it owes one.
+                let per_tick_scale = tick_deadline.map_or(1, |deadline| {
+                    tick_lateness.observe(deadline.into_std(), tick_now)
+                });
                 let now_ms = loop_clock.ms_at(tick_now);
 
                 persistence_tick::check_auto_save_trigger(
@@ -2441,10 +2451,11 @@ impl super::Shard {
                         .unwrap_or(0),
                 );
 
-                if persistence_tick::advance_snapshot_segment(
+                if persistence_tick::advance_snapshot_segments(
                     &mut snapshot_state,
                     &shard_databases,
                     shard_id,
+                    per_tick_scale,
                 ) {
                     // moon#1186: the file is written, fsynced and renamed on
                     // the snapshot's writer thread; the tick only polls.
@@ -2804,8 +2815,10 @@ impl super::Shard {
                 // for the park decision: moon#1221 review F2, the idle park
                 // must not stretch to 10 ms while the queue drains (one
                 // 250 µs slice per 10 ms held the memory ~10x longer).
-                let lazy_free_pending =
-                    crate::server::expiration::drain_lazy_free_tick(shard_databases.db_count());
+                let lazy_free_pending = crate::server::expiration::drain_lazy_free_tick_scaled(
+                    shard_databases.db_count(),
+                    per_tick_scale,
+                );
                 let quiet = wal_writer
                     .as_ref()
                     .is_none_or(|w| w.buffered_bytes() == 0 && !w.flush_backing_off())
