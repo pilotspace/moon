@@ -171,3 +171,44 @@ fn a_crash_inside_a_txn_does_not_keep_its_uncommitted_writes() {
          GET k -> {k:?} (want \"original\"), GET new -> {new:?} (want nil)"
     );
 }
+
+/// A write by ANOTHER client to a key the open transaction wrote is not
+/// refused (no write-write conflict with the transaction's intent), and the
+/// abort's restore — an absolute `RESTORE … REPLACE` since WS27 — then
+/// overwrites it: the other client's acknowledged `SET` is lost, live, after
+/// a restart, and on every replica.
+///
+/// Live, pre-existing (ce65400 answers the same `orig`). On ce65400 the
+/// restart replayed the other client's write and brought it back; since
+/// WS27 the compensating `RESTORE` makes the lost update durable too.
+#[test]
+#[ignore = "real-server suite: MOON_BIN pinned"]
+fn an_abort_does_not_overwrite_another_clients_acknowledged_write() {
+    let dir = common::unique_test_dir("rv-w1-txn-lost-update");
+    let (mut guard, port) = start_with(&dir, "yes");
+    let mut c = Conn::open(port);
+    assert_eq!(c.send(&["SET", "k", "orig"]), OK);
+    let mut t = Conn::open(port);
+    assert_eq!(t.send(&["TXN", "BEGIN"]), OK);
+    assert_eq!(t.send(&["SET", "k", "txn"]), OK);
+    // Another client's write, acknowledged while the transaction is open.
+    let other = c.send(&["SET", "k", "other-client"]);
+    let aborted = t.send(&["TXN", "ABORT"]);
+    let live = c.send(&["GET", "k"]);
+    drop(t);
+    drop(c);
+    guard.kill_now();
+    let (mut guard, port) = start_with(&dir, "yes");
+    let mut c = Conn::open(port);
+    let after = c.send(&["GET", "k"]);
+    guard.kill_now();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(aborted, OK);
+    if other == OK {
+        assert!(
+            live == bulk("other-client") && after == bulk("other-client"),
+            "another client's acknowledged SET was overwritten by TXN ABORT: live {live:?}, \
+             after kill -9 + restart {after:?} (want \"other-client\" both times)"
+        );
+    }
+}
