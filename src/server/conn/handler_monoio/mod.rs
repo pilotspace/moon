@@ -4823,10 +4823,11 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 // durable storage. Under EverySec/No this is a zero-cost noop.
                 if !write_resp_idxs.is_empty() {
                     if let Some(ref pool) = ctx.aof_pool {
-                        if pool.fsync_barrier(target).await.is_err() {
+                        if let Err(ack) = pool.fsync_barrier(target).await {
+                            // moon#1272: a backlogged writer is not a failed fsync.
+                            let err = aof::append_refusal_reply(ack);
                             for idx in write_resp_idxs {
-                                responses[idx] =
-                                    Frame::Error(Bytes::from_static(aof::AOF_FSYNC_ERR));
+                                responses[idx] = Frame::Error(Bytes::from_static(err));
                             }
                         }
                     }

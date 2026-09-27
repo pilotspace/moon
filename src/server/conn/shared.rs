@@ -998,8 +998,9 @@ pub(crate) async fn persist_txn_aof(
         }
     }
     // appendfsync=always: one barrier confirms the whole body is on disk.
-    if barrier_pending && pool.fsync_barrier(ctx.shard_id).await.is_err() {
-        return Err(crate::persistence::aof::AOF_FSYNC_ERR);
+    if barrier_pending && let Err(ack) = pool.fsync_barrier(ctx.shard_id).await {
+        // moon#1272 review: a backlogged writer is not a failed fsync.
+        return Err(crate::persistence::aof::append_refusal_reply(ack));
     }
     Ok(())
 }
@@ -4930,8 +4931,9 @@ pub(crate) async fn confirm_routed_script_write(
     let Some(ref pool) = ctx.aof_pool else {
         return reply;
     };
-    if pool.fsync_barrier(owner).await.is_err() {
-        return Frame::Error(Bytes::from_static(crate::persistence::aof::AOF_FSYNC_ERR));
+    if let Err(ack) = pool.fsync_barrier(owner).await {
+        // moon#1272 review: a backlogged writer is not a failed fsync.
+        return crate::persistence::aof::append_refusal_frame(ack);
     }
     reply
 }

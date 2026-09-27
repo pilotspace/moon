@@ -876,11 +876,12 @@ pub(super) async fn try_handle_multi_exec(
                                 // under everysec/no.
                                 if r.wrote {
                                     if let Some(ref pool) = ctx.aof_pool {
-                                        if pool.fsync_barrier(s).await.is_err() {
+                                        if let Err(ack) = pool.fsync_barrier(s).await {
                                             exec_publishes.clear();
-                                            responses.push(Frame::Error(Bytes::from_static(
-                                                crate::persistence::aof::AOF_FSYNC_ERR,
-                                            )));
+                                            // moon#1272: backlog is not a failed fsync.
+                                            responses.push(
+                                                crate::persistence::aof::append_refusal_frame(ack),
+                                            );
                                             return true;
                                         }
                                     }

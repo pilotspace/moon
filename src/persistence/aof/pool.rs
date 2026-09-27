@@ -1180,6 +1180,15 @@ impl AofWriterPool {
         epoch: FoldEpoch,
     ) -> crate::runtime::channel::OneshotReceiver<AofAck> {
         use super::rewrite_overflow::SpillReject;
+        // A zero-length fsync barrier carries no record: refusing it drops
+        // nothing from the log, so it must not mark an AOF hole (moon#1272
+        // review). It is still a backpressure refusal of the write it guards.
+        let carries_record = !bytes.is_empty();
+        let what = if carries_record {
+            "appendfsync always append"
+        } else {
+            "appendfsync always barrier"
+        };
         let (ack_tx, ack_rx) = crate::runtime::channel::oneshot::<AofAck>();
         let mut msg = AofMessage::AppendSync {
             lsn,
@@ -1202,7 +1211,10 @@ impl AofWriterPool {
                 Ok(()) => return ack_rx,
                 Err(SpillReject::Disarmed(returned)) => msg = returned,
                 Err(SpillReject::CapExceeded) => {
-                    super::record_append_dropped(self.overflow_for(shard_id), 1);
+                    if carries_record {
+                        super::record_append_dropped(self.overflow_for(shard_id), 1);
+                    }
+                    super::note_append_backpressure_refusal(shard_id, what, Duration::ZERO);
                     let (pre_tx, pre_rx) = crate::runtime::channel::oneshot::<AofAck>();
                     let _ = pre_tx.send(AofAck::ChannelFull);
                     return pre_rx;
@@ -1222,13 +1234,12 @@ impl AofWriterPool {
                 // signal ChannelFull back to the caller via a pre-filled
                 // oneshot so the caller's `.await` resolves immediately to
                 // Err(AofAck::ChannelFull) without a writer round-trip.
-                super::record_append_dropped(self.overflow_for(shard_id), 1);
-                warn!(
-                    "AOF writer channel full (shard {}): AppendSync dropped; \
-                     backpressure_dropped={}",
-                    shard_id,
-                    AOF_BACKPRESSURE_DROPPED.load(std::sync::atomic::Ordering::Relaxed),
-                );
+                if carries_record {
+                    super::record_append_dropped(self.overflow_for(shard_id), 1);
+                }
+                // Counted and logged once per stall (moon#1272 review), not
+                // one WARN per refused write.
+                super::note_append_backpressure_refusal(shard_id, what, Duration::ZERO);
                 // Pre-send ChannelFull into a fresh oneshot pair; the
                 // caller's `ack_rx` was already returned — we create a
                 // new pair and use its sender to pre-fill what the caller
@@ -2768,6 +2779,39 @@ mod pool_tests {
         assert!(
             rx0.try_recv().is_err(),
             "fsync_barrier under EverySec must NOT enqueue any message"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // moon#1272 round 2b: an `appendfsync always` barrier refused because the
+    // writer is backlogged is a backpressure refusal (counted as one, answered
+    // with the backlog reply), never "fsync failed".
+    // -----------------------------------------------------------------------
+    #[test]
+    fn fsync_barrier_always_on_full_channel_is_a_backpressure_refusal() {
+        use crate::persistence::aof::{
+            AOF_APPEND_BACKPRESSURE_REFUSALS, AOF_BACKLOG_ERR, append_refusal_reply,
+        };
+        let (tx0, _rx0) = channel::mpsc_bounded::<AofMessage>(1);
+        tx0.try_send(AofMessage::Shutdown).expect("pre-fill");
+        let (tx1, _rx1) = channel::mpsc_bounded::<AofMessage>(1);
+        let pool = AofWriterPool::per_shard_with_policy(
+            vec![tx0, tx1],
+            FsyncPolicy::Always,
+            Duration::ZERO,
+        );
+
+        let before = AOF_APPEND_BACKPRESSURE_REFUSALS.load(std::sync::atomic::Ordering::Relaxed);
+        let result = futures::executor::block_on(pool.fsync_barrier(0));
+        let Err(ack) = result else {
+            panic!("a barrier on a full channel must be refused, got {result:?}");
+        };
+        assert_eq!(ack, AofAck::ChannelFull);
+        assert!(ack.is_backpressure());
+        assert_eq!(append_refusal_reply(ack), AOF_BACKLOG_ERR);
+        assert!(
+            AOF_APPEND_BACKPRESSURE_REFUSALS.load(std::sync::atomic::Ordering::Relaxed) > before,
+            "the refused barrier must count as a backpressure refusal"
         );
     }
 

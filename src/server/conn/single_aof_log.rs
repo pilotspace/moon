@@ -157,15 +157,23 @@ impl<'a> SingleAofLog<'a> {
             }
         }
         if !self.barrier_idxs.is_empty() {
-            let synced = match self.pool {
-                Some(pool) => pool.fsync_barrier(0).await.is_ok(),
-                None => true,
+            let barrier = match self.pool {
+                Some(pool) => pool.fsync_barrier(0).await,
+                None => Ok(()),
             };
-            if !synced {
-                outcome = Settled::NotDurable;
+            if let Err(ack) = barrier {
+                // moon#1272 review: a barrier refused for writer backlog is
+                // backpressure (the connection stays open); only a failed or
+                // unconfirmed fsync is NotDurable.
+                outcome = if !ack.is_backpressure() || outcome == Settled::NotDurable {
+                    Settled::NotDurable
+                } else {
+                    Settled::Backlogged
+                };
+                let err = crate::persistence::aof::append_refusal_reply(ack);
                 for &idx in &self.barrier_idxs {
                     if let Some(slot) = responses.get_mut(idx) {
-                        *slot = Frame::Error(Bytes::from_static(AOF_FSYNC_ERR));
+                        *slot = Frame::Error(Bytes::from_static(err));
                     }
                 }
             }
