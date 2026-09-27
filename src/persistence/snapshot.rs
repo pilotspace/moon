@@ -1489,3 +1489,6 @@ mod eviction_capture_tests;
 
 #[cfg(test)]
 mod removal_move_tests;
+
+#[cfg(test)]
+mod review_r2a_tests;

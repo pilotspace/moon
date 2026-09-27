@@ -263,21 +263,50 @@ impl AofManifest {
     /// Call immediately after initialization, before any writer opens the
     /// incr; the record is fsynced so it is never a torn head.
     pub fn seed_cold_cut(&self, watermark_for_shard: impl Fn(u16) -> u64) -> std::io::Result<()> {
-        use crate::persistence::cold_records::{frame_unoffset, serialize_cold_cut};
-        let write = |path: PathBuf, bytes: &[u8]| -> std::io::Result<()> {
+        self.seed_generation_head(watermark_for_shard, |_| {
+            crate::persistence::cold_records::ColdDeletes::default()
+        })
+    }
+
+    /// [`Self::seed_cold_cut`] with the `DEL`s the fresh generation's head
+    /// must carry, per shard (moon#1281 round 2: the dead spill slots a boot
+    /// dropped on a no-AOF snapshot's word —
+    /// `aof::fold_stream::fresh_generation_deletes`). The head is written and
+    /// fsynced before any client write can be acknowledged, like a fold's.
+    pub fn seed_generation_head(
+        &self,
+        watermark_for_shard: impl Fn(u16) -> u64,
+        mut deletes_for_shard: impl FnMut(u16) -> crate::persistence::cold_records::ColdDeletes,
+    ) -> std::io::Result<()> {
+        use crate::persistence::cold_records::write_generation_head_to;
+        let write = |path: PathBuf,
+                     watermark: u64,
+                     deletes: crate::persistence::cold_records::ColdDeletes,
+                     framed: bool|
+         -> std::io::Result<()> {
             let mut f = std::fs::OpenOptions::new().append(true).open(&path)?;
-            f.write_all(bytes)?;
+            let mut buf = std::io::BufWriter::new(&mut f);
+            write_generation_head_to(&mut buf, watermark, deletes, framed)?;
+            buf.flush()?;
+            drop(buf);
             f.sync_data()
         };
         match self.layout {
-            AofLayout::TopLevel => {
-                let resp = serialize_cold_cut(watermark_for_shard(0));
-                write(self.incr_path(), &resp)
-            }
+            AofLayout::TopLevel => write(
+                self.incr_path(),
+                watermark_for_shard(0),
+                deletes_for_shard(0),
+                false,
+            ),
             AofLayout::PerShard => {
                 for shard in &self.shards {
-                    let resp = serialize_cold_cut(watermark_for_shard(shard.shard_id));
-                    write(self.shard_incr_path(shard.shard_id), &frame_unoffset(&resp))?;
+                    let sid = shard.shard_id;
+                    write(
+                        self.shard_incr_path(sid),
+                        watermark_for_shard(sid),
+                        deletes_for_shard(sid),
+                        true,
+                    )?;
                 }
                 Ok(())
             }

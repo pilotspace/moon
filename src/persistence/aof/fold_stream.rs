@@ -434,8 +434,6 @@ pub(crate) fn for_each_in_flight_base_entry(
 /// own pass for the expired shadows — for a fold that does not stream its
 /// base through [`stream_fold_image`] (the legacy cloning
 /// `do_rewrite_single`).
-// Only the monoio-only `do_rewrite_single` folds without streaming.
-#[cfg_attr(not(feature = "runtime-monoio"), allow(dead_code))]
 pub(crate) fn fold_cold_deletes(dbs: &[&Database], now_ms: u64) -> ColdDeletes {
     let mut out = ColdDeletes::default();
     for (db_idx, db) in dbs.iter().enumerate() {
@@ -458,6 +456,19 @@ pub(crate) fn fold_cold_deletes(dbs: &[&Database], now_ms: u64) -> ColdDeletes {
         });
     }
     out
+}
+
+/// The `DEL`s a FRESH AOF generation's head must carry (moon#1281 round 2,
+/// R2-1): a boot that loaded a no-AOF snapshot and dropped its dead spill
+/// slots seeded the dead-slot ledger with them, but only a fold's head ever
+/// wrote that ledger out — and a generation created at boot has had no
+/// fold. Its `MOON.COLDCUT` authorizes every listed spill file, so without
+/// these deletes the next AOF-led boot re-indexes the slots. The same
+/// selection as a fold's head: live keys (hot, in flight, or cold elsewhere)
+/// are filtered out.
+pub fn fresh_generation_deletes(dbs: &[Database], now_ms: u64) -> ColdDeletes {
+    let refs: Vec<&Database> = dbs.iter().collect();
+    fold_cold_deletes(&refs, now_ms)
 }
 
 /// How often a writer waiting on a slow image logs that it is still waiting.

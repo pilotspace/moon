@@ -652,25 +652,32 @@ pub(crate) fn run_cold_orphan_sweep(
 /// snapshot already excludes the keys those files backed. Then the start is
 /// counted. Owner thread, no database guard held.
 ///
-/// Returns the snapshot's cold-graves trailer (moon#1281): without an AOF,
-/// every dead slot the cold indexes hold at this instant, encoded for the
-/// snapshot to carry (`persistence::snapshot::cold_graves`). Empty with an
-/// AOF, without a cold tier, or with no dead slot — the snapshot is then
+/// Returns the snapshot's cold-graves trailer (moon#1281): every dead slot
+/// the cold indexes' grave records hold at this instant, encoded for the
+/// snapshot to carry (`persistence::snapshot::cold_graves`). Without an AOF
+/// that is every dead slot; with one only the graves a boot carried forward.
+/// Empty without a cold tier or with no grave — the snapshot is then
 /// byte-identical to the pre-moon#1281 format.
 #[must_use]
 pub(crate) fn note_snapshot_started(shard_databases: &Arc<ShardDatabases>) -> Vec<u8> {
     use crate::storage::tiered::snapshot_hold;
     let mut graves = crate::persistence::snapshot::cold_graves::Encoder::default();
-    if snapshot_hold::applies() {
-        let stamp = snapshot_hold::epoch_before_start();
-        for db_idx in 0..shard_databases.db_count() {
-            crate::shard::slice::with_shard_db(db_idx, |db| {
-                if let Some(ci) = db.cold_index.as_mut() {
+    let hold = snapshot_hold::applies();
+    let stamp = snapshot_hold::epoch_before_start();
+    for db_idx in 0..shard_databases.db_count() {
+        crate::shard::slice::with_shard_db(db_idx, |db| {
+            if let Some(ci) = db.cold_index.as_mut() {
+                if hold {
                     ci.hold_queued_before_snapshot(stamp);
-                    ci.encode_graves_into(&mut graves);
                 }
-            });
-        }
+                // Also with an AOF (moon#1281 round 2, R2-1): an AOF process
+                // records no new graves, but still carries those its boot
+                // dropped on a no-AOF snapshot's word; a layout that loads
+                // the snapshot under its log (tokio `--shards 1`) must not
+                // lose them at the next BGSAVE. Empty = no trailer.
+                ci.encode_graves_into(&mut graves);
+            }
+        });
     }
     snapshot_hold::note_snapshot_started();
     graves.finish()

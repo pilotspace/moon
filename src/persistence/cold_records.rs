@@ -195,6 +195,16 @@ pub fn frame_unoffset(resp: &[u8]) -> Vec<u8> {
 ///
 /// Returns whether the head was written.
 pub fn seed_cold_cut_if_fresh(path: &std::path::Path, watermark: u64) -> std::io::Result<bool> {
+    seed_generation_head_if_fresh(path, watermark, ColdDeletes::default())
+}
+
+/// [`seed_cold_cut_if_fresh`] with the `DEL`s the fresh generation's head
+/// must carry (moon#1281 round 2; see `AofManifest::seed_generation_head`).
+pub fn seed_generation_head_if_fresh(
+    path: &std::path::Path,
+    watermark: u64,
+    deletes: ColdDeletes,
+) -> std::io::Result<bool> {
     use std::io::Write;
     match std::fs::metadata(path) {
         Ok(meta) if meta.len() > 0 => return Ok(false),
@@ -206,7 +216,10 @@ pub fn seed_cold_cut_if_fresh(path: &std::path::Path, watermark: u64) -> std::io
         .create(true)
         .append(true)
         .open(path)?;
-    file.write_all(&serialize_cold_cut(watermark))?;
+    let mut buf = std::io::BufWriter::new(&mut file);
+    write_generation_head_to(&mut buf, watermark, deletes, false)?;
+    buf.flush()?;
+    drop(buf);
     file.sync_data()?;
     Ok(true)
 }
