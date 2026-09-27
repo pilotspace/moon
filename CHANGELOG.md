@@ -511,7 +511,11 @@ shared 4-vCPU Linux container against HEAD `935c555` — re-measure on the GCE r
   `spill_thread_restarts`, `spill_thread_degraded`, `spill_thread_rehydrated`
   (`spill_thread_alive` now means "no shard's thread is down right now"); new
   metrics `moon_spill_thread_deaths_total`, `moon_spill_thread_restarts_total`,
-  `moon_spill_threads_degraded`.
+  `moon_spill_threads_degraded`. A cold-reclaim file that kills the thread twice
+  is given up (left on disk and still readable, not compacted again), so one
+  corrupt file cannot use up the restart budget; INFO
+  `cold_reclaim_files_given_up` counts every reclaim give-up. The restart
+  budget runs on a monotonic clock: a wall-clock step no longer refills it.
 
 - **Data loss on a graceful exit with the default `--appendonly yes`** (moon#1274). SIGTERM (`systemctl stop`), SIGINT or `SHUTDOWN` lost acknowledged writes still queued for the AOF writers: all 300 of 300 at `--shards 1`. Shutdown now stops the shards, then lets every AOF writer write its queue and fsync before exiting, as redis's `prepareForShutdown` does.
 - **Data loss on SIGTERM/SIGINT with save points and `--appendonly no`** (moon#1263). Every write since the last automatic save was lost. The server now saves first; see Changed.
