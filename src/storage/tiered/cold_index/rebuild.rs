@@ -93,12 +93,20 @@ impl ColdIndex {
         let mut per_db: Vec<(usize, Vec<((u64, Bytes), ColdLocation)>)> = Vec::new();
         // moon#1281: the grave slots dropped per db, `(file_id, packed slot)`,
         // re-recorded into that db's rebuilt index below.
-        let mut buried_per_db: Vec<(usize, Vec<(u64, u64)>)> = Vec::new();
+        // Per db: every grave slot this scan dropped, as `(file_id, the
+        // slot's key and TTL when it decoded)` — the key feeds an AOF
+        // process's dead-slot ledger.
+        let mut buried_per_db: Vec<(usize, Vec<(u64, Option<(Bytes, Option<u64>)>)>)> = Vec::new();
+        // Every listed (Active KvLeaf) file and its db: the graves of a
+        // listed file are carried forward whether or not this boot could
+        // read it (review F2).
+        let mut listed_db: HashMap<u64, usize> = HashMap::new();
         let data_dir = shard_dir.join("data");
 
         for entry in manifest.files() {
             if entry.status == FileStatus::Active && entry.file_type == PageType::KvLeaf as u8 {
                 let db = entry.db_index as usize;
+                listed_db.insert(entry.file_id, db);
                 let pairs = match per_db.iter_mut().find(|(d, _)| *d == db) {
                     Some((_, p)) => p,
                     None => {
@@ -210,13 +218,12 @@ impl ColdIndex {
                     for slot_idx in 0..page.slot_count() {
                         if graves.is_some_and(|g| g.contains(file_id, page_idx as u32, slot_idx)) {
                             report.entries_tombstoned += 1;
-                            let packed = crate::persistence::snapshot::cold_graves::pack_slot(
-                                page_idx as u32,
-                                slot_idx,
-                            );
+                            let slot = page
+                                .get(slot_idx)
+                                .map(|kv| (Bytes::from(kv.key), kv.ttl_ms));
                             match buried_per_db.iter_mut().find(|(d, _)| *d == db) {
-                                Some((_, v)) => v.push((file_id, packed)),
-                                None => buried_per_db.push((db, vec![(file_id, packed)])),
+                                Some((_, v)) => v.push((file_id, slot)),
+                                None => buried_per_db.push((db, vec![(file_id, slot)])),
                             }
                             continue;
                         }
@@ -270,8 +277,21 @@ impl ColdIndex {
         // every duplicated key to its newest on-disk copy. A db that recovered
         // nothing but has missing files to retire still gets an (empty) index
         // so the queue has somewhere to live.
+        // moon#1281: every grave of a still-listed file, by the file's db —
+        // including files this boot could not read or found missing: the
+        // next snapshot must carry them again (review F2), or a later boot
+        // that can read the file brings the deleted keys back.
+        let mut carried: Vec<(usize, u64, Vec<u64>)> = Vec::new();
+        if let Some(g) = graves {
+            for (file_id, slots) in g.to_files() {
+                if let Some(&db) = listed_db.get(&file_id) {
+                    carried.push((db, file_id, slots));
+                }
+            }
+        }
         let extra_dbs = missing_per_db.iter().map(|(d, _)| *d);
-        for db in extra_dbs.chain(buried_per_db.iter().map(|(d, _)| *d)) {
+        let extra_dbs = extra_dbs.chain(buried_per_db.iter().map(|(d, _)| *d));
+        for db in extra_dbs.chain(carried.iter().map(|(d, _, _)| *d)) {
             if !per_db.iter().any(|(d, _)| *d == db) {
                 per_db.push((db, Vec::new()));
             }
@@ -284,11 +304,22 @@ impl ColdIndex {
                     index.pending_unlink.extend_from_slice(ids);
                     index.missing_at_rebuild.extend_from_slice(ids);
                 }
+                for (_, file_id, slots) in carried.iter().filter(|(d, _, _)| *d == db) {
+                    for &packed in slots {
+                        index.graves.note_unconditionally(*file_id, packed);
+                    }
+                }
                 if let Some((_, buried)) = buried_per_db.iter().find(|(d, _)| *d == db) {
                     let mut files = std::collections::HashSet::new();
-                    for &(file_id, packed) in buried {
-                        index.graves.note_unconditionally(file_id, packed);
-                        files.insert(file_id);
+                    for (file_id, slot) in buried {
+                        // With an AOF writer (a no-AOF snapshot booted with
+                        // `--appendonly yes`, review F1) the fold's key ledger
+                        // must know the dropped slot too, or the first
+                        // AOF-led boot re-indexes it. A no-op without one.
+                        if let Some((key, ttl_ms)) = slot {
+                            index.dead.note(*file_id, key.clone(), *ttl_ms);
+                        }
+                        files.insert(*file_id);
                     }
                     for file_id in files {
                         if !index.file_refs.contains_key(&file_id)

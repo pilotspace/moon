@@ -453,11 +453,14 @@ pub fn recover_shard_v3_pitr(
                 );
             }
             Ok(mut manifest) => {
-                // moon#1281: with an AOF the log (and its folds' DELs) decides
-                // which slots are dead; the graves are the no-AOF authority.
-                let graves = snapshot_graves
-                    .as_ref()
-                    .filter(|_| crate::storage::tiered::snapshot_hold::applies());
+                // moon#1281: the loaded snapshot is this boot's KV base, and
+                // the slots it names were dead when it was taken — whatever
+                // this process's own AOF mode (review F1: a no-AOF snapshot
+                // booted with `--appendonly yes` loaded the keys and ignored
+                // the graves). Slots are immutable and never re-pointed, so no
+                // log replayed after the snapshot can make one live again.
+                // Only a no-AOF snapshot carries a trailer.
+                let graves = snapshot_graves.as_ref();
                 let crate::storage::tiered::cold_index::ColdRebuild { per_db, report } =
                     crate::storage::tiered::cold_index::ColdIndex::rebuild_from_manifest_per_db_with_graves(
                         shard_dir, &manifest, graves,

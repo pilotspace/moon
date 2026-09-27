@@ -438,9 +438,12 @@ fn info_raw(db: &Database, facts: &InstanceFacts) -> String {
     // operator must be able to see how much of it is ledger. Summed over
     // every shard and database; two relaxed loads.
     let (cold_dead_slots, cold_dead_slot_bytes) = crate::storage::tiered::dead_slots::totals();
+    // moon#1281 review F7: the no-AOF dead-slot record (8 B per slot).
+    let (cold_grave_slots, cold_grave_bytes) = crate::storage::tiered::slot_graves::totals();
     let _ = write!(
         sections,
-        "cold_dead_slots:{cold_dead_slots}\r\ncold_dead_slot_bytes:{cold_dead_slot_bytes}\r\n"
+        "cold_dead_slots:{cold_dead_slots}\r\ncold_dead_slot_bytes:{cold_dead_slot_bytes}\r\n\
+         cold_grave_slots:{cold_grave_slots}\r\ncold_grave_bytes:{cold_grave_bytes}\r\n"
     );
 
     // Allocator counters, Redis's `allocator_*` field names so existing

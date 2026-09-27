@@ -21,6 +21,7 @@
 //! the authority and the key-carrying ledger does this job.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::persistence::snapshot::cold_graves::pack_slot;
 
@@ -51,11 +52,31 @@ fn enabled() -> bool {
     }
 }
 
+/// Grave slots held by every record in the process (`INFO` Memory
+/// `cold_grave_slots`; review F7). One relaxed add or sub per change.
+static GRAVE_SLOTS_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// `(grave slots, approximate bytes)` over every record in the process.
+#[must_use]
+pub fn totals() -> (u64, u64) {
+    let n = GRAVE_SLOTS_TOTAL.load(Ordering::Relaxed);
+    (n, n * std::mem::size_of::<u64>() as u64)
+}
+
 /// Dead slot locations, by file.
 #[derive(Debug, Default)]
 pub struct SlotGraves {
     by_file: HashMap<u64, Vec<u64>>,
     len: usize,
+}
+
+impl Drop for SlotGraves {
+    /// A dropped record (its index replaced or freed) leaves the totals.
+    fn drop(&mut self) {
+        if self.len != 0 {
+            GRAVE_SLOTS_TOTAL.fetch_sub(self.len as u64, Ordering::Relaxed);
+        }
+    }
 }
 
 impl SlotGraves {
@@ -71,6 +92,7 @@ impl SlotGraves {
             .or_default()
             .push(pack_slot(page_idx, slot_idx));
         self.len += 1;
+        GRAVE_SLOTS_TOTAL.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Record a slot that is already known dead (the boot re-seeding what the
@@ -78,12 +100,14 @@ impl SlotGraves {
     pub(crate) fn note_unconditionally(&mut self, file_id: u64, packed: u64) {
         self.by_file.entry(file_id).or_default().push(packed);
         self.len += 1;
+        GRAVE_SLOTS_TOTAL.fetch_add(1, Ordering::Relaxed);
     }
 
     /// `file_id` is gone from disk: its slots cannot come back.
     pub fn forget_file(&mut self, file_id: u64) {
         if let Some(v) = self.by_file.remove(&file_id) {
             self.len -= v.len();
+            GRAVE_SLOTS_TOTAL.fetch_sub(v.len() as u64, Ordering::Relaxed);
         }
     }
 
@@ -123,17 +147,18 @@ impl SlotGraves {
         self.len == 0
     }
 
-    /// Append `(file_id, packed slots)` for every file into `out`: what a
-    /// snapshot starting now carries. O(slots), a copy of `u64`s.
+    /// Append `(file_id, packed slots)` for every file into `out` (tests
+    /// and tools; the snapshot uses [`Self::encode_into`]).
     pub fn collect_into(&self, out: &mut Vec<(u64, Vec<u64>)>) {
         out.extend(self.by_file.iter().map(|(&f, s)| (f, s.clone())));
     }
 
-    /// Approximate RAM held (the `u64` per slot plus the per-file vectors).
-    #[must_use]
-    pub fn resident_bytes(&self) -> usize {
-        self.len * std::mem::size_of::<u64>()
-            + self.by_file.len() * (std::mem::size_of::<(u64, Vec<u64>)>() + 16)
+    /// Write every file's slots into the trailer being built: what a snapshot
+    /// starting now carries. O(slots), no intermediate copy (review F6).
+    pub fn encode_into(&self, enc: &mut crate::persistence::snapshot::cold_graves::Encoder) {
+        for (&file_id, slots) in &self.by_file {
+            enc.add_file(file_id, slots);
+        }
     }
 }
 

@@ -372,46 +372,6 @@ pub(crate) fn fire_pending_mq_triggers(
 /// Default interval for cold-tier orphan sweep (5 minutes).
 pub const COLD_ORPHAN_SWEEP_INTERVAL_SECS: u64 = 300;
 
-/// Run a cold-tier orphan sweep across all databases for a single shard.
-///
-/// Iterates each database's cold index and removes entries whose key is now
-/// present in the hot DashTable (i.e. a hot write shadowed the spilled copy).
-/// The corresponding DataFile and manifest entry are tombstoned atomically.
-///
-/// Also runs the proactive TTL-expiry sweep (R1, H-2:
-/// `tmp/OFFLOAD-COMPRESSION-REVIEW.md`) in the same tick: cold entries whose
-/// TTL has passed and which were never re-read (the on-read reclaim in
-/// `cold_read.rs` only fires on an actual `GET`) previously leaked their
-/// index entry and file refcount forever. Sharing this tick's cadence keeps
-/// the plumbing (interval config, disk-offload gate, manifest handle) single
-/// -sourced rather than adding a second timer for the same "sweep the cold
-/// tier" concern.
-///
-/// Called from the shard event loop on a low-priority 5-minute timer (or the
-/// interval configured via `--cold-orphan-sweep-interval-secs`).
-///
-/// # Concurrency
-///
-/// Each database is accessed via `with_shard_db`, which gives exclusive
-/// access for the duration of the closure on this shard's own event-loop
-/// thread (thread-per-core model — no other thread ever touches this
-/// shard's databases). Spill, read-promotion, and eviction all run through
-/// the same single-threaded exclusivity, preventing TOCTOU races with either
-/// sweep.
-///
-/// # Which zero-ref files it unlinks (moon#1231)
-///
-/// With an AOF writer (`aof_pool`), every unlink decision gets a fresh
-/// [`FoldView`](crate::storage::tiered::unlink_hold::FoldView) — this
-/// shard's fold epoch, committed floor and spill-file counter
-/// (`spill_file_id`), read right before the decision on this thread — and a
-/// file a replayable generation may still read is held until a committed fold
-/// covers it (`storage::tiered::unlink_hold`). Without one, a file is held
-/// until a snapshot that started after it went zero-ref has succeeded
-/// (moon#1260, `storage::tiered::snapshot_hold`), with or without save points.
-/// In a TopLevel layout with more than one
-/// shard — which no shipped configuration builds — no committed fold covers
-/// this shard, so held files are never released (see the guard below).
 /// The unlink hold's view of this shard right now (moon#1231 / moon#1260):
 /// the AOF fold state with a writer, the snapshot lifecycle without one.
 fn fold_view_now(
@@ -476,6 +436,46 @@ pub(crate) fn observe_boot_fold_view(
     }
 }
 
+/// Run a cold-tier orphan sweep across all databases for a single shard.
+///
+/// Iterates each database's cold index and removes entries whose key is now
+/// present in the hot DashTable (i.e. a hot write shadowed the spilled copy).
+/// The corresponding DataFile and manifest entry are tombstoned atomically.
+///
+/// Also runs the proactive TTL-expiry sweep (R1, H-2:
+/// `tmp/OFFLOAD-COMPRESSION-REVIEW.md`) in the same tick: cold entries whose
+/// TTL has passed and which were never re-read (the on-read reclaim in
+/// `cold_read.rs` only fires on an actual `GET`) previously leaked their
+/// index entry and file refcount forever. Sharing this tick's cadence keeps
+/// the plumbing (interval config, disk-offload gate, manifest handle) single
+/// -sourced rather than adding a second timer for the same "sweep the cold
+/// tier" concern.
+///
+/// Called from the shard event loop on a low-priority 5-minute timer (or the
+/// interval configured via `--cold-orphan-sweep-interval-secs`).
+///
+/// # Concurrency
+///
+/// Each database is accessed via `with_shard_db`, which gives exclusive
+/// access for the duration of the closure on this shard's own event-loop
+/// thread (thread-per-core model — no other thread ever touches this
+/// shard's databases). Spill, read-promotion, and eviction all run through
+/// the same single-threaded exclusivity, preventing TOCTOU races with either
+/// sweep.
+///
+/// # Which zero-ref files it unlinks (moon#1231)
+///
+/// With an AOF writer (`aof_pool`), every unlink decision gets a fresh
+/// [`FoldView`](crate::storage::tiered::unlink_hold::FoldView) — this
+/// shard's fold epoch, committed floor and spill-file counter
+/// (`spill_file_id`), read right before the decision on this thread — and a
+/// file a replayable generation may still read is held until a committed fold
+/// covers it (`storage::tiered::unlink_hold`). Without one, a file is held
+/// until a snapshot that started after it went zero-ref has succeeded
+/// (moon#1260, `storage::tiered::snapshot_hold`), with or without save points.
+/// In a TopLevel layout with more than one
+/// shard — which no shipped configuration builds — no committed fold covers
+/// this shard, so held files are never released (see the guard below).
 pub(crate) fn run_cold_orphan_sweep(
     shard_databases: &Arc<super::shared_databases::ShardDatabases>,
     shard_id: usize,
@@ -652,20 +652,20 @@ pub(crate) fn run_cold_orphan_sweep(
 #[must_use]
 pub(crate) fn note_snapshot_started(shard_databases: &Arc<ShardDatabases>) -> Vec<u8> {
     use crate::storage::tiered::snapshot_hold;
-    let mut graves = Vec::new();
+    let mut graves = crate::persistence::snapshot::cold_graves::Encoder::default();
     if snapshot_hold::applies() {
         let stamp = snapshot_hold::epoch_before_start();
         for db_idx in 0..shard_databases.db_count() {
             crate::shard::slice::with_shard_db(db_idx, |db| {
                 if let Some(ci) = db.cold_index.as_mut() {
                     ci.hold_queued_before_snapshot(stamp);
-                    ci.collect_graves_into(&mut graves);
+                    ci.encode_graves_into(&mut graves);
                 }
             });
         }
     }
     snapshot_hold::note_snapshot_started();
-    crate::persistence::snapshot::cold_graves::encode(&graves)
+    graves.finish()
 }
 
 /// A snapshot of this shard just finished successfully (moon#1260 review

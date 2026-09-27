@@ -166,28 +166,56 @@ impl std::fmt::Display for GravesError {
 /// to nothing: a snapshot with no graves is byte-identical to the old format.
 #[must_use]
 pub fn encode(files: &[(u64, Vec<u64>)]) -> Vec<u8> {
-    let files: Vec<&(u64, Vec<u64>)> = files.iter().filter(|(_, s)| !s.is_empty()).collect();
-    if files.is_empty() {
-        return Vec::new();
-    }
-    let slots: usize = files.iter().map(|(_, s)| s.len()).sum();
-    let mut out =
-        Vec::with_capacity(HEADER_LEN + files.len() * FILE_HEADER_LEN + slots * SLOT_LEN + CRC_LEN);
-    out.extend_from_slice(MAGIC);
-    out.push(VERSION);
-    out.extend_from_slice(&(files.len() as u32).to_le_bytes());
+    let mut enc = Encoder::default();
     for (file_id, packed) in files {
-        out.extend_from_slice(&file_id.to_le_bytes());
-        out.extend_from_slice(&(packed.len() as u32).to_le_bytes());
+        enc.add_file(*file_id, packed);
+    }
+    enc.finish()
+}
+
+/// Streaming trailer encoder: each file's slots are written straight from
+/// the caller's storage (review F6 — the snapshot start builds the trailer on
+/// the shard thread, so no per-file copy is made first).
+#[derive(Debug, Default)]
+pub struct Encoder {
+    out: Vec<u8>,
+    files: u32,
+}
+
+impl Encoder {
+    /// Append one file's packed slots (nothing for an empty slice).
+    pub fn add_file(&mut self, file_id: u64, packed: &[u64]) {
+        if packed.is_empty() {
+            return;
+        }
+        if self.out.is_empty() {
+            self.out.extend_from_slice(MAGIC);
+            self.out.push(VERSION);
+            self.out.extend_from_slice(&0u32.to_le_bytes()); // patched in `finish`
+        }
+        self.out.reserve(FILE_HEADER_LEN + packed.len() * SLOT_LEN);
+        self.out.extend_from_slice(&file_id.to_le_bytes());
+        self.out
+            .extend_from_slice(&(packed.len() as u32).to_le_bytes());
         for &p in packed {
             let (page, slot) = unpack_slot(p);
-            out.extend_from_slice(&page.to_le_bytes());
-            out.extend_from_slice(&slot.to_le_bytes());
+            self.out.extend_from_slice(&page.to_le_bytes());
+            self.out.extend_from_slice(&slot.to_le_bytes());
         }
+        self.files += 1;
     }
-    let crc = crc32fast::hash(&out);
-    out.extend_from_slice(&crc.to_le_bytes());
-    out
+
+    /// The trailer; empty when no file had a slot.
+    #[must_use]
+    pub fn finish(mut self) -> Vec<u8> {
+        if self.out.is_empty() {
+            return self.out;
+        }
+        self.out[5..9].copy_from_slice(&self.files.to_le_bytes());
+        let crc = crc32fast::hash(&self.out);
+        self.out.extend_from_slice(&crc.to_le_bytes());
+        self.out
+    }
 }
 
 #[inline]
@@ -211,6 +239,12 @@ fn le_u32(b: &[u8]) -> u32 {
 /// panics and never allocates past what the input can hold: every count is
 /// checked against the bytes left before anything is reserved.
 pub fn decode(bytes: &[u8]) -> Result<ColdGraves, GravesError> {
+    // No trailer means no graves: the inverse of `encode(&[])`, so every
+    // encoding round-trips (review F3; the loader only calls this when bytes
+    // follow EOF).
+    if bytes.is_empty() {
+        return Ok(ColdGraves::default());
+    }
     if bytes.len() < HEADER_LEN + CRC_LEN {
         return Err(GravesError::Truncated);
     }
@@ -255,6 +289,28 @@ pub fn decode(bytes: &[u8]) -> Result<ColdGraves, GravesError> {
     Ok(graves)
 }
 
+/// The loader's view of the bytes after a snapshot's EOF marker: `None`
+/// when there are none (every pre-moon#1281 file) or when they fail their
+/// own checks — logged, never a reason to refuse the key data the global CRC
+/// already proved.
+pub fn read_trailer(after_eof: &[u8], path: &std::path::Path) -> Option<ColdGraves> {
+    if after_eof.is_empty() {
+        return None;
+    }
+    match decode(after_eof) {
+        Ok(g) => Some(g),
+        Err(e) => {
+            tracing::error!(
+                path = %path.display(),
+                bytes = after_eof.len(),
+                "Snapshot load: cold-graves trailer ignored ({e}); spill slots of cold keys \
+                 deleted before this snapshot may read as live again"
+            );
+            None
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -288,7 +344,7 @@ mod tests {
     #[test]
     fn every_corruption_is_refused_never_a_panic() {
         let good = encode(&[(1, vec![pack_slot(2, 3)])]);
-        for cut in 0..good.len() {
+        for cut in 1..good.len() {
             assert!(decode(&good[..cut]).is_err(), "prefix of {cut} bytes");
         }
         for i in 0..good.len() {

@@ -1297,20 +1297,8 @@ pub fn shard_snapshot_load_with_graves<D: std::borrow::BorrowMut<Database>>(
 
         match tag[0] {
             EOF_MARKER => {
-                // moon#1281: anything between EOF and the global CRC is the
-                // cold-graves trailer (older writers leave nothing there).
-                let at = cursor.position() as usize;
-                if at < payload.len() {
-                    match cold_graves::decode(&payload[at..]) {
-                        Ok(g) => *graves = Some(g),
-                        Err(e) => tracing::error!(
-                            path = %path.display(),
-                            bytes = payload.len() - at,
-                            "Snapshot load: cold-graves trailer ignored ({e}); spill slots of \
-                             cold keys deleted before this snapshot may read as live again"
-                        ),
-                    }
-                }
+                // moon#1281: the bytes between EOF and the global CRC.
+                *graves = cold_graves::read_trailer(&payload[cursor.position() as usize..], path);
                 break;
             }
             DB_SELECTOR => {

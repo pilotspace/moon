@@ -414,6 +414,12 @@ impl ColdIndex {
         self.graves.collect_into(out);
     }
 
+    /// Write this index's no-AOF dead slots into the snapshot trailer being
+    /// built at snapshot start (moon#1281; no intermediate copy).
+    pub fn encode_graves_into(&self, enc: &mut crate::persistence::snapshot::cold_graves::Encoder) {
+        self.graves.encode_into(enc);
+    }
+
     /// The no-AOF dead-slot record (moon#1281; tests, diagnostics).
     #[inline]
     pub fn slot_graves(&self) -> &super::slot_graves::SlotGraves {

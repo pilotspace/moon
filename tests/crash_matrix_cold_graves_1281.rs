@@ -14,6 +14,7 @@
 //! | `AfterPublish` | `BGSAVE` completed | absent |
 //! | `DuringSweep` | `BGSAVE` completed + 0-2.5 s (the post-save sweep, its unlinks and manifest commit) | absent |
 //! | `SecondGeneration` | `BGSAVE`, kill, restart, `BGSAVE`, kill | absent |
+//! | `WholeFilesSweep` | every probe AND filler deleted (whole files go zero-ref), `BGSAVE`, 0-2.5 s (the post-save sweep's unlinks and manifest tombstone commit) | every probe absent |
 //!
 //! Every point: every ODD probe comes back with its value (nothing lost), and
 //! no probe ever reads a value it never had.
@@ -21,7 +22,7 @@
 //!   MOON_BIN=target/release/moon cargo test --release \
 //!     --test crash_matrix_cold_graves_1281 -- --ignored --test-threads 1
 //! Knobs: `MOON_TEST_COLD_DEL_SHARDS` (1 or 4, default 4),
-//! `MOON_TEST_MATRIX_RUNS` (iterations, default 20), `MOON_TEST_SEED`.
+//! `MOON_TEST_MATRIX_RUNS` (iterations, default 24: four per kill point), `MOON_TEST_SEED`.
 //!
 //! Requires: built release binary, `redis-cli` on PATH.
 
@@ -43,14 +44,19 @@ enum KillPoint {
     AfterPublish,
     DuringSweep,
     SecondGeneration,
+    /// Review F5: with the odd probes alive every file kept a live key, so
+    /// no unlink or manifest commit ever ran in the kill window. Here whole
+    /// files go zero-ref and the post-save sweep unlinks them.
+    WholeFilesSweep,
 }
 
-const POINTS: [KillPoint; 5] = [
+const POINTS: [KillPoint; 6] = [
     KillPoint::NoSave,
     KillPoint::DuringSave,
     KillPoint::AfterPublish,
     KillPoint::DuringSweep,
     KillPoint::SecondGeneration,
+    KillPoint::WholeFilesSweep,
 ];
 
 const SAVE: [&str; 2] = ["--save", "3600 100000000"];
@@ -167,10 +173,18 @@ fn iteration(pristine: &Path, point: KillPoint, rng: &mut Rng, i: usize) -> (usi
         before.iter().any(|(_, v)| *v == val),
         "precondition failed: no probe inherited"
     );
-    let evens: Vec<String> = (0..PROBE_COUNT).step_by(2).map(probe_key).collect();
+    let whole = point == KillPoint::WholeFilesSweep;
+    let evens: Vec<String> = (0..PROBE_COUNT)
+        .step_by(if whole { 1 } else { 2 })
+        .map(probe_key)
+        .collect();
     let mut del: Vec<&str> = vec!["DEL"];
     del.extend(evens.iter().map(String::as_str));
     redis_cmd(port, &del);
+    let files_before = count_heap_files(&dir);
+    if whole {
+        del_fillers_counting(port);
+    }
 
     match point {
         KillPoint::NoSave => {}
@@ -183,6 +197,10 @@ fn iteration(pristine: &Path, point: KillPoint, rng: &mut Rng, i: usize) -> (usi
             bgsave_and_wait(port);
             std::thread::sleep(Duration::from_millis(rng.below(2_500)));
         }
+        KillPoint::WholeFilesSweep => {
+            bgsave_and_wait(port);
+            std::thread::sleep(Duration::from_millis(rng.below(2_500)));
+        }
         KillPoint::SecondGeneration => {
             bgsave_and_wait(port);
             server.kill_now();
@@ -192,8 +210,14 @@ fn iteration(pristine: &Path, point: KillPoint, rng: &mut Rng, i: usize) -> (usi
             bgsave_and_wait(port);
         }
     }
+    let files_at_kill = count_heap_files(&dir);
     server.kill_now();
     wait_for_port_down(port);
+    if whole {
+        eprintln!(
+            "    whole-file point: heap files {files_before} before, {files_at_kill} at the kill"
+        );
+    }
 
     let mut server2 = start_moon_alive_with(port, &dir, 3600, "no", &SAVE);
     let after = probes_present(port);
@@ -202,7 +226,7 @@ fn iteration(pristine: &Path, point: KillPoint, rng: &mut Rng, i: usize) -> (usi
 
     let odd_before: Vec<usize> = before
         .iter()
-        .filter(|(i, _)| i % 2 == 1)
+        .filter(|(i, _)| !whole && i % 2 == 1)
         .map(|(i, _)| *i)
         .collect();
     let mut wrong = Vec::new();
@@ -216,10 +240,13 @@ fn iteration(pristine: &Path, point: KillPoint, rng: &mut Rng, i: usize) -> (usi
             wrong.push(format!("{} reads a value it never had", probe_key(*i)));
         }
     }
-    let evens_back = after.iter().filter(|(i, _)| i % 2 == 0).count();
+    let evens_back = after.iter().filter(|(i, _)| whole || i % 2 == 0).count();
     let must_stay_deleted = matches!(
         point,
-        KillPoint::AfterPublish | KillPoint::DuringSweep | KillPoint::SecondGeneration
+        KillPoint::AfterPublish
+            | KillPoint::DuringSweep
+            | KillPoint::SecondGeneration
+            | KillPoint::WholeFilesSweep
     );
     let resurrected = if must_stay_deleted { evens_back } else { 0 };
     let bad = resurrected > 0 || !wrong.is_empty();
@@ -238,7 +265,7 @@ fn cold_deletes_survive_every_kill_point_without_an_aof() {
     let runs: usize = std::env::var("MOON_TEST_MATRIX_RUNS")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(20);
+        .unwrap_or(24);
     let seed: u64 = std::env::var("MOON_TEST_SEED")
         .ok()
         .and_then(|v| v.parse().ok())
