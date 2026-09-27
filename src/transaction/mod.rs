@@ -6,6 +6,7 @@
 
 pub mod abort;
 pub mod commit_hooks;
+pub mod kv_compensation;
 pub mod kv_mvcc;
 pub mod undo_log;
 

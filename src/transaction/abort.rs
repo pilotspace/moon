@@ -1,34 +1,25 @@
 //! Shared cross-store transaction abort helper.
 //!
-//! Single source of truth for rolling back a `CrossStoreTxn`. Called from:
-//!   1. Explicit `TXN.ABORT` in `handler_sharded.rs` and `handler_monoio.rs`
-//!      (Phase 166 Plan 03 — this file).
-//!   2. Disconnect cleanup in both handlers (Phase 166 Plan 04 — forthcoming,
-//!      reuses this exact helper to eliminate two-handler drift).
+//! Single source of truth for rolling back a `CrossStoreTxn`. Called from
+//! explicit `TXN.ABORT`, from a `TXN.COMMIT` refused for rejected ops (#499)
+//! and from disconnect cleanup, on both runtimes — always through
+//! `server::conn::txn_abort::abort_logged`, which logs what this module
+//! returns.
 //!
 //! # Execution sequence (Phase 161 T-161-01 lock ordering)
 //!
-//! The helper performs five phases under the per-shard lock hierarchy defined
-//! in Phase 161 Plan 02:
-//!
 //! ```text
-//!   write_db guard          ─┐
-//!     KV undo replay         │ drop before next layer
-//!     drop(db)               │
-//!   graph_store_write guard ─┤ drop before next layer
-//!     graph_intents reverse replay
-//!     (edges removed before nodes via LIFO iteration)
-//!     drain graph WAL records
-//!     drop(gs)               │
-//!   vector_store guard      ─┤ drop before next layer
-//!     mark_deleted_by_key_hash for every vector_intent
-//!     txn_manager_mut().abort(txn.txn_id)
-//!     // LOCK-ORDER: drop vector_store before kv_intents
-//!     drop(vector_store)     │
-//!   kv_intents               │ no guard held across boundary
-//!     release_txn
-//!   hnsw_queue               │ no guard held across boundary
-//!     discard_for_txn
+//!   KV undo            per (db, key): first undo record only, pre-image to
+//!                      an armed snapshot by MOVE, compensating record out
+//!   graph rollback     undo ops (LIFO) then create-intent removal (LIFO);
+//!                      every step that changed the graph yields its WAL
+//!                      record
+//!   vector rollback    mark_deleted_by_key_hash_after_lsn per intent,
+//!                      txn_manager.abort
+//!                      // LOCK-ORDER: drop vector_store before kv_intents
+//!   index re-derive    every undone key's vector/text documents rebuilt
+//!                      from the RESTORED value
+//!   side tables        kv_intents.release_txn, hnsw_queue.discard_for_txn
 //! ```
 //!
 //! The `// LOCK-ORDER: drop vector_store before kv_intents` marker below is
@@ -36,38 +27,72 @@
 //! preserves the Phase 161 T-161-01 invariant regardless of guard variable
 //! naming.
 //!
+//! # Durability (moon#1285, moon#1185 option b)
+//!
+//! A transaction's writes reach the AOF, the WAL and the replication stream
+//! as they run. An abort that only rewinds memory is therefore undone by the
+//! next restart and never reaches a replica. Every plane now returns the
+//! records that make its rollback durable, in an [`AbortLog`]:
+//!
+//! - **KV** — `DEL` / `RESTORE … REPLACE ABSTTL` (+ `HPEXPIREAT`) per restored
+//!   key ([`crate::transaction::kv_compensation`]); the caller replicates
+//!   them and appends them to the AOF with the fold epoch read in the same
+//!   no-await stretch as the undo.
+//! - **Graph** — `GRAPH.REMOVENODE` / `REMOVEEDGE` for created entities,
+//!   `GRAPH.SETPROP` / `GRAPH.DELPROP` for restored properties,
+//!   `GRAPH.UNDELETENODE` / `UNDELETEEDGE` for deleted ones; the caller
+//!   WAL-appends (and, single-shard, replicates) them. Remote legs append on
+//!   the owning shard (`ShardMessage::GraphRollback`).
+//! - **Vector / text** — derived planes: the indexes are rebuilt from the
+//!   restored KV value here, and a restart rebuilds them from the recovered
+//!   keyspace (`vector::persistence::recover_v2`: dedup rescan + deletion
+//!   probe), a replica from the replicated `DEL` / `RESTORE` (index hooks).
+//!   No vector WAL record is needed: recovery never replays one.
+//! - **MQ** — `MQ PUBLISH` intents are held until commit; an abort drops them
+//!   and there is nothing to log.
+//!
 //! # Error discipline
 //!
-//! Every step is fault-tolerant:
-//! - Missing graph (e.g. `GRAPH.DELETE` earlier in the transaction) → log at
-//!   `tracing::warn!` and skip. No panic.
-//! - Missing vector index (e.g. `FT.DROPINDEX` earlier) → log and skip.
-//! - `MemGraph::remove_node` / `remove_edge` return `false` on invalid or
-//!   already-deleted keys — treated as idempotent no-op.
-//! - No `unwrap()` / `expect()` anywhere in the helper — every failure path
-//!   logs and continues.
-//!
-//! # WAL durability
-//!
-//! `TransactionManager::abort` emits the `XactAbort`-equivalent internal
-//! state transition. The graph rollback drains any WAL records produced by
-//! `MemGraph::remove_node` / `remove_edge` into `shard_databases.wal_append`
-//! so crash recovery replay sees the soft-delete records in the same order
-//! the live write path would have produced them. KV undo replay writes
-//! directly to the database without emitting new WAL records — the
-//! XactCommit record for this txn was never written (this is ABORT, not
-//! COMMIT), so WAL replay correctly reconstructs pre-txn state by skipping
-//! the uncommitted forward records.
+//! Every step is fault-tolerant: a missing graph or vector index is logged
+//! and skipped, `remove_node` / `remove_edge` returning `false` is an
+//! idempotent no-op, and there is no `unwrap()` / `expect()` in the helper.
 
-use crate::shard::shared_databases::ShardDatabases;
-use crate::transaction::{CrossStoreTxn, UndoRecord};
+use bytes::Bytes;
+
+use crate::transaction::CrossStoreTxn;
+use crate::transaction::kv_compensation::{self, CompensatingRecord};
 
 #[cfg(feature = "graph")]
 use crate::graph::types::{EdgeKey, NodeKey};
-#[cfg(feature = "graph")]
-use bytes::Bytes;
 
-/// Roll back every store side-effect of `txn`.
+/// What a rollback must log so a restart and a replica land the same state
+/// the abort left in memory (moon#1285).
+#[derive(Debug, Default)]
+pub struct AbortLog {
+    /// KV compensating records, `(db, RESP command)`, in apply order — for
+    /// the AOF and the replication stream.
+    pub kv: Vec<CompensatingRecord>,
+    /// Graph compensating WAL records of the LOCAL graph leg (RESP
+    /// `GRAPH.*`, `WalRecordType::Command`), in apply order. Always empty
+    /// without the `graph` feature.
+    pub graph: Vec<Bytes>,
+}
+
+/// The graph ops of a multi-shard abort that belong to OTHER shards, grouped
+/// by owner. Produced by [`abort_local`], shipped by
+/// [`send_remote_graph_rollbacks`].
+#[cfg(feature = "graph")]
+pub type RemoteGraphLegs = Vec<(
+    usize,
+    Vec<crate::transaction::GraphUndoOp>,
+    Vec<crate::transaction::GraphIntent>,
+)>;
+/// Without the `graph` feature there is never a remote leg.
+#[cfg(not(feature = "graph"))]
+pub type RemoteGraphLegs = Vec<std::convert::Infallible>;
+
+/// Roll back every store side-effect of `txn` on THIS shard and return the
+/// records that make the rollback durable.
 ///
 /// Consumes the transaction by value — the caller must have already
 /// `.take()`'d it off `conn.active_cross_txn`. Idempotent on a re-entry
@@ -75,89 +100,47 @@ use bytes::Bytes;
 /// (`kv_intents`, `hnsw_queue`) are keyed by `txn_id` and treat missing
 /// entries as no-op.
 ///
-/// # Arguments
+/// # Concurrency
 ///
-/// * `shard_databases` — the per-server `ShardDatabases` registry (both
-///   handlers expose this as `ctx.shard_databases` or an `Arc<_>` field).
-/// * `shard_id`        — the shard this transaction lives on.
-/// * `selected_db`     — the logical KV database index (from
-///   `conn.selected_db`) used to scope the undo replay.
-/// * `txn`             — the transaction to abort. Consumed.
-///
-/// # Safety / concurrency
-///
-/// Runs on the shard event-loop thread. All locks taken are per-shard
-/// `parking_lot` guards; no `.await` points are crossed while any guard is
-/// held. Follows Phase 161 lock ordering: each layer's guard is dropped
-/// before the next layer is accessed.
-// `shard_databases` and `shard_id` are consumed only under `#[cfg(feature = "graph")]`
-// (WAL record drain). Without the graph feature they are structurally unused;
-// suppress the lint rather than removing a semantically load-bearing parameter.
-#[allow(clippy::needless_pass_by_value)]
-#[cfg_attr(not(feature = "graph"), allow(unused_variables))]
-pub fn abort_cross_store_txn(
-    shard_databases: &ShardDatabases,
-    shard_id: usize,
-    selected_db: usize,
-    txn: CrossStoreTxn,
-) {
+/// Runs on the shard event-loop thread, synchronously: nothing here awaits,
+/// so the keyspace changes and the caller's fold-stamp read and replication
+/// records form one no-await stretch. Each layer's thread-local borrow ends
+/// before the next layer is accessed (Phase 161 lock ordering).
+pub fn abort_cross_store_txn(txn: CrossStoreTxn) -> AbortLog {
     let txn_id = txn.txn_id;
+    let mut log = AbortLog::default();
 
     // ------------------------------------------------------------------
-    // 1. KV undo replay — walk the undo log in reverse insertion order
-    //    and restore before-images. Mirrors the original logic lifted
-    //    out of handler_sharded/handler_monoio TXN.ABORT.
+    // 1. KV undo — the first undo record of each (db, key), which holds the
+    //    key's pre-transaction state (moon#1285). Each restore hands the
+    //    value it replaces to an armed snapshot by move and yields its
+    //    compensating record(s).
     // ------------------------------------------------------------------
-    {
-        crate::shard::slice::with_shard_db(selected_db, |db| {
-            for record in txn.kv_undo.into_rollback_order() {
-                match record {
-                    UndoRecord::Insert { key } => {
-                        db.remove(&key);
-                    }
-                    UndoRecord::Update { key, old_entry } => {
-                        db.set(&key, old_entry);
-                    }
-                    UndoRecord::Delete { key, old_entry } => {
-                        db.set(&key, old_entry);
-                    }
-                }
-            }
+    let plan = kv_compensation::first_per_key(txn.kv_undo);
+    log.kv.reserve(plan.len());
+    for (db, record) in plan {
+        crate::shard::slice::with_shard_db(db, |d| {
+            kv_compensation::undo_one(d, db, record, &mut log.kv);
         });
-        // with_shard_db releases the borrow at the closure boundary — before next layer.
     }
 
     // ------------------------------------------------------------------
     // 2. Graph rollback — undo ops (2a) then create-intent removal (2b),
-    //    both in LIFO order, applied via the shared `apply_graph_rollback`
-    //    helper (also used by the ShardMessage::GraphRollback handler for
-    //    the multi-shard TXN.ABORT legs). Slice-aware: once ShardSlice is
-    //    initialized the graph store is thread-local and the lock-based
-    //    accessor would hit a different store.
+    //    both in LIFO order, via the shared `apply_graph_rollback` (also
+    //    used by the ShardMessage::GraphRollback handler for the
+    //    multi-shard legs). The records it returns are the rollback's WAL.
     // ------------------------------------------------------------------
     #[cfg(feature = "graph")]
-    {
-        if !txn.graph_undo.is_empty() || !txn.graph_intents.is_empty() {
-            // Unconditional slice path: ShardSlice is always initialized.
-            let wal_records = crate::shard::slice::with_shard(|s| {
-                apply_graph_rollback(
-                    &mut s.graph_store,
-                    txn_id,
-                    &txn.graph_undo,
-                    &txn.graph_intents,
-                )
-            });
-            // Drain any WAL records produced by remove_node/remove_edge so
-            // replay observes the rollback in the same ordering the live
-            // write path would have produced.
-            for record in wal_records {
-                shard_databases.wal_append(
-                    shard_id,
-                    crate::persistence::wal_v3::record::WalRecordType::Command,
-                    Bytes::from(record),
-                );
-            }
-        }
+    if !txn.graph_undo.is_empty() || !txn.graph_intents.is_empty() {
+        let records = crate::shard::slice::with_shard(|s| {
+            apply_graph_rollback(
+                &mut s.graph_store,
+                txn_id,
+                &txn.graph_undo,
+                &txn.graph_intents,
+            )
+        });
+        log.graph.extend(records.into_iter().map(Bytes::from));
     }
 
     // ------------------------------------------------------------------
@@ -207,6 +190,7 @@ pub fn abort_cross_store_txn(
         s.kv_write_intents.release_txn(txn_id);
         s.deferred_hnsw_inserts.discard_for_txn(txn_id);
     });
+    log
 }
 
 /// Apply the graph half of a TXN.ABORT to one `GraphStore`.
@@ -400,92 +384,101 @@ pub fn apply_graph_rollback(
     gs.drain_wal()
 }
 
-/// Multi-shard-aware TXN.ABORT.
+/// Multi-shard-aware local half of TXN.ABORT.
 ///
 /// Graphs live on the shard that owns their NAME (`graph_to_shard`), so the
 /// graph half of the rollback must run where the entities actually are.
-/// This wrapper partitions `txn.graph_undo` / `txn.graph_intents` by owning
-/// shard, runs the full local abort (KV undo, local graph ops, vector
-/// tombstones, side tables) via `abort_cross_store_txn`, then ships each
-/// remote group to its owner via `ShardMessage::GraphRollback` and awaits
-/// the acknowledgements.
+/// This partitions `txn.graph_undo` / `txn.graph_intents` by owning shard,
+/// runs the full local abort (KV undo, local graph ops, vector tombstones,
+/// index re-derivation, side tables) via [`abort_cross_store_txn`], and
+/// returns the remote groups for [`send_remote_graph_rollbacks`].
 ///
-/// Failure handling: a closed reply channel (owner shard gone) is logged and
-/// skipped — abort is already best-effort per-step (see module docs), and
-/// the per-shard side tables treat missing entries as no-ops.
+/// Synchronous on purpose: the caller reads the AOF fold epoch and records
+/// the replication stream right after it, before its first await.
 ///
 /// At `num_shards <= 1` this is exactly `abort_cross_store_txn`.
-#[allow(clippy::too_many_arguments)]
-pub async fn abort_cross_store_txn_routed(
-    shard_databases: &ShardDatabases,
+#[allow(unused_mut)]
+pub fn abort_local(
     shard_id: usize,
-    selected_db: usize,
     num_shards: usize,
+    mut txn: CrossStoreTxn,
+) -> (AbortLog, RemoteGraphLegs) {
+    // Partition the graph ops by owning shard BEFORE the local abort
+    // consumes the transaction. Plain data shuffling — no locks held.
+    #[cfg(feature = "graph")]
+    let remote: RemoteGraphLegs =
+        if num_shards > 1 && (!txn.graph_undo.is_empty() || !txn.graph_intents.is_empty()) {
+            use crate::shard::dispatch::graph_to_shard;
+            let mut by_owner: std::collections::BTreeMap<
+                usize,
+                (
+                    Vec<crate::transaction::GraphUndoOp>,
+                    Vec<crate::transaction::GraphIntent>,
+                ),
+            > = std::collections::BTreeMap::new();
+            let mut local_undo = Vec::with_capacity(txn.graph_undo.len());
+            for op in txn.graph_undo.drain(..) {
+                let owner = {
+                    let name = match &op {
+                        crate::transaction::GraphUndoOp::RestoreProperty { graph_name, .. }
+                        | crate::transaction::GraphUndoOp::UndeleteNode { graph_name, .. }
+                        | crate::transaction::GraphUndoOp::UndeleteEdge { graph_name, .. } => {
+                            graph_name
+                        }
+                    };
+                    graph_to_shard(name, num_shards)
+                };
+                if owner == shard_id {
+                    local_undo.push(op);
+                } else {
+                    by_owner.entry(owner).or_default().0.push(op);
+                }
+            }
+            txn.graph_undo = local_undo;
+            let mut local_intents: smallvec::SmallVec<[crate::transaction::GraphIntent; 8]> =
+                smallvec::SmallVec::new();
+            for intent in txn.graph_intents.drain(..) {
+                let owner = graph_to_shard(&intent.graph_name, num_shards);
+                if owner == shard_id {
+                    local_intents.push(intent);
+                } else {
+                    by_owner.entry(owner).or_default().1.push(intent);
+                }
+            }
+            txn.graph_intents = local_intents;
+            by_owner
+                .into_iter()
+                .map(|(owner, (undo, intents))| (owner, undo, intents))
+                .collect()
+        } else {
+            Vec::new()
+        };
+    #[cfg(not(feature = "graph"))]
+    let remote: RemoteGraphLegs = {
+        let _ = (shard_id, num_shards);
+        Vec::new()
+    };
+
+    let log = abort_cross_store_txn(txn);
+    (log, remote)
+}
+
+/// Ship the remote graph legs [`abort_local`] split off to their owning
+/// shards via `ShardMessage::GraphRollback` and await the acknowledgements.
+/// The owner applies the rollback and WAL-appends its records itself.
+///
+/// Failure handling: a closed reply channel (owner shard gone) is logged and
+/// skipped — abort is best-effort per step (see module docs), and the
+/// per-shard side tables treat missing entries as no-ops.
+pub async fn send_remote_graph_rollbacks(
+    shard_id: usize,
+    txn_id: u64,
     dispatch_tx: &std::rc::Rc<
         std::cell::RefCell<Vec<ringbuf::HeapProd<crate::shard::dispatch::ShardMessage>>>,
     >,
     spsc_notifiers: &[std::sync::Arc<crate::runtime::channel::Notify>],
-    #[allow(unused_mut)] mut txn: CrossStoreTxn,
+    remote: RemoteGraphLegs,
 ) {
-    // Partition the graph ops by owning shard BEFORE the local abort
-    // consumes the transaction. Plain data shuffling — no locks held.
-    #[cfg(feature = "graph")]
-    let remote: Vec<(
-        usize,
-        Vec<crate::transaction::GraphUndoOp>,
-        Vec<crate::transaction::GraphIntent>,
-    )> = if num_shards > 1 && (!txn.graph_undo.is_empty() || !txn.graph_intents.is_empty()) {
-        use crate::shard::dispatch::graph_to_shard;
-        let mut by_owner: std::collections::BTreeMap<
-            usize,
-            (
-                Vec<crate::transaction::GraphUndoOp>,
-                Vec<crate::transaction::GraphIntent>,
-            ),
-        > = std::collections::BTreeMap::new();
-        let mut local_undo = Vec::with_capacity(txn.graph_undo.len());
-        for op in txn.graph_undo.drain(..) {
-            let owner = {
-                let name = match &op {
-                    crate::transaction::GraphUndoOp::RestoreProperty { graph_name, .. }
-                    | crate::transaction::GraphUndoOp::UndeleteNode { graph_name, .. }
-                    | crate::transaction::GraphUndoOp::UndeleteEdge { graph_name, .. } => {
-                        graph_name
-                    }
-                };
-                graph_to_shard(name, num_shards)
-            };
-            if owner == shard_id {
-                local_undo.push(op);
-            } else {
-                by_owner.entry(owner).or_default().0.push(op);
-            }
-        }
-        txn.graph_undo = local_undo;
-        let mut local_intents: smallvec::SmallVec<[crate::transaction::GraphIntent; 8]> =
-            smallvec::SmallVec::new();
-        for intent in txn.graph_intents.drain(..) {
-            let owner = graph_to_shard(&intent.graph_name, num_shards);
-            if owner == shard_id {
-                local_intents.push(intent);
-            } else {
-                by_owner.entry(owner).or_default().1.push(intent);
-            }
-        }
-        txn.graph_intents = local_intents;
-        by_owner
-            .into_iter()
-            .map(|(owner, (undo, intents))| (owner, undo, intents))
-            .collect()
-    } else {
-        Vec::new()
-    };
-    #[cfg(not(feature = "graph"))]
-    let _ = num_shards;
-
-    let txn_id = txn.txn_id;
-    abort_cross_store_txn(shard_databases, shard_id, selected_db, txn);
-
     #[cfg(feature = "graph")]
     for (owner, graph_undo, graph_intents) in remote {
         let (reply_tx, reply_rx) = crate::runtime::channel::oneshot();
@@ -524,7 +517,7 @@ pub async fn abort_cross_store_txn_routed(
         }
     }
     #[cfg(not(feature = "graph"))]
-    let _ = (txn_id, dispatch_tx, spsc_notifiers);
+    let _ = (shard_id, txn_id, dispatch_tx, spsc_notifiers, remote);
 }
 
 #[cfg(all(test, feature = "graph"))]

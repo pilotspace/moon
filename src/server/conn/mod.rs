@@ -28,6 +28,7 @@ pub(crate) mod single_aof_log;
 pub mod subscriber_mode;
 #[cfg(all(test, feature = "runtime-monoio"))]
 mod tests;
+pub(crate) mod txn_abort;
 pub(crate) mod txn_script;
 pub mod util;
 pub mod watch;

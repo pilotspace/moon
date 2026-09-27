@@ -3738,14 +3738,8 @@ pub(crate) async fn handle_connection_sharded_inner<
         // Box::pin (c10k future diet): this ~5.4 KB rollback state machine
         // otherwise sits inline in EVERY connection future; boxing costs one
         // alloc on the leaked-txn teardown path only.
-        Box::pin(crate::transaction::abort::abort_cross_store_txn_routed(
-            &ctx.shard_databases,
-            ctx.shard_id,
-            conn.selected_db,
-            ctx.num_shards,
-            &ctx.dispatch_tx,
-            &ctx.spsc_notifiers,
-            *txn,
+        let _ = Box::pin(crate::server::conn::txn_abort::abort_logged(
+            ctx, *txn, None,
         ))
         .await;
     }
