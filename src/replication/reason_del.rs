@@ -57,11 +57,11 @@
 //! a script's `SPOP` / `XADD … '*'` re-rolls on replay exactly like the
 //! connection form) — instead of a synthetic `DEL`.
 //!
-//! moon#517: `record_effect_write` is the one entry point here that is NOT
-//! monoio-only. Its AOF leg runs on every runtime (see
-//! `record_bytes_conn`); only the replication leg stays gated. The
-//! `record_reason_del*` flavors keep their whole-function gate because
-//! every one of their call sites is itself monoio-only.
+//! moon#517: `record_effect_write` and (round-2b review MAJOR-3)
+//! `record_reason_del_conn` run on every runtime: their AOF leg is a channel
+//! send to the writer pool (see `record_bytes_conn`); only the replication
+//! leg stays monoio-gated. The tokio write gates and the script bridge rely
+//! on this for every evicted key.
 
 use bytes::Bytes;
 

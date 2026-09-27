@@ -493,8 +493,9 @@ shared 4-vCPU Linux container against HEAD `935c555` — re-measure on the GCE r
   names the oracle version the expected values assume (redis 7.2+/8.x).
 
 - **Under the tokio runtime, keys evicted by `maxmemory` came back after an
-  AOF restart.** The tokio write gates (the per-command gate and the MQ write
-  gate) dropped eviction victims without appending a `DEL`, so the AOF
+  AOF restart.** The tokio write gates (the per-command gate, the MQ write
+  gate and the script bridge's gate for `redis.call` writes) dropped eviction
+  victims without appending a `DEL`, so the AOF
   replayed them: 29,172 of 29,175 evicted keys returned in the new
   `plain_evictions_are_not_resurrected_by_the_aof` test (8 MB `allkeys-lru`,
   `--appendonly yes`). They now log a `DEL` per victim, as the monoio gates
