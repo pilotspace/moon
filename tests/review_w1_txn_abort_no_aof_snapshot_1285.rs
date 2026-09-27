@@ -36,6 +36,10 @@ fn bulk(s: &str) -> String {
 }
 
 fn start(dir: &std::path::Path) -> (common::ServerGuard, u16) {
+    start_with(dir, "no")
+}
+
+fn start_with(dir: &std::path::Path, appendonly: &str) -> (common::ServerGuard, u16) {
     let bin = common::find_moon_binary();
     let dir_s = dir.to_str().expect("utf8 dir").to_string();
     let (guard, port) = common::spawn_listening_guarded(|port| {
@@ -48,7 +52,9 @@ fn start(dir: &std::path::Path) -> (common::ServerGuard, u16) {
                 "--dir",
                 &dir_s,
                 "--appendonly",
-                "no",
+                appendonly,
+                "--appendfsync",
+                "always",
                 "--save",
                 "",
                 "--disk-free-min-pct",
@@ -129,5 +135,39 @@ fn an_abort_after_a_mid_txn_snapshot_survives_a_restart_without_an_aof() {
         k == bulk("original") && new == "$-1\r\n",
         "an aborted TXN came back after kill -9 + restart from a snapshot taken while it was \
          open: GET k -> {k:?} (want \"original\"), GET new -> {new:?} (want nil)"
+    );
+}
+
+/// Sibling of the case above, WITH an AOF: a crash is an implicit abort, but
+/// a transaction's writes reach the AOF as they run (no TXN markers) and
+/// recovery has nothing that rolls an unfinished transaction back. After
+/// kill -9 inside `TXN BEGIN … SET`, the uncommitted value is the recovered
+/// one. Pre-existing (red on ce65400 and f7f1d96, both runtimes); WS27 made
+/// the explicit abort durable, not the crash.
+#[test]
+#[ignore = "real-server suite: MOON_BIN pinned"]
+fn a_crash_inside_a_txn_does_not_keep_its_uncommitted_writes() {
+    let dir = common::unique_test_dir("rv-w1-txn-crash");
+    let (mut guard, port) = start_with(&dir, "yes");
+    let mut c = Conn::open(port);
+    assert_eq!(c.send(&["SET", "k", "original"]), OK);
+    let mut t = Conn::open(port);
+    assert_eq!(t.send(&["TXN", "BEGIN"]), OK);
+    assert_eq!(t.send(&["SET", "k", "uncommitted"]), OK);
+    assert_eq!(t.send(&["SET", "new", "uncommitted"]), OK);
+    guard.kill_now();
+    drop(t);
+    drop(c);
+
+    let (mut guard, port) = start_with(&dir, "yes");
+    let mut c = Conn::open(port);
+    let k = c.send(&["GET", "k"]);
+    let new = c.send(&["GET", "new"]);
+    guard.kill_now();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        k == bulk("original") && new == "$-1\r\n",
+        "a transaction interrupted by kill -9 kept its uncommitted writes after recovery: \
+         GET k -> {k:?} (want \"original\"), GET new -> {new:?} (want nil)"
     );
 }
