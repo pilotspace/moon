@@ -99,6 +99,12 @@ fn value(i: usize) -> String {
 /// Pipeline `SET k:i value(i)` for `range`; returns how many were refused
 /// `-OOM` (the rest must be `+OK`).
 fn set_range(port: u16, range: std::ops::Range<usize>) -> usize {
+    set_range_refused(port, range).len()
+}
+
+/// [`set_range`], returning the indexes whose `SET` was refused `-OOM`
+/// (replies arrive in order, one per `SET`).
+fn set_range_refused(port: u16, range: std::ops::Range<usize>) -> Vec<usize> {
     let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
     let mut buf = Vec::new();
     for i in range.clone() {
@@ -114,36 +120,30 @@ fn set_range(port: u16, range: std::ops::Range<usize>) -> usize {
         out.extend_from_slice(&chunk[..n]);
     }
     let text = String::from_utf8_lossy(&out);
-    let mut oom = 0;
-    for line in text.split("\r\n").filter(|l| !l.is_empty()) {
+    let replies: Vec<&str> = text.split("\r\n").filter(|l| !l.is_empty()).collect();
+    assert_eq!(replies.len(), range.len(), "one reply per SET");
+    let mut refused = Vec::new();
+    for (i, line) in range.zip(replies) {
         if line.starts_with("-OOM") {
-            oom += 1;
+            refused.push(i);
         } else {
             assert_eq!(line, "+OK", "SET reply");
         }
     }
-    oom
+    refused
 }
 
-/// [`set_range`], then retry each refused key (100 ms apart, up to 10 s):
-/// the keys still refused at the end. A burst right after a respawn may
-/// outrun the new thread for a moment on a loaded host (WS25 risk 1: death
-/// and recovery are observed on the shard's tick); what moon#1265 fixed is
-/// the PERMANENT `-OOM` of a shard whose spill thread was gone.
+/// [`set_range`], then retry ONLY the refused keys (100 ms apart, up to
+/// 10 s): (refused at first, still refused at the end). A burst right after
+/// a respawn may outrun the new thread for a moment on a loaded host (WS25
+/// risk 1: death and recovery are observed on the shard's tick); what
+/// moon#1265 fixed is the PERMANENT `-OOM` of a shard whose spill thread was
+/// gone. An acknowledged key is never rewritten here, so one lost later is
+/// still caught by the reads (round-3 review MINOR-3).
 fn set_range_settling(port: u16, range: std::ops::Range<usize>) -> (usize, usize) {
-    let first = set_range(port, range.clone());
-    if first == 0 {
-        return (0, 0);
-    }
+    let mut left = set_range_refused(port, range);
+    let first = left.len();
     let mut c = Conn::open(port);
-    let mut left: Vec<usize> = range
-        .filter(|i| {
-            c.send(&["EXISTS", &format!("k:{i}")])
-                .trim_start_matches(':')
-                .trim()
-                != "1"
-        })
-        .collect();
     for _ in 0..100 {
         if left.is_empty() {
             break;
