@@ -1482,6 +1482,28 @@ impl super::Shard {
                     // duties the milliseconds it skipped (capped).
                     let per_tick_scale =
                         tick_lateness.observe(tick_deadline.into_std(), std::time::Instant::now());
+                    // moon#1288: adaptive fast expiry slice (see the monoio
+                    // tick below); this loop never stretches its 1 ms period,
+                    // so the pending answer is not needed here.
+                    let _ = timers::run_active_expiry_fast(
+                        &shard_databases,
+                        shard_id,
+                        &mut wal_writer,
+                        &repl_backlog,
+                        &mut replica_txs,
+                        &repl_offsets,
+                        aof_pool.as_ref(),
+                        match wal_kv_log_mode {
+                            crate::config::WalKvLogMode::On => true,
+                            crate::config::WalKvLogMode::Off => false,
+                            crate::config::WalKvLogMode::Auto => {
+                                !appendonly_enabled || !cdc_registry.is_empty()
+                            }
+                        },
+                        is_replica_mirror
+                            .as_ref()
+                            .is_some_and(|m| m.load(std::sync::atomic::Ordering::Acquire)),
+                    );
                     // moon#1190: lazy-free drain (see the monoio tick below).
                     // Its pending flag feeds only the monoio idle park; this
                     // loop never stretches its 1 ms period.
@@ -2819,6 +2841,29 @@ impl super::Shard {
                 // for the park decision: moon#1221 review F2, the idle park
                 // must not stretch to 10 ms while the queue drains (one
                 // 250 µs slice per 10 ms held the memory ~10x longer).
+                // moon#1288: the adaptive fast expiry cycle — one duty-capped
+                // slice per tick while an expired backlog exists (one
+                // thread-local read otherwise). Its pending answer keeps the
+                // idle park off: a 10 ms park would cut the drain tenfold.
+                let expiry_backlog = timers::run_active_expiry_fast(
+                    &shard_databases,
+                    shard_id,
+                    &mut wal_writer,
+                    &repl_backlog,
+                    &mut replica_txs,
+                    &repl_offsets,
+                    aof_pool.as_ref(),
+                    match wal_kv_log_mode {
+                        crate::config::WalKvLogMode::On => true,
+                        crate::config::WalKvLogMode::Off => false,
+                        crate::config::WalKvLogMode::Auto => {
+                            !appendonly_enabled || !cdc_registry.is_empty()
+                        }
+                    },
+                    is_replica_mirror
+                        .as_ref()
+                        .is_some_and(|m| m.load(std::sync::atomic::Ordering::Acquire)),
+                );
                 let lazy_free_pending = crate::server::expiration::drain_lazy_free_tick_scaled(
                     shard_databases.db_count(),
                     per_tick_scale,
@@ -2840,7 +2885,8 @@ impl super::Shard {
                     && cdc_registry.is_empty()
                     && !hit_cap
                     && !spsc_had_work
-                    && !lazy_free_pending;
+                    && !lazy_free_pending
+                    && !expiry_backlog;
                 let was_idle = idle_park.is_idle();
                 let now_idle = idle_park.on_timer_tick(
                     crate::admin::metrics_setup::this_thread_commands(),

@@ -12,6 +12,137 @@ use crate::config::RuntimeConfig;
 
 use super::shared_databases::ShardDatabases;
 
+/// Everything a key removed by active expiry owes (task #34 Wave A, moon#1086):
+/// the stream-reader wakeup note, the `expired` keyspace event, and the
+/// dual-plane reason-`DEL`. Shared by the slow and the fast cycle.
+#[allow(clippy::too_many_arguments)]
+#[inline]
+fn emit_expired(
+    key: &[u8],
+    db: usize,
+    wal_writer: &mut Option<crate::persistence::wal_v3::segment::WalWriterV3>,
+    repl_backlog: &crate::replication::backlog::SharedBacklog,
+    replica_txs: &mut Vec<crate::shard::dispatch::ReplicaFanout>,
+    repl_state: &Option<crate::replication::state::OffsetHandle>,
+    shard_id: usize,
+    aof_pool: Option<&Arc<crate::persistence::aof::AofWriterPool>>,
+    wal_kv_log: bool,
+    reason_del_budget: &mut std::time::Duration,
+) {
+    // moon#1086: an expired stream may have a group reader parked on it.
+    crate::blocking::wakeup::note_unsignalled_removal();
+    // Cache-invalidation consumers subscribe to this to drop their copy.
+    // Queued here and delivered by the shard loop's own drain — there is no
+    // connection to attribute an expiry to.
+    crate::notify::notify_keyspace_event(crate::notify::NotifyFlags::EXPIRED, "expired", key, db);
+    crate::replication::reason_del::record_reason_del(
+        key,
+        db,
+        wal_writer,
+        repl_backlog,
+        replica_txs,
+        repl_state,
+        shard_id,
+        aof_pool,
+        wal_kv_log,
+        reason_del_budget,
+    );
+}
+
+/// Free writer-channel slots a fast expiry slice wants before it runs
+/// (moon#1288): a slice removes at most ~1 ms worth of keys (well under a
+/// thousand reason-`DEL`s), so with this much room it cannot block on the
+/// AOF. Below it the fast cycle stands down and leaves the backlog to the
+/// 100 ms slow cycle — its one shared bound per sweep is the only AOF wait
+/// active expiry is allowed.
+const FAST_EXPIRY_AOF_HEADROOM: usize = 2_048;
+
+/// The adaptive fast expiry cycle (moon#1288): called from BOTH runtimes'
+/// 1 ms periodic tick. While this shard has an expired backlog (latched by a
+/// cycle that ran out of budget with due keys left), spend one duty-capped
+/// slice on it — see `server::expiration`'s adaptive-expiry notes for the
+/// token bucket that caps it at `EXPIRE_FAST_DUTY_PCT`% of the shard and
+/// `EXPIRE_FAST_SLICE_MAX` per tick.
+///
+/// Returns whether the backlog is still pending (the monoio idle park must
+/// not stretch its period while it is). One thread-local read when there is
+/// no backlog — the common case.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_active_expiry_fast(
+    shard_databases: &Arc<ShardDatabases>,
+    shard_id: usize,
+    wal_writer: &mut Option<crate::persistence::wal_v3::segment::WalWriterV3>,
+    repl_backlog: &crate::replication::backlog::SharedBacklog,
+    replica_txs: &mut Vec<crate::shard::dispatch::ReplicaFanout>,
+    repl_state: &Option<crate::replication::state::OffsetHandle>,
+    aof_pool: Option<&Arc<crate::persistence::aof::AofWriterPool>>,
+    wal_kv_log: bool,
+    is_replica: bool,
+) -> bool {
+    use crate::server::expire_adaptive as fast;
+    if !fast::expire_backlog_pending() {
+        return false;
+    }
+    // #71b: a replica never runs its own expiry sweep.
+    if is_replica {
+        fast::note_expire_backlog(false);
+        return false;
+    }
+    // A backlogged AOF writer: stand down (the backlog stays latched; the
+    // slow cycle keeps draining it under its own per-sweep bound).
+    if aof_pool.is_some_and(|p| p.free_append_slots(shard_id) < FAST_EXPIRY_AOF_HEADROOM) {
+        return true;
+    }
+    let start = std::time::Instant::now();
+    let Some(slice) = fast::take_fast_expire_slice(start) else {
+        return true;
+    };
+    let deadline = start + slice;
+    let db_count = shard_databases.db_count();
+    let first = fast::next_fast_expire_db(db_count);
+    // #454 P2.8 shape: one shared bound per slice (rarely touched — the
+    // headroom check above makes a blocking append unlikely).
+    let mut reason_del_budget = crate::persistence::aof::AOF_REASON_DEL_BACKPRESSURE_BOUND;
+    let mut backlog = false;
+    for k in 0..db_count {
+        let i = (first + k) % db_count;
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            // Out of slice: a database not visited keeps whatever it had;
+            // stay latched so the next tick looks again.
+            backlog = true;
+            break;
+        }
+        backlog |= crate::shard::slice::with_shard_db(i, |db| {
+            if !db.maybe_has_expiring_keys() && !db.has_pending_lazy_expired() {
+                return false;
+            }
+            crate::server::expiration::expire_cycle_direct_budget(
+                db,
+                &mut |key| {
+                    emit_expired(
+                        key,
+                        i,
+                        wal_writer,
+                        repl_backlog,
+                        replica_txs,
+                        repl_state,
+                        shard_id,
+                        aof_pool,
+                        wal_kv_log,
+                        &mut reason_del_budget,
+                    );
+                },
+                deadline - now,
+                crate::storage::db::HASH_SWEEP_MAX_KEYS_PER_TICK,
+            )
+        });
+    }
+    fast::charge_fast_expire_slice(start.elapsed());
+    fast::note_expire_backlog(backlog);
+    backlog
+}
+
 /// Run cooperative active expiry across all databases.
 /// Shard 0 also updates the RSS gauge (once per expiry cycle, ~100ms).
 ///
@@ -52,25 +183,13 @@ pub(crate) fn run_active_expiry(
         // #454 P2.8: ONE shared backpressure bound for this entire sweep
         // (per-key minting could stall the shard bound x victim-count).
         let mut reason_del_budget = crate::persistence::aof::AOF_REASON_DEL_BACKPRESSURE_BOUND;
+        let mut backlog = false;
         for i in 0..db_count {
-            crate::shard::slice::with_shard_db(i, |db| {
+            backlog |= crate::shard::slice::with_shard_db(i, |db| {
                 crate::server::expiration::expire_cycle_direct_scaled(
                     db,
                     &mut |key| {
-                        // moon#1086: an expired stream may have a group reader
-                        // parked on it.
-                        crate::blocking::wakeup::note_unsignalled_removal();
-                        // Cache-invalidation consumers subscribe to this to drop
-                        // their copy. Queued here and delivered by the shard
-                        // loop's own drain — there is no connection to attribute
-                        // an expiry to.
-                        crate::notify::notify_keyspace_event(
-                            crate::notify::NotifyFlags::EXPIRED,
-                            "expired",
-                            key,
-                            i,
-                        );
-                        crate::replication::reason_del::record_reason_del(
+                        emit_expired(
                             key,
                             i,
                             wal_writer,
@@ -84,9 +203,14 @@ pub(crate) fn run_active_expiry(
                         );
                     },
                     budget_scale,
-                );
+                )
             });
         }
+        // moon#1288: due work left after the budget -> the 1 ms tick's fast
+        // cycle drains it (`run_active_expiry_fast`).
+        crate::server::expire_adaptive::note_expire_backlog(backlog);
+    } else {
+        crate::server::expire_adaptive::note_expire_backlog(false);
     }
     // Update RSS gauge on shard 0 only, once per second (not every 100ms tick).
     // Gated by a simple counter to reduce /proc/self/statm open/read/close churn.
@@ -1335,3 +1459,8 @@ mod tests {
         );
     }
 }
+
+/// moon#1288: the fast expiry cycle against a real shard slice.
+#[cfg(test)]
+#[path = "timers_expiry_fast_tests.rs"]
+mod active_expiry_fast_tests;
