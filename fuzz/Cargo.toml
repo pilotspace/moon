@@ -168,3 +168,8 @@ doc = false
 name = "snapshot_cold_graves"
 path = "fuzz_targets/snapshot_cold_graves.rs"
 doc = false
+
+[[bin]]
+name = "graph_wal_replay"
+path = "fuzz_targets/graph_wal_replay.rs"
+doc = false
