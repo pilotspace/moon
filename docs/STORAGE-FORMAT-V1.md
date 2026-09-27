@@ -83,6 +83,20 @@ Authoritative source: `src/persistence/snapshot.rs`.
   `HashWithTtl`. Authoritative encoder/decoder: `src/persistence/rdb.rs` —
   search for `has_hash_ttl_trailer`.
 - **Trailer:** `0xFF` EOF byte + CRC32 over the whole file.
+- **Cold-graves trailer (optional, moon#1281):** between the `0xFF` EOF byte and
+  the global CRC32 a snapshot taken WITHOUT an AOF may carry the spill-file
+  slots that were already dead when it started:
+  `"MCGV" | ver u8 = 1 | file_count u32 | { file_id u64 | slot_count u32 |
+  { page_idx u32 | slot_idx u16 }* }* | crc32 u32` (all little-endian; the
+  trailer's CRC covers `"MCGV"` through the last slot). Boot of a no-AOF
+  process drops exactly those slots before rebuilding the cold index, so a cold
+  key deleted before a successful snapshot stays deleted after a crash. Every
+  reader stops at the EOF byte, so readers that predate the trailer load the
+  file unchanged and ignore it (and resurrect those keys, as before) — the
+  version byte is NOT bumped. Absent trailer = no graves. A trailer that fails
+  its own checks is logged and ignored; the global CRC still guards the keys.
+  Authoritative codec: `src/persistence/snapshot/cold_graves.rs` (fuzz target
+  `snapshot_cold_graves`).
 - **PITR:** the embedded `last_lsn` ties each snapshot to the WAL position it shadows; replay resumes at `last_lsn + 1`.
 - **Forkless:** snapshots are produced by cooperative segment iteration with per-snapshot overflow buffers — no `fork()`, no COW RSS spike.
 

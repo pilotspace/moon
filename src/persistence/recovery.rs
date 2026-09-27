@@ -231,6 +231,10 @@ pub fn recover_shard_v3_pitr(
     // replay up to the target -- slower but correct.
     let snap_path = shard_dir.join(format!("shard-{}.rrdshard", shard_id));
     let mut snapshot_expired = Vec::new(); // moon#1236: dropped from the cold index below
+    // moon#1281: the loaded snapshot's cold-graves trailer — the spill slots
+    // that were already dead when it was taken. Applied to the cold rebuild
+    // below only without an AOF, where the snapshot is the KV authority.
+    let mut snapshot_graves: Option<crate::persistence::snapshot::cold_graves::ColdGraves> = None;
     if snap_path.exists() && !kv.snapshot() {
         info!(
             "Shard {}: snapshot load skipped — the multi-part AOF is the KV authority \
@@ -277,8 +281,13 @@ pub fn recover_shard_v3_pitr(
         };
 
         if snapshot_ok {
-            use crate::persistence::snapshot::shard_snapshot_load_noting_expired as load;
-            match load(databases, &snap_path, &mut snapshot_expired) {
+            use crate::persistence::snapshot::shard_snapshot_load_with_graves as load;
+            match load(
+                databases,
+                &snap_path,
+                &mut snapshot_expired,
+                &mut snapshot_graves,
+            ) {
                 Ok(n) => {
                     info!("Shard {}: loaded {} keys from snapshot", shard_id, n);
                 }
@@ -444,10 +453,23 @@ pub fn recover_shard_v3_pitr(
                 );
             }
             Ok(mut manifest) => {
+                // moon#1281: with an AOF the log (and its folds' DELs) decides
+                // which slots are dead; the graves are the no-AOF authority.
+                let graves = snapshot_graves
+                    .as_ref()
+                    .filter(|_| crate::storage::tiered::snapshot_hold::applies());
                 let crate::storage::tiered::cold_index::ColdRebuild { per_db, report } =
-                    crate::storage::tiered::cold_index::ColdIndex::rebuild_from_manifest_per_db(
-                        shard_dir, &manifest,
+                    crate::storage::tiered::cold_index::ColdIndex::rebuild_from_manifest_per_db_with_graves(
+                        shard_dir, &manifest, graves,
                     );
+                if report.entries_tombstoned > 0 {
+                    info!(
+                        shard_id,
+                        slots = report.entries_tombstoned,
+                        "cold recovery: dropped the spill slots the snapshot records as dead \
+                         (moon#1281)"
+                    );
+                }
                 // moon#875: the one line that distinguishes a clean rebuild
                 // from one that skipped forty files. Loss classes are counted
                 // into `INFO` too, so a monitor can alarm on them.

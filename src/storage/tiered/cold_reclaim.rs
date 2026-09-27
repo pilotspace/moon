@@ -662,7 +662,7 @@ impl ColdIndex {
                         self.insert(m.key, m.to);
                         report.keys_moved += 1;
                     } else {
-                        self.note_dead_slot(m.to.file_id, m.key, m.to.ttl_ms);
+                        self.note_dead_slot(m.key, m.to);
                     }
                 }
                 // moon#1231 review: an output listed in phase A because some

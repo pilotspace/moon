@@ -224,6 +224,10 @@ pub struct SnapshotState {
     last_lsn: u64,
     /// Wall-clock at snapshot construction, milliseconds since unix epoch (v0.2).
     created_at_unix_ms: u64,
+    /// The cold-graves trailer written after `EOF` (moon#1281,
+    /// [`cold_graves`]): the dead spill slots at this snapshot's start.
+    /// Empty = no trailer, the pre-moon#1281 byte layout.
+    cold_graves_trailer: Vec<u8>,
     /// Set when a structural change the epoch does not follow (a FLUSHALL,
     /// a replica full resync) happened while it was in flight: the snapshot
     /// fails loudly instead of publishing a file.
@@ -324,6 +328,7 @@ impl SnapshotState {
             shard_id,
             file_path,
             header_written: false,
+            cold_graves_trailer: Vec::new(),
             db_selector_written: vec![false; num_databases],
             last_lsn: 0,
             created_at_unix_ms: current_time_ms() as u64,
@@ -341,6 +346,13 @@ impl SnapshotState {
     #[cfg(test)]
     pub(crate) fn pin_fixed_budget(&mut self) {
         self.fixed_budget = true;
+    }
+
+    /// Set the cold-graves trailer (moon#1281): the encoded dead spill slots
+    /// at this snapshot's start (`shard::timers::note_snapshot_started`).
+    /// Written after `EOF` at finalize; any time before the finalize.
+    pub fn set_cold_graves_trailer(&mut self, trailer: Vec<u8>) {
+        self.cold_graves_trailer = trailer;
     }
 
     /// Stamp the WAL LSN at which this snapshot was taken.
@@ -484,6 +496,9 @@ impl SnapshotState {
             self.start_streaming()?;
         }
         self.output_buf.push(EOF_MARKER);
+        // After EOF: every v1-v3 reader stops at the marker (moon#1281).
+        let trailer = std::mem::take(&mut self.cold_graves_trailer);
+        self.output_buf.extend_from_slice(&trailer);
         let block = std::mem::take(&mut self.output_buf);
         if let Some(stream) = self.stream.as_mut() {
             stream.send(block);
@@ -1014,8 +1029,10 @@ impl SnapshotState {
                 .into()
             });
         }
-        // Write EOF marker
+        // Write EOF marker, then the cold-graves trailer (moon#1281)
         self.output_buf.push(EOF_MARKER);
+        let trailer = std::mem::take(&mut self.cold_graves_trailer);
+        self.output_buf.extend_from_slice(&trailer);
 
         // Global CRC32 of entire output_buf
         let mut hasher = Hasher::new();
@@ -1107,6 +1124,21 @@ pub fn shard_snapshot_load_noting_expired<D: std::borrow::BorrowMut<Database>>(
     path: &Path,
     expired: &mut Vec<(usize, Bytes, Entry)>,
 ) -> Result<usize, MoonError> {
+    let mut graves = None;
+    shard_snapshot_load_with_graves(databases, path, expired, &mut graves)
+}
+
+/// [`shard_snapshot_load_noting_expired`], also returning the snapshot's
+/// cold-graves trailer (moon#1281): `Some` when the file carries a valid one.
+/// A trailer that fails its own checks is logged and ignored — the key data
+/// the global CRC proved still loads.
+pub fn shard_snapshot_load_with_graves<D: std::borrow::BorrowMut<Database>>(
+    databases: &mut [D],
+    path: &Path,
+    expired: &mut Vec<(usize, Bytes, Entry)>,
+    graves: &mut Option<cold_graves::ColdGraves>,
+) -> Result<usize, MoonError> {
+    *graves = None;
     // moon#1232 review 5: booting from a snapshot is no keyspace change —
     // redis 7.0.15 starts with `rdb_changes_since_last_save:0`. Counted, every
     // loaded key armed the `--save` rules: `--save "3 100"` rewrote the whole
@@ -1264,7 +1296,23 @@ pub fn shard_snapshot_load_noting_expired<D: std::borrow::BorrowMut<Database>>(
         }
 
         match tag[0] {
-            EOF_MARKER => break,
+            EOF_MARKER => {
+                // moon#1281: anything between EOF and the global CRC is the
+                // cold-graves trailer (older writers leave nothing there).
+                let at = cursor.position() as usize;
+                if at < payload.len() {
+                    match cold_graves::decode(&payload[at..]) {
+                        Ok(g) => *graves = Some(g),
+                        Err(e) => tracing::error!(
+                            path = %path.display(),
+                            bytes = payload.len() - at,
+                            "Snapshot load: cold-graves trailer ignored ({e}); spill slots of \
+                             cold keys deleted before this snapshot may read as live again"
+                        ),
+                    }
+                }
+                break;
+            }
             DB_SELECTOR => {
                 let mut db_idx = [0u8; 1];
                 cursor
@@ -1398,6 +1446,7 @@ pub fn shard_snapshot_load_noting_expired<D: std::borrow::BorrowMut<Database>>(
     Ok(total_keys)
 }
 
+pub mod cold_graves;
 pub(crate) mod frozen;
 
 mod meta;

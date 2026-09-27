@@ -163,3 +163,8 @@ doc = false
 name = "parse_i64_bytes_differential"
 path = "fuzz_targets/parse_i64_bytes_differential.rs"
 doc = false
+
+[[bin]]
+name = "snapshot_cold_graves"
+path = "fuzz_targets/snapshot_cold_graves.rs"
+doc = false

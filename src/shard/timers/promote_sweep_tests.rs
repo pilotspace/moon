@@ -441,7 +441,7 @@ fn without_an_aof_a_file_emptied_before_a_snapshot_is_released_by_it() {
         }
         // The FLUSHALL save, or a BGSAVE, starts and succeeds before the
         // next interval sweep: the shard's start hook, then its finish.
-        super::note_snapshot_started(&live.shared);
+        let _ = super::note_snapshot_started(&live.shared);
         note_snapshot_finished(true);
         // The event loop sweeps right after a successful snapshot.
         super::sweep_after_snapshot(
@@ -474,7 +474,7 @@ fn with_an_aof_the_snapshot_hooks_touch_nothing() {
         for (k, _) in keys("k", 10) {
             assert_eq!(run("DEL", &[&k]), Frame::Integer(1));
         }
-        super::note_snapshot_started(&live.shared);
+        let _ = super::note_snapshot_started(&live.shared);
         assert!(!live.held(OLD), "the start hook is off with an AOF");
         super::sweep_after_snapshot(
             &live.shared,

@@ -76,6 +76,7 @@ jobs:
           - ft_create_args
           - canonical_i64_differential
           - parse_i64_bytes_differential
+          - snapshot_cold_graves
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@nightly
@@ -164,6 +165,7 @@ jobs:
           - ft_create_args
           - canonical_i64_differential
           - parse_i64_bytes_differential
+          - snapshot_cold_graves
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@nightly

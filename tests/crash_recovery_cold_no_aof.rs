@@ -431,3 +431,160 @@ fn run_no_aof_ttl_overwrite_scenario(suffix: &str) {
 fn no_aof_cold_keys_overwritten_with_a_ttl_do_not_come_back_old_after_a_bgsave_and_crash() {
     run_no_aof_ttl_overwrite_scenario("noaof-ttlow");
 }
+
+// ── moon#1281: a cold DEL must be durable no later than the next snapshot ─────
+
+/// moon#1281: `--appendonly no`, inherited cold probes sharing spill files
+/// with live fillers. `DEL` every probe (their files still back the fillers,
+/// so none is zero-ref and none is unlinked), `BGSAVE`, kill -9, restart.
+/// The snapshot taken after the deletes is the only durable authority: not
+/// one probe may come back from its spill slot. The fillers are the control
+/// — they are untouched and must all still be readable.
+fn run_no_aof_cold_del_scenario(suffix: &str) {
+    let port = common::reserve_port();
+    let dir = unique_dir(suffix);
+    std::fs::create_dir_all(&dir).expect("create test dir");
+    inherit_cold_probes(port, &dir);
+    let save = ["--save", "3600 100000000"];
+    let mut server = start_moon_with(port, &dir, 1, "no", &save);
+    wait_for_port(port);
+    // No GET first: a read promotes the probe (moon#1260's case). This one is
+    // the DEL of a key that is COLD when it is deleted.
+    // `cold_keys` is published by the first orphan sweep (1 s here).
+    let mut cold_before = 0;
+    wait_until(20, || {
+        cold_before = info_u64(port, "cold_keys").unwrap_or(0);
+        cold_before > 0
+    });
+    assert!(
+        cold_before > 0,
+        "precondition failed: nothing cold was inherited"
+    );
+    let dbsize_before = integer_reply(&redis_cmd(port, &["DBSIZE"])).unwrap_or(0);
+    let mut deleted = 0i64;
+    for i in 0..PROBE_COUNT {
+        deleted += integer_reply(&redis_cmd(port, &["DEL", &probe_key(i)])).unwrap_or(0);
+    }
+    assert!(deleted > 0, "precondition failed: DEL removed no probe");
+    let files_at_del = count_heap_files(&dir);
+    assert!(
+        files_at_del > 0,
+        "precondition failed: every spill file went away"
+    );
+    bgsave_and_wait(port);
+    // Let the orphan sweep decide on whatever became zero-ref.
+    std::thread::sleep(Duration::from_secs(3));
+    let dbsize_saved = integer_reply(&redis_cmd(port, &["DBSIZE"])).unwrap_or(0);
+    server.kill_now();
+    wait_for_port_down(port);
+    let mut server2 = start_moon_alive_with(port, &dir, 1, "no", &save);
+    let back: Vec<String> = (0..PROBE_COUNT)
+        .filter(|i| redis_get(port, &probe_key(*i)).is_some())
+        .map(probe_key)
+        .collect();
+    let dbsize_after = integer_reply(&redis_cmd(port, &["DBSIZE"])).unwrap_or(-1);
+    server2.kill_now();
+    let mut wrong = back.clone();
+    if dbsize_after != dbsize_saved {
+        wrong.push(format!(
+            "DBSIZE {dbsize_after} after, {dbsize_saved} at the save"
+        ));
+    }
+    finish(&dir, &wrong);
+    assert!(
+        wrong.is_empty(),
+        "--appendonly no: DEL of {deleted} cold probes, BGSAVE, kill -9 brought {} of them \
+         back (DBSIZE {dbsize_before} before the DELs, {dbsize_saved} at the save, \
+         {dbsize_after} after the restart; {files_at_del} spill files at the DEL); first: {:?}",
+        back.len(),
+        &wrong[..wrong.len().min(8)]
+    );
+}
+
+/// moon#1281: a deleted cold key stays deleted across BGSAVE + kill -9.
+#[test]
+#[ignore]
+fn no_aof_deleted_cold_keys_stay_deleted_after_a_bgsave_and_crash() {
+    run_no_aof_cold_del_scenario("noaof-cold-del");
+}
+
+/// moon#1281 comment (REVIEW-FINAL-P5B finding 2, `rvfb_f6_second_crash.py`):
+/// the moon#1236 no-AOF hook drops the OLD cold shadow of a key the boot
+/// snapshot holds as expired — in memory only. One more BGSAVE (whose image
+/// no longer names the key) and a second kill -9 brought the OLD value back.
+fn run_no_aof_ttl_overwrite_second_crash_scenario(suffix: &str) {
+    const TTL_MS: u64 = 10_000;
+    let port = common::reserve_port();
+    let dir = unique_dir(suffix);
+    std::fs::create_dir_all(&dir).expect("create test dir");
+    inherit_cold_probes(port, &dir);
+    let save = ["--save", "3600 100000000"];
+    let mut server = start_moon_with(port, &dir, 3600, "no", &save);
+    wait_for_port(port);
+    let val = probe_value();
+    let new = overwrite_value();
+    let overwritten_at = Instant::now();
+    for i in (0..PROBE_COUNT).step_by(2) {
+        redis_cmd(
+            port,
+            &["SET", &probe_key(i), &new, "PX", &TTL_MS.to_string()],
+        );
+    }
+    bgsave_and_wait(port);
+    server.kill_now();
+    wait_for_port_down(port);
+    if let Some(rest) = Duration::from_millis(TTL_MS + 1_500).checked_sub(overwritten_at.elapsed())
+    {
+        std::thread::sleep(rest);
+    }
+    // Boot 1: the moon#1236 hook drops the shadows.
+    let mut server = start_moon_alive_with(port, &dir, 3600, "no", &save);
+    let boot1: usize = (0..PROBE_COUNT)
+        .step_by(2)
+        .filter(|i| redis_get(port, &probe_key(*i)).is_some())
+        .count();
+    let odd_before = (1..PROBE_COUNT)
+        .step_by(2)
+        .filter(|i| redis_get(port, &probe_key(*i)).as_deref() == Some(val.as_str()))
+        .count();
+    // A second snapshot: its image no longer names the even probes at all.
+    redis_set(port, "hot:control", "H");
+    bgsave_and_wait(port);
+    server.kill_now();
+    wait_for_port_down(port);
+    // Boot 2.
+    let mut server2 = start_moon_alive_with(port, &dir, 3600, "no", &save);
+    let boot2: Vec<(usize, String)> = (0..PROBE_COUNT)
+        .step_by(2)
+        .filter_map(|i| redis_get(port, &probe_key(i)).map(|v| (i, v)))
+        .collect();
+    let odd_after = (1..PROBE_COUNT)
+        .step_by(2)
+        .filter(|i| redis_get(port, &probe_key(*i)).as_deref() == Some(val.as_str()))
+        .count();
+    let hot_ok = redis_get(port, "hot:control").as_deref() == Some("H");
+    server2.kill_now();
+    let old_back = boot2.iter().filter(|(_, v)| *v == val).count();
+    let mut wrong: Vec<String> = boot2.iter().map(|(i, _)| probe_key(*i)).collect();
+    if odd_after < odd_before {
+        wrong.push(format!("{odd_after}/{odd_before} odd"));
+    }
+    if !hot_ok || boot1 != 0 {
+        wrong.push(format!("hot control {hot_ok}, boot 1 brought {boot1} back"));
+    }
+    finish(&dir, &wrong);
+    assert!(
+        wrong.is_empty(),
+        "--appendonly no: TTL'd overwrite of cold keys, BGSAVE, kill -9, boot 1 ({boot1} even \
+         back), BGSAVE, kill -9, boot 2 brought {} even probe(s) back ({old_back} with the OLD \
+         value); odd probes {odd_after} of {odd_before}; hot control {hot_ok}",
+        boot2.len()
+    );
+}
+
+/// moon#1281: the moon#1236 drop is durable across a second snapshot + crash.
+#[test]
+#[ignore]
+fn no_aof_ttl_overwritten_cold_keys_stay_gone_after_a_second_bgsave_and_crash() {
+    run_no_aof_ttl_overwrite_second_crash_scenario("noaof-ttlow-2nd");
+}

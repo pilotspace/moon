@@ -101,7 +101,8 @@ pub(crate) fn handle_pending_snapshot(
             // the life of this snapshot. See `persistence::snapshot_cow`.
             // moon#1186: with the layout, so written segments are skipped.
             crate::persistence::snapshot_cow::arm_with_layout(segment_counts);
-            super::timers::note_snapshot_started(shard_databases); // moon#1260
+            // moon#1260 hold + moon#1281 cold graves, in this same section.
+            state.set_cold_graves_trailer(super::timers::note_snapshot_started(shard_databases));
             *snapshot_state = Some(state);
             *snapshot_reply_tx = Some(reply_tx);
         }
@@ -188,7 +189,8 @@ pub(crate) fn check_auto_save_trigger(
         start_snapshot_streaming(&mut state, shard_id);
         // moon#517: same arming as the explicit-BGSAVE path above.
         crate::persistence::snapshot_cow::arm_with_layout(segment_counts);
-        super::timers::note_snapshot_started(shard_databases); // moon#1260
+        // moon#1260 hold + moon#1281 cold graves, in this same section.
+        state.set_cold_graves_trailer(super::timers::note_snapshot_started(shard_databases));
         *snapshot_state = Some(state);
     }
 }
@@ -1221,7 +1223,25 @@ fn apply_completion_vec(
         // file is published for its other keys, those slots are on disk in a
         // listed file and a rebuild would index them: the cold index's
         // dead-slot ledger must know, so an AOF rewrite can keep them dead.
-        let mut ghosts: Vec<(usize, bytes::Bytes, Option<u64>)> = Vec::new();
+        // The slot's location rides along: without an AOF the snapshot
+        // records dead slots by location (moon#1281).
+        let ghost_at = |page_idx: u32,
+                        slot_idx: u16,
+                        ttl_ms: Option<u64>,
+                        value_type: crate::persistence::kv_page::ValueType| {
+            crate::storage::tiered::cold_index::ColdLocation {
+                file_id,
+                page_idx,
+                slot_idx,
+                ttl_ms,
+                value_type,
+            }
+        };
+        let mut ghosts: Vec<(
+            usize,
+            bytes::Bytes,
+            crate::storage::tiered::cold_index::ColdLocation,
+        )> = Vec::new();
         for entry in c.entries {
             let (publishable, stranded) =
                 crate::shard::slice::with_shard_db(entry.db_index, |db| {
@@ -1249,7 +1269,13 @@ fn apply_completion_vec(
                     None => groups.push((entry.db_index, vec![entry])),
                 }
             } else {
-                ghosts.push((entry.db_index, entry.key, entry.ttl_ms));
+                let at = ghost_at(
+                    entry.page_idx,
+                    entry.slot_idx,
+                    entry.ttl_ms,
+                    entry.value_type,
+                );
+                ghosts.push((entry.db_index, entry.key, at));
             }
         }
 
@@ -1272,7 +1298,10 @@ fn apply_completion_vec(
                 for entry in &entries {
                     rehydrate_unpublished_spill(entry, file_id);
                 }
-                ghosts.extend(entries.iter().map(|e| (db_index, e.key.clone(), e.ttl_ms)));
+                ghosts.extend(entries.iter().map(|e| {
+                    let at = ghost_at(e.page_idx, e.slot_idx, e.ttl_ms, e.value_type);
+                    (db_index, e.key.clone(), at)
+                }));
                 continue;
             }
             published_any = true;
@@ -1313,10 +1342,10 @@ fn apply_completion_vec(
                 tracing::error!(file_id, error = %e, "Spill completion: manifest add_file refused");
             } else {
                 manifest_dirty = true;
-                for (db_index, key, ttl_ms) in ghosts {
+                for (db_index, key, at) in ghosts {
                     crate::shard::slice::with_shard_db(db_index, |db| {
                         if let Some(ci) = db.cold_index.as_mut() {
-                            ci.note_dead_slot(file_id, key, ttl_ms);
+                            ci.note_dead_slot(key, at);
                         }
                     });
                 }

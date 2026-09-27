@@ -243,7 +243,7 @@ fn a_completion_before_the_fold_hands_the_key_to_the_ledger() {
     assert!(live.spill_superseded_settle(&Bytes::from_static(b"k1"), 7));
     assert!(live.spill_superseded_is_empty());
     if let Some(ci) = live.cold_index.as_mut() {
-        ci.note_dead_slot(7, Bytes::from_static(b"k1"), None);
+        ci.note_dead_slot_in(7, Bytes::from_static(b"k1"), None);
     }
     let image = fold_then_completion(&live, 8);
     assert!(head_deletes(&image, "k1"));

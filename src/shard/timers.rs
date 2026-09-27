@@ -643,19 +643,29 @@ pub(crate) fn run_cold_orphan_sweep(
 /// epoch BEFORE the start, so this snapshot's success releases it — the
 /// snapshot already excludes the keys those files backed. Then the start is
 /// counted. Owner thread, no database guard held.
-pub(crate) fn note_snapshot_started(shard_databases: &Arc<ShardDatabases>) {
+///
+/// Returns the snapshot's cold-graves trailer (moon#1281): without an AOF,
+/// every dead slot the cold indexes hold at this instant, encoded for the
+/// snapshot to carry (`persistence::snapshot::cold_graves`). Empty with an
+/// AOF, without a cold tier, or with no dead slot — the snapshot is then
+/// byte-identical to the pre-moon#1281 format.
+#[must_use]
+pub(crate) fn note_snapshot_started(shard_databases: &Arc<ShardDatabases>) -> Vec<u8> {
     use crate::storage::tiered::snapshot_hold;
+    let mut graves = Vec::new();
     if snapshot_hold::applies() {
         let stamp = snapshot_hold::epoch_before_start();
         for db_idx in 0..shard_databases.db_count() {
             crate::shard::slice::with_shard_db(db_idx, |db| {
                 if let Some(ci) = db.cold_index.as_mut() {
                     ci.hold_queued_before_snapshot(stamp);
+                    ci.collect_graves_into(&mut graves);
                 }
             });
         }
     }
     snapshot_hold::note_snapshot_started();
+    crate::persistence::snapshot::cold_graves::encode(&graves)
 }
 
 /// A snapshot of this shard just finished successfully (moon#1260 review

@@ -41,6 +41,7 @@ impl ColdIndex {
             || !self.older_copies.is_empty()
             || !self.pending_unlink.is_empty()
             || !self.dead.is_empty()
+            || !self.graves.is_empty()
             || !self.hold.is_empty()
             || !self.reclaim.is_idle()
     }
@@ -89,6 +90,7 @@ impl ColdIndex {
         self.promote_orphaned_older_copies();
         out.promote_orphaned_older_copies();
         out.dead = self.dead.split_off_files(&moves);
+        out.graves = self.graves.split_off_files(&moves);
         let (go, stay): (Vec<u64>, Vec<u64>) = self.pending_unlink.iter().partition(|f| moves(**f));
         self.pending_unlink = stay;
         out.pending_unlink = go;
@@ -110,6 +112,7 @@ impl ColdIndex {
             map,
             older_copies,
             dead,
+            graves,
             pending_unlink,
             missing_at_rebuild,
             hold,
@@ -143,6 +146,7 @@ impl ColdIndex {
             mine.sort_by_key(|l| std::cmp::Reverse(l.recency_key()));
         }
         self.dead.merge(dead);
+        self.graves.merge(graves);
         self.hold.merge(hold);
         self.pending_unlink.extend(pending_unlink);
         self.missing_at_rebuild.extend(missing_at_rebuild);

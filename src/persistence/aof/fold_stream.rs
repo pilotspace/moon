@@ -833,7 +833,7 @@ mod tests {
         // `respilled` moved to file 2 (alive there); `twice` was also dead in
         // file 3 — one DEL.
         ci.insert(Bytes::from_static(b"respilled"), cold_loc(2));
-        ci.note_dead_slot(3, Bytes::from_static(b"twice"), None);
+        ci.note_dead_slot_in(3, Bytes::from_static(b"twice"), None);
         // A live cold key with no dead slot, and a stale shadow behind a hot
         // key whose value expired.
         ci.insert(Bytes::from_static(b"cold"), cold_loc(4));
@@ -921,7 +921,7 @@ mod tests {
             let mut ci = crate::storage::tiered::cold_index::ColdIndex::new();
             ci.insert(Bytes::from_static(b"anchor"), cold_loc(1));
             for i in 0..count {
-                ci.note_dead_slot(1, Bytes::from(format!("dead:{i:05}")), None);
+                ci.note_dead_slot_in(1, Bytes::from(format!("dead:{i:05}")), None);
             }
             dbs[db_idx].cold_index = Some(ci);
         }

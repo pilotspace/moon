@@ -38,7 +38,7 @@ fn db_with_keys(n: usize, len: usize) -> Database {
 /// Give `db` a dead-slot ledger of roughly `bytes` and return its exact size.
 fn add_ledger(db: &mut Database, bytes: usize) -> usize {
     let mut ci = db.cold_index.take().unwrap_or_else(ColdIndex::new);
-    ci.note_dead_slot(1, Bytes::from(vec![b'd'; bytes.max(1)]), None);
+    ci.note_dead_slot_in(1, Bytes::from(vec![b'd'; bytes.max(1)]), None);
     let ledger = ci.dead_slot_bytes();
     db.cold_index = Some(ci);
     ledger
