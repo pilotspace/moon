@@ -37,6 +37,19 @@ jobs:
           cargo test --release --no-default-features --features runtime-tokio,jemalloc
           --test txn_abort_durability_1285 -- --ignored --test-threads=1
         timeout-minutes: 10
+      # moon#1294 / moon#1288 / moon#1290: the real-server guards the wave-1
+      # review found in no gate (MINOR 2) plus its routed-EVAL finding (F2):
+      # one reason-DEL backpressure bound per eviction run against a stalled
+      # AOF, the adaptive expired-backlog drain, and a script routed to
+      # another shard (--shards 4) tiering its no-AOF eviction victims
+      # instead of dropping them.
+      - name: Run eviction / active-expiry / routed-script tiering guards
+        run: >-
+          MOON_BIN=target/release/moon
+          cargo test --release --no-default-features --features runtime-tokio,jemalloc
+          --test eviction_reason_del_run_budget_1294 --test active_expiry_backlog_drain_1288
+          --test review_w1_routed_eval_tiering_1290 -- --include-ignored --test-threads=1
+        timeout-minutes: 8
       - name: Run jepsen-lite tests
         run: cargo test --release --no-default-features --features runtime-tokio,jemalloc --test jepsen_lite
         timeout-minutes: 10
@@ -45,7 +58,8 @@ jobs:
     name: Crash Matrix (per-shard AOF)
     if: github.event_name == 'push' || contains(github.event.pull_request.labels.*.name, 'ci-full')
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # 15 -> 20: the eviction / expiry / routed-script guards (~2 min) joined.
+    timeout-minutes: 20
     # MOON_NO_URING is already set globally at the workflow level (line 16).
     # No job-level env override needed — monoio falls back to epoll automatically.
     steps:
@@ -68,6 +82,15 @@ jobs:
           MOON_BIN=target/release/moon
           cargo test --release --test txn_abort_durability_1285 -- --ignored --test-threads=1
         timeout-minutes: 10
+      # moon#1294 / moon#1288 / moon#1290: the same guards as the durability
+      # job's tokio leg, on the runtime that ships.
+      - name: Run eviction / active-expiry / routed-script tiering guards
+        run: >-
+          MOON_BIN=target/release/moon
+          cargo test --release
+          --test eviction_reason_del_run_budget_1294 --test active_expiry_backlog_drain_1288
+          --test review_w1_routed_eval_tiering_1290 -- --include-ignored --test-threads=1
+        timeout-minutes: 8
 
   replication:
     name: Replication Tests
