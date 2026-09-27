@@ -91,17 +91,18 @@ pub(crate) fn record_txn_kv_write(
     key: &bytes::Bytes,
     is_delete: bool,
 ) {
+    let db_index = db.db_index;
     if is_delete {
         // Capture before-image so TXN.ABORT can restore the deleted key.
         if let Some(old_entry) = db.get(key) {
-            txn.record_kv_delete(key.clone(), old_entry.clone());
+            txn.record_kv_delete(db_index, key.clone(), old_entry.clone());
         }
         // If the key doesn't exist, a delete is a no-op — nothing to undo.
     } else {
         // Check if key exists for insert vs update
         match db.get(key) {
-            Some(old_entry) => txn.record_kv_update(key.clone(), old_entry.clone()),
-            None => txn.record_kv_insert(key.clone()),
+            Some(old_entry) => txn.record_kv_update(db_index, key.clone(), old_entry.clone()),
+            None => txn.record_kv_insert(db_index, key.clone()),
         }
     }
 }

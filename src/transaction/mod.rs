@@ -168,22 +168,32 @@ impl CrossStoreTxn {
         self.rejected_ops > 0
     }
 
-    /// Record a KV insert (key did not exist).
+    /// Record a KV insert in database `db` (key did not exist).
     #[inline]
-    pub fn record_kv_insert(&mut self, key: Bytes) {
-        self.kv_undo.record_insert(key);
+    pub fn record_kv_insert(&mut self, db: usize, key: Bytes) {
+        self.kv_undo.record_insert(db, key);
     }
 
-    /// Record a KV update (key had previous entry).
+    /// Record a KV update in database `db` (key had previous entry).
     #[inline]
-    pub fn record_kv_update(&mut self, key: Bytes, old_entry: crate::storage::entry::Entry) {
-        self.kv_undo.record_update(key, old_entry);
+    pub fn record_kv_update(
+        &mut self,
+        db: usize,
+        key: Bytes,
+        old_entry: crate::storage::entry::Entry,
+    ) {
+        self.kv_undo.record_update(db, key, old_entry);
     }
 
-    /// Record a KV delete (captures before-image for rollback).
+    /// Record a KV delete in database `db` (captures before-image for rollback).
     #[inline]
-    pub fn record_kv_delete(&mut self, key: Bytes, old_entry: crate::storage::entry::Entry) {
-        self.kv_undo.record_delete(key, old_entry);
+    pub fn record_kv_delete(
+        &mut self,
+        db: usize,
+        key: Bytes,
+        old_entry: crate::storage::entry::Entry,
+    ) {
+        self.kv_undo.record_delete(db, key, old_entry);
     }
 
     /// Record a vector modification.
@@ -285,7 +295,7 @@ mod tests {
     fn test_has_modifications_kv() {
         let mut txn = CrossStoreTxn::new(1, 0, 0);
         assert!(!txn.has_modifications());
-        txn.record_kv_insert(Bytes::from_static(b"key"));
+        txn.record_kv_insert(0, Bytes::from_static(b"key"));
         assert!(txn.has_modifications());
     }
 

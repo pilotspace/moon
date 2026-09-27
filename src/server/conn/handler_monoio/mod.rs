@@ -3652,7 +3652,11 @@ pub(crate) async fn handle_connection_sharded_monoio<
                                     if let Frame::BulkString(key_bytes) = arg {
                                         if let Some(old_entry) = db.get(key_bytes.as_ref()).cloned()
                                         {
-                                            txn.kv_undo.record_delete(key_bytes.clone(), old_entry);
+                                            txn.kv_undo.record_delete(
+                                                sel_db,
+                                                key_bytes.clone(),
+                                                old_entry,
+                                            );
                                             let lsn = txn.snapshot_lsn;
                                             let tid = txn.txn_id;
                                             // Direct field access — the outer with_shard
@@ -3706,9 +3710,9 @@ pub(crate) async fn handle_connection_sharded_monoio<
                                 }
                                 for key in written {
                                     match db.get(key.as_ref()).cloned() {
-                                        None => txn.kv_undo.record_insert(key.clone()),
+                                        None => txn.kv_undo.record_insert(sel_db, key.clone()),
                                         Some(entry) => {
-                                            txn.kv_undo.record_update(key.clone(), entry)
+                                            txn.kv_undo.record_update(sel_db, key.clone(), entry)
                                         }
                                     }
                                     // Direct field access — see DEL/UNLINK arm above.

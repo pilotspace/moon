@@ -2668,7 +2668,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                                         for arg in cmd_args.iter() {
                                             if let Frame::BulkString(key_bytes) = arg {
                                                 if let Some(old_entry) = db.get(key_bytes.as_ref()).cloned() {
-                                                    txn.kv_undo.record_delete(key_bytes.clone(), old_entry);
+                                                    txn.kv_undo.record_delete(conn.selected_db, key_bytes.clone(), old_entry);
                                                     let lsn = txn.snapshot_lsn;
                                                     let tid = txn.txn_id;
                                                     // Direct field access — `s` is this
@@ -2699,8 +2699,8 @@ pub(crate) async fn handle_connection_sharded_inner<
                                         }
                                         for key in written {
                                             match db.get(key.as_ref()).cloned() {
-                                                None => txn.kv_undo.record_insert(key.clone()),
-                                                Some(entry) => txn.kv_undo.record_update(key.clone(), entry),
+                                                None => txn.kv_undo.record_insert(conn.selected_db, key.clone()),
+                                                Some(entry) => txn.kv_undo.record_update(conn.selected_db, key.clone(), entry),
                                             }
                                             // Direct field access — see DEL/UNLINK arm above.
                                             s.kv_write_intents.record_write(key, lsn, tid);
