@@ -1016,14 +1016,14 @@ impl super::Shard {
         let mut autovacuum_interval =
             TimerImpl::interval(Duration::from_secs(autovacuum_interval_secs));
 
-        // monoio: counter-based sub-timer dispatch from 1ms periodic tick.
-        // Each sub-timer fires at its native interval via modular arithmetic.
+        // monoio: nominal-millisecond tick counter. Since moon#1280 the
+        // sub-timers are due by elapsed time (`tick_cadence::ChoreCadences`,
+        // created at loop entry); the counter now only phases idle-park entry.
         #[cfg(feature = "runtime-monoio")]
         let mut monoio_tick_counter: u64 = 0;
         // #373 phase 2: adaptive idle park. After a proven-quiet streak the
         // periodic park stretches 1ms -> IDLE_PARK_MS (10ms), stepping the
-        // counter by 10 from an aligned boundary so every counter-based
-        // cadence below (all multiples of 10) still fires exactly on time.
+        // counter by 10 from an aligned boundary.
         #[cfg(feature = "runtime-monoio")]
         let mut idle_park = crate::shard::idle_park::IdleParkState::new();
         // O3: adaptive busy-poll contention governor. Only constructed when a
@@ -1204,6 +1204,32 @@ impl super::Shard {
         // fd-exhaustion storm can't hot-spin this shard's select loop.
         #[cfg(feature = "runtime-tokio")]
         let mut per_shard_accept_backoff = crate::server::accept_backoff::AcceptBackoff::new();
+
+        // moon#1280: every periodic interval above skips missed ticks
+        // (`runtime::interval`), so a stall costs one catch-up tick, not N.
+        // Chores are timed on this monotonic loop clock — elapsed time, not
+        // tick counts — and duties that owe work for the skipped time scale
+        // their one catch-up run (`tick_cadence`).
+        let loop_clock = crate::shard::tick_cadence::LoopClock::new();
+        let mut tick_lateness = crate::shard::tick_cadence::TickLateness::new();
+        #[cfg(feature = "runtime-tokio")]
+        let mut expiry_catch_up = crate::shard::tick_cadence::Cadence::new(
+            loop_clock.now_ms(),
+            crate::shard::tick_cadence::EXPIRY_PERIOD_MS,
+        );
+        #[cfg(feature = "runtime-tokio")]
+        let mut ops_sample_catch_up =
+            crate::shard::tick_cadence::Cadence::new(loop_clock.now_ms(), 1_000);
+        // Created here, at loop entry, so every chore's first run is one full
+        // period after the loop starts — what the old `counter % N` chores
+        // did (the counter started at 0 here too).
+        #[cfg(feature = "runtime-monoio")]
+        let mut chores = crate::shard::tick_cadence::ChoreCadences::new(
+            loop_clock.now_ms(),
+            warm_poll_ms,
+            autovacuum_interval_secs,
+            orphan_sweep_interval_secs,
+        );
 
         loop {
             #[cfg(feature = "runtime-tokio")]
@@ -1450,8 +1476,9 @@ impl super::Shard {
                     }
                 }
                 // Periodic 1ms timer for WAL flush, snapshot advance, io_uring poll
-                _ = periodic_interval.0.tick() => {
+                tick_deadline = periodic_interval.0.tick() => {
                     cached_clock.update();
+                    tick_lateness.observe(tick_deadline.into_std(), std::time::Instant::now());
                     // moon#1190: lazy-free drain (see the monoio tick below).
                     // Its pending flag feeds only the monoio idle park; this
                     // loop never stretches its 1 ms period.
@@ -1681,6 +1708,13 @@ impl super::Shard {
                 // WAL fsync + MVCC sweep on 1-second interval
                 _ = wal_sync_interval.0.tick() => {
                     timers::sync_wal_v3(&mut wal_writer);
+                    // INFO instantaneous_ops_per_sec, over the time that
+                    // actually elapsed (moon#1280). Shard 0 only: the sample
+                    // is process-wide.
+                    let ops_elapsed_ms = ops_sample_catch_up.mark_run(loop_clock.now_ms());
+                    if shard_id == 0 {
+                        crate::admin::metrics_setup::sample_ops_per_sec(ops_elapsed_ms);
+                    }
                     // D1: idle-timeout enforcement, same policy and cadence as
                     // the monoio chore (the per-connection timeout wrapper it
                     // replaces read its config once at connection setup and
@@ -1795,6 +1829,13 @@ impl super::Shard {
                 }
                 // Cooperative active expiry + MQ triggers
                 _ = expiry_interval.0.tick() => {
+                    // moon#1280: the one catch-up tick after a stall owes the
+                    // skipped cycles' expiry work — scaled, and capped.
+                    let expiry_scale = crate::shard::tick_cadence::catch_up_scale(
+                        expiry_catch_up.mark_run(loop_clock.now_ms()),
+                        crate::shard::tick_cadence::EXPIRY_PERIOD_MS,
+                        crate::shard::tick_cadence::EXPIRY_CATCH_UP_MAX_SCALE,
+                    );
                     timers::run_active_expiry(
                         &shard_databases, shard_id,
                         &mut wal_writer, &repl_backlog, &mut replica_txs, &repl_offsets,
@@ -1809,6 +1850,7 @@ impl super::Shard {
                         is_replica_mirror
                             .as_ref()
                             .is_some_and(|m| m.load(std::sync::atomic::Ordering::Acquire)),
+                        expiry_scale,
                     );
                     // MQ trigger check: fire debounced triggers
                     timers::fire_pending_mq_triggers(
@@ -2180,7 +2222,9 @@ impl super::Shard {
                 // at runtime by tests/spsc_wake_floor_red.rs::swf0 on both drivers.
                 // A losing notified() arm re-queues an undelivered token on drop
                 // (swf_a3), so there is no lost-wake window.
-                let timer_fired = if idle_park.is_idle() {
+                // `tick_deadline`: the fast-path tick's scheduled deadline, for
+                // the lateness stats (moon#1280); None on the idle one-shot.
+                let (timer_fired, tick_deadline) = if idle_park.is_idle() {
                     // #373 phase 2: stretched park. A one-shot sleep replaces
                     // the Interval while idle — the Interval is deliberately
                     // NOT polled here and is reset on every idle exit, so its
@@ -2189,17 +2233,22 @@ impl super::Shard {
                         crate::shard::idle_park::IDLE_PARK_MS
                     )));
                     let notified = std::pin::pin!(spsc_notify_local.notified());
-                    matches!(
+                    let fired = matches!(
                         crate::runtime::race::race2(tick, notified).await,
                         crate::runtime::race::Arm::First(_)
-                    )
+                    );
+                    (fired, None)
                 } else {
+                    // moon#1280: the Interval skips missed ticks, so after a
+                    // stall this resolves once, not once per missed 1 ms (a
+                    // Burst interval re-fired synchronously on every poll and
+                    // the loop never yielded until it had replayed them all).
                     let tick = std::pin::pin!(periodic_interval.0.tick());
                     let notified = std::pin::pin!(spsc_notify_local.notified());
-                    matches!(
-                        crate::runtime::race::race2(tick, notified).await,
-                        crate::runtime::race::Arm::First(_)
-                    )
+                    match crate::runtime::race::race2(tick, notified).await {
+                        crate::runtime::race::Arm::First(deadline) => (true, Some(deadline)),
+                        crate::runtime::race::Arm::Second(_) => (false, None),
+                    }
                 };
                 if !timer_fired {
                     if idle_park.note_notify_wake() {
@@ -2370,6 +2419,13 @@ impl super::Shard {
                 // 10 idle) so the counter keeps counting nominal milliseconds.
                 monoio_tick_counter = monoio_tick_counter.wrapping_add(idle_park.counter_step());
                 cached_clock.update();
+                // moon#1280: one monotonic clock read per timer tick drives the
+                // lateness stats and every chore cadence below.
+                let tick_now = std::time::Instant::now();
+                if let Some(deadline) = tick_deadline {
+                    tick_lateness.observe(deadline.into_std(), tick_now);
+                }
+                let now_ms = loop_clock.ms_at(tick_now);
 
                 persistence_tick::check_auto_save_trigger(
                     &snapshot_trigger_rx,
@@ -2489,13 +2545,23 @@ impl super::Shard {
                     }
                 }
 
-                // --- Counter-based sub-timer dispatch ---
-                // block_timeout: every 10ms (10 ticks)
-                if monoio_tick_counter % 10 == 0 {
+                // --- Elapsed-time sub-timer dispatch (moon#1280) ---
+                // Each chore is due by monotonic elapsed time, not by tick
+                // count: a stall or a late loop costs a chore at most one
+                // catch-up run, and never slows its long-run rate.
+                // block_timeout: every 10ms
+                if chores.block_timeout.poll(now_ms).is_some() {
                     timers::expire_blocked_clients(&blocking_rc);
                 }
-                // expiry + eviction + MQ triggers: every 100ms (100 ticks)
-                if monoio_tick_counter % 100 == 0 {
+                // expiry + eviction + MQ triggers: every 100ms
+                if let Some(expiry_elapsed_ms) = chores.expiry.poll(now_ms) {
+                    // The one catch-up sweep after a stall owes the skipped
+                    // cycles' work — scaled, and capped.
+                    let expiry_scale = crate::shard::tick_cadence::catch_up_scale(
+                        expiry_elapsed_ms,
+                        crate::shard::tick_cadence::EXPIRY_PERIOD_MS,
+                        crate::shard::tick_cadence::EXPIRY_CATCH_UP_MAX_SCALE,
+                    );
                     timers::run_active_expiry(
                         &shard_databases,
                         shard_id,
@@ -2514,6 +2580,7 @@ impl super::Shard {
                         is_replica_mirror
                             .as_ref()
                             .is_some_and(|m| m.load(std::sync::atomic::Ordering::Acquire)),
+                        expiry_scale,
                     );
                     persistence_tick::run_eviction_tick(
                         spill_thread.as_ref(),
@@ -2551,10 +2618,15 @@ impl super::Shard {
                         &all_notifiers,
                     );
                 }
-                // WAL fsync + P6 ceiling-trigger + MVCC sweep: every 1s (1000 ticks).
+                // WAL fsync + P6 ceiling-trigger + MVCC sweep: every 1s.
                 // P6 is gated here (not per-1ms tick) to avoid the read_dir
                 // syscall overhead of wal.stats() on the hot path.
-                if monoio_tick_counter % 1000 == 0 {
+                if let Some(second_elapsed_ms) = chores.second.poll(now_ms) {
+                    // INFO instantaneous_ops_per_sec over the time that
+                    // actually elapsed. Shard 0 only: the sample is global.
+                    if shard_id == 0 {
+                        crate::admin::metrics_setup::sample_ops_per_sec(second_elapsed_ms);
+                    }
                     // `.tpost`: encode dirty text indexes (2 ms budget) for
                     // the off-loop writer.
                     crate::shard::slice::with_shard(|s| {
@@ -2641,8 +2713,8 @@ impl super::Shard {
                         }
                     }
                 }
-                // Warm tier check: every warm_poll_ms ticks
-                if monoio_tick_counter % (warm_poll_ms as u64) == 0 {
+                // Warm tier check: every warm_poll_ms
+                if chores.warm.poll(now_ms).is_some() {
                     // task/issue #45: `disk_offload_dir` (Some iff offload
                     // enabled) is precomputed at shard init — no per-tick
                     // format!/join.
@@ -2671,16 +2743,14 @@ impl super::Shard {
                         );
                     });
                 }
-                // MA12: Disk free-space poll (every 5000 ticks = 5s, shard 0 only).
-                if shard_id == 0 && monoio_tick_counter % 5000 == 0 {
+                // MA12: Disk free-space poll (every 5s, shard 0 only).
+                if chores.disk.poll(now_ms).is_some() && shard_id == 0 {
                     crate::shard::disk_monitor::poll_global();
                     // Wave 3: RSS memory watchdog poll (same 5s tick).
                     crate::shard::mem_monitor::poll_global();
                 }
-                // P4: Autovacuum daemon tick (every autovacuum_interval_secs * 1000 ticks).
-                if monoio_tick_counter % (autovacuum_interval_secs * 1000) == 0
-                    && monoio_tick_counter > 0
-                {
+                // P4: Autovacuum daemon tick (every autovacuum_interval_secs).
+                if chores.autovacuum.poll(now_ms).is_some() {
                     crate::shard::slice::with_shard(|s| {
                         autovacuum_daemon.run_tick(
                             &mut s.vector_store,
@@ -2700,10 +2770,14 @@ impl super::Shard {
                         );
                     });
                 }
-                // Cold-tier orphan sweep (P9): every orphan_sweep_interval_secs * 1000 ticks.
-                // Matches the tokio select! branch above. Disabled when interval is 0.
-                if orphan_sweep_interval_secs > 0
-                    && monoio_tick_counter % (orphan_sweep_interval_secs * 1000) == 0
+                // Cold-tier orphan sweep (P9): every orphan_sweep_interval_secs.
+                // Matches the tokio select! branch above. Disabled when interval
+                // is 0 (`chores.orphan` is None). First run one full interval
+                // after loop start, exactly as the old counter chore.
+                if chores
+                    .orphan
+                    .as_mut()
+                    .is_some_and(|c| c.poll(now_ms).is_some())
                     && let Some(shard_dir) = disk_offload_dir.as_deref()
                 {
                     timers::run_cold_orphan_sweep(
@@ -2717,13 +2791,10 @@ impl super::Shard {
                     );
                 }
 
-                // #373 phase 2: decide the next park. Every counter-based
-                // cadence above is a multiple of IDLE_PARK_MS — 10 / 100 /
-                // 1000 / 5000 / warm_poll_ms (secs*1000, clamped ≥1000) /
-                // autovacuum & orphan (secs*1000) — so the 10ms-stepped
-                // counter hits each boundary exactly; entry is additionally
-                // gated on an aligned counter. Any new `% N` dispatch added
-                // here MUST keep N a multiple of IDLE_PARK_MS.
+                // #373 phase 2: decide the next park. The chores above are
+                // due by elapsed time (moon#1280), so a 10 ms idle park makes
+                // a chore at most one park late; the counter's aligned-entry
+                // gate below is kept only to phase idle entry as before.
                 //
                 // moon#1190: free lazily-unlinked / expired large values, a
                 // bounded slice per tick (one relaxed load when none queued).

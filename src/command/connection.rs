@@ -715,7 +715,9 @@ fn info_raw(db: &Database, facts: &InstanceFacts) -> String {
          spsc_notify_wakes:{}\r\n\
          spsc_drain_renotify:{}\r\n\
          spsc_notify_skipped:{}\r\n\
-         ft_search_cooperative_yields_total:{}\r\n",
+         ft_search_cooperative_yields_total:{}\r\n\
+         shard_tick_late_total:{}\r\n\
+         shard_tick_burst_max:{}\r\n",
         crate::admin::metrics_setup::total_commands_processed(),
         crate::admin::metrics_setup::total_connections_received(),
         crate::admin::metrics_setup::total_dispatch_cross_spsc(),
@@ -730,6 +732,11 @@ fn info_raw(db: &Database, facts: &InstanceFacts) -> String {
         crate::admin::metrics_setup::spsc_drain_renotify(),
         crate::admin::metrics_setup::spsc_notify_skipped(),
         crate::admin::metrics_setup::ft_search_cooperative_yields(),
+        // moon#1280: periodic ticks that fired >5 ms late, and the most ticks
+        // one stall fired back to back (the worst catch-up burst; 1 per
+        // stall with missed ticks skipped).
+        crate::shard::tick_cadence::tick_late_total(),
+        crate::shard::tick_cadence::tick_burst_max(),
     );
     // Fields stock monitoring agents read. Backed by real counters — a field
     // Moon cannot answer truthfully is omitted rather than reported as a

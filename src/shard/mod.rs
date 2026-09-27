@@ -48,6 +48,8 @@ pub mod spsc_handler;
 pub(crate) mod spsc_two_db;
 /// Test-only `MOON_TEST_*` fault-injection hooks for the persistence tick.
 pub(crate) mod test_hooks;
+/// moon#1280: elapsed-time chore cadences + periodic-tick lateness stats.
+pub(crate) mod tick_cadence;
 pub mod timers;
 pub mod uring_handler;
 /// moon#1182: multi-shard FT.SEARCH KNN legs on the cooperative search path.

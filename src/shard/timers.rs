@@ -42,6 +42,10 @@ pub(crate) fn run_active_expiry(
     // could even resurrect ordering hazards). The RSS gauge update below still
     // runs on either role.
     is_replica: bool,
+    // moon#1280: `tick_cadence::catch_up_scale` of the time since the previous
+    // sweep — 1 on schedule, up to `EXPIRY_CATCH_UP_MAX_SCALE` for the one
+    // catch-up sweep after a stall (which skipped the cycles in between).
+    budget_scale: u32,
 ) {
     if !is_replica {
         let db_count = shard_databases.db_count();
@@ -50,33 +54,37 @@ pub(crate) fn run_active_expiry(
         let mut reason_del_budget = crate::persistence::aof::AOF_REASON_DEL_BACKPRESSURE_BOUND;
         for i in 0..db_count {
             crate::shard::slice::with_shard_db(i, |db| {
-                crate::server::expiration::expire_cycle_direct(db, &mut |key| {
-                    // moon#1086: an expired stream may have a group reader
-                    // parked on it.
-                    crate::blocking::wakeup::note_unsignalled_removal();
-                    // Cache-invalidation consumers subscribe to this to drop
-                    // their copy. Queued here and delivered by the shard
-                    // loop's own drain — there is no connection to attribute
-                    // an expiry to.
-                    crate::notify::notify_keyspace_event(
-                        crate::notify::NotifyFlags::EXPIRED,
-                        "expired",
-                        key,
-                        i,
-                    );
-                    crate::replication::reason_del::record_reason_del(
-                        key,
-                        i,
-                        wal_writer,
-                        repl_backlog,
-                        replica_txs,
-                        repl_state,
-                        shard_id,
-                        aof_pool,
-                        wal_kv_log,
-                        &mut reason_del_budget,
-                    );
-                });
+                crate::server::expiration::expire_cycle_direct_scaled(
+                    db,
+                    &mut |key| {
+                        // moon#1086: an expired stream may have a group reader
+                        // parked on it.
+                        crate::blocking::wakeup::note_unsignalled_removal();
+                        // Cache-invalidation consumers subscribe to this to drop
+                        // their copy. Queued here and delivered by the shard
+                        // loop's own drain — there is no connection to attribute
+                        // an expiry to.
+                        crate::notify::notify_keyspace_event(
+                            crate::notify::NotifyFlags::EXPIRED,
+                            "expired",
+                            key,
+                            i,
+                        );
+                        crate::replication::reason_del::record_reason_del(
+                            key,
+                            i,
+                            wal_writer,
+                            repl_backlog,
+                            replica_txs,
+                            repl_state,
+                            shard_id,
+                            aof_pool,
+                            wal_kv_log,
+                            &mut reason_del_budget,
+                        );
+                    },
+                    budget_scale,
+                );
             });
         }
     }

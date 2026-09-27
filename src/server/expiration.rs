@@ -181,6 +181,19 @@ thread_local! {
 /// (replicas run the identical reaper against the identical TTLs, a bounded
 /// divergence documented in CHANGELOG rather than wired up here).
 pub fn expire_cycle_direct(db: &mut Database, on_removed: &mut dyn FnMut(&[u8])) {
+    expire_cycle_direct_scaled(db, on_removed, 1);
+}
+
+/// [`expire_cycle_direct`] with its per-cycle budget multiplied by
+/// `budget_scale` (moon#1280): the shard loop's one catch-up cycle after a
+/// stall owes the work of every 100 ms cycle the stall skipped, and passes
+/// `tick_cadence::catch_up_scale` of the elapsed time — at least 1, capped
+/// by the caller. Scales the 1 ms time budget and the hash-sweep key cap.
+pub fn expire_cycle_direct_scaled(
+    db: &mut Database,
+    on_removed: &mut dyn FnMut(&[u8]),
+    budget_scale: u32,
+) {
     // moon#542: delete-and-emit the keys the LAZY paths discovered expired
     // since the last tick. Runs before the latch fast-path — the queue check
     // is one branch on an empty Vec, and a lazily-hidden key implies the
@@ -217,7 +230,7 @@ pub fn expire_cycle_direct(db: &mut Database, on_removed: &mut dyn FnMut(&[u8]))
         }
         return;
     }
-    expire_cycle(db, on_removed);
+    expire_cycle_scaled(db, on_removed, budget_scale);
 }
 
 /// True when [`expire_cycle`] would provably remove nothing (moon#552) — the
@@ -297,9 +310,18 @@ fn drain_lazy_expired(db: &mut Database, on_removed: &mut dyn FnMut(&[u8])) {
 /// `maybe_has_expiring_keys` is cleared only when **both** sweeps have
 /// nothing left, so a database with hash-field TTLs but no whole-key TTLs
 /// is not incorrectly short-circuited on the next tick.
+#[cfg(test)]
 fn expire_cycle(db: &mut Database, on_removed: &mut dyn FnMut(&[u8])) {
+    expire_cycle_scaled(db, on_removed, 1);
+}
+
+/// [`expire_cycle`] with the 1 ms budget and [`HASH_SWEEP_MAX_KEYS_PER_TICK`]
+/// multiplied by `budget_scale` (≥ 1; see [`expire_cycle_direct_scaled`]).
+fn expire_cycle_scaled(db: &mut Database, on_removed: &mut dyn FnMut(&[u8]), budget_scale: u32) {
+    let budget_scale = budget_scale.max(1);
     let start = Instant::now();
-    let budget = Duration::from_millis(1);
+    let budget = Duration::from_millis(1) * budget_scale;
+    let hash_key_cap = HASH_SWEEP_MAX_KEYS_PER_TICK.saturating_mul(budget_scale);
 
     // ── Sweep 1: deadline-ordered whole-key expiry (moon#541) ───────────────
     //
@@ -382,7 +404,7 @@ fn expire_cycle(db: &mut Database, on_removed: &mut dyn FnMut(&[u8])) {
         }
         db.rearm_hash_expiry(ts, &key);
         visited += 1;
-        if visited >= HASH_SWEEP_MAX_KEYS_PER_TICK || start.elapsed() >= budget {
+        if visited >= hash_key_cap || start.elapsed() >= budget {
             break;
         }
     }
