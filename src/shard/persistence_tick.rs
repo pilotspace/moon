@@ -2566,6 +2566,9 @@ mod superseded_settle_tests;
 mod spill_supervise_tests;
 
 #[cfg(test)]
+mod review_r2b_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::persistence::checkpoint::CheckpointTrigger;
