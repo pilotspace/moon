@@ -141,7 +141,9 @@ fn push_restore_records(
     entry: &Entry,
     out: &mut Vec<CompensatingRecord>,
 ) {
-    let payload = dump_payload::encode(entry);
+    // The HPEXPIREAT records below restore what the payload cannot carry,
+    // so the encoder's "drops per-field TTLs" warning would be false here.
+    let payload = dump_payload::encode_field_ttls_restored_separately(entry);
     let mut ms = itoa::Buffer::new();
     // `0` = no expiry: RESTORE only applies a TTL above zero. A deadline
     // already in the past is kept as is — RESTORE ABSTTL of a past deadline
@@ -436,5 +438,74 @@ mod tests {
                 Frame::BulkString(Bytes::from_static(b"v1"))
             );
         }
+    }
+
+    /// WARN lines logged on this thread while `f` runs.
+    fn warnings_during(f: impl FnOnce()) -> String {
+        #[derive(Clone, Default)]
+        struct Capture(std::sync::Arc<parking_lot::Mutex<Vec<u8>>>);
+        impl std::io::Write for Capture {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Capture {
+            type Writer = Capture;
+            fn make_writer(&'a self) -> Capture {
+                self.clone()
+            }
+        }
+        let cap = Capture::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(cap.clone())
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::with_default(subscriber, f);
+        let out = String::from_utf8_lossy(&cap.0.lock()).into_owned();
+        out
+    }
+
+    /// Wave-1 review NIT: every abort restoring a hash with field TTLs logged
+    /// "Redis-compat RDB drops per-field TTLs" although its `HPEXPIREAT`
+    /// records restore them. The compensation is quiet; a plain `DUMP` of the
+    /// same entry still warns (the capture can see the warning), and both
+    /// payloads are byte-identical.
+    #[test]
+    fn restoring_a_hash_with_field_ttls_does_not_warn_that_they_are_dropped() {
+        let mut db = Database::new();
+        dispatch(&mut db, &[b"HSET", b"h", b"f1", b"v1", b"f2", b"v2"]);
+        let deadline = (current_time_ms() + 900_000).to_string();
+        dispatch(
+            &mut db,
+            &[
+                b"HPEXPIREAT",
+                b"h",
+                deadline.as_bytes(),
+                b"FIELDS",
+                b"1",
+                b"f1",
+            ],
+        );
+        let entry = db.get(b"h").cloned().expect("hash");
+        let key = Bytes::from_static(b"h");
+        let mut records = Vec::new();
+        let quiet = warnings_during(|| push_restore_records(0, &key, &entry, &mut records));
+        assert_eq!(records.len(), 2, "RESTORE + HPEXPIREAT: {records:?}");
+        assert!(
+            !quiet.contains("drops per-field TTLs"),
+            "the compensation warned: {quiet}"
+        );
+        let mut dumped = Vec::new();
+        let loud = warnings_during(|| dumped = dump_payload::encode(&entry));
+        assert!(loud.contains("drops per-field TTLs"), "control: {loud:?}");
+        assert_eq!(
+            dumped,
+            dump_payload::encode_field_ttls_restored_separately(&entry)
+        );
     }
 }

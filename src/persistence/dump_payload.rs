@@ -39,7 +39,7 @@
 use std::io::Cursor;
 
 use crate::persistence::redis_rdb::{
-    REDIS_RDB_VERSION_NUM, crc64_jones, read_rdb_entry, write_typed_value,
+    FieldTtls, REDIS_RDB_VERSION_NUM, crc64_jones, read_rdb_entry, write_typed_value_with,
 };
 use crate::storage::Entry;
 
@@ -84,8 +84,20 @@ impl DumpError {
 /// `RESTORE`'s own `ttl` argument, not inside the payload, and a payload that
 /// carried one would be rejected by redis as a bad type byte.
 pub fn encode(entry: &Entry) -> Vec<u8> {
+    encode_with(entry, FieldTtls::Dropped)
+}
+
+/// [`encode`] for a caller that restores a hash's per-field TTLs itself with
+/// `HPEXPIREAT` records (the TXN.ABORT compensation, moon#1285): the payload
+/// is byte-identical, only the "Redis-compat RDB drops per-field TTLs"
+/// warning — false for this caller — is not logged.
+pub fn encode_field_ttls_restored_separately(entry: &Entry) -> Vec<u8> {
+    encode_with(entry, FieldTtls::RestoredSeparately)
+}
+
+fn encode_with(entry: &Entry, field_ttls: FieldTtls) -> Vec<u8> {
     let mut out = Vec::with_capacity(64);
-    write_typed_value(&mut out, None, entry);
+    write_typed_value_with(&mut out, None, entry, field_ttls);
     out.extend_from_slice(&REDIS_RDB_VERSION_NUM.to_le_bytes());
     let crc = crc64_jones(&out);
     out.extend_from_slice(&crc.to_le_bytes());

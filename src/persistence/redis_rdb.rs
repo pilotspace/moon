@@ -301,6 +301,27 @@ fn write_opt_key(buf: &mut Vec<u8>, key: Option<&[u8]>) {
 /// Type tag + optional key + value bytes, i.e. everything after any TTL
 /// opcode. `key: None` produces exactly the body of a `DUMP` payload.
 pub(crate) fn write_typed_value(buf: &mut Vec<u8>, key: Option<&[u8]>, entry: &Entry) {
+    write_typed_value_with(buf, key, entry, FieldTtls::Dropped);
+}
+
+/// What happens to a hash's per-field TTLs that the Redis-compat encoding
+/// cannot carry — decides whether [`write_typed_value_with`] warns.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum FieldTtls {
+    /// Lost: warn the operator (cross-vendor RDB, a client's `DUMP`).
+    Dropped,
+    /// Restored by the caller through `HPEXPIREAT` records of its own (the
+    /// TXN.ABORT compensation, moon#1285): the warning would be false.
+    RestoredSeparately,
+}
+
+/// [`write_typed_value`] with the field-TTL disposition spelled out.
+pub(crate) fn write_typed_value_with(
+    buf: &mut Vec<u8>,
+    key: Option<&[u8]>,
+    entry: &Entry,
+    field_ttls: FieldTtls,
+) {
     match entry.as_redis_value() {
         RedisValueRef::String(s) => {
             buf.push(RDB_TYPE_STRING);
@@ -328,7 +349,7 @@ pub(crate) fn write_typed_value(buf: &mut Vec<u8>, key: Option<&[u8]>, entry: &E
         // receivers reconstruct it as a TTL-less hash, identical to Moon's
         // own v1 RDB reader behavior).
         RedisValueRef::HashWithTtl { fields, ttls, .. } => {
-            if !ttls.is_empty() {
+            if !ttls.is_empty() && field_ttls == FieldTtls::Dropped {
                 tracing::warn!(
                     // A DUMP payload carries no key, so name the caller
                     // rather than print an empty string that reads as a
