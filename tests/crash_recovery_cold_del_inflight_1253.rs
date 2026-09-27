@@ -30,6 +30,14 @@
 //!   cargo build --release --bin moon --test crash_recovery_cold_del_inflight_1253
 //!   MOON_BIN=target/release/moon MOON_TEST_COLD_DEL_SHARDS=4 cargo test --release \
 //!     --test crash_recovery_cold_del_inflight_1253 -- --ignored --test-threads=1
+//!
+//! `MOON_TEST_COLD_DEL_SPILL_PANIC=1` (moon#1265) also kills spill threads
+//! mid-flight in every round (`MOON_TEST_SPILL_PANIC_FILE`, `after-write
+//! once`): the first flush of the filler — full of evicted probes — writes
+//! its file and dies before announcing it, and the hook is re-armed for the
+//! mutation window, so the probes' spills, their DEL/overwrite/FLUSH and the
+//! rewrite run across a death, its reconcile and the respawn. The run then
+//! also fails unless some round saw INFO `spill_thread_restarts` rise.
 
 #![cfg(any(feature = "runtime-monoio", feature = "runtime-tokio"))]
 #![allow(clippy::unwrap_used)]
@@ -68,6 +76,15 @@ fn shards() -> usize {
         .unwrap_or(4)
 }
 
+/// moon#1265: inject a spill-thread panic mid-flight in every round.
+fn spill_panic() -> bool {
+    std::env::var("MOON_TEST_COLD_DEL_SPILL_PANIC").as_deref() == Ok("1")
+}
+
+fn panic_file(dir: &std::path::Path) -> std::path::PathBuf {
+    dir.join("spill-panic")
+}
+
 fn start(dir: &std::path::Path) -> (common::ServerGuard, u16) {
     let off = dir.join("off");
     std::fs::create_dir_all(&off).unwrap();
@@ -97,6 +114,7 @@ fn start(dir: &std::path::Path) -> (common::ServerGuard, u16) {
                 "--dir",
                 dir.to_str().unwrap(),
             ])
+            .env("MOON_TEST_SPILL_PANIC_FILE", panic_file(&dir))
             .stdout(common::server_stderr(&dir))
             .stderr(common::server_stderr(&dir))
             .spawn()
@@ -107,19 +125,43 @@ fn start(dir: &std::path::Path) -> (common::ServerGuard, u16) {
 
 fn filler(port: u16) {
     let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
-    let val = "F".repeat(FILLER_LEN);
-    let mut buf = Vec::new();
-    for i in 0..FILLER {
-        buf.extend_from_slice(&common::encode(&["SET", &format!("filler:{i}"), &val]));
-    }
-    s.write_all(&buf).unwrap();
     s.set_read_timeout(Some(Duration::from_secs(120))).unwrap();
-    let mut got = 0usize;
-    let mut chunk = [0u8; 65536];
-    while got < FILLER {
-        let n = s.read(&mut chunk).unwrap();
-        assert!(n > 0, "filler conn closed after {got}");
-        got += chunk[..n].iter().filter(|&&b| b == b'\n').count();
+    let val = "F".repeat(FILLER_LEN);
+    let mut todo: Vec<usize> = (0..FILLER).collect();
+    // moon#1265: with a spill thread killed mid-filler, the writes that need
+    // an eviction while it is down (until the shard's next tick respawns it)
+    // are refused -OOM. Without the panic none are (measured 0 of 16000); with
+    // it, re-send them so the round keeps its memory pressure — dropping them
+    // (1061 of 16000 at `--shards 1`) settled every spill before the mutation
+    // and the round never reached the moon#1253 window.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let mut buf = Vec::new();
+        for &i in &todo {
+            buf.extend_from_slice(&common::encode(&["SET", &format!("filler:{i}"), &val]));
+        }
+        s.write_all(&buf).unwrap();
+        let mut replies = Vec::new();
+        let mut chunk = [0u8; 65536];
+        while replies.iter().filter(|&&b| b == b'\n').count() < todo.len() {
+            let n = s.read(&mut chunk).unwrap();
+            assert!(n > 0, "filler conn closed");
+            replies.extend_from_slice(&chunk[..n]);
+        }
+        if !spill_panic() {
+            return;
+        }
+        let refused: Vec<usize> = String::from_utf8_lossy(&replies)
+            .split("\r\n")
+            .zip(&todo)
+            .filter(|(r, _)| r.starts_with('-'))
+            .map(|(_, &i)| i)
+            .collect();
+        if refused.is_empty() || Instant::now() > deadline {
+            return;
+        }
+        todo = refused;
+        std::thread::sleep(Duration::from_millis(20));
     }
 }
 
@@ -134,11 +176,15 @@ fn get(c: &mut Conn, key: &str) -> Option<String> {
 /// INFO `spill_completion_superseded`: completions applied for requests a
 /// write had retired while they were in flight (process-wide, all shards).
 fn superseded_completions(c: &mut Conn) -> u64 {
+    info_u64(c, "spill_completion_superseded")
+}
+
+fn info_u64(c: &mut Conn, field: &str) -> u64 {
     let info = c.send(&["INFO", "persistence"]);
     info.lines()
-        .find_map(|l| l.strip_prefix("spill_completion_superseded:"))
+        .find_map(|l| l.strip_prefix(&format!("{field}:")))
         .and_then(|v| v.trim().parse().ok())
-        .unwrap_or_else(|| panic!("INFO persistence has no spill_completion_superseded: {info}"))
+        .unwrap_or_else(|| panic!("INFO persistence has no {field}: {info}"))
 }
 
 /// Newest incr sequence per AOF directory (per shard, or the TopLevel one),
@@ -212,11 +258,12 @@ enum Want {
 type Mutate = fn(&mut Conn, &[String]) -> Vec<String>;
 
 /// One round: probes, filler, `mutate` the even probes WITHOUT settling,
-/// rewrite, SIGKILL, restart, judge. Returns the probes that read wrong, and
-/// how many superseded completions were applied from just before the
-/// BGREWRITEAOF until the rewrite finished: requests still in flight when
-/// the rewrite began, the window the bug needs.
-fn round(tag: &str, mutate: Mutate, want: Want) -> (Vec<String>, u64) {
+/// rewrite, SIGKILL, restart, judge. Returns the probes that read wrong, how
+/// many superseded completions were applied from just before the
+/// BGREWRITEAOF until the rewrite finished (requests still in flight when
+/// the rewrite began, the window the bug needs), and how many spill threads
+/// were respawned before the kill (moon#1265, with `spill_panic()`).
+fn round(tag: &str, mutate: Mutate, want: Want) -> (Vec<String>, u64, u64) {
     let dir = common::unique_test_dir(&format!("cold-del-inflight-1253-{tag}-{}", shards()));
     std::fs::create_dir_all(&dir).unwrap();
     let (mut server, port) = start(&dir);
@@ -228,7 +275,21 @@ fn round(tag: &str, mutate: Mutate, want: Want) -> (Vec<String>, u64) {
             "+OK\r\n"
         );
     }
+    // moon#1265: armed before the filler, the first flush of any shard —
+    // full of evicted probes — dies after writing its file; re-armed after
+    // it, a flush in the mutation window may die too (not every round has
+    // one left: a disarmed file is simply removed before the kill).
+    let restarts_before = info_u64(&mut c, "spill_thread_restarts");
+    if spill_panic() {
+        std::fs::write(panic_file(&dir), "after-write once").unwrap();
+    }
     filler(port);
+    // Panics injected: the hook removes the file of the one it fires.
+    let mut fired = 0u64;
+    if spill_panic() && !panic_file(&dir).exists() {
+        fired += 1;
+        std::fs::write(panic_file(&dir), "after-write once").unwrap();
+    }
     let even: Vec<String> = (0..PROBES)
         .filter(|i| i % 2 == 0)
         .map(|i| format!("probe:{i}"))
@@ -244,6 +305,30 @@ fn round(tag: &str, mutate: Mutate, want: Want) -> (Vec<String>, u64) {
     let superseded_before = superseded_completions(&mut c);
     rewrite(&mut c, &dir);
     let hits = superseded_completions(&mut c).saturating_sub(superseded_before);
+    let restarts = if spill_panic() {
+        // Disarm (a file already gone was consumed by a panic), then wait
+        // until every injected death was observed, reconciled and respawned
+        // — the shard sees a death on its next 100 ms eviction tick, which a
+        // busy loop can delay — so the kill lands on respawned threads.
+        if std::fs::remove_file(panic_file(&dir))
+            .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+        {
+            fired += 1;
+        }
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while info_u64(&mut c, "spill_thread_restarts").saturating_sub(restarts_before) < fired
+            || info_u64(&mut c, "spill_thread_alive") == 0
+        {
+            assert!(
+                Instant::now() < deadline,
+                "{tag}: {fired} injected spill-thread panic(s) never all respawned"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        info_u64(&mut c, "spill_thread_restarts").saturating_sub(restarts_before)
+    } else {
+        0
+    };
     server.kill_now();
     common::wait_for_port_down(port);
     drop(c);
@@ -279,14 +364,16 @@ fn round(tag: &str, mutate: Mutate, want: Want) -> (Vec<String>, u64) {
     } else {
         eprintln!("{tag}: dir kept at {}", dir.display());
     }
-    (wrong, hits)
+    (wrong, hits, restarts)
 }
 
 fn run(tag: &str, mutate: Mutate, want: fn() -> Want) {
     let mut hits = Vec::with_capacity(ROUNDS);
+    let mut restarts = Vec::with_capacity(ROUNDS);
     for r in 0..ROUNDS {
-        let (wrong, round_hits) = round(tag, mutate, want());
+        let (wrong, round_hits, round_restarts) = round(tag, mutate, want());
         hits.push(round_hits);
+        restarts.push(round_restarts);
         assert!(
             wrong.is_empty(),
             "--shards {}, round {r}: {} probe(s) read wrong after the restart (first: {:?})",
@@ -296,7 +383,14 @@ fn run(tag: &str, mutate: Mutate, want: fn() -> Want) {
         );
     }
     eprintln!(
-        "{tag}, --shards {}: superseded completions applied during the rewrite, per round: {hits:?}",
+        "{tag}, --shards {}: superseded completions applied during the rewrite, per round: \
+         {hits:?}; spill threads respawned, per round: {restarts:?}",
+        shards()
+    );
+    assert!(
+        !spill_panic() || restarts.iter().any(|&n| n > 0),
+        "--shards {}: MOON_TEST_COLD_DEL_SPILL_PANIC=1 but no round respawned a spill thread: \
+         the injected panic never fired, so this run proves nothing about moon#1265",
         shards()
     );
     assert!(
