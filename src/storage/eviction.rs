@@ -720,7 +720,12 @@ pub(crate) fn force_aof_backstop(present: Option<bool>) {
 }
 
 /// Smallest durable batch a no-AOF eviction writes, in bytes (moon#1290 N6).
-const DURABLE_BATCH_MIN_BYTES: usize = 256 * 1024;
+/// 1 MiB (was 256 KiB in the first cut): every batch costs a heap fsync and a
+/// manifest commit, and a larger batch amortizes them — a no-AOF write flood
+/// over `maxmemory` measured +25–55% rps (monoio `--shards 4`: ~122K → 151–164K
+/// rps). The cost is disk: without an AOF nothing reclaims a spill file until
+/// its last live key leaves it, so a bigger file holds more dead slots.
+const DURABLE_BATCH_MIN_BYTES: usize = 1024 * 1024;
 
 /// The bytes one no-AOF durable batch reclaims: the deficit, but at least
 /// 1/16 of the target (capped at [`DURABLE_BATCH_MIN_BYTES`]). A write gate's
@@ -1379,10 +1384,11 @@ pub fn compute_elastic_budget(shard_id: usize, base: usize, used: &[usize]) -> u
 }
 
 /// Maximum victims collected into a single durable batch by
-/// [`evict_batch_durable`], mirroring `SpillThread`'s own
-/// `FLUSH_ENTRY_CAP` (256) so the no-AOF-backstop path's on-disk batch size
-/// matches the async path's.
-const NO_AOF_BATCH_CAP: usize = 256;
+/// [`evict_batch_durable`]. 1024 — four times `SpillThread`'s own
+/// `FLUSH_ENTRY_CAP` (256): the no-AOF path fsyncs and commits the manifest per
+/// batch on the shard thread, so it amortizes that over more entries (see
+/// [`DURABLE_BATCH_MIN_BYTES`] for the measured gain and the disk cost).
+const NO_AOF_BATCH_CAP: usize = 1024;
 
 /// Bounded retries when victim sampling re-picks a key already staged in the
 /// current batch (possible because, unlike the single-victim paths, this
