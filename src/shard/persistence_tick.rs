@@ -750,6 +750,12 @@ pub(crate) fn run_eviction_tick(
         spill_thread,
         cascade_ledger_bytes,
     );
+    // moon#1265: after the reclaim tick saw this tick's liveness (it
+    // abandons a dead thread's compactions first), respawn a spill thread
+    // whose backoff is over.
+    if let Some(st) = spill_thread {
+        spill_supervise::respawn_if_due(st, shard_databases.db_count(), shard_id);
+    }
     if server_config.disk_offload_enabled()
         && should_run_pressure_cascade(
             runtime_config,
@@ -888,21 +894,19 @@ fn drain_and_apply(
     let done_below = spill_thread.done_below();
     let completions = spill_thread.drain_completions();
     apply_completion_vec(completions, shard_manifest, marker_sink);
-    prune_superseded(spill_thread.take_prune(done_below, was_dead), db_count);
-    // Refs moon#1265: one error line and INFO `spill_thread_alive:0`.
-    spill_thread.report_death_once(was_dead, shard_id);
+    prune_superseded(spill_thread.take_prune(done_below), db_count);
+    // moon#1265: a thread seen dead before the drain has had everything it
+    // sent applied; reconcile what died with it and schedule its respawn.
+    spill_supervise::after_drain(spill_thread, was_dead, db_count, shard_id);
 }
 
 /// Bound the superseded sets (refs moon#1253): a request whose completion
-/// never arrives — dropped at shutdown, or its spill thread dead — would stay
-/// in its database's set for good. Runs only when the spill thread's
-/// watermark moved (or it died), and touches only non-empty sets.
-fn prune_superseded(
-    prune: Option<crate::storage::tiered::spill_thread::SupersededPrune>,
-    db_count: usize,
-) {
-    use crate::storage::tiered::spill_thread::SupersededPrune;
-    let Some(prune) = prune else {
+/// never arrives — dropped at shutdown — would stay in its database's set for
+/// good. Runs only when the spill thread's watermark moved, and touches only
+/// non-empty sets. (A request that died with its spill thread is forgotten by
+/// the reconcile, `spill_supervise`, moon#1265.)
+fn prune_superseded(prune_below: Option<u64>, db_count: usize) {
+    let Some(done_below) = prune_below else {
         return;
     };
     for db_index in 0..db_count {
@@ -910,10 +914,7 @@ fn prune_superseded(
             if db.spill_superseded_is_empty() {
                 return;
             }
-            let pruned = match prune {
-                SupersededPrune::Below(done_below) => db.spill_superseded_prune_below(done_below),
-                SupersededPrune::All => db.spill_superseded_clear(),
-            };
+            let pruned = db.spill_superseded_prune_below(done_below);
             if pruned > 0 {
                 tracing::debug!(
                     db = db_index,
@@ -1630,12 +1631,14 @@ pub(crate) fn handle_memory_pressure(
                                 .budget(budget)
                                 .ledger(0)
                                 .report(
-                                    // task #34 (Wave A): only the no-manifest,
-                                    // `--appendonly no` plain-drop fallback
-                                    // inside this function ever calls this sink
-                                    // (the async-spill and durable-batch
-                                    // branches leave a cold/AOF-recoverable
-                                    // copy and never invoke it).
+                                    // task #34 (Wave A): only the plain-drop
+                                    // fallbacks inside this function call this
+                                    // sink — no manifest under `--appendonly
+                                    // no`, or a degraded shard's closed spill
+                                    // channel (moon#1265); the async-spill and
+                                    // durable-batch branches leave a
+                                    // cold/AOF-recoverable copy and never
+                                    // invoke it.
                                     &mut |key| {
                                         crate::replication::reason_del::record_reason_del(
                                             key,
@@ -2521,6 +2524,7 @@ mod checkpoint_tick_tests;
 mod superseded_spill_tests;
 
 mod cold_reclaim_tick;
+mod spill_supervise;
 
 #[cfg(test)]
 mod cascade_ledger_tests;
@@ -2536,6 +2540,9 @@ mod reclaim_offload_tests;
 
 #[cfg(test)]
 mod superseded_settle_tests;
+
+#[cfg(test)]
+mod spill_supervise_tests;
 
 #[cfg(test)]
 mod tests {

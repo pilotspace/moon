@@ -924,14 +924,33 @@ impl Database {
         before - self.spill_superseded.len()
     }
 
-    /// Forget every superseded request: the spill thread died, so no
-    /// completion will arrive and none of their files gets listed (refs
-    /// moon#1253). Returns how many were forgotten.
-    pub fn spill_superseded_clear(&mut self) -> usize {
-        let n = self.spill_superseded.len();
-        self.spill_superseded.clear();
-        self.spill_superseded_bytes = 0;
-        n
+    /// Forget every superseded request whose id `keep` rejects: its spill
+    /// thread died holding it (moon#1265), so no completion will arrive and
+    /// no file of it gets listed (refs moon#1253). The requests `keep`
+    /// accepts are still queued for the next incarnation and stay until
+    /// their completion settles them. Returns how many were forgotten.
+    pub fn spill_superseded_retain(&mut self, keep: impl Fn(u64) -> bool) -> usize {
+        if self.spill_superseded.is_empty() {
+            return 0;
+        }
+        let before = self.spill_superseded.len();
+        let mut credit = 0usize;
+        self.spill_superseded.retain(|(key, req_id), _| {
+            let kept = keep(*req_id);
+            if !kept {
+                credit += key.len() + SPILL_SUPERSEDED_OVERHEAD;
+            }
+            kept
+        });
+        self.spill_superseded_bytes = self.spill_superseded_bytes.saturating_sub(credit);
+        before - self.spill_superseded.len()
+    }
+
+    /// `(key, request id)` of every in-flight record: what the shard checks
+    /// against the requests still queued when its spill thread died
+    /// (moon#1265).
+    pub fn spill_inflight_records(&self) -> impl Iterator<Item = (&bytes::Bytes, u64)> {
+        self.spill_inflight.iter().map(|(k, p)| (k, p.req_id))
     }
 
     /// Keys whose superseded in-flight slot can still come back at `now_ms`

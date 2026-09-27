@@ -191,6 +191,33 @@ pub fn record_key_spilled() {
     counter!("moon_spilled_keys_total").increment(1);
 }
 
+/// Record one spill-thread death observed by its shard (moon#1265).
+#[inline]
+pub fn record_spill_thread_death() {
+    if !METRICS_INITIALIZED.load(Ordering::Relaxed) {
+        return;
+    }
+    counter!("moon_spill_thread_deaths_total").increment(1);
+}
+
+/// Record one spill-thread respawn (moon#1265).
+#[inline]
+pub fn record_spill_thread_restart() {
+    if !METRICS_INITIALIZED.load(Ordering::Relaxed) {
+        return;
+    }
+    counter!("moon_spill_thread_restarts_total").increment(1);
+}
+
+/// Publish how many shards stopped spilling for good (moon#1265).
+#[inline]
+pub fn set_spill_threads_degraded(shards: u64) {
+    if !METRICS_INITIALIZED.load(Ordering::Relaxed) {
+        return;
+    }
+    gauge!("moon_spill_threads_degraded").set(shards as f64);
+}
+
 // ── Persistence metrics ─────────────────────────────────────────────────
 
 /// Record an AOF fsync duration.

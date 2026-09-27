@@ -524,7 +524,10 @@ fn info_raw(db: &Database, facts: &InstanceFacts) -> String {
          spill_completion_id_rejected:{}\r\n\
          spill_completion_marker_withdrawn:{}\r\n\
          spill_last_heartbeat_ms:{}\r\n\
-         spill_thread_alive:{}\r\n",
+         spill_thread_alive:{}\r\n\
+         spill_thread_restarts:{}\r\n\
+         spill_thread_degraded:{}\r\n\
+         spill_thread_rehydrated:{}\r\n",
         // moon#744: was a hardcoded `loading:0`. `any_shard_loading()` is a
         // process-wide counter precisely so INFO can answer this from a thread
         // that is not the recovering shard's -- nothing had ever read it.
@@ -610,9 +613,14 @@ fn info_raw(db: &Database, facts: &InstanceFacts) -> String {
         crate::storage::tiered::spill_thread::spill_completion_id_rejected_total(),
         crate::storage::tiered::spill_thread::spill_completion_marker_withdrawn_total(),
         crate::storage::tiered::spill_thread::spill_last_heartbeat_ms(),
-        // Refs moon#1265: 0 once any shard's spill thread was found dead; it
-        // is not respawned, so that shard spills and compacts nothing more.
+        // moon#1265: 0 while any shard's spill thread is down (dead and not
+        // yet respawned, or degraded); respawns so far; shards whose restart
+        // budget is spent (they spill nothing more until a restart); and the
+        // in-flight payloads a death put back into RAM.
         u8::from(crate::storage::tiered::spill_thread::spill_threads_alive()),
+        crate::storage::tiered::spill_thread::spill_thread_restarts_total(),
+        crate::storage::tiered::spill_thread::spill_threads_degraded(),
+        crate::storage::tiered::spill_thread::spill_thread_rehydrated_total(),
     ));
     sections.push_str("\r\n");
 

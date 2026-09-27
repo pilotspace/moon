@@ -74,8 +74,11 @@ pub(super) fn run(
     let overflow = pool.overflow_for(shard_id);
     let committed = overflow.committed_floor().0;
     let db_count = shard_databases.db_count();
-    // Refs moon#1265: sampled before the answers are drained, so everything a
+    // moon#1265: sampled before the answers are drained, so everything a
     // dead thread sent is applied below before its other jobs are abandoned.
+    // "Dead" is any tick with no thread running: just died, in backoff before
+    // its respawn (which runs after this tick, `spill_supervise`), or
+    // degraded.
     let dead = spill_thread.is_some_and(SpillThread::is_dead);
 
     // 1. Apply what the spill thread finished: a read becomes a write job
@@ -89,9 +92,11 @@ pub(super) fn run(
             });
         }
     }
-    // Refs moon#1265: a dead spill thread answers nothing more. Abandon what
-    // it still held and start nothing new on it; it is not respawned (the
-    // death is logged and in INFO, `spill_thread_alive:0`).
+    // moon#1265: a dead spill thread answers nothing more. Abandon what it
+    // still held (its queued jobs are dropped by the shard's reconcile; a
+    // write it finished unannounced is an unlisted file the startup orphan
+    // sweep removes) and start nothing new until the respawn: the files are
+    // not given up, so the next incarnation compacts them.
     let spill_thread = if dead {
         for db_index in 0..db_count {
             crate::shard::slice::with_shard_db(db_index, |db| {

@@ -139,18 +139,6 @@ static SPILL_LAST_HEARTBEAT_MS: AtomicU64 = AtomicU64::new(0);
 /// Cumulative number of spill batches flushed to disk across all shards.
 static SPILL_BATCHES_FLUSHED: AtomicU64 = AtomicU64::new(0);
 
-/// Spill threads found dead — exited without being asked to stop — across
-/// all shards. A dead thread is not respawned (moon#1265): its shard spills
-/// nothing more and its cold reclaim compacts nothing until a restart.
-static SPILL_THREADS_DEAD: AtomicU64 = AtomicU64::new(0);
-
-/// `false` once any shard's spill thread was found dead (INFO
-/// `spill_thread_alive`; refs moon#1265).
-#[inline]
-pub fn spill_threads_alive() -> bool {
-    SPILL_THREADS_DEAD.load(Ordering::Relaxed) == 0
-}
-
 /// Unix millis of the most recent spill-thread loop tick (0 = never ran).
 #[inline]
 pub fn spill_last_heartbeat_ms() -> u64 {
@@ -256,6 +244,16 @@ use crate::persistence::page::PageType;
 use crate::storage::tiered::kv_spill::{
     SpillEntry, build_kv_spill_batch, build_kv_spill_pages, write_kv_spill_batch,
     write_kv_spill_pages,
+};
+
+pub(crate) mod fault;
+mod supervision;
+pub(crate) mod supervisor;
+
+pub(crate) use supervision::{Respawn, record_spill_thread_rehydrated};
+pub use supervision::{
+    spill_thread_rehydrated_total, spill_thread_restarts_total, spill_threads_alive,
+    spill_threads_degraded,
 };
 
 /// Request sent from event loop to background spill thread.
@@ -562,7 +560,14 @@ fn spill_single_entry(req: &SpillRequest, file_id: u64) -> SpillCompletion {
 /// One per shard. Matches the WAL writer pattern: dedicated `std::thread`
 /// that blocks on a flume channel, buffers requests, and flushes as batched
 /// multi-page DataFiles.
+///
+/// Supervised (moon#1265, `supervision`): the thread body runs under
+/// `catch_unwind`, a panic is recorded rather than lost, and the shard
+/// respawns the thread on its tick with bounded backoff — reattached to the
+/// SAME channels, whose thread-side ends this struct keeps, so the clones of
+/// [`Self::sender`] every connection holds stay valid across a restart.
 pub struct SpillThread {
+    shard_id: usize,
     request_tx: flume::Sender<SpillRequest>,
     completion_rx: flume::Receiver<SpillCompletion>,
     /// Cold-reclaim disk work (moon#1240, `super::reclaim_io`): the shard
@@ -570,28 +575,33 @@ pub struct SpillThread {
     /// thread, not the event loop.
     reclaim_tx: flume::Sender<super::reclaim_io::ReclaimJob>,
     reclaim_done_rx: flume::Receiver<super::reclaim_io::ReclaimDone>,
-    join_handle: Option<std::thread::JoinHandle<()>>,
+    /// The running incarnation and its restart policy.
+    worker: parking_lot::Mutex<supervision::Worker>,
     stop_flag: Arc<AtomicBool>,
     /// Every request with a file id below this has had its completion sent
     /// (or dropped at shutdown): the thread stores one past the largest id
     /// of each flush, after that flush's `send_completions` returns (refs
-    /// moon#1253, see [`Self::done_below`]).
+    /// moon#1253, see [`Self::done_below`]). Shared by every incarnation, so
+    /// it never moves backwards across a respawn.
     done_below: Arc<AtomicU64>,
     /// The watermark the shard last pruned its superseded sets with.
     pruned_below: AtomicU64,
-    /// Set once this thread's death was logged and counted
-    /// ([`Self::report_death_once`]).
-    death_reported: AtomicBool,
+    /// Test-only panic injection (`MOON_TEST_SPILL_PANIC_FILE`); `None` in
+    /// production.
+    fault: Option<Arc<fault::PanicPlan>>,
 }
 
-/// How [`SpillThread::take_prune`] says to prune the shard's superseded sets.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum SupersededPrune {
-    /// Every request below this id is done.
-    Below(u64),
-    /// The thread is dead: no pending completion will ever arrive, and no
-    /// file of an unflushed request gets listed.
-    All,
+/// The thread's ends of the four channels. [`SpillThread`] keeps one set and
+/// hands each incarnation a clone, so a dead thread disconnects nothing: its
+/// queued requests wait for the next incarnation. Dropped once the shard is
+/// degraded (moon#1265), which disconnects the request channel — every
+/// eviction then takes the no-spill path (`eviction::evict_to_budget`).
+#[derive(Clone)]
+struct ThreadEnds {
+    request_rx: flume::Receiver<SpillRequest>,
+    completion_tx: flume::Sender<SpillCompletion>,
+    reclaim_rx: flume::Receiver<super::reclaim_io::ReclaimJob>,
+    reclaim_done_tx: flume::Sender<super::reclaim_io::ReclaimDone>,
 }
 
 /// Reclaim jobs queued for one spill thread at most. The shard sends with
@@ -611,6 +621,11 @@ impl SpillThread {
     /// rebuilds `cold_index` from the manifest, so dropping is safe (though
     /// we count it for observability).
     pub fn new(shard_id: usize) -> Self {
+        Self::with_fault(shard_id, fault::PanicPlan::from_env())
+    }
+
+    /// [`Self::new`] with an explicit panic-injection plan (tests).
+    pub(crate) fn with_fault(shard_id: usize, fault: Option<Arc<fault::PanicPlan>>) -> Self {
         let (request_tx, request_rx) = flume::bounded::<SpillRequest>(REQUEST_QUEUE_CAP);
         let (completion_tx, completion_rx) = flume::bounded::<SpillCompletion>(8192);
         let (reclaim_tx, reclaim_rx) =
@@ -618,42 +633,75 @@ impl SpillThread {
         // Unbounded: at most one answer per job, and jobs are bounded above.
         let (reclaim_done_tx, reclaim_done_rx) =
             flume::unbounded::<super::reclaim_io::ReclaimDone>();
+        let ends = ThreadEnds {
+            request_rx,
+            completion_tx,
+            reclaim_rx,
+            reclaim_done_tx,
+        };
         let stop_flag = Arc::new(AtomicBool::new(false));
-        let stop_flag_bg = stop_flag.clone();
         let done_below = Arc::new(AtomicU64::new(0));
-        let done_below_bg = done_below.clone();
 
         #[allow(clippy::expect_used)]
         // Startup: spill thread is critical infrastructure — spawn failure is fatal
-        let join_handle = std::thread::Builder::new()
-            .name(format!("spill-{shard_id}"))
-            .spawn(move || {
-                // O5: this thread is spawned from the shard's own (pinned)
-                // event-loop thread and would otherwise inherit its exact
-                // single-core mask — re-pin to the non-shard core set as the
-                // first act, before anything else runs.
-                crate::shard::numa::pin_current_aux_thread(&format!("spill-{shard_id}"));
-                Self::run(
-                    request_rx,
-                    completion_tx,
-                    (reclaim_rx, reclaim_done_tx),
-                    stop_flag_bg,
-                    &done_below_bg,
-                );
-            })
-            .expect("failed to spawn spill thread");
+        let (handle, exit) = Self::spawn_incarnation(
+            shard_id,
+            ends.clone(),
+            stop_flag.clone(),
+            done_below.clone(),
+            fault.clone(),
+        )
+        .expect("failed to spawn spill thread");
 
         Self {
+            shard_id,
             request_tx,
             completion_rx,
             reclaim_tx,
             reclaim_done_rx,
-            join_handle: Some(join_handle),
+            worker: parking_lot::Mutex::new(supervision::Worker::new(handle, exit, ends)),
             stop_flag,
             done_below,
             pruned_below: AtomicU64::new(0),
-            death_reported: AtomicBool::new(false),
+            fault,
         }
+    }
+
+    /// Start one incarnation of the thread on `ends`. The body runs under
+    /// `catch_unwind` (moon#1265): a panic's message is stored in the
+    /// returned slot for the shard to log when it observes the death, and
+    /// the thread exits normally — its channel ends are clones, so nothing
+    /// disconnects.
+    ///
+    /// Unwind safety: what the body owns (its request buffer, a batch being
+    /// built) is dropped by the unwind and never observed again; what it
+    /// shares is channels and atomics, which a panic cannot leave torn.
+    fn spawn_incarnation(
+        shard_id: usize,
+        ends: ThreadEnds,
+        stop_flag: Arc<AtomicBool>,
+        done_below: Arc<AtomicU64>,
+        fault: Option<Arc<fault::PanicPlan>>,
+    ) -> std::io::Result<(std::thread::JoinHandle<()>, supervision::ExitSlot)> {
+        let exit = supervision::ExitSlot::default();
+        let exit_bg = exit.clone();
+        let handle = std::thread::Builder::new()
+            .name(format!("spill-{shard_id}"))
+            .spawn(move || {
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    // O5: this thread is spawned from the shard's own (pinned)
+                    // event-loop thread and would otherwise inherit its exact
+                    // single-core mask — re-pin to the non-shard core set as
+                    // the first act, before anything else runs.
+                    crate::shard::numa::pin_current_aux_thread(&format!("spill-{shard_id}"));
+                    fault::check(fault.as_deref(), fault::PanicPoint::Start);
+                    Self::run(ends, stop_flag, &done_below, fault.as_deref());
+                }));
+                if let Err(payload) = outcome {
+                    exit_bg.record_panic(payload.as_ref());
+                }
+            })?;
+        Ok((handle, exit))
     }
 
     /// Background thread main loop.
@@ -663,15 +711,17 @@ impl SpillThread {
     /// - `recv_timeout(100ms)` fires with a non-empty buffer (latency guard).
     /// - stop_flag is set or channel disconnects — flush remaining, then exit.
     fn run(
-        request_rx: flume::Receiver<SpillRequest>,
-        completion_tx: flume::Sender<SpillCompletion>,
-        (reclaim_rx, reclaim_done_tx): (
-            flume::Receiver<super::reclaim_io::ReclaimJob>,
-            flume::Sender<super::reclaim_io::ReclaimDone>,
-        ),
+        ends: ThreadEnds,
         stop_flag: Arc<AtomicBool>,
         done_below: &AtomicU64,
+        fault: Option<&fault::PanicPlan>,
     ) {
+        let ThreadEnds {
+            request_rx,
+            completion_tx,
+            reclaim_rx,
+            reclaim_done_tx,
+        } = ends;
         let mut buffer: Vec<SpillRequest> = Vec::with_capacity(FLUSH_ENTRY_CAP);
         // Flush the buffer, send its completions, then publish the watermark
         // (refs moon#1253): the requests are handled FIFO and their file ids
@@ -680,7 +730,10 @@ impl SpillThread {
         // a shard that reads the watermark finds those completions queued.
         let flush = |buffer: &mut Vec<SpillRequest>| {
             let through = buffer.iter().map(|r| r.file_id).max();
-            Self::send_completions(&completion_tx, flush_buffer(buffer), &stop_flag);
+            let completions = flush_buffer(buffer);
+            fault::check(fault, fault::PanicPoint::AfterWrite);
+            Self::send_completions(&completion_tx, completions, &stop_flag);
+            fault::check(fault, fault::PanicPoint::AfterSend);
             if let Some(id) = through {
                 done_below.fetch_max(id.saturating_add(1), Ordering::Release);
             }
@@ -724,7 +777,12 @@ impl SpillThread {
             // `recv_timeout`; a shutdown drops unserved jobs (their outputs,
             // if any, are unlisted files the startup orphan sweep removes).
             while let Ok(job) = reclaim_rx.try_recv() {
-                let _ = reclaim_done_tx.send(super::reclaim_io::run_job(job));
+                let write = matches!(job, super::reclaim_io::ReclaimJob::Write { .. });
+                let done = super::reclaim_io::run_job(job);
+                if write {
+                    fault::check(fault, fault::PanicPoint::ReclaimWrite);
+                }
+                let _ = reclaim_done_tx.send(done);
             }
 
             match request_rx.recv_timeout(std::time::Duration::from_millis(100)) {
@@ -815,11 +873,16 @@ impl SpillThread {
     }
 
     /// Queue a cold-reclaim job (moon#1240). Never blocks: the job comes back
-    /// when the queue is full or the thread is gone.
+    /// when the queue is full or no thread is running to serve it (moon#1265:
+    /// a job queued for a dead thread would outlive the abandonment of its
+    /// compaction).
     pub(crate) fn try_submit_reclaim(
         &self,
         job: super::reclaim_io::ReclaimJob,
     ) -> Result<(), super::reclaim_io::ReclaimJob> {
+        if self.is_dead() {
+            return Err(job);
+        }
         self.reclaim_tx.try_send(job).map_err(|e| e.into_inner())
     }
 
@@ -838,90 +901,33 @@ impl SpillThread {
         self.done_below.load(Ordering::Acquire)
     }
 
-    /// Whether the superseded sets need a prune now: the watermark moved past
-    /// the last one, or the thread is dead. Records the watermark as pruned.
+    /// The watermark to prune the shard's superseded sets below, when it
+    /// moved past the last one. Records it as pruned.
     ///
-    /// `was_dead` is [`Self::is_dead`] sampled BEFORE `done_below` was read
-    /// and the completions drained (refs moon#1253, review 5): a thread seen
-    /// dead then had sent everything it ever will, and the drain applied it.
-    /// Sampled after the drain, a thread that sent one more completion and
-    /// died in between had its entries cleared while that completion was
-    /// still queued, un-applied — which reopens the moon#1253 fold window.
-    pub(crate) fn take_prune(&self, done_below: u64, was_dead: bool) -> Option<SupersededPrune> {
-        if was_dead {
-            return Some(SupersededPrune::All);
-        }
-        if done_below > self.pruned_below.fetch_max(done_below, Ordering::Relaxed) {
-            Some(SupersededPrune::Below(done_below))
-        } else {
-            None
-        }
-    }
-
-    /// The thread exited while nobody asked it to stop (a panic): no
-    /// completion will arrive for anything it had not flushed.
-    pub fn is_dead(&self) -> bool {
-        let dead = !self.stop_flag.load(Ordering::Acquire)
-            && self
-                .join_handle
-                .as_ref()
-                .is_some_and(std::thread::JoinHandle::is_finished);
-        if dead {
-            // `is_finished` is a relaxed read of the value the thread's exit
-            // released; this fence orders everything the thread did before it
-            // exited (its last completion sends included) before the caller's
-            // next read of the completion channel.
-            std::sync::atomic::fence(Ordering::Acquire);
-        }
-        dead
-    }
-
-    /// Given [`Self::is_dead`] as the caller sampled it: the first time it is
-    /// `true`, log the death once at `error` and count it for INFO
-    /// (`spill_thread_alive:0`). Returns whether this call reported it.
-    /// Refs moon#1265: the thread is not respawned.
-    pub(crate) fn report_death_once(&self, was_dead: bool, shard_id: usize) -> bool {
-        if !was_dead || self.death_reported.swap(true, Ordering::Relaxed) {
-            return false;
-        }
-        SPILL_THREADS_DEAD.fetch_add(1, Ordering::Relaxed);
-        tracing::error!(
-            shard_id,
-            "spill thread died (it exited without a shutdown request): until the server \
-             restarts this shard spills no evicted key to disk (an eviction that needs a spill \
-             keeps its key in RAM, so a shard over maxmemory may answer -OOM) and its cold \
-             reclaim compacts nothing (moon#1265: no respawn yet)"
-        );
-        true
+    /// A dead thread is not a reason to prune everything any more (moon#1265):
+    /// its queued requests are served by the next incarnation, and the
+    /// shard's reconcile (`persistence_tick::spill_supervise`) forgets
+    /// exactly the requests that died with it.
+    pub(crate) fn take_prune(&self, done_below: u64) -> Option<u64> {
+        (done_below > self.pruned_below.fetch_max(done_below, Ordering::Relaxed))
+            .then_some(done_below)
     }
 
     /// A spill thread whose thread exited without being asked to (tests of
-    /// [`Self::is_dead`]).
+    /// [`Self::is_dead`] and of the shard's reconcile): its first incarnation
+    /// panics as it starts; the next one runs normally.
     #[cfg(test)]
     pub(crate) fn exited_for_test() -> Self {
-        let (request_tx, _) = flume::bounded::<SpillRequest>(1);
-        let (_, completion_rx) = flume::bounded::<SpillCompletion>(1);
-        let (reclaim_tx, _) = flume::bounded::<super::reclaim_io::ReclaimJob>(1);
-        let (_, reclaim_done_rx) = flume::unbounded::<super::reclaim_io::ReclaimDone>();
-        #[allow(clippy::expect_used)] // test-only
-        let join_handle = std::thread::Builder::new()
-            .name("spill-exited".to_string())
-            .spawn(|| {})
-            .expect("spawn");
-        while !join_handle.is_finished() {
+        let st = Self::with_fault(
+            0,
+            Some(fault::PanicPlan::times(fault::PanicPoint::Start, 1)),
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !st.is_dead() {
+            assert!(std::time::Instant::now() < deadline, "never exited");
             std::thread::yield_now();
         }
-        Self {
-            request_tx,
-            completion_rx,
-            reclaim_tx,
-            reclaim_done_rx,
-            join_handle: Some(join_handle),
-            stop_flag: Arc::new(AtomicBool::new(false)),
-            done_below: Arc::new(AtomicU64::new(0)),
-            pruned_below: AtomicU64::new(0),
-            death_reported: AtomicBool::new(false),
-        }
+        st
     }
 
     /// Get a clone of the request sender for the event loop to hold.
@@ -952,10 +958,16 @@ impl SpillThread {
     /// Returns any completions produced by the thread's final buffer flush that
     /// the event loop never drained, so the caller can still apply them
     /// (manifest `add_file` + `cold_index` insert) instead of losing those keys.
+    ///
+    /// A shard shut down while its thread is down (moon#1265: in backoff, or
+    /// degraded) has no thread to flush what is queued: those requests' keys
+    /// are still in the AOF that authorized their eviction, exactly as for a
+    /// crash, and their unwritten ids are gaps.
     #[must_use]
-    pub fn shutdown(mut self) -> Vec<SpillCompletion> {
+    pub fn shutdown(self) -> Vec<SpillCompletion> {
         self.stop_flag.store(true, Ordering::Release);
-        if let Some(handle) = self.join_handle.take() {
+        let handle = self.worker.lock().retire_for_shutdown();
+        if let Some(handle) = handle {
             let _ = handle.join();
         }
         // Thread has exited; surface any completions from its final buffer flush
@@ -966,3 +978,6 @@ impl SpillThread {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod supervision_tests;
