@@ -269,6 +269,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Performance
 
+- **A write that evicts against a backlogged AOF writer no longer stalls its
+  shard for k × 500 ms** (moon#1294). Every connection-path eviction gate
+  (monoio write gate, tokio per-command and MQ gates, script bridge, inline
+  SET) shares one reason-DEL backpressure bound per eviction run; past it the
+  remaining victims' DELs fail fast into `aof_reason_del_dropped` (counted,
+  logged, `aof_last_append_status:err`). One evicting write against a stalled
+  writer: 21.5–45.1 s → 0.52 s, both runtimes.
+
+- **Active expiry adapts to an expired backlog** (moon#1288). When a cycle runs
+  out of time with keys still due, the 1 ms tick drains the backlog in slices
+  capped at 25% of the shard and 1 ms per tick (a token bucket; a saturated
+  loop gets fewer slices). 1.84M keys expired during a 6 s stall clear in
+  ~5–6 s instead of ~4 min (7–8K → 300–370K keys/s; redis 7.0.15: 3.8 s), at
+  about +250 µs PING/GET p99 while it drains. Not on replicas; stands down when
+  the AOF channel is nearly full. New INFO `expired_time_cap_reached_count`,
+  `expire_cycle_cpu_milliseconds`.
+
+- **SSCAN pages a large set by position: O(COUNT) per call** (moon#1287). It
+  materialized and sorted the whole set on every call (a full scan of 1M
+  members ~9–10 min; now 2.1–2.7 s, redis 3.0–3.3 s), and a member removed
+  before the cursor could make it skip members present for the whole scan.
+  Small (intset/listpack) sets answer in one call with cursor 0, as redis does.
+  HSCAN keeps the old path until moon#1171's IndexMap.
+
+
 - **A stalled shard no longer replays every missed periodic tick** (moon#1280).
   Every interval now skips missed ticks (both runtimes; `clippy.toml` forbids
   the raw constructors), the monoio chores are due by elapsed time instead of
