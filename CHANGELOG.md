@@ -512,6 +512,34 @@ shared 4-vCPU Linux container against HEAD `935c555` — re-measure on the GCE r
   counted (`aof_backpressure_dropped`) and logged, never silent. Cost: the abort DUMPs each restored value, O(value) on the shard thread
   (a 200k-field hash: ~11 ms more).
 
+- **`TXN.ABORT` no longer answers `+OK` when its graph rollback records were
+  dropped** (moon#1285, PR #1301 review). The rollback's WAL records went
+  through an unchecked `try_send` into the shard's 4096-slot append channel: a
+  6000-node transaction answered `+OK`, showed 0 nodes live, and brought 1904
+  aborted nodes back after kill -9, on the local leg and on a remote shard's
+  leg. The records are now appended checked and in order (the WAL holds a
+  prefix of the rollback, never a gap). A refusal answers
+  `MOONERR WAL backpressure: TXN rolled back in memory, but its graph rollback
+  records were not all queued for persistence; ...`, is counted in
+  `INFO persistence` `txn_rollback_wal_dropped`, and a remote shard's rollback
+  that was not delivered or not acknowledged fails the abort too. Durability
+  matches forward graph writes (no reply waits for a WAL fsync), so abort
+  latency is unchanged. A rollback larger than the free channel capacity
+  (about 4096 records per shard) now always answers this error.
+
+- **Writes made by `EVAL`, `EVALSHA` or `FCALL` inside an open `TXN` are rolled
+  back by `TXN.ABORT`** (moon#1285, PR #1301 review) — live, after a restart and
+  on replicas. They used to bypass the transaction's undo log, so the abort
+  left them in place. Each key a script writes is pre-image captured once,
+  before its first write, and joins the transaction's undo log when the script
+  returns. **Behaviour change:** inside a TXN, a script's `FLUSHDB`,
+  `FLUSHALL`, `SWAPDB`, `MOVE` or `COPY … DB` is refused with
+  `ERR TXN cannot roll back this command from a script …`, and a read-write
+  script whose keys live on another shard is refused with the TXN cross-shard
+  error (`EVAL_RO` / `EVALSHA_RO` / `FCALL_RO` still route). Both refusals
+  poison the TXN. Cost: none outside a TXN; ~0.7 µs per captured write inside
+  one.
+
 - **Without an AOF, a deleted cold key came back after `BGSAVE` + kill -9**
   (moon#1281). The durable state is the last snapshot plus every listed spill
   file, and a spill file is unlinked only when its last live key leaves it, so
