@@ -77,6 +77,15 @@ impl UndoLog {
         self.dbs.extend(other.dbs);
     }
 
+    /// Drop every record past the first `len` (moon#1285: a script write
+    /// that answered an error wrote nothing, so the pre-images captured for
+    /// it are taken back).
+    #[inline]
+    pub fn truncate(&mut self, len: usize) {
+        self.records.truncate(len);
+        self.dbs.truncate(len);
+    }
+
     /// Number of records in the undo log.
     #[inline]
     pub fn len(&self) -> usize {

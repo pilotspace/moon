@@ -1312,3 +1312,67 @@ fn over_long_script_write_argv_captures_nothing() {
     drop(c);
     drop(server);
 }
+
+/// PR #1301 review, round 3 (found by the registry guard once its fillers
+/// were well-formed numbers): a script write that answers an error — a
+/// syntax error after the key (`SET k v BADOPT`, `ZMPOP 1 k JUNK`) or a type
+/// or value error (`INCR` of a non-number) — wrote nothing, so it keeps no
+/// capture. It used to keep one: the abort restored the pre-image over (or
+/// deleted) another client's write, and the write intent hid the key.
+#[test]
+#[ignore = "spawns a real server; set MOON_BIN"]
+fn erroring_script_write_keeps_no_capture() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let server = start(dir.path(), 1, true);
+    let mut c = Conn::open(server.port);
+    let mut other = Conn::open(server.port);
+    let mut t2 = Conn::open(server.port);
+    assert_eq!(c.send(&["SET", "word", "abc"]), OK);
+    assert_eq!(c.send(&["TXN", "BEGIN"]), OK);
+    for (script, key) in [
+        (
+            "return redis.pcall('SET', KEYS[1], 'v', 'BADOPT')",
+            "badopt",
+        ),
+        ("return redis.pcall('ZMPOP', 1, KEYS[1], 'JUNK')", "zjunk"),
+        ("return redis.pcall('INCR', KEYS[1])", "word"),
+    ] {
+        let r = c.send(&["EVAL", script, "1", key]);
+        assert!(r.starts_with('-'), "{script} {key}: an error reply: {r:?}");
+    }
+    let mut wrong: Vec<String> = Vec::new();
+    assert_eq!(t2.send(&["TXN", "BEGIN"]), OK);
+    let got = t2.send(&["GET", "word"]);
+    if got != bulk("abc") {
+        wrong.push(format!(
+            "another TXN's GET word -> {got:?}: a phantom write intent hid it"
+        ));
+    }
+    assert_eq!(t2.send(&["TXN", "ABORT"]), OK);
+    assert_eq!(other.send(&["SET", "badopt", "theirs"]), OK);
+    assert_eq!(other.send(&["ZADD", "zjunk", "1", "theirs"]), int(1));
+    assert_eq!(other.send(&["SET", "word", "theirs"]), OK);
+    assert_eq!(c.send(&["TXN", "ABORT"]), OK);
+    let check = |c: &mut Conn, when: &str, wrong: &mut Vec<String>| {
+        for (cmd, want) in [
+            (&["GET", "badopt"][..], bulk("theirs")),
+            (&["ZSCORE", "zjunk", "theirs"][..], bulk("1")),
+            (&["GET", "word"][..], bulk("theirs")),
+        ] {
+            let got = c.send(cmd);
+            if got != want {
+                wrong.push(format!(
+                    "{when}: {cmd:?} -> {got:?}: TXN.ABORT undid a write the TXN never made"
+                ));
+            }
+        }
+    };
+    check(&mut c, "live", &mut wrong);
+    drop((c, other, t2));
+    let server = restart(server, dir.path(), 1);
+    let mut c = Conn::open(server.port);
+    check(&mut c, "after kill -9 + restart", &mut wrong);
+    assert!(wrong.is_empty(), "phantom captures:\n{}", wrong.join("\n"));
+    drop(c);
+    drop(server);
+}

@@ -188,6 +188,9 @@ pub fn make_redis_call_fn(
                 return Ok(err);
             }
 
+            // Where this write's TXN undo captures begin: an error reply
+            // takes them back (see `txn_undo_discard`).
+            let mut txn_mark = None;
             if cmd_is_write {
                 // moon#1285 (PR #1301 review): inside an open TXN, a write
                 // TXN.ABORT could not undo is refused BEFORE any effect —
@@ -231,7 +234,7 @@ pub fn make_redis_call_fn(
                 // after the eviction gate and right before the write — the
                 // connection leg's order. `None` outside a TXN.
                 if let Some(keys) = txn_keys {
-                    super::txn_capture::txn_undo_capture(db, db_idx, &cmd_bytes, keys);
+                    txn_mark = super::txn_capture::txn_undo_capture(db, db_idx, &cmd_bytes, keys);
                 }
             }
 
@@ -274,6 +277,19 @@ pub fn make_redis_call_fn(
                     (reply, Some(target))
                 }
             };
+
+            // moon#1285 (PR #1301 review): a write that answered an error
+            // wrote nothing — the invariant the effect record relies on too
+            // (`serialize_effect_for_log` logs nothing for an error reply) —
+            // so the pre-images captured for it are taken back. Kept, the
+            // abort would restore them over another client's writes
+            // (`SET k v BADOPT`, `ZMPOP 1 k JUNK`), and their write intents
+            // would hide the keys from other transactions.
+            if let Some(mark) = txn_mark
+                && matches!(frame, Frame::Error(_))
+            {
+                super::txn_capture::txn_undo_discard(mark);
+            }
 
             // moon#685: a flush issued from Lua has to reach as far as the
             // same flush issued on the connection — `FLUSHDB` the selected

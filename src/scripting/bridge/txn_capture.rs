@@ -322,16 +322,22 @@ pub(super) fn txn_undo_plan(
 /// The pre-image is a copy, as on the connection leg: the write mutates the
 /// value in place, so there is nothing to move yet. The value the abort
 /// REPLACES is handed to an armed snapshot by move (`kv_compensation`).
+///
+/// Returns where this write's captures begin (`None` when no capture is
+/// armed), for [`txn_undo_discard`] should the write answer an error.
 pub(super) fn txn_undo_capture(
     db: &mut crate::storage::Database,
     db_idx: usize,
     cmd: &[u8],
     keys: smallvec::SmallVec<[Bytes; 4]>,
-) {
+) -> Option<TxnCaptureMark> {
     TXN_UNDO_CAPTURE.with(|c| {
         let mut slot = c.borrow_mut();
-        let Some(capture) = slot.as_mut() else {
-            return;
+        let capture = slot.as_mut()?;
+        let mark = TxnCaptureMark {
+            db_idx,
+            undo_len: capture.undo.len(),
+            written_len: capture.written.len(),
         };
         let is_delete = cmd.eq_ignore_ascii_case(b"DEL") || cmd.eq_ignore_ascii_case(b"UNLINK");
         for key in keys {
@@ -349,6 +355,35 @@ pub(super) fn txn_undo_capture(
             }
             capture.written.push(key.clone());
             capture.seen.insert((db_idx, key));
+        }
+        Some(mark)
+    })
+}
+
+/// Where one script write's captures begin in the armed [`ScriptTxnUndo`].
+#[derive(Debug)]
+pub(super) struct TxnCaptureMark {
+    db_idx: usize,
+    undo_len: usize,
+    written_len: usize,
+}
+
+/// Take back what [`txn_undo_capture`] captured for a write that then
+/// answered an error, and so wrote nothing (moon#1285, PR #1301 review): its
+/// pre-images, its write intents, and its `seen` entries — so a later
+/// successful write of the same key captures that key's real pre-image.
+///
+/// A write's captures are always the tail of the log: nothing else is
+/// captured between [`txn_undo_capture`] and the write's reply.
+pub(super) fn txn_undo_discard(mark: TxnCaptureMark) {
+    TXN_UNDO_CAPTURE.with(|c| {
+        let mut slot = c.borrow_mut();
+        let Some(capture) = slot.as_mut() else {
+            return;
+        };
+        capture.undo.truncate(mark.undo_len);
+        for key in capture.written.drain(mark.written_len..) {
+            capture.seen.remove(&(mark.db_idx, key));
         }
     });
 }
@@ -375,31 +410,50 @@ mod tests {
         }
     }
 
-    /// The bridge's order: plan, then capture what was planned, then write.
-    fn capture(db: &mut Database, cmd: &str, args: &[&str]) {
-        let planned = txn_undo_plan(cmd.as_bytes(), &frames(args), 0, 16);
-        if let Ok(Some(keys)) = planned {
-            txn_undo_capture(db, 0, cmd.as_bytes(), keys);
+    /// The bridge's order: plan, then capture what was planned, then write —
+    /// and take the captures back if the write answered an error.
+    fn capture(db: &mut Database, cmd: &str, args: &[&str]) -> Frame {
+        let mark = match txn_undo_plan(cmd.as_bytes(), &frames(args), 0, 16) {
+            Err(refused) => return refused,
+            Ok(Some(keys)) => txn_undo_capture(db, 0, cmd.as_bytes(), keys),
+            Ok(None) => None,
+        };
+        let reply = bridge_reply(db, cmd, args);
+        if let Some(mark) = mark
+            && matches!(reply, Frame::Error(_))
+        {
+            txn_undo_discard(mark);
         }
-        run(db, cmd, args);
+        reply
     }
 
     fn refused(cmd: &str, args: &[&str]) -> bool {
         txn_undo_plan(cmd.as_bytes(), &frames(args), 0, 16).is_err()
     }
 
-    /// What the bridge (`redis_call.rs`) answers for `cmd args`: a two-db
-    /// resolver's error is the whole reply, anything else runs through
-    /// `dispatch`. A resolved two-db op would write a second database, which
+    /// What the bridge (`redis_call.rs`) answers for `cmd args`: `SELECT` is
+    /// refused, a two-db resolver's error is the whole reply, anything else
+    /// runs through `dispatch`. A resolved two-db op would write a second database, which
     /// no caller of this helper expects.
     fn bridge_reply(db: &mut Database, cmd: &str, args: &[&str]) -> Frame {
         use crate::command::keyspace::move_cmd::resolve_two_db;
+        // The bridge refuses `SELECT` before any TXN planning.
+        if cmd.eq_ignore_ascii_case("SELECT") {
+            return Frame::Error(Bytes::from_static(b"ERR SELECT inside scripts"));
+        }
         match resolve_two_db(cmd.as_bytes(), &frames(args), 0, 16) {
             Some(Err(reply)) => reply,
             Some(Ok(_)) => panic!("{cmd} {args:?} resolved a two-database write"),
             None => run(db, cmd, args),
         }
     }
+
+    /// Argument fillers for the registry guards. `x` alone fails every
+    /// numeric parse, so a handler could answer a parse error whatever the
+    /// argument COUNT, hiding an arity check looser than the registry's; `1`
+    /// and `0` are well-formed counts, indexes, scores, databases and TTLs.
+    /// The seeded key is `x`, so a write to `1` or `0` shows in `DBSIZE`.
+    const GUARD_FILLERS: [&str; 3] = ["x", "1", "0"];
 
     /// Disarmed, the bridge hooks are inert: nothing refused, nothing held.
     #[test]
@@ -557,7 +611,7 @@ mod tests {
     /// `dispatch` arm without joining the refusal list fails here.
     #[test]
     fn keyless_script_writes_are_refused_or_inert() {
-        use crate::command::metadata::{COMMAND_META, CommandFlags};
+        use crate::command::metadata::{COMMAND_META, CommandFlags, KeySpecClass, class_of};
         let mut checked = 0;
         for (name, meta) in COMMAND_META.entries() {
             if !meta.flags.contains(CommandFlags::WRITE) || meta.first_key > 0 {
@@ -565,34 +619,52 @@ mod tests {
             }
             let min = usize::from(meta.arity.unsigned_abs()).saturating_sub(1);
             let max = if meta.arity >= 0 { min } else { min + 4 };
-            for n in min..=max {
-                let args = vec!["x"; n];
-                let ((plan, reply, db), _) = capture_txn_undo(|| {
+            for (n, filler) in (min..=max).flat_map(|n| GUARD_FILLERS.map(|f| (n, f))) {
+                let args = vec![filler; n];
+                let plan = txn_write_plan(name.as_bytes(), &frames(&args), 0, 16);
+                let ((reply, mut db), captured) = capture_txn_undo(|| {
                     let mut db = Database::new();
                     run(&mut db, "SET", &["x", "keep"]);
-                    let plan = txn_undo_plan(name.as_bytes(), &frames(&args), 0, 16);
-                    let reply = run(&mut db, name, &args);
-                    (plan, reply, db)
+                    let reply = capture(&mut db, name, &args);
+                    (reply, db)
                 });
+                let unchanged = |db: &mut Database| {
+                    assert_eq!(
+                        run(db, "DBSIZE", &[]),
+                        Frame::Integer(1),
+                        "{name} {args:?} changed the keyspace"
+                    );
+                    assert_eq!(
+                        run(db, "GET", &["x"]),
+                        bulk("keep"),
+                        "{name} {args:?} changed a key"
+                    );
+                };
                 match plan {
-                    Err(_) => {}
-                    Ok(Some(keys)) => panic!("{name} {args:?} captured {keys:?}"),
-                    Ok(None) => {
+                    TxnWritePlan::Refuse => {}
+                    // Only a movable-key write (`LMPOP`, `ZMPOP`) names its
+                    // keys; one that then answers an error keeps nothing.
+                    TxnWritePlan::Capture(keys) => {
+                        assert_eq!(
+                            class_of(meta),
+                            KeySpecClass::Movable,
+                            "{name} {args:?} captured {keys:?}"
+                        );
+                        if matches!(reply, Frame::Error(_)) {
+                            let (undo, written, _) = captured.into_parts();
+                            assert!(
+                                undo.is_empty() && written.is_empty(),
+                                "{name} {args:?} answered {reply:?} but kept its capture"
+                            );
+                            unchanged(&mut db);
+                        }
+                    }
+                    TxnWritePlan::Inert => {
                         assert!(
                             matches!(reply, Frame::Error(_)),
                             "{name} {args:?} is planned inert but dispatch answered {reply:?}"
                         );
-                        let mut db = db;
-                        assert_eq!(
-                            run(&mut db, "DBSIZE", &[]),
-                            Frame::Integer(1),
-                            "{name} {args:?} changed the keyspace"
-                        );
-                        assert_eq!(
-                            run(&mut db, "GET", &["x"]),
-                            bulk("keep"),
-                            "{name} {args:?} changed a key"
-                        );
+                        unchanged(&mut db);
                     }
                 }
                 checked += 1;
@@ -702,6 +774,49 @@ mod tests {
         assert_eq!(run(&mut db, "GET", &["k"]), bulk("orig"));
     }
 
+    /// PR #1301 review round 3: a write that answers an error wrote nothing,
+    /// so what was captured for it is taken back — pre-image, write intent
+    /// and `seen` entry. It used to be kept (`SET k v BADOPT`, `ZMPOP 1 k
+    /// JUNK`, `INCR` of a non-number): the abort restored the pre-image over
+    /// another client's write. A later successful write of the same key
+    /// still captures the key's real pre-image.
+    #[test]
+    fn a_write_that_answers_an_error_keeps_no_capture() {
+        let mut db = Database::new();
+        run(&mut db, "SET", &["s", "abc"]);
+        run(&mut db, "SET", &["k", "orig"]);
+        let (replies, captured) = capture_txn_undo(|| {
+            [
+                capture(&mut db, "SET", &["k", "v", "BADOPT"]),
+                capture(&mut db, "ZMPOP", &["1", "z", "JUNK"]),
+                capture(&mut db, "INCR", &["s"]),
+                capture(&mut db, "LPUSH", &["s", "x"]),
+                // Succeeds: `k`'s pre-image is `orig`, captured once.
+                capture(&mut db, "SET", &["k", "new"]),
+                // Fails after `k` was captured: nothing more to take back.
+                capture(&mut db, "SET", &["k", "v", "BADOPT"]),
+            ]
+        });
+        for reply in &replies[..4] {
+            assert!(matches!(reply, Frame::Error(_)), "{reply:?}");
+        }
+        assert!(matches!(replies[5], Frame::Error(_)));
+        let (undo, written, refused) = captured.into_parts();
+        assert!(refused.is_none());
+        assert_eq!(written, vec![Bytes::from("k")]);
+        let records: Vec<_> = undo.into_records_with_db().collect();
+        assert_eq!(records.len(), 1, "{records:?}");
+        match &records[0] {
+            (0, UndoRecord::Update { key, old_entry }) => {
+                assert_eq!(key, &Bytes::from("k"));
+                let mut probe = Database::new();
+                probe.set(b"k", old_entry.clone());
+                assert_eq!(run(&mut probe, "GET", &["k"]), bulk("orig"));
+            }
+            other => panic!("expected k's update record, got {other:?}"),
+        }
+    }
+
     /// The guard behind "an arity-invalid argv is inert": for EVERY write in
     /// `COMMAND_META`, the bridge with fewer arguments than the arity — or,
     /// for an exact (positive) arity, one or two MORE — answers an error and
@@ -720,8 +835,11 @@ mod tests {
             } else {
                 0..0
             };
-            for n in (0..min).chain(long) {
-                let args = vec!["x"; n];
+            for (n, filler) in (0..min)
+                .chain(long)
+                .flat_map(|n| GUARD_FILLERS.map(|f| (n, f)))
+            {
+                let args = vec![filler; n];
                 let ((plan, reply, mut db), _) = capture_txn_undo(|| {
                     let mut db = Database::new();
                     run(&mut db, "SET", &["x", "keep"]);
