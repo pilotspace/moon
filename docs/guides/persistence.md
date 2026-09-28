@@ -83,6 +83,19 @@ A non-zero `aof_append_backpressure_refusals` means the disk cannot keep up
 with the write rate. Look at device latency, or give the writer more time with
 `--aof-fsync-timeout-ms`.
 
+The graph plane's rollback has the same contract. A `TXN.ABORT` logs the
+records that undo its graph writes into the shard's WAL, and when the WAL
+append channel is full (or its writer is gone) the records that do not fit
+are counted in INFO `persistence` field `txn_rollback_wal_dropped`, logged,
+and the abort answers
+
+```text
+-MOONERR WAL backpressure: TXN rolled back in memory, but its graph rollback records were not all queued for persistence; a restart may replay the aborted graph writes
+```
+
+instead of `+OK`. The rollback is applied in memory and a retry has nothing
+left to roll back; only its durability is missing.
+
 ### Per-shard WAL advantage
 
 Unlike Redis's single global AOF file, Moon writes a separate WAL per shard. This eliminates the global serialization bottleneck:

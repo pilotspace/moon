@@ -117,6 +117,14 @@ Moon exposes standard Redis-compatible INFO metrics through the Prometheus endpo
   A disk that is failing shows in `aof_fsync_failures` /
   `aof_last_fsync_status:err` instead. See
   [Persistence -- when the AOF writer falls behind](persistence.md#when-the-aof-writer-falls-behind-backpressure).
+- INFO `txn_rollback_wal_dropped` (`persistence` section; no Prometheus
+  series) -- graph rollback records of a `TXN.ABORT` that the shard's WAL
+  append channel refused (full or closed). The rollback itself was applied in
+  memory; what is missing is its durability, so a restart can replay the
+  aborted graph writes. An explicit `TXN.ABORT` in that state answers
+  `-MOONERR WAL backpressure: TXN rolled back in memory, ...` instead of
+  `+OK`; a dirty-commit or disconnect rollback has no client to tell and logs
+  at `ERROR`. Any non-zero value is worth an alert.
 
 ### `evicted_keys` vs `spilled_keys` (moon#585)
 
