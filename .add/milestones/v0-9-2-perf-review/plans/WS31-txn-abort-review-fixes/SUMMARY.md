@@ -70,5 +70,26 @@ The review found no BLOCKER. Its one MAJOR is residual risks 2–3 above, extend
 
 Also in this round: `47cda75` fsyncs the parent of every new ancestor of the data, offload, migration and AOF directories (CodeRabbit; an EACCES ancestor is logged and skipped). `779ebe8` fixes a sampling flake in WS28's F9 unit test.
 
+## Round 3: review of the round-2 fixes plus CodeRabbit (WS34, `afd9b54..18ad969`)
+The TXN undo capture recorded keys that no write touched, so TXN.ABORT restored their pre-images over other clients' writes (logged to the AOF and replicas). Three cases are fixed:
+
+- **Too many arguments:** an exact-arity script write with extra arguments (`SETNX k v extra`) is inert. A probe of all 33 exact-arity dispatched writes (495 argvs) showed that dispatch always rejects such an argv.
+- **Error replies:** a script write that answers any error (`SET k v BADOPT`, `ZMPOP 1 k JUNK`, WRONGTYPE) takes its capture back (`txn_undo_discard`). The guard found this once its fillers became well-formed numbers.
+- **Read-only keys:** a write-flagged command that only reads its keys (`SORT src`, or `GEORADIUS src` without STORE) captures nothing. This applies on the connection legs of both runtimes and from scripts. The primary-key fallback now runs only when the key walker cannot enumerate the argv (`written_keys_if_known`).
+
+Side effects: `MOVE k <same db>` and `XGROUP HELP` are inert, where they used to be captured or refused.
+
+Other fixes in this round:
+- `redis.pcall` catches the read-only refusal (EVAL_RO, FCALL_RO, no-writes FCALL). The error text is Redis 7's exact wording, checked byte for byte against redis 7.0.15.
+- The embedded entry and `Config::resolve_dir` create directories durably.
+- `create_dir_all_durable` handles fsync errors on a pre-existing ancestor:
+  - it skips EACCES, EINVAL, EBADF and ENOTSUP there, so boot no longer fails on squashfs, vboxsf, WSL1 or procfs;
+  - it warns only for entries it created;
+  - EIO, and any error on a directory it created, stay fatal.
+
+Evidence: every fix is red on the base binaries or by mutation, and green on both runtimes (`txn_abort_durability_1285` 23/23 on each).
+
+Residual: a *connection* write that answers an error still keeps its capture. This predates the PR (moon#500) and is filed as moon#1303.
+
 ## Self-evaluation (0–1)
 Completeness 0.9 · Clarity 0.9 · Practicality 0.9 · Optimization 0.9 · Edge cases 0.9 · Self-evaluation 0.9
