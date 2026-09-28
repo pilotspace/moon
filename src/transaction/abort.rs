@@ -623,9 +623,12 @@ pub fn abort_local(
 /// checked ([`append_graph_rollback_wal`]).
 ///
 /// Failure handling: every leg is attempted. A leg that could not be
-/// delivered, whose reply channel closed, or whose owner refused its WAL
-/// records makes the result `Err` (the first such reply) — never a silent
-/// `+OK` (PR #1301 review). Each failure is logged here.
+/// delivered, whose reply channel closed, or whose owner answered an error
+/// makes the result `Err` (the first such reply) — never a silent `+OK`
+/// (PR #1301 review). The owner's WAL refusal is answered as
+/// [`ROLLBACK_WAL_REFUSED_ERR`]; any other error the owner answers is passed
+/// through verbatim rather than reported as a WAL refusal it was not. Each
+/// failure is logged here.
 pub async fn send_remote_graph_rollbacks(
     shard_id: usize,
     txn_id: u64,
@@ -634,9 +637,9 @@ pub async fn send_remote_graph_rollbacks(
     >,
     spsc_notifiers: &[std::sync::Arc<crate::runtime::channel::Notify>],
     remote: RemoteGraphLegs,
-) -> Result<(), &'static [u8]> {
+) -> Result<(), Bytes> {
     #[allow(unused_mut)]
-    let mut result: Result<(), &'static [u8]> = Ok(());
+    let mut result: Result<(), Bytes> = Ok(());
     #[cfg(feature = "graph")]
     for (owner, graph_undo, graph_intents) in remote {
         let (reply_tx, reply_rx) = crate::runtime::channel::oneshot();
@@ -661,11 +664,11 @@ pub async fn send_remote_graph_rollbacks(
                 "txn abort: remote graph rollback DROPPED under dispatch \
                  backpressure — remote graph intents not undone"
             );
-            result = result.and(Err(REMOTE_ROLLBACK_UNDELIVERED_ERR));
+            result = result.and(Err(Bytes::from_static(REMOTE_ROLLBACK_UNDELIVERED_ERR)));
             continue;
         }
         match crate::shard::coordinator::recv_reply_bounded(reply_rx).await {
-            Ok(crate::protocol::Frame::Error(_)) => {
+            Ok(crate::protocol::Frame::Error(e)) if e.as_ref() == ROLLBACK_WAL_REFUSED_ERR => {
                 // The owner applied the rollback but refused (and counted,
                 // and logged) some of its WAL records.
                 tracing::warn!(
@@ -673,7 +676,17 @@ pub async fn send_remote_graph_rollbacks(
                     owner,
                     "txn abort: remote graph rollback applied but its WAL records were refused"
                 );
-                result = result.and(Err(ROLLBACK_WAL_REFUSED_ERR));
+                result = result.and(Err(e));
+            }
+            Ok(crate::protocol::Frame::Error(e)) => {
+                // Not the WAL refusal: whatever the owner answered, say that.
+                tracing::warn!(
+                    txn_id,
+                    owner,
+                    reply = %String::from_utf8_lossy(&e),
+                    "txn abort: remote graph rollback answered an error"
+                );
+                result = result.and(Err(e));
             }
             Ok(_) => {}
             Err(_) => {
@@ -683,7 +696,7 @@ pub async fn send_remote_graph_rollbacks(
                     "txn abort: remote graph rollback reply channel closed — \
                      not known to be applied"
                 );
-                result = result.and(Err(REMOTE_ROLLBACK_UNDELIVERED_ERR));
+                result = result.and(Err(Bytes::from_static(REMOTE_ROLLBACK_UNDELIVERED_ERR)));
             }
         }
     }

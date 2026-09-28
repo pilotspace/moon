@@ -79,7 +79,7 @@ pub(crate) async fn abort_logged(
     txn: CrossStoreTxn,
     replicate: Option<ReplicationRecorder>,
     cause: AbortCause,
-) -> Result<(), &'static [u8]> {
+) -> Result<(), Bytes> {
     let txn_id = txn.txn_id;
     let graph_db = txn.db_index;
     let (log, remote) = crate::transaction::abort::abort_local(ctx.shard_id, ctx.num_shards, txn);
@@ -129,8 +129,11 @@ pub(crate) async fn abort_logged(
     // The first refusal in log order (KV AOF, local graph WAL, remote graph
     // legs) is the reply; every one was already counted and logged where it
     // happened.
-    let outcome = persisted.and(graph_wal).and(remote_legs);
-    if let Err(reply) = outcome {
+    let outcome = persisted
+        .and(graph_wal)
+        .map_err(Bytes::from_static)
+        .and(remote_legs);
+    if let Err(reply) = &outcome {
         let reply = String::from_utf8_lossy(reply);
         if cause == AbortCause::Explicit {
             tracing::warn!(

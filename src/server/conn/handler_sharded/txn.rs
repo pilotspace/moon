@@ -308,7 +308,7 @@ pub(super) async fn try_handle_txn_abort(
                 // AOF append means its durability is not guaranteed — say so.
                 responses.push(match logged {
                     Ok(()) => Frame::SimpleString(Bytes::from_static(b"OK")),
-                    Err(reply) => Frame::Error(Bytes::from_static(reply)),
+                    Err(reply) => Frame::Error(reply),
                 });
             } else {
                 responses.push(Frame::Error(Bytes::from_static(b"ERR not in transaction")));
