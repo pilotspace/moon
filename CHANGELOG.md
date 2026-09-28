@@ -470,6 +470,10 @@ shared 4-vCPU Linux container against HEAD `935c555` — re-measure on the GCE r
   across both runtimes at `--shards` 1 and 4. Every head is now written and
   fsynced (with its directory entry) before the manifest commits; a crash before
   the commit leaves no manifest and the next boot redoes the initialization.
+  Every newly created data, offload or AOF directory (binary and embedded
+  entry) has its entry fsynced too; a pre-existing ancestor on a filesystem
+  without directory fsync (squashfs, vboxsf, WSL1 drvfs: `EINVAL`) or that
+  the process may not open is skipped, not a boot failure.
 
 - **Cold-key graves survive a smaller `--databases` and a failed spill commit**
   (moon#1291). Restarting a no-AOF server with fewer databases aborted the
@@ -534,8 +538,14 @@ shared 4-vCPU Linux container against HEAD `935c555` — re-measure on the GCE r
   before its first write, and joins the transaction's undo log when the script
   returns. A write a script cannot run — one only a connection-level handler
   serves (blocking pops, `FCALL`, `MQ`, `WS`, `FT.*`, `GRAPH.*`, `FUNCTION`,
-  `TEMPORAL.*`), or an argv shorter than the command's arity — answers its
-  usual error and captures nothing. **Behaviour change:** inside a TXN, a
+  `TEMPORAL.*`), an argv its arity rejects (too short, or longer than an exact
+  arity: `SETNX k v extra`), or a write that answers any other error
+  (`SET k v BADOPT`, `MOVE k <same db>`, WRONGTYPE) — captures nothing, so the
+  abort never restores over another client's write. Nor does a write-flagged
+  command that only READS its keys (`SORT src` or `GEORADIUS src ...` without
+  `STORE`), on the connection or from a script: it captured `src`, and the
+  abort restored `src` over concurrent writes, logged to the AOF and replicas. A malformed write on the connection itself is still captured
+  (a pre-existing limit). **Behaviour change:** inside a TXN, a
   script's `FLUSHDB`, `FLUSHALL`, `SWAPDB`, `MOVE` or `COPY … DB`, or an
   arity-valid write whose keys cannot be enumerated (a malformed `LMPOP`,
   `ZMPOP` or `XREADGROUP`), is refused with
@@ -545,8 +555,11 @@ shared 4-vCPU Linux container against HEAD `935c555` — re-measure on the GCE r
   registered `no-writes` still route). Both refusals poison the TXN, each
   refused command counting once. A function registered `no-writes` now runs
   read-only under plain `FCALL` as well, as in Redis: a write from it answers
-  `Write commands are not allowed from read-only scripts`. Cost: none outside
-  a TXN; ~0.7 µs per captured write inside one.
+  `ERR Write commands are not allowed from read-only scripts.` — an ordinary
+  command error, as in Redis 7: `redis.call` raises it and `redis.pcall`
+  returns it as `{err = ...}` (also for `EVAL_RO` / `FCALL_RO`, where it used
+  to be raised even from `redis.pcall`). Cost: none outside a TXN; ~0.7 µs per
+  captured write inside one.
 
 - **Without an AOF, a deleted cold key came back after `BGSAVE` + kill -9**
   (moon#1281). The durable state is the last snapshot plus every listed spill
