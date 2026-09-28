@@ -27,3 +27,11 @@ The maintainer picked all four areas, run as **durability and perf workstreams i
 - **Wave 2 adds:**
   - **moon#1297, no-AOF block reclaim:** compact mostly-dead spill files without an AOF, adopting `F'` after the next successful snapshot. This removes the disk cost of the bigger batches. It is durability-sensitive, so it needs crash tests at every kill point.
   - **moon#1298, expiry time-bucket wheel (evaluate):** memory per TTL key vs the sorted `ExpiryPair` index, plus drain and `SET … EX` throughput. Ship only if it wins on memory with no throughput loss.
+
+## Wave-1 review follow-ups: maintainer decisions (2026-09-28)
+- F1 (SSCAN rewrite regression) and F2 (routed-script plain drop) were fixed in wave 1 by WS30, together with the MINOR/NIT items.
+- **F5 → moon#1299: block other writers.** A key written inside an open TXN is locked until COMMIT/ABORT. Other clients' writes, and FLUSHDB/FLUSHALL/SWAPDB on a db with open intents, are refused with a distinct error. There must be zero cost when no TXN is open.
+- **F3 + F4 → moon#1300: fix both in wave 2.**
+  - F4: TXN begin/commit markers in the AOF, and recovery rolls back an unterminated TXN (brief option c2, AOF only). Needs a fuzz target.
+  - F3: the snapshot serializes the pre-TXN image for keys with open intents.
+- Wave 2 scope: moon#1299, moon#1300, moon#1295, moon#1283 (a), moon#1266 (option 3, then measure 1A), moon#1297, moon#1298 (evaluate), plus parity moon#1286, moon#1289 and moon#1296.
