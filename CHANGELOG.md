@@ -290,8 +290,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   materialized and sorted the whole set on every call (a full scan of 1M
   members ~9–10 min; now 2.1–2.7 s, redis 3.0–3.3 s), and a member removed
   before the cursor could make it skip members present for the whole scan.
-  Small (intset/listpack) sets answer in one call with cursor 0, as redis does.
-  HSCAN keeps the old path until moon#1171's IndexMap.
+  Small (intset/listpack) sets answer in one call with cursor 0, as redis does;
+  an intset answers in numeric order and `SSCAN key -1` is accepted as in
+  redis. A set rebuilt mid-scan (SUNIONSTORE/SINTERSTORE/SDIFFSTORE, RENAME,
+  COPY REPLACE, RESTORE, the cold tier) is detected at zero bytes per set and
+  the scan continues on a hash-ordered cursor that always terminates, so no
+  member present for the whole scan is skipped. HSCAN keeps the old path until
+  moon#1171's IndexMap.
 
 
 - **A stalled shard no longer replays every missed periodic tick** (moon#1280).
@@ -476,7 +481,9 @@ shared 4-vCPU Linux container against HEAD `935c555` — re-measure on the GCE r
   tiering them** (moon#1290). The connection write gates and the cross-shard
   gate had no manifest to spill durably with and plain-dropped victims: 3.3–5.4K
   of 16.2K keys were gone in the repro, with no error to the client. They now
-  tier every victim durably (0 lost, including after BGSAVE + kill -9). The
+  tier every victim durably (0 lost, including after BGSAVE + kill -9), and so
+  does a script routed to another shard at `--shards` ≥ 2 (EVAL, FCALL, or a
+  script inside a routed MULTI: 1.5–2.2K of 16K keys were lost). The
   async-spill route is chosen by whether an AOF writer exists, not by the
   `CONFIG SET appendonly` string. Cost: without an AOF each spill batch is
   fsynced and committed on the shard thread, so a write flood over `maxmemory`
@@ -499,7 +506,8 @@ shared 4-vCPU Linux container against HEAD `935c555` — re-measure on the GCE r
   WAL records (`GRAPH.DELPROP`, `GRAPH.UNDELETENODE`, `GRAPH.UNDELETEEDGE`;
   fuzz target `graph_wal_replay`). `TXN.ABORT` answers the AOF's refusal instead
   of `+OK` when its records cannot be queued (the rollback is applied either
-  way). Cost: the abort DUMPs each restored value, O(value) on the shard thread
+  way); a refused rollback record on the disconnect / dirty-COMMIT path is
+  counted (`aof_backpressure_dropped`) and logged, never silent. Cost: the abort DUMPs each restored value, O(value) on the shard thread
   (a 200k-field hash: ~11 ms more).
 
 - **Without an AOF, a deleted cold key came back after `BGSAVE` + kill -9**
