@@ -202,11 +202,11 @@ const KEYLESS_DISPATCHED_WRITES: [&[u8]; 3] = [b"FLUSHDB", b"FLUSHALL", b"SWAPDB
 enum TxnWritePlan {
     /// Capture these keys' pre-images and hold write intents on them.
     Capture(smallvec::SmallVec<[Bytes; 4]>),
-    /// Nothing to capture: `command::dispatch` answers this argv with an
-    /// error and writes nothing — a write only a connection-level intercept
-    /// serves (`unknown command`, [`SCRIPT_UNDISPATCHED_WRITES`]), an argv
-    /// shorter than the command's arity (the arity error), or `TXN`. Runs
-    /// exactly as outside a TXN.
+    /// Nothing to capture: the bridge answers this argv with an error and
+    /// writes nothing — a write only a connection-level intercept serves
+    /// (`unknown command`, [`SCRIPT_UNDISPATCHED_WRITES`]), an argv the
+    /// command's arity rejects (the arity error), a `MOVE` / `COPY ... DB`
+    /// the two-db resolver rejects, or `TXN`. Runs exactly as outside a TXN.
     Inert,
     /// A write the TXN could not undo; refused before it runs.
     Refuse,
@@ -215,7 +215,8 @@ enum TxnWritePlan {
 /// Plan one script write inside a TXN.
 ///
 /// Inert first: a write `dispatch` does not execute
-/// ([`SCRIPT_UNDISPATCHED_WRITES`]) or an argv shorter than the arity.
+/// ([`SCRIPT_UNDISPATCHED_WRITES`]), an argv the arity rejects (shorter than
+/// it, or longer than an exact one), or a two-db write the resolver rejects.
 ///
 /// Captured: the shared walker's WRITE positions, else — for a command whose
 /// registry entry names a first key (`first_key > 0`) — the primary key, the
@@ -240,18 +241,22 @@ fn txn_write_plan(cmd: &[u8], args: &[Frame], db_idx: usize, db_count: usize) ->
         return TxnWritePlan::Inert;
     }
     // Arity counts the command name; positive is exact, negative a minimum.
-    // Only a SHORT argv is inert: dispatch answers the arity error before it
-    // looks at a key. A long argv of an exact-arity command still names its
-    // keys and is planned like any other.
+    // An argv the arity rejects is inert: a SHORT one for any command, and a
+    // LONG one for an exact-arity command (`SETNX k v extra`) — dispatch
+    // answers the arity error before it touches a key. Pinned for every
+    // registered write, up to two arguments past an exact arity, by
+    // `every_arity_rejected_write_argv_is_an_error_that_writes_nothing`.
     let given = args.len() + 1;
-    if given < usize::from(meta.arity.unsigned_abs()) {
+    let arity = usize::from(meta.arity.unsigned_abs());
+    if given < arity || (meta.arity > 0 && given != arity) {
         return TxnWritePlan::Inert;
     }
-    if matches!(
-        crate::command::keyspace::move_cmd::resolve_two_db(cmd, args, db_idx, db_count),
-        Some(Ok(_))
-    ) {
-        return TxnWritePlan::Refuse;
+    match crate::command::keyspace::move_cmd::resolve_two_db(cmd, args, db_idx, db_count) {
+        Some(Ok(_)) => return TxnWritePlan::Refuse,
+        // The bridge answers the resolver's error and writes nothing
+        // (`MOVE k <same db>`, `COPY a b DB <junk>`).
+        Some(Err(_)) => return TxnWritePlan::Inert,
+        None => {}
     }
     let written = crate::tracking::invalidation::written_keys(cmd, args);
     if !written.is_empty() {
@@ -381,6 +386,19 @@ mod tests {
 
     fn refused(cmd: &str, args: &[&str]) -> bool {
         txn_undo_plan(cmd.as_bytes(), &frames(args), 0, 16).is_err()
+    }
+
+    /// What the bridge (`redis_call.rs`) answers for `cmd args`: a two-db
+    /// resolver's error is the whole reply, anything else runs through
+    /// `dispatch`. A resolved two-db op would write a second database, which
+    /// no caller of this helper expects.
+    fn bridge_reply(db: &mut Database, cmd: &str, args: &[&str]) -> Frame {
+        use crate::command::keyspace::move_cmd::resolve_two_db;
+        match resolve_two_db(cmd.as_bytes(), &frames(args), 0, 16) {
+            Some(Err(reply)) => reply,
+            Some(Ok(_)) => panic!("{cmd} {args:?} resolved a two-database write"),
+            None => run(db, cmd, args),
+        }
     }
 
     /// Disarmed, the bridge hooks are inert: nothing refused, nothing held.
@@ -628,11 +646,68 @@ mod tests {
         assert!(refused.is_none(), "the TXN is not poisoned");
     }
 
-    /// The guard behind "a short argv is inert": for EVERY write in
-    /// `COMMAND_META`, `dispatch` with fewer arguments than the arity
-    /// answers an error and leaves the keyspace untouched.
+    /// PR #1301 review round 3: an exact-arity write given MORE arguments
+    /// than its arity (`SETNX k v extra`, `HSETNX h f v x`) is an arity error
+    /// that writes nothing, so it is inert like a short argv. It used to be
+    /// captured and get a write intent: `TXN.ABORT` then restored the
+    /// pre-image over a concurrent client's write, and the intent hid the key
+    /// from other transactions. `MOVE k <same db>` likewise never runs (the
+    /// bridge answers the resolver's error), so it captures nothing either.
     #[test]
-    fn every_short_write_argv_is_an_error_that_writes_nothing() {
+    fn long_exact_arity_argv_is_inert_and_answers_the_arity_error() {
+        let mut db = Database::new();
+        run(&mut db, "SET", &["k", "orig"]);
+        let (plans, captured) = capture_txn_undo(|| {
+            [
+                (
+                    "SETNX",
+                    &["k", "v", "extra"][..],
+                    "wrong number of arguments",
+                ),
+                (
+                    "HSETNX",
+                    &["h", "f", "v", "x"][..],
+                    "wrong number of arguments",
+                ),
+                ("INCRBY", &["n", "1", "1"][..], "wrong number of arguments"),
+                ("RENAME", &["k", "b", "c"][..], "wrong number of arguments"),
+                ("MOVE", &["k", "3", "x"][..], "wrong number of arguments"),
+                (
+                    "MOVE",
+                    &["k", "0"][..],
+                    "source and destination objects are the same",
+                ),
+            ]
+            .map(|(cmd, args, err)| {
+                let plan = txn_undo_plan(cmd.as_bytes(), &frames(args), 0, 16);
+                let reply = bridge_reply(&mut db, cmd, args);
+                (cmd, args, err, plan, reply)
+            })
+        });
+        for (cmd, args, err, plan, reply) in plans {
+            assert_eq!(
+                plan,
+                Ok(None),
+                "{cmd} {args:?}: neither captured nor refused"
+            );
+            assert!(
+                matches!(&reply, Frame::Error(e) if e.windows(err.len()).any(|w| w == err.as_bytes())),
+                "{cmd} {args:?}: dispatch answers `{err}`: {reply:?}"
+            );
+        }
+        let (undo, written, refused) = captured.into_parts();
+        assert!(undo.is_empty() && written.is_empty(), "nothing captured");
+        assert!(refused.is_none(), "the TXN is not poisoned");
+        assert_eq!(run(&mut db, "DBSIZE", &[]), Frame::Integer(1));
+        assert_eq!(run(&mut db, "GET", &["k"]), bulk("orig"));
+    }
+
+    /// The guard behind "an arity-invalid argv is inert": for EVERY write in
+    /// `COMMAND_META`, the bridge with fewer arguments than the arity — or,
+    /// for an exact (positive) arity, one or two MORE — answers an error and
+    /// leaves the keyspace untouched, and the plan is inert.
+    #[test]
+    fn every_arity_rejected_write_argv_is_an_error_that_writes_nothing() {
         use crate::command::metadata::{COMMAND_META, CommandFlags};
         let mut checked = 0;
         for (name, meta) in COMMAND_META.entries() {
@@ -640,13 +715,18 @@ mod tests {
                 continue;
             }
             let min = usize::from(meta.arity.unsigned_abs()).saturating_sub(1);
-            for n in 0..min {
+            let long = if meta.arity > 0 {
+                min + 1..min + 3
+            } else {
+                0..0
+            };
+            for n in (0..min).chain(long) {
                 let args = vec!["x"; n];
                 let ((plan, reply, mut db), _) = capture_txn_undo(|| {
                     let mut db = Database::new();
                     run(&mut db, "SET", &["x", "keep"]);
                     let plan = txn_undo_plan(name.as_bytes(), &frames(&args), 0, 16);
-                    let reply = run(&mut db, name, &args);
+                    let reply = bridge_reply(&mut db, name, &args);
                     (plan, reply, db)
                 });
                 assert_eq!(plan, Ok(None), "{name} {args:?} is inert");

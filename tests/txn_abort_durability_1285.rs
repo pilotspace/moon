@@ -1247,3 +1247,68 @@ fn no_writes_fcall_routes_inside_a_txn_shards_4() {
     drop(c);
     drop(server);
 }
+
+/// PR #1301 review, round 3: a script write whose argv is LONGER than its
+/// exact arity (`SETNX k v extra`, `HSETNX h f v x`) is an arity error that
+/// writes nothing, so it captures nothing. It used to be captured: the abort
+/// deleted (or restored over) another client's key of that name, logged to
+/// the AOF, and the write intent hid the key from other transactions.
+#[test]
+#[ignore = "spawns a real server; set MOON_BIN"]
+fn over_long_script_write_argv_captures_nothing() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let server = start(dir.path(), 1, true);
+    let mut c = Conn::open(server.port);
+    let mut other = Conn::open(server.port);
+    let mut t2 = Conn::open(server.port);
+    assert_eq!(c.send(&["SET", "held", "visible"]), OK);
+    assert_eq!(c.send(&["TXN", "BEGIN"]), OK);
+    for (script, key) in [
+        ("return redis.pcall('SETNX', KEYS[1], 'v', 'extra')", "nx"),
+        (
+            "return redis.pcall('HSETNX', KEYS[1], 'f', 'v', 'x')",
+            "hnx",
+        ),
+        ("return redis.pcall('SETNX', KEYS[1], 'v', 'extra')", "held"),
+    ] {
+        let r = c.send(&["EVAL", script, "1", key]);
+        assert!(
+            r.starts_with('-') && r.contains("wrong number of arguments"),
+            "{script} {key}: the arity error: {r:?}"
+        );
+    }
+    let mut wrong: Vec<String> = Vec::new();
+    assert_eq!(t2.send(&["TXN", "BEGIN"]), OK);
+    let got = t2.send(&["GET", "held"]);
+    if got != bulk("visible") {
+        wrong.push(format!(
+            "another TXN's GET held -> {got:?}: a phantom write intent hid it"
+        ));
+    }
+    assert_eq!(t2.send(&["TXN", "ABORT"]), OK);
+    assert_eq!(other.send(&["SET", "nx", "theirs"]), OK);
+    assert_eq!(other.send(&["HSET", "hnx", "f", "theirs"]), int(1));
+    assert_eq!(c.send(&["TXN", "ABORT"]), OK);
+    let check = |c: &mut Conn, when: &str, wrong: &mut Vec<String>| {
+        for (cmd, want) in [
+            (&["GET", "nx"][..], bulk("theirs")),
+            (&["HGET", "hnx", "f"][..], bulk("theirs")),
+            (&["GET", "held"][..], bulk("visible")),
+        ] {
+            let got = c.send(cmd);
+            if got != want {
+                wrong.push(format!(
+                    "{when}: {cmd:?} -> {got:?}: TXN.ABORT undid a write the TXN never made"
+                ));
+            }
+        }
+    };
+    check(&mut c, "live", &mut wrong);
+    drop((c, other, t2));
+    let server = restart(server, dir.path(), 1);
+    let mut c = Conn::open(server.port);
+    check(&mut c, "after kill -9 + restart", &mut wrong);
+    assert!(wrong.is_empty(), "phantom captures:\n{}", wrong.join("\n"));
+    drop(c);
+    drop(server);
+}
