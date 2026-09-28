@@ -522,7 +522,8 @@ shared 4-vCPU Linux container against HEAD `935c555` — re-measure on the GCE r
   `MOONERR WAL backpressure: TXN rolled back in memory, but its graph rollback
   records were not all queued for persistence; ...`, is counted in
   `INFO persistence` `txn_rollback_wal_dropped`, and a remote shard's rollback
-  that was not delivered or not acknowledged fails the abort too. Durability
+  that was not delivered or not acknowledged fails the abort too (any other
+  error the remote shard answers is passed through as-is). Durability
   matches forward graph writes (no reply waits for a WAL fsync), so abort
   latency is unchanged. A rollback larger than the free channel capacity
   (about 4096 records per shard) now always answers this error.
@@ -532,13 +533,21 @@ shared 4-vCPU Linux container against HEAD `935c555` — re-measure on the GCE r
   on replicas. They used to bypass the transaction's undo log, so the abort
   left them in place. Each key a script writes is pre-image captured once,
   before its first write, and joins the transaction's undo log when the script
-  returns. **Behaviour change:** inside a TXN, a script's `FLUSHDB`,
-  `FLUSHALL`, `SWAPDB`, `MOVE` or `COPY … DB` is refused with
+  returns. A write a script cannot run — one only a connection-level handler
+  serves (blocking pops, `FCALL`, `MQ`, `WS`, `FT.*`, `GRAPH.*`, `FUNCTION`,
+  `TEMPORAL.*`), or an argv shorter than the command's arity — answers its
+  usual error and captures nothing. **Behaviour change:** inside a TXN, a
+  script's `FLUSHDB`, `FLUSHALL`, `SWAPDB`, `MOVE` or `COPY … DB`, or an
+  arity-valid write whose keys cannot be enumerated (a malformed `LMPOP`,
+  `ZMPOP` or `XREADGROUP`), is refused with
   `ERR TXN cannot roll back this command from a script …`, and a read-write
   script whose keys live on another shard is refused with the TXN cross-shard
-  error (`EVAL_RO` / `EVALSHA_RO` / `FCALL_RO` still route). Both refusals
-  poison the TXN. Cost: none outside a TXN; ~0.7 µs per captured write inside
-  one.
+  error (`EVAL_RO` / `EVALSHA_RO` / `FCALL_RO` and an `FCALL` of a function
+  registered `no-writes` still route). Both refusals poison the TXN, each
+  refused command counting once. A function registered `no-writes` now runs
+  read-only under plain `FCALL` as well, as in Redis: a write from it answers
+  `Write commands are not allowed from read-only scripts`. Cost: none outside
+  a TXN; ~0.7 µs per captured write inside one.
 
 - **Without an AOF, a deleted cold key came back after `BGSAVE` + kill -9**
   (moon#1281). The durable state is the last snapshot plus every listed spill
