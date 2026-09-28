@@ -64,7 +64,8 @@ pub(crate) fn routed_script_refusal(
 ///   restores each key's FIRST pre-image, so a key the transaction wrote
 ///   before the script keeps its pre-transaction state);
 /// - every written key gets a write intent, as the connection leg records;
-/// - a refused command poisons the transaction.
+/// - each refused command counts against the transaction, which may then
+///   not commit.
 ///
 /// Without a transaction this is `run()`.
 pub(crate) fn run_local_script<R>(txn: Option<&mut CrossStoreTxn>, run: impl FnOnce() -> R) -> R {
@@ -73,8 +74,8 @@ pub(crate) fn run_local_script<R>(txn: Option<&mut CrossStoreTxn>, run: impl FnO
     };
     let (out, captured) = crate::scripting::bridge::capture_txn_undo(run);
     let (undo, written, refused) = captured.into_parts();
-    if let Some(cmd) = refused {
-        txn.record_rejected_op(&cmd);
+    if let Some((cmd, count)) = refused {
+        txn.record_rejected_ops(&cmd, count);
     }
     txn.kv_undo.append(undo);
     if !written.is_empty() {

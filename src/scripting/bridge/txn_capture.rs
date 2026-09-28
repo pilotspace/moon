@@ -114,6 +114,8 @@ pub(crate) struct ScriptTxnUndo {
     /// The first command refused because the TXN could not undo it; the
     /// handler poisons the transaction with it (#499).
     refused: Option<Bytes>,
+    /// How many writes were refused, each one counted against the TXN.
+    refused_count: u32,
     /// `(db, key)` already captured during this script: only a key's FIRST
     /// pre-image is ever restored (`kv_compensation::first_per_key`), so a
     /// loop rewriting one key clones its value once, not once per write.
@@ -121,9 +123,16 @@ pub(crate) struct ScriptTxnUndo {
 }
 
 impl ScriptTxnUndo {
-    /// `(pre-images, written keys, first refused command)`.
-    pub(crate) fn into_parts(self) -> (crate::transaction::UndoLog, Vec<Bytes>, Option<Bytes>) {
-        (self.undo, self.written, self.refused)
+    /// `(pre-images, written keys, (first refused command, refusal count))`.
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        crate::transaction::UndoLog,
+        Vec<Bytes>,
+        Option<(Bytes, u32)>,
+    ) {
+        let refused = self.refused.map(|cmd| (cmd, self.refused_count));
+        (self.undo, self.written, refused)
     }
 }
 
@@ -272,7 +281,7 @@ fn txn_write_plan(cmd: &[u8], args: &[Frame], db_idx: usize, db_count: usize) ->
 /// - `Ok(Some(keys))`: capture `keys` right before the write
 ///   ([`txn_undo_capture`]) — computed once, here;
 /// - `Err(reply)`: refused. The reply is `ERR_TXN_SCRIPT_NOT_UNDOABLE`, and
-///   the first refused command poisons the TXN (#499).
+///   every refusal counts against the TXN (#499), which may then not commit.
 pub(super) fn txn_undo_plan(
     cmd: &[u8],
     args: &[Frame],
@@ -291,6 +300,7 @@ pub(super) fn txn_undo_plan(
                 if capture.refused.is_none() {
                     capture.refused = Some(Bytes::copy_from_slice(cmd));
                 }
+                capture.refused_count = capture.refused_count.saturating_add(1);
                 Err(Frame::Error(Bytes::from_static(
                     crate::command::transaction::ERR_TXN_SCRIPT_NOT_UNDOABLE,
                 )))
@@ -442,7 +452,10 @@ mod tests {
         });
         assert_eq!(refusals, [true, true, true, true, true, true, false, false]);
         let (_, _, refused) = captured.into_parts();
-        assert_eq!(refused, Some(Bytes::from_static(b"FLUSHDB")));
+        assert_eq!(
+            refused.map(|(cmd, _)| cmd),
+            Some(Bytes::from_static(b"FLUSHDB"))
+        );
     }
 
     /// PR #1301 review MINOR-1: a write that only a connection-level
@@ -651,6 +664,19 @@ mod tests {
             }
         }
         assert!(checked > 100, "the registry walk ran ({checked} argvs)");
+    }
+
+    /// Every refused write counts against the TXN, not just the first.
+    #[test]
+    fn every_refusal_is_counted() {
+        let ((), captured) = capture_txn_undo(|| {
+            assert!(refused("FLUSHDB", &[]));
+            assert!(refused("MOVE", &["k", "3"]));
+            assert!(!refused("SET", &["k", "v"]));
+            assert!(refused("FLUSHALL", &[]));
+        });
+        let (_, _, refused) = captured.into_parts();
+        assert_eq!(refused, Some((Bytes::from_static(b"FLUSHDB"), 3)));
     }
 
     /// A panic inside the script disarms the capture.

@@ -162,6 +162,20 @@ impl CrossStoreTxn {
         }
     }
 
+    /// [`record_rejected_op`](Self::record_rejected_op) for `count` rejected
+    /// ops of which `first_cmd` came first — a script whose writes the TXN
+    /// refused (moon#1285, PR #1301 review), counted once per refusal.
+    #[inline]
+    pub fn record_rejected_ops(&mut self, first_cmd: &[u8], count: u32) {
+        if count == 0 {
+            return;
+        }
+        self.rejected_ops = self.rejected_ops.saturating_add(count);
+        if self.first_rejected_cmd.is_none() {
+            self.first_rejected_cmd = Some(Bytes::copy_from_slice(first_cmd));
+        }
+    }
+
     /// #499: true when at least one op in the body was rejected — the
     /// transaction may not commit.
     #[inline]
@@ -290,6 +304,18 @@ mod tests {
         assert_eq!(txn.first_rejected_cmd.as_deref(), Some(&b"SET"[..]));
         // A rejected op applied nothing, so it is not a "modification".
         assert!(!txn.has_modifications());
+
+        // A script's refusals count one each; the first command stays.
+        txn.record_rejected_ops(b"FLUSHDB", 3);
+        txn.record_rejected_ops(b"SWAPDB", 0);
+        assert_eq!(txn.rejected_ops, 5);
+        assert_eq!(txn.first_rejected_cmd.as_deref(), Some(&b"SET"[..]));
+        let mut fresh = CrossStoreTxn::new(8, 7, 0);
+        fresh.record_rejected_ops(b"FLUSHDB", 0);
+        assert!(!fresh.is_dirty(), "zero refusals poison nothing");
+        fresh.record_rejected_ops(b"FLUSHDB", 2);
+        assert_eq!(fresh.rejected_ops, 2);
+        assert_eq!(fresh.first_rejected_cmd.as_deref(), Some(&b"FLUSHDB"[..]));
     }
 
     #[test]
