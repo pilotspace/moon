@@ -6,6 +6,7 @@ The two MAJOR CodeRabbit findings on PR #1301 against WS27's TXN.ABORT (moon#128
 pinned for every run.
 
 ## Per-issue verdict
+
 | finding | verdict | commit (branch) | evidence |
 |---|---|---|---|
 | 1. Graph rollback WAL records could be dropped while TXN.ABORT answered `+OK` (local leg and remote `GraphRollback` leg) | FIXED | `effb016` | `graph_rollback_wal_overflow_is_never_acked_shards_1` and `graph_remote_rollback_wal_overflow_is_never_acked_shards_4`. **Base (ws30-monoio):** `+OK`, 0 nodes live, **1904 nodes back after kill -9** (6000 − 4096 channel slots), both legs. **Fixed:** `-MOONERR WAL backpressure: …`, `txn_rollback_wal_dropped` 0 → 1904. Unit tests `transaction::abort::rollback_wal_tests` (3). |
