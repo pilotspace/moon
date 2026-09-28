@@ -745,6 +745,55 @@ fn eval_ro_reads_but_refuses_a_write() {
     );
 }
 
+/// PR #1301 review round 3: the read-only refusal is an ordinary command
+/// error, as in Redis 7 (`scriptVerifyWriteCommandAllow`): `redis.call`
+/// raises it, `redis.pcall` returns it as `{err = ...}` and the script goes
+/// on. It used to be raised as a Lua error even from `redis.pcall`, so a
+/// script could not catch it. Text measured against redis-server 7.0.15.
+#[test]
+fn eval_ro_write_refusal_is_catchable_by_pcall() {
+    let lua = setup_lua_vm(bridge::LuaEvictionCtx::disabled()).unwrap();
+    let cache = Rc::new(RefCell::new(ScriptCache::new()));
+    let mut db = Database::new();
+    let mut eval_ro = |script: &'static [u8]| {
+        let argv = vec![
+            Frame::BulkString(Bytes::from_static(script)),
+            Frame::BulkString(Bytes::from_static(b"1")),
+            Frame::BulkString(Bytes::from_static(b"rk")),
+        ];
+        handle_eval(
+            &lua,
+            &cache,
+            &argv,
+            &mut db,
+            0,
+            1,
+            0,
+            1,
+            &crate::acl::ScriptAcl::trusted(),
+            true,
+        )
+    };
+    let caught = eval_ro(
+        b"local r = redis.pcall('SET', KEYS[1], 'x'); \
+          return {r.err, 'continued'}",
+    );
+    assert_eq!(
+        caught,
+        Frame::Array(crate::protocol::FrameVec::from_vec(vec![
+            Frame::BulkString(Bytes::from_static(ERR_RO_SCRIPT_WRITE)),
+            Frame::BulkString(Bytes::from_static(b"continued")),
+        ])),
+        "redis.pcall returns the refusal and the script continues"
+    );
+    let raised = eval_ro(b"return redis.call('SET', KEYS[1], 'x')");
+    assert_eq!(
+        raised,
+        Frame::Error(Bytes::from_static(ERR_RO_SCRIPT_WRITE))
+    );
+    assert!(db.peek(b"rk").is_none(), "nothing was written");
+}
+
 /// The read-only flag must not leak into the NEXT script on the same VM.
 /// It lives in a thread-local, and a shard thread runs every script for
 /// its connections, so a sticky flag would silently turn plain `EVAL`

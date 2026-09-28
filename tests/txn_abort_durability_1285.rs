@@ -1473,3 +1473,70 @@ fn read_only_sort_and_georadius_capture_nothing() {
     drop(c);
     drop(server);
 }
+
+/// Redis 7.0.15's text for a write from a read-only script
+/// (`scriptVerifyWriteCommandAllow`).
+const ERR_RO_WRITE: &str = "ERR Write commands are not allowed from read-only scripts.";
+
+const PCALL_LIB: &str = "#!lua name=rocatch\n\
+    redis.register_function{function_name='pc', \
+    callback=function(keys, args) local r = redis.pcall('SET', keys[1], 'v') \
+    return {r.err, 'continued'} end, flags={'no-writes'}}\n\
+    redis.register_function{function_name='cc', \
+    callback=function(keys, args) return redis.call('SET', keys[1], 'v') end, \
+    flags={'no-writes'}}";
+
+/// PR #1301 review, round 3: the read-only refusal (`EVAL_RO`, and since
+/// this PR a plain `FCALL` of a `no-writes` function) is an ordinary command
+/// error, as in Redis 7: `redis.pcall` returns `{err = ...}` and the script
+/// continues; `redis.call` raises it. It was raised as a Lua error even from
+/// `redis.pcall`, so no script could catch it. The replies below are the ones
+/// redis-server 7.0.15 gives (the `redis.call` error there also carries a
+/// ` script: ...` suffix, which moon omits for every script error).
+#[test]
+#[ignore = "spawns a real server; set MOON_BIN"]
+fn read_only_script_write_refusal_is_catchable_by_pcall() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let server = start(dir.path(), 1, false);
+    let mut c = Conn::open(server.port);
+    let lib = c.send(&["FUNCTION", "LOAD", "REPLACE", PCALL_LIB]);
+    assert!(lib.contains("rocatch"), "FUNCTION LOAD: {lib:?}");
+    let caught = format!("*2\r\n{}{}", bulk(ERR_RO_WRITE), bulk("continued"));
+    let pcall = "local r = redis.pcall('SET', KEYS[1], 'v'); return {r.err, 'continued'}";
+    assert_eq!(
+        c.send(&["EVAL_RO", pcall, "1", "k"]),
+        caught,
+        "EVAL_RO pcall"
+    );
+    assert_eq!(
+        c.send(&["FCALL", "pc", "1", "k"]),
+        caught,
+        "no-writes FCALL pcall"
+    );
+    assert_eq!(
+        c.send(&["FCALL_RO", "pc", "1", "k"]),
+        caught,
+        "FCALL_RO pcall"
+    );
+    for (what, argv) in [
+        (
+            "EVAL_RO call",
+            &[
+                "EVAL_RO",
+                "return redis.call('SET', KEYS[1], 'v')",
+                "1",
+                "k",
+            ][..],
+        ),
+        ("no-writes FCALL call", &["FCALL", "cc", "1", "k"][..]),
+    ] {
+        let r = c.send(argv);
+        assert!(
+            r.starts_with(&format!("-{ERR_RO_WRITE}")),
+            "{what}: raised: {r:?}"
+        );
+    }
+    assert_eq!(c.send(&["EXISTS", "k"]), int(0), "nothing was written");
+    drop(c);
+    drop(server);
+}

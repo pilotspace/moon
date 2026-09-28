@@ -854,6 +854,45 @@ mod tests {
         assert!(db.peek(b"k").is_some(), "the read-write function wrote");
     }
 
+    /// PR #1301 review round 3: from a `no-writes` function, as from
+    /// `EVAL_RO`, `redis.pcall` catches the read-only refusal and the
+    /// function continues; `redis.call` raises it. As in Redis 7.
+    #[test]
+    fn no_writes_function_pcall_catches_the_refusal() {
+        let mut reg = FunctionRegistry::new(crate::scripting::bridge::LuaEvictionCtx::disabled());
+        let body = b"#!lua name=nwp\n\
+            redis.register_function{function_name='pc', \
+            callback=function(keys) local r = redis.pcall('SET', keys[1], 'v') \
+            return {r.err, 'continued'} end, flags={'no-writes'}}\n\
+            redis.register_function{function_name='cc', \
+            callback=function(keys) return redis.call('SET', keys[1], 'v') end, \
+            flags={'no-writes'}}";
+        reg.load(body, false).unwrap();
+        let mut db = Database::new();
+        let mut call = |name: &[u8]| {
+            reg.call_function(
+                name,
+                vec![Bytes::from_static(b"k")],
+                vec![],
+                &mut db,
+                0,
+                1,
+                false,
+                &crate::acl::ScriptAcl::trusted(),
+            )
+        };
+        let err = Bytes::from_static(crate::scripting::ERR_RO_SCRIPT_WRITE);
+        assert_eq!(
+            call(b"pc"),
+            Frame::Array(crate::protocol::FrameVec::from_vec(vec![
+                Frame::BulkString(err.clone()),
+                Frame::BulkString(Bytes::from_static(b"continued")),
+            ]))
+        );
+        assert_eq!(call(b"cc"), Frame::Error(err));
+        assert!(db.peek(b"k").is_none(), "nothing was written");
+    }
+
     #[test]
     fn test_call_function_not_found() {
         let reg = FunctionRegistry::new(crate::scripting::bridge::LuaEvictionCtx::disabled());

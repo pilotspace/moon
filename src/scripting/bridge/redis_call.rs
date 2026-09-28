@@ -105,15 +105,24 @@ pub fn make_redis_call_fn(
                 )));
             }
 
-            // Reject non-readonly commands in read-only mode (FCALL_RO / EVAL_RO)
-            // Use positive allowlist (READONLY flag) instead of negative blocklist (!WRITE)
-            // to also block PUBLISH and other side-effecting commands.
+            // Reject non-readonly commands in read-only mode (FCALL_RO / EVAL_RO,
+            // a `no-writes` function). Use positive allowlist (READONLY flag)
+            // instead of negative blocklist (!WRITE) to also block PUBLISH and
+            // other side-effecting commands. Redis rejects WRITE | MAY_REPLICATE;
+            // moon's PUBLISH / SPUBLISH carry neither flag (MAY_REPLICATE also
+            // drives AOF admission here), so a WRITE-only rule would let them
+            // through where Redis refuses them.
+            //
+            // PR #1301 review round 3: an ordinary command error, as in Redis 7
+            // (`scriptVerifyWriteCommandAllow`) — `redis.call` raises it below,
+            // `redis.pcall` returns it as `{err = ...}` and the script goes on.
+            // It used to be a Lua error even from `redis.pcall`.
             let cmd_is_readonly = crate::command::metadata::is_read(&cmd_bytes);
             let cmd_is_write = crate::command::metadata::is_write(&cmd_bytes);
             if SCRIPT_READ_ONLY.with(|c| c.get()) && !cmd_is_readonly {
-                return Err(mlua::Error::RuntimeError(
-                    "Write commands are not allowed from read-only scripts".to_string(),
-                ));
+                return Ok(Frame::Error(Bytes::from_static(
+                    crate::scripting::ERR_RO_SCRIPT_WRITE,
+                )));
             }
             // Task #38: reject a write attempted from a CLIENT-issued script
             // on a read-only replica, at the first offending `redis.call`/

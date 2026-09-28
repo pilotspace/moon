@@ -2432,6 +2432,10 @@ if should_run "scripting"; then
         EVAL_RO "return redis.call('SET', KEYS[1], 'x')" 1 lua:k1
     # ...and refused means the value did NOT change.
     assert_match "EVAL_RO write did not land" GET lua:k1
+    # PR #1301 review: the refusal is an ordinary command error, so
+    # redis.pcall catches it (as {err=...}) and the script goes on.
+    assert_match "EVAL_RO pcall catches the refusal" \
+        EVAL_RO "local r = redis.pcall('SET', KEYS[1], 'x'); return {r.err, 'continued'}" 1 lua:k1
 
     # moon#672: the redis error CODE raised inside a script must LEAD the reply
     # -- it is the part a client matches on. moon buried it behind
