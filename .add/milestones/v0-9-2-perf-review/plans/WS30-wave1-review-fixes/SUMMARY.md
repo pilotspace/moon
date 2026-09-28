@@ -21,8 +21,9 @@ New file: `src/command/set/sscan_cursor.rs`.
 
 **How a rewrite is detected.** I used option (a), a per-set generation stamp, but it costs **0 extra bytes per set**:
 - Every `IndexSet` owns its own `RandomState`, and std seeds each new one differently. So `hasher().hash_one(PROBE)` identifies the set instance.
-- Every rebuild creates a new hasher: SUNIONSTORE, SINTERSTORE, SDIFFSTORE, RENAME, COPY REPLACE, RESTORE, a cold decode, a restart.
+- Every rebuild creates a new hasher: SUNIONSTORE, SINTERSTORE, SDIFFSTORE, RESTORE, a cold decode, a restart. RENAME and COPY REPLACE install ANOTHER key's set, whose tag differs from the scanned set's, so they are detected too.
 - `insert` and `swap_remove` keep it, and `clone()` keeps both the hasher and the order.
+- **Blind spot (PR #1301 review):** because a clone keeps the tag, a clone of the scanned set that is modified elsewhere and then moved back onto the scanned key (`COPY s tmp`, writes to `tmp`, `COPY tmp s REPLACE` or `RENAME tmp s`) presents the same tag with a possibly different layout. Its cursor is then accepted, and members can be skipped. This is residual risk 1; closing it means re-seeding the hasher on COPY, which was not done.
 - The cursor carries a 30-bit tag of it: `tag<<32 | pos`.
 - No command has to remember to bump a counter.
 

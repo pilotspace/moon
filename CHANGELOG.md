@@ -292,10 +292,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   before the cursor could make it skip members present for the whole scan.
   Small (intset/listpack) sets answer in one call with cursor 0, as redis does;
   an intset answers in numeric order and `SSCAN key -1` is accepted as in
-  redis. A set rebuilt mid-scan (SUNIONSTORE/SINTERSTORE/SDIFFSTORE, RENAME,
-  COPY REPLACE, RESTORE, the cold tier) is detected at zero bytes per set and
-  the scan continues on a hash-ordered cursor that always terminates, so no
-  member present for the whole scan is skipped. HSCAN keeps the old path until
+  redis. A set rebuilt mid-scan (SUNIONSTORE/SINTERSTORE/SDIFFSTORE, RESTORE,
+  the cold tier, or another key's set moved in by RENAME / COPY REPLACE) is
+  detected at zero bytes per set and the scan continues on a hash-ordered
+  cursor that always terminates, so no member present for the whole scan is
+  skipped. One case is not detected: a copy of the scanned set itself,
+  modified and moved back onto it mid-scan, keeps its tag. HSCAN keeps the old path until
   moon#1171's IndexMap.
 
 
