@@ -56,6 +56,10 @@ fn a_failed_spill_commit_never_leaves_a_listed_file_of_unindexed_slots() {
     assert_eq!(reclaimed, 0, "a failed commit spills nothing");
     assert_eq!(db.len(), 8, "every victim stays hot");
     assert!(next_file_id > 1, "precondition: a spill file was written");
+    // One file id per staged victim. The sampler is random and stops after
+    // NO_AOF_BATCH_STALL_LIMIT repeat picks, so the batch can hold fewer than
+    // all 8 keys; every one it did write must be graved.
+    let spilled = (next_file_id - 1) as usize;
 
     // Every victim is later DELeted while hot: no cold entry, no grave.
     for i in 0..8 {
@@ -96,8 +100,8 @@ fn a_failed_spill_commit_never_leaves_a_listed_file_of_unindexed_slots() {
         "moon#1291 F9: keys DELeted while hot came back from the failed batch's file: {back:?}"
     );
     assert!(
-        graves >= 8,
+        graves >= spilled,
         "moon#1291 F9: the failed batch's slots must be graves for the next snapshot \
-         (in case the failed commit reached the disk), got {graves}"
+         (in case the failed commit reached the disk): {spilled} spilled, {graves} graved"
     );
 }
