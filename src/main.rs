@@ -439,7 +439,9 @@ fn main() -> anyhow::Result<()> {
     }
 
     // Validate persistence directory is accessible
-    if let Err(e) = moon::persistence::fsync::create_dir_all_durable(std::path::Path::new(&config.dir)) {
+    if let Err(e) =
+        moon::persistence::fsync::create_dir_all_durable(std::path::Path::new(&config.dir))
+    {
         return Err(anyhow::anyhow!(
             "failed to create persistence directory {:?}: {}",
             config.dir,
