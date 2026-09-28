@@ -43,9 +43,59 @@ pub fn fsync_directory(dir: &Path) -> std::io::Result<()> {
 /// created, so a file later committed under `path` (a manifest, a base RDB)
 /// is never left in a directory the next boot cannot see. The parent of
 /// `path` is fsynced even when `path` already existed: its entry may have
-/// been created by an earlier, unsynced call. An ancestor this process may
-/// not open (`EACCES`) is logged and skipped; any other error propagates.
+/// been created by an earlier, unsynced call.
+///
+/// A directory that ALREADY existed may refuse the fsync without failing
+/// the call ([`dir_fsync_error_is_tolerable`]): an ancestor this process may
+/// not open (`EACCES`, a `0711` home), or a filesystem without directory
+/// fsync (`EINVAL` / `EBADF` / `ENOTSUP` — squashfs, erofs, iso9660,
+/// vboxsf, WSL1 drvfs, procfs), as PostgreSQL's `fsync_fname_ext` ignores
+/// `EBADF` / `EINVAL` on directories. `main.rs` fsyncs the parent of the
+/// data directory on every boot, so refusing there made a server that booted
+/// before stop booting. Any other error (`EIO`), and any error on a
+/// directory this call created, propagates. A skip is a warning only when
+/// the entry it leaves unsynced was created by this call; for a
+/// pre-existing entry it is logged at debug, so a boot does not warn every
+/// time.
 pub fn create_dir_all_durable(path: &Path) -> std::io::Result<()> {
+    for skip in create_dir_all_durable_with(path, fsync_directory)? {
+        if skip.entry_created {
+            tracing::warn!(
+                "cannot fsync {} to persist the new directory entry {}: {}",
+                skip.dir.display(),
+                skip.entry.display(),
+                skip.error
+            );
+        } else {
+            tracing::debug!(
+                "cannot fsync {} (entry {} already existed): {}",
+                skip.dir.display(),
+                skip.entry.display(),
+                skip.error
+            );
+        }
+    }
+    Ok(())
+}
+
+/// A directory fsync [`create_dir_all_durable`] skipped.
+#[derive(Debug)]
+struct SkippedDirSync {
+    /// The directory whose fsync failed.
+    dir: std::path::PathBuf,
+    /// The entry in `dir` the fsync would have made durable.
+    entry: std::path::PathBuf,
+    /// Whether this call created `entry`.
+    entry_created: bool,
+    error: std::io::Error,
+}
+
+/// [`create_dir_all_durable`] with the directory fsync injected (tests), and
+/// the skipped fsyncs returned rather than logged.
+fn create_dir_all_durable_with(
+    path: &Path,
+    mut fsync: impl FnMut(&Path) -> std::io::Result<()>,
+) -> std::io::Result<Vec<SkippedDirSync>> {
     // Newly created directories, deepest first.
     let mut missing: Vec<&Path> = Vec::new();
     let mut cur = path;
@@ -57,28 +107,57 @@ pub fn create_dir_all_durable(path: &Path) -> std::io::Result<()> {
         }
     }
     std::fs::create_dir_all(path)?;
-    fsync_parent_entry(parent_or_cwd(path))?;
-    // `missing[0]` is `path` itself, whose parent was just fsynced.
-    for dir in missing.iter().skip(1) {
-        fsync_parent_entry(parent_or_cwd(dir))?;
+    let mut skipped = Vec::new();
+    // `missing[0]` is `path` itself (when it was created): its parent is
+    // `missing[1]`, created by this call too, if there is one. The parent of
+    // the last created directory already existed.
+    let entries = std::iter::once((path, !missing.is_empty(), missing.len() > 1)).chain(
+        missing
+            .iter()
+            .enumerate()
+            .skip(1)
+            .map(|(i, dir)| (*dir, true, i + 1 < missing.len())),
+    );
+    for (entry, entry_created, dir_created) in entries {
+        let dir = parent_or_cwd(entry);
+        if let Err(error) = fsync(dir) {
+            if !dir_fsync_error_is_tolerable(&error, dir_created) {
+                return Err(error);
+            }
+            skipped.push(SkippedDirSync {
+                dir: dir.to_path_buf(),
+                entry: entry.to_path_buf(),
+                entry_created,
+                error,
+            });
+        }
     }
-    Ok(())
+    Ok(skipped)
 }
 
-/// Fsync a directory this process may not be allowed to open: an ancestor
-/// such as an execute-only (`0711`) home directory refuses `open`, and
-/// refusing to boot over that would be worse than the power-loss window it
-/// closes. Any other error (EIO from the fsync itself) still propagates.
-fn fsync_parent_entry(dir: &Path) -> std::io::Result<()> {
-    match fsync_directory(dir) {
-        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-            tracing::warn!(
-                "cannot fsync {} to persist a new directory entry: {e}",
-                dir.display()
-            );
-            Ok(())
-        }
-        r => r,
+/// May [`create_dir_all_durable`] skip a directory fsync that failed with
+/// `error`? Only for a directory that already existed (`dir_created` false),
+/// and only when the failure says the fsync cannot be done there at all: no
+/// permission to open it, or a filesystem that does not fsync directories
+/// (`EINVAL`, `EBADF`, `ENOTSUP` / `ErrorKind::Unsupported`). `EIO` — the
+/// fsync ran and failed — is never skipped.
+fn dir_fsync_error_is_tolerable(error: &std::io::Error, dir_created: bool) -> bool {
+    if dir_created {
+        return false;
+    }
+    if matches!(
+        error.kind(),
+        std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::Unsupported
+    ) {
+        return true;
+    }
+    #[cfg(unix)]
+    {
+        matches!(error.raw_os_error(), Some(libc::EINVAL | libc::EBADF))
+    }
+    #[cfg(not(unix))]
+    {
+        false
     }
 }
 
@@ -182,6 +261,113 @@ mod tests {
                 parent.display()
             );
         }
+    }
+
+    #[cfg(unix)]
+    fn os_err(code: i32) -> std::io::Error {
+        std::io::Error::from_raw_os_error(code)
+    }
+
+    /// PR #1301 review round 3: a pre-existing directory that cannot be
+    /// fsynced (no permission, or a filesystem without directory fsync) is
+    /// skipped; `EIO`, and anything on a directory this call created, is not.
+    #[cfg(unix)]
+    #[test]
+    fn dir_fsync_error_classification() {
+        use std::io::{Error, ErrorKind};
+        for (e, pre_existing_ok) in [
+            (os_err(libc::EINVAL), true),
+            (os_err(libc::EBADF), true),
+            (os_err(libc::ENOTSUP), true),
+            (os_err(libc::EACCES), true),
+            (Error::from(ErrorKind::PermissionDenied), true),
+            (Error::from(ErrorKind::Unsupported), true),
+            (os_err(libc::EIO), false),
+            (os_err(libc::ENOSPC), false),
+            (Error::from(ErrorKind::NotFound), false),
+        ] {
+            assert_eq!(
+                dir_fsync_error_is_tolerable(&e, false),
+                pre_existing_ok,
+                "{e:?}"
+            );
+            assert!(
+                !dir_fsync_error_is_tolerable(&e, true),
+                "created dir: {e:?}"
+            );
+        }
+    }
+
+    /// The pre-existing parent of a new data dir answers `EINVAL`: the dir is
+    /// created, the skip is reported as leaving a NEW entry unsynced (a
+    /// warning). On an already-existing dir the same skip is quiet.
+    #[cfg(unix)]
+    #[test]
+    fn create_dir_all_durable_skips_einval_on_a_pre_existing_parent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let leaf = tmp.path().join("data");
+        let einval = |_: &Path| Err(os_err(libc::EINVAL));
+        let skipped = create_dir_all_durable_with(&leaf, einval).unwrap();
+        assert!(leaf.is_dir());
+        assert_eq!(skipped.len(), 1, "{skipped:?}");
+        assert_eq!(skipped[0].dir, tmp.path());
+        assert!(skipped[0].entry_created, "the new entry's skip warns");
+        // Every later boot: the dir exists, the skip is not warned about.
+        let skipped = create_dir_all_durable_with(&leaf, einval).unwrap();
+        assert_eq!(skipped.len(), 1, "{skipped:?}");
+        assert!(
+            !skipped[0].entry_created,
+            "a pre-existing entry's skip is quiet"
+        );
+    }
+
+    /// `EIO` is fatal even on a pre-existing parent; any error on a
+    /// directory this call created is fatal.
+    #[cfg(unix)]
+    #[test]
+    fn create_dir_all_durable_keeps_eio_and_created_dir_errors_fatal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let eio =
+            create_dir_all_durable_with(&tmp.path().join("x"), |_: &Path| Err(os_err(libc::EIO)))
+                .unwrap_err();
+        assert_eq!(eio.raw_os_error(), Some(libc::EIO));
+        // `a/b/c` is new: `a/b` and `a` were created by this call and refuse
+        // with EINVAL; the pre-existing `tmp` would be tolerated.
+        let base = tmp.path().to_path_buf();
+        let leaf = base.join("a").join("b").join("c");
+        let err =
+            create_dir_all_durable_with(&leaf, |_: &Path| Err(os_err(libc::EINVAL))).unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(libc::EINVAL));
+        // Only the pre-existing `tmp` refuses: tolerated, and the three new
+        // entries' parents were all asked.
+        let mut asked = Vec::new();
+        let leaf2 = base.join("p").join("q");
+        let skipped = create_dir_all_durable_with(&leaf2, |d: &Path| {
+            asked.push(d.to_path_buf());
+            if d == base {
+                Err(os_err(libc::EINVAL))
+            } else {
+                Ok(())
+            }
+        })
+        .unwrap();
+        assert_eq!(asked, vec![base.join("p"), base.clone()]);
+        assert_eq!(skipped.len(), 1);
+        assert!(skipped[0].entry_created);
+    }
+
+    /// A real filesystem without directory fsync: procfs answers `EINVAL`.
+    /// `/proc/self` exists, so its parent `/proc` is a pre-existing directory
+    /// and the call succeeds (it failed with `EINVAL` before).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn create_dir_all_durable_tolerates_procfs() {
+        if fsync_directory(Path::new("/proc")).map_err(|e| e.raw_os_error())
+            != Err(Some(libc::EINVAL))
+        {
+            return; // this kernel fsyncs /proc: nothing to show
+        }
+        create_dir_all_durable(Path::new("/proc/self")).unwrap();
     }
 
     #[test]
