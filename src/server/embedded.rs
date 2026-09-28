@@ -110,13 +110,16 @@ pub async fn run_embedded(
         config.graph_result_cache_bytes,
     );
 
-    // Validate / create persistence directory up front.
-    std::fs::create_dir_all(&config.dir).with_context(|| {
-        format!(
-            "embedded moon: failed to create persistence directory {:?}",
-            config.dir
-        )
-    })?;
+    // Validate / create persistence directory up front — durably, as the
+    // binary entry does (moon#1293): a file later committed under it must not
+    // sit in a directory whose own entry a power loss can drop.
+    crate::persistence::fsync::create_dir_all_durable(std::path::Path::new(&config.dir))
+        .with_context(|| {
+            format!(
+                "embedded moon: failed to create persistence directory {:?}",
+                config.dir
+            )
+        })?;
 
     // G1 memory guardrail: resolve --maxmemory before RuntimeConfig is built
     // (matches the binary entry in main.rs).
