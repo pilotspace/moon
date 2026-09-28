@@ -51,5 +51,24 @@ Interleaved, base = ws30-monoio, fix = ws31-monoio, `--shards 1`.
 ## Gates (agent run, `perf/ws31`)
 `cargo fmt --check`; clippy `--all-targets -D warnings` on monoio and tokio,jemalloc; clippy `--lib` on tokio+text-index and tokio+graph; fuzz `cargo check --all-targets`; `cargo test --lib -- transaction graph scripting snapshot aof` (monoio 1199, tokio 617); integration `txn_abort_durability_1285` (monoio 16/16; tokio 12 pass, 4 skip), `review_r3_lua_eviction_aof`, `review_w1_routed_eval_tiering_1290`, `txn_kv_wiring`, `txn_graph_wiring`. `replication_streaming` is 7/7 on monoio and 0/7 on tokio — identical 0/7 on the ws30-tokio base. The orchestrator re-gated the integrated tree (see the PR).
 
+## Round 2: adversarial review of effb016 / 8314999 (WS32, `ca35be0..cf836ef`)
+The review found no BLOCKER. Its one MAJOR is residual risks 2–3 above, extended with a pipelining case (the limit is the *free* channel capacity) and moved to moon#1302. The three MINORs and four NITs are fixed:
+
+- **MINOR-1 (data loss):** a script write that `dispatch` cannot run was captured anyway. The primary-key fallback took `args[0]` (a graph name, or a literal such as FLUSH / PUBLISH), and the key walker named MQ's queue key and the blocking pops' keys. TXN.ABORT then deleted or RESTOREd another client's key, logged to the AOF and replicas, and the write intent hid it from other TXNs. Such writes (FT.*, GRAPH.*, MQ, WS, FUNCTION, FCALL, TEMPORAL.*, blocking pops) are now inert inside a TXN. The fallback applies only when `first_key > 0`. Guards pin `SCRIPT_UNDISPATCHED_WRITES` to exactly the writes `dispatch` answers `unknown command`, in both directions.
+- **MINOR-2:** a short argv (`redis.pcall('DEL')`) gets the arity error instead of poisoning the TXN. The docs now list what is actually refused.
+- **MINOR-3:** a `no-writes` FCALL routes inside a TXN, sent as FCALL_RO. `no-writes` is now enforced under plain FCALL, as in Redis — a behaviour change outside TXNs too. moon does not parse EVAL shebang flags.
+- **NITs:**
+  - rollback-owner errors are passed through verbatim;
+  - `txn_rollback_wal_dropped` is documented;
+  - every refused script write is counted;
+  - the double key walk is removed.
+- **Evidence:** red on `2861785` (monoio and tokio), green after. `txn_abort_durability_1285` is 19/19 on both runtimes. Tokio replica-suite failures reproduce on base (no master-side PSYNC on tokio).
+- **Remaining risks:**
+  - the undispatched set must track the registry; the guards catch drift for registered commands only;
+  - an arity-valid but malformed movable-key write (`LMPOP 5 a b LEFT`) is refused and poisons the TXN;
+  - the FUNCTION LOAD REPLACE race behind the FCALL_RO rewrite has no deterministic test.
+
+Also in this round: `47cda75` fsyncs the parent of every new ancestor of the data, offload, migration and AOF directories (CodeRabbit; an EACCES ancestor is logged and skipped). `779ebe8` fixes a sampling flake in WS28's F9 unit test.
+
 ## Self-evaluation (0–1)
 Completeness 0.9 · Clarity 0.9 · Practicality 0.9 · Optimization 0.9 · Edge cases 0.9 · Self-evaluation 0.9
