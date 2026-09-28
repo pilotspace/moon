@@ -39,7 +39,8 @@
 //!
 //! PR #1301 review, round 2: a script write `dispatch` cannot run (`FT.*`,
 //! `GRAPH.*`, `MQ`, blocking pops) captures no keyspace key; a write with
-//! too few arguments is an arity error, not a TXN poison.
+//! too few arguments is an arity error, not a TXN poison; a `no-writes`
+//! `FCALL` routes inside a TXN and is held to its flag.
 
 mod common;
 
@@ -1185,6 +1186,64 @@ fn short_script_write_argv_is_an_arity_error_not_a_poison() {
         "an arity error poisons nothing"
     );
     assert_eq!(c.send(&["GET", "k"]), bulk("v"));
+    drop(c);
+    drop(server);
+}
+
+const NO_WRITES_LIB: &str = "#!lua name=nowrites\n\
+    redis.register_function{function_name='getro', \
+    callback=function(keys, args) return redis.call('GET', keys[1]) end, \
+    flags={'no-writes'}}\n\
+    redis.register_function{function_name='lies', \
+    callback=function(keys, args) return redis.call('SET', keys[1], 'lied') end, \
+    flags={'no-writes'}}";
+
+/// MINOR-3: `--shards 4`, an `FCALL` of a `no-writes` function whose key
+/// lives on another shard is routed inside a TXN, as `FCALL_RO` is — it was
+/// refused with the cross-shard error and poisoned the TXN. The flag is
+/// enforced (as in Redis), so a `no-writes` function that tries to write is
+/// refused, locally and routed, inside a TXN and outside one.
+#[test]
+#[ignore = "spawns a real server; set MOON_BIN"]
+fn no_writes_fcall_routes_inside_a_txn_shards_4() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let server = start(dir.path(), 4, true);
+    let mut c = Conn::open(server.port);
+    let remote = remote_tag(&mut c).expect("--shards 4 has a remote hash tag");
+    let local = local_tag(&mut c);
+    let rkey = format!("{{{remote}}}:nw");
+    let lkey = format!("{{{local}}}:nw");
+    for key in [&rkey, &lkey] {
+        assert_eq!(c.send(&["SET", key, "original"]), OK);
+    }
+    let lib = c.send(&["FUNCTION", "LOAD", "REPLACE", NO_WRITES_LIB]);
+    assert!(lib.contains("nowrites"), "FUNCTION LOAD: {lib:?}");
+    assert_eq!(c.send(&["TXN", "BEGIN"]), OK);
+    assert_eq!(
+        c.send(&["FCALL", "getro", "1", &rkey]),
+        bulk("original"),
+        "a no-writes FCALL routes inside a TXN"
+    );
+    for key in [&rkey, &lkey] {
+        let r = c.send(&["FCALL", "lies", "1", key]);
+        assert!(
+            r.starts_with('-') && r.contains("not allowed from read-only scripts"),
+            "a no-writes function may not write ({key}): {r:?}"
+        );
+    }
+    assert_eq!(
+        c.send(&["TXN", "COMMIT"]),
+        OK,
+        "nothing was refused by the TXN"
+    );
+    let r = c.send(&["FCALL", "lies", "1", &lkey]);
+    assert!(
+        r.starts_with('-') && r.contains("not allowed from read-only scripts"),
+        "outside a TXN too: {r:?}"
+    );
+    for key in [&rkey, &lkey] {
+        assert_eq!(c.send(&["GET", key]), bulk("original"), "{key}");
+    }
     drop(c);
     drop(server);
 }

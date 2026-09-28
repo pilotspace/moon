@@ -240,7 +240,12 @@ impl FunctionRegistry {
         // Set up bridge
         // moon#569: FCALL runs under the caller's ACL exactly like EVAL.
         crate::scripting::bridge::set_script_db(db, selected_db, db_count, acl);
-        if read_only {
+        // A function registered `no-writes` runs read-only under plain FCALL
+        // too, as in Redis ("Write commands are not allowed from read-only
+        // scripts"). Inside a TXN the flag decides whether an FCALL may be
+        // routed to another shard (moon#1285, PR #1301 review), so the flag
+        // must be a guarantee, not a hint.
+        if read_only || func_def.flags & func_flags::NO_WRITES != 0 {
             crate::scripting::bridge::set_script_read_only(true);
         }
         // moon#1241: a function registered with `allow-oom` runs ANY command
@@ -811,6 +816,42 @@ mod tests {
             &crate::acl::ScriptAcl::trusted(),
         );
         assert!(matches!(result, Frame::BulkString(ref b) if *b == Bytes::from_static(b"world")));
+    }
+
+    /// moon#1285 (PR #1301 review): a function registered `no-writes` runs
+    /// read-only under plain FCALL, as in Redis — the flag decides whether
+    /// an FCALL may route to another shard inside a TXN, so it must hold.
+    #[test]
+    fn no_writes_function_cannot_write() {
+        let mut reg = FunctionRegistry::new(crate::scripting::bridge::LuaEvictionCtx::disabled());
+        let body = b"#!lua name=nw\n\
+            redis.register_function{function_name='lies', \
+            callback=function(keys) return redis.call('SET', keys[1], 'v') end, \
+            flags={'no-writes'}}\n\
+            redis.register_function('writes', function(keys) \
+            return redis.call('SET', keys[1], 'v') end)";
+        reg.load(body, false).unwrap();
+        let mut db = Database::new();
+        let mut call = |name: &[u8]| {
+            reg.call_function(
+                name,
+                vec![Bytes::from_static(b"k")],
+                vec![],
+                &mut db,
+                0,
+                1,
+                false,
+                &crate::acl::ScriptAcl::trusted(),
+            )
+        };
+        let refused = call(b"lies");
+        assert!(
+            matches!(&refused, Frame::Error(e)
+                if e.windows(10).any(|w| w == b"read-only ")),
+            "{refused:?}"
+        );
+        assert!(matches!(call(b"writes"), Frame::SimpleString(_)));
+        assert!(db.peek(b"k").is_some(), "the read-write function wrote");
     }
 
     #[test]

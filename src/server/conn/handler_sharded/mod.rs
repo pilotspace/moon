@@ -1522,7 +1522,11 @@ pub(crate) async fn handle_connection_sharded_inner<
                             }
                             if let Some(routed) =
                                 crate::server::conn::shared::route_script_elsewhere(
-                                    cmd,
+                                    crate::server::conn::txn_script_undo::routed_script_cmd(
+                                        cmd,
+                                        cmd_args,
+                                        conn.in_cross_txn(),
+                                    ),
                                     cmd_args,
                                     conn.selected_db,
                                     &script_acl,
