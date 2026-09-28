@@ -63,6 +63,84 @@ use smallvec::SmallVec;
 use crate::transaction::CrossStoreTxn;
 use crate::transaction::kv_compensation::{self, CompensatingRecord};
 
+/// Graph rollback WAL records a `TXN.ABORT` could not enqueue (moon#1285,
+/// PR #1301 review): the shard's WAL append channel was full (or its writer
+/// gone) while the rollback's records were being appended. Each counted
+/// record belongs to an abort whose client was answered
+/// [`ROLLBACK_WAL_REFUSED_ERR`], never `+OK` (a disconnect rollback has no
+/// client; it is logged at ERROR instead).
+///
+/// Exposed as `txn_rollback_wal_dropped` in `INFO persistence`.
+pub static ROLLBACK_WAL_RECORDS_DROPPED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Reply for a `TXN.ABORT` whose graph rollback was applied in memory but
+/// whose WAL records could not all be enqueued. Same "applied in memory"
+/// contract as the AOF's refusal texts (`persistence::aof::refusal`): the
+/// rollback is NOT undone and a retry has nothing to roll back; what is
+/// missing is its durability — a restart replays the forward graph writes
+/// without (all of) their undo.
+pub const ROLLBACK_WAL_REFUSED_ERR: &[u8] =
+    b"MOONERR WAL backpressure: TXN rolled back in memory, \
+but its graph rollback records were not all queued for persistence; a restart may replay the \
+aborted graph writes";
+
+/// Reply for a `TXN.ABORT` whose graph rollback for ANOTHER shard could not be
+/// delivered or acknowledged: those aborted graph writes may still be live
+/// on that shard.
+pub const REMOTE_ROLLBACK_UNDELIVERED_ERR: &[u8] = b"MOONERR TXN rollback incomplete: the graph \
+rollback for another shard was not delivered or not acknowledged; its aborted graph writes may \
+still be live";
+
+/// Append a rollback's graph WAL records on `shard_id` — CHECKED (moon#1285,
+/// PR #1301 review). The forward graph writes use the fire-and-forget
+/// `ShardDatabases::wal_append`; a rollback record lost the same way turned
+/// an acked abort into a restart that replays the aborted writes. Used by the
+/// connection-local leg (`server::conn::txn_abort::abort_logged`) and by the
+/// owner of a remote leg (`ShardMessage::GraphRollback`).
+///
+/// Durability parity: an enqueued record is exactly as durable as a forward
+/// graph write — drained into WAL-v3 on the shard's 1 ms tick and fsynced by
+/// the off-loop sync agent (`appendfsync always`) or the everysec flush.
+/// Neither waits for a durable LSN before its reply (the event loop's
+/// `request_sync` comment: "replies are not gated on WAL v3 durability"), so
+/// the abort does not either.
+///
+/// `Err` carries [`ROLLBACK_WAL_REFUSED_ERR`]; the dropped records are counted
+/// in [`ROLLBACK_WAL_RECORDS_DROPPED`] and logged here.
+pub fn append_graph_rollback_wal(
+    shard_databases: &crate::shard::shared_databases::ShardDatabases,
+    shard_id: usize,
+    txn_id: u64,
+    records: Vec<Bytes>,
+) -> Result<(), &'static [u8]> {
+    if records.is_empty() {
+        return Ok(());
+    }
+    let total = records.len();
+    match shard_databases.try_wal_append_all(
+        shard_id,
+        crate::persistence::wal_v3::record::WalRecordType::Command,
+        records,
+    ) {
+        Ok(()) => Ok(()),
+        Err(dropped) => {
+            ROLLBACK_WAL_RECORDS_DROPPED
+                .fetch_add(dropped as u64, std::sync::atomic::Ordering::Relaxed);
+            tracing::warn!(
+                txn_id,
+                shard_id,
+                total,
+                dropped,
+                "TXN rollback: graph WAL records refused by the WAL append channel \
+                 (full or closed); the rollback is applied in memory only past the \
+                 first dropped record"
+            );
+            Err(ROLLBACK_WAL_REFUSED_ERR)
+        }
+    }
+}
+
 #[cfg(feature = "graph")]
 use crate::graph::types::{EdgeKey, NodeKey};
 
@@ -541,11 +619,13 @@ pub fn abort_local(
 
 /// Ship the remote graph legs [`abort_local`] split off to their owning
 /// shards via `ShardMessage::GraphRollback` and await the acknowledgements.
-/// The owner applies the rollback and WAL-appends its records itself.
+/// The owner applies the rollback and WAL-appends its records itself,
+/// checked ([`append_graph_rollback_wal`]).
 ///
-/// Failure handling: a closed reply channel (owner shard gone) is logged and
-/// skipped — abort is best-effort per step (see module docs), and the
-/// per-shard side tables treat missing entries as no-ops.
+/// Failure handling: every leg is attempted. A leg that could not be
+/// delivered, whose reply channel closed, or whose owner refused its WAL
+/// records makes the result `Err` (the first such reply) — never a silent
+/// `+OK` (PR #1301 review). Each failure is logged here.
 pub async fn send_remote_graph_rollbacks(
     shard_id: usize,
     txn_id: u64,
@@ -554,7 +634,9 @@ pub async fn send_remote_graph_rollbacks(
     >,
     spsc_notifiers: &[std::sync::Arc<crate::runtime::channel::Notify>],
     remote: RemoteGraphLegs,
-) {
+) -> Result<(), &'static [u8]> {
+    #[allow(unused_mut)]
+    let mut result: Result<(), &'static [u8]> = Ok(());
     #[cfg(feature = "graph")]
     for (owner, graph_undo, graph_intents) in remote {
         let (reply_tx, reply_rx) = crate::runtime::channel::oneshot();
@@ -579,21 +661,35 @@ pub async fn send_remote_graph_rollbacks(
                 "txn abort: remote graph rollback DROPPED under dispatch \
                  backpressure — remote graph intents not undone"
             );
+            result = result.and(Err(REMOTE_ROLLBACK_UNDELIVERED_ERR));
             continue;
         }
-        if crate::shard::coordinator::recv_reply_bounded(reply_rx)
-            .await
-            .is_err()
-        {
-            tracing::warn!(
-                txn_id,
-                owner,
-                "txn abort: remote graph rollback reply channel closed"
-            );
+        match crate::shard::coordinator::recv_reply_bounded(reply_rx).await {
+            Ok(crate::protocol::Frame::Error(_)) => {
+                // The owner applied the rollback but refused (and counted,
+                // and logged) some of its WAL records.
+                tracing::warn!(
+                    txn_id,
+                    owner,
+                    "txn abort: remote graph rollback applied but its WAL records were refused"
+                );
+                result = result.and(Err(ROLLBACK_WAL_REFUSED_ERR));
+            }
+            Ok(_) => {}
+            Err(_) => {
+                tracing::error!(
+                    txn_id,
+                    owner,
+                    "txn abort: remote graph rollback reply channel closed — \
+                     not known to be applied"
+                );
+                result = result.and(Err(REMOTE_ROLLBACK_UNDELIVERED_ERR));
+            }
         }
     }
     #[cfg(not(feature = "graph"))]
     let _ = (shard_id, txn_id, dispatch_tx, spsc_notifiers, remote);
+    result
 }
 
 #[cfg(all(test, feature = "graph"))]
@@ -987,5 +1083,70 @@ mod tests {
         assert_eq!(c.command_count(), 0);
         assert!(c.collect_command(b"graph.undeleteedge", &[b"g", b"5"]));
         assert!(GraphReplayCollector::is_graph_command(b"GRAPH.DELPROP"));
+    }
+}
+
+#[cfg(test)]
+mod rollback_wal_tests {
+    //! PR #1301 review: a graph rollback record the WAL channel refuses is
+    //! never dropped silently.
+
+    use super::*;
+    use crate::persistence::wal_v3::record::WalRecordType;
+    use crate::shard::shared_databases::ShardDatabases;
+    use crate::storage::Database;
+
+    fn records(n: usize) -> Vec<Bytes> {
+        (0..n).map(|i| Bytes::from(format!("r{i}"))).collect()
+    }
+
+    /// No WAL writer (persistence off): nothing is owed, nothing refused.
+    #[test]
+    fn persistence_disabled_is_ok() {
+        let (shared, _inits) = ShardDatabases::new(vec![vec![Database::new()]]);
+        assert_eq!(
+            shared.try_wal_append_all(0, WalRecordType::Command, records(3)),
+            Ok(())
+        );
+        assert_eq!(append_graph_rollback_wal(&shared, 0, 1, records(3)), Ok(()));
+    }
+
+    /// A channel with room for 2 of 5 records: the first 2 are enqueued IN
+    /// ORDER, the rest refused and reported — a prefix, never a gap.
+    #[test]
+    fn full_channel_keeps_a_prefix_and_reports_the_rest() {
+        let (shared, _inits) = ShardDatabases::new(vec![vec![Database::new()]]);
+        let (tx, rx) = crate::runtime::channel::mpsc_bounded(2);
+        shared.set_wal_append_tx(0, tx);
+        assert_eq!(
+            shared.try_wal_append_all(0, WalRecordType::Command, records(5)),
+            Err(3)
+        );
+        let got: Vec<Bytes> = rx.try_iter().map(|(_, b)| b).collect();
+        assert_eq!(got, records(2));
+    }
+
+    /// The helper answers the refusal text, never `Ok`, and counts every
+    /// record it could not enqueue.
+    #[test]
+    fn refused_rollback_is_answered_and_counted() {
+        let (shared, _inits) = ShardDatabases::new(vec![vec![Database::new()]]);
+        let (tx, rx) = crate::runtime::channel::mpsc_bounded(1);
+        shared.set_wal_append_tx(0, tx);
+        let before = ROLLBACK_WAL_RECORDS_DROPPED.load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            append_graph_rollback_wal(&shared, 0, 7, records(4)),
+            Err(ROLLBACK_WAL_REFUSED_ERR)
+        );
+        let after = ROLLBACK_WAL_RECORDS_DROPPED.load(std::sync::atomic::Ordering::Relaxed);
+        // `>=`: other tests in this binary may count concurrently.
+        assert!(
+            after - before >= 3,
+            "3 dropped records counted: {before} -> {after}"
+        );
+        assert_eq!(rx.try_iter().count(), 1);
+        // Room again: the same helper is Ok.
+        assert_eq!(append_graph_rollback_wal(&shared, 0, 8, records(1)), Ok(()));
+        assert_eq!(append_graph_rollback_wal(&shared, 0, 9, Vec::new()), Ok(()));
     }
 }

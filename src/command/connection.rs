@@ -511,6 +511,7 @@ fn info_raw(db: &Database, facts: &InstanceFacts) -> String {
          aof_backpressure_stalls:{}\r\n\
          aof_backpressure_refused:{}\r\n\
          aof_append_backpressure_refusals:{}\r\n\
+         txn_rollback_wal_dropped:{}\r\n\
          aof_last_fsync_status:{}\r\n\
          aof_fsync_failures:{}\r\n\
          aof_last_append_status:{}\r\n\
@@ -589,6 +590,10 @@ fn info_raw(db: &Database, facts: &InstanceFacts) -> String {
         // past `--aof-fsync-timeout-ms` (or the rewrite overflow cap) — NOT
         // fsync failures, which are counted in `aof_fsync_failures`.
         crate::persistence::aof::AOF_APPEND_BACKPRESSURE_REFUSALS
+            .load(std::sync::atomic::Ordering::Relaxed),
+        // moon#1285 (PR #1301 review): graph rollback WAL records a
+        // TXN.ABORT could not enqueue; its client was answered the refusal.
+        crate::transaction::abort::ROLLBACK_WAL_RECORDS_DROPPED
             .load(std::sync::atomic::Ordering::Relaxed),
         if crate::persistence::aof::aof_last_fsync_ok() {
             "ok"

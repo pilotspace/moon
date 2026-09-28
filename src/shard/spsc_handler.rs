@@ -2187,16 +2187,19 @@ pub(crate) fn handle_shard_message_shared(
                     )
                 })
             };
-            for record in wal_records {
-                shard_databases.wal_append(
-                    shard_id,
-                    crate::persistence::wal_v3::record::WalRecordType::Command,
-                    bytes::Bytes::from(record),
-                );
-            }
-            let _ = reply_tx.send(crate::protocol::Frame::SimpleString(
-                bytes::Bytes::from_static(b"OK"),
-            ));
+            // PR #1301 review: checked — a refused record is counted, logged
+            // and reported to the aborting connection, never dropped under
+            // an `OK` acknowledgement.
+            let reply = match crate::transaction::abort::append_graph_rollback_wal(
+                shard_databases,
+                shard_id,
+                txn_id,
+                wal_records.into_iter().map(bytes::Bytes::from).collect(),
+            ) {
+                Ok(()) => crate::protocol::Frame::SimpleString(bytes::Bytes::from_static(b"OK")),
+                Err(reply) => crate::protocol::Frame::Error(bytes::Bytes::from_static(reply)),
+            };
+            let _ = reply_tx.send(reply);
         }
         #[cfg(feature = "text-index")]
         ShardMessage::InvertedSearch(payload) => {

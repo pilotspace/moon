@@ -32,6 +32,10 @@
 //! tokio leg has neither graph nor master-side PSYNC), detected by
 //! `GRAPH.CREATE` answering "unknown command". MQ is an audit: `MQ PUBLISH`
 //! intents are held until commit, so an abort has nothing to undo.
+//!
+//! PR #1301 review: a graph rollback whose WAL records overflow the shard's
+//! WAL append channel (local leg at `--shards 1`, remote owner leg at `4`)
+//! must answer the refusal, never `+OK` followed by resurrected writes.
 
 mod common;
 
@@ -535,6 +539,146 @@ fn graph_abort_survives_restart() {
     let server = restart(server, dir.path(), 1);
     let mut c = Conn::open(server.port);
     graph_assert_seed(&mut c, "after kill -9 + restart");
+}
+
+// ---------------------------------------------------------------------------
+// Graph: a rollback record the WAL channel refuses (PR #1301 review)
+// ---------------------------------------------------------------------------
+
+/// More graph entities than the per-shard WAL append channel holds (4096
+/// slots, `shard::event_loop`). The forward writes reach the channel a batch
+/// at a time and drain on the 1 ms tick; the rollback emits one record per
+/// entity in ONE synchronous stretch, so the channel overflows mid-rollback.
+const OVERFLOW_NODES: usize = 6000;
+
+/// `INFO persistence` field `name` as an integer; 0 when the field is absent
+/// (a binary that predates it), so the unfixed code fails on the restart
+/// invariant — the real defect — rather than on a missing counter.
+fn info_int(c: &mut Conn, name: &str) -> i64 {
+    let info = c.send(&["INFO", "persistence"]);
+    let prefix = format!("{name}:");
+    info.lines()
+        .find_map(|l| l.strip_prefix(&prefix))
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(0)
+}
+
+/// `MATCH (n:N) RETURN count(n)` on `graph`.
+fn node_count(c: &mut Conn, graph: &str) -> i64 {
+    let r = c.send(&["GRAPH.QUERY", graph, "MATCH (n:N) RETURN count(n)"]);
+    r.split("\r\n:")
+        .nth(1)
+        .and_then(|t| t.split("\r\n").next())
+        .and_then(|n| n.parse().ok())
+        .unwrap_or_else(|| panic!("no count in {r:?}"))
+}
+
+/// A hash tag this connection's shard does NOT own: a `TXN` refuses a write
+/// to it. `None` at `--shards 1`.
+fn remote_tag(c: &mut Conn) -> Option<String> {
+    for i in 0..512 {
+        let tag = format!("r{i}");
+        assert_eq!(c.send(&["TXN", "BEGIN"]), OK);
+        let r = c.send(&["SET", &format!("{{{tag}}}:probe"), "1"]);
+        let _ = c.send(&["TXN", "ABORT"]);
+        if r.contains("cross-shard") {
+            return Some(tag);
+        }
+        if r == OK {
+            assert_eq!(c.send(&["DEL", &format!("{{{tag}}}:probe")]), int(0));
+        }
+    }
+    None
+}
+
+/// The invariant: a `TXN.ABORT` that answered `+OK` must not come back after
+/// a kill -9. On the unfixed code the rollback's records past the channel's
+/// capacity were dropped silently: `+OK`, 0 nodes live, 1904 after restart.
+/// Fixed, an abort whose records do not all fit answers the WAL refusal and
+/// counts the dropped records (the rollback is still applied in memory); one
+/// whose records fit answers `+OK` and stays aborted.
+fn graph_rollback_overflow_case(shards: usize, remote: bool) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let server = start(dir.path(), shards, true);
+    let mut c = Conn::open(server.port);
+    if !has_graph(&mut c) {
+        eprintln!("SKIP: this binary has no `graph` feature (tokio leg)");
+        return;
+    }
+    let tag = if remote {
+        remote_tag(&mut c).expect("--shards > 1 has a remote hash tag")
+    } else {
+        local_tag(&mut c)
+    };
+    let graph = format!("{{{tag}}}g");
+    assert_eq!(c.send(&["GRAPH.CREATE", &graph]), OK);
+    let dropped_before = info_int(&mut c, "txn_rollback_wal_dropped");
+
+    assert_eq!(c.send(&["TXN", "BEGIN"]), OK);
+    let ids: Vec<String> = (0..OVERFLOW_NODES).map(|i| i.to_string()).collect();
+    for chunk in ids.chunks(200) {
+        let cmds: Vec<Vec<&str>> = chunk
+            .iter()
+            .map(|i| vec!["GRAPH.ADDNODE", graph.as_str(), "N", "i", i.as_str()])
+            .collect();
+        let refs: Vec<&[&str]> = cmds.iter().map(Vec::as_slice).collect();
+        let replies = c.pipeline(&refs);
+        assert!(
+            !replies.contains("\r\n-") && !replies.starts_with('-'),
+            "{replies}"
+        );
+        // Let the forward records drain: this test is about the rollback's.
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(node_count(&mut c, &graph), OVERFLOW_NODES as i64);
+    let abort = c.send(&["TXN", "ABORT"]);
+    assert_eq!(
+        node_count(&mut c, &graph),
+        0,
+        "the rollback is applied in memory whatever its reply ({abort:?})"
+    );
+    let dropped_after = info_int(&mut c, "txn_rollback_wal_dropped");
+    if abort == OK {
+        assert_eq!(dropped_after, dropped_before, "+OK with dropped records");
+    } else {
+        assert!(
+            abort.starts_with("-MOONERR WAL backpressure"),
+            "a refused rollback answers the WAL refusal: {abort:?}"
+        );
+        assert!(
+            dropped_after > dropped_before,
+            "a refused rollback record is counted in INFO txn_rollback_wal_dropped"
+        );
+    }
+    eprintln!(
+        "shards={shards} remote={remote}: TXN.ABORT -> {abort:?}, \
+         txn_rollback_wal_dropped {dropped_before} -> {dropped_after}"
+    );
+    drop(c);
+    let_wal_v3_flush();
+    let server = restart(server, dir.path(), shards);
+    let mut c = Conn::open(server.port);
+    let after = node_count(&mut c, &graph);
+    if abort == OK {
+        assert_eq!(
+            after, 0,
+            "TXN.ABORT answered +OK, yet {after} aborted graph nodes came back after kill -9"
+        );
+    }
+}
+
+#[test]
+#[ignore = "spawns a real server; set MOON_BIN"]
+fn graph_rollback_wal_overflow_is_never_acked_shards_1() {
+    graph_rollback_overflow_case(1, false);
+}
+
+/// The remote leg: the graph lives on another shard, whose
+/// `ShardMessage::GraphRollback` handler appends the records.
+#[test]
+#[ignore = "spawns a real server; set MOON_BIN"]
+fn graph_remote_rollback_wal_overflow_is_never_acked_shards_4() {
+    graph_rollback_overflow_case(4, true);
 }
 
 // ---------------------------------------------------------------------------

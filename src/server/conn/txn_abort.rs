@@ -9,7 +9,8 @@
 //!
 //! 1. the undo and everything below it up to the first await form ONE
 //!    synchronous stretch: the AOF fold epoch is read, the replication
-//!    records are recorded (monoio), the graph WAL records are appended;
+//!    records are recorded (monoio), the graph WAL records are appended —
+//!    checked, a refused record fails the reply (PR #1301 review);
 //! 2. the KV records are appended to this shard's AOF through the MULTI/EXEC
 //!    group commit ([`persist_txn_aof`]) — one `fsync` barrier under
 //!    `appendfsync always`, so an `+OK` means the abort is on disk;
@@ -55,15 +56,24 @@ pub(crate) type ReplicationRecorder = fn(&ConnectionContext, usize, Bytes);
 /// connection's writes are replicated (the caller's
 /// `replication_fanout_active`); the tokio runtime passes `None`.
 ///
-/// `Err(reply)` when the AOF refused the records or their barrier — the
-/// keyspace IS rolled back either way. A refusal is never silent (wave-1
-/// review MINOR 5): the pool counts it where it happens
+/// `Err(reply)` when the AOF refused the records or their barrier, when the
+/// WAL channel refused a graph rollback record (local or on a remote leg's
+/// owner — PR #1301 review), or when a remote graph leg was not delivered or
+/// acknowledged — the stores ARE rolled back either way (a remote leg that
+/// was never delivered excepted, which its reply says). A refusal is never
+/// silent (wave-1 review MINOR 5): it is counted where it happens
 /// (`aof_append_backpressure_refusals` / `aof_backpressure_dropped` for a
-/// backlogged or dead writer, `aof_fsync_failures` for a failed fsync), and
-/// this logs it with its `cause` — at WARN for an explicit `TXN.ABORT`, whose
-/// client is answered the refusal, and at ERROR for a dirty-commit or
-/// disconnect rollback, where no client learns of it and the master's AOF
-/// lacks records its replicas already received.
+/// backlogged or dead AOF writer, `aof_fsync_failures` for a failed fsync,
+/// `txn_rollback_wal_dropped` for graph WAL records), and this logs it with
+/// its `cause` — at WARN for an explicit `TXN.ABORT`, whose client is
+/// answered the refusal, and at ERROR for a dirty-commit or disconnect
+/// rollback, where no client learns of it and the master's logs lack records
+/// its replicas already received.
+///
+/// Durability parity (PR #1301 review): the graph records get what the
+/// FORWARD graph writes get — enqueued in the no-await stretch, drained into
+/// WAL-v3 on the 1 ms tick, fsynced off-loop; neither waits for a durable WAL
+/// LSN before replying. The KV records keep the AOF barrier.
 pub(crate) async fn abort_logged(
     ctx: &ConnectionContext,
     txn: CrossStoreTxn,
@@ -95,19 +105,20 @@ pub(crate) async fn abort_logged(
             }
         }
     }
-    for bytes in log.graph {
-        ctx.shard_databases.wal_append(
-            ctx.shard_id,
-            crate::persistence::wal_v3::record::WalRecordType::Command,
-            bytes,
-        );
-    }
+    // PR #1301 review: checked. A record the WAL channel refuses is counted
+    // and logged, and the abort answers the refusal instead of `+OK`.
+    let graph_wal = crate::transaction::abort::append_graph_rollback_wal(
+        &ctx.shard_databases,
+        ctx.shard_id,
+        txn_id,
+        log.graph,
+    );
     // -----------------------------------------------------------------------
 
     let persisted =
         crate::server::conn::shared::persist_txn_aof(ctx, log.kv, replicate.is_some(), fold_stamp)
             .await;
-    crate::transaction::abort::send_remote_graph_rollbacks(
+    let remote_legs = crate::transaction::abort::send_remote_graph_rollbacks(
         ctx.shard_id,
         txn_id,
         &ctx.dispatch_tx,
@@ -115,25 +126,29 @@ pub(crate) async fn abort_logged(
         remote,
     )
     .await;
-    if let Err(reply) = persisted {
+    // The first refusal in log order (KV AOF, local graph WAL, remote graph
+    // legs) is the reply; every one was already counted and logged where it
+    // happened.
+    let outcome = persisted.and(graph_wal).and(remote_legs);
+    if let Err(reply) = outcome {
         let reply = String::from_utf8_lossy(reply);
         if cause == AbortCause::Explicit {
             tracing::warn!(
                 txn_id,
                 cause = cause.as_str(),
                 reply = %reply,
-                "TXN rollback applied but its AOF records were refused; the client was answered the refusal"
+                "TXN rollback applied but some of its log records were refused; the client was answered the refusal"
             );
         } else {
             tracing::error!(
                 txn_id,
                 cause = cause.as_str(),
                 reply = %reply,
-                "TXN rollback applied but its AOF records were refused and NO client was told: \
-                 a restart may replay the rolled-back writes, and replicas received records \
-                 this AOF lacks"
+                "TXN rollback applied but some of its log records were refused and NO client \
+                 was told: a restart may replay the rolled-back writes, and replicas may hold \
+                 records this node's logs lack"
             );
         }
     }
-    persisted
+    outcome
 }
