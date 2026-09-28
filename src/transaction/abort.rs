@@ -626,9 +626,11 @@ pub fn abort_local(
 /// delivered, whose reply channel closed, or whose owner answered an error
 /// makes the result `Err` (the first such reply) — never a silent `+OK`
 /// (PR #1301 review). The owner's WAL refusal is answered as
-/// [`ROLLBACK_WAL_REFUSED_ERR`]; any other error the owner answers is passed
-/// through verbatim rather than reported as a WAL refusal it was not. Each
-/// failure is logged here.
+/// [`ROLLBACK_WAL_REFUSED_ERR`]. Today's owner (`spsc_handler`'s
+/// `GraphRollback` arm) answers only `+OK` or that refusal; the pass-through
+/// of any other error is defensive and unreachable now — should an owner
+/// ever answer one, it is reported verbatim rather than as a WAL refusal it
+/// was not. Each failure is logged here.
 pub async fn send_remote_graph_rollbacks(
     shard_id: usize,
     txn_id: u64,
@@ -679,7 +681,9 @@ pub async fn send_remote_graph_rollbacks(
                 result = result.and(Err(e));
             }
             Ok(crate::protocol::Frame::Error(e)) => {
-                // Not the WAL refusal: whatever the owner answered, say that.
+                // Defensive, unreachable today: the owner answers only `+OK`
+                // or the WAL refusal above. Should it ever answer another
+                // error, say what it answered, not a WAL refusal.
                 tracing::warn!(
                     txn_id,
                     owner,

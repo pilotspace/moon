@@ -522,8 +522,7 @@ shared 4-vCPU Linux container against HEAD `935c555` — re-measure on the GCE r
   `MOONERR WAL backpressure: TXN rolled back in memory, but its graph rollback
   records were not all queued for persistence; ...`, is counted in
   `INFO persistence` `txn_rollback_wal_dropped`, and a remote shard's rollback
-  that was not delivered or not acknowledged fails the abort too (any other
-  error the remote shard answers is passed through as-is). Durability
+  that was not delivered or not acknowledged fails the abort too. Durability
   matches forward graph writes (no reply waits for a WAL fsync), so abort
   latency is unchanged. A rollback larger than the free channel capacity
   (about 4096 records per shard) now always answers this error.
