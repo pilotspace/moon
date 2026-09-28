@@ -232,7 +232,7 @@ fn main() -> anyhow::Result<()> {
             config.migrate_aof_shards
         );
         // Create destination directory if absent.
-        if let Err(e) = std::fs::create_dir_all(to) {
+        if let Err(e) = moon::persistence::fsync::create_dir_all_durable(to) {
             return Err(anyhow::anyhow!(
                 "Failed to create migration destination directory {}: {}",
                 to.display(),
@@ -439,7 +439,7 @@ fn main() -> anyhow::Result<()> {
     }
 
     // Validate persistence directory is accessible
-    if let Err(e) = std::fs::create_dir_all(&config.dir) {
+    if let Err(e) = moon::persistence::fsync::create_dir_all_durable(std::path::Path::new(&config.dir)) {
         return Err(anyhow::anyhow!(
             "failed to create persistence directory {:?}: {}",
             config.dir,
@@ -456,7 +456,7 @@ fn main() -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     let _offload_dir_lock = if config.disk_offload_enabled() {
         let offload_dir = config.effective_disk_offload_dir();
-        if let Err(e) = std::fs::create_dir_all(&offload_dir) {
+        if let Err(e) = moon::persistence::fsync::create_dir_all_durable(&offload_dir) {
             return Err(anyhow::anyhow!(
                 "failed to create disk-offload directory {:?}: {}",
                 offload_dir,

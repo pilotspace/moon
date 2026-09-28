@@ -88,11 +88,11 @@ impl AofManifest {
                 })
                 .collect(),
         };
-        std::fs::create_dir_all(manifest.aof_dir())?;
-        // The new `appendonlydir/` entry itself must survive a power loss, or a
-        // committed manifest could sit in a directory the next boot cannot see
-        // (review of PR #1301: nothing fsynced its parent).
-        fsync_directory(&manifest.dir)?;
+        // The new `appendonlydir/` entry, and the persistence dir's own entry
+        // when this call creates it, must survive a power loss, or a committed
+        // manifest could sit in a directory the next boot cannot see (review of
+        // PR #1301: nothing fsynced their parents).
+        create_dir_all_durable(&manifest.aof_dir())?;
 
         // Pre-flight: refuse if manifest already exists to avoid overwriting
         // already-written shard base RDB files (idempotency guard).

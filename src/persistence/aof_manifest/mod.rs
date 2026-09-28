@@ -39,7 +39,7 @@ use std::path::{Path, PathBuf};
 
 use tracing::{error, info, warn};
 
-use crate::persistence::fsync::fsync_directory;
+use crate::persistence::fsync::{create_dir_all_durable, fsync_directory};
 
 mod generation;
 mod orphans;

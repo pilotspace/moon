@@ -137,11 +137,11 @@ impl AofManifest {
                 max_lsn: 0,
             }],
         };
-        std::fs::create_dir_all(manifest.aof_dir())?;
-        // The new `appendonlydir/` entry itself must survive a power loss, or a
-        // committed manifest could sit in a directory the next boot cannot see
-        // (review of PR #1301: nothing fsynced its parent).
-        fsync_directory(&manifest.dir)?;
+        // The new `appendonlydir/` entry, and the persistence dir's own entry
+        // when this call creates it, must survive a power loss, or a committed
+        // manifest could sit in a directory the next boot cannot see (review of
+        // PR #1301: nothing fsynced their parents).
+        create_dir_all_durable(&manifest.aof_dir())?;
 
         // Write base RDB atomically: tmp file + fsync + rename.
         let base_path = manifest.base_path();

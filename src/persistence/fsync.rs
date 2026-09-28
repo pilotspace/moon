@@ -37,6 +37,59 @@ pub fn fsync_directory(dir: &Path) -> std::io::Result<()> {
     }
 }
 
+/// `create_dir_all` whose directory entries survive a power loss.
+///
+/// Fsyncs the parent of `path` and the parent of every ancestor this call
+/// created, so a file later committed under `path` (a manifest, a base RDB)
+/// is never left in a directory the next boot cannot see. The parent of
+/// `path` is fsynced even when `path` already existed: its entry may have
+/// been created by an earlier, unsynced call. An ancestor this process may
+/// not open (`EACCES`) is logged and skipped; any other error propagates.
+pub fn create_dir_all_durable(path: &Path) -> std::io::Result<()> {
+    // Newly created directories, deepest first.
+    let mut missing: Vec<&Path> = Vec::new();
+    let mut cur = path;
+    while !cur.exists() {
+        missing.push(cur);
+        match cur.parent() {
+            Some(p) if !p.as_os_str().is_empty() => cur = p,
+            _ => break,
+        }
+    }
+    std::fs::create_dir_all(path)?;
+    fsync_parent_entry(parent_or_cwd(path))?;
+    // `missing[0]` is `path` itself, whose parent was just fsynced.
+    for dir in missing.iter().skip(1) {
+        fsync_parent_entry(parent_or_cwd(dir))?;
+    }
+    Ok(())
+}
+
+/// Fsync a directory this process may not be allowed to open: an ancestor
+/// such as an execute-only (`0711`) home directory refuses `open`, and
+/// refusing to boot over that would be worse than the power-loss window it
+/// closes. Any other error (EIO from the fsync itself) still propagates.
+fn fsync_parent_entry(dir: &Path) -> std::io::Result<()> {
+    match fsync_directory(dir) {
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            tracing::warn!(
+                "cannot fsync {} to persist a new directory entry: {e}",
+                dir.display()
+            );
+            Ok(())
+        }
+        r => r,
+    }
+}
+
+/// The directory holding `path`'s entry (`.` for a bare relative name).
+fn parent_or_cwd(path: &Path) -> &Path {
+    match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    }
+}
+
 /// Test-only record of the directory fsyncs this thread issues, each with the
 /// entry names the directory held at that instant: an entry is durable only
 /// if a directory fsync ran after it was created.
@@ -104,6 +157,45 @@ mod tests {
         let file_path = tmp.path().join("test.dat");
         std::fs::write(&file_path, b"hello world").unwrap();
         assert!(fsync_file(&file_path).is_ok());
+    }
+
+    #[test]
+    fn create_dir_all_durable_fsyncs_the_parent_of_every_new_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let leaf = tmp.path().join("a").join("b").join("c");
+        dir_fsync_probe::start();
+        create_dir_all_durable(&leaf).unwrap();
+        let synced: Vec<_> = dir_fsync_probe::stop()
+            .into_iter()
+            .map(|(d, _)| d)
+            .collect();
+        assert!(leaf.is_dir());
+        // Each new entry (a, b, c) is durable: its parent was fsynced after it existed.
+        for parent in [
+            tmp.path().to_path_buf(),
+            tmp.path().join("a"),
+            tmp.path().join("a").join("b"),
+        ] {
+            assert!(
+                synced.contains(&parent),
+                "{} not fsynced: {synced:?}",
+                parent.display()
+            );
+        }
+    }
+
+    #[test]
+    fn create_dir_all_durable_on_an_existing_dir_still_fsyncs_its_parent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let leaf = tmp.path().join("appendonlydir");
+        std::fs::create_dir(&leaf).unwrap();
+        dir_fsync_probe::start();
+        create_dir_all_durable(&leaf).unwrap();
+        let synced: Vec<_> = dir_fsync_probe::stop()
+            .into_iter()
+            .map(|(d, _)| d)
+            .collect();
+        assert_eq!(synced, vec![tmp.path().to_path_buf()]);
     }
 
     #[test]
