@@ -37,10 +37,13 @@ pub const ERR_TXN_CROSS_SHARD: &[u8] = b"ERR TXN does not support cross-shard wr
       -- use hash tags {tag} to co-locate keys (e.g. SET {txn}:key value)";
 
 /// moon#1285 (PR #1301 review): a script's `redis.call` inside an open TXN
-/// whose effect `TXN.ABORT` could not undo — a write with no key to capture
-/// (`FLUSHDB`, `FLUSHALL`, `SWAPDB`, an argv the key walker cannot
-/// enumerate) or a second-database write (`MOVE`, `COPY ... DB`). Refused
-/// before it runs, and the TXN is poisoned (#499).
+/// whose effect `TXN.ABORT` could not undo — a keyless write `dispatch`
+/// executes (`FLUSHDB`, `FLUSHALL`, `SWAPDB`), a second-database write
+/// (`MOVE`, `COPY ... DB`), or an arity-valid argv whose written keys cannot
+/// be enumerated (a malformed movable-key command such as `LMPOP 5 a b
+/// LEFT`). Refused before it runs, and the TXN is poisoned (#499). An argv
+/// shorter than the command's arity is not refused: it gets the arity error.
+/// See `scripting::bridge::txn_capture::txn_write_plan`.
 pub const ERR_TXN_SCRIPT_NOT_UNDOABLE: &[u8] = b"ERR TXN cannot roll back this command \
       from a script (keyless or second-database write) -- run it outside the TXN";
 

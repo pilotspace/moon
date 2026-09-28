@@ -195,8 +195,9 @@ enum TxnWritePlan {
     Capture(smallvec::SmallVec<[Bytes; 4]>),
     /// Nothing to capture: `command::dispatch` answers this argv with an
     /// error and writes nothing — a write only a connection-level intercept
-    /// serves (`unknown command`, [`SCRIPT_UNDISPATCHED_WRITES`]), or `TXN`.
-    /// Runs exactly as outside a TXN.
+    /// serves (`unknown command`, [`SCRIPT_UNDISPATCHED_WRITES`]), an argv
+    /// shorter than the command's arity (the arity error), or `TXN`. Runs
+    /// exactly as outside a TXN.
     Inert,
     /// A write the TXN could not undo; refused before it runs.
     Refuse,
@@ -205,7 +206,7 @@ enum TxnWritePlan {
 /// Plan one script write inside a TXN.
 ///
 /// Inert first: a write `dispatch` does not execute
-/// ([`SCRIPT_UNDISPATCHED_WRITES`]).
+/// ([`SCRIPT_UNDISPATCHED_WRITES`]) or an argv shorter than the arity.
 ///
 /// Captured: the shared walker's WRITE positions, else — for a command whose
 /// registry entry names a first key (`first_key > 0`) — the primary key, the
@@ -215,9 +216,10 @@ enum TxnWritePlan {
 /// key the transaction never wrote (another client's).
 ///
 /// Refused: a second-database write (`MOVE`, `COPY ... DB n`); a keyless
-/// write `dispatch` executes ([`KEYLESS_DISPATCHED_WRITES`]); and an argv
-/// whose written keys cannot be enumerated — a malformed movable-key command
-/// (`LMPOP 5 a b LEFT`), or a keyed one with no primary key.
+/// write `dispatch` executes ([`KEYLESS_DISPATCHED_WRITES`]); and an
+/// arity-valid argv whose written keys cannot be enumerated — a malformed
+/// movable-key command (`LMPOP 5 a b LEFT`), or a keyed one with no primary
+/// key.
 fn txn_write_plan(cmd: &[u8], args: &[Frame], db_idx: usize, db_count: usize) -> TxnWritePlan {
     use crate::command::metadata::{KeySpecClass, class_of, lookup};
     // `is_write` gates the caller, so an unregistered name cannot get here;
@@ -226,6 +228,14 @@ fn txn_write_plan(cmd: &[u8], args: &[Frame], db_idx: usize, db_count: usize) ->
         return TxnWritePlan::Inert;
     };
     if SCRIPT_UNDISPATCHED_WRITES.contains(meta.name) {
+        return TxnWritePlan::Inert;
+    }
+    // Arity counts the command name; positive is exact, negative a minimum.
+    // Only a SHORT argv is inert: dispatch answers the arity error before it
+    // looks at a key. A long argv of an exact-arity command still names its
+    // keys and is planned like any other.
+    let given = args.len() + 1;
+    if given < usize::from(meta.arity.unsigned_abs()) {
         return TxnWritePlan::Inert;
     }
     if matches!(
@@ -568,6 +578,79 @@ mod tests {
                 String::from_utf8_lossy(cmd)
             );
         }
+    }
+
+    /// PR #1301 review MINOR-2: a write whose argv is SHORTER than its arity
+    /// (`redis.pcall('DEL')`, `redis.pcall('SET')`, `SET k`) is neither
+    /// captured nor refused — `dispatch` answers the arity error, exactly as
+    /// outside a TXN, and the TXN stays committable. `DEL` / `SET` used to be
+    /// refused (no key to capture) and poisoned the TXN; `SET k` captured a
+    /// key the failing command never wrote.
+    #[test]
+    fn short_argv_is_inert_and_answers_the_arity_error() {
+        let mut db = Database::new();
+        let (plans, captured) = capture_txn_undo(|| {
+            [
+                ("DEL", &[][..]),
+                ("SET", &[][..]),
+                ("SET", &["k"][..]),
+                ("HSET", &["h", "f"][..]),
+                ("MSET", &["k"][..]),
+            ]
+            .map(|(cmd, args)| {
+                let plan = txn_undo_plan(cmd.as_bytes(), &frames(args), 0, 16);
+                let reply = run(&mut db, cmd, args);
+                (cmd, plan, reply)
+            })
+        });
+        for (cmd, plan, reply) in plans {
+            assert_eq!(plan, Ok(None), "{cmd}: neither captured nor refused");
+            assert!(
+                matches!(&reply, Frame::Error(e) if e.starts_with(b"ERR wrong number of arguments")),
+                "{cmd}: dispatch answers the arity error: {reply:?}"
+            );
+        }
+        let (undo, written, refused) = captured.into_parts();
+        assert!(undo.is_empty() && written.is_empty());
+        assert!(refused.is_none(), "the TXN is not poisoned");
+    }
+
+    /// The guard behind "a short argv is inert": for EVERY write in
+    /// `COMMAND_META`, `dispatch` with fewer arguments than the arity
+    /// answers an error and leaves the keyspace untouched.
+    #[test]
+    fn every_short_write_argv_is_an_error_that_writes_nothing() {
+        use crate::command::metadata::{COMMAND_META, CommandFlags};
+        let mut checked = 0;
+        for (name, meta) in COMMAND_META.entries() {
+            if !meta.flags.contains(CommandFlags::WRITE) {
+                continue;
+            }
+            let min = usize::from(meta.arity.unsigned_abs()).saturating_sub(1);
+            for n in 0..min {
+                let args = vec!["x"; n];
+                let ((plan, reply, mut db), _) = capture_txn_undo(|| {
+                    let mut db = Database::new();
+                    run(&mut db, "SET", &["x", "keep"]);
+                    let plan = txn_undo_plan(name.as_bytes(), &frames(&args), 0, 16);
+                    let reply = run(&mut db, name, &args);
+                    (plan, reply, db)
+                });
+                assert_eq!(plan, Ok(None), "{name} {args:?} is inert");
+                assert!(
+                    matches!(reply, Frame::Error(_)),
+                    "{name} {args:?}: dispatch answered {reply:?}"
+                );
+                assert_eq!(
+                    run(&mut db, "DBSIZE", &[]),
+                    Frame::Integer(1),
+                    "{name} {args:?}"
+                );
+                assert_eq!(run(&mut db, "GET", &["x"]), bulk("keep"), "{name} {args:?}");
+                checked += 1;
+            }
+        }
+        assert!(checked > 100, "the registry walk ran ({checked} argvs)");
     }
 
     /// A panic inside the script disarms the capture.

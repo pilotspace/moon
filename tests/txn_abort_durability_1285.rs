@@ -38,7 +38,8 @@
 //! must answer the refusal, never `+OK` followed by resurrected writes.
 //!
 //! PR #1301 review, round 2: a script write `dispatch` cannot run (`FT.*`,
-//! `GRAPH.*`, `MQ`, blocking pops) captures no keyspace key.
+//! `GRAPH.*`, `MQ`, blocking pops) captures no keyspace key; a write with
+//! too few arguments is an arity error, not a TXN poison.
 
 mod common;
 
@@ -1152,6 +1153,38 @@ fn inert_script_writes_capture_no_keyspace_key() {
     let mut c = Conn::open(server.port);
     check(&mut c, "after kill -9 + restart", &mut wrong);
     assert!(wrong.is_empty(), "phantom captures:\n{}", wrong.join("\n"));
+    drop(c);
+    drop(server);
+}
+
+/// MINOR-2: a keyed write with too few arguments gets the arity error from a
+/// script inside a TXN, exactly as outside one, and does not poison the TXN.
+/// It used to be refused as "keyless" and made `TXN.COMMIT` fail.
+#[test]
+#[ignore = "spawns a real server; set MOON_BIN"]
+fn short_script_write_argv_is_an_arity_error_not_a_poison() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let server = start(dir.path(), 1, true);
+    let mut c = Conn::open(server.port);
+    assert_eq!(c.send(&["TXN", "BEGIN"]), OK);
+    for script in [
+        "return redis.pcall('DEL')",
+        "return redis.pcall('SET')",
+        "return redis.pcall('SET', KEYS[1])",
+    ] {
+        let r = c.send(&["EVAL", script, "1", "k"]);
+        assert!(
+            r.starts_with('-') && r.contains("wrong number of arguments"),
+            "{script}: the arity error: {r:?}"
+        );
+    }
+    assert_eq!(c.send(&["SET", "k", "v"]), OK);
+    assert_eq!(
+        c.send(&["TXN", "COMMIT"]),
+        OK,
+        "an arity error poisons nothing"
+    );
+    assert_eq!(c.send(&["GET", "k"]), bulk("v"));
     drop(c);
     drop(server);
 }
