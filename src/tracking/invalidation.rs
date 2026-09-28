@@ -514,16 +514,41 @@ pub fn command_keys(cmd: &[u8], cmd_args: &[Frame]) -> SmallVec<[Bytes; 4]> {
 ///
 /// [`KeyRole`]: crate::acl::keyspec::KeyRole
 pub fn written_keys(cmd: &[u8], cmd_args: &[Frame]) -> SmallVec<[Bytes; 4]> {
-    collect_keys(cmd, cmd_args, Some(crate::acl::keyspec::KeyRole::Write))
+    written_keys_if_known(cmd, cmd_args).unwrap_or_default()
+}
+
+/// [`written_keys`], but `None` when the walker could NOT enumerate this
+/// argv's keys ([`KeyPositions::Unknown`]) — as opposed to `Some(empty)`: it
+/// named every key and none is written (`SORT src` or `GEORADIUS src ...`
+/// without `STORE`, a keyless command).
+///
+/// moon#1285 (PR #1301 review): the TXN undo capture needs the difference.
+/// Its fallback to the primary key exists for an argv the walker cannot
+/// read; taken for an argv the walker read and found write-free, it captured
+/// a key the command only READ, and `TXN.ABORT` restored that key's
+/// pre-image over another client's write.
+///
+/// [`KeyPositions::Unknown`]: crate::acl::keyspec::KeyPositions::Unknown
+pub fn written_keys_if_known(cmd: &[u8], cmd_args: &[Frame]) -> Option<SmallVec<[Bytes; 4]>> {
+    collect_keys_if_known(cmd, cmd_args, Some(crate::acl::keyspec::KeyRole::Write))
 }
 
 /// Shared body: collect the walker's key positions, optionally filtered to one
-/// role.
+/// role. An argv the walker cannot enumerate yields no keys.
 fn collect_keys(
     cmd: &[u8],
     cmd_args: &[Frame],
     only: Option<crate::acl::keyspec::KeyRole>,
 ) -> SmallVec<[Bytes; 4]> {
+    collect_keys_if_known(cmd, cmd_args, only).unwrap_or_default()
+}
+
+/// [`collect_keys`], with `None` for an argv the walker cannot enumerate.
+fn collect_keys_if_known(
+    cmd: &[u8],
+    cmd_args: &[Frame],
+    only: Option<crate::acl::keyspec::KeyRole>,
+) -> Option<SmallVec<[Bytes; 4]>> {
     use crate::acl::keyspec::{KeyPositions, command_key_positions};
 
     let mut keys: SmallVec<[Bytes; 4]> = SmallVec::new();
@@ -533,8 +558,11 @@ fn collect_keys(
         // still be invalidated — redis reports them either way. (ACL takes the
         // opposite view of the same argv and denies it; that asymmetry is the
         // reason the walker reports facts and each caller applies policy.)
+        // The unnamed keys are READ (a `BY` / `GET` pattern) or belong to a
+        // dangling clause the command rejects, so the written set is whole.
         KeyPositions::At(idx) | KeyPositions::AtPlusComputed(idx) => idx,
-        KeyPositions::None | KeyPositions::Unknown => return keys,
+        KeyPositions::None => return Some(keys),
+        KeyPositions::Unknown => return None,
     };
     keys.reserve(idx.len());
     for k in idx {
@@ -550,7 +578,7 @@ fn collect_keys(
             keys.push(b);
         }
     }
-    keys
+    Some(keys)
 }
 
 /// Test fixture for server-initiated invalidation (moon#1013): one tracking
@@ -1070,6 +1098,28 @@ mod tests {
     /// `written_keys` is a SUBSET of `command_keys` by construction; pinning
     /// it means a future role change can never invent a key the argv does not
     /// name (which would invalidate a key nobody asked about).
+    /// PR #1301 review round 3: "named every key, none written" is
+    /// `Some(empty)`, distinct from "could not enumerate" (`None`).
+    #[test]
+    fn written_keys_if_known_separates_write_free_from_unknown() {
+        let known = |cmd: &[u8], parts: &[&str]| {
+            let args: Vec<Frame> = parts
+                .iter()
+                .map(|p| Frame::BulkString(Bytes::copy_from_slice(p.as_bytes())))
+                .collect();
+            written_keys_if_known(cmd, &args).map(|k| k.len())
+        };
+        assert_eq!(known(b"SORT", &["src"]), Some(0));
+        assert_eq!(known(b"SORT", &["src", "BY", "w_*"]), Some(0));
+        assert_eq!(known(b"GEORADIUS", &["g", "0", "0", "1", "km"]), Some(0));
+        assert_eq!(known(b"XGROUP", &["HELP"]), Some(0));
+        assert_eq!(known(b"FLUSHDB", &[]), Some(0));
+        assert_eq!(known(b"SORT", &["src", "STORE", "d"]), Some(1));
+        assert_eq!(known(b"SET", &["k", "v"]), Some(1));
+        assert_eq!(known(b"LMPOP", &["5", "a", "b", "LEFT"]), None);
+        assert_eq!(known(b"NOSUCHCMD", &["k"]), None);
+    }
+
     #[test]
     fn written_keys_never_names_a_key_the_command_does_not() {
         for (cmd, argv) in [

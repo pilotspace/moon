@@ -218,12 +218,15 @@ enum TxnWritePlan {
 /// ([`SCRIPT_UNDISPATCHED_WRITES`]), an argv the arity rejects (shorter than
 /// it, or longer than an exact one), or a two-db write the resolver rejects.
 ///
-/// Captured: the shared walker's WRITE positions, else — for a command whose
-/// registry entry names a first key (`first_key > 0`) — the primary key, the
-/// connection leg's rule. The fallback is NEVER taken for a `first_key: 0`
-/// command: its `args[0]` is a graph, an index or a subcommand literal, and
-/// capturing a keyspace key of that name made `TXN.ABORT` delete or restore a
-/// key the transaction never wrote (another client's).
+/// Captured: the shared walker's WRITE positions. Only when the walker
+/// cannot enumerate the argv at all, and the registry entry names a first key
+/// (`first_key > 0`), the primary key — the connection leg's rule. An argv
+/// the walker read and found write-free (`SORT src` without `STORE`) captures
+/// nothing: the fallback captured the key it only READ, and `TXN.ABORT`
+/// restored that key over another client's write. The fallback is NEVER
+/// taken for a `first_key: 0` command either: its `args[0]` is a graph, an
+/// index or a subcommand literal, and capturing a keyspace key of that name
+/// made `TXN.ABORT` delete or restore a key the transaction never wrote.
 ///
 /// Refused: a second-database write (`MOVE`, `COPY ... DB n`); a keyless
 /// write `dispatch` executes ([`KEYLESS_DISPATCHED_WRITES`]); and an
@@ -258,15 +261,21 @@ fn txn_write_plan(cmd: &[u8], args: &[Frame], db_idx: usize, db_count: usize) ->
         Some(Err(_)) => return TxnWritePlan::Inert,
         None => {}
     }
-    let written = crate::tracking::invalidation::written_keys(cmd, args);
-    if !written.is_empty() {
-        return TxnWritePlan::Capture(written);
-    }
-    if meta.first_key > 0 {
-        return match crate::server::conn::shared::extract_primary_key(cmd, args) {
-            Some(key) => TxnWritePlan::Capture(smallvec::smallvec![key.clone()]),
-            None => TxnWritePlan::Refuse,
-        };
+    match crate::tracking::invalidation::written_keys_if_known(cmd, args) {
+        Some(written) if !written.is_empty() => return TxnWritePlan::Capture(written),
+        // Every key named, none written — `SORT src` / `GEORADIUS src ...`
+        // without `STORE`, `XGROUP HELP`: nothing to capture. Falling back to
+        // the primary key here captured a key the command only READ.
+        Some(_) => {}
+        // The walker could not read this argv: the primary key, as on the
+        // connection leg.
+        None if meta.first_key > 0 => {
+            return match crate::server::conn::shared::extract_primary_key(cmd, args) {
+                Some(key) => TxnWritePlan::Capture(smallvec::smallvec![key.clone()]),
+                None => TxnWritePlan::Refuse,
+            };
+        }
+        None => {}
     }
     if KEYLESS_DISPATCHED_WRITES
         .iter()
@@ -815,6 +824,43 @@ mod tests {
             }
             other => panic!("expected k's update record, got {other:?}"),
         }
+    }
+
+    /// PR #1301 review round 3: a write that only READS the keys this argv
+    /// names (`SORT src`, `GEORADIUS src ...` without `STORE`) captures
+    /// nothing, and `XGROUP HELP` (no key at all) is inert rather than
+    /// refused. The primary-key fallback used to capture `src` — a key the
+    /// script only read — and refuse `XGROUP HELP`, poisoning the TXN.
+    #[test]
+    fn a_write_free_argv_captures_nothing() {
+        let mut db = Database::new();
+        run(&mut db, "RPUSH", &["src", "b", "a"]);
+        run(&mut db, "GEOADD", &["g", "0", "0", "m"]);
+        let (plans, captured) = capture_txn_undo(|| {
+            [
+                ("SORT", &["src", "ALPHA"][..]),
+                ("GEORADIUS", &["g", "0", "0", "10", "km"][..]),
+                ("GEORADIUSBYMEMBER", &["g", "m", "10", "km"][..]),
+                ("XGROUP", &["HELP"][..]),
+            ]
+            .map(|(cmd, args)| {
+                let plan = txn_undo_plan(cmd.as_bytes(), &frames(args), 0, 16);
+                let reply = capture(&mut db, cmd, args);
+                (cmd, plan, reply)
+            })
+        });
+        for (cmd, plan, reply) in plans {
+            assert_eq!(plan, Ok(None), "{cmd}: nothing captured, nothing refused");
+            assert!(!matches!(reply, Frame::Error(_)), "{cmd} runs: {reply:?}");
+        }
+        let (undo, written, refused) = captured.into_parts();
+        assert!(undo.is_empty() && written.is_empty(), "nothing captured");
+        assert!(refused.is_none(), "the TXN is not poisoned");
+        // With `STORE`, the destination is captured (and only it).
+        let (plan, _) = capture_txn_undo(|| {
+            txn_undo_plan(b"SORT", &frames(&["src", "ALPHA", "STORE", "d"]), 0, 16)
+        });
+        assert_eq!(plan, Ok(Some(smallvec::smallvec![Bytes::from("d")])));
     }
 
     /// The guard behind "an arity-invalid argv is inert": for EVERY write in

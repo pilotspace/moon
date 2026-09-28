@@ -1376,3 +1376,100 @@ fn erroring_script_write_keeps_no_capture() {
     drop(c);
     drop(server);
 }
+
+/// PR #1301 review, round 3: a write-flagged command that only READS the
+/// keys this argv names — `SORT src` and `GEORADIUS src ...` without `STORE`
+/// — captures nothing inside a TXN, on the connection and from a script.
+/// The primary-key fallback used to capture `src`: `TXN.ABORT` restored its
+/// pre-image over another client's write (logged to the AOF, so it survived
+/// a restart) and the write intent hid `src` from other transactions. And
+/// `XGROUP HELP` from a script is inert, not refused (it poisoned the TXN).
+#[test]
+#[ignore = "spawns a real server; set MOON_BIN"]
+fn read_only_sort_and_georadius_capture_nothing() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let server = start(dir.path(), 1, true);
+    let mut c = Conn::open(server.port);
+    let mut other = Conn::open(server.port);
+    let mut t2 = Conn::open(server.port);
+    assert_eq!(c.send(&["RPUSH", "conn:l", "a"]), int(1));
+    assert_eq!(c.send(&["RPUSH", "lua:l", "a"]), int(1));
+    assert_eq!(c.send(&["GEOADD", "conn:g", "0", "0", "m"]), int(1));
+    assert_eq!(c.send(&["TXN", "BEGIN"]), OK);
+    let one_a = "*1\r\n$1\r\na\r\n".to_string();
+    assert_eq!(
+        c.send(&["SORT", "conn:l", "ALPHA"]),
+        one_a,
+        "connection SORT"
+    );
+    assert_eq!(
+        c.send(&["GEORADIUS", "conn:g", "0", "0", "10", "km"]),
+        "*1\r\n$1\r\nm\r\n",
+        "connection GEORADIUS"
+    );
+    assert_eq!(
+        c.send(&[
+            "EVAL",
+            "return redis.call('SORT', KEYS[1], 'ALPHA')",
+            "1",
+            "lua:l"
+        ]),
+        one_a,
+        "script SORT"
+    );
+    let mut wrong: Vec<String> = Vec::new();
+    // Another TXN reads the sorted keys: nothing wrote them, so no write
+    // intent may hide them from its snapshot.
+    assert_eq!(t2.send(&["TXN", "BEGIN"]), OK);
+    for key in ["conn:l", "lua:l"] {
+        let got = t2.send(&["LRANGE", key, "0", "-1"]);
+        if got != one_a {
+            wrong.push(format!(
+                "another TXN's LRANGE {key} -> {got:?}: a phantom write intent hid it"
+            ));
+        }
+    }
+    assert_eq!(t2.send(&["TXN", "ABORT"]), OK);
+    // Another, non-TXN client writes the sorted keys meanwhile.
+    assert_eq!(other.send(&["RPUSH", "conn:l", "x"]), int(2));
+    assert_eq!(other.send(&["RPUSH", "lua:l", "x"]), int(2));
+    assert_eq!(other.send(&["GEOADD", "conn:g", "1", "1", "n"]), int(1));
+    assert_eq!(c.send(&["TXN", "ABORT"]), OK);
+    let check = |c: &mut Conn, when: &str, wrong: &mut Vec<String>| {
+        let two = "*2\r\n$1\r\na\r\n$1\r\nx\r\n".to_string();
+        for (cmd, want, what) in [
+            (
+                &["LRANGE", "conn:l", "0", "-1"][..],
+                two.clone(),
+                "connection SORT",
+            ),
+            (&["LRANGE", "lua:l", "0", "-1"][..], two, "script SORT"),
+            (&["ZCARD", "conn:g"][..], int(2), "connection GEORADIUS"),
+        ] {
+            let got = c.send(cmd);
+            if got != want {
+                wrong.push(format!(
+                    "{when}: {cmd:?} -> {got:?}: TXN.ABORT restored a key the {what} only read"
+                ));
+            }
+        }
+    };
+    check(&mut c, "live", &mut wrong);
+    drop((c, other, t2));
+    let server = restart(server, dir.path(), 1);
+    let mut c = Conn::open(server.port);
+    check(&mut c, "after kill -9 + restart", &mut wrong);
+    // `XGROUP HELP` from a script names no key and writes nothing.
+    assert_eq!(c.send(&["TXN", "BEGIN"]), OK);
+    let help = c.send(&["EVAL", "return redis.pcall('XGROUP', 'HELP')", "0"]);
+    if !help.starts_with('*') {
+        wrong.push(format!("script XGROUP HELP -> {help:?}: refused"));
+    }
+    let commit = c.send(&["TXN", "COMMIT"]);
+    if commit != OK {
+        wrong.push(format!("TXN COMMIT -> {commit:?}: XGROUP HELP poisoned it"));
+    }
+    assert!(wrong.is_empty(), "phantom captures:\n{}", wrong.join("\n"));
+    drop(c);
+    drop(server);
+}

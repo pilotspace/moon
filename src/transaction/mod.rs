@@ -275,9 +275,81 @@ impl CrossStoreTxn {
     }
 }
 
+/// The keys a connection's write (other than `DEL` / `UNLINK`) inside an open
+/// TXN undo-captures and holds write intents on, on both runtimes' generic
+/// write leg (moon#500).
+///
+/// The shared key walker's WRITE positions. Only for an argv the walker
+/// cannot enumerate does it fall back to the primary key — fewer keys than
+/// the historical single-key capture would be a regression. It used to fall
+/// back whenever the written set was EMPTY, which also covered an argv the
+/// walker read and found write-free: `SORT src` or `GEORADIUS src ...`
+/// without `STORE` captured `src`, a key they only READ, so `TXN.ABORT`
+/// restored its pre-image over another client's write (logged to the AOF
+/// and replicas) and the write intent hid it from other transactions
+/// (moon#1285, PR #1301 review).
+pub(crate) fn conn_txn_capture_keys(
+    cmd: &[u8],
+    args: &[crate::protocol::Frame],
+) -> SmallVec<[Bytes; 4]> {
+    match crate::tracking::invalidation::written_keys_if_known(cmd, args) {
+        Some(written) => written,
+        None => crate::server::conn::shared::extract_primary_key(cmd, args)
+            .cloned()
+            .into_iter()
+            .collect(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn capture_keys(cmd: &str, args: &[&str]) -> Vec<Bytes> {
+        let args: Vec<crate::protocol::Frame> = args
+            .iter()
+            .map(|a| crate::protocol::Frame::BulkString(Bytes::copy_from_slice(a.as_bytes())))
+            .collect();
+        conn_txn_capture_keys(cmd.as_bytes(), &args).into_vec()
+    }
+
+    /// PR #1301 review round 3: a write whose keys are all READ in this argv
+    /// captures nothing; one the walker cannot read keeps the primary-key
+    /// fallback; written keys are captured as before.
+    #[test]
+    fn conn_txn_capture_keys_never_captures_a_key_only_read() {
+        let none: Vec<Bytes> = Vec::new();
+        assert_eq!(capture_keys("SORT", &["src"]), none);
+        assert_eq!(
+            capture_keys("SORT", &["src", "ALPHA", "LIMIT", "0", "1"]),
+            none
+        );
+        assert_eq!(capture_keys("SORT", &["src", "BY", "w_*"]), none);
+        assert_eq!(capture_keys("GEORADIUS", &["g", "0", "0", "1", "km"]), none);
+        assert_eq!(
+            capture_keys("GEORADIUSBYMEMBER", &["g", "m", "1", "km", "ASC"]),
+            none
+        );
+        assert_eq!(
+            capture_keys("SORT", &["src", "STORE", "dst"]),
+            vec![Bytes::from("dst")]
+        );
+        assert_eq!(
+            capture_keys("GEORADIUS", &["g", "0", "0", "1", "km", "STORE", "d"]),
+            vec![Bytes::from("d")]
+        );
+        assert_eq!(capture_keys("SET", &["k", "v"]), vec![Bytes::from("k")]);
+        assert_eq!(
+            capture_keys("MSET", &["a", "1", "b", "2"]),
+            vec![Bytes::from("a"), Bytes::from("b")]
+        );
+        // The walker cannot enumerate a malformed `numkeys`: the primary-key
+        // fallback still applies (here `extract_primary_key`'s answer).
+        assert_eq!(
+            capture_keys("LMPOP", &["5", "a", "b", "LEFT"]),
+            vec![Bytes::from("a")]
+        );
+    }
 
     #[test]
     fn test_cross_store_txn_new() {

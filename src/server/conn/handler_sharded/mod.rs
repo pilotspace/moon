@@ -2739,16 +2739,13 @@ pub(crate) async fn handle_connection_sharded_inner<
                                         // TXN ABORT. `written_keys` is filtered to
                                         // `KeyRole::Write`, so reads stay out of
                                         // `kv_write_intents`.
+                                        // An unenumerable argv falls back to
+                                        // the primary key; a write-free one
+                                        // (`SORT src`) captures nothing.
                                         let lsn = txn.snapshot_lsn;
                                         let tid = txn.txn_id;
-                                        let mut written =
-                                            crate::tracking::invalidation::written_keys(cmd, cmd_args);
-                                        if written.is_empty()
-                                            && let Some(key) =
-                                                crate::server::conn::shared::extract_primary_key(cmd, cmd_args)
-                                        {
-                                            written.push(key.clone());
-                                        }
+                                        let written =
+                                            crate::transaction::conn_txn_capture_keys(cmd, cmd_args);
                                         for key in written {
                                             match db.get(key.as_ref()).cloned() {
                                                 None => txn.kv_undo.record_insert(conn.selected_db, key.clone()),

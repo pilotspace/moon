@@ -3699,23 +3699,16 @@ pub(crate) async fn handle_connection_sharded_monoio<
                                 // `kv_write_intents`, which is the cross-shard
                                 // conflict surface, turning working
                                 // transactions into spurious conflicts.
+                                //
+                                // An argv the walker cannot enumerate falls
+                                // back to the historical single-key capture;
+                                // one it read and found write-free (`SORT
+                                // src`, no `STORE`) captures nothing — see
+                                // `conn_txn_capture_keys`.
                                 let lsn = txn.snapshot_lsn;
                                 let tid = txn.txn_id;
-                                let mut written =
-                                    crate::tracking::invalidation::written_keys(cmd, cmd_args);
-                                // The walker reports nothing for an argv it
-                                // cannot enumerate. Fall back to the historical
-                                // single-key capture rather than silently
-                                // capturing nothing — fewer keys than before
-                                // would be a regression, not a fix.
-                                if written.is_empty()
-                                    && let Some(key) =
-                                        crate::server::conn::shared::extract_primary_key(
-                                            cmd, cmd_args,
-                                        )
-                                {
-                                    written.push(key.clone());
-                                }
+                                let written =
+                                    crate::transaction::conn_txn_capture_keys(cmd, cmd_args);
                                 for key in written {
                                     match db.get(key.as_ref()).cloned() {
                                         None => txn.kv_undo.record_insert(sel_db, key.clone()),
