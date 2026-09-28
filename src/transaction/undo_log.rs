@@ -68,6 +68,15 @@ impl UndoLog {
         self.dbs.push(db);
     }
 
+    /// Move every record of `other` to the end of this log, keeping each
+    /// record's database and `other`'s order (moon#1285: a script's captured
+    /// pre-images join the transaction's log at the script's position).
+    #[inline]
+    pub fn append(&mut self, other: UndoLog) {
+        self.records.extend(other.records);
+        self.dbs.extend(other.dbs);
+    }
+
     /// Number of records in the undo log.
     #[inline]
     pub fn len(&self) -> usize {

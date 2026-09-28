@@ -2534,7 +2534,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 && dispatch::try_handle_evalsha(
                     cmd,
                     cmd_args,
-                    &conn,
+                    &mut conn,
                     ctx,
                     shaped!(),
                     &mut local_leg_write_idxs,
@@ -2547,7 +2547,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 && dispatch::try_handle_eval(
                     cmd,
                     cmd_args,
-                    &conn,
+                    &mut conn,
                     ctx,
                     &shutdown,
                     shaped!(),
@@ -2791,7 +2791,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 && dispatch::try_handle_functions(
                     cmd,
                     cmd_args,
-                    &conn,
+                    &mut conn,
                     ctx,
                     &func_registry,
                     &shutdown,

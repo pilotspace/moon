@@ -1316,6 +1316,21 @@ pub(crate) async fn handle_connection_sharded_inner<
                         // shard this script may route to.
                         let script_acl = conn.script_acl(&ctx.acl_table)
                         .with_caller(conn.tracking_state.script_caller(conn.client_id));
+                        // moon#1285 (PR #1301 review): a read-write script
+                        // bound for another shard inside a TXN is refused —
+                        // its writes could not be undone here.
+                        if let Some(refused) =
+                            crate::server::conn::txn_script_undo::routed_script_refusal(
+                                cmd,
+                                cmd_args,
+                                conn.in_cross_txn(),
+                                ctx,
+                            )
+                        {
+                            conn.mark_cross_txn_rejected(cmd);
+                            responses.push(refused);
+                            continue;
+                        }
                         if let Some(routed) = crate::server::conn::shared::route_script_elsewhere(
                             cmd,
                             cmd_args,
@@ -1334,10 +1349,15 @@ pub(crate) async fn handle_connection_sharded_inner<
                         // than `with_shard_db`, so a `redis.call('FLUSHALL')`
                         // finishes on the other fifteen databases once this
                         // one's `&mut` borrow has ended.
-                        let (response, pending_flush) = crate::shard::slice::with_shard(|s| {
+                        // moon#1285: inside a TXN the script's writes are
+                        // undo-captured.
+                        let selected_db = conn.selected_db;
+                        let (response, pending_flush) = crate::server::conn::txn_script_undo::run_local_script(
+                            conn.active_cross_txn.as_deref_mut(),
+                            || crate::shard::slice::with_shard(|s| {
                             crate::scripting::pending_flush::run_and_complete(
                                 s,
-                                conn.selected_db,
+                                selected_db,
                                 crate::blocking::wakeup::ScriptWakes::Serve(&ctx.blocking_registry),
                                 |db| {
                             // This handler refreshes the clock per command in
@@ -1346,19 +1366,19 @@ pub(crate) async fn handle_connection_sharded_inner<
                             if script_is_eval {
                                 crate::scripting::handle_eval(
                                     &ctx.lua, &ctx.script_cache, cmd_args, db,
-                                    ctx.shard_id, ctx.num_shards, conn.selected_db, db_count,
+                                    ctx.shard_id, ctx.num_shards, selected_db, db_count,
                                     &script_acl, script_read_only,
                                 )
                             } else {
                                 crate::scripting::handle_evalsha(
                                     &ctx.lua, &ctx.script_cache, cmd_args, db,
-                                    ctx.shard_id, ctx.num_shards, conn.selected_db, db_count,
+                                    ctx.shard_id, ctx.num_shards, selected_db, db_count,
                                     &script_acl, script_read_only,
                                 )
                             }
                                 },
                             )
-                        });
+                        }));
                         // moon#831: read the write flag BEFORE the await —
                         // thread-local; another connection's script can run
                         // on this thread during the yield.
@@ -1487,6 +1507,19 @@ pub(crate) async fn handle_connection_sharded_inner<
                             // shard owning the key instead of refusing
                             // CROSSSLOT because the key is not local. Same
                             // helper as handler_monoio — one routing policy.
+                            // moon#1285 (PR #1301 review): see the EVAL arm.
+                            if let Some(refused) =
+                                crate::server::conn::txn_script_undo::routed_script_refusal(
+                                    cmd,
+                                    cmd_args,
+                                    conn.in_cross_txn(),
+                                    ctx,
+                                )
+                            {
+                                conn.mark_cross_txn_rejected(cmd);
+                                responses.push(refused);
+                                continue;
+                            }
                             if let Some(routed) =
                                 crate::server::conn::shared::route_script_elsewhere(
                                     cmd,
@@ -1513,10 +1546,15 @@ pub(crate) async fn handle_connection_sharded_inner<
                             let reg = guard.as_ref().unwrap();
                             // Unconditional slice path: ShardSlice is always initialized.
                             // moon#685: see the EVAL arm above.
-                            crate::shard::slice::with_shard(|s| {
+                            // moon#1285: inside a TXN the function's writes are
+                            // undo-captured.
+                            let selected_db = conn.selected_db;
+                            crate::server::conn::txn_script_undo::run_local_script(
+                                conn.active_cross_txn.as_deref_mut(),
+                                || crate::shard::slice::with_shard(|s| {
                                 crate::scripting::pending_flush::run_and_complete(
                                     s,
-                                    conn.selected_db,
+                                    selected_db,
                                     crate::blocking::wakeup::ScriptWakes::Serve(&ctx.blocking_registry),
                                     |db| {
                                 // Refresh the clock the function's expiry
@@ -1531,19 +1569,19 @@ pub(crate) async fn handle_connection_sharded_inner<
                                 if is_fcall {
                                     crate::command::functions::handle_fcall(
                                         reg, cmd_args, db,
-                                        ctx.shard_id, ctx.num_shards, conn.selected_db, db_count,
+                                        ctx.shard_id, ctx.num_shards, selected_db, db_count,
                                         &script_acl,
                                     )
                                 } else {
                                     crate::command::functions::handle_fcall_ro(
                                         reg, cmd_args, db,
-                                        ctx.shard_id, ctx.num_shards, conn.selected_db, db_count,
+                                        ctx.shard_id, ctx.num_shards, selected_db, db_count,
                                         &script_acl,
                                     )
                                 }
                                     },
                                 )
-                            })
+                            }))
                             };
                             // moon#831: read BEFORE the await — see the EVAL arm.
                             let wrote = crate::scripting::bridge::take_script_had_write();

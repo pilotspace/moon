@@ -30,6 +30,7 @@ pub mod subscriber_mode;
 mod tests;
 pub(crate) mod txn_abort;
 pub(crate) mod txn_script;
+pub(crate) mod txn_script_undo;
 pub mod util;
 pub mod watch;
 

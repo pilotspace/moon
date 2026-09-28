@@ -36,7 +36,8 @@
 //! - `eviction_ctx`: [`LuaEvictionCtx`], the shard handles a script's
 //!   eviction/OOM gate and its dual-plane effect emission use.
 //! - `txn_capture`: moon#894's MULTI/EXEC capture of a queued script's
-//!   effect records.
+//!   effect records, and moon#1285's undo capture of a script's writes
+//!   inside an open cross-store TXN (`TXN.ABORT` restores them).
 //! - `script_state`: the per-script thread-locals (`CURRENT_DB`, the ACL,
 //!   read-only / OOM mode, the write flag) and their setters.
 //! - `redis_call`: [`make_redis_call_fn`], the `redis.call`/`redis.pcall`
@@ -53,7 +54,7 @@ pub use script_state::{
     ScriptOomMode, clear_script_db, is_script_read_only, script_had_write, set_script_db,
     set_script_oom_mode, set_script_read_only, take_script_had_write,
 };
-pub(crate) use txn_capture::{CapturedEffect, capture_txn_effects};
+pub(crate) use txn_capture::{CapturedEffect, capture_txn_effects, capture_txn_undo};
 
 #[cfg(test)]
 mod tests {

@@ -219,7 +219,7 @@ pub(super) fn try_handle_cluster(
 pub(super) async fn try_handle_evalsha(
     cmd: &[u8],
     cmd_args: &[Frame],
-    conn: &ConnectionState,
+    conn: &mut ConnectionState,
     ctx: &ConnectionContext,
     responses: &mut crate::server::conn::intercept::InterceptReplies<'_>,
     // moon#831: reply slots of local-leg writes pending the batch-end
@@ -239,6 +239,18 @@ pub(super) async fn try_handle_evalsha(
     let script_acl = conn
         .script_acl(&ctx.acl_table)
         .with_caller(conn.tracking_state.script_caller(conn.client_id));
+    // moon#1285 (PR #1301 review): a read-write script bound for another
+    // shard inside a TXN is refused — its writes could not be undone here.
+    if let Some(refused) = crate::server::conn::txn_script_undo::routed_script_refusal(
+        cmd,
+        cmd_args,
+        conn.in_cross_txn(),
+        ctx,
+    ) {
+        conn.mark_cross_txn_rejected(cmd);
+        responses.push(refused);
+        return true;
+    }
     if let Some(routed) = crate::server::conn::shared::route_script_elsewhere(
         cmd,
         cmd_args,
@@ -251,31 +263,38 @@ pub(super) async fn try_handle_evalsha(
         responses.push(routed);
         return true;
     }
-    let (response, pending_flush) = crate::shard::slice::with_shard(|s| {
-        let db_count = s.databases.db_count();
-        // moon#685: `run_and_complete`, not a bare index, so a script's flush
-        // finishes on the other fifteen databases — and reports what is left
-        // for `finish_script_flush` to broadcast once this borrow has ended.
-        crate::scripting::pending_flush::run_and_complete(
-            s,
-            conn.selected_db,
-            crate::blocking::wakeup::ScriptWakes::Serve(&ctx.blocking_registry),
-            |db| {
-                crate::scripting::handle_evalsha(
-                    &ctx.lua,
-                    &ctx.script_cache,
-                    cmd_args,
-                    db,
-                    ctx.shard_id,
-                    ctx.num_shards,
-                    conn.selected_db,
-                    db_count,
-                    &script_acl,
-                    read_only,
+    // moon#1285: inside a TXN the script's writes are undo-captured.
+    let selected_db = conn.selected_db;
+    let (response, pending_flush) = crate::server::conn::txn_script_undo::run_local_script(
+        conn.active_cross_txn.as_deref_mut(),
+        || {
+            crate::shard::slice::with_shard(|s| {
+                let db_count = s.databases.db_count();
+                // moon#685: `run_and_complete`, not a bare index, so a script's flush
+                // finishes on the other fifteen databases — and reports what is left
+                // for `finish_script_flush` to broadcast once this borrow has ended.
+                crate::scripting::pending_flush::run_and_complete(
+                    s,
+                    selected_db,
+                    crate::blocking::wakeup::ScriptWakes::Serve(&ctx.blocking_registry),
+                    |db| {
+                        crate::scripting::handle_evalsha(
+                            &ctx.lua,
+                            &ctx.script_cache,
+                            cmd_args,
+                            db,
+                            ctx.shard_id,
+                            ctx.num_shards,
+                            selected_db,
+                            db_count,
+                            &script_acl,
+                            read_only,
+                        )
+                    },
                 )
-            },
-        )
-    });
+            })
+        },
+    );
     // moon#831: read the write flag BEFORE the await below — it is a
     // thread-local and another connection's script may run on this thread
     // during the yield.
@@ -308,7 +327,7 @@ pub(super) async fn try_handle_evalsha(
 pub(super) async fn try_handle_eval(
     cmd: &[u8],
     cmd_args: &[Frame],
-    conn: &ConnectionState,
+    conn: &mut ConnectionState,
     ctx: &ConnectionContext,
     shutdown: &crate::runtime::cancel::CancellationToken,
     responses: &mut crate::server::conn::intercept::InterceptReplies<'_>,
@@ -329,6 +348,18 @@ pub(super) async fn try_handle_eval(
     let script_acl = conn
         .script_acl(&ctx.acl_table)
         .with_caller(conn.tracking_state.script_caller(conn.client_id));
+    // moon#1285 (PR #1301 review): a read-write script bound for another
+    // shard inside a TXN is refused — its writes could not be undone here.
+    if let Some(refused) = crate::server::conn::txn_script_undo::routed_script_refusal(
+        cmd,
+        cmd_args,
+        conn.in_cross_txn(),
+        ctx,
+    ) {
+        conn.mark_cross_txn_rejected(cmd);
+        responses.push(refused);
+        return true;
+    }
     if let Some(routed) = crate::server::conn::shared::route_script_elsewhere(
         cmd,
         cmd_args,
@@ -341,29 +372,36 @@ pub(super) async fn try_handle_eval(
         responses.push(routed);
         return true;
     }
-    let (response, pending_flush) = crate::shard::slice::with_shard(|s| {
-        let db_count = s.databases.db_count();
-        // moon#685: see `try_handle_evalsha`.
-        crate::scripting::pending_flush::run_and_complete(
-            s,
-            conn.selected_db,
-            crate::blocking::wakeup::ScriptWakes::Serve(&ctx.blocking_registry),
-            |db| {
-                crate::scripting::handle_eval(
-                    &ctx.lua,
-                    &ctx.script_cache,
-                    cmd_args,
-                    db,
-                    ctx.shard_id,
-                    ctx.num_shards,
-                    conn.selected_db,
-                    db_count,
-                    &script_acl,
-                    read_only,
+    // moon#1285: inside a TXN the script's writes are undo-captured.
+    let selected_db = conn.selected_db;
+    let (response, pending_flush) = crate::server::conn::txn_script_undo::run_local_script(
+        conn.active_cross_txn.as_deref_mut(),
+        || {
+            crate::shard::slice::with_shard(|s| {
+                let db_count = s.databases.db_count();
+                // moon#685: see `try_handle_evalsha`.
+                crate::scripting::pending_flush::run_and_complete(
+                    s,
+                    selected_db,
+                    crate::blocking::wakeup::ScriptWakes::Serve(&ctx.blocking_registry),
+                    |db| {
+                        crate::scripting::handle_eval(
+                            &ctx.lua,
+                            &ctx.script_cache,
+                            cmd_args,
+                            db,
+                            ctx.shard_id,
+                            ctx.num_shards,
+                            selected_db,
+                            db_count,
+                            &script_acl,
+                            read_only,
+                        )
+                    },
                 )
-            },
-        )
-    });
+            })
+        },
+    );
     // moon#831: read the write flag BEFORE the await below — it is a
     // thread-local and another connection's script may run on this thread
     // during the yield.
@@ -1563,7 +1601,7 @@ pub(super) fn try_enforce_acl(
 pub(super) async fn try_handle_functions(
     cmd: &[u8],
     cmd_args: &[Frame],
-    conn: &ConnectionState,
+    conn: &mut ConnectionState,
     ctx: &ConnectionContext,
     func_registry: &Rc<RefCell<Option<crate::scripting::FunctionRegistry>>>,
     shutdown: &crate::runtime::cancel::CancellationToken,
@@ -1612,6 +1650,17 @@ pub(super) async fn try_handle_functions(
         // cross a slot, it just lives elsewhere. Route it to the shard that
         // owns the key. A genuinely cross-shard key set is still refused,
         // before anything is touched.
+        // moon#1285 (PR #1301 review): see `try_handle_evalsha`.
+        if let Some(refused) = crate::server::conn::txn_script_undo::routed_script_refusal(
+            cmd,
+            cmd_args,
+            conn.in_cross_txn(),
+            ctx,
+        ) {
+            conn.mark_cross_txn_rejected(cmd);
+            responses.push(refused);
+            return true;
+        }
         if let Some(routed) = crate::server::conn::shared::route_script_elsewhere(
             cmd,
             cmd_args,
@@ -1633,41 +1682,48 @@ pub(super) async fn try_handle_functions(
             #[allow(clippy::unwrap_used)]
             // ensure_function_registry guarantees Some
             let reg = guard.as_ref().unwrap();
-            crate::shard::slice::with_shard(|s| {
-                let db_count = s.databases.db_count();
-                // moon#685: a FUNCTION body reaches `redis.call` through the same
-                // bridge an EVAL does, so it needs the same completion.
-                crate::scripting::pending_flush::run_and_complete(
-                    s,
-                    conn.selected_db,
-                    crate::blocking::wakeup::ScriptWakes::Serve(&ctx.blocking_registry),
-                    |db| {
-                        if is_fcall {
-                            crate::command::functions::handle_fcall(
-                                reg,
-                                cmd_args,
-                                db,
-                                ctx.shard_id,
-                                ctx.num_shards,
-                                conn.selected_db,
-                                db_count,
-                                &script_acl,
-                            )
-                        } else {
-                            crate::command::functions::handle_fcall_ro(
-                                reg,
-                                cmd_args,
-                                db,
-                                ctx.shard_id,
-                                ctx.num_shards,
-                                conn.selected_db,
-                                db_count,
-                                &script_acl,
-                            )
-                        }
-                    },
-                )
-            })
+            // moon#1285: inside a TXN the function's writes are undo-captured.
+            let selected_db = conn.selected_db;
+            crate::server::conn::txn_script_undo::run_local_script(
+                conn.active_cross_txn.as_deref_mut(),
+                || {
+                    crate::shard::slice::with_shard(|s| {
+                        let db_count = s.databases.db_count();
+                        // moon#685: a FUNCTION body reaches `redis.call` through the same
+                        // bridge an EVAL does, so it needs the same completion.
+                        crate::scripting::pending_flush::run_and_complete(
+                            s,
+                            selected_db,
+                            crate::blocking::wakeup::ScriptWakes::Serve(&ctx.blocking_registry),
+                            |db| {
+                                if is_fcall {
+                                    crate::command::functions::handle_fcall(
+                                        reg,
+                                        cmd_args,
+                                        db,
+                                        ctx.shard_id,
+                                        ctx.num_shards,
+                                        selected_db,
+                                        db_count,
+                                        &script_acl,
+                                    )
+                                } else {
+                                    crate::command::functions::handle_fcall_ro(
+                                        reg,
+                                        cmd_args,
+                                        db,
+                                        ctx.shard_id,
+                                        ctx.num_shards,
+                                        selected_db,
+                                        db_count,
+                                        &script_acl,
+                                    )
+                                }
+                            },
+                        )
+                    })
+                },
+            )
         };
         // moon#831: read BEFORE the await — see `try_handle_eval`.
         let wrote = crate::scripting::bridge::take_script_had_write();

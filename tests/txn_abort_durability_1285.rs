@@ -786,3 +786,259 @@ fn replica_converges_to_the_aborted_to_state() {
     drop(replica);
     drop(master);
 }
+
+// ---------------------------------------------------------------------------
+// Scripts inside a TXN (PR #1301 review)
+// ---------------------------------------------------------------------------
+//
+// An `EVAL` / `EVALSHA` / `FCALL` inside a TXN used to bypass the undo log:
+// its writes went through the Lua bridge, never the connection's write leg,
+// so TXN.ABORT answered `+OK` and left them live, durable and replicated.
+
+const SCRIPT_SET: &str = "redis.call('SET', KEYS[1], 'x') return 1";
+/// Rewrites a key twice (only the first pre-image may be restored), deletes
+/// one and creates one.
+const SCRIPT_MIXED: &str = "redis.call('SET', KEYS[1], 'x1') \
+    redis.call('SET', KEYS[1], 'x2') \
+    redis.call('DEL', KEYS[2]) \
+    redis.call('SET', KEYS[3], 'created') \
+    redis.call('HSET', KEYS[4], 'f', 'changed') \
+    return 1";
+const FUNCTION_LIB: &str = "#!lua name=txnlib\n\
+    redis.register_function('setx', function(keys, args) \
+    return redis.call('SET', keys[1], 'x') end)";
+
+struct ScriptKeys {
+    eval: String,
+    sha: String,
+    fcall: String,
+    del: String,
+    new: String,
+    hash: String,
+}
+
+impl ScriptKeys {
+    fn new(tag: &str) -> Self {
+        let k = |n: &str| format!("{{{tag}}}:s{n}");
+        ScriptKeys {
+            eval: k("eval"),
+            sha: k("sha"),
+            fcall: k("fcall"),
+            del: k("del"),
+            new: k("new"),
+            hash: k("hash"),
+        }
+    }
+}
+
+fn script_seed(c: &mut Conn, k: &ScriptKeys) {
+    for key in [&k.eval, &k.sha, &k.fcall] {
+        assert_eq!(c.send(&["SET", key, "original"]), OK);
+    }
+    assert_eq!(c.send(&["RPUSH", &k.del, "a", "b"]), int(2));
+    assert_eq!(c.send(&["HSET", &k.hash, "f", "v", "g", "w"]), int(2));
+}
+
+fn script_assert_seed(c: &mut Conn, k: &ScriptKeys, when: &str) {
+    for key in [&k.eval, &k.sha, &k.fcall] {
+        assert_eq!(
+            c.send(&["GET", key]),
+            bulk("original"),
+            "{when}: {key} restored"
+        );
+    }
+    assert_eq!(
+        c.send(&["LRANGE", &k.del, "0", "-1"]),
+        "*2\r\n$1\r\na\r\n$1\r\nb\r\n",
+        "{when}: the script's DEL undone"
+    );
+    assert_eq!(
+        c.send(&["EXISTS", &k.new]),
+        int(0),
+        "{when}: the script's insert undone"
+    );
+    assert_eq!(
+        c.send(&["HGET", &k.hash, "f"]),
+        bulk("v"),
+        "{when}: hash field"
+    );
+    assert_eq!(
+        c.send(&["HGET", &k.hash, "g"]),
+        bulk("w"),
+        "{when}: hash field the connection wrote before the script"
+    );
+    assert_eq!(c.send(&["HLEN", &k.hash]), int(2), "{when}: hash fields");
+}
+
+/// EVAL (a mixed script), EVALSHA and FCALL inside one TXN, then TXN.ABORT.
+fn script_txn_then_abort(c: &mut Conn, k: &ScriptKeys) {
+    let sha = c.send(&["SCRIPT", "LOAD", SCRIPT_SET]);
+    let sha = sha.lines().nth(1).expect("sha").to_string();
+    let lib = c.send(&["FUNCTION", "LOAD", "REPLACE", FUNCTION_LIB]);
+    assert!(lib.contains("txnlib"), "FUNCTION LOAD: {lib:?}");
+    assert_eq!(c.send(&["TXN", "BEGIN"]), OK);
+    // The connection writes the hash BEFORE the script does: the abort must
+    // restore the pre-TXN value, not the one the script found.
+    assert_eq!(c.send(&["HSET", &k.hash, "g", "by-conn"]), int(0));
+    assert_eq!(
+        c.send(&["EVAL", SCRIPT_MIXED, "4", &k.eval, &k.del, &k.new, &k.hash]),
+        int(1)
+    );
+    assert_eq!(c.send(&["EVALSHA", &sha, "1", &k.sha]), int(1));
+    assert_eq!(c.send(&["FCALL", "setx", "1", &k.fcall]), OK);
+    assert_eq!(c.send(&["GET", &k.eval]), bulk("x2"), "the script wrote");
+    assert_eq!(c.send(&["TXN", "ABORT"]), OK);
+}
+
+fn script_case(shards: usize) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let server = start(dir.path(), shards, true);
+    let mut c = Conn::open(server.port);
+    let tag = local_tag(&mut c);
+    let k = ScriptKeys::new(&tag);
+    script_seed(&mut c, &k);
+    script_txn_then_abort(&mut c, &k);
+    script_assert_seed(&mut c, &k, "live, after TXN.ABORT");
+    drop(c);
+    let server = restart(server, dir.path(), shards);
+    let mut c = Conn::open(server.port);
+    script_assert_seed(
+        &mut c,
+        &k,
+        &format!("after kill -9 + restart (shards={shards})"),
+    );
+}
+
+#[test]
+#[ignore = "spawns a real server; set MOON_BIN"]
+fn script_writes_are_rolled_back_shards_1() {
+    script_case(1);
+}
+
+#[test]
+#[ignore = "spawns a real server; set MOON_BIN"]
+fn script_writes_are_rolled_back_shards_4() {
+    script_case(4);
+}
+
+/// A write the undo log cannot capture is refused inside the script, before
+/// it runs, and poisons the TXN: `FLUSHDB` used to wipe the database with the
+/// abort restoring nothing; `MOVE` wrote a second database.
+#[test]
+#[ignore = "spawns a real server; set MOON_BIN"]
+fn script_writes_the_txn_cannot_undo_are_refused() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let server = start(dir.path(), 1, true);
+    let mut c = Conn::open(server.port);
+    assert_eq!(c.send(&["SET", "keep", "1"]), OK);
+    assert_eq!(c.send(&["TXN", "BEGIN"]), OK);
+    let r = c.send(&["EVAL", "redis.call('FLUSHDB') return 1", "0"]);
+    assert!(
+        r.starts_with('-') && r.contains("TXN cannot roll back"),
+        "FLUSHDB from a script inside a TXN is refused: {r:?}"
+    );
+    let r = c.send(&[
+        "EVAL",
+        "return redis.call('MOVE', KEYS[1], '3')",
+        "1",
+        "keep",
+    ]);
+    assert!(
+        r.starts_with('-') && r.contains("TXN cannot roll back"),
+        "MOVE from a script inside a TXN is refused: {r:?}"
+    );
+    // A pcall'd refusal still poisons the TXN.
+    let r = c.send(&[
+        "EVAL",
+        "local e = redis.pcall('FLUSHDB') return 'swallowed'",
+        "0",
+    ]);
+    assert_eq!(r, bulk("swallowed"));
+    assert_eq!(c.send(&["GET", "keep"]), bulk("1"), "nothing was flushed");
+    let commit = c.send(&["TXN", "COMMIT"]);
+    assert!(
+        commit.starts_with("-EXECABORT"),
+        "a TXN with a refused script write cannot commit: {commit:?}"
+    );
+    assert_eq!(c.send(&["GET", "keep"]), bulk("1"));
+    assert_eq!(c.send(&["SELECT", "3"]), OK);
+    assert_eq!(c.send(&["EXISTS", "keep"]), int(0), "MOVE did not run");
+    drop(c);
+    drop(server);
+}
+
+/// `--shards 4`: a read-write script whose keys live on another shard is
+/// refused inside a TXN (the undo log is applied on the connection's shard,
+/// which is why a TXN refuses a cross-shard write) — it used to be routed,
+/// write there, and survive the abort. A read-only script still routes.
+#[test]
+#[ignore = "spawns a real server; set MOON_BIN"]
+fn routed_script_writes_inside_a_txn_are_refused_shards_4() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let server = start(dir.path(), 4, true);
+    let mut c = Conn::open(server.port);
+    let tag = remote_tag(&mut c).expect("--shards 4 has a remote hash tag");
+    let key = format!("{{{tag}}}:routed");
+    assert_eq!(c.send(&["SET", &key, "original"]), OK);
+    let lib = c.send(&["FUNCTION", "LOAD", "REPLACE", FUNCTION_LIB]);
+    assert!(lib.contains("txnlib"), "FUNCTION LOAD: {lib:?}");
+    assert_eq!(c.send(&["TXN", "BEGIN"]), OK);
+    let eval = c.send(&["EVAL", SCRIPT_SET, "1", &key]);
+    let fcall = c.send(&["FCALL", "setx", "1", &key]);
+    let ro = c.send(&["EVAL_RO", "return redis.call('GET', KEYS[1])", "1", &key]);
+    let abort = c.send(&["TXN", "ABORT"]);
+    assert_eq!(
+        c.send(&["GET", &key]),
+        bulk("original"),
+        "live: a routed script's write survived TXN.ABORT (EVAL {eval:?}, FCALL {fcall:?})"
+    );
+    assert!(eval.contains("cross-shard"), "EVAL refused: {eval:?}");
+    assert!(fcall.contains("cross-shard"), "FCALL refused: {fcall:?}");
+    assert_eq!(ro, bulk("original"), "EVAL_RO still routes");
+    assert_eq!(abort, OK);
+    drop(c);
+    let server = restart(server, dir.path(), 4);
+    let mut c = Conn::open(server.port);
+    assert_eq!(c.send(&["GET", &key]), bulk("original"), "after restart");
+}
+
+/// The replica leg (monoio master): the script's effects were replicated as
+/// they ran; the abort's compensation must follow them.
+#[test]
+#[ignore = "spawns real servers; set MOON_BIN to a monoio build"]
+fn script_abort_reaches_the_replica() {
+    let mdir = tempfile::tempdir().expect("tempdir");
+    let rdir = tempfile::tempdir().expect("tempdir");
+    let master = start(mdir.path(), 1, false);
+    let replica = start(rdir.path(), 1, false);
+    let mut m = Conn::open(master.port);
+    if !has_graph(&mut m) {
+        eprintln!("SKIP: no `graph` feature — the tokio leg has no master-side PSYNC");
+        return;
+    }
+    let mut r = Conn::open(replica.port);
+    assert_eq!(
+        r.send(&["REPLICAOF", "127.0.0.1", &master.port.to_string()]),
+        OK
+    );
+    wait_for("the replication link", Duration::from_secs(20), || {
+        r.send(&["INFO", "replication"])
+            .contains("master_link_status:up")
+    });
+    let k = ScriptKeys::new("rs");
+    script_seed(&mut m, &k);
+    assert_eq!(m.send(&["SET", "seeded", "1"]), OK);
+    wait_for("the seed on the replica", Duration::from_secs(20), || {
+        r.send(&["GET", "seeded"]) == bulk("1")
+    });
+    script_txn_then_abort(&mut m, &k);
+    assert_eq!(m.send(&["SET", "after-abort", "1"]), OK);
+    wait_for(
+        "the post-abort marker on the replica",
+        Duration::from_secs(20),
+        || r.send(&["GET", "after-abort"]) == bulk("1"),
+    );
+    script_assert_seed(&mut r, &k, "replica, after the master's TXN.ABORT");
+    drop(replica);
+    drop(master);
+}

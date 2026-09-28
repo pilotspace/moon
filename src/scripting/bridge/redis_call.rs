@@ -189,6 +189,15 @@ pub fn make_redis_call_fn(
             }
 
             if cmd_is_write {
+                // moon#1285 (PR #1301 review): inside an open TXN, a write
+                // TXN.ABORT could not undo is refused BEFORE any effect —
+                // eviction, COW capture, MONITOR, the write itself. One
+                // thread-local borrow when no TXN capture is armed.
+                if let Some(refused) =
+                    super::txn_capture::txn_undo_refusal(&cmd_bytes, &frames[1..], db_idx, db_count)
+                {
+                    return Ok(refused);
+                }
                 // Track writes for SCRIPT KILL safety check
                 SCRIPT_HAD_WRITE.with(|c| c.set(true));
                 // OOM eviction gate (M3): mirrors the connection handlers'
@@ -213,6 +222,10 @@ pub fn make_redis_call_fn(
                 // the db) and BEFORE `execute_command` overwrites the value.
                 // One thread-local `bool` load when no BGSAVE is in flight.
                 crate::persistence::snapshot_cow::capture_command_pre_image(db, db_idx, &frames);
+                // moon#1285 (PR #1301 review): the TXN's undo pre-images,
+                // after the eviction gate and right before the write — the
+                // connection leg's order. No-op outside a TXN.
+                super::txn_capture::txn_undo_capture(db, db_idx, &cmd_bytes, &frames[1..]);
             }
 
             // MONITOR: a script-issued command is fed with the literal `lua`
