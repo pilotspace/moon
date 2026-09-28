@@ -154,56 +154,145 @@ pub(crate) fn capture_txn_undo<R>(run: impl FnOnce() -> R) -> (R, ScriptTxnUndo)
     (out, captured)
 }
 
-/// The keys `cmd` writes — the connection leg's rule: the shared walker's
-/// WRITE positions, else the primary key.
-fn txn_written_keys(cmd: &[u8], args: &[Frame]) -> smallvec::SmallVec<[Bytes; 4]> {
-    let mut written = crate::tracking::invalidation::written_keys(cmd, args);
-    if written.is_empty()
-        && let Some(key) = crate::server::conn::shared::extract_primary_key(cmd, args)
-    {
-        written.push(key.clone());
-    }
-    written
+/// Writes `command::dispatch` does NOT execute: a connection-level intercept
+/// serves each of them (blocking pops, `FCALL`, `MQ`, `WS`, `FT.*`,
+/// `GRAPH.*`, `FUNCTION`, `TEMPORAL.*`), so from a script they answer
+/// `unknown command` and write nothing. Inside a TXN they are therefore
+/// neither captured nor refused (moon#1285, PR #1301 review): capturing the
+/// key their argv names — `BLPOP`'s list, `MQ`'s queue, or a graph / index
+/// name taken as `args[0]` — made `TXN.ABORT` delete or restore another
+/// client's key of that name, and the write intent hid it from other TXNs.
+///
+/// `script_undispatched_writes_match_dispatch` walks `COMMAND_META` and pins
+/// this set to exactly the WRITE commands `dispatch` answers `unknown
+/// command`, in both directions.
+static SCRIPT_UNDISPATCHED_WRITES: phf::Set<&'static str> = phf::phf_set! {
+    "BLPOP", "BRPOP", "BLMOVE", "BRPOPLPUSH", "BLMPOP", "BZPOPMIN", "BZPOPMAX",
+    "BZMPOP", "FCALL", "FUNCTION", "MQ", "WS",
+    "FT.CREATE", "FT.DROPINDEX", "FT.COMPACT", "FT.CONFIG",
+    "GRAPH.CREATE", "GRAPH.ADDNODE", "GRAPH.ADDEDGE", "GRAPH.DELETE",
+    "GRAPH.DROP", "GRAPH.QUERY",
+    "TEMPORAL.SNAPSHOT_AT", "TEMPORAL.INVALIDATE",
+};
+
+/// Keyless writes `command::dispatch` EXECUTES from a script, whose pre-image
+/// is a whole database: refused inside a TXN (moon#1285, PR #1301 review).
+///
+/// Any other `first_key: 0` write outside [`KeySpecClass::Movable`] and
+/// outside [`SCRIPT_UNDISPATCHED_WRITES`] (`TXN`; `SELECT` is refused by the
+/// bridge before this) answers an error from `dispatch` and writes nothing.
+/// `keyless_script_writes_are_refused_or_inert` checks it for every such
+/// registry entry.
+///
+/// [`KeySpecClass::Movable`]: crate::command::metadata::KeySpecClass::Movable
+const KEYLESS_DISPATCHED_WRITES: [&[u8]; 3] = [b"FLUSHDB", b"FLUSHALL", b"SWAPDB"];
+
+/// What the TXN undo capture does with one script write (moon#1285, PR #1301
+/// review).
+#[derive(Debug, PartialEq)]
+enum TxnWritePlan {
+    /// Capture these keys' pre-images and hold write intents on them.
+    Capture(smallvec::SmallVec<[Bytes; 4]>),
+    /// Nothing to capture: `command::dispatch` answers this argv with an
+    /// error and writes nothing — a write only a connection-level intercept
+    /// serves (`unknown command`, [`SCRIPT_UNDISPATCHED_WRITES`]), or `TXN`.
+    /// Runs exactly as outside a TXN.
+    Inert,
+    /// A write the TXN could not undo; refused before it runs.
+    Refuse,
 }
 
-/// Refuse a script write the TXN could not undo, before it has any effect:
-/// `None` when no capture is armed or the write is capturable.
+/// Plan one script write inside a TXN.
 ///
-/// Refused, and the TXN poisoned:
-/// - a write with no key to capture (`FLUSHDB`, `FLUSHALL`, `SWAPDB`, and any
-///   argv the key walker cannot enumerate) — its pre-image is a whole
-///   database or unknown;
-/// - a second-database write (`MOVE`, `COPY ... DB n`) — refused on the
-///   connection inside a TXN too, and the undo leg would have to capture the
-///   destination database as well.
-pub(super) fn txn_undo_refusal(
+/// Inert first: a write `dispatch` does not execute
+/// ([`SCRIPT_UNDISPATCHED_WRITES`]).
+///
+/// Captured: the shared walker's WRITE positions, else — for a command whose
+/// registry entry names a first key (`first_key > 0`) — the primary key, the
+/// connection leg's rule. The fallback is NEVER taken for a `first_key: 0`
+/// command: its `args[0]` is a graph, an index or a subcommand literal, and
+/// capturing a keyspace key of that name made `TXN.ABORT` delete or restore a
+/// key the transaction never wrote (another client's).
+///
+/// Refused: a second-database write (`MOVE`, `COPY ... DB n`); a keyless
+/// write `dispatch` executes ([`KEYLESS_DISPATCHED_WRITES`]); and an argv
+/// whose written keys cannot be enumerated — a malformed movable-key command
+/// (`LMPOP 5 a b LEFT`), or a keyed one with no primary key.
+fn txn_write_plan(cmd: &[u8], args: &[Frame], db_idx: usize, db_count: usize) -> TxnWritePlan {
+    use crate::command::metadata::{KeySpecClass, class_of, lookup};
+    // `is_write` gates the caller, so an unregistered name cannot get here;
+    // if one did, `dispatch` would answer `unknown command`.
+    let Some(meta) = lookup(cmd) else {
+        return TxnWritePlan::Inert;
+    };
+    if SCRIPT_UNDISPATCHED_WRITES.contains(meta.name) {
+        return TxnWritePlan::Inert;
+    }
+    if matches!(
+        crate::command::keyspace::move_cmd::resolve_two_db(cmd, args, db_idx, db_count),
+        Some(Ok(_))
+    ) {
+        return TxnWritePlan::Refuse;
+    }
+    let written = crate::tracking::invalidation::written_keys(cmd, args);
+    if !written.is_empty() {
+        return TxnWritePlan::Capture(written);
+    }
+    if meta.first_key > 0 {
+        return match crate::server::conn::shared::extract_primary_key(cmd, args) {
+            Some(key) => TxnWritePlan::Capture(smallvec::smallvec![key.clone()]),
+            None => TxnWritePlan::Refuse,
+        };
+    }
+    if KEYLESS_DISPATCHED_WRITES
+        .iter()
+        .any(|k| cmd.eq_ignore_ascii_case(k))
+        || class_of(meta) == KeySpecClass::Movable
+    {
+        return TxnWritePlan::Refuse;
+    }
+    TxnWritePlan::Inert
+}
+
+/// Plan a script write against the armed TXN undo capture, before it has any
+/// effect ([`txn_write_plan`]):
+///
+/// - `Ok(None)`: no capture is armed, or the write is inert — run it as
+///   usual, capture nothing;
+/// - `Ok(Some(keys))`: capture `keys` right before the write
+///   ([`txn_undo_capture`]) — computed once, here;
+/// - `Err(reply)`: refused. The reply is `ERR_TXN_SCRIPT_NOT_UNDOABLE`, and
+///   the first refused command poisons the TXN (#499).
+pub(super) fn txn_undo_plan(
     cmd: &[u8],
     args: &[Frame],
     db_idx: usize,
     db_count: usize,
-) -> Option<Frame> {
+) -> Result<Option<smallvec::SmallVec<[Bytes; 4]>>, Frame> {
     TXN_UNDO_CAPTURE.with(|c| {
         let mut slot = c.borrow_mut();
-        let capture = slot.as_mut()?;
-        let two_db = matches!(
-            crate::command::keyspace::move_cmd::resolve_two_db(cmd, args, db_idx, db_count),
-            Some(Ok(_))
-        );
-        if !two_db && !txn_written_keys(cmd, args).is_empty() {
-            return None;
+        let Some(capture) = slot.as_mut() else {
+            return Ok(None);
+        };
+        match txn_write_plan(cmd, args, db_idx, db_count) {
+            TxnWritePlan::Capture(keys) => Ok(Some(keys)),
+            TxnWritePlan::Inert => Ok(None),
+            TxnWritePlan::Refuse => {
+                if capture.refused.is_none() {
+                    capture.refused = Some(Bytes::copy_from_slice(cmd));
+                }
+                Err(Frame::Error(Bytes::from_static(
+                    crate::command::transaction::ERR_TXN_SCRIPT_NOT_UNDOABLE,
+                )))
+            }
         }
-        if capture.refused.is_none() {
-            capture.refused = Some(Bytes::copy_from_slice(cmd));
-        }
-        Some(Frame::Error(Bytes::from_static(
-            crate::command::transaction::ERR_TXN_SCRIPT_NOT_UNDOABLE,
-        )))
     })
 }
 
-/// Capture the pre-image of every key `cmd` is about to write into `db`
-/// (database `db_idx`). No-op unless a capture is armed. Runs after the
-/// eviction gate, right before the write — the connection leg's order.
+/// Capture the pre-image of each of `keys` — the keys [`txn_undo_plan`]
+/// planned for `cmd` — which `cmd` is about to write into `db` (database
+/// `db_idx`). No-op unless a capture is armed. Runs after the eviction gate,
+/// right before the write — the connection leg's order.
 ///
 /// The pre-image is a copy, as on the connection leg: the write mutates the
 /// value in place, so there is nothing to move yet. The value the abort
@@ -212,7 +301,7 @@ pub(super) fn txn_undo_capture(
     db: &mut crate::storage::Database,
     db_idx: usize,
     cmd: &[u8],
-    args: &[Frame],
+    keys: smallvec::SmallVec<[Bytes; 4]>,
 ) {
     TXN_UNDO_CAPTURE.with(|c| {
         let mut slot = c.borrow_mut();
@@ -220,7 +309,7 @@ pub(super) fn txn_undo_capture(
             return;
         };
         let is_delete = cmd.eq_ignore_ascii_case(b"DEL") || cmd.eq_ignore_ascii_case(b"UNLINK");
-        for key in txn_written_keys(cmd, args) {
+        for key in keys {
             if capture.seen.contains(&(db_idx, key.clone())) {
                 continue;
             }
@@ -249,24 +338,37 @@ mod tests {
         Frame::BulkString(Bytes::from(s.to_string()))
     }
 
-    fn run(db: &mut Database, cmd: &str, args: &[&str]) {
-        let args: Vec<Frame> = args.iter().map(|a| bulk(a)).collect();
-        let mut sel = 0;
-        let _ = crate::command::dispatch(db, cmd.as_bytes(), &args, &mut sel, 16);
+    fn frames(args: &[&str]) -> Vec<Frame> {
+        args.iter().map(|a| bulk(a)).collect()
     }
 
+    fn run(db: &mut Database, cmd: &str, args: &[&str]) -> Frame {
+        let mut sel = 0;
+        match crate::command::dispatch(db, cmd.as_bytes(), &frames(args), &mut sel, 16) {
+            crate::command::DispatchResult::Response(f)
+            | crate::command::DispatchResult::Quit(f) => f,
+        }
+    }
+
+    /// The bridge's order: plan, then capture what was planned, then write.
     fn capture(db: &mut Database, cmd: &str, args: &[&str]) {
-        let frames: Vec<Frame> = args.iter().map(|a| bulk(a)).collect();
-        txn_undo_capture(db, 0, cmd.as_bytes(), &frames);
+        let planned = txn_undo_plan(cmd.as_bytes(), &frames(args), 0, 16);
+        if let Ok(Some(keys)) = planned {
+            txn_undo_capture(db, 0, cmd.as_bytes(), keys);
+        }
         run(db, cmd, args);
+    }
+
+    fn refused(cmd: &str, args: &[&str]) -> bool {
+        txn_undo_plan(cmd.as_bytes(), &frames(args), 0, 16).is_err()
     }
 
     /// Disarmed, the bridge hooks are inert: nothing refused, nothing held.
     #[test]
     fn disarmed_capture_is_a_no_op() {
         let mut db = Database::new();
-        assert!(txn_undo_refusal(b"FLUSHDB", &[], 0, 16).is_none());
-        txn_undo_capture(&mut db, 0, b"SET", &[bulk("k"), bulk("v")]);
+        assert_eq!(txn_undo_plan(b"FLUSHDB", &[], 0, 16), Ok(None));
+        txn_undo_capture(&mut db, 0, b"SET", smallvec::smallvec![Bytes::from("k")]);
         let ((), captured) = capture_txn_undo(|| ());
         let (undo, written, refused) = captured.into_parts();
         assert!(undo.is_empty() && written.is_empty() && refused.is_none());
@@ -316,24 +418,156 @@ mod tests {
     fn uncapturable_writes_are_refused() {
         let (refusals, captured) = capture_txn_undo(|| {
             [
-                txn_undo_refusal(b"FLUSHDB", &[], 0, 16).is_some(),
-                txn_undo_refusal(b"FLUSHALL", &[], 0, 16).is_some(),
-                txn_undo_refusal(b"MOVE", &[bulk("k"), bulk("3")], 0, 16).is_some(),
-                txn_undo_refusal(
-                    b"COPY",
-                    &[bulk("a"), bulk("b"), bulk("DB"), bulk("2")],
-                    0,
-                    16,
-                )
-                .is_some(),
+                refused("FLUSHDB", &[]),
+                refused("FLUSHALL", &["ASYNC"]),
+                refused("SWAPDB", &["0", "1"]),
+                refused("MOVE", &["k", "3"]),
+                refused("COPY", &["a", "b", "DB", "2"]),
+                // A well-formed arity whose keys cannot be enumerated.
+                refused("LMPOP", &["5", "a", "b", "LEFT"]),
                 // Same-db COPY and ordinary writes are capturable.
-                txn_undo_refusal(b"COPY", &[bulk("a"), bulk("b")], 0, 16).is_some(),
-                txn_undo_refusal(b"SET", &[bulk("k"), bulk("v")], 0, 16).is_some(),
+                refused("COPY", &["a", "b"]),
+                refused("SET", &["k", "v"]),
             ]
         });
-        assert_eq!(refusals, [true, true, true, true, false, false]);
+        assert_eq!(refusals, [true, true, true, true, true, true, false, false]);
         let (_, _, refused) = captured.into_parts();
         assert_eq!(refused, Some(Bytes::from_static(b"FLUSHDB")));
+    }
+
+    /// PR #1301 review MINOR-1: a write that only a connection-level
+    /// intercept serves (`GRAPH.*`, `FT.*`, `MQ`, `WS`, `FUNCTION`, the
+    /// blocking pops) answers `unknown command` from a script and writes
+    /// nothing — so it captures NOTHING. It used to capture `args[0]` (a
+    /// graph, an index or a subcommand literal) or the key its argv names
+    /// (`MQ`'s queue, `BLPOP`'s list) as a keyspace key: `TXN.ABORT` then
+    /// deleted or restored another client's key of that name.
+    #[test]
+    fn keyless_writes_a_script_cannot_run_capture_nothing() {
+        let mut db = Database::new();
+        run(&mut db, "SET", &["users", "orig"]);
+        let (plans, captured) = capture_txn_undo(|| {
+            [
+                ("GRAPH.QUERY", &["users", "CREATE (:N)"][..]),
+                ("GRAPH.ADDNODE", &["users", "N"][..]),
+                ("FT.DROPINDEX", &["users"][..]),
+                ("FT.CREATE", &["users", "SCHEMA", "f", "TEXT"][..]),
+                ("MQ", &["PUBLISH", "users", "m"][..]),
+                ("WS", &["CREATE", "users"][..]),
+                ("FUNCTION", &["FLUSH"][..]),
+                ("BLPOP", &["users", "0"][..]),
+                ("BZPOPMIN", &["users", "0"][..]),
+            ]
+            .map(|(cmd, args)| {
+                let plan = txn_undo_plan(cmd.as_bytes(), &frames(args), 0, 16);
+                capture(&mut db, cmd, args);
+                (cmd, plan)
+            })
+        });
+        for (cmd, plan) in plans {
+            assert_eq!(plan, Ok(None), "{cmd} plans no capture");
+        }
+        let (undo, written, refused) = captured.into_parts();
+        assert!(undo.is_empty(), "no pre-image captured");
+        assert!(written.is_empty(), "no write intent");
+        assert!(refused.is_none(), "nothing refused");
+    }
+
+    /// [`SCRIPT_UNDISPATCHED_WRITES`] is exactly the set of WRITE commands
+    /// `dispatch` answers `unknown command` — in both directions, so a
+    /// listed command that gains a `dispatch` arm (and would then write
+    /// uncaptured) fails here, as does a new undispatched write left out.
+    /// The name match in `dispatch` does not depend on the arguments.
+    #[test]
+    fn script_undispatched_writes_match_dispatch() {
+        use crate::command::metadata::{COMMAND_META, CommandFlags};
+        for (name, meta) in COMMAND_META.entries() {
+            if !meta.flags.contains(CommandFlags::WRITE) {
+                continue;
+            }
+            let n = usize::from(meta.arity.unsigned_abs())
+                .saturating_sub(1)
+                .max(1);
+            let args = vec!["1"; n];
+            let mut db = Database::new();
+            let mut sel = 0;
+            let unknown =
+                crate::command::dispatch(&mut db, name.as_bytes(), &frames(&args), &mut sel, 16)
+                    .is_unknown_command();
+            assert_eq!(
+                SCRIPT_UNDISPATCHED_WRITES.contains(name),
+                unknown,
+                "{name}: listed as undispatched iff dispatch answers `unknown command`"
+            );
+        }
+        for name in SCRIPT_UNDISPATCHED_WRITES.iter() {
+            assert!(
+                crate::command::metadata::is_write(name.as_bytes()),
+                "{name} is a registered write"
+            );
+        }
+    }
+
+    /// The registry guard for [`KEYLESS_DISPATCHED_WRITES`]: every WRITE
+    /// entry of `COMMAND_META` with `first_key: 0` is either refused, or
+    /// planned inert — and an inert one really is inert: `dispatch` answers
+    /// it with an error and leaves the database untouched, for every argv
+    /// length its arity allows (up to 4). A keyless write that gains a
+    /// `dispatch` arm without joining the refusal list fails here.
+    #[test]
+    fn keyless_script_writes_are_refused_or_inert() {
+        use crate::command::metadata::{COMMAND_META, CommandFlags};
+        let mut checked = 0;
+        for (name, meta) in COMMAND_META.entries() {
+            if !meta.flags.contains(CommandFlags::WRITE) || meta.first_key > 0 {
+                continue;
+            }
+            let min = usize::from(meta.arity.unsigned_abs()).saturating_sub(1);
+            let max = if meta.arity >= 0 { min } else { min + 4 };
+            for n in min..=max {
+                let args = vec!["x"; n];
+                let ((plan, reply, db), _) = capture_txn_undo(|| {
+                    let mut db = Database::new();
+                    run(&mut db, "SET", &["x", "keep"]);
+                    let plan = txn_undo_plan(name.as_bytes(), &frames(&args), 0, 16);
+                    let reply = run(&mut db, name, &args);
+                    (plan, reply, db)
+                });
+                match plan {
+                    Err(_) => {}
+                    Ok(Some(keys)) => panic!("{name} {args:?} captured {keys:?}"),
+                    Ok(None) => {
+                        assert!(
+                            matches!(reply, Frame::Error(_)),
+                            "{name} {args:?} is planned inert but dispatch answered {reply:?}"
+                        );
+                        let mut db = db;
+                        assert_eq!(
+                            run(&mut db, "DBSIZE", &[]),
+                            Frame::Integer(1),
+                            "{name} {args:?} changed the keyspace"
+                        );
+                        assert_eq!(
+                            run(&mut db, "GET", &["x"]),
+                            bulk("keep"),
+                            "{name} {args:?} changed a key"
+                        );
+                    }
+                }
+                checked += 1;
+            }
+        }
+        assert!(checked > 20, "the registry walk ran ({checked} argvs)");
+        for cmd in KEYLESS_DISPATCHED_WRITES {
+            let ((), captured) = capture_txn_undo(|| {
+                let _ = txn_undo_plan(cmd, &frames(&["0", "1"]), 0, 16);
+            });
+            assert!(
+                captured.into_parts().2.is_some(),
+                "{} is refused",
+                String::from_utf8_lossy(cmd)
+            );
+        }
     }
 
     /// A panic inside the script disarms the capture.
@@ -341,6 +575,6 @@ mod tests {
     fn capture_disarms_on_unwind() {
         let r = std::panic::catch_unwind(|| capture_txn_undo(|| panic!("script panicked")));
         assert!(r.is_err());
-        assert!(txn_undo_refusal(b"FLUSHDB", &[], 0, 16).is_none());
+        assert_eq!(txn_undo_plan(b"FLUSHDB", &[], 0, 16), Ok(None));
     }
 }

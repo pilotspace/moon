@@ -36,6 +36,9 @@
 //! PR #1301 review: a graph rollback whose WAL records overflow the shard's
 //! WAL append channel (local leg at `--shards 1`, remote owner leg at `4`)
 //! must answer the refusal, never `+OK` followed by resurrected writes.
+//!
+//! PR #1301 review, round 2: a script write `dispatch` cannot run (`FT.*`,
+//! `GRAPH.*`, `MQ`, blocking pops) captures no keyspace key.
 
 mod common;
 
@@ -1041,4 +1044,114 @@ fn script_abort_reaches_the_replica() {
     script_assert_seed(&mut r, &k, "replica, after the master's TXN.ABORT");
     drop(replica);
     drop(master);
+}
+
+// ---------------------------------------------------------------------------
+// Script writes a TXN has nothing to undo for (moon#1285, PR #1301 review
+// round 2)
+// ---------------------------------------------------------------------------
+
+/// MINOR-1: a write that `command::dispatch` cannot run from a script
+/// (`FT.*`, `GRAPH.*`, `MQ`, `BLPOP`: served by connection-level intercepts
+/// only) answers an error and writes nothing. Its `args[0]` — or the key its
+/// argv names — used to be captured as a KEYSPACE key anyway, so the abort
+/// deleted, or restored over, another client's key of the same name, logged
+/// to the AOF, and the write intent hid that key from other transactions.
+#[test]
+#[ignore = "spawns a real server; set MOON_BIN"]
+fn inert_script_writes_capture_no_keyspace_key() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let server = start(dir.path(), 1, true);
+    let mut c = Conn::open(server.port);
+    let mut other = Conn::open(server.port);
+    let mut t2 = Conn::open(server.port);
+    let graph = has_graph(&mut c);
+    // `accts` and `held` exist before the TXN; the other names do not.
+    assert_eq!(c.send(&["SET", "accts", "orig"]), OK);
+    assert_eq!(c.send(&["SET", "held", "visible"]), OK);
+    assert_eq!(c.send(&["TXN", "BEGIN"]), OK);
+    for (script, key) in [
+        ("return redis.pcall('FT.DROPINDEX', KEYS[1])", "users"),
+        ("return redis.pcall('FT.COMPACT', KEYS[1])", "accts"),
+        ("return redis.pcall('FT.DROPINDEX', KEYS[1])", "held"),
+        ("return redis.pcall('MQ', 'PUBLISH', KEYS[1], 'm')", "queue"),
+        ("return redis.pcall('BLPOP', KEYS[1], '0')", "list"),
+    ] {
+        let r = c.send(&["EVAL", script, "1", key]);
+        assert!(r.starts_with('-'), "{script} {key}: an error reply: {r:?}");
+    }
+    if graph {
+        let r = c.send(&[
+            "EVAL",
+            "return redis.pcall('GRAPH.QUERY', KEYS[1], 'CREATE (:N)')",
+            "1",
+            "gusers",
+        ]);
+        assert!(r.starts_with('-'), "GRAPH.QUERY from a script: {r:?}");
+    }
+    // Every mismatch is collected, so one run names each phantom capture.
+    let mut wrong: Vec<String> = Vec::new();
+    // Another TXN reads `held`: the script wrote no such key, so no write
+    // intent may hide it from that TXN's snapshot.
+    assert_eq!(t2.send(&["TXN", "BEGIN"]), OK);
+    let got = t2.send(&["GET", "held"]);
+    if got != bulk("visible") {
+        wrong.push(format!(
+            "another TXN's GET held -> {got:?}: a phantom write intent hid it"
+        ));
+    }
+    assert_eq!(t2.send(&["TXN", "ABORT"]), OK);
+    // Another, non-TXN client writes keys of the same names meanwhile.
+    assert_eq!(other.send(&["SET", "users", "theirs"]), OK);
+    assert_eq!(other.send(&["SET", "accts", "theirs"]), OK);
+    assert_eq!(other.send(&["SET", "queue", "theirs"]), OK);
+    assert_eq!(other.send(&["RPUSH", "list", "theirs"]), int(1));
+    if graph {
+        assert_eq!(other.send(&["SET", "gusers", "theirs"]), OK);
+    }
+    assert_eq!(c.send(&["TXN", "ABORT"]), OK);
+    let check = |c: &mut Conn, when: &str, wrong: &mut Vec<String>| {
+        let mut expect = |cmd: &[&str], want: String, what: &str| {
+            let got = c.send(cmd);
+            if got != want {
+                wrong.push(format!("{when}: {cmd:?} -> {got:?}: {what}"));
+            }
+        };
+        let theirs = bulk("theirs");
+        expect(
+            &["GET", "users"],
+            theirs.clone(),
+            "TXN.ABORT deleted another client's key (FT.DROPINDEX)",
+        );
+        expect(
+            &["GET", "accts"],
+            theirs.clone(),
+            "TXN.ABORT restored over another client's write (FT.COMPACT)",
+        );
+        expect(
+            &["GET", "queue"],
+            theirs.clone(),
+            "MQ's queue key captured though MQ never ran",
+        );
+        expect(
+            &["LRANGE", "list", "0", "-1"],
+            "*1\r\n$6\r\ntheirs\r\n".to_string(),
+            "BLPOP's list captured though BLPOP never ran",
+        );
+        if graph {
+            expect(
+                &["GET", "gusers"],
+                theirs,
+                "GRAPH.QUERY's graph name captured as a key",
+            );
+        }
+    };
+    check(&mut c, "live", &mut wrong);
+    drop((c, other, t2));
+    let server = restart(server, dir.path(), 1);
+    let mut c = Conn::open(server.port);
+    check(&mut c, "after kill -9 + restart", &mut wrong);
+    assert!(wrong.is_empty(), "phantom captures:\n{}", wrong.join("\n"));
+    drop(c);
+    drop(server);
 }
