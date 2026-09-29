@@ -565,6 +565,15 @@ shared 4-vCPU Linux container against HEAD `935c555` — re-measure on the GCE r
   to be raised even from `redis.pcall`). Cost: none outside a TXN; ~0.7 µs per
   captured write inside one.
 
+- **`FLUSHDB` / `FLUSHALL` inside a `TXN` no longer wipe data `TXN.ABORT`
+  cannot bring back** (moon#1285, PR #1301 review). Sent on the connection
+  inside an open TXN they ran, and the abort answered `+OK` restoring nothing
+  (`SET k v; TXN BEGIN; FLUSHDB; TXN ABORT; GET k` → nil, both runtimes, any
+  shard count). **Behaviour change:** they are now refused before they run
+  with `ERR TXN cannot roll back this command (whole-database write) …` and
+  poison the TXN (`TXN.COMMIT` answers `EXECABORT`), as a script's already
+  were. `SWAPDB`, `MOVE` and `COPY … DB` keep their existing TXN refusal.
+
 - **Without an AOF, a deleted cold key came back after `BGSAVE` + kill -9**
   (moon#1281). The durable state is the last snapshot plus every listed spill
   file, and a spill file is unlinked only when its last live key leaves it, so

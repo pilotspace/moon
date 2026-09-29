@@ -1540,3 +1540,122 @@ fn read_only_script_write_refusal_is_catchable_by_pcall() {
     drop(c);
     drop(server);
 }
+
+// ---------------------------------------------------------------------------
+// Connection-leg writes the undo log cannot capture (PR #1301 review, round 4)
+// ---------------------------------------------------------------------------
+
+/// `FLUSHDB` / `FLUSHALL` sent on the connection inside a TXN, in every form
+/// (`ASYNC` / `SYNC`), and the `SWAPDB`, `MOVE` and `COPY ... DB` the
+/// connection leg already refused beside them.
+fn conn_undoable(k: &str, k2: &str) -> Vec<Vec<String>> {
+    let v = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    vec![
+        v(&["FLUSHDB"]),
+        v(&["FLUSHDB", "ASYNC"]),
+        v(&["FLUSHDB", "SYNC"]),
+        v(&["FLUSHALL"]),
+        v(&["FLUSHALL", "ASYNC"]),
+        v(&["FLUSHALL", "SYNC"]),
+        v(&["SWAPDB", "3", "4"]),
+        v(&["MOVE", k, "5"]),
+        v(&["COPY", k, k2, "DB", "5"]),
+    ]
+}
+
+/// A whole-database write sent on the connection inside a TXN is refused
+/// before it runs and poisons the TXN, as the script path already refuses
+/// it: `FLUSHDB` / `FLUSHALL` used to be accepted, and `TXN.ABORT` answered
+/// `+OK` restoring nothing (`SET k orig; TXN BEGIN; FLUSHDB; TXN ABORT;
+/// GET k -> nil`, both runtimes, any shard count).
+fn connection_undoable_case(shards: usize) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let server = start(dir.path(), shards, true);
+    let mut c = Conn::open(server.port);
+    let tag = local_tag(&mut c);
+    let k = format!("{{{tag}}}:k");
+    let k4 = format!("{{{tag}}}:k4");
+    assert_eq!(c.send(&["SELECT", "4"]), OK);
+    assert_eq!(c.send(&["SET", &k4, "four"]), OK);
+    assert_eq!(c.send(&["SELECT", "3"]), OK);
+    assert_eq!(c.send(&["SET", &k, "orig"]), OK);
+    let mut wrong = Vec::new();
+    for argv in conn_undoable(&k, &format!("{{{tag}}}:k2")) {
+        let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
+        let argv = &argv[..];
+        let what = argv.join(" ");
+        // Refused, and nothing ran: the abort then has nothing to undo.
+        assert_eq!(c.send(&["TXN", "BEGIN"]), OK);
+        let r = c.send(argv);
+        if !r.starts_with("-ERR TXN") {
+            wrong.push(format!("{what} inside a TXN -> {r:?}: not refused"));
+        }
+        let abort = c.send(&["TXN", "ABORT"]);
+        if abort != OK {
+            wrong.push(format!("{what}: TXN ABORT -> {abort:?}"));
+        }
+        let got = c.send(&["GET", &k]);
+        if got != bulk("orig") {
+            wrong.push(format!("{what}; TXN ABORT: GET k -> {got:?}, want orig"));
+            assert_eq!(c.send(&["SET", &k, "orig"]), OK);
+        }
+        // The refusal poisons the TXN: COMMIT rolls back the accepted SET.
+        assert_eq!(c.send(&["TXN", "BEGIN"]), OK);
+        assert_eq!(c.send(&["SET", &k, "in-txn"]), OK);
+        let _ = c.send(argv);
+        let commit = c.send(&["TXN", "COMMIT"]);
+        if !commit.starts_with("-EXECABORT") {
+            wrong.push(format!("{what}: TXN COMMIT -> {commit:?}, want EXECABORT"));
+        }
+        let got = c.send(&["GET", &k]);
+        if got != bulk("orig") {
+            wrong.push(format!("{what}; TXN COMMIT: GET k -> {got:?}, want orig"));
+            assert_eq!(c.send(&["SET", &k, "orig"]), OK);
+        }
+        assert_eq!(c.send(&["SELECT", "4"]), OK);
+        let got = c.send(&["GET", &k4]);
+        if got != bulk("four") {
+            wrong.push(format!("{what}: db 4 GET k4 -> {got:?}, want four"));
+            assert_eq!(c.send(&["SET", &k4, "four"]), OK);
+        }
+        assert_eq!(c.send(&["SELECT", "5"]), OK);
+        if c.send(&["DBSIZE"]) != int(0) {
+            wrong.push(format!("{what}: wrote db 5"));
+            assert_eq!(c.send(&["FLUSHDB"]), OK);
+        }
+        assert_eq!(c.send(&["SELECT", "3"]), OK);
+    }
+    assert!(
+        wrong.is_empty(),
+        "shards={shards}: an un-undoable write ran inside a TXN:\n{}",
+        wrong.join("\n")
+    );
+    // Outside a TXN they still run.
+    assert_eq!(c.send(&["FLUSHDB"]), OK);
+    assert_eq!(
+        c.send(&["EXISTS", &k]),
+        int(0),
+        "FLUSHDB outside a TXN runs"
+    );
+    assert_eq!(c.send(&["SET", &k, "orig"]), OK);
+    drop(c);
+
+    let server = restart(server, dir.path(), shards);
+    let mut c = Conn::open(server.port);
+    assert_eq!(c.send(&["SELECT", "3"]), OK);
+    assert_eq!(c.send(&["GET", &k]), bulk("orig"), "after restart");
+    assert_eq!(c.send(&["SELECT", "4"]), OK);
+    assert_eq!(c.send(&["GET", &k4]), bulk("four"), "db 4 after restart");
+}
+
+#[test]
+#[ignore = "spawns a real server; set MOON_BIN"]
+fn connection_writes_the_txn_cannot_undo_are_refused_shards_1() {
+    connection_undoable_case(1);
+}
+
+#[test]
+#[ignore = "spawns a real server; set MOON_BIN"]
+fn connection_writes_the_txn_cannot_undo_are_refused_shards_4() {
+    connection_undoable_case(4);
+}

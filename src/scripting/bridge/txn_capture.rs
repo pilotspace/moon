@@ -194,7 +194,10 @@ static SCRIPT_UNDISPATCHED_WRITES: phf::Set<&'static str> = phf::phf_set! {
 /// registry entry.
 ///
 /// [`KeySpecClass::Movable`]: crate::command::metadata::KeySpecClass::Movable
-const KEYLESS_DISPATCHED_WRITES: [&[u8]; 3] = [b"FLUSHDB", b"FLUSHALL", b"SWAPDB"];
+///
+/// The same set the connection leg refuses:
+/// [`crate::transaction::TXN_WHOLE_DB_WRITES`].
+const KEYLESS_DISPATCHED_WRITES: [&[u8]; 3] = crate::transaction::TXN_WHOLE_DB_WRITES;
 
 /// What the TXN undo capture does with one script write (moon#1285, PR #1301
 /// review).
