@@ -269,6 +269,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Performance
 
+- **A write that evicts against a backlogged AOF writer no longer stalls its
+  shard for k × 500 ms** (moon#1294). Every connection-path eviction gate
+  (monoio write gate, tokio per-command and MQ gates, script bridge, inline
+  SET) shares one reason-DEL backpressure bound per eviction run; past it the
+  remaining victims' DELs fail fast into `aof_reason_del_dropped` (counted,
+  logged, `aof_last_append_status:err`). One evicting write against a stalled
+  writer: 21.5–45.1 s → 0.52 s, both runtimes.
+
+- **Active expiry adapts to an expired backlog** (moon#1288). When a cycle runs
+  out of time with keys still due, the 1 ms tick drains the backlog in slices
+  capped at 25% of the shard and 1 ms per tick (a token bucket; a saturated
+  loop gets fewer slices). 1.84M keys expired during a 6 s stall clear in
+  ~5–6 s instead of ~4 min (7–8K → 300–370K keys/s; redis 7.0.15: 3.8 s), at
+  about +250 µs PING/GET p99 while it drains. Not on replicas; stands down when
+  the AOF channel is nearly full. New INFO `expired_time_cap_reached_count`,
+  `expire_cycle_cpu_milliseconds`.
+
+- **SSCAN pages a large set by position: O(COUNT) per call** (moon#1287). It
+  materialized and sorted the whole set on every call (a full scan of 1M
+  members ~9–10 min; now 2.1–2.7 s, redis 3.0–3.3 s), and a member removed
+  before the cursor could make it skip members present for the whole scan.
+  Small (intset/listpack) sets answer in one call with cursor 0, as redis does;
+  an intset answers in numeric order and `SSCAN key -1` is accepted as in
+  redis. A set rebuilt mid-scan (SUNIONSTORE/SINTERSTORE/SDIFFSTORE, RESTORE,
+  the cold tier, or another key's set moved in by RENAME / COPY REPLACE) is
+  detected at zero bytes per set and the scan continues on a hash-ordered
+  cursor that always terminates, so no member present for the whole scan is
+  skipped. One case is not detected: a copy of the scanned set itself,
+  modified and moved back onto it mid-scan, keeps its tag. HSCAN keeps the old path until
+  moon#1171's IndexMap.
+
+
 - **A stalled shard no longer replays every missed periodic tick** (moon#1280).
   Every interval now skips missed ticks (both runtimes; `clippy.toml` forbids
   the raw constructors), the monoio chores are due by elapsed time instead of
@@ -429,6 +461,105 @@ shared 4-vCPU Linux container against HEAD `935c555` — re-measure on the GCE r
   and reads in chunks on a CDC read pool (a poll at a ~1M-record tail 5.8 s → 0.17 ms).
 
 ### Fixed
+
+- **A crash while a boot opened a fresh AOF generation could bring back cold
+  keys deleted before the switch to `--appendonly yes`** (moon#1293). The
+  manifest committed before each incr file's `MOON.COLDCUT` head (and its cold
+  `DEL`s) was written, so a crash between the two left a headless generation
+  that the next boot replayed ungated: 88–167 of 88–167 deleted probes came back
+  across both runtimes at `--shards` 1 and 4. Every head is now written and
+  fsynced (with its directory entry) before the manifest commits; a crash before
+  the commit leaves no manifest and the next boot redoes the initialization.
+  Every newly created data, offload or AOF directory (binary and embedded
+  entry) has its entry fsynced too; a pre-existing ancestor on a filesystem
+  without directory fsync (squashfs, vboxsf, WSL1 drvfs: `EINVAL`) or that
+  the process may not open is skipped, not a boot failure.
+
+- **Cold-key graves survive a smaller `--databases` and a failed spill commit**
+  (moon#1291). Restarting a no-AOF server with fewer databases aborted the
+  snapshot load before its graves trailer, so every deleted cold key of the
+  dropped databases came back at the next restart with the original count
+  (129–173 probes per run); out-of-range databases are now skipped and their
+  graves carried forward. A failed manifest commit during a no-AOF durable
+  spill no longer leaves the file listed with slots neither indexed nor graved.
+
+- **With `--appendonly no --disk-offload enable`, eviction lost keys instead of
+  tiering them** (moon#1290). The connection write gates and the cross-shard
+  gate had no manifest to spill durably with and plain-dropped victims: 3.3–5.4K
+  of 16.2K keys were gone in the repro, with no error to the client. They now
+  tier every victim durably (0 lost, including after BGSAVE + kill -9), and so
+  does a script routed to another shard at `--shards` ≥ 2 (EVAL, FCALL, or a
+  script inside a routed MULTI: 1.5–2.2K of 16K keys were lost). The
+  async-spill route is chosen by whether an AOF writer exists, not by the
+  `CONFIG SET appendonly` string. Cost: without an AOF each spill batch is
+  fsynced and committed on the shard thread, so a write flood over `maxmemory`
+  runs at the durable spill rate (monoio `--shards 4`: ~150–160K rps with the
+  1024-entry / 1 MiB batches, where it used to run 315–559K rps while dropping
+  keys); AOF-backed tiering is unaffected (~170–195K rps).
+
+- **`TXN.ABORT` is durable and replicated on both runtimes** (moon#1285,
+  moon#1185 option b). An aborted write used to come back after a kill -9
+  restart (both runtimes) and stayed on replicas: the forward writes reached the
+  AOF and the replica stream, the rollback only memory. The abort now logs
+  compensating records stamped with the fold epoch — `DEL` for an undone insert,
+  `RESTORE … REPLACE ABSTTL` (plus `HPEXPIREAT` per field deadline) for an undone
+  update or delete — and moves each replaced value into an in-flight BGSAVE's
+  pre-image, so the image stays point-in-time. A `SELECT` inside a transaction
+  no longer makes the abort restore into the wrong database. Vector / text
+  documents of restored keys are rebuilt live and on replicas (`RESTORE` now
+  updates FT indexes, keeping `FT.SEARCH … AS_OF` history). Graph rollbacks were
+  never logged at all; they are now WAL-logged and replicated, with three new
+  WAL records (`GRAPH.DELPROP`, `GRAPH.UNDELETENODE`, `GRAPH.UNDELETEEDGE`;
+  fuzz target `graph_wal_replay`). `TXN.ABORT` answers the AOF's refusal instead
+  of `+OK` when its records cannot be queued (the rollback is applied either
+  way); a refused rollback record on the disconnect / dirty-COMMIT path is
+  counted (`aof_backpressure_dropped`) and logged, never silent. Cost: the abort DUMPs each restored value, O(value) on the shard thread
+  (a 200k-field hash: ~11 ms more).
+
+- **`TXN.ABORT` no longer answers `+OK` when its graph rollback records were
+  dropped** (moon#1285, PR #1301 review). The rollback's WAL records went
+  through an unchecked `try_send` into the shard's 4096-slot append channel: a
+  6000-node transaction answered `+OK`, showed 0 nodes live, and brought 1904
+  aborted nodes back after kill -9, on the local leg and on a remote shard's
+  leg. The records are now appended checked and in order (the WAL holds a
+  prefix of the rollback, never a gap). A refusal answers
+  `MOONERR WAL backpressure: TXN rolled back in memory, but its graph rollback
+  records were not all queued for persistence; ...`, is counted in
+  `INFO persistence` `txn_rollback_wal_dropped`, and a remote shard's rollback
+  that was not delivered or not acknowledged fails the abort too. Durability
+  matches forward graph writes (no reply waits for a WAL fsync), so abort
+  latency is unchanged. A rollback larger than the free channel capacity
+  (about 4096 records per shard) now always answers this error.
+
+- **Writes made by `EVAL`, `EVALSHA` or `FCALL` inside an open `TXN` are rolled
+  back by `TXN.ABORT`** (moon#1285, PR #1301 review) — live, after a restart and
+  on replicas. They used to bypass the transaction's undo log, so the abort
+  left them in place. Each key a script writes is pre-image captured once,
+  before its first write, and joins the transaction's undo log when the script
+  returns. A write a script cannot run — one only a connection-level handler
+  serves (blocking pops, `FCALL`, `MQ`, `WS`, `FT.*`, `GRAPH.*`, `FUNCTION`,
+  `TEMPORAL.*`), an argv its arity rejects (too short, or longer than an exact
+  arity: `SETNX k v extra`), or a write that answers any other error
+  (`SET k v BADOPT`, `MOVE k <same db>`, WRONGTYPE) — captures nothing, so the
+  abort never restores over another client's write. Nor does a write-flagged
+  command that only READS its keys (`SORT src` or `GEORADIUS src ...` without
+  `STORE`), on the connection or from a script: it captured `src`, and the
+  abort restored `src` over concurrent writes, logged to the AOF and replicas. A malformed write on the connection itself is still captured
+  (a pre-existing limit). **Behaviour change:** inside a TXN, a
+  script's `FLUSHDB`, `FLUSHALL`, `SWAPDB`, `MOVE` or `COPY … DB`, or an
+  arity-valid write whose keys cannot be enumerated (a malformed `LMPOP`,
+  `ZMPOP` or `XREADGROUP`), is refused with
+  `ERR TXN cannot roll back this command from a script …`, and a read-write
+  script whose keys live on another shard is refused with the TXN cross-shard
+  error (`EVAL_RO` / `EVALSHA_RO` / `FCALL_RO` and an `FCALL` of a function
+  registered `no-writes` still route). Both refusals poison the TXN, each
+  refused command counting once. A function registered `no-writes` now runs
+  read-only under plain `FCALL` as well, as in Redis: a write from it answers
+  `ERR Write commands are not allowed from read-only scripts.` — an ordinary
+  command error, as in Redis 7: `redis.call` raises it and `redis.pcall`
+  returns it as `{err = ...}` (also for `EVAL_RO` / `FCALL_RO`, where it used
+  to be raised even from `redis.pcall`). Cost: none outside a TXN; ~0.7 µs per
+  captured write inside one.
 
 - **Without an AOF, a deleted cold key came back after `BGSAVE` + kill -9**
   (moon#1281). The durable state is the last snapshot plus every listed spill

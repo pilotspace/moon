@@ -115,6 +115,10 @@ jobs:
   # was deleted, flushed or overwritten (no settle before the mutation).
   # moon#1260 / moon#1236: the `--appendonly no` cases (a promoted,
   # flushed or TTL-overwritten inherited cold key and a kill -9).
+  # moon#1293 / moon#1291 / moon#1290: a crash inside the boot-time AOF
+  # generation creation (MOON_TEST_AOF_INIT_CRASH), a restart with a smaller
+  # `--databases`, and no-AOF write-gate tiering — ~45 + ~21 + ~27 s per
+  # shard count.
   #
   # Its own job (it ran as a step of `nightly`, whose 30 min it outgrew):
   # measured 2026-09-26, debug builds, per shard count — del_rewrite
@@ -137,14 +141,17 @@ jobs:
       - name: Build release binary + the cold-tier suites
         run: |
           cargo build --release --bin moon --test crash_recovery_cold_del_rewrite \
-            --test crash_recovery_cold_del_inflight_1253 --test crash_recovery_cold_no_aof
+            --test crash_recovery_cold_del_inflight_1253 --test crash_recovery_cold_no_aof \
+            --test crash_aof_init_generation_1293 --test cold_graves_reduced_databases_1291 \
+            --test tiering_no_aof_write_gate_1290
       - name: Cold-tier DEL survives rewrite + restart (moon#1215), --shards 4 and 1
         run: |
           export MOON_BIN="$CARGO_TARGET_DIR/release/moon"
           touch "$RUNNER_TEMP/cold-tier-start"  # failed cases' preserved dirs are newer
           for s in 4 1; do
             for t in crash_recovery_cold_del_rewrite crash_recovery_cold_del_inflight_1253 \
-              crash_recovery_cold_no_aof; do
+              crash_recovery_cold_no_aof crash_aof_init_generation_1293 \
+              cold_graves_reduced_databases_1291 tiering_no_aof_write_gate_1290; do
               MOON_TEST_COLD_DEL_SHARDS=$s cargo test --release --test "$t" \
                 -- --ignored --test-threads=1 2>&1 | tee -a cold-tier-nightly.log
               test "${PIPESTATUS[0]}" -eq 0 || exit 1

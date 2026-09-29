@@ -3138,9 +3138,15 @@ mod tests {
                 "server/conn/handler_sharded/mod.rs",
                 include_str!("../server/conn/handler_sharded/mod.rs"),
             ),
+            // moon#1290 wave-1 NIT: `scripting/bridge.rs` became a
+            // directory module; the write-back lives in `eviction_ctx.rs`.
             (
-                "scripting/bridge.rs",
-                include_str!("../scripting/bridge.rs"),
+                "scripting/bridge/eviction_ctx.rs",
+                include_str!("../scripting/bridge/eviction_ctx.rs"),
+            ),
+            (
+                "scripting/bridge/redis_call.rs",
+                include_str!("../scripting/bridge/redis_call.rs"),
             ),
         ];
         let mut lowering: Vec<String> = Vec::new();

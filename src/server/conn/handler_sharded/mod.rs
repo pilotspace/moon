@@ -1316,6 +1316,21 @@ pub(crate) async fn handle_connection_sharded_inner<
                         // shard this script may route to.
                         let script_acl = conn.script_acl(&ctx.acl_table)
                         .with_caller(conn.tracking_state.script_caller(conn.client_id));
+                        // moon#1285 (PR #1301 review): a read-write script
+                        // bound for another shard inside a TXN is refused —
+                        // its writes could not be undone here.
+                        if let Some(refused) =
+                            crate::server::conn::txn_script_undo::routed_script_refusal(
+                                cmd,
+                                cmd_args,
+                                conn.in_cross_txn(),
+                                ctx,
+                            )
+                        {
+                            conn.mark_cross_txn_rejected(cmd);
+                            responses.push(refused);
+                            continue;
+                        }
                         if let Some(routed) = crate::server::conn::shared::route_script_elsewhere(
                             cmd,
                             cmd_args,
@@ -1334,10 +1349,15 @@ pub(crate) async fn handle_connection_sharded_inner<
                         // than `with_shard_db`, so a `redis.call('FLUSHALL')`
                         // finishes on the other fifteen databases once this
                         // one's `&mut` borrow has ended.
-                        let (response, pending_flush) = crate::shard::slice::with_shard(|s| {
+                        // moon#1285: inside a TXN the script's writes are
+                        // undo-captured.
+                        let selected_db = conn.selected_db;
+                        let (response, pending_flush) = crate::server::conn::txn_script_undo::run_local_script(
+                            conn.active_cross_txn.as_deref_mut(),
+                            || crate::shard::slice::with_shard(|s| {
                             crate::scripting::pending_flush::run_and_complete(
                                 s,
-                                conn.selected_db,
+                                selected_db,
                                 crate::blocking::wakeup::ScriptWakes::Serve(&ctx.blocking_registry),
                                 |db| {
                             // This handler refreshes the clock per command in
@@ -1346,19 +1366,19 @@ pub(crate) async fn handle_connection_sharded_inner<
                             if script_is_eval {
                                 crate::scripting::handle_eval(
                                     &ctx.lua, &ctx.script_cache, cmd_args, db,
-                                    ctx.shard_id, ctx.num_shards, conn.selected_db, db_count,
+                                    ctx.shard_id, ctx.num_shards, selected_db, db_count,
                                     &script_acl, script_read_only,
                                 )
                             } else {
                                 crate::scripting::handle_evalsha(
                                     &ctx.lua, &ctx.script_cache, cmd_args, db,
-                                    ctx.shard_id, ctx.num_shards, conn.selected_db, db_count,
+                                    ctx.shard_id, ctx.num_shards, selected_db, db_count,
                                     &script_acl, script_read_only,
                                 )
                             }
                                 },
                             )
-                        });
+                        }));
                         // moon#831: read the write flag BEFORE the await —
                         // thread-local; another connection's script can run
                         // on this thread during the yield.
@@ -1487,9 +1507,26 @@ pub(crate) async fn handle_connection_sharded_inner<
                             // shard owning the key instead of refusing
                             // CROSSSLOT because the key is not local. Same
                             // helper as handler_monoio — one routing policy.
+                            // moon#1285 (PR #1301 review): see the EVAL arm.
+                            if let Some(refused) =
+                                crate::server::conn::txn_script_undo::routed_script_refusal(
+                                    cmd,
+                                    cmd_args,
+                                    conn.in_cross_txn(),
+                                    ctx,
+                                )
+                            {
+                                conn.mark_cross_txn_rejected(cmd);
+                                responses.push(refused);
+                                continue;
+                            }
                             if let Some(routed) =
                                 crate::server::conn::shared::route_script_elsewhere(
-                                    cmd,
+                                    crate::server::conn::txn_script_undo::routed_script_cmd(
+                                        cmd,
+                                        cmd_args,
+                                        conn.in_cross_txn(),
+                                    ),
                                     cmd_args,
                                     conn.selected_db,
                                     &script_acl,
@@ -1513,10 +1550,15 @@ pub(crate) async fn handle_connection_sharded_inner<
                             let reg = guard.as_ref().unwrap();
                             // Unconditional slice path: ShardSlice is always initialized.
                             // moon#685: see the EVAL arm above.
-                            crate::shard::slice::with_shard(|s| {
+                            // moon#1285: inside a TXN the function's writes are
+                            // undo-captured.
+                            let selected_db = conn.selected_db;
+                            crate::server::conn::txn_script_undo::run_local_script(
+                                conn.active_cross_txn.as_deref_mut(),
+                                || crate::shard::slice::with_shard(|s| {
                                 crate::scripting::pending_flush::run_and_complete(
                                     s,
-                                    conn.selected_db,
+                                    selected_db,
                                     crate::blocking::wakeup::ScriptWakes::Serve(&ctx.blocking_registry),
                                     |db| {
                                 // Refresh the clock the function's expiry
@@ -1531,19 +1573,19 @@ pub(crate) async fn handle_connection_sharded_inner<
                                 if is_fcall {
                                     crate::command::functions::handle_fcall(
                                         reg, cmd_args, db,
-                                        ctx.shard_id, ctx.num_shards, conn.selected_db, db_count,
+                                        ctx.shard_id, ctx.num_shards, selected_db, db_count,
                                         &script_acl,
                                     )
                                 } else {
                                     crate::command::functions::handle_fcall_ro(
                                         reg, cmd_args, db,
-                                        ctx.shard_id, ctx.num_shards, conn.selected_db, db_count,
+                                        ctx.shard_id, ctx.num_shards, selected_db, db_count,
                                         &script_acl,
                                     )
                                 }
                                     },
                                 )
-                            })
+                            }))
                             };
                             // moon#831: read BEFORE the await — see the EVAL arm.
                             let wrote = crate::scripting::bridge::take_script_had_write();
@@ -2582,6 +2624,10 @@ pub(crate) async fn handle_connection_sharded_inner<
                                     // (round-2b review MAJOR-3: without it the AOF replayed
                                     // every evicted key back after a restart).
                                     let sel_db = conn.selected_db;
+                                    // moon#1294: ONE AOF backpressure bound per
+                                    // eviction run, shared by every victim.
+                                    let mut aof_budget =
+                                        crate::persistence::aof::AOF_REASON_DEL_BACKPRESSURE_BOUND;
                                     let mut report_eviction_del = |key: &[u8]| {
                                         crate::replication::reason_del::record_reason_del_conn(
                                             &ctx.repl_state,
@@ -2590,6 +2636,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                                             ctx.aof_pool.as_ref(),
                                             sel_db,
                                             key,
+                                            &mut aof_budget,
                                         );
                                     };
                                     let evict_result = if let Some(ref sender) = ctx.spill_sender {
@@ -2598,18 +2645,23 @@ pub(crate) async fn handle_connection_sharded_inner<
                                             .disk_offload_dir
                                             .as_deref()
                                             .unwrap_or(std::path::Path::new("."));
-                                        let res = evict_to_budget(
-                                            db,
-                                            &rt,
-                                            EvictionRun::async_spill(
-                                                sender,
-                                                dir,
-                                                &mut fid,
-                                                conn.selected_db,
-                                                None,
-                                            )
-                                            .budget(budget)
-                                            .report(&mut report_eviction_del),
+                                        // moon#1290 N6: tier durably without an AOF.
+                                        let res = crate::shard::manifest_cell::with_manifest(
+                                            |manifest| {
+                                                evict_to_budget(
+                                                    db,
+                                                    &rt,
+                                                    EvictionRun::async_spill(
+                                                        sender,
+                                                        dir,
+                                                        &mut fid,
+                                                        conn.selected_db,
+                                                        manifest,
+                                                    )
+                                                    .budget(budget)
+                                                    .report(&mut report_eviction_del),
+                                                )
+                                            },
                                         );
                                         ctx.spill_file_id.set(ctx.spill_file_id.get().max(fid));
                                         res
@@ -2668,7 +2720,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                                         for arg in cmd_args.iter() {
                                             if let Frame::BulkString(key_bytes) = arg {
                                                 if let Some(old_entry) = db.get(key_bytes.as_ref()).cloned() {
-                                                    txn.kv_undo.record_delete(key_bytes.clone(), old_entry);
+                                                    txn.kv_undo.record_delete(conn.selected_db, key_bytes.clone(), old_entry);
                                                     let lsn = txn.snapshot_lsn;
                                                     let tid = txn.txn_id;
                                                     // Direct field access — `s` is this
@@ -2687,20 +2739,17 @@ pub(crate) async fn handle_connection_sharded_inner<
                                         // TXN ABORT. `written_keys` is filtered to
                                         // `KeyRole::Write`, so reads stay out of
                                         // `kv_write_intents`.
+                                        // An unenumerable argv falls back to
+                                        // the primary key; a write-free one
+                                        // (`SORT src`) captures nothing.
                                         let lsn = txn.snapshot_lsn;
                                         let tid = txn.txn_id;
-                                        let mut written =
-                                            crate::tracking::invalidation::written_keys(cmd, cmd_args);
-                                        if written.is_empty()
-                                            && let Some(key) =
-                                                crate::server::conn::shared::extract_primary_key(cmd, cmd_args)
-                                        {
-                                            written.push(key.clone());
-                                        }
+                                        let written =
+                                            crate::transaction::conn_txn_capture_keys(cmd, cmd_args);
                                         for key in written {
                                             match db.get(key.as_ref()).cloned() {
-                                                None => txn.kv_undo.record_insert(key.clone()),
-                                                Some(entry) => txn.kv_undo.record_update(key.clone(), entry),
+                                                None => txn.kv_undo.record_insert(conn.selected_db, key.clone()),
+                                                Some(entry) => txn.kv_undo.record_update(conn.selected_db, key.clone(), entry),
                                             }
                                             // Direct field access — see DEL/UNLINK arm above.
                                             s.kv_write_intents.record_write(key, lsn, tid);
@@ -2835,6 +2884,26 @@ pub(crate) async fn handle_connection_sharded_inner<
                                         conn.selected_db,
                                     );
                                 });
+                            }
+                            // moon#1285: RESTORE replaces a whole value — rebuild the
+                            // key's documents from what it holds now (also the
+                            // replay half of TXN.ABORT's restore).
+                            if !matches!(response, Frame::Error(_))
+                                && cmd.eq_ignore_ascii_case(b"RESTORE")
+                            {
+                                if let Some(key) = cmd_args.first().and_then(|f| extract_bytes(f)) {
+                                    let db_index = conn.selected_db;
+                                    crate::shard::slice::with_shard(|s| {
+                                        let guard = s.databases.read(db_index);
+                                        crate::shard::write_hooks::reindex_key_from_keyspace(
+                                            &mut s.vector_store,
+                                            &mut s.text_store,
+                                            &guard,
+                                            &key,
+                                            db_index,
+                                        );
+                                    });
+                                }
                             }
                             // R4: HDEL of an indexed VECTOR field tombstones the vector
                             // in exactly the affected indexes (whole-key deletion is the
@@ -3738,14 +3807,13 @@ pub(crate) async fn handle_connection_sharded_inner<
         // Box::pin (c10k future diet): this ~5.4 KB rollback state machine
         // otherwise sits inline in EVERY connection future; boxing costs one
         // alloc on the leaked-txn teardown path only.
-        Box::pin(crate::transaction::abort::abort_cross_store_txn_routed(
-            &ctx.shard_databases,
-            ctx.shard_id,
-            conn.selected_db,
-            ctx.num_shards,
-            &ctx.dispatch_tx,
-            &ctx.spsc_notifiers,
+        // A refusal is counted by the pool and logged by `abort_logged`
+        // (moon#1285 review MINOR 5); there is no client left to tell.
+        let _refused = Box::pin(crate::server::conn::txn_abort::abort_logged(
+            ctx,
             *txn,
+            None,
+            crate::server::conn::txn_abort::AbortCause::Disconnect,
         ))
         .await;
     }

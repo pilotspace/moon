@@ -322,6 +322,35 @@ impl ShardDatabases {
         }
     }
 
+    /// Checked, ordered append of a record SEQUENCE (moon#1285, PR #1301
+    /// review): `Ok(())` when every record was accepted by this shard's WAL
+    /// channel or persistence is disabled; otherwise `Err(dropped)`, the
+    /// number of records NOT enqueued.
+    ///
+    /// Stops at the first refusal, so what reached the WAL is always a
+    /// PREFIX of `records` — a replay applies the leading steps in order and
+    /// never a later step without an earlier one. Continuing would not save
+    /// more anyway: the only drainer of this channel is the shard's own event
+    /// loop, which cannot run while the caller holds its thread.
+    #[must_use = "a refused rollback record must be reported, never dropped silently"]
+    pub fn try_wal_append_all(
+        &self,
+        shard_id: usize,
+        record_type: WalRecordType,
+        records: Vec<bytes::Bytes>,
+    ) -> Result<(), usize> {
+        let Some(tx) = self.wal_append_txs[shard_id].get() else {
+            return Ok(()); // persistence disabled — no durability requirement
+        };
+        let total = records.len();
+        for (sent, data) in records.into_iter().enumerate() {
+            if tx.try_send((record_type, data)).is_err() {
+                return Err(total - sent);
+            }
+        }
+        Ok(())
+    }
+
     /// Acquire the process-global WorkspaceRegistry lock (C3 / M3).
     ///
     /// Workspaces are control-plane objects looked up by every connection

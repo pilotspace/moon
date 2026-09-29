@@ -202,6 +202,56 @@ pub fn serialize_set_label(graph_name: &[u8], node_id: u64, label: u16) -> Vec<u
     buf
 }
 
+/// Serialize `GRAPH.DELPROP <graph> <N|E> <entity_id> <key>` (moon#1285).
+///
+/// WAL-internal record: `TXN.ABORT` undoing a `SET` of a property the entity
+/// did not have before. Replayed with the `SETPROP` records, in WAL order.
+pub fn serialize_del_prop(graph_name: &[u8], entity_id: u64, is_node: bool, key: u16) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(80);
+    write_array_header(&mut buf, 5);
+    write_bulk(&mut buf, b"GRAPH.DELPROP");
+    write_bulk(&mut buf, graph_name);
+    write_bulk(&mut buf, if is_node { b"N" } else { b"E" });
+    write_bulk(&mut buf, itoa::Buffer::new().format(entity_id).as_bytes());
+    write_bulk(&mut buf, itoa::Buffer::new().format(key).as_bytes());
+    buf
+}
+
+/// Serialize `GRAPH.UNDELETENODE <graph> <node_id> <n> <edge_id>...`
+/// (moon#1285).
+///
+/// WAL-internal record: `TXN.ABORT` undoing a `DELETE` of a node, and of the
+/// incident edges that delete cascaded to — named explicitly, because replay
+/// removes everything at LSN 0 and cannot tell a cascaded edge from one
+/// deleted on its own. Replayed with the remove records, in WAL order.
+pub fn serialize_undelete_node(graph_name: &[u8], node_id: u64, edge_ids: &[u64]) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(80 + edge_ids.len() * 24);
+    write_array_header(&mut buf, 4 + edge_ids.len());
+    write_bulk(&mut buf, b"GRAPH.UNDELETENODE");
+    write_bulk(&mut buf, graph_name);
+    write_bulk(&mut buf, itoa::Buffer::new().format(node_id).as_bytes());
+    write_bulk(
+        &mut buf,
+        itoa::Buffer::new().format(edge_ids.len()).as_bytes(),
+    );
+    for id in edge_ids {
+        write_bulk(&mut buf, itoa::Buffer::new().format(*id).as_bytes());
+    }
+    buf
+}
+
+/// Serialize `GRAPH.UNDELETEEDGE <graph> <edge_id>` (moon#1285).
+///
+/// WAL-internal record: `TXN.ABORT` undoing a `DELETE` of an edge.
+pub fn serialize_undelete_edge(graph_name: &[u8], edge_id: u64) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(64);
+    write_array_header(&mut buf, 3);
+    write_bulk(&mut buf, b"GRAPH.UNDELETEEDGE");
+    write_bulk(&mut buf, graph_name);
+    write_bulk(&mut buf, itoa::Buffer::new().format(edge_id).as_bytes());
+    buf
+}
+
 /// Serialize a property value as two RESP bulk strings: type tag + value.
 fn serialize_property_value(buf: &mut Vec<u8>, val: &PropertyValue) {
     match val {

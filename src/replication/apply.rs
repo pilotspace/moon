@@ -879,6 +879,22 @@ fn apply_index_parity_hooks(
         // otherwise the replica resurrects it on its own restart even
         // though the master's copy stayed correctly deleted.
         crate::shard::mq_exec::auto_drop_mq_streams(s, args, db_index as usize);
+    } else if cmd.eq_ignore_ascii_case(b"RESTORE") {
+        // moon#1285: a replicated RESTORE (a master's, or the compensating
+        // record of a master's TXN.ABORT) replaced the whole value.
+        if let Some(key) = args
+            .first()
+            .and_then(crate::server::connection::extract_bytes)
+        {
+            let guard = s.databases.read(db_index as usize);
+            crate::shard::write_hooks::reindex_key_from_keyspace(
+                &mut s.vector_store,
+                &mut s.text_store,
+                &guard,
+                key.as_ref(),
+                db_index as usize,
+            );
+        }
     } else if cmd.eq_ignore_ascii_case(b"HDEL") {
         hooks::auto_hdel_vectors(&mut s.vector_store, args, db_index);
     } else if cmd.eq_ignore_ascii_case(b"FLUSHDB") || cmd.eq_ignore_ascii_case(b"FLUSHALL") {

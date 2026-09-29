@@ -1,6 +1,7 @@
 mod set_algebra;
 mod set_read;
 mod set_write;
+mod sscan_cursor;
 
 use crate::protocol::Frame;
 
@@ -106,6 +107,10 @@ pub use set_write::sunionstore;
 mod algebra_tests;
 #[cfg(test)]
 mod smove_cold_fault_tests;
+#[cfg(test)]
+mod sscan_rewrite_review_tests;
+#[cfg(test)]
+mod sscan_tests;
 
 #[cfg(test)]
 mod tests {

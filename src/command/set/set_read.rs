@@ -5,7 +5,7 @@ use crate::framevec;
 use crate::protocol::Frame;
 use crate::storage::Database;
 
-use super::{glob_match, parse_int, set_algebra};
+use super::{glob_match, parse_int, set_algebra, sscan_cursor};
 use crate::command::helpers::{err_wrong_args, extract_bytes};
 
 // ---------------------------------------------------------------------------
@@ -468,9 +468,10 @@ pub fn sscan_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
         Some(k) => k,
         None => return err_wrong_args("SSCAN"),
     };
-    let cursor: usize = match extract_bytes(&args[1])
-        .and_then(|b| std::str::from_utf8(b).ok())
-        .and_then(|s| s.parse().ok())
+    // redis 7.0.15 `parseScanCursorOrReply` (strtoul): `-1`, `+0` and an
+    // empty cursor are accepted (see `scan_options::parse_scan_cursor`).
+    let cursor = match extract_bytes(&args[1])
+        .and_then(|b| crate::command::scan_options::parse_scan_cursor(b))
     {
         Some(c) => c,
         None => return Frame::Error(Bytes::from_static(b"ERR invalid cursor")),
@@ -485,39 +486,42 @@ pub fn sscan_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
     };
     let match_pattern = opts.pattern;
     let count = opts.count;
-    let members: Vec<Bytes> = match db.get_set_ref_if_alive(key, now_ms) {
-        Ok(Some(sref)) => {
-            let mut v = sref.members();
-            v.sort();
-            v
+    match db.get_set_ref_if_alive(key, now_ms) {
+        // moon#1287: the full encoding pages by POSITION, O(COUNT) per call,
+        // and falls back to a hash-ordered walk when the set was replaced
+        // mid-scan (wave-1 review F1) — see `sscan_cursor`.
+        Ok(Some(crate::storage::db_read::SetRef::Hash(set))) => {
+            sscan_cursor::sscan_page(set, cursor, count, match_pattern, true)
         }
-        Ok(None) => vec![],
-        Err(e) => return e,
-    };
-    let total = members.len();
-    let mut results = Vec::new();
-    let mut pos = cursor;
-    let mut checked = 0;
-    while pos < total && checked < count {
-        let member = &members[pos];
-        pos += 1;
-        checked += 1;
-        if let Some(pattern) = match_pattern {
-            if !glob_match(pattern, member) {
-                continue;
+        // Decoded fresh from the cold tier on every call: a new layout each
+        // time, so it is walked in hash order from the start.
+        Ok(Some(crate::storage::db_read::SetRef::Owned(set))) => {
+            sscan_cursor::sscan_page(&set, cursor, count, match_pattern, false)
+        }
+        // Compact encodings (intset / listpack, a few hundred members at
+        // most) answer in ONE call with cursor 0, whatever the cursor and
+        // COUNT — redis does the same for them. A small set never has a
+        // scan cursor in flight, so none can be misread after the set grows
+        // into the full encoding mid-scan.
+        Ok(Some(small)) => {
+            let numeric = matches!(small, crate::storage::db_read::SetRef::Intset(_));
+            let mut members = small.members();
+            // An intset iterates in ascending NUMERIC order, the order redis
+            // answers it in (`1 2 3 10`, not the byte order `1 10 2 3`).
+            if !numeric {
+                members.sort_unstable();
             }
+            let mut results = Vec::with_capacity(members.len());
+            for member in members {
+                if match_pattern.is_none_or(|p| glob_match(p, &member)) {
+                    results.push(Frame::BulkString(member));
+                }
+            }
+            sscan_cursor::scan_reply(0, results)
         }
-        results.push(Frame::BulkString(member.clone()));
+        Ok(None) => sscan_cursor::scan_reply(0, Vec::new()),
+        Err(e) => e,
     }
-    let next_cursor = if pos >= total {
-        Bytes::from_static(b"0")
-    } else {
-        Bytes::from(pos.to_string())
-    };
-    Frame::Array(framevec![
-        Frame::BulkString(next_cursor),
-        Frame::Array(results.into()),
-    ])
 }
 
 // ---------------------------------------------------------------------------

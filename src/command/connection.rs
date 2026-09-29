@@ -511,6 +511,7 @@ fn info_raw(db: &Database, facts: &InstanceFacts) -> String {
          aof_backpressure_stalls:{}\r\n\
          aof_backpressure_refused:{}\r\n\
          aof_append_backpressure_refusals:{}\r\n\
+         txn_rollback_wal_dropped:{}\r\n\
          aof_last_fsync_status:{}\r\n\
          aof_fsync_failures:{}\r\n\
          aof_last_append_status:{}\r\n\
@@ -589,6 +590,10 @@ fn info_raw(db: &Database, facts: &InstanceFacts) -> String {
         // past `--aof-fsync-timeout-ms` (or the rewrite overflow cap) — NOT
         // fsync failures, which are counted in `aof_fsync_failures`.
         crate::persistence::aof::AOF_APPEND_BACKPRESSURE_REFUSALS
+            .load(std::sync::atomic::Ordering::Relaxed),
+        // moon#1285 (PR #1301 review): graph rollback WAL records a
+        // TXN.ABORT could not enqueue; its client was answered the refusal.
+        crate::transaction::abort::ROLLBACK_WAL_RECORDS_DROPPED
             .load(std::sync::atomic::Ordering::Relaxed),
         if crate::persistence::aof::aof_last_fsync_ok() {
             "ok"
@@ -765,6 +770,8 @@ fn info_raw(db: &Database, facts: &InstanceFacts) -> String {
         "keyspace_hits:{}\r\n\
          keyspace_misses:{}\r\n\
          expired_keys:{}\r\n\
+         expired_time_cap_reached_count:{}\r\n\
+         expire_cycle_cpu_milliseconds:{}\r\n\
          evicted_keys:{}\r\n\
          spilled_keys:{}\r\n\
          rejected_connections:{}\r\n\
@@ -779,6 +786,9 @@ fn info_raw(db: &Database, facts: &InstanceFacts) -> String {
         crate::admin::metrics_setup::keyspace_hits(),
         crate::admin::metrics_setup::keyspace_misses(),
         crate::admin::metrics_setup::expired_keys(),
+        // moon#1288: the adaptive active-expiry cycle (redis parity names).
+        crate::server::expire_adaptive::expired_time_cap_reached_count(),
+        crate::server::expire_adaptive::expire_cycle_cpu_milliseconds(),
         crate::admin::metrics_setup::evicted_keys(),
         // moon#585: keys the disk-offload tier moved out of RAM. NOT
         // evictions — they are still in `DBSIZE` and still readable. This is

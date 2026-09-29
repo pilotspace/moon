@@ -129,6 +129,17 @@ pub(super) fn record_local_write_db(ctx: &ConnectionContext, db: usize, bytes: B
     }
 }
 
+/// The recorder a `TXN.ABORT` rollback replicates its compensating records
+/// through (moon#1285): [`record_local_write_db`] when this connection's
+/// writes reach replicas, else `None`.
+#[inline]
+pub(super) fn abort_replicator(
+    ctx: &ConnectionContext,
+) -> Option<crate::server::conn::txn_abort::ReplicationRecorder> {
+    replication_fanout_active(ctx)
+        .then_some(record_local_write_db as crate::server::conn::txn_abort::ReplicationRecorder)
+}
+
 /// Handle FT.* commands. Returns `true` if the command was consumed.
 ///
 /// Caller should `continue` the frame loop when this returns `true`.

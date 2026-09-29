@@ -517,7 +517,10 @@ pub fn recover_shard_v3_pitr(
                 // the WAL tail resurrects via cold read-through after restart
                 // whenever the crash lands inside the pre-orphan-sweep window
                 // (the manifest entry is still Active until the sweep).
-                for (db_index, cold_idx) in per_db {
+                // moon#1291 F8: graves of dbs this boot cannot attach.
+                let mut unattached_graves =
+                    crate::storage::tiered::slot_graves::SlotGraves::default();
+                for (db_index, mut cold_idx) in per_db {
                     info!(
                         "Shard {}: rebuilt cold index for db {} with {} entries",
                         shard_id,
@@ -537,7 +540,12 @@ pub fn recover_shard_v3_pitr(
                             // was written under. The keys are unreachable either
                             // way (their db no longer exists); refuse to attach
                             // them to a WRONG db and say so loudly instead of
-                            // silently resurrecting them elsewhere.
+                            // silently resurrecting them elsewhere. Their files
+                            // stay listed, so their graves must reach the next
+                            // snapshot's trailer (moon#1291 F8): a boot with the
+                            // original count re-attaches them, and without the
+                            // graves every key deleted before this boot is back.
+                            unattached_graves.merge(cold_idx.take_graves());
                             tracing::warn!(
                                 shard_id,
                                 db_index,
@@ -548,6 +556,17 @@ pub fn recover_shard_v3_pitr(
                             );
                         }
                     }
+                }
+                // The trailer is keyed by file id, not db: carry them in db 0's
+                // index (files are never re-issued, so no slot can collide).
+                if !unattached_graves.is_empty()
+                    && let Some(db0) = databases.first_mut()
+                {
+                    db0.cold_shard_dir
+                        .get_or_insert_with(|| shard_dir.to_path_buf());
+                    db0.cold_index
+                        .get_or_insert_with(crate::storage::tiered::cold_index::ColdIndex::new)
+                        .adopt_graves(unattached_graves);
                 }
                 crate::storage::tiered::snapshot_hold::drop_cold_shadows_of_expired_image_keys(
                     databases,

@@ -4,6 +4,7 @@ pub mod conn;
 #[cfg(feature = "runtime-tokio")]
 pub mod embedded;
 pub mod expiration;
+pub mod expire_adaptive;
 pub mod listener;
 pub mod response_slot;
 pub mod shutdown;

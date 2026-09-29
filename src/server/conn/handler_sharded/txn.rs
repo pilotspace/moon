@@ -82,14 +82,14 @@ pub(super) async fn try_handle_txn_commit(
                         rejected,
                         txn.first_rejected_cmd.as_deref(),
                     );
-                    Box::pin(crate::transaction::abort::abort_cross_store_txn_routed(
-                        &ctx.shard_databases,
-                        ctx.shard_id,
-                        conn.selected_db,
-                        ctx.num_shards,
-                        &ctx.dispatch_tx,
-                        &ctx.spsc_notifiers,
+                    // A refusal is counted by the pool and logged by
+                    // `abort_logged` (moon#1285 review MINOR 5); the client is
+                    // answered the commit error either way.
+                    let _refused = Box::pin(crate::server::conn::txn_abort::abort_logged(
+                        ctx,
                         *txn,
+                        None,
+                        crate::server::conn::txn_abort::AbortCause::DirtyCommit,
                     ))
                     .await;
                     responses.push(err);
@@ -297,17 +297,19 @@ pub(super) async fn try_handle_txn_abort(
                 // Box::pin (c10k future diet): keeps the ~5.4 KB rollback
                 // state machine out of the per-connection future; the alloc
                 // only happens when TXN.ABORT actually executes.
-                Box::pin(crate::transaction::abort::abort_cross_store_txn_routed(
-                    &ctx.shard_databases,
-                    ctx.shard_id,
-                    conn.selected_db,
-                    ctx.num_shards,
-                    &ctx.dispatch_tx,
-                    &ctx.spsc_notifiers,
+                let logged = Box::pin(crate::server::conn::txn_abort::abort_logged(
+                    ctx,
                     *txn,
+                    None,
+                    crate::server::conn::txn_abort::AbortCause::Explicit,
                 ))
                 .await;
-                responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
+                // moon#1285: the rollback is applied either way; a refused
+                // AOF append means its durability is not guaranteed — say so.
+                responses.push(match logged {
+                    Ok(()) => Frame::SimpleString(Bytes::from_static(b"OK")),
+                    Err(reply) => Frame::Error(reply),
+                });
             } else {
                 responses.push(Frame::Error(Bytes::from_static(b"ERR not in transaction")));
             }

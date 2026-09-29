@@ -866,8 +866,10 @@ pub(crate) fn capture_wake_pre_image(db: &Database, db_index: usize, key: &Bytes
 /// apply), the owner-side `MQ` subcommands and their TXN / replica siblings,
 /// and the stream waker's group reads. Each of them reaches the keyspace
 /// through `Database` methods directly, so no dispatch hook sees the key.
-/// `TXN.ABORT`'s KV undo (`transaction::abort`) writes through `Database`
-/// directly too, and is NOT a caller.
+/// `TXN.ABORT`'s KV undo (`transaction::kv_compensation`, moon#1285) is a
+/// caller too, for a key that is ABSENT when the undo restores it (its
+/// epoch-start state is "absent"); a present value it replaces is handed over
+/// by move through [`capture_removed_sized`] instead.
 ///
 /// `db` MUST be `databases[db_index]`. One thread-local `bool` load when no
 /// snapshot is in flight.

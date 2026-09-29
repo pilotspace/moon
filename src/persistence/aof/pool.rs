@@ -1080,7 +1080,13 @@ impl AofWriterPool {
         }
         match self.sender(shard_id).try_send(msg) {
             Ok(()) => return Ok(()),
-            Err(flume::TrySendError::Disconnected(_)) => return Err(AofAck::WriteFailed),
+            Err(flume::TrySendError::Disconnected(_)) => {
+                // A dead writer drops the record like a full one: count it,
+                // so a refusal a caller cannot report (a disconnect-time
+                // TXN rollback, moon#1285 review) is never silent.
+                super::record_append_dropped(self.overflow_for(shard_id), 1);
+                return Err(AofAck::WriteFailed);
+            }
             Err(flume::TrySendError::Full(returned)) => msg = returned,
         }
         // Channel full: if a fold is in progress, spill instead of parking —
@@ -1116,7 +1122,11 @@ impl AofWriterPool {
         if timeout.is_zero() {
             return match send_fut.await {
                 Ok(()) => Ok(()),
-                Err(_) => Err(AofAck::WriteFailed),
+                Err(_) => {
+                    // The writer died while this waited: counted as above.
+                    super::record_append_dropped(self.overflow_for(shard_id), 1);
+                    Err(AofAck::WriteFailed)
+                }
             };
         }
         let outcome: Result<(), AofAck>;
@@ -2751,6 +2761,35 @@ mod pool_tests {
         assert!(
             result.is_err(),
             "a dead writer must surface as Err so the caller never acks +OK"
+        );
+    }
+
+    /// moon#1285 review MINOR 5: a record refused by a DEAD writer is counted
+    /// in `aof_backpressure_dropped` like one refused by a full channel — a
+    /// caller that cannot report it (a disconnect-time TXN rollback) must
+    /// not make the loss silent.
+    #[test]
+    fn a_record_refused_by_a_dead_writer_is_counted_as_dropped() {
+        let (tx0, rx0) = channel::mpsc_bounded::<AofMessage>(4);
+        let (tx1, _rx1) = channel::mpsc_bounded::<AofMessage>(4);
+        drop(rx0); // writer gone
+        let pool = AofWriterPool::per_shard_with_policy(
+            vec![tx0, tx1],
+            FsyncPolicy::EverySec,
+            Duration::from_millis(50),
+        );
+        let before = AOF_BACKPRESSURE_DROPPED.load(std::sync::atomic::Ordering::Relaxed);
+        let result = futures::executor::block_on(pool.send_append_group(
+            0,
+            80,
+            0,
+            Bytes::from_static(b"RESTORE k 0 x REPLACE"),
+            FoldEpoch::INITIAL,
+        ));
+        assert_eq!(result, Err(AofAck::WriteFailed));
+        assert!(
+            AOF_BACKPRESSURE_DROPPED.load(std::sync::atomic::Ordering::Relaxed) > before,
+            "the dropped record must be counted"
         );
     }
 

@@ -39,6 +39,10 @@
 //! - `HDEL` → [`auto_hdel_vectors`]: a removed vector field tombstones it.
 //! - `FLUSHDB`/`FLUSHALL` → [`auto_flush_indexes`] (index contents; the
 //!   `FT.CREATE` definitions survive) and [`auto_drop_mq_streams_on_flush`].
+//! - `RESTORE` → [`reindex_key_from_keyspace`] (moon#1285): the command
+//!   replaces a whole value, so the key's documents are rebuilt from what it
+//!   holds now. It is also the replica/replay half of `TXN.ABORT`, whose
+//!   compensating record for a restored key is a `RESTORE … REPLACE`.
 //!
 //! The keyspace half of `FLUSHALL` (every other database of the shard) is NOT
 //! here: it needs the database guards, and each arm already runs it once its
@@ -64,6 +68,8 @@ pub(crate) enum HookKind {
     Hdel,
     FlushDb,
     FlushAll,
+    /// `RESTORE` (moon#1285): rebuild the key's documents from its value.
+    Restore,
 }
 
 /// Classify `cmd`. Length first: an ordinary write (`SET`, `INCR`, `LPUSH`,
@@ -77,6 +83,7 @@ pub(crate) fn hook_kind(cmd: &[u8]) -> HookKind {
         4 if cmd.eq_ignore_ascii_case(b"HDEL") => HookKind::Hdel,
         6 if cmd.eq_ignore_ascii_case(b"UNLINK") => HookKind::Delete,
         7 if cmd.eq_ignore_ascii_case(b"FLUSHDB") => HookKind::FlushDb,
+        7 if cmd.eq_ignore_ascii_case(b"RESTORE") => HookKind::Restore,
         8 if cmd.eq_ignore_ascii_case(b"FLUSHALL") => HookKind::FlushAll,
         _ => HookKind::None,
     }
@@ -146,7 +153,121 @@ pub(crate) fn run_post_write_hooks(
             );
             crate::shard::mq_exec::auto_drop_mq_streams_on_flush(s, db_index);
         }
+        HookKind::Restore => {
+            if let Some(Frame::BulkString(key)) = args.first() {
+                let guard = s.databases.read(db_index);
+                reindex_key_from_keyspace(
+                    &mut s.vector_store,
+                    &mut s.text_store,
+                    &guard,
+                    key,
+                    db_index,
+                );
+            }
+        }
     }
+}
+
+/// Rebuild `key`'s vector and text documents in database `db_index` from the
+/// value the key holds NOW in `db` (moon#1285).
+///
+/// For a writer that replaced the key's value wholesale outside `HSET`:
+/// `RESTORE` (live, replicated or replayed) and `TXN.ABORT`'s restore.
+///
+/// - A live hash is re-indexed exactly as an `HSET` of all its (unexpired)
+///   fields: the HSET path tombstones the key's previous vector MVCC-style,
+///   at the new insert's LSN, so `FT.SEARCH … AS_OF` a point before this
+///   write still sees the previous version (a `DEL`-style tombstone would
+///   erase it from every snapshot). An index whose vector field the hash
+///   does not carry drops the key, as an `HDEL` of that field would.
+/// - A key that is absent, expired or not a hash loses its documents, as
+///   after a `DEL`.
+///
+/// Free when no index exists on the shard (two length loads); otherwise one
+/// prefix lookup per store before anything is built.
+pub(crate) fn reindex_key_from_keyspace(
+    vector_store: &mut crate::vector::store::VectorStore,
+    text_store: &mut crate::text::store::TextStore,
+    db: &crate::storage::Database,
+    key: &[u8],
+    db_index: usize,
+) {
+    if vector_store.is_empty() && text_store.index_count() == 0 {
+        return;
+    }
+    let db_tag = db_index as u8;
+    let vector_indexes = vector_store.find_matching_index_names_for_db(key, db_tag);
+    if vector_indexes.is_empty()
+        && text_store
+            .find_matching_index_names_for_db(key, db_tag)
+            .is_empty()
+    {
+        return;
+    }
+    let Some(args) = hash_as_hset_args(db, key) else {
+        vector_store.mark_deleted_for_key_for_db(key, db_tag);
+        return;
+    };
+    for name in &vector_indexes {
+        let carries_vector = vector_store.get_index(name).is_some_and(|idx| {
+            idx.meta.vector_fields.first().is_some_and(|f| {
+                crate::shard::spsc_handler::find_vector_blob(
+                    &args,
+                    &f.field_name,
+                    f.dimension as usize,
+                )
+                .is_some()
+            })
+        });
+        if !carries_vector {
+            vector_store.mark_deleted_for_key_in_index(name, key);
+        }
+    }
+    let _ = crate::shard::spsc_handler::auto_index_hset_public(
+        vector_store,
+        text_store,
+        key,
+        &args,
+        db_tag,
+    );
+}
+
+/// `key f1 v1 f2 v2 …` for a live hash — the argument shape the `HSET`
+/// auto-indexer reads — or `None` when `key` holds no live hash. Fields whose
+/// own TTL has passed are left out.
+fn hash_as_hset_args(db: &crate::storage::Database, key: &[u8]) -> Option<Vec<Frame>> {
+    use crate::storage::compact_value::RedisValueRef;
+    let now_ms = db.now_ms();
+    let entry = db.peek_if_alive(key, now_ms)?;
+    let bulk = |b: &[u8]| Frame::BulkString(bytes::Bytes::copy_from_slice(b));
+    let mut args = vec![bulk(key)];
+    match entry.value.as_redis_value() {
+        RedisValueRef::Hash(map) => {
+            args.reserve(map.len() * 2);
+            for (f, v) in map.iter() {
+                args.push(Frame::BulkString(f.clone()));
+                args.push(Frame::BulkString(v.clone()));
+            }
+        }
+        RedisValueRef::HashWithTtl { fields, ttls, .. } => {
+            args.reserve(fields.len() * 2);
+            for (f, v) in fields.iter() {
+                if ttls.get(f).is_some_and(|&deadline| now_ms >= deadline) {
+                    continue;
+                }
+                args.push(Frame::BulkString(f.clone()));
+                args.push(Frame::BulkString(v.clone()));
+            }
+        }
+        RedisValueRef::HashListpack(lp) => {
+            for (f, v) in lp.iter_pairs() {
+                args.push(bulk(&f.as_bytes()));
+                args.push(bulk(&v.as_bytes()));
+            }
+        }
+        _ => return None,
+    }
+    Some(args)
 }
 
 #[cfg(test)]
@@ -162,6 +283,7 @@ mod tests {
         assert_eq!(hook_kind(b"HDEL"), HookKind::Hdel);
         assert_eq!(hook_kind(b"flushdb"), HookKind::FlushDb);
         assert_eq!(hook_kind(b"FLUSHALL"), HookKind::FlushAll);
+        assert_eq!(hook_kind(b"restore"), HookKind::Restore);
     }
 
     #[test]
@@ -188,6 +310,8 @@ mod tests {
             b"HSETNX",
             b"RPUSHX",
             b"HINCRBY",
+            b"LINSERT",
+            b"RESTORES",
             b"FLUSHALLX",
             b"",
         ] {

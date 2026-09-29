@@ -63,6 +63,10 @@ pub(super) fn spsc_eviction_gate(
     spill_sender: Option<&flume::Sender<SpillRequest>>,
     spill_file_id: &Rc<Cell<u64>>,
     disk_offload_dir: Option<&std::path::Path>,
+    // moon#1290 N6: the shard's manifest (the event loop's, passed down by
+    // `drain_spsc_shared`), so a no-AOF victim is tiered durably instead of
+    // plain-dropped.
+    manifest: Option<&mut crate::persistence::manifest::ShardManifest>,
     // task #34 (Wave A): fires once per plain-dropped (non-spill) victim so
     // the caller can emit a dual-plane DEL record. Callers build this from
     // `record_reason_del` (event-loop-context flavor) — `drain_spsc_shared`
@@ -77,18 +81,14 @@ pub(super) fn spsc_eviction_gate(
     let global_result = if let Some(sender) = spill_sender {
         let mut fid = spill_file_id.get();
         let dir = disk_offload_dir.unwrap_or(std::path::Path::new("."));
-        // Task #34 review (defect 1 follow-through): this gate has no
-        // `ShardManifest` handle either (same reasoning as
-        // `run_write_eviction_gate`'s doc comment) — a cross-shard write
-        // past `maxmemory` under `--disk-offload enable` reliably takes the
-        // "no manifest reachable" plain-drop fallback. Previously called the
-        // non-reporting wrapper (hardcoded no-op sink), silently dropping
-        // `on_plain_drop` on the floor for this branch even though the
-        // caller already threads a real one for the sibling branch below.
+        // moon#1290 N6: before the manifest was passed here, a cross-shard
+        // write past `maxmemory` under `--appendonly no --disk-offload
+        // enable` took the "no manifest reachable" plain-drop fallback for
+        // every victim (3.7K of 5.4K drops at --shards 4 in the repro).
         let res = evict_to_budget(
             db,
             &rt,
-            EvictionRun::async_spill(sender, dir, &mut fid, db_idx, None)
+            EvictionRun::async_spill(sender, dir, &mut fid, db_idx, manifest)
                 .budget(budget)
                 .report(on_plain_drop),
         );
@@ -595,49 +595,57 @@ pub(crate) fn handle_shard_message_shared(
                     // completes it in async context, skipping this shard —
                     // the same division of labour
                     // `coordinator::broadcast_txn_flushes` uses for MULTI.
-                    let (frame, pending_flush) = crate::shard::slice::with_shard(|s| {
-                        let db_count = s.databases.db_count();
-                        crate::scripting::pending_flush::run_and_complete(
-                            s,
-                            db_idx,
-                            crate::blocking::wakeup::ScriptWakes::Serve(blocking_registry),
-                            |db| {
-                                // A routed script runs against a database no
-                                // command on this shard may have refreshed in
-                                // a long while, and every expiry check inside
-                                // it reads that clock: refresh it, as the
-                                // Execute arms do before their dispatch.
-                                db.refresh_now_from_cache(cached_clock);
-                                if is_plain_eval {
-                                    crate::scripting::handle_eval(
-                                        &vm,
-                                        script_cache,
-                                        args,
-                                        db,
-                                        shard_id,
-                                        rt.num_shards(),
-                                        db_idx,
-                                        db_count,
-                                        &script_acl,
-                                        read_only,
-                                    )
-                                } else {
-                                    crate::scripting::handle_evalsha(
-                                        &vm,
-                                        script_cache,
-                                        args,
-                                        db,
-                                        shard_id,
-                                        rt.num_shards(),
-                                        db_idx,
-                                        db_count,
-                                        &script_acl,
-                                        read_only,
-                                    )
-                                }
-                            },
-                        )
-                    });
+                    //
+                    // moon#1290 (wave-1 review F2): the drain holds the
+                    // manifest cell, so the script's bridge gate reaches the
+                    // manifest only because it is LENT for the run — else a
+                    // no-AOF victim is plain-dropped (`manifest_cell::lend`).
+                    let (frame, pending_flush) =
+                        crate::shard::manifest_cell::lend(shard_manifest, || {
+                            crate::shard::slice::with_shard(|s| {
+                                let db_count = s.databases.db_count();
+                                crate::scripting::pending_flush::run_and_complete(
+                                    s,
+                                    db_idx,
+                                    crate::blocking::wakeup::ScriptWakes::Serve(blocking_registry),
+                                    |db| {
+                                        // A routed script runs against a database no
+                                        // command on this shard may have refreshed in
+                                        // a long while, and every expiry check inside
+                                        // it reads that clock: refresh it, as the
+                                        // Execute arms do before their dispatch.
+                                        db.refresh_now_from_cache(cached_clock);
+                                        if is_plain_eval {
+                                            crate::scripting::handle_eval(
+                                                &vm,
+                                                script_cache,
+                                                args,
+                                                db,
+                                                shard_id,
+                                                rt.num_shards(),
+                                                db_idx,
+                                                db_count,
+                                                &script_acl,
+                                                read_only,
+                                            )
+                                        } else {
+                                            crate::scripting::handle_evalsha(
+                                                &vm,
+                                                script_cache,
+                                                args,
+                                                db,
+                                                shard_id,
+                                                rt.num_shards(),
+                                                db_idx,
+                                                db_count,
+                                                &script_acl,
+                                                read_only,
+                                            )
+                                        }
+                                    },
+                                )
+                            })
+                        });
                     let _ = reply_tx.send(crate::shard::dispatch::ExecReply {
                         frame,
                         // moon#705: the flush this script issued, reported so
@@ -710,50 +718,53 @@ pub(crate) fn handle_shard_message_shared(
                     };
                     // moon#685 + moon#705: see the routed EVAL arm above,
                     // including why the broadcast is REPORTED here rather than
-                    // performed here.
-                    let (frame, pending_flush) = crate::shard::slice::with_shard(|s| {
-                        let db_count = s.databases.db_count();
-                        crate::scripting::pending_flush::run_and_complete(
-                            s,
-                            db_idx,
-                            crate::blocking::wakeup::ScriptWakes::Serve(blocking_registry),
-                            |db| {
-                                // Refresh the clock every expiry check in the
-                                // function reads (see the routed EVAL arm).
-                                db.refresh_now_from_cache(cached_clock);
-                                // moon#569 + moon#514: the ACL that travels with
-                                // `ShardMessage::Execute` is the ORIGIN connection's, so a
-                                // routed FCALL authorizes each inner `redis.call` exactly as
-                                // it would have on the shard the client is attached to.
-                                // Using this shard's own identity instead would let routing —
-                                // an implementation detail the client cannot see — decide
-                                // permissions.
-                                if is_fcall {
-                                    crate::command::functions::handle_fcall(
-                                        reg,
-                                        args,
-                                        db,
-                                        shard_id,
-                                        rt.num_shards(),
-                                        db_idx,
-                                        db_count,
-                                        &script_acl,
-                                    )
-                                } else {
-                                    crate::command::functions::handle_fcall_ro(
-                                        reg,
-                                        args,
-                                        db,
-                                        shard_id,
-                                        rt.num_shards(),
-                                        db_idx,
-                                        db_count,
-                                        &script_acl,
-                                    )
-                                }
-                            },
-                        )
-                    });
+                    // performed here — and, moon#1290, why the manifest is lent.
+                    let (frame, pending_flush) =
+                        crate::shard::manifest_cell::lend(shard_manifest, || {
+                            crate::shard::slice::with_shard(|s| {
+                                let db_count = s.databases.db_count();
+                                crate::scripting::pending_flush::run_and_complete(
+                                    s,
+                                    db_idx,
+                                    crate::blocking::wakeup::ScriptWakes::Serve(blocking_registry),
+                                    |db| {
+                                        // Refresh the clock every expiry check in the
+                                        // function reads (see the routed EVAL arm).
+                                        db.refresh_now_from_cache(cached_clock);
+                                        // moon#569 + moon#514: the ACL that travels with
+                                        // `ShardMessage::Execute` is the ORIGIN connection's, so a
+                                        // routed FCALL authorizes each inner `redis.call` exactly as
+                                        // it would have on the shard the client is attached to.
+                                        // Using this shard's own identity instead would let routing —
+                                        // an implementation detail the client cannot see — decide
+                                        // permissions.
+                                        if is_fcall {
+                                            crate::command::functions::handle_fcall(
+                                                reg,
+                                                args,
+                                                db,
+                                                shard_id,
+                                                rt.num_shards(),
+                                                db_idx,
+                                                db_count,
+                                                &script_acl,
+                                            )
+                                        } else {
+                                            crate::command::functions::handle_fcall_ro(
+                                                reg,
+                                                args,
+                                                db,
+                                                shard_id,
+                                                rt.num_shards(),
+                                                db_idx,
+                                                db_count,
+                                                &script_acl,
+                                            )
+                                        }
+                                    },
+                                )
+                            })
+                        });
                     drop(guard);
                     let _ = reply_tx.send(crate::shard::dispatch::ExecReply {
                         frame,
@@ -978,6 +989,7 @@ pub(crate) fn handle_shard_message_shared(
                             spill_sender,
                             spill_file_id,
                             disk_offload_dir,
+                            shard_manifest.as_mut(),
                         )
                     });
                     if let Some(crate::shard::spsc_two_db::TwoDbOutcome {
@@ -1055,6 +1067,7 @@ pub(crate) fn handle_shard_message_shared(
                                     spill_sender,
                                     spill_file_id,
                                     disk_offload_dir,
+                                    shard_manifest.as_mut(),
                                     // task #34 (Wave A): cross-shard write leg.
                                     &mut |key| {
                                         crate::replication::reason_del::record_reason_del(
@@ -1222,6 +1235,7 @@ pub(crate) fn handle_shard_message_shared(
                             spill_sender,
                             spill_file_id,
                             disk_offload_dir,
+                            shard_manifest.as_mut(),
                         ) {
                             let mut aof_ok = true;
                             if matches!(response, crate::protocol::Frame::Integer(1))
@@ -1293,6 +1307,7 @@ pub(crate) fn handle_shard_message_shared(
                                 spill_sender,
                                 spill_file_id,
                                 disk_offload_dir,
+                                shard_manifest.as_mut(),
                                 // task #34 (Wave A): cross-shard write leg.
                                 &mut |key| {
                                     crate::replication::reason_del::record_reason_del(
@@ -1463,6 +1478,7 @@ pub(crate) fn handle_shard_message_shared(
                             spill_sender,
                             spill_file_id,
                             disk_offload_dir,
+                            shard_manifest.as_mut(),
                         ) {
                             let mut aof_ok = true;
                             if matches!(response, crate::protocol::Frame::Integer(1))
@@ -1534,6 +1550,7 @@ pub(crate) fn handle_shard_message_shared(
                                 spill_sender,
                                 spill_file_id,
                                 disk_offload_dir,
+                                shard_manifest.as_mut(),
                                 // task #34 (Wave A): cross-shard write leg.
                                 &mut |key| {
                                     crate::replication::reason_del::record_reason_del(
@@ -2170,16 +2187,19 @@ pub(crate) fn handle_shard_message_shared(
                     )
                 })
             };
-            for record in wal_records {
-                shard_databases.wal_append(
-                    shard_id,
-                    crate::persistence::wal_v3::record::WalRecordType::Command,
-                    bytes::Bytes::from(record),
-                );
-            }
-            let _ = reply_tx.send(crate::protocol::Frame::SimpleString(
-                bytes::Bytes::from_static(b"OK"),
-            ));
+            // PR #1301 review: checked — a refused record is counted, logged
+            // and reported to the aborting connection, never dropped under
+            // an `OK` acknowledgement.
+            let reply = match crate::transaction::abort::append_graph_rollback_wal(
+                shard_databases,
+                shard_id,
+                txn_id,
+                wal_records.into_iter().map(bytes::Bytes::from).collect(),
+            ) {
+                Ok(()) => crate::protocol::Frame::SimpleString(bytes::Bytes::from_static(b"OK")),
+                Err(reply) => crate::protocol::Frame::Error(bytes::Bytes::from_static(reply)),
+            };
+            let _ = reply_tx.send(reply);
         }
         #[cfg(feature = "text-index")]
         ShardMessage::InvertedSearch(payload) => {
@@ -2428,6 +2448,7 @@ pub(crate) fn handle_shard_message_shared(
                         spill_sender,
                         spill_file_id,
                         disk_offload_dir,
+                        shard_manifest.as_mut(),
                         &mut |key| {
                             crate::replication::reason_del::record_reason_del(
                                 key,
@@ -2701,21 +2722,27 @@ pub(crate) fn handle_shard_message_shared(
                 }
                 _ => None,
             };
+            // moon#1290 (wave-1 review F2): a queued script's bridge gate
+            // reaches the manifest the drain holds only through the lend —
+            // see the routed EVAL arm.
+            let wake_armed = blocking_registry.borrow().has_any_waiters();
             let (result, aof_entries, graph_records) =
-                crate::server::conn::shared::execute_transaction_sharded(
-                    shard_databases,
-                    shard_id,
-                    &commands,
-                    db_index,
-                    proto,
-                    cached_clock,
-                    &mut exec_publishes,
-                    &mut exec_flushes,
-                    &mut exec_wakes,
-                    blocking_registry.borrow().has_any_waiters(),
-                    &watched,
-                    txn_scripting.as_ref(),
-                );
+                crate::shard::manifest_cell::lend(shard_manifest, || {
+                    crate::server::conn::shared::execute_transaction_sharded(
+                        shard_databases,
+                        shard_id,
+                        &commands,
+                        db_index,
+                        proto,
+                        cached_clock,
+                        &mut exec_publishes,
+                        &mut exec_flushes,
+                        &mut exec_wakes,
+                        wake_armed,
+                        &watched,
+                        txn_scripting.as_ref(),
+                    )
+                });
             // The waiters are registered HERE, on the owning shard's registry
             // — the same one the live cross-shard write path wakes. They are
             // woken below, once the body is logged (moon#1056).

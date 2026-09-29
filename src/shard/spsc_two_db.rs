@@ -105,6 +105,7 @@ pub(crate) fn try_two_db_intercept(
     spill_sender: Option<&flume::Sender<SpillRequest>>,
     spill_file_id: &Rc<Cell<u64>>,
     disk_offload_dir: Option<&std::path::Path>,
+    manifest: Option<&mut crate::persistence::manifest::ShardManifest>,
 ) -> Option<TwoDbOutcome> {
     if cmd.eq_ignore_ascii_case(b"MOVE") {
         // `resolve_move` refuses `dst_db == db_idx` with redis's same-object
@@ -171,6 +172,8 @@ pub(crate) fn try_two_db_intercept(
                         spill_sender,
                         spill_file_id,
                         disk_offload_dir,
+                        // moon#1290 N6: tiered durably without an AOF.
+                        manifest,
                         &mut |_| {},
                     ) {
                         return (oom, None);

@@ -947,6 +947,17 @@ if should_run "set"; then
     assert_match "SRANDMEMBER -3 (one member)" SRANDMEMBER {s}:one -3
     assert_moon_ok "SMEMBERS"          SMEMBERS {s}:A
     assert_moon_ok "SSCAN"             SSCAN {s}:A 0
+    # moon#1287: a compact set answers in one call, cursor 0, whatever COUNT.
+    # An intset on every oracle (a small STRING set is listpack only from
+    # redis 7.2; 7.0 pages it as a hashtable), and its members come back in
+    # ascending order on both.
+    rcli SADD {s}:ints 3 1 2 >/dev/null 2>&1; mcli SADD {s}:ints 3 1 2 >/dev/null 2>&1
+    assert_match "SSCAN COUNT 1 (intset: one call)" SSCAN {s}:ints 0 COUNT 1
+    # Wave-1 review NITs: numeric (not byte) order on an intset, and a `-1`
+    # cursor accepted as redis's strtoul accepts it.
+    rcli SADD {s}:ints10 10 2 1 >/dev/null 2>&1; mcli SADD {s}:ints10 10 2 1 >/dev/null 2>&1
+    assert_match "SSCAN intset numeric order" SSCAN {s}:ints10 0
+    assert_match "SSCAN cursor -1"     SSCAN {s}:ints10 -1
 fi
 
 # ===========================================================================
@@ -2421,6 +2432,10 @@ if should_run "scripting"; then
         EVAL_RO "return redis.call('SET', KEYS[1], 'x')" 1 lua:k1
     # ...and refused means the value did NOT change.
     assert_match "EVAL_RO write did not land" GET lua:k1
+    # PR #1301 review: the refusal is an ordinary command error, so
+    # redis.pcall catches it (as {err=...}) and the script goes on.
+    assert_match "EVAL_RO pcall catches the refusal" \
+        EVAL_RO "local r = redis.pcall('SET', KEYS[1], 'x'); return {r.err, 'continued'}" 1 lua:k1
 
     # moon#672: the redis error CODE raised inside a script must LEAD the reply
     # -- it is the part a client matches on. moon buried it behind

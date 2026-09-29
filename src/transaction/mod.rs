@@ -6,6 +6,7 @@
 
 pub mod abort;
 pub mod commit_hooks;
+pub mod kv_compensation;
 pub mod kv_mvcc;
 pub mod undo_log;
 
@@ -161,6 +162,20 @@ impl CrossStoreTxn {
         }
     }
 
+    /// [`record_rejected_op`](Self::record_rejected_op) for `count` rejected
+    /// ops of which `first_cmd` came first — a script whose writes the TXN
+    /// refused (moon#1285, PR #1301 review), counted once per refusal.
+    #[inline]
+    pub fn record_rejected_ops(&mut self, first_cmd: &[u8], count: u32) {
+        if count == 0 {
+            return;
+        }
+        self.rejected_ops = self.rejected_ops.saturating_add(count);
+        if self.first_rejected_cmd.is_none() {
+            self.first_rejected_cmd = Some(Bytes::copy_from_slice(first_cmd));
+        }
+    }
+
     /// #499: true when at least one op in the body was rejected — the
     /// transaction may not commit.
     #[inline]
@@ -168,22 +183,32 @@ impl CrossStoreTxn {
         self.rejected_ops > 0
     }
 
-    /// Record a KV insert (key did not exist).
+    /// Record a KV insert in database `db` (key did not exist).
     #[inline]
-    pub fn record_kv_insert(&mut self, key: Bytes) {
-        self.kv_undo.record_insert(key);
+    pub fn record_kv_insert(&mut self, db: usize, key: Bytes) {
+        self.kv_undo.record_insert(db, key);
     }
 
-    /// Record a KV update (key had previous entry).
+    /// Record a KV update in database `db` (key had previous entry).
     #[inline]
-    pub fn record_kv_update(&mut self, key: Bytes, old_entry: crate::storage::entry::Entry) {
-        self.kv_undo.record_update(key, old_entry);
+    pub fn record_kv_update(
+        &mut self,
+        db: usize,
+        key: Bytes,
+        old_entry: crate::storage::entry::Entry,
+    ) {
+        self.kv_undo.record_update(db, key, old_entry);
     }
 
-    /// Record a KV delete (captures before-image for rollback).
+    /// Record a KV delete in database `db` (captures before-image for rollback).
     #[inline]
-    pub fn record_kv_delete(&mut self, key: Bytes, old_entry: crate::storage::entry::Entry) {
-        self.kv_undo.record_delete(key, old_entry);
+    pub fn record_kv_delete(
+        &mut self,
+        db: usize,
+        key: Bytes,
+        old_entry: crate::storage::entry::Entry,
+    ) {
+        self.kv_undo.record_delete(db, key, old_entry);
     }
 
     /// Record a vector modification.
@@ -250,9 +275,81 @@ impl CrossStoreTxn {
     }
 }
 
+/// The keys a connection's write (other than `DEL` / `UNLINK`) inside an open
+/// TXN undo-captures and holds write intents on, on both runtimes' generic
+/// write leg (moon#500).
+///
+/// The shared key walker's WRITE positions. Only for an argv the walker
+/// cannot enumerate does it fall back to the primary key — fewer keys than
+/// the historical single-key capture would be a regression. It used to fall
+/// back whenever the written set was EMPTY, which also covered an argv the
+/// walker read and found write-free: `SORT src` or `GEORADIUS src ...`
+/// without `STORE` captured `src`, a key they only READ, so `TXN.ABORT`
+/// restored its pre-image over another client's write (logged to the AOF
+/// and replicas) and the write intent hid it from other transactions
+/// (moon#1285, PR #1301 review).
+pub(crate) fn conn_txn_capture_keys(
+    cmd: &[u8],
+    args: &[crate::protocol::Frame],
+) -> SmallVec<[Bytes; 4]> {
+    match crate::tracking::invalidation::written_keys_if_known(cmd, args) {
+        Some(written) => written,
+        None => crate::server::conn::shared::extract_primary_key(cmd, args)
+            .cloned()
+            .into_iter()
+            .collect(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn capture_keys(cmd: &str, args: &[&str]) -> Vec<Bytes> {
+        let args: Vec<crate::protocol::Frame> = args
+            .iter()
+            .map(|a| crate::protocol::Frame::BulkString(Bytes::copy_from_slice(a.as_bytes())))
+            .collect();
+        conn_txn_capture_keys(cmd.as_bytes(), &args).into_vec()
+    }
+
+    /// PR #1301 review round 3: a write whose keys are all READ in this argv
+    /// captures nothing; one the walker cannot read keeps the primary-key
+    /// fallback; written keys are captured as before.
+    #[test]
+    fn conn_txn_capture_keys_never_captures_a_key_only_read() {
+        let none: Vec<Bytes> = Vec::new();
+        assert_eq!(capture_keys("SORT", &["src"]), none);
+        assert_eq!(
+            capture_keys("SORT", &["src", "ALPHA", "LIMIT", "0", "1"]),
+            none
+        );
+        assert_eq!(capture_keys("SORT", &["src", "BY", "w_*"]), none);
+        assert_eq!(capture_keys("GEORADIUS", &["g", "0", "0", "1", "km"]), none);
+        assert_eq!(
+            capture_keys("GEORADIUSBYMEMBER", &["g", "m", "1", "km", "ASC"]),
+            none
+        );
+        assert_eq!(
+            capture_keys("SORT", &["src", "STORE", "dst"]),
+            vec![Bytes::from("dst")]
+        );
+        assert_eq!(
+            capture_keys("GEORADIUS", &["g", "0", "0", "1", "km", "STORE", "d"]),
+            vec![Bytes::from("d")]
+        );
+        assert_eq!(capture_keys("SET", &["k", "v"]), vec![Bytes::from("k")]);
+        assert_eq!(
+            capture_keys("MSET", &["a", "1", "b", "2"]),
+            vec![Bytes::from("a"), Bytes::from("b")]
+        );
+        // The walker cannot enumerate a malformed `numkeys`: the primary-key
+        // fallback still applies (here `extract_primary_key`'s answer).
+        assert_eq!(
+            capture_keys("LMPOP", &["5", "a", "b", "LEFT"]),
+            vec![Bytes::from("a")]
+        );
+    }
 
     #[test]
     fn test_cross_store_txn_new() {
@@ -279,13 +376,25 @@ mod tests {
         assert_eq!(txn.first_rejected_cmd.as_deref(), Some(&b"SET"[..]));
         // A rejected op applied nothing, so it is not a "modification".
         assert!(!txn.has_modifications());
+
+        // A script's refusals count one each; the first command stays.
+        txn.record_rejected_ops(b"FLUSHDB", 3);
+        txn.record_rejected_ops(b"SWAPDB", 0);
+        assert_eq!(txn.rejected_ops, 5);
+        assert_eq!(txn.first_rejected_cmd.as_deref(), Some(&b"SET"[..]));
+        let mut fresh = CrossStoreTxn::new(8, 7, 0);
+        fresh.record_rejected_ops(b"FLUSHDB", 0);
+        assert!(!fresh.is_dirty(), "zero refusals poison nothing");
+        fresh.record_rejected_ops(b"FLUSHDB", 2);
+        assert_eq!(fresh.rejected_ops, 2);
+        assert_eq!(fresh.first_rejected_cmd.as_deref(), Some(&b"FLUSHDB"[..]));
     }
 
     #[test]
     fn test_has_modifications_kv() {
         let mut txn = CrossStoreTxn::new(1, 0, 0);
         assert!(!txn.has_modifications());
-        txn.record_kv_insert(Bytes::from_static(b"key"));
+        txn.record_kv_insert(0, Bytes::from_static(b"key"));
         assert!(txn.has_modifications());
     }
 

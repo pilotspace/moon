@@ -45,6 +45,16 @@ fn config(maxmemory: usize, policy: &str) -> RuntimeConfig {
     }
 }
 
+/// This process has an AOF writer — what `--appendonly yes` means to the
+/// async-spill sink since moon#1290 N7: it routes on the writer pool's
+/// existence (`dead_slots::enable_ledger`, which every pool calls at boot),
+/// not on `RuntimeConfig::appendonly`, which `CONFIG SET` flips without one.
+/// Process-global; the other tests here use the `Plain` / `SyncSpill` sinks,
+/// which do not consult it.
+fn aof_writer_present() {
+    moon::storage::tiered::dead_slots::enable_ledger();
+}
+
 fn filled_db(with_cold_index: bool) -> Database {
     let mut db = Database::new();
     if with_cold_index {
@@ -161,6 +171,7 @@ fn pending_spill_bytes_stay_charged_to_used_memory() {
     let mut db = filled_db(true);
     let mut cfg = config(1, "allkeys-lru");
     cfg.appendonly = "yes".to_string();
+    aof_writer_present();
 
     let _ = evict_to_budget(
         &mut db,
@@ -204,6 +215,7 @@ fn flush_retires_in_flight_spills_and_their_byte_charge() {
     let mut db = filled_db(true);
     let mut cfg = config(1, "allkeys-lru");
     cfg.appendonly = "yes".to_string();
+    aof_writer_present();
     let _ = evict_to_budget(
         &mut db,
         &cfg,
@@ -247,6 +259,7 @@ fn eviction_stops_once_pending_bytes_cover_the_deficit() {
     let budget = db.estimated_memory() - VALUE_LEN * 2;
     let mut cfg = config(budget, "allkeys-lru");
     cfg.appendonly = "yes".to_string();
+    aof_writer_present();
 
     let res = evict_to_budget(
         &mut db,

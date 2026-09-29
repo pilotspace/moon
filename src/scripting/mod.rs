@@ -736,6 +736,12 @@ fn run_compiled(
     }
 }
 
+/// A write — any command not flagged `READONLY` — from `EVAL_RO`,
+/// `EVALSHA_RO`, `FCALL_RO` or a function registered `no-writes`. Redis 7's
+/// text (`scriptVerifyWriteCommandAllow`), measured against 7.0.15.
+pub(crate) const ERR_RO_SCRIPT_WRITE: &[u8] =
+    b"ERR Write commands are not allowed from read-only scripts.";
+
 /// Turn a script-execution failure into the wire error the client sees.
 ///
 /// Shared with `FunctionRegistry::call_function` so EVAL and FCALL answer an
@@ -760,9 +766,7 @@ pub(crate) fn script_error_to_frame(e: mlua::Error) -> Frame {
         return Frame::Error(Bytes::from(tail[..end].trim_end().to_string()));
     }
     if msg.contains("Write commands are not allowed") {
-        return Frame::Error(Bytes::from_static(
-            b"ERR Write commands are not allowed from read-only scripts",
-        ));
+        return Frame::Error(Bytes::from_static(ERR_RO_SCRIPT_WRITE));
     }
     // A redis error raised by `redis.call` reaches the client with its CODE
     // still first. That code is the only part a client matches on, and moon

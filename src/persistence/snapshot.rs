@@ -1341,15 +1341,13 @@ pub fn shard_snapshot_load_with_graves<D: std::borrow::BorrowMut<Database>>(
                         source: e,
                     })?;
                 current_db = db_idx[0] as usize;
+                // moon#1291 F8: skip a db past `--databases`, don't abort — that
+                // lost the graves trailer after EOF (the global CRC rules out a flip).
                 if current_db >= databases.len() {
-                    return Err(SnapshotError::Corrupted {
-                        detail: format!(
-                            "snapshot references database {} but only {} configured",
-                            current_db,
-                            databases.len()
-                        ),
-                    }
-                    .into());
+                    let n = databases.len();
+                    tracing::warn!(
+                        "Snapshot load: db {current_db} is past --databases {n}: skipped"
+                    );
                 }
             }
             SEGMENT_BLOCK_MARKER => {
@@ -1433,9 +1431,11 @@ pub fn shard_snapshot_load_with_graves<D: std::borrow::BorrowMut<Database>>(
 
                 // Insert non-expired entries into the database
                 for (key, entry) in entries {
-                    if entry.has_expiry() && entry.is_expired_at(now_ms) {
+                    if current_db >= databases.len() {
+                        continue;
+                    } else if entry.has_expiry() && entry.is_expired_at(now_ms) {
                         expired.push((current_db, key, entry));
-                    } else if current_db < databases.len() {
+                    } else {
                         databases[current_db].borrow_mut().set(&key, entry);
                         total_keys += 1;
                     }
@@ -1506,3 +1506,6 @@ mod removal_move_tests;
 
 #[cfg(test)]
 mod review_r2a_tests;
+
+#[cfg(test)]
+mod txn_abort_tests;

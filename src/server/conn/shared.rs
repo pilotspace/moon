@@ -874,6 +874,23 @@ pub(crate) fn execute_transaction_sharded(
             });
         }
 
+        // moon#1285: RESTORE replaces a whole value (a user's, or TXN.ABORT's
+        // compensating record) — rebuild the key's documents from it.
+        if !matches!(response, Frame::Error(_)) && cmd.eq_ignore_ascii_case(b"RESTORE") {
+            if let Some(Frame::BulkString(key_bytes)) = cmd_args.first() {
+                crate::shard::slice::with_shard(|s| {
+                    let guard = s.databases.read(entry_db);
+                    crate::shard::write_hooks::reindex_key_from_keyspace(
+                        &mut s.vector_store,
+                        &mut s.text_store,
+                        &guard,
+                        key_bytes,
+                        entry_db,
+                    );
+                });
+            }
+        }
+
         // R4: HDEL of an indexed vector field tombstones it.
         if !matches!(response, Frame::Error(_)) && cmd.eq_ignore_ascii_case(b"HDEL") {
             crate::shard::slice::with_shard(|s| {

@@ -55,6 +55,24 @@ enum GraphCommand {
         node_id: u64,
         label: u16,
     },
+    /// GRAPH.DELPROP <name> <N|E> <entity_id> <key> (moon#1285: TXN.ABORT
+    /// of a SET that added a property) — replayed with the SETs, in order.
+    DelProp {
+        graph_name: Bytes,
+        entity_id: u64,
+        is_node: bool,
+        key: u16,
+    },
+    /// GRAPH.UNDELETENODE <name> <node_id> <n> <edge_id>... (moon#1285:
+    /// TXN.ABORT of a DELETE, with the edges it cascaded to) — replayed with
+    /// the removes, in order.
+    UndeleteNode {
+        graph_name: Bytes,
+        node_id: u64,
+        edge_ids: SmallVec<[u64; 8]>,
+    },
+    /// GRAPH.UNDELETEEDGE <name> <edge_id> (moon#1285).
+    UndeleteEdge { graph_name: Bytes, edge_id: u64 },
     /// GRAPH.DROP <name>
     Drop { name: Bytes },
 }
@@ -82,6 +100,9 @@ impl GraphReplayCollector {
             || cmd.eq_ignore_ascii_case(b"GRAPH.SETPROP")
             || cmd.eq_ignore_ascii_case(b"GRAPH.SETLABEL")
             || cmd.eq_ignore_ascii_case(b"GRAPH.DROP")
+            || cmd.eq_ignore_ascii_case(b"GRAPH.DELPROP")
+            || cmd.eq_ignore_ascii_case(b"GRAPH.UNDELETENODE")
+            || cmd.eq_ignore_ascii_case(b"GRAPH.UNDELETEEDGE")
     }
 
     /// Collect a graph command from WAL replay args.
@@ -162,6 +183,67 @@ impl GraphReplayCollector {
                     is_node,
                     key,
                     value,
+                });
+                true
+            }
+            b"GRAPH.DELPROP" => {
+                // Format: <graph> <N|E> <entity_id> <key>
+                if args.len() < 4 {
+                    return false;
+                }
+                let is_node = match args[1] {
+                    b"N" => true,
+                    b"E" => false,
+                    _ => return false,
+                };
+                let (Some(entity_id), Some(key)) = (parse_u64(args[2]), parse_u16(args[3])) else {
+                    return false;
+                };
+                self.commands.push(GraphCommand::DelProp {
+                    graph_name: Bytes::copy_from_slice(args[0]),
+                    entity_id,
+                    is_node,
+                    key,
+                });
+                true
+            }
+            b"GRAPH.UNDELETENODE" => {
+                // Format: <graph> <node_id> <n> <edge_id>...
+                if args.len() < 3 {
+                    return false;
+                }
+                let (Some(node_id), Some(n)) = (parse_u64(args[1]), parse_usize(args[2])) else {
+                    return false;
+                };
+                // Exactly `n` ids follow: a count that disagrees with the
+                // record is a torn or forged record, never a partial undo.
+                if args.len() - 3 != n {
+                    return false;
+                }
+                let mut edge_ids = SmallVec::new();
+                for raw in &args[3..] {
+                    let Some(id) = parse_u64(raw) else {
+                        return false;
+                    };
+                    edge_ids.push(id);
+                }
+                self.commands.push(GraphCommand::UndeleteNode {
+                    graph_name: Bytes::copy_from_slice(args[0]),
+                    node_id,
+                    edge_ids,
+                });
+                true
+            }
+            b"GRAPH.UNDELETEEDGE" => {
+                if args.len() < 2 {
+                    return false;
+                }
+                let Some(edge_id) = parse_u64(args[1]) else {
+                    return false;
+                };
+                self.commands.push(GraphCommand::UndeleteEdge {
+                    graph_name: Bytes::copy_from_slice(args[0]),
+                    edge_id,
                 });
                 true
             }
@@ -371,8 +453,10 @@ impl GraphReplayCollector {
             /// inserts (targets must exist) and before removes (a later
             /// DELETE tombstones the set like the live execution did).
             set_indices: Vec<usize>,
-            remove_node_indices: Vec<usize>,
-            remove_edge_indices: Vec<usize>,
+            /// REMOVENODE / REMOVEEDGE / UNDELETENODE / UNDELETEEDGE in WAL
+            /// order (moon#1285: an undelete must land after the remove it
+            /// undoes, and a later remove after that undelete).
+            tombstone_indices: Vec<usize>,
             drop_idx: Option<usize>,
         }
 
@@ -387,8 +471,7 @@ impl GraphReplayCollector {
                 node_indices: Vec::new(),
                 edge_indices: Vec::new(),
                 set_indices: Vec::new(),
-                remove_node_indices: Vec::new(),
-                remove_edge_indices: Vec::new(),
+                tombstone_indices: Vec::new(),
                 drop_idx,
             }
         }
@@ -449,7 +532,8 @@ impl GraphReplayCollector {
                     epochs[*eidx].edge_indices.push(idx);
                 }
                 GraphCommand::SetProp { graph_name, .. }
-                | GraphCommand::SetLabel { graph_name, .. } => {
+                | GraphCommand::SetLabel { graph_name, .. }
+                | GraphCommand::DelProp { graph_name, .. } => {
                     let eidx = current_epoch.entry(graph_name.clone()).or_insert_with(|| {
                         let i = epochs.len();
                         epochs.push(new_epoch(graph_name.clone(), None, None));
@@ -457,21 +541,16 @@ impl GraphReplayCollector {
                     });
                     epochs[*eidx].set_indices.push(idx);
                 }
-                GraphCommand::RemoveNode { graph_name, .. } => {
+                GraphCommand::RemoveNode { graph_name, .. }
+                | GraphCommand::RemoveEdge { graph_name, .. }
+                | GraphCommand::UndeleteNode { graph_name, .. }
+                | GraphCommand::UndeleteEdge { graph_name, .. } => {
                     let eidx = current_epoch.entry(graph_name.clone()).or_insert_with(|| {
                         let i = epochs.len();
                         epochs.push(new_epoch(graph_name.clone(), None, None));
                         i
                     });
-                    epochs[*eidx].remove_node_indices.push(idx);
-                }
-                GraphCommand::RemoveEdge { graph_name, .. } => {
-                    let eidx = current_epoch.entry(graph_name.clone()).or_insert_with(|| {
-                        let i = epochs.len();
-                        epochs.push(new_epoch(graph_name.clone(), None, None));
-                        i
-                    });
-                    epochs[*eidx].remove_edge_indices.push(idx);
+                    epochs[*eidx].tombstone_indices.push(idx);
                 }
             }
         }
@@ -493,8 +572,7 @@ impl GraphReplayCollector {
             if !epoch.node_indices.is_empty()
                 || !epoch.edge_indices.is_empty()
                 || !epoch.set_indices.is_empty()
-                || !epoch.remove_node_indices.is_empty()
-                || !epoch.remove_edge_indices.is_empty()
+                || !epoch.tombstone_indices.is_empty()
             {
                 let Some(graph) = store.get_graph_mut(&epoch.graph_name) else {
                     continue;
@@ -714,6 +792,38 @@ impl GraphReplayCollector {
                                 *replayed += 1;
                             }
                         }
+                        GraphCommand::DelProp {
+                            entity_id,
+                            is_node: true,
+                            key,
+                            ..
+                        } => {
+                            let nk = nk_of(*entity_id);
+                            if !node_alive(&mg, nk) {
+                                continue;
+                            }
+                            if mg.get_node(nk).is_none()
+                                && !crate::graph::store::copy_up_into(&mut mg, &immutable, nk)
+                            {
+                                continue;
+                            }
+                            if mg.remove_node_property(nk, *key).is_some() {
+                                *replayed += 1;
+                            }
+                        }
+                        GraphCommand::DelProp {
+                            entity_id,
+                            is_node: false,
+                            key,
+                            ..
+                        } => {
+                            let ek = crate::graph::types::EdgeKey::from(
+                                slotmap::KeyData::from_ffi(*entity_id),
+                            );
+                            if mg.remove_edge_property(ek, *key).is_some() {
+                                *replayed += 1;
+                            }
+                        }
                         GraphCommand::SetLabel { node_id, label, .. } => {
                             let nk = nk_of(*node_id);
                             if !node_alive(&mg, nk) {
@@ -739,38 +849,69 @@ impl GraphReplayCollector {
                     }
                 }
 
-                // Remove nodes.
-                for &idx in &epoch.remove_node_indices {
-                    if let GraphCommand::RemoveNode { node_id, .. } = &self.commands[idx] {
-                        let nk = nk_of(*node_id);
-                        if node_alive(&mg, nk) {
-                            if mg.remove_node(nk, 0) {
+                // Removes and undeletes, in WAL order (moon#1285).
+                for &idx in &epoch.tombstone_indices {
+                    match &self.commands[idx] {
+                        GraphCommand::RemoveNode { node_id, .. } => {
+                            let nk = nk_of(*node_id);
+                            if node_alive(&mg, nk) {
+                                if mg.remove_node(nk, 0) {
+                                    *replayed += 1;
+                                } else if mg.get_node(nk).is_none() {
+                                    // CSR-resident node (copy-up delete, W2-2):
+                                    // materialize a tombstone shadow so the frozen
+                                    // row stays hidden after replay.
+                                    if crate::graph::store::copy_up_into(&mut mg, &immutable, nk)
+                                        && mg.remove_node(nk, 0)
+                                    {
+                                        *replayed += 1;
+                                    }
+                                }
+                            }
+                        }
+                        GraphCommand::RemoveEdge { edge_id, .. } => {
+                            if mg.remove_edge_by_id(*edge_id, 0) {
                                 *replayed += 1;
-                            } else if mg.get_node(nk).is_none() {
-                                // CSR-resident node (copy-up delete, W2-2):
-                                // materialize a tombstone shadow so the frozen
-                                // row stays hidden after replay.
-                                if crate::graph::store::copy_up_into(&mut mg, &immutable, nk)
-                                    && mg.remove_node(nk, 0)
-                                {
+                            } else {
+                                tracing::warn!(
+                                    "WAL replay: REMOVEEDGE edge_id={} not found in mutable segment",
+                                    edge_id
+                                );
+                            }
+                        }
+                        GraphCommand::UndeleteNode {
+                            node_id, edge_ids, ..
+                        } => {
+                            // Whatever LSN the replayed remove used: the live
+                            // undelete names the node, not an LSN.
+                            let nk = nk_of(*node_id);
+                            let deleted_at = mg
+                                .get_node(nk)
+                                .map(|n| n.deleted_lsn)
+                                .filter(|&lsn| lsn != u64::MAX);
+                            if let Some(lsn) = deleted_at
+                                && mg.undelete_node(nk, lsn)
+                            {
+                                *replayed += 1;
+                            }
+                            for id in edge_ids {
+                                let ek = crate::graph::types::EdgeKey::from(
+                                    slotmap::KeyData::from_ffi(*id),
+                                );
+                                if mg.undelete_edge(ek) {
                                     *replayed += 1;
                                 }
                             }
                         }
-                    }
-                }
-
-                // Remove edges.
-                for &idx in &epoch.remove_edge_indices {
-                    if let GraphCommand::RemoveEdge { edge_id, .. } = &self.commands[idx] {
-                        if mg.remove_edge_by_id(*edge_id, 0) {
-                            *replayed += 1;
-                        } else {
-                            tracing::warn!(
-                                "WAL replay: REMOVEEDGE edge_id={} not found in mutable segment",
-                                edge_id
+                        GraphCommand::UndeleteEdge { edge_id, .. } => {
+                            let ek = crate::graph::types::EdgeKey::from(
+                                slotmap::KeyData::from_ffi(*edge_id),
                             );
+                            if mg.undelete_edge(ek) {
+                                *replayed += 1;
+                            }
                         }
+                        _ => {}
                     }
                 }
 

@@ -105,6 +105,11 @@ Moon exposes standard Redis-compatible INFO metrics through the Prometheus endpo
 - **`moon_spilled_keys_total`** (INFO: `spilled_keys`) -- keys **moved from RAM
   to disk** under maxmemory pressure, with `--disk-offload enable`.
 - **`moon_expired_keys_total`** -- keys removed by expiration
+- INFO `expired_time_cap_reached_count` / `expire_cycle_cpu_milliseconds`
+  (redis names, moon#1288) -- active-expiry cycles that ran out of time with
+  expired keys still due, and the cumulative time the cycles spent. A climbing
+  cap count means an expired backlog is being drained by the adaptive fast
+  cycle (at most 25% of a shard, at most 1 ms per 1 ms tick).
 - **`moon_aof_append_backpressure_refusals_total`** (INFO:
   `aof_append_backpressure_refusals`) -- writes refused because the AOF writer
   was **backlogged** (its queue stayed full for `--aof-fsync-timeout-ms`), not
@@ -112,6 +117,14 @@ Moon exposes standard Redis-compatible INFO metrics through the Prometheus endpo
   A disk that is failing shows in `aof_fsync_failures` /
   `aof_last_fsync_status:err` instead. See
   [Persistence -- when the AOF writer falls behind](persistence.md#when-the-aof-writer-falls-behind-backpressure).
+- INFO `txn_rollback_wal_dropped` (`persistence` section; no Prometheus
+  series) -- graph rollback records of a `TXN.ABORT` that the shard's WAL
+  append channel refused (full or closed). The rollback itself was applied in
+  memory; what is missing is its durability, so a restart can replay the
+  aborted graph writes. An explicit `TXN.ABORT` in that state answers
+  `-MOONERR WAL backpressure: TXN rolled back in memory, ...` instead of
+  `+OK`; a dirty-commit or disconnect rollback has no client to tell and logs
+  at `ERROR`. Any non-zero value is worth an alert.
 
 ### `evicted_keys` vs `spilled_keys` (moon#585)
 

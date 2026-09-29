@@ -684,6 +684,58 @@ impl EvictionPolicy {
     }
 }
 
+/// Whether an AOF writer backs this process's evictions (moon#1290 N7): the
+/// async spill window is safe only when the AOF durably holds every write a
+/// victim carries. Decided by the writer pool's existence
+/// (`dead_slots::aof_consumer_present`, set when a pool's fold state is
+/// built at boot), not by `config.appendonly`, which `CONFIG SET` changes
+/// without creating a writer.
+///
+/// Unit tests describe the process through `config.appendonly` (the pool
+/// flag is process-global) unless [`force_aof_backstop`] overrides it.
+#[inline]
+fn aof_backstop(config: &RuntimeConfig) -> bool {
+    #[cfg(test)]
+    {
+        AOF_BACKSTOP_OVERRIDE
+            .with(std::cell::Cell::get)
+            .unwrap_or(config.appendonly == "yes")
+    }
+    #[cfg(not(test))]
+    {
+        let _ = config;
+        crate::storage::tiered::dead_slots::aof_consumer_present()
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static AOF_BACKSTOP_OVERRIDE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Test-only: force [`aof_backstop`] on this thread (`None` restores it).
+#[cfg(test)]
+pub(crate) fn force_aof_backstop(present: Option<bool>) {
+    AOF_BACKSTOP_OVERRIDE.with(|c| c.set(present));
+}
+
+/// Smallest durable batch a no-AOF eviction writes, in bytes (moon#1290 N6).
+/// 1 MiB (was 256 KiB in the first cut): every batch costs a heap fsync and a
+/// manifest commit, and a larger batch amortizes them — a no-AOF write flood
+/// over `maxmemory` measured +25–55% rps (monoio `--shards 4`: ~122K → 151–164K
+/// rps). The cost is disk: without an AOF nothing reclaims a spill file until
+/// its last live key leaves it, so a bigger file holds more dead slots.
+const DURABLE_BATCH_MIN_BYTES: usize = 1024 * 1024;
+
+/// The bytes one no-AOF durable batch reclaims: the deficit, but at least
+/// 1/16 of the target (capped at [`DURABLE_BATCH_MIN_BYTES`]). A write gate's
+/// deficit is one write's worth; without the floor every write over budget
+/// paid its own heap fsync and manifest commit for one victim.
+#[inline]
+fn durable_batch_bytes(deficit: usize, target: usize) -> usize {
+    deficit.max((target / 16).min(DURABLE_BATCH_MIN_BYTES))
+}
+
 /// OOM error frame returned when eviction cannot free enough memory.
 fn oom_error() -> Frame {
     Frame::Error(Bytes::from_static(
@@ -734,12 +786,19 @@ pub enum EvictionSink<'s, 'm> {
     /// write, so a crash between "dropped from RAM" and "spilled to disk" is
     /// recovered by AOF replay.
     ///
-    /// Under `--appendonly no` there is no second copy once a value leaves
-    /// RAM, so with a `manifest` available this batches victims through
-    /// [`evict_batch_durable`] (fully durable before drop); with no manifest
-    /// reachable it falls back to plain-drop (cap still enforced, Redis
-    /// semantics, `noeviction` OOMs) — the tick-driven memory-pressure
-    /// cascade with its manifest picks up durable spilling within 100ms.
+    /// Without an AOF writer in the process there is no second copy once a
+    /// value leaves RAM, so with a `manifest` available this batches victims
+    /// through [`evict_batch_durable`] (fully durable before drop); with no
+    /// manifest reachable it falls back to plain-drop (cap still enforced,
+    /// Redis semantics, `noeviction` OOMs). Every write gate passes the
+    /// shard's manifest (`shard::manifest_cell`, moon#1290 N6), so the plain
+    /// drop is the no-manifest corner only.
+    ///
+    /// The choice is made on whether an AOF writer exists
+    /// ([`aof_backstop`]), never on the `appendonly` config string: `CONFIG
+    /// SET appendonly yes` changes only the string (moon#1290 N7) and used to
+    /// route a no-AOF process's victims to the async window with nothing
+    /// behind it.
     AsyncSpill {
         sender: &'s flume::Sender<SpillRequest>,
         shard_dir: &'s Path,
@@ -1037,10 +1096,12 @@ pub fn evict_to_budget(
                 db_index,
                 manifest,
             } => {
-                if config.appendonly != "yes" {
+                if !aof_backstop(config) {
                     match manifest.as_deref_mut() {
                         // No AOF backstop but a manifest is reachable:
-                        // durable batched spill before any drop.
+                        // durable batched spill before any drop, sized so
+                        // one batch (one heap fsync + one manifest commit)
+                        // covers many writes, not one (moon#1290 N6).
                         Some(m) => {
                             evict_batch_durable(
                                 db,
@@ -1050,7 +1111,7 @@ pub fn evict_to_budget(
                                 next_file_id,
                                 m,
                                 *db_index,
-                                deficit,
+                                durable_batch_bytes(deficit, target),
                                 on_plain_drop,
                             ) > 0
                         }
@@ -1323,10 +1384,11 @@ pub fn compute_elastic_budget(shard_id: usize, base: usize, used: &[usize]) -> u
 }
 
 /// Maximum victims collected into a single durable batch by
-/// [`evict_batch_durable`], mirroring `SpillThread`'s own
-/// `FLUSH_ENTRY_CAP` (256) so the no-AOF-backstop path's on-disk batch size
-/// matches the async path's.
-const NO_AOF_BATCH_CAP: usize = 256;
+/// [`evict_batch_durable`]. 1024 — four times `SpillThread`'s own
+/// `FLUSH_ENTRY_CAP` (256): the no-AOF path fsyncs and commits the manifest per
+/// batch on the shard thread, so it amortizes that over more entries (see
+/// [`DURABLE_BATCH_MIN_BYTES`] for the measured gain and the disk cost).
+const NO_AOF_BATCH_CAP: usize = 1024;
 
 /// Bounded retries when victim sampling re-picks a key already staged in the
 /// current batch (possible because, unlike the single-victim paths, this
@@ -1631,6 +1693,19 @@ fn evict_batch_durable(
                  appendonly=no; retaining hot values (spill file may be orphaned; \
                  the orphan sweep reclaims it)"
             );
+            // moon#1291 F9: `add_file` left the entry in the in-memory root, so
+            // the next successful commit would list this file although none of
+            // its slots is a key's entry — and a key DELeted while hot (no cold
+            // entry, so no grave) would come back from it at the next boot.
+            // Retire the entry (the next commit writes it as a Tombstone), and,
+            // in case the failed commit reached the disk anyway, record every
+            // slot as a grave for the next snapshot's trailer.
+            manifest.remove_file(file_id, crate::persistence::page::PageType::KvLeaf);
+            if let Some(ref mut ci) = db.cold_index {
+                for entry in &completion.entries {
+                    ci.note_unpublished_slot(file_id, entry.page_idx, entry.slot_idx);
+                }
+            }
             continue;
         }
 
@@ -4095,5 +4170,9 @@ mod tests {
     }
 }
 
+#[cfg(test)]
+mod aof_routing_tests;
+#[cfg(test)]
+mod commit_failure_tests;
 #[cfg(test)]
 mod ledger_admission_tests;

@@ -64,6 +64,19 @@ pub fn start_moon_with(
     appendonly: &str,
     extra: &[&str],
 ) -> common::ServerGuard {
+    start_moon_with_env(port, dir, sweep_secs, appendonly, extra, &[])
+}
+
+/// [`start_moon_with`] with extra environment variables for the server
+/// process (the `MOON_TEST_*` fault-injection hooks).
+pub fn start_moon_with_env(
+    port: u16,
+    dir: &std::path::Path,
+    sweep_secs: u64,
+    appendonly: &str,
+    extra: &[&str],
+    envs: &[(&str, &str)],
+) -> common::ServerGuard {
     let off_dir = dir.join("off");
     std::fs::create_dir_all(&off_dir).expect("create off dir");
     common::ServerGuard::new(
@@ -104,6 +117,7 @@ pub fn start_moon_with(
             ])
             .arg(dir)
             .args(extra)
+            .envs(envs.iter().copied())
             // Captured to a log file so a CI flake produces a real diagnostic
             // (never Stdio::null()).
             .stdout(

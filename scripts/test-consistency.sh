@@ -801,6 +801,65 @@ redis_sm=$(redis-cli -p "$PORT_REDIS" SMEMBERS s:test 2>&1 | sort)
 rust_sm=$(redis-cli -p "$PORT_RUST" SMEMBERS s:test 2>&1 | sort)
 assert_eq "SMEMBERS (sorted)" "$redis_sm" "$rust_sm"
 
+# moon#1287: SSCAN. A compact (intset/listpack) set answers in ONE call with
+# cursor 0 whatever COUNT says, as redis does. An integer set, so it is an
+# intset on every oracle (a small STRING set is listpack only from redis 7.2;
+# 7.0 pages it as a hashtable). Member order is unspecified on both, so the
+# cursor line and the sorted members are compared separately.
+both DEL s:scan:small s:scan:big
+both SADD s:scan:small 1 2 3 4 5 6 7
+redis_ss=$(redis-cli -p "$PORT_REDIS" SSCAN s:scan:small 0 COUNT 2 2>&1)
+rust_ss=$(redis-cli -p "$PORT_RUST" SSCAN s:scan:small 0 COUNT 2 2>&1)
+assert_eq "SSCAN compact set: one call, cursor 0" "$(head -1 <<<"$redis_ss")" "$(head -1 <<<"$rust_ss")"
+assert_eq "SSCAN compact set: every member (sorted)" \
+    "$(tail -n +2 <<<"$redis_ss" | sort)" "$(tail -n +2 <<<"$rust_ss" | sort)"
+# A full-encoding set scanned to completion with COUNT 100: the union of the
+# pages is exactly the set (moon pages it by position since moon#1287).
+sscan_all() {
+    local port=$1 key=$2 cur=0 out="" reply n=0
+    while :; do
+        reply=$(redis-cli -p "$port" SSCAN "$key" "$cur" COUNT 100 2>&1)
+        cur=$(head -1 <<<"$reply")
+        out+=$(tail -n +2 <<<"$reply")$'\n'
+        n=$((n + 1))
+        [[ "$cur" == 0 || $n -gt 100000 ]] && break
+    done
+    sed '/^$/d' <<<"$out" | sort -u
+}
+# shellcheck disable=SC2046
+both SADD s:scan:big $(seq -f 'm%g' 1 1000)
+assert_both "SSCAN full set: encoding" OBJECT ENCODING s:scan:big
+assert_eq "SSCAN full set: union of all pages (sorted)" \
+    "$(sscan_all "$PORT_REDIS" s:scan:big)" "$(sscan_all "$PORT_RUST" s:scan:big)"
+assert_eq "SSCAN full set: 1000 members returned" "1000" "$(sscan_all "$PORT_RUST" s:scan:big | wc -l | tr -d ' ')"
+# moon#1287 wave-1 review F1: a same-membership rewrite (SUNIONSTORE k k)
+# between the first and second page must not make the scan skip members that
+# were present for the whole scan (moon's position cursor did: 100 of 2000).
+sscan_across_rewrite() {
+    local port=$1 key=$2 cur out reply n=0
+    reply=$(redis-cli -p "$port" SSCAN "$key" 0 COUNT 100 2>&1)
+    cur=$(head -1 <<<"$reply")
+    out=$(tail -n +2 <<<"$reply")$'\n'
+    redis-cli -p "$port" SUNIONSTORE "$key" "$key" >/dev/null 2>&1
+    while [[ "$cur" != 0 && $n -le 100000 ]]; do
+        reply=$(redis-cli -p "$port" SSCAN "$key" "$cur" COUNT 100 2>&1)
+        cur=$(head -1 <<<"$reply")
+        out+=$(tail -n +2 <<<"$reply")$'\n'
+        n=$((n + 1))
+    done
+    sed '/^$/d' <<<"$out" | sort -u
+}
+assert_eq "SSCAN full set: every member across a SUNIONSTORE rewrite" \
+    "$(sscan_all "$PORT_REDIS" s:scan:big)" "$(sscan_across_rewrite "$PORT_RUST" s:scan:big)"
+assert_eq "SSCAN full set across a rewrite (redis)" \
+    "$(sscan_all "$PORT_REDIS" s:scan:big)" "$(sscan_across_rewrite "$PORT_REDIS" s:scan:big)"
+# Wave-1 review NITs: an intset answers in ascending NUMERIC order (not byte
+# order), and `-1` is a valid cursor (redis parses it with strtoul).
+both DEL s:scan:ints
+both SADD s:scan:ints 10 2 1 100 -5
+assert_both "SSCAN intset: numeric order" SSCAN s:scan:ints 0
+assert_both "SSCAN cursor -1" SSCAN s:scan:ints -1
+
 # ===========================================================================
 # 9. Sorted Set operations
 # ===========================================================================

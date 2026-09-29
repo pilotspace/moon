@@ -1239,19 +1239,21 @@ impl ServerConfig {
                 );
                 self.dir = ".".to_owned();
             }
-            DirResolution::UserData(d) => match std::fs::create_dir_all(&d) {
-                Ok(()) => {
-                    tracing::info!(dir = %d.display(), "--dir not set; using platform user-data directory");
-                    self.dir = d.to_string_lossy().into_owned();
+            DirResolution::UserData(d) => {
+                match crate::persistence::fsync::create_dir_all_durable(&d) {
+                    Ok(()) => {
+                        tracing::info!(dir = %d.display(), "--dir not set; using platform user-data directory");
+                        self.dir = d.to_string_lossy().into_owned();
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            dir = %d.display(), error = %e,
+                            "cannot create user-data directory; falling back to current directory"
+                        );
+                        self.dir = ".".to_owned();
+                    }
                 }
-                Err(e) => {
-                    tracing::warn!(
-                        dir = %d.display(), error = %e,
-                        "cannot create user-data directory; falling back to current directory"
-                    );
-                    self.dir = ".".to_owned();
-                }
-            },
+            }
             DirResolution::FallbackCwd => {
                 tracing::warn!(
                     "--dir not set and no HOME/XDG_DATA_HOME/LOCALAPPDATA in the \

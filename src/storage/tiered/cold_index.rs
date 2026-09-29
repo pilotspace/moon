@@ -426,6 +426,27 @@ impl ColdIndex {
         &self.graves
     }
 
+    /// Record `(file_id, page_idx, slot_idx)` as a no-AOF grave WITHOUT a key
+    /// ledger entry: a slot that was written but never became any key's
+    /// entry (moon#1291 F9 — a spill batch whose manifest commit failed; its
+    /// keys are still hot, so a `DEL` in an AOF fold would be wrong). A no-op
+    /// with an AOF writer, like every grave.
+    pub fn note_unpublished_slot(&mut self, file_id: u64, page_idx: u32, slot_idx: u16) {
+        self.graves.note(file_id, page_idx, slot_idx);
+    }
+
+    /// Take this index's grave record, leaving an empty one (moon#1291 F8:
+    /// the graves of a db this boot cannot attach move to one it can, so the
+    /// next snapshot's trailer still carries them).
+    pub fn take_graves(&mut self) -> super::slot_graves::SlotGraves {
+        std::mem::take(&mut self.graves)
+    }
+
+    /// Fold `graves` into this index's record (see [`Self::take_graves`]).
+    pub fn adopt_graves(&mut self, graves: super::slot_graves::SlotGraves) {
+        self.graves.merge(graves);
+    }
+
     /// Test shim for the pre-moon#1281 signature: a ghost slot at page 0,
     /// slot 0 of `file_id` (only the ledger's key matters to those tests).
     #[cfg(test)]
