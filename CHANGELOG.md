@@ -546,11 +546,21 @@ shared 4-vCPU Linux container against HEAD `935c555` — re-measure on the GCE r
   arity: `SETNX k v extra`), or a write that answers any other error
   (`SET k v BADOPT`, `MOVE k <same db>`, WRONGTYPE) — captures nothing, so the
   abort never restores over another client's write. Nor does a write-flagged
-  command that only READS its keys (`SORT src` or `GEORADIUS src ...` without
-  `STORE`), on the connection or from a script: it captured `src`, and the
-  abort restored `src` over concurrent writes, logged to the AOF and replicas. A malformed write on the connection itself is still captured
-  (a pre-existing limit). **Behaviour change:** inside a TXN, a
-  script's `FLUSHDB`, `FLUSHALL`, `SWAPDB`, `MOVE` or `COPY … DB`, or an
+  command whose argv the key walker reads as naming no written key (`SORT src`
+  or `GEORADIUS src ...` without `STORE`), on the connection or from a script:
+  it captured `src`, and the abort restored `src` over concurrent writes,
+  logged to the AOF and replicas. Over-capture remains in these cases, each of
+  which lets an abort restore a key over another client's write until moon#1299
+  keeps other writers off the keys an open TXN holds: `LMPOP` / `ZMPOP` capture
+  every candidate key, not only the one popped; two walker corner cases
+  (`GEORADIUSBYMEMBER g STORE 100 km` whose member is literally `STORE`
+  captures `100`; `XGROUP HELP <x>` captures `<x>`); a write that succeeds as
+  a no-op keeps its capture (`SETNX` or `SET … NX` on an existing key, `COPY`
+  without `REPLACE` onto an existing key, `RENAMENX`, `LPUSHX` on a missing
+  key, `SMOVE` of a missing member); and a write on the connection itself
+  that answers an error keeps its capture (moon#1303; scripts drop it).
+  **Behaviour change:** inside a TXN, a script's `FLUSHDB`, `FLUSHALL`,
+  `SWAPDB`, `MOVE` or `COPY … DB`, or an
   arity-valid write whose keys cannot be enumerated (a malformed `LMPOP`,
   `ZMPOP` or `XREADGROUP`), is refused with
   `ERR TXN cannot roll back this command from a script …`, and a read-write
