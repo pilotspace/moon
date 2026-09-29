@@ -45,35 +45,47 @@ pub fn fsync_directory(dir: &Path) -> std::io::Result<()> {
 /// `path` is fsynced even when `path` already existed: its entry may have
 /// been created by an earlier, unsynced call.
 ///
-/// A directory that ALREADY existed may refuse the fsync without failing
-/// the call ([`dir_fsync_error_is_tolerable`]): an ancestor this process may
-/// not open (`EACCES`, a `0711` home), or a filesystem without directory
-/// fsync (`EINVAL` / `EBADF` / `ENOTSUP` — squashfs, erofs, iso9660,
-/// vboxsf, WSL1 drvfs, procfs), as PostgreSQL's `fsync_fname_ext` ignores
-/// `EBADF` / `EINVAL` on directories. `main.rs` fsyncs the parent of the
-/// data directory on every boot, so refusing there made a server that booted
-/// before stop booting. Any other error (`EIO`), and any error on a
-/// directory this call created, propagates. A skip is a warning only when
-/// the entry it leaves unsynced was created by this call; for a
-/// pre-existing entry it is logged at debug, so a boot does not warn every
-/// time.
+/// A directory fsync may fail without failing the call
+/// ([`dir_fsync_error_is_tolerable`]) in two cases. A filesystem that cannot
+/// fsync directories at all (`EINVAL` / `EROFS` / `EBADF` / `ENOTSUP` /
+/// `EOPNOTSUPP` / `ENOTTY` — squashfs, erofs, iso9660, vboxsf, WSL1 drvfs,
+/// procfs, macOS exFAT/SMB) is tolerated whether or not this call created the directory,
+/// as PostgreSQL's `fsync_fname_ext` ignores `EBADF` / `EINVAL` on
+/// directories: refusing there made `--dir /mnt/x/moon/data` with two
+/// missing levels fail boot while the one-level case and every later boot
+/// succeeded — the error buys no durability the filesystem can give. And an
+/// ancestor that ALREADY existed and that this process may not open
+/// (`EACCES`, a `0711` home) is tolerated; `EACCES` on a directory this call
+/// created is fatal (it just made it; not being able to open it is not a
+/// property of the filesystem). Any other error (`EIO`: the fsync ran and
+/// failed) propagates. When a skip leaves an entry this call created
+/// unsynced, ONE warning names them all; a skip that leaves only
+/// pre-existing entries unsynced is logged at debug, so a boot does not
+/// warn every time.
 pub fn create_dir_all_durable(path: &Path) -> std::io::Result<()> {
-    for skip in create_dir_all_durable_with(path, fsync_directory)? {
-        if skip.entry_created {
-            tracing::warn!(
-                "cannot fsync {} to persist the new directory entry {}: {}",
-                skip.dir.display(),
-                skip.entry.display(),
-                skip.error
-            );
-        } else {
-            tracing::debug!(
-                "cannot fsync {} (entry {} already existed): {}",
-                skip.dir.display(),
-                skip.entry.display(),
-                skip.error
-            );
-        }
+    let skipped = create_dir_all_durable_with(path, fsync_directory)?;
+    let new_entries: Vec<&SkippedDirSync> = skipped.iter().filter(|s| s.entry_created).collect();
+    if let Some(first) = new_entries.first() {
+        let names: Vec<String> = new_entries
+            .iter()
+            .map(|s| s.entry.display().to_string())
+            .collect();
+        tracing::warn!(
+            "cannot fsync directories to persist {} new director{} ({}): {}; \
+             they may not survive a power loss",
+            names.len(),
+            if names.len() == 1 { "y" } else { "ies" },
+            names.join(", "),
+            first.error,
+        );
+    }
+    for skip in skipped.iter().filter(|s| !s.entry_created) {
+        tracing::debug!(
+            "cannot fsync {} (entry {} already existed): {}",
+            skip.dir.display(),
+            skip.entry.display(),
+            skip.error
+        );
     }
     Ok(())
 }
@@ -136,24 +148,51 @@ fn create_dir_all_durable_with(
 }
 
 /// May [`create_dir_all_durable`] skip a directory fsync that failed with
-/// `error`? Only for a directory that already existed (`dir_created` false),
-/// and only when the failure says the fsync cannot be done there at all: no
-/// permission to open it, or a filesystem that does not fsync directories
-/// (`EINVAL`, `EBADF`, `ENOTSUP` / `ErrorKind::Unsupported`). `EIO` — the
-/// fsync ran and failed — is never skipped.
+/// `error`?
+///
+/// - The filesystem cannot fsync directories ([`dir_fsync_unsupported`]):
+///   yes, whether or not this call created `dir` (`dir_created`) — the
+///   filesystem gives no directory durability to wait for.
+/// - No permission to open it (`EACCES` / `ErrorKind::PermissionDenied`):
+///   only for a directory that already existed. On one this call created it
+///   is fatal.
+/// - Anything else (`EIO` — the fsync ran and failed, `ENOSPC`, ...): no.
 fn dir_fsync_error_is_tolerable(error: &std::io::Error, dir_created: bool) -> bool {
-    if dir_created {
-        return false;
+    if dir_fsync_unsupported(error) {
+        return true;
     }
-    if matches!(
-        error.kind(),
-        std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::Unsupported
-    ) {
+    !dir_created && error.kind() == std::io::ErrorKind::PermissionDenied
+}
+
+/// Does `error` say the filesystem cannot fsync a directory at all?
+///
+/// `EINVAL` / `EROFS` are what fsync(2) documents for "a file which does
+/// not support synchronization"; `EBADF` is what some FUSE / network
+/// filesystems answer for a read-only directory descriptor. Matched on the
+/// raw errno, not on `ErrorKind`: std maps `EINVAL` to `InvalidInput` and
+/// `EROFS` to `ReadOnlyFilesystem`, and leaves `EBADF` / `EOPNOTSUPP` /
+/// `ENOTTY` uncategorized, so the kind does not carry the distinction.
+/// `ENOTSUP` and `EOPNOTSUPP` are the same value on Linux but differ on
+/// macOS (45 and 102), where `F_FULLFSYNC` on exFAT / SMB answers `ENOTSUP`
+/// or `ENOTTY`. `ErrorKind::Unsupported` (std's `ENOSYS`, and a synthetic
+/// error) counts too.
+fn dir_fsync_unsupported(error: &std::io::Error) -> bool {
+    if error.kind() == std::io::ErrorKind::Unsupported {
         return true;
     }
     #[cfg(unix)]
     {
-        matches!(error.raw_os_error(), Some(libc::EINVAL | libc::EBADF))
+        const NO_DIR_FSYNC: [i32; 6] = [
+            libc::EINVAL,
+            libc::EROFS,
+            libc::EBADF,
+            libc::ENOTSUP,
+            libc::EOPNOTSUPP,
+            libc::ENOTTY,
+        ];
+        error
+            .raw_os_error()
+            .is_some_and(|e| NO_DIR_FSYNC.contains(&e))
     }
     #[cfg(not(unix))]
     {
@@ -268,31 +307,39 @@ mod tests {
         std::io::Error::from_raw_os_error(code)
     }
 
-    /// PR #1301 review round 3: a pre-existing directory that cannot be
-    /// fsynced (no permission, or a filesystem without directory fsync) is
-    /// skipped; `EIO`, and anything on a directory this call created, is not.
+    /// PR #1301 review round 4: a filesystem without directory fsync
+    /// (`EINVAL` / `EROFS` / `EBADF` / `ENOTSUP` / `EOPNOTSUPP` / `ENOTTY` /
+    /// `Unsupported`) is skipped on a created and a pre-existing directory
+    /// alike; no permission (`EACCES`) only on a pre-existing one; `EIO` and
+    /// anything else never.
     #[cfg(unix)]
     #[test]
     fn dir_fsync_error_classification() {
         use std::io::{Error, ErrorKind};
-        for (e, pre_existing_ok) in [
-            (os_err(libc::EINVAL), true),
-            (os_err(libc::EBADF), true),
-            (os_err(libc::ENOTSUP), true),
-            (os_err(libc::EACCES), true),
-            (Error::from(ErrorKind::PermissionDenied), true),
-            (Error::from(ErrorKind::Unsupported), true),
-            (os_err(libc::EIO), false),
-            (os_err(libc::ENOSPC), false),
-            (Error::from(ErrorKind::NotFound), false),
+        // (error, tolerated on a pre-existing dir, tolerated on a created dir)
+        for (e, pre_existing_ok, created_ok) in [
+            (os_err(libc::EINVAL), true, true),
+            (os_err(libc::EBADF), true, true),
+            (os_err(libc::ENOTSUP), true, true),
+            (os_err(libc::EOPNOTSUPP), true, true),
+            (os_err(libc::ENOTTY), true, true),
+            (Error::from(ErrorKind::Unsupported), true, true),
+            (os_err(libc::EACCES), true, false),
+            (Error::from(ErrorKind::PermissionDenied), true, false),
+            (os_err(libc::EIO), false, false),
+            (os_err(libc::ENOSPC), false, false),
+            (os_err(libc::EROFS), true, true),
+            (Error::from(ErrorKind::NotFound), false, false),
+            (Error::from(ErrorKind::InvalidInput), false, false),
         ] {
             assert_eq!(
                 dir_fsync_error_is_tolerable(&e, false),
                 pre_existing_ok,
-                "{e:?}"
+                "pre-existing dir: {e:?}"
             );
-            assert!(
-                !dir_fsync_error_is_tolerable(&e, true),
+            assert_eq!(
+                dir_fsync_error_is_tolerable(&e, true),
+                created_ok,
                 "created dir: {e:?}"
             );
         }
@@ -321,31 +368,36 @@ mod tests {
         );
     }
 
-    /// `EIO` is fatal even on a pre-existing parent; any error on a
+    /// `EIO` is fatal even on a pre-existing parent, and `EACCES` on a
     /// directory this call created is fatal.
     #[cfg(unix)]
     #[test]
-    fn create_dir_all_durable_keeps_eio_and_created_dir_errors_fatal() {
+    fn create_dir_all_durable_keeps_eio_and_created_dir_eacces_fatal() {
         let tmp = tempfile::tempdir().unwrap();
         let eio =
             create_dir_all_durable_with(&tmp.path().join("x"), |_: &Path| Err(os_err(libc::EIO)))
                 .unwrap_err();
         assert_eq!(eio.raw_os_error(), Some(libc::EIO));
-        // `a/b/c` is new: `a/b` and `a` were created by this call and refuse
-        // with EINVAL; the pre-existing `tmp` would be tolerated.
+        // `a/b/c` is new: `a/b` and `a` were created by this call.
         let base = tmp.path().to_path_buf();
         let leaf = base.join("a").join("b").join("c");
-        let err =
-            create_dir_all_durable_with(&leaf, |_: &Path| Err(os_err(libc::EINVAL))).unwrap_err();
-        assert_eq!(err.raw_os_error(), Some(libc::EINVAL));
-        // Only the pre-existing `tmp` refuses: tolerated, and the three new
-        // entries' parents were all asked.
+        let err = create_dir_all_durable_with(&leaf, |d: &Path| {
+            if d == base {
+                Ok(())
+            } else {
+                Err(os_err(libc::EACCES))
+            }
+        })
+        .unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(libc::EACCES));
+        // `EACCES` on the pre-existing `base` only: tolerated, and every new
+        // entry's parent was asked.
         let mut asked = Vec::new();
         let leaf2 = base.join("p").join("q");
         let skipped = create_dir_all_durable_with(&leaf2, |d: &Path| {
             asked.push(d.to_path_buf());
             if d == base {
-                Err(os_err(libc::EINVAL))
+                Err(os_err(libc::EACCES))
             } else {
                 Ok(())
             }
@@ -354,6 +406,44 @@ mod tests {
         assert_eq!(asked, vec![base.join("p"), base.clone()]);
         assert_eq!(skipped.len(), 1);
         assert!(skipped[0].entry_created);
+    }
+
+    /// PR #1301 review round 4 (a regression of round 3): on a filesystem
+    /// without directory fsync, `--dir /mnt/x/moon/data` with `moon` and
+    /// `data` both missing failed with `EINVAL` — the fsync of `moon`, a
+    /// directory this call created — while the one-level case and every
+    /// later boot succeeded. Every level now skips alike, and every new
+    /// entry is reported as left unsynced.
+    #[cfg(unix)]
+    #[test]
+    fn create_dir_all_durable_skips_unsupported_dir_fsync_on_created_dirs() {
+        for errno in [
+            libc::EINVAL,
+            libc::EROFS,
+            libc::EBADF,
+            libc::ENOTSUP,
+            libc::EOPNOTSUPP,
+            libc::ENOTTY,
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let leaf = tmp.path().join("moon").join("data");
+            let skipped =
+                create_dir_all_durable_with(&leaf, |_: &Path| Err(os_err(errno))).unwrap();
+            assert!(leaf.is_dir());
+            let mut dirs: Vec<_> = skipped.iter().map(|s| s.dir.clone()).collect();
+            dirs.sort();
+            assert_eq!(
+                dirs,
+                vec![tmp.path().to_path_buf(), tmp.path().join("moon")],
+                "errno {errno}"
+            );
+            assert!(skipped.iter().all(|s| s.entry_created), "errno {errno}");
+            // A later boot: nothing created, the parent's skip is quiet.
+            let skipped =
+                create_dir_all_durable_with(&leaf, |_: &Path| Err(os_err(errno))).unwrap();
+            assert_eq!(skipped.len(), 1);
+            assert!(!skipped[0].entry_created);
+        }
     }
 
     /// A real filesystem without directory fsync: procfs answers `EINVAL`.

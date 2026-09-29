@@ -1061,6 +1061,32 @@ enum DirResolution {
     FallbackCwd,
 }
 
+/// What [`ServerConfig::resolve_dir`] does with the platform user-data
+/// directory once `create_dir_all_durable` has run on it (pure decision).
+#[derive(Debug)]
+enum UserDataDirChoice {
+    /// Created (or already there) and durable: use it.
+    Use,
+    /// The durable create failed, but the directory exists — a directory
+    /// fsync refused after `create_dir_all` succeeded: use it, with a
+    /// warning. Falling back to `.` would put the data where a later boot
+    /// from another working directory never looks (PR #1301 review round 4).
+    UseDespite(std::io::Error),
+    /// The directory does not exist: fall back to the current directory.
+    FallbackCwd(std::io::Error),
+}
+
+fn user_data_dir_choice(
+    created: std::io::Result<()>,
+    is_dir: impl FnOnce() -> bool,
+) -> UserDataDirChoice {
+    match created {
+        Ok(()) => UserDataDirChoice::Use,
+        Err(e) if is_dir() => UserDataDirChoice::UseDespite(e),
+        Err(e) => UserDataDirChoice::FallbackCwd(e),
+    }
+}
+
 fn decide_dir(
     dir: &str,
     cwd_has_data: bool,
@@ -1223,7 +1249,9 @@ impl ServerConfig {
     /// persistence component reads `self.dir`). See `decide_dir` for the
     /// resolution order. Creation failure of the user-data directory
     /// degrades to the current directory with a warning rather than
-    /// refusing to start.
+    /// refusing to start; a durability failure (a directory fsync) on a
+    /// directory that does exist keeps it, with a warning
+    /// ([`user_data_dir_choice`]).
     pub fn resolve_dir(&mut self) {
         match decide_dir(
             &self.dir,
@@ -1240,12 +1268,21 @@ impl ServerConfig {
                 self.dir = ".".to_owned();
             }
             DirResolution::UserData(d) => {
-                match crate::persistence::fsync::create_dir_all_durable(&d) {
-                    Ok(()) => {
+                let created = crate::persistence::fsync::create_dir_all_durable(&d);
+                match user_data_dir_choice(created, || d.is_dir()) {
+                    UserDataDirChoice::Use => {
                         tracing::info!(dir = %d.display(), "--dir not set; using platform user-data directory");
                         self.dir = d.to_string_lossy().into_owned();
                     }
-                    Err(e) => {
+                    UserDataDirChoice::UseDespite(e) => {
+                        tracing::warn!(
+                            dir = %d.display(), error = %e,
+                            "--dir not set; the user-data directory exists but could not \
+                             be made durable; using it anyway"
+                        );
+                        self.dir = d.to_string_lossy().into_owned();
+                    }
+                    UserDataDirChoice::FallbackCwd(e) => {
                         tracing::warn!(
                             dir = %d.display(), error = %e,
                             "cannot create user-data directory; falling back to current directory"
@@ -2573,6 +2610,26 @@ mod tests {
         let mut config = ServerConfig::parse_from(["moon", "--dir", "/var/lib/moon"]);
         config.resolve_dir();
         assert_eq!(config.dir, "/var/lib/moon");
+    }
+
+    /// PR #1301 review round 4: a durable-create error on a directory that
+    /// exists afterwards keeps the directory (with a warning); only a
+    /// directory that is not there falls back to `.`.
+    #[test]
+    fn test_user_data_dir_choice() {
+        use std::io::{Error, ErrorKind};
+        assert!(matches!(
+            user_data_dir_choice(Ok(()), || unreachable!("not asked on success")),
+            UserDataDirChoice::Use
+        ));
+        assert!(matches!(
+            user_data_dir_choice(Err(Error::from(ErrorKind::Other)), || true),
+            UserDataDirChoice::UseDespite(_)
+        ));
+        assert!(matches!(
+            user_data_dir_choice(Err(Error::from(ErrorKind::PermissionDenied)), || false),
+            UserDataDirChoice::FallbackCwd(_)
+        ));
     }
 
     #[test]

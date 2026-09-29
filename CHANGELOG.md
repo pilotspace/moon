@@ -471,9 +471,13 @@ shared 4-vCPU Linux container against HEAD `935c555` — re-measure on the GCE r
   fsynced (with its directory entry) before the manifest commits; a crash before
   the commit leaves no manifest and the next boot redoes the initialization.
   Every newly created data, offload or AOF directory (binary and embedded
-  entry) has its entry fsynced too; a pre-existing ancestor on a filesystem
-  without directory fsync (squashfs, vboxsf, WSL1 drvfs: `EINVAL`) or that
-  the process may not open is skipped, not a boot failure.
+  entry) has its entry fsynced too. On a filesystem without directory fsync
+  (squashfs, vboxsf, WSL1 drvfs, macOS exFAT/SMB: `EINVAL`, `EBADF`,
+  `ENOTSUP`, `ENOTTY`, ...) the fsync is skipped at every level, new or
+  pre-existing, with one warning; a pre-existing ancestor the process may not
+  open is skipped too. Neither fails boot; `EIO` does. An auto-resolved
+  user-data directory that exists but could not be made durable is used, with
+  a warning, instead of falling back to the current directory.
 
 - **Cold-key graves survive a smaller `--databases` and a failed spill commit**
   (moon#1291). Restarting a no-AOF server with fewer databases aborted the
