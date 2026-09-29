@@ -91,5 +91,25 @@ Evidence: every fix is red on the base binaries or by mutation, and green on bot
 
 Residual: a *connection* write that answers an error still keeps its capture. This predates the PR (moon#500) and is filed as moon#1303.
 
+## Round 4: review of the round-3 fixes (WS35, follow-up after PR #1301 merged as `9d72003`)
+The review found no BLOCKER.
+
+**Deferred to moon#1299 / moon#1303 as acceptance cases.** Its MAJORs and MINORs are over-capture shapes. Each is harmful only while other clients can write keys that an open TXN holds, which is what moon#1299 closes. On the connection leg they are pre-existing. The shapes are:
+- LMPOP/ZMPOP candidates;
+- connection writes that answer an error;
+- successful writes that change nothing;
+- `GEORADIUSBYMEMBER g STORE 100 km`;
+- `XGROUP HELP <x>`.
+
+**Fixed:**
+- **m4 (moon#1293, regression from `c55924b`):** a directory fsync that the filesystem cannot perform is now skipped on created and pre-existing directories alike, with one warning per call. That covers EINVAL, EROFS, EBADF, ENOTSUP, EOPNOTSUPP, ENOTTY and `Unsupported`, matched on the raw errno.
+  - `--dir /mnt/x/moon/data` with two missing levels on vboxsf or WSL1 drvfs no longer fails boot.
+  - EACCES is tolerated only on a pre-existing ancestor. EIO stays fatal.
+  - `resolve_dir` keeps a user-data dir that exists but could not be made durable, instead of falling back to `.`.
+- **m3 (moon#1285, pre-existing data loss):** FLUSHDB / FLUSHALL sent on the connection inside a TXN used to run, and `TXN ABORT` answered +OK with the data gone. Both runtimes now refuse them before routing with `ERR TXN cannot roll back this command (whole-database write)` and poison the TXN, so COMMIT answers EXECABORT. The command list is shared with the script path through `transaction::TXN_WHOLE_DB_WRITES`. The test is red on `18ad969` and green now, on both runtimes at `--shards 1` and `--shards 4`, including after kill -9.
+- **n1, n2:** a misplaced doc comment is restored. The CHANGELOG capture claim is narrowed, and its residuals are named.
+
+**Gates (Linux container, not the merge bar):** fmt, clippy on both runtimes, the fuzz check and unit tests all exit 0. The integration suites pass on both runtimes except the three known tokio replica tests, which fail because tokio has no master-side PSYNC.
+
 ## Self-evaluation (0–1)
 Completeness 0.9 · Clarity 0.9 · Practicality 0.9 · Optimization 0.9 · Edge cases 0.9 · Self-evaluation 0.9
