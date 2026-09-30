@@ -721,6 +721,11 @@ pub fn replay_ordered_merge(
     Ok(replayed)
 }
 
+/// Fuzzing entry points into the readers above (moon#1283).
+#[cfg(any(test, feature = "fuzzing"))]
+#[path = "shard_replay_fuzz.rs"]
+pub mod fuzz;
+
 #[cfg(test)]
 mod tests {
     use super::*;
