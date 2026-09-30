@@ -132,3 +132,56 @@ fn a_write_over_an_expired_key_counts_it() {
     db.get_or_create_hash(b"w1286").expect("hash");
     assert_eq!(counted() - before, 1);
 }
+
+/// Review N4: the same for a key only the cold tier holds. Its TTL is known
+/// from the in-RAM index, so the write reaps it — counted once, the dead
+/// entry gone — while a live cold shadow is left alone, as before.
+#[test]
+fn a_write_over_an_expired_cold_only_key_counts_it_once() {
+    use crate::persistence::kv_page::ValueType;
+    use crate::storage::tiered::cold_index::{ColdIndex, ColdLocation};
+    let mut db = Database::new();
+    let mut ci = ColdIndex::new();
+    for (slot, (key, ttl_ms)) in [
+        (&b"cold1286:dead"[..], Some(1_000)),
+        (b"cold1286:live", None),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let location = ColdLocation {
+            file_id: 7,
+            page_idx: 0,
+            slot_idx: slot as u16,
+            ttl_ms,
+            value_type: ValueType::String,
+        };
+        ci.insert(Bytes::copy_from_slice(key), location);
+    }
+    db.cold_index = Some(ci);
+    let cold = |db: &Database, key: &[u8]| db.cold_index.as_ref().and_then(|ci| ci.lookup(key));
+    let before = counted();
+    db.set(
+        b"cold1286:dead",
+        Entry::new_string(Bytes::from_static(b"new")),
+    );
+    assert_eq!(counted() - before, 1, "the expired cold-only key is reaped");
+    assert!(
+        cold(&db, b"cold1286:dead").is_none(),
+        "and its dead entry went"
+    );
+    db.set(
+        b"cold1286:dead",
+        Entry::new_string(Bytes::from_static(b"again")),
+    );
+    db.set(
+        b"cold1286:live",
+        Entry::new_string(Bytes::from_static(b"new")),
+    );
+    assert_eq!(
+        counted() - before,
+        1,
+        "an overwrite and a live shadow count nothing"
+    );
+    assert!(cold(&db, b"cold1286:live").is_some(), "a live shadow stays");
+}

@@ -657,6 +657,15 @@ impl ColdIndex {
 
     /// Look up a key's cold location (equal-hash range probe; the group is
     /// almost always a single entry at 48 bits).
+    /// Does `key` have an entry here whose TTL passed before `now_ms`? From
+    /// the in-RAM location alone (no I/O); the same judgement as the expiry
+    /// sweep and `remove_counting_cold`.
+    #[inline]
+    pub fn expired_at(&self, key: &[u8], now_ms: u64) -> bool {
+        self.lookup(key)
+            .is_some_and(|loc| loc.ttl_ms.is_some_and(|ttl| now_ms > ttl))
+    }
+
     pub fn lookup(&self, key: &[u8]) -> Option<ColdLocation> {
         let h = scan_h48(key);
         self.map
