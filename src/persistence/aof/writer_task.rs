@@ -669,13 +669,11 @@ pub async fn aof_writer_task(
                         let t = Instant::now();
                         if let Err(e) = file.flush().and_then(|_| file.sync_data()) {
                             error!("AOF sync failed (seq {}, everysec): {}", manifest.seq, e);
-                            crate::persistence::aof::record_everysec_fsync_result(0, false);
                             everysec.inline_done(false);
                         } else {
                             crate::admin::metrics_setup::record_aof_fsync(
                                 t.elapsed().as_micros() as u64
                             );
-                            crate::persistence::aof::record_everysec_fsync_result(0, true);
                             everysec.inline_done(true);
                             idle_wait.clear_pending();
                         }
@@ -1035,7 +1033,6 @@ pub async fn aof_writer_task(
                     match res {
                         Err(e) => {
                             error!("AOF sync failed (everysec, tokio TopLevel): {}", e);
-                            crate::persistence::aof::record_everysec_fsync_result(0, false);
                             // The deadline stays armed — a silent success-record
                             // here would let the failed window's loss self-heal
                             // invisibly.
@@ -1045,7 +1042,6 @@ pub async fn aof_writer_task(
                             crate::admin::metrics_setup::record_aof_fsync(
                                 t.elapsed().as_micros() as u64
                             );
-                            crate::persistence::aof::record_everysec_fsync_result(0, true);
                             everysec.inline_done(true);
                             idle_wait.clear_pending();
                         }
@@ -1545,19 +1541,11 @@ pub async fn per_shard_aof_writer_task(
                                 "AOF sync failed shard {} (everysec, tokio PerShard): {}",
                                 shard_id, e
                             );
-                            crate::persistence::aof::record_everysec_fsync_result(
-                                usize::from(shard_id),
-                                false,
-                            );
                             everysec.inline_done(false);
                         }
                         Ok(()) => {
                             crate::admin::metrics_setup::record_aof_fsync(
                                 t.elapsed().as_micros() as u64
-                            );
-                            crate::persistence::aof::record_everysec_fsync_result(
-                                usize::from(shard_id),
-                                true,
                             );
                             everysec.inline_done(true);
                             idle_wait.clear_pending();
@@ -1999,18 +1987,10 @@ pub async fn per_shard_aof_writer_task(
                                 "AOF EverySec sync failed shard {} (seq {}): {}",
                                 shard_id, manifest.seq, e
                             );
-                            crate::persistence::aof::record_everysec_fsync_result(
-                                usize::from(shard_id),
-                                false,
-                            );
                             everysec.inline_done(false);
                         } else {
                             crate::admin::metrics_setup::record_aof_fsync(
                                 t.elapsed().as_micros() as u64
-                            );
-                            crate::persistence::aof::record_everysec_fsync_result(
-                                usize::from(shard_id),
-                                true,
                             );
                             everysec.inline_done(true);
                             idle_wait.clear_pending();

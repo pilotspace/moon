@@ -23,7 +23,12 @@
 //! * The agent records the outcome exactly where the inline fsync did: the
 //!   fsync-latency metric and `record_everysec_fsync_result` (INFO
 //!   `aof_last_fsync_status` / `aof_fsync_failures`). A failed fsync is
-//!   retried at the next deadline even when nothing new was written.
+//!   retried at the next deadline even when nothing new was written, but a
+//!   retry alone does not clear the writer's `err` bit (fsyncgate: the
+//!   failed window's pages may be gone, and the retry "succeeds" on the
+//!   clean pages that remain). The bit clears only when a successful fsync
+//!   covers a successful write batch the writer issued AFTER it learned of
+//!   the failure ([`EverysecSync`]'s heal rule, R1 review finding 7).
 //! * No agent (the OS refused the thread, or it died): the writer fsyncs
 //!   inline, exactly as before. A durability request is never dropped.
 //!
@@ -106,7 +111,9 @@ pub(super) fn sync_gate_for_test() {
 
 /// One writer's fsync agent thread.
 struct AofFsyncAgent {
-    tx: flume::Sender<std::fs::File>,
+    /// The dup to fsync, and whether a success clears the writer's `err`
+    /// bit (the heal rule, see [`EverysecSync::dispatch`]).
+    tx: flume::Sender<(std::fs::File, bool)>,
     handoff: Arc<FsyncHandoff>,
     /// [`mono_ms`] when the fsync in flight was handed over; 0 when none.
     /// Registered in [`IN_FLIGHT_SLOTS`] for INFO.
@@ -126,7 +133,7 @@ impl AofFsyncAgent {
         // Depth 1 is enough: a job is sent only after a successful
         // `try_begin`, and the state returns to IDLE only once the agent has
         // taken and settled it — at most one job exists (fsync_handoff docs).
-        let (tx, rx) = flume::bounded::<std::fs::File>(1);
+        let (tx, rx) = flume::bounded::<(std::fs::File, bool)>(1);
         let handoff = Arc::new(FsyncHandoff::new());
         let agent_handoff = Arc::clone(&handoff);
         let in_flight_since = Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -136,7 +143,7 @@ impl AofFsyncAgent {
             .name(name.clone())
             .spawn(move || {
                 crate::shard::numa::pin_current_aux_thread(&name);
-                while let Ok(file) = rx.recv() {
+                while let Ok((file, heals)) = rx.recv() {
                     sync_gate_for_test();
                     let t = Instant::now();
                     let result = backend(&file);
@@ -156,7 +163,9 @@ impl AofFsyncAgent {
                     match &result {
                         Ok(()) => {
                             crate::admin::metrics_setup::record_aof_fsync(took.as_micros() as u64);
-                            super::record_everysec_fsync_result(writer_idx, true);
+                            if heals {
+                                super::record_everysec_fsync_result(writer_idx, true);
+                            }
                         }
                         Err(e) => {
                             tracing::error!(
@@ -217,6 +226,16 @@ pub(super) struct EverysecSync {
     /// [`STALL`] periods of the in-flight fsync already counted in
     /// [`AOF_DELAYED_FSYNC`].
     stalls_counted: u64,
+    /// The heal rule (R1 review, finding 7). This writer knows its last
+    /// fsync failed (its `err` bit is set) ...
+    heal_pending: bool,
+    /// ... and it has written a batch since it learned that, so the next
+    /// successful fsync covers post-failure data and may clear the bit.
+    written_after_failure: bool,
+    /// A job was handed to the agent and its outcome not yet observed.
+    job_outstanding: bool,
+    /// That job's success clears the bit.
+    job_heals: bool,
 }
 
 impl EverysecSync {
@@ -243,6 +262,10 @@ impl EverysecSync {
             dirty: false,
             dispatched_at: Instant::now(),
             stalls_counted: 0,
+            heal_pending: false,
+            written_after_failure: false,
+            job_outstanding: false,
+            job_heals: false,
         }
     }
 
@@ -258,6 +281,10 @@ impl EverysecSync {
             dirty: false,
             dispatched_at: Instant::now(),
             stalls_counted: 0,
+            heal_pending: false,
+            written_after_failure: false,
+            job_outstanding: false,
+            job_heals: false,
         }
     }
 
@@ -265,6 +292,38 @@ impl EverysecSync {
     #[inline]
     pub(super) fn note_written(&mut self) {
         self.dirty = true;
+        // Issued after the writer learned of its failure: the next fsync
+        // that succeeds covers post-failure data (the heal rule).
+        self.written_after_failure |= self.heal_pending;
+    }
+
+    /// The writer learned that its fsync failed: its `err` bit is set, and
+    /// only data written from here on can clear it.
+    fn enter_heal_pending(&mut self) {
+        self.heal_pending = true;
+        self.written_after_failure = false;
+    }
+
+    /// Whether a successful fsync issued now may clear the writer's `err`
+    /// bit: no failure is known, or a batch was written since it was.
+    #[inline]
+    fn fsync_heals(&self) -> bool {
+        !self.heal_pending || self.written_after_failure
+    }
+
+    /// The job handed to the agent has settled (seen at the next `Owned`
+    /// claim, which acquires its outcome): learn a failure, or that a
+    /// healing job succeeded.
+    fn observe_settled_job(&mut self, failed: bool) {
+        if !std::mem::take(&mut self.job_outstanding) {
+            return;
+        }
+        if failed {
+            self.enter_heal_pending();
+        } else if self.job_heals {
+            self.heal_pending = false;
+            self.written_after_failure = false;
+        }
     }
 
     /// Make the next deadline fall `by` earlier than a full second from now
@@ -332,6 +391,8 @@ impl EverysecSync {
         match agent.handoff.try_begin() {
             Begin::Owned => {
                 self.stalls_counted = 0;
+                let failed = agent.handoff.last_failed();
+                self.observe_settled_job(failed);
                 Claim::Owned
             }
             Begin::Postponed => {
@@ -364,7 +425,7 @@ impl EverysecSync {
             .in_flight_since
             .store(mono_ms(), std::sync::atomic::Ordering::Relaxed);
         let sent = match dup {
-            Ok(file) => agent.tx.try_send(file).is_ok(),
+            Ok(file) => agent.tx.try_send((file, self.fsync_heals())).is_ok(),
             Err(e) => {
                 tracing::warn!(
                     "AOF writer {}: could not dup the fd for the fsync agent ({e}); \
@@ -375,6 +436,8 @@ impl EverysecSync {
             }
         };
         if sent {
+            self.job_outstanding = true;
+            self.job_heals = self.fsync_heals();
             self.last_handoff = Instant::now();
             self.dispatched_at = self.last_handoff;
             self.dirty = false;
@@ -387,12 +450,23 @@ impl EverysecSync {
         sent
     }
 
-    /// The caller's inline fallback fsync returned. A failure keeps the
-    /// deadline armed (retried on the next wake, as before the agent).
+    /// The caller's inline fallback fsync returned: records it in INFO
+    /// `aof_last_fsync_status` under the heal rule (a success clears the
+    /// writer's `err` bit only when it covers a batch written after the
+    /// failure was learned). A failure keeps the deadline armed (retried on
+    /// the next wake, as before the agent).
     pub(super) fn inline_done(&mut self, ok: bool) {
         if ok {
+            if self.fsync_heals() {
+                super::record_everysec_fsync_result(self.writer_idx, true);
+                self.heal_pending = false;
+                self.written_after_failure = false;
+            }
             self.last_handoff = Instant::now();
             self.dirty = false;
+        } else {
+            super::record_everysec_fsync_result(self.writer_idx, false);
+            self.enter_heal_pending();
         }
     }
 }
@@ -501,23 +575,76 @@ mod tests {
     }
 
     /// A failed fsync is retried at the next deadline with nothing new
-    /// written; the writer's status bit is set by the agent.
+    /// written — but that retry does not clear the writer's status bit
+    /// (fsyncgate: it succeeds on whatever clean pages remain). The bit
+    /// clears only once a successful fsync covers a batch written after
+    /// the failure was learned (R1 review, finding 7).
     #[test]
     fn a_failed_fsync_is_retried_without_new_writes() {
-        let mut s = EverysecSync::with_backend(57, |_f: &std::fs::File| {
-            Err(std::io::Error::other("disk gone"))
-        });
+        let fail = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let backend = {
+            let fail = Arc::clone(&fail);
+            move |_f: &std::fs::File| {
+                if fail.load(Ordering::SeqCst) {
+                    Err(std::io::Error::other("disk gone"))
+                } else {
+                    Ok(())
+                }
+            }
+        };
+        let err_bit = || super::super::AOF_FSYNC_ERR_WRITERS.load(Ordering::Relaxed) & (1 << 57);
+        let mut s = EverysecSync::with_backend(57, backend);
+        let handoff = Arc::clone(&s.agent.as_ref().expect("agent").handoff);
+        s.note_written();
         s.backdate(EVERYSEC);
         assert_eq!(s.claim(), Claim::Owned);
         assert!(s.dispatch(file()));
-        let handoff = Arc::clone(&s.agent.as_ref().expect("agent").handoff);
         wait_until("the fsync to settle", || handoff.settled() == 1);
         assert!(handoff.last_failed());
+        assert_ne!(err_bit(), 0, "the agent set the bit");
         assert!(!s.due(), "not before the next second");
         s.last_handoff = Instant::now() - EVERYSEC;
         assert!(s.due(), "a failed fsync keeps the deadline armed");
-        assert!(super::super::AOF_FSYNC_ERR_WRITERS.load(Ordering::Relaxed) & (1 << 57) != 0);
-        super::super::record_everysec_fsync_result(57, true);
+
+        // The retry, with nothing new written, succeeds — the bit stays.
+        fail.store(false, Ordering::SeqCst);
+        assert_eq!(s.claim(), Claim::Owned);
+        assert!(s.heal_pending, "the writer learned of the failure");
+        assert!(s.dispatch(file()));
+        wait_until("the retry to settle", || handoff.settled() == 2);
+        assert!(!handoff.last_failed());
+        assert_ne!(err_bit(), 0, "a retry with no new write must not heal");
+        s.last_handoff = Instant::now() - EVERYSEC;
+        assert!(!s.due(), "nothing owed: clean, and the retry succeeded");
+
+        // A batch written after the failure, then a successful fsync: healed.
+        s.note_written();
+        s.last_handoff = Instant::now() - EVERYSEC;
+        assert!(s.due());
+        assert_eq!(s.claim(), Claim::Owned);
+        assert!(s.dispatch(file()));
+        wait_until("the healing fsync to settle", || handoff.settled() == 3);
+        assert_eq!(err_bit(), 0, "healed by a post-failure write + fsync");
+        s.note_written();
+        s.last_handoff = Instant::now() - EVERYSEC;
+        assert_eq!(s.claim(), Claim::Owned);
+        assert!(!s.heal_pending);
+        handoff.abort();
+    }
+
+    /// The inline fallback follows the same heal rule.
+    #[test]
+    fn an_inline_retry_heals_only_after_a_new_write() {
+        let err_bit = || super::super::AOF_FSYNC_ERR_WRITERS.load(Ordering::Relaxed) & (1 << 58);
+        let mut s = EverysecSync::new(58, FsyncPolicy::Always); // no agent: inline
+        s.note_written();
+        s.inline_done(false);
+        assert_ne!(err_bit(), 0);
+        s.inline_done(true);
+        assert_ne!(err_bit(), 0, "a retry with no new write must not heal");
+        s.note_written();
+        s.inline_done(true);
+        assert_eq!(err_bit(), 0);
     }
 
     /// A dup that fails releases the claim: the caller fsyncs inline and the
