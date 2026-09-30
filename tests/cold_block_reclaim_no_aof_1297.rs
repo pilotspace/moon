@@ -382,6 +382,11 @@ fn run_case(kill: Kill, sabotage: bool) -> Outcome {
             compactions > 0,
             "precondition: no compaction started (deleted {deleted_a} A keys)"
         );
+        // No further compaction from here: after the adoption a compacted
+        // file is itself half dead (its B slots) and would be compacted
+        // again, and that second adoption, after `S3`, would unlink files
+        // `S3`'s trailer rightly names. One generation per case.
+        std::fs::write(&hold, b"").expect("hold file");
         let deleted_b = del_keys(port, &b);
         assert!(deleted_b > 0, "precondition: no B key to delete");
         match kill {
