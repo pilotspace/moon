@@ -2391,8 +2391,11 @@ mod pool_tests {
         let manifest = AofManifest::initialize_multi(&base_dir, 2).unwrap();
         let incr = manifest.shard_incr_path(0);
 
-        // Inject: the 2nd Append tears (header written, payload "fails").
-        TEST_FAIL_WRITE_AT.store(2, Ordering::SeqCst);
+        // Inject: the 3rd Append tears (header written, payload "fails").
+        // The 1st is the `SELECT 0` a writer that reopens its incr writes
+        // before its first record (R1 review: the stream's db is unknown),
+        // the 2nd is lsn 1.
+        TEST_FAIL_WRITE_AT.store(3, Ordering::SeqCst);
 
         let (tx, rx) = channel::mpsc_bounded::<AofMessage>(16);
         let cancel = CancellationToken::new();
@@ -2457,14 +2460,18 @@ mod pool_tests {
         TEST_FAIL_WRITE_AT.store(0, Ordering::SeqCst);
         let _ = tokio::time::timeout(std::time::Duration::from_secs(5), writer).await;
 
-        // On disk: exactly one replayable frame (lsn=1, "AAAA"). The orphaned
-        // lsn=2 header is a truncated tail (crash boundary); lsn 3 and 4 were
-        // never written (latch held) — no corruption.
+        // On disk: exactly the pre-tear frames (the SELECT 0 prefix at lsn 0,
+        // then lsn=1 "AAAA"). The orphaned lsn=2 header is a truncated tail
+        // (crash boundary); lsn 3 and 4 were never written (latch held) — no
+        // corruption.
         let raw = std::fs::read(&incr).unwrap();
         let frames = parse_framed(&raw);
         assert_eq!(
             frames,
-            vec![(1u64, b"AAAA".to_vec())],
+            vec![
+                (0u64, serialize_select_record(0).to_vec()),
+                (1u64, b"AAAA".to_vec())
+            ],
             "only the pre-tear record may replay; orphaned headers / suppressed \
              records must not corrupt the stream"
         );
