@@ -9,14 +9,25 @@
 //! and come back as answers this tick applies; the adoption's manifest commit
 //! is handed to the manifest-sync thread and its ack polled on a later tick.
 //! What this thread does is choose, filter and re-point — in memory.
+//!
+//! moon#1297: without an AOF the same tick runs the pipeline with a committed
+//! snapshot as the commit point (`storage::tiered::cold_reclaim::no_aof`):
+//! compactions are stamped with the shard's snapshot epoch when recorded,
+//! adopted once a snapshot that started after them has committed, and
+//! started from the grave record's dead-slot counts instead of the ledger.
 
 use std::path::Path;
 use std::sync::Arc;
 
 use crate::persistence::aof::AofWriterPool;
 use crate::persistence::manifest::ShardManifest;
+use crate::storage::tiered::cold_index::ColdIndex;
 use crate::storage::tiered::cold_reclaim::CulpritOutcome;
+use crate::storage::tiered::cold_reclaim::test_hooks::{
+    ReclaimCrashPoint, compaction_held_for_test, crash_point,
+};
 use crate::storage::tiered::reclaim_io::{ReclaimDone, ReclaimJob};
+use crate::storage::tiered::snapshot_hold;
 use crate::storage::tiered::spill_thread::SpillThread;
 
 /// Files whose compaction starts per shard tick at most. The disk work runs
@@ -44,12 +55,22 @@ pub(super) fn reclaim_threshold(maxmemory: usize, per_shard_budget: usize) -> us
     }
 }
 
+/// What commits a compaction on this shard.
+#[derive(Clone, Copy)]
+enum CommitPoint<'a> {
+    /// A committed AOF fold (the ledger bound, moon#1215).
+    Fold(&'a crate::persistence::aof::rewrite::RewriteOverflow),
+    /// A committed snapshot: no AOF writer in this process (moon#1297).
+    Snapshot,
+}
+
 /// One tick of reclaim. `ledger_bytes` is the shard's ledger as this tick
-/// published it. A no-op without an AOF writer (no ledger exists then),
-/// without disk offload, or in the legacy multi-shard TopLevel layout, where
-/// one fold epoch spans several shards and so cannot say which shard's
-/// compaction a commit covers. Without a spill thread no new compaction
-/// starts (adoption still runs).
+/// published it. A no-op without disk offload, or in the legacy multi-shard
+/// TopLevel AOF layout, where one fold epoch spans several shards and so
+/// cannot say which shard's compaction a commit covers. With an AOF writer a
+/// committed fold commits a compaction and the ledger drives it; without one
+/// (moon#1297) a committed snapshot commits it and the grave record drives
+/// it. Without a spill thread no new compaction starts (adoption still runs).
 #[allow(clippy::too_many_arguments)]
 pub(super) fn run(
     shard_databases: &Arc<crate::shard::shared_databases::ShardDatabases>,
@@ -62,18 +83,26 @@ pub(super) fn run(
     spill_thread: Option<&SpillThread>,
     ledger_bytes: usize,
 ) {
-    let (Some(pool), Some(shard_dir), Some(manifest)) =
-        (aof_pool, offload_shard_dir, shard_manifest.as_mut())
-    else {
+    let (Some(shard_dir), Some(manifest)) = (offload_shard_dir, shard_manifest.as_mut()) else {
         return;
     };
-    if pool.layout() == crate::persistence::aof_manifest::AofLayout::TopLevel
-        && shard_databases.num_shards() > 1
-    {
-        return;
-    }
-    let overflow = pool.overflow_for(shard_id);
-    let committed = overflow.committed_floor().0;
+    let commit_point = match aof_pool {
+        Some(pool) => {
+            if pool.layout() == crate::persistence::aof_manifest::AofLayout::TopLevel
+                && shard_databases.num_shards() > 1
+            {
+                return;
+            }
+            CommitPoint::Fold(pool.overflow_for(shard_id))
+        }
+        None if snapshot_hold::applies() => CommitPoint::Snapshot,
+        None => return,
+    };
+    let committed = match commit_point {
+        CommitPoint::Fold(overflow) => overflow.committed_floor().0,
+        CommitPoint::Snapshot => snapshot_hold::snapshot_fold_view(0).committed_floor,
+    };
+    let no_aof = matches!(commit_point, CommitPoint::Snapshot);
     let db_count = shard_databases.db_count();
     // moon#1265: sampled before the answers are drained, so everything a
     // dead thread sent is applied below before its other jobs are abandoned.
@@ -85,12 +114,23 @@ pub(super) fn run(
     // 1. Apply what the spill thread finished: a read becomes a write job
     //    (survivors filtered, output ids minted and the fold epoch stamped
     //    in this one synchronous section), a write becomes a pending
-    //    compaction.
+    //    compaction. Without an AOF the stamp is the snapshot epoch at the
+    //    record instead (moon#1297): the adopting snapshot must START after
+    //    the compaction is known, so its trailer can name the compacted
+    //    slots of the survivors that changed.
     if let Some(st) = spill_thread {
+        let stamps = Stamps {
+            plan: &|| match commit_point {
+                CommitPoint::Fold(overflow) => overflow.stamp().0,
+                CommitPoint::Snapshot => 0,
+            },
+            record: &|planned| match commit_point {
+                CommitPoint::Fold(_) => planned,
+                CommitPoint::Snapshot => snapshot_hold::epoch_before_start(),
+            },
+        };
         for done in st.drain_reclaim_done() {
-            apply_done(done, st, shard_id, shard_dir, next_file_id, || {
-                overflow.stamp().0
-            });
+            apply_done(done, st, shard_id, shard_dir, next_file_id, &stamps, no_aof);
         }
     }
     // moon#1265: a dead spill thread answers nothing more. Abandon what it
@@ -152,9 +192,15 @@ pub(super) fn run(
                         keys_moved = r.keys_moved,
                         files_unlinked = r.files_unlinked,
                         bytes_unlinked = r.bytes_unlinked,
-                        "cold reclaim: adopted compacted spill files after a committed AOF fold"
+                        commit_point = if no_aof { "snapshot" } else { "AOF fold" },
+                        "cold reclaim: adopted compacted spill files after their commit point (a committed AOF \
+                         fold, or a snapshot without an AOF)"
                     );
                 }
+            }
+            if no_aof && ci.compactions_ready(committed) > 0 {
+                // moon#1297 kill point: the snapshot committed, nothing listed.
+                crash_point(ReclaimCrashPoint::AdoptReady);
             }
             if ci.pending_compactions() > 0 {
                 let r = ci.begin_adoption(committed, shard_dir, manifest);
@@ -183,7 +229,9 @@ pub(super) fn run(
     for db_index in 0..db_count {
         crate::shard::slice::with_shard_db(db_index, |db| {
             if let Some(ci) = db.cold_index.as_mut() {
-                ci.note_held_files_pressure(over, committed);
+                if !no_aof {
+                    ci.note_held_files_pressure(over, committed);
+                }
                 in_flight += ci.compactions_in_flight();
             }
         });
@@ -194,9 +242,16 @@ pub(super) fn run(
     let Some(st) = spill_thread.filter(|st| !st.reclaim_disabled()) else {
         return;
     };
-    if !over {
+    // Without an AOF there is no ledger: each database's grave record says
+    // whether it has enough dead slots to compact (moon#1297).
+    if !(over || no_aof) || (no_aof && compaction_held_for_test()) {
         return;
     }
+    let max_pending = if no_aof {
+        crate::storage::tiered::cold_reclaim::NO_AOF_MAX_PENDING_PER_DB
+    } else {
+        MAX_PENDING_PER_DB
+    };
     let mut files_left = FILES_PER_TICK.min(MAX_IN_FLIGHT.saturating_sub(in_flight));
     for db_index in 0..db_count {
         if files_left == 0 {
@@ -207,26 +262,52 @@ pub(super) fn run(
                 return;
             };
             let busy = ci.pending_compactions() + ci.compactions_in_flight();
-            let room = MAX_PENDING_PER_DB.saturating_sub(busy);
-            for file_id in ci.reclaim_candidates(files_left.min(room)) {
-                if !ci.start_compaction(file_id) {
-                    continue;
-                }
-                let job = ReclaimJob::Read {
-                    db_index,
-                    file_id,
-                    shard_dir: shard_dir.to_path_buf(),
-                };
-                if st.try_submit_reclaim(job).is_err() {
-                    // Queue full or thread gone: try again on a later tick.
-                    ci.abandon_compaction(file_id, false);
-                    files_left = 0;
-                    break;
-                }
-                files_left -= 1;
-            }
+            let room = files_left.min(max_pending.saturating_sub(busy));
+            let candidates = if no_aof {
+                ci.reclaim_candidates_no_aof(room)
+            } else {
+                ci.reclaim_candidates(room)
+            };
+            start_reads(ci, st, db_index, candidates, shard_dir, &mut files_left);
         });
     }
+}
+
+/// Send a `Read` job for each of `candidates` (step 3 of [`run`]), counting
+/// them off `files_left`; a full queue ends this tick's starts.
+fn start_reads(
+    ci: &mut ColdIndex,
+    st: &SpillThread,
+    db_index: usize,
+    candidates: Vec<u64>,
+    shard_dir: &Path,
+    files_left: &mut usize,
+) {
+    for file_id in candidates {
+        if !ci.start_compaction(file_id) {
+            continue;
+        }
+        let job = ReclaimJob::Read {
+            db_index,
+            file_id,
+            shard_dir: shard_dir.to_path_buf(),
+        };
+        if st.try_submit_reclaim(job).is_err() {
+            // Queue full or thread gone: try again on a later tick.
+            ci.abandon_compaction(file_id, false);
+            *files_left = 0;
+            return;
+        }
+        *files_left -= 1;
+    }
+}
+
+/// The epoch a compaction is stamped with: `plan` when its output ids are
+/// minted (carried by the write job), `record` maps that to the stamp it is
+/// recorded under when the write comes back.
+struct Stamps<'a> {
+    plan: &'a dyn Fn() -> u64,
+    record: &'a dyn Fn(u64) -> u64,
 }
 
 /// Apply one answer from the spill thread (step 1 of [`run`]).
@@ -236,7 +317,8 @@ fn apply_done(
     shard_id: usize,
     shard_dir: &Path,
     next_file_id: &mut u64,
-    stamp: impl Fn() -> u64,
+    stamps: &Stamps<'_>,
+    no_aof: bool,
 ) {
     match done {
         ReclaimDone::Read {
@@ -261,7 +343,7 @@ fn apply_done(
                         // The fold epoch at the instant the output ids were
                         // minted (same synchronous section): adoption waits
                         // for a committed fold cut after them.
-                        epoch: stamp(),
+                        epoch: (stamps.plan)(),
                         moved: plan.moved,
                         requests: plan.requests,
                         shard_dir: shard_dir.to_path_buf(),
@@ -291,6 +373,7 @@ fn apply_done(
             moved,
             result,
         } => {
+            let epoch = (stamps.record)(epoch);
             let recorded =
                 crate::shard::slice::with_shard_db(db_index, |db| match db.cold_index.as_mut() {
                     Some(ci) => ci.record_compaction(old_file, epoch, moved, result, shard_dir),
@@ -306,8 +389,11 @@ fn apply_done(
                         Err("the database has no cold index any more".to_string())
                     }
                 });
-            if let Err(why) = recorded {
-                warn_not_compacted(shard_id, db_index, old_file, &why);
+            match recorded {
+                Err(why) => warn_not_compacted(shard_id, db_index, old_file, &why),
+                // moon#1297 kill point: `F'` written and fsynced, unlisted.
+                Ok(()) if no_aof => crash_point(ReclaimCrashPoint::Compacted),
+                Ok(()) => {}
             }
         }
     }

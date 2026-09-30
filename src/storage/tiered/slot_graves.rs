@@ -147,6 +147,18 @@ impl SlotGraves {
         self.len == 0
     }
 
+    /// `(file_id, dead slots recorded)` for every file with at least one:
+    /// the no-AOF reclaim's input (moon#1297). O(files with a grave).
+    pub fn files(&self) -> impl Iterator<Item = (u64, usize)> + '_ {
+        self.by_file.iter().map(|(&f, s)| (f, s.len()))
+    }
+
+    /// The dead slots recorded for `file_id` (packed; tests).
+    #[cfg(test)]
+    pub(crate) fn slots_of(&self, file_id: u64) -> &[u64] {
+        self.by_file.get(&file_id).map_or(&[], Vec::as_slice)
+    }
+
     /// Append `(file_id, packed slots)` for every file into `out` (tests
     /// and tools; the snapshot uses [`Self::encode_into`]).
     pub fn collect_into(&self, out: &mut Vec<(u64, Vec<u64>)>) {
