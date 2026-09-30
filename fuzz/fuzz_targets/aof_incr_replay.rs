@@ -1,9 +1,13 @@
 #![no_main]
 use libfuzzer_sys::fuzz_target;
 
-use moon::persistence::aof_manifest::shard_replay::fuzz::{replay_framed, replay_resp};
+use moon::persistence::aof_manifest::shard_replay::fuzz::{
+    replay_framed, replay_framed_file, replay_resp, replay_resp_file,
+};
 use moon::persistence::replay::DispatchReplayEngine;
-use moon::persistence::replay::clock::{pin_replay_clock_ms, pinned_replay_clock_ms};
+use moon::persistence::replay::clock::{
+    pin_replay_clock_ms, pinned_replay_clock_ms, take_open_foreign_segment,
+};
 use moon::storage::Database;
 
 // Fuzz the AOF replay engine end to end (moon#1283): arbitrary log bytes
@@ -14,15 +18,23 @@ use moon::storage::Database;
 // intercept (`MOON.TS`, `MOON.COLDCUT`, `MOON.SPILLED`; `MOON.TXN` once
 // moon#1300 lands).
 //
+// R2 review of moon#1283: the clean-close marker `MOON.TS <ms> CLOSE` and the
+// forward scan across the foreign segment after it (`replay::log_segment`),
+// which re-reads the FILE — reached through the file-backed readers (mode 2,
+// and mode 3: the framed or RESP incr from a file, pinned as production pins
+// it).
+//
 // Invariants: no reader panics on any input (a corrupt file is refused with
 // an error, a torn tail is dropped); the expiry-judgment clock a replay sets
 // from `MOON.TS` never outlives the replay's pin scope (a leak would make the
 // next replay on this thread — or a live read — judge by a stale log clock).
 //
-// Input: byte 0 picks the reader (low 2 bits) and which well-formed pseudo
-// records to put in front of the fuzzed bytes (bits 2..4), so the intercept
-// arms are reached without the fuzzer having to discover `MOON.TS`; bytes
-// 1..9 are the stamp / watermark value; the rest is the log.
+// Input: byte 0 picks the reader (low 2 bits), which well-formed pseudo
+// records to put in front of the fuzzed bytes (bits 2..5: COLDCUT, TS, a
+// malformed TS, a CLOSE marker), so the intercept arms are reached without
+// the fuzzer having to discover `MOON.TS`, and, in mode 3, the layout (bit
+// 6: framed); bytes 1..9 are the stamp / watermark value; the rest is the
+// log.
 fn resp(parts: &[&[u8]]) -> Vec<u8> {
     let mut out = format!("*{}\r\n", parts.len()).into_bytes();
     for p in parts {
@@ -63,9 +75,13 @@ fuzz_target!(|data: &[u8]| {
     if sel & 0b1_0000 != 0 {
         prefix.push(resp(&[b"MOON.TS"]));
     }
+    if sel & 0b10_0000 != 0 {
+        prefix.push(resp(&[b"MOON.TS", v.as_bytes(), b"CLOSE"]));
+    }
+    let framed_file = mode == 3 && sel & 0b100_0000 != 0;
     let mut bytes = Vec::new();
     for p in &prefix {
-        if mode == 0 {
+        if mode == 0 || framed_file {
             bytes.extend_from_slice(&framed(p));
         } else {
             bytes.extend_from_slice(p);
@@ -88,14 +104,24 @@ fuzz_target!(|data: &[u8]| {
             let _ = replay_resp(&mut dbs, &bytes, &engine);
         }
         _ => {
-            // The flat reader pins its own clock to the file's mtime.
+            // The file readers pin their own clock to the file's mtime and
+            // scan it after a clean-close marker.
             let Ok(dir) = tempfile::tempdir() else {
                 return;
             };
             let path = dir.path().join("appendonly.aof");
             if std::fs::write(&path, &bytes).is_ok() {
-                let _ = moon::persistence::aof::replay_aof(&mut dbs, &path, &engine);
+                if mode == 2 {
+                    let _ = moon::persistence::aof::replay_aof(&mut dbs, &path, &engine);
+                } else if framed_file {
+                    let _ = replay_framed_file(&mut dbs, &path, &engine);
+                } else {
+                    let _ = replay_resp_file(&mut dbs, &path, &engine);
+                }
             }
+            // A segment open at the end of the file was reported for the
+            // writer; nobody takes it here, so drop it (bounded registry).
+            let _ = take_open_foreign_segment(&path);
         }
     }
     assert_eq!(

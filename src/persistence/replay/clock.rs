@@ -78,27 +78,36 @@
 //! Not pinned: `replay_ordered_merge` (no production emitter yet) and the
 //! replica's apply of the master stream, which runs live on the wall clock.
 //!
-//! ## A tail an older binary appended (R1 review of moon#1283, finding 1)
+//! ## A segment another binary appended (R2 review of moon#1283)
 //!
 //! After a downgrade, an older binary appends to the same file with no
-//! stamps; after the re-upgrade those records would all be judged by the last
-//! stamp the newer binary wrote before the downgrade — hours or days stale —
-//! so a key the older binary saw expire and rewrote (moon#542: no `DEL`
-//! first) replayed onto its old value and old deadline, and was lost.
-//! This binary re-stamps whenever its clock moves, so the records after its
-//! last stamp were written within that clock tick, and the file's mtime is
-//! that tick (plus the writer's pickup latency). An mtime more than
-//! [`FOREIGN_TAIL_TOLERANCE_MS`] past the file's LAST stamp therefore means
-//! something else appended after it (or the mtime was moved forward). The
-//! records that stamp covers — found by [`super::log_tail::last_ts_in_file`]
-//! from the end of the file, matched by value — are then judged by
-//! `max(last stamp, mtime pin)`, which is the pin: exactly the judgment the
-//! older binary itself replays them with. A stamped file whose mtime is
-//! EARLIER than its last stamp (the moon#1283 case) never engages the rule.
-//! The replay reports it ([`foreign_tail_replayed`]) so boot runs one AOF
-//! rewrite: once this binary appends stamped records behind that tail, it is
-//! no longer at the end of the file, and only a new generation keeps a later
-//! boot from judging it by the stale stamp again.
+//! stamps; judged by the last stamp the newer binary wrote before the
+//! downgrade — hours or days stale — a key the older binary saw expire and
+//! rewrote (moon#542: no `DEL` first) replayed onto its old value and old
+//! deadline, and was lost. The rule that catches those records is
+//! POSITIONAL, not a guess from the file's timestamps:
+//! - whenever this binary's writer stops in order it appends a clean-close
+//!   marker, `MOON.TS <ms> CLOSE` ([`super::pseudo`]), made durable by the
+//!   final sync;
+//! - whenever it (re)opens a file it writes a stamp before its FIRST append
+//!   (`aof::record_ctx`).
+//!
+//! So the records after a `CLOSE` and before the next stamp cannot be this
+//! binary's: they are a foreign segment. At the `CLOSE` the replay scans
+//! forward ([`super::log_segment`]) — only across that segment — for the
+//! next stamp, and judges the segment's records by it: the later binary's
+//! session stamp, never earlier than their real write time (late judgment is
+//! how the older binary itself replays them, by the mtime). A segment that
+//! runs to the end of the file is judged by `max(close stamp, mtime pin)`,
+//! the moment it was last written; that judgment is reported
+//! ([`take_open_foreign_segment`]) to the writer that reopens the file,
+//! which writes it as its session stamp before its first append, so every
+//! later boot judges the segment exactly as this one did. No rewrite is
+//! needed: the rule holds wherever the segment ends up in the file.
+//!
+//! Unprotected, by construction: an older binary appending after an UNCLEAN
+//! stop of this one (no `CLOSE`) — its records follow the last stamp and are
+//! judged by it (`docs/STORAGE-FORMAT-V1.md` §3.3 gives the procedure).
 //!
 //! A snapshot the logs replay over (`KvSources::SnapshotAndLogs`) keeps its
 //! expired entries ([`keep_expired_image_entries`]): its loader skips them on
@@ -109,36 +118,56 @@
 
 use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 
-/// How far a file's mtime may pass its last `MOON.TS` before the records
-/// that stamp covers are judged as a foreign tail (see the module doc). The
-/// gap a writer of THIS binary leaves is its pickup latency — well under a
-/// millisecond while it writes, longer only while it is stalled (a slow
-/// disk under `always`); an older binary appending after a downgrade leaves
-/// at least a restart.
-pub const FOREIGN_TAIL_TOLERANCE_MS: u64 = 1_000;
-
-/// Set once any replay in this process judged a foreign tail by its file's
-/// mtime ([`foreign_tail_replayed`]).
-static FOREIGN_TAIL_REPLAYED: AtomicBool = AtomicBool::new(false);
-
-/// Whether a replay in this process met a tail an older binary appended after
-/// the file's last `MOON.TS` (see the module doc). Boot then asks for one AOF
-/// rewrite, so the tail stops being judged by that stale stamp once this
-/// binary appends behind it.
-pub fn foreign_tail_replayed() -> bool {
-    FOREIGN_TAIL_REPLAYED.load(Ordering::Relaxed)
+/// How a replayed log file frames its records (for the forward scan across a
+/// foreign segment, [`super::log_segment`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum LogFormat {
+    /// Bare RESP: the flat `appendonly.aof` (after any RDB preamble) and the
+    /// multi-part top-level incr.
+    #[default]
+    Resp,
+    /// The per-shard incr: `[u64 lsn LE][u32 len LE][RESP]` per record.
+    Framed,
 }
 
-/// The file a pin scope replays, for the foreign-tail rule.
+/// The file a pin scope replays.
 #[derive(Default)]
-struct TailSource {
+struct LogSource {
     /// The replayed log (None: no file, e.g. a WAL directory or a test pin).
     path: Option<PathBuf>,
-    /// Its last `MOON.TS`, scanned lazily on first need: `None` = not yet
-    /// scanned, `Some(None)` = it has none.
-    last_ts: Option<Option<u64>>,
+    format: LogFormat,
+    /// The judgment of a non-empty foreign segment that runs to the end of
+    /// the file (0 = none), handed to the writer when the scope closes.
+    open_segment_ms: u64,
+}
+
+/// Judgments of foreign segments that ran to the end of their file, by file
+/// (see the module doc): set by a replay, taken by the writer that reopens
+/// the file. Touched once per replayed file and once per writer session.
+static OPEN_SEGMENTS: parking_lot::Mutex<Vec<(PathBuf, u64)>> =
+    parking_lot::const_mutex(Vec::new());
+
+/// The same file under the name a replay and a writer each built for it.
+fn segment_key(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// The judgment this process's replay gave a foreign segment at the END of
+/// `path` (see the module doc), if it met one: the writer that appends to
+/// `path` next writes it as its first stamp. Taken once.
+pub fn take_open_foreign_segment(path: &Path) -> Option<u64> {
+    let key = segment_key(path);
+    let mut open = OPEN_SEGMENTS.lock();
+    let at = open.iter().position(|(p, _)| *p == key)?;
+    Some(open.swap_remove(at).1)
+}
+
+fn report_open_segment(path: &Path, ms: u64) {
+    let key = segment_key(path);
+    let mut open = OPEN_SEGMENTS.lock();
+    open.retain(|(p, _)| *p != key);
+    open.push((key, ms));
 }
 
 thread_local! {
@@ -151,29 +180,38 @@ thread_local! {
     /// How many pin guards are open on this thread: a stamp is honoured only
     /// inside one.
     static PIN_DEPTH: Cell<u32> = const { Cell::new(0) };
-    /// The judgment clock of the records after the current file's LAST stamp
-    /// when they are a foreign tail (0 = not in one). R1 review, finding 1.
-    static TAIL_MS: Cell<u64> = const { Cell::new(0) };
-    /// The current file, for the foreign-tail rule.
-    static TAIL_SRC: RefCell<TailSource> = RefCell::new(TailSource::default());
+    /// The judgment clock of the foreign segment the replay is in (0 = not in
+    /// one). R2 review of moon#1283.
+    static SEGMENT_MS: Cell<u64> = const { Cell::new(0) };
+    /// The file offset just past the record being replayed ([`at_record_end`]).
+    static RECORD_END: Cell<u64> = const { Cell::new(0) };
+    /// The current file.
+    static SRC: RefCell<LogSource> = RefCell::new(LogSource::default());
 }
 
 /// Restores the previous pin (or none) and the enclosing file's stamp when
-/// dropped.
+/// dropped; reports a foreign segment left open at the end of its file.
 #[must_use = "the pin lasts only while the guard lives"]
 pub struct ReplayClockGuard {
     previous: u64,
     previous_ts: u64,
-    previous_tail: u64,
-    previous_src: TailSource,
+    previous_segment: u64,
+    previous_end: u64,
+    previous_src: LogSource,
 }
 
 impl Drop for ReplayClockGuard {
     fn drop(&mut self) {
         PINNED_MS.with(|c| c.set(self.previous));
         LOG_TS_MS.with(|c| c.set(self.previous_ts));
-        TAIL_MS.with(|c| c.set(self.previous_tail));
-        TAIL_SRC.with(|c| *c.borrow_mut() = std::mem::take(&mut self.previous_src));
+        SEGMENT_MS.with(|c| c.set(self.previous_segment));
+        RECORD_END.with(|c| c.set(self.previous_end));
+        let src = SRC.with(|c| c.replace(std::mem::take(&mut self.previous_src)));
+        if let (Some(path), ms) = (src.path, src.open_segment_ms)
+            && ms != 0
+        {
+            report_open_segment(&path, ms);
+        }
         PIN_DEPTH.with(|c| c.set(c.get().saturating_sub(1)));
     }
 }
@@ -182,22 +220,27 @@ impl Drop for ReplayClockGuard {
 /// open the scope of one replayed file: no `MOON.TS` read yet. `0` pins
 /// nothing (the databases' own clock) but still opens the scope.
 pub fn pin_replay_clock_ms(ms: u64) -> ReplayClockGuard {
-    pin_scope(ms, None)
+    pin_scope(ms, LogSource::default())
 }
 
-fn pin_scope(ms: u64, path: Option<PathBuf>) -> ReplayClockGuard {
+fn pin_scope(ms: u64, src: LogSource) -> ReplayClockGuard {
     PIN_DEPTH.with(|c| c.set(c.get().saturating_add(1)));
     ReplayClockGuard {
         previous: PINNED_MS.with(|c| c.replace(ms)),
         previous_ts: LOG_TS_MS.with(|c| c.replace(0)),
-        previous_tail: TAIL_MS.with(|c| c.replace(0)),
-        previous_src: TAIL_SRC.with(|c| {
-            c.replace(TailSource {
-                path,
-                last_ts: None,
-            })
-        }),
+        previous_segment: SEGMENT_MS.with(|c| c.replace(0)),
+        previous_end: RECORD_END.with(|c| c.replace(0)),
+        previous_src: SRC.with(|c| c.replace(src)),
     }
+}
+
+/// The record about to be replayed ends at file offset `offset`. Every log
+/// reader that pins a file ([`pin_replay_clock_to_log`]) calls it before it
+/// hands the record to the engine, so a `CLOSE` marker knows where the
+/// segment after it starts. One thread-local store.
+#[inline]
+pub fn at_record_end(offset: u64) {
+    RECORD_END.with(|c| c.set(offset));
 }
 
 /// A `MOON.TS <ms>` record was read (moon#1283): judge the records after it
@@ -209,48 +252,63 @@ pub fn observe_log_ts(ms: u64) -> bool {
         return false;
     }
     LOG_TS_MS.with(|c| c.set(ms));
-    TAIL_MS.with(|c| c.set(foreign_tail_clock(ms)));
+    SEGMENT_MS.with(|c| c.set(0));
     true
 }
 
-/// The clock for the records after the stamp `ms` when `ms` is the current
-/// file's LAST stamp and the file's mtime pin is more than
-/// [`FOREIGN_TAIL_TOLERANCE_MS`] past it (a foreign tail, see the module
-/// doc): the pin. 0 otherwise. The file is scanned at most once per scope,
-/// and only once a stamp trails the pin by more than the tolerance.
-fn foreign_tail_clock(ms: u64) -> u64 {
-    let pin = PINNED_MS.with(Cell::get);
-    if pin <= ms.saturating_add(FOREIGN_TAIL_TOLERANCE_MS) {
-        return 0;
+/// A clean-close marker `MOON.TS <ms> CLOSE` was read (R2 review of
+/// moon#1283): the records after it, up to the next stamp, are a foreign
+/// segment (see the module doc). Scans forward for that stamp and judges the
+/// segment by it — or, when the segment runs to the end of the file, by
+/// `max(ms, pin)`, which is also reported to the writer that reopens the
+/// file. Ignored outside a pin scope and for `ms == 0`. Returns whether the
+/// marker was taken.
+pub fn observe_close(ms: u64) -> bool {
+    if ms == 0 || PIN_DEPTH.with(Cell::get) == 0 {
+        return false;
     }
-    let last = TAIL_SRC.with(|c| {
-        let mut src = c.borrow_mut();
-        if src.last_ts.is_none() {
-            let scanned = src
-                .path
-                .as_deref()
-                .and_then(super::log_tail::last_ts_in_file);
-            src.last_ts = Some(scanned);
-        }
-        src.last_ts.flatten()
+    LOG_TS_MS.with(|c| c.set(ms));
+    let (path, format) = SRC.with(|c| {
+        let src = c.borrow();
+        (src.path.clone(), src.format)
     });
-    if last != Some(ms) {
-        return 0;
-    }
-    if !FOREIGN_TAIL_REPLAYED.swap(true, Ordering::Relaxed) {
-        let path = TAIL_SRC.with(|c| c.borrow().path.clone());
-        tracing::warn!(
-            "AOF replay: {} was appended to {:.1}s after its last MOON.TS; the records \
-             after that stamp have no stamp of their own (an older moon binary wrote \
-             them after a downgrade, or the file's mtime was moved forward) and are \
-             judged by the file's mtime instead of that stale stamp. One AOF rewrite \
-             runs after boot so later boots do not depend on it.",
+    let from = RECORD_END.with(Cell::get);
+    let scan = match path.as_deref() {
+        Some(p) => super::log_segment::scan_after_close(p, from, format),
+        // No file to scan (a WAL directory, a test pin): no writer of this
+        // binary writes a `CLOSE` there; judge conservatively, as at EOF.
+        None => super::log_segment::SegmentScan {
+            next_stamp_ms: None,
+            records: 1,
+        },
+    };
+    let judged = match (scan.records, scan.next_stamp_ms) {
+        (0, _) => 0,
+        (_, Some(next)) => next,
+        (_, None) => {
+            let at_eof = ms.max(PINNED_MS.with(Cell::get));
+            SRC.with(|c| c.borrow_mut().open_segment_ms = at_eof);
+            at_eof
+        }
+    };
+    SEGMENT_MS.with(|c| c.set(judged));
+    if judged != 0 {
+        tracing::info!(
+            "AOF replay: {} holds {} record(s) another binary appended after this binary \
+             closed it cleanly at {} ms (a downgrade); they are judged by {} ms, {}",
             path.as_deref()
                 .map_or_else(|| "a log".into(), |p| p.display().to_string()),
-            (pin - ms) as f64 / 1000.0,
+            scan.records,
+            ms,
+            judged,
+            if scan.next_stamp_ms.is_some() {
+                "the next stamp in the file"
+            } else {
+                "the time the file was last written (they run to its end)"
+            },
         );
     }
-    pin
+    true
 }
 
 /// Pin this thread's replay judgment clock to the newest modification time of
@@ -269,12 +327,15 @@ pub fn pin_replay_clock_to_files(files: &[&Path]) -> ReplayClockGuard {
 
 /// Pin this thread's replay judgment clock to the modification time of the
 /// AOF file `path` (see [`pin_replay_clock_to_files`]) and open its scope for
-/// the foreign-tail rule (the module doc): the records after the file's last
-/// `MOON.TS` are judged by the mtime when it is more than
-/// [`FOREIGN_TAIL_TOLERANCE_MS`] later than that stamp.
-pub fn pin_replay_clock_to_log(path: &Path) -> ReplayClockGuard {
+/// the positional foreign-segment rule (the module doc): its reader frames
+/// records as `format` and reports each record's end ([`at_record_end`]).
+pub fn pin_replay_clock_to_log(path: &Path, format: LogFormat) -> ReplayClockGuard {
     let guard = pin_replay_clock_to_files(&[path]);
-    TAIL_SRC.with(|c| c.borrow_mut().path = Some(path.to_path_buf()));
+    SRC.with(|c| {
+        let mut src = c.borrow_mut();
+        src.path = Some(path.to_path_buf());
+        src.format = format;
+    });
     guard
 }
 
@@ -310,20 +371,29 @@ pub fn keep_expired_image_entries(
     }
 }
 
-/// The judgment clock of this thread's replay, if any: the mtime pin past
-/// a foreign tail's cut (the module doc), else the last `MOON.TS` of the
-/// current file, else the pin.
+/// The judgment clock of this thread's replay, if any: a foreign segment's
+/// judgment (the module doc), else the last `MOON.TS` of the current file,
+/// else the pin.
 #[inline]
 pub fn pinned_replay_clock_ms() -> Option<u64> {
-    let tail = TAIL_MS.with(Cell::get);
-    if tail != 0 {
-        return Some(tail);
+    let segment = SEGMENT_MS.with(Cell::get);
+    if segment != 0 {
+        return Some(segment);
     }
     let ts = LOG_TS_MS.with(Cell::get);
     if ts != 0 {
         return Some(ts);
     }
     PINNED_MS.with(|c| Some(c.get()).filter(|&ms| ms != 0))
+}
+
+/// Test access to the foreign-segment registry.
+#[cfg(test)]
+pub(crate) mod tests_support {
+    /// As a replay does when a foreign segment runs to the end of `path`.
+    pub(crate) fn report_open_segment(path: &std::path::Path, ms: u64) {
+        super::report_open_segment(path, ms);
+    }
 }
 
 #[cfg(test)]

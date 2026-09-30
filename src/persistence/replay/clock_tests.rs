@@ -222,112 +222,268 @@ fn touch_mtime(path: &std::path::Path, mtime_ms: u64) {
         .expect("set mtime");
 }
 
-// ── R1 review of moon#1283, finding 1: a tail an older binary appended ──────
+// ── R2 review of moon#1283: the positional foreign-segment rule ─────────────
 
-/// After a downgrade an older binary appended to the file with no stamps: it
-/// saw `n` expire (its deadline passed after the newer binary's last stamp)
-/// and `INCR` started a fresh counter. The file's mtime is that append,
-/// well past the last stamp, so the tail is judged by the mtime — `n` is `1`
-/// and persistent, as it was live. Judged by the stale stamp, the `INCR`
-/// landed on `5` with the old deadline and the key was lost.
-#[test]
-fn a_tail_appended_after_the_last_stamp_is_judged_by_the_mtime() {
-    let now = current_time_ms();
-    let stamp = now - 60_000;
-    let deadline = stamp + 2_000;
-    let appended = now - 10_000;
-    let (s, d) = (stamp.to_string(), deadline.to_string());
-    let db = replay_written_at(
-        &[
-            &[b"MOON.TS", s.as_bytes()],
-            &[b"SET", b"n", b"5", b"PXAT", d.as_bytes()],
-            // The older binary's tail, no stamp:
-            &[b"INCR", b"n"],
-        ],
-        appended,
-    );
+/// The three production log readers.
+#[derive(Clone, Copy, Debug)]
+enum Layout {
+    /// `aof::replay_aof`: the flat `appendonly.aof`.
+    Flat,
+    /// The multi-part top-level incr (bare RESP).
+    Incr,
+    /// The per-shard incr (`[u64 lsn][u32 len][RESP]`).
+    Framed,
+}
+
+const LAYOUTS: [Layout; 3] = [Layout::Flat, Layout::Incr, Layout::Framed];
+
+fn ts(ms: u64) -> Vec<u8> {
+    crate::persistence::replay::pseudo::TsRecord::new(ms)
+        .as_bytes()
+        .to_vec()
+}
+
+fn close(ms: u64) -> Vec<u8> {
+    crate::persistence::replay::pseudo::TsRecord::close(ms)
+        .as_bytes()
+        .to_vec()
+}
+
+fn cmd(parts: &[&str]) -> Vec<u8> {
+    let parts: Vec<&[u8]> = parts.iter().map(|p| p.as_bytes()).collect();
+    resp(&parts)
+}
+
+/// Replay `records` from a file of `layout` last modified at `mtime_ms`,
+/// through the production reader. Returns the database and the file's path
+/// (kept alive by the returned tempdir).
+fn replay_layout(
+    layout: Layout,
+    records: &[Vec<u8>],
+    mtime_ms: u64,
+) -> (Database, std::path::PathBuf, tempfile::TempDir) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("log.aof");
+    let mut bytes = Vec::new();
+    for (i, r) in records.iter().enumerate() {
+        if matches!(layout, Layout::Framed) {
+            bytes.extend_from_slice(&(i as u64 + 1).to_le_bytes());
+            bytes.extend_from_slice(&(r.len() as u32).to_le_bytes());
+        }
+        bytes.extend_from_slice(r);
+    }
+    std::fs::write(&path, &bytes).expect("write log");
+    touch_mtime(&path, mtime_ms);
+    let mut dbs = vec![Database::new()];
+    let engine = DispatchReplayEngine::new();
+    use crate::persistence::aof_manifest::shard_replay::fuzz;
+    let replayed = match layout {
+        Layout::Flat => crate::persistence::aof::replay_aof(&mut dbs, &path, &engine).is_ok(),
+        Layout::Incr => fuzz::replay_resp_file(&mut dbs, &path, &engine).is_some(),
+        Layout::Framed => fuzz::replay_framed_file(&mut dbs, &path, &engine).is_some(),
+    };
+    assert!(replayed, "{layout:?}: the log replays");
     assert_eq!(
-        raw(&db, b"n"),
-        Some((b"1".to_vec(), 0)),
-        "the older binary's INCR saw n expired; judged by the stale stamp it lands on 5 \
-         with the old deadline and the key is lost"
+        super::pinned_replay_clock_ms(),
+        None,
+        "the pin ends with it"
     );
-    assert!(
-        super::foreign_tail_replayed(),
-        "boot must be told to rewrite"
-    );
+    (dbs.remove(0), path, dir)
 }
 
-/// The moon#1283 case stays fixed: an mtime EARLIER than the last stamp (a
-/// clock stepped back, a `touch -d`) never engages the foreign-tail rule;
-/// every record is judged by its own stamp.
+/// A downgrade in the MIDDLE of a file: this binary closed it cleanly
+/// (`CLOSE` at `ta + 100`), an older binary appended with no stamp — it saw
+/// `n` expire and `INCR` restarted it at 1 — and a later session of this
+/// binary stamped `tb` before its first record. The segment is judged by
+/// `tb`: `n` is `1` and persistent, as it was live. Judged by the stale
+/// stamp (the pre-R1 replay) the `INCR` landed on `5` with the old deadline
+/// and the key was lost; the file's mtime (much later) is irrelevant, and the
+/// later session's own records keep their own stamps (`p`).
 #[test]
-fn an_mtime_earlier_than_the_last_stamp_keeps_the_stamps() {
+fn a_segment_after_a_close_is_judged_by_the_next_stamp() {
     let now = current_time_ms();
-    let t0 = now - 20_000;
-    let t1 = t0 + 100;
-    let deadline = t0 + 30;
-    let (s0, s1, d) = (t0.to_string(), t1.to_string(), deadline.to_string());
-    let db = replay_written_at(
-        &[
-            &[b"MOON.TS", s0.as_bytes()],
-            &[b"SET", b"l", b"5", b"PXAT", d.as_bytes()],
-            &[b"MOON.TS", s1.as_bytes()],
-            // Live: l had expired (t1 > deadline), INCR started at 1.
-            &[b"INCR", b"l"],
-        ],
-        t0 - 3_600_000,
-    );
-    assert_eq!(raw(&db, b"l"), Some((b"1".to_vec(), 0)));
-}
-
-/// Only the records the file's LAST stamp covers form the tail: records under
-/// an earlier stamp keep that stamp's judgment even when the mtime is later
-/// than both, and the records behind the last stamp are judged by the mtime.
-#[test]
-fn only_the_records_after_the_last_stamp_form_the_tail() {
-    let now = current_time_ms();
-    let ta = now - 60_000;
-    let tb = ta + 3_000;
+    let ta = now - 600_000;
     let n_deadline = ta + 2_000;
-    let m_deadline = tb + 500;
-    let (sa, sb) = (ta.to_string(), tb.to_string());
-    let (dn, dm) = (n_deadline.to_string(), m_deadline.to_string());
-    let db = replay_written_at(
-        &[
-            &[b"MOON.TS", sa.as_bytes()],
-            &[b"SET", b"n", b"5", b"PXAT", dn.as_bytes()],
-            // Under stamp ta, n was alive: 6, keeps its deadline.
-            &[b"INCR", b"n"],
-            &[b"MOON.TS", sb.as_bytes()],
-            &[b"SET", b"m", b"5", b"PXAT", dm.as_bytes()],
-            // The foreign tail (the mtime is 50 s later): m had expired.
-            &[b"INCR", b"m"],
-        ],
-        now - 10_000,
-    );
-    assert_eq!(
-        (raw(&db, b"n"), raw(&db, b"m")),
-        (Some((b"6".to_vec(), n_deadline)), Some((b"1".to_vec(), 0)))
-    );
+    let tb = ta + 60_000;
+    let p_deadline = tb + 50;
+    for layout in LAYOUTS {
+        let (db, path, _dir) = replay_layout(
+            layout,
+            &[
+                ts(ta),
+                cmd(&["SET", "n", "5", "PXAT", &n_deadline.to_string()]),
+                close(ta + 100),
+                // The older binary's segment: n had expired live.
+                cmd(&["INCR", "n"]),
+                // The later session of this binary.
+                ts(tb),
+                cmd(&["SET", "p", "5", "PXAT", &p_deadline.to_string()]),
+                cmd(&["INCR", "p"]),
+            ],
+            now - 1_000,
+        );
+        assert_eq!(
+            (raw(&db, b"n"), raw(&db, b"p")),
+            (Some((b"1".to_vec(), 0)), Some((b"6".to_vec(), p_deadline))),
+            "{layout:?}"
+        );
+        assert_eq!(
+            super::take_open_foreign_segment(&path),
+            None,
+            "{layout:?}: a segment that ends at a stamp is nobody's business later"
+        );
+    }
 }
 
-/// Within the tolerance a stamp's own records are never re-judged: an mtime
-/// less than `FOREIGN_TAIL_TOLERANCE_MS` past the last stamp is this binary's
-/// own pickup latency.
+/// A segment that runs to the END of the file (the re-upgrade boot itself)
+/// is judged by the time the file was last written — `max(close, mtime
+/// pin)` — and that judgment is handed to the writer that reopens the file.
+/// A mtime moved BEFORE the close never judges earlier than the close.
 #[test]
-fn an_mtime_within_the_tolerance_of_the_last_stamp_keeps_the_stamp() {
+fn a_segment_at_the_end_of_the_file_is_judged_by_its_last_write() {
     let now = current_time_ms();
-    let t = now - 30_000;
-    let deadline = t + 200;
-    let (s, d) = (t.to_string(), deadline.to_string());
-    let db = replay_written_at(
-        &[
-            &[b"MOON.TS", s.as_bytes()],
-            &[b"SET", b"n", b"5", b"PXAT", d.as_bytes()],
-            &[b"INCR", b"n"],
-        ],
-        t + super::FOREIGN_TAIL_TOLERANCE_MS - 100,
-    );
-    assert_eq!(raw(&db, b"n"), Some((b"6".to_vec(), deadline)));
+    let t = now - 600_000;
+    let deadline = t + 2_000;
+    for layout in LAYOUTS {
+        let records = [
+            ts(t),
+            cmd(&["SET", "n", "5", "PXAT", &deadline.to_string()]),
+            close(t + 10),
+            cmd(&["INCR", "n"]),
+        ];
+        let appended = t + 30_000;
+        let (db, path, _dir) = replay_layout(layout, &records, appended);
+        assert_eq!(raw(&db, b"n"), Some((b"1".to_vec(), 0)), "{layout:?}");
+        assert_eq!(
+            super::take_open_foreign_segment(&path),
+            Some(appended),
+            "{layout:?}"
+        );
+        // Touched an hour back: the close is the floor.
+        let (db, path, _dir) = replay_layout(layout, &records, t - 3_600_000);
+        assert_eq!(
+            raw(&db, b"n"),
+            Some((b"6".to_vec(), deadline)),
+            "{layout:?}: judged at the close, n was alive"
+        );
+        assert_eq!(super::take_open_foreign_segment(&path), Some(t + 10));
+    }
+}
+
+/// Every graceful stop leaves a `CLOSE`; each opens its own (possibly empty)
+/// segment, ended by the next stamp — a later session's stamp or another
+/// `CLOSE`. Two restarts with no write between them leave two markers in a
+/// row: an empty segment.
+#[test]
+fn multiple_close_markers_each_open_their_own_segment() {
+    let now = current_time_ms();
+    let t = now - 600_000;
+    let (a, b) = (t + 1_000, t + 50_000);
+    for layout in LAYOUTS {
+        let (db, path, _dir) = replay_layout(
+            layout,
+            &[
+                ts(t),
+                cmd(&["SET", "a", "5", "PXAT", &a.to_string()]),
+                cmd(&["SET", "b", "5", "PXAT", &b.to_string()]),
+                close(t + 10),
+                close(t + 20), // restarted, nothing written, stopped again
+                // First foreign segment: judged by the next stamp (t + 5 s).
+                cmd(&["INCR", "a"]),
+                cmd(&["INCR", "b"]),
+                ts(t + 5_000),
+                close(t + 5_010),
+                // Second foreign segment, ended by a CLOSE (t + 60 s): b too
+                // had expired by then.
+                cmd(&["INCR", "b"]),
+                close(t + 60_000),
+            ],
+            now - 1_000,
+        );
+        assert_eq!(
+            (raw(&db, b"a"), raw(&db, b"b")),
+            (Some((b"1".to_vec(), 0)), Some((b"1".to_vec(), 0))),
+            "{layout:?}"
+        );
+        assert_eq!(super::take_open_foreign_segment(&path), None);
+    }
+}
+
+/// A `CLOSE` followed at once by a stamp is an empty segment: the records
+/// after that stamp are this binary's, judged by it — and a `CLOSE` at the
+/// very end of the file (a clean stop) opens nothing either.
+#[test]
+fn a_close_followed_by_a_stamp_is_an_empty_segment() {
+    let now = current_time_ms();
+    let t = now - 600_000;
+    let deadline = t + 50;
+    for layout in LAYOUTS {
+        let (db, path, _dir) = replay_layout(
+            layout,
+            &[
+                ts(t),
+                cmd(&["SET", "n", "5", "PXAT", &deadline.to_string()]),
+                close(t + 10),
+                ts(t + 20),
+                cmd(&["INCR", "n"]),
+                close(t + 30),
+            ],
+            now - 1_000,
+        );
+        assert_eq!(
+            raw(&db, b"n"),
+            Some((b"6".to_vec(), deadline)),
+            "{layout:?}"
+        );
+        assert_eq!(super::take_open_foreign_segment(&path), None);
+    }
+}
+
+/// NEW-A (R2 review): the file's last clock tick is never re-judged by a
+/// moved mtime. `SET k 10 PX 600; INCR k`, killed, then the file touched
+/// forward an hour (a `cp`, a restore): with no `CLOSE` — or with the
+/// `CLOSE` a clean stop leaves at the very end — nothing is foreign, so `k`
+/// replays as 11 with its deadline (and has expired), never as a
+/// persistent 1.
+#[test]
+fn a_moved_mtime_never_rejudges_the_last_clock_tick() {
+    let now = current_time_ms();
+    let t = now - 600_000;
+    let deadline = t + 600;
+    for layout in LAYOUTS {
+        for clean in [false, true] {
+            let mut records = vec![
+                ts(t),
+                cmd(&["SET", "k", "10", "PXAT", &deadline.to_string()]),
+                cmd(&["INCR", "k"]),
+            ];
+            if clean {
+                records.push(close(t + 100));
+            }
+            let (db, path, _dir) = replay_layout(layout, &records, now + 3_600_000);
+            assert_eq!(
+                raw(&db, b"k"),
+                Some((b"11".to_vec(), deadline)),
+                "{layout:?} clean {clean}"
+            );
+            assert_eq!(super::take_open_foreign_segment(&path), None);
+        }
+    }
+}
+
+/// A `CLOSE` read outside any replay scope (a live apply) changes nothing,
+/// and one inside a scope with no file behind it (a WAL directory, a test
+/// pin) judges what follows conservatively, as a segment at the end.
+#[test]
+fn a_close_outside_a_file_scope() {
+    assert!(!super::observe_close(5));
+    assert_eq!(super::pinned_replay_clock_ms(), None);
+    {
+        let _pin = super::pin_replay_clock_ms(9_000);
+        assert!(super::observe_close(5));
+        assert_eq!(super::pinned_replay_clock_ms(), Some(9_000));
+        assert!(super::observe_log_ts(7));
+        assert_eq!(super::pinned_replay_clock_ms(), Some(7));
+    }
+    assert_eq!(super::pinned_replay_clock_ms(), None);
 }
