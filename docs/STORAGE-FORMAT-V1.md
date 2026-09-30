@@ -97,6 +97,15 @@ Authoritative source: `src/persistence/snapshot.rs`.
   its own checks is logged and ignored; the global CRC still guards the keys.
   Authoritative codec: `src/persistence/snapshot/cold_graves.rs` (fuzz target
   `snapshot_cold_graves`).
+  Since moon#1297 (no-AOF block reclaim) a trailer may also name slots of a
+  file the manifest did NOT list when the snapshot started: the compacted copy
+  `F'` of a mostly-dead file `F`, which is listed only after a snapshot that
+  started after the compaction commits. Those slots are the copies of
+  survivors that changed after the compaction; a crash after `F'` is listed
+  needs them. A boot applies graves only to listed files (an unlisted `F'` is
+  a crash orphan and removed), and a file id may appear in more than one
+  `file_id` group — the decoder merges them. Same layout, same version byte:
+  an older reader ignores them like every other grave.
 - **PITR:** the embedded `last_lsn` ties each snapshot to the WAL position it shadows; replay resumes at `last_lsn + 1`.
 - **Forkless:** snapshots are produced by cooperative segment iteration with per-snapshot overflow buffers — no `fork()`, no COW RSS spike.
 
