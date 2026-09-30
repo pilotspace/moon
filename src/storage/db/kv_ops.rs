@@ -305,11 +305,15 @@ impl Database {
                 // tier held. Its deadline is in the in-RAM index (no I/O),
                 // and the lookup runs only for a NEW hot key while anything
                 // is spilled. The dead entry goes now, so no later sweep or
-                // read counts it again.
+                // read counts it again. Live traffic only (`counts_expiry`):
+                // during a log replay the cold slot is the replayed write's
+                // own spill, which a later `MOON.SPILLED` marker names (the
+                // task #56 rule above), and a replica leaves it to its master.
                 if self
                     .cold_index
                     .as_ref()
                     .is_some_and(|ci| ci.len() > 0 && ci.expired_at(key, now_ms))
+                    && crate::admin::metrics_setup::counts_expiry()
                 {
                     self.remove_cold_only(key);
                     crate::admin::metrics_setup::record_expired_key();
