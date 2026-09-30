@@ -604,6 +604,15 @@ mod tests {
         }
     }
 
+    /// Opens the gate when dropped (also while a failed test unwinds).
+    struct ReleaseOnDrop(Arc<Gate>);
+
+    impl Drop for ReleaseOnDrop {
+        fn drop(&mut self) {
+            self.0.release();
+        }
+    }
+
     fn wait_until(what: &str, f: impl Fn() -> bool) {
         let deadline = Instant::now() + Duration::from_secs(10);
         while !f() {
@@ -632,6 +641,9 @@ mod tests {
     fn dispatch_returns_while_the_fsync_is_still_running() {
         let gate = Gate::new();
         let mut s = EverysecSync::with_backend(0, gate.backend());
+        // Declared after `s`, so it drops (opens the gate) first: a failed
+        // assertion must not leave the agent held while `s` joins it.
+        let _release = ReleaseOnDrop(Arc::clone(&gate));
         s.backdate(EVERYSEC);
         assert_eq!(s.claim(), Claim::Owned);
         assert!(s.dispatch(file()));
@@ -652,6 +664,9 @@ mod tests {
     fn a_deadline_during_a_running_fsync_is_postponed() {
         let gate = Gate::new();
         let mut s = EverysecSync::with_backend(1, gate.backend());
+        // Declared after `s`, so it drops (opens the gate) first: a failed
+        // assertion must not leave the agent held while `s` joins it.
+        let _release = ReleaseOnDrop(Arc::clone(&gate));
         s.backdate(EVERYSEC);
         assert_eq!(s.claim(), Claim::Owned);
         assert!(s.dispatch(file()));
@@ -787,6 +802,9 @@ mod tests {
     fn a_stalled_fsync_is_counted_every_two_seconds_and_visible_in_info() {
         let gate = Gate::new();
         let mut s = EverysecSync::with_backend(2, gate.backend());
+        // Declared after `s`, so it drops (opens the gate) first: a failed
+        // assertion must not leave the agent held while `s` joins it.
+        let _release = ReleaseOnDrop(Arc::clone(&gate));
         s.backdate(EVERYSEC);
         assert_eq!(s.claim(), Claim::Owned);
         assert!(s.dispatch(file()));
@@ -803,13 +821,12 @@ mod tests {
         s.dispatched_at = Instant::now() - Duration::from_millis(6_000);
         assert_eq!(s.claim(), Claim::Postponed);
         assert_eq!(s.stalls_counted, 3);
-        // The age INFO reports is the slot's (the real hand-off time here).
-        slot.store(
-            mono_ms().saturating_sub(4_000),
-            std::sync::atomic::Ordering::Relaxed,
-        );
+        // The age INFO reports is the slot's: back-date it to the clock's
+        // first tick (the process may be younger than any fixed age).
+        let before = mono_ms();
+        slot.store(1, std::sync::atomic::Ordering::Relaxed);
         let (n, oldest) = in_flight_fsyncs();
-        assert!(n >= 1 && oldest >= 4_000, "({n}, {oldest})");
+        assert!(n >= 1 && oldest + 1 >= before, "({n}, {oldest}, {before})");
         assert!(s.due(), "still owed; the stall warning path runs");
         gate.release();
         let handoff = Arc::clone(&s.agent.as_ref().expect("agent").handoff);
@@ -836,6 +853,9 @@ mod tests {
     fn a_runtime_policy_switch_drains_then_restarts_the_agent() {
         let gate = Gate::new();
         let mut s = EverysecSync::with_backend(4, gate.backend());
+        // Declared after `s`, so it drops (opens the gate) first: a failed
+        // assertion must not leave the agent held while `s` joins it.
+        let _release = ReleaseOnDrop(Arc::clone(&gate));
         s.backdate(EVERYSEC);
         assert_eq!(s.claim(), Claim::Owned);
         assert!(s.dispatch(file()));
@@ -931,6 +951,9 @@ mod tests {
     fn drop_joins_the_agent_after_its_fsync() {
         let gate = Gate::new();
         let mut s = EverysecSync::with_backend(0, gate.backend());
+        // Declared after `s`, so it drops (opens the gate) first: a failed
+        // assertion must not leave the agent held while `s` joins it.
+        let _release = ReleaseOnDrop(Arc::clone(&gate));
         s.backdate(EVERYSEC);
         assert_eq!(s.claim(), Claim::Owned);
         assert!(s.dispatch(file()));
