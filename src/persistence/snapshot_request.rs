@@ -4,10 +4,11 @@
 //! snapshot for its own reasons, with nobody at a keyboard. The first is the
 //! cold tier without an AOF: a dead spill file the snapshot hold covers
 //! (`storage::tiered::snapshot_hold`) is released only by a snapshot that
-//! started after it went zero-ref, and nothing else asks for one. moon#1297
-//! (the no-AOF block reclaim) is the next caller. This module is the shared
-//! trigger, so each caller supplies a [`SnapshotReason`] and a spacing and
-//! none re-implements the gate.
+//! started after it went zero-ref, and nothing else asks for one. The second
+//! is moon#1297 (the no-AOF block reclaim): a compaction is committed only by
+//! a snapshot that started after it. This module is the shared trigger, so
+//! each caller supplies a [`SnapshotReason`] and a spacing and none
+//! re-implements the gate.
 //!
 //! # The gate
 //!
@@ -47,14 +48,18 @@ pub enum SnapshotReason {
     /// A held cold spill file waited for a snapshot to release it
     /// (moon#1289).
     HeldColdFiles,
+    /// A no-AOF cold reclaim compaction waited for the snapshot that commits
+    /// it (moon#1297).
+    ColdReclaim,
 }
 
-const REASONS: usize = 1;
+const REASONS: usize = 2;
 
 impl SnapshotReason {
     const fn index(self) -> usize {
         match self {
             SnapshotReason::HeldColdFiles => 0,
+            SnapshotReason::ColdReclaim => 1,
         }
     }
 }
@@ -150,7 +155,7 @@ impl Default for SnapshotGate {
 static GATE: SnapshotGate = SnapshotGate::new();
 
 /// Snapshots started per reason, process-wide.
-static STARTED: [AtomicU64; REASONS] = [AtomicU64::new(0)];
+static STARTED: [AtomicU64; REASONS] = [AtomicU64::new(0), AtomicU64::new(0)];
 
 fn process_ms() -> u64 {
     static START: OnceLock<Instant> = OnceLock::new();
