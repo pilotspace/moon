@@ -348,7 +348,7 @@ blocks. `tests/aof_everysec_kill9_1266.rs` measures it: 10,000 acked SETs
 (unpipelined, or pipelined 100 deep) or one SET after an idle second, SIGKILL
 1 ms after the last ack, restart, count what is missing. On a 4-vCPU Linux
 container shared with other builds (2026-09-30, 20 reps per cell, `--shards`
-1 and 4): before moon#1266 Option 3, 228 of 240 reps lost acked writes (median
+1 and 4): before moon#1266 Option 3, 226 of 240 reps lost acked writes (median
 rep 1–1,100 keys, worst 10,000); after it, 6 of 240 reps did (monoio 800 and
 1,900 keys, tokio 1, 1, 1 and 800), every one a writer stalled or descheduled
 for longer than the 1 ms kill delay. A kill inside that sub-millisecond window,
