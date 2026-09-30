@@ -119,7 +119,7 @@ pub(crate) async fn abort_logged(
         &ctx.shard_databases,
         ctx.shard_id,
         txn_id,
-        log.graph,
+        &log.graph,
     );
     // -----------------------------------------------------------------------
 
@@ -138,7 +138,7 @@ pub(crate) async fn abort_logged(
     // legs) is the reply; every one was already counted and logged where it
     // happened.
     let outcome = persisted
-        .and(graph_wal)
+        .and(graph_wal.map_err(|_| crate::transaction::abort::ROLLBACK_WAL_REFUSED_ERR))
         .map_err(Bytes::from_static)
         .and(remote_legs);
     if let Err(reply) = &outcome {

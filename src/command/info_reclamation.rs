@@ -168,12 +168,13 @@ pub static RECL_WAL_PLANE_SCAN_TOTAL: AtomicU64 = AtomicU64::new(0);
 /// Bytes read by [`RECL_WAL_PLANE_SCAN_TOTAL`] scans.
 pub static RECL_WAL_PLANE_SCAN_BYTES_TOTAL: AtomicU64 = AtomicU64::new(0);
 
-/// Cumulative count of plane WAL records (MQ/WS/temporal) DROPPED because the
-/// shard's `wal_append` channel was full at enqueue time (capacity 4096,
-/// drained every 1ms by the same shard thread — blocking there would deadlock
-/// the drain, so `try_send` is structural). Non-zero means an already-applied
-/// in-memory mutation is MISSING from crash recovery: a real durability gap.
-/// Alert on any increase. See `mq_exec::wal_append_on_slice`.
+/// Cumulative count of WAL records (graph, MQ, workspace, temporal) DROPPED
+/// after their in-memory mutation was applied. Since moon#1302 a full append
+/// channel no longer drops (the record takes the shard thread's overflow,
+/// `reclamation_wal_append_overflow_total`), so non-zero means the shard's
+/// WAL writer was gone (its event loop exited) or a record was produced off
+/// its shard's thread: a real durability gap. Alert on any increase. See
+/// `shard::wal_append::report_dropped`.
 pub static RECL_WAL_APPEND_CHANNEL_DROPPED_TOTAL: AtomicU64 = AtomicU64::new(0);
 
 /// Graph plan-cache hit count (cumulative). Used to compute hit_ratio.
@@ -236,14 +237,16 @@ pub fn write_reclamation_section(buf: &mut String) {
          reclamation_wal_recycle_graph_temporal_freed_total:{}\r\n\
          reclamation_wal_plane_scan_total:{}\r\n\
          reclamation_wal_plane_scan_bytes_total:{}\r\n\
-         reclamation_wal_append_channel_dropped_total:{}\r\n",
+         reclamation_wal_append_channel_dropped_total:{}\r\n\
+         reclamation_wal_append_overflow_total:{}\r\n",
         RECL_WAL_BYTES.load(Ordering::Relaxed),
         RECL_WAL_SEGMENTS.load(Ordering::Relaxed),
         RECL_WAL_RECYCLE_BLOCKED_NO_CHECKPOINT_TOTAL.load(Ordering::Relaxed),
         RECL_WAL_RECYCLE_GRAPH_TEMPORAL_FREED_TOTAL.load(Ordering::Relaxed),
         RECL_WAL_PLANE_SCAN_TOTAL.load(Ordering::Relaxed),
         RECL_WAL_PLANE_SCAN_BYTES_TOTAL.load(Ordering::Relaxed),
-        RECL_WAL_APPEND_CHANNEL_DROPPED_TOTAL.load(Ordering::Relaxed)
+        RECL_WAL_APPEND_CHANNEL_DROPPED_TOTAL.load(Ordering::Relaxed),
+        crate::shard::wal_append::WAL_APPEND_OVERFLOW_TOTAL.load(Ordering::Relaxed)
     );
 
     // -- Write stall: OR of disk-pressure (MA12), segment-backlog (MA1), and
@@ -584,6 +587,7 @@ mod tests {
             "reclamation_plan_cache_evictions_total:",
             "reclamation_delete_pending_visible_lsn:",
             "reclamation_wal_append_channel_dropped_total:",
+            "reclamation_wal_append_overflow_total:",
             "reclamation_wal_recycle_graph_temporal_freed_total:",
         ];
 

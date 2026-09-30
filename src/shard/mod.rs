@@ -55,6 +55,7 @@ pub mod timers;
 pub mod uring_handler;
 /// moon#1182: multi-shard FT.SEARCH KNN legs on the cooperative search path.
 pub(crate) mod vector_scatter;
+pub mod wal_append;
 /// moon#1162: the post-write index/queue hooks every shard-side write path
 /// runs — one list, so the dispatch arms cannot drift apart again.
 pub(crate) mod write_hooks;
