@@ -1,0 +1,244 @@
+//! The monoio AOF writers' bounded channel receive (moon#1266): park-free
+//! while writes flow, parked once they stop. See [`poll_recv`].
+
+use super::*;
+
+/// Poll step while the writer is WARM (a message arrived within the last
+/// [`AOF_WARM_POLL_SPAN`]): the longest an acked record can sit in the
+/// channel before this writer picks it up and `write(2)`s it while writes
+/// are flowing (moon#1266). It used to be `wait/16` — ~3 ms while writing,
+/// 50 ms for the first write after an idle second — and a kill -9 inside
+/// that window lost acknowledged writes under everysec.
+const AOF_WARM_POLL_STEP: std::time::Duration = std::time::Duration::from_micros(100);
+
+/// How long the writer keeps polling at [`AOF_WARM_POLL_STEP`] after its
+/// last message before it parks on the channel instead.
+const AOF_WARM_POLL_SPAN: std::time::Duration = std::time::Duration::from_millis(5);
+
+/// Bounded receive for the std-thread writer loops under
+/// `FsyncPolicy::EverySec`/`No`: park-free while writes are flowing, parked
+/// once they stop.
+///
+/// A parked `recv_timeout` registers this thread as a flume waiter, so the
+/// producer `try_send` that finds it pays a futex WAKE **on the shard
+/// thread**. Parking after every batch cost 149,718 futex calls (63% of the
+/// shard thread's syscall time) in an 8 s p1 SET run under everysec, so
+/// while WARM (`warm`: the previous receive returned a message) the writer
+/// polls with `try_recv` + [`AOF_WARM_POLL_STEP`] sleeps for up to
+/// [`AOF_WARM_POLL_SPAN`] — producer sends stay pure userspace atomics, and
+/// a queued record waits at most one short step.
+///
+/// Once the span passes with nothing queued, or when the previous receive
+/// already timed out (COLD), it parks for the rest of `wait`. The first
+/// record after an idle period then costs its producer ONE futex wake and
+/// is picked up at once (moon#1266: it used to wait up to a 50 ms poll step,
+/// and a kill -9 in that step lost it though it had been acknowledged). An
+/// idle writer wakes only when `wait` elapses — at most 1/s once escalated.
+fn poll_recv(
+    rx: &channel::MpscReceiver<AofMessage>,
+    wait: std::time::Duration,
+    warm: bool,
+) -> Result<AofMessage, flume::RecvTimeoutError> {
+    let start = std::time::Instant::now();
+    let deadline = start + wait;
+    let warm_until = if warm {
+        start + AOF_WARM_POLL_SPAN.min(wait)
+    } else {
+        start
+    };
+    loop {
+        match rx.try_recv() {
+            Ok(m) => return Ok(m),
+            Err(flume::TryRecvError::Disconnected) => {
+                return Err(flume::RecvTimeoutError::Disconnected);
+            }
+            Err(flume::TryRecvError::Empty) => {
+                let now = std::time::Instant::now();
+                if now >= deadline {
+                    return Err(flume::RecvTimeoutError::Timeout);
+                }
+                if now >= warm_until {
+                    return rx.recv_timeout(deadline - now);
+                }
+                std::thread::sleep(AOF_WARM_POLL_STEP);
+            }
+        }
+    }
+}
+
+/// Bounded receive for the std-thread writer loops: parked under `Always`
+/// (ack latency is client-visible), warm-polled then parked otherwise (see
+/// [`poll_recv`]).
+pub(super) fn recv_next(
+    rx: &channel::MpscReceiver<AofMessage>,
+    idle_wait: &IdleWait,
+    park: bool,
+) -> Result<AofMessage, flume::RecvTimeoutError> {
+    if park {
+        rx.recv_timeout(idle_wait.current())
+    } else {
+        poll_recv(rx, idle_wait.current(), idle_wait.warm())
+    }
+}
+
+#[cfg(test)]
+mod poll_recv_tests {
+    use super::*;
+
+    #[test]
+    fn returns_queued_message_immediately() {
+        let (tx, rx) = channel::mpsc_bounded::<AofMessage>(4);
+        assert!(
+            tx.try_send(AofMessage::Append {
+                lsn: 7,
+                db: 0,
+                bytes: bytes::Bytes::from_static(b"x"),
+                epoch: FoldEpoch::INITIAL,
+                clock_ms: 0,
+            })
+            .is_ok()
+        );
+        let start = std::time::Instant::now();
+        let Ok(got) = poll_recv(&rx, std::time::Duration::from_secs(1), true) else {
+            panic!("expected message");
+        };
+        assert!(matches!(got, AofMessage::Append { lsn: 7, .. }));
+        // No sleep step should have been taken for an already-queued message.
+        assert!(start.elapsed() < std::time::Duration::from_millis(50));
+    }
+
+    #[test]
+    fn picks_up_message_sent_mid_wait() {
+        let (tx, rx) = channel::mpsc_bounded::<AofMessage>(4);
+        let sender = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            assert!(
+                tx.try_send(AofMessage::Append {
+                    lsn: 1,
+                    db: 0,
+                    bytes: bytes::Bytes::from_static(b"y"),
+                    epoch: FoldEpoch::INITIAL,
+                    clock_ms: 0,
+                })
+                .is_ok()
+            );
+        });
+        let Ok(got) = poll_recv(&rx, std::time::Duration::from_secs(5), true) else {
+            panic!("expected message");
+        };
+        assert!(matches!(got, AofMessage::Append { lsn: 1, .. }));
+        assert!(sender.join().is_ok());
+    }
+
+    #[test]
+    fn times_out_when_empty() {
+        let (_tx, rx) = channel::mpsc_bounded::<AofMessage>(4);
+        let start = std::time::Instant::now();
+        // AofMessage has no Debug impl — match instead of unwrap_err.
+        let Err(err) = poll_recv(&rx, std::time::Duration::from_millis(30), true) else {
+            panic!("expected timeout");
+        };
+        assert!(matches!(err, flume::RecvTimeoutError::Timeout));
+        assert!(start.elapsed() >= std::time::Duration::from_millis(30));
+    }
+
+    #[test]
+    fn reports_disconnect() {
+        let (tx, rx) = channel::mpsc_bounded::<AofMessage>(4);
+        drop(tx);
+        // AofMessage has no Debug impl — match instead of unwrap_err.
+        let Err(err) = poll_recv(&rx, std::time::Duration::from_secs(1), false) else {
+            panic!("expected disconnect");
+        };
+        assert!(matches!(err, flume::RecvTimeoutError::Disconnected));
+    }
+
+    fn append(lsn: u64) -> AofMessage {
+        AofMessage::Append {
+            lsn,
+            db: 0,
+            bytes: bytes::Bytes::from_static(b"z"),
+            epoch: FoldEpoch::INITIAL,
+            clock_ms: 0,
+        }
+    }
+
+    /// Median pickup latency over 5 sends, each made `after` into a
+    /// `wait`-long receive (the median, so one scheduling hiccup on a loaded
+    /// host does not decide the verdict).
+    fn median_pickup(
+        wait: std::time::Duration,
+        warm: bool,
+        after: std::time::Duration,
+    ) -> std::time::Duration {
+        let mut lat = Vec::with_capacity(5);
+        for round in 0..5u64 {
+            let (tx, rx) = channel::mpsc_bounded::<AofMessage>(4);
+            let sender = std::thread::spawn(move || {
+                std::thread::sleep(after);
+                let sent = std::time::Instant::now();
+                assert!(tx.try_send(append(round)).is_ok());
+                (sent, tx)
+            });
+            let Ok(_) = poll_recv(&rx, wait, warm) else {
+                panic!("expected message");
+            };
+            let got = std::time::Instant::now();
+            let Ok((sent, _tx)) = sender.join() else {
+                panic!("sender panicked");
+            };
+            lat.push(got.saturating_duration_since(sent));
+        }
+        lat.sort();
+        lat[2]
+    }
+
+    /// moon#1266: the first record after an idle period is picked up at
+    /// once — the COLD writer is parked on the channel, not sleeping through
+    /// a 50 ms poll step (the old `wait/16` step at the escalated 1 s wait).
+    #[test]
+    fn a_cold_writer_picks_up_the_first_record_promptly() {
+        // Old step: 50 ms, so a send 120 ms in waited ~30 ms. Bound 10 ms.
+        let median = median_pickup(
+            std::time::Duration::from_secs(1),
+            false,
+            std::time::Duration::from_millis(120),
+        );
+        assert!(
+            median < std::time::Duration::from_millis(10),
+            "a record sent to an idle writer waited {median:?} (median) to be picked up"
+        );
+    }
+
+    /// moon#1266: while WARM the poll step is short (the old step was 3 ms
+    /// at the 50 ms fast floor).
+    #[test]
+    fn a_warm_writer_polls_with_a_short_step() {
+        // Old step: 3.125 ms, so a send 3.3 ms in waited ~2.9 ms. New step:
+        // 100 us (+ timer slack). Bound 1.5 ms.
+        let median = median_pickup(
+            std::time::Duration::from_millis(50),
+            true,
+            std::time::Duration::from_micros(3300),
+        );
+        assert!(
+            median < std::time::Duration::from_micros(1500),
+            "a record sent to a warm writer waited {median:?} (median) to be picked up"
+        );
+    }
+
+    /// A warm writer whose span passes with nothing queued parks for the
+    /// rest of the wait and still times out on schedule.
+    #[test]
+    fn a_warm_writer_parks_after_its_span_and_times_out_on_schedule() {
+        let (_tx, rx) = channel::mpsc_bounded::<AofMessage>(4);
+        let start = std::time::Instant::now();
+        let Err(err) = poll_recv(&rx, std::time::Duration::from_millis(40), true) else {
+            panic!("expected timeout");
+        };
+        assert!(matches!(err, flume::RecvTimeoutError::Timeout));
+        let took = start.elapsed();
+        assert!(took >= std::time::Duration::from_millis(40), "{took:?}");
+        assert!(took < std::time::Duration::from_millis(500), "{took:?}");
+    }
+}
