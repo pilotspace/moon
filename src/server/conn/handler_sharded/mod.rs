@@ -2726,8 +2726,9 @@ pub(crate) async fn handle_connection_sharded_inner<
                                 }
 
                                 // KV undo-log capture for active cross-store transactions,
-                                // BEFORE dispatch — twin of the monoio leg: pre-images
-                                // and intents (`transaction::conn_capture`).
+                                // BEFORE dispatch — twin of the monoio leg: pre-images,
+                                // intents and moon#1299 holds, or the TXNCONFLICT refusal
+                                // (`transaction::conn_capture`).
                                 let sel_db = conn.selected_db;
                                 let txn_capture = match conn.active_cross_txn.as_deref_mut() {
                                     Some(txn) => Some(crate::transaction::conn_capture::capture_conn_write(

@@ -652,6 +652,13 @@ pub(super) async fn try_handle_swapdb(
         return true;
     }
 
+    // moon#1299: refused while an open TXN on any shard holds a key in either
+    // db — its abort would restore into the db now holding the other's data.
+    if let Some(refused) = crate::transaction::isolation::check_swapdb(a, b) {
+        responses.push(refused);
+        return true;
+    }
+
     // moon#1237: refused while a swapped db has cold-tier data on any shard.
     let cold = crate::storage::db::swapdb_cold_refusal(a, b, ctx.shard_id, ctx.num_shards);
     if let Some(refused) = cold {

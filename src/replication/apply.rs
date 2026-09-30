@@ -340,6 +340,10 @@ pub(crate) fn apply_local(
     let Some((cmd, args)) = extract_command_static(&rc.command) else {
         return ApplyOutcome::Applied; // not an array command — nothing to apply (defensive)
     };
+    // moon#1299: the master already decided — a replica applies its stream
+    // whatever keys a local transaction holds (it cannot hold any: a replica
+    // refuses client writes). Scoped to this apply.
+    let _txn_isolation_bypass = crate::transaction::isolation::BypassScope::enter();
     // Redis parity (and #373 idle-park visibility): applied master-stream
     // commands count toward total_commands_processed. The apply task runs
     // on the target shard's OS thread, so this lands in the same counter

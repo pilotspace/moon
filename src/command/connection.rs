@@ -809,6 +809,9 @@ fn info_raw(db: &Database, facts: &InstanceFacts) -> String {
         facts.pubsub_channels,
         facts.pubsub_patterns,
     );
+    // moon#1299: open cross-store transactions, the oldest one's age, the
+    // keys they hold and the writes refused on them.
+    crate::transaction::isolation::write_info(&mut sections);
     sections.push_str("\r\n");
 
     // # CPU

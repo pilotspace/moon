@@ -45,6 +45,14 @@ pub fn move_core(
     dst_idx: usize,
     key: &[u8],
 ) -> Frame {
+    // moon#1299: the key leaves one database and lands in another; either
+    // held by an open TXN refuses the move. Every MOVE funnels through here
+    // (connection, MULTI/EXEC, script, replica apply under its bypass).
+    if let Some(refused) =
+        crate::transaction::isolation::check_keys([(src_idx, key), (dst_idx, key)])
+    {
+        return refused;
+    }
     // moon#1228: an armed snapshot epoch needs the key's state in BOTH
     // databases before it leaves one and lands in the other.
     crate::persistence::snapshot_cow::capture_two_db(src, src_idx, Some(key), dst, dst_idx, key);
@@ -119,6 +127,10 @@ pub fn copy_core(
     dst_key: &[u8],
     replace: bool,
 ) -> Frame {
+    // moon#1299: the destination is written (the source only read).
+    if let Some(refused) = crate::transaction::isolation::check_keys([(dst_idx, dst_key)]) {
+        return refused;
+    }
     // moon#1228: an armed snapshot epoch needs the destination key's state
     // before the copy lands (the source is only read).
     crate::persistence::snapshot_cow::capture_two_db(src, src_idx, None, dst, dst_idx, dst_key);
