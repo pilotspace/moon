@@ -480,9 +480,31 @@ clock (moon#1277). Keep those mtimes truthful:
   its OLD value (measured with the mtime set an hour back: 27–36 of 40 such
   keys, against 0 on a build that judged by the wall clock).
 
-Restore AOF files with their original mtimes (`cp -p`, `rsync -t`, `tar`).
-A time record inside the log (like redis's `aof-timestamp-enabled`) would
-remove the dependency; it is a format change tracked separately.
+Since moon#1283 the AOF carries that time itself: the writer stamps the log
+with `MOON.TS <ms>` records (the shard clock each record was judged under),
+and a replay judges every stamped record by its own stamp, whatever the
+file's mtime. The mtime still judges a log written before moon#1283 (and the
+stamp-less start of one an older binary began), so keep restoring AOF files
+with their original mtimes (`cp -p`, `rsync -t`, `tar`).
+
+**Downgrading and upgrading again.** An older binary appends to the same AOF
+without stamps. moon recognises those records by position — each orderly
+stop of the newer binary ends the file with a clean-close marker
+(`MOON.TS <ms> CLOSE`), and its first write after a restart is stamped — and
+judges them as the older binary did, on every later boot
+([`STORAGE-FORMAT-V1.md`](STORAGE-FORMAT-V1.md) §3.3). That works only if the
+newer binary was stopped cleanly:
+
+1. Stop the newer binary with `SHUTDOWN` or SIGTERM and check its log for
+   `AOF writers drained and synced` before starting the older one. If it
+   crashed (kill -9, OOM kill, power loss), start it once and stop it cleanly
+   first.
+2. If that was not done, run `BGREWRITEAOF` on the older binary as its last
+   action, and stop it once the rewrite completed, before upgrading again.
+
+Otherwise keys the older binary saw expire and restarted (an `INCR` on an
+expired counter) are judged by the newer binary's last stamp, which is stale,
+and replay onto their old value and deadline: they are lost.
 
 ### Persistence volume in Docker
 
