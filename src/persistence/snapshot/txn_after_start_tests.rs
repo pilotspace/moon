@@ -53,7 +53,7 @@ fn txn_write(
     reply
 }
 
-fn values<'a>(records: &'a [Record], key: &[u8]) -> Vec<Vec<u8>> {
+fn values(records: &[Record], key: &[u8]) -> Vec<Vec<u8>> {
     records
         .iter()
         .filter(|(_, k, _)| k.as_ref() == key)
