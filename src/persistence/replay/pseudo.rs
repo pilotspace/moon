@@ -31,7 +31,10 @@
 //! A replay sets its judgment clock to the LAST `MOON.TS` read — never a
 //! running maximum: a producer that parked between its mutation and its
 //! enqueue lands after newer records, and its own, older stamp is the right
-//! clock for it. Until a file's first `MOON.TS` the file's mtime pin rules
+//! clock for it. The one exception is a foreign tail: the records after a
+//! file's LAST stamp, when its mtime is more than a second later, are judged
+//! by the mtime ([`super::clock`], R1 review: an older binary appended them
+//! after a downgrade). Until a file's first `MOON.TS` the file's mtime pin rules
 //! (an older binary's log, or its stamp-less prefix, replays exactly as
 //! before). `MOON.TS 0`, a value past the year 9999 and a malformed record
 //! are skipped and leave the clock where it was.

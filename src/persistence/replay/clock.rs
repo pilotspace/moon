@@ -78,6 +78,28 @@
 //! Not pinned: `replay_ordered_merge` (no production emitter yet) and the
 //! replica's apply of the master stream, which runs live on the wall clock.
 //!
+//! ## A tail an older binary appended (R1 review of moon#1283, finding 1)
+//!
+//! After a downgrade, an older binary appends to the same file with no
+//! stamps; after the re-upgrade those records would all be judged by the last
+//! stamp the newer binary wrote before the downgrade — hours or days stale —
+//! so a key the older binary saw expire and rewrote (moon#542: no `DEL`
+//! first) replayed onto its old value and old deadline, and was lost.
+//! This binary re-stamps whenever its clock moves, so the records after its
+//! last stamp were written within that clock tick, and the file's mtime is
+//! that tick (plus the writer's pickup latency). An mtime more than
+//! [`FOREIGN_TAIL_TOLERANCE_MS`] past the file's LAST stamp therefore means
+//! something else appended after it (or the mtime was moved forward). The
+//! records that stamp covers — found by [`super::log_tail::last_ts_in_file`]
+//! from the end of the file, matched by value — are then judged by
+//! `max(last stamp, mtime pin)`, which is the pin: exactly the judgment the
+//! older binary itself replays them with. A stamped file whose mtime is
+//! EARLIER than its last stamp (the moon#1283 case) never engages the rule.
+//! The replay reports it ([`foreign_tail_replayed`]) so boot runs one AOF
+//! rewrite: once this binary appends stamped records behind that tail, it is
+//! no longer at the end of the file, and only a new generation keeps a later
+//! boot from judging it by the stale stamp again.
+//!
 //! A snapshot the logs replay over (`KvSources::SnapshotAndLogs`) keeps its
 //! expired entries ([`keep_expired_image_entries`]): its loader skips them on
 //! the WALL clock, and a key dropped there would be absent for a record the
@@ -85,8 +107,39 @@
 //! the replay judges them like any other key and the active expiry reaps the
 //! rest, as for an AOF base (moon#1236).
 
-use std::cell::Cell;
-use std::path::Path;
+use std::cell::{Cell, RefCell};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// How far a file's mtime may pass its last `MOON.TS` before the records
+/// that stamp covers are judged as a foreign tail (see the module doc). The
+/// gap a writer of THIS binary leaves is its pickup latency — well under a
+/// millisecond while it writes, longer only while it is stalled (a slow
+/// disk under `always`); an older binary appending after a downgrade leaves
+/// at least a restart.
+pub const FOREIGN_TAIL_TOLERANCE_MS: u64 = 1_000;
+
+/// Set once any replay in this process judged a foreign tail by its file's
+/// mtime ([`foreign_tail_replayed`]).
+static FOREIGN_TAIL_REPLAYED: AtomicBool = AtomicBool::new(false);
+
+/// Whether a replay in this process met a tail an older binary appended after
+/// the file's last `MOON.TS` (see the module doc). Boot then asks for one AOF
+/// rewrite, so the tail stops being judged by that stale stamp once this
+/// binary appends behind it.
+pub fn foreign_tail_replayed() -> bool {
+    FOREIGN_TAIL_REPLAYED.load(Ordering::Relaxed)
+}
+
+/// The file a pin scope replays, for the foreign-tail rule.
+#[derive(Default)]
+struct TailSource {
+    /// The replayed log (None: no file, e.g. a WAL directory or a test pin).
+    path: Option<PathBuf>,
+    /// Its last `MOON.TS`, scanned lazily on first need: `None` = not yet
+    /// scanned, `Some(None)` = it has none.
+    last_ts: Option<Option<u64>>,
+}
 
 thread_local! {
     /// The pinned judgment clock of this thread's replay (0 = not pinned:
@@ -98,6 +151,11 @@ thread_local! {
     /// How many pin guards are open on this thread: a stamp is honoured only
     /// inside one.
     static PIN_DEPTH: Cell<u32> = const { Cell::new(0) };
+    /// The judgment clock of the records after the current file's LAST stamp
+    /// when they are a foreign tail (0 = not in one). R1 review, finding 1.
+    static TAIL_MS: Cell<u64> = const { Cell::new(0) };
+    /// The current file, for the foreign-tail rule.
+    static TAIL_SRC: RefCell<TailSource> = RefCell::new(TailSource::default());
 }
 
 /// Restores the previous pin (or none) and the enclosing file's stamp when
@@ -106,12 +164,16 @@ thread_local! {
 pub struct ReplayClockGuard {
     previous: u64,
     previous_ts: u64,
+    previous_tail: u64,
+    previous_src: TailSource,
 }
 
 impl Drop for ReplayClockGuard {
     fn drop(&mut self) {
         PINNED_MS.with(|c| c.set(self.previous));
         LOG_TS_MS.with(|c| c.set(self.previous_ts));
+        TAIL_MS.with(|c| c.set(self.previous_tail));
+        TAIL_SRC.with(|c| *c.borrow_mut() = std::mem::take(&mut self.previous_src));
         PIN_DEPTH.with(|c| c.set(c.get().saturating_sub(1)));
     }
 }
@@ -120,10 +182,21 @@ impl Drop for ReplayClockGuard {
 /// open the scope of one replayed file: no `MOON.TS` read yet. `0` pins
 /// nothing (the databases' own clock) but still opens the scope.
 pub fn pin_replay_clock_ms(ms: u64) -> ReplayClockGuard {
+    pin_scope(ms, None)
+}
+
+fn pin_scope(ms: u64, path: Option<PathBuf>) -> ReplayClockGuard {
     PIN_DEPTH.with(|c| c.set(c.get().saturating_add(1)));
     ReplayClockGuard {
         previous: PINNED_MS.with(|c| c.replace(ms)),
         previous_ts: LOG_TS_MS.with(|c| c.replace(0)),
+        previous_tail: TAIL_MS.with(|c| c.replace(0)),
+        previous_src: TAIL_SRC.with(|c| {
+            c.replace(TailSource {
+                path,
+                last_ts: None,
+            })
+        }),
     }
 }
 
@@ -136,7 +209,48 @@ pub fn observe_log_ts(ms: u64) -> bool {
         return false;
     }
     LOG_TS_MS.with(|c| c.set(ms));
+    TAIL_MS.with(|c| c.set(foreign_tail_clock(ms)));
     true
+}
+
+/// The clock for the records after the stamp `ms` when `ms` is the current
+/// file's LAST stamp and the file's mtime pin is more than
+/// [`FOREIGN_TAIL_TOLERANCE_MS`] past it (a foreign tail, see the module
+/// doc): the pin. 0 otherwise. The file is scanned at most once per scope,
+/// and only once a stamp trails the pin by more than the tolerance.
+fn foreign_tail_clock(ms: u64) -> u64 {
+    let pin = PINNED_MS.with(Cell::get);
+    if pin <= ms.saturating_add(FOREIGN_TAIL_TOLERANCE_MS) {
+        return 0;
+    }
+    let last = TAIL_SRC.with(|c| {
+        let mut src = c.borrow_mut();
+        if src.last_ts.is_none() {
+            let scanned = src
+                .path
+                .as_deref()
+                .and_then(super::log_tail::last_ts_in_file);
+            src.last_ts = Some(scanned);
+        }
+        src.last_ts.flatten()
+    });
+    if last != Some(ms) {
+        return 0;
+    }
+    if !FOREIGN_TAIL_REPLAYED.swap(true, Ordering::Relaxed) {
+        let path = TAIL_SRC.with(|c| c.borrow().path.clone());
+        tracing::warn!(
+            "AOF replay: {} was appended to {:.1}s after its last MOON.TS; the records \
+             after that stamp have no stamp of their own (an older moon binary wrote \
+             them after a downgrade, or the file's mtime was moved forward) and are \
+             judged by the file's mtime instead of that stale stamp. One AOF rewrite \
+             runs after boot so later boots do not depend on it.",
+            path.as_deref()
+                .map_or_else(|| "a log".into(), |p| p.display().to_string()),
+            (pin - ms) as f64 / 1000.0,
+        );
+    }
+    pin
 }
 
 /// Pin this thread's replay judgment clock to the newest modification time of
@@ -151,6 +265,17 @@ pub fn pin_replay_clock_to_files(files: &[&Path]) -> ReplayClockGuard {
         .max()
         .map_or(0, |ms| ms.min(crate::storage::entry::current_time_ms()));
     pin_replay_clock_ms(newest)
+}
+
+/// Pin this thread's replay judgment clock to the modification time of the
+/// AOF file `path` (see [`pin_replay_clock_to_files`]) and open its scope for
+/// the foreign-tail rule (the module doc): the records after the file's last
+/// `MOON.TS` are judged by the mtime when it is more than
+/// [`FOREIGN_TAIL_TOLERANCE_MS`] later than that stamp.
+pub fn pin_replay_clock_to_log(path: &Path) -> ReplayClockGuard {
+    let guard = pin_replay_clock_to_files(&[path]);
+    TAIL_SRC.with(|c| c.borrow_mut().path = Some(path.to_path_buf()));
+    guard
 }
 
 /// Pin this thread's replay judgment clock to the newest `*.wal` segment in
@@ -185,10 +310,15 @@ pub fn keep_expired_image_entries(
     }
 }
 
-/// The judgment clock of this thread's replay, if any: the last `MOON.TS`
-/// of the current file, else the pin.
+/// The judgment clock of this thread's replay, if any: the mtime pin past
+/// a foreign tail's cut (the module doc), else the last `MOON.TS` of the
+/// current file, else the pin.
 #[inline]
 pub fn pinned_replay_clock_ms() -> Option<u64> {
+    let tail = TAIL_MS.with(Cell::get);
+    if tail != 0 {
+        return Some(tail);
+    }
     let ts = LOG_TS_MS.with(Cell::get);
     if ts != 0 {
         return Some(ts);

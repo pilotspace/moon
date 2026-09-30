@@ -140,7 +140,9 @@ the replication stream never carries it.
 
 A replay judges every record by the **last** `MOON.TS` read in the current
 file (not a running maximum: a parked producer's record carries an older
-stamp than the records it lands after). Until a file's first `MOON.TS` — an
+stamp than the records it lands after), except the records after the file's
+last stamp when the file was modified more than 1 s after it (a tail an older
+binary appended, see *Downgrade, then re-upgrade* below). Until a file's first `MOON.TS` — an
 older binary's log, or the stamp-less prefix of a file an older binary
 started — it falls back to the file's modification time capped at the wall
 clock (moon#1277), exactly as before. A `MOON.TS` of 0, past the year 9999,
@@ -154,10 +156,27 @@ not a storage-format bump:
 - *Downgrade:* a binary that predates `MOON.TS` sends it to command dispatch,
   gets "unknown command", counts it as an unhandled record, and replays every
   data record around it — with its own (mtime) expiry judgment. The boot does
-  not fail. If that older binary then appends to the same file, its records
-  have no stamps and replay after the last stamp the newer binary wrote,
-  which judges them by that older clock; `BGREWRITEAOF` after an upgrade
-  clears the mixture.
+  not fail.
+- *Downgrade, then re-upgrade:* the older binary appends to the same file
+  with no stamps, so after the re-upgrade its records follow the last stamp
+  the newer binary wrote, which can be hours or days stale. Judged by it, a
+  key the older binary saw expire and restarted (`INCR` onto an expired
+  counter, with no `DEL` logged first) replays onto its old value and old
+  deadline and is lost. A newer binary re-stamps whenever its clock moves,
+  so the file's modification time can pass its last stamp by more than the
+  writer's pickup latency only if something else appended after it (or the
+  mtime was moved forward). When the mtime is more than 1 s past the file's
+  last stamp, the records that stamp covers are judged by the mtime (capped
+  at the wall clock) — the judgment the older binary itself replays them
+  with — and the boot runs one AOF rewrite, so the tail is folded into a new
+  generation before this binary's own stamped records bury it. A crash
+  before that rewrite commits leaves the old tail mid-file, judged by the
+  stale stamp on the next boot; run `BGREWRITEAOF` after a re-upgrade if
+  the boot log does not show the rewrite completing. An mtime EARLIER than
+  the last stamp (the moon#1283 case) never engages this rule. The price:
+  an mtime moved more than 1 s FORWARD re-judges the records of the file's
+  last clock tick by it (the pre-moon#1283 behaviour, for those records
+  only).
 - *Redis:* a redis server cannot load a moon AOF regardless (`MOON.COLDCUT`
   is already an unknown command there).
 
