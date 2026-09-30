@@ -67,10 +67,11 @@ pub fn key_pattern_to_rule(kp: &KeyPattern) -> Option<String> {
 /// - a bare `+cmd` / `-cmd` clears every `cmd|*` rule applied before it, so
 ///   `cmd|arg` tokens must not precede their bare `cmd` token
 ///   ([`CommandRules::tokens`] guarantees it);
-/// - the first `-<cmd>` after `+@all` is what transitions to
-///   `Specific { base_allow: true }`. A `+get` re-grant that lands before any
-///   revocation reads back as a no-op on the still all-allowed user, which is
-///   the same permission (nothing is denied ahead of it).
+/// - the first `+<cmd>` or `-<cmd>` after `+@all` is what transitions to
+///   `Specific { base_allow: true }`. A grant is recorded there too (R1
+///   finding 7), so `+@all +get -set` reloads as itself; when grants were
+///   dropped it reloaded as `+@all -set`, the same permission but not the
+///   same text, and redis 7.2 keeps it.
 pub fn command_rules_to_string(perms: &CommandPermissions) -> String {
     match perms {
         CommandPermissions::AllAllowed => "+@all".to_string(),

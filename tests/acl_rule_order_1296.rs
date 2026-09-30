@@ -44,6 +44,27 @@ const CASES: &[(&str, &str)] = &[
     ("+@all -config -config|get", "+@all -config -config|get"),
 ];
 
+/// R1 finding 7: a grant applied under `+@all` before the first revocation.
+/// f766fc2 dropped it on reload (`+@all -get +get -set` rendered
+/// `+@all +get -set` live and `+@all -set` after ACL SAVE / LOAD); redis
+/// 7.2.7 renders these as below, live and after every SAVE / LOAD round.
+const GRANTS_UNDER_ALL: &[(&str, &str)] = &[
+    ("+@all -get +get -set", "+@all +get -set"),
+    ("+@all +get", "+@all +get"),
+    ("+@all +get -set", "+@all +get -set"),
+    ("+@all -get +get", "+@all +get"),
+    ("+@all +get +set -del", "+@all +get +set -del"),
+    ("+@all -set +get +set", "+@all +get +set"),
+    (
+        "+@all +config|get -config|set",
+        "+@all +config|get -config|set",
+    ),
+    ("+@all -config +config|get", "+@all -config +config|get"),
+    ("allcommands +get -set", "+@all +get -set"),
+    ("-@all +@all +get -set", "+@all +get -set"),
+    ("+@all -get +get -set +del", "+@all +get -set +del"),
+];
+
 fn spawn(dir: &std::path::Path, shards: &str) -> (common::ServerGuard, u16) {
     let bin = common::find_moon_binary();
     let dir = dir.to_path_buf();
@@ -89,11 +110,15 @@ fn getuser_commands(c: &mut Conn) -> String {
 }
 
 fn run(shards: &str) {
+    run_cases(shards, CASES);
+}
+
+fn run_cases(shards: &str, cases: &[(&str, &str)]) {
     let dir = common::unique_test_dir("acl1296");
     std::fs::create_dir_all(&dir).unwrap();
     let (_guard, port) = spawn(&dir, shards);
     let mut c = Conn::open(port);
-    for (typed, want) in CASES {
+    for (typed, want) in cases {
         c.send(&["ACL", "DELUSER", "u"]);
         let mut cmd = vec!["ACL", "SETUSER", "u", "on", "nopass"];
         cmd.extend(typed.split(' '));
@@ -117,6 +142,14 @@ fn run(shards: &str) {
             *want,
             "GETUSER after `{typed}` and an ACL SAVE / ACL LOAD round trip"
         );
+        // A second round: what was reloaded must save as itself.
+        assert_eq!(c.send(&["ACL", "SAVE"]), "+OK\r\n");
+        assert_eq!(c.send(&["ACL", "LOAD"]), "+OK\r\n");
+        assert_eq!(
+            getuser_commands(&mut c),
+            *want,
+            "GETUSER after `{typed}` and two ACL SAVE / ACL LOAD round trips"
+        );
     }
 }
 
@@ -130,4 +163,16 @@ fn rules_render_in_application_order_1_shard() {
 #[ignore = "real-server suite: MOON_BIN pinned"]
 fn rules_render_in_application_order_4_shards() {
     run("4");
+}
+
+#[test]
+#[ignore = "real-server suite: MOON_BIN pinned"]
+fn grants_under_all_survive_save_and_load_1_shard() {
+    run_cases("1", GRANTS_UNDER_ALL);
+}
+
+#[test]
+#[ignore = "real-server suite: MOON_BIN pinned"]
+fn grants_under_all_survive_save_and_load_4_shards() {
+    run_cases("4", GRANTS_UNDER_ALL);
 }
