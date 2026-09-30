@@ -671,7 +671,7 @@ pub async fn aof_writer_task(
                             everysec.inline_done(false);
                         } else {
                             crate::admin::metrics_setup::record_aof_fsync(
-                                t.elapsed().as_micros() as u64,
+                                t.elapsed().as_micros() as u64
                             );
                             crate::persistence::aof::record_everysec_fsync_result(0, true);
                             everysec.inline_done(true);
@@ -2002,7 +2002,7 @@ pub async fn per_shard_aof_writer_task(
                             everysec.inline_done(false);
                         } else {
                             crate::admin::metrics_setup::record_aof_fsync(
-                                t.elapsed().as_micros() as u64,
+                                t.elapsed().as_micros() as u64
                             );
                             crate::persistence::aof::record_everysec_fsync_result(
                                 usize::from(shard_id),

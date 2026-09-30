@@ -93,7 +93,7 @@ impl AofFsyncAgent {
                     match &result {
                         Ok(()) => {
                             crate::admin::metrics_setup::record_aof_fsync(
-                                t.elapsed().as_micros() as u64,
+                                t.elapsed().as_micros() as u64
                             );
                             super::record_everysec_fsync_result(writer_idx, true);
                         }
