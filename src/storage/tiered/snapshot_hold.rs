@@ -45,9 +45,14 @@
 //! (REVIEW-WS20 F2): since moon#1267 a snapshot can always be written
 //! (`BGSAVE` / `SHUTDOWN SAVE` go to `--dir` whatever the save rules say),
 //! and the cold tier is rebuilt at every boot, so a promoted key's file is
-//! its durable copy in every no-AOF configuration. Without save points only
-//! a manual `BGSAVE` or `SHUTDOWN SAVE` releases held files (and a database
-//! with held files refuses SWAPDB until then, moon#1237).
+//! its durable copy in every no-AOF configuration. Without save points held
+//! files are released by a manual `BGSAVE` or `SHUTDOWN SAVE`, or by the
+//! automatic held-file snapshot (moon#1289: `shard::held_release_tick` asks
+//! `persistence::snapshot_request` once a held file has waited
+//! `held_release::STALE_AFTER_SWEEPS` orphan sweeps, rate limited, and not
+//! while a `TXN` is open). That snapshot runs even with `save ""` and writes
+//! the dump file like any `BGSAVE`. Until one of them completes, a database
+//! with held files refuses SWAPDB (moon#1237).
 
 use std::cell::Cell;
 
