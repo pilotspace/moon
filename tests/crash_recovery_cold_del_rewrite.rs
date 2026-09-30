@@ -413,14 +413,21 @@ fn run_promote_scenario(suffix: &str, touch: Touch, second_rewrite: bool) {
 
     let mut released = None;
     if second_rewrite {
+        // moon#1289: a database whose files stay held for three sweeps asks the
+        // auto-rewrite monitor for a fold, and with 1 s sweeps that fold can
+        // commit (and release the files) inside the wait above. That is a later
+        // fold capturing the probes too; the kill -9 below still checks them.
+        let auto_folds = info_u64(port, "cold_held_release_folds_requested").unwrap_or(0);
         assert!(
-            files_before_second > 0,
+            files_before_second > 0 || auto_folds > 0,
             "the spill files that backed the probes at the fold were unlinked before any \
-             later fold captured them ({heap_files} at the fold, 0 now)"
+             later fold captured them ({heap_files} at the fold, 0 now, no held-release fold)"
         );
-        rewrite_and_wait(port, &dir);
-        std::thread::sleep(Duration::from_secs(4));
-        released = Some(count_heap_files(&dir));
+        if files_before_second > 0 {
+            rewrite_and_wait(port, &dir);
+            std::thread::sleep(Duration::from_secs(4));
+            released = Some(count_heap_files(&dir));
+        }
     }
 
     server.kill_now();
