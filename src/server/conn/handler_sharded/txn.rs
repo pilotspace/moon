@@ -106,7 +106,8 @@ pub(super) async fn try_handle_txn_commit(
                 // Unconditional slice path: returns true iff the snapshot was killed.
                 let was_killed = crate::shard::slice::with_shard(|s| {
                     if s.vector_store.txn_manager().is_killed(txn.txn_id) {
-                        s.vector_store.txn_manager_mut().abort_killed(txn.txn_id);
+                        // Retired by the rollback below (`abort_local` ->
+                        // `txn_manager.abort`), like a dirty commit.
                         true
                     } else {
                         s.vector_store.txn_manager_mut().commit(txn.txn_id);
@@ -114,18 +115,28 @@ pub(super) async fn try_handle_txn_commit(
                     }
                 });
                 if was_killed {
-                    // moon#1299: the transaction is over — release its keys
-                    // and intents (the killed path used to leak both).
-                    let killed_id = txn.txn_id;
-                    crate::shard::slice::with_shard(|s| s.kv_write_intents.release_txn(killed_id));
-                    crate::transaction::isolation::txn_end(killed_id);
                     tracing::warn!(
                         txn_id = txn.txn_id,
-                        "TXN.COMMIT rejected: snapshot was killed (snapshot too old)"
+                        "TXN.COMMIT rejected: snapshot was killed (snapshot too old) -- rolling back"
                     );
                     let mut msg = bytes::BytesMut::new();
                     use std::fmt::Write as _;
                     let _ = write!(msg, "MOONERR snapshot too old: {}", txn.txn_id);
+                    // moon#1299 R1: the reply says the commit FAILED, so the
+                    // transaction's writes are rolled back — through the
+                    // TXN.ABORT path, which also retires it in the manager and
+                    // releases its intents and key holds. It used to release
+                    // only those, and the writes stayed applied. A refusal of
+                    // the rollback's log records is counted and logged by
+                    // `abort_logged`; the client is answered the commit error
+                    // either way.
+                    let _refused = Box::pin(crate::server::conn::txn_abort::abort_logged(
+                        ctx,
+                        *txn,
+                        None,
+                        crate::server::conn::txn_abort::AbortCause::KilledCommit,
+                    ))
+                    .await;
                     responses.push(Frame::Error(msg.freeze()));
                     return true;
                 }

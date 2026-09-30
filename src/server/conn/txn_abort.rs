@@ -41,6 +41,11 @@ pub(crate) enum AbortCause {
     /// ends the transaction; the client is answered `+RESET` whatever the
     /// rollback's durability.
     Reset,
+    /// A `TXN.COMMIT` refused because its snapshot was killed
+    /// (`KILL SNAPSHOT` / `old_snapshot_threshold`): the client is answered
+    /// `snapshot too old`, which says nothing about the rollback's
+    /// durability.
+    KilledCommit,
 }
 
 impl AbortCause {
@@ -50,6 +55,7 @@ impl AbortCause {
             AbortCause::DirtyCommit => "TXN.COMMIT rollback (rejected ops)",
             AbortCause::Disconnect => "disconnect rollback",
             AbortCause::Reset => "RESET rollback",
+            AbortCause::KilledCommit => "TXN.COMMIT rollback (snapshot killed)",
         }
     }
 }
