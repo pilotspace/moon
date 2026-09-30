@@ -268,9 +268,14 @@ pub(crate) fn hold(db: usize, key: &Bytes, txn_id: u64) -> bool {
         (true, h.per_db[db] == 1)
     });
     if newly {
-        HELD.with(|c| c.set(c.get() + 1));
+        let held = HELD.with(|c| {
+            c.set(c.get() + 1);
+            c.get()
+        });
         if first_in_db {
             publish();
+        } else {
+            publish_held_keys(held);
         }
     }
     newly
@@ -296,9 +301,14 @@ pub(crate) fn unhold(db: usize, key: &[u8], txn_id: u64) {
         (true, h.per_db[db] == 0)
     });
     if removed {
-        HELD.with(|c| c.set(c.get().saturating_sub(1)));
+        let held = HELD.with(|c| {
+            c.set(c.get().saturating_sub(1));
+            c.get()
+        });
         if last_in_db {
             publish();
+        } else {
+            publish_held_keys(held);
         }
     }
 }
@@ -501,6 +511,27 @@ fn publish() {
     view.held_dbs.store(dbs, Ordering::Release);
     view.held_keys.store(keys, Ordering::Release);
     view.open_word.store(word, Ordering::Release);
+}
+
+/// Store this shard's held-key count alone — a hold that did not change
+/// which databases hold keys (moon#1299 R1 F3: `INFO txn_held_keys` read
+/// the count as of the last database transition, e.g. `1` for five held
+/// keys). One `Relaxed` store by the single writer, no `Arc` clone; a shard
+/// whose view is not registered yet takes the full [`publish`].
+fn publish_held_keys(held: usize) {
+    #[cfg(test)]
+    if !PUBLISH_IN_TESTS.with(Cell::get) {
+        return;
+    }
+    let stored = MY_VIEW.with(|v| {
+        v.borrow()
+            .as_ref()
+            .map(|view| view.held_keys.store(held as u64, Ordering::Relaxed))
+            .is_some()
+    });
+    if !stored {
+        publish();
+    }
 }
 
 /// Does any shard hold a key in a database under `mask`?
@@ -801,6 +832,28 @@ mod tests {
             assert!(i.oldest_age_ms >= 250);
             assert!(i.held_keys >= 1);
             txn_end(31);
+        });
+    }
+
+    /// moon#1299 R1 F3: the published count follows EVERY hold and release,
+    /// not only a database's first and last (it read 1 for five keys).
+    #[test]
+    fn published_held_keys_follow_every_hold_and_release() {
+        on_fresh_thread(|| {
+            PUBLISH_IN_TESTS.with(|p| p.set(true));
+            let mine = || my_view().held_keys.load(Ordering::Acquire);
+            txn_begin(41);
+            let keys: [&'static [u8]; 5] = [b"a", b"b", b"c", b"d", b"e"];
+            for (n, key) in keys.into_iter().enumerate() {
+                assert!(hold(62, &Bytes::from_static(key), 41));
+                assert_eq!(mine(), n as u64 + 1, "after {} holds", n + 1);
+            }
+            assert!(hold(63, &Bytes::from_static(b"z"), 41));
+            assert_eq!(mine(), 6);
+            unhold(62, b"e", 41);
+            assert_eq!(mine(), 5, "an unhold that leaves db 62 non-empty");
+            txn_end(41);
+            assert_eq!(mine(), 0);
         });
     }
 }
