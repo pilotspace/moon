@@ -3668,9 +3668,10 @@ pub(crate) async fn handle_connection_sharded_monoio<
                         }
 
                         // KV undo-log capture (MUST precede dispatch):
-                        // pre-images and write intents of every key this
-                        // write may write. moon#500 / moon#1303 rationale in
-                        // `transaction::conn_capture`.
+                        // pre-images, write intents and moon#1299 holds of
+                        // every key this write may write — or the TXNCONFLICT
+                        // refusal when another TXN holds one. moon#500 /
+                        // moon#1303 rationale in `transaction::conn_capture`.
                         let txn_capture = match conn.active_cross_txn.as_deref_mut() {
                             Some(txn) => {
                                 Some(crate::transaction::conn_capture::capture_conn_write(

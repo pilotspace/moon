@@ -38,6 +38,8 @@ pub(super) fn try_handle_txn_begin(
                 active.snapshot_lsn,
                 conn.selected_db,
             )));
+            // moon#1299: this shard's open-TXN view (INFO; the hold table).
+            crate::transaction::isolation::txn_begin(active.txn_id);
             responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
         }
         Err(e) => responses.push(e),
@@ -112,6 +114,11 @@ pub(super) async fn try_handle_txn_commit(
                     }
                 }); // with_shard borrow released here
                 if killed {
+                    // moon#1299: the transaction is over — release its keys
+                    // and intents (the killed path used to leak both).
+                    let killed_id = txn.txn_id;
+                    crate::shard::slice::with_shard(|s| s.kv_write_intents.release_txn(killed_id));
+                    crate::transaction::isolation::txn_end(killed_id);
                     tracing::warn!(
                         txn_id = txn.txn_id,
                         "TXN.COMMIT rejected: snapshot was killed (snapshot too old)"
@@ -151,6 +158,8 @@ pub(super) async fn try_handle_txn_commit(
                     s.kv_write_intents.release_txn(txn_id);
                     s.deferred_hnsw_inserts.drain_for_txn(txn_id).count()
                 });
+                // moon#1299: committed — its keys are free to other writers.
+                crate::transaction::isolation::txn_end(txn_id);
                 if drain_count > 0 {
                     tracing::debug!(txn_id, count = drain_count, "Drained deferred HNSW inserts");
                 }

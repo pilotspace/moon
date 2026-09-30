@@ -2123,6 +2123,11 @@ pub(crate) fn immediate_serve(
     // write first, exactly as dispatch would. Over-inclusive by design (a key
     // that ends up not served costs one clone while a BGSAVE is in flight);
     // one thread-local `bool` load when none is.
+    // moon#1299: a pop served now writes its key (and a move's destination);
+    // refused, like any other write, when an open TXN holds one.
+    if let Some(refused) = crate::transaction::isolation::check_write(db_index, cmd, args) {
+        return Some((refused, false));
+    }
     crate::persistence::snapshot_cow::capture_dispatch_pre_image(db, db_index, cmd, args);
     if let Some(target) = local_group_read(cmd, args, keys, shard_id, num_shards) {
         return immediate_group_read(cmd, args, keys, db, db_index, shard_id, num_shards, &target);
@@ -2682,7 +2687,10 @@ pub(crate) fn try_inline_dispatch(
     // Validate command matches argc
     match (&cmd_upper, is_get) {
         ([b'G', b'E', b'T'], true) => {}
-        ([b'S', b'E', b'T'], false) => {}
+        // moon#1299: while an open TXN on this shard holds any key, a SET
+        // takes generic dispatch, whose isolation check refuses a held key.
+        // One thread-local load.
+        ([b'S', b'E', b'T'], false) if !crate::transaction::isolation::any_held() => {}
         _ => return 0,
     }
 

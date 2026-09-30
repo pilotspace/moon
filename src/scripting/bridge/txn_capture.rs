@@ -372,6 +372,20 @@ pub(super) fn txn_undo_capture(
     })
 }
 
+/// moon#1299: the script's write was refused because ANOTHER open
+/// transaction holds one of its keys. Like every TXN guard refusal it counts
+/// against the script's transaction (#499), which may then not commit.
+pub(super) fn txn_note_conflict(cmd: &[u8]) {
+    TXN_UNDO_CAPTURE.with(|c| {
+        if let Some(capture) = c.borrow_mut().as_mut() {
+            if capture.refused.is_none() {
+                capture.refused = Some(Bytes::copy_from_slice(cmd));
+            }
+            capture.refused_count = capture.refused_count.saturating_add(1);
+        }
+    });
+}
+
 /// Where one script write's captures begin in the armed [`ScriptTxnUndo`].
 #[derive(Debug)]
 pub(super) struct TxnCaptureMark {

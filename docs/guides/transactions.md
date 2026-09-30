@@ -58,6 +58,43 @@ OK
 
 4. **TXN ABORT** replays the undo log in reverse to restore before-images, discards all deferred intents, writes a `XactAbort` WAL record, and clears state.
 
+## Isolation: keys held by an open transaction
+
+A key a transaction writes is **held** until it commits or aborts. `TXN ABORT`
+restores every written key's pre-transaction value, so a write another client
+made to such a key in between would be overwritten by the abort. That write is
+refused instead:
+
+```
+A> TXN BEGIN
+A> SET k txn
+B> SET k other        -> (error) TXNCONFLICT key held by an open transaction
+B> FLUSHDB            -> (error) TXNCONFLICT database has keys held by an open transaction
+A> TXN ABORT          -> OK   (k is back to its value before the transaction)
+B> SET k other        -> OK
+```
+
+- Every write path checks: plain commands, `MULTI`/`EXEC` bodies (the queued
+  write's element is the error), scripts (`redis.call` raises it), blocking pops
+  (a pop that would be served at once is refused; a parked client is not served
+  from a held key and is served once the key is released), `MOVE`, `COPY … DB`,
+  `MQ`, and routed writes at `--shards > 1`.
+- `FLUSHDB`, `FLUSHALL` and `SWAPDB` are refused while an open transaction holds a
+  key in a database they would clear or move.
+- Reads are not blocked: a client outside a transaction still reads the
+  uncommitted value; a reader inside its own transaction does not see it.
+- A transaction that writes a key another open transaction holds gets the same
+  error, and — like any refused command inside a transaction — can then only be
+  aborted (`TXN COMMIT` answers `EXECABORT`).
+- A command that answers an error inside a transaction wrote nothing and holds
+  nothing.
+- Eviction and active expiry skip held keys; an expired held key is reaped
+  after the transaction ends. A replica applies its master's stream
+  regardless.
+- There is no idle timeout: a key stays held until its transaction commits,
+  aborts, or its connection closes. `INFO stats` reports `txn_open`,
+  `txn_oldest_age_ms`, `txn_held_keys` and `txn_conflicts_refused`.
+
 ## Crash recovery
 
 Transaction WAL records (`XactBegin` 0x33, `XactCommit` 0x34, `XactAbort` 0x37) are replayed on startup. Uncommitted transactions (begin without commit/abort) are automatically rolled back during recovery.

@@ -99,6 +99,19 @@ pub(crate) fn execute_mq_on_owner(
         Err(e) => return e,
     };
 
+    // moon#1299: every mutating subcommand writes the queue's stream key;
+    // refused while an open TXN holds it (a TXN's `DEL q` / `XADD q` would
+    // otherwise be restored over this write on abort).
+    if crate::transaction::isolation::any_held()
+        && !sub.eq_ignore_ascii_case(b"DLQLEN")
+        && let Some(Frame::BulkString(raw_key)) = cmd_args.get(1)
+        && let Some(refused) = crate::transaction::isolation::check_keys([(
+            db_index,
+            effective_key(&key_prefix, raw_key).as_ref(),
+        )])
+    {
+        return refused;
+    }
     if sub.eq_ignore_ascii_case(b"CREATE") {
         return handle_create(cmd_args, &key_prefix, db_index, gate);
     }

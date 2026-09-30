@@ -129,6 +129,11 @@ pub(crate) async fn abort_logged(
     // The first refusal in log order (KV AOF, local graph WAL, remote graph
     // legs) is the reply; every one was already counted and logged where it
     // happened.
+    // moon#1299: the restore is applied and its compensating records are
+    // enqueued (or refused and reported): only now may other clients write
+    // the transaction's keys — released earlier, a write in the window could
+    // reach the log AHEAD of the compensation that overwrites it on replay.
+    crate::transaction::isolation::txn_end(txn_id);
     let outcome = persisted
         .and(graph_wal)
         .map_err(Bytes::from_static)

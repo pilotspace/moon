@@ -549,6 +549,12 @@ fn sample_victim(
         let Some((k, v)) = pick_in_segment(seg, volatile_only, &mut rng) else {
             continue;
         };
+        // moon#1299: a key an open TXN holds is never a victim — its abort
+        // would restore it, its commit would find it gone. One thread-local
+        // load while no TXN holds anything.
+        if crate::transaction::isolation::is_held(db.db_index, k.as_bytes()) {
+            continue;
+        }
         judged += 1;
         if best.is_none_or(|(_, b)| better(v, b)) {
             best = Some((k, v));
@@ -2016,6 +2022,12 @@ fn find_victim_volatile_ttl(db: &mut Database) -> Option<CompactKey> {
             .get(key.as_bytes())
             .is_some_and(|e| e.expires_at_ms() == ts)
         {
+            // moon#1299: the nearest deadline belongs to a key an open TXN
+            // holds — no victim this call (this sampler is exact, it cannot
+            // skip to the next deadline without walking the index).
+            if crate::transaction::isolation::is_held(db.db_index, key.as_bytes()) {
+                return None;
+            }
             return Some(key);
         }
         // Provably stale. `drop_expiry_index_pair` removes exactly the pair
