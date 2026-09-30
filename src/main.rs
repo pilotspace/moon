@@ -2085,24 +2085,6 @@ fn main() -> anyhow::Result<()> {
             }
         };
 
-    // R1 review of moon#1283 (finding 1): the replay met records an older
-    // binary appended after the log's last `MOON.TS` (a downgrade, then this
-    // re-upgrade) and judged them by the file's mtime. Once this binary
-    // appends stamped records behind them they are no longer the file's tail,
-    // and a later boot would judge them by that stale stamp again — so one
-    // rewrite folds them into a new generation. A crash before it commits
-    // leaves the old file authoritative with those records no longer at its
-    // end, judged by the stale stamp again (docs/STORAGE-FORMAT-V1.md §3.3).
-    let force_foreign_tail_rewrite =
-        moon::persistence::replay::clock::foreign_tail_replayed() && aof_pool.is_some();
-    if force_foreign_tail_rewrite {
-        tracing::warn!(
-            "AOF replay judged records an older moon binary appended by the log's mtime \
-             (see the warning above); running ONE background AOF rewrite so later boots \
-             do not depend on it. Clients are served meanwhile."
-        );
-    }
-
     // Extract databases from all shards and wrap in ShardDatabases
     let all_dbs: Vec<Vec<moon::storage::Database>> = shards
         .iter_mut()
@@ -2171,7 +2153,7 @@ fn main() -> anyhow::Result<()> {
             shard_databases.clone(),
             config.auto_aof_rewrite_percentage,
             min_size,
-            force_legacy_aof_rewrite || force_foreign_tail_rewrite,
+            force_legacy_aof_rewrite,
         );
     }
 

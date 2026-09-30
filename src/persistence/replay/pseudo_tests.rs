@@ -4,7 +4,7 @@ use std::time::{Duration, SystemTime};
 
 use bytes::Bytes;
 
-use super::{Pseudo, TS_RECORD_MAX_LEN, TsRecord, classify, intercept};
+use super::{CLOSE_RECORD_MAX_LEN, Pseudo, TS_RECORD_MAX_LEN, TsRecord, classify, intercept};
 use crate::persistence::replay::clock::{
     observe_log_ts, pin_replay_clock_ms, pinned_replay_clock_ms,
 };
@@ -56,6 +56,49 @@ fn a_ts_record_is_a_plain_resp_array_every_reader_parses() {
         assert_eq!(classify(b"MOON.TS", &arr[1..]), Some(want));
     }
     assert_eq!(TsRecord::new(u64::MAX).as_bytes().len(), TS_RECORD_MAX_LEN);
+}
+
+/// R2 review of moon#1283: the clean-close marker is `MOON.TS <ms> CLOSE`,
+/// a plain three-element array; a well-formed one classifies as
+/// [`Pseudo::Close`], anything else with extra arguments stays malformed
+/// (skipped, the clock unmoved).
+#[test]
+fn a_close_marker_is_a_three_element_ts_record() {
+    for ms in [1u64, 1_790_000_000_123, super::MAX_TS_MS, u64::MAX] {
+        let rec = TsRecord::close(ms);
+        assert_eq!(
+            rec.as_bytes(),
+            resp(&[b"MOON.TS", ms.to_string().as_bytes(), b"CLOSE"])
+        );
+        let arr = parse_one(rec.as_bytes());
+        let want = if ms <= super::MAX_TS_MS {
+            Pseudo::Close(ms)
+        } else {
+            Pseudo::MalformedTs
+        };
+        assert_eq!(classify(b"MOON.TS", &arr[1..]), Some(want));
+        assert_eq!(want.route(), ReplayRoute::Marker);
+    }
+    assert_eq!(
+        TsRecord::close(u64::MAX).as_bytes().len(),
+        CLOSE_RECORD_MAX_LEN
+    );
+    assert_eq!(
+        classify(b"MOON.TS", &[bulk(b"5"), bulk(b"close")]),
+        Some(Pseudo::Close(5))
+    );
+    for bad in [
+        &[bulk(b"0"), bulk(b"CLOSE")][..],
+        &[bulk(b"5"), bulk(b"OPEN")][..],
+        &[bulk(b"5"), bulk(b"CLOSE"), bulk(b"x")][..],
+        &[bulk(b"5"), Frame::Integer(1)][..],
+    ] {
+        assert_eq!(
+            classify(b"MOON.TS", bad),
+            Some(Pseudo::MalformedTs),
+            "{bad:?}"
+        );
+    }
 }
 
 #[test]

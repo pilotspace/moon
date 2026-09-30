@@ -14,6 +14,7 @@
 //! | record | class | effect on replay |
 //! |---|---|---|
 //! | `MOON.TS <ms>` | clock observation | sets the expiry-judgment clock ([`super::clock`]) |
+//! | `MOON.TS <ms> CLOSE` | clock observation | a clean close by this binary: ends its session in the file ([`super::clock`]) |
 //! | `MOON.COLDCUT <watermark>` | cold plane | opens the cold replay gate ([`crate::persistence::cold_records`]) |
 //! | `MOON.SPILLED <file_id> key…` | cold plane | demotes replay-built hot copies to their cold entries |
 //!
@@ -31,13 +32,24 @@
 //! A replay sets its judgment clock to the LAST `MOON.TS` read — never a
 //! running maximum: a producer that parked between its mutation and its
 //! enqueue lands after newer records, and its own, older stamp is the right
-//! clock for it. The one exception is a foreign tail: the records after a
-//! file's LAST stamp, when its mtime is more than a second later, are judged
-//! by the mtime ([`super::clock`], R1 review: an older binary appended them
-//! after a downgrade). Until a file's first `MOON.TS` the file's mtime pin rules
+//! clock for it. Until a file's first `MOON.TS` the file's mtime pin rules
 //! (an older binary's log, or its stamp-less prefix, replays exactly as
 //! before). `MOON.TS 0`, a value past the year 9999 and a malformed record
 //! are skipped and leave the clock where it was.
+//!
+//! ## `MOON.TS <ms> CLOSE` (R2 review of moon#1283)
+//!
+//! The writer appends it, as its last record, whenever it stops in order
+//! (SHUTDOWN, SIGTERM, a closed channel) with the file still the live incr,
+//! and makes it durable with the final sync. `<ms>` is the writer's clock at
+//! the close. This binary writes a stamp before its FIRST record after it
+//! opens a file ([`crate::persistence::aof::record_ctx`]), so records that
+//! follow a `CLOSE` and precede the next stamp were written by another binary
+//! (an older one, after a downgrade): a foreign segment, judged by
+//! [`super::clock`]'s positional rule. A binary that predates `MOON.TS` sends
+//! the record to dispatch ("unknown command") and skips it; one that knows
+//! only the one-argument form classifies it [`Pseudo::MalformedTs`] and skips
+//! it too.
 //!
 //! ## Clock records are observations, not data (decision Q6)
 //!
@@ -76,12 +88,19 @@ const PREFIX: &[u8] = b"MOON.";
 /// `*2\r\n$7\r\nMOON.TS\r\n$20\r\n<20 digits>\r\n` = 44 bytes.
 pub const TS_RECORD_MAX_LEN: usize = 44;
 
-/// `MOON.TS <ms>` encoded on the stack — no allocation. The writer copies it
-/// into its record arena (`aof::record_ctx`); a generation head writes it
-/// straight into the file.
+/// The third argument of the clean-close marker `MOON.TS <ms> CLOSE`.
+pub const CLOSE: &[u8] = b"CLOSE";
+
+/// Longest RESP encoding of `MOON.TS <u64> CLOSE`: the 44 bytes above with
+/// `*3` for `*2` and `$5\r\nCLOSE\r\n` (11 bytes) appended.
+pub const CLOSE_RECORD_MAX_LEN: usize = TS_RECORD_MAX_LEN + 11;
+
+/// `MOON.TS <ms>` (or `MOON.TS <ms> CLOSE`) encoded on the stack — no
+/// allocation. The writer copies it into its record arena
+/// (`aof::record_ctx`); a generation head writes it straight into the file.
 #[derive(Clone, Copy)]
 pub struct TsRecord {
-    buf: [u8; TS_RECORD_MAX_LEN],
+    buf: [u8; CLOSE_RECORD_MAX_LEN],
     len: usize,
 }
 
@@ -89,19 +108,30 @@ impl TsRecord {
     /// Encode `MOON.TS <ms>`.
     #[must_use]
     pub fn new(ms: u64) -> Self {
+        Self::encode(ms, false)
+    }
+
+    /// Encode the clean-close marker `MOON.TS <ms> CLOSE` (see the module
+    /// doc).
+    #[must_use]
+    pub fn close(ms: u64) -> Self {
+        Self::encode(ms, true)
+    }
+
+    fn encode(ms: u64, close: bool) -> Self {
         let mut digits = itoa::Buffer::new();
         let d = digits.format(ms).as_bytes();
         let mut dl = itoa::Buffer::new();
         let dlen = dl.format(d.len()).as_bytes();
-        let mut buf = [0u8; TS_RECORD_MAX_LEN];
+        let mut buf = [0u8; CLOSE_RECORD_MAX_LEN];
         let mut len = 0;
-        for part in [
-            b"*2\r\n$7\r\nMOON.TS\r\n$".as_slice(),
-            dlen,
-            b"\r\n",
-            d,
-            b"\r\n",
-        ] {
+        let head: &[u8] = if close {
+            b"*3\r\n$7\r\nMOON.TS\r\n$"
+        } else {
+            b"*2\r\n$7\r\nMOON.TS\r\n$"
+        };
+        let tail: &[u8] = if close { b"$5\r\nCLOSE\r\n" } else { b"" };
+        for part in [head, dlen, b"\r\n", d, b"\r\n", tail] {
             buf[len..len + part.len()].copy_from_slice(part);
             len += part.len();
         }
@@ -121,9 +151,12 @@ impl TsRecord {
 pub enum Pseudo {
     /// `MOON.TS <ms>` with a well-formed, non-zero `<ms>`.
     Ts(u64),
-    /// `MOON.TS` with no argument, extra arguments, a non-numeric, zero or
-    /// out-of-range (> [`MAX_TS_MS`]) `<ms>`: skipped, the clock does not
-    /// move.
+    /// `MOON.TS <ms> CLOSE` with a well-formed, non-zero `<ms>`: this binary
+    /// closed the file cleanly at `<ms>` (see the module doc).
+    Close(u64),
+    /// `MOON.TS` with no argument, extra arguments (other than one `CLOSE`),
+    /// a non-numeric, zero or out-of-range (> [`MAX_TS_MS`]) `<ms>`:
+    /// skipped, the clock does not move.
     MalformedTs,
     /// `MOON.COLDCUT` / `MOON.SPILLED` (applied by
     /// [`crate::persistence::cold_records::replay_cold_plane_record`]).
@@ -136,7 +169,7 @@ impl Pseudo {
     #[must_use]
     pub fn route(self) -> ReplayRoute {
         match self {
-            Pseudo::Ts(_) | Pseudo::MalformedTs => ReplayRoute::Marker,
+            Pseudo::Ts(_) | Pseudo::Close(_) | Pseudo::MalformedTs => ReplayRoute::Marker,
             Pseudo::ColdPlane => ReplayRoute::ColdPlane,
         }
     }
@@ -161,10 +194,12 @@ pub fn classify(cmd: &[u8], args: &[Frame]) -> Option<Pseudo> {
         return None;
     }
     if cmd.eq_ignore_ascii_case(TS) {
+        let valid = |ms: &Frame| frame_ms(ms).filter(|&ms| ms != 0 && ms <= MAX_TS_MS);
         return Some(match args {
-            [ms] => frame_ms(ms)
-                .filter(|&ms| ms != 0 && ms <= MAX_TS_MS)
-                .map_or(Pseudo::MalformedTs, Pseudo::Ts),
+            [ms] => valid(ms).map_or(Pseudo::MalformedTs, Pseudo::Ts),
+            [ms, Frame::BulkString(tag)] if tag.eq_ignore_ascii_case(CLOSE) => {
+                valid(ms).map_or(Pseudo::MalformedTs, Pseudo::Close)
+            }
             _ => Pseudo::MalformedTs,
         });
     }
@@ -187,6 +222,9 @@ pub fn apply(
     match record {
         Pseudo::Ts(ms) => {
             super::clock::observe_log_ts(ms);
+        }
+        Pseudo::Close(ms) => {
+            super::clock::observe_close(ms);
         }
         Pseudo::MalformedTs => tracing::warn!(
             "AOF replay: malformed MOON.TS ({} args) skipped; the expiry judgment clock \
@@ -225,6 +263,12 @@ pub fn intercept(
 #[cfg(test)]
 pub(crate) fn is_ts_record(resp: &[u8]) -> bool {
     resp.starts_with(b"*2\r\n$7\r\nMOON.TS\r\n")
+}
+
+/// Whether `resp` is one clean-close marker (test helper).
+#[cfg(test)]
+pub(crate) fn is_close_record(resp: &[u8]) -> bool {
+    resp.starts_with(b"*3\r\n$7\r\nMOON.TS\r\n") && resp.ends_with(b"$5\r\nCLOSE\r\n")
 }
 
 #[cfg(test)]

@@ -40,6 +40,33 @@ pub fn replay_resp(
     super::replay_incr_resp(databases, data, engine).ok()
 }
 
+/// Replay the framed per-shard incr at `path` as `replay_per_shard` does:
+/// pinned to its mtime, with the positional foreign-segment rule scanning the
+/// file itself (R2 review of moon#1283). `None` when the reader refused it.
+pub fn replay_framed_file(
+    databases: &mut [Database],
+    path: &std::path::Path,
+    engine: &dyn CommandReplayEngine,
+) -> Option<usize> {
+    use crate::persistence::replay::clock::{LogFormat, pin_replay_clock_to_log};
+    let data = std::fs::read(path).ok()?;
+    let _clock = pin_replay_clock_to_log(path, LogFormat::Framed);
+    replay_framed(databases, &data, engine)
+}
+
+/// Replay the multi-part RESP incr at `path` as `replay_multi_part` does
+/// (see [`replay_framed_file`]).
+pub fn replay_resp_file(
+    databases: &mut [Database],
+    path: &std::path::Path,
+    engine: &dyn CommandReplayEngine,
+) -> Option<usize> {
+    use crate::persistence::replay::clock::{LogFormat, pin_replay_clock_to_log};
+    let file = std::fs::File::open(path).ok()?;
+    let _clock = pin_replay_clock_to_log(path, LogFormat::Resp);
+    super::replay_incr_resp(databases, file, engine).ok()
+}
+
 /// A stable-toolchain smoke run of the fuzz target's contract (the libFuzzer
 /// target itself needs nightly): a well-formed stamped log, then thousands of
 /// seeded mutations of it, through both readers. Nothing may panic and the
@@ -74,6 +101,13 @@ mod tests {
             resp(&[b"MOON.SPILLED", b"3", b"k"]),
             resp(&[b"MOON.TS"]),
             resp(&[b"APPEND", b"s", b"x"]),
+            // R2 review: a clean close, a foreign segment, the next session.
+            resp(&[b"MOON.TS", b"1790000000300", b"CLOSE"]),
+            resp(&[b"INCR", b"k"]),
+            resp(&[b"MOON.TS", b"1790000000400"]),
+            resp(&[b"MOON.TS", b"1790000000500", b"CLOSE"]),
+            resp(&[b"MOON.TS", b"1", b"OPEN"]),
+            resp(&[b"DEL", b"k"]),
         ];
         let mut out = Vec::new();
         for (i, r) in records.iter().enumerate() {
@@ -102,6 +136,8 @@ mod tests {
             seed ^= seed << 17;
             seed
         };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("incr.aof");
         for framed in [true, false] {
             let good = log(framed);
             let mut dbs: Vec<Database> = (0..4).map(|_| Database::new()).collect();
@@ -135,6 +171,16 @@ mod tests {
                     }
                 }
                 assert_eq!(pinned_replay_clock_ms(), None, "the replay clock leaked");
+                // The file readers: a clean-close marker scans the file.
+                std::fs::write(&path, &bytes).expect("write");
+                let mut dbs: Vec<Database> = (0..4).map(|_| Database::new()).collect();
+                if framed {
+                    let _ = replay_framed_file(&mut dbs, &path, &engine);
+                } else {
+                    let _ = replay_resp_file(&mut dbs, &path, &engine);
+                }
+                assert_eq!(pinned_replay_clock_ms(), None, "the replay clock leaked");
+                let _ = crate::persistence::replay::clock::take_open_foreign_segment(&path);
             }
         }
     }

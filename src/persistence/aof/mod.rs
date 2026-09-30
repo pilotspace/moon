@@ -1076,7 +1076,10 @@ pub fn replay_aof(
     path: &Path,
     engine: &dyn CommandReplayEngine,
 ) -> Result<usize, MoonError> {
-    let _clock = crate::persistence::replay::clock::pin_replay_clock_to_log(path);
+    let _clock = crate::persistence::replay::clock::pin_replay_clock_to_log(
+        path,
+        crate::persistence::replay::clock::LogFormat::Resp,
+    );
     replay_aof_with_resync(databases, path, engine, aof_best_effort_resync_enabled())
 }
 
@@ -1187,6 +1190,9 @@ fn replay_aof_with_resync(
                         continue;
                     }
                 };
+                // R2 review of moon#1283: where a clean-close marker's
+                // segment starts (absolute: the reader includes the preamble).
+                crate::persistence::replay::clock::at_record_end(chunks.offset());
                 engine.replay_command(databases, cmd, cmd_args, &mut selected_db);
                 count += 1;
             }
