@@ -1756,9 +1756,9 @@ pub(crate) async fn handle_connection_sharded_monoio<
             // cross-store transaction the generic write leg captures an undo
             // record (`txn.kv_undo.record_insert` / `record_update`) and a
             // write intent (`s.kv_write_intents.record_write`) BEFORE
-            // dispatching — all three in the cross-txn arm further down THIS
-            // file; grep the names rather than trusting a line number, the
-            // two cited here had already drifted by ~120 lines once.
+            // dispatching — `transaction::conn_capture::capture_conn_write`,
+            // called from the cross-txn arm further down THIS file (grep the
+            // name rather than trusting a line number).
             // `try_inline_dispatch` does
             // neither — grepping `cross_txn`/`kv_undo`/`write_intent` in
             // `server/conn/blocking.rs` returns nothing.
@@ -3667,76 +3667,23 @@ pub(crate) async fn handle_connection_sharded_monoio<
                             run_write_eviction_gate(ctx, db, sel_db, cmd)?;
                         }
 
-                        // KV undo-log capture (MUST precede dispatch)
-                        if let Some(ref mut txn) = conn.active_cross_txn {
-                            if cmd.eq_ignore_ascii_case(b"DEL")
-                                || cmd.eq_ignore_ascii_case(b"UNLINK")
-                            {
-                                for arg in cmd_args.iter() {
-                                    if let Frame::BulkString(key_bytes) = arg {
-                                        if let Some(old_entry) = db.get(key_bytes.as_ref()).cloned()
-                                        {
-                                            txn.kv_undo.record_delete(
-                                                sel_db,
-                                                key_bytes.clone(),
-                                                old_entry,
-                                            );
-                                            let lsn = txn.snapshot_lsn;
-                                            let tid = txn.txn_id;
-                                            // Direct field access — the outer with_shard
-                                            // closure already owns `s`; re-entering
-                                            // with_shard here panics (slice re-entrancy
-                                            // guard). `db` borrows s.databases only, so
-                                            // s.kv_write_intents is a disjoint field (NLL).
-                                            s.kv_write_intents.record_write(
-                                                key_bytes.clone(),
-                                                lsn,
-                                                tid,
-                                            );
-                                        }
-                                    }
-                                }
-                            } else {
-                                // moon#500: this used to capture
-                                // `extract_primary_key`, which returns exactly
-                                // ONE key. A multi-key write (MSET, MSETNX,
-                                // BITOP, COPY, SINTERSTORE, ...) therefore
-                                // logged an undo record for its FIRST key only,
-                                // and `TXN ABORT` restored that one while
-                                // leaving the rest at their new values — an
-                                // acked abort landing a keyspace that is
-                                // neither the pre- nor the post-TXN image.
-                                //
-                                // `written_keys` walks the same key spec the
-                                // ACL and cache-invalidation paths use, and is
-                                // filtered to `KeyRole::Write`: reads are NOT
-                                // captured. That filter is load-bearing —
-                                // capturing read keys would inflate
-                                // `kv_write_intents`, which is the cross-shard
-                                // conflict surface, turning working
-                                // transactions into spurious conflicts.
-                                //
-                                // An argv the walker cannot enumerate falls
-                                // back to the historical single-key capture;
-                                // one it read and found write-free (`SORT
-                                // src`, no `STORE`) captures nothing — see
-                                // `conn_txn_capture_keys`.
-                                let lsn = txn.snapshot_lsn;
-                                let tid = txn.txn_id;
-                                let written =
-                                    crate::transaction::conn_txn_capture_keys(cmd, cmd_args);
-                                for key in written {
-                                    match db.get(key.as_ref()).cloned() {
-                                        None => txn.kv_undo.record_insert(sel_db, key.clone()),
-                                        Some(entry) => {
-                                            txn.kv_undo.record_update(sel_db, key.clone(), entry)
-                                        }
-                                    }
-                                    // Direct field access — see DEL/UNLINK arm above.
-                                    s.kv_write_intents.record_write(key, lsn, tid);
-                                }
+                        // KV undo-log capture (MUST precede dispatch):
+                        // pre-images and write intents of every key this
+                        // write may write. moon#500 / moon#1303 rationale in
+                        // `transaction::conn_capture`.
+                        let txn_capture = match conn.active_cross_txn.as_deref_mut() {
+                            Some(txn) => {
+                                Some(crate::transaction::conn_capture::capture_conn_write(
+                                    txn,
+                                    &mut s.kv_write_intents,
+                                    db,
+                                    sel_db,
+                                    cmd,
+                                    cmd_args,
+                                )?)
                             }
-                        }
+                            None => None,
+                        };
 
                         // Dispatch — the timed interval is exactly this call.
                         let mut new_sel_db = sel_db;
@@ -3750,6 +3697,12 @@ pub(crate) async fn handle_connection_sharded_monoio<
                         // Borrow, never clone: this is a one-bit question and
                         // the reply may be a whole `Frame::Array`.
                         let is_error = result.is_error();
+                        // moon#1303: an erroring TXN write takes its capture back.
+                        if let (Some(capture), Some(txn)) =
+                            (txn_capture, conn.active_cross_txn.as_deref_mut())
+                        {
+                            capture.finish(is_error, txn, &mut s.kv_write_intents);
+                        }
 
                         // HSET auto-index: disjoint field borrows (NLL)
                         // &mut s.vector_store + &mut s.text_store are separate

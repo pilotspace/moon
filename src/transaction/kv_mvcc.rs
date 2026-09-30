@@ -49,6 +49,23 @@ impl KvWriteIntents {
         )
     }
 
+    /// Put back the intent `key` had before a [`record_write`] whose write
+    /// then answered an error (moon#1303): `prev` is what that call
+    /// returned; `None` removes the key's intent.
+    ///
+    /// [`record_write`]: Self::record_write
+    #[inline]
+    pub fn restore(&mut self, key: Bytes, prev: Option<WriteIntent>) {
+        match prev {
+            Some(intent) => {
+                self.intents.insert(key, intent);
+            }
+            None => {
+                self.intents.remove(&key);
+            }
+        }
+    }
+
     /// Get the write intent for a key, if any.
     #[inline]
     pub fn get(&self, key: &[u8]) -> Option<&WriteIntent> {
@@ -166,6 +183,21 @@ mod tests {
         intents.record_write(Bytes::from_static(b"key1"), 50, 2);
         // txn 2 not committed
         assert!(!intents.is_key_visible(b"key1", 100, 1, &empty_committed()));
+    }
+
+    /// moon#1303: restoring the returned previous intent undoes a
+    /// `record_write`, whether the key had an intent before or not.
+    #[test]
+    fn restore_undoes_record_write() {
+        let mut intents = KvWriteIntents::new();
+        let prev = intents.record_write(Bytes::from_static(b"a"), 5, 1);
+        intents.restore(Bytes::from_static(b"a"), prev);
+        assert!(intents.get(b"a").is_none());
+        intents.record_write(Bytes::from_static(b"b"), 5, 1);
+        let prev = intents.record_write(Bytes::from_static(b"b"), 9, 2);
+        intents.restore(Bytes::from_static(b"b"), prev);
+        let b = intents.get(b"b").copied().expect("kept");
+        assert_eq!((b.insert_lsn, b.txn_id), (5, 1));
     }
 
     #[test]

@@ -2725,49 +2725,21 @@ pub(crate) async fn handle_connection_sharded_inner<
                                     drop(rt);
                                 }
 
-                                // KV undo-log capture for active cross-store transactions.
-                                // MUST happen BEFORE dispatch() overwrites the database entry.
-                                if let Some(ref mut txn) = conn.active_cross_txn {
-                                    if cmd.eq_ignore_ascii_case(b"DEL") || cmd.eq_ignore_ascii_case(b"UNLINK") {
-                                        for arg in cmd_args.iter() {
-                                            if let Frame::BulkString(key_bytes) = arg {
-                                                if let Some(old_entry) = db.get(key_bytes.as_ref()).cloned() {
-                                                    txn.kv_undo.record_delete(conn.selected_db, key_bytes.clone(), old_entry);
-                                                    let lsn = txn.snapshot_lsn;
-                                                    let tid = txn.txn_id;
-                                                    // Direct field access — `s` is this
-                                                    // closure's own param; re-entering
-                                                    // with_shard here panics.
-                                                    s.kv_write_intents.record_write(key_bytes.clone(), lsn, tid);
-                                                }
-                                            }
-                                        }
-                                    } else {
-                                        // moon#500 — twin of the monoio capture
-                                        // (`handler_monoio/mod.rs`); see the full
-                                        // rationale there. `extract_primary_key`
-                                        // returns ONE key, so a multi-key write
-                                        // rolled back only its first key on
-                                        // TXN ABORT. `written_keys` is filtered to
-                                        // `KeyRole::Write`, so reads stay out of
-                                        // `kv_write_intents`.
-                                        // An unenumerable argv falls back to
-                                        // the primary key; a write-free one
-                                        // (`SORT src`) captures nothing.
-                                        let lsn = txn.snapshot_lsn;
-                                        let tid = txn.txn_id;
-                                        let written =
-                                            crate::transaction::conn_txn_capture_keys(cmd, cmd_args);
-                                        for key in written {
-                                            match db.get(key.as_ref()).cloned() {
-                                                None => txn.kv_undo.record_insert(conn.selected_db, key.clone()),
-                                                Some(entry) => txn.kv_undo.record_update(conn.selected_db, key.clone(), entry),
-                                            }
-                                            // Direct field access — see DEL/UNLINK arm above.
-                                            s.kv_write_intents.record_write(key, lsn, tid);
-                                        }
-                                    }
-                                }
+                                // KV undo-log capture for active cross-store transactions,
+                                // BEFORE dispatch — twin of the monoio leg: pre-images
+                                // and intents (`transaction::conn_capture`).
+                                let sel_db = conn.selected_db;
+                                let txn_capture = match conn.active_cross_txn.as_deref_mut() {
+                                    Some(txn) => Some(crate::transaction::conn_capture::capture_conn_write(
+                                        txn,
+                                        &mut s.kv_write_intents,
+                                        db,
+                                        sel_db,
+                                        cmd,
+                                        cmd_args,
+                                    )?),
+                                    None => None,
+                                };
 
                                 db.refresh_now_from_cache(&ctx.cached_clock);
                                 let mut probe = crate::admin::metrics_setup::LatencyProbe::new(
@@ -2784,6 +2756,12 @@ pub(crate) async fn handle_connection_sharded_inner<
                                     DispatchResult::Response(f) => f,
                                     DispatchResult::Quit(f) => { should_quit = true; f }
                                 };
+                                // moon#1303: an erroring TXN write takes its capture back.
+                                if let (Some(capture), Some(txn)) =
+                                    (txn_capture, conn.active_cross_txn.as_deref_mut())
+                                {
+                                    capture.finish(matches!(response, Frame::Error(_)), txn, &mut s.kv_write_intents);
+                                }
                                 // moon#595/moon#1069: the shared hook — see
                                 // the twin in handler_monoio. It wakes the
                                 // waiters on every key this write touched.
