@@ -1,14 +1,15 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::config::ServerConfig;
 use crate::protocol::Frame;
 
+use super::command_rules::CommandRules;
 use super::rules::{
     AclRuleError, apply_rule, get_category_commands, hash_password, verify_password,
 };
-use super::subcommand::{clear_first_arg_rules, permits};
+use super::subcommand::permits;
 use super::verdict::AclDenial;
 
 #[derive(Clone, Debug)]
@@ -33,8 +34,11 @@ pub enum CommandPermissions {
         /// get-only. The polarity is set once, at the transition that
         /// establishes it, and never derived from set contents again.
         base_allow: bool,
-        allowed: HashSet<String>,
-        denied: HashSet<String>,
+        /// The `+cmd` / `-cmd` rules in the order they were applied
+        /// (moon#1296). One ordered map for both polarities, so the
+        /// interleaving of grants and revocations survives to
+        /// `ACL GETUSER` / `ACL LIST` / `ACL SAVE`, as in redis 7.2+.
+        rules: CommandRules,
     },
 }
 
@@ -104,8 +108,7 @@ impl AclUser {
             nopass: false,
             allowed_commands: CommandPermissions::Specific {
                 base_allow: false,
-                allowed: HashSet::new(),
-                denied: HashSet::new(),
+                rules: CommandRules::new(),
             },
             key_patterns: vec![],
             channel_patterns: vec![],
@@ -189,29 +192,24 @@ impl AclUser {
         };
         match &mut self.allowed_commands {
             CommandPermissions::AllAllowed => {} // already all allowed
-            CommandPermissions::Specific {
-                allowed, denied, ..
-            } => {
+            CommandPermissions::Specific { rules, .. } => {
                 if let Some(cmds) = category {
                     for cmd in cmds {
-                        allowed.insert(cmd.to_string());
-                        denied.remove(*cmd);
+                        rules.apply(cmd, true);
                     }
-                    clear_first_arg_rules(allowed, cmds);
-                    clear_first_arg_rules(denied, cmds);
+                    rules.clear_first_arg_rules(cmds);
                 } else {
                     // `cmd` or `cmd|sub`, lowercased: the check lowercases
                     // the incoming name before probing. A bare rule is newer
                     // than every `cmd|*` rule, so it clears them (see
                     // `acl::subcommand`); a `cmd|sub` rule replaces its own
-                    // opposite entry, or `-x|y +x|y` would stay denied.
+                    // opposite entry, or `-x|y +x|y` would stay denied
+                    // (`apply` drops the older entry, whichever polarity).
                     let rule = rule.to_ascii_lowercase();
                     if !rule.contains('|') {
-                        clear_first_arg_rules(allowed, &[rule.as_str()]);
-                        clear_first_arg_rules(denied, &[rule.as_str()]);
+                        rules.clear_first_arg_rules(&[rule.as_str()]);
                     }
-                    denied.remove(&rule);
-                    allowed.insert(rule);
+                    rules.apply(&rule, true);
                 }
             }
         }
@@ -237,8 +235,7 @@ impl AclUser {
         if rule.eq_ignore_ascii_case("@all") {
             self.allowed_commands = CommandPermissions::Specific {
                 base_allow: false,
-                allowed: HashSet::new(),
-                denied: HashSet::new(),
+                rules: CommandRules::new(),
             };
             return Ok(());
         }
@@ -250,38 +247,31 @@ impl AclUser {
         match &mut self.allowed_commands {
             CommandPermissions::AllAllowed => {
                 // Transition to Specific with everything allowed except this
-                let mut denied = HashSet::new();
+                let mut rules = CommandRules::new();
                 if let Some(cmds) = category {
                     for cmd in cmds {
-                        denied.insert(cmd.to_string());
+                        rules.apply(cmd, false);
                     }
                 } else {
-                    denied.insert(rule.to_ascii_lowercase());
+                    rules.apply(&rule.to_ascii_lowercase(), false);
                 }
                 self.allowed_commands = CommandPermissions::Specific {
                     base_allow: true, // came from AllAllowed: default is still allow
-                    allowed: HashSet::new(),
-                    denied,
+                    rules,
                 };
             }
-            CommandPermissions::Specific {
-                allowed, denied, ..
-            } => {
+            CommandPermissions::Specific { rules, .. } => {
                 if let Some(cmds) = category {
                     for cmd in cmds {
-                        denied.insert(cmd.to_string());
-                        allowed.remove(*cmd);
+                        rules.apply(cmd, false);
                     }
-                    clear_first_arg_rules(allowed, cmds);
-                    clear_first_arg_rules(denied, cmds);
+                    rules.clear_first_arg_rules(cmds);
                 } else {
                     let rule = rule.to_ascii_lowercase();
                     if !rule.contains('|') {
-                        clear_first_arg_rules(allowed, &[rule.as_str()]);
-                        clear_first_arg_rules(denied, &[rule.as_str()]);
+                        rules.clear_first_arg_rules(&[rule.as_str()]);
                     }
-                    allowed.remove(&rule);
-                    denied.insert(rule);
+                    rules.apply(&rule, false);
                 }
             }
         }

@@ -1,6 +1,6 @@
 use sha2::{Digest, Sha256};
-use std::collections::HashSet;
 
+use super::command_rules::CommandRules;
 use super::table::{AclUser, CommandPermissions, KeyPattern};
 
 /// A rule token that Moon refuses to apply.
@@ -403,8 +403,7 @@ fn apply_keyword(user: &mut AclUser, kw: Keyword) -> Result<(), AclRuleError> {
             user.channel_patterns.clear();
             user.allowed_commands = CommandPermissions::Specific {
                 base_allow: false,
-                allowed: HashSet::new(),
-                denied: HashSet::new(),
+                rules: CommandRules::new(),
             };
         }
         // `allkeys` / `~*` and `allchannels` / `&*` REPLACE the list, as in
@@ -1678,7 +1677,7 @@ pub fn acl_category_names() -> impl Iterator<Item = &'static str> {
 /// This function used to end in `_ => &[]`. An unknown category therefore
 /// resolved to "no commands at all", and [`AclUser::deny_command`] walked that
 /// empty slice, inserted nothing, and then *unconditionally* rebuilt the
-/// permission set as `Specific { base_allow: true, allowed: {}, denied: {} }`
+/// permission set as `Specific { base_allow: true, rules: [] }`
 /// -- base-allow with an empty deny set, i.e. **every command permitted**.
 /// `is_command_allowed` fell through to `base_allow == true`, while
 /// `user_to_acl_line` (which discards `base_allow`) printed the user as
@@ -1827,13 +1826,13 @@ mod tests {
         ));
 
         apply_rule(&mut user, "+get").expect("rule must apply");
-        if let CommandPermissions::Specific { allowed, .. } = &user.allowed_commands {
-            assert!(allowed.contains("get"));
+        if let CommandPermissions::Specific { rules, .. } = &user.allowed_commands {
+            assert_eq!(rules.get("get"), Some(true));
         }
 
         apply_rule(&mut user, "-set").expect("rule must apply");
-        if let CommandPermissions::Specific { denied, .. } = &user.allowed_commands {
-            assert!(denied.contains("set"));
+        if let CommandPermissions::Specific { rules, .. } = &user.allowed_commands {
+            assert_eq!(rules.get("set"), Some(false));
         }
     }
 
