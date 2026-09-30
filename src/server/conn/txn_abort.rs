@@ -102,7 +102,7 @@ pub(crate) async fn abort_logged(
     let fold_stamp = ctx
         .aof_pool
         .as_ref()
-        .map_or(crate::persistence::aof::FoldEpoch::INITIAL, |pool| {
+        .map_or(crate::persistence::aof::AppendStamp::INITIAL, |pool| {
             pool.fold_stamp(ctx.shard_id)
         });
     // moon#1302: the graph records are appended FIRST and only the accepted

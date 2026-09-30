@@ -3869,7 +3869,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                     let fold_stamp = ctx
                         .aof_pool
                         .as_ref()
-                        .map_or(aof::FoldEpoch::INITIAL, |pool| {
+                        .map_or(aof::AppendStamp::INITIAL, |pool| {
                             pool.fold_stamp(ctx.shard_id)
                         });
 

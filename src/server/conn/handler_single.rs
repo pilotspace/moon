@@ -2229,7 +2229,7 @@ pub async fn handle_connection(
                                     // #455: read once, before any enqueue can
                                     // park — no await since the graph mutation.
                                     let fold_stamp = aof_pool.as_ref().map_or(
-                                        crate::persistence::aof::FoldEpoch::INITIAL,
+                                        crate::persistence::aof::AppendStamp::INITIAL,
                                         |pool| pool.fold_stamp(0),
                                     );
                                     for record in wal_records {

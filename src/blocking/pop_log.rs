@@ -548,6 +548,7 @@ mod tests {
             db: 0,
             bytes: Bytes::from_static(b"filler"),
             epoch: crate::persistence::aof::FoldEpoch::INITIAL,
+            clock_ms: 0,
         })
         .map_err(|_| ())
         .expect("room for the filler");
@@ -604,6 +605,7 @@ mod tests {
                 db: 0,
                 bytes: Bytes::from_static(b"filler"),
                 epoch: crate::persistence::aof::FoldEpoch::INITIAL,
+                clock_ms: 0,
             })
             .map_err(|_| ())
             .expect("room for the filler");

@@ -54,7 +54,7 @@ fn the_fold_fsyncs_the_directory_after_renaming_the_new_file_into_place() {
         panic!("no AofFold request arrived");
     });
 
-    let mut last_db = 0usize;
+    let mut last_db = crate::persistence::aof::RecordCtx::new();
     dir_fsync_probe::start();
     let result = super::rewrite_aof_sharded_sync(
         &shard_dbs,
@@ -148,7 +148,7 @@ fn the_flat_file_fold_writes_the_cold_deletes_and_the_in_flight_keys() {
         panic!("no AofFold request arrived");
     });
 
-    let mut last_db = 0usize;
+    let mut last_db = crate::persistence::aof::RecordCtx::new();
     let result = super::rewrite_aof_sharded_sync(
         &shard_dbs,
         &aof_path,
@@ -163,11 +163,18 @@ fn the_flat_file_fold_writes_the_cold_deletes_and_the_in_flight_keys() {
     assert!(matches!(outcome, super::FoldOutcome::Committed { .. }));
 
     let published = std::fs::read(&aof_path).expect("published aof");
-    let mut head = crate::persistence::cold_records::serialize_cold_cut(3).to_vec();
-    head.extend_from_slice(b"*2\r\n$3\r\nDEL\r\n$4\r\ndead\r\n");
+    // moon#1283: the head is `MOON.COLDCUT 3`, the generation's `MOON.TS`,
+    // then the DEL.
+    let cut = crate::persistence::cold_records::serialize_cold_cut(3).to_vec();
+    let del = b"*2\r\n$3\r\nDEL\r\n$4\r\ndead\r\n";
+    let at = published
+        .windows(cut.len())
+        .rposition(|w| w == cut.as_slice())
+        .expect("the published file carries MOON.COLDCUT 3");
+    let tail = &published[at + cut.len()..];
     assert!(
-        published.ends_with(&head),
-        "the published file must end with MOON.COLDCUT 3 + DEL dead, got tail {:?}",
+        crate::persistence::replay::pseudo::is_ts_record(tail) && tail.ends_with(del),
+        "the published file must end with MOON.COLDCUT 3 + MOON.TS + DEL dead, got tail {:?}",
         String::from_utf8_lossy(&published[published.len().saturating_sub(80)..])
     );
 

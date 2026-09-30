@@ -253,6 +253,7 @@ mod poll_recv_tests {
                 db: 0,
                 bytes: bytes::Bytes::from_static(b"x"),
                 epoch: FoldEpoch::INITIAL,
+                clock_ms: 0,
             })
             .is_ok()
         );
@@ -276,6 +277,7 @@ mod poll_recv_tests {
                     db: 0,
                     bytes: bytes::Bytes::from_static(b"y"),
                     epoch: FoldEpoch::INITIAL,
+                    clock_ms: 0,
                 })
                 .is_ok()
             );
@@ -417,7 +419,7 @@ pub async fn aof_writer_task(
     // the full rationale. Resets to 0 on every successful rewrite (fresh
     // file: replay starts a segment at db 0).
     #[cfg(feature = "runtime-tokio")]
-    let mut last_db: usize = 0;
+    let mut last_db = RecordCtx::new();
     // #455: snapshot epoch of the generation this writer appends to; records
     // stamped below it are already in that generation's base and are dropped
     // wherever they are dequeued. Moves only when a fold's generation is
@@ -544,7 +546,7 @@ pub async fn aof_writer_task(
         // `SELECT <db>` record injected first (see `inject_select_records`).
         // Resets to 0 whenever a NEW incr/base file becomes the append
         // target (fresh manifest segment — replay starts each incr at db 0).
-        let mut last_db: usize = 0;
+        let mut last_db = RecordCtx::new();
         // #455: see the tokio declaration above.
         let mut fold_floor = FoldEpoch::INITIAL;
         // moon#1187: persistent batch-coalescing buffer (shrink hysteresis) —
@@ -595,7 +597,7 @@ pub async fn aof_writer_task(
                 // before committing — rides the same write path as any other
                 // record (raw bytes on this TopLevel format). #455: drops
                 // records already folded into the committed base first.
-                batch.data = inject_select_records(
+                batch.data = inject_record_prefixes(
                     std::mem::take(&mut batch.data),
                     fold_floor,
                     &mut last_db,
@@ -848,7 +850,7 @@ pub async fn aof_writer_task(
                     // switch before committing (see the monoio TopLevel loop
                     // above). #455: drops records already folded into the
                     // committed base first.
-                    batch.data = inject_select_records(
+                    batch.data = inject_record_prefixes(
                         std::mem::take(&mut batch.data),
                         fold_floor,
                         &mut last_db,
@@ -953,7 +955,7 @@ pub async fn aof_writer_task(
                                 // whatever it already was.
                                 Ok(()) => {
                                     write_error = false;
-                                    last_db = 0;
+                                    last_db.reset();
                                 }
                                 Err(e) => error!("AOF rewrite failed: {}", e),
                             }
@@ -1286,7 +1288,7 @@ pub async fn per_shard_aof_writer_task(
         let mut idle_wait = IdleWait::new();
         // task #35: AOF db-aware writer — see the monoio TopLevel loop's docs
         // near the top of this file for the full rationale.
-        let mut last_db: usize = 0;
+        let mut last_db = RecordCtx::new();
         // #455: see the TopLevel declaration near the top of this file.
         let mut fold_floor = FoldEpoch::INITIAL;
         // (No `interval` here: the EverySec flush deadline is enforced by the
@@ -1359,7 +1361,7 @@ pub async fn per_shard_aof_writer_task(
                             );
                             // task #35: inject SELECT <db> records on db-context
                             // changes before this batch's framed writes go out.
-                            batch.data = inject_select_records(
+                            batch.data = inject_record_prefixes(
                                 std::mem::take(&mut batch.data),
                                 fold_floor,
                                 &mut last_db,
@@ -1748,7 +1750,7 @@ pub async fn per_shard_aof_writer_task(
         let mut idle_wait = IdleWait::new();
         // task #35: AOF db-aware writer — see the monoio TopLevel loop's docs
         // near the top of this file for the full rationale.
-        let mut last_db: usize = 0;
+        let mut last_db = RecordCtx::new();
         // #455: see the TopLevel declaration near the top of this file.
         let mut fold_floor = FoldEpoch::INITIAL;
         // Test-only fault injection: if MOON_TEST_AOF_FSYNC_FAIL=1 is set in
@@ -1816,7 +1818,7 @@ pub async fn per_shard_aof_writer_task(
                 );
                 // task #35: inject SELECT <db> records on db-context changes
                 // before this batch's framed writes go into batch_buf.
-                batch.data = inject_select_records(
+                batch.data = inject_record_prefixes(
                     std::mem::take(&mut batch.data),
                     fold_floor,
                     &mut last_db,

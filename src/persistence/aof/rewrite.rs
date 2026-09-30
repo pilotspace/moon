@@ -554,7 +554,7 @@ pub(crate) fn drain_pending_appends_bounded(
     rx: &channel::MpscReceiver<AofMessage>,
     file: &mut std::fs::File,
     max_drain: usize,
-    db_ctx: &mut usize,
+    db_ctx: &mut RecordCtx,
     floor: FoldEpoch,
 ) -> Result<DrainOutcome, MoonError> {
     use std::io::Write;
@@ -566,9 +566,12 @@ pub(crate) fn drain_pending_appends_bounded(
             Ok(msg) if is_folded(&msg, floor) => outcome.fold_away(msg),
             Ok(msg) => match msg {
                 AofMessage::Append {
-                    bytes: data, db, ..
+                    bytes: data,
+                    db,
+                    clock_ms,
+                    ..
                 } => {
-                    if let Some(sel) = select_prefix_if_needed(db, data.is_empty(), db_ctx) {
+                    for sel in db_ctx.prefix(db, clock_ms, data.is_empty()) {
                         file.write_all(&sel).map_err(|e| AofError::Io {
                             path: PathBuf::from("<aof toplevel incr drain>"),
                             source: e,
@@ -584,9 +587,10 @@ pub(crate) fn drain_pending_appends_bounded(
                     bytes: data,
                     db,
                     ack,
+                    clock_ms,
                     ..
                 } => {
-                    if let Some(sel) = select_prefix_if_needed(db, data.is_empty(), db_ctx) {
+                    for sel in db_ctx.prefix(db, clock_ms, data.is_empty()) {
                         file.write_all(&sel).map_err(|e| AofError::Io {
                             path: PathBuf::from("<aof toplevel incr drain>"),
                             source: e,
@@ -617,7 +621,7 @@ pub(crate) fn drain_pending_appends_bounded(
 pub(crate) fn drain_pending_appends(
     rx: &channel::MpscReceiver<AofMessage>,
     file: &mut std::fs::File,
-    db_ctx: &mut usize,
+    db_ctx: &mut RecordCtx,
     floor: FoldEpoch,
 ) -> Result<DrainOutcome, MoonError> {
     drain_pending_appends_bounded(rx, file, usize::MAX, db_ctx, floor)
@@ -649,7 +653,7 @@ pub(crate) fn drain_pending_appends_framed(
     rx: &channel::MpscReceiver<AofMessage>,
     file: &mut std::fs::File,
     max_drain: usize,
-    db_ctx: &mut usize,
+    db_ctx: &mut RecordCtx,
     floor: FoldEpoch,
 ) -> Result<DrainOutcome, MoonError> {
     use std::io::Write;
@@ -670,9 +674,10 @@ pub(crate) fn drain_pending_appends_framed(
                     lsn,
                     db,
                     bytes: data,
+                    clock_ms,
                     ..
                 } => {
-                    if let Some(sel) = select_prefix_if_needed(db, data.is_empty(), db_ctx) {
+                    for sel in db_ctx.prefix(db, clock_ms, data.is_empty()) {
                         write_framed(file, 0, &sel).map_err(|e| AofError::Io {
                             path: PathBuf::from("<aof per-shard incr drain>"),
                             source: e,
@@ -689,6 +694,7 @@ pub(crate) fn drain_pending_appends_framed(
                     db,
                     bytes: data,
                     ack,
+                    clock_ms,
                     ..
                 } => {
                     // H1-BARRIER: a zero-length AppendSync is an fsync barrier
@@ -697,7 +703,7 @@ pub(crate) fn drain_pending_appends_framed(
                     // still counts toward `drained` (sender.len() counted it)
                     // and its ack still parks for the boundary fsync.
                     if !data.is_empty() {
-                        if let Some(sel) = select_prefix_if_needed(db, false, db_ctx) {
+                        for sel in db_ctx.prefix(db, clock_ms, false) {
                             write_framed(file, 0, &sel).map_err(|e| AofError::Io {
                                 path: PathBuf::from("<aof per-shard incr drain>"),
                                 source: e,
@@ -802,7 +808,7 @@ pub(crate) fn do_rewrite_per_shard(
     coord: &PerShardRewriteCoord,
     fold_producer: &parking_lot::Mutex<ringbuf::HeapProd<crate::shard::dispatch::ShardMessage>>,
     fold_notifier: &std::sync::Arc<crate::runtime::channel::Notify>,
-    last_db: &mut usize,
+    last_db: &mut RecordCtx,
     floor: FoldEpoch,
 ) -> Result<FoldOutcome, MoonError> {
     use ringbuf::traits::Producer;
@@ -983,7 +989,7 @@ pub(crate) fn do_rewrite_per_shard(
     *file = new_file;
     // Fresh incr: replay starts every incr segment at db 0, so the writer's
     // db context restarts there too.
-    *last_db = 0;
+    last_db.reset();
     Ok(FoldOutcome::Committed {
         floor: fold_snapshot.fold_epoch,
     })
@@ -1015,7 +1021,7 @@ pub(crate) fn do_rewrite_single(
     manifest: &mut crate::persistence::aof_manifest::AofManifest,
     file: &mut std::fs::File,
     rx: &channel::MpscReceiver<AofMessage>,
-    last_db: &mut usize,
+    last_db: &mut RecordCtx,
     overflow: &super::rewrite_overflow::RewriteOverflow,
     floor: FoldEpoch,
 ) -> Result<FoldOutcome, MoonError> {
@@ -1103,7 +1109,7 @@ pub(crate) fn do_rewrite_single(
     })?;
     *file = new_file;
     // task #35: fresh incr — replay always starts a segment at db 0.
-    *last_db = 0;
+    last_db.reset();
 
     info!(
         "AOF rewrite complete (single): drained {}+{} pre-snapshot appends, seq={}",
@@ -1151,7 +1157,7 @@ pub(crate) fn do_rewrite_sharded(
         Arc<parking_lot::Mutex<ringbuf::HeapProd<crate::shard::dispatch::ShardMessage>>>,
         Arc<crate::runtime::channel::Notify>,
     )>,
-    last_db: &mut usize,
+    last_db: &mut RecordCtx,
     floor: FoldEpoch,
 ) -> Result<FoldOutcome, MoonError> {
     use ringbuf::traits::Producer;
@@ -1249,7 +1255,7 @@ pub(crate) fn do_rewrite_sharded(
     )?;
     *file = new_file;
     // task #35: fresh incr — replay always starts a segment at db 0.
-    *last_db = 0;
+    last_db.reset();
 
     info!(
         "TopLevel AOF rewrite complete: drained {}+{} appends, seq={}",
@@ -1344,7 +1350,7 @@ pub(crate) fn rewrite_aof_sharded_sync(
         Arc<parking_lot::Mutex<ringbuf::HeapProd<crate::shard::dispatch::ShardMessage>>>,
         Arc<crate::runtime::channel::Notify>,
     )>,
-    last_db: &mut usize,
+    last_db: &mut RecordCtx,
     floor: FoldEpoch,
 ) -> Result<(FoldOutcome, std::fs::File), MoonError> {
     use ringbuf::traits::Producer;
@@ -1384,9 +1390,12 @@ pub(crate) fn rewrite_aof_sharded_sync(
             }
             match msg {
                 AofMessage::Append {
-                    db, bytes: data, ..
+                    db,
+                    bytes: data,
+                    clock_ms,
+                    ..
                 } => {
-                    if let Some(sel) = select_prefix_if_needed(db, data.is_empty(), last_db) {
+                    for sel in last_db.prefix(db, clock_ms, data.is_empty()) {
                         old_file.write_all(&sel).map_err(|e| AofError::Io {
                             path: aof_path.to_path_buf(),
                             source: e,
@@ -1401,9 +1410,10 @@ pub(crate) fn rewrite_aof_sharded_sync(
                     db,
                     bytes: data,
                     ack,
+                    clock_ms,
                     ..
                 } => {
-                    if let Some(sel) = select_prefix_if_needed(db, data.is_empty(), last_db) {
+                    for sel in last_db.prefix(db, clock_ms, data.is_empty()) {
                         old_file.write_all(&sel).map_err(|e| AofError::Io {
                             path: aof_path.to_path_buf(),
                             source: e,
@@ -1486,9 +1496,12 @@ pub(crate) fn rewrite_aof_sharded_sync(
                 }
                 Ok(msg) => match msg {
                     AofMessage::Append {
-                        db, bytes: data, ..
+                        db,
+                        bytes: data,
+                        clock_ms,
+                        ..
                     } => {
-                        if let Some(sel) = select_prefix_if_needed(db, data.is_empty(), last_db) {
+                        for sel in last_db.prefix(db, clock_ms, data.is_empty()) {
                             old_file.write_all(&sel).map_err(|e| AofError::Io {
                                 path: aof_path.to_path_buf(),
                                 source: e,
@@ -1504,9 +1517,10 @@ pub(crate) fn rewrite_aof_sharded_sync(
                         db,
                         bytes: data,
                         ack,
+                        clock_ms,
                         ..
                     } => {
-                        if let Some(sel) = select_prefix_if_needed(db, data.is_empty(), last_db) {
+                        for sel in last_db.prefix(db, clock_ms, data.is_empty()) {
                             old_file.write_all(&sel).map_err(|e| AofError::Io {
                                 path: aof_path.to_path_buf(),
                                 source: e,
@@ -1617,7 +1631,7 @@ pub(crate) fn rewrite_aof_sharded_sync(
     }
     // task #35: aof_path now points at a brand-new file (RDB base only) —
     // replay always starts a segment at db 0.
-    *last_db = 0;
+    last_db.reset();
 
     info!(
         "rewrite_aof_sharded_sync (tokio) complete: {} bytes ({:.1}ms)",
@@ -1708,6 +1722,7 @@ mod fold_tests {
             db: 0,
             bytes: Bytes::from_static(payload),
             epoch,
+            clock_ms: 0,
         }
     }
 
@@ -1726,7 +1741,7 @@ mod fold_tests {
         let mut fx = fixture();
         let old_seq = fx.manifest.seq;
         let old_incr = fx.manifest.incr_path();
-        let mut last_db = 0usize;
+        let mut last_db = RecordCtx::new();
 
         test_fault::set_fail_new_incr_open(true);
         let res = do_rewrite_single(
@@ -1782,7 +1797,7 @@ mod fold_tests {
         );
         let old_seq = fx.manifest.seq;
         let old_incr = fx.manifest.incr_path();
-        let mut last_db = 0usize;
+        let mut last_db = RecordCtx::new();
 
         let res = do_rewrite_single(
             &fx.dbs,
@@ -1823,7 +1838,7 @@ mod fold_tests {
     fn a_committed_fold_reports_its_snapshot_epoch_and_switches_the_handle() {
         let mut fx = fixture();
         let old_seq = fx.manifest.seq;
-        let mut last_db = 0usize;
+        let mut last_db = RecordCtx::new();
         let stamped_before = fx.overflow.stamp();
 
         let outcome = do_rewrite_single(
@@ -1861,7 +1876,7 @@ mod fold_tests {
     #[test]
     fn a_record_stamped_before_a_committed_snapshot_is_never_written_after_it() {
         let mut fx = fixture();
-        let mut last_db = 0usize;
+        let mut last_db = RecordCtx::new();
         // INCR k happened (k=1 is in the db) — its record has not been sent.
         let late = append(b"*2\r\n$4\r\nINCR\r\n$1\r\nk\r\n", fx.overflow.stamp());
 
