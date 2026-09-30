@@ -26,9 +26,10 @@
 //! | `P` × 5 | `SET v`, `APPEND x` | `vx`, persistent |
 //!
 //! Also here: a mixed old/new log (records without any `MOON.TS`, as an older
-//! binary wrote them, followed by records with it), and a downgrade read (an
-//! older binary replaying a `MOON.TS`-bearing log) gated on
-//! `MOON_DOWNGRADE_BIN`.
+//! binary wrote them, followed by records with it), a downgrade read (an
+//! older binary replaying a `MOON.TS`-bearing log) and a downgrade followed by
+//! a re-upgrade (an older binary APPENDING to a stamped log, R1 review), the
+//! last two gated on `MOON_DOWNGRADE_BIN`.
 //!
 //! Pin the binary for a specific runtime:
 //! `MOON_BIN=<moon> cargo test --test aof_replay_clock_1283 -- --include-ignored`.
@@ -685,4 +686,169 @@ fn moon_1283_downgrade_read_s1() {
 #[ignore = "real-server: run with --include-ignored, MOON_BIN and MOON_DOWNGRADE_BIN pinned"]
 fn moon_1283_downgrade_read_s4() {
     downgrade_read(4);
+}
+
+// ── downgrade, then re-upgrade (R1 review, finding 1) ───────────────────────
+
+/// Every `k*` key and its PTTL (sorted): the live truth.
+fn k_keys(c: &mut Conn, n: usize) -> Vec<(String, i64)> {
+    (0..n)
+        .filter_map(|i| {
+            let k = format!("k{i}");
+            let pttl: i64 = c
+                .send(&["PTTL", &k])
+                .trim_start_matches(':')
+                .trim_end()
+                .parse()
+                .unwrap_or(i64::MIN);
+            (pttl != -2).then_some((k, pttl))
+        })
+        .collect()
+}
+
+/// This binary writes stamps; an older binary (`MOON_DOWNGRADE_BIN`, a build
+/// that predates moon#1283) then appends to the same log with none — 400
+/// keys `SET … PX 1000`, then `INCR`s hammered across the expiry instant, so
+/// most keys are lazily expired and restarted at 1 by an `INCR` with no `DEL`
+/// logged first (moon#542) — and this binary boots on the result. Every key
+/// that existed live must exist after the re-upgrade (and persistent, as
+/// every surviving key is an `INCR`-restarted counter). The log's last stamp
+/// is seconds older than the old binary's writes; judged by it, every
+/// restarted key replayed onto its old value and old deadline and was lost
+/// (R1 review: 299–325 of ~300 keys missing).
+///
+/// Then one more restart after the re-upgraded server has written its own
+/// stamped records behind that tail: the boot-time rewrite the re-upgrade
+/// triggered must have folded the tail, so nothing is lost there either.
+fn downgrade_then_reupgrade(shards: usize) {
+    let Some(old) = std::env::var_os("MOON_DOWNGRADE_BIN").map(PathBuf::from) else {
+        eprintln!(
+            "MOON_DOWNGRADE_BIN unset: the downgrade-then-re-upgrade test is skipped. Point it \
+             at a pre-moon#1283 build of the SAME runtime as MOON_BIN to run it."
+        );
+        return;
+    };
+    assert!(
+        old.exists(),
+        "MOON_DOWNGRADE_BIN={} does not exist",
+        old.display()
+    );
+    const N: usize = 400;
+    let bin = common::find_moon_binary();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let dir = tmp.path();
+
+    // 1. This binary: a stamped log.
+    let (mut server, port) = spawn_bin(&bin, dir, shards);
+    let mut c = Conn::open(port);
+    assert_reply(&mut c, &["SET", "seed", "1"], "+OK\r\n");
+    std::thread::sleep(Duration::from_millis(1_200));
+    drop(c);
+    stop(&mut server, port);
+
+    // 2. The older binary appends, unstamped.
+    let (mut server, port) = spawn_bin(&old, dir, shards);
+    std::thread::sleep(Duration::from_secs(2));
+    let mut c = Conn::open(port);
+    let sets: Vec<Vec<String>> = (0..N)
+        .map(|i| {
+            vec![
+                "SET".into(),
+                format!("k{i}"),
+                "10".into(),
+                "PX".into(),
+                "1000".into(),
+            ]
+        })
+        .collect();
+    let sets: Vec<Vec<&str>> = sets
+        .iter()
+        .map(|v| v.iter().map(String::as_str).collect())
+        .collect();
+    let sets: Vec<&[&str]> = sets.iter().map(Vec::as_slice).collect();
+    c.pipeline(&sets);
+    std::thread::sleep(Duration::from_millis(990));
+    for round in 0..30 {
+        let incrs: Vec<String> = ((round * 13) % N..N)
+            .step_by(7)
+            .map(|i| format!("k{i}"))
+            .collect();
+        let cmds: Vec<[&str; 2]> = incrs.iter().map(|k| ["INCR", k.as_str()]).collect();
+        let cmds: Vec<&[&str]> = cmds.iter().map(|c| c.as_slice()).collect();
+        c.pipeline(&cmds);
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    // Every SET … PX 1000 is past its deadline: what is left live is the
+    // INCR-restarted counters (persistent).
+    std::thread::sleep(Duration::from_millis(2_000));
+    let live = k_keys(&mut c, N);
+    assert!(
+        live.len() > N / 4,
+        "only {} keys survived live: the hammer did not cross the expiry",
+        live.len()
+    );
+    drop(c);
+    std::thread::sleep(Duration::from_millis(1_300));
+    stop(&mut server, port);
+
+    // 3. Re-upgrade.
+    let (mut server, port) = spawn_bin(&bin, dir, shards);
+    let mut c = Conn::open(port);
+    let after = k_keys(&mut c, N);
+    let missing: Vec<_> = live.iter().filter(|k| !after.contains(k)).collect();
+    assert!(
+        missing.is_empty(),
+        "new -> old -> new, --shards {shards}, {} over {}: {}/{} live keys missing or with a \
+         TTL after the re-upgrade (key, live PTTL): {missing:?}",
+        bin.display(),
+        old.display(),
+        missing.len(),
+        live.len(),
+    );
+
+    // 4. The re-upgrade asked for one rewrite; once it is done, write behind
+    // the old tail and restart again.
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let idle = c
+            .send(&["INFO", "persistence"])
+            .contains("aof_rewrite_in_progress:0");
+        let done = compacted_bases(dir);
+        if idle && (done == shards || done == 1) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the re-upgrade's boot-time AOF rewrite did not complete within 60 s ({done} bases)"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    for i in 0..20 {
+        assert_reply(&mut c, &["SET", &format!("post:{i}"), "v"], "+OK\r\n");
+    }
+    drop(c);
+    stop(&mut server, port);
+    let (_server, port) = spawn_bin(&bin, dir, shards);
+    let mut c = Conn::open(port);
+    let again = k_keys(&mut c, N);
+    let missing: Vec<_> = live.iter().filter(|k| !again.contains(k)).collect();
+    assert!(
+        missing.is_empty(),
+        "new -> old -> new -> new, --shards {shards}: {}/{} live keys missing or with a TTL \
+         on the boot after the re-upgrade: {missing:?}",
+        missing.len(),
+        live.len(),
+    );
+}
+
+#[test]
+#[ignore = "real-server: run with --include-ignored, MOON_BIN and MOON_DOWNGRADE_BIN pinned"]
+fn moon_1283_downgrade_then_reupgrade_s1() {
+    downgrade_then_reupgrade(1);
+}
+
+#[test]
+#[ignore = "real-server: run with --include-ignored, MOON_BIN and MOON_DOWNGRADE_BIN pinned"]
+fn moon_1283_downgrade_then_reupgrade_s4() {
+    downgrade_then_reupgrade(4);
 }

@@ -26,6 +26,8 @@ use crate::storage::db::HashTtlCond;
 pub(crate) mod chunks;
 /// The expiry-judgment clock of a replay (moon#1277, moon#1283).
 pub mod clock;
+// The last `MOON.TS` of a log file (the clock's foreign-tail rule).
+pub(crate) mod log_tail;
 /// Replay-only `MOON.*` pseudo-commands and their intercept (moon#1283).
 pub mod pseudo;
 
