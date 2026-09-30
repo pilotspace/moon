@@ -12,6 +12,7 @@ mod read;
 mod txn;
 mod write;
 
+use exit::BodyExit;
 pub(crate) use exit::handle_connection_sharded_monoio;
 
 /// c10k C1 — bound a reply write so a peer that stops reading cannot park the
@@ -384,7 +385,8 @@ fn run_write_eviction_gate(
 ///
 /// moon#1299: entered ONLY through [`exit::handle_connection_sharded_monoio`],
 /// which owns `conn` and runs the connection's exit epilogue (the open-TXN
-/// abort) after this returns — by ANY `return`, `break` or hand-off.
+/// abort) after this returns — by ANY `return`, `break` or hand-off — and
+/// closes the socket only after it (a [`BodyExit`], moon#1299 R2 N1).
 #[cfg(feature = "runtime-monoio")]
 async fn handle_connection_body<
     S: monoio::io::AsyncReadRent + monoio::io::AsyncWriteRent + idle_park::IdleParkRead,
@@ -405,7 +407,7 @@ async fn handle_connection_body<
     park: ParkArgs,
     // Owned by the exit wrapper, which ends its open TXN (moon#1299).
     conn: &mut super::core::ConnectionState,
-) -> (MonoioHandlerResult, Option<S>) {
+) -> (MonoioHandlerResult, BodyExit<S>) {
     use monoio::io::AsyncWriteRentExt;
 
     // Solo-conn spin gate (L1 convoy fix): register this connection on the
@@ -722,7 +724,7 @@ async fn handle_connection_body<
                                                         codec.encode_frame(&err, &mut resp_buf);
                                                         let data = resp_buf.freeze();
                                                         let (wr, _): (std::io::Result<usize>, bytes::Bytes) = stream.write_all(data).await;
-                                                        if wr.is_err() { return (MonoioHandlerResult::Done, None); }
+                                                        if wr.is_err() { return (MonoioHandlerResult::Done, BodyExit::Close(stream)); }
                                                         continue;
                                                     }
                                                     for arg in cmd_args {
@@ -738,7 +740,7 @@ async fn handle_connection_body<
                                                                 codec.encode_frame(&err, &mut resp_buf);
                                                                 let data = resp_buf.freeze();
                                                                 let (wr, _): (std::io::Result<usize>, bytes::Bytes) = stream.write_all(data).await;
-                                                                if wr.is_err() { return (MonoioHandlerResult::Done, None); }
+                                                                if wr.is_err() { return (MonoioHandlerResult::Done, BodyExit::Close(stream)); }
                                                                 continue;
                                                             }
                                                             #[allow(clippy::unwrap_used)] // conn.pubsub_tx is always Some when in subscriber mode
@@ -761,7 +763,7 @@ async fn handle_connection_body<
                                                             codec.encode_frame(&resp, &mut resp_buf);
                                                             let data = resp_buf.freeze();
                                                             let (wr, _): (std::io::Result<usize>, bytes::Bytes) = stream.write_all(data).await;
-                                                            if wr.is_err() { return (MonoioHandlerResult::Done, None); }
+                                                            if wr.is_err() { return (MonoioHandlerResult::Done, BodyExit::Close(stream)); }
                                                         }
                                                     }
                                                 }
@@ -782,7 +784,7 @@ async fn handle_connection_body<
                                                         codec.encode_frame(&err, &mut resp_buf);
                                                         let data = resp_buf.freeze();
                                                         let (wr, _): (std::io::Result<usize>, bytes::Bytes) = stream.write_all(data).await;
-                                                        if wr.is_err() { return (MonoioHandlerResult::Done, None); }
+                                                        if wr.is_err() { return (MonoioHandlerResult::Done, BodyExit::Close(stream)); }
                                                         continue;
                                                     }
                                                     for arg in cmd_args {
@@ -797,7 +799,7 @@ async fn handle_connection_body<
                                                                 codec.encode_frame(&err, &mut resp_buf);
                                                                 let data = resp_buf.freeze();
                                                                 let (wr, _): (std::io::Result<usize>, bytes::Bytes) = stream.write_all(data).await;
-                                                                if wr.is_err() { return (MonoioHandlerResult::Done, None); }
+                                                                if wr.is_err() { return (MonoioHandlerResult::Done, BodyExit::Close(stream)); }
                                                                 continue;
                                                             }
                                                             #[allow(clippy::unwrap_used)] // conn.pubsub_tx is always Some in subscriber mode
@@ -814,7 +816,7 @@ async fn handle_connection_body<
                                                             codec.encode_frame(&resp, &mut resp_buf);
                                                             let data = resp_buf.freeze();
                                                             let (wr, _): (std::io::Result<usize>, bytes::Bytes) = stream.write_all(data).await;
-                                                            if wr.is_err() { return (MonoioHandlerResult::Done, None); }
+                                                            if wr.is_err() { return (MonoioHandlerResult::Done, BodyExit::Close(stream)); }
                                                         }
                                                     }
                                                 }
@@ -831,7 +833,7 @@ async fn handle_connection_body<
                                                         codec.encode_frame(&resp, &mut resp_buf);
                                                         let data = resp_buf.freeze();
                                                         let (wr, _): (std::io::Result<usize>, bytes::Bytes) = stream.write_all(data).await;
-                                                        if wr.is_err() { return (MonoioHandlerResult::Done, None); }
+                                                        if wr.is_err() { return (MonoioHandlerResult::Done, BodyExit::Close(stream)); }
                                                     } else {
                                                         for ch in &targets {
                                                             ctx.pubsub_registry.write().sunsubscribe(ch.as_ref(), conn.subscriber_id);
@@ -842,7 +844,7 @@ async fn handle_connection_body<
                                                             codec.encode_frame(&resp, &mut resp_buf);
                                                             let data = resp_buf.freeze();
                                                             let (wr, _): (std::io::Result<usize>, bytes::Bytes) = stream.write_all(data).await;
-                                                            if wr.is_err() { return (MonoioHandlerResult::Done, None); }
+                                                            if wr.is_err() { return (MonoioHandlerResult::Done, BodyExit::Close(stream)); }
                                                         }
                                                     }
                                                 }
@@ -859,7 +861,7 @@ async fn handle_connection_body<
                                                             codec.encode_frame(&resp, &mut resp_buf);
                                                             let data = resp_buf.freeze();
                                                             let (wr, _): (std::io::Result<usize>, bytes::Bytes) = stream.write_all(data).await;
-                                                            if wr.is_err() { return (MonoioHandlerResult::Done, None); }
+                                                            if wr.is_err() { return (MonoioHandlerResult::Done, BodyExit::Close(stream)); }
                                                         } else {
                                                             for ch in &removed {
                                                                 conn.subscription_count = conn.subscription_count.saturating_sub(1);
@@ -868,7 +870,7 @@ async fn handle_connection_body<
                                                                 codec.encode_frame(&resp, &mut resp_buf);
                                                                 let data = resp_buf.freeze();
                                                                 let (wr, _): (std::io::Result<usize>, bytes::Bytes) = stream.write_all(data).await;
-                                                                if wr.is_err() { return (MonoioHandlerResult::Done, None); }
+                                                                if wr.is_err() { return (MonoioHandlerResult::Done, BodyExit::Close(stream)); }
                                                             }
                                                         }
                                                     } else {
@@ -882,7 +884,7 @@ async fn handle_connection_body<
                                                                 codec.encode_frame(&resp, &mut resp_buf);
                                                                 let data = resp_buf.freeze();
                                                                 let (wr, _): (std::io::Result<usize>, bytes::Bytes) = stream.write_all(data).await;
-                                                                if wr.is_err() { return (MonoioHandlerResult::Done, None); }
+                                                                if wr.is_err() { return (MonoioHandlerResult::Done, BodyExit::Close(stream)); }
                                                             }
                                                         }
                                                     }
@@ -894,7 +896,7 @@ async fn handle_connection_body<
                                                         codec.encode_frame(&err, &mut resp_buf);
                                                         let data = resp_buf.freeze();
                                                         let (wr, _): (std::io::Result<usize>, bytes::Bytes) = stream.write_all(data).await;
-                                                        if wr.is_err() { return (MonoioHandlerResult::Done, None); }
+                                                        if wr.is_err() { return (MonoioHandlerResult::Done, BodyExit::Close(stream)); }
                                                         continue;
                                                     }
                                                     for arg in cmd_args {
@@ -910,7 +912,7 @@ async fn handle_connection_body<
                                                                 codec.encode_frame(&err, &mut resp_buf);
                                                                 let data = resp_buf.freeze();
                                                                 let (wr, _): (std::io::Result<usize>, bytes::Bytes) = stream.write_all(data).await;
-                                                                if wr.is_err() { return (MonoioHandlerResult::Done, None); }
+                                                                if wr.is_err() { return (MonoioHandlerResult::Done, BodyExit::Close(stream)); }
                                                                 continue;
                                                             }
                                                             #[allow(clippy::unwrap_used)] // conn.pubsub_tx is always Some when in subscriber mode
@@ -933,7 +935,7 @@ async fn handle_connection_body<
                                                             codec.encode_frame(&resp, &mut resp_buf);
                                                             let data = resp_buf.freeze();
                                                             let (wr, _): (std::io::Result<usize>, bytes::Bytes) = stream.write_all(data).await;
-                                                            if wr.is_err() { return (MonoioHandlerResult::Done, None); }
+                                                            if wr.is_err() { return (MonoioHandlerResult::Done, BodyExit::Close(stream)); }
                                                         }
                                                     }
                                                 }
@@ -950,7 +952,7 @@ async fn handle_connection_body<
                                                             codec.encode_frame(&resp, &mut resp_buf);
                                                             let data = resp_buf.freeze();
                                                             let (wr, _): (std::io::Result<usize>, bytes::Bytes) = stream.write_all(data).await;
-                                                            if wr.is_err() { return (MonoioHandlerResult::Done, None); }
+                                                            if wr.is_err() { return (MonoioHandlerResult::Done, BodyExit::Close(stream)); }
                                                         } else {
                                                             for pat in &removed {
                                                                 conn.subscription_count = conn.subscription_count.saturating_sub(1);
@@ -959,7 +961,7 @@ async fn handle_connection_body<
                                                                 codec.encode_frame(&resp, &mut resp_buf);
                                                                 let data = resp_buf.freeze();
                                                                 let (wr, _): (std::io::Result<usize>, bytes::Bytes) = stream.write_all(data).await;
-                                                                if wr.is_err() { return (MonoioHandlerResult::Done, None); }
+                                                                if wr.is_err() { return (MonoioHandlerResult::Done, BodyExit::Close(stream)); }
                                                             }
                                                         }
                                                     } else {
@@ -973,7 +975,7 @@ async fn handle_connection_body<
                                                                 codec.encode_frame(&resp, &mut resp_buf);
                                                                 let data = resp_buf.freeze();
                                                                 let (wr, _): (std::io::Result<usize>, bytes::Bytes) = stream.write_all(data).await;
-                                                                if wr.is_err() { return (MonoioHandlerResult::Done, None); }
+                                                                if wr.is_err() { return (MonoioHandlerResult::Done, BodyExit::Close(stream)); }
                                                             }
                                                         }
                                                     }
@@ -987,7 +989,7 @@ async fn handle_connection_body<
                                                     codec.encode_frame(&resp, &mut resp_buf);
                                                     let data = resp_buf.freeze();
                                                     let (wr, _): (std::io::Result<usize>, bytes::Bytes) = stream.write_all(data).await;
-                                                    if wr.is_err() { return (MonoioHandlerResult::Done, None); }
+                                                    if wr.is_err() { return (MonoioHandlerResult::Done, BodyExit::Close(stream)); }
                                                 }
                                                 _ if cmd.eq_ignore_ascii_case(b"QUIT") => {
                                                     let resp = Frame::SimpleString(Bytes::from_static(b"OK"));
@@ -996,7 +998,7 @@ async fn handle_connection_body<
                                                     let data = resp_buf.freeze();
                                                     let (wr, _): (std::io::Result<usize>, bytes::Bytes) = stream.write_all(data).await;
                                                     let _ = wr; // ignore write error on quit
-                                                    return (MonoioHandlerResult::Done, None); // exit connection
+                                                    return (MonoioHandlerResult::Done, BodyExit::Close(stream)); // exit connection
                                                 }
                                                 _ if cmd.eq_ignore_ascii_case(b"RESET") => {
                                                     // The sanctioned way out of subscriber mode, and
@@ -1026,7 +1028,7 @@ async fn handle_connection_body<
                                                     }
                                                     let data = resp_buf.freeze();
                                                     let (wr, _): (std::io::Result<usize>, bytes::Bytes) = stream.write_all(data).await;
-                                                    if wr.is_err() { return (MonoioHandlerResult::Done, None); }
+                                                    if wr.is_err() { return (MonoioHandlerResult::Done, BodyExit::Close(stream)); }
                                                     // The count is 0 now: the check below hands the
                                                     // rest of the batch back to the normal path.
                                                 }
@@ -1039,7 +1041,7 @@ async fn handle_connection_body<
                                                     codec.encode_frame(&err, &mut resp_buf);
                                                     let data = resp_buf.freeze();
                                                     let (wr, _): (std::io::Result<usize>, bytes::Bytes) = stream.write_all(data).await;
-                                                    if wr.is_err() { return (MonoioHandlerResult::Done, None); }
+                                                    if wr.is_err() { return (MonoioHandlerResult::Done, BodyExit::Close(stream)); }
                                                 }
                                             }
                                         }
@@ -1065,7 +1067,7 @@ async fn handle_connection_body<
                                             let (_wr, _b): (std::io::Result<usize>, bytes::Bytes) =
                                                 stream.write_all(data).await;
                                         }
-                                        return (MonoioHandlerResult::Done, None);
+                                        return (MonoioHandlerResult::Done, BodyExit::Close(stream));
                                     }
                                 }
                             }
@@ -1459,7 +1461,7 @@ async fn handle_connection_body<
                                 state,
                                 registry_guard,
                             },
-                            Some(stream),
+                            BodyExit::HandOff(stream),
                         );
                     }
                 }
@@ -1932,7 +1934,7 @@ async fn handle_connection_body<
                     client_live,
                     client_id
                 );
-                return (MonoioHandlerResult::Done, None);
+                return (MonoioHandlerResult::Done, BodyExit::Close(stream));
             }
             continue;
         }
@@ -2620,7 +2622,7 @@ async fn handle_connection_body<
                             client_live,
                             client_id
                         ) {
-                            return (MonoioHandlerResult::Done, None);
+                            return (MonoioHandlerResult::Done, BodyExit::Close(stream));
                         }
                     }
                     return (
@@ -2629,7 +2631,7 @@ async fn handle_connection_body<
                             client_offset: offset,
                             peer_addr: peer_addr.clone(),
                         },
-                        Some(stream),
+                        BodyExit::HandOff(stream),
                     );
                 }
                 // try_handle_psync may have pushed an error response (multi-shard,
@@ -2715,7 +2717,9 @@ async fn handle_connection_body<
                     }
                     break;
                 }
-                pubsub::SubscribeResult::WriteError => return (MonoioHandlerResult::Done, None),
+                pubsub::SubscribeResult::WriteError => {
+                    return (MonoioHandlerResult::Done, BodyExit::Close(stream));
+                }
             }
             if !skip_name_gates && pubsub::try_handle_unsubscribe(cmd, &mut responses) {
                 continue;
@@ -2926,10 +2930,14 @@ async fn handle_connection_body<
                     }
                     break;
                 }
-                dispatch::BlockingResult::WriteError => return (MonoioHandlerResult::Done, None),
+                dispatch::BlockingResult::WriteError => {
+                    return (MonoioHandlerResult::Done, BodyExit::Close(stream));
+                }
                 // c10k A1: peer vanished mid-block. Nothing to write; the
                 // registry entry and maxclients slot are released by returning.
-                dispatch::BlockingResult::PeerGone => return (MonoioHandlerResult::Done, None),
+                dispatch::BlockingResult::PeerGone => {
+                    return (MonoioHandlerResult::Done, BodyExit::Close(stream));
+                }
                 // The node became a replica: write the `-UNBLOCKED` reply and
                 // close, dropping anything pipelined behind it, as redis does.
                 dispatch::BlockingResult::HandledThenClose => {
@@ -4909,7 +4917,7 @@ async fn handle_connection_body<
                     state: migrated_state,
                     target_shard,
                 },
-                Some(stream),
+                BodyExit::HandOff(stream),
             );
         }
 
@@ -4926,7 +4934,7 @@ async fn handle_connection_body<
         if !frames_carried && let Some(kind) = proto_fault.take() {
             let data = bytes::Bytes::from(super::util::proto_error_frame(kind));
             let (_wr, _b): (std::io::Result<usize>, bytes::Bytes) = stream.write_all(data).await;
-            return (MonoioHandlerResult::Done, None);
+            return (MonoioHandlerResult::Done, BodyExit::Close(stream));
         }
 
         // Check shutdown (polled after each batch -- acceptable for MVP)
@@ -4979,14 +4987,10 @@ async fn handle_connection_body<
         }
     }
 
-    // --- Graceful TCP shutdown: send FIN to client to avoid CLOSE_WAIT ---
-    // Uses monoio's own shutdown() which properly manages the fd through
-    // the runtime (unlike raw libc::shutdown which corrupts monoio state).
-    let _ = stream.shutdown().await;
-
-    // Phase 166 / moon#1299: an open cross-store TXN is ended by the exit
-    // wrapper (`exit.rs`) after this body returns — on this path and on
-    // every early `return` above alike.
+    // Phase 166 / moon#1299: the exit wrapper (`exit.rs`) ends an open
+    // cross-store TXN after this body returns, THEN closes the socket — the
+    // graceful `shutdown()` (FIN) for this path (`BodyExit::Shutdown`), a
+    // drop for every early `return` above (`BodyExit::Close`).
 
     // --- Disconnect cleanup: propagate unsubscribe to all shards' remote subscriber maps ---
     if conn.subscriber_id > 0 {
@@ -5070,5 +5074,5 @@ async fn handle_connection_body<
     // AtomicU64 counter — it wraps to u64::MAX on the second subtraction
     // and all subsequent `try_accept_connection` comparisons against
     // `maxclients` reject new connections.
-    (MonoioHandlerResult::Done, None)
+    (MonoioHandlerResult::Done, BodyExit::Shutdown(stream))
 }

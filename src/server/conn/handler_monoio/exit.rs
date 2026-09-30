@@ -27,6 +27,14 @@
 //!   `active_cross_txn.is_none()` — so the epilogue is a no-op there. Should
 //!   that gate ever regress, the transaction is rolled back rather than
 //!   leaked: the migrated/parked state has no field that could carry it.
+//!
+//! Close order (moon#1299 R2 N1): the socket is closed HERE, after the
+//! epilogue — never by the body. The rollback awaits the AOF's fsync barrier
+//! under `appendfsync always` and releases the holds only at its end; a body
+//! that closed first let a client read its `QUIT` reply (or its
+//! protocol-error reply) and EOF, then find its keys still held from
+//! another connection. The body hands the stream back in a [`BodyExit`]
+//! saying how to close it.
 
 use bytes::BytesMut;
 
@@ -35,6 +43,25 @@ use crate::runtime::cancel::CancellationToken;
 use crate::server::conn::affinity::MigratedConnectionState;
 use crate::server::conn::core::{ConnectionContext, ConnectionState};
 use crate::server::conn::txn_abort::{AbortCause, end_open_txn};
+
+/// How the connection body hands its socket back to this wrapper
+/// (moon#1299 R2 N1): what to do with it AFTER the exit epilogue.
+pub(super) enum BodyExit<S> {
+    /// A hand-off (`MigrateConnection`, `ParkIdle`, `HijackForPsync`): the
+    /// stream goes back to the caller, open.
+    HandOff(S),
+    /// An early exit — a protocol fault, subscriber `QUIT`/fault, a failed,
+    /// timed-out or over-limit reply write, a vanished blocked peer: closed
+    /// by dropping it, as before. No graceful `shutdown()` here: on a peer
+    /// that stopped reading, a TLS `close_notify` would park the task.
+    Close(S),
+    /// The loop's normal exit (EOF, `QUIT`, shutdown): a graceful
+    /// `shutdown()` — FIN, and `close_notify` on TLS — so the socket does
+    /// not linger in CLOSE_WAIT, then drop. monoio's own `shutdown()`
+    /// manages the fd through the runtime (a raw `libc::shutdown` corrupts
+    /// monoio's state).
+    Shutdown(S),
+}
 
 /// Monoio connection handler: builds the connection's state, serves it
 /// (`handle_connection_body`), then runs the exit epilogue whatever the
@@ -68,7 +95,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
     );
     conn.refresh_acl_cache(&ctx.acl_table);
 
-    let result = handle_connection_body(
+    let (result, exit) = handle_connection_body(
         stream,
         peer_addr,
         ctx,
@@ -88,10 +115,14 @@ pub(crate) async fn handle_connection_sharded_monoio<
     // client left to tell.
     debug_assert!(
         !matches!(
-            result.0,
+            result,
             MonoioHandlerResult::MigrateConnection { .. } | MonoioHandlerResult::ParkIdle { .. }
         ) || conn.active_cross_txn.is_none(),
         "a migrated or parked connection must not carry an open TXN"
+    );
+    debug_assert!(
+        matches!(exit, BodyExit::HandOff(_)) != matches!(result, MonoioHandlerResult::Done),
+        "the stream is handed back open exactly when the result is a hand-off"
     );
     let _ = end_open_txn(
         ctx,
@@ -100,5 +131,17 @@ pub(crate) async fn handle_connection_sharded_monoio<
         AbortCause::Disconnect,
     )
     .await;
-    result
+    // Only now may the client see the close (moon#1299 R2 N1).
+    match exit {
+        BodyExit::HandOff(stream) => (result, Some(stream)),
+        BodyExit::Close(stream) => {
+            drop(stream);
+            (result, None)
+        }
+        BodyExit::Shutdown(mut stream) => {
+            let _ = stream.shutdown().await;
+            drop(stream);
+            (result, None)
+        }
+    }
 }

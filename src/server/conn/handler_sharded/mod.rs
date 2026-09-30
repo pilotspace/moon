@@ -90,6 +90,7 @@ mod txn;
 mod txn_intercepts;
 mod write;
 
+use exit::BodyExit;
 pub(crate) use exit::handle_connection_sharded_inner;
 
 /// Result of `handle_connection_sharded_inner` execution.
@@ -333,12 +334,13 @@ pub(crate) async fn handle_connection_sharded(
 /// Works with any stream implementing `AsyncRead + AsyncWrite + Unpin`,
 /// enabling both plain TCP (`TcpStream`) and TLS (`tokio_rustls::server::TlsStream<TcpStream>`).
 ///
-/// Returns `(HandlerResult, Option<S>)`: the stream is returned when migration is triggered
-/// so the concrete caller can extract the raw FD.
+/// Returns the stream in a [`BodyExit`]: open for a migration hand-off,
+/// otherwise for the wrapper to close.
 ///
 /// moon#1299: entered ONLY through [`exit::handle_connection_sharded_inner`],
 /// which owns `conn` and runs the connection's exit epilogue (the open-TXN
-/// abort) after this returns — by ANY `return`, `break` or hand-off.
+/// abort) after this returns — by ANY `return`, `break` or hand-off — and
+/// closes the socket only after it (moon#1299 R2 N1).
 async fn handle_connection_body<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
     stream: S,
     peer_addr: String,
@@ -352,7 +354,7 @@ async fn handle_connection_body<S: tokio::io::AsyncRead + tokio::io::AsyncWrite 
     kill_fd: i32,
     // Owned by the exit wrapper, which ends its open TXN (moon#1299).
     conn: &mut super::core::ConnectionState,
-) -> (HandlerResult, Option<S>) {
+) -> (HandlerResult, BodyExit<S>) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     // Solo-conn spin gate (L1 convoy fix): register this connection on the
@@ -543,7 +545,7 @@ async fn handle_connection_body<S: tokio::io::AsyncRead + tokio::io::AsyncWrite 
                     break;
                 }
                 pubsub::SubscriberAction::EarlyReturn => {
-                    return (HandlerResult::Done, None);
+                    return (HandlerResult::Done, BodyExit::Close(stream));
                 }
             }
         }
@@ -1754,7 +1756,7 @@ async fn handle_connection_body<S: tokio::io::AsyncRead + tokio::io::AsyncWrite 
                             &responses,
                             &mut write_buf,
                         );
-                        if !write_all_bounded!(stream, &write_buf, write_timeout, out_cap_normal, client_live, client_id) { arena.reset(); return (HandlerResult::Done, None); }
+                        if !write_all_bounded!(stream, &write_buf, write_timeout, out_cap_normal, client_live, client_id) { arena.reset(); return (HandlerResult::Done, BodyExit::Close(stream)); }
                         // c10k A1: `read_buf` doubles as the carry buffer — it
                         // holds only the unparsed tail of this batch here, so
                         // bytes the client pipelines while blocked append in
@@ -1781,7 +1783,7 @@ async fn handle_connection_body<S: tokio::io::AsyncRead + tokio::io::AsyncWrite 
                             // down, nothing to reply to, close the connection.
                             crate::server::conn::blocking::BlockingOutcome::PeerGone => {
                                 arena.reset();
-                                return (HandlerResult::Done, None);
+                                return (HandlerResult::Done, BodyExit::Close(stream));
                             }
                         };
                     // moon#644: the blocking path modifies the keyspace, so it owes tracking
@@ -1800,7 +1802,7 @@ async fn handle_connection_body<S: tokio::io::AsyncRead + tokio::io::AsyncWrite 
                         if peer_gone_after_serve {
                             // Nobody left to write the reply to.
                             arena.reset();
-                            return (HandlerResult::Done, None);
+                            return (HandlerResult::Done, BodyExit::Close(stream));
                         }
                     // moon#827 / moon#1056: the pop's record is already in the
                     // AOF of the shard that OWNS the key, written in the pop's
@@ -1878,7 +1880,7 @@ async fn handle_connection_body<S: tokio::io::AsyncRead + tokio::io::AsyncWrite 
                                 }
                                 break;
                             }
-                            pubsub::SubscriberAction::EarlyReturn => { return (HandlerResult::Done, None); }
+                            pubsub::SubscriberAction::EarlyReturn => { return (HandlerResult::Done, BodyExit::Close(stream)); }
                         }
                     }
                     // UNSUBSCRIBE/PUNSUBSCRIBE in normal mode (not subscribed)
@@ -3612,7 +3614,7 @@ async fn handle_connection_body<S: tokio::io::AsyncRead + tokio::io::AsyncWrite 
                     &mut write_buf,
                 );
                 if !write_all_bounded!(stream, &write_buf, write_timeout, out_cap_normal, client_live, client_id) {
-                    return (HandlerResult::Done, None);
+                    return (HandlerResult::Done, BodyExit::Close(stream));
                 }
 
                 // Deliver anything this batch's commands queued. Once per
@@ -3624,7 +3626,7 @@ async fn handle_connection_body<S: tokio::io::AsyncRead + tokio::io::AsyncWrite 
                 // E4: a timed-out cross-shard reply slot must never be reused
                 // — the error replies are flushed above, now close.
                 if xshard_reply_fatal {
-                    return (HandlerResult::Done, None);
+                    return (HandlerResult::Done, BodyExit::Close(stream));
                 }
 
                 // Update live state after each batch — lock-free (QW8, 2026-06
@@ -3668,7 +3670,7 @@ async fn handle_connection_body<S: tokio::io::AsyncRead + tokio::io::AsyncWrite 
                     };
                     return (
                         HandlerResult::MigrateConnection { state: migrated_state, target_shard },
-                        Some(stream),
+                        BodyExit::HandOff(stream),
                     );
                 }
 
@@ -3852,5 +3854,5 @@ async fn handle_connection_body<S: tokio::io::AsyncRead + tokio::io::AsyncWrite 
         ctx.tracking_table.lock().untrack_all(client_id);
     }
 
-    (HandlerResult::Done, None)
+    (HandlerResult::Done, BodyExit::Close(stream))
 }

@@ -23,6 +23,13 @@
 //! transaction is rolled back rather than leaked: the migrated state has no
 //! field that could carry it. This runtime has no master-side `PSYNC`
 //! hijack.
+//!
+//! Close order (moon#1299 R2 N1): the socket is closed HERE, after the
+//! epilogue — never by the body. The rollback awaits the AOF's fsync barrier
+//! under `appendfsync always` and releases the holds only at its end; a body
+//! that dropped the stream first let a client read its `QUIT` reply (or its
+//! protocol-error reply) and EOF, then find its keys still held from
+//! another connection. The body hands the stream back in a [`BodyExit`].
 
 use bytes::BytesMut;
 
@@ -31,6 +38,17 @@ use crate::runtime::cancel::CancellationToken;
 use crate::server::conn::affinity::MigratedConnectionState;
 use crate::server::conn::core::{ConnectionContext, ConnectionState};
 use crate::server::conn::txn_abort::{AbortCause, end_open_txn};
+
+/// How the connection body hands its socket back to this wrapper
+/// (moon#1299 R2 N1): what to do with it AFTER the exit epilogue.
+pub(super) enum BodyExit<S> {
+    /// `MigrateConnection`: the stream goes back to the caller, open, for
+    /// its fd to be passed to the target shard.
+    HandOff(S),
+    /// Every other exit: closed by dropping it, as the body used to (this
+    /// runtime never issued a graceful `shutdown()`).
+    Close(S),
+}
 
 /// Generic inner handler for sharded connections (Tokio runtime): builds the
 /// connection's state, serves it (`handle_connection_body`), then runs the
@@ -69,7 +87,7 @@ pub(crate) async fn handle_connection_sharded_inner<
     );
     conn.refresh_acl_cache(&ctx.acl_table);
 
-    let result = handle_connection_body(
+    let (result, exit) = handle_connection_body(
         stream,
         peer_addr,
         ctx,
@@ -86,10 +104,21 @@ pub(crate) async fn handle_connection_sharded_inner<
     // logged by `abort_logged` (moon#1285 review MINOR 5); there is no
     // client left to tell. This runtime serves no replicas (`None`).
     debug_assert!(
-        !matches!(result.0, HandlerResult::MigrateConnection { .. })
+        !matches!(result, HandlerResult::MigrateConnection { .. })
             || conn.active_cross_txn.is_none(),
         "a migrated connection must not carry an open TXN"
     );
+    debug_assert!(
+        matches!(exit, BodyExit::HandOff(_)) != matches!(result, HandlerResult::Done),
+        "the stream is handed back open exactly when the result is a hand-off"
+    );
     let _ = end_open_txn(ctx, &mut conn, None, AbortCause::Disconnect).await;
-    result
+    // Only now may the client see the close (moon#1299 R2 N1).
+    match exit {
+        BodyExit::HandOff(stream) => (result, Some(stream)),
+        BodyExit::Close(stream) => {
+            drop(stream);
+            (result, None)
+        }
+    }
 }
