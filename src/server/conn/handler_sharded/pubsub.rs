@@ -304,17 +304,18 @@ pub(super) async fn run_subscriber_step<S: tokio::io::AsyncRead + tokio::io::Asy
                                 // unsubscribe, so db, tracking, name and auth survived it.
                                 // No codec here: `conn.protocol_version` is authoritative.
                                 let mut out: Vec<Frame> = Vec::with_capacity(1);
-                                crate::server::conn::shared::try_handle_reset(
+                                // moon#1299 R1: also ends an open TXN.
+                                crate::server::conn::txn_abort::try_handle_reset(
+                                    ctx,
+                                    None,
                                     cmd,
                                     cmd_args,
                                     conn.client_id,
                                     conn,
-                                    &ctx.requirepass,
-                                    &ctx.tracking_table,
-                                    &ctx.shard_pubsub(),
                                     &mut out,
                                     None,
-                                );
+                                )
+                                .await;
                                 write_buf.clear();
                                 for resp in &out {
                                     ser(conn, resp, write_buf);

@@ -1010,17 +1010,19 @@ async fn handle_connection_body<S: tokio::io::AsyncRead + tokio::io::AsyncWrite 
                     // Shared with handler_monoio: a per-handler copy of this is
                     // how RESET came to exist ONLY inside this handler's
                     // subscribe-mode loop and nowhere else.
-                    if crate::server::conn::shared::try_handle_reset(
+                    // moon#1299 R1: RESET also ends an open TXN (`txn_abort`).
+                    if crate::server::conn::txn_abort::try_handle_reset(
+                        ctx,
+                        None,
                         cmd,
                         cmd_args,
                         client_id,
                         conn,
-                        &ctx.requirepass,
-                        &ctx.tracking_table,
-                        &ctx.shard_pubsub(),
                         &mut responses,
                         None,
-                    ) {
+                    )
+                    .await
+                    {
                         continue;
                     }
 
