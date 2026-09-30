@@ -11,6 +11,8 @@
 //!   while other legs were applied answered the bare `-TXNCONFLICT`; it now
 //!   says the command was partially executed (as the AOF-backpressure
 //!   refusal already did).
+//! - A `TXN.COMMIT` refused with `snapshot too old` (`KILL SNAPSHOT`) kept
+//!   the transaction's writes applied; it now rolls them back.
 //!
 //! Each test runs on whichever runtime `MOON_BIN` was built with; run the
 //! suite once per runtime:
@@ -340,5 +342,45 @@ fn partially_applied_cross_shard_writes_say_so() {
         "a refusal with no other part applied is the plain one, got {reply:?}"
     );
     assert_eq!(a.send(&["TXN", "ABORT"]), OK);
+    cleanup(guard, dir);
+}
+
+// ---------------------------------------------------------------------------
+// A TXN.COMMIT refused for a killed snapshot rolls the writes back
+// ---------------------------------------------------------------------------
+
+#[test]
+#[ignore]
+fn killed_snapshot_commit_rolls_the_transaction_back() {
+    let (guard, port, dir) = spawn(1, &[]);
+    let mut a = Conn::open(port);
+    let mut w = Conn::open(port);
+    assert_eq!(w.send(&["SET", "k", "orig"]), OK);
+    assert_eq!(a.send(&["TXN", "BEGIN"]), OK);
+    assert_eq!(a.send(&["SET", "k", "txn"]), OK);
+    assert_eq!(a.send(&["SET", "fresh", "txn"]), OK);
+    // The TXN's id is its snapshot's: the first one a fresh server hands
+    // out is small.
+    let killed = (1..=16).any(|id| w.send(&["KILL", "SNAPSHOT", &id.to_string()]) == OK);
+    assert!(killed, "KILL SNAPSHOT found the open transaction");
+    let commit = a.send(&["TXN", "COMMIT"]);
+    assert!(
+        commit.contains("snapshot too old"),
+        "TXN.COMMIT of a killed snapshot is refused, got {commit:?}"
+    );
+    // Refused = not committed: nothing it wrote may stay applied.
+    assert_eq!(
+        w.send(&["GET", "k"]),
+        bulk("orig"),
+        "a refused commit must roll back the overwrite"
+    );
+    assert_eq!(
+        w.send(&["EXISTS", "fresh"]),
+        ":0\r\n",
+        "a refused commit must roll back the created key"
+    );
+    assert_eq!(info_field(&mut w, "txn_open"), Some(0));
+    assert_eq!(info_field(&mut w, "txn_held_keys"), Some(0));
+    assert_eq!(w.send(&["SET", "k", "W"]), OK);
     cleanup(guard, dir);
 }
