@@ -7,6 +7,10 @@
 //!   count went 0↔1 (it read 1 for five held keys).
 //! - RESET left an open `TXN` (and its key holds) in place; redis's RESET
 //!   discards the connection's MULTI state, and now so does moon's for TXN.
+//! - A cross-shard `MSET` / `DEL` / `UNLINK` refused on the held key's leg
+//!   while other legs were applied answered the bare `-TXNCONFLICT`; it now
+//!   says the command was partially executed (as the AOF-backpressure
+//!   refusal already did).
 //!
 //! Each test runs on whichever runtime `MOON_BIN` was built with; run the
 //! suite once per runtime:
@@ -279,5 +283,62 @@ fn reset_ends_the_open_txn_and_releases_its_keys() {
     assert_eq!(info_field(&mut w, "txn_open"), Some(1));
     assert_eq!(a.send(&["TXN", "COMMIT"]), OK);
     assert_eq!(w.send(&["GET", "k"]), bulk("txn2"));
+    cleanup(guard, dir);
+}
+
+// ---------------------------------------------------------------------------
+// A cross-shard write refused on one leg says it was partially executed
+// ---------------------------------------------------------------------------
+
+#[test]
+#[ignore]
+fn partially_applied_cross_shard_writes_say_so() {
+    let (guard, port, dir) = spawn(4, &[]);
+    let mut a = Conn::open(port);
+    let held = find_key("h", "held", |k| is_local(&mut a, k));
+    let tag_end = held.find('}').expect("tag") + 1;
+    let local_free = format!("{}free", &held[..tag_end]);
+    let mut b = find_conn(port, |c| is_local(c, &held));
+    let remote = find_key("r", "x", |k| !is_local(&mut b, k));
+    let mut w = Conn::open(port);
+    for k in [&held, &local_free, &remote] {
+        assert_eq!(w.send(&["SET", k, "orig"]), OK);
+    }
+    assert_eq!(a.send(&["TXN", "BEGIN"]), OK);
+    assert_eq!(a.send(&["SET", &held, "txn"]), OK);
+
+    // MSET: the remote leg is applied, the held key's leg is refused.
+    let reply = b.send(&["MSET", &remote, "B", &held, "B", &local_free, "B"]);
+    assert!(
+        reply.starts_with(CONFLICT) && reply.contains("partially executed"),
+        "a cross-shard MSET refused on one leg while another was applied must say \
+         it was partially executed, got {reply:?}"
+    );
+    assert_eq!(
+        w.send(&["GET", &remote]),
+        "$1\r\nB\r\n",
+        "remote leg applied"
+    );
+    assert_eq!(
+        w.send(&["GET", &local_free]),
+        "$4\r\norig\r\n",
+        "refused leg unapplied"
+    );
+
+    // DEL (F2): the same shape.
+    let reply = b.send(&["DEL", &remote, &held, &local_free]);
+    assert!(
+        reply.starts_with(CONFLICT) && reply.contains("partially executed"),
+        "DEL: {reply:?}"
+    );
+    assert_eq!(exists(&mut w, &remote), ":0\r\n", "remote leg applied");
+
+    // Nothing else ran: the plain refusal, no "partially".
+    let reply = b.send(&["MSET", &held, "B", &local_free, "B"]);
+    assert!(
+        reply.starts_with(CONFLICT) && !reply.contains("partially"),
+        "a refusal with no other part applied is the plain one, got {reply:?}"
+    );
+    assert_eq!(a.send(&["TXN", "ABORT"]), OK);
     cleanup(guard, dir);
 }

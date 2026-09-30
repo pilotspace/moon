@@ -275,21 +275,24 @@ pub(crate) async fn recv_reply_bounded<T: Send + 'static>(
 
 /// The reply for a multi-shard write whose leg on some shard answered `err`.
 ///
-/// A leg its owner refused before running it
-/// ([`AOF_BACKPRESSURE_REFUSED_ERR`](crate::shard::aof_admission::AOF_BACKPRESSURE_REFUSED_ERR))
-/// says "not executed", which is only true of the whole command when no
-/// other part of it ran. When the local slice or another leg was applied,
-/// the reply says the command was partially executed instead (moon#769).
-/// Every other error passes through unchanged.
+/// A leg refused before it ran — its owner's AOF writer stalled
+/// ([`AOF_BACKPRESSURE_REFUSED_ERR`](crate::shard::aof_admission::AOF_BACKPRESSURE_REFUSED_ERR)),
+/// or a key in it held by an open transaction
+/// ([`ERR_TXN_CONFLICT_KEY`](crate::transaction::isolation::ERR_TXN_CONFLICT_KEY),
+/// moon#1299) — reads as "not executed", which is only true of the whole
+/// command when no other part of it ran. When the local slice or another
+/// leg was applied, the reply says the command was partially executed
+/// instead (moon#769; moon#1299 R1). Every other error passes through
+/// unchanged.
 fn refused_leg_error(err: Frame, other_parts_ran: bool) -> Frame {
+    use crate::shard::aof_admission::{AOF_BACKPRESSURE_PARTIAL_ERR, AOF_BACKPRESSURE_REFUSED_ERR};
+    use crate::transaction::isolation::{ERR_TXN_CONFLICT_KEY, ERR_TXN_CONFLICT_PARTIAL};
     match &err {
-        Frame::Error(e)
-            if other_parts_ran
-                && e.as_ref() == crate::shard::aof_admission::AOF_BACKPRESSURE_REFUSED_ERR =>
-        {
-            Frame::Error(Bytes::from_static(
-                crate::shard::aof_admission::AOF_BACKPRESSURE_PARTIAL_ERR,
-            ))
+        Frame::Error(e) if other_parts_ran && e.as_ref() == AOF_BACKPRESSURE_REFUSED_ERR => {
+            Frame::Error(Bytes::from_static(AOF_BACKPRESSURE_PARTIAL_ERR))
+        }
+        Frame::Error(e) if other_parts_ran && e.as_ref() == ERR_TXN_CONFLICT_KEY => {
+            Frame::Error(Bytes::from_static(ERR_TXN_CONFLICT_PARTIAL))
         }
         _ => err,
     }
