@@ -82,12 +82,15 @@ use super::affinity::MigratedConnectionState;
 use crate::server::response_slot::ResponseSlotPool;
 
 mod dispatch;
+mod exit;
 mod ft;
 mod pubsub;
 mod read;
 mod txn;
 mod txn_intercepts;
 mod write;
+
+pub(crate) use exit::handle_connection_sharded_inner;
 
 /// Result of `handle_connection_sharded_inner` execution.
 ///
@@ -325,29 +328,30 @@ pub(crate) async fn handle_connection_sharded(
     }
 }
 
-/// Generic inner handler for sharded connections (Tokio runtime).
+/// Generic connection body for sharded connections (Tokio runtime).
 ///
 /// Works with any stream implementing `AsyncRead + AsyncWrite + Unpin`,
 /// enabling both plain TCP (`TcpStream`) and TLS (`tokio_rustls::server::TlsStream<TcpStream>`).
 ///
 /// Returns `(HandlerResult, Option<S>)`: the stream is returned when migration is triggered
-/// so the concrete caller can extract the raw FD. `can_migrate` controls whether the
-/// AffinityTracker is active (set to `false` for TLS connections).
-pub(crate) async fn handle_connection_sharded_inner<
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
->(
+/// so the concrete caller can extract the raw FD.
+///
+/// moon#1299: entered ONLY through [`exit::handle_connection_sharded_inner`],
+/// which owns `conn` and runs the connection's exit epilogue (the open-TXN
+/// abort) after this returns — by ANY `return`, `break` or hand-off.
+async fn handle_connection_body<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
     stream: S,
     peer_addr: String,
     ctx: &super::core::ConnectionContext,
     shutdown: CancellationToken,
     client_id: u64,
-    can_migrate: bool,
     initial_read_buf: BytesMut,
-    migrated_state: Option<&MigratedConnectionState>,
     // Raw socket fd for CLIENT KILL force-close (R-3), or -1 if unavailable
     // (non-unix). Threaded from the concrete spawn site; the generic `S` here
     // has no `AsRawFd` bound.
     kill_fd: i32,
+    // Owned by the exit wrapper, which ends its open TXN (moon#1299).
+    conn: &mut super::core::ConnectionState,
 ) -> (HandlerResult, Option<S>) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -380,17 +384,6 @@ pub(crate) async fn handle_connection_sharded_inner<
     // `read_buf`, so a large upload is scanned once, not once per read. Every
     // other consumer of `read_buf`'s front resets it (see `ParseState`).
     let mut parse_state = crate::protocol::ParseState::new();
-    let mut conn = super::core::ConnectionState::new(
-        client_id,
-        peer_addr.clone(),
-        &ctx.requirepass,
-        ctx.shard_id,
-        ctx.num_shards,
-        can_migrate,
-        ctx.runtime_config.read().acllog_max_len,
-        migrated_state,
-    );
-    conn.refresh_acl_cache(&ctx.acl_table);
 
     // Register in global client registry for CLIENT LIST/INFO/KILL.
     // RegistryGuard ensures deregister on all exit paths (including early returns).
@@ -505,7 +498,7 @@ pub(crate) async fn handle_connection_sharded_inner<
         crate::server::conn::shared::publish_pubsub_counts(
             &client_live,
             &ctx.shard_pubsub(),
-            &mut conn,
+            conn,
             ctx.cached_clock.ms(),
         );
 
@@ -532,7 +525,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                 &mut read_buf,
                 &mut write_buf,
                 &parse_config,
-                &mut conn,
+                conn,
                 ctx,
                 &peer_addr,
                 &shutdown,
@@ -791,7 +784,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                                     // were produced under the OLD protocol and
                                     // keep it — see `encode_response_batch`.
                                     crate::server::conn::shared::note_protocol_switch(
-                                        &mut conn,
+                                        conn,
                                         responses.len(),
                                         new_proto,
                                     );
@@ -979,7 +972,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                         && txn_intercepts::try_handle_auth(
                             cmd,
                             cmd_args,
-                            &mut conn,
+                            conn,
                             ctx,
                             &peer_addr,
                             &mut auth_delay_ms,
@@ -994,7 +987,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                         && txn_intercepts::try_handle_hello(
                             cmd,
                             cmd_args,
-                            &mut conn,
+                            conn,
                             ctx,
                             client_id,
                             &peer_addr,
@@ -1021,7 +1014,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                         cmd,
                         cmd_args,
                         client_id,
-                        &mut conn,
+                        conn,
                         &ctx.requirepass,
                         &ctx.tracking_table,
                         &ctx.shard_pubsub(),
@@ -1188,7 +1181,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                         // never a PUBLISH channel — refuse a denied one HERE so
                         // the block aborts, instead of at EXEC after the rest ran.
                         if let Some(err) = crate::server::conn::shared::conn_queued_publish_channel_deny(
-                            &conn,
+                            &*conn,
                             &ctx.acl_table,
                             cmd,
                             cmd_args,
@@ -1462,7 +1455,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                         cmd,
                         cmd_args,
                         client_id,
-                        &mut conn,
+                        conn,
                         ctx,
                         &peer_addr,
                         &mut responses,
@@ -1640,7 +1633,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                     }
 
                     // --- INFO ---
-                    if dispatch::try_handle_info(cmd, cmd_args, &conn, ctx, shaped!()).await {
+                    if dispatch::try_handle_info(cmd, cmd_args, &*conn, ctx, shaped!()).await {
                         continue;
                     }
 
@@ -1661,18 +1654,18 @@ pub(crate) async fn handle_connection_sharded_inner<
                     }
 
                     // --- CLIENT subcommands ---
-                    if dispatch::try_handle_client_command(cmd, cmd_args, client_id, &mut conn, ctx, shaped!()) {
+                    if dispatch::try_handle_client_command(cmd, cmd_args, client_id, conn, ctx, shaped!()) {
                         continue;
                     }
 
                     // --- TXN.BEGIN / TXN.COMMIT / TXN.ABORT ---
-                    if txn::try_handle_txn_begin(cmd, cmd_args, &mut conn, ctx, &mut responses) {
+                    if txn::try_handle_txn_begin(cmd, cmd_args, conn, ctx, &mut responses) {
                         continue;
                     }
-                    if txn::try_handle_txn_commit(cmd, cmd_args, &mut conn, ctx, &mut responses).await {
+                    if txn::try_handle_txn_commit(cmd, cmd_args, conn, ctx, &mut responses).await {
                         continue;
                     }
-                    if txn::try_handle_txn_abort(cmd, cmd_args, &mut conn, ctx, &mut responses)
+                    if txn::try_handle_txn_abort(cmd, cmd_args, conn, ctx, &mut responses)
                         .await
                     {
                         continue;
@@ -1695,18 +1688,18 @@ pub(crate) async fn handle_connection_sharded_inner<
                     }
 
                     // --- WS.* ---
-                    if write::try_handle_ws_command(cmd, cmd_args, &mut conn, ctx, &mut responses).await {
+                    if write::try_handle_ws_command(cmd, cmd_args, conn, ctx, &mut responses).await {
                         continue;
                     }
 
                     // --- MQ.* ---
-                    if write::try_handle_mq_command(cmd, cmd_args, &frame, &mut conn, ctx, &mut responses).await {
+                    if write::try_handle_mq_command(cmd, cmd_args, &frame, conn, ctx, &mut responses).await {
                         continue;
                     }
 
                     // --- MULTI / EXEC_CMD / DISCARD ---
                     let mut exec_publishes: Vec<crate::shard::exec_publish::ExecPublish> = Vec::new();
-                    if write::try_handle_multi_exec(cmd, cmd_args, &mut conn, ctx, &mut responses, &mut exec_publishes, &shutdown, &func_registry).await {
+                    if write::try_handle_multi_exec(cmd, cmd_args, conn, ctx, &mut responses, &mut exec_publishes, &shutdown, &func_registry).await {
                         // C2: a PUBLISH or SPUBLISH (moon#1043) queued inside MULTI
                         // fans out only now — after the transaction body has been
                         // applied — into its own namespace, and its placeholder in
@@ -1718,7 +1711,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                                 // security): a denied channel is patched with
                                 // NOPERM and never fanned out.
                                 let patched = match crate::server::conn::shared::conn_publish_channel_acl_deny(
-                                    &conn,
+                                    &*conn,
                                     &ctx.acl_table,
                                     &p.channel,
                                 ) {
@@ -1755,7 +1748,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                         // moves the protocol partway through the batch, and the
                         // replies produced before it must keep the old encoding.
                         crate::server::conn::shared::encode_response_batch(
-                            &mut conn,
+                            conn,
                             &responses,
                             &mut write_buf,
                         );
@@ -1861,7 +1854,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                     // queue (it used to execute immediately, fanning out before
                     // the transaction's writes were applied).
                     if !conn.in_multi
-                        && pubsub::try_handle_publish(cmd, cmd_args, &conn, ctx, &mut responses, &mut publish_batches)
+                        && pubsub::try_handle_publish(cmd, cmd_args, &*conn, ctx, &mut responses, &mut publish_batches)
                     {
                         continue;
                     }
@@ -1869,7 +1862,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                     // --- SUBSCRIBE / PSUBSCRIBE ---
                     if let Some(action) = pubsub::try_handle_subscribe(
                         cmd, cmd_args, &mut stream, &mut write_buf,
-                        &mut conn, ctx, &peer_addr, &mut responses,
+                        conn, ctx, &peer_addr, &mut responses,
                         &mut local_leg_write_idxs,
                     ).await {
                         match action {
@@ -1910,25 +1903,25 @@ pub(crate) async fn handle_connection_sharded_inner<
                     }
 
                     // --- SWAPDB: handler-layer intercept (needs async + multi-db access) ---
-                    if dispatch::try_handle_swapdb(cmd, cmd_args, &mut conn, ctx, shaped!())
+                    if dispatch::try_handle_swapdb(cmd, cmd_args, conn, ctx, shaped!())
                         .await
                     {
                         continue;
                     }
 
                     // --- Cross-shard aggregation: KEYS, SCAN, DBSIZE, RANDOMKEY ---
-                    if dispatch::try_handle_cross_shard_scan(cmd, cmd_args, &conn, ctx, shaped!()).await {
+                    if dispatch::try_handle_cross_shard_scan(cmd, cmd_args, &*conn, ctx, shaped!()).await {
                         continue;
                     }
 
                     // --- FT.* vector search commands ---
-                    if ft::try_handle_ft_command(cmd, cmd_args, &frame, &conn, ctx, &mut responses).await {
+                    if ft::try_handle_ft_command(cmd, cmd_args, &frame, &*conn, ctx, &mut responses).await {
                         continue;
                     }
 
                     // --- GRAPH.* graph commands ---
                     #[cfg(feature = "graph")]
-                    if write::try_handle_graph_command(cmd, cmd_args, &frame, &mut conn, ctx, &mut responses).await {
+                    if write::try_handle_graph_command(cmd, cmd_args, &frame, conn, ctx, &mut responses).await {
                         continue;
                     }
 
@@ -2789,7 +2782,7 @@ pub(crate) async fn handle_connection_sharded_inner<
 
                             // Unconditional slice path: ShardSlice is always initialized.
                             let write_outcome: WriteOutcome =
-                                crate::shard::slice::with_shard(|s| do_write(s, &mut conn));
+                                crate::shard::slice::with_shard(|s| do_write(s, conn));
                             // #455: the AOF record below can park on a full
                             // writer channel before it is enqueued; its fold
                             // epoch is read here, in the mutation's no-await
@@ -3612,7 +3605,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                 // protocol partway through the batch, and the replies produced
                 // before it must keep the old encoding.
                 crate::server::conn::shared::encode_response_batch(
-                    &mut conn,
+                    conn,
                     &responses,
                     &mut write_buf,
                 );
@@ -3642,7 +3635,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                 crate::server::conn::shared::publish_pubsub_counts(
                     &client_live,
                     &ctx.shard_pubsub(),
-                    &mut conn,
+                    conn,
                     ctx.cached_clock.ms(),
                 );
 
@@ -3790,24 +3783,9 @@ pub(crate) async fn handle_connection_sharded_inner<
         }
     }
 
-    // Phase 166: release any leaked cross-store TXN (client disconnected mid-txn).
-    // Idempotent: TXN.ABORT already takes() active_cross_txn so this is a no-op if abort ran.
-    // Closes T-161-05 — without this, a disconnect after TXN.BEGIN + SET would leak
-    // kv_intents and pin the key invisible for all subsequent readers.
-    if let Some(txn) = conn.active_cross_txn.take() {
-        // Box::pin (c10k future diet): this ~5.4 KB rollback state machine
-        // otherwise sits inline in EVERY connection future; boxing costs one
-        // alloc on the leaked-txn teardown path only.
-        // A refusal is counted by the pool and logged by `abort_logged`
-        // (moon#1285 review MINOR 5); there is no client left to tell.
-        let _refused = Box::pin(crate::server::conn::txn_abort::abort_logged(
-            ctx,
-            *txn,
-            None,
-            crate::server::conn::txn_abort::AbortCause::Disconnect,
-        ))
-        .await;
-    }
+    // Phase 166 / moon#1299: an open cross-store TXN is ended by the exit
+    // wrapper (`exit.rs`) after this body returns — on this path and on
+    // every early `return` above alike.
 
     // Detach from the MONITOR feed. A retained dead sink would keep the feed
     // formatting into a closed channel and keep `any_attached()` true, which
