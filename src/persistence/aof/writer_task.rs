@@ -22,13 +22,6 @@ use super::group_commit::{
 #[cfg(feature = "runtime-monoio")]
 use super::group_commit::{BatchBuf, GroupCommitSink, commit_group_commit_batch_with};
 
-/// User-space bytes a tokio AOF writer may hold between batches without a
-/// `flush()` into the kernel — the pre-moon#1187 `BufWriter` default
-/// capacity, i.e. the tail a SIGKILL can lose under `everysec`/`no` (the
-/// kernel page cache survives a process kill; a `BufWriter` does not).
-#[cfg(feature = "runtime-tokio")]
-const AOF_TOKIO_UNFLUSHED_TAIL_BOUND: usize = 8 * 1024;
-
 /// Capacity of the tokio writers' `BufWriter`: `tokio::fs::File`'s own
 /// per-operation maximum (tokio's `DEFAULT_MAX_BUF_SIZE`, 2 MiB). A
 /// `tokio::fs::File` hands at most that much to one blocking-pool hop,
@@ -38,8 +31,8 @@ const AOF_TOKIO_BUF_CAPACITY: usize = 2 * 1024 * 1024;
 
 /// The tokio writers' `BufWriter` (moon#1187): large enough that a batch
 /// reaches the kernel in one `tokio::fs` blocking-pool hop per 2 MiB instead
-/// of one per 8 KiB (~128 per 1 MiB batch). The durability bound is kept by
-/// the batch-end [`flush_tail_if_over_bound`], not by the capacity.
+/// of one per 8 KiB (~128 per 1 MiB batch). The capacity is not a durability
+/// bound: every batch ends with [`flush_batch_to_kernel`].
 ///
 /// Sized at [`AOF_TOKIO_BUF_CAPACITY`], not at a whole group-commit batch
 /// (moon#1226): it was `AOF_GROUP_COMMIT_MAX_BYTES` (8 MiB) per writer, one
@@ -52,20 +45,23 @@ fn aof_buf_writer<W: tokio::io::AsyncWrite>(file: W) -> tokio::io::BufWriter<W> 
     tokio::io::BufWriter::with_capacity(AOF_TOKIO_BUF_CAPACITY, file)
 }
 
-/// After a batch is buffered: push it to the kernel when more than
-/// [`AOF_TOKIO_UNFLUSHED_TAIL_BOUND`] bytes sit in user space, so a SIGKILL
-/// never loses more than the pre-moon#1187 8 KiB `BufWriter` could. A batch
-/// smaller than the bound stays buffered exactly as before.
+/// After a batch is buffered: push it to the kernel (moon#1266). A SIGKILL
+/// does not touch the kernel page cache, so once `write(2)` has returned the
+/// batch survives a process crash under every `appendfsync` policy — what
+/// redis guarantees by writing its AOF buffer before it sends the replies of
+/// an event-loop iteration. It used to stay in the `BufWriter` until 8 KiB
+/// had accumulated, and a SIGKILL took that tail with it.
+///
+/// `flush()` also waits for the write `tokio::fs::File` may still have in
+/// flight on the blocking pool (its `poll_write` returns before the write
+/// is done), so on `Ok` the bytes are in the kernel, not merely handed off.
+/// Cost: one blocking-pool hop per batch instead of one per 8 KiB.
 #[cfg(feature = "runtime-tokio")]
-async fn flush_tail_if_over_bound(
+async fn flush_batch_to_kernel(
     writer: &mut tokio::io::BufWriter<tokio::fs::File>,
 ) -> std::io::Result<()> {
     use tokio::io::AsyncWriteExt;
-    if writer.buffer().len() >= AOF_TOKIO_UNFLUSHED_TAIL_BOUND {
-        writer.flush().await
-    } else {
-        Ok(())
-    }
+    writer.flush().await
 }
 
 /// Idle-adaptive wake cadence for a background AOF writer's channel poll
@@ -877,12 +873,13 @@ pub async fn aof_writer_task(
                                 }
                             }
                             let do_fsync = matches!(fsync, FsyncPolicy::Always);
-                            // moon#1187: the batch reaches the kernel in one
-                            // hop; the user-space tail stays within the old
-                            // 8 KiB SIGKILL bound. (Always flushes below.)
+                            // moon#1266: the whole batch reaches the kernel
+                            // before the loop moves on — nothing acked stays
+                            // in user space for a SIGKILL to take. (Always
+                            // flushes below, before its fsync.)
                             if !write_failed
                                 && !do_fsync
-                                && let Err(e) = flush_tail_if_over_bound(&mut writer).await
+                                && let Err(e) = flush_batch_to_kernel(&mut writer).await
                             {
                                 error!("AOF batch flush error: {}", e);
                                 write_failed = true;
@@ -1440,11 +1437,11 @@ pub async fn per_shard_aof_writer_task(
                                     }
 
                                     let do_fsync = matches!(fsync, FsyncPolicy::Always);
-                                    // moon#1187: see the TopLevel tokio loop.
+                                    // moon#1266: see the TopLevel tokio loop.
                                     if !write_failed
                                         && !do_fsync
                                         && let Err(e) =
-                                            flush_tail_if_over_bound(&mut writer).await
+                                            flush_batch_to_kernel(&mut writer).await
                                     {
                                         error!(
                                             "AOF batch flush error shard {}: {}",
