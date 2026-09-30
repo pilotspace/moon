@@ -29,7 +29,7 @@
 //! `--dir`, and counts acked keys that did not come back. Every rep's count
 //! is printed. The assertion is the Option-3 property: the MEDIAN rep loses
 //! nothing and at most a quarter of the reps lose anything (before the fix
-//! the median rep lost 1-460 keys in every cell). `MOON_1266_STRICT=1`
+//! the median rep lost 1-1,100 keys in every cell). `MOON_1266_STRICT=1`
 //! asserts 0 lost in every rep — the bar for 1A.
 //!
 //! What this does NOT cover: power loss / OS crash (the page cache is lost
