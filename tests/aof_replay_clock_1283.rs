@@ -27,9 +27,12 @@
 //!
 //! Also here: a mixed old/new log (records without any `MOON.TS`, as an older
 //! binary wrote them, followed by records with it), a downgrade read (an
-//! older binary replaying a `MOON.TS`-bearing log) and a downgrade followed by
-//! a re-upgrade (an older binary APPENDING to a stamped log, R1 review), the
-//! last two gated on `MOON_DOWNGRADE_BIN`.
+//! older binary replaying a `MOON.TS`-bearing log, clean-close marker
+//! included) and a downgrade followed by a re-upgrade (an older binary
+//! APPENDING to a stamped log after a clean stop, R1/R2 review), the last two
+//! gated on `MOON_DOWNGRADE_BIN`; the R2 review's positional rule: the file's
+//! last clock tick is never re-judged by a moved mtime (NEW-A), and a pure
+//! new-binary lifecycle never leaves a foreign segment.
 //!
 //! Pin the binary for a specific runtime:
 //! `MOON_BIN=<moon> cargo test --test aof_replay_clock_1283 -- --include-ignored`.
@@ -38,8 +41,9 @@
 
 mod common;
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use common::{Conn, ServerGuard};
 
@@ -282,6 +286,30 @@ fn shift_aof_mtimes(dir: &Path, delta: Duration, back: bool) -> usize {
 fn stop(server: &mut ServerGuard, port: u16) {
     server.kill_now();
     common::wait_for_port_down(port);
+}
+
+/// A graceful stop: `SHUTDOWN`, then wait for the process to exit (the
+/// writers' final sync, and their clean-close marker, happen before it).
+fn shutdown(server: &mut ServerGuard, port: u16) {
+    let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
+    s.write_all(&common::encode(&["SHUTDOWN"]))
+        .expect("SHUTDOWN");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while server.as_mut().try_wait().expect("try_wait").is_none() {
+        assert!(Instant::now() < deadline, "SHUTDOWN did not exit in 30 s");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let _ = server.take();
+    common::wait_for_port_down(port);
+}
+
+/// Stop gracefully or with a kill -9.
+fn stop_as(server: &mut ServerGuard, port: u16, graceful: bool) {
+    if graceful {
+        shutdown(server, port);
+    } else {
+        stop(server, port);
+    }
 }
 
 /// Whether `dir` holds an AOF base with seq > 1 (a completed rewrite).
@@ -588,6 +616,81 @@ fn count_ts(data: &[u8]) -> usize {
         .count()
 }
 
+/// The kind of one log record, for the positional checks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Rec {
+    Stamp,
+    Close,
+    Data,
+}
+
+/// The records of an AOF command log (a per-shard framed incr, a multi-part
+/// RESP incr, or a flat `appendonly.aof` with no RDB preamble), classified;
+/// `None` for any other file (a base, the manifest, a preamble file).
+fn classify_records(path: &Path) -> Option<Vec<Rec>> {
+    let name = path.file_name()?.to_string_lossy().to_string();
+    if !(name.ends_with(".incr.aof") || name == "appendonly.aof") {
+        return None;
+    }
+    let data = std::fs::read(path).expect("read AOF file");
+    if data.starts_with(b"MOON") || data.starts_with(b"REDIS") {
+        return None;
+    }
+    let kind = |payload: &[u8]| -> Option<(Rec, usize)> {
+        let (first, used) = resp_array(payload)?;
+        if !first.eq_ignore_ascii_case(b"MOON.TS") {
+            return Some((Rec::Data, used));
+        }
+        let three = payload.starts_with(b"*3\r\n");
+        Some((if three { Rec::Close } else { Rec::Stamp }, used))
+    };
+    let mut out = Vec::new();
+    let mut at = 0;
+    if data.first() != Some(&b'*') {
+        // Framed: `[u64 lsn][u32 len][RESP]`.
+        while at < data.len() {
+            let hdr = data.get(at..at + 12)?;
+            let len = u32::from_le_bytes(hdr[8..12].try_into().unwrap()) as usize;
+            let (rec, used) = kind(data.get(at + 12..at + 12 + len)?)?;
+            assert_eq!(used, len, "{}: one record per frame", path.display());
+            out.push(rec);
+            at += 12 + len;
+        }
+        return Some(out);
+    }
+    while at < data.len() {
+        let (rec, used) = kind(&data[at..])?;
+        out.push(rec);
+        at += used;
+    }
+    Some(out)
+}
+
+/// The positional invariant this binary keeps (R2 review of moon#1283):
+/// every clean-close marker is followed by a stamp (a later session's, or
+/// another `CLOSE`) or by the end of the file — never by a data record.
+/// Returns the number of markers seen.
+fn assert_no_foreign_segment(dir: &Path, what: &str) -> usize {
+    let mut closes = 0;
+    for p in aof_files(dir) {
+        let Some(recs) = classify_records(&p) else {
+            continue;
+        };
+        for (i, r) in recs.iter().enumerate() {
+            if *r == Rec::Close {
+                closes += 1;
+                assert_ne!(
+                    recs.get(i + 1),
+                    Some(&Rec::Data),
+                    "{what}: {} has a data record right after clean-close marker #{i}: {recs:?}",
+                    p.display()
+                );
+            }
+        }
+    }
+    closes
+}
+
 #[test]
 #[ignore = "real-server: run with --include-ignored and MOON_BIN pinned"]
 fn moon_1283_mixed_old_new_log_s1() {
@@ -651,7 +754,9 @@ fn downgrade_read(shards: usize) {
     let mut c = Conn::open(port);
     let work = write_workload(&mut c, "");
     drop(c);
-    stop(&mut server, port);
+    // Graceful: the log ends in the clean-close marker the old binary must
+    // skip too (R2 review of moon#1283).
+    shutdown(&mut server, port);
     let ts: usize = aof_files(dir)
         .iter()
         .map(|p| count_ts(&std::fs::read(p).unwrap()))
@@ -659,6 +764,10 @@ fn downgrade_read(shards: usize) {
     assert!(
         ts > 0,
         "the new binary wrote no MOON.TS: nothing to downgrade-read"
+    );
+    assert!(
+        assert_no_foreign_segment(dir, "downgrade read") >= 1,
+        "a graceful stop leaves a clean-close marker"
     );
     sleep_until_ms(work.down_deadline_ms + 300);
 
@@ -706,21 +815,25 @@ fn k_keys(c: &mut Conn, n: usize) -> Vec<(String, i64)> {
         .collect()
 }
 
-/// This binary writes stamps; an older binary (`MOON_DOWNGRADE_BIN`, a build
-/// that predates moon#1283) then appends to the same log with none — 400
-/// keys `SET … PX 1000`, then `INCR`s hammered across the expiry instant, so
-/// most keys are lazily expired and restarted at 1 by an `INCR` with no `DEL`
-/// logged first (moon#542) — and this binary boots on the result. Every key
-/// that existed live must exist after the re-upgrade (and persistent, as
-/// every surviving key is an `INCR`-restarted counter). The log's last stamp
-/// is seconds older than the old binary's writes; judged by it, every
-/// restarted key replayed onto its old value and old deadline and was lost
-/// (R1 review: 299–325 of ~300 keys missing).
+/// This binary writes stamps and is stopped CLEANLY (the documented
+/// procedure: its clean-close marker ends the file); an older binary
+/// (`MOON_DOWNGRADE_BIN`, a build that predates moon#1283) then appends to
+/// the same log with none — 400 keys `SET … PX 1000`, then `INCR`s hammered
+/// across the expiry instant, so most keys are lazily expired and restarted
+/// at 1 by an `INCR` with no `DEL` logged first (moon#542) — and this binary
+/// boots on the result. Every key that existed live must exist after the
+/// re-upgrade (and persistent, as every surviving key is an `INCR`-restarted
+/// counter): judged by the stale stamp, every restarted key replayed onto its
+/// old value and old deadline and was lost (R1 review: 299–325 of ~300 keys
+/// missing).
 ///
-/// Then one more restart after the re-upgraded server has written its own
-/// stamped records behind that tail: the boot-time rewrite the re-upgrade
-/// triggered must have folded the tail, so nothing is lost there either.
-fn downgrade_then_reupgrade(shards: usize) {
+/// Then the R2 review's residual: ONE write right after the re-upgrade boot,
+/// and a restart at once — `graceful` or kill -9 — with no rewrite in
+/// between. The older binary's records are no longer the file's tail, and
+/// must still be judged as a foreign segment (R2: 299–351 keys lost when the
+/// rule depended on a boot-time rewrite committing first). Then one more
+/// restart after more writes. No AOF rewrite may be needed for any of it.
+fn downgrade_then_reupgrade(shards: usize, graceful: bool) {
     let Some(old) = std::env::var_os("MOON_DOWNGRADE_BIN").map(PathBuf::from) else {
         eprintln!(
             "MOON_DOWNGRADE_BIN unset: the downgrade-then-re-upgrade test is skipped. Point it \
@@ -738,13 +851,13 @@ fn downgrade_then_reupgrade(shards: usize) {
     let tmp = tempfile::tempdir().expect("tempdir");
     let dir = tmp.path();
 
-    // 1. This binary: a stamped log.
+    // 1. This binary: a stamped log, stopped cleanly.
     let (mut server, port) = spawn_bin(&bin, dir, shards);
     let mut c = Conn::open(port);
     assert_reply(&mut c, &["SET", "seed", "1"], "+OK\r\n");
     std::thread::sleep(Duration::from_millis(1_200));
     drop(c);
-    stop(&mut server, port);
+    shutdown(&mut server, port);
 
     // 2. The older binary appends, unstamped.
     let (mut server, port) = spawn_bin(&old, dir, shards);
@@ -806,28 +919,29 @@ fn downgrade_then_reupgrade(shards: usize) {
         live.len(),
     );
 
-    // 4. The re-upgrade asked for one rewrite; once it is done, write behind
-    // the old tail and restart again.
-    let deadline = std::time::Instant::now() + Duration::from_secs(60);
-    loop {
-        let idle = c
-            .send(&["INFO", "persistence"])
-            .contains("aof_rewrite_in_progress:0");
-        let done = compacted_bases(dir);
-        if idle && (done == shards || done == 1) {
-            break;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "the re-upgrade's boot-time AOF rewrite did not complete within 60 s ({done} bases)"
-        );
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    for i in 0..20 {
+    // 4. One write right away, then a restart at once (R2 residual).
+    assert_reply(&mut c, &["SET", "post:0", "v"], "+OK\r\n");
+    drop(c);
+    stop_as(&mut server, port, graceful);
+    let (mut server, port) = spawn_bin(&bin, dir, shards);
+    let mut c = Conn::open(port);
+    let again = k_keys(&mut c, N);
+    let missing: Vec<_> = live.iter().filter(|k| !again.contains(k)).collect();
+    assert!(
+        missing.is_empty(),
+        "new -> old -> new, one SET, {} restart, --shards {shards}: {}/{} live keys missing \
+         or with a TTL: {missing:?}",
+        if graceful { "graceful" } else { "kill -9" },
+        missing.len(),
+        live.len(),
+    );
+
+    // 5. More writes, one more restart: the rule is permanent.
+    for i in 1..20 {
         assert_reply(&mut c, &["SET", &format!("post:{i}"), "v"], "+OK\r\n");
     }
     drop(c);
-    stop(&mut server, port);
+    shutdown(&mut server, port);
     let (_server, port) = spawn_bin(&bin, dir, shards);
     let mut c = Conn::open(port);
     let again = k_keys(&mut c, N);
@@ -835,20 +949,163 @@ fn downgrade_then_reupgrade(shards: usize) {
     assert!(
         missing.is_empty(),
         "new -> old -> new -> new, --shards {shards}: {}/{} live keys missing or with a TTL \
-         on the boot after the re-upgrade: {missing:?}",
+         on the third boot: {missing:?}",
         missing.len(),
         live.len(),
+    );
+    for i in 0..20 {
+        assert_eq!(
+            bulk(&c.send(&["GET", &format!("post:{i}")])).as_deref(),
+            Some("v")
+        );
+    }
+    assert_eq!(
+        compacted_bases(dir),
+        0,
+        "no AOF rewrite is needed (nor may one be forced) for the rule to hold"
     );
 }
 
 #[test]
 #[ignore = "real-server: run with --include-ignored, MOON_BIN and MOON_DOWNGRADE_BIN pinned"]
 fn moon_1283_downgrade_then_reupgrade_s1() {
-    downgrade_then_reupgrade(1);
+    downgrade_then_reupgrade(1, true);
 }
 
 #[test]
 #[ignore = "real-server: run with --include-ignored, MOON_BIN and MOON_DOWNGRADE_BIN pinned"]
 fn moon_1283_downgrade_then_reupgrade_s4() {
-    downgrade_then_reupgrade(4);
+    downgrade_then_reupgrade(4, true);
+}
+
+#[test]
+#[ignore = "real-server: run with --include-ignored, MOON_BIN and MOON_DOWNGRADE_BIN pinned"]
+fn moon_1283_downgrade_then_reupgrade_then_kill9_s1() {
+    downgrade_then_reupgrade(1, false);
+}
+
+#[test]
+#[ignore = "real-server: run with --include-ignored, MOON_BIN and MOON_DOWNGRADE_BIN pinned"]
+fn moon_1283_downgrade_then_reupgrade_then_kill9_s4() {
+    downgrade_then_reupgrade(4, false);
+}
+
+// ── R2 review: the positional rule ───────────────────────────────────────────
+
+/// NEW-A (R2 review): `SET k 10 PX 600; INCR k`, a stop (kill -9, or
+/// graceful), the TTL passes while down, and the AOF's mtime moves forward
+/// (a `touch`, a `cp` restore). Nothing in the file is another binary's, so
+/// `k` is judged by its own stamp — `11` with its deadline, expired — and
+/// is absent. A rule that re-judged the file's last clock tick by the mtime
+/// resurrected it as a persistent `1`.
+fn touch_forward_last_tick(shards: usize) {
+    let bin = common::find_moon_binary();
+    for graceful in [false, true] {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path();
+        let (mut server, port) = spawn_bin(&bin, dir, shards);
+        let mut c = Conn::open(port);
+        let mut keys = Vec::new();
+        for i in 0..8 {
+            let k = format!("k{i}");
+            assert_reply(&mut c, &["SET", &k, "10", "PX", "600"], "+OK\r\n");
+            assert_reply(&mut c, &["INCR", &k], ":11\r\n");
+            keys.push((k, Want::Absent));
+        }
+        drop(c);
+        std::thread::sleep(Duration::from_millis(100));
+        stop_as(&mut server, port, graceful);
+        std::thread::sleep(Duration::from_millis(2_000));
+        shift_aof_mtimes(dir, HOUR, false);
+        let (_server, port) = spawn_bin(&bin, dir, shards);
+        let mut c = Conn::open(port);
+        let wrong = wrong_keys(&mut c, &keys);
+        assert!(
+            wrong.is_empty(),
+            "NEW-A, --shards {shards}, {} stop, {}: {}/{} keys wrong after moving the AOF \
+             mtime forward (key, want, GET, PTTL): {wrong:#?}",
+            if graceful { "graceful" } else { "kill -9" },
+            bin.display(),
+            wrong.len(),
+            keys.len(),
+        );
+    }
+}
+
+#[test]
+#[ignore = "real-server: run with --include-ignored and MOON_BIN pinned"]
+fn moon_1283_touchforward_never_rejudges_the_last_tick_s1() {
+    touch_forward_last_tick(1);
+}
+
+#[test]
+#[ignore = "real-server: run with --include-ignored and MOON_BIN pinned"]
+fn moon_1283_touchforward_never_rejudges_the_last_tick_s4() {
+    touch_forward_last_tick(4);
+}
+
+/// A pure new-binary lifecycle (R2 review `q1`): boots stopped gracefully,
+/// by kill -9, and twice with nothing written in between. Every clean-close
+/// marker in the log is followed by a stamp or the end of the file — the
+/// positional rule never engages — and every key keeps its verdict.
+fn pure_lifecycle(shards: usize) {
+    let bin = common::find_moon_binary();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let dir = tmp.path();
+    let (mut server, port) = spawn_bin(&bin, dir, shards);
+    let mut c = Conn::open(port);
+    let work = write_workload(&mut c, "");
+    let mut keys = work.keys;
+    drop(c);
+    shutdown(&mut server, port);
+    // (graceful?, write before the stop?)
+    for (round, (graceful, write)) in [(false, true), (true, true), (true, false), (true, false)]
+        .into_iter()
+        .enumerate()
+    {
+        let (mut server, port) = spawn_bin(&bin, dir, shards);
+        let mut c = Conn::open(port);
+        if write {
+            for i in 0..10 {
+                let k = format!("r{round}:{i}");
+                assert_reply(&mut c, &["SET", &k, "v"], "+OK\r\n");
+                keys.push((k, Want::Persistent("v")));
+            }
+        }
+        drop(c);
+        stop_as(&mut server, port, graceful);
+    }
+    let closes = assert_no_foreign_segment(dir, &format!("pure lifecycle, --shards {shards}"));
+    assert!(
+        closes >= 4 * shards,
+        "4 graceful stops leave a clean-close marker in each of the {shards} logs: found \
+         {closes}"
+    );
+    sleep_until_ms(work.down_deadline_ms + 300);
+    let (_server, port) = spawn_bin(&bin, dir, shards);
+    let mut c = Conn::open(port);
+    let wrong = wrong_keys(&mut c, &keys);
+    assert!(
+        wrong.is_empty(),
+        "pure lifecycle, --shards {shards}: {}/{} keys wrong: {wrong:#?}",
+        wrong.len(),
+        keys.len()
+    );
+    let log = std::fs::read_to_string(dir.join("server.err")).unwrap_or_default();
+    assert!(
+        !log.contains("another binary appended"),
+        "a pure lifecycle must never engage the foreign-segment rule"
+    );
+}
+
+#[test]
+#[ignore = "real-server: run with --include-ignored and MOON_BIN pinned"]
+fn moon_1283_a_pure_lifecycle_leaves_no_foreign_segment_s1() {
+    pure_lifecycle(1);
+}
+
+#[test]
+#[ignore = "real-server: run with --include-ignored and MOON_BIN pinned"]
+fn moon_1283_a_pure_lifecycle_leaves_no_foreign_segment_s4() {
+    pure_lifecycle(4);
 }
