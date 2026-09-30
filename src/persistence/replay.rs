@@ -28,6 +28,8 @@ pub(crate) mod chunks;
 pub mod clock;
 /// Replay-only `MOON.*` pseudo-commands and their intercept (moon#1283).
 pub mod pseudo;
+/// Marks a replay on this thread: expiries it causes are not counted (moon#1286).
+pub(crate) mod scope;
 
 /// Parse a Frame as an unsigned integer (BulkString or Integer).
 #[inline]
@@ -354,6 +356,9 @@ impl CommandReplayEngine for DispatchReplayEngine {
         args: &[Frame],
         selected_db: &mut usize,
     ) -> ReplayRoute {
+        // moon#1286: nothing this record reaps is counted in `expired_keys`;
+        // the live server counted it when it happened.
+        let _replaying = scope::ReplayScope::enter();
         // moon#1283: every `MOON.*` pseudo-command (the clock stamps, the
         // cold-plane cut records) is applied here, FIRST — before anything
         // that could skip a data record — and never reaches dispatch.
