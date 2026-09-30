@@ -11,6 +11,21 @@ use super::*;
 /// that window lost acknowledged writes under everysec.
 const AOF_WARM_POLL_STEP: std::time::Duration = std::time::Duration::from_micros(100);
 
+/// [`AOF_WARM_POLL_STEP`], or `MOON_AOF_WARM_POLL_US` (10..=50,000 µs) — a
+/// diagnostic override for same-binary A/B runs of the step's trade-off: a
+/// shorter step narrows the kill -9 window, a longer one costs fewer writer
+/// wake-ups (`docs/internal/env-knobs.md`). Read once per process.
+fn warm_poll_step() -> std::time::Duration {
+    static STEP: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
+    *STEP.get_or_init(|| {
+        std::env::var("MOON_AOF_WARM_POLL_US")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .map(|us| std::time::Duration::from_micros(us.clamp(10, 50_000)))
+            .unwrap_or(AOF_WARM_POLL_STEP)
+    })
+}
+
 /// How long the writer keeps polling at [`AOF_WARM_POLL_STEP`] after its
 /// last message before it parks on the channel instead.
 const AOF_WARM_POLL_SPAN: std::time::Duration = std::time::Duration::from_millis(5);
@@ -60,7 +75,7 @@ fn poll_recv(
                 if now >= warm_until {
                     return rx.recv_timeout(deadline - now);
                 }
-                std::thread::sleep(AOF_WARM_POLL_STEP);
+                std::thread::sleep(warm_poll_step());
             }
         }
     }
