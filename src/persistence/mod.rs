@@ -23,6 +23,7 @@ pub mod redis_rdb;
 pub mod replay;
 pub mod snapshot;
 pub mod snapshot_cow;
+pub mod snapshot_request;
 /// Off-shard-thread writer for the incremental snapshot (moon#1186).
 pub(crate) mod snapshot_stream;
 pub mod vec_undo;

@@ -332,6 +332,9 @@ fn monitor_loop(
     let mut saw_in_progress = false;
     let mut forced_pending = force_once;
     let mut last_reclaim_rewrite: Option<std::time::Instant> = None;
+    // moon#1289: the last fold dispatched for held files that waited for
+    // nothing; the next one is one `held_release::spacing` away.
+    let mut last_held_release: Option<std::time::Instant> = None;
     // Compactions waiting at the previous tick, and since when some have.
     let mut prev_awaiting = 0usize;
     let mut awaiting_since: Option<std::time::Instant> = None;
@@ -363,7 +366,15 @@ fn monitor_loop(
             || std::time::Instant::now() < cooldown_until;
         let base = AOF_BASE_SIZE.load(Ordering::Relaxed);
         let compactions = crate::storage::tiered::cold_reclaim::awaiting_fold();
-        let held = crate::storage::tiered::cold_reclaim::held_files_pressure();
+        let held_ledger = crate::storage::tiered::cold_reclaim::held_files_pressure();
+        // moon#1289: a database whose held files have waited several sweeps
+        // with no fold coming asks for one, whatever the ledger says. Spaced,
+        // because a fold rewrites the whole base and files that die faster
+        // than folds cover them would otherwise fold back to back.
+        let held_stale_due = crate::storage::tiered::held_release::stale_databases() > 0
+            && last_held_release
+                .is_none_or(|t| t.elapsed() >= crate::storage::tiered::held_release::spacing());
+        let held = held_ledger + usize::from(held_stale_due);
         let awaiting = compactions + held;
         if awaiting == 0 {
             awaiting_since = None;
@@ -398,6 +409,10 @@ fn monitor_loop(
             ),
             RewriteTrigger::ColdReclaim => {
                 last_reclaim_rewrite = Some(std::time::Instant::now());
+                if held_stale_due {
+                    last_held_release = last_reclaim_rewrite;
+                    crate::storage::tiered::held_release::note_fold_requested();
+                }
                 awaiting_since = None;
                 info!(
                     "aof-auto-rewrite: triggering BGREWRITEAOF so {} compacted cold spill \

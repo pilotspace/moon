@@ -191,6 +191,9 @@ pub struct ReclaimState {
     /// Whether this database counts in [`HELD_FILES_PRESSURE`] (see
     /// [`ColdIndex::note_held_files_pressure`]).
     held_signal: bool,
+    /// moon#1289: how long a held file has waited for a fold that no one
+    /// asked for ([`super::held_release`]).
+    pub(super) held_wait: super::held_release::HeldWait,
 }
 
 impl Drop for ReclaimState {
