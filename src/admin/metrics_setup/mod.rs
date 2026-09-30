@@ -712,10 +712,24 @@ pub fn record_expired_key() {
     record_expired_keys(1);
 }
 
+/// Whether an expiry on this thread counts toward `expired_keys`.
+///
+/// Not while a replica applies its master's stream (the master decided; a
+/// replica expires nothing of its own — `expireIfNeeded` for the master
+/// client), and not while a log is replayed (redis counts nothing while
+/// loading; the live server already counted each logged reap, moon#1286).
+/// Two thread-local loads.
+#[inline]
+pub fn counts_expiry() -> bool {
+    !crate::persistence::replay::scope::replaying()
+        && !crate::replication::apply::applying_master_stream()
+}
+
 /// Record `n` expired keys at once (a batch reclaim, e.g. the cold TTL sweep).
+/// Nothing is recorded where [`counts_expiry`] says no.
 #[inline]
 pub fn record_expired_keys(n: u64) {
-    if n > 0 {
+    if n > 0 && counts_expiry() {
         bump_hot(|s| &s.expired_keys, n);
         #[cfg(test)]
         THREAD_EXPIRED.with(|c| c.set(c.get() + n));
