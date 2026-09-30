@@ -109,6 +109,37 @@ pub(super) fn sync_gate_for_test() {
     }
 }
 
+/// Settles an agent's taken job as FAILED if the agent thread unwinds before
+/// it reaches `finish` (disarmed with `mem::forget` on the normal path). The
+/// writer then learns the failure at its next claim, finds the agent gone
+/// (the send fails) and fsyncs inline — the hand-off never sticks IN_FLIGHT.
+/// It drives the same `finish` transition as the normal path, so the
+/// loom-modeled state machine is unchanged.
+struct SettleOnUnwind<'a> {
+    handoff: &'a FsyncHandoff,
+    in_flight: &'a std::sync::atomic::AtomicU64,
+    dead: &'a std::sync::atomic::AtomicBool,
+    writer_idx: usize,
+}
+
+impl Drop for SettleOnUnwind<'_> {
+    fn drop(&mut self) {
+        self.in_flight
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        tracing::error!(
+            "AOF everysec fsync agent (writer {}) died mid-fsync; the writer fsyncs inline \
+             from now on",
+            self.writer_idx
+        );
+        super::record_everysec_fsync_result(self.writer_idx, false);
+        // Before `finish` releases IDLE: a writer that claims next sees the
+        // agent dead and never sends a job the dying thread's still-open
+        // channel would swallow.
+        self.dead.store(true, std::sync::atomic::Ordering::Release);
+        self.handoff.finish(false);
+    }
+}
+
 /// One writer's fsync agent thread.
 struct AofFsyncAgent {
     /// The dup to fsync, and whether a success clears the writer's `err`
@@ -118,6 +149,8 @@ struct AofFsyncAgent {
     /// [`mono_ms`] when the fsync in flight was handed over; 0 when none.
     /// Registered in [`IN_FLIGHT_SLOTS`] for INFO.
     in_flight_since: Arc<std::sync::atomic::AtomicU64>,
+    /// Set by [`SettleOnUnwind`]: the agent thread is gone.
+    dead: Arc<std::sync::atomic::AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -138,12 +171,24 @@ impl AofFsyncAgent {
         let agent_handoff = Arc::clone(&handoff);
         let in_flight_since = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let agent_in_flight = Arc::clone(&in_flight_since);
+        let dead = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let agent_dead = Arc::clone(&dead);
         let name = format!("aof-fsync-{writer_idx}");
         let thread = std::thread::Builder::new()
             .name(name.clone())
             .spawn(move || {
                 crate::shard::numa::pin_current_aux_thread(&name);
                 while let Ok((file, heals)) = rx.recv() {
+                    // R1 review NIT: an unwind between here and `finish`
+                    // must not leave the hand-off IN_FLIGHT forever (every
+                    // later deadline would be postponed, with no inline
+                    // fallback): the guard settles it as a failure.
+                    let unwind = SettleOnUnwind {
+                        handoff: &agent_handoff,
+                        in_flight: &agent_in_flight,
+                        dead: &agent_dead,
+                        writer_idx,
+                    };
                     sync_gate_for_test();
                     let t = Instant::now();
                     let result = backend(&file);
@@ -175,6 +220,7 @@ impl AofFsyncAgent {
                         }
                     }
                     // Outcome recorded first: a writer that sees IDLE sees it.
+                    std::mem::forget(unwind);
                     agent_handoff.finish(result.is_ok());
                 }
             })?;
@@ -183,6 +229,7 @@ impl AofFsyncAgent {
             tx,
             handoff,
             in_flight_since,
+            dead,
             thread: Some(thread),
         })
     }
@@ -461,6 +508,13 @@ impl EverysecSync {
         let Some(agent) = self.agent.as_ref() else {
             return false;
         };
+        // The agent died (its unwind guard settled the last job): release
+        // the claim and drop it, so every later deadline fsyncs inline.
+        if agent.dead.load(std::sync::atomic::Ordering::Acquire) {
+            agent.handoff.abort();
+            self.agent = None;
+            return false;
+        }
         // Set before the send: the agent clears it once the fsync returns,
         // which must never be overtaken by this store.
         agent
@@ -811,6 +865,38 @@ mod tests {
         s.backdate(EVERYSEC);
         assert_eq!(s.claim(), Claim::Owned);
         assert!(s.dispatch(file()));
+    }
+
+    /// R1 review NIT: an agent that unwinds mid-fsync settles its job as a
+    /// failure instead of leaving the hand-off IN_FLIGHT; the writer then
+    /// falls back to inline fsyncs.
+    #[test]
+    fn an_agent_that_unwinds_mid_fsync_does_not_stick_the_handoff() {
+        let mut s = EverysecSync::with_backend(60, |_f: &std::fs::File| -> std::io::Result<()> {
+            panic!("injected agent panic (expected in this test)")
+        });
+        let handoff = Arc::clone(&s.agent.as_ref().expect("agent").handoff);
+        s.note_written();
+        s.backdate(EVERYSEC);
+        assert_eq!(s.claim(), Claim::Owned);
+        assert!(s.dispatch(file()));
+        wait_until("the dying agent to settle its job", || {
+            handoff.settled() == 1
+        });
+        assert!(!handoff.in_flight(), "never stuck IN_FLIGHT");
+        assert!(handoff.last_failed());
+        s.last_handoff = Instant::now() - EVERYSEC;
+        assert!(s.due(), "the failure keeps the deadline armed");
+        assert_eq!(s.claim(), Claim::Owned, "not postponed forever");
+        // The agent is gone: the claim is released, the caller fsyncs
+        // inline, and every later deadline is inline too.
+        assert!(!s.dispatch(file()), "a dead agent must refuse the job");
+        assert!(!handoff.in_flight());
+        s.inline_done(true);
+        s.backdate(EVERYSEC);
+        assert_eq!(s.claim(), Claim::Inline);
+        s.inline_done(true);
+        super::super::record_everysec_fsync_result(60, true);
     }
 
     #[test]

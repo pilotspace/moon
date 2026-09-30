@@ -23,11 +23,21 @@ const AOF_WARM_POLL_STEP: std::time::Duration = std::time::Duration::from_micros
 fn warm_poll_step() -> std::time::Duration {
     static STEP: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
     *STEP.get_or_init(|| {
-        std::env::var("MOON_AOF_WARM_POLL_US")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .map(|us| std::time::Duration::from_micros(us.clamp(10, 50_000)))
-            .unwrap_or(AOF_WARM_POLL_STEP)
+        let Ok(v) = std::env::var("MOON_AOF_WARM_POLL_US") else {
+            return AOF_WARM_POLL_STEP;
+        };
+        match v.trim().parse::<u64>() {
+            Ok(us) => std::time::Duration::from_micros(us.clamp(10, 50_000)),
+            Err(_) => {
+                // Once per process (this runs inside the OnceLock init).
+                tracing::warn!(
+                    "MOON_AOF_WARM_POLL_US={v:?} is not a number of microseconds; using the \
+                     default {} us",
+                    AOF_WARM_POLL_STEP.as_micros()
+                );
+                AOF_WARM_POLL_STEP
+            }
+        }
     })
 }
 
@@ -80,7 +90,9 @@ fn poll_recv(
                 if now >= warm_until {
                     return rx.recv_timeout(deadline - now);
                 }
-                std::thread::sleep(warm_poll_step());
+                // Never past the span (a large MOON_AOF_WARM_POLL_US step
+                // used to overshoot it, and the deadline with it).
+                std::thread::sleep(warm_poll_step().min(warm_until - now));
             }
         }
     }
