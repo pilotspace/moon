@@ -192,6 +192,14 @@ pub fn started(reason: SnapshotReason) -> u64 {
     STARTED[reason.index()].load(Ordering::Relaxed)
 }
 
+/// `CONFIG RESETSTAT`: zero the per-reason started / deferred statistics.
+/// The gate's spacing slot is state, not a statistic, and is kept.
+pub fn reset_stats() {
+    for counter in STARTED.iter().chain(DEFERRED.iter()) {
+        counter.store(0, Ordering::Relaxed);
+    }
+}
+
 /// Requests for `reason` deferred because a transaction was open (INFO).
 #[must_use]
 pub fn deferred_for_open_txn(reason: SnapshotReason) -> u64 {

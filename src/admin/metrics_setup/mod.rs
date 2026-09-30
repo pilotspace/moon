@@ -712,6 +712,15 @@ pub fn record_expired_key() {
     record_expired_keys(1);
 }
 
+/// `CONFIG RESETSTAT`: zero `expired_keys` (redis `resetServerStats`
+/// resets `stat_expiredkeys`). Every slot is stored; an increment racing
+/// the reset lands before or after it, as with redis's single field.
+pub fn reset_expired_keys() {
+    for slot in &HOT_COUNTERS {
+        slot.expired_keys.store(0, Ordering::Relaxed);
+    }
+}
+
 /// Whether an expiry on this thread counts toward `expired_keys`.
 ///
 /// Not while a replica applies its master's stream (the master decided; a

@@ -106,6 +106,12 @@ pub fn folds_requested() -> u64 {
     FOLDS_REQUESTED.load(Ordering::Relaxed)
 }
 
+/// `CONFIG RESETSTAT`: zero `cold_held_release_folds_requested` (a
+/// statistic; `cold_held_files_stale_databases` is a gauge and is kept).
+pub fn reset_stats() {
+    FOLDS_REQUESTED.store(0, Ordering::Relaxed);
+}
+
 /// The auto-rewrite monitor dispatched a fold because of a stale database.
 pub fn note_fold_requested() {
     FOLDS_REQUESTED.fetch_add(1, Ordering::Relaxed);

@@ -28,6 +28,10 @@
 //!   EX -1` answered "value is not an integer" where redis says "invalid
 //!   expire time in 'getex' command".
 //!
+//! - **`CONFIG RESETSTAT` (finding 5):** redis's `resetServerStats` zeroes
+//!   `expired_keys`; f766fc2's RESETSTAT was a placeholder that reset
+//!   nothing. WS36's `txn_conflicts_refused` statistic is reset with it.
+//!
 //! Expected values were captured from redis 7.2.7 with the same commands.
 //!
 //! `MOON_BIN=<moon> cargo test --test expired_keys_parity_1286 -- --include-ignored`
@@ -681,4 +685,54 @@ fn a_past_absolute_deadline_deletes_without_counting_1_shard() {
 #[ignore = "real-server suite: MOON_BIN pinned"]
 fn a_past_absolute_deadline_deletes_without_counting_4_shards() {
     past_deadline_matrix(4);
+}
+
+// ---------------------------------------------------------------------------
+// Finding 5: CONFIG RESETSTAT
+// ---------------------------------------------------------------------------
+
+fn info_u64(c: &mut Conn, field: &str) -> Option<u64> {
+    let info = c.send(&["INFO", "all"]);
+    let prefix = format!("{field}:");
+    info.lines()
+        .find_map(|l| l.strip_prefix(prefix.as_str()))
+        .and_then(|v| v.trim().parse().ok())
+}
+
+#[test]
+#[ignore = "real-server suite: MOON_BIN pinned"]
+fn config_resetstat_zeroes_expired_keys() {
+    let dir = common::unique_test_dir("moon-1286-resetstat");
+    let (mut guard, port) = spawn(&dir, 1, false);
+    let mut c = Conn::open(port);
+    each(&mut c, 50, "r", &["SET"], &["v", "PX", "20"]);
+    let before = wait_for(&mut c, 50);
+    // A write refused because an open TXN holds the key: one conflict.
+    let mut t = Conn::open(port);
+    assert_eq!(t.send(&["TXN", "BEGIN"]), "+OK\r\n");
+    assert_eq!(t.send(&["SET", "held", "txn"]), "+OK\r\n");
+    let refused = c.send(&["SET", "held", "other"]);
+    let conflicts = info_u64(&mut c, "txn_conflicts_refused");
+    assert_eq!(t.send(&["TXN", "ABORT"]), "+OK\r\n");
+    let reset = c.send(&["CONFIG", "RESETSTAT"]);
+    let after = expired_keys(&mut c);
+    let conflicts_after = info_u64(&mut c, "txn_conflicts_refused");
+    guard.kill_now();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(before, 50, "precondition");
+    assert!(
+        refused.starts_with("-TXNCONFLICT"),
+        "precondition: {refused:?}"
+    );
+    assert_eq!(conflicts, Some(1), "precondition");
+    assert_eq!(reset, "+OK\r\n");
+    assert_eq!(
+        after, 0,
+        "expired_keys after CONFIG RESETSTAT (redis 7.2.7: 0)"
+    );
+    assert_eq!(
+        conflicts_after,
+        Some(0),
+        "txn_conflicts_refused is a statistic"
+    );
 }
