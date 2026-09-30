@@ -305,9 +305,10 @@ pub async fn aof_writer_task(
     let mut idle_wait = IdleWait::new();
     // task #35: AOF db-aware writer — see the monoio TopLevel loop above for
     // the full rationale. Resets to 0 on every successful rewrite (fresh
-    // file: replay starts a segment at db 0).
+    // file: replay starts a segment at db 0); starts unknown, because the
+    // file opened above may end in the previous run's `SELECT` (R1 review).
     #[cfg(feature = "runtime-tokio")]
-    let mut last_db = RecordCtx::new();
+    let mut last_db = RecordCtx::appending();
     // #455: snapshot epoch of the generation this writer appends to; records
     // stamped below it are already in that generation's base and are dropped
     // wherever they are dequeued. Moves only when a fold's generation is
@@ -435,8 +436,9 @@ pub async fn aof_writer_task(
         // clock differs from the last stamp a `MOON.TS <ms>` first (see
         // `inject_record_prefixes`). Reset whenever a NEW incr/base file
         // becomes the append target (replay starts each incr at db 0, with
-        // no clock).
-        let mut last_db = RecordCtx::new();
+        // no clock). It STARTS unknown (`appending`): the incr opened above
+        // may be the previous run's, ending in any `SELECT` (R1 review).
+        let mut last_db = RecordCtx::appending();
         // #455: see the tokio declaration above.
         let mut fold_floor = FoldEpoch::INITIAL;
         // moon#1187: persistent batch-coalescing buffer (shrink hysteresis) —
@@ -1197,8 +1199,9 @@ pub async fn per_shard_aof_writer_task(
         // see `IdleWait` docs near the top of this file.
         let mut idle_wait = IdleWait::new();
         // task #35: AOF db-aware writer — see the monoio TopLevel loop's docs
-        // near the top of this file for the full rationale.
-        let mut last_db = RecordCtx::new();
+        // near the top of this file for the full rationale (starts unknown:
+        // the reopened incr may end in any `SELECT`).
+        let mut last_db = RecordCtx::appending();
         // #455: see the TopLevel declaration near the top of this file.
         let mut fold_floor = FoldEpoch::INITIAL;
         // (No `interval` here: the EverySec flush deadline is enforced by the
@@ -1673,8 +1676,9 @@ pub async fn per_shard_aof_writer_task(
         // see `IdleWait` docs near the top of this file.
         let mut idle_wait = IdleWait::new();
         // task #35: AOF db-aware writer — see the monoio TopLevel loop's docs
-        // near the top of this file for the full rationale.
-        let mut last_db = RecordCtx::new();
+        // near the top of this file for the full rationale (starts unknown:
+        // the reopened incr may end in any `SELECT`).
+        let mut last_db = RecordCtx::appending();
         // #455: see the TopLevel declaration near the top of this file.
         let mut fold_floor = FoldEpoch::INITIAL;
         // Test-only fault injection: if MOON_TEST_AOF_FSYNC_FAIL=1 is set in

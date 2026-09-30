@@ -14,7 +14,10 @@
 //! [`super::inject_record_prefixes`], the rewrite drains and the overflow
 //! drains per record. A new generation (a fresh incr, a rewritten flat file)
 //! starts from [`RecordCtx::reset`]: db 0, and no clock, so its first stamped
-//! record carries its own `MOON.TS`.
+//! record carries its own `MOON.TS`. A writer that starts appending to a file
+//! it did not just create starts from [`RecordCtx::appending`] instead: the
+//! file may end in any `SELECT`, so the db is unknown until the first record
+//! states it (redis: `aof_selected_db = -1`).
 //!
 //! [`AppendStamp`] is what a producer reads in the same synchronous section as
 //! the mutation its record logs: the fold epoch (#455) and the shard's cached
@@ -70,10 +73,15 @@ impl From<FoldEpoch> for AppendStamp {
 /// stamps, none while earlier stamps have been written and dropped).
 const TS_ARENA_BYTES: usize = 4096;
 
+/// [`RecordCtx::db`] of a stream whose selected db is not known: no real db
+/// index equals it, so the next record always gets a `SELECT`.
+pub const UNKNOWN_DB: usize = usize::MAX;
+
 /// The writer's running record context. See the module doc.
 #[derive(Debug, Default)]
 pub struct RecordCtx {
-    /// The db a replay has selected at the current end of the stream.
+    /// The db a replay has selected at the current end of the stream
+    /// ([`UNKNOWN_DB`] when the writer cannot know it).
     db: usize,
     /// The last `MOON.TS` in the stream (0 = none since the generation began).
     ts_ms: u64,
@@ -88,6 +96,22 @@ impl RecordCtx {
         Self::default()
     }
 
+    /// A context for a writer that (re)opens its append target at boot: an
+    /// incr or flat `appendonly.aof` a previous run may have left in ANY db
+    /// (its last `SELECT`). The db is unknown, so the first non-empty record
+    /// always carries a `SELECT <db>` — without it, a restarted writer's
+    /// first db-0 record replayed into whatever db the previous run ended in
+    /// (R1 review, finding 2). The clock is unknown too (no `MOON.TS` yet),
+    /// as in [`Self::new`]. redis starts every AOF with `aof_selected_db =
+    /// -1` for the same reason.
+    #[must_use]
+    pub fn appending() -> Self {
+        Self {
+            db: UNKNOWN_DB,
+            ..Self::default()
+        }
+    }
+
     /// The writer moved to a NEW generation file: a replay starts it at db 0
     /// with no clock (the next stamped record emits its `MOON.TS`).
     #[inline]
@@ -96,7 +120,8 @@ impl RecordCtx {
         self.ts_ms = 0;
     }
 
-    /// The db a replay of the stream so far has selected.
+    /// The db a replay of the stream so far has selected ([`UNKNOWN_DB`]
+    /// before the first record of an [`Self::appending`] context).
     #[inline]
     #[must_use]
     pub fn db(&self) -> usize {
@@ -225,6 +250,33 @@ mod tests {
         assert_eq!((ctx.db(), ctx.ts_ms()), (0, 0));
         let got = collect(ctx.prefix(0, 5, false));
         assert_eq!(got, vec![TsRecord::new(5).as_bytes().to_vec()]);
+    }
+
+    /// R1 review finding 2: a writer that reopens an existing file does not
+    /// know the stream's db, so even a db-0 record gets its `SELECT 0` —
+    /// once — and a barrier still writes nothing.
+    #[test]
+    fn a_reopened_stream_selects_its_first_records_db_even_db_0() {
+        let mut ctx = RecordCtx::appending();
+        assert_eq!(ctx.db(), UNKNOWN_DB);
+        assert!(ctx.prefix(0, 0, true).is_empty(), "a barrier never selects");
+        assert!(ctx.needs_prefix(0, 0, false));
+        let got = collect(ctx.prefix(0, 0, false));
+        assert_eq!(got, vec![super::super::serialize_select_record(0).to_vec()]);
+        assert!(ctx.prefix(0, 0, false).is_empty(), "db 0 is now known");
+        // With a clock: the stamp first, then the SELECT.
+        let mut ctx = RecordCtx::appending();
+        let got = collect(ctx.prefix(0, 7, false));
+        assert_eq!(
+            got,
+            vec![
+                TsRecord::new(7).as_bytes().to_vec(),
+                super::super::serialize_select_record(0).to_vec(),
+            ]
+        );
+        // A new generation after it starts at a known db 0 again.
+        ctx.reset();
+        assert_eq!(ctx.prefix(0, 7, false).count(), 1, "only the stamp");
     }
 
     #[test]
