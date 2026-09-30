@@ -8,9 +8,11 @@
 //! this logs them the way the connection's generic write path logs a write:
 //!
 //! 1. the undo and everything below it up to the first await form ONE
-//!    synchronous stretch: the AOF fold epoch is read, the replication
-//!    records are recorded (monoio), the graph WAL records are appended —
-//!    checked, a refused record fails the reply (PR #1301 review);
+//!    synchronous stretch: the AOF fold epoch is read, the graph WAL records
+//!    are appended — checked, a refused record fails the reply (PR #1301
+//!    review), with no capacity limit on this thread (moon#1302) — and then
+//!    the replication records are recorded (monoio), the graph ones only as
+//!    far as the WAL accepted them;
 //! 2. the KV records are appended to this shard's AOF through the MULTI/EXEC
 //!    group commit ([`persist_txn_aof`]) — one `fsync` barrier under
 //!    `appendfsync always`, so an `+OK` means the abort is on disk;
@@ -57,8 +59,9 @@ pub(crate) type ReplicationRecorder = fn(&ConnectionContext, usize, Bytes);
 /// `replication_fanout_active`); the tokio runtime passes `None`.
 ///
 /// `Err(reply)` when the AOF refused the records or their barrier, when the
-/// WAL channel refused a graph rollback record (local or on a remote leg's
-/// owner — PR #1301 review), or when a remote graph leg was not delivered or
+/// shard's WAL writer refused a graph rollback record (local or on a remote
+/// leg's owner — PR #1301 review; since moon#1302 only a writer that is gone
+/// refuses, there is no capacity limit), or when a remote graph leg was not delivered or
 /// acknowledged — the stores ARE rolled back either way (a remote leg that
 /// was never delivered excepted, which its reply says). A refusal is never
 /// silent (wave-1 review MINOR 5): it is counted where it happens
@@ -67,8 +70,9 @@ pub(crate) type ReplicationRecorder = fn(&ConnectionContext, usize, Bytes);
 /// `txn_rollback_wal_dropped` for graph WAL records), and this logs it with
 /// its `cause` — at WARN for an explicit `TXN.ABORT`, whose client is
 /// answered the refusal, and at ERROR for a dirty-commit or disconnect
-/// rollback, where no client learns of it and the master's logs lack records
-/// its replicas already received.
+/// rollback, where no client learns of it and the master's AOF may lack KV
+/// records its replicas already received (the graph records are replicated
+/// only as far as the WAL accepted them, moon#1302).
 ///
 /// Durability parity (PR #1301 review): the graph records get what the
 /// FORWARD graph writes get — enqueued in the no-await stretch, drained into
@@ -101,6 +105,22 @@ pub(crate) async fn abort_logged(
         .map_or(crate::persistence::aof::FoldEpoch::INITIAL, |pool| {
             pool.fold_stamp(ctx.shard_id)
         });
+    // moon#1302: the graph records are appended FIRST and only the accepted
+    // prefix is replicated. Replicated first (the pre-fix order), a refusal
+    // left the replica holding the whole rollback while this node's WAL held
+    // a prefix — after a restart the two disagreed for good. The append has
+    // no capacity limit on this thread, so a refusal now means the WAL writer
+    // is gone; it is still counted, logged and answered (PR #1301 review).
+    let graph_wal = crate::transaction::abort::append_graph_rollback_wal(
+        &ctx.shard_databases,
+        ctx.shard_id,
+        txn_id,
+        &log.graph,
+    );
+    let graph_logged = match graph_wal {
+        Ok(()) => log.graph.len(),
+        Err(refused) => refused.accepted,
+    };
     if let Some(record) = replicate {
         for (db, bytes) in &log.kv {
             record(ctx, *db, bytes.clone());
@@ -108,19 +128,11 @@ pub(crate) async fn abort_logged(
         // Graph replication is single-shard scope, exactly like the forward
         // GRAPH.* leg (`try_handle_graph_command`).
         if ctx.num_shards == 1 {
-            for bytes in &log.graph {
+            for bytes in &log.graph[..graph_logged] {
                 record(ctx, graph_db, bytes.clone());
             }
         }
     }
-    // PR #1301 review: checked. A record the WAL channel refuses is counted
-    // and logged, and the abort answers the refusal instead of `+OK`.
-    let graph_wal = crate::transaction::abort::append_graph_rollback_wal(
-        &ctx.shard_databases,
-        ctx.shard_id,
-        txn_id,
-        &log.graph,
-    );
     // -----------------------------------------------------------------------
 
     let persisted =
