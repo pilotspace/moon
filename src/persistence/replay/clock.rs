@@ -53,8 +53,22 @@
 //!   key lazily expired and rewritten before its `DEL` was logged (moon#542)
 //!   replays onto its OLD value. REVIEW-FINAL-P5B measured 27-36 of 40 such
 //!   keys wrong with the mtime set an hour back (main: 0 of 40).
-//! The durable fix is a time record in the log itself (redis's
-//! `aof-timestamp-enabled`), a format change tracked as a follow-up.
+//!
+//! moon#1283 closes that hole with a time record in the log itself:
+//! `MOON.TS <ms>` ([`super::pseudo`]), the shard clock each record was judged
+//! under, which the writer emits whenever it changes. A replay that reads one
+//! judges every later record of that file by the LAST stamp read
+//! ([`observe_log_ts`]) — never a running maximum, since a parked producer's
+//! record carries an older stamp than the records it lands after — and falls
+//! back to the pin above only until the file's first stamp. A log written
+//! before moon#1283 (or its stamp-less prefix) therefore replays exactly as
+//! described above; a stamped one no longer depends on the mtime at all.
+//! Each pin guard is one replayed file (a flat `appendonly.aof`, one incr, one
+//! WAL directory): opening a guard starts with no stamp, closing it restores
+//! the enclosing file's stamp, and a stamp read outside any guard (a live
+//! apply) is ignored. A stamp is not capped at the wall clock: it is the
+//! write-time clock by construction, and a clock stepped back since then is
+//! exactly the case it exists for.
 //!
 //! Pinned by every production replay of a command log: `aof::replay_aof`
 //! (the flat `appendonly.aof`), `aof_manifest::replay_multi_part` and
@@ -78,26 +92,51 @@ thread_local! {
     /// The pinned judgment clock of this thread's replay (0 = not pinned:
     /// the databases keep their own clock).
     static PINNED_MS: Cell<u64> = const { Cell::new(0) };
+    /// The last `MOON.TS` the replay of the current file read (0 = none yet:
+    /// [`PINNED_MS`] rules). moon#1283.
+    static LOG_TS_MS: Cell<u64> = const { Cell::new(0) };
+    /// How many pin guards are open on this thread: a stamp is honoured only
+    /// inside one.
+    static PIN_DEPTH: Cell<u32> = const { Cell::new(0) };
 }
 
-/// Restores the previous pin (or none) when dropped.
+/// Restores the previous pin (or none) and the enclosing file's stamp when
+/// dropped.
 #[must_use = "the pin lasts only while the guard lives"]
 pub struct ReplayClockGuard {
     previous: u64,
+    previous_ts: u64,
 }
 
 impl Drop for ReplayClockGuard {
     fn drop(&mut self) {
         PINNED_MS.with(|c| c.set(self.previous));
+        LOG_TS_MS.with(|c| c.set(self.previous_ts));
+        PIN_DEPTH.with(|c| c.set(c.get().saturating_sub(1)));
     }
 }
 
-/// Pin this thread's replay judgment clock to `ms` until the guard drops.
-/// `0` unpins.
+/// Pin this thread's replay judgment clock to `ms` until the guard drops, and
+/// open the scope of one replayed file: no `MOON.TS` read yet. `0` pins
+/// nothing (the databases' own clock) but still opens the scope.
 pub fn pin_replay_clock_ms(ms: u64) -> ReplayClockGuard {
+    PIN_DEPTH.with(|c| c.set(c.get().saturating_add(1)));
     ReplayClockGuard {
         previous: PINNED_MS.with(|c| c.replace(ms)),
+        previous_ts: LOG_TS_MS.with(|c| c.replace(0)),
     }
+}
+
+/// A `MOON.TS <ms>` record was read (moon#1283): judge the records after it
+/// by `ms` until the next stamp or the end of the file. Ignored outside a pin
+/// scope (nothing is being replayed) and for `ms == 0`. Returns whether the
+/// stamp was taken.
+pub fn observe_log_ts(ms: u64) -> bool {
+    if ms == 0 || PIN_DEPTH.with(Cell::get) == 0 {
+        return false;
+    }
+    LOG_TS_MS.with(|c| c.set(ms));
+    true
 }
 
 /// Pin this thread's replay judgment clock to the newest modification time of
@@ -146,9 +185,14 @@ pub fn keep_expired_image_entries(
     }
 }
 
-/// The pinned judgment clock, if any.
+/// The judgment clock of this thread's replay, if any: the last `MOON.TS`
+/// of the current file, else the pin.
 #[inline]
 pub fn pinned_replay_clock_ms() -> Option<u64> {
+    let ts = LOG_TS_MS.with(Cell::get);
+    if ts != 0 {
+        return Some(ts);
+    }
     PINNED_MS.with(|c| Some(c.get()).filter(|&ms| ms != 0))
 }
 
