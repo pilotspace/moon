@@ -81,6 +81,14 @@ pub(crate) async fn abort_logged(
     cause: AbortCause,
 ) -> Result<(), Bytes> {
     let txn_id = txn.txn_id;
+    // moon#1299: the transaction's keys stay held until the restore is
+    // applied AND its compensating records are enqueued (or refused and
+    // reported) — released earlier, another client's write in the window
+    // could reach the log AHEAD of the compensation that overwrites it on
+    // replay. Released when this guard drops: at the end of this function,
+    // or if the future is dropped mid-await, so a cancelled abort can never
+    // leave the keys held forever.
+    let _release = crate::transaction::isolation::EndOnDrop::new(txn_id);
     let graph_db = txn.db_index;
     let (log, remote) = crate::transaction::abort::abort_local(ctx.shard_id, ctx.num_shards, txn);
 
@@ -129,11 +137,6 @@ pub(crate) async fn abort_logged(
     // The first refusal in log order (KV AOF, local graph WAL, remote graph
     // legs) is the reply; every one was already counted and logged where it
     // happened.
-    // moon#1299: the restore is applied and its compensating records are
-    // enqueued (or refused and reported): only now may other clients write
-    // the transaction's keys — released earlier, a write in the window could
-    // reach the log AHEAD of the compensation that overwrites it on replay.
-    crate::transaction::isolation::txn_end(txn_id);
     let outcome = persisted
         .and(graph_wal)
         .map_err(Bytes::from_static)

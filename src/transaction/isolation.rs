@@ -342,6 +342,24 @@ pub(crate) fn txn_end(txn_id: u64) {
     publish();
 }
 
+/// Calls [`txn_end`] when dropped: `TXN.ABORT`'s release, which must run
+/// after the abort's last await AND if that future is dropped mid-await.
+/// Dropped on the shard thread (connection futures never leave it).
+#[must_use = "the release happens when the guard drops"]
+pub(crate) struct EndOnDrop(u64);
+
+impl EndOnDrop {
+    pub(crate) fn new(txn_id: u64) -> Self {
+        EndOnDrop(txn_id)
+    }
+}
+
+impl Drop for EndOnDrop {
+    fn drop(&mut self) {
+        txn_end(self.0);
+    }
+}
+
 /// A blocking-pop waker is about to serve `(db, key)`. When the key is held,
 /// the waiters stay parked (serving one would write the held key) and the
 /// wake is retried once the hold is released. `true` = skip the serve.
@@ -639,6 +657,19 @@ mod tests {
             txn_end(7);
             assert!(!any_held());
             assert_eq!(check_write(0, b"SET", &args(&["k", "v"])), None);
+        });
+    }
+
+    #[test]
+    fn end_on_drop_releases() {
+        on_fresh_thread(|| {
+            txn_begin(51);
+            hold(0, &Bytes::from_static(b"k"), 51);
+            {
+                let _g = EndOnDrop::new(51);
+                assert!(any_held(), "held until the guard drops");
+            }
+            assert!(!any_held());
         });
     }
 
