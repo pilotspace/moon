@@ -458,7 +458,8 @@ fn always_acks_only_after_the_fsync_s4() {
 /// moon#1266 Option 3: under everysec a held (slow) fsync runs on the
 /// writer's agent thread — writes keep being acknowledged AND written to
 /// the kernel meanwhile, the next deadline is postponed (INFO
-/// `aof_delayed_fsync`), and a kill -9 during the held fsync loses nothing.
+/// `aof_delayed_fsync` once it has been in flight 2 s), and a kill -9 during
+/// the held fsync loses nothing.
 fn everysec_writer_keeps_writing_while_the_fsync_is_held(shards: usize) {
     let dir = tempfile::tempdir().expect("tempdir");
     let gate = dir.path().join("sync.gate");
@@ -467,12 +468,13 @@ fn everysec_writer_keeps_writing_while_the_fsync_is_held(shards: usize) {
     });
     let mut s = ready_conn(port);
     std::fs::write(&gate, b"").expect("create gate");
-    // Write for 2.5 s: the first deadline's fsync is held, so the second
-    // (and later) deadlines find it in flight.
+    // Write for 3.5 s: the first deadline's fsync is held, so the later
+    // deadlines find it in flight, and `aof_delayed_fsync` counts once the
+    // held fsync has been in flight for 2 s (redis's cadence, R1 review).
     let started = Instant::now();
     let mut n = 0usize;
     let mut slowest = Duration::ZERO;
-    while started.elapsed() < Duration::from_millis(2500) {
+    while started.elapsed() < Duration::from_millis(3500) {
         let t = Instant::now();
         acked_sets(&mut s, &format!("g:{n}"), 50, 50);
         slowest = slowest.max(t.elapsed());
