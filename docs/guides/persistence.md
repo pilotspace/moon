@@ -182,13 +182,37 @@ itself (moon#1289). After three cold orphan sweeps with a held file (about
 two minutes at the default `--cold-orphan-sweep-interval-secs 60`), it starts
 one, at most one per ten sweep intervals (about ten minutes). This happens
 **even with `save ""`**, and the snapshot is an ordinary `BGSAVE`: it
-overwrites the dump file in `--dir`, and moves `LASTSAVE`. While any `TXN`
-is open the automatic snapshot waits and is retried on a later sweep, so it
-never captures a transaction's uncommitted writes.
+overwrites the dump file in `--dir`, and moves `LASTSAVE`.
+
+The automatic snapshot never contains a `TXN`'s uncommitted writes:
+
+- While any `TXN` is open it is not requested; the next sweep asks again.
+- Each shard checks again as it starts its part. If an uncommitted `TXN`
+  write is in memory on that shard (one began after the request), the
+  whole snapshot is abandoned: no shard's file is replaced, `LASTSAVE` and
+  `rdb_last_bgsave_status` do not change, no held file is released, and a
+  later sweep asks again.
+- A `TXN` write that lands on a shard after that shard started is saved at
+  its pre-transaction value (copy-on-write).
+
+This guarantee covers only this automatic snapshot. `BGSAVE`, `SAVE`, the
+`--save` rules and `SHUTDOWN`'s save still capture uncommitted writes
+(moon#1300).
+
+The cost is starvation: a `TXN` left open, or `TXN` traffic that never
+pauses, keeps the snapshot from running. The held files then stay on disk,
+and `SWAPDB` stays refused for their databases, until a snapshot does run.
+There is no timeout. End or abort long transactions, or run `BGSAVE` in a
+quiet moment. `INFO` shows it: `cold_held_release_snapshots_deferred_txn`
+counts requests deferred for an open `TXN`, and
+`cold_held_release_snapshots_abandoned_txn` counts snapshots abandoned at a
+shard's start. Both keep growing while `cold_held_files_stale_databases`
+stays above 0.
 
 Watch it with `INFO`: `cold_held_files_stale_databases`,
-`cold_held_release_snapshots_requested` and
-`cold_held_release_snapshots_deferred_txn`. With `--appendonly yes` no
+`cold_held_release_snapshots_requested`,
+`cold_held_release_snapshots_deferred_txn` and
+`cold_held_release_snapshots_abandoned_txn`. With `--appendonly yes` no
 snapshot is taken: an AOF rewrite releases the held files instead
 (`cold_held_release_folds_requested`).
 
