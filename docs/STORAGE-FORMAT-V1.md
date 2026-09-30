@@ -194,8 +194,10 @@ not a storage-format bump:
   replays as a stamp-less prefix (mtime judgment, as on any upgrade). Also
   not protected:
   a newer binary whose writer could not finish its stop (abandoned after the
-  stop timeout, or a torn write it latched) — its log shows no
-  "AOF writers drained and synced" line.
+  stop timeout, a torn write it latched, a failed marker append, a panic) —
+  its log shows no "AOF writers drained and synced" line: it shows
+  "AOF writers stopped ... WITHOUT their clean-close marker" (or the
+  abandoned-writer error) instead.
 - *Redis:* a redis server cannot load a moon AOF regardless (`MOON.COLDCUT`
   is already an unknown command there).
 

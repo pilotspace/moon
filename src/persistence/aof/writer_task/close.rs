@@ -38,8 +38,9 @@ fn warn_unwritten(e: &std::io::Error) {
 /// caller's final sync makes them durable.
 #[cfg(feature = "runtime-monoio")]
 pub(super) fn append_sync(file: &mut impl std::io::Write, ctx: &mut RecordCtx, framed: bool) {
-    if let Err(e) = file.write_all(&close_bytes(ctx, framed)) {
-        warn_unwritten(&e);
+    match file.write_all(&close_bytes(ctx, framed)) {
+        Ok(()) => crate::persistence::aof::writer_stop::note_close_marker(),
+        Err(e) => warn_unwritten(&e),
     }
 }
 
@@ -51,8 +52,9 @@ where
     W: tokio::io::AsyncWrite + Unpin,
 {
     use tokio::io::AsyncWriteExt;
-    if let Err(e) = writer.write_all(&close_bytes(ctx, framed)).await {
-        warn_unwritten(&e);
+    match writer.write_all(&close_bytes(ctx, framed)).await {
+        Ok(()) => crate::persistence::aof::writer_stop::note_close_marker(),
+        Err(e) => warn_unwritten(&e),
     }
 }
 

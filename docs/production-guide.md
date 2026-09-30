@@ -498,9 +498,12 @@ judges them as the older binary did, on every later boot
 newer binary was stopped cleanly:
 
 1. Stop the newer binary with `SHUTDOWN` or SIGTERM and check its log for
-   `AOF writers drained and synced` before starting the older one. If it
-   crashed (kill -9, OOM kill, power loss), start it once and stop it cleanly
-   first.
+   `AOF writers drained and synced` before starting the older one. A stop
+   that logs `WITHOUT their clean-close marker` (a writer with a latched
+   write error, a failed append or a panic) or an abandoned-writer error
+   instead did not protect the downgrade: fix the cause, then start and stop
+   the newer binary cleanly again. If it crashed (kill -9, OOM kill, power
+   loss), start it once and stop it cleanly first.
 2. If that was not done, run `BGREWRITEAOF` on the older binary as its last
    action, and stop it once the rewrite completed, before upgrading again.
 
