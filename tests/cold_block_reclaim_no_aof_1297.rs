@@ -316,7 +316,7 @@ fn run(kill: Kill) {
     assert!(outcome.wrong.is_empty(), "{kill:?}: {:?}", outcome.wrong);
 }
 
-/// One kill point. `sabotage`: remove one compacted file after the kill,
+/// One kill point. `sabotage`: remove every compacted file after the kill,
 /// before the restart — the instrument check (its keys must count as lost).
 fn run_case(kill: Kill, sabotage: bool) -> Outcome {
     let n = shards();
@@ -486,17 +486,24 @@ fn run_case(kill: Kill, sabotage: bool) -> Outcome {
     }
 
     if sabotage {
-        let victim = (0..n)
-            .flat_map(|s| heap_ids(&dir, s).into_iter().map(move |f| (s, f)))
-            .filter(|&(s, f)| f > max_id_at_s1[s])
-            .max_by_key(|&(_, f)| f)
-            .expect("a compacted file to remove");
-        std::fs::remove_file(
-            shard_dir(&dir, victim.0)
-                .join("data")
-                .join(format!("heap-{:06}.mpf", victim.1)),
-        )
-        .expect("remove the compacted file");
+        // Every compacted file: on the shard whose hook stopped the process
+        // the old files are gone, so nothing else holds those keys.
+        let mut removed = 0;
+        for shard in 0..n {
+            for f in heap_ids(&dir, shard)
+                .into_iter()
+                .filter(|&f| f > max_id_at_s1[shard])
+            {
+                std::fs::remove_file(
+                    shard_dir(&dir, shard)
+                        .join("data")
+                        .join(format!("heap-{f:06}.mpf")),
+                )
+                .expect("remove a compacted file");
+                removed += 1;
+            }
+        }
+        assert!(removed > 0, "no compacted file to remove");
     }
     let mut restarted = start_moon_alive_with(port, &dir, 3600, "no", &SAVE);
     let probe_keys: Vec<String> = (0..PROBE_COUNT).map(probe_key).collect();
@@ -611,7 +618,7 @@ fn kill_after_adoption_and_the_next_snapshot() {
 /// The instrument can fail (the loss half; the resurrection half was shown
 /// by a mutant that left the compacted graves out of the trailer — see the
 /// moon#1297 SUMMARY — and is pinned at unit level): after the old files
-/// are unlinked, removing one compacted file must read as lost keys.
+/// are unlinked, removing the compacted files must read as lost keys.
 #[test]
 #[ignore]
 fn the_harness_counts_the_keys_of_a_removed_compacted_file_as_lost() {
