@@ -3,6 +3,8 @@
 //! - F2: a cross-shard `DEL` / `UNLINK` whose LOCAL slice is refused
 //!   (`-TXNCONFLICT`) answered a success count of the remote legs, hiding
 //!   keys that were never deleted.
+//! - F3: `INFO txn_held_keys` was published only when a database's held
+//!   count went 0↔1 (it read 1 for five held keys).
 //!
 //! Each test runs on whichever runtime `MOON_BIN` was built with; run the
 //! suite once per runtime:
@@ -159,5 +161,59 @@ fn cross_shard_del_with_a_refused_local_slice_answers_the_conflict() {
     // Released: the same DEL now deletes everything it names.
     assert_eq!(w.send(&["SET", &remote, "orig"]), OK);
     assert_eq!(b.send(&["DEL", &remote, &held, &local_free]), ":3\r\n");
+    cleanup(guard, dir);
+}
+
+// ---------------------------------------------------------------------------
+// F3: INFO txn_held_keys counts every held key
+// ---------------------------------------------------------------------------
+
+fn info_field(c: &mut Conn, field: &str) -> Option<u64> {
+    let info = c.send(&["INFO", "stats"]);
+    info.lines()
+        .find_map(|l| l.strip_prefix(&format!("{field}:")))
+        .and_then(|v| v.trim().parse().ok())
+}
+
+#[test]
+#[ignore]
+fn info_txn_held_keys_counts_every_held_key() {
+    let (guard, port, dir) = spawn(1, &[]);
+    let mut a = Conn::open(port);
+    let mut w = Conn::open(port);
+    for end in ["COMMIT", "ABORT"] {
+        assert_eq!(a.send(&["TXN", "BEGIN"]), OK);
+        for i in 0..5 {
+            assert_eq!(a.send(&["SET", &format!("k{i}"), "v"]), OK);
+        }
+        assert_eq!(info_field(&mut w, "txn_held_keys"), Some(5), "5 SETs");
+        for i in 5..7 {
+            assert_eq!(a.send(&["SET", &format!("k{i}"), "v"]), OK);
+        }
+        assert_eq!(info_field(&mut w, "txn_held_keys"), Some(7), "7 SETs");
+        // A rewrite of a held key holds nothing new.
+        assert_eq!(a.send(&["SET", "k0", "v2"]), OK);
+        assert_eq!(info_field(&mut w, "txn_held_keys"), Some(7), "rewrite");
+        // Another database.
+        assert_eq!(a.send(&["SELECT", "2"]), OK);
+        assert_eq!(a.send(&["SET", "z", "v"]), OK);
+        assert_eq!(a.send(&["SELECT", "0"]), OK);
+        assert_eq!(info_field(&mut w, "txn_held_keys"), Some(8), "+1 in db 2");
+        // moon#1303: an erroring write takes its new hold back.
+        assert!(a.send(&["INCR", "k0"]).starts_with("-ERR"));
+        assert!(a.send(&["SET", "n", "v", "BADOPT"]).starts_with("-ERR"));
+        assert_eq!(
+            info_field(&mut w, "txn_held_keys"),
+            Some(8),
+            "erroring writes"
+        );
+        assert_eq!(a.send(&["TXN", end]), OK);
+        assert_eq!(
+            info_field(&mut w, "txn_held_keys"),
+            Some(0),
+            "after TXN {end}"
+        );
+        assert_eq!(info_field(&mut w, "txn_open"), Some(0), "after TXN {end}");
+    }
     cleanup(guard, dir);
 }
