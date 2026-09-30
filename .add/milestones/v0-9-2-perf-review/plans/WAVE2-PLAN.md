@@ -279,6 +279,17 @@ flowchart LR
 | Q5 | Split the over-cap files as a P0 pre-step, or after wave 2? | After wave 2: a split mid-wave conflicts with every lane. |
 | Q6 | For #1283 and #1300 together: does a skipped (unterminated) TXN block still advance the `MOON.TS` replay clock? | Yes. TS records are clock observations, not data, so replay applies them even inside a skipped block. |
 
+**Maintainer decisions (2026-09-30):**
+- **Q1:** yes. #1302 is WS41, using option (b), the inline append.
+- **Q2:** #1289 uses option (2) without an AOF (a rate-limited snapshot request, shared with #1297). With an AOF it uses option (1), pressure after T seconds or K sweeps with no fold.
+- **Q3:** #1299, as recommended:
+  - eviction and active expiry skip held keys, and lazy expiry defers;
+  - no idle-TXN timeout this wave;
+  - INFO shows the open-TXN count and the age of the oldest;
+  - the error is `-TXNCONFLICT`.
+- **Q4:** two PRs, wave 2a after R1 and wave 2b after R2.
+- **Q5 and Q6:** the recommendations stand as defaults. File splits happen after wave 2. `MOON.TS` still advances inside a skipped TXN block.
+
 ### 2.8 Risks
 
 - **WS42 is XL and crosses two lanes.** It has one owner and starts only after R1.
