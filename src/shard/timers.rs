@@ -804,6 +804,10 @@ pub(crate) fn note_snapshot_started(shard_databases: &Arc<ShardDatabases>) -> Ve
                 // the snapshot under its log (tokio `--shards 1`) must not
                 // lose them at the next BGSAVE. Empty = no trailer.
                 ci.encode_graves_into(&mut graves);
+                if hold {
+                    // moon#1297: the compacted slots of changed survivors.
+                    ci.encode_compaction_graves_into(&mut graves);
+                }
             }
         });
     }
