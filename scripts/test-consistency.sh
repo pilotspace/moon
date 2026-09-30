@@ -43,8 +43,11 @@ qgrep() { local _in; _in=$(cat); grep "$@" <<< "$_in" > /dev/null; }
 #   - the COMMAND GETKEYS text for a keyless command;
 #   - hash-field-expiry (HEXPIRE family) and its tracking rows;
 #   - DEBUG DIGEST values;
-#   - the moon#981 '-@all +get +set' ACL GETUSER row is FLAKY on 7.0: it
-#     renders per-command rules in dict order under a per-process random seed.
+#   - the moon#981 / moon#1296 ACL rule-order rows ('-@all +set +get' ...) FLIP
+#     on 7.0: it renders per-command rules in dict order under a per-process
+#     random seed. redis 7.2+ renders them in the order they were applied and
+#     moon does the same (moon#1296), so on a 7.2+ oracle those rows are
+#     deterministic.
 # The run prints the oracle's version at startup and warns below 7.2.
 ###############################################################################
 
@@ -6304,7 +6307,17 @@ if wait_for_port "$PORT_REDIS" && wait_for_port "$PORT_RUST"; then
         grep '^user rt ' "$1" | grep -o '[+-]@all.*' || true
     }
 
-    for f981_spec in "+@all -flushall" "-@all +get +set"; do
+    # moon#1296: the rules render in the order they were APPLIED, as redis
+    # 7.2+ does (`+set +get` is not `+get +set`; a re-applied rule moves to the
+    # end; grants and revocations stay interleaved; a bare `cmd` drops the
+    # `cmd|*` rules before it). Category tokens (`+@read`) are not in this list:
+    # moon expands a category into its commands where redis keeps the token.
+    for f981_spec in "+@all -flushall" "-@all +get +set" \
+        "-@all +set +get" "-@all +get +set +get" "+@all -set -get" \
+        "+@all -get -set +get -del" "-@all +get -set +append" \
+        "-@all +hset +hget +hdel" "-@all +config|get +config" \
+        "-@all +config +config|get" "+@all -config|set -config|get" \
+        "-@all +config|set +config|get +get"; do
         read -r -a f981_rules <<< "$f981_spec"
         both ACL DELUSER rt
         both ACL SETUSER rt on '>pw' '~*' '&*' "${f981_rules[@]}"

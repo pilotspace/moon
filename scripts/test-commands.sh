@@ -46,8 +46,8 @@ qgrep() { local _in; _in=$(cat); grep "$@" <<< "$_in" > /dev/null; }
 # of moon bugs: listpack set/list encodings, ZRANK ... WITHSCORE, the NOPERM
 # text "User <name> has no permissions ...", the COMMAND GETKEYS keyless
 # text, hash-field-expiry tracking, DEBUG DIGEST values, and the moon#981
-# '-@all +get +set' ACL GETUSER row (flaky on 7.0: dict-order rendering under
-# a per-process random seed). The run prints the oracle's version at startup
+# moon#981/#1296 ACL rule-order rows ('-@all +set +get' ...; they flip on 7.0:
+# dict-order rendering under a per-process random seed; deterministic on 7.2+). The run prints the oracle's version at startup
 # and warns below 7.2.
 ###############################################################################
 
@@ -1890,6 +1890,24 @@ if should_run "acl"; then
     assert_match "ACL SETUSER ~a %R~b allkeys" \
         ACL SETUSER tc:acl:a on '>pw' '~tc:acl:x' '%R~tc:acl:y' allkeys +@all
     assert_acl_field "allkeys replaces earlier patterns" tc:acl:a keys
+
+    # --- #1296: command rules render in the order they were applied ---------
+    # redis 7.2+ keeps application order (`+set +get` is not `+get +set`; a
+    # re-applied rule moves to the end; grants and revocations stay
+    # interleaved; a bare `cmd` drops the `cmd|*` rules before it). Categories
+    # (`+@read`) are left out: moon expands them, redis keeps the token. On a
+    # redis 7.0 oracle these rows flip (dict-order rendering).
+    for acl_spec in "-@all +set +get" "-@all +get +set +get" "+@all -set -get" \
+        "+@all -get -set +get -del" "-@all +get -set +append" \
+        "-@all +hset +hget +hdel" "-@all +config|get +config" \
+        "-@all +config +config|get" "+@all -config|set -config|get" \
+        "-@all +config|set +config|get +get" "+@all -get +get"; do
+        read -r -a acl_spec_rules <<< "$acl_spec"
+        acl_both ACL DELUSER tc:acl:o
+        acl_both ACL SETUSER tc:acl:o on '>pw' '~*' '&*' "${acl_spec_rules[@]}"
+        assert_acl_field "#1296 rule order '$acl_spec' (GETUSER commands)" tc:acl:o commands
+    done
+    acl_both ACL DELUSER tc:acl:o
 
     # --- #970: %RW~ / lowercase %r~ / %W~ key selectors ------------------------
     acl_both ACL DELUSER tc:acl:s
