@@ -264,12 +264,13 @@ impl AofWriterPool {
         self.fold_notifiers = Some(notifiers);
     }
 
-    /// Returns the configured fsync policy. Hot-path callers read this to
-    /// decide between the fast (`try_send_append`) and durable
-    /// (`try_send_append_sync`) write paths.
+    /// Returns the fsync policy in force: the configured one, or the last
+    /// `CONFIG SET appendfsync` ([`super::runtime_fsync`], one relaxed load).
+    /// Hot-path callers read this to decide between the fast
+    /// (`try_send_append`) and durable (`try_send_append_sync`) write paths.
     #[inline]
     pub fn fsync_policy(&self) -> FsyncPolicy {
-        self.fsync_policy
+        super::runtime_fsync::effective(self.fsync_policy)
     }
 
     /// `--aof-fsync-timeout-ms`: the bound on a durable-path producer's wait
@@ -312,7 +313,7 @@ impl AofWriterPool {
         stamp: impl Into<AppendStamp>,
     ) -> Result<(), AofAck> {
         let stamp = stamp.into();
-        match self.fsync_policy {
+        match self.fsync_policy() {
             FsyncPolicy::Always => {
                 let rx = self.try_send_append_sync(shard_id, lsn, db, bytes, stamp);
                 // F2 (design-for-failure): bound the wait so a stalled disk
@@ -399,7 +400,7 @@ impl AofWriterPool {
         let stamp = stamp.into();
         self.send_append_backpressure(shard_id, lsn, db, bytes, stamp)
             .await?;
-        Ok(matches!(self.fsync_policy, FsyncPolicy::Always))
+        Ok(matches!(self.fsync_policy(), FsyncPolicy::Always))
     }
 
     /// Enqueue a record and apply its mutation in ONE synchronous section, for
@@ -453,7 +454,7 @@ impl AofWriterPool {
         loop {
             match self.try_append_now(shard_id, lsn, db, bytes.clone()) {
                 AppendNow::Enqueued => {
-                    return Ok((apply(), matches!(self.fsync_policy, FsyncPolicy::Always)));
+                    return Ok((apply(), matches!(self.fsync_policy(), FsyncPolicy::Always)));
                 }
                 AppendNow::Refused(ack) => {
                     if ack.is_backpressure() {
@@ -564,7 +565,7 @@ impl AofWriterPool {
     /// durable path.
     #[inline]
     pub async fn fsync_barrier(&self, shard_id: usize) -> Result<(), AofAck> {
-        match self.fsync_policy {
+        match self.fsync_policy() {
             FsyncPolicy::Always => {
                 // Enqueue a zero-length AppendSync. The writer will fsync all
                 // preceding Append messages (ordered channel) then ack Synced.

@@ -182,3 +182,103 @@ fn a_stalled_everysec_fsync_is_visible_s1() {
 fn a_stalled_everysec_fsync_is_visible_s4() {
     stall_is_visible(4);
 }
+
+// ── R1 review, finding 8: CONFIG SET appendfsync at runtime ─────────────────
+
+/// `CONFIG SET appendfsync always` used to answer OK — and CONFIG GET showed
+/// `always` — while every writer kept its startup policy: with the fsync
+/// held, a `SET` still returned at once, acknowledged without its fsync.
+/// Now the switch reaches the producers and every writer: with the fsync
+/// held, the `SET` answers only after the release; switching back to
+/// `everysec` acknowledges at once again while the fsync is held, and
+/// `appendfsync no` does too.
+fn runtime_appendfsync_switch(shards: usize) {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let dir = tmp.path();
+    let gate = dir.join("sync.gate");
+    let (_server, port) = spawn(dir, shards, "everysec", &gate);
+    let mut c = Conn::open(port);
+    assert_eq!(c.send(&["SET", "warm", "1"]), "+OK\r\n");
+
+    assert!(
+        c.send(&["CONFIG", "SET", "appendfsync", "bogus"])
+            .starts_with("-ERR")
+    );
+    assert_eq!(
+        c.send(&["CONFIG", "GET", "appendfsync"]),
+        "*2\r\n$11\r\nappendfsync\r\n$8\r\neverysec\r\n"
+    );
+
+    std::fs::write(&gate, b"").expect("hold the fsync");
+    assert_eq!(
+        c.send(&["CONFIG", "SET", "appendfsync", "always"]),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        c.send(&["CONFIG", "GET", "appendfsync"]),
+        "*2\r\n$11\r\nappendfsync\r\n$6\r\nalways\r\n"
+    );
+    // A SET (one per shard at --shards 4: tagged keys all over) must wait.
+    let (tx, rx) = std::sync::mpsc::channel();
+    let setter = std::thread::spawn(move || {
+        let mut c = Conn::open(port);
+        for i in 0..8 {
+            let t = Instant::now();
+            let r = c.send(&["SET", &format!("x{i}"), "1"]);
+            tx.send((r, t.elapsed())).expect("report");
+        }
+    });
+    let early = rx.recv_timeout(Duration::from_millis(1_500));
+    std::fs::remove_file(&gate).expect("release the fsync");
+    let Ok((first, waited)) = early.or_else(|_| rx.recv_timeout(Duration::from_secs(20))) else {
+        panic!("--shards {shards}: the SET never answered after the release");
+    };
+    assert_eq!(first, "+OK\r\n");
+    assert!(
+        waited >= Duration::from_millis(1_400),
+        "--shards {shards}: after CONFIG SET appendfsync always, a SET answered in {waited:?} \
+         while its fsync was held — acknowledged without the fsync"
+    );
+    for _ in 1..8 {
+        let (r, _) = rx
+            .recv_timeout(Duration::from_secs(20))
+            .expect("later SETs");
+        assert_eq!(r, "+OK\r\n");
+    }
+    setter.join().expect("setter");
+
+    // Back to everysec: acknowledged at once while the fsync is held.
+    for policy in ["everysec", "no"] {
+        assert_eq!(c.send(&["CONFIG", "SET", "appendfsync", policy]), "+OK\r\n");
+        std::fs::write(&gate, b"").expect("hold the fsync");
+        // Let a deadline find the held fsync (everysec hands it off).
+        for i in 0..20 {
+            let t = Instant::now();
+            assert_eq!(c.send(&["SET", &format!("{policy}{i}"), "1"]), "+OK\r\n");
+            assert!(
+                t.elapsed() < Duration::from_millis(900),
+                "--shards {shards}: appendfsync {policy}: a SET took {:?} with the fsync held",
+                t.elapsed()
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        std::fs::remove_file(&gate).expect("release the fsync");
+    }
+    assert_eq!(
+        c.send(&["CONFIG", "SET", "appendfsync", "everysec"]),
+        "+OK\r\n"
+    );
+    assert_eq!(c.send(&["SET", "last", "1"]), "+OK\r\n");
+}
+
+#[test]
+#[ignore = "real-server: run with --include-ignored and MOON_BIN pinned"]
+fn config_set_appendfsync_reaches_the_writers_s1() {
+    runtime_appendfsync_switch(1);
+}
+
+#[test]
+#[ignore = "real-server: run with --include-ignored and MOON_BIN pinned"]
+fn config_set_appendfsync_reaches_the_writers_s4() {
+    runtime_appendfsync_switch(4);
+}

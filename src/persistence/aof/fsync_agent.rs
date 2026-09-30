@@ -269,6 +269,38 @@ impl EverysecSync {
         }
     }
 
+    /// The writer's policy changed at runtime (`CONFIG SET appendfsync`,
+    /// [`super::runtime_fsync`]). Leaving `everysec` drops the agent, which
+    /// joins it: an fsync still in flight finishes (and records its outcome)
+    /// before the writer runs its first batch under the new policy — redis's
+    /// `bioDrainWorker(BIO_AOF_FSYNC)` on the same switch. Entering
+    /// `everysec` starts an agent (or keeps fsyncing inline without one).
+    /// A no-op when the agent already matches the policy. Returns whether
+    /// the everysec state changed (the caller's pending deadline is void).
+    pub(super) fn set_policy(&mut self, policy: FsyncPolicy) -> bool {
+        let everysec = policy == FsyncPolicy::EverySec;
+        if everysec == self.agent.is_some() {
+            return false;
+        }
+        if everysec {
+            *self = Self {
+                heal_pending: self.heal_pending,
+                written_after_failure: self.written_after_failure,
+                ..Self::new(self.writer_idx, policy)
+            };
+        } else {
+            // The dropped agent's settled outcome is still the writer's to
+            // learn: a failure keeps its `err` bit under the heal rule.
+            if let Some(agent) = self.agent.take() {
+                let handoff = std::sync::Arc::clone(&agent.handoff);
+                drop(agent); // joins: the in-flight fsync finishes first
+                self.observe_settled_job(handoff.last_failed());
+            }
+            self.dirty = false;
+        }
+        true
+    }
+
     #[cfg(test)]
     fn with_backend<F>(writer_idx: usize, backend: F) -> Self
     where
@@ -742,6 +774,43 @@ mod tests {
         assert!(IN_FLIGHT_SLOTS.lock().iter().any(|x| Arc::ptr_eq(x, &slot)));
         drop(s);
         assert!(!IN_FLIGHT_SLOTS.lock().iter().any(|x| Arc::ptr_eq(x, &slot)));
+    }
+
+    /// R1 review, finding 8: leaving everysec at runtime joins the agent
+    /// after its in-flight fsync; entering it starts a new agent.
+    #[test]
+    fn a_runtime_policy_switch_drains_then_restarts_the_agent() {
+        let gate = Gate::new();
+        let mut s = EverysecSync::with_backend(4, gate.backend());
+        s.backdate(EVERYSEC);
+        assert_eq!(s.claim(), Claim::Owned);
+        assert!(s.dispatch(file()));
+        wait_until("the agent to enter the fsync", || {
+            gate.calls.load(Ordering::SeqCst) == 1
+        });
+        let releaser = {
+            let gate = Arc::clone(&gate);
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(100));
+                gate.release();
+            })
+        };
+        let t = Instant::now();
+        assert!(s.set_policy(FsyncPolicy::Always));
+        assert!(
+            t.elapsed() >= Duration::from_millis(90),
+            "the switch must wait for the in-flight fsync ({:?})",
+            t.elapsed()
+        );
+        releaser.join().expect("releaser");
+        assert!(s.agent.is_none());
+        assert_eq!(s.claim(), Claim::Inline);
+        assert!(!s.set_policy(FsyncPolicy::Always), "no-op");
+        assert!(s.set_policy(FsyncPolicy::EverySec));
+        assert!(s.agent.is_some(), "a new agent under everysec");
+        s.backdate(EVERYSEC);
+        assert_eq!(s.claim(), Claim::Owned);
+        assert!(s.dispatch(file()));
     }
 
     #[test]
