@@ -421,8 +421,22 @@ fn chrono_lite_now() -> String {
     format!("Generated at epoch {secs}")
 }
 
-/// CONFIG RESETSTAT — reset server statistics (placeholder).
+/// CONFIG RESETSTAT — reset server statistics.
+///
+/// Partial (R1 finding 5): what is reset is what redis's `resetServerStats`
+/// resets among the counters wave 2a touched — `expired_keys` — plus the
+/// moon-only STATISTICS those workstreams added (monotonic event counts:
+/// `txn_conflicts_refused`, `cold_held_release_folds_requested`,
+/// `cold_held_release_snapshots_requested`,
+/// `cold_held_release_snapshots_deferred_txn`). Gauges of live state
+/// (`txn_open`, `txn_held_keys`, `cold_held_files_stale_databases`, …) are
+/// never reset. The other redis stats (`keyspace_hits`, `evicted_keys`,
+/// `total_commands_processed`, …) are still not reset here.
 pub fn config_resetstat() -> Frame {
+    crate::admin::metrics_setup::reset_expired_keys();
+    crate::transaction::isolation::reset_stats();
+    crate::storage::tiered::held_release::reset_stats();
+    crate::persistence::snapshot_request::reset_stats();
     Frame::SimpleString(Bytes::from_static(b"OK"))
 }
 
@@ -454,6 +468,21 @@ mod tests {
     /// the next test to read that state failed. The victim was order-dependent;
     /// the leak was permanent. Scoping it here fixes the WRITER rather than
     /// hardening each of the readers one by one.
+    /// R1 finding 5: `CONFIG RESETSTAT` zeroes `expired_keys`, as redis's
+    /// `resetServerStats` does. The counter is process-wide and other tests
+    /// bump it in parallel, so the check is "the million this test added is
+    /// gone", not "exactly 0".
+    #[test]
+    fn resetstat_zeroes_expired_keys() {
+        crate::admin::metrics_setup::record_expired_keys(1_000_000);
+        assert!(crate::admin::metrics_setup::expired_keys() >= 1_000_000);
+        assert_eq!(
+            super::config_resetstat(),
+            Frame::SimpleString(Bytes::from_static(b"OK"))
+        );
+        assert!(crate::admin::metrics_setup::expired_keys() < 1_000_000);
+    }
+
     fn config_set_scoped(runtime_config: &mut RuntimeConfig, args: &[Frame]) -> Frame {
         let _limits = crate::storage::eviction::PublishedLimits::capture();
         super::config_set(runtime_config, args)

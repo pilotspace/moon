@@ -176,6 +176,13 @@ fn conflicts(db: usize, key: &[u8]) -> bool {
 
 static CONFLICTS_REFUSED: AtomicU64 = AtomicU64::new(0);
 
+/// `CONFIG RESETSTAT`: zero `txn_conflicts_refused` (a statistic; the
+/// `txn_open` / `txn_held_keys` / `txn_oldest_age_ms` gauges describe live
+/// state and are not reset).
+pub(crate) fn reset_stats() {
+    CONFLICTS_REFUSED.store(0, Ordering::Relaxed);
+}
+
 fn refuse(msg: &'static [u8]) -> Frame {
     CONFLICTS_REFUSED.fetch_add(1, Ordering::Relaxed);
     Frame::Error(Bytes::from_static(msg))
