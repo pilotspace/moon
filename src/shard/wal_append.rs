@@ -19,10 +19,12 @@
 //! stretch. So there is no fixed capacity for one command's records and no
 //! drop:
 //!
-//! * **FIFO.** The overflow only receives while the channel is full, and only
-//!   [`drain_into`] empties either, both at once; so "overflow non-empty"
-//!   implies "channel full", every later record also overflows, and the
-//!   order the WAL sees is exactly the order the records were produced.
+//! * **FIFO for the owner's records.** The overflow only receives while the
+//!   channel is full, and only [`drain_into`] empties either, both at once;
+//!   so "overflow non-empty" implies "channel full", every later record the
+//!   owner produces also overflows, and the WAL sees the owner thread's
+//!   records exactly in the order they were produced. (The one foreign
+//!   producer is the exception — see "Same thread only".)
 //! * **Durability parity.** An overflowed record is appended on the same
 //!   tick a channel record produced at the same moment would be, and both
 //!   then wait for the same flush — neither is ever durable before the tick,
@@ -36,9 +38,16 @@
 //!   and the io_uring intercept: it still goes through the channel, and if
 //!   shard 0's channel is full at that instant it is refused
 //!   ([`Refused::NotOwner`]) and counted — never queued where the owner
-//!   cannot drain it. A foreign record cannot jump the owner's overflow:
-//!   it can only enter the channel once the owner's drain freed a slot, and
-//!   that drain appends the whole overflow before the owner produces again.
+//!   cannot drain it. A foreign record CAN be appended ahead of the owner's
+//!   overflow (R1 review): [`drain_into`] frees a channel slot with every
+//!   record it pops, so a foreign record sent while its channel loop runs
+//!   enters the channel and is appended in that same loop — before the
+//!   overflowed records, which the owner produced earlier. Only a workspace
+//!   `WS CREATE` / `WS DROP` can move this way, and only ahead of shard 0's
+//!   overflowed graph / MQ / temporal records; no replay consequence of that
+//!   pair has been found, but the order guarantee above is for the owner's
+//!   records alone. The owner itself never produces during a drain (both run
+//!   on its thread), so its records cannot interleave with the drain.
 //!   The overflow is thread-local and the counters are `Relaxed`
 //!   statistics, so there is no new cross-thread protocol (the channel is
 //!   flume's).
@@ -155,8 +164,10 @@ pub fn report_dropped(why: Refused, shard_id: usize, record_type: WalRecordType)
     }
 }
 
-/// Append every queued record to `wal` in production order: the channel's,
-/// then the overflow's. The shard's 1 ms tick (and its shutdown path) calls
+/// Append every queued record to `wal`: the channel's, then the overflow's —
+/// production order for the owner thread's records (a foreign workspace
+/// record sent mid-drain can land ahead of the overflow; see the module
+/// doc). The shard's 1 ms tick (and its shutdown path) calls
 /// this; `wal` is `None` only when persistence is off, and then the sender is
 /// never wired, so both queues are empty. Returns the records appended.
 pub fn drain_into(rx: &MpscReceiver<WalAppendMsg>, wal: &mut Option<WalWriterV3>) -> usize {
