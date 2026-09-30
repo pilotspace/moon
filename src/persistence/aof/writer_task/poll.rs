@@ -9,7 +9,12 @@ use super::*;
 /// are flowing (moon#1266). It used to be `wait/16` — ~3 ms while writing,
 /// 50 ms for the first write after an idle second — and a kill -9 inside
 /// that window lost acknowledged writes under everysec.
-const AOF_WARM_POLL_STEP: std::time::Duration = std::time::Duration::from_micros(100);
+///
+/// 500 us, measured (4-vCPU Linux, --shards 1, everysec, SET): 100 us cost
+/// ~10-15% rps at p1 c50 and +20-28% server CPU per op, 500 us ran at
+/// parity with the old step, and a kill -9 1 ms after the last ack lost as
+/// often with either (the residue is writer stalls, not the step).
+const AOF_WARM_POLL_STEP: std::time::Duration = std::time::Duration::from_micros(500);
 
 /// [`AOF_WARM_POLL_STEP`], or `MOON_AOF_WARM_POLL_US` (10..=50,000 µs) — a
 /// diagnostic override for same-binary A/B runs of the step's trade-off: a
@@ -230,7 +235,7 @@ mod poll_recv_tests {
     #[test]
     fn a_warm_writer_polls_with_a_short_step() {
         // Old step: 3.125 ms, so a send 3.3 ms in waited ~2.9 ms. New step:
-        // 100 us (+ timer slack). Bound 1.5 ms.
+        // 500 us (+ timer slack). Bound 1.5 ms.
         let median = median_pickup(
             std::time::Duration::from_millis(50),
             true,

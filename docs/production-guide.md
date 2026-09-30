@@ -316,7 +316,7 @@ tuning knobs — but understanding them explains the durability/throughput trade
   thread is not syscall-bound at high pipeline depth (this is what makes
   `everysec` P16 beat Redis rather than trail it).
 - **Writer poll: warm, then parked (`everysec`/`no`).** While writes flow, the
-  AOF writer thread polls its channel every 100 µs instead of parking in a
+  AOF writer thread polls its channel every 500 µs instead of parking in a
   blocking receive: a parked receiver forces every shard thread to issue a
   futex wake on each write — at non-pipelined `everysec` load that was ~150k
   wakes/sec of pure overhead on the hot path. After 5 ms with nothing queued it
@@ -342,16 +342,16 @@ A SIGKILL does not touch the kernel page cache, so a record survives it once the
 AOF writer has `write(2)`-n it; only an OS crash or power loss needs the fsync.
 moon acknowledges a write when its record is queued to the shard's writer, so
 the exposure to a process crash is the time from the ack to that `write(2)`:
-one poll step (100 µs) while writes flow, one thread wake-up after an idle
+one poll step (500 µs) while writes flow, one thread wake-up after an idle
 period, plus any time the writer thread is not scheduled or its `write(2)`
 blocks. `tests/aof_everysec_kill9_1266.rs` measures it: 10,000 acked SETs
 (unpipelined, or pipelined 100 deep) or one SET after an idle second, SIGKILL
 1 ms after the last ack, restart, count what is missing. On a 4-vCPU Linux
 container shared with other builds (2026-09-30, 20 reps per cell, `--shards`
 1 and 4): before moon#1266 Option 3, 226 of 240 reps lost acked writes (median
-rep 1–1,100 keys, worst 10,000); after it, 6 of 240 reps did (monoio 800 and
-1,900 keys, tokio 1, 1, 1 and 800), every one a writer stalled or descheduled
-for longer than the 1 ms kill delay. A kill inside that sub-millisecond window,
+rep 1–1,100 keys, worst 10,000); after it, 9 of 240 reps did (monoio 3, 18,
+400, 546 and 1,100 keys; tokio 1, 1, 1 and 800), every one a writer stalled or
+descheduled for longer than the 1 ms kill delay. A kill inside that sub-millisecond window,
 or while the writer thread is starved of CPU or its `write(2)` stalls, can
 still lose the last acknowledged writes. redis
 has no such window: it `write(2)`s its AOF buffer before it sends the replies

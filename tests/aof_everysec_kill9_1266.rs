@@ -17,7 +17,7 @@
 //! - an inline everysec `fdatasync` on the writer thread, during which the
 //!   channel did not drain at all.
 //!
-//! Option 3 (this fix) shortens that lag to one 100 µs poll step or one
+//! Option 3 (this fix) shortens that lag to one 500 µs poll step or one
 //! thread wake-up — but the ack still does not wait for the `write(2)`, so a
 //! writer thread that is descheduled, or whose `write(2)` stalls (a VM's I/O
 //! jitter, dirty-page throttling, a journal commit behind the everysec
