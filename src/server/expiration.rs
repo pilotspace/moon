@@ -302,6 +302,8 @@ fn drain_lazy_expired(db: &mut Database, on_removed: &mut dyn FnMut(&[u8])) {
             // moon#1190: a large expired value is freed by the lazy-free
             // drain, not inside this tick.
             db.remove_lazily(key.as_bytes());
+            // moon#1286: a lazily-discovered expiry is an expired key too.
+            crate::admin::metrics_setup::record_expired_key();
             on_removed(key.as_bytes());
             // moon#1013: a lazily-expired key is as gone as a swept one.
             crate::tracking::invalidation::invalidate_server_removed(key.as_bytes());
@@ -380,6 +382,10 @@ fn expire_cycle_budget(
     while let Some((ts, key)) = db.pop_due_expiry(now_ms) {
         match db.remove_expired_at(key.as_bytes(), ts, now_ms) {
             ExpiredRemoval::Removed => {
+                // moon#1286: `INFO expired_keys` counts every expiry-driven
+                // whole-key removal (not hash-field expiry). A per-thread
+                // striped bump: no shared cache line on the shard tick.
+                crate::admin::metrics_setup::record_expired_key();
                 on_removed(key.as_bytes());
                 // moon#1013: tell CLIENT TRACKING caches the key is gone. One
                 // relaxed load per key when nobody tracks.
@@ -1397,3 +1403,8 @@ mod lazy_free_tokio_tests {
 #[cfg(test)]
 #[path = "expiration_lazy_free_tick_tests.rs"]
 mod lazy_free_tick_tests;
+
+/// moon#1286: `INFO expired_keys` counts each expiry-driven whole-key removal.
+#[cfg(test)]
+#[path = "expiration_expired_keys_tests.rs"]
+mod expired_keys_tests;

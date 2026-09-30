@@ -1500,7 +1500,9 @@ mod tests {
         };
         let args = [Frame::BulkString(Bytes::from_static(b"k"))];
 
+        let expired = crate::admin::metrics_setup::this_thread_expired_keys;
         let mut db = expired_db();
+        let before = expired();
         {
             let _master = MasterStreamScope::enter();
             assert!(applying_master_stream());
@@ -1508,6 +1510,9 @@ mod tests {
         }
         assert!(!applying_master_stream(), "the scope ends with its guard");
         assert_eq!(db.len(), 0, "the master's DEL deleted the key");
+        // moon#1286: a redis replica's `expired_keys` stays 0 (measured on
+        // 7.0.15 and 7.2.7) - it applies the master's DEL, it does not expire.
+        assert_eq!(expired() - before, 0, "a replica counts no expiry");
 
         let mut db = expired_db();
         assert_eq!(
@@ -1515,6 +1520,7 @@ mod tests {
             Frame::Integer(0)
         );
         assert_eq!(db.len(), 0, "a client's UNLINK reaps it, counting nothing");
+        assert_eq!(expired() - before, 1, "a client's reap counts (moon#1286)");
     }
 
     fn poison_count() -> u64 {
