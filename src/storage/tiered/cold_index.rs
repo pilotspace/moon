@@ -1038,6 +1038,8 @@ impl ColdIndex {
         stats.bytes_reclaimed = self.drain_pending_unlink(shard_dir, manifest)?;
 
         if stats.entries_reclaimed > 0 {
+            // moon#1286: each reclaimed entry is one expired key.
+            crate::admin::metrics_setup::record_expired_keys(stats.entries_reclaimed as u64);
             crate::command::info_reclamation::record_cold_expired_reclaim(
                 stats.entries_reclaimed as u64,
                 stats.bytes_reclaimed,

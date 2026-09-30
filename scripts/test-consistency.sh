@@ -6225,6 +6225,30 @@ ACL_U="n978:probe"
 # END acl-rule-token-section -- moon#979
 
 # ===========================================================================
+# moon#1286: INFO stats expired_keys counts every expiry-driven key removal
+# ===========================================================================
+# It read 0 forever (no production caller). Compared as a DELTA around 50
+# `SET k v PX 20` keys: nothing reads them (active expiry), then again with
+# every key read after its deadline (lazy expiry -- counted once, not twice).
+log "=== moon#1286: INFO expired_keys ==="
+ek1286() { redis-cli -p "$1" INFO stats 2>/dev/null | tr -d '\r' | awk -F: '/^expired_keys/{print $2}'; }
+for ek1286_mode in active lazy; do
+    ek1286_r0=$(ek1286 "$PORT_REDIS"); ek1286_m0=$(ek1286 "$PORT_RUST")
+    for ek1286_i in $(seq 1 50); do
+        both SET "ek1286:$ek1286_mode:$ek1286_i" v PX 20
+    done
+    if [[ "$ek1286_mode" == lazy ]]; then
+        sleep 0.1
+        for ek1286_i in $(seq 1 50); do both GET "ek1286:$ek1286_mode:$ek1286_i"; done
+    fi
+    sleep 1.5
+    assert_eq "moon#1286 expired_keys delta ($ek1286_mode)" \
+        "$(( $(ek1286 "$PORT_REDIS") - ek1286_r0 ))" "$(( $(ek1286 "$PORT_RUST") - ek1286_m0 ))"
+    assert_eq "moon#1286 expired_keys delta ($ek1286_mode) is 50" \
+        "50" "$(( $(ek1286 "$PORT_RUST") - ek1286_m0 ))"
+done
+
+# ===========================================================================
 # moon#981: ACL SAVE must write the base polarity the table holds in memory
 # ===========================================================================
 # `CommandPermissions::Specific` carries `base_allow` (moon#971), but the

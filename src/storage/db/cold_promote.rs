@@ -267,6 +267,8 @@ impl Database {
                 // moon#1013: the lazy cold-tier expiry — same signal as the
                 // hot drain and the periodic `sweep_expired`.
                 crate::tracking::invalidation::invalidate_server_removed(key);
+                // moon#1286: a cold-tier lazy expiry is an expired key.
+                crate::admin::metrics_setup::record_expired_key();
                 false
             }
             ColdReadOutcome::Miss => false,

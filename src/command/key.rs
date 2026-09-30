@@ -93,6 +93,10 @@ fn settle_deletion(outcome: KeyDeletion, key: &[u8], db_index: usize) -> bool {
                 notify_del(key, db_index);
                 true
             } else {
+                // moon#1286: DEL/UNLINK found an expired key and reaped it, as
+                // redis's `expireIfNeeded` does (and counts). Not counted when
+                // applying the master's stream: a replica does not expire keys.
+                crate::admin::metrics_setup::record_expired_key();
                 crate::notify::notify_keyspace_event(
                     crate::notify::NotifyFlags::EXPIRED,
                     "expired",

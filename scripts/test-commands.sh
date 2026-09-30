@@ -1500,6 +1500,35 @@ if should_run "connection"; then
     assert_moon_ok "SELECT 0"          SELECT 0
     assert_moon_ok "SELECT 1"          SELECT 1
     assert_moon_contains "INFO server" "redis_version" INFO server
+    # moon#1286: `INFO stats` expired_keys counted nothing (no production
+    # caller). 50 short-TTL keys nobody reads (active expiry) must move the
+    # counter by exactly 50 on both servers; the same keys read after their
+    # deadline (lazy expiry) must count once, not twice.
+    ek1286() { redis-cli -p "$1" INFO stats 2>/dev/null | tr -d '\r' | awk -F: '/^expired_keys/{print $2}'; }
+    for ek1286_mode in active lazy; do
+        ek1286_r0=$(ek1286 "$PORT_REDIS"); ek1286_m0=$(ek1286 "$PORT_RUST")
+        for ek1286_i in $(seq 1 50); do
+            rcli SET "ek1286:$ek1286_mode:$ek1286_i" v PX 20 >/dev/null
+            mcli SET "ek1286:$ek1286_mode:$ek1286_i" v PX 20 >/dev/null
+        done
+        if [[ "$ek1286_mode" == lazy ]]; then
+            sleep 0.1
+            for ek1286_i in $(seq 1 50); do
+                rcli GET "ek1286:$ek1286_mode:$ek1286_i" >/dev/null
+                mcli GET "ek1286:$ek1286_mode:$ek1286_i" >/dev/null
+            done
+        fi
+        sleep 1.5
+        TOTAL=$((TOTAL + 1))
+        ek1286_rd=$(( $(ek1286 "$PORT_REDIS") - ek1286_r0 ))
+        ek1286_md=$(( $(ek1286 "$PORT_RUST") - ek1286_m0 ))
+        if [[ "$ek1286_rd" == 50 && "$ek1286_md" == 50 ]]; then
+            PASS=$((PASS + 1))
+        else
+            FAIL=$((FAIL + 1))
+            echo "  FAIL: moon#1286 INFO expired_keys delta ($ek1286_mode): redis=$ek1286_rd moon=$ek1286_md (want 50/50)"
+        fi
+    done
     assert_moon_ok "DBSIZE"            DBSIZE
     assert_moon_ok "COMMAND"           COMMAND
     assert_moon_ok "COMMAND COUNT"     COMMAND COUNT
