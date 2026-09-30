@@ -301,6 +301,19 @@ impl Database {
             }
             InsertOrUpdate::Inserted(_) => {
                 self.used_memory += new_cost;
+                // moon#1286 review N4: the same reap for a key only the cold
+                // tier held. Its deadline is in the in-RAM index (no I/O),
+                // and the lookup runs only for a NEW hot key while anything
+                // is spilled. The dead entry goes now, so no later sweep or
+                // read counts it again.
+                if self
+                    .cold_index
+                    .as_ref()
+                    .is_some_and(|ci| ci.len() > 0 && ci.expired_at(key, now_ms))
+                {
+                    self.remove_cold_only(key);
+                    crate::admin::metrics_setup::record_expired_key();
+                }
             }
         }
         // moon#1286: overwriting an entry whose TTL had passed reaps it, as
