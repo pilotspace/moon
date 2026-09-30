@@ -330,6 +330,13 @@ tuning knobs — but understanding them explains the durability/throughput trade
   draining acknowledged writes into the file. At most one fsync is in flight per
   writer; a deadline that finds the previous one still running is postponed
   until it returns. `always` keeps its fsync on the writer, before the acks.
+- **`CONFIG SET appendfsync` applies at once, as in redis.** Every producer
+  and AOF writer uses the new policy from its next write. Leaving `everysec`
+  first waits for an fsync still running on the agent (redis drains its
+  background fsync the same way); a write already queued to be acknowledged
+  after its fsync is fsynced before its ack whatever the switch. (Before the
+  R1 review fix the command answered `OK` and `CONFIG GET` showed the new
+  value while the writers kept their startup policy.)
 - **A slow or hung `everysec` fsync is loud, as in redis.** While a writer's
   fsync has been running for 2 s or more, moon logs redis's
   `Asynchronous AOF fsync is taking too long (disk is busy?)` (at most once

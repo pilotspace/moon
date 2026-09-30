@@ -808,6 +808,8 @@ mod record_ctx;
 mod refusal;
 pub mod rewrite;
 pub mod rewrite_overflow;
+/// `CONFIG SET appendfsync` at runtime (R1 review, finding 8).
+pub mod runtime_fsync;
 pub mod writer_stop;
 mod writer_task;
 

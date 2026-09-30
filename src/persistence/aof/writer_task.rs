@@ -252,7 +252,7 @@ impl GroupCommitSink for FileGroupSink<'_> {
 pub async fn aof_writer_task(
     rx: channel::MpscReceiver<AofMessage>,
     aof_path: PathBuf,
-    fsync: FsyncPolicy,
+    configured_fsync: FsyncPolicy,
     cancel: CancellationToken,
     fold_channels: Option<(
         Arc<parking_lot::Mutex<ringbuf::HeapProd<crate::shard::dispatch::ShardMessage>>>,
@@ -281,7 +281,7 @@ pub async fn aof_writer_task(
     let mut writer = aof_buf_writer(file);
     // moon#1266: the everysec deadline and its fsync agent.
     #[cfg(feature = "runtime-tokio")]
-    let mut everysec = EverysecSync::new(0, fsync);
+    let mut everysec = EverysecSync::new(0, super::runtime_fsync::effective(configured_fsync));
     // Torn-write latch (tokio TopLevel): once a batch write fails partway, the
     // plain-RESP stream may carry a partial record — never append more bytes nor
     // claim durability after the tear. Latched for the writer's lifetime; reset
@@ -412,7 +412,7 @@ pub async fn aof_writer_task(
         );
 
         // moon#1266: the everysec deadline and its fsync agent.
-        let mut everysec = EverysecSync::new(0, fsync);
+        let mut everysec = EverysecSync::new(0, super::runtime_fsync::effective(configured_fsync));
 
         let mut write_error = false;
 
@@ -446,6 +446,12 @@ pub async fn aof_writer_task(
         let mut batch_scratch = BatchBuf::new();
 
         loop {
+            // R1 review, finding 8: `CONFIG SET appendfsync` applies from this
+            // wake on (`runtime_fsync`); leaving everysec drains the agent.
+            let fsync = super::runtime_fsync::effective(configured_fsync);
+            if everysec.set_policy(fsync) {
+                idle_wait.clear_pending();
+            }
             // Group commit: wait (bounded) for one message, then
             // opportunistically drain whatever else is already queued into a
             // bounded batch so a single fsync makes the whole batch durable
@@ -498,7 +504,7 @@ pub async fn aof_writer_task(
                         // AppendSync waiter — never a false durability claim.
                         let _ = group_commit::ack_batch(&mut batch, BatchAck::WriteFailed);
                     } else {
-                        let do_fsync = matches!(fsync, FsyncPolicy::Always);
+                        let do_fsync = group_commit::batch_needs_fsync(fsync, &batch);
                         let mut sink = FileGroupSink {
                             file: &mut file,
                             fail_sync: fail_fsync_for_test,
@@ -699,6 +705,12 @@ pub async fn aof_writer_task(
     loop {
         #[cfg(feature = "runtime-tokio")]
         {
+            // R1 review, finding 8: `CONFIG SET appendfsync` applies from this
+            // wake on (`runtime_fsync`); leaving everysec drains the agent.
+            let fsync = super::runtime_fsync::effective(configured_fsync);
+            if everysec.set_policy(fsync) {
+                idle_wait.clear_pending();
+            }
             // Bounded recv (EverySec durability): wake at least every
             // `idle_wait.current()` (50ms floor, escalates to 1s while truly
             // idle — see `IdleWait` docs) even when idle so the flush deadline
@@ -783,7 +795,7 @@ pub async fn aof_writer_task(
                                     break;
                                 }
                             }
-                            let do_fsync = matches!(fsync, FsyncPolicy::Always);
+                            let do_fsync = group_commit::batch_needs_fsync(fsync, &batch);
                             // moon#1266: the whole batch reaches the kernel
                             // before the loop moves on — nothing acked stays
                             // in user space for a SIGKILL to take. (Always
@@ -1106,7 +1118,7 @@ pub async fn per_shard_aof_writer_task(
     rx: channel::MpscReceiver<AofMessage>,
     base_dir: PathBuf,
     shard_id: u16,
-    fsync: FsyncPolicy,
+    configured_fsync: FsyncPolicy,
     cancel: CancellationToken,
 ) {
     test_hooks::hold_writer_start(shard_id, &cancel);
@@ -1214,7 +1226,10 @@ pub async fn per_shard_aof_writer_task(
 
         let mut writer = aof_buf_writer(file);
         // moon#1266: the everysec deadline and its fsync agent.
-        let mut everysec = EverysecSync::new(usize::from(shard_id), fsync);
+        let mut everysec = EverysecSync::new(
+            usize::from(shard_id),
+            super::runtime_fsync::effective(configured_fsync),
+        );
         // Idle-adaptive channel-poll wake cadence (RSS/CPU wave 5, item B) —
         // see `IdleWait` docs near the top of this file.
         let mut idle_wait = IdleWait::new();
@@ -1256,6 +1271,11 @@ pub async fn per_shard_aof_writer_task(
         let mut test_append_ordinal: usize = 0;
 
         loop {
+            // R1 review, finding 8: see the TopLevel loops.
+            let fsync = super::runtime_fsync::effective(configured_fsync);
+            if everysec.set_policy(fsync) {
+                idle_wait.clear_pending();
+            }
             tokio::select! {
                 biased;
                 // Bounded recv (EverySec durability): wake at least every
@@ -1371,7 +1391,7 @@ pub async fn per_shard_aof_writer_task(
                                         }
                                     }
 
-                                    let do_fsync = matches!(fsync, FsyncPolicy::Always);
+                                    let do_fsync = group_commit::batch_needs_fsync(fsync, &batch);
                                     // moon#1266: see the TopLevel tokio loop.
                                     if !write_failed
                                         && !do_fsync
@@ -1681,7 +1701,10 @@ pub async fn per_shard_aof_writer_task(
         );
 
         // moon#1266: the everysec deadline and its fsync agent.
-        let mut everysec = EverysecSync::new(usize::from(shard_id), fsync);
+        let mut everysec = EverysecSync::new(
+            usize::from(shard_id),
+            super::runtime_fsync::effective(configured_fsync),
+        );
         let mut write_error = false;
         let mut _dbg_processed: u64 = 0;
         let _dbg_start = Instant::now();
@@ -1706,6 +1729,11 @@ pub async fn per_shard_aof_writer_task(
         let fail_fsync_for_test = std::env::var("MOON_TEST_AOF_FSYNC_FAIL").as_deref() == Ok("1");
 
         loop {
+            // R1 review, finding 8: see the TopLevel loops.
+            let fsync = super::runtime_fsync::effective(configured_fsync);
+            if everysec.set_policy(fsync) {
+                idle_wait.clear_pending();
+            }
             // Use recv_timeout so the EverySec fsync fires even when no new
             // Appends arrive after a fold (or when the client stops writing).
             // Without a timeout, the writer blocks forever in rx.recv() and
@@ -1825,7 +1853,7 @@ pub async fn per_shard_aof_writer_task(
                         // after a sustained run of small batches.
                         batch_buf.finish();
 
-                        let do_fsync = matches!(fsync, FsyncPolicy::Always);
+                        let do_fsync = group_commit::batch_needs_fsync(fsync, &batch);
                         let verdict = if write_failed {
                             // A torn write may leave a partial record — latch so no
                             // further bytes are appended after the tear.
