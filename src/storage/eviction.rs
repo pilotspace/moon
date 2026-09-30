@@ -1427,11 +1427,20 @@ fn select_victim(
             find_victim_lfu(db, config.maxmemory_samples, config.lfu_decay_time, false)
         }
         EvictionPolicy::AllKeysRandom => find_victim_random(db, false),
-        EvictionPolicy::VolatileLru => find_victim_lru(db, config.maxmemory_samples, true),
+        // A volatile sampler draws random SEGMENTS and gives up after
+        // `8 x samples` draws, so with few TTL keys among many segments it
+        // found none and the write was refused OOM while a volatile key
+        // existed (redis samples its expires dict and cannot miss). Fall back
+        // to the exact nearest-deadline victim (R2 review, item 5).
+        EvictionPolicy::VolatileLru => find_victim_lru(db, config.maxmemory_samples, true)
+            .or_else(|| find_victim_volatile_ttl(db)),
         EvictionPolicy::VolatileLfu => {
             find_victim_lfu(db, config.maxmemory_samples, config.lfu_decay_time, true)
+                .or_else(|| find_victim_volatile_ttl(db))
         }
-        EvictionPolicy::VolatileRandom => find_victim_random(db, true),
+        EvictionPolicy::VolatileRandom => {
+            find_victim_random(db, true).or_else(|| find_victim_volatile_ttl(db))
+        }
         EvictionPolicy::VolatileTtl => find_victim_volatile_ttl(db),
     }
 }
@@ -4188,3 +4197,5 @@ mod aof_routing_tests;
 mod commit_failure_tests;
 #[cfg(test)]
 mod ledger_admission_tests;
+#[cfg(test)]
+mod volatile_fallback_tests;

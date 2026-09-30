@@ -285,6 +285,9 @@ fn split_big(records: Vec<Record>) -> (Vec<usize>, Vec<Record>) {
 /// `db` with 300 small strings and a 5,000-field hash `big`, the only key
 /// with a TTL, and a budget one byte under its memory: `volatile-lru`
 /// evicts exactly `big`.
+///
+/// The budget has no slack, so each test pins the footprint correction
+/// (process-global, republished by other tests) to neutral on its thread.
 fn big_victim_fixture() -> (Vec<Database>, RuntimeConfig) {
     let mut dbs = slots(1);
     preload(&mut dbs[0], "s", 300);
@@ -310,6 +313,7 @@ fn big_victim_fixture() -> (Vec<Database>, RuntimeConfig) {
 /// removed) and one lazy-free item (the original, freed separately).
 #[test]
 fn a_large_victim_is_moved_into_its_pre_image_not_cloned() {
+    let _pin = crate::admin::footprint::pin_footprint_correction_for_test(1.0);
     let (mut dbs, config) = big_victim_fixture();
     let mut expected = string_keyspace(&dbs[..0]);
     for (k, e) in dbs[0].data().iter() {
@@ -357,6 +361,7 @@ fn a_large_victim_is_moved_into_its_pre_image_not_cloned() {
 /// one the write made.
 #[test]
 fn a_victim_captured_earlier_is_freed_as_usual() {
+    let _pin = crate::admin::footprint::pin_footprint_correction_for_test(1.0);
     let (mut dbs, config) = big_victim_fixture();
     let epoch = Epoch::begin(&dbs);
     let clones = snapshot_cow::pre_image_clones_for_test();
@@ -381,6 +386,7 @@ fn a_victim_captured_earlier_is_freed_as_usual() {
 /// `abort`, so nothing reached `moon-snapdrop` (0 values).
 #[test]
 fn a_failed_save_frees_a_held_victim_off_the_shard_thread() {
+    let _pin = crate::admin::footprint::pin_footprint_correction_for_test(1.0);
     let (mut dbs, config) = big_victim_fixture();
     let mut epoch = Epoch::begin(&dbs);
     evict_to_budget(&mut dbs[0], &config, EvictionRun::plain()).expect("evicts to budget");
