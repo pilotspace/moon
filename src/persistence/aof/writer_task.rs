@@ -584,6 +584,12 @@ pub async fn aof_writer_task(
                                 "AOF rewrite overflow drain failed (seq {}): {}",
                                 manifest.seq, e
                             );
+                            // R1 review, finding 6: the boundary fsync failed —
+                            // record it and retry within ~100 ms.
+                            if fsync == FsyncPolicy::EverySec {
+                                everysec.boundary_fsync_failed();
+                                idle_wait.mark_pending();
+                            }
                         }
                         crate::command::persistence::AOF_REWRITE_IN_PROGRESS
                             .store(false, std::sync::atomic::Ordering::SeqCst);
@@ -631,6 +637,12 @@ pub async fn aof_writer_task(
                                 "AOF rewrite overflow drain failed (seq {}): {}",
                                 manifest.seq, e
                             );
+                            // R1 review, finding 6: the boundary fsync failed —
+                            // record it and retry within ~100 ms.
+                            if fsync == FsyncPolicy::EverySec {
+                                everysec.boundary_fsync_failed();
+                                idle_wait.mark_pending();
+                            }
                         }
                         crate::command::persistence::AOF_REWRITE_IN_PROGRESS
                             .store(false, std::sync::atomic::Ordering::SeqCst);
@@ -897,6 +909,12 @@ pub async fn aof_writer_task(
                                     overflow.finish_raw(&rx, &mut sf, &mut last_db, fold_floor)
                                 {
                                     error!("AOF rewrite overflow drain failed: {}", e);
+                                    // R1 review, finding 6: the boundary fsync failed —
+                                    // record it and retry within ~100 ms.
+                                    if fsync == FsyncPolicy::EverySec {
+                                        everysec.boundary_fsync_failed();
+                                        idle_wait.mark_pending();
+                                    }
                                 }
                                 writer = aof_buf_writer(tokio::fs::File::from_std(sf));
                             }
@@ -966,6 +984,12 @@ pub async fn aof_writer_task(
                                 overflow.finish_raw(&rx, &mut active, &mut last_db, fold_floor)
                             {
                                 error!("AOF rewrite overflow drain failed: {}", e);
+                                // R1 review, finding 6: the boundary fsync failed —
+                                // record it and retry within ~100 ms.
+                                if fsync == FsyncPolicy::EverySec {
+                                    everysec.boundary_fsync_failed();
+                                    idle_wait.mark_pending();
+                                }
                             }
                             // Released only after the drain (moon#1158): a
                             // rewrite dispatched earlier would be consumed by
@@ -1487,6 +1511,12 @@ pub async fn per_shard_aof_writer_task(
                                                  drain failed: {}",
                                                 shard_id, e
                                             );
+                                            // R1 review, finding 6: the boundary fsync failed —
+                                            // record it and retry within ~100 ms.
+                                            if fsync == FsyncPolicy::EverySec {
+                                                everysec.boundary_fsync_failed();
+                                                idle_wait.mark_pending();
+                                            }
                                         }
                                         writer = aof_buf_writer(tokio::fs::File::from_std(sf));
                                     }
@@ -1913,35 +1943,45 @@ pub async fn per_shard_aof_writer_task(
                         // Combined, the two fsyncs bound the post-fold EverySec window
                         // to ≤150ms — well within the test's 1500ms kill margin.
                         if !write_error {
-                            if let Ok(mut post_drain) = drain_pending_appends_framed(
+                            let drained = drain_pending_appends_framed(
                                 &rx,
                                 &mut file,
                                 usize::MAX,
                                 &mut last_db,
                                 fold_floor,
-                            ) {
-                                if let Err(e) = sync_and_fulfill_drain(
+                            )
+                            .and_then(|mut post_drain| {
+                                sync_and_fulfill_drain(
                                     &mut post_drain,
                                     &mut file,
                                     std::path::PathBuf::from("<aof per-shard new-incr post-fold>"),
-                                ) {
-                                    error!(
-                                        "F6 per-shard rewrite: shard {} post-fold fsync \
-                                         failed: {}. EverySec window open until next Append.",
-                                        shard_id, e
-                                    );
-                                } else {
-                                    // Back-date the deadline by 900ms: the hand-off
-                                    // (threshold=1s) fires within the next 100ms, covering
-                                    // any appends that arrived after the drain above. This
-                                    // IS a pending deadline — pin the idle wait at its
-                                    // floor (`on_message` already reset it for this
-                                    // iteration; `mark_pending` keeps it there) so
-                                    // escalation cannot push the next check out past the
-                                    // ≤150ms window the comment above promises.
-                                    everysec.backdate(std::time::Duration::from_millis(900));
+                                )
+                            });
+                            if let Err(e) = drained {
+                                // R1 review, finding 6: record it and retry
+                                // within ~100 ms — `due()` is gated on dirty,
+                                // so nothing else would fsync before the
+                                // next Append.
+                                error!(
+                                    "F6 per-shard rewrite: shard {} post-fold drain/fsync \
+                                         failed: {}. Retrying the fsync within ~100 ms.",
+                                    shard_id, e
+                                );
+                                if fsync == FsyncPolicy::EverySec {
+                                    everysec.boundary_fsync_failed();
                                     idle_wait.mark_pending();
                                 }
+                            } else {
+                                // Back-date the deadline by 900ms: the hand-off
+                                // (threshold=1s) fires within the next 100ms, covering
+                                // any appends that arrived after the drain above. This
+                                // IS a pending deadline — pin the idle wait at its
+                                // floor (`on_message` already reset it for this
+                                // iteration; `mark_pending` keeps it there) so
+                                // escalation cannot push the next check out past the
+                                // ≤150ms window the comment above promises.
+                                everysec.backdate(std::time::Duration::from_millis(900));
+                                idle_wait.mark_pending();
                             }
                         }
                     }

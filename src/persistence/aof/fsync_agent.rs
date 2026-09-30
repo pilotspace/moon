@@ -297,6 +297,16 @@ impl EverysecSync {
         self.written_after_failure |= self.heal_pending;
     }
 
+    /// An everysec-owed fsync this writer ran outside the deadline path (the
+    /// post-fold drain's) failed: record it in INFO `aof_last_fsync_status`
+    /// like a deadline fsync failure, and arm a retry that fires within
+    /// ~100 ms instead of waiting for the next write (R1 review, finding 6).
+    pub(super) fn boundary_fsync_failed(&mut self) {
+        super::record_everysec_fsync_result(self.writer_idx, false);
+        self.enter_heal_pending();
+        self.backdate(EVERYSEC - Duration::from_millis(100));
+    }
+
     /// The writer learned that its fsync failed: its `err` bit is set, and
     /// only data written from here on can clear it.
     fn enter_heal_pending(&mut self) {
@@ -645,6 +655,26 @@ mod tests {
         s.note_written();
         s.inline_done(true);
         assert_eq!(err_bit(), 0);
+    }
+
+    /// R1 review, finding 6: a failed post-fold fsync is recorded and
+    /// retried within ~100 ms, with no new write.
+    #[test]
+    fn a_failed_boundary_fsync_is_recorded_and_retried_soon() {
+        let err_bit = || super::super::AOF_FSYNC_ERR_WRITERS.load(Ordering::Relaxed) & (1 << 59);
+        let mut s = EverysecSync::with_backend(59, |_f: &std::fs::File| Ok(()));
+        assert!(!s.due());
+        s.boundary_fsync_failed();
+        assert_ne!(err_bit(), 0, "recorded in aof_last_fsync_status");
+        assert!(!s.due(), "not at once");
+        std::thread::sleep(Duration::from_millis(150));
+        assert!(s.due(), "retried within ~100 ms, no new write needed");
+        assert_eq!(s.claim(), Claim::Owned);
+        assert!(s.dispatch(file()));
+        let handoff = Arc::clone(&s.agent.as_ref().expect("agent").handoff);
+        wait_until("the retry to settle", || handoff.settled() == 1);
+        assert_ne!(err_bit(), 0, "the retry alone does not heal");
+        super::super::record_everysec_fsync_result(59, true);
     }
 
     /// A dup that fails releases the claim: the caller fsyncs inline and the
