@@ -128,8 +128,10 @@ pub static AOF_FSYNC_FAILURES: std::sync::atomic::AtomicU64 = std::sync::atomic:
 /// would otherwise mask a failing shard's hole (deep-review P2). Kernel
 /// semantics make a *retry* of a failed fsync succeed trivially while the
 /// failed window's pages are already gone (fsyncgate), so each writer's bit
-/// clears only when a fsync that follows a successful write batch completes
-/// on THAT writer — operators must treat any "err" observation as "an AOF
+/// clears only when a successful fsync covers a successful write batch that
+/// THAT writer issued after it learned of the failure — a retry with nothing
+/// new written leaves it set (`fsync_agent::EverysecSync`'s heal rule, R1
+/// review finding 7). Operators must treat any "err" observation as "an AOF
 /// has a hole".
 pub static AOF_FSYNC_ERR_WRITERS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
