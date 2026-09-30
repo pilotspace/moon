@@ -91,7 +91,7 @@ pub async fn run_embedded(
 ) -> anyhow::Result<()> {
     // Resolve empty --dir to the platform user-data directory (or legacy
     // cwd data) before validating it — matches the binary entry in main.rs.
-    config.resolve_dir();
+    config.resolve_dir().map_err(|e| anyhow::anyhow!("{e}"))?;
 
     // Install the vector/graph tuning defaults exactly like the binary entry
     // (first write wins — a host process that already set them keeps its

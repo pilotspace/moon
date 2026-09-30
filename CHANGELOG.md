@@ -475,9 +475,9 @@ shared 4-vCPU Linux container against HEAD `935c555` — re-measure on the GCE r
   (squashfs, vboxsf, WSL1 drvfs, macOS exFAT/SMB: `EINVAL`, `EBADF`,
   `ENOTSUP`, `ENOTTY`, ...) the fsync is skipped at every level, new or
   pre-existing, with one warning; a pre-existing ancestor the process may not
-  open is skipped too. Neither fails boot; `EIO` does. An auto-resolved
-  user-data directory that exists but could not be made durable is used, with
-  a warning, instead of falling back to the current directory.
+  open is skipped too. Neither fails boot; `EIO` does, including on an
+  auto-resolved user-data directory. An auto-resolved user-data directory that
+  cannot be created at all still falls back to the current directory.
 
 - **Cold-key graves survive a smaller `--databases` and a failed spill commit**
   (moon#1291). Restarting a no-AOF server with fewer databases aborted the

@@ -1067,11 +1067,16 @@ enum DirResolution {
 enum UserDataDirChoice {
     /// Created (or already there) and durable: use it.
     Use,
-    /// The durable create failed, but the directory exists — a directory
-    /// fsync refused after `create_dir_all` succeeded: use it, with a
-    /// warning. Falling back to `.` would put the data where a later boot
-    /// from another working directory never looks (PR #1301 review round 4).
-    UseDespite(std::io::Error),
+    /// The durable create failed but the directory exists: an ancestor's
+    /// directory fsync failed after `create_dir_all` succeeded. Every
+    /// tolerable fsync error (EINVAL/ENOTSUP/…, EACCES on a pre-existing
+    /// ancestor) is already skipped inside `create_dir_all_durable`, so what
+    /// reaches here is fatal (EIO, EACCES on a created dir): refuse to start.
+    /// Using the directory would boot on an entry that may not survive a
+    /// power loss, and falling back to `.` would put the data where a later
+    /// boot never looks. A retry on the next boot cannot repair it either:
+    /// the directory then exists, so only its own parent is fsynced.
+    Fail(std::io::Error),
     /// The directory does not exist: fall back to the current directory.
     FallbackCwd(std::io::Error),
 }
@@ -1082,7 +1087,7 @@ fn user_data_dir_choice(
 ) -> UserDataDirChoice {
     match created {
         Ok(()) => UserDataDirChoice::Use,
-        Err(e) if is_dir() => UserDataDirChoice::UseDespite(e),
+        Err(e) if is_dir() => UserDataDirChoice::Fail(e),
         Err(e) => UserDataDirChoice::FallbackCwd(e),
     }
 }
@@ -1249,10 +1254,10 @@ impl ServerConfig {
     /// persistence component reads `self.dir`). See `decide_dir` for the
     /// resolution order. Creation failure of the user-data directory
     /// degrades to the current directory with a warning rather than
-    /// refusing to start; a durability failure (a directory fsync) on a
-    /// directory that does exist keeps it, with a warning
-    /// ([`user_data_dir_choice`]).
-    pub fn resolve_dir(&mut self) {
+    /// refusing to start; a fatal durability failure (a directory fsync
+    /// error `create_dir_all_durable` does not tolerate) on a directory that
+    /// does exist is returned, so startup fails ([`user_data_dir_choice`]).
+    pub fn resolve_dir(&mut self) -> std::io::Result<()> {
         match decide_dir(
             &self.dir,
             dir_has_moon_data(std::path::Path::new(".")),
@@ -1274,13 +1279,15 @@ impl ServerConfig {
                         tracing::info!(dir = %d.display(), "--dir not set; using platform user-data directory");
                         self.dir = d.to_string_lossy().into_owned();
                     }
-                    UserDataDirChoice::UseDespite(e) => {
-                        tracing::warn!(
-                            dir = %d.display(), error = %e,
-                            "--dir not set; the user-data directory exists but could not \
-                             be made durable; using it anyway"
-                        );
-                        self.dir = d.to_string_lossy().into_owned();
+                    UserDataDirChoice::Fail(e) => {
+                        return Err(std::io::Error::new(
+                            e.kind(),
+                            format!(
+                                "--dir not set; the user-data directory {} could not be \
+                                 made durable: {e}",
+                                d.display()
+                            ),
+                        ));
                     }
                     UserDataDirChoice::FallbackCwd(e) => {
                         tracing::warn!(
@@ -1299,6 +1306,7 @@ impl ServerConfig {
                 self.dir = ".".to_owned();
             }
         }
+        Ok(())
     }
 
     /// Returns true when disk offload is enabled.
@@ -2601,19 +2609,20 @@ mod tests {
     fn test_dir_explicit_dot_is_preserved() {
         // `--dir .` is an explicit opt-out of auto-resolution.
         let mut config = ServerConfig::parse_from(["moon", "--dir", "."]);
-        config.resolve_dir();
+        config.resolve_dir().expect("explicit --dir never fails");
         assert_eq!(config.dir, ".");
     }
 
     #[test]
     fn test_dir_explicit_path_is_preserved() {
         let mut config = ServerConfig::parse_from(["moon", "--dir", "/var/lib/moon"]);
-        config.resolve_dir();
+        config.resolve_dir().expect("explicit --dir never fails");
         assert_eq!(config.dir, "/var/lib/moon");
     }
 
-    /// PR #1301 review round 4: a durable-create error on a directory that
-    /// exists afterwards keeps the directory (with a warning); only a
+    /// PR #1301 review round 4 / PR #1305 review: a durable-create error on
+    /// a directory that exists afterwards is fatal (every tolerable fsync
+    /// error is already skipped inside `create_dir_all_durable`); only a
     /// directory that is not there falls back to `.`.
     #[test]
     fn test_user_data_dir_choice() {
@@ -2624,7 +2633,7 @@ mod tests {
         ));
         assert!(matches!(
             user_data_dir_choice(Err(Error::from(ErrorKind::Other)), || true),
-            UserDataDirChoice::UseDespite(_)
+            UserDataDirChoice::Fail(_)
         ));
         assert!(matches!(
             user_data_dir_choice(Err(Error::from(ErrorKind::PermissionDenied)), || false),
