@@ -494,11 +494,8 @@ fn run_case(kill: Kill, sabotage: bool) -> Outcome {
         // Every compacted file: on the shard whose hook stopped the process
         // the old files are gone, so nothing else holds those keys.
         let mut removed = 0;
-        for shard in 0..n {
-            for f in heap_ids(&dir, shard)
-                .into_iter()
-                .filter(|&f| f > max_id_at_s1[shard])
-            {
+        for (shard, &max_id) in max_id_at_s1.iter().enumerate() {
+            for f in heap_ids(&dir, shard).into_iter().filter(|&f| f > max_id) {
                 std::fs::remove_file(
                     shard_dir(&dir, shard)
                         .join("data")
