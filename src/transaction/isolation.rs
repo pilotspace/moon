@@ -68,6 +68,15 @@ use crate::protocol::Frame;
 /// transaction ends" from a command error.
 pub const ERR_TXN_CONFLICT_KEY: &[u8] = b"TXNCONFLICT key held by an open transaction";
 
+/// [`ERR_TXN_CONFLICT_KEY`] for a multi-shard write (`MSET`, `DEL`,
+/// `UNLINK`) whose leg on the shard holding the key was refused while other
+/// legs were applied (moon#1299 R1): cross-shard writes have no two-phase
+/// commit, so the command did run in part. Same error code, so a client's
+/// retry handling is unchanged.
+pub const ERR_TXN_CONFLICT_PARTIAL: &[u8] = b"TXNCONFLICT key held by an open transaction: \
+      command partially executed; its keys on the shard holding that key were left \
+      unchanged, the rest were applied";
+
 /// The reply to `FLUSHDB` / `FLUSHALL` / `SWAPDB` while an open transaction
 /// holds a key in a database it would clear or move (moon#1299).
 pub const ERR_TXN_CONFLICT_DB: &[u8] = b"TXNCONFLICT database has keys held by an open transaction";
