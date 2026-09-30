@@ -275,6 +275,22 @@ impl CrossStoreTxn {
     }
 }
 
+/// Keyless writes `command::dispatch` executes whose pre-image is a whole
+/// database (`FLUSHDB`, `FLUSHALL`, `SWAPDB`): the undo log cannot capture
+/// them, so a TXN refuses them before they run and is poisoned (#499) — on
+/// the connection leg of both runtimes and from a script (moon#1285, PR #1301
+/// review). The connection leg used to accept `FLUSHDB` / `FLUSHALL`, and
+/// `TXN.ABORT` then answered `+OK` restoring nothing.
+pub(crate) const TXN_WHOLE_DB_WRITES: [&[u8]; 3] = [b"FLUSHDB", b"FLUSHALL", b"SWAPDB"];
+
+/// Is `cmd` one of [`TXN_WHOLE_DB_WRITES`]?
+#[inline]
+pub(crate) fn is_txn_whole_db_write(cmd: &[u8]) -> bool {
+    TXN_WHOLE_DB_WRITES
+        .iter()
+        .any(|k| cmd.eq_ignore_ascii_case(k))
+}
+
 /// The keys a connection's write (other than `DEL` / `UNLINK`) inside an open
 /// TXN undo-captures and holds write intents on, on both runtimes' generic
 /// write leg (moon#500).
@@ -311,6 +327,18 @@ mod tests {
             .map(|a| crate::protocol::Frame::BulkString(Bytes::copy_from_slice(a.as_bytes())))
             .collect();
         conn_txn_capture_keys(cmd.as_bytes(), &args).into_vec()
+    }
+
+    /// PR #1301 review round 4: the whole-database writes a TXN refuses, in
+    /// any case, and nothing else.
+    #[test]
+    fn whole_db_writes_are_named_in_any_case() {
+        for cmd in ["FLUSHDB", "flushdb", "FLUSHALL", "FlushAll", "SWAPDB"] {
+            assert!(is_txn_whole_db_write(cmd.as_bytes()), "{cmd}");
+        }
+        for cmd in ["FLUSH", "FLUSHDBX", "DEL", "SELECT", "MOVE", "COPY", ""] {
+            assert!(!is_txn_whole_db_write(cmd.as_bytes()), "{cmd}");
+        }
     }
 
     /// PR #1301 review round 3: a write whose keys are all READ in this argv

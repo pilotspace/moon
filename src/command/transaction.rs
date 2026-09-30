@@ -47,6 +47,16 @@ pub const ERR_TXN_CROSS_SHARD: &[u8] = b"ERR TXN does not support cross-shard wr
 pub const ERR_TXN_SCRIPT_NOT_UNDOABLE: &[u8] = b"ERR TXN cannot roll back this command \
       from a script (keyless or second-database write) -- run it outside the TXN";
 
+/// PR #1301 review round 4: a whole-database write (`FLUSHDB`, `FLUSHALL`)
+/// sent on the connection inside an open TXN. The undo log cannot capture a
+/// whole database, so the write is refused before it runs and the TXN is
+/// poisoned (#499) — the connection-leg twin of
+/// [`ERR_TXN_SCRIPT_NOT_UNDOABLE`]. See
+/// `crate::transaction::TXN_WHOLE_DB_WRITES`. (`SWAPDB`, `MOVE` and
+/// `COPY ... DB` keep their older `ERR_TXN_CROSS_SHARD` refusal.)
+pub const ERR_TXN_NOT_UNDOABLE: &[u8] = b"ERR TXN cannot roll back this command \
+      (whole-database write) -- run it outside the TXN";
+
 /// #499: the error `TXN.COMMIT` answers when the body contained rejected ops.
 ///
 /// Every guard rejection inside a TXN body (cross-shard write, `MOVE`,

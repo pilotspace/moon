@@ -2996,6 +2996,22 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 continue;
             }
 
+            // PR #1301 review round 4: a whole-database write (`FLUSHDB`,
+            // `FLUSHALL`) inside an active TXN is refused before it runs and
+            // poisons the TXN (#499), as the script path refuses it
+            // (`KEYLESS_DISPATCHED_WRITES`). The undo log captures keys, not
+            // databases: `SET k v; TXN BEGIN; FLUSHDB; TXN ABORT` answered
+            // `+OK` and `k` stayed gone. `SWAPDB` is refused earlier by its
+            // own intercept. Above every routing/fan-out site, so the refusal
+            // holds at any shard count.
+            if conn.in_cross_txn() && crate::transaction::is_txn_whole_db_write(cmd) {
+                conn.mark_cross_txn_rejected(cmd);
+                responses.push(Frame::Error(Bytes::from_static(
+                    crate::command::transaction::ERR_TXN_NOT_UNDOABLE,
+                )));
+                continue;
+            }
+
             // moon#500: a multi-key WRITE inside an active TXN must not reach
             // `try_handle_cross_shard_commands`. Its `coordinate_multi_key` arm
             // executes across shards and returns consumed, bypassing BOTH the

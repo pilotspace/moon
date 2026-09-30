@@ -206,7 +206,7 @@ fn main() -> anyhow::Result<()> {
     // (check-config validation, persistence init, WAL). Empty --dir
     // auto-resolves to the platform user-data directory, or stays on the
     // current directory when it already holds pre-v0.2.0 moon data.
-    config.resolve_dir();
+    config.resolve_dir().map_err(|e| anyhow::anyhow!("{e}"))?;
 
     // Apply the TCP listen backlog before any listener binds (S-5,
     // `--tcp-backlog`; per-socket — SO_REUSEPORT splits load across shards).

@@ -1095,9 +1095,6 @@ mod tests {
         assert!(written_of(b"MEMORY", &["USAGE", "k"]).is_empty());
     }
 
-    /// `written_keys` is a SUBSET of `command_keys` by construction; pinning
-    /// it means a future role change can never invent a key the argv does not
-    /// name (which would invalidate a key nobody asked about).
     /// PR #1301 review round 3: "named every key, none written" is
     /// `Some(empty)`, distinct from "could not enumerate" (`None`).
     #[test]
@@ -1120,6 +1117,9 @@ mod tests {
         assert_eq!(known(b"NOSUCHCMD", &["k"]), None);
     }
 
+    /// `written_keys` is a SUBSET of `command_keys` by construction; pinning
+    /// it means a future role change can never invent a key the argv does not
+    /// name (which would invalidate a key nobody asked about).
     #[test]
     fn written_keys_never_names_a_key_the_command_does_not() {
         for (cmd, argv) in [

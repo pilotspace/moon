@@ -2041,6 +2041,18 @@ pub(crate) async fn handle_connection_sharded_inner<
                         continue;
                     }
 
+                    // PR #1301 review round 4: a whole-database write
+                    // (`FLUSHDB`, `FLUSHALL`) inside an active TXN is refused
+                    // before it runs and poisons the TXN — twin of the monoio
+                    // guard; see `handler_monoio/mod.rs`.
+                    if conn.in_cross_txn() && crate::transaction::is_txn_whole_db_write(cmd) {
+                        conn.mark_cross_txn_rejected(cmd);
+                        responses.push(Frame::Error(bytes::Bytes::from_static(
+                            crate::command::transaction::ERR_TXN_NOT_UNDOABLE,
+                        )));
+                        continue;
+                    }
+
                     // --- Multi-key commands ---
                     // moon#513 (A1): when ONE shard owns every key, this branch
                     // stands aside and ordinary routing slots the command into
