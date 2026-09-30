@@ -371,9 +371,11 @@ blocks. `tests/aof_everysec_kill9_1266.rs` measures it: 10,000 acked SETs
 1 ms after the last ack, restart, count what is missing. On a 4-vCPU Linux
 container shared with other builds (2026-09-30, 20 reps per cell, `--shards`
 1 and 4): before moon#1266 Option 3, 226 of 240 reps lost acked writes (median
-rep 1–1,100 keys, worst 10,000); after it, 9 of 240 reps did (monoio 3, 18,
-400, 546 and 1,100 keys; tokio 1, 1, 1 and 800), every one a writer stalled or
-descheduled for longer than the 1 ms kill delay. A kill inside that sub-millisecond window,
+rep 1–1,100 keys, worst 10,000); after it, 9 of 240 reps did in the run of
+the final binaries (monoio 5 of 120: 3, 18, 400, 546 and 1,100 keys; tokio 4 of
+120: 1, 1, 1 and 800). A second 20-rep tokio run lost in 7 of its 120 reps (up
+to 40 keys), so across both tokio runs the total is 16 of 360 reps. Every lossy
+rep was a writer stalled or descheduled for longer than the 1 ms kill delay. A kill inside that sub-millisecond window,
 or while the writer thread is starved of CPU or its `write(2)` stalls, can
 still lose the last acknowledged writes. redis
 has no such window: it `write(2)`s its AOF buffer before it sends the replies
