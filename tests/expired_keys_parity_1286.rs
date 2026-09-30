@@ -9,6 +9,16 @@
 //!   `DEL` of expired = 1050 before a restart, **0** after a graceful and a
 //!   kill -9 restart. f766fc2: 1050 after both, s1 and s4.
 //!
+//! - **Writes over an expired key (finding 3):** redis's `lookupKeyWrite`
+//!   reaps (and counts) the expired key before the write. Oracle: every case
+//!   below counts one per key. f766fc2 counted 0 for SET, SETNX, SET NX,
+//!   GETSET, APPEND, INCRBYFLOAT, SETBIT, PFADD, the COPY / RENAME
+//!   destination, GET→SET and EXISTS→SET (the read hides the key and the SET
+//!   lands before the drain), a timing-dependent part of MSET, and INCR at s4.
+//!   Also SETRANGE, SET … GET, SETEX, MSETNX, INCRBY, DECR and the
+//!   SUNIONSTORE / BITOP destination (0 at s1). HSET, LPUSH, GETDEL, GETEX
+//!   and DEL were right and are the controls.
+//!
 //! Expected values were captured from redis 7.2.7 with the same commands.
 //!
 //! `MOON_BIN=<moon> cargo test --test expired_keys_parity_1286 -- --include-ignored`
@@ -192,4 +202,131 @@ fn aof_replay_does_not_recount_expired_keys_1_shard() {
 #[ignore = "real-server suite: MOON_BIN pinned"]
 fn aof_replay_does_not_recount_expired_keys_4_shards() {
     replay_does_not_recount(4);
+}
+
+// ---------------------------------------------------------------------------
+// Finding 3: a write over an expired key
+// ---------------------------------------------------------------------------
+
+/// Keys per case; the oracle counts exactly one per key.
+const OVERWRITE_N: usize = 1000;
+
+/// `(name, commands for key index i)`. Keys share a hash tag per index, so a
+/// two-key command stays on one shard at s4.
+type Case = (&'static str, fn(usize) -> Vec<Vec<String>>);
+
+fn v(parts: &[&str]) -> Vec<String> {
+    parts.iter().map(|s| s.to_string()).collect()
+}
+
+fn o(i: usize) -> String {
+    format!("{{t{i}}}o")
+}
+
+fn src(i: usize) -> String {
+    format!("{{t{i}}}s")
+}
+
+const OVERWRITE_CASES: &[Case] = &[
+    ("SET", |i| vec![v(&["SET", &o(i), "x"])]),
+    ("SETNX", |i| vec![v(&["SETNX", &o(i), "x"])]),
+    ("SET NX", |i| vec![v(&["SET", &o(i), "x", "NX"])]),
+    ("GETSET", |i| vec![v(&["GETSET", &o(i), "x"])]),
+    ("APPEND", |i| vec![v(&["APPEND", &o(i), "x"])]),
+    ("INCR", |i| vec![v(&["INCR", &o(i)])]),
+    ("INCRBYFLOAT", |i| vec![v(&["INCRBYFLOAT", &o(i), "1.5"])]),
+    ("SETBIT", |i| vec![v(&["SETBIT", &o(i), "1", "1"])]),
+    ("PFADD", |i| vec![v(&["PFADD", &o(i), "x"])]),
+    ("MSET", |i| vec![v(&["MSET", &o(i), "x"])]),
+    ("COPY destination", |i| {
+        vec![v(&["SET", &src(i), "x"]), v(&["COPY", &src(i), &o(i)])]
+    }),
+    ("RENAME destination", |i| {
+        vec![v(&["SET", &src(i), "x"]), v(&["RENAME", &src(i), &o(i)])]
+    }),
+    ("GET then SET", |i| {
+        vec![v(&["GET", &o(i)]), v(&["SET", &o(i), "x"])]
+    }),
+    ("EXISTS then SET", |i| {
+        vec![v(&["EXISTS", &o(i)]), v(&["SET", &o(i), "x"])]
+    }),
+    ("SETRANGE", |i| vec![v(&["SETRANGE", &o(i), "0", "x"])]),
+    ("SET GET", |i| vec![v(&["SET", &o(i), "x", "GET"])]),
+    ("SETEX", |i| vec![v(&["SETEX", &o(i), "100", "x"])]),
+    ("MSETNX", |i| vec![v(&["MSETNX", &o(i), "x"])]),
+    ("INCRBY", |i| vec![v(&["INCRBY", &o(i), "3"])]),
+    ("DECR", |i| vec![v(&["DECR", &o(i)])]),
+    ("SUNIONSTORE destination", |i| {
+        vec![
+            v(&["SADD", &src(i), "x"]),
+            v(&["SUNIONSTORE", &o(i), &src(i)]),
+        ]
+    }),
+    ("BITOP destination", |i| {
+        vec![
+            v(&["SET", &src(i), "x"]),
+            v(&["BITOP", "NOT", &o(i), &src(i)]),
+        ]
+    }),
+    // Controls: counted before this fix.
+    ("HSET", |i| vec![v(&["HSET", &o(i), "f", "v"])]),
+    ("LPUSH", |i| vec![v(&["LPUSH", &o(i), "x"])]),
+    ("GETDEL", |i| vec![v(&["GETDEL", &o(i)])]),
+    ("GETEX", |i| vec![v(&["GETEX", &o(i), "EX", "100"])]),
+    ("DEL", |i| vec![v(&["DEL", &o(i)])]),
+];
+
+fn overwrite_matrix(shards: usize) {
+    let dir = common::unique_test_dir(&format!("moon-1286-overwrite-s{shards}"));
+    let (mut guard, port) = spawn(&dir, shards, false);
+    let mut c = Conn::open(port);
+    let mut wrong = Vec::new();
+    for (name, mk) in OVERWRITE_CASES {
+        assert_eq!(c.send(&["FLUSHALL"]), "+OK\r\n");
+        std::thread::sleep(Duration::from_millis(300));
+        let before = expired_keys(&mut c);
+        let sets: Vec<Vec<String>> = (0..OVERWRITE_N)
+            .map(|i| v(&["SET", &o(i), "5", "PX", "30"]))
+            .collect();
+        pipeline(&mut c, &sets);
+        std::thread::sleep(Duration::from_millis(32));
+        let writes: Vec<Vec<String>> = (0..OVERWRITE_N).flat_map(mk).collect();
+        pipeline(&mut c, &writes);
+        // Whatever the write left expired (nothing, here) is reaped by now.
+        std::thread::sleep(Duration::from_millis(1200));
+        let delta = expired_keys(&mut c) - before;
+        if delta != OVERWRITE_N as u64 {
+            wrong.push(format!("{name}: {delta}"));
+        }
+    }
+    guard.kill_now();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        wrong.is_empty(),
+        "s{shards}: expired_keys per {OVERWRITE_N} writes over an expired key (redis 7.2.7: \
+         {OVERWRITE_N} each): {wrong:?}"
+    );
+}
+
+fn pipeline(c: &mut Conn, cmds: &[Vec<String>]) {
+    for chunk in cmds.chunks(500) {
+        let owned: Vec<Vec<&str>> = chunk
+            .iter()
+            .map(|cmd| cmd.iter().map(String::as_str).collect())
+            .collect();
+        let refs: Vec<&[&str]> = owned.iter().map(Vec::as_slice).collect();
+        c.pipeline(&refs);
+    }
+}
+
+#[test]
+#[ignore = "real-server suite: MOON_BIN pinned"]
+fn a_write_over_an_expired_key_counts_it_1_shard() {
+    overwrite_matrix(1);
+}
+
+#[test]
+#[ignore = "real-server suite: MOON_BIN pinned"]
+fn a_write_over_an_expired_key_counts_it_4_shards() {
+    overwrite_matrix(4);
 }
