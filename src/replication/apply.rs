@@ -295,6 +295,13 @@ pub(crate) fn applying_master_stream() -> bool {
     APPLYING_MASTER_STREAM.with(std::cell::Cell::get)
 }
 
+/// Run the rest of the calling scope as a master-stream dispatch (tests of
+/// the command layer's replica behaviour, review N2).
+#[cfg(test)]
+pub(crate) fn master_stream_scope_for_test() -> impl Drop {
+    MasterStreamScope::enter()
+}
+
 /// Marks one master-stream dispatch; cleared on drop, so an early return or
 /// an unwind cannot leave a client command looking like the master's.
 struct MasterStreamScope;

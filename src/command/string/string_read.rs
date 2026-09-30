@@ -296,8 +296,9 @@ pub fn getex(db: &mut Database, args: &[Frame]) -> Frame {
             // redis `checkAlreadyExpired` (R1 finding 4): an EXAT / PXAT
             // already past deletes the key now — a deletion (`del`), not an
             // expiry — and still answers the value. Judged on the database
-            // clock, which a replay pins to the log's time (moon#1277).
-            if absolute && when <= db.now_ms() {
+            // clock, which a replay pins to the log's time (moon#1277); never
+            // on a replica applying its master's stream (review N2).
+            if absolute && crate::command::key::deadline_already_past(db, when) {
                 if db.remove(key).is_some() {
                     crate::command::key::notify_del(key, db.db_index);
                 }
