@@ -38,6 +38,7 @@ fn filler() -> AofMessage {
         db: 0,
         bytes: bytes::Bytes::from_static(b"*1\r\n$4\r\nPING\r\n"),
         epoch: FoldEpoch::INITIAL,
+        clock_ms: 0,
     }
 }
 

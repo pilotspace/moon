@@ -159,6 +159,7 @@ mod tests {
             db: 0,
             bytes: bytes::Bytes::from_static(b"*1\r\n$4\r\nPING\r\n"),
             epoch: crate::persistence::aof::FoldEpoch::INITIAL,
+            clock_ms: 0,
         }
     }
 

@@ -309,8 +309,9 @@ impl AofWriterPool {
         lsn: u64,
         db: usize,
         bytes: Bytes,
-        stamp: FoldEpoch,
+        stamp: impl Into<AppendStamp>,
     ) -> Result<(), AofAck> {
+        let stamp = stamp.into();
         match self.fsync_policy {
             FsyncPolicy::Always => {
                 let rx = self.try_send_append_sync(shard_id, lsn, db, bytes, stamp);
@@ -356,9 +357,14 @@ impl AofWriterPool {
     /// `send_append_bounded_blocking`, `try_send_append_ordered`) read it
     /// themselves: they cannot suspend between their caller's mutation and
     /// their own entry.
+    ///
+    /// moon#1283: the stamp also carries this thread's cached clock — on a
+    /// shard thread the `CachedClock` value the mutation was judged with —
+    /// so the writer can put the exact `MOON.TS` before the record however
+    /// late it is enqueued.
     #[inline]
-    pub fn fold_stamp(&self, shard_id: usize) -> FoldEpoch {
-        self.overflow_for(shard_id).stamp()
+    pub fn fold_stamp(&self, shard_id: usize) -> AppendStamp {
+        AppendStamp::now(self.overflow_for(shard_id).stamp())
     }
 
     /// Group-commit append for coordinator LOCAL legs (v3-5 local-leg fix).
@@ -388,8 +394,9 @@ impl AofWriterPool {
         lsn: u64,
         db: usize,
         bytes: Bytes,
-        stamp: FoldEpoch,
+        stamp: impl Into<AppendStamp>,
     ) -> Result<bool, AofAck> {
+        let stamp = stamp.into();
         self.send_append_backpressure(shard_id, lsn, db, bytes, stamp)
             .await?;
         Ok(matches!(self.fsync_policy, FsyncPolicy::Always))
@@ -488,6 +495,7 @@ impl AofWriterPool {
             db,
             bytes,
             epoch: ovf.stamp(),
+            clock_ms: crate::storage::entry::current_time_ms(),
         };
         let msg = if ovf.spill_first() {
             match ovf.try_spill(msg) {
@@ -668,6 +676,7 @@ impl AofWriterPool {
             db,
             bytes,
             epoch,
+            clock_ms: crate::storage::entry::current_time_ms(),
         };
         // #452.1 ordering rule 1: while this writer's rewrite overflow holds
         // spilled appends, every new append must also spill — a `try_send`
@@ -978,12 +987,13 @@ impl AofWriterPool {
         use super::rewrite_overflow::SpillReject;
         // #455: synchronous — the stamp is the caller's mutation epoch, and
         // a block below holds the whole thread, so no fold can interleave.
-        let epoch = self.fold_stamp(shard_id);
+        let stamp = self.fold_stamp(shard_id);
         let mut msg = AofMessage::Append {
             lsn,
             db,
             bytes,
-            epoch,
+            epoch: stamp.epoch,
+            clock_ms: stamp.clock_ms,
         };
         // #452.1 ordering rule 1: while the rewrite overflow holds spilled
         // appends, keep spilling — see `try_send_append`. A cap-exceeded
@@ -1043,17 +1053,19 @@ impl AofWriterPool {
         lsn: u64,
         db: usize,
         bytes: Bytes,
-        epoch: FoldEpoch,
+        stamp: AppendStamp,
     ) -> Result<(), AofAck> {
         use super::rewrite_overflow::SpillReject;
-        // #455: `epoch` was read at the caller's mutation. This function can
+        // #455: `stamp` was read at the caller's mutation. This function can
         // park in `send_async` below, and a fold snapshot can land during
-        // that park; the stamp classifies the record correctly either way.
+        // that park; the stamp classifies the record correctly either way,
+        // and its clock (moon#1283) stays the mutation's, not the enqueue's.
         let mut msg = AofMessage::Append {
             lsn,
             db,
             bytes,
-            epoch,
+            epoch: stamp.epoch,
+            clock_ms: stamp.clock_ms,
         };
         // #452.1 ordering rule 1 (P0 fix): this path MUST honor the spill
         // gate like every other producer — the fold's phase-1/3 drains free
@@ -1187,8 +1199,9 @@ impl AofWriterPool {
         lsn: u64,
         db: usize,
         bytes: Bytes,
-        epoch: FoldEpoch,
+        stamp: impl Into<AppendStamp>,
     ) -> crate::runtime::channel::OneshotReceiver<AofAck> {
+        let stamp = stamp.into();
         use super::rewrite_overflow::SpillReject;
         // A zero-length fsync barrier carries no record: refusing it drops
         // nothing from the log, so it must not mark an AOF hole (moon#1272
@@ -1205,7 +1218,8 @@ impl AofWriterPool {
             db,
             bytes,
             ack: ack_tx,
-            epoch,
+            epoch: stamp.epoch,
+            clock_ms: stamp.clock_ms,
         };
         // #452.1 ordering rule 1 (P0 fix): AppendSync producers (always-path
         // appends and zero-length fsync barriers) must honor the spill gate
@@ -1301,12 +1315,14 @@ impl AofWriterPool {
             lsn,
         );
         let tagged_lsn = (lsn & !ORDERED_LSN_FLAG) | ORDERED_LSN_FLAG;
+        let stamp = self.fold_stamp(shard_id);
         let msg = AofMessage::Append {
             lsn: tagged_lsn,
             db,
             bytes,
             // #455: synchronous producer — see `fold_stamp`.
-            epoch: self.fold_stamp(shard_id),
+            epoch: stamp.epoch,
+            clock_ms: stamp.clock_ms,
         };
         // #452.1 (re-verify Q2): this leg must honor the same spill-first
         // gate as every other producer — an ungated try_send during a fold
@@ -1707,7 +1723,7 @@ mod pool_tests {
         // on the reply. In this unit test there's no shard event loop consuming the
         // SPSC ring, so the fold will error out. The test verifies the abort path,
         // which is triggered by the fold guard's error handling.
-        let mut last_db: usize = 0;
+        let mut last_db = RecordCtx::new();
         let outcome = do_rewrite_per_shard(
             0,
             &shard_dbs,
@@ -2064,7 +2080,7 @@ mod pool_tests {
             .append(true)
             .open(&incr)
             .unwrap();
-        let mut last_db: usize = 0;
+        let mut last_db = RecordCtx::new();
         let mut outcome = drain_pending_appends_framed(
             &rx0,
             &mut file,
@@ -2114,7 +2130,7 @@ mod pool_tests {
             .append(true)
             .open(&incr)
             .unwrap();
-        let mut last_db: usize = 0;
+        let mut last_db = RecordCtx::new();
         let mut outcome = drain_pending_appends_framed(
             &rx0,
             &mut file,
@@ -2128,12 +2144,17 @@ mod pool_tests {
         assert_eq!(outcome.pending_acks.len(), 1, "barrier ack parked");
 
         // On disk: ONLY the real append's framed record (12-byte header + 14
-        // payload bytes). The barrier must leave no trace.
+        // payload bytes), after the `MOON.TS` of its clock (moon#1283). The
+        // barrier must leave no trace.
         file.sync_data().unwrap();
         let on_disk = std::fs::read(&incr).unwrap();
+        let ts_len = u32::from_le_bytes(on_disk[8..12].try_into().unwrap()) as usize;
+        assert!(crate::persistence::replay::pseudo::is_ts_record(
+            &on_disk[12..12 + ts_len]
+        ));
         assert_eq!(
             on_disk.len(),
-            12 + 14,
+            12 + ts_len + 12 + 14,
             "barrier must write no header/payload; got {} bytes",
             on_disk.len()
         );
@@ -2174,7 +2195,7 @@ mod pool_tests {
             .append(true)
             .open(&incr)
             .unwrap();
-        let mut last_db: usize = 0;
+        let mut last_db = RecordCtx::new();
         let outcome = drain_pending_appends_framed(
             &rx0,
             &mut file,
@@ -2185,7 +2206,8 @@ mod pool_tests {
         .unwrap();
         assert_eq!(outcome.drained, 3, "all three real appends were drained");
         assert_eq!(
-            last_db, 0,
+            last_db.db(),
+            0,
             "context tracker ends at the 3rd record's db (0)"
         );
 
@@ -2204,6 +2226,10 @@ mod pool_tests {
             frames.push(raw[i + 12..i + 12 + len].to_vec());
             i += 12 + len;
         }
+        // moon#1283: the first record carries its clock; the `MOON.TS`
+        // records are not what this test is about.
+        assert!(crate::persistence::replay::pseudo::is_ts_record(&frames[0]));
+        frames.retain(|f| !crate::persistence::replay::pseudo::is_ts_record(f));
 
         assert_eq!(
             frames,
@@ -2243,7 +2269,7 @@ mod pool_tests {
             .append(true)
             .open(&incr)
             .unwrap();
-        let mut last_db: usize = 0;
+        let mut last_db = RecordCtx::new();
         let mut outcome =
             drain_pending_appends(&rx0, &mut file, &mut last_db, FoldEpoch::INITIAL).unwrap();
         assert_eq!(
@@ -2383,6 +2409,7 @@ mod pool_tests {
             db: 0,
             bytes: Bytes::from_static(b"AAAA"),
             epoch: FoldEpoch::INITIAL,
+            clock_ms: 0,
         })
         .unwrap();
         tx.try_send(AofMessage::Append {
@@ -2390,6 +2417,7 @@ mod pool_tests {
             db: 0,
             bytes: Bytes::from_static(b"BBBB"),
             epoch: FoldEpoch::INITIAL,
+            clock_ms: 0,
         })
         .unwrap();
         tx.try_send(AofMessage::Append {
@@ -2397,6 +2425,7 @@ mod pool_tests {
             db: 0,
             bytes: Bytes::from_static(b"CCCC"),
             epoch: FoldEpoch::INITIAL,
+            clock_ms: 0,
         })
         .unwrap();
 
@@ -2409,6 +2438,7 @@ mod pool_tests {
             bytes: Bytes::from_static(b"DDDD"),
             ack: ack_tx,
             epoch: FoldEpoch::INITIAL,
+            clock_ms: 0,
         })
         .unwrap();
 
@@ -2951,6 +2981,7 @@ mod pool_tests {
             db: 0,
             bytes: Bytes::from_static(b"x"),
             epoch: FoldEpoch::INITIAL,
+            clock_ms: 0,
         })
         .unwrap();
         let pool = AofWriterPool::top_level_with_policy(
@@ -2986,6 +3017,7 @@ mod pool_tests {
             db: 0,
             bytes: Bytes::from_static(b"x"),
             epoch: FoldEpoch::INITIAL,
+            clock_ms: 0,
         })
         .unwrap();
         let pool = AofWriterPool::top_level_with_policy(
@@ -3099,6 +3131,7 @@ mod pool_tests {
             db: 0,
             bytes: Bytes::from_static(b"x"),
             epoch: FoldEpoch::INITIAL,
+            clock_ms: 0,
         })
         .unwrap();
         let pool = AofWriterPool::top_level_with_policy(
@@ -3140,6 +3173,7 @@ mod pool_tests {
             db: 0,
             bytes: Bytes::from_static(b"x"),
             epoch: FoldEpoch::INITIAL,
+            clock_ms: 0,
         })
         .unwrap();
         let pool = AofWriterPool::top_level_with_policy(
@@ -3216,6 +3250,7 @@ mod pool_tests {
                 db: 0,
                 bytes: Bytes::from_static(b"older-buffered"),
                 epoch: FoldEpoch::INITIAL,
+                clock_ms: 0,
             })
             .is_ok()
         );
@@ -3241,6 +3276,7 @@ mod pool_tests {
                 db: 0,
                 bytes: Bytes::from_static(b"older-spilled"),
                 epoch: FoldEpoch::INITIAL,
+                clock_ms: 0,
             })
             .is_ok()
         );
@@ -3278,6 +3314,7 @@ mod pool_tests {
                 db: 0,
                 bytes: Bytes::from_static(b"older-spilled"),
                 epoch: FoldEpoch::INITIAL,
+                clock_ms: 0,
             })
             .is_ok()
         );
@@ -3301,7 +3338,7 @@ mod pool_tests {
             .append(true)
             .open(&path)
             .unwrap();
-        let mut db_ctx = 0usize;
+        let mut db_ctx = RecordCtx::new();
         pool.overflow_for(0)
             .finish_framed(&rx, &mut file, &mut db_ctx, FoldEpoch::INITIAL)
             .unwrap();

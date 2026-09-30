@@ -874,7 +874,7 @@ pub(super) async fn try_handle_multi_exec(
             let fold_stamp = ctx
                 .aof_pool
                 .as_ref()
-                .map_or(crate::persistence::aof::FoldEpoch::INITIAL, |pool| {
+                .map_or(crate::persistence::aof::AppendStamp::INITIAL, |pool| {
                     pool.fold_stamp(ctx.shard_id)
                 });
             // moon#1084: log the body in the SAME synchronous stretch as the

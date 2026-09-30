@@ -682,7 +682,7 @@ async fn persist_local_leg(
     // record so the replica applies it in the same db.
     db: usize,
     serialized: Bytes,
-    fold_stamp: crate::persistence::aof::FoldEpoch,
+    fold_stamp: crate::persistence::aof::AppendStamp,
 ) -> Result<bool, crate::persistence::aof::AofAck> {
     let repl_active = crate::replication::state::fanout_active_for(repl_state);
     if !repl_active && aof_pool.is_none() {
@@ -715,14 +715,15 @@ async fn persist_local_leg(
         .await
 }
 
-/// The AOF fold epoch of `my_shard`'s writer, or the initial epoch when AOF is
-/// off. Read it in the same no-await stretch as the mutation it stamps.
+/// The AOF stamp of `my_shard`'s writer — its fold epoch and this shard's
+/// clock (moon#1283) — or the initial stamp when AOF is off. Read it in the
+/// same no-await stretch as the mutation it stamps.
 #[inline]
 fn local_fold_stamp(
     aof_pool: Option<&Arc<crate::persistence::aof::AofWriterPool>>,
     my_shard: usize,
-) -> crate::persistence::aof::FoldEpoch {
-    aof_pool.map_or(crate::persistence::aof::FoldEpoch::INITIAL, |pool| {
+) -> crate::persistence::aof::AppendStamp {
+    aof_pool.map_or(crate::persistence::aof::AppendStamp::INITIAL, |pool| {
         pool.fold_stamp(my_shard)
     })
 }

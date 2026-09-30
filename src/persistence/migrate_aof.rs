@@ -484,6 +484,20 @@ fn append_resp_to_shards(
                     continue;
                 }
 
+                // moon#1283: a `MOON.TS` stamp is no key's — it is the clock of
+                // the records after it, whichever shard they route to, so
+                // every shard's incr gets it in stream order (lsn 0, like the
+                // writer's own; never counted as a written command).
+                if cmd_upper.as_slice() == crate::persistence::replay::pseudo::TS {
+                    let mut resp_buf = BytesMut::new();
+                    crate::protocol::serialize::serialize(&frame, &mut resp_buf);
+                    for (sid, file) in shard_files.iter_mut().enumerate() {
+                        write_framed(file, 0, &resp_buf, manifest.shard_incr_path(sid as u16))?;
+                    }
+                    commands_skipped += 1;
+                    continue;
+                }
+
                 // Route to shard: keyless commands go to shard 0.
                 let shard_idx = if arr.len() < 2 {
                     if matches!(cmd_upper.as_slice(), b"FLUSHALL" | b"FLUSHDB") {
@@ -742,6 +756,31 @@ mod tests {
             total_incr_bytes > 0,
             "at least some bytes written to shard incr files"
         );
+    }
+
+    /// moon#1283: a `MOON.TS` stamp reaches every shard's incr, in stream
+    /// order, as an unoffset record — not just the shard its argument hashes
+    /// to.
+    #[test]
+    fn migrate_aof_copies_a_clock_stamp_to_every_shard() {
+        let src_dir = tempfile::tempdir().unwrap();
+        let dst_dir = tempfile::tempdir().unwrap();
+        let mut aof_data: Vec<u8> = cmd_resp(&["MOON.TS", "1790000000000"]);
+        for i in 0..10u32 {
+            aof_data.extend(set_resp(&format!("key{i}"), "value"));
+        }
+        std::fs::write(src_dir.path().join("appendonly.aof"), &aof_data).expect("write source aof");
+        let result = migrate_aof(src_dir.path(), dst_dir.path(), 4).expect("migration succeeds");
+        assert_eq!(result.commands_written, 10, "the stamp is not a command");
+        let manifest = AofManifest::load(dst_dir.path())
+            .expect("load manifest")
+            .expect("manifest present");
+        let stamp = cmd_resp(&["MOON.TS", "1790000000000"]);
+        for sid in 0..4u16 {
+            let incr = std::fs::read(manifest.shard_incr_path(sid)).expect("incr");
+            assert_eq!(&incr[..8], &0u64.to_le_bytes(), "shard {sid}: lsn 0");
+            assert_eq!(&incr[12..12 + stamp.len()], stamp.as_slice(), "shard {sid}");
+        }
     }
 
     #[test]

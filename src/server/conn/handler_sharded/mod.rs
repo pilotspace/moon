@@ -2817,7 +2817,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                             // stretch (see the monoio handler's generic write
                             // leg).
                             let fold_stamp = ctx.aof_pool.as_ref().map_or(
-                                aof::FoldEpoch::INITIAL,
+                                aof::AppendStamp::INITIAL,
                                 |pool| pool.fold_stamp(ctx.shard_id),
                             );
 
