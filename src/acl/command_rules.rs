@@ -48,6 +48,12 @@ impl CommandRules {
         self.rules.is_empty()
     }
 
+    /// Whether every rule held is a grant (vacuously true when empty).
+    #[must_use]
+    pub fn all_allow(&self) -> bool {
+        self.rules.values().all(|allow| *allow)
+    }
+
     /// The verdict of exactly this rule (`None` when none was applied).
     #[inline]
     #[must_use]
@@ -154,6 +160,52 @@ mod tests {
     fn rendered(rule_line: &str) -> String {
         let user = parse_acl_line(&format!("user u {rule_line}")).expect("rules must parse");
         command_rules_to_string(&user.allowed_commands)
+    }
+
+    /// R1 finding 7: a grant applied under `+@all` before the first
+    /// revocation is recorded, so the rendered rules survive ACL SAVE →
+    /// LOAD unchanged. Every expectation is redis 7.2.7's `ACL GETUSER`
+    /// `commands`, live and after two SAVE/LOAD rounds (identical there).
+    #[test]
+    fn grants_under_all_render_as_redis_and_reload_as_themselves() {
+        for (input, want) in [
+            ("+@all -get +get -set", "+@all +get -set"),
+            ("+@all +get", "+@all +get"),
+            ("+@all +get -set", "+@all +get -set"),
+            ("+@all -get +get", "+@all +get"),
+            ("+@all +get +set -del", "+@all +get +set -del"),
+            ("+@all -set +get +set", "+@all +get +set"),
+            (
+                "+@all +config|get -config|set",
+                "+@all +config|get -config|set",
+            ),
+            ("+@all -config +config|get", "+@all -config +config|get"),
+            ("allcommands +get -set", "+@all +get -set"),
+            ("+@all +get -@all +set", "-@all +set"),
+            ("-@all +@all +get -set", "+@all +get -set"),
+            ("+@all -get +get -set +del", "+@all +get -set +del"),
+            ("+@all +get nocommands +set", "-@all +set"),
+        ] {
+            let live = rendered(input);
+            assert_eq!(live, want, "{input}: live");
+            assert_eq!(rendered(&live), want, "{input}: after SAVE/LOAD");
+        }
+    }
+
+    /// A grant under `+@all` permits nothing new, so the user keeps the
+    /// `unrestricted` fast path; the first revocation drops it.
+    #[test]
+    fn grants_under_all_keep_the_unrestricted_cache() {
+        let open = parse_acl_line("user u on nopass ~* &* +@all +get +config|get")
+            .expect("rules must parse");
+        assert!(open.unrestricted());
+        assert!(open.is_command_allowed("flushall"));
+        let narrowed =
+            parse_acl_line("user u on nopass ~* &* +@all +get -set").expect("rules must parse");
+        assert!(!narrowed.unrestricted());
+        assert!(!narrowed.is_command_allowed("set"));
+        assert!(narrowed.is_command_allowed("get"));
+        assert!(narrowed.is_command_allowed("flushall"));
     }
 
     /// Redis 7.2.7 (`ACL SETUSER u <rules>`, then `ACL LIST`), verbatim: the
