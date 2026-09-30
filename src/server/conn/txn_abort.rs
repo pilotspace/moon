@@ -175,3 +175,22 @@ pub(crate) async fn abort_logged(
     }
     outcome
 }
+
+/// End `conn`'s open transaction, if it has one: roll it back and log the
+/// rollback ([`abort_logged`]), releasing its key holds (moon#1299). `None`
+/// when no transaction was open.
+///
+/// Idempotent — the transaction is `take()`n first, so a second call (or a
+/// call after `TXN.ABORT` / `TXN.COMMIT`) is a no-op. The rollback future is
+/// boxed (c10k future diet: ~5.4 KB that would otherwise sit inline in every
+/// connection future); the allocation happens only when a transaction is
+/// actually open.
+pub(crate) async fn end_open_txn(
+    ctx: &ConnectionContext,
+    conn: &mut crate::server::conn::core::ConnectionState,
+    replicate: Option<ReplicationRecorder>,
+    cause: AbortCause,
+) -> Option<Result<(), Bytes>> {
+    let txn = conn.active_cross_txn.take()?;
+    Some(Box::pin(abort_logged(ctx, *txn, replicate, cause)).await)
+}
