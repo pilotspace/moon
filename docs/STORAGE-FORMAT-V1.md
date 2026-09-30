@@ -112,6 +112,57 @@ Authoritative source: `src/persistence/aof.rs`, `src/persistence/aof_manifest.rs
 - **Base file:** optional RDB-format snapshot of state at last rewrite.
 - **Incremental files:** RESP-encoded write commands appended since last rewrite.
 - **Legacy single-file `appendonly.aof`** is recognized on first boot, captured as seq-1 of the multi-part structure, and the legacy file is renamed to `appendonly.aof.legacy`. Older v0.1.x AOF files are read once, never written.
+- **Per-shard incremental files** (`--shards` ≥ 2) frame every record as `[u64 lsn LE][u32 len LE][RESP command]`; the multi-part top-level incr and the flat `appendonly.aof` hold bare RESP.
+
+#### Replay-only records (`MOON.*` pseudo-commands)
+
+Besides client write commands, the writer interleaves a few records that only
+a replay acts on. Each is an ordinary RESP array (never a `#…` annotation
+line, which moon's parser reads as a malformed RESP3 boolean, and never a new
+WAL record type byte), written with `lsn = 0` in the framed layout so it never
+moves the replication offset a replay recovers. A client that sends one gets
+`ERR unknown command`. Authoritative source:
+`src/persistence/replay/pseudo.rs` and `src/persistence/cold_records.rs`.
+
+| Record | Written | Replay effect |
+|---|---|---|
+| `SELECT <db>` | before a record whose execution db differs from the stream's | switches the db the following records apply to |
+| `MOON.COLDCUT <watermark>` | first record of every generation (boot head, rewrite head) | opens the cold-tier replay gate: cold files with `file_id < watermark` are a valid base for what follows |
+| `MOON.TS <ms>` (moon#1283) | right after `MOON.COLDCUT` in every generation head, then before any record whose shard clock differs from the last `MOON.TS` in the stream | sets the expiry-judgment clock (see below) |
+| `MOON.SPILLED <file_id> key…` | when a spill publishes keys into the cold index | demotes replay-built hot copies of those keys to their cold entries |
+
+`MOON.TS <ms>` carries the shard's cached clock in unix milliseconds — the
+clock the command after it judged key expiry with — read in the same
+synchronous section as the mutation. It is at most one record per 1 ms clock
+tick in which the shard logged a write (≤ 44 bytes each), plus one per record
+whose producer parked between its mutation and its enqueue. It is AOF-only:
+the replication stream never carries it.
+
+A replay judges every record by the **last** `MOON.TS` read in the current
+file (not a running maximum: a parked producer's record carries an older
+stamp than the records it lands after). Until a file's first `MOON.TS` — an
+older binary's log, or the stamp-less prefix of a file an older binary
+started — it falls back to the file's modification time capped at the wall
+clock (moon#1277), exactly as before. A `MOON.TS` of 0, past the year 9999,
+or malformed is skipped. Clock stamps are observations, not data: a replay
+that skips a block of data records still applies the stamps inside it.
+
+**Compatibility.** Adding `MOON.TS` changes no byte layout covered by §2
+rule 4 (WAL v3 records, the RDB v2 preamble, the manifest framing), so it is
+not a storage-format bump:
+- *Upgrade:* a log without stamps replays exactly as before (mtime judgment).
+- *Downgrade:* a binary that predates `MOON.TS` sends it to command dispatch,
+  gets "unknown command", counts it as an unhandled record, and replays every
+  data record around it — with its own (mtime) expiry judgment. The boot does
+  not fail. If that older binary then appends to the same file, its records
+  have no stamps and replay after the last stamp the newer binary wrote,
+  which judges them by that older clock; `BGREWRITEAOF` after an upgrade
+  clears the mixture.
+- *Redis:* a redis server cannot load a moon AOF regardless (`MOON.COLDCUT`
+  is already an unknown command there).
+
+The per-shard WAL v3 KV log (`--appendonly no`) does not carry `MOON.TS`
+yet: its replay keeps the mtime judgment of its newest segment.
 
 ## 4. Configuration Surface
 
