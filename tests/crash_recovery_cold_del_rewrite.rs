@@ -355,6 +355,35 @@ fn appended_value() -> String {
 /// second BGREWRITEAOF follows the touches: it captures the promoted probes in
 /// its base, after which the sweep must release the spill files it held — the
 /// hold is a wait for a fold, not a leak — and a kill -9 still loses nothing.
+/// Sum of the base sequence numbers of every AOF generation in `dir` (per
+/// shard dir and top level): it grows exactly when a rewrite commits a new
+/// generation somewhere.
+fn base_generation(dir: &std::path::Path) -> u64 {
+    fn seqs(d: &std::path::Path) -> u64 {
+        std::fs::read_dir(d).map_or(0, |files| {
+            files
+                .flatten()
+                .filter_map(|f| {
+                    let name = f.file_name().to_string_lossy().to_string();
+                    name.strip_prefix("moon.aof.")
+                        .and_then(|r| r.strip_suffix(".base.rdb"))
+                        .and_then(|seq| seq.parse::<u64>().ok())
+                })
+                .max()
+                .unwrap_or(0)
+        })
+    }
+    let aof_dir = dir.join("appendonlydir");
+    let per_shard: u64 = std::fs::read_dir(&aof_dir).map_or(0, |entries| {
+        entries
+            .flatten()
+            .filter(|e| e.path().is_dir())
+            .map(|e| seqs(&e.path()))
+            .sum()
+    });
+    per_shard + seqs(&aof_dir)
+}
+
 fn run_promote_scenario(suffix: &str, touch: Touch, second_rewrite: bool) {
     let port = common::reserve_port();
     let dir = unique_dir(suffix);
@@ -407,27 +436,39 @@ fn run_promote_scenario(suffix: &str, touch: Touch, second_rewrite: bool) {
             }
         }
     }
-    // Several 1 s orphan sweeps run.
-    std::thread::sleep(Duration::from_secs(5));
+    // Several 1 s orphan sweeps run. moon#1289: a database whose files stay
+    // held for three sweeps asks the auto-rewrite monitor for a fold, and with
+    // 1 s sweeps that fold can commit and release the files inside this wait.
+    // That is a later fold capturing the probes too, but only if it COMMITTED
+    // before the files went: sample both every 100 ms and check the order at
+    // the first sample with no spill file left (moon#1231's invariant).
+    let gen_at_fold = base_generation(&dir);
+    let wait_end = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < wait_end {
+        let gen_now = base_generation(&dir);
+        if count_heap_files(&dir) == 0 {
+            // A flat legacy `appendonly.aof` (tokio `--shards 1`) has no base
+            // sequence to watch; there the held-release fold counter is the
+            // best evidence available.
+            let flat_evidence = gen_at_fold == 0
+                && info_u64(port, "cold_held_release_folds_requested").unwrap_or(0) > 0;
+            assert!(
+                gen_now > gen_at_fold || flat_evidence,
+                "the spill files that backed the probes at the fold were unlinked before \
+                 any later fold committed ({heap_files} at the fold, 0 now, AOF generation \
+                 {gen_at_fold} -> {gen_now})"
+            );
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
     let files_before_second = count_heap_files(&dir);
 
     let mut released = None;
-    if second_rewrite {
-        // moon#1289: a database whose files stay held for three sweeps asks the
-        // auto-rewrite monitor for a fold, and with 1 s sweeps that fold can
-        // commit (and release the files) inside the wait above. That is a later
-        // fold capturing the probes too; the kill -9 below still checks them.
-        let auto_folds = info_u64(port, "cold_held_release_folds_requested").unwrap_or(0);
-        assert!(
-            files_before_second > 0 || auto_folds > 0,
-            "the spill files that backed the probes at the fold were unlinked before any \
-             later fold captured them ({heap_files} at the fold, 0 now, no held-release fold)"
-        );
-        if files_before_second > 0 {
-            rewrite_and_wait(port, &dir);
-            std::thread::sleep(Duration::from_secs(4));
-            released = Some(count_heap_files(&dir));
-        }
+    if second_rewrite && files_before_second > 0 {
+        rewrite_and_wait(port, &dir);
+        std::thread::sleep(Duration::from_secs(4));
+        released = Some(count_heap_files(&dir));
     }
 
     server.kill_now();
