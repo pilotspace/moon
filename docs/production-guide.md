@@ -342,9 +342,11 @@ tuning knobs — but understanding them explains the durability/throughput trade
   `Asynchronous AOF fsync is taking too long (disk is busy?)` (at most once
   every 2 s), and a WARN when the fsync finally returns. `INFO persistence`
   shows it while it lasts:
-  - `aof_pending_bio_fsync` — writers with an fsync in flight (redis: pending
-    `BIO_AOF_FSYNC` jobs; 0 or 1 with one writer, up to `--shards` with
-    per-shard writers);
+  - `aof_pending_bio_fsync` — writers with an fsync in flight. redis's field
+    counts pending `BIO_AOF_FSYNC` jobs and is 0 or 1 in practice; moon's is
+    0 or 1 with one writer (`--shards 1`) but counts WRITERS, so it reaches
+    N at `--shards N` (per-shard writers, one agent each). Alert on `> 0`,
+    never on `== 1`;
   - `aof_fsync_in_flight_ms` — how long the oldest of them has been running
     (0 when none; moon-only);
   - `aof_delayed_fsync` — counted as redis counts it: once for every 2 s an

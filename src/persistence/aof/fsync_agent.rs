@@ -17,7 +17,7 @@
 //!   while one has been in flight for 2 s or more the writer logs
 //!   "Asynchronous AOF fsync is taking too long (disk is busy?)" (at most once
 //!   per 2 s for the process), INFO shows `aof_pending_bio_fsync` (writers
-//!   with an fsync in flight) and `aof_fsync_in_flight_ms` (the oldest one's
+//!   with an fsync in flight: 0..=N at `--shards N`, unlike redis's 0/1) and `aof_fsync_in_flight_ms` (the oldest one's
 //!   age), and `aof_delayed_fsync` counts, as redis's field does, once per 2 s
 //!   of an fsync in flight while written data waits for the next one.
 //! * The agent records the outcome exactly where the inline fsync did: the
@@ -73,9 +73,11 @@ static IN_FLIGHT_SLOTS: parking_lot::Mutex<Vec<Arc<std::sync::atomic::AtomicU64>
     parking_lot::Mutex::new(Vec::new());
 
 /// INFO `aof_pending_bio_fsync` and `aof_fsync_in_flight_ms`: how many
-/// writers have an everysec fsync in flight on their agent (redis: pending
-/// `BIO_AOF_FSYNC` jobs — 0 or 1 with one writer), and how long the oldest
-/// of them has been running, in ms (0 when none).
+/// writers have an everysec fsync in flight on their agent, and how long the
+/// oldest of them has been running, in ms (0 when none). redis's field counts
+/// pending `BIO_AOF_FSYNC` jobs, 0 or 1 in practice; this one counts WRITERS,
+/// so it ranges 0..=N at `--shards N` (R2 review, NEW-D: documented in the
+/// production guide; tooling should test `> 0`).
 pub fn in_flight_fsyncs() -> (usize, u64) {
     let now = mono_ms();
     let slots = IN_FLIGHT_SLOTS.lock();
