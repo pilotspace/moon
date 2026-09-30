@@ -2006,6 +2006,13 @@ async fn coordinate_multi_del_or_exists(
         send_owner_legs(groups, my_shard, db_index, dispatch_tx, spsc_notifiers).await;
 
     let mut total_count: i64 = 0;
+    // An error from the local slice — a `-TXNCONFLICT` for a key an open
+    // transaction holds (moon#1299), which refuses the whole slice: nothing
+    // in it was removed, so it is not logged, not counted as applied, and
+    // the command answers the error. Before R1 F2 it was dropped and the
+    // reply summed only the remote legs — a success count hiding keys that
+    // were never deleted (MSET's local slice already worked this way).
+    let mut local_err: Option<Frame> = None;
     if !local_group.is_empty() {
         let reaps = crate::command::key::expired_reaps();
         // moon#1162: through `run_local`, so this slice's deleted
@@ -2039,13 +2046,15 @@ async fn coordinate_multi_del_or_exists(
                     }
                 }
             }
+        } else if matches!(result, Frame::Error(_)) {
+            local_err = Some(result);
         }
     }
 
     // Every leg is drained even after an error, so the reply can say
     // whether any part of the command ran.
-    let mut leg_err: Option<Frame> = None;
-    let mut applied_parts = usize::from(!local_group.is_empty());
+    let mut applied_parts = usize::from(!local_group.is_empty() && local_err.is_none());
+    let mut leg_err: Option<Frame> = local_err;
     for reply_rx in pending_shards {
         match recv_reply_bounded(reply_rx).await {
             Ok(frames) => {
