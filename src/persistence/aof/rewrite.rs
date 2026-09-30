@@ -541,14 +541,14 @@ pub use super::rewrite_overflow::{AOF_REWRITE_OVERFLOW_SPILLED, RewriteOverflow}
 /// that belong in the NEW incr, and those bytes would then be lost when
 /// `manifest.advance()` deletes the old incr at the end of the fold.
 ///
-/// `db_ctx` is the writer's running db-attribution context for THIS incr file
-/// (task #35): the caller passes `&mut` the writer's `last_db` when draining
-/// into the file the live writer was already appending to (so the drain
-/// continues that stream's context), or a fresh `0` when draining into a
-/// brand-new incr (replay always starts a segment at db 0). A non-empty
-/// record whose db differs from `*db_ctx` gets a raw `SELECT <db>` record
-/// written first (same rule as the live writer loops); `*db_ctx` is updated
-/// in place so the caller can read back the final context after the drain.
+/// `db_ctx` is the writer's running record context for THIS incr file
+/// (task #35, moon#1283): the caller passes `&mut` the writer's `last_db`
+/// when draining into the file the live writer was already appending to (so
+/// the drain continues that stream's context), or a reset one when draining
+/// into a brand-new incr (replay starts a segment at db 0, with no clock). A
+/// non-empty record gets the `MOON.TS` / `SELECT` records
+/// [`RecordCtx::prefix`] asks for written first (same rule as the live
+/// writer loops); `*db_ctx` is updated in place.
 #[cfg(any(feature = "runtime-monoio", feature = "runtime-tokio"))]
 pub(crate) fn drain_pending_appends_bounded(
     rx: &channel::MpscReceiver<AofMessage>,

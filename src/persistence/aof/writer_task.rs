@@ -541,11 +541,12 @@ pub async fn aof_writer_task(
         // The bounded recv + end-of-loop proactive fsync below restore the
         // ~1s EverySec bound exactly like the PerShard writers.
         let mut idle_wait = IdleWait::new();
-        // task #35: AOF db-aware writer. Tracks the db the last-written
-        // record executed in; a non-empty record whose db differs gets a
-        // `SELECT <db>` record injected first (see `inject_select_records`).
-        // Resets to 0 whenever a NEW incr/base file becomes the append
-        // target (fresh manifest segment — replay starts each incr at db 0).
+        // task #35 + moon#1283: the writer's record context. A non-empty
+        // record whose db differs gets a `SELECT <db>` first, and one whose
+        // clock differs from the last stamp a `MOON.TS <ms>` first (see
+        // `inject_record_prefixes`). Reset whenever a NEW incr/base file
+        // becomes the append target (replay starts each incr at db 0, with
+        // no clock).
         let mut last_db = RecordCtx::new();
         // #455: see the tokio declaration above.
         let mut fold_floor = FoldEpoch::INITIAL;
