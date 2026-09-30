@@ -2391,11 +2391,12 @@ mod pool_tests {
         let manifest = AofManifest::initialize_multi(&base_dir, 2).unwrap();
         let incr = manifest.shard_incr_path(0);
 
-        // Inject: the 3rd Append tears (header written, payload "fails").
-        // The 1st is the `SELECT 0` a writer that reopens its incr writes
-        // before its first record (R1 review: the stream's db is unknown),
-        // the 2nd is lsn 1.
-        TEST_FAIL_WRITE_AT.store(3, Ordering::SeqCst);
+        // Inject: the 4th Append tears (header written, payload "fails").
+        // The 1st is the session `MOON.TS` a writer that reopens its incr
+        // writes before its first record (R2 review of moon#1283: even with
+        // no producer clock), the 2nd the `SELECT 0` (R1 review: the stream's
+        // db is unknown), the 3rd is lsn 1.
+        TEST_FAIL_WRITE_AT.store(4, Ordering::SeqCst);
 
         let (tx, rx) = channel::mpsc_bounded::<AofMessage>(16);
         let cancel = CancellationToken::new();
@@ -2460,12 +2461,20 @@ mod pool_tests {
         TEST_FAIL_WRITE_AT.store(0, Ordering::SeqCst);
         let _ = tokio::time::timeout(std::time::Duration::from_secs(5), writer).await;
 
-        // On disk: exactly the pre-tear frames (the SELECT 0 prefix at lsn 0,
-        // then lsn=1 "AAAA"). The orphaned lsn=2 header is a truncated tail
-        // (crash boundary); lsn 3 and 4 were never written (latch held) — no
-        // corruption.
+        // On disk: exactly the pre-tear frames (the session stamp and the
+        // SELECT 0 prefix at lsn 0, then lsn=1 "AAAA"). The orphaned lsn=2
+        // header is a truncated tail (crash boundary); lsn 3 and 4 were never
+        // written (latch held), and neither was a clean-close marker at the
+        // cancel — no corruption.
         let raw = std::fs::read(&incr).unwrap();
-        let frames = parse_framed(&raw);
+        let mut frames = parse_framed(&raw);
+        assert!(
+            !frames.is_empty()
+                && frames[0].0 == 0
+                && crate::persistence::replay::pseudo::is_ts_record(&frames[0].1),
+            "the session stamp first: {frames:?}"
+        );
+        frames.remove(0);
         assert_eq!(
             frames,
             vec![
