@@ -98,7 +98,8 @@ async fn flush_batch_to_kernel(
 struct IdleWait {
     step: usize,
     pending: bool,
-    /// The last receive returned a message (see [`poll_recv`]).
+    /// The last receive returned a message that arrived promptly: poll
+    /// before parking (see `poll::recv_next`).
     warm: bool,
 }
 
@@ -167,9 +168,9 @@ impl IdleWait {
     /// A message (data or control) was just received: reset to the fast
     /// floor so the very next poll — which re-checks the EverySec deadline
     /// — happens promptly again, exactly like the old fixed cadence did.
+    /// (Whether the next receive warm-polls is `recv_next`'s call.)
     fn on_message(&mut self) {
         self.step = 0;
-        self.warm = true;
     }
 
     /// The poll timed out with nothing queued. Escalates towards the max
@@ -459,7 +460,7 @@ pub async fn aof_writer_task(
             // to the EverySec proactive fsync at the end of the loop.
             // Park-free under EverySec/No so producer try_sends never pay a
             // futex wake on the shard thread — see `poll_recv`.
-            let first = match recv_next(&rx, &idle_wait, matches!(fsync, FsyncPolicy::Always)) {
+            let first = match recv_next(&rx, &mut idle_wait, matches!(fsync, FsyncPolicy::Always)) {
                 Ok(m) => {
                     idle_wait.on_message();
                     Some(m)
@@ -1745,7 +1746,7 @@ pub async fn per_shard_aof_writer_task(
             // `IdleWait` docs. Park-free under EverySec/No so producer
             // try_sends never pay a futex wake on the shard thread — see
             // `poll_recv`.
-            let first = match recv_next(&rx, &idle_wait, matches!(fsync, FsyncPolicy::Always)) {
+            let first = match recv_next(&rx, &mut idle_wait, matches!(fsync, FsyncPolicy::Always)) {
                 Ok(m) => {
                     idle_wait.on_message();
                     Some(m)

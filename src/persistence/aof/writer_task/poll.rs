@@ -89,16 +89,37 @@ fn poll_recv(
 /// Bounded receive for the std-thread writer loops: parked under `Always`
 /// (ack latency is client-visible), warm-polled then parked otherwise (see
 /// [`poll_recv`]).
+///
+/// WARM is earned, not granted by any message (R1 review, finding 5): the
+/// next receive polls only if THIS message arrived within
+/// [`warm_keep_max_wait`] (two poll steps, 1 ms by default) of the receive
+/// starting. Every message used to re-arm the 5 ms polling span, so one
+/// client writing every ~4 ms kept the writer polling forever — ~1,700
+/// wake-ups/s per shard, 4× the CPU of the old cadence — to save a producer
+/// futex wake that costs nothing at that rate. A writer fed faster than one
+/// message per 1 ms stays warm, so its pickup latency is unchanged; a slower
+/// one parks, and each record costs its producer one futex wake (a few µs,
+/// at most ~1,000/s) and is picked up at once.
 pub(super) fn recv_next(
     rx: &channel::MpscReceiver<AofMessage>,
-    idle_wait: &IdleWait,
+    idle_wait: &mut IdleWait,
     park: bool,
 ) -> Result<AofMessage, flume::RecvTimeoutError> {
     if park {
-        rx.recv_timeout(idle_wait.current())
-    } else {
-        poll_recv(rx, idle_wait.current(), idle_wait.warm())
+        return rx.recv_timeout(idle_wait.current());
     }
+    let started = std::time::Instant::now();
+    let got = poll_recv(rx, idle_wait.current(), idle_wait.warm());
+    if got.is_ok() {
+        idle_wait.warm = started.elapsed() <= warm_keep_max_wait();
+    }
+    got
+}
+
+/// A message that arrived within this long of its receive starting keeps
+/// the writer WARM (see [`recv_next`]): two poll steps.
+fn warm_keep_max_wait() -> std::time::Duration {
+    warm_poll_step() * 2
 }
 
 #[cfg(test)]
@@ -245,6 +266,50 @@ mod poll_recv_tests {
             median < std::time::Duration::from_micros(1500),
             "a record sent to a warm writer waited {median:?} (median) to be picked up"
         );
+    }
+
+    /// R1 review, finding 5: a writer fed one record every ~4 ms parks
+    /// between records instead of polling through each gap (every record
+    /// used to re-arm the 5 ms span: ~8 poll wake-ups per record), and a
+    /// writer fed faster than two poll steps stays warm.
+    #[test]
+    fn a_trickle_parks_between_records_and_a_stream_stays_warm() {
+        let (tx, rx) = channel::mpsc_bounded::<AofMessage>(64);
+        let sender = std::thread::spawn(move || {
+            for i in 0..40u64 {
+                std::thread::sleep(std::time::Duration::from_millis(4));
+                assert!(tx.try_send(append(i)).is_ok());
+            }
+            tx
+        });
+        let mut w = IdleWait::new();
+        let mut warm_after = 0usize;
+        for _ in 0..40 {
+            let Ok(_) = recv_next(&rx, &mut w, false) else {
+                panic!("expected a record");
+            };
+            w.on_message();
+            warm_after += usize::from(w.warm());
+        }
+        let Ok(tx) = sender.join() else {
+            panic!("sender panicked");
+        };
+        // A few may land within 1 ms on a loaded host; most must not.
+        assert!(
+            warm_after <= 10,
+            "{warm_after}/40 records 4 ms apart left the writer warm-polling"
+        );
+        // A stream: every record already queued keeps it warm.
+        for i in 0..8 {
+            assert!(tx.try_send(append(100 + i)).is_ok());
+        }
+        for _ in 0..8 {
+            let Ok(_) = recv_next(&rx, &mut w, false) else {
+                panic!("expected a record");
+            };
+            w.on_message();
+            assert!(w.warm(), "a queued record keeps the writer warm");
+        }
     }
 
     /// A warm writer whose span passes with nothing queued parks for the
