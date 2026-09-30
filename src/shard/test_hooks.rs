@@ -23,3 +23,18 @@ pub(crate) fn snapshot_hold_requested_for_test() -> bool {
         .as_ref()
         .is_some_and(|path| path.exists())
 }
+
+/// `MOON_TEST_SNAPSHOT_START_HOLD_FILE=<path>` (test-only): while `<path>`
+/// exists, a shard does not START its part of a new snapshot epoch; the epoch
+/// stays pending and the shard picks it up at the first tick after the file
+/// is removed. A test puts writes between a request and the shards' start by
+/// construction (`tests/held_release_txn_race_1289.rs`, moon#1289 R2).
+///
+/// With the variable unset the cost is one cached `Option` check, and only
+/// on a tick with a new epoch pending.
+pub(crate) fn snapshot_start_held_for_test() -> bool {
+    static HOLD: OnceLock<Option<PathBuf>> = OnceLock::new();
+    HOLD.get_or_init(|| std::env::var_os("MOON_TEST_SNAPSHOT_START_HOLD_FILE").map(PathBuf::from))
+        .as_ref()
+        .is_some_and(|path| path.exists())
+}

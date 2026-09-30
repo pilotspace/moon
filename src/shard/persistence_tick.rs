@@ -124,7 +124,15 @@ pub(crate) fn check_auto_save_trigger(
 ) {
     let new_epoch = snapshot_trigger_rx.borrow();
     if new_epoch > *last_snapshot_epoch && snapshot_state.is_none() {
+        // Test-only (`MOON_TEST_SNAPSHOT_START_HOLD_FILE`): not yet.
+        if crate::shard::test_hooks::snapshot_start_held_for_test() {
+            return;
+        }
         *last_snapshot_epoch = new_epoch;
+        // moon#1289 R2: an automatic round checks this shard's TXN holds.
+        if super::snapshot_txn_guard::skip_start(new_epoch, shard_id) {
+            return;
+        }
         // #366: consume the epoch but skip the save while the data directory
         // is missing — the snapshot temp file can't be created, and retrying
         // per save-point trigger just spams one doomed attempt per epoch.
@@ -220,6 +228,12 @@ pub(crate) fn drive_snapshot_finalize(
 ) -> Option<bool> {
     let snap = snapshot_state.as_mut()?;
     if !snap.finalize_started() {
+        // moon#1289 R2: an automatic round publishes all-or-nothing. `None`
+        // here also covers a part dropped and reported as abandoned.
+        if super::snapshot_txn_guard::publish_held(snapshot_state, snapshot_reply_tx, shard_id) {
+            return None;
+        }
+        let snap = snapshot_state.as_mut()?;
         if let Err(e) = snap.begin_finalize() {
             finalize_snapshot_error(snapshot_state, snapshot_reply_tx, shard_id, &e.to_string());
             return Some(false);
@@ -277,6 +291,10 @@ pub(crate) fn advance_snapshot_segment(
         // taken.
         crate::persistence::snapshot_cow::drain_into(snap);
         if snap.finalize_started() || snap.stream_failed() {
+            return true;
+        }
+        // moon#1289 R2: another shard abandoned this automatic round.
+        if crate::persistence::snapshot_request::txn_round::is_abandoned(snap.epoch) {
             return true;
         }
         // moon#1186: the writer thread is too far behind the disk — skip
