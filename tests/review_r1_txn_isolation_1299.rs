@@ -11,6 +11,8 @@
 //!   while other legs were applied answered the bare `-TXNCONFLICT`; it now
 //!   says the command was partially executed (as the AOF-backpressure
 //!   refusal already did).
+//!   R2 N2: only when another part changed something — a `DEL`/`UNLINK`
+//!   part that removed nothing (`:0`) does not count.
 //! - A `TXN.COMMIT` refused with `snapshot too old` (`KILL SNAPSHOT`) kept
 //!   the transaction's writes applied; it now rolls them back.
 //!
@@ -340,6 +342,68 @@ fn partially_applied_cross_shard_writes_say_so() {
     assert!(
         reply.starts_with(CONFLICT) && !reply.contains("partially"),
         "a refusal with no other part applied is the plain one, got {reply:?}"
+    );
+    assert_eq!(a.send(&["TXN", "ABORT"]), OK);
+    cleanup(guard, dir);
+}
+
+/// R2 N2: "partially executed; … the rest were applied" only when another
+/// part of the `DEL`/`UNLINK` actually removed a key. A part that ran but
+/// found its keys absent (`:0`) changed nothing, so the refusal is the plain
+/// one — whether the refused part is the coordinator's own slice or a
+/// remote leg.
+#[test]
+#[ignore]
+fn a_cross_shard_del_that_removed_nothing_else_is_not_partial() {
+    let (guard, port, dir) = spawn(4, &[]);
+    let mut a = Conn::open(port);
+    let held = find_key("h", "held", |k| is_local(&mut a, k));
+    // `b` coordinates on the held key's shard (its own slice is refused);
+    // `c` elsewhere (a remote leg is refused).
+    let mut b = find_conn(port, |c| is_local(c, &held));
+    let mut c = find_conn(port, |c| !is_local(c, &held));
+    let missing_remote = find_key("m", "gone", |k| !is_local(&mut b, k));
+    let present_remote = find_key("p", "here", |k| !is_local(&mut b, k));
+    let missing_at_c = find_key("n", "gone", |k| is_local(&mut c, k));
+    let present_at_c = find_key("q", "here", |k| is_local(&mut c, k));
+    let mut w = Conn::open(port);
+    assert_eq!(w.send(&["SET", &held, "orig"]), OK);
+    assert_eq!(a.send(&["TXN", "BEGIN"]), OK);
+    assert_eq!(a.send(&["SET", &held, "txn"]), OK);
+
+    let plain = |conn: &mut Conn, who: &str, cmd: &str, k0: &str, k1: &str| {
+        let reply = conn.send(&[cmd, k0, k1]);
+        assert!(
+            reply.starts_with(CONFLICT) && !reply.contains("partially"),
+            "{cmd} {k0} {k1} ({who}): nothing else was removed, so the refusal must \
+             not claim the rest was applied, got {reply:?}"
+        );
+    };
+    for cmd in ["DEL", "UNLINK"] {
+        plain(&mut b, "local refusal", cmd, &missing_remote, &held);
+        plain(&mut c, "remote refusal", cmd, &missing_at_c, &held);
+    }
+
+    // Something else WAS removed: still "partially executed".
+    for k in [&present_remote, &present_at_c] {
+        assert_eq!(w.send(&["SET", k, "v"]), OK);
+    }
+    let reply = b.send(&["DEL", &missing_remote, &present_remote, &held]);
+    assert!(
+        reply.starts_with(CONFLICT) && reply.contains("partially executed"),
+        "local refusal, a remote key removed: {reply:?}"
+    );
+    assert_eq!(exists(&mut w, &present_remote), ":0\r\n");
+    let reply = c.send(&["UNLINK", &present_at_c, &held]);
+    assert!(
+        reply.starts_with(CONFLICT) && reply.contains("partially executed"),
+        "remote refusal, the local key removed: {reply:?}"
+    );
+    assert_eq!(exists(&mut w, &present_at_c), ":0\r\n");
+    assert_eq!(
+        exists(&mut w, &held),
+        ":1\r\n",
+        "the held key is never deleted"
     );
     assert_eq!(a.send(&["TXN", "ABORT"]), OK);
     cleanup(guard, dir);
