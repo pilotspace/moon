@@ -60,18 +60,42 @@ fn the_lazy_drain_counts_every_key_once() {
     );
 }
 
-/// A key rewritten after a lazy read is live at the drain: not expired, so
-/// not counted.
+/// A key rewritten after a lazy read (GET then SET): the overwrite reaps the
+/// hidden expired entry and counts it, as redis's `lookupKeyWrite` does; the
+/// drain then finds a live key and counts nothing more (R1 finding 3).
 #[test]
-fn a_key_rewritten_before_the_drain_is_not_counted() {
+fn a_key_rewritten_before_the_drain_is_counted_once_by_the_write() {
     let mut db = Database::new();
     expired_string(&mut db, b"rew1286");
     let before = counted();
     assert!(db.get(b"rew1286").is_none());
     db.set(b"rew1286", Entry::new_string(Bytes::from_static(b"live")));
+    assert_eq!(counted() - before, 1, "the overwrite reaped it");
     drain_lazy_expired(&mut db, &mut |_| {});
-    assert_eq!(counted() - before, 0);
+    assert_eq!(counted() - before, 1, "the drain skips the fresh value");
     assert!(db.exists(b"rew1286"));
+}
+
+/// An overwrite of an expired key nobody read (SET, and every write that
+/// lands through `Database::set`) counts it; an overwrite of a live key, or
+/// of one whose TTL is still ahead, does not (R1 finding 3).
+#[test]
+fn an_overwrite_counts_only_an_expired_entry() {
+    let mut db = Database::new();
+    expired_string(&mut db, b"ow1286:expired");
+    db.set(
+        b"ow1286:ttl",
+        Entry::new_string_with_expiry(Bytes::from_static(b"v"), current_time_ms() + 60_000),
+    );
+    db.set(b"ow1286:plain", Entry::new_string(Bytes::from_static(b"v")));
+    let before = counted();
+    for key in [&b"ow1286:expired"[..], b"ow1286:ttl", b"ow1286:plain"] {
+        db.set(key, Entry::new_string(Bytes::from_static(b"new")));
+    }
+    assert_eq!(counted() - before, 1);
+    expire_cycle_direct(&mut db, &mut |_| {});
+    assert_eq!(counted() - before, 1, "nothing left to reap");
+    assert_eq!(db.len(), 3);
 }
 
 /// Redis counts a whole key only: a hash field reaped by its TTL, or a hash

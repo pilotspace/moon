@@ -222,6 +222,7 @@ impl Database {
             crate::storage::entry::AccessTracking::Off
         };
         let now_secs = self.cached_now;
+        let now_ms = self.cached_now_ms;
 
         // `insert_or_update` invariant: exactly one of the two closures fires
         // exactly once per call, so the `Cell::take()` below cannot observe
@@ -301,6 +302,16 @@ impl Database {
             InsertOrUpdate::Inserted(_) => {
                 self.used_memory += new_cost;
             }
+        }
+        // moon#1286: overwriting an entry whose TTL had passed reaps it, as
+        // redis's `lookupKeyWrite` -> `expireIfNeeded` does before the write
+        // (SET, SETNX, GETSET, APPEND, INCR*, SETBIT, PFADD, MSET, a COPY /
+        // RENAME destination, and a key a read hid for the lazy drain — the
+        // drain re-verifies and skips the fresh value, so it is counted
+        // once). One compare on the write path; the counter itself skips a
+        // replay and a replica's master stream (`counts_expiry`).
+        if old_ttl != 0 && now_ms >= old_ttl {
+            crate::admin::metrics_setup::record_expired_key();
         }
         if has_expiry {
             self.maybe_has_expiring_keys = true;
