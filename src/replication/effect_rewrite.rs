@@ -25,6 +25,8 @@
 //! | `HEXPIRE`/`HPEXPIRE key ttl [cond] FIELDS n …` | per-field codes | `HPEXPIREAT key <abs> FIELDS m <fields set or deleted>` |
 //! | `HGETEX key EX\|PX ttl FIELDS n …` | per-field values | `HPEXPIREAT key <abs> FIELDS m <fields that exist>` |
 //! | `RESTORE key ttl payload …` | `+OK` | `RESTORE key <abs> payload … ABSTTL` |
+//! | `EXPIREAT`/`PEXPIREAT key <past>`, `GETEX key EXAT\|PXAT <past>` | `:1` / value | `DEL key` |
+//! | `RESTORE key <past> payload … ABSTTL [REPLACE]` | `+OK` | `DEL key` (`REPLACE`), nothing otherwise |
 //! | `XREADGROUP` / `XCLAIM` / `XAUTOCLAIM` | entries / ids | `XCLAIM … 0 <ids> TIME <ms> … FORCE` (+ cursor), see [`crate::replication::stream_effect`] |
 //!
 //! A reply that proves nothing was written (`SPOP` on a missing key, a
@@ -32,6 +34,12 @@
 //! [`Propagation::Skip`]: a no-op must reach neither plane. Everything else
 //! is [`Propagation::Verbatim`], and the caller then applies the frame-only
 //! expire rewrite as before.
+//!
+//! The past-deadline rows are redis's `checkAlreadyExpired`: the master
+//! deleted the key (or wrote nothing) instead of storing the deadline, and
+//! says so with `DEL`, because a replica never deletes by its own clock
+//! (`command::key::deadline_already_past`, review N2) — sent verbatim, the
+//! deadline would sit on the replica, invisible and never reaped.
 //!
 //! `now_ms` MUST be the executing shard's cached clock (`current_time_ms()`).
 //! `CachedClock::update` writes that thread-local and `Database::now_ms` from
@@ -136,6 +144,7 @@ pub fn rewrite_effect_for_propagation(frame: &Frame, reply: &Frame, now_ms: u64)
     match cmd.len() {
         4 if eq_ignore_ascii(cmd, b"SPOP") => rewrite_spop(args, reply),
         4 if eq_ignore_ascii(cmd, b"XADD") => rewrite_xadd(args, reply),
+        5 if eq_ignore_ascii(cmd, b"GETEX") => rewrite_getex_past(args, reply, now_ms),
         6 if eq_ignore_ascii(cmd, b"EXPIRE") => rewrite_expire(args, reply, now_ms, false),
         6 if eq_ignore_ascii(cmd, b"HGETEX") => rewrite_hgetex(args, reply, now_ms),
         6 if eq_ignore_ascii(cmd, b"XCLAIM") => {
@@ -145,6 +154,8 @@ pub fn rewrite_effect_for_propagation(frame: &Frame, reply: &Frame, now_ms: u64)
         7 if eq_ignore_ascii(cmd, b"HEXPIRE") => rewrite_hexpire(args, reply, now_ms, false),
         7 if eq_ignore_ascii(cmd, b"RESTORE") => rewrite_restore(args, now_ms),
         8 if eq_ignore_ascii(cmd, b"HPEXPIRE") => rewrite_hexpire(args, reply, now_ms, true),
+        8 if eq_ignore_ascii(cmd, b"EXPIREAT") => rewrite_expire_at(args, reply, now_ms, false),
+        9 if eq_ignore_ascii(cmd, b"PEXPIREAT") => rewrite_expire_at(args, reply, now_ms, true),
         10 if eq_ignore_ascii(cmd, b"XREADGROUP") => {
             crate::replication::stream_effect::rewrite_xreadgroup(args, reply, now_ms)
         }
@@ -268,6 +279,64 @@ fn rewrite_expire(args: &FrameVec, reply: &Frame, now_ms: u64, millis: bool) -> 
     ])))
 }
 
+/// `DEL key`: the master deleted `key` at once for a deadline already past.
+fn del_key(key: &Frame) -> Propagation {
+    Propagation::Rewritten(Frame::Array(FrameVec::from_vec(vec![
+        lit(b"DEL"),
+        key.clone(),
+    ])))
+}
+
+/// `EXPIREAT`/`PEXPIREAT key when [NX|XX|GT|LT]` that answered `:1` with
+/// `when` at or before now: the master deleted the key -> `DEL key`
+/// (review N2). A future deadline, or `:0`, propagates as before.
+fn rewrite_expire_at(args: &FrameVec, reply: &Frame, now_ms: u64, millis: bool) -> Propagation {
+    if !matches!(reply, Frame::Integer(1)) || args.len() < 3 {
+        return Propagation::Verbatim;
+    }
+    let Some(when) = arg_bytes(&args[2]).and_then(parse_i64) else {
+        return Propagation::Verbatim;
+    };
+    let when_ms = if millis {
+        when
+    } else {
+        when.saturating_mul(1000)
+    };
+    if when_ms > 0 && when_ms as u64 > now_ms {
+        return Propagation::Verbatim;
+    }
+    del_key(&args[1])
+}
+
+/// `GETEX key EXAT|PXAT when` that answered the value with `when` at or
+/// before now: the master deleted the key -> `DEL key` (review N2).
+fn rewrite_getex_past(args: &FrameVec, reply: &Frame, now_ms: u64) -> Propagation {
+    if !matches!(reply, Frame::BulkString(_)) || args.len() < 4 {
+        return Propagation::Verbatim;
+    }
+    let Some(opt) = arg_bytes(&args[2]) else {
+        return Propagation::Verbatim;
+    };
+    let unit: i64 = if eq_ignore_ascii(opt, b"EXAT") {
+        1000
+    } else if eq_ignore_ascii(opt, b"PXAT") {
+        1
+    } else {
+        return Propagation::Verbatim;
+    };
+    let Some(when) = arg_bytes(&args[3])
+        .and_then(parse_i64)
+        .filter(|n| *n > 0)
+        .and_then(|n| n.checked_mul(unit))
+    else {
+        return Propagation::Verbatim;
+    };
+    if when as u64 > now_ms {
+        return Propagation::Verbatim;
+    }
+    del_key(&args[1])
+}
+
 /// Locate `FIELDS n f…` starting the scan at `from`; returns the field
 /// frames, or `None` when the layout is not the one the handler accepted.
 fn fields_after(args: &FrameVec, from: usize) -> Option<&[Frame]> {
@@ -379,10 +448,21 @@ fn rewrite_restore(args: &FrameVec, now_ms: u64) -> Propagation {
     if ttl <= 0 {
         return Propagation::Verbatim;
     }
-    if args[4..]
-        .iter()
-        .any(|a| arg_bytes(a).is_some_and(|o| eq_ignore_ascii(o, b"ABSTTL")))
-    {
+    let has = |opt: &[u8]| {
+        args[4..]
+            .iter()
+            .any(|a| arg_bytes(a).is_some_and(|o| eq_ignore_ascii(o, opt)))
+    };
+    if has(b"ABSTTL") {
+        // review N2: an ABSTTL already past wrote nothing; with REPLACE it
+        // deleted the old key.
+        if ttl as u64 <= now_ms {
+            return if has(b"REPLACE") {
+                del_key(&args[1])
+            } else {
+                Propagation::Skip
+            };
+        }
         return Propagation::Verbatim;
     }
     // The handler saturates; a deadline past u64::MAX is not reachable from
@@ -640,6 +720,53 @@ mod tests {
             NOW,
         );
         assert!(matches!(p, Propagation::Verbatim));
+    }
+
+    /// review N2: an absolute deadline already past deleted the key on the
+    /// master (redis `checkAlreadyExpired`), so it propagates as `DEL`; a
+    /// future one, or one that changed nothing, as before.
+    #[test]
+    fn a_past_absolute_deadline_propagates_as_del() {
+        let past = (NOW - 1).to_string();
+        let past_s = (NOW / 1000 - 1).to_string();
+        let future = (NOW + 1).to_string();
+        let now = NOW.to_string();
+        let value = bulk(b"v");
+        let ok = Frame::SimpleString(Bytes::from_static(b"OK"));
+        let del: [(&[&str], &Frame); 7] = [
+            (&["PEXPIREAT", "k", &past], &Frame::Integer(1)),
+            (&["PEXPIREAT", "k", &now, "GT"], &Frame::Integer(1)),
+            (&["expireat", "k", &past_s], &Frame::Integer(1)),
+            (&["EXPIREAT", "k", "0"], &Frame::Integer(1)),
+            (&["GETEX", "k", "PXAT", &past], &value),
+            (&["getex", "k", "exat", &past_s], &value),
+            (
+                &["RESTORE", "k", &past, "payload", "ABSTTL", "REPLACE"],
+                &ok,
+            ),
+        ];
+        for (form, reply) in del {
+            let p = rewrite_effect_for_propagation(&cmd_s(form), reply, NOW);
+            assert_eq!(strs(&rewritten(p)), ["DEL", "k"], "{form:?}");
+        }
+        let p = rewrite_effect_for_propagation(
+            &cmd_s(&["RESTORE", "k", &past, "payload", "ABSTTL"]),
+            &ok,
+            NOW,
+        );
+        assert!(matches!(p, Propagation::Skip), "wrote nothing");
+        let verbatim: [(&[&str], &Frame); 6] = [
+            (&["PEXPIREAT", "k", &future], &Frame::Integer(1)),
+            (&["PEXPIREAT", "k", &past], &Frame::Integer(0)),
+            (&["GETEX", "k", "PXAT", &future], &value),
+            (&["GETEX", "k", "PXAT", &past], &Frame::Null),
+            (&["GETEX", "k", "PERSIST"], &value),
+            (&["RESTORE", "k", &future, "payload", "ABSTTL"], &ok),
+        ];
+        for (form, reply) in verbatim {
+            let p = rewrite_effect_for_propagation(&cmd_s(form), reply, NOW);
+            assert!(matches!(p, Propagation::Verbatim), "{form:?}");
+        }
     }
 
     #[test]

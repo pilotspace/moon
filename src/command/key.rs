@@ -140,6 +140,18 @@ pub(crate) fn notify_del(key: &[u8], db_index: usize) {
     crate::notify::notify_keyspace_event(crate::notify::NotifyFlags::GENERIC, "del", key, db_index);
 }
 
+/// redis's `checkAlreadyExpired`: is the absolute deadline `when_ms` at or
+/// before now, so the command deletes the key at once instead of storing it?
+/// Judged on the database clock, which a replay pins to the log's time
+/// (moon#1277). Never while applying the master's stream (review N2): a
+/// replica does not decide expiry by its own clock — a deadline its lag
+/// made past is stored like any other, and the master's own immediate delete
+/// arrives as `DEL` (`replication::effect_rewrite`).
+#[inline]
+pub(crate) fn deadline_already_past(db: &Database, when_ms: u64) -> bool {
+    when_ms <= db.now_ms() && !crate::replication::apply::applying_master_stream()
+}
+
 /// redis's `checkAlreadyExpired` arm of `EXPIRE` / `EXPIREAT` (and their
 /// `P` forms): a deadline at or before now deletes the key at once. It is a
 /// deletion, not an expiry — `del` is published and `expired_keys` does not
@@ -540,8 +552,8 @@ pub fn expireat(db: &mut Database, args: &[Frame]) -> Frame {
         Ok(true) => {}
     }
     // R1 finding 4: a deadline already past deletes now, judged on the
-    // database clock (a replay's is the log's, moon#1277).
-    if expires_at_ms <= db.now_ms() {
+    // database clock (a replay's is the log's, moon#1277); not on a replica.
+    if deadline_already_past(db, expires_at_ms) {
         return delete_already_expired(db, key);
     }
     if db.set_expiry(key, expires_at_ms) {
@@ -587,7 +599,7 @@ pub fn pexpireat(db: &mut Database, args: &[Frame]) -> Frame {
         Ok(true) => {}
     }
     // R1 finding 4: see `expireat`.
-    if timestamp_ms as u64 <= db.now_ms() {
+    if deadline_already_past(db, timestamp_ms as u64) {
         return delete_already_expired(db, key);
     }
     if db.set_expiry(key, timestamp_ms as u64) {

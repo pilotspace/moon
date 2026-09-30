@@ -197,3 +197,67 @@ fn a_past_deadline_on_an_already_expired_key_answers_0_and_counts_it_once() {
         );
     }
 }
+
+/// Review N2: a replica applying its master's stream never deletes because a
+/// deadline is past on ITS clock (redis's `checkAlreadyExpired` is false on
+/// a replica): the key stays, carrying the deadline, until the master says
+/// otherwise. The master's own immediate delete arrives as `DEL`
+/// (`replication::effect_rewrite`).
+#[test]
+fn a_replica_applying_its_master_stream_stores_a_past_deadline() {
+    let past_ms = current_time_ms() - 1000;
+    let past_s = current_time_ms() / 1000 - 10;
+    let mut src = with_key();
+    let Frame::BulkString(payload) = dump(&mut src, &[bulk("k")]) else {
+        panic!("DUMP answered no payload");
+    };
+    let cases: [(&str, u64, Box<dyn Fn(&mut Database) -> Frame>); 4] = [
+        (
+            "PEXPIREAT",
+            past_ms,
+            Box::new(move |db| pexpireat(db, &[bulk("k"), bulk(&past_ms.to_string())])),
+        ),
+        (
+            "EXPIREAT",
+            past_s * 1000,
+            Box::new(move |db| expireat(db, &[bulk("k"), bulk(&past_s.to_string())])),
+        ),
+        (
+            "GETEX PXAT",
+            past_ms,
+            Box::new(move |db| getex(db, &[bulk("k"), bulk("PXAT"), bulk(&past_ms.to_string())])),
+        ),
+        (
+            "RESTORE ABSTTL REPLACE",
+            past_ms,
+            Box::new(move |db| {
+                restore(
+                    db,
+                    &[
+                        bulk("k"),
+                        bulk(&past_ms.to_string()),
+                        Frame::BulkString(payload.clone()),
+                        bulk("ABSTTL"),
+                        bulk("REPLACE"),
+                    ],
+                )
+            }),
+        ),
+    ];
+    for (what, deadline, run) in cases {
+        let mut db = with_key();
+        let _master = crate::replication::apply::master_stream_scope_for_test();
+        let reply = run(&mut db);
+        assert!(!matches!(reply, Frame::Error(_)), "{what}: {reply:?}");
+        let kept = db.data().get(b"k").map(|e| e.expires_at_ms());
+        assert_eq!(
+            kept,
+            Some(deadline),
+            "{what}: a replica stores the master's deadline instead of deleting"
+        );
+    }
+    // Not on the master stream: the same command deletes (R1 finding 4).
+    let mut db = with_key();
+    pexpireat(&mut db, &[bulk("k"), bulk(&past_ms.to_string())]);
+    assert!(db.data().get(b"k").is_none());
+}
