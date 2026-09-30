@@ -43,7 +43,6 @@ use crate::server::conn::txn_abort::{AbortCause, end_open_txn};
 /// triggered so the concrete caller can extract the raw FD. `can_migrate`
 /// controls whether the AffinityTracker is active (set to `false` for TLS
 /// connections).
-#[allow(clippy::too_many_arguments)]
 pub(crate) async fn handle_connection_sharded_inner<
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 >(

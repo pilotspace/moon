@@ -40,7 +40,6 @@ use crate::server::conn::txn_abort::{AbortCause, end_open_txn};
 /// (`handle_connection_body`), then runs the exit epilogue whatever the
 /// body returned — see the module doc.
 #[tracing::instrument(skip_all, level = "debug")]
-#[allow(clippy::too_many_arguments)]
 pub(crate) async fn handle_connection_sharded_monoio<
     S: monoio::io::AsyncReadRent + monoio::io::AsyncWriteRent + idle_park::IdleParkRead,
 >(

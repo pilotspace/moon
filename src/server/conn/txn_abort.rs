@@ -217,7 +217,6 @@ pub(crate) async fn end_open_txn(
 /// changes nothing, the transaction included.
 ///
 /// [`shared::try_handle_reset`]: crate::server::conn::shared::try_handle_reset
-#[allow(clippy::too_many_arguments)]
 pub(crate) async fn try_handle_reset(
     ctx: &ConnectionContext,
     replicate: Option<ReplicationRecorder>,
