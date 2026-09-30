@@ -315,17 +315,59 @@ tuning knobs — but understanding them explains the durability/throughput trade
   single contiguous `write_all`, not one `write(2)` per record — so the writer
   thread is not syscall-bound at high pipeline depth (this is what makes
   `everysec` P16 beat Redis rather than trail it).
-- **Park-free writer poll (`everysec`/`no`).** The AOF writer thread does not park
-  in a blocking channel receive; it polls. This matters because a parked receiver
-  forces every shard thread to issue a futex wake on each write — at non-pipelined
-  `everysec` load that was ~150k wakes/sec of pure overhead on the hot path.
-  Polling keeps producer enqueues as plain userspace atomics, restoring P1 parity
-  with Redis. Under `always` the writer still parks (the client is already blocked
+- **Writer poll: warm, then parked (`everysec`/`no`).** While writes flow, the
+  AOF writer thread polls its channel every 100 µs instead of parking in a
+  blocking receive: a parked receiver forces every shard thread to issue a
+  futex wake on each write — at non-pipelined `everysec` load that was ~150k
+  wakes/sec of pure overhead on the hot path. After 5 ms with nothing queued it
+  parks, so the first write after an idle period wakes it at once (one futex
+  wake) instead of waiting out a poll step (moon#1266: that step was up to
+  50 ms). Under `always` the writer always parks (the client is already blocked
   on the fsync ack, so receive latency there is client-visible RTT anyway).
+- **The `everysec` fsync runs on an agent thread (moon#1266).** Each AOF writer
+  has an `aof-fsync-<n>` thread; once a second the writer hands it the fsync and
+  goes straight back to writing, so a slow disk no longer stops the writer from
+  draining acknowledged writes into the file. At most one fsync is in flight per
+  writer; a deadline that finds the previous one still running is postponed and
+  counted in INFO `aof_delayed_fsync`. `always` keeps its fsync on the writer,
+  before the acks.
 
-None of these weaken durability: `always` remains RPO = 0, `everysec` remains
-RPO ≤ 1 s, validated by the SIGKILL crash-recovery matrix (100% of acked writes
-recovered). See `BENCHMARK.md` §7.3 for the measured before/after matrix.
+None of these weaken durability: `always` remains RPO = 0 (an ack is sent only
+after its fsync — `tests/aof_everysec_kill9_1266.rs` holds the fsync open and
+sees no reply until it returns), `everysec` remains RPO ≤ 1 s against an OS crash
+or power loss. See `BENCHMARK.md` §7.3 for the measured before/after matrix.
+
+**What a process crash (`kill -9`, OOM kill, panic) can lose under `everysec`.**
+A SIGKILL does not touch the kernel page cache, so a record survives it once the
+AOF writer has `write(2)`-n it; only an OS crash or power loss needs the fsync.
+moon acknowledges a write when its record is queued to the shard's writer, so
+the exposure to a process crash is the time from the ack to that `write(2)`:
+one poll step (100 µs) while writes flow, one thread wake-up after an idle
+period, plus any time the writer thread is not scheduled or its `write(2)`
+blocks. `tests/aof_everysec_kill9_1266.rs` measures it: 10,000 acked SETs
+(unpipelined, or pipelined 100 deep) or one SET after an idle second, SIGKILL
+1 ms after the last ack, restart, count what is missing. On a 4-vCPU Linux
+container shared with other builds (2026-09-30, 20 reps per cell, `--shards`
+1 and 4): before moon#1266 Option 3, 228 of 240 reps lost acked writes (median
+rep 1–1,100 keys, worst 10,000); after it, 6 of 240 reps did (monoio 800 and
+1,900 keys, tokio 1, 1, 1 and 800), every one a writer stalled or descheduled
+for longer than the 1 ms kill delay. A kill inside that sub-millisecond window,
+or while the writer thread is starved of CPU or its `write(2)` stalls, can
+still lose the last acknowledged writes. redis
+has no such window: it `write(2)`s its AOF buffer before it sends the replies
+of an event-loop iteration (moon#1266 option 1A is the measured follow-up).
+
+**redis's own `everysec` is not absolutely kill-9-safe either.** When the
+previous background fsync is still running, redis *postpones the write* of its
+AOF buffer (the `write(2)`, not only the fsync) for up to 2 s, because on Linux
+a `write(2)` to a file whose fsync is in progress would block behind it
+anyway. Replies are still sent during those 2 s; past them redis writes anyway
+and counts `aof_delayed_fsync`. So on a slow disk redis can lose up to ~2 s of
+acknowledged writes to a process crash (0 on a healthy disk). moon never
+postpones the write — only the fsync, counted in its own `aof_delayed_fsync` —
+so a slow fsync by itself opens no window; a `write(2)` that the kernel makes
+wait behind that fsync still delays the record, and that wait is part of the
+window above.
 
 ### RDB snapshots
 
