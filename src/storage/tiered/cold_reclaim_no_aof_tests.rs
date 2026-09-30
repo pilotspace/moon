@@ -344,3 +344,21 @@ fn an_output_discarded_at_listing_keeps_the_old_file() {
     assert!(!heap(&dir, NEW).exists());
     assert_eq!(boot(&dir, &s), expected(&[]), "s saw every survivor live");
 }
+
+/// A compaction abandoned without a grave changing (its job could not be
+/// sent, or its spill thread died) makes its file a candidate again: the
+/// memo of an earlier empty scan must not hide it.
+#[test]
+fn an_abandoned_compaction_is_found_again_without_a_grave_changing() {
+    let _m = NoAof::on();
+    let (_t, _d, _m2, mut ci) = fixture(DEAD);
+    assert_eq!(ci.reclaim_candidates_no_aof(4), vec![OLD]);
+    assert!(ci.start_compaction(OLD));
+    assert!(ci.reclaim_candidates_no_aof(4).is_empty(), "busy: memoized");
+    ci.abandon_compaction(OLD, false);
+    assert_eq!(ci.reclaim_candidates_no_aof(4), vec![OLD]);
+    assert!(ci.start_compaction(OLD));
+    assert!(ci.reclaim_candidates_no_aof(4).is_empty());
+    ci.abandon_compactions_in_flight();
+    assert_eq!(ci.reclaim_candidates_no_aof(4), vec![OLD]);
+}

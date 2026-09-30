@@ -279,6 +279,12 @@ impl ReclaimState {
         }
     }
 
+    /// A file that was busy is a candidate again although no grave changed:
+    /// the next no-AOF scan must not be skipped (moon#1297).
+    fn candidates_changed(&mut self) {
+        self.no_aof_idle_at = None;
+    }
+
     /// Whether `file_id` is being compacted or adopted.
     fn is_busy(&self, file_id: u64) -> bool {
         self.in_flight.contains(&file_id)
@@ -417,6 +423,7 @@ impl ColdIndex {
     pub fn abandon_compactions_in_flight(&mut self) -> usize {
         let n = self.reclaim.in_flight.len();
         self.reclaim.in_flight.clear();
+        self.reclaim.candidates_changed();
         n
     }
 
@@ -461,6 +468,8 @@ impl ColdIndex {
         self.reclaim.in_flight.remove(&file_id);
         if give_up {
             self.reclaim.give_up(file_id);
+        } else {
+            self.reclaim.candidates_changed();
         }
     }
 
@@ -776,6 +785,7 @@ impl ColdIndex {
             };
             self.reclaim.bytes = self.reclaim.bytes.saturating_sub(adopting.bytes);
             if let Err(e) = outcome {
+                self.reclaim.candidates_changed();
                 for out in &adopting.outputs {
                     manifest.remove_file(out.entry.file_id, PageType::KvLeaf);
                     discard_output(shard_dir, out.entry.file_id);
