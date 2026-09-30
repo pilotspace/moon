@@ -277,9 +277,19 @@ classic gaps too:
   (N = physical cores) is the throughput-correct choice.
 - **Fully durable writes** (`appendfsync always`, p=16) went from 0.12× to
   **0.91× Redis** via per-batch group commit + coalesced writes, while
-  `everysec` p=16 is a **1.32× win** — with kill-9-lossless recovery.
-  Measured 2026-07-08 (GCE c3-standard-8, `--shards 2`); **not** re-measured on
-  the current tree — [archive](docs/internal/benchmark-history.md) §7.3.
+  `everysec` p=16 is a **1.32× win** (both measured 2026-07-08, GCE
+  c3-standard-8, `--shards 2`; **not** re-measured on the current tree —
+  [archive](docs/internal/benchmark-history.md) §7.3). `everysec`'s fsync runs off the writer on a
+  background thread (redis's model). An acknowledged write reaches the kernel
+  page cache — which survives a `kill -9` — within the AOF writer's pickup
+  latency: ≤ ~0.5 ms while writing, immediately after idle. A kill inside that
+  window, or while the writer thread is stalled, can still lose the last
+  acknowledged writes. Measured with SIGKILL 1 ms after the last ack, 20 reps
+  per cell (`tests/aof_everysec_kill9_1266.rs`, 2026-09-30, 4-vCPU Linux
+  container): losses in 9 of 240 reps (16 of 360 across both tokio runs), down
+  from 226 of 240. See the production guide, "What a process crash can lose
+  under `everysec`" in [docs/production-guide.md](docs/production-guide.md).
+  Use `appendfsync always` for zero acknowledged-write loss.
 - **Vector time-to-index-green** (bulk load → searchable at target recall)
   beats Qdrant **1.6–2.3×** on GCE with the parallel HNSW build. Measured
   2026-07-08; not re-measured on the current tree —
