@@ -1857,6 +1857,11 @@ impl super::Shard {
                             aof_pool.as_ref(),
                             &spill_file_id,
                         );
+                        // moon#1289: held files that no fold/snapshot is coming for.
+                        crate::shard::held_release_tick::after_sweep(
+                            &shard_databases, shard_id, aof_pool.as_ref(), &spill_file_id,
+                            &snapshot_trigger_tx, orphan_sweep_interval_secs,
+                        );
                     }
                 }
                 // Expire timed-out blocked clients every 10ms
@@ -2830,6 +2835,15 @@ impl super::Shard {
                         cached_clock.ms(),
                         aof_pool.as_ref(),
                         &spill_file_id,
+                    );
+                    // moon#1289: held files that no fold/snapshot is coming for.
+                    crate::shard::held_release_tick::after_sweep(
+                        &shard_databases,
+                        shard_id,
+                        aof_pool.as_ref(),
+                        &spill_file_id,
+                        &snapshot_trigger_tx,
+                        orphan_sweep_interval_secs,
                     );
                 }
 

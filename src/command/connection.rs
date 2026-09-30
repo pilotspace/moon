@@ -721,6 +721,21 @@ fn info_raw(db: &Database, facts: &InstanceFacts) -> String {
             }
         }
     }
+    // moon#1289: held cold files that waited for a fold or snapshot nobody
+    // asked for. Process-wide atomics, so present whatever the sweep
+    // published: databases stale now, and the folds / snapshots requested for
+    // them since boot (both stay 0 on a server with no held file).
+    let _ = write!(
+        sections,
+        "cold_held_files_stale_databases:{}\r\n\
+         cold_held_release_folds_requested:{}\r\n\
+         cold_held_release_snapshots_requested:{}\r\n",
+        crate::storage::tiered::held_release::stale_databases(),
+        crate::storage::tiered::held_release::folds_requested(),
+        crate::persistence::snapshot_request::started(
+            crate::persistence::snapshot_request::SnapshotReason::HeldColdFiles
+        ),
+    );
     sections.push_str("\r\n");
 
     // # Reclamation — observability foundation for Wave-1 production hardening (P10).
