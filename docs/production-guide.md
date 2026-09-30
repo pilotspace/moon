@@ -328,9 +328,24 @@ tuning knobs — but understanding them explains the durability/throughput trade
   has an `aof-fsync-<n>` thread; once a second the writer hands it the fsync and
   goes straight back to writing, so a slow disk no longer stops the writer from
   draining acknowledged writes into the file. At most one fsync is in flight per
-  writer; a deadline that finds the previous one still running is postponed and
-  counted in INFO `aof_delayed_fsync`. `always` keeps its fsync on the writer,
-  before the acks.
+  writer; a deadline that finds the previous one still running is postponed
+  until it returns. `always` keeps its fsync on the writer, before the acks.
+- **A slow or hung `everysec` fsync is loud, as in redis.** While a writer's
+  fsync has been running for 2 s or more, moon logs redis's
+  `Asynchronous AOF fsync is taking too long (disk is busy?)` (at most once
+  every 2 s), and a WARN when the fsync finally returns. `INFO persistence`
+  shows it while it lasts:
+  - `aof_pending_bio_fsync` — writers with an fsync in flight (redis: pending
+    `BIO_AOF_FSYNC` jobs; 0 or 1 with one writer, up to `--shards` with
+    per-shard writers);
+  - `aof_fsync_in_flight_ms` — how long the oldest of them has been running
+    (0 when none; moon-only);
+  - `aof_delayed_fsync` — counted as redis counts it: once for every 2 s an
+    fsync stays in flight while written data waits for the next one, so an
+    alert built for redis (`rate(aof_delayed_fsync) > 0`) fires the same way.
+  Writes keep being acknowledged and reach the kernel meanwhile (a process
+  crash loses nothing extra), but nothing written since the last completed
+  fsync survives an OS crash or power loss until the fsync returns.
 
 None of these weaken durability: `always` remains RPO = 0 (an ack is sent only
 after its fsync — `tests/aof_everysec_kill9_1266.rs` holds the fsync open and
@@ -364,7 +379,8 @@ a `write(2)` to a file whose fsync is in progress would block behind it
 anyway. Replies are still sent during those 2 s; past them redis writes anyway
 and counts `aof_delayed_fsync`. So on a slow disk redis can lose up to ~2 s of
 acknowledged writes to a process crash (0 on a healthy disk). moon never
-postpones the write — only the fsync, counted in its own `aof_delayed_fsync` —
+postpones the write — only the fsync; its `aof_delayed_fsync` counts the same
+2 s periods —
 so a slow fsync by itself opens no window; a `write(2)` that the kernel makes
 wait behind that fsync still delays the record, and that wait is part of the
 window above.

@@ -12,8 +12,14 @@
 //!   [`EverysecSync::dispatch`]) and goes straight back to its channel.
 //! * At most one fsync is in flight per writer; a deadline that finds the
 //!   previous one still running is postponed, not queued
-//!   ([`super::fsync_handoff`], loom-modeled in `tests/loom_aof_fsync_agent.rs`),
-//!   and counted in INFO `aof_delayed_fsync`.
+//!   ([`super::fsync_handoff`], loom-modeled in `tests/loom_aof_fsync_agent.rs`).
+//! * A stalled fsync is loud, as in redis (R1 review, findings 3 and 4):
+//!   while one has been in flight for 2 s or more the writer logs
+//!   "Asynchronous AOF fsync is taking too long (disk is busy?)" (at most once
+//!   per 2 s for the process), INFO shows `aof_pending_bio_fsync` (writers
+//!   with an fsync in flight) and `aof_fsync_in_flight_ms` (the oldest one's
+//!   age), and `aof_delayed_fsync` counts, as redis's field does, once per 2 s
+//!   of an fsync in flight while written data waits for the next one.
 //! * The agent records the outcome exactly where the inline fsync did: the
 //!   fsync-latency metric and `record_everysec_fsync_result` (INFO
 //!   `aof_last_fsync_status` / `aof_fsync_failures`). A failed fsync is
@@ -30,15 +36,55 @@ use std::time::{Duration, Instant};
 use super::FsyncPolicy;
 use super::fsync_handoff::{Begin, FsyncHandoff};
 
-/// INFO `aof_delayed_fsync`: everysec deadlines (all writers) whose fsync
-/// hand-off had to be postponed because the writer's previous fsync was
-/// still running — counted once per deadline, however many wakes it took.
-/// redis's field of the same name counts its postponed WRITES; moon never
-/// postpones a write.
+/// INFO `aof_delayed_fsync` (all writers): counted the way redis counts its
+/// field of the same name — once for every [`STALL`] (2 s) that a writer's
+/// fsync has been in flight while written data waits for the next one. redis
+/// counts when it stops postponing its WRITE after 2 s and writes anyway,
+/// again every 2 s while the fsync stays stuck; moon never postpones the
+/// write, so the count marks the same moments without the write being held.
+/// An exporter or alert built for redis reads it the same way: non-zero means
+/// the disk kept an fsync busy for 2 s or more.
 pub static AOF_DELAYED_FSYNC: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// The everysec deadline: an fsync is handed off at most once per this.
 const EVERYSEC: Duration = Duration::from_secs(1);
+
+/// An fsync in flight this long is "taking too long": redis's threshold for
+/// its log line and its `aof_delayed_fsync` count.
+const STALL: Duration = Duration::from_secs(2);
+
+/// Milliseconds on a process-wide monotonic clock, never 0 (0 = "none" in
+/// the in-flight slots below).
+fn mono_ms() -> u64 {
+    static EPOCH: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    let ms = EPOCH.get_or_init(Instant::now).elapsed().as_millis();
+    u64::try_from(ms).unwrap_or(u64::MAX).saturating_add(1)
+}
+
+/// Every live agent's in-flight slot ([`mono_ms`] when its current fsync was
+/// handed over, 0 when none), for INFO. Locked only when an agent starts or
+/// stops and when INFO reads it — never per write.
+static IN_FLIGHT_SLOTS: parking_lot::Mutex<Vec<Arc<std::sync::atomic::AtomicU64>>> =
+    parking_lot::Mutex::new(Vec::new());
+
+/// INFO `aof_pending_bio_fsync` and `aof_fsync_in_flight_ms`: how many
+/// writers have an everysec fsync in flight on their agent (redis: pending
+/// `BIO_AOF_FSYNC` jobs — 0 or 1 with one writer), and how long the oldest
+/// of them has been running, in ms (0 when none).
+pub fn in_flight_fsyncs() -> (usize, u64) {
+    let now = mono_ms();
+    let slots = IN_FLIGHT_SLOTS.lock();
+    slots.iter().fold((0, 0), |(n, oldest), slot| {
+        match slot.load(std::sync::atomic::Ordering::Relaxed) {
+            0 => (n, oldest),
+            since => (n + 1, oldest.max(now.saturating_sub(since))),
+        }
+    })
+}
+
+/// When [`EverysecSync::due`] last logged a stalled fsync (process-wide, in
+/// [`mono_ms`]): the log line is rate-limited to one per [`STALL`].
+static LAST_STALL_WARN_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Test-only: `MOON_TEST_AOF_SYNC_GATE=<path>` holds every AOF data fsync —
 /// the everysec agent's and `always`'s per-batch one — while `<path>` exists.
@@ -62,6 +108,9 @@ pub(super) fn sync_gate_for_test() {
 struct AofFsyncAgent {
     tx: flume::Sender<std::fs::File>,
     handoff: Arc<FsyncHandoff>,
+    /// [`mono_ms`] when the fsync in flight was handed over; 0 when none.
+    /// Registered in [`IN_FLIGHT_SLOTS`] for INFO.
+    in_flight_since: Arc<std::sync::atomic::AtomicU64>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -80,6 +129,8 @@ impl AofFsyncAgent {
         let (tx, rx) = flume::bounded::<std::fs::File>(1);
         let handoff = Arc::new(FsyncHandoff::new());
         let agent_handoff = Arc::clone(&handoff);
+        let in_flight_since = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let agent_in_flight = Arc::clone(&in_flight_since);
         let name = format!("aof-fsync-{writer_idx}");
         let thread = std::thread::Builder::new()
             .name(name.clone())
@@ -90,11 +141,21 @@ impl AofFsyncAgent {
                     let t = Instant::now();
                     let result = backend(&file);
                     drop(file);
+                    let took = t.elapsed();
+                    // Cleared before `finish`: the writer's next hand-off
+                    // (which acquires the IDLE `finish` releases) sets it
+                    // again, so a clear can never land on a newer fsync.
+                    agent_in_flight.store(0, std::sync::atomic::Ordering::Relaxed);
+                    if took >= STALL {
+                        tracing::warn!(
+                            "AOF everysec fsync completed after {:.1}s (writer {writer_idx}, \
+                             agent): the disk was busy; writes continued meanwhile",
+                            took.as_secs_f64()
+                        );
+                    }
                     match &result {
                         Ok(()) => {
-                            crate::admin::metrics_setup::record_aof_fsync(
-                                t.elapsed().as_micros() as u64
-                            );
+                            crate::admin::metrics_setup::record_aof_fsync(took.as_micros() as u64);
                             super::record_everysec_fsync_result(writer_idx, true);
                         }
                         Err(e) => {
@@ -108,9 +169,11 @@ impl AofFsyncAgent {
                     agent_handoff.finish(result.is_ok());
                 }
             })?;
+        IN_FLIGHT_SLOTS.lock().push(Arc::clone(&in_flight_since));
         Ok(Self {
             tx,
             handoff,
+            in_flight_since,
             thread: Some(thread),
         })
     }
@@ -125,6 +188,9 @@ impl Drop for AofFsyncAgent {
         if let Some(t) = self.thread.take() {
             let _ = t.join();
         }
+        IN_FLIGHT_SLOTS
+            .lock()
+            .retain(|slot| !Arc::ptr_eq(slot, &self.in_flight_since));
     }
 }
 
@@ -146,8 +212,11 @@ pub(super) struct EverysecSync {
     agent: Option<AofFsyncAgent>,
     last_handoff: Instant,
     dirty: bool,
-    /// The current deadline was already counted as postponed.
-    postponed: bool,
+    /// When the fsync now (or last) in flight was handed to the agent.
+    dispatched_at: Instant,
+    /// [`STALL`] periods of the in-flight fsync already counted in
+    /// [`AOF_DELAYED_FSYNC`].
+    stalls_counted: u64,
 }
 
 impl EverysecSync {
@@ -172,7 +241,8 @@ impl EverysecSync {
             agent,
             last_handoff: Instant::now(),
             dirty: false,
-            postponed: false,
+            dispatched_at: Instant::now(),
+            stalls_counted: 0,
         }
     }
 
@@ -186,7 +256,8 @@ impl EverysecSync {
             agent: AofFsyncAgent::spawn_with_backend(writer_idx, backend).ok(),
             last_handoff: Instant::now(),
             dirty: false,
-            postponed: false,
+            dispatched_at: Instant::now(),
+            stalls_counted: 0,
         }
     }
 
@@ -206,9 +277,51 @@ impl EverysecSync {
 
     /// The everysec deadline has come and there is something to fsync: new
     /// bytes, or a previous fsync that failed and must be retried.
+    ///
+    /// Every writer wake calls this under everysec, so it is also where a
+    /// stalled agent fsync is reported ([`Self::warn_if_stalled`]).
     pub(super) fn due(&self) -> bool {
+        self.warn_if_stalled();
         (self.dirty || self.agent.as_ref().is_some_and(|a| a.handoff.last_failed()))
             && self.last_handoff.elapsed() >= EVERYSEC
+    }
+
+    /// redis's "Asynchronous AOF fsync is taking too long (disk is busy?)":
+    /// logged while this writer's fsync has been in flight for [`STALL`] or
+    /// more, at most once per [`STALL`] for the whole process. One relaxed
+    /// load when no fsync is in flight.
+    fn warn_if_stalled(&self) {
+        use std::sync::atomic::Ordering;
+        let Some(agent) = self.agent.as_ref() else {
+            return;
+        };
+        let since = agent.in_flight_since.load(Ordering::Relaxed);
+        if since == 0 {
+            return;
+        }
+        let now = mono_ms();
+        let age = now.saturating_sub(since);
+        let stall_ms = STALL.as_millis() as u64;
+        if age < stall_ms {
+            return;
+        }
+        let last = LAST_STALL_WARN_MS.load(Ordering::Relaxed);
+        if (last != 0 && now.saturating_sub(last) < stall_ms)
+            || LAST_STALL_WARN_MS
+                .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+                .is_err()
+        {
+            return;
+        }
+        tracing::warn!(
+            "Asynchronous AOF fsync is taking too long (disk is busy?): writer {}'s everysec \
+             fsync has been running for {:.1}s. Writes are still accepted and written to the \
+             kernel, but nothing written since the last completed fsync is durable against \
+             an OS crash or power loss until it returns (INFO persistence: \
+             aof_pending_bio_fsync, aof_fsync_in_flight_ms, aof_delayed_fsync).",
+            self.writer_idx,
+            age as f64 / 1000.0
+        );
     }
 
     /// Claim the next fsync.
@@ -218,13 +331,20 @@ impl EverysecSync {
         };
         match agent.handoff.try_begin() {
             Begin::Owned => {
-                self.postponed = false;
+                self.stalls_counted = 0;
                 Claim::Owned
             }
             Begin::Postponed => {
-                if !self.postponed {
-                    self.postponed = true;
-                    AOF_DELAYED_FSYNC.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                // redis's cadence: one count per full STALL the fsync has
+                // been in flight while this deadline waits for it.
+                let periods = self.dispatched_at.elapsed().as_millis() / STALL.as_millis();
+                let periods = u64::try_from(periods).unwrap_or(u64::MAX);
+                if periods > self.stalls_counted {
+                    AOF_DELAYED_FSYNC.fetch_add(
+                        periods - self.stalls_counted,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                    self.stalls_counted = periods;
                 }
                 Claim::Postponed
             }
@@ -238,6 +358,11 @@ impl EverysecSync {
         let Some(agent) = self.agent.as_ref() else {
             return false;
         };
+        // Set before the send: the agent clears it once the fsync returns,
+        // which must never be overtaken by this store.
+        agent
+            .in_flight_since
+            .store(mono_ms(), std::sync::atomic::Ordering::Relaxed);
         let sent = match dup {
             Ok(file) => agent.tx.try_send(file).is_ok(),
             Err(e) => {
@@ -251,8 +376,12 @@ impl EverysecSync {
         };
         if sent {
             self.last_handoff = Instant::now();
+            self.dispatched_at = self.last_handoff;
             self.dirty = false;
         } else {
+            agent
+                .in_flight_since
+                .store(0, std::sync::atomic::Ordering::Relaxed);
             agent.handoff.abort();
         }
         sent
@@ -348,21 +477,18 @@ mod tests {
     }
 
     /// A deadline that finds the previous fsync running is postponed, not
-    /// queued, and counted; once it settles the next claim succeeds.
+    /// queued; once it settles the next claim succeeds.
     #[test]
-    fn a_deadline_during_a_running_fsync_is_postponed_and_counted() {
+    fn a_deadline_during_a_running_fsync_is_postponed() {
         let gate = Gate::new();
         let mut s = EverysecSync::with_backend(1, gate.backend());
         s.backdate(EVERYSEC);
         assert_eq!(s.claim(), Claim::Owned);
         assert!(s.dispatch(file()));
         s.backdate(EVERYSEC);
-        let before = AOF_DELAYED_FSYNC.load(Ordering::Relaxed);
         assert_eq!(s.claim(), Claim::Postponed);
         assert_eq!(s.claim(), Claim::Postponed);
-        // INFO counts the deadline once; the hand-off counts every attempt.
-        assert!(AOF_DELAYED_FSYNC.load(Ordering::Relaxed) > before);
-        assert!(s.postponed);
+        assert_eq!(s.stalls_counted, 0, "not yet in flight for 2 s");
         let handoff = Arc::clone(&s.agent.as_ref().expect("agent").handoff);
         assert_eq!(handoff.delayed(), 2);
         assert!(s.due(), "still dirty: the postponed deadline stays armed");
@@ -408,6 +534,57 @@ mod tests {
         s.backdate(EVERYSEC);
         assert_eq!(s.claim(), Claim::Owned, "the aborted claim was released");
         assert!(s.dispatch(file()));
+    }
+
+    /// R1 review, findings 3 and 4: `aof_delayed_fsync` counts like redis's
+    /// field — once per 2 s the fsync has been in flight while a deadline
+    /// waits for it, not once per stall — and INFO sees the fsync in flight
+    /// and its age until it returns.
+    #[test]
+    fn a_stalled_fsync_is_counted_every_two_seconds_and_visible_in_info() {
+        let gate = Gate::new();
+        let mut s = EverysecSync::with_backend(2, gate.backend());
+        s.backdate(EVERYSEC);
+        assert_eq!(s.claim(), Claim::Owned);
+        assert!(s.dispatch(file()));
+        let slot = Arc::clone(&s.agent.as_ref().expect("agent").in_flight_since);
+        assert_ne!(slot.load(Ordering::Relaxed), 0, "in flight");
+        assert!(in_flight_fsyncs().0 >= 1);
+        // The fsync has been running 5.x s (three deadlines later).
+        s.dispatched_at = Instant::now() - Duration::from_millis(5_100);
+        s.backdate(EVERYSEC);
+        assert_eq!(s.claim(), Claim::Postponed);
+        assert_eq!(s.stalls_counted, 2, "two full 2 s periods");
+        assert_eq!(s.claim(), Claim::Postponed);
+        assert_eq!(s.stalls_counted, 2, "counted once per period, not per wake");
+        s.dispatched_at = Instant::now() - Duration::from_millis(6_000);
+        assert_eq!(s.claim(), Claim::Postponed);
+        assert_eq!(s.stalls_counted, 3);
+        // The age INFO reports is the slot's (the real hand-off time here).
+        slot.store(
+            mono_ms().saturating_sub(4_000),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        let (n, oldest) = in_flight_fsyncs();
+        assert!(n >= 1 && oldest >= 4_000, "({n}, {oldest})");
+        assert!(s.due(), "still owed; the stall warning path runs");
+        gate.release();
+        let handoff = Arc::clone(&s.agent.as_ref().expect("agent").handoff);
+        wait_until("the fsync to settle", || handoff.settled() == 1);
+        assert_eq!(slot.load(Ordering::Relaxed), 0, "cleared when it returns");
+        assert_eq!(s.claim(), Claim::Owned);
+        assert_eq!(s.stalls_counted, 0, "a new fsync starts a new count");
+        handoff.abort();
+    }
+
+    /// An agent leaves INFO's registry when it is dropped.
+    #[test]
+    fn a_dropped_agent_leaves_the_in_flight_registry() {
+        let s = EverysecSync::with_backend(3, |_f: &std::fs::File| Ok(()));
+        let slot = Arc::clone(&s.agent.as_ref().expect("agent").in_flight_since);
+        assert!(IN_FLIGHT_SLOTS.lock().iter().any(|x| Arc::ptr_eq(x, &slot)));
+        drop(s);
+        assert!(!IN_FLIGHT_SLOTS.lock().iter().any(|x| Arc::ptr_eq(x, &slot)));
     }
 
     #[test]

@@ -809,7 +809,7 @@ pub mod rewrite_overflow;
 pub mod writer_stop;
 mod writer_task;
 
-pub use fsync_agent::AOF_DELAYED_FSYNC;
+pub use fsync_agent::{AOF_DELAYED_FSYNC, in_flight_fsyncs};
 pub use pool::{AofWriterPool, BoundedRefusal};
 pub use record_ctx::{AppendStamp, RecordCtx};
 pub(crate) use refusal::note_append_backpressure_refusal;

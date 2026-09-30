@@ -494,6 +494,7 @@ fn info_raw(db: &Database, facts: &InstanceFacts) -> String {
     } else {
         0
     };
+    let aof_fsyncs_in_flight = crate::persistence::aof::in_flight_fsyncs();
     sections.push_str(&format!(
         "loading:{}\r\n\
          current_cow_size:{}\r\n\
@@ -515,6 +516,8 @@ fn info_raw(db: &Database, facts: &InstanceFacts) -> String {
          aof_last_fsync_status:{}\r\n\
          aof_fsync_failures:{}\r\n\
          aof_delayed_fsync:{}\r\n\
+         aof_pending_bio_fsync:{}\r\n\
+         aof_fsync_in_flight_ms:{}\r\n\
          aof_last_append_status:{}\r\n\
          aof_reason_del_dropped:{}\r\n\
          aof_rewrite_overflow_spilled:{}\r\n\
@@ -602,10 +605,15 @@ fn info_raw(db: &Database, facts: &InstanceFacts) -> String {
             "err"
         },
         crate::persistence::aof::AOF_FSYNC_FAILURES.load(std::sync::atomic::Ordering::Relaxed),
-        // moon#1266: everysec fsyncs postponed because the previous one was
-        // still running on the writer's fsync agent (redis's field counts
-        // postponed WRITES; moon keeps writing and postpones only the fsync).
+        // moon#1266 + R1 review: redis's cadence — one count per 2 s an
+        // everysec fsync stays in flight while written data waits for the
+        // next one (redis counts its postponed WRITES at the same moments;
+        // moon keeps writing and postpones only the fsync).
         crate::persistence::aof::AOF_DELAYED_FSYNC.load(std::sync::atomic::Ordering::Relaxed),
+        // Writers with an everysec fsync in flight on their agent (redis:
+        // pending BIO_AOF_FSYNC jobs), and the oldest one's age in ms.
+        aof_fsyncs_in_flight.0,
+        aof_fsyncs_in_flight.1,
         if crate::persistence::aof::aof_last_append_ok() {
             "ok"
         } else {
