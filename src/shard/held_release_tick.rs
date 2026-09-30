@@ -72,6 +72,13 @@ pub(crate) fn after_sweep(
              start one (moon#1289); asking again in {:?}",
             held_release::spacing()
         ),
+        // A TXN is open somewhere: a snapshot now would keep its uncommitted
+        // writes (moon#1300). The slot is untouched, the database stays
+        // stale, and the next sweep asks again.
+        SnapshotRequest::TxnOpen => tracing::debug!(
+            shard = shard_id,
+            "held cold spill files: snapshot deferred while a transaction is open (moon#1300)"
+        ),
         SnapshotRequest::RateLimited | SnapshotRequest::Busy => {}
     }
 }

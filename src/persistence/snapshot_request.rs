@@ -20,6 +20,20 @@
 //! server refuses (no persistence directory) does consume it, so a server
 //! that can never snapshot is asked once per spacing, not once per tick.
 //!
+//! # Open transactions (until moon#1300)
+//!
+//! A snapshot taken while a `TXN` is open keeps that transaction's
+//! uncommitted writes, and without an AOF a later `TXN ABORT` has nothing
+//! durable to compensate them with: a crash-restart from that image brings
+//! the aborted writes back (moon#1300 F3). `BGSAVE`, `SAVE` and the save
+//! rules share that flaw and are WS42's to fix; an AUTOMATIC reason
+//! ([`SnapshotReason::waits_for_open_txns`]) must not add a new way to hit
+//! it, so while any shard has an open transaction [`request`] answers
+//! [`SnapshotRequest::TxnOpen`] without touching the gate: the slot is not
+//! consumed, and the caller's next tick asks again. The signal is the
+//! process-wide published view behind `INFO txn_open`
+//! (`transaction::isolation::info`), never another shard's thread-local.
+//!
 //! The request goes through `bgsave_start_sharded`, the entry `BGSAVE` and
 //! the auto-save use: `SAVE_IN_PROGRESS` and the per-shard fan-in are armed,
 //! `LASTSAVE` moves on success, and a `BGSAVE` issued meanwhile is refused as
@@ -48,6 +62,17 @@ impl SnapshotReason {
             SnapshotReason::HeldColdFiles => 0,
         }
     }
+
+    /// Whether this reason is automatic — nobody at a keyboard asked — and so
+    /// waits while any transaction is open (see the module docs). Every
+    /// reason is automatic today; a caller acting on an explicit request
+    /// (none yet) would answer `false`.
+    #[must_use]
+    pub const fn waits_for_open_txns(self) -> bool {
+        match self {
+            SnapshotReason::HeldColdFiles => true,
+        }
+    }
 }
 
 /// What [`request`] did.
@@ -61,6 +86,9 @@ pub enum SnapshotRequest {
     Busy,
     /// The server refused (for instance it has no persistence directory).
     Refused,
+    /// A transaction is open on some shard and the reason is automatic.
+    /// Nothing was asked and the slot was not consumed; try again later.
+    TxnOpen,
 }
 
 /// How the start attempt ended, as [`SnapshotGate::try_request`] needs it.
@@ -143,6 +171,16 @@ static GATE: SnapshotGate = SnapshotGate::new();
 /// Snapshots started per reason, process-wide.
 static STARTED: [AtomicU64; REASONS] = [AtomicU64::new(0)];
 
+/// Requests deferred per reason because a transaction was open. A plain
+/// statistics counter (not a state machine).
+static DEFERRED: [AtomicU64; REASONS] = [AtomicU64::new(0)];
+
+/// Is a `TXN` open on any shard? Reads each shard's published view (the
+/// `INFO txn_open` source): one short registry lock, once per caller tick.
+fn any_txn_open() -> bool {
+    crate::transaction::isolation::info(0).open > 0
+}
+
 fn process_ms() -> u64 {
     static START: OnceLock<Instant> = OnceLock::new();
     START.get_or_init(Instant::now).elapsed().as_millis() as u64
@@ -152,6 +190,12 @@ fn process_ms() -> u64 {
 #[must_use]
 pub fn started(reason: SnapshotReason) -> u64 {
     STARTED[reason.index()].load(Ordering::Relaxed)
+}
+
+/// Requests for `reason` deferred because a transaction was open (INFO).
+#[must_use]
+pub fn deferred_for_open_txn(reason: SnapshotReason) -> u64 {
+    DEFERRED[reason.index()].load(Ordering::Relaxed)
 }
 
 /// Request a snapshot of every shard for `reason`, at most one per `spacing`
@@ -165,7 +209,7 @@ pub fn request(
 ) -> SnapshotRequest {
     use crate::command::persistence::{SAVE_IN_PROGRESS, bgsave_start_sharded};
     use crate::protocol::Frame;
-    let outcome = GATE.try_request(process_ms(), spacing, || {
+    let outcome = gated(&GATE, process_ms(), spacing, reason, any_txn_open, || {
         if SAVE_IN_PROGRESS.load(Ordering::SeqCst) {
             return StartOutcome::Busy;
         }
@@ -177,10 +221,34 @@ pub fn request(
             _ => StartOutcome::Refused,
         }
     });
-    if outcome == SnapshotRequest::Started {
-        STARTED[reason.index()].fetch_add(1, Ordering::Relaxed);
+    match outcome {
+        SnapshotRequest::Started => {
+            STARTED[reason.index()].fetch_add(1, Ordering::Relaxed);
+        }
+        SnapshotRequest::TxnOpen => {
+            DEFERRED[reason.index()].fetch_add(1, Ordering::Relaxed);
+        }
+        _ => {}
     }
     outcome
+}
+
+/// [`request`]'s decision, with the clock, the transaction probe and the
+/// start injected so it is unit tested: an automatic reason with a
+/// transaction open answers [`SnapshotRequest::TxnOpen`] before the gate is
+/// touched, so the deferral never consumes the spacing slot.
+fn gated(
+    gate: &SnapshotGate,
+    now_ms: u64,
+    spacing: Duration,
+    reason: SnapshotReason,
+    txn_open: impl FnOnce() -> bool,
+    start: impl FnOnce() -> StartOutcome,
+) -> SnapshotRequest {
+    if reason.waits_for_open_txns() && txn_open() {
+        return SnapshotRequest::TxnOpen;
+    }
+    gate.try_request(now_ms, spacing, start)
 }
 
 #[cfg(test)]
@@ -251,6 +319,59 @@ mod tests {
         assert_eq!(
             gate.try_request(2_000, SPACING, || StartOutcome::Started),
             SnapshotRequest::RateLimited
+        );
+    }
+
+    /// moon#1300 until WS42: an automatic snapshot waits while a TXN is open,
+    /// starts nothing, and leaves the slot free for the first tick after the
+    /// transaction ends.
+    #[test]
+    fn an_open_txn_defers_an_automatic_snapshot_without_consuming_the_slot() {
+        let gate = SnapshotGate::new();
+        let reason = SnapshotReason::HeldColdFiles;
+        assert!(reason.waits_for_open_txns());
+        let mut asked = false;
+        for now in [1_000, 1_001, 2_000] {
+            assert_eq!(
+                gated(
+                    &gate,
+                    now,
+                    SPACING,
+                    reason,
+                    || true,
+                    || {
+                        asked = true;
+                        StartOutcome::Started
+                    }
+                ),
+                SnapshotRequest::TxnOpen,
+                "at {now} ms"
+            );
+        }
+        assert!(!asked, "a deferred request must not touch the server");
+        assert_eq!(
+            gated(
+                &gate,
+                2_001,
+                SPACING,
+                reason,
+                || false,
+                || { StartOutcome::Started }
+            ),
+            SnapshotRequest::Started,
+            "the transaction ended: the very next tick starts the snapshot"
+        );
+        assert_eq!(
+            gated(
+                &gate,
+                2_002,
+                SPACING,
+                reason,
+                || false,
+                || { StartOutcome::Started }
+            ),
+            SnapshotRequest::RateLimited,
+            "and that start consumed the slot as usual"
         );
     }
 
