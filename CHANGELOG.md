@@ -478,7 +478,9 @@ shared 4-vCPU Linux container against HEAD `935c555` — re-measure on the GCE r
   closes, and every connection exit — a protocol error, a blocked pop whose
   client vanished, an output-buffer-limit disconnect, `QUIT` or an error in
   subscriber mode, `PSYNC` — now rolls an open transaction back and releases
-  its keys. `RESET` ends an open `TXN` the same way, as redis `RESET` discards
+  its keys before the socket closes, so a client that has seen its `QUIT`
+  reply finds the keys free (`CLIENT KILL` still replies first, moon#1312).
+  `RESET` ends an open `TXN` the same way, as redis `RESET` discards
   `MULTI` state. New `INFO stats` fields: `txn_open`, `txn_oldest_age_ms`,
   `txn_held_keys`, `txn_conflicts_refused`. Graph writes are not isolated yet
   (moon#1307).
@@ -519,10 +521,15 @@ shared 4-vCPU Linux container against HEAD `935c555` — re-measure on the GCE r
   `touch -d` restore). The writer now emits a `MOON.TS <ms>` record whenever
   the shard clock changes and at every generation head, and replay pins its
   clock to it. Logs written before this change replay as before; an older
-  binary skips `MOON.TS` as an unknown command. After a downgrade and
-  re-upgrade, the unstamped tail the older binary appended is judged by the
-  log's mtime, not by the stale last stamp, and boot runs one AOF rewrite to
-  fold it (docs/STORAGE-FORMAT-V1.md §3.3). `size_of::<AofMessage>()` is 80
+  binary skips `MOON.TS` as an unknown command. A clean stop (`SHUTDOWN`,
+  `SIGTERM`) ends each incr with a close marker `MOON.TS <ms> CLOSE` and a
+  restarted writer stamps its first write, so records an older binary appends
+  after a downgrade are recognised by their position and judged as the older
+  binary judged them, on the re-upgrade boot and every boot after it, with no
+  rewrite; a `touch` or `cp` of the AOF never re-judges its last writes. Not
+  protected: a downgrade after an unclean stop of the newer binary — stop it
+  cleanly first, or run `BGREWRITEAOF` as the older binary's last action
+  (docs/STORAGE-FORMAT-V1.md §3.3). `size_of::<AofMessage>()` is 80
   bytes (was 72). New fuzz target `aof_incr_replay`.
 
 - **`appendfsync everysec` lost most acknowledged writes to a process crash**
@@ -537,8 +544,8 @@ shared 4-vCPU Linux container against HEAD `935c555` — re-measure on the GCE r
   Linux container). The remaining sub-millisecond window is moon#1266 Option
   1A. `appendfsync always` is unchanged. A stalled fsync is reported as redis
   does: the log line "Asynchronous AOF fsync is taking too long (disk is
-  busy?)", new `INFO` fields `aof_pending_bio_fsync` and
-  `aof_fsync_in_flight_ms`, and `aof_delayed_fsync` counted once per 2 s of an
+  busy?)", new `INFO` fields `aof_pending_bio_fsync` (writers with an fsync
+  in flight: 0..N at `--shards N`) and `aof_fsync_in_flight_ms`, and `aof_delayed_fsync` counted once per 2 s of an
   ongoing postpone (unlike redis, the write itself is never postponed). A
   failed post-rewrite fsync is recorded and retried within about 100 ms.
   Diagnostic knob: `MOON_AOF_WARM_POLL_US`.
@@ -559,12 +566,14 @@ shared 4-vCPU Linux container against HEAD `935c555` — re-measure on the GCE r
   fast slices), the lazy-reap drain, a `DEL` / `UNLINK` or write that lands on
   an expired key (`SET`, `SETNX`, `GETSET`, `APPEND`, `INCR*`, `SETBIT`,
   `PFADD`, `MSET`, a `COPY` / `RENAME` / `*STORE` destination, a key a read had
-  hidden), and the cold-tier TTL sweep and on-read reclaim. AOF replay counts
-  nothing, hash-field expiry and a replica applying its master's `DEL` are not
-  counted, and `CONFIG RESETSTAT` resets it — all as redis 7.2.7 does. An
-  absolute deadline already in the past (`EXPIREAT` / `PEXPIREAT`,
-  `GETEX ... EXAT/PXAT`, `RESTORE ... ABSTTL`) now deletes the key at once and
-  publishes `del` rather than counting an expiry; `EXPIRE k -1` publishes
+  hidden, a key only the cold tier held), and the cold-tier TTL sweep and
+  on-read reclaim. AOF replay counts nothing, a replica applying its master's
+  `DEL` does not count it, and `CONFIG RESETSTAT` resets it, as redis 7.2.7
+  does; hash-field expiry is not counted. An absolute deadline already in the
+  past (`EXPIREAT` / `PEXPIREAT`, `GETEX ... EXAT/PXAT`, `RESTORE ... ABSTTL`)
+  now deletes the key at once and publishes `del` rather than counting an
+  expiry, and the master propagates that delete as `DEL`; a replica applying
+  its master's stream stores the deadline instead. `EXPIRE k -1` publishes
   `del`, and `GETEX k EX -1` answers `ERR invalid expire time in 'getex'
   command`.
 
@@ -583,11 +592,26 @@ shared 4-vCPU Linux container against HEAD `935c555` — re-measure on the GCE r
   auto-rewrite monitor folds, and without one a rate-limited snapshot is
   requested, at most one per 10 sweep intervals (10 minutes by default).
   Without an AOF this automatic snapshot runs **even with `save ""`** and
-  overwrites the dump file like any `BGSAVE`; it waits while any `TXN` is open,
-  so it never captures uncommitted writes. New `INFO` fields:
-  `cold_held_files_stale_databases`, `cold_held_release_folds_requested`,
-  `cold_held_release_snapshots_requested`,
-  `cold_held_release_snapshots_deferred_txn`.
+  overwrites the dump file like any `BGSAVE`. It never contains a `TXN`'s
+  uncommitted writes: it waits while any `TXN` is open, and it is abandoned
+  whole — no shard file replaced, `LASTSAVE` unmoved, no held file released —
+  and retried at a later sweep if any shard holds an uncommitted `TXN` write
+  when that shard starts its part; `TXN` writes after a shard's start are
+  saved at their pre-transaction value. An open `TXN`, or unbroken `TXN`
+  traffic, therefore keeps held files on disk (and `SWAPDB` refused) until a
+  snapshot can run. `BGSAVE`, `SAVE` and the save rules are not covered yet
+  (moon#1300). New `INFO` fields: `cold_held_files_stale_databases`,
+  `cold_held_release_folds_requested`, `cold_held_release_snapshots_requested`,
+  `cold_held_release_snapshots_deferred_txn`,
+  `cold_held_release_snapshots_abandoned_txn`.
+
+- **`volatile-lru`, `volatile-lfu` and `volatile-random` could answer OOM while
+  a key with a TTL existed.** Victim sampling draws random table segments and
+  gives up after `8 × maxmemory-samples` draws, so a database with a few TTL
+  keys among many could miss them all (1 TTL key in 301: 14 misses in 3,000
+  runs). When sampling finds no candidate, these policies now fall back to the
+  key with the nearest deadline, as redis's sampling of its expires dict
+  cannot miss one.
 
 - **A crash while a boot opened a fresh AOF generation could bring back cold
   keys deleted before the switch to `--appendonly yes`** (moon#1293). The
