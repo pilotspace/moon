@@ -409,10 +409,6 @@ fn monitor_loop(
             ),
             RewriteTrigger::ColdReclaim => {
                 last_reclaim_rewrite = Some(std::time::Instant::now());
-                if held_stale_due {
-                    last_held_release = last_reclaim_rewrite;
-                    crate::storage::tiered::held_release::note_fold_requested();
-                }
                 awaiting_since = None;
                 info!(
                     "aof-auto-rewrite: triggering BGREWRITEAOF so {} compacted cold spill \
@@ -423,8 +419,22 @@ fn monitor_loop(
                 );
             }
         }
-        match crate::command::persistence::bgrewriteaof_start_sharded(pool, shard_databases.clone())
-        {
+        let reply =
+            crate::command::persistence::bgrewriteaof_start_sharded(pool, shard_databases.clone());
+        let dispatched = !matches!(reply, Frame::Error(_));
+        // moon#1289 (R1 finding 10): only a fold that was actually dispatched
+        // counts as a held-release fold and arms the held-release spacing; a
+        // failed dispatch retries after `FAILED_DISPATCH_COOLDOWN`, not a
+        // whole spacing later.
+        if note_held_release_fold(
+            dispatched,
+            trigger == RewriteTrigger::ColdReclaim && held_stale_due,
+            &mut last_held_release,
+            std::time::Instant::now(),
+        ) {
+            crate::storage::tiered::held_release::note_fold_requested();
+        }
+        match reply {
             Frame::Error(e) => {
                 warn!(
                     "aof-auto-rewrite: dispatch failed ({}); retrying in {:?}",
@@ -506,9 +516,47 @@ fn finish_forced_rewrite(still_running: bool, last_ok: bool) -> bool {
     }
 }
 
+/// Account a held-release fold (moon#1289): when `held_release_fold` and
+/// the rewrite was `dispatched`, arm the spacing at `now` and answer `true`
+/// (the caller counts it). A failed dispatch changes nothing, so the next
+/// attempt waits only the dispatch cooldown (R1 finding 10).
+fn note_held_release_fold(
+    dispatched: bool,
+    held_release_fold: bool,
+    last_held_release: &mut Option<std::time::Instant>,
+    now: std::time::Instant,
+) -> bool {
+    if dispatched && held_release_fold {
+        *last_held_release = Some(now);
+        true
+    } else {
+        false
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{RewriteTrigger, finish_forced_rewrite, next_trigger, should_trigger};
+    use super::{
+        RewriteTrigger, finish_forced_rewrite, next_trigger, note_held_release_fold, should_trigger,
+    };
+
+    /// R1 finding 10: a held-release fold whose dispatch failed is neither
+    /// counted nor allowed to push the next held-release fold a whole
+    /// spacing away; a dispatched one is both.
+    #[test]
+    fn only_a_dispatched_held_release_fold_counts_and_arms_the_spacing() {
+        let now = std::time::Instant::now();
+        let mut last = None;
+        assert!(!note_held_release_fold(false, true, &mut last, now));
+        assert_eq!(last, None, "a failed dispatch must not arm the spacing");
+        assert!(!note_held_release_fold(true, false, &mut last, now));
+        assert_eq!(
+            last, None,
+            "a fold for another reason is not a held release"
+        );
+        assert!(note_held_release_fold(true, true, &mut last, now));
+        assert_eq!(last, Some(now));
+    }
 
     /// moon#914 (b): a pending forced rewrite fires on the first idle tick
     /// even when growth rewrites are disabled or the AOF is under min_size.
