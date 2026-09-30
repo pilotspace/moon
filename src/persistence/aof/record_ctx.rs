@@ -41,7 +41,9 @@
 //! clock — the value `Database::now_ms` judged the command with. Both ride the
 //! [`super::AofMessage`] in memory only. A `clock_ms` of 0 means "unknown": no
 //! `MOON.TS` is emitted for the record, which replays under the previous one
-//! (barriers, tests, and records with no producer clock).
+//! (barriers, tests, and records with no producer clock) — except as a
+//! reopened file's first append, which is stamped with the writer's clock
+//! (above).
 
 use std::path::{Path, PathBuf};
 
