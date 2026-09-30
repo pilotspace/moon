@@ -1009,17 +1009,17 @@ async fn handle_connection_body<
                                                     // into the reply stream of a connection that
                                                     // believes it is back to ordinary commands.
                                                     let mut out: Vec<Frame> = Vec::with_capacity(1);
-                                                    crate::server::conn::shared::try_handle_reset(
+                                                    // moon#1299 R1: also ends an open TXN.
+                                                    crate::server::conn::txn_abort::try_handle_reset(
+                                                        ctx,
+                                                        ft::abort_replicator(ctx),
                                                         cmd,
                                                         cmd_args,
                                                         client_id,
                                                         conn,
-                                                        &ctx.requirepass,
-                                                        &ctx.tracking_table,
-                                                        &ctx.shard_pubsub(),
                                                         &mut out,
                                                         Some(&mut codec),
-                                                    );
+                                                    ).await;
                                                     let mut resp_buf = BytesMut::new();
                                                     for resp in &out {
                                                         codec.encode_frame(resp, &mut resp_buf);
@@ -2254,18 +2254,19 @@ async fn handle_connection_body<
             // lost track of that state. It is also above the MULTI queueing
             // step below — measured on redis-server 8.6.1, RESET inside MULTI
             // executes immediately and discards the transaction.
+            // moon#1299 R1: RESET also ends an open TXN (`txn_abort`).
             if cmd_len == 5
-                && crate::server::conn::shared::try_handle_reset(
+                && crate::server::conn::txn_abort::try_handle_reset(
+                    ctx,
+                    ft::abort_replicator(ctx),
                     cmd,
                     cmd_args,
                     client_id,
                     conn,
-                    &ctx.requirepass,
-                    &ctx.tracking_table,
-                    &ctx.shard_pubsub(),
                     &mut responses,
                     Some(&mut codec),
                 )
+                .await
             {
                 continue;
             }

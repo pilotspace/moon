@@ -37,6 +37,10 @@ pub(crate) enum AbortCause {
     DirtyCommit,
     /// Disconnect cleanup: there is no client left to tell.
     Disconnect,
+    /// `RESET` (moon#1299 R1): like redis's RESET discarding MULTI state, it
+    /// ends the transaction; the client is answered `+RESET` whatever the
+    /// rollback's durability.
+    Reset,
 }
 
 impl AbortCause {
@@ -45,6 +49,7 @@ impl AbortCause {
             AbortCause::Explicit => "TXN.ABORT",
             AbortCause::DirtyCommit => "TXN.COMMIT rollback (rejected ops)",
             AbortCause::Disconnect => "disconnect rollback",
+            AbortCause::Reset => "RESET rollback",
         }
     }
 }
@@ -193,4 +198,45 @@ pub(crate) async fn end_open_txn(
 ) -> Option<Result<(), Bytes>> {
     let txn = conn.active_cross_txn.take()?;
     Some(Box::pin(abort_logged(ctx, *txn, replicate, cause)).await)
+}
+
+/// `RESET` on the sharded runtimes: [`shared::try_handle_reset`], after
+/// ending the connection's open cross-store transaction (moon#1299 R1).
+///
+/// redis's RESET discards the connection's MULTI state; a `TXN` left open
+/// across it kept every key it wrote held — a pooled connection's
+/// RESET-and-return locked them until the pool closed the socket. The
+/// rollback runs FIRST and is awaited, so a command pipelined after RESET
+/// already sees the pre-transaction values. A RESET refused for its arity
+/// changes nothing, the transaction included.
+///
+/// [`shared::try_handle_reset`]: crate::server::conn::shared::try_handle_reset
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn try_handle_reset(
+    ctx: &ConnectionContext,
+    replicate: Option<ReplicationRecorder>,
+    cmd: &[u8],
+    args: &[crate::protocol::Frame],
+    client_id: u64,
+    conn: &mut crate::server::conn::core::ConnectionState,
+    responses: &mut Vec<crate::protocol::Frame>,
+    codec: Option<&mut crate::server::codec::RespCodec>,
+) -> bool {
+    if !cmd.eq_ignore_ascii_case(b"RESET") {
+        return false;
+    }
+    if args.is_empty() {
+        let _ = end_open_txn(ctx, conn, replicate, AbortCause::Reset).await;
+    }
+    crate::server::conn::shared::try_handle_reset(
+        cmd,
+        args,
+        client_id,
+        conn,
+        &ctx.requirepass,
+        &ctx.tracking_table,
+        &ctx.shard_pubsub(),
+        responses,
+        codec,
+    )
 }

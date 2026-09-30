@@ -5,6 +5,8 @@
 //!   keys that were never deleted.
 //! - F3: `INFO txn_held_keys` was published only when a database's held
 //!   count went 0↔1 (it read 1 for five held keys).
+//! - RESET left an open `TXN` (and its key holds) in place; redis's RESET
+//!   discards the connection's MULTI state, and now so does moon's for TXN.
 //!
 //! Each test runs on whichever runtime `MOON_BIN` was built with; run the
 //! suite once per runtime:
@@ -215,5 +217,67 @@ fn info_txn_held_keys_counts_every_held_key() {
         );
         assert_eq!(info_field(&mut w, "txn_open"), Some(0), "after TXN {end}");
     }
+    cleanup(guard, dir);
+}
+
+// ---------------------------------------------------------------------------
+// RESET ends an open TXN (redis RESET discards MULTI state)
+// ---------------------------------------------------------------------------
+
+fn bulk(s: &str) -> String {
+    format!("${}\r\n{s}\r\n", s.len())
+}
+
+#[test]
+#[ignore]
+fn reset_ends_the_open_txn_and_releases_its_keys() {
+    let (guard, port, dir) = spawn(1, &[]);
+    let mut a = Conn::open(port);
+    let mut w = Conn::open(port);
+    assert_eq!(w.send(&["SET", "k", "orig"]), OK);
+
+    // RESET pipelined between the TXN's write and a read: the rollback is
+    // applied before the next command runs.
+    let replies = a.pipeline(&[
+        &["TXN", "BEGIN"],
+        &["SET", "k", "txnval"],
+        &["RESET"],
+        &["GET", "k"],
+    ]);
+    assert_eq!(
+        replies,
+        format!("{OK}{OK}+RESET\r\n{}", bulk("orig")),
+        "RESET must roll the open TXN back before the next command"
+    );
+    assert_eq!(w.send(&["GET", "k"]), bulk("orig"));
+    assert_eq!(info_field(&mut w, "txn_open"), Some(0));
+    assert_eq!(info_field(&mut w, "txn_held_keys"), Some(0));
+    assert_eq!(w.send(&["SET", "k", "other"]), OK, "released by RESET");
+    assert_eq!(w.send(&["FLUSHALL"]), OK);
+    // The transaction is gone: nothing left to commit.
+    let commit = a.send(&["TXN", "COMMIT"]);
+    assert!(
+        commit.starts_with("-"),
+        "TXN.COMMIT after RESET: {commit:?}"
+    );
+    assert_eq!(w.send(&["GET", "k"]), "$-1\r\n");
+
+    // From subscriber mode too (RESET is the sanctioned way out of it).
+    assert_eq!(w.send(&["SET", "k", "orig"]), OK);
+    assert_eq!(a.send(&["TXN", "BEGIN"]), OK);
+    assert_eq!(a.send(&["SET", "k", "txnval"]), OK);
+    assert!(a.send(&["SUBSCRIBE", "ch"]).contains("subscribe"));
+    assert_eq!(a.send(&["RESET"]), "+RESET\r\n");
+    assert_eq!(w.send(&["GET", "k"]), bulk("orig"));
+    assert_eq!(info_field(&mut w, "txn_open"), Some(0));
+    assert_eq!(w.send(&["SET", "k", "other"]), OK);
+
+    // A RESET refused for its arity changes nothing, the TXN included.
+    assert_eq!(a.send(&["TXN", "BEGIN"]), OK);
+    assert_eq!(a.send(&["SET", "k", "txn2"]), OK);
+    assert!(a.send(&["RESET", "extra"]).starts_with("-ERR wrong number"));
+    assert_eq!(info_field(&mut w, "txn_open"), Some(1));
+    assert_eq!(a.send(&["TXN", "COMMIT"]), OK);
+    assert_eq!(w.send(&["GET", "k"]), bulk("txn2"));
     cleanup(guard, dir);
 }
