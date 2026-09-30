@@ -64,9 +64,10 @@ use crate::transaction::CrossStoreTxn;
 use crate::transaction::kv_compensation::{self, CompensatingRecord};
 
 /// Graph rollback WAL records a `TXN.ABORT` could not enqueue (moon#1285,
-/// PR #1301 review): the shard's WAL append channel was full (or its writer
-/// gone) while the rollback's records were being appended. Each counted
-/// record belongs to an abort whose client was answered
+/// PR #1301 review). Since moon#1302 the append has no capacity limit on the
+/// shard's own thread, so this counts only records refused because the
+/// shard's WAL writer is gone (its event loop exited) — never a burst. Each
+/// counted record belongs to an abort whose client was answered
 /// [`ROLLBACK_WAL_REFUSED_ERR`], never `+OK` (a disconnect rollback has no
 /// client; it is logged at ERROR instead).
 ///
@@ -75,11 +76,12 @@ pub static ROLLBACK_WAL_RECORDS_DROPPED: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
 /// Reply for a `TXN.ABORT` whose graph rollback was applied in memory but
-/// whose WAL records could not all be enqueued. Same "applied in memory"
-/// contract as the AOF's refusal texts (`persistence::aof::refusal`): the
-/// rollback is NOT undone and a retry has nothing to roll back; what is
-/// missing is its durability — a restart replays the forward graph writes
-/// without (all of) their undo.
+/// whose WAL records could not all be enqueued — since moon#1302 only when
+/// the shard's WAL writer is gone. Same "applied in memory" contract as the
+/// AOF's refusal texts (`persistence::aof::refusal`): the rollback is NOT
+/// undone and a retry has nothing to roll back; what is missing is its
+/// durability — a restart replays the forward graph writes without (all of)
+/// their undo.
 pub const ROLLBACK_WAL_REFUSED_ERR: &[u8] =
     b"MOONERR WAL backpressure: TXN rolled back in memory, \
 but its graph rollback records were not all queued for persistence; a restart may replay the \
@@ -92,28 +94,37 @@ pub const REMOTE_ROLLBACK_UNDELIVERED_ERR: &[u8] = b"MOONERR TXN rollback incomp
 rollback for another shard was not delivered or not acknowledged; its aborted graph writes may \
 still be live";
 
+/// A graph rollback whose WAL records were not all enqueued: the first
+/// `accepted` were, in order (a prefix). Answered [`ROLLBACK_WAL_REFUSED_ERR`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RollbackWalRefused {
+    /// Records enqueued before the first refusal — what the WAL holds, and
+    /// therefore all the replication stream may carry.
+    pub accepted: usize,
+}
+
 /// Append a rollback's graph WAL records on `shard_id` — CHECKED (moon#1285,
-/// PR #1301 review). The forward graph writes use the fire-and-forget
-/// `ShardDatabases::wal_append`; a rollback record lost the same way turned
-/// an acked abort into a restart that replays the aborted writes. Used by the
+/// PR #1301 review) and, on the shard's own thread, without a capacity
+/// limit (moon#1302: records past the channel's free slots take the shard's
+/// overflow queue, appended by the same tick in order). Used by the
 /// connection-local leg (`server::conn::txn_abort::abort_logged`) and by the
 /// owner of a remote leg (`ShardMessage::GraphRollback`).
 ///
 /// Durability parity: an enqueued record is exactly as durable as a forward
-/// graph write — drained into WAL-v3 on the shard's 1 ms tick and fsynced by
+/// graph write — appended to WAL-v3 on the shard's 1 ms tick and fsynced by
 /// the off-loop sync agent (`appendfsync always`) or the everysec flush.
 /// Neither waits for a durable LSN before its reply (the event loop's
 /// `request_sync` comment: "replies are not gated on WAL v3 durability"), so
 /// the abort does not either.
 ///
-/// `Err` carries [`ROLLBACK_WAL_REFUSED_ERR`]; the dropped records are counted
-/// in [`ROLLBACK_WAL_RECORDS_DROPPED`] and logged here.
+/// `Err` only when the shard's WAL writer is gone: the dropped records are
+/// counted in [`ROLLBACK_WAL_RECORDS_DROPPED`] and logged here.
 pub fn append_graph_rollback_wal(
     shard_databases: &crate::shard::shared_databases::ShardDatabases,
     shard_id: usize,
     txn_id: u64,
-    records: Vec<Bytes>,
-) -> Result<(), &'static [u8]> {
+    records: &[Bytes],
+) -> Result<(), RollbackWalRefused> {
     if records.is_empty() {
         return Ok(());
     }
@@ -132,11 +143,12 @@ pub fn append_graph_rollback_wal(
                 shard_id,
                 total,
                 dropped,
-                "TXN rollback: graph WAL records refused by the WAL append channel \
-                 (full or closed); the rollback is applied in memory only past the \
-                 first dropped record"
+                "TXN rollback: graph WAL records refused (the shard's WAL writer is gone); \
+                 the rollback is applied in memory only past the first dropped record"
             );
-            Err(ROLLBACK_WAL_REFUSED_ERR)
+            Err(RollbackWalRefused {
+                accepted: total - dropped,
+            })
         }
     }
 }
@@ -1122,25 +1134,56 @@ mod rollback_wal_tests {
     fn persistence_disabled_is_ok() {
         let (shared, _inits) = ShardDatabases::new(vec![vec![Database::new()]]);
         assert_eq!(
-            shared.try_wal_append_all(0, WalRecordType::Command, records(3)),
+            shared.try_wal_append_all(0, WalRecordType::Command, &records(3)),
             Ok(())
         );
-        assert_eq!(append_graph_rollback_wal(&shared, 0, 1, records(3)), Ok(()));
+        assert_eq!(
+            append_graph_rollback_wal(&shared, 0, 1, &records(3)),
+            Ok(())
+        );
     }
 
-    /// A channel with room for 2 of 5 records: the first 2 are enqueued IN
-    /// ORDER, the rest refused and reported — a prefix, never a gap.
+    /// Off the shard's own thread a channel with room for 2 of 5 records
+    /// cannot overflow: the first 2 are enqueued IN ORDER, the rest refused
+    /// and reported — a prefix, never a gap.
     #[test]
-    fn full_channel_keeps_a_prefix_and_reports_the_rest() {
+    fn off_the_owner_thread_a_full_channel_keeps_a_prefix_and_reports_the_rest() {
         let (shared, _inits) = ShardDatabases::new(vec![vec![Database::new()]]);
         let (tx, rx) = crate::runtime::channel::mpsc_bounded(2);
         shared.set_wal_append_tx(0, tx);
         assert_eq!(
-            shared.try_wal_append_all(0, WalRecordType::Command, records(5)),
+            shared.try_wal_append_all(0, WalRecordType::Command, &records(5)),
             Err(3)
         );
         let got: Vec<Bytes> = rx.try_iter().map(|(_, b)| b).collect();
         assert_eq!(got, records(2));
+    }
+
+    /// moon#1302: on the shard's own thread there is no capacity limit — a
+    /// rollback of 5 records through a 2-slot channel is accepted whole, and
+    /// the tick's drain appends all 5 in order.
+    #[test]
+    fn on_the_owner_thread_a_full_channel_accepts_every_record_in_order() {
+        let (shared, _inits) = ShardDatabases::new(vec![vec![Database::new()]]);
+        let (tx, rx) = crate::runtime::channel::mpsc_bounded(2);
+        shared.set_wal_append_tx(0, tx);
+        crate::shard::wal_append::register_owner(0);
+        assert_eq!(
+            append_graph_rollback_wal(&shared, 0, 3, &records(5)),
+            Ok(())
+        );
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut wal = Some(
+            crate::persistence::wal_v3::segment::WalWriterV3::new(
+                0,
+                &dir.path().join("wal-v3"),
+                crate::persistence::wal_v3::segment::DEFAULT_SEGMENT_SIZE,
+                crate::persistence::wal_v3::segment::WalBounds::DEFAULT,
+            )
+            .expect("wal writer"),
+        );
+        assert_eq!(crate::shard::wal_append::drain_into(&rx, &mut wal), 5);
+        assert!(crate::shard::wal_append::is_drained(&rx));
     }
 
     /// The helper answers the refusal text, never `Ok`, and counts every
@@ -1152,8 +1195,8 @@ mod rollback_wal_tests {
         shared.set_wal_append_tx(0, tx);
         let before = ROLLBACK_WAL_RECORDS_DROPPED.load(std::sync::atomic::Ordering::Relaxed);
         assert_eq!(
-            append_graph_rollback_wal(&shared, 0, 7, records(4)),
-            Err(ROLLBACK_WAL_REFUSED_ERR)
+            append_graph_rollback_wal(&shared, 0, 7, &records(4)),
+            Err(RollbackWalRefused { accepted: 1 })
         );
         let after = ROLLBACK_WAL_RECORDS_DROPPED.load(std::sync::atomic::Ordering::Relaxed);
         // `>=`: other tests in this binary may count concurrently.
@@ -1163,7 +1206,10 @@ mod rollback_wal_tests {
         );
         assert_eq!(rx.try_iter().count(), 1);
         // Room again: the same helper is Ok.
-        assert_eq!(append_graph_rollback_wal(&shared, 0, 8, records(1)), Ok(()));
-        assert_eq!(append_graph_rollback_wal(&shared, 0, 9, Vec::new()), Ok(()));
+        assert_eq!(
+            append_graph_rollback_wal(&shared, 0, 8, &records(1)),
+            Ok(())
+        );
+        assert_eq!(append_graph_rollback_wal(&shared, 0, 9, &[]), Ok(()));
     }
 }

@@ -2194,10 +2194,15 @@ pub(crate) fn handle_shard_message_shared(
                 shard_databases,
                 shard_id,
                 txn_id,
-                wal_records.into_iter().map(bytes::Bytes::from).collect(),
+                &wal_records
+                    .into_iter()
+                    .map(bytes::Bytes::from)
+                    .collect::<Vec<_>>(),
             ) {
                 Ok(()) => crate::protocol::Frame::SimpleString(bytes::Bytes::from_static(b"OK")),
-                Err(reply) => crate::protocol::Frame::Error(bytes::Bytes::from_static(reply)),
+                Err(_) => crate::protocol::Frame::Error(bytes::Bytes::from_static(
+                    crate::transaction::abort::ROLLBACK_WAL_REFUSED_ERR,
+                )),
             };
             let _ = reply_tx.send(reply);
         }
