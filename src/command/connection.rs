@@ -514,6 +514,7 @@ fn info_raw(db: &Database, facts: &InstanceFacts) -> String {
          txn_rollback_wal_dropped:{}\r\n\
          aof_last_fsync_status:{}\r\n\
          aof_fsync_failures:{}\r\n\
+         aof_delayed_fsync:{}\r\n\
          aof_last_append_status:{}\r\n\
          aof_reason_del_dropped:{}\r\n\
          aof_rewrite_overflow_spilled:{}\r\n\
@@ -601,6 +602,10 @@ fn info_raw(db: &Database, facts: &InstanceFacts) -> String {
             "err"
         },
         crate::persistence::aof::AOF_FSYNC_FAILURES.load(std::sync::atomic::Ordering::Relaxed),
+        // moon#1266: everysec fsyncs postponed because the previous one was
+        // still running on the writer's fsync agent (redis's field counts
+        // postponed WRITES; moon keeps writing and postpones only the fsync).
+        crate::persistence::aof::AOF_DELAYED_FSYNC.load(std::sync::atomic::Ordering::Relaxed),
         if crate::persistence::aof::aof_last_append_ok() {
             "ok"
         } else {

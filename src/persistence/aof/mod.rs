@@ -790,6 +790,11 @@ pub const DEFAULT_AOF_FSYNC_TIMEOUT: Duration = Duration::from_millis(2000);
 pub mod auto_rewrite;
 /// Exactly-sized, allocation-lean record encoding (moon#1187).
 mod encode;
+/// The everysec fsync agent: the once-per-second fsync off the writer's
+/// loop (moon#1266).
+mod fsync_agent;
+/// The writer <-> fsync-agent hand-off state (loom-modeled, moon#1266).
+mod fsync_handoff;
 /// Streamed base image for the rewrite fold (moon#1185).
 pub mod fold_stream;
 /// Group-commit batching seam (coalesce concurrent pending writes into one fsync
@@ -804,6 +809,7 @@ pub mod rewrite_overflow;
 pub mod writer_stop;
 mod writer_task;
 
+pub use fsync_agent::AOF_DELAYED_FSYNC;
 pub use pool::{AofWriterPool, BoundedRefusal};
 pub use record_ctx::{AppendStamp, RecordCtx};
 pub(crate) use refusal::note_append_backpressure_refusal;
