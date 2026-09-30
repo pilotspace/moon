@@ -169,6 +169,29 @@ Moon uses forkless compartmentalized snapshots instead of Redis's `fork()` appro
 - DashTable segments are iterated asynchronously
 - Snapshot runs alongside normal operations without blocking
 
+### Automatic snapshots with disk offload
+
+With `--appendonly no` and `--disk-offload enable`, a cold key's spill file
+that is no longer referenced (the key was deleted, overwritten or promoted)
+is **held** on disk until a snapshot that started after it went unused has
+completed: until then that file is the key's only durable copy, and deleting
+it early could bring a deleted key back after a crash, or lose a live one.
+
+Nobody may ever run `BGSAVE` on such a server, so Moon requests the snapshot
+itself (moon#1289). After three cold orphan sweeps with a held file (about
+two minutes at the default `--cold-orphan-sweep-interval-secs 60`), it starts
+one, at most one per ten sweep intervals (about ten minutes). This happens
+**even with `save ""`**, and the snapshot is an ordinary `BGSAVE`: it
+overwrites the dump file in `--dir`, and moves `LASTSAVE`. While any `TXN`
+is open the automatic snapshot waits and is retried on a later sweep, so it
+never captures a transaction's uncommitted writes.
+
+Watch it with `INFO`: `cold_held_files_stale_databases`,
+`cold_held_release_snapshots_requested` and
+`cold_held_release_snapshots_deferred_txn`. With `--appendonly yes` no
+snapshot is taken: an AOF rewrite releases the held files instead
+(`cold_held_release_folds_requested`).
+
 ## Using both
 
 For maximum durability, enable both AOF and RDB:
