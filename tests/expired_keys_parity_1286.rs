@@ -19,6 +19,15 @@
 //!   SUNIONSTORE / BITOP destination (0 at s1). HSET, LPUSH, GETDEL, GETEX
 //!   and DEL were right and are the controls.
 //!
+//! - **An absolute deadline already past (finding 4, and finding 9's NITs):**
+//!   redis's `checkAlreadyExpired` deletes the key at once — a deletion, so
+//!   it publishes `del` and counts 0 expired. f766fc2 stored the past
+//!   deadline and let expiry reap it (1 counted, `expired` published) for
+//!   `EXPIREAT`/`PEXPIREAT` past, `GETEX … EXAT/PXAT` past and `RESTORE …
+//!   ABSTTL` past; `EXPIRE k -1` deleted but published nothing; and `GETEX k
+//!   EX -1` answered "value is not an integer" where redis says "invalid
+//!   expire time in 'getex' command".
+//!
 //! Expected values were captured from redis 7.2.7 with the same commands.
 //!
 //! `MOON_BIN=<moon> cargo test --test expired_keys_parity_1286 -- --include-ignored`
@@ -28,6 +37,7 @@
 
 mod common;
 
+use std::io::Read;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -268,12 +278,17 @@ const OVERWRITE_CASES: &[Case] = &[
             v(&["BITOP", "NOT", &o(i), &src(i)]),
         ]
     }),
+    // A past deadline on an already-expired key: the key does not exist
+    // for the command (answers 0) and is reaped as expired.
+    ("EXPIREAT past", |i| vec![v(&["EXPIREAT", &o(i), "1"])]),
     // Controls: counted before this fix.
     ("HSET", |i| vec![v(&["HSET", &o(i), "f", "v"])]),
     ("LPUSH", |i| vec![v(&["LPUSH", &o(i), "x"])]),
     ("GETDEL", |i| vec![v(&["GETDEL", &o(i)])]),
     ("GETEX", |i| vec![v(&["GETEX", &o(i), "EX", "100"])]),
     ("DEL", |i| vec![v(&["DEL", &o(i)])]),
+    ("PERSIST", |i| vec![v(&["PERSIST", &o(i)])]),
+    ("MOVE", |i| vec![v(&["MOVE", &o(i), "1"])]),
 ];
 
 fn overwrite_matrix(shards: usize) {
@@ -329,4 +344,341 @@ fn a_write_over_an_expired_key_counts_it_1_shard() {
 #[ignore = "real-server suite: MOON_BIN pinned"]
 fn a_write_over_an_expired_key_counts_it_4_shards() {
     overwrite_matrix(4);
+}
+
+// ---------------------------------------------------------------------------
+// Finding 4 (+ finding 9): an absolute deadline already in the past
+// ---------------------------------------------------------------------------
+
+/// A `PSUBSCRIBE __keyevent@0__:*` connection; [`Self::drain`] returns the
+/// event names published since the last call.
+struct Events {
+    sock: std::net::TcpStream,
+    buf: Vec<u8>,
+}
+
+impl Events {
+    fn open(port: u16) -> Self {
+        let mut sock = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        std::io::Write::write_all(
+            &mut sock,
+            &common::encode(&["PSUBSCRIBE", "__keyevent@0__:*"]),
+        )
+        .unwrap();
+        sock.set_read_timeout(Some(Duration::from_millis(200)))
+            .unwrap();
+        let mut ev = Events {
+            sock,
+            buf: Vec::new(),
+        };
+        ev.drain();
+        ev
+    }
+
+    fn drain(&mut self) -> Vec<String> {
+        let mut chunk = [0u8; 4096];
+        while let Ok(n) = self.sock.read(&mut chunk) {
+            if n == 0 {
+                break;
+            }
+            self.buf.extend_from_slice(&chunk[..n]);
+        }
+        let text = String::from_utf8_lossy(&self.buf).into_owned();
+        self.buf.clear();
+        text.split("__keyevent@0__:")
+            .skip(1)
+            .filter_map(|rest| rest.split("\r\n").next())
+            .filter(|name| *name != "*")
+            .map(str::to_string)
+            .collect()
+    }
+}
+
+/// One command on a fresh connection, byte-exact both ways.
+fn raw(port: u16, parts: &[&[u8]]) -> Vec<u8> {
+    let mut out = format!("*{}\r\n", parts.len()).into_bytes();
+    for p in parts {
+        out.extend_from_slice(format!("${}\r\n", p.len()).as_bytes());
+        out.extend_from_slice(p);
+        out.extend_from_slice(b"\r\n");
+    }
+    let mut sock = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+    sock.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    std::io::Write::write_all(&mut sock, &out).unwrap();
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 4096];
+    while common::framed_len(&buf, 1).is_none() {
+        let n = sock.read(&mut chunk).unwrap();
+        assert!(n > 0, "server closed mid-reply");
+        buf.extend_from_slice(&chunk[..n]);
+    }
+    buf
+}
+
+struct PastCase {
+    name: &'static str,
+    setup: &'static [&'static [&'static str]],
+    /// `None` in an argument is replaced by a deadline `offset` ms from now.
+    cmd: &'static [Option<&'static str>],
+    past_offset_ms: i64,
+    /// redis 7.2.7: (reply, EXISTS k after, events, expired_keys delta).
+    reply: &'static str,
+    exists: bool,
+    events: &'static [&'static str],
+}
+
+const SET_K: &[&[&str]] = &[&["SET", "k", "v"]];
+
+const PAST_CASES: &[PastCase] = &[
+    PastCase {
+        name: "EXPIREAT k 1",
+        setup: SET_K,
+        cmd: &[Some("EXPIREAT"), Some("k"), Some("1")],
+        past_offset_ms: 0,
+        reply: ":1\r\n",
+        exists: false,
+        events: &["del"],
+    },
+    PastCase {
+        name: "EXPIREAT k now-10s",
+        setup: SET_K,
+        cmd: &[Some("EXPIREAT"), Some("k"), None],
+        past_offset_ms: -10_000,
+        reply: ":1\r\n",
+        exists: false,
+        events: &["del"],
+    },
+    PastCase {
+        name: "PEXPIREAT k 1",
+        setup: SET_K,
+        cmd: &[Some("PEXPIREAT"), Some("k"), Some("1")],
+        past_offset_ms: 0,
+        reply: ":1\r\n",
+        exists: false,
+        events: &["del"],
+    },
+    PastCase {
+        name: "PEXPIREAT k now-1000",
+        setup: SET_K,
+        cmd: &[Some("PEXPIREAT"), Some("k"), None],
+        past_offset_ms: -1000,
+        reply: ":1\r\n",
+        exists: false,
+        events: &["del"],
+    },
+    PastCase {
+        name: "EXPIREAT k 1 LT",
+        setup: SET_K,
+        cmd: &[Some("EXPIREAT"), Some("k"), Some("1"), Some("LT")],
+        past_offset_ms: 0,
+        reply: ":1\r\n",
+        exists: false,
+        events: &["del"],
+    },
+    PastCase {
+        name: "EXPIREAT k 1 GT",
+        setup: SET_K,
+        cmd: &[Some("EXPIREAT"), Some("k"), Some("1"), Some("GT")],
+        past_offset_ms: 0,
+        reply: ":0\r\n",
+        exists: true,
+        events: &[],
+    },
+    PastCase {
+        name: "EXPIREAT k 1 on a hash",
+        setup: &[&["HSET", "k", "f", "v"]],
+        cmd: &[Some("EXPIREAT"), Some("k"), Some("1")],
+        past_offset_ms: 0,
+        reply: ":1\r\n",
+        exists: false,
+        events: &["del"],
+    },
+    PastCase {
+        name: "EXPIREAT k 0",
+        setup: SET_K,
+        cmd: &[Some("EXPIREAT"), Some("k"), Some("0")],
+        past_offset_ms: 0,
+        reply: ":1\r\n",
+        exists: false,
+        events: &["del"],
+    },
+    PastCase {
+        name: "EXPIRE k -1",
+        setup: SET_K,
+        cmd: &[Some("EXPIRE"), Some("k"), Some("-1")],
+        past_offset_ms: 0,
+        reply: ":1\r\n",
+        exists: false,
+        events: &["del"],
+    },
+    PastCase {
+        name: "EXPIRE k 0",
+        setup: SET_K,
+        cmd: &[Some("EXPIRE"), Some("k"), Some("0")],
+        past_offset_ms: 0,
+        reply: ":1\r\n",
+        exists: false,
+        events: &["del"],
+    },
+    PastCase {
+        name: "PEXPIRE k -1",
+        setup: SET_K,
+        cmd: &[Some("PEXPIRE"), Some("k"), Some("-1")],
+        past_offset_ms: 0,
+        reply: ":1\r\n",
+        exists: false,
+        events: &["del"],
+    },
+    PastCase {
+        name: "GETEX k PXAT 1",
+        setup: SET_K,
+        cmd: &[Some("GETEX"), Some("k"), Some("PXAT"), Some("1")],
+        past_offset_ms: 0,
+        reply: "$1\r\nv\r\n",
+        exists: false,
+        events: &["del"],
+    },
+    PastCase {
+        name: "GETEX k PXAT now-1000",
+        setup: SET_K,
+        cmd: &[Some("GETEX"), Some("k"), Some("PXAT"), None],
+        past_offset_ms: -1000,
+        reply: "$1\r\nv\r\n",
+        exists: false,
+        events: &["del"],
+    },
+    PastCase {
+        name: "GETEX k EXAT 1",
+        setup: SET_K,
+        cmd: &[Some("GETEX"), Some("k"), Some("EXAT"), Some("1")],
+        past_offset_ms: 0,
+        reply: "$1\r\nv\r\n",
+        exists: false,
+        events: &["del"],
+    },
+    PastCase {
+        name: "GETEX k EX -1",
+        setup: SET_K,
+        cmd: &[Some("GETEX"), Some("k"), Some("EX"), Some("-1")],
+        past_offset_ms: 0,
+        reply: "-ERR invalid expire time in 'getex' command\r\n",
+        exists: true,
+        events: &[],
+    },
+    PastCase {
+        name: "GETEX k PX 0",
+        setup: SET_K,
+        cmd: &[Some("GETEX"), Some("k"), Some("PX"), Some("0")],
+        past_offset_ms: 0,
+        reply: "-ERR invalid expire time in 'getex' command\r\n",
+        exists: true,
+        events: &[],
+    },
+    PastCase {
+        name: "GETEX k EX abc",
+        setup: SET_K,
+        cmd: &[Some("GETEX"), Some("k"), Some("EX"), Some("abc")],
+        past_offset_ms: 0,
+        reply: "-ERR value is not an integer or out of range\r\n",
+        exists: true,
+        events: &[],
+    },
+];
+
+fn past_deadline_matrix(shards: usize) {
+    let dir = common::unique_test_dir(&format!("moon-1286-past-s{shards}"));
+    let (mut guard, port) = spawn(&dir, shards, false);
+    let mut c = Conn::open(port);
+    assert_eq!(
+        c.send(&["CONFIG", "SET", "notify-keyspace-events", "KEA"]),
+        "+OK\r\n"
+    );
+    let mut ev = Events::open(port);
+    let mut wrong = Vec::new();
+    let mut run = |name: &str,
+                   c: &mut Conn,
+                   setup: &[&[&str]],
+                   exec: &dyn Fn(&mut Conn) -> String,
+                   want: (&str, bool, &[&str])| {
+        c.send(&["FLUSHALL"]);
+        for s in setup {
+            c.send(s);
+        }
+        std::thread::sleep(Duration::from_millis(100));
+        ev.drain();
+        let before = expired_keys(c);
+        let reply = exec(c);
+        let exists = c.send(&["EXISTS", "k"]) == ":1\r\n";
+        std::thread::sleep(Duration::from_millis(300));
+        let delta = expired_keys(c) - before;
+        let events = ev.drain();
+        if reply != want.0 || exists != want.1 || events != want.2 || delta != 0 {
+            wrong.push(format!(
+                "{name}: got reply {reply:?} exists {exists} events {events:?} expired {delta}; \
+                 redis {:?} {} {:?} 0",
+                want.0, want.1, want.2
+            ));
+        }
+    };
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    for case in PAST_CASES {
+        let seconds = case.cmd[0] == Some("EXPIREAT") || case.cmd.contains(&Some("EXAT"));
+        let deadline = now_ms + case.past_offset_ms;
+        let deadline = if seconds { deadline / 1000 } else { deadline }.to_string();
+        let cmd: Vec<&str> = case.cmd.iter().map(|a| a.unwrap_or(&deadline)).collect();
+        run(
+            case.name,
+            &mut c,
+            case.setup,
+            &|c: &mut Conn| c.send(&cmd),
+            (case.reply, case.exists, case.events),
+        );
+    }
+    // RESTORE … ABSTTL in the past: nothing written; REPLACE deletes (`del`).
+    // The DUMP payload is binary, so both go through a byte-exact socket.
+    raw(port, &[b"SET", b"src", b"v"]);
+    let dump = raw(port, &[b"DUMP", b"src"]);
+    let start = dump.iter().position(|b| *b == b'\n').unwrap() + 1;
+    let payload = dump[start..dump.len() - 2].to_vec();
+    for (name, setup, replace, events) in [
+        ("RESTORE k 1 <dump> ABSTTL", &[][..], false, &[][..]),
+        (
+            "RESTORE k 1 <dump> ABSTTL REPLACE",
+            SET_K,
+            true,
+            &["del"][..],
+        ),
+    ] {
+        let exec = |_: &mut Conn| {
+            let mut parts: Vec<&[u8]> = vec![b"RESTORE", b"k", b"1", &payload, b"ABSTTL"];
+            if replace {
+                parts.push(b"REPLACE");
+            }
+            String::from_utf8_lossy(&raw(port, &parts)).into_owned()
+        };
+        run(name, &mut c, setup, &exec, ("+OK\r\n", false, events));
+    }
+    drop(ev);
+    guard.kill_now();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        wrong.is_empty(),
+        "s{shards}: an absolute deadline already past, vs redis 7.2.7:\n{}",
+        wrong.join("\n")
+    );
+}
+
+#[test]
+#[ignore = "real-server suite: MOON_BIN pinned"]
+fn a_past_absolute_deadline_deletes_without_counting_1_shard() {
+    past_deadline_matrix(1);
+}
+
+#[test]
+#[ignore = "real-server suite: MOON_BIN pinned"]
+fn a_past_absolute_deadline_deletes_without_counting_4_shards() {
+    past_deadline_matrix(4);
 }
