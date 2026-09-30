@@ -656,3 +656,42 @@ fn test_sweep_expired_noop_when_nothing_expired() {
     assert!(!ci.has_pending_unlink());
     assert_eq!(ci.len(), 1);
 }
+
+/// R1 finding 11 (moon#1286): the expiry sweep counts every entry it took
+/// out of the index in `expired_keys` even when the unlink phase that
+/// follows fails (here: its manifest commit). The entries are gone from the
+/// index either way; the early `?` used to skip the count.
+#[test]
+fn an_unlink_error_does_not_lose_the_expired_count() {
+    use crate::admin::metrics_setup::this_thread_expired_keys as counted;
+    let tmp = make_shard_with_heap(&[21]);
+    let shard_dir = tmp.path();
+    let mut manifest =
+        crate::persistence::manifest::ShardManifest::create(&shard_dir.join("shard.manifest"))
+            .unwrap();
+    let mut ci = ColdIndex::new();
+    for (slot, key) in [b"exp:a", b"exp:b"].into_iter().enumerate() {
+        ci.insert(
+            Bytes::from_static(key),
+            ColdLocation {
+                file_id: 21,
+                page_idx: 0,
+                slot_idx: slot as u16,
+                ttl_ms: Some(1_000),
+                value_type: crate::persistence::kv_page::ValueType::String,
+            },
+        );
+    }
+    manifest.set_inject_persist_error(true);
+    let before = counted();
+    let result = ci.sweep_expired(
+        2_000,
+        shard_dir,
+        Some(&mut manifest),
+        MAX_EXPIRED_SWEEP_BATCH,
+    );
+    manifest.set_inject_persist_error(false);
+    assert!(result.is_err(), "precondition: the commit failed");
+    assert_eq!(ci.len(), 0, "the entries left the index");
+    assert_eq!(counted() - before, 2, "and each is an expired key");
+}

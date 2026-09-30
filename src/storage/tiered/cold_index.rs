@@ -1034,12 +1034,16 @@ impl ColdIndex {
             }
         }
 
+        // moon#1286: each reclaimed entry is one expired key. Counted before
+        // Phase 3, whose I/O error returns early: the entries are already
+        // out of the index, expired whether or not their files unlink now
+        // (R1 finding 11).
+        crate::admin::metrics_setup::record_expired_keys(stats.entries_reclaimed as u64);
+
         // Phase 3: unlink now-zero-ref files (off the hot path).
         stats.bytes_reclaimed = self.drain_pending_unlink(shard_dir, manifest)?;
 
         if stats.entries_reclaimed > 0 {
-            // moon#1286: each reclaimed entry is one expired key.
-            crate::admin::metrics_setup::record_expired_keys(stats.entries_reclaimed as u64);
             crate::command::info_reclamation::record_cold_expired_reclaim(
                 stats.entries_reclaimed as u64,
                 stats.bytes_reclaimed,
