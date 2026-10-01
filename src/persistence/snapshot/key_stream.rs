@@ -142,6 +142,12 @@ impl KeyCursor {
         !entry.has_expiry() && shape(entry) == Some((self.kind, self.total, self.payload))
     }
 
+    /// Elements written so far.
+    #[inline]
+    pub(crate) fn position(&self) -> usize {
+        self.pos
+    }
+
     /// True once every element (and the hash trailer) is written.
     #[inline]
     pub(crate) fn done(&self) -> bool {
