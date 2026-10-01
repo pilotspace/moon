@@ -1441,6 +1441,8 @@ mod epoch_harness;
 #[cfg(test)]
 mod eviction_capture_tests;
 #[cfg(test)]
+mod key_stream_tests;
+#[cfg(test)]
 mod multi_key_cow_tests;
 #[cfg(test)]
 mod prop_tests;

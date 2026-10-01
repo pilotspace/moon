@@ -97,9 +97,8 @@ pub(crate) fn streamable_len(entry: &Entry) -> Option<usize> {
 /// Resumable serializer of one entry, in exactly `rdb::write_entry`'s
 /// encoding (element order aside, which no reader depends on).
 ///
-/// Position `pos` counts elements written. Hash and sorted-set members are
-/// `HashMap`s, which have no positional access: a resume re-walks the first
-/// `pos` buckets (`skip`, which reads control bytes only — a few ms at 5M).
+/// Position `pos` counts elements written. A list and a set resume in O(1);
+/// hash and sorted-set members are `HashMap`s, which re-skip (`skip_to`).
 /// The order is stable because the value does not change while it streams —
 /// what [`Self::matches`] re-checks before every chunk.
 pub(crate) struct KeyCursor {
@@ -149,58 +148,53 @@ impl KeyCursor {
         self.done
     }
 
-    /// Append the next elements of `entry` to `buf`, until about `budget`
-    /// bytes are written (at least one element) or the value is done.
-    /// Returns [`Self::done`]. `entry` must [`Self::matches`].
-    pub(crate) fn write_some(&mut self, entry: &Entry, buf: &mut Vec<u8>, budget: usize) -> bool {
+    /// Append the next elements of `entry` to `buf` within `limit` (always
+    /// some progress), or the rest of the value. Returns [`Self::done`].
+    /// `entry` must [`Self::matches`].
+    pub(crate) fn write_some(
+        &mut self,
+        entry: &Entry,
+        buf: &mut Vec<u8>,
+        limit: ChunkLimit,
+    ) -> bool {
         if self.done {
             return true;
         }
         let start = buf.len();
-        let full = |buf: &Vec<u8>| buf.len() - start >= budget;
-        let mut wrote = 0usize;
-        match entry.value.as_redis_value() {
+        let pos = self.pos;
+        let began = limit.time.map(|_| std::time::Instant::now());
+        let wrote = match entry.value.as_redis_value() {
             RedisValueRef::Hash(m) => {
-                for (f, v) in m.iter().skip(self.pos) {
-                    if full(buf) {
-                        break;
-                    }
+                let mut it = m.iter();
+                skip_to(&mut it, pos);
+                emit(it, buf, limit.started(began), |buf, (f, v)| {
                     put_len_bytes(buf, f);
                     put_len_bytes(buf, v);
-                    wrote += 1;
-                }
+                })
             }
-            RedisValueRef::List(l) => {
-                for e in l.range(self.pos.min(l.len())..) {
-                    if full(buf) {
-                        break;
-                    }
-                    put_len_bytes(buf, e);
-                    wrote += 1;
-                }
-            }
+            RedisValueRef::List(l) => emit(
+                l.range(pos.min(l.len())..),
+                buf,
+                limit.started(began),
+                |buf, e| put_len_bytes(buf, e),
+            ),
             RedisValueRef::Set(s) => {
-                for m in s.iter().skip(self.pos) {
-                    if full(buf) {
-                        break;
-                    }
-                    put_len_bytes(buf, m);
-                    wrote += 1;
-                }
+                let rest = s.get_range(pos.min(s.len())..).into_iter().flatten();
+                emit(rest, buf, limit.started(began), |buf, m| {
+                    put_len_bytes(buf, m)
+                })
             }
             RedisValueRef::SortedSet { members, .. }
             | RedisValueRef::SortedSetBPTree { members, .. } => {
-                for (m, score) in members.iter().skip(self.pos) {
-                    if full(buf) {
-                        break;
-                    }
+                let mut it = members.iter();
+                skip_to(&mut it, pos);
+                emit(it, buf, limit.started(began), |buf, (m, score)| {
                     put_len_bytes(buf, m);
                     put_f64(buf, *score);
-                    wrote += 1;
-                }
+                })
             }
-            _ => {}
-        }
+            _ => 0,
+        };
         self.pos += wrote;
         if self.pos >= self.total {
             if self.kind == Kind::Hash {
@@ -216,7 +210,7 @@ impl KeyCursor {
     /// Append everything not written yet (a writer that cannot wait is
     /// about to change or drop the value).
     pub(crate) fn write_rest(&mut self, entry: &Entry, buf: &mut Vec<u8>) {
-        self.write_some(entry, buf, usize::MAX);
+        self.write_some(entry, buf, ChunkLimit::UNLIMITED);
     }
 
     /// The block's CRC32: every entry byte goes through [`Self::begin`] or
@@ -224,6 +218,68 @@ impl KeyCursor {
     fn finish_crc(self) -> u32 {
         self.crc.finalize()
     }
+}
+
+/// How much one [`KeyCursor::write_some`] may write.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ChunkLimit {
+    /// Stop once about this many bytes are written.
+    pub(crate) bytes: usize,
+    /// Stop once serializing has taken this long — or as long as the
+    /// resume's re-skip took, whichever is longer, so a large hash's re-skip
+    /// is at most half of a chunk's time. Checked every 64 elements.
+    pub(crate) time: Option<std::time::Duration>,
+}
+
+impl ChunkLimit {
+    pub(crate) const UNLIMITED: ChunkLimit = ChunkLimit {
+        bytes: usize::MAX,
+        time: None,
+    };
+
+    /// The deadline of a chunk whose positioning began at `began`.
+    fn started(self, began: Option<std::time::Instant>) -> (usize, Option<std::time::Instant>) {
+        let deadline = match (self.time, began) {
+            (Some(time), Some(began)) => {
+                let now = std::time::Instant::now();
+                Some(now + time.max(now - began))
+            }
+            _ => None,
+        };
+        (self.bytes, deadline)
+    }
+}
+
+/// Position a `HashMap` iterator at element `pos`: no positional access, so
+/// a resume re-walks the first `pos` buckets (control bytes only, ~2 ns an
+/// element). Stable because the map does not change while it streams.
+fn skip_to<I: Iterator>(it: &mut I, pos: usize) {
+    if pos > 0 {
+        let _ = it.nth(pos - 1);
+    }
+}
+
+/// Write elements from `it` with `put` until `(bytes, deadline)` says stop;
+/// returns how many. At least 64 elements per call (or all that are left).
+fn emit<T>(
+    it: impl Iterator<Item = T>,
+    buf: &mut Vec<u8>,
+    (bytes, deadline): (usize, Option<std::time::Instant>),
+    mut put: impl FnMut(&mut Vec<u8>, T),
+) -> usize {
+    let start = buf.len();
+    let mut n = 0usize;
+    for item in it {
+        if n > 0 && buf.len() - start >= bytes {
+            break;
+        }
+        if n % 64 == 63 && deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+            break;
+        }
+        put(buf, item);
+        n += 1;
+    }
+    n
 }
 
 impl SnapshotState {
