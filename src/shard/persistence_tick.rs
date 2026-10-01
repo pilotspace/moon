@@ -349,6 +349,36 @@ pub(crate) fn finalize_snapshot_success(
     *snapshot_state = None;
 }
 
+/// Shutdown began: this shard stops ticking, so a BGSAVE whose walk is still
+/// running can never finish — abandon it now, as redis kills its saving child
+/// (`prepareForShutdown`; the previous snapshot file stays). Called before the
+/// connection drain: a writer parked on a stream (moon#1295, `wait_for_streams`)
+/// is woken by the disarm, finds no epoch, runs and gets its reply, instead of
+/// holding the drain to `SHUTDOWN_DRAIN_MAX` and being dropped unanswered.
+/// A save already finalizing has disarmed (no writer can be parked) and is
+/// left to the exit path as before.
+pub(crate) fn abandon_snapshot_for_shutdown(
+    snapshot_state: &mut Option<SnapshotState>,
+    snapshot_reply_tx: &mut Option<channel::OneshotSender<Result<(), String>>>,
+) {
+    if snapshot_state
+        .as_ref()
+        .is_some_and(|s| !s.finalize_started())
+    {
+        if let Some(snap) = snapshot_state.as_mut() {
+            snap.abort("the server is shutting down");
+        }
+        if let Some(tx) = snapshot_reply_tx.take() {
+            let _ = tx.send(Err("the server is shutting down".to_string()));
+        }
+        crate::storage::tiered::snapshot_hold::note_snapshot_finished(false); // moon#1260
+        *snapshot_state = None;
+    }
+    if crate::persistence::snapshot_cow::is_armed() {
+        crate::persistence::snapshot_cow::disarm();
+    }
+}
+
 /// Handle failed snapshot finalization: send error reply.
 pub(crate) fn finalize_snapshot_error(
     snapshot_state: &mut Option<SnapshotState>,
