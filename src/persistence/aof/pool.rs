@@ -2479,6 +2479,7 @@ mod pool_tests {
             bytes: Bytes::from_static(b"AAAA"),
             epoch: FoldEpoch::INITIAL,
             clock_ms: 0,
+            txn: 0,
         })
         .unwrap();
         tx.try_send(AofMessage::Append {
@@ -2487,6 +2488,7 @@ mod pool_tests {
             bytes: Bytes::from_static(b"BBBB"),
             epoch: FoldEpoch::INITIAL,
             clock_ms: 0,
+            txn: 0,
         })
         .unwrap();
         tx.try_send(AofMessage::Append {
@@ -2495,6 +2497,7 @@ mod pool_tests {
             bytes: Bytes::from_static(b"CCCC"),
             epoch: FoldEpoch::INITIAL,
             clock_ms: 0,
+            txn: 0,
         })
         .unwrap();
 
@@ -2508,6 +2511,7 @@ mod pool_tests {
             ack: ack_tx,
             epoch: FoldEpoch::INITIAL,
             clock_ms: 0,
+            txn: 0,
         })
         .unwrap();
 
@@ -3063,6 +3067,7 @@ mod pool_tests {
             bytes: Bytes::from_static(b"x"),
             epoch: FoldEpoch::INITIAL,
             clock_ms: 0,
+            txn: 0,
         })
         .unwrap();
         let pool = AofWriterPool::top_level_with_policy(
@@ -3099,6 +3104,7 @@ mod pool_tests {
             bytes: Bytes::from_static(b"x"),
             epoch: FoldEpoch::INITIAL,
             clock_ms: 0,
+            txn: 0,
         })
         .unwrap();
         let pool = AofWriterPool::top_level_with_policy(

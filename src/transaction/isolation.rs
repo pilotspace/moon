@@ -821,12 +821,13 @@ mod tests {
             assert!(hold(1, &n, 5, || None));
             let seen = |db: usize, key: &[u8]| {
                 with_held_keys(|it| {
-                    it.find(|h| h.db == db && h.key.as_ref() == key).map(|h| {
-                        (
-                            h.txn,
-                            h.pre.and_then(|e| e.value.as_bytes().map(<[u8]>::to_vec)),
-                        )
-                    })
+                    for h in &mut *it {
+                        if h.db == db && h.key.as_ref() == key {
+                            let pre = h.pre.and_then(|e| e.value.as_bytes().map(<[u8]>::to_vec));
+                            return Some((h.txn, pre));
+                        }
+                    }
+                    None
                 })
             };
             assert_eq!(seen(0, b"k"), Some((5, Some(b"v0".to_vec()))));
