@@ -331,7 +331,7 @@ fn record_bytes_conn(
         let record = if txn == 0 {
             bytes.clone()
         } else {
-            crate::server::conn::txn_log::repl_record(txn, &bytes)
+            crate::server::conn::txn_log::repl_record(shard_id, txn, &bytes)
         };
         push_record_db(repl_state, shard_id, num_shards, db, record);
     }

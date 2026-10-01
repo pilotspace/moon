@@ -831,7 +831,7 @@ mod writer_task;
 
 pub use fsync_agent::{AOF_DELAYED_FSYNC, in_flight_fsyncs};
 pub use pool::{AofWriterPool, BoundedRefusal};
-pub use record_ctx::{AppendStamp, RecordCtx, TXN_END_FLAG, txn_end_record};
+pub use record_ctx::{AppendStamp, RecordCtx, TXN_END_FLAG, txn_end_record, txn_log_id};
 pub(crate) use refusal::note_append_backpressure_refusal;
 pub use refusal::{
     AOF_APPEND_BACKPRESSURE_REFUSALS, AOF_BACKLOG_ERR, AOF_BARRIER_BACKLOG_ERR,

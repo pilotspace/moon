@@ -24,6 +24,16 @@
 //! A clean-close marker (`MOON.TS <ms> CLOSE`) also ends every open block:
 //! the process that ran them stopped.
 //!
+//! A block is identified by its `<id>` alone, so an id must name ONE
+//! transaction in a stream. Each shard's transaction manager issues its own
+//! ids and a multi-shard master's replication stream merges every shard's
+//! records, so the writers log `aof::txn_log_id(shard, id)` — the origin
+//! shard above the manager's id (R2b W1). A per-shard AOF file holds one
+//! shard's records, and a flat file one shard's (`--shards 1`; a flat
+//! manifest under `--shards >= 2` is refused at boot); `migrate_aof` copies
+//! one origin's markers to every shard. A log written before carries bare
+//! manager ids from one shard: still unique within it.
+//!
 //! redis drops an unterminated `MULTI` at the end of its AOF; it can, because
 //! a `MULTI` body is logged as one contiguous block at `EXEC`. A `TXN` block
 //! is interleaved with other clients' acknowledged writes, so "skip from

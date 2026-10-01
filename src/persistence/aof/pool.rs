@@ -468,7 +468,7 @@ impl AofWriterPool {
     }
 
     /// [`Self::append_then_apply`] for a record tagged `txn` (an
-    /// [`AppendStamp::txn`], moon#1300): a transaction's END record, enqueued
+    /// [`AppendStamp::txn`] — already a log id, moon#1300): a transaction's END record, enqueued
     /// stamped at the enqueue instant in the same synchronous section that
     /// releases the transaction's keys (`apply`), so a fold snapshot falls
     /// either before both (and re-opens the block in its new generation, where
@@ -987,8 +987,10 @@ impl AofWriterPool {
     }
 
     /// [`Self::send_append_bounded_blocking`] for a record cross-store
-    /// transaction `txn` wrote (moon#1300: a script's write effect inside a
-    /// `TXN`; 0 = none). The writer brackets it in the transaction's block.
+    /// transaction `txn` (its manager id on `shard_id`; 0 = none) wrote
+    /// (moon#1300: a script's write effect inside a `TXN`). The writer
+    /// brackets it in the transaction's block, named by its log id
+    /// ([`super::txn_log_id`]).
     pub fn send_append_bounded_blocking_in_txn(
         &self,
         shard_id: usize,
@@ -1085,7 +1087,7 @@ impl AofWriterPool {
         use super::rewrite_overflow::SpillReject;
         // #455: synchronous — the stamp is the caller's mutation epoch, and
         // a block below holds the whole thread, so no fold can interleave.
-        let stamp = self.fold_stamp(shard_id).in_txn(txn);
+        let stamp = self.fold_stamp(shard_id).in_txn(shard_id, txn);
         let mut msg = AofMessage::Append {
             lsn,
             db,

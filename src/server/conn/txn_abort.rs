@@ -133,7 +133,11 @@ pub(crate) async fn abort_logged(
     };
     if let Some(record) = replicate {
         for (db, bytes) in &log.kv {
-            record(ctx, *db, super::txn_log::repl_record(txn_id, bytes));
+            record(
+                ctx,
+                *db,
+                super::txn_log::repl_record(ctx.shard_id, txn_id, bytes),
+            );
         }
         // Graph replication is single-shard scope, exactly like the forward
         // GRAPH.* leg (`try_handle_graph_command`).

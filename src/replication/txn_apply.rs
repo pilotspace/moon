@@ -11,6 +11,17 @@
 //! rolled back, as the master's own crash recovery would. A full resync
 //! replaces the dataset and forgets the blocks.
 //!
+//! The master's shards issue transaction ids independently and their records
+//! share this one stream, so every marker carries the transaction's LOG id
+//! (`aof::txn_log_id`: origin shard and the shard's id) — two shards' blocks
+//! never share an id here (R2b W1). Ids are unique within one master
+//! PROCESS: a restarted master issues them from 1 again. A full resync
+//! forgets every block ([`discard`]); a partial resync across a master
+//! restart (persisted replication id, offset recovered from its AOF) can
+//! leave the old process's block open here — rolled back at a promotion,
+//! or resumed by the new process's same id (known residual, see the R2b
+//! fix-A summary).
+//!
 //! A replica has one shard and its apply runs on that shard's thread, so
 //! the state is a thread-local, like the hold table. Nothing runs while no
 //! block is open: one `RefCell` borrow per applied record.
@@ -121,7 +132,7 @@ pub(crate) fn stream_reopen(shard_id: usize) {
         crate::replication::state::record_local_write_db_global(
             shard_id,
             db,
-            crate::server::conn::txn_log::repl_record(txn, &record),
+            crate::server::conn::txn_log::repl_record(shard_id, txn, &record),
         );
     }
 }

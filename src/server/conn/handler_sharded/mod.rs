@@ -2805,7 +2805,7 @@ async fn handle_connection_body<S: tokio::io::AsyncRead + tokio::io::AsyncWrite 
                             let fold_stamp = ctx.aof_pool.as_ref().map_or(
                                 aof::AppendStamp::INITIAL,
                                 |pool| pool.fold_stamp(ctx.shard_id),
-                            ).in_txn(conn.active_cross_txn.as_ref().map_or(0, |t| t.txn_id));
+                            ).in_txn(ctx.shard_id, conn.active_cross_txn.as_ref().map_or(0, |t| t.txn_id));
 
                             let (mut response, ready): (Frame, crate::blocking::wakeup::ReadyKeys) = match write_outcome {
                                 Ok(t) => t,

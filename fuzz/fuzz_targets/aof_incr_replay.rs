@@ -42,7 +42,8 @@ use moon::storage::Database;
 // the fuzzer having to discover `MOON.TS`, and, in mode 3, the layout (bit
 // 6: framed); bit 7 adds a transaction-block prefix whose shape is the high
 // 16 bits of the value (BEGIN, a data record, PAUSE, an END of the same or
-// another id, RESET; id = low 4 bits + 1); bytes 1..9 are the stamp /
+// another id, RESET; id = low 4 bits + 1, or with shape bit 7 that local id
+// encoded as two shards' log ids, `aof::txn_log_id`); bytes 1..9 are the stamp /
 // watermark value; the rest is the log.
 fn resp(parts: &[&[u8]]) -> Vec<u8> {
     let mut out = format!("*{}\r\n", parts.len()).into_bytes();
@@ -89,8 +90,20 @@ fuzz_target!(|data: &[u8]| {
     }
     if sel & 0b1000_0000 != 0 {
         let shape = value >> 48;
-        let id = ((value & 0xF) + 1).to_string();
-        let other = ((value & 0xF) + 2).to_string();
+        // R2b W1: the writers log `txn_log_id(shard, id)` — the origin shard
+        // above bit 48 — so `other` is also the same local id from another
+        // shard (a two-shard collision the replay must keep apart).
+        let (id, other) = if shape & 0b1000_0000 != 0 {
+            let local = (value & 0xF) + 1;
+            let shard = ((value >> 4) & 0x3) as usize;
+            (
+                moon::persistence::aof::txn_log_id(shard, local),
+                moon::persistence::aof::txn_log_id(shard + 1, local),
+            )
+        } else {
+            ((value & 0xF) + 1, (value & 0xF) + 2)
+        };
+        let (id, other) = (id.to_string(), other.to_string());
         if shape & 0b1 != 0 {
             prefix.push(resp(&[b"MOON.TXN", b"BEGIN", id.as_bytes()]));
         }

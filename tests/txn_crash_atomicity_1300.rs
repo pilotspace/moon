@@ -1183,6 +1183,140 @@ fn a_replica_attached_before_the_txn_agrees_on_commit() {
     replica_txn(false, ReplEnding::Commit);
 }
 
+/// The id of the last `MOON.TXN BEGIN` in the AOF file that logs `tag`'s
+/// keys, reduced to its LOCAL part: the low 48 bits, the id the shard's
+/// transaction manager issued (R2b W1 puts the origin shard above them).
+fn last_begin_local(dir: &Path, tag: &str) -> u64 {
+    let needle = format!("{{{tag}}}");
+    let pat = b"MOON.TXN\r\n$5\r\nBEGIN\r\n$";
+    let mut found = None;
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        for e in std::fs::read_dir(&d).into_iter().flatten().flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                stack.push(p);
+                continue;
+            }
+            if !p.to_string_lossy().contains(".aof") {
+                continue;
+            }
+            let bytes = std::fs::read(&p).unwrap_or_default();
+            if !contains(&bytes, needle.as_bytes()) {
+                continue;
+            }
+            let Some(at) = bytes.windows(pat.len()).rposition(|w| w == pat) else {
+                continue;
+            };
+            let rest = &bytes[at + pat.len()..];
+            let text = String::from_utf8_lossy(&rest[..rest.len().min(32)]).to_string();
+            let mut lines = text.split("\r\n");
+            let _len = lines.next();
+            let id: u64 = lines
+                .next()
+                .and_then(|s| s.parse().ok())
+                .expect("a BEGIN id");
+            assert!(found.is_none(), "{tag}'s keys are in one shard's AOF");
+            found = Some(id & ((1 << 48) - 1));
+        }
+    }
+    found.unwrap_or_else(|| panic!("no MOON.TXN BEGIN logs {tag}'s keys"))
+}
+
+/// R2b W1: each master shard's transaction manager issues its own ids
+/// (1, 2, 3, …), and a multi-shard master merges every shard's records into
+/// ONE replication stream. Transactions on two shards that drew the same id
+/// must stay two blocks on the replica: shard A's END must not close shard
+/// B's block, or a promotion after the master dies keeps B's never-committed
+/// write.
+#[test]
+#[ignore = "real-server suite: MOON_BIN pinned (monoio)"]
+fn a_replica_of_a_multi_shard_master_keeps_same_id_txns_apart() {
+    if no_master_psync() {
+        eprintln!("MOON_TEST_NO_MASTER_PSYNC set: replica test skipped");
+        return;
+    }
+    let dm = tmpdir("repl-collide-m");
+    let ds = tmpdir("repl-collide-s");
+    let mut master = start(&Cfg::new(&dm, 2, true));
+    let mut replica = start(&Cfg::new(&ds, 1, false));
+    let mut a = Conn::open(master.port);
+    let ta = local_tag(&mut a);
+    // A connection on the OTHER shard: `ta` is not local to it.
+    let (mut b, tb) = (0..64)
+        .find_map(|_| {
+            let mut b = Conn::open(master.port);
+            assert_eq!(b.send(&["TXN", "BEGIN"]), OK);
+            let r = b.send(&["SET", &format!("{{{ta}}}:probe"), "1"]);
+            assert_eq!(b.send(&["TXN", "ABORT"]), OK);
+            if r == OK {
+                assert_eq!(b.send(&["DEL", &format!("{{{ta}}}:probe")]), int(0));
+                return None;
+            }
+            let tb = local_tag(&mut b);
+            Some((b, tb))
+        })
+        .expect("a connection on the other shard");
+    let (ka, kb) = (format!("{{{ta}}}:k"), format!("{{{tb}}}:k"));
+    let mut c = Conn::open(master.port);
+    assert_eq!(c.send(&["SET", &ka, "origA"]), OK);
+    assert_eq!(c.send(&["SET", &kb, "origB"]), OK);
+    let r = Conn::open(replica.port).send(&["REPLICAOF", "127.0.0.1", &master.port.to_string()]);
+    assert!(r.starts_with('+'), "REPLICAOF answered {r:?}");
+    wait_for("the replica link", || {
+        Conn::open(replica.port)
+            .send(&["INFO", "replication"])
+            .contains("master_link_status:up")
+    });
+    // Align the two shards' id counters: one logged transaction each shows
+    // where they stand, then empty transactions (an id, no record) on the
+    // shard behind.
+    for (t, tag) in [(&mut a, &ta), (&mut b, &tb)] {
+        assert_eq!(t.send(&["TXN", "BEGIN"]), OK);
+        assert_eq!(t.send(&["SET", &format!("{{{tag}}}:x"), "1"]), OK);
+        assert_eq!(t.send(&["TXN", "ABORT"]), OK);
+    }
+    let (la, lb) = (last_begin_local(&dm, &ta), last_begin_local(&dm, &tb));
+    let behind = if la < lb { &mut a } else { &mut b };
+    for _ in 0..la.abs_diff(lb) {
+        assert_eq!(behind.send(&["TXN", "BEGIN"]), OK);
+        assert_eq!(behind.send(&["TXN", "ABORT"]), OK);
+    }
+    assert_eq!(a.send(&["TXN", "BEGIN"]), OK);
+    assert_eq!(a.send(&["SET", &ka, "txnA"]), OK);
+    assert_eq!(b.send(&["TXN", "BEGIN"]), OK);
+    assert_eq!(b.send(&["SET", &kb, "txnB"]), OK);
+    assert_eq!(
+        last_begin_local(&dm, &ta),
+        last_begin_local(&dm, &tb),
+        "precondition: both shards' transactions drew the same id"
+    );
+    assert_eq!(a.send(&["TXN", "COMMIT"]), OK);
+    settle(master.port, replica.port);
+    let mut r = Conn::open(replica.port);
+    assert_eq!(r.send(&["GET", &ka]), bulk("txnA"));
+    assert_eq!(r.send(&["GET", &kb]), bulk("txnB"));
+    // The master dies with B's transaction open; the replica is promoted.
+    master.guard.kill_now();
+    assert_eq!(r.send(&["REPLICAOF", "NO", "ONE"]), OK);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while r.send(&["GET", &kb]) != bulk("origB") && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(
+        r.send(&["GET", &kb]),
+        bulk("origB"),
+        "B's transaction never committed: the promotion rolls it back \
+         (A's END with the same id must not have closed it)"
+    );
+    assert_eq!(r.send(&["GET", &ka]), bulk("txnA"), "A committed");
+    drop((a, b, c, r));
+    replica.guard.kill_now();
+    drop(master);
+    let _ = std::fs::remove_dir_all(&dm);
+    let _ = std::fs::remove_dir_all(&ds);
+}
+
 // ---------------------------------------------------------------------------
 // Downgrade (MOON_DOWNGRADE_BIN: a binary that predates moon#1300)
 // ---------------------------------------------------------------------------
