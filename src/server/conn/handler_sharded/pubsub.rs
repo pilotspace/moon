@@ -473,6 +473,8 @@ pub(super) async fn try_handle_subscribe<
                 crate::protocol::serialize(resp, write_buf);
             }
         }
+        // moon#1266 1A: the batch's AOF records reach the kernel first.
+        crate::persistence::aof::lane::flush_before_reply();
         if stream.write_all(write_buf).await.is_err() {
             return Some(SubscriberAction::EarlyReturn);
         }

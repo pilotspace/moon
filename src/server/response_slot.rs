@@ -119,6 +119,10 @@ impl ResponseSlot {
     /// is a logic error (response would be lost). Debug-asserts guard this.
     /// Single-producer only (target shard thread).
     pub(crate) fn fill(&self, response: Vec<Frame>) {
+        // moon#1266 1A: the requesting shard may write these replies to its
+        // client before this thread's next park — this thread's buffered AOF
+        // records go to the kernel first.
+        crate::persistence::aof::lane::flush_current();
         // Write data before state transition (will be visible via Release ordering)
         // SAFETY: Single-producer guarantee (only target shard calls fill). State is
         // EMPTY, so no consumer is reading the UnsafeCell. Data write completes before

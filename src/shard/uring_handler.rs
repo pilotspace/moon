@@ -47,6 +47,8 @@ pub(crate) fn send_serialized(
     resp_buf: bytes::BytesMut,
     inflight_sends: &mut std::collections::HashMap<u32, std::collections::VecDeque<InFlightSend>>,
 ) {
+    // moon#1266 1A: this thread's AOF records reach the kernel before a reply.
+    crate::persistence::aof::lane::flush_current();
     let resp_len = resp_buf.len();
     // Try pooled fixed buffer: must fit in pool buffer size
     if let Some((buf_idx, pool_buf)) = driver.alloc_send_buf() {

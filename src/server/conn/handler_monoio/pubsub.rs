@@ -294,6 +294,8 @@ pub(super) async fn try_handle_subscribe_entry<S: monoio::io::AsyncWriteRent>(
     // Flush responses and re-enter loop (next iteration enters subscriber mode)
     if !write_buf.is_empty() {
         use monoio::io::AsyncWriteRentExt;
+        // moon#1266 1A: the batch's AOF records reach the kernel first.
+        crate::persistence::aof::lane::flush_before_reply();
         let data = write_buf.split().freeze();
         let (result, _): (std::io::Result<usize>, bytes::Bytes) = stream.write_all(data).await;
         if result.is_err() {

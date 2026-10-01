@@ -81,6 +81,20 @@ pub fn set_legacy_spin_hooks(advertise: Box<dyn Fn(bool)>, probe: Box<dyn Fn() -
     driver::set_legacy_spin_hooks(advertise, probe)
 }
 
+/// moon patch (moon#1266 1A): install (`Some`) or clear (`None`) the CALLING
+/// thread's before-submit hook. The io_uring driver runs it before every
+/// `io_uring_enter` that submits SQEs (park, cold-path submit, a full
+/// submission queue), so whatever the hook writes reaches the kernel before
+/// any I/O this thread queued since its previous submit. Returns `true` when
+/// this thread's driver submits I/O ONLY at those points (io_uring without an
+/// SQPOLL kernel thread) — then a reply queued with `write_all` cannot reach
+/// the socket before the hook ran. `false` otherwise (legacy epoll/kqueue
+/// driver, SQPOLL): writes run inside the task and the hook alone does not
+/// order them. Call on the runtime's own thread, after it was built.
+pub fn set_before_submit_hook(hook: Option<fn()>) -> bool {
+    driver::set_before_submit_hook(hook)
+}
+
 /// Start a monoio runtime.
 ///
 /// # Examples

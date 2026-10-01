@@ -957,9 +957,21 @@ fn main() -> anyhow::Result<()> {
 
         if use_per_shard {
             let base_dir = PathBuf::from(&config.dir);
-            let mut senders = Vec::with_capacity(num_shards);
-            for sid in 0..num_shards {
-                let (tx, rx) = channel::mpsc_bounded::<AofMessage>(10_000);
+            // The pool first: each writer takes its lane from it (moon#1266 1A).
+            let (senders, receivers): (Vec<_>, Vec<_>) = (0..num_shards)
+                .map(|_| channel::mpsc_bounded::<AofMessage>(10_000))
+                .unzip();
+            // [F6] per_shard_with_base_dir records the persistence base dir so a
+            // per-shard BGREWRITEAOF can load the authoritative manifest fresh
+            // at rewrite time (try_send_rewrite_per_shard).
+            let pool = AofWriterPool::per_shard_with_base_dir(
+                senders,
+                fsync,
+                std::time::Duration::from_millis(config.aof_fsync_timeout_ms),
+                base_dir.clone(),
+            );
+            for (sid, rx) in receivers.into_iter().enumerate() {
+                let lane = pool.lane(sid);
                 let aof_token = aof_writer_token.clone();
                 let base_dir = base_dir.clone();
                 let thread_name = format!("aof-writer-{sid}");
@@ -973,27 +985,18 @@ fn main() -> anyhow::Result<()> {
                         RuntimeFactoryImpl::block_on_local(
                             thread_name_inner,
                             aof::per_shard_aof_writer_task(
-                                rx, base_dir, sid as u16, fsync, aof_token,
+                                rx, base_dir, sid as u16, fsync, aof_token, lane,
                             ),
                         );
                     })
                     .expect("failed to spawn per-shard AOF writer thread");
                 aof_writers.push(writer);
-                senders.push(tx);
             }
             info!(
                 "AOF enabled (PerShard, {} writers, fsync: {:?})",
                 num_shards, fsync
             );
-            // [F6] per_shard_with_base_dir records the persistence base dir so a
-            // per-shard BGREWRITEAOF can load the authoritative manifest fresh
-            // at rewrite time (try_send_rewrite_per_shard).
-            Some(AofWriterPool::per_shard_with_base_dir(
-                senders,
-                fsync,
-                std::time::Duration::from_millis(config.aof_fsync_timeout_ms),
-                base_dir.clone(),
-            ))
+            Some(pool)
         } else {
             let (tx, rx) = channel::mpsc_bounded::<AofMessage>(10_000);
             let aof_token = aof_writer_token.clone();
@@ -1012,6 +1015,13 @@ fn main() -> anyhow::Result<()> {
             // fold channels for the writer task
             let writer_fold_channels = Some((tl_fold_producer.clone(), tl_fold_notifier.clone()));
 
+            // The pool first: the writer takes its lane from it (moon#1266 1A).
+            let pool = AofWriterPool::top_level_with_policy(
+                tx,
+                fsync,
+                std::time::Duration::from_millis(config.aof_fsync_timeout_ms),
+            );
+            let lane = pool.lane(0);
             // Legacy single-writer thread; each shard clones the outer `aof_pool` Arc.
             let writer = std::thread::Builder::new()
                 .name("aof-writer".to_string())
@@ -1027,6 +1037,7 @@ fn main() -> anyhow::Result<()> {
                             fsync,
                             aof_token,
                             writer_fold_channels,
+                            lane,
                         ),
                     );
                 })
@@ -1039,11 +1050,7 @@ fn main() -> anyhow::Result<()> {
             toplevel_pool_fold_producer = Some(tl_fold_producer);
             toplevel_pool_fold_notifier = Some(tl_fold_notifier);
 
-            Some(AofWriterPool::top_level_with_policy(
-                tx,
-                fsync,
-                std::time::Duration::from_millis(config.aof_fsync_timeout_ms),
-            ))
+            Some(pool)
         }
     } else {
         None
