@@ -269,6 +269,14 @@ pub async fn aof_writer_task(
     use tokio::io::AsyncWriteExt;
     let _lane_close = super::lane::CloseOnExit(Arc::clone(&lane)); // moon#1266 1A
 
+    // R2b review P1: main.rs may still publish a fresh generation over this
+    // path by rename (`fresh_generation`); opening it first would leave this
+    // writer appending to the replaced inode.
+    #[cfg(feature = "runtime-tokio")]
+    if !super::fresh_generation::wait_writer_open(&cancel).await {
+        info!("AOF writer: cancelled before the boot opened its generation");
+        return;
+    }
     // Open file in append mode (create if not exists)
     #[cfg(feature = "runtime-tokio")]
     let file: tokio::fs::File = match tokio::fs::OpenOptions::new()

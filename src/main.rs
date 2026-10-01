@@ -938,6 +938,12 @@ fn main() -> anyhow::Result<()> {
         None;
 
     let (aof_writer_token, mut aof_writers) = (CancellationToken::new(), Vec::new()); // moon#1274
+    // R2b review P1: tokio `--shards 1` may publish its fresh generation by
+    // rename after recovery (`fresh_generation`); its writer opens the file
+    // only once this guard is dropped, below the generation seed.
+    let fresh_aof_gate =
+        (cfg!(not(feature = "runtime-monoio")) && num_shards == 1 && config.appendonly == "yes")
+            .then(moon::persistence::aof::fresh_generation::hold_writer_open);
     let mut aof_pool: Option<std::sync::Arc<AofWriterPool>> = if config.appendonly == "yes" {
         let fsync = FsyncPolicy::from_str(&config.appendfsync);
         // PerShard writers required when num_shards >= 2 AND we'll have a
@@ -1975,25 +1981,46 @@ fn main() -> anyhow::Result<()> {
             // Its head's DELs read the ledger in the cold index (moon#1281 round 2b).
             reattach_cold_wiring(&mut shards, &mut preserved_cold_wiring);
             let aof_path = base_dir.join(&config.appendfilename);
-            let seeded = moon::persistence::cold_records::seed_generation_head_if_fresh(
-                &aof_path,
+            // R2b review P1: a generation opened over a non-empty keyspace (a
+            // snapshot loaded because no AOF held a record) carries it as its
+            // RDB preamble — the AOF is the only KV source of the next boot.
+            use moon::persistence::aof::fresh_generation::{self, FreshGeneration};
+            let dbs = &shards[0].databases;
+            let base = || {
+                if dbs.iter().all(|db| db.len() == 0) {
+                    return Ok(None);
+                }
+                moon::persistence::rdb::save_to_bytes(dbs)
+                    .map(Some)
+                    .map_err(std::io::Error::other)
+            };
+            let head = (
                 cold_file_watermark(&spill_seeds, 0),
                 fresh_deletes(&shards, 0),
-            )
-            .with_context(|| {
-                format!(
-                    "failed to seed the AOF cold-plane cut in {} (moon#914)",
-                    aof_path.display()
-                )
-            })?;
-            if seeded {
-                info!(
+            );
+            let opened = fresh_generation::open_fresh_flat_generation(&aof_path, base, Some(head))
+                .with_context(|| {
+                    format!(
+                        "failed to open the AOF generation {} (moon#914, R2b review P1)",
+                        aof_path.display()
+                    )
+                })?;
+            match opened {
+                FreshGeneration::Existing => {}
+                FreshGeneration::HeadOnly => info!(
                     "Opened AOF generation {} with its MOON.COLDCUT head (moon#914)",
                     aof_path.display()
-                );
+                ),
+                FreshGeneration::WithBase { bytes } => info!(
+                    "Opened AOF generation {} with the loaded keyspace as its RDB preamble \
+                     ({} bytes) and its MOON.COLDCUT head",
+                    aof_path.display(),
+                    bytes
+                ),
             }
         }
     }
+    drop(fresh_aof_gate);
 
     // (The former standalone tokio "multi-part AOF ignored" warn block was
     // removed: multi-shard PerShard AOF is now loaded on tokio too, and the
