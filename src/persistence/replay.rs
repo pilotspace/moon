@@ -33,6 +33,8 @@ pub mod log_segment;
 pub mod pseudo;
 /// Marks a replay on this thread: expiries it causes are not counted (moon#1286).
 pub(crate) mod scope;
+/// `MOON.TXN` blocks: a transaction a crash cut is rolled back (moon#1300).
+pub mod txn;
 
 /// Parse a Frame as an unsigned integer (BulkString or Integer).
 #[inline]
@@ -262,6 +264,17 @@ pub trait CommandReplayEngine {
         args: &[Frame],
         selected_db: &mut usize,
     ) -> ReplayRoute;
+
+    /// The end of one replayed log file (moon#1300): a `MOON.TXN` block
+    /// still open was cut by a crash, and is rolled back into `databases`
+    /// (the slice the file replayed into). Returns how many blocks were
+    /// open. Every reader calls it once per file, after its last record —
+    /// at a torn tail too. An engine with no transaction state has nothing
+    /// to do.
+    fn finish_log(&self, databases: &mut [Database]) -> usize {
+        let _ = databases;
+        0
+    }
 }
 
 /// Decode one WAL v3 `Command` record payload and replay every command in it
@@ -322,6 +335,8 @@ pub fn replay_resp_payload<E: CommandReplayEngine + ?Sized>(
 pub struct DispatchReplayEngine {
     #[cfg(feature = "graph")]
     graph_collector: std::cell::RefCell<crate::graph::replay::GraphReplayCollector>,
+    /// moon#1300: the `MOON.TXN` blocks of the file being replayed.
+    txn: std::cell::RefCell<txn::TxnReplay>,
 }
 
 impl DispatchReplayEngine {
@@ -332,6 +347,7 @@ impl DispatchReplayEngine {
             graph_collector: std::cell::RefCell::new(
                 crate::graph::replay::GraphReplayCollector::new(),
             ),
+            txn: std::cell::RefCell::new(txn::TxnReplay::default()),
         }
     }
 
@@ -363,21 +379,26 @@ impl CommandReplayEngine for DispatchReplayEngine {
         // the live server counted it when it happened.
         let _replaying = scope::ReplayScope::enter();
         // moon#1283: every `MOON.*` pseudo-command (the clock stamps, the
-        // cold-plane cut records) is applied here, FIRST — before anything
-        // that could skip a data record — and never reaches dispatch.
-        if let Some(route) = pseudo::intercept(databases, cmd, args, *selected_db) {
-            return route;
+        // cold-plane cut records, the transaction blocks) is applied here,
+        // FIRST — before anything that could roll a data record back — and
+        // never reaches dispatch.
+        if let Some(record) = pseudo::classify(cmd, args) {
+            return self.apply_pseudo(record, databases, cmd, args, *selected_db);
         }
         // moon#1277: judge expiry by the log's time, not the replay's — and
         // hand the databases back on the wall clock after every record, so
         // nothing after the replay (a foreign read of an idle shard, before
         // its owner refreshes) sees the pinned time.
         let Some(ms) = clock::pinned_replay_clock_ms() else {
+            self.before_data(databases, *selected_db, cmd, args);
             return self.replay_one(databases, cmd, args, selected_db);
         };
         databases
             .iter_mut()
             .for_each(|db| db.set_replay_clock_ms(ms));
+        // moon#1300: under the record's own judgment clock, so the pre-image
+        // a block captures is the value the record was applied over.
+        self.before_data(databases, *selected_db, cmd, args);
         let route = self.replay_one(databases, cmd, args, selected_db);
         let now = crate::storage::entry::current_time_ms();
         databases
@@ -385,9 +406,71 @@ impl CommandReplayEngine for DispatchReplayEngine {
             .for_each(|db| db.set_replay_clock_ms(now));
         route
     }
+
+    fn finish_log(&self, databases: &mut [Database]) -> usize {
+        let mut txn = self.txn.borrow_mut();
+        if txn.is_idle() {
+            return 0;
+        }
+        let open = txn.finish(databases);
+        // The writer that reopens this file writes `MOON.TXN RESET` first,
+        // so this rollback happens HERE on every later boot too, before the
+        // records it appends (`aof::record_ctx`).
+        if open > 0
+            && let Some(path) = clock::current_log_path()
+        {
+            txn::note_reset_owed(&path);
+        }
+        open
+    }
 }
 
 impl DispatchReplayEngine {
+    /// A classified `MOON.*` record: the transaction markers move this
+    /// engine's block state; the rest go to [`pseudo::apply`]. A clean-close
+    /// marker also ends every open block (the process that ran them stopped).
+    fn apply_pseudo(
+        &self,
+        record: pseudo::Pseudo,
+        databases: &mut [Database],
+        cmd: &[u8],
+        args: &[Frame],
+        selected_db: usize,
+    ) -> ReplayRoute {
+        match record {
+            pseudo::Pseudo::Txn(marker) => {
+                self.txn.borrow_mut().on_marker(databases, marker);
+                record.route()
+            }
+            pseudo::Pseudo::Close(_) => {
+                let route = pseudo::apply(record, databases, cmd, args, selected_db);
+                let mut txn = self.txn.borrow_mut();
+                if !txn.is_idle() {
+                    txn.on_marker(databases, pseudo::TxnMarker::Reset);
+                }
+                route
+            }
+            _ => pseudo::apply(record, databases, cmd, args, selected_db),
+        }
+    }
+
+    /// moon#1300: a data record about to be applied — see
+    /// [`txn::TxnReplay::before_data`]. One `RefCell` borrow and an
+    /// `is_empty` check while no block is open.
+    #[inline]
+    fn before_data(
+        &self,
+        databases: &mut [Database],
+        selected_db: usize,
+        cmd: &[u8],
+        args: &[Frame],
+    ) {
+        let mut txn = self.txn.borrow_mut();
+        if !txn.is_idle() {
+            txn.before_data(databases, selected_db, cmd, args);
+        }
+    }
+
     /// One replayed record (the body of [`CommandReplayEngine::replay_command`]).
     fn replay_one(
         &self,

@@ -446,13 +446,32 @@ impl AofWriterPool {
         bytes: Bytes,
         apply: impl FnOnce() -> R,
     ) -> Result<(R, bool), AofAck> {
+        self.append_then_apply_in_txn(shard_id, lsn, db, bytes, 0, apply)
+            .await
+    }
+
+    /// [`Self::append_then_apply`] for a record tagged `txn` (an
+    /// [`AppendStamp::txn`], moon#1300): a transaction's END record, enqueued
+    /// stamped at the enqueue instant in the same synchronous section that
+    /// releases the transaction's keys (`apply`), so a fold snapshot falls
+    /// either before both (and re-opens the block in its new generation, where
+    /// this END then lands) or after both.
+    pub async fn append_then_apply_in_txn<R>(
+        &self,
+        shard_id: usize,
+        lsn: u64,
+        db: usize,
+        bytes: Bytes,
+        txn: u64,
+        apply: impl FnOnce() -> R,
+    ) -> Result<(R, bool), AofAck> {
         let deadline = if self.fsync_timeout.is_zero() {
             None
         } else {
             Some(std::time::Instant::now() + self.fsync_timeout)
         };
         loop {
-            match self.try_append_now(shard_id, lsn, db, bytes.clone()) {
+            match self.try_append_now(shard_id, lsn, db, bytes.clone(), txn) {
                 AppendNow::Enqueued => {
                     return Ok((apply(), matches!(self.fsync_policy(), FsyncPolicy::Always)));
                 }
@@ -488,7 +507,14 @@ impl AofWriterPool {
     /// One non-parking enqueue attempt, stamped at the enqueue instant. Honours
     /// the rewrite overflow's spill-first ordering exactly like
     /// [`Self::send_append_backpressure`].
-    fn try_append_now(&self, shard_id: usize, lsn: u64, db: usize, bytes: Bytes) -> AppendNow {
+    fn try_append_now(
+        &self,
+        shard_id: usize,
+        lsn: u64,
+        db: usize,
+        bytes: Bytes,
+        txn: u64,
+    ) -> AppendNow {
         use super::rewrite_overflow::SpillReject;
         let ovf = self.overflow_for(shard_id);
         let msg = AofMessage::Append {
@@ -497,6 +523,7 @@ impl AofWriterPool {
             bytes,
             epoch: ovf.stamp(),
             clock_ms: crate::storage::entry::current_time_ms(),
+            txn,
         };
         let msg = if ovf.spill_first() {
             match ovf.try_spill(msg) {
@@ -668,16 +695,33 @@ impl AofWriterPool {
     /// [`Self::try_send_append_durable`] (async contexts).
     #[inline]
     pub fn try_send_append(&self, shard_id: usize, lsn: u64, db: usize, bytes: Bytes) -> bool {
-        let ovf = self.overflow_for(shard_id);
         // #455: synchronous — no suspension between the caller's mutation
         // and this read, so the stamp is the mutation's epoch.
-        let epoch = ovf.stamp();
+        let stamp = self.fold_stamp(shard_id);
+        self.try_send_append_stamped(shard_id, lsn, db, bytes, stamp)
+    }
+
+    /// [`Self::try_send_append`] with the caller's [`AppendStamp`] (moon#1300:
+    /// the records a fold re-opens an open transaction with in the new
+    /// generation, stamped at or above the fold's epoch and with the
+    /// transaction's id). Same spill gate, same loss accounting.
+    #[inline]
+    pub fn try_send_append_stamped(
+        &self,
+        shard_id: usize,
+        lsn: u64,
+        db: usize,
+        bytes: Bytes,
+        stamp: AppendStamp,
+    ) -> bool {
+        let ovf = self.overflow_for(shard_id);
         let msg = AofMessage::Append {
             lsn,
             db,
             bytes,
-            epoch,
-            clock_ms: crate::storage::entry::current_time_ms(),
+            epoch: stamp.epoch,
+            clock_ms: stamp.clock_ms,
+            txn: stamp.txn,
         };
         // #452.1 ordering rule 1: while this writer's rewrite overflow holds
         // spilled appends, every new append must also spill — a `try_send`
@@ -902,7 +946,22 @@ impl AofWriterPool {
         bytes: Bytes,
         budget: &mut Duration,
     ) -> bool {
-        let refusal = match self.send_bounded_or_refuse(shard_id, lsn, db, bytes, budget) {
+        self.send_append_bounded_blocking_in_txn(shard_id, lsn, db, bytes, 0, budget)
+    }
+
+    /// [`Self::send_append_bounded_blocking`] for a record cross-store
+    /// transaction `txn` wrote (moon#1300: a script's write effect inside a
+    /// `TXN`; 0 = none). The writer brackets it in the transaction's block.
+    pub fn send_append_bounded_blocking_in_txn(
+        &self,
+        shard_id: usize,
+        lsn: u64,
+        db: usize,
+        bytes: Bytes,
+        txn: u64,
+        budget: &mut Duration,
+    ) -> bool {
+        let refusal = match self.send_bounded_or_refuse(shard_id, lsn, db, bytes, txn, budget) {
             Ok(()) => return true,
             Err(refusal) => refusal,
         };
@@ -972,7 +1031,7 @@ impl AofWriterPool {
         bytes: Bytes,
         budget: &mut Duration,
     ) -> Result<(), BoundedRefusal> {
-        self.send_bounded_or_refuse(shard_id, lsn, db, bytes, budget)
+        self.send_bounded_or_refuse(shard_id, lsn, db, bytes, 0, budget)
     }
 
     /// Shared body of the two bounded senders above; performs no loss
@@ -983,18 +1042,20 @@ impl AofWriterPool {
         lsn: u64,
         db: usize,
         bytes: Bytes,
+        txn: u64,
         budget: &mut Duration,
     ) -> Result<(), BoundedRefusal> {
         use super::rewrite_overflow::SpillReject;
         // #455: synchronous — the stamp is the caller's mutation epoch, and
         // a block below holds the whole thread, so no fold can interleave.
-        let stamp = self.fold_stamp(shard_id);
+        let stamp = self.fold_stamp(shard_id).in_txn(txn);
         let mut msg = AofMessage::Append {
             lsn,
             db,
             bytes,
             epoch: stamp.epoch,
             clock_ms: stamp.clock_ms,
+            txn: stamp.txn,
         };
         // #452.1 ordering rule 1: while the rewrite overflow holds spilled
         // appends, keep spilling — see `try_send_append`. A cap-exceeded
@@ -1067,6 +1128,7 @@ impl AofWriterPool {
             bytes,
             epoch: stamp.epoch,
             clock_ms: stamp.clock_ms,
+            txn: stamp.txn,
         };
         // #452.1 ordering rule 1 (P0 fix): this path MUST honor the spill
         // gate like every other producer — the fold's phase-1/3 drains free
@@ -1221,6 +1283,7 @@ impl AofWriterPool {
             ack: ack_tx,
             epoch: stamp.epoch,
             clock_ms: stamp.clock_ms,
+            txn: stamp.txn,
         };
         // #452.1 ordering rule 1 (P0 fix): AppendSync producers (always-path
         // appends and zero-length fsync barriers) must honor the spill gate
@@ -1324,6 +1387,7 @@ impl AofWriterPool {
             // #455: synchronous producer — see `fold_stamp`.
             epoch: stamp.epoch,
             clock_ms: stamp.clock_ms,
+            txn: stamp.txn,
         };
         // #452.1 (re-verify Q2): this leg must honor the same spill-first
         // gate as every other producer — an ungated try_send during a fold
@@ -3149,6 +3213,7 @@ mod pool_tests {
             bytes: Bytes::from_static(b"x"),
             epoch: FoldEpoch::INITIAL,
             clock_ms: 0,
+            txn: 0,
         })
         .unwrap();
         let pool = AofWriterPool::top_level_with_policy(
@@ -3191,6 +3256,7 @@ mod pool_tests {
             bytes: Bytes::from_static(b"x"),
             epoch: FoldEpoch::INITIAL,
             clock_ms: 0,
+            txn: 0,
         })
         .unwrap();
         let pool = AofWriterPool::top_level_with_policy(
@@ -3268,6 +3334,7 @@ mod pool_tests {
                 bytes: Bytes::from_static(b"older-buffered"),
                 epoch: FoldEpoch::INITIAL,
                 clock_ms: 0,
+                txn: 0,
             })
             .is_ok()
         );
@@ -3294,6 +3361,7 @@ mod pool_tests {
                 bytes: Bytes::from_static(b"older-spilled"),
                 epoch: FoldEpoch::INITIAL,
                 clock_ms: 0,
+                txn: 0,
             })
             .is_ok()
         );
@@ -3332,6 +3400,7 @@ mod pool_tests {
                 bytes: Bytes::from_static(b"older-spilled"),
                 epoch: FoldEpoch::INITIAL,
                 clock_ms: 0,
+                txn: 0,
             })
             .is_ok()
         );

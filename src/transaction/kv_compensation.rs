@@ -34,17 +34,16 @@
 //!
 //! # Snapshot pre-images, by move
 //!
-//! A BGSAVE epoch armed between a transaction's write and its abort must keep
-//! the value that was live at the epoch instant F — the UNCOMMITTED value —
-//! or the image is not point-in-time and the fold's exactly-once contract
-//! (records at or above F replay on top of the base) breaks. The value the
-//! undo replaces leaves the keyspace anyway, so it is taken out with
-//! `remove_counting_cold_costed` and handed to the epoch by MOVE
+//! A BGSAVE epoch armed while the transaction was open holds the key's
+//! PRE-transaction value from its start (moon#1300: the arm files every held
+//! key's pre-image first, `snapshot_cow`), so the capture here only ever
+//! disposes of the entry. A key the epoch has not captured — it was not
+//! held at the epoch's start — gets the value the undo replaces as its
+//! epoch-start state: that value leaves the keyspace anyway, so it is taken
+//! out with `remove_counting_cold_costed` and handed to the epoch by MOVE
 //! ([`snapshot_cow::capture_removed_sized`], the moon#1269 removal pattern) —
 //! never deep-cloned. When the key is absent at abort time its epoch-start
-//! state is "absent" and a tombstone is recorded instead. If the forward write
-//! came after F, dispatch already captured the pre-transaction value (first
-//! capture wins) and the capture here disposes of the entry as usual.
+//! state is "absent" and a tombstone is recorded instead.
 //!
 //! [`UndoLog::into_records_with_db`]: crate::transaction::UndoLog::into_records_with_db
 //! [`snapshot_cow::capture_removed_sized`]: crate::persistence::snapshot_cow::capture_removed_sized
@@ -119,6 +118,19 @@ pub(crate) fn undo_one(
     }
 }
 
+/// Put `key` back to `pre` (`None`: absent) in `db`, replacing whatever it
+/// holds now, hot or cold — the restore of a transaction the log shows was
+/// cut by a crash (moon#1300: the AOF replay of an unterminated `MOON.TXN`
+/// block, `persistence::replay::txn`, and a promoted replica's open blocks,
+/// `replication::txn_apply`). No snapshot is armed there, and nothing is
+/// logged: the replayed log itself is the record.
+pub(crate) fn restore_pre_image(db: &mut Database, key: &[u8], pre: Option<Entry>) {
+    let _ = db.remove_counting_cold_costed(key);
+    if let Some(entry) = pre {
+        db.set(key, entry);
+    }
+}
+
 /// Remove whatever `key` holds now (hot and cold copies), handing a hot
 /// entry to an armed snapshot as the key's pre-image by MOVE, or recording
 /// "absent" as its pre-image when there is none.
@@ -135,7 +147,7 @@ fn take_out_current(db: &mut Database, slot: usize, key: &[u8]) {
 
 /// `RESTORE key <abs-ms> <payload> REPLACE ABSTTL` for `entry`, plus the
 /// per-field deadlines the payload cannot carry.
-fn push_restore_records(
+pub(crate) fn push_restore_records(
     slot: usize,
     key: &Bytes,
     entry: &Entry,

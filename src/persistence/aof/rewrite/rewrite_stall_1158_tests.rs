@@ -38,6 +38,7 @@ fn append(lsn: u64, payload: &'static [u8]) -> AofMessage {
         bytes: Bytes::from_static(payload),
         epoch: FoldEpoch::INITIAL,
         clock_ms: 0,
+        txn: 0,
     }
 }
 
