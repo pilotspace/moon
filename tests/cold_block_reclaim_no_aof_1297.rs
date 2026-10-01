@@ -518,11 +518,12 @@ fn run_case(kill: Kill, sabotage: bool, txn: bool) -> Outcome {
                     .strip_prefix("filler:")
                     .and_then(|s| s.parse().ok())
                     .unwrap_or(usize::MAX);
-                if touched.contains(&i) {
-                    // Written by the open TXN: promoted, so graved in the
-                    // file the compaction wrote — but it may also have been
-                    // spilled again since, live, with the TXN's value. The
-                    // restart below checks its value.
+                if touched.contains(&i) || (txn && key.starts_with("{t}")) {
+                    // Written by the open TXN (a filler, or `{t}k` when it
+                    // had been spilled): promoted, so graved in the file the
+                    // compaction wrote — but it may also have been spilled
+                    // again since, live, with the TXN's value. The restart
+                    // below checks its value.
                     continue;
                 }
                 let dead = i != usize::MAX && in_b(i);
