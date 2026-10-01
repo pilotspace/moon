@@ -347,6 +347,10 @@ pub(crate) fn apply_local(
     let Some((cmd, args)) = extract_command_static(&rc.command) else {
         return ApplyOutcome::Applied; // not an array command — nothing to apply (defensive)
     };
+    // moon#1300: the master's transaction blocks (`replication::txn_apply`).
+    if crate::replication::txn_apply::try_apply_marker(cmd, args) {
+        return ApplyOutcome::Applied;
+    }
     // moon#1299: the master already decided — a replica applies its stream
     // whatever keys a local transaction holds (it cannot hold any: a replica
     // refuses client writes). Scoped to this apply.
@@ -385,6 +389,9 @@ pub(crate) fn apply_local(
             return true;
         }
         let db_idx = rc.db_index.min(db_count - 1);
+        // moon#1300: inside a master transaction's block, capture what this
+        // record overwrites; outside one, release what it writes.
+        crate::replication::txn_apply::before_data(s, db_idx, cmd, args);
         if db_idx != rc.db_index {
             // Replica configured with fewer logical dbs than the master: a
             // high-index write is clamped rather than lost, but that is a
@@ -1072,6 +1079,8 @@ pub(crate) fn load_snapshot(
     // multi-shard master's merged snapshot carries one MQ registry aux
     // entry PER shard.
     let mq_blobs = redis_rdb::read_moon_aux_all(rdb, redis_rdb::MOON_AUX_MQ_REGISTRY);
+    // moon#1300: the new dataset is the master's: forget every open block.
+    crate::replication::txn_apply::discard();
     let result: anyhow::Result<usize> = match crate::shard::slice::try_with_shard(|s| {
         // moon#1227 review F6: this replaces every table outside `dispatch`;
         // a BGSAVE epoch still writing on this shard (the replica's own

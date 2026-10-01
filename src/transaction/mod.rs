@@ -10,6 +10,7 @@ pub mod conn_capture;
 pub mod isolation;
 pub mod kv_compensation;
 pub mod kv_mvcc;
+pub(crate) mod reopen;
 pub mod undo_log;
 
 pub use abort::abort_cross_store_txn;

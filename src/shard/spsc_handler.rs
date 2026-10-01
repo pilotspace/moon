@@ -2649,9 +2649,13 @@ pub(crate) fn handle_shard_message_shared(
                 cold_file_watermark: spill_file_id.get(),
                 fold_epoch,
             };
+            // moon#1300: same instant — re-open every open TXN in the new
+            // generation; refused, the fold fails (`reply_tx` dropped).
+            let reopened = aof_pool
+                .is_none_or(|p| crate::persistence::aof::fold_txn::enqueue_reopen(p, shard_id));
             // A send failure means the AOF writer dropped its receiver
             // (rewrite aborted): nothing will read the image, skip it.
-            if reply_tx.send(snapshot).is_ok() {
+            if reopened && reply_tx.send(snapshot).is_ok() {
                 crate::shard::slice::with_shard(|s| {
                     // Shared guards on EVERY db for the whole capture: the
                     // same cross-db atomicity the single-threaded loop gives
@@ -3025,6 +3029,8 @@ pub(crate) fn handle_shard_message_shared(
                 kicked,
                 cut: shard_offset,
             });
+            // moon#1300: re-open this shard's open TXNs past the cut.
+            crate::replication::txn_apply::stream_reopen(shard_id);
             tracing::debug!(
                 shard_id,
                 replica_id,
