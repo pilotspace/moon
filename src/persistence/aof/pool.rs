@@ -98,7 +98,7 @@ impl AofWriterPool {
                 .map(|_| Arc::new(super::rewrite::RewriteOverflow::new()))
                 .collect(),
             senders: vec![sender],
-            lanes: vec![super::lane::AofLane::new(false)],
+            lanes: super::lane::AofLane::new_set(1, false),
             layout: crate::persistence::aof_manifest::AofLayout::TopLevel,
             fsync_policy,
             fsync_timeout,
@@ -132,10 +132,7 @@ impl AofWriterPool {
                 .iter()
                 .map(|_| Arc::new(super::rewrite::RewriteOverflow::new()))
                 .collect(),
-            lanes: senders
-                .iter()
-                .map(|_| super::lane::AofLane::new(true))
-                .collect(),
+            lanes: super::lane::AofLane::new_set(senders.len(), true),
             senders,
             layout: crate::persistence::aof_manifest::AofLayout::PerShard,
             fsync_policy,
@@ -165,10 +162,7 @@ impl AofWriterPool {
                 .iter()
                 .map(|_| Arc::new(super::rewrite::RewriteOverflow::new()))
                 .collect(),
-            lanes: senders
-                .iter()
-                .map(|_| super::lane::AofLane::new(true))
-                .collect(),
+            lanes: super::lane::AofLane::new_set(senders.len(), true),
             senders,
             layout: crate::persistence::aof_manifest::AofLayout::PerShard,
             fsync_policy,
@@ -217,10 +211,7 @@ impl AofWriterPool {
                 .iter()
                 .map(|_| Arc::new(super::rewrite::RewriteOverflow::new()))
                 .collect(),
-            lanes: senders
-                .iter()
-                .map(|_| super::lane::AofLane::new(true))
-                .collect(),
+            lanes: super::lane::AofLane::new_set(senders.len(), true),
             senders,
             layout: crate::persistence::aof_manifest::AofLayout::PerShard,
             fsync_policy,
@@ -281,13 +272,37 @@ impl AofWriterPool {
         self.fold_notifiers = Some(notifiers);
     }
 
-    /// Returns the fsync policy in force: the configured one, or the last
-    /// `CONFIG SET appendfsync` ([`super::runtime_fsync`], one relaxed load).
-    /// Hot-path callers read this to decide between the fast
-    /// (`try_send_append`) and durable (`try_send_append_sync`) write paths.
+    /// Returns the fsync policy the producers must follow: the configured
+    /// one, or the last `CONFIG SET appendfsync` ([`super::runtime_fsync`],
+    /// one relaxed load) — or `Always` while any of this pool's lanes is held
+    /// (moon#1266 1A, W2B-1: a writer owns the append position outside a
+    /// fold, e.g. before its first hand-over after boot or right after
+    /// leaving `always`, so a plain record's reply could leave before its
+    /// `write(2)`; the barrier's ack comes after it). For callers that do not
+    /// know their shard (one writer: `--shards 1`; the inline dispatch's
+    /// refusal); the pool's own write paths use [`Self::fsync_policy_for`].
     #[inline]
     pub fn fsync_policy(&self) -> FsyncPolicy {
-        super::runtime_fsync::effective(self.fsync_policy)
+        match super::runtime_fsync::effective(self.fsync_policy) {
+            FsyncPolicy::Always => FsyncPolicy::Always,
+            _ if self.lanes[0].any_held() => FsyncPolicy::Always,
+            p => p,
+        }
+    }
+
+    /// [`Self::fsync_policy`] for a record to `shard_id`'s writer: `Always`
+    /// while THAT writer's lane is held. Per lane, so one writer that has not
+    /// handed over yet does not send every other shard's producers down the
+    /// acked path (whose `AppendSync` would flip their lanes back). Hot-path
+    /// callers read this to decide between the fast (`try_send_append`) and
+    /// durable (`try_send_append_sync` / [`Self::fsync_barrier`]) paths.
+    #[inline]
+    pub fn fsync_policy_for(&self, shard_id: usize) -> FsyncPolicy {
+        match super::runtime_fsync::effective(self.fsync_policy) {
+            FsyncPolicy::Always => FsyncPolicy::Always,
+            _ if self.lane_for(shard_id).is_held() => FsyncPolicy::Always,
+            p => p,
+        }
     }
 
     /// `--aof-fsync-timeout-ms`: the bound on a durable-path producer's wait
@@ -330,7 +345,7 @@ impl AofWriterPool {
         stamp: impl Into<AppendStamp>,
     ) -> Result<(), AofAck> {
         let stamp = stamp.into();
-        match self.fsync_policy() {
+        match self.fsync_policy_for(shard_id) {
             FsyncPolicy::Always => {
                 let rx = self.try_send_append_sync(shard_id, lsn, db, bytes, stamp);
                 // F2 (design-for-failure): bound the wait so a stalled disk
@@ -417,7 +432,10 @@ impl AofWriterPool {
         let stamp = stamp.into();
         self.send_append_backpressure(shard_id, lsn, db, bytes, stamp)
             .await?;
-        Ok(matches!(self.fsync_policy(), FsyncPolicy::Always))
+        Ok(matches!(
+            self.fsync_policy_for(shard_id),
+            FsyncPolicy::Always
+        ))
     }
 
     /// Enqueue a record and apply its mutation in ONE synchronous section, for
@@ -490,7 +508,10 @@ impl AofWriterPool {
         loop {
             match self.try_append_now(shard_id, lsn, db, bytes.clone(), txn) {
                 AppendNow::Enqueued => {
-                    return Ok((apply(), matches!(self.fsync_policy(), FsyncPolicy::Always)));
+                    return Ok((
+                        apply(),
+                        matches!(self.fsync_policy_for(shard_id), FsyncPolicy::Always),
+                    ));
                 }
                 AppendNow::Refused(ack) => {
                     if ack.is_backpressure() {
@@ -609,7 +630,7 @@ impl AofWriterPool {
     /// durable path.
     #[inline]
     pub async fn fsync_barrier(&self, shard_id: usize) -> Result<(), AofAck> {
-        match self.fsync_policy() {
+        match self.fsync_policy_for(shard_id) {
             FsyncPolicy::Always => {
                 // Enqueue a zero-length AppendSync. The writer will fsync all
                 // preceding Append messages (ordered channel) then ack Synced.
@@ -708,8 +729,38 @@ impl AofWriterPool {
         }
     }
 
-    /// Writer `idx`'s lane, for its writer task.
+    /// Boot (moon#1266 1A, W2B-1): wait until every writer of this pool has
+    /// handed its append position to the shard threads — or `bound` passes —
+    /// so the first client writes find the lanes DIRECT. Correctness does not
+    /// depend on it (a held lane sends the replies through the acked path);
+    /// it only keeps the first writes off the fsync barrier. Returns at once
+    /// under `always` (the writers keep the position) or with 1A off.
+    pub fn await_hand_over(&self, bound: Duration) -> bool {
+        if super::runtime_fsync::effective(self.fsync_policy) == FsyncPolicy::Always {
+            return true;
+        }
+        let deadline = std::time::Instant::now() + bound;
+        while self.lanes[0].any_held() {
+            if std::time::Instant::now() >= deadline {
+                tracing::warn!(
+                    "AOF writers did not hand their append position to the shard threads \
+                     within {bound:?} of boot; the first writes wait for an fsync barrier \
+                     until they do"
+                );
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        true
+    }
+
+    /// Writer `idx`'s lane, for its writer task — call it only to hand the
+    /// lane to the writer that will run it. The lane is held from here until
+    /// that writer first hands the append position to the producers (W2B-1:
+    /// the producers take the acked path in between, so no reply precedes
+    /// its record's `write(2)` while the writer is still starting).
     pub fn lane(&self, idx: usize) -> Arc<super::lane::AofLane> {
+        self.lanes[idx].hold();
         Arc::clone(&self.lanes[idx])
     }
 
@@ -1967,6 +2018,29 @@ mod pool_tests {
             coord.failed.load(Ordering::Acquire),
             "the dropped guard must have marked the rewrite failed"
         );
+    }
+
+    /// W2B-1: from the moment a writer is attached (`lane`) until it hands
+    /// the position over, the producers see `always` (their replies wait for
+    /// a barrier); the boot wait sees the hand-over.
+    #[test]
+    fn a_held_lane_reports_always_until_its_writer_hands_over() {
+        if !crate::persistence::aof::lane::enabled() {
+            return; // MOON_AOF_SHARD_WRITE=0 in this test's environment
+        }
+        let (tx, rx) = channel::mpsc_bounded::<AofMessage>(8);
+        let pool = AofWriterPool::top_level(tx);
+        assert_eq!(pool.fsync_policy(), FsyncPolicy::EverySec);
+        let lane = pool.lane(0);
+        assert_eq!(pool.fsync_policy(), FsyncPolicy::Always, "held from attach");
+        assert_eq!(pool.fsync_policy_for(0), FsyncPolicy::Always);
+        assert!(!pool.await_hand_over(Duration::from_millis(5)));
+        let mut ctx = crate::persistence::aof::RecordCtx::new();
+        let file = tempfile::tempfile().expect("tempfile");
+        assert!(lane.release(&rx, &mut ctx, FoldEpoch::INITIAL, file));
+        assert_eq!(pool.fsync_policy(), FsyncPolicy::EverySec);
+        assert_eq!(pool.fsync_policy_for(0), FsyncPolicy::EverySec);
+        assert!(pool.await_hand_over(Duration::from_millis(5)));
     }
 
     #[test]

@@ -382,7 +382,7 @@ pub async fn aof_writer_task(
                         );
                         return;
                     }
-                    std::thread::sleep(std::time::Duration::from_millis(50));
+                    std::thread::sleep(std::time::Duration::from_millis(5));
                 }
                 Err(e) => {
                     error!(
@@ -459,7 +459,16 @@ pub async fn aof_writer_task(
             if everysec.set_policy(fsync) {
                 idle_wait.clear_pending();
             }
-            lane_hooks::on_policy(&lane, fsync, &mut last_db, &mut write_error); // moon#1266 1A
+            // moon#1266 1A (W2B-1): hold under always, else offer before the receive.
+            lane_hooks::top_of_wake(
+                &lane,
+                &rx,
+                fsync,
+                &mut write_error,
+                &mut last_db,
+                fold_floor,
+                &file,
+            );
             // Group commit: wait (bounded) for one message, then
             // opportunistically drain whatever else is already queued into a
             // bounded batch so a single fsync makes the whole batch durable
@@ -734,7 +743,16 @@ pub async fn aof_writer_task(
             if everysec.set_policy(fsync) {
                 idle_wait.clear_pending();
             }
-            lane_hooks::on_policy(&lane, fsync, &mut last_db, &mut write_error); // moon#1266 1A
+            // moon#1266 1A (W2B-1): hold under always, else offer before the receive.
+            lane_hooks::top_of_wake(
+                &lane,
+                &rx,
+                fsync,
+                &mut write_error,
+                &mut last_db,
+                fold_floor,
+                &writer,
+            );
             // Bounded recv (EverySec durability): wake at least every
             // `idle_wait.current()` (50ms floor, escalates to 1s while truly
             // idle — see `IdleWait` docs) even when idle so the flush deadline
@@ -1196,7 +1214,7 @@ pub async fn per_shard_aof_writer_task(
                         );
                         return;
                     }
-                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
                 }
                 Err(e) => {
                     error!(
@@ -1319,7 +1337,16 @@ pub async fn per_shard_aof_writer_task(
             if everysec.set_policy(fsync) {
                 idle_wait.clear_pending();
             }
-            lane_hooks::on_policy(&lane, fsync, &mut last_db, &mut write_error); // moon#1266 1A
+            // moon#1266 1A (W2B-1): hold under always, else offer before the receive.
+            lane_hooks::top_of_wake(
+                &lane,
+                &rx,
+                fsync,
+                &mut write_error,
+                &mut last_db,
+                fold_floor,
+                &writer,
+            );
             tokio::select! {
                 biased;
                 // Bounded recv (EverySec durability): wake at least every
@@ -1702,7 +1729,7 @@ pub async fn per_shard_aof_writer_task(
                         );
                         return;
                     }
-                    std::thread::sleep(std::time::Duration::from_millis(50));
+                    std::thread::sleep(std::time::Duration::from_millis(5));
                 }
                 Err(e) => {
                     error!(
@@ -1801,7 +1828,16 @@ pub async fn per_shard_aof_writer_task(
             if everysec.set_policy(fsync) {
                 idle_wait.clear_pending();
             }
-            lane_hooks::on_policy(&lane, fsync, &mut last_db, &mut write_error); // moon#1266 1A
+            // moon#1266 1A (W2B-1): hold under always, else offer before the receive.
+            lane_hooks::top_of_wake(
+                &lane,
+                &rx,
+                fsync,
+                &mut write_error,
+                &mut last_db,
+                fold_floor,
+                &file,
+            );
             // Use recv_timeout so the EverySec fsync fires even when no new
             // Appends arrive after a fold (or when the client stops writing).
             // Without a timeout, the writer blocks forever in rx.recv() and

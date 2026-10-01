@@ -2,8 +2,9 @@
 //! writer loops call these at fixed points, so the append position moves
 //! between the writer and the producers the same way in every loop.
 //!
-//! - [`on_policy`] at the top of every wake: under `always` the position is
-//!   the writer's (its group commit acks after the fsync);
+//! - [`top_of_wake`] at the top of every wake: under `always` the position is
+//!   the writer's (its group commit acks after the fsync) and the lane is
+//!   held, so the producers take the acked path (W2B-1);
 //! - [`reclaim`] before the writer handles any message, and before every
 //!   stop path: the position (and its `RecordCtx`) is the writer's again,
 //!   with whatever the producers buffered written first — so rewrites,
@@ -12,11 +13,15 @@
 //! - [`on_wake`] on every wake, before the everysec deadline check: direct
 //!   writes owe the deadline (learned BEFORE the deadline's `claim`, so the
 //!   R1 heal rule counts only writes made after a failure was learned);
-//! - [`offer`] at the end of a wake: hand the position to the producers when
-//!   nothing is in flight;
-//! - [`park`]: while 1A is on the monoio writer parks in its receive — the
-//!   warm poll only shortened the pickup of records the shard threads now
-//!   write themselves.
+//! - [`offer`] at the top of every wake, before the receive (so the boot and
+//!   a policy that just left `always` hand the position over at once, not
+//!   after the next record — W2B-1), and again at the end of a wake: hand the
+//!   position to the producers when nothing is in flight, which clears the
+//!   lane's hold;
+//! - [`park`]: the monoio writer parks in its receive while the shard threads
+//!   write their own records (DIRECT) or wait for its acks (held); it
+//!   warm-polls, as in Option 3, only while records reach it with no ack to
+//!   wait for (a fold, a latched write error).
 
 use super::*;
 use crate::persistence::aof::lane::AofLane;
@@ -27,7 +32,18 @@ pub(super) fn reclaim(lane: &AofLane, ctx: &mut RecordCtx, write_error: &mut boo
     if !lane.is_on() {
         return;
     }
-    let back = lane.take_back();
+    adopt(lane.take_back(), ctx, write_error);
+}
+
+/// What a take-back hands the writer: its context, and a failed direct
+/// write's latch.
+fn adopt(
+    back: crate::persistence::aof::lane_protocol::TakenBack<
+        crate::persistence::aof::lane::DirectCtx,
+    >,
+    ctx: &mut RecordCtx,
+    write_error: &mut bool,
+) {
     if let Some(direct) = back.ctx {
         *ctx = direct.rec;
     }
@@ -37,16 +53,31 @@ pub(super) fn reclaim(lane: &AofLane, ctx: &mut RecordCtx, write_error: &mut boo
     }
 }
 
-/// Top of every wake: `always` (also after a runtime `CONFIG SET`) keeps the
-/// position on the writer.
-pub(super) fn on_policy(
+/// Top of every wake, before the receive: `always` (also after a runtime
+/// `CONFIG SET`) keeps the position on the writer and holds the lane; any
+/// other policy offers it to the producers at once — at the boot (the lane is
+/// held from attach until this first hand-over) and on the first wake after
+/// the policy left `always` — instead of only after the next record.
+pub(super) fn top_of_wake(
     lane: &AofLane,
+    rx: &channel::MpscReceiver<AofMessage>,
     fsync: FsyncPolicy,
-    ctx: &mut RecordCtx,
     write_error: &mut bool,
+    ctx: &mut RecordCtx,
+    floor: FoldEpoch,
+    file: &impl DupFile,
 ) {
-    if fsync == FsyncPolicy::Always && lane.is_direct() {
-        reclaim(lane, ctx, write_error);
+    on_policy(lane, fsync, ctx, write_error);
+    offer(lane, rx, fsync, *write_error, ctx, floor, file);
+}
+
+/// `always` keeps the position on the writer and holds the lane.
+fn on_policy(lane: &AofLane, fsync: FsyncPolicy, ctx: &mut RecordCtx, write_error: &mut bool) {
+    if fsync == FsyncPolicy::Always && lane.is_on() {
+        // Take the position back and hold the lane under one lock: the
+        // producers' replies wait for this writer's acks from now until the
+        // next hand-over (also once the policy leaves `always` again).
+        adopt(lane.take_back_held(), ctx, write_error);
     }
 }
 
@@ -63,10 +94,11 @@ pub(super) fn on_wake(
     }
 }
 
-/// Whether the monoio writer parks in its receive (no warm poll).
+/// Whether the monoio writer parks in its receive (no warm poll): under
+/// `always`, and under 1A unless records reach it with no ack to wait for.
 #[cfg(feature = "runtime-monoio")]
 pub(super) fn park(lane: &AofLane, fsync: FsyncPolicy) -> bool {
-    fsync == FsyncPolicy::Always || lane.is_on()
+    fsync == FsyncPolicy::Always || (lane.is_on() && !lane.channel_unacked())
 }
 
 /// A writer's file the producers can get a handle on.
@@ -90,8 +122,11 @@ impl DupFile for tokio::io::BufWriter<tokio::fs::File> {
     }
 }
 
-/// End of a wake: hand the position to the producers when nothing is in
-/// flight (`AofLane::release` re-checks under the lane lock).
+/// Top and end of a wake: hand the position to the producers when nothing
+/// is in flight (`AofLane::release` re-checks under the lane lock), which
+/// clears the lane's hold. A latched write error drops the hold instead: the
+/// writer appends nothing more, and the acked path would only turn every
+/// write into an error (Option 3's behaviour, moon#1314).
 pub(super) fn offer(
     lane: &AofLane,
     rx: &channel::MpscReceiver<AofMessage>,
@@ -101,7 +136,11 @@ pub(super) fn offer(
     floor: FoldEpoch,
     file: &impl DupFile,
 ) {
-    if fsync == FsyncPolicy::Always || write_error || !lane.may_release(rx) {
+    if write_error {
+        lane.unhold();
+        return;
+    }
+    if fsync == FsyncPolicy::Always || !lane.may_release(rx) {
         return;
     }
     match file.dup() {

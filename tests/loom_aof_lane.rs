@@ -29,7 +29,24 @@
 //!      record that reaches the channel after the writer handed the position
 //!      over, and overtakes it (negative control);
 //!   4. deciding "channel" under the lock but sending after releasing it is
-//!      caught the same way (negative control) — the send must be under it.
+//!      caught the same way (negative control) — the send must be under it;
+//!   5. write before reply (W2B-1, `model_replies`): a lane starts HELD (a
+//!      writer attached, no hand-over yet — the same state as right after
+//!      the policy left `always`) and the writer holds it again on one wake
+//!      (`always`); the producer reads the lane's hold (the
+//!      `AofWriterPool::fsync_policy_for` view) after each append and, held,
+//!      sends an `AppendSync` barrier and waits for its ack; then it flushes
+//!      and "replies" — and the record must already be in the log. Loom
+//!      finds the lost-ack interleaving when the producer ignores the hold,
+//!      and when an `AppendSync` that flips a DIRECT lane does not hold it
+//!      again (two negative controls).
+//!
+//! Outside the models: a reply sent while the lane is WRITER and UNHELD — a
+//! rewrite fold and its post-fold drain, or a latched write error — may
+//! precede its record's `write(2)`; that is the documented fold residual
+//! (and moon#1314), so `model_replies` sends no control message. The
+//! producers' flush points themselves (the drivers' hooks, the reply
+//! macros) are modelled as one `flush` call before the reply.
 //!
 //! Run with (from the repo root, in a target dir of its own):
 //!   cargo rustc --release --test loom_aof_lane -- --cfg loom
@@ -48,11 +65,11 @@ use std::collections::VecDeque;
 use lane_protocol::LaneCore;
 
 #[cfg(loom)]
-use loom::sync::atomic::{AtomicBool, Ordering};
+use loom::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 #[cfg(loom)]
 use loom::sync::{Arc, Mutex};
 #[cfg(not(loom))]
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 #[cfg(not(loom))]
 use std::sync::{Arc, Mutex};
 
@@ -65,6 +82,21 @@ enum Msg {
     Rec(u8),
     /// A control message (`Rewrite*`, `Shutdown`): carries no record.
     Ctl,
+    /// A zero-length `AppendSync` (`fsync_barrier`): acked by the writer
+    /// once everything before it is written.
+    Barrier(u8),
+}
+
+/// How the producer replies (`model_replies` and its controls).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Reply {
+    /// Production: a barrier while the pool is held; an `AppendSync` that
+    /// flips a DIRECT lane holds it again (`AofLane::enqueue`).
+    Correct,
+    /// Negative control: the producer never takes the acked path.
+    IgnoreHold,
+    /// Negative control: the `AppendSync` flip does not hold the lane.
+    NoRehold,
 }
 
 /// The producers' handle on the writer's file (a dup in production).
@@ -89,6 +121,11 @@ struct World {
     log: Arc<Mutex<Vec<u8>>>,
     /// The producer has issued everything (the writer may stop waking).
     done: AtomicBool,
+    /// The lane's hold, as the producers read it (`AofLane::held`, one lane
+    /// here): changed under the lane lock, read without it.
+    holds: AtomicUsize,
+    /// The last barrier the writer acked.
+    acked: AtomicU8,
 }
 
 fn write(sink: &mut Sink, bytes: &[u8]) -> std::io::Result<()> {
@@ -114,9 +151,54 @@ impl World {
             chan: Mutex::new(VecDeque::new()),
             log: Arc::new(Mutex::new(Vec::new())),
             done: AtomicBool::new(false),
+            holds: AtomicUsize::new(0),
+            acked: AtomicU8::new(0),
         }
     }
 
+    /// A lane its writer was just attached to (`AofWriterPool::lane`): held.
+    fn attached() -> Self {
+        let w = Self::new();
+        assert!(w.core.lock().unwrap().hold());
+        w.holds.store(1, Ordering::Release);
+        w
+    }
+
+    /// `fsync_policy_for`'s view: must the producers take the acked path?
+    fn held(&self) -> bool {
+        self.holds.load(Ordering::Acquire) != 0
+    }
+
+    /// `fsync_barrier` while held: an `AppendSync` (flip, hold again, send
+    /// under one lock), then wait for its ack.
+    fn barrier(&self, id: u8, how: Reply) {
+        {
+            let mut core = self.core.lock().unwrap();
+            core.flip(write);
+            if how != Reply::NoRehold && core.hold() {
+                self.holds.fetch_add(1, Ordering::AcqRel);
+            }
+            self.send_writer_mode(core, Msg::Barrier(id), How::Correct);
+        }
+        while self.acked.load(Ordering::Acquire) < id {
+            yield_now();
+        }
+    }
+
+    /// One write acknowledged: append, the acked path if the pool is held,
+    /// the flush point, then the reply — after which the record must be in
+    /// the kernel (checks 5.).
+    fn write_and_reply(&self, id: u8, how: Reply) {
+        self.append(id, How::Correct);
+        if how != Reply::IgnoreHold && self.held() {
+            self.barrier(id, how);
+        }
+        self.flush();
+        assert!(
+            self.log.lock().unwrap().contains(&id),
+            "write before reply violated: (5) record {id} acknowledged before its write"
+        );
+    }
     // ── producer (shard thread) ────────────────────────────────────────
 
     /// `AofLane::enqueue` of an `Append`.
@@ -193,6 +275,10 @@ impl World {
 
     /// The writer writes one channel record with its own context.
     fn writer_write(&self, ctx: &mut Option<u8>, msg: Msg) {
+        if let Msg::Barrier(id) = msg {
+            self.acked.store(id, Ordering::Release);
+            return;
+        }
         if let Msg::Rec(id) = msg {
             let ctx = ctx
                 .as_mut()
@@ -223,13 +309,41 @@ impl World {
             return;
         };
         let empty = self.chan.lock().unwrap().is_empty();
-        if let Err((c, _)) = core.release(c, Sink(Arc::clone(&self.log)), empty) {
+        let was = core.is_held();
+        match core.release(c, Sink(Arc::clone(&self.log)), empty) {
+            Ok(()) => {
+                if was {
+                    self.holds.fetch_sub(1, Ordering::AcqRel);
+                }
+            }
+            Err((c, _)) => *ctx = Some(c),
+        }
+    }
+
+    /// `lane_hooks::on_policy` under `always` (`AofLane::take_back_held`):
+    /// take the position back AND hold, under one lock. (Two locks let a
+    /// producer find the lane WRITER and unheld in between: loom found that
+    /// interleaving, record 3, before production took both under one lock.)
+    fn writer_always(&self, ctx: &mut Option<u8>) {
+        let back = {
+            let mut core = self.core.lock().unwrap();
+            let back = core.take_back(write);
+            if core.hold() {
+                self.holds.fetch_add(1, Ordering::AcqRel);
+            }
+            back
+        };
+        assert!(!back.write_failed);
+        if let Some(c) = back.ctx {
+            assert!(ctx.is_none(), "lane order violated: two contexts");
             *ctx = Some(c);
         }
     }
 
-    /// One writer wake: a message (reclaim first) or none, then the offer.
+    /// One writer wake: the offer before the receive (`top_of_wake`), a
+    /// message (reclaim first) or none, then the offer again.
     fn writer_wake(&self, ctx: &mut Option<u8>) {
+        self.offer(ctx);
         let msg = self.chan.lock().unwrap().pop_front();
         if let Some(msg) = msg {
             self.reclaim(ctx);
@@ -300,6 +414,55 @@ fn spawn_writer(w: &Arc<World>) -> impl FnOnce() -> Option<u8> {
         }
     });
     move || handle.join().unwrap()
+}
+
+/// The writer for `model_replies`: like [`spawn_writer`], but its second wake
+/// runs under `always` (takes the position back and holds the lane) and the
+/// rest leave it again — what the producer sees right after a `CONFIG SET
+/// appendfsync always` → `everysec`.
+fn spawn_policy_writer(w: &Arc<World>) -> impl FnOnce() -> Option<u8> {
+    let w = Arc::clone(w);
+    let handle = thread_spawn(move || {
+        let mut ctx = Some(0u8);
+        let mut wake = 0u32;
+        loop {
+            wake += 1;
+            if wake == 2 {
+                w.writer_always(&mut ctx);
+                let msg = w.chan.lock().unwrap().pop_front();
+                if let Some(msg) = msg {
+                    w.reclaim(&mut ctx);
+                    w.writer_write(&mut ctx, msg);
+                }
+            } else {
+                w.writer_wake(&mut ctx);
+            }
+            if w.done.load(Ordering::Acquire) {
+                return ctx;
+            }
+            yield_now();
+        }
+    });
+    move || handle.join().unwrap()
+}
+
+/// Write before reply (checks 5.): from a held boot, three acknowledged
+/// writes while the writer hands over, holds (`always`) and hands over again.
+fn model_replies(how: Reply) {
+    let w = Arc::new(World::attached());
+    let writer = spawn_policy_writer(&w);
+    let producer = {
+        let w = Arc::clone(&w);
+        thread_spawn(move || {
+            w.write_and_reply(1, how);
+            w.write_and_reply(2, how);
+            w.write_and_reply(3, how);
+            w.done.store(true, Ordering::Release);
+        })
+    };
+    producer.join().unwrap();
+    let ctx = writer();
+    w.finish(ctx, 3);
 }
 
 /// The producer appends 1, flushes, sends an `AppendSync` 2, appends 3,
@@ -375,6 +538,23 @@ mod loom_models {
     fn loom_send_outside_the_lock_is_caught() {
         model(|| model_slow_path(How::UnlockedSend));
     }
+
+    #[test]
+    fn loom_held_lane_replies_after_the_write() {
+        model(|| model_replies(Reply::Correct));
+    }
+
+    #[test]
+    #[should_panic(expected = "write before reply violated")]
+    fn loom_ignoring_the_hold_is_caught() {
+        model(|| model_replies(Reply::IgnoreHold));
+    }
+
+    #[test]
+    #[should_panic(expected = "write before reply violated")]
+    fn loom_appendsync_flip_without_rehold_is_caught() {
+        model(|| model_replies(Reply::NoRehold));
+    }
 }
 
 #[cfg(not(loom))]
@@ -392,6 +572,13 @@ mod smoke {
     fn smoke_lane_slow_sender_holds_the_hand_over() {
         for _ in 0..500 {
             model_slow_path(How::Correct);
+        }
+    }
+
+    #[test]
+    fn smoke_held_lane_replies_after_the_write() {
+        for _ in 0..500 {
+            model_replies(Reply::Correct);
         }
     }
 }

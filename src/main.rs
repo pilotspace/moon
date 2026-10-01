@@ -2164,6 +2164,13 @@ fn main() -> anyhow::Result<()> {
         );
     }
 
+    // moon#1266 1A (W2B-1): the writers hand their append position to the
+    // shard threads before any client can write (bounded; a lane still held
+    // then is safe, only slower — its replies wait for an fsync barrier).
+    if let Some(ref pool) = aof_pool {
+        pool.await_hand_over(std::time::Duration::from_secs(2));
+    }
+
     // All shards recovered — mark server as ready for /readyz.
     moon::admin::metrics_setup::set_server_ready();
     // Register global ShardDatabases for MEMORY DOCTOR + Prometheus per-kind gauges.
