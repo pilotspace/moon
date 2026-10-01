@@ -14,8 +14,12 @@
 
 use std::borrow::Borrow;
 use std::cmp::Ordering;
+use std::collections::BTreeSet;
 
 use crate::storage::compact_key::CompactKey;
+use crate::storage::dashtable::DashTable;
+use crate::storage::db::expiry_wheel::ExpiryWheel;
+use crate::storage::entry::Entry;
 
 /// One `(deadline, key)` pair of the whole-key expiry index.
 ///
@@ -93,10 +97,186 @@ pub(crate) fn lookup(ts: u64, key: &[u8]) -> (u64, &[u8]) {
     (ts, key)
 }
 
+/// Process-wide switch for the time-bucket wheel (moon#1298 prototype):
+/// `MOON_EXPIRY_WHEEL=1` selects it for every `Database` created afterwards.
+/// Default OFF — the sorted set below stays the index. Read once.
+pub(crate) fn wheel_enabled_by_env() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("MOON_EXPIRY_WHEEL").is_ok_and(|v| !v.is_empty() && v != "0"))
+}
+
+/// The whole-key expiry index: the sorted set (default) or the wheel.
+///
+/// Every method has identical observable behaviour in both arms except the
+/// order of same-millisecond ties (bytes vs hash) — see `expiry_wheel.rs`.
+/// The wheel stores key HASHES, so the methods that must hand a key back take
+/// the keyspace to resolve it against.
+#[derive(Debug)]
+pub(crate) enum ExpiryIndex {
+    Tree(BTreeSet<ExpiryPair>),
+    Wheel(ExpiryWheel),
+}
+
+impl ExpiryIndex {
+    pub(crate) fn new(wheel: bool) -> Self {
+        if wheel {
+            Self::Wheel(ExpiryWheel::default())
+        } else {
+            Self::Tree(BTreeSet::new())
+        }
+    }
+
+    /// An empty index of the same kind as `self`.
+    pub(crate) fn empty_like(&self) -> Self {
+        Self::new(self.is_wheel())
+    }
+
+    pub(crate) fn is_wheel(&self) -> bool {
+        matches!(self, Self::Wheel(_))
+    }
+
+    #[inline]
+    pub(crate) fn len(&self) -> usize {
+        match self {
+            Self::Tree(t) => t.len(),
+            Self::Wheel(w) => w.len(),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub(crate) fn clear(&mut self) {
+        match self {
+            Self::Tree(t) => t.clear(),
+            Self::Wheel(w) => w.clear(),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn insert(&mut self, ts: u64, key: &[u8]) {
+        match self {
+            Self::Tree(t) => {
+                t.insert(ExpiryPair {
+                    ts,
+                    key: CompactKey::from(key),
+                });
+            }
+            Self::Wheel(w) => w.insert(ts, key),
+        }
+    }
+
+    /// Put back a pair the sweep popped (the key is already owned).
+    #[inline]
+    pub(crate) fn insert_owned(&mut self, ts: u64, key: CompactKey) {
+        match self {
+            Self::Tree(t) => {
+                t.insert(ExpiryPair { ts, key });
+            }
+            Self::Wheel(w) => w.insert(ts, key.as_bytes()),
+        }
+    }
+
+    /// Remove `(ts, key)`; allocation-free in both arms.
+    #[inline]
+    pub(crate) fn remove(&mut self, ts: u64, key: &[u8]) {
+        match self {
+            Self::Tree(t) => {
+                t.remove(&lookup(ts, key) as &dyn ExpiryLookup);
+            }
+            Self::Wheel(w) => {
+                w.remove(ts, key);
+            }
+        }
+    }
+
+    /// Earliest deadline indexed (due or not).
+    #[inline]
+    pub(crate) fn first_ts(&self) -> Option<u64> {
+        match self {
+            Self::Tree(t) => t.first().map(|p| p.ts),
+            Self::Wheel(w) => w.first_ts(),
+        }
+    }
+
+    /// Pop the earliest pair if due at `now_ms`. The sorted set's key MOVES
+    /// out; the wheel resolves its hash against `data` (and silently retires
+    /// references that resolve to no live entry).
+    #[inline]
+    pub(crate) fn pop_due(
+        &mut self,
+        now_ms: u64,
+        data: &DashTable<CompactKey, Entry>,
+    ) -> Option<(u64, CompactKey)> {
+        match self {
+            Self::Tree(t) => {
+                if t.first().is_some_and(|p| p.ts <= now_ms) {
+                    t.pop_first().map(|p| (p.ts, p.key))
+                } else {
+                    None
+                }
+            }
+            Self::Wheel(w) => w.pop_due(now_ms, data),
+        }
+    }
+
+    pub(crate) fn peek_due(
+        &self,
+        now_ms: u64,
+        data: &DashTable<CompactKey, Entry>,
+    ) -> Option<(u64, CompactKey)> {
+        match self {
+            Self::Tree(t) => t
+                .first()
+                .filter(|p| p.ts <= now_ms)
+                .map(|p| (p.ts, p.key.clone())),
+            Self::Wheel(w) => w.peek_due(now_ms, data),
+        }
+    }
+
+    /// Nearest pair, due or not. The wheel retires a bounded number of
+    /// unresolvable heads itself (hence `&mut self`).
+    pub(crate) fn peek_nearest(
+        &mut self,
+        data: &DashTable<CompactKey, Entry>,
+    ) -> Option<(u64, CompactKey)> {
+        match self {
+            Self::Tree(t) => t.first().map(|p| (p.ts, p.key.clone())),
+            Self::Wheel(w) => w.peek_nearest(data),
+        }
+    }
+
+    /// Every indexed key, in deadline order (O(N); tests and diagnostics).
+    pub(crate) fn keys(&self, data: &DashTable<CompactKey, Entry>) -> Vec<CompactKey> {
+        match self {
+            Self::Tree(t) => t.iter().map(|p| p.key.clone()).collect(),
+            Self::Wheel(w) => w
+                .iter()
+                .filter_map(|(ts, h)| {
+                    crate::storage::db::expiry_wheel::resolve(data, ts, h).cloned()
+                })
+                .collect(),
+        }
+    }
+
+    /// Does the index hold exactly `expected` (the scan-derived truth)?
+    #[cfg(test)]
+    pub(crate) fn equals_scan(&self, expected: &BTreeSet<ExpiryPair>) -> bool {
+        match self {
+            Self::Tree(t) => t == expected,
+            Self::Wheel(w) => {
+                w.len() == expected.len()
+                    && expected.iter().all(|p| w.contains(p.ts, p.key.as_bytes()))
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::BTreeSet;
 
     fn pair(ts: u64, k: &[u8]) -> ExpiryPair {
         ExpiryPair {

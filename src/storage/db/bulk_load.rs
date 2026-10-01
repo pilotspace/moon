@@ -45,16 +45,13 @@ impl Database {
         // moon#541: this post-bulk-load pass is also the index's healer —
         // rebuild it from scratch so any load path that bypassed
         // `insert_for_load` still ends consistent.
-        let mut index = std::collections::BTreeSet::new();
+        let mut index = self.expiry_index.empty_like();
         let mut hash_index = std::collections::BTreeSet::new();
         for (key, entry) in self.data.iter() {
             total += entry_overhead(key.as_bytes(), entry);
             if entry.has_expiry() {
                 any_expiring = true;
-                index.insert(super::expiry_index::ExpiryPair {
-                    ts: entry.expires_at_ms(),
-                    key: key.clone(),
-                });
+                index.insert(entry.expires_at_ms(), key.as_bytes());
             }
             // moon#543: the same healing property for the hash-field index —
             // a load path that bypassed `insert_for_load` still ends indexed.

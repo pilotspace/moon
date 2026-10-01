@@ -1143,7 +1143,7 @@ impl Database {
     pub fn keys_with_expiry(&self) -> Vec<CompactKey> {
         // moon#541: read the deadline index (deadline order) instead of
         // scanning the whole data map — O(volatile) instead of O(N).
-        self.expiry_index.iter().map(|p| p.key.clone()).collect()
+        self.expiry_index.keys(&self.data)
     }
 
     /// Check if a key exists and its expiry is in the past.

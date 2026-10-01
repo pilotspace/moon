@@ -10,6 +10,10 @@ mod cold_replay_gate;
 mod compact_write_access_tests;
 /// moon#1189: the whole-key deadline index's element + borrowed lookup.
 mod expiry_index;
+mod expiry_wheel;
+/// moon#1298 prototype: the expiry wheel vs the sorted set. Test-only.
+#[cfg(test)]
+mod expiry_wheel_tests;
 mod hash_ttl;
 mod incr;
 /// moon#1255: an expired in-flight spill record is retired when its key is
@@ -612,7 +616,7 @@ pub struct Database {
     /// walked hot entries; cold TTLs stay lazy-only. The index's own
     /// memory (~48B/pair) is metadata outside `used_memory`, like every
     /// other side table here.
-    expiry_index: std::collections::BTreeSet<expiry_index::ExpiryPair>,
+    expiry_index: expiry_index::ExpiryIndex,
     /// Deadline-ordered hash-FIELD expiry index (moon#543), the sibling of
     /// [`Self::expiry_index`]: one `(min_expiry_ms, key)` pair per hot
     /// `HashWithTtl` entry whose `ttls` sidecar is non-empty.
@@ -706,7 +710,7 @@ impl Database {
             spill_superseded: std::collections::HashMap::new(),
             spill_superseded_bytes: 0,
             birth_counter: 0,
-            expiry_index: std::collections::BTreeSet::new(),
+            expiry_index: expiry_index::ExpiryIndex::new(expiry_index::wheel_enabled_by_env()),
             hash_expiry_index: std::collections::BTreeSet::new(),
             lazy_free: lazy_free::LazyFreeQueue::default(),
         }
@@ -744,7 +748,7 @@ impl Database {
             spill_superseded: std::collections::HashMap::new(),
             spill_superseded_bytes: 0,
             birth_counter: 0,
-            expiry_index: std::collections::BTreeSet::new(),
+            expiry_index: expiry_index::ExpiryIndex::new(expiry_index::wheel_enabled_by_env()),
             hash_expiry_index: std::collections::BTreeSet::new(),
             lazy_free: lazy_free::LazyFreeQueue::default(),
         }
@@ -1108,36 +1112,30 @@ impl Database {
     /// pair when the entry is gone or its TTL differs from `ts`.
     #[inline]
     pub fn peek_due_expiry(&self, now_ms: u64) -> Option<(u64, CompactKey)> {
-        self.expiry_index
-            .first()
-            .filter(|p| p.ts <= now_ms)
-            .map(|p| (p.ts, p.key.clone()))
+        self.expiry_index.peek_due(now_ms, &self.data)
     }
 
     /// `true` iff the earliest indexed deadline is due at `now_ms` — the
     /// sweep's head-peek gate, without cloning the key (moon#1189).
     #[inline]
     pub fn has_due_expiry(&self, now_ms: u64) -> bool {
-        self.expiry_index.first().is_some_and(|p| p.ts <= now_ms)
+        self.expiry_index.first_ts().is_some_and(|ts| ts <= now_ms)
     }
 
     /// Pop the earliest pair if it is due at `now_ms` (moon#1189). O(log n);
-    /// the key MOVES out of the index — no clone, and no second index search
-    /// to retire the pair afterwards.
+    /// the key MOVES out of the sorted-set index — no clone, and no second
+    /// index search to retire the pair afterwards. (The wheel index, moon#1298,
+    /// resolves a hash reference against the keyspace instead.)
     #[inline]
     pub(crate) fn pop_due_expiry(&mut self, now_ms: u64) -> Option<(u64, CompactKey)> {
-        if !self.has_due_expiry(now_ms) {
-            return None;
-        }
-        self.expiry_index.pop_first().map(|p| (p.ts, p.key))
+        self.expiry_index.pop_due(now_ms, &self.data)
     }
 
     /// Put back a pair [`Self::pop_due_expiry`] handed out that turned out
     /// to be valid but not yet due (wall clock stepped backwards).
     #[inline]
     pub(crate) fn restore_expiry_pair(&mut self, ts: u64, key: CompactKey) {
-        self.expiry_index
-            .insert(expiry_index::ExpiryPair { ts, key });
+        self.expiry_index.insert_owned(ts, key);
     }
 
     /// Earliest `(expires_at_ms, key)` pair in the index regardless of
@@ -1146,8 +1144,8 @@ impl Database {
     /// volatile. Cold-spilled keys are not indexed, matching the old
     /// sampling picker which also only saw hot entries.
     #[inline]
-    pub fn peek_nearest_expiry(&self) -> Option<(u64, CompactKey)> {
-        self.expiry_index.first().map(|p| (p.ts, p.key.clone()))
+    pub fn peek_nearest_expiry(&mut self) -> Option<(u64, CompactKey)> {
+        self.expiry_index.peek_nearest(&self.data)
     }
 
     /// Drop one specific index pair. The sweep calls this when a popped
@@ -1157,8 +1155,30 @@ impl Database {
     /// not dropped — see [`Self::peek_due_expiry`].
     #[inline]
     pub fn drop_expiry_index_pair(&mut self, ts: u64, key: &CompactKey) {
-        self.expiry_index
-            .remove(&expiry_index::lookup(ts, key.as_bytes()) as &dyn expiry_index::ExpiryLookup);
+        self.expiry_index.remove(ts, key.as_bytes());
+    }
+
+    /// moon#1298: `true` when this database indexes TTLs in the time-bucket
+    /// wheel (`MOON_EXPIRY_WHEEL=1`) rather than the sorted set.
+    #[inline]
+    pub fn expiry_wheel_enabled(&self) -> bool {
+        self.expiry_index.is_wheel()
+    }
+
+    /// moon#1298: choose the index kind for THIS database (tests, A/B
+    /// harnesses). A no-op when it already is `on`; otherwise the index is
+    /// rebuilt from the keyspace, O(N).
+    pub fn set_expiry_wheel(&mut self, on: bool) {
+        if self.expiry_index.is_wheel() == on {
+            return;
+        }
+        let mut index = expiry_index::ExpiryIndex::new(on);
+        for (key, entry) in self.data.iter() {
+            if entry.has_expiry() {
+                index.insert(entry.expires_at_ms(), key.as_bytes());
+            }
+        }
+        self.expiry_index = index;
     }
 
     /// Number of indexed (hot, TTL-carrying) keys. Exact — backs
@@ -1178,10 +1198,7 @@ impl Database {
     /// Insert an index pair. Callers pass `ttl_ms != 0` only.
     #[inline]
     pub(crate) fn expiry_index_insert(&mut self, ttl_ms: u64, key: &[u8]) {
-        self.expiry_index.insert(expiry_index::ExpiryPair {
-            ts: ttl_ms,
-            key: CompactKey::from(key),
-        });
+        self.expiry_index.insert(ttl_ms, key);
     }
 
     /// Remove an index pair. Callers pass the entry's CURRENT `ttl_ms`
@@ -1192,8 +1209,7 @@ impl Database {
     /// find the pair it is about to drop.
     #[inline]
     pub(crate) fn expiry_index_remove(&mut self, ttl_ms: u64, key: &[u8]) {
-        self.expiry_index
-            .remove(&expiry_index::lookup(ttl_ms, key) as &dyn expiry_index::ExpiryLookup);
+        self.expiry_index.remove(ttl_ms, key);
     }
 
     // ── moon#543: deadline-ordered hash-FIELD expiry index ──────────────
@@ -1320,7 +1336,7 @@ impl Database {
                 .iter()
                 .any(|(ts, ik)| ik == k && *ts <= min)
         });
-        scan == self.expiry_index && hash_ok
+        self.expiry_index.equals_scan(&scan) && hash_ok
     }
 
     /// Record a key a lazy read discovered expired (moon#542) so the next
