@@ -345,6 +345,37 @@ fn an_output_discarded_at_listing_keeps_the_old_file() {
     assert_eq!(boot(&dir, &s), expected(&[]), "s saw every survivor live");
 }
 
+/// R3 fix-e × moon#1297: `ColdIndex::remove` returns at once when the index
+/// holds no entry and no older copy. A pending compaction keeps no per-key
+/// state that a remove must update — "changed" is judged when a trailer is
+/// encoded (`lookup` against the slot read) — so once every survivor has
+/// left, a remove is still a no-op and the trailer still graves each
+/// survivor's compacted slot.
+#[test]
+fn removes_on_an_emptied_index_leave_a_pending_compactions_graves_exact() {
+    let _m = NoAof::on();
+    let (_t, dir, _m2, mut ci) = fixture(DEAD);
+    let mut next = NEW;
+    ci.compact_file(OLD, 0, &dir, &mut next, 0)
+        .expect("compact");
+    for i in DEAD..KEYS {
+        assert!(ci.remove(key(i).as_bytes()));
+    }
+    assert_eq!(ci.len(), 0, "every survivor has left");
+    let before = slots(&trailer(&ci));
+    for i in [0, DEAD, KEYS - 1] {
+        assert!(!ci.remove(key(i).as_bytes()), "nothing to remove");
+    }
+    assert_eq!(slots(&trailer(&ci)), before, "the remove changed nothing");
+    let compacted = ci.collect_compaction_graves();
+    assert_eq!(compacted.len(), 1);
+    assert_eq!(
+        compacted[0].1.len(),
+        KEYS - DEAD,
+        "every survivor's compacted slot is a grave"
+    );
+}
+
 /// A compaction abandoned without a grave changing (its job could not be
 /// sent, or its spill thread died) makes its file a candidate again: the
 /// memo of an earlier empty scan must not hide it.
