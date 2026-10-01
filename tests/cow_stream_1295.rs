@@ -521,3 +521,49 @@ fn a_large_key_held_by_an_open_txn_streams_its_pre_transaction_image() {
         );
     }
 }
+
+/// A MULTI body cannot wait once it runs: EXEC waits for the streams of the
+/// large collections its writes touch first (no copy), then runs.
+#[test]
+#[ignore = "real server: run with --include-ignored"]
+fn exec_waits_for_the_streams_of_its_body_before_it_runs() {
+    let dir = common::unique_test_dir("cow-stream-1295-exec");
+    let _dir = DirGuard(dir.clone());
+    let env = [
+        ("MOON_TEST_COW_STREAM_MIN_ELEMENTS", "1000"),
+        ("MOON_TEST_COW_STREAM_TICK_BYTES", "8192"),
+    ];
+    let (mut server, port) = spawn(&dir, 1, &env);
+    let mut c = Conn::open(port);
+    const N: usize = 30_000;
+    pipeline_all(&mut c, bulk("HSET", "a", N, 1000));
+    assert!(c.send(&["SELECT", "2"]).starts_with("+OK"));
+    pipeline_all(&mut c, bulk("RPUSH", "b", N, 1000));
+    assert!(c.send(&["SELECT", "0"]).starts_with("+OK"));
+    let digest_before = c.send(&["DEBUG", "DIGEST"]);
+    start_held_bgsave(&mut c, &dir);
+    let reply = c.pipeline(&[
+        &["MULTI"],
+        &["HSET", "a", "new", "x"],
+        &["SELECT", "2"],
+        &["LPUSH", "b", "head"],
+        &["EXEC"],
+    ]);
+    assert!(reply.ends_with("*3\r\n:1\r\n+OK\r\n:30001\r\n"), "{reply}");
+    let streamed: u64 = info_field(&mut c, "rdb_cow_streamed_keys")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    assert_eq!(streamed, 2, "both large values streamed, neither copied");
+    assert!(c.send(&["SELECT", "0"]).starts_with("+OK"));
+    release_and_wait(&mut c, &dir);
+    server.kill_now();
+    drop(server);
+    let (_server, port) = spawn(&dir, 1, &[]);
+    let mut c = Conn::open(port);
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while int(&c.send(&["DBSIZE"])) == 0 {
+        assert!(Instant::now() < deadline, "snapshot never loaded");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(c.send(&["DEBUG", "DIGEST"]), digest_before);
+}
