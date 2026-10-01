@@ -30,13 +30,22 @@
 //! - the shard event loop flushes once per iteration (background records:
 //!   expiry, eviction), and once on exit.
 //!
+//! While the WRITER thread owns the append position for any reason but a
+//! rewrite fold or a latched write error — from the boot until its first
+//! hand-over, under `appendfsync always`, after a producer's `AppendSync`
+//! flipped the lane — the lane is HELD ([`super::lane_protocol`]): the pool
+//! then reports `always` to its producers ([`AofLane::any_held`]), so every
+//! reply waits for the fsync barrier that follows its record's `write(2)`.
+//! No reply leaves before its record is written in those windows either
+//! (W2B-1 of the R2b review).
+//!
 //! On by default; `MOON_AOF_SHARD_WRITE=0` ([`enabled`]) turns it off: the
 //! pool then never touches a lane, and Option 3 runs unchanged (the same-
 //! binary A/B, and the escape hatch).
 
 use std::cell::{Cell, RefCell};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use tracing::error;
 
@@ -155,6 +164,13 @@ pub struct AofLane {
     /// that parked with records buffered knows they were written once it
     /// moved (see [`ParkUntilHook`]).
     flushes: AtomicU64,
+    /// Held lanes of this lane's pool (every lane of a pool shares it):
+    /// changed under the changing lane's lock, read by the producers' policy
+    /// check ([`Self::any_held`]).
+    holds: Arc<AtomicUsize>,
+    /// This lane is held (mirrors the protocol's flag; set under the lock,
+    /// read without it by [`Self::is_held`]).
+    held: AtomicBool,
     /// Direct writes issued (tests).
     #[cfg(test)]
     writes: AtomicU64,
@@ -191,8 +207,21 @@ impl AofLane {
         Self::with_switch(framed, enabled())
     }
 
+    /// The lanes of one pool's `n` writers, sharing one hold count.
+    pub(crate) fn new_set(n: usize, framed: bool) -> Vec<Arc<Self>> {
+        let holds = Arc::new(AtomicUsize::new(0));
+        let on = enabled();
+        (0..n)
+            .map(|_| Self::build(framed, on, Arc::clone(&holds)))
+            .collect()
+    }
+
     /// [`Self::new`] with the switch given (tests).
     pub(crate) fn with_switch(framed: bool, on: bool) -> Arc<Self> {
+        Self::build(framed, on, Arc::new(AtomicUsize::new(0)))
+    }
+
+    fn build(framed: bool, on: bool, holds: Arc<AtomicUsize>) -> Arc<Self> {
         Arc::new(Self {
             framed,
             on,
@@ -200,9 +229,73 @@ impl AofLane {
             dirty: AtomicBool::new(false),
             written: AtomicBool::new(false),
             flushes: AtomicU64::new(0),
+            holds,
+            held: AtomicBool::new(false),
             #[cfg(test)]
             writes: AtomicU64::new(0),
         })
+    }
+
+    /// Whether this lane is held: the producers writing to it must then take
+    /// the acked (`always`) path. One acquire load.
+    #[inline]
+    pub(crate) fn is_held(&self) -> bool {
+        self.on && self.held.load(Ordering::Acquire)
+    }
+
+    /// Whether any lane of this lane's pool is held (the view of a caller
+    /// that does not know its shard). One acquire load.
+    #[inline]
+    pub(crate) fn any_held(&self) -> bool {
+        self.on && self.holds.load(Ordering::Acquire) != 0
+    }
+
+    /// Account a hold change of this lane (under its lock).
+    #[inline]
+    fn count_hold(&self, was: bool, now: bool) {
+        match (was, now) {
+            (false, true) => {
+                self.held.store(true, Ordering::Release);
+                self.holds.fetch_add(1, Ordering::AcqRel);
+            }
+            (true, false) => {
+                self.held.store(false, Ordering::Release);
+                self.holds.fetch_sub(1, Ordering::AcqRel);
+            }
+            _ => {}
+        }
+    }
+
+    /// Hold the lane (WRITER mode only, see [`super::lane_protocol`]): a
+    /// writer is attached and has not handed the position over yet, or its
+    /// policy is `always`.
+    pub(crate) fn hold(&self) {
+        if !self.on {
+            return;
+        }
+        let mut core = self.core.lock();
+        if core.hold() {
+            self.count_hold(false, true);
+        }
+    }
+
+    /// Drop the hold without a hand-over (a latched write error).
+    pub(crate) fn unhold(&self) {
+        if !self.on {
+            return;
+        }
+        let mut core = self.core.lock();
+        if core.unhold() {
+            self.count_hold(true, false);
+        }
+    }
+
+    /// Whether records reach the writer through its channel with no ack for
+    /// a reply to wait on (WRITER, unheld: a fold, a latched error) — the
+    /// writer then warm-polls its channel as in Option 3.
+    #[cfg_attr(not(feature = "runtime-monoio"), allow(dead_code))] // the monoio writer's park only
+    pub(crate) fn channel_unacked(&self) -> bool {
+        self.on && self.core.lock().channel_unacked()
     }
 
     /// Whether 1A is on for this lane.
@@ -275,6 +368,13 @@ impl AofLane {
             } else {
                 // A non-Append message must come after every buffered record.
                 self.flip_locked(&mut core);
+                // An `AppendSync` sent from a producer that saw the lane held
+                // (or `always`) a moment before the writer handed it over:
+                // the lane is the writer's again, so its producers take the
+                // acked path again until the next hand-over (W2B-1).
+                if matches!(msg, AofMessage::AppendSync { .. }) && core.hold() {
+                    self.count_hold(false, true);
+                }
             }
         }
         match tx.try_send(msg) {
@@ -343,12 +443,6 @@ impl AofLane {
         self.on && self.written.swap(false, Ordering::AcqRel)
     }
 
-    /// Whether the producers hold the append position.
-    #[inline]
-    pub(crate) fn is_direct(&self) -> bool {
-        self.on && self.core.lock().mode() == Mode::Direct
-    }
-
     /// The writer, before it handles any message and before any stop path:
     /// the append position is the writer's again (buffer written first).
     pub(crate) fn take_back(&self) -> TakenBack<DirectCtx> {
@@ -358,10 +452,24 @@ impl AofLane {
         taken
     }
 
+    /// [`Self::take_back`] and [`Self::hold`] under ONE lock (`always`): no
+    /// producer can find the lane WRITER and unheld in between.
+    pub(crate) fn take_back_held(&self) -> TakenBack<DirectCtx> {
+        let mut core = self.core.lock();
+        let taken = core.take_back(write_all);
+        self.after_write(taken.flushed);
+        if self.on && core.hold() {
+            self.count_hold(false, true);
+        }
+        taken
+    }
+
     /// The writer exits (also on unwind): CLOSED for good.
     pub(crate) fn close(&self) -> TakenBack<DirectCtx> {
         let mut core = self.core.lock();
+        let was = core.is_held();
         let taken = core.close(write_all);
+        self.count_hold(was, core.is_held());
         self.after_write(taken.flushed);
         taken
     }
@@ -397,8 +505,12 @@ impl AofLane {
             rec: std::mem::take(ctx),
             floor,
         };
+        let was = core.is_held();
         match core.release(direct, file, empty) {
-            Ok(()) => true,
+            Ok(()) => {
+                self.count_hold(was, false);
+                true
+            }
             Err((back, _file)) => {
                 *ctx = back.rec;
                 false
@@ -1139,6 +1251,66 @@ mod tests {
             5,
             "every record written"
         );
+    }
+
+    /// W2B-1: a lane a writer is attached to is held until its first
+    /// hand-over; a producer's `AppendSync` that flips a DIRECT lane holds it
+    /// again; the pool's view covers every lane; switched off, never.
+    #[test]
+    fn a_lane_is_held_from_attach_to_hand_over_and_after_an_appendsync_flip() {
+        let lanes = AofLane::new_set(2, true);
+        if !lanes[0].on {
+            return; // MOON_AOF_SHARD_WRITE=0 in this test's environment
+        }
+        let (tx, rx) = channel::mpsc_bounded::<AofMessage>(8);
+        assert!(!lanes[0].any_held());
+        lanes[0].hold();
+        lanes[1].hold();
+        lanes[1].hold(); // idempotent
+        assert!(lanes[0].any_held() && lanes[1].any_held());
+        assert_eq!(lanes[0].holds.load(Ordering::Acquire), 2);
+        assert!(!lanes[0].channel_unacked());
+        let mut ctx = RecordCtx::new();
+        let file = tempfile::tempfile().expect("tempfile");
+        assert!(lanes[0].release(&rx, &mut ctx, FoldEpoch::INITIAL, file));
+        assert!(
+            lanes[1].any_held(),
+            "lane 1 still held: the pool stays acked"
+        );
+        lanes[1].unhold();
+        assert!(!lanes[0].any_held());
+        // An AppendSync flips the DIRECT lane 0 and holds it again.
+        let (ack, _ack_rx) = channel::oneshot();
+        let sync = AofMessage::AppendSync {
+            lsn: 0,
+            db: 0,
+            bytes: Bytes::new(),
+            ack,
+            epoch: FoldEpoch::INITIAL,
+            clock_ms: 0,
+            txn: 0,
+        };
+        assert!(!lanes[1].is_held());
+        assert!(matches!(lanes[0].enqueue(sync, &tx), Sent::Ok));
+        assert_eq!(lanes[0].mode(), Mode::Writer);
+        assert!(lanes[0].is_held() && !lanes[1].is_held());
+        assert!(lanes[1].any_held());
+        // A plain flip (fold, shutdown) does not hold.
+        let _ = lanes[0].take_back();
+        let file = tempfile::tempfile().expect("tempfile");
+        let _ = rx.try_recv();
+        assert!(lanes[0].release(&rx, &mut ctx, FoldEpoch::INITIAL, file));
+        lanes[0].flip();
+        assert!(!lanes[0].any_held());
+        assert!(lanes[0].channel_unacked());
+        // Close drops a hold.
+        lanes[1].hold();
+        let _ = lanes[1].close();
+        assert!(!lanes[0].any_held());
+        // Switched off: never held.
+        let off = AofLane::with_switch(false, false);
+        off.hold();
+        assert!(!off.any_held());
     }
 
     #[test]

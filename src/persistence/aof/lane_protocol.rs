@@ -43,6 +43,26 @@
 //! hands only under the lock, so the file holds records in lock order — the
 //! order producers appended them.
 //!
+//! **Hold** (W2B-1, the reply-before-write window). In WRITER mode a plain
+//! `Append` reaches the file only when the writer thread gets to it, while
+//! the reply that acknowledges it leaves at once: a `kill -9` in between
+//! loses an acknowledged write. So WRITER mode carries a flag, `hold`, set
+//! whenever the writer owns the position for a reason that is not a rewrite
+//! fold or the write-error latch: from the boot until the writer's first
+//! hand-over ([`LaneCore::hold`] when the writer is attached), under
+//! `appendfsync always`, and after a producer's `AppendSync` flipped a DIRECT
+//! lane. While any lane of a pool is held the pool reports `always` to its
+//! producers: their replies wait for the writer's fsync barrier, which comes
+//! after the record's `write(2)`. A successful [`LaneCore::release`] clears
+//! it (DIRECT needs no hold: the flush points write before the replies), and
+//! so does [`LaneCore::close`]. What stays unheld in WRITER mode is the
+//! documented residual: a rewrite fold (and its post-fold drain) and a latched
+//! write error.
+//!
+//! Whether a reply waits is decided by its caller from the pool's view, not
+//! by this state machine; `tests/loom_aof_lane.rs` models the hand-over and
+//! the hold transitions, not the replies.
+//!
 //! This file is compiled into `tests/loom_aof_lane.rs` through `#[path]`;
 //! keep it self-contained (`std` only).
 
@@ -110,6 +130,8 @@ pub(crate) struct LaneCore<C, F> {
     slow_senders: usize,
     /// Consecutive small writes (see [`BUF_SHRINK_AFTER`]).
     small_streak: u32,
+    /// WRITER only: producers must take the acked path (see the module doc).
+    held: bool,
 }
 
 impl<C, F> Default for LaneCore<C, F> {
@@ -130,7 +152,43 @@ impl<C, F> LaneCore<C, F> {
             write_failed: false,
             slow_senders: 0,
             small_streak: 0,
+            held: false,
         }
+    }
+
+    /// Whether the lane is held (see the module doc).
+    #[inline]
+    #[must_use]
+    pub(crate) fn is_held(&self) -> bool {
+        self.held
+    }
+
+    /// Hold a WRITER lane: its producers take the acked path until the next
+    /// [`Self::release`]. Returns whether the flag changed. A no-op in DIRECT
+    /// (no reply can precede its write there) and CLOSED.
+    pub(crate) fn hold(&mut self) -> bool {
+        if self.mode != Mode::Writer || self.held {
+            return false;
+        }
+        self.held = true;
+        true
+    }
+
+    /// Drop the hold without a hand-over (the writer latched a write error:
+    /// it appends nothing, so the acked path would only turn every write into
+    /// an error — the Option 3 behaviour, moon#1314). Returns whether the flag
+    /// changed.
+    pub(crate) fn unhold(&mut self) -> bool {
+        std::mem::replace(&mut self.held, false)
+    }
+
+    /// Whether records reach the writer through the channel with no ack to
+    /// wait for: WRITER and not held (a fold, a latched error).
+    #[inline]
+    #[must_use]
+    #[cfg_attr(not(feature = "runtime-monoio"), allow(dead_code))] // the monoio writer's park only
+    pub(crate) fn channel_unacked(&self) -> bool {
+        self.mode == Mode::Writer && !self.held
     }
 
     /// The current mode.
@@ -256,6 +314,7 @@ impl<C, F> LaneCore<C, F> {
         self.ctx = Some(ctx);
         self.file = Some(file);
         self.mode = Mode::Direct;
+        self.held = false;
         Ok(())
     }
 
@@ -279,6 +338,7 @@ impl<C, F> LaneCore<C, F> {
     ) -> TakenBack<C> {
         let taken = self.take_back(write);
         self.mode = Mode::Closed;
+        self.held = false;
         taken
     }
 
@@ -403,6 +463,34 @@ mod tests {
             c.buf.capacity() <= BUF_RETAIN_FLOOR,
             "given back after the streak"
         );
+    }
+
+    #[test]
+    fn a_hold_lasts_from_writer_mode_until_the_hand_over() {
+        let mut c = Core::new();
+        assert!(c.channel_unacked(), "a fresh lane is unheld");
+        assert!(c.hold());
+        assert!(!c.hold(), "idempotent");
+        assert!(c.is_held() && !c.channel_unacked());
+        // A refused release keeps it.
+        assert!(c.release(1, Vec::new(), false).is_err());
+        assert!(c.is_held());
+        assert!(c.release(1, Vec::new(), true).is_ok());
+        assert!(!c.is_held(), "the hand-over clears it");
+        // DIRECT cannot be held: the flush points write before the replies.
+        assert!(!c.hold());
+        // A flip (fold, failed write) leaves the lane unheld...
+        assert_eq!(c.flip(ok), Flushed::Nothing);
+        assert!(c.channel_unacked());
+        // ...until someone holds it again; unhold drops it without a release.
+        assert!(c.hold());
+        assert!(c.unhold());
+        assert!(!c.unhold());
+        assert!(c.hold());
+        let _ = c.close(ok);
+        assert!(!c.is_held(), "close clears it");
+        assert!(!c.hold(), "a closed lane is never held");
+        assert!(!c.channel_unacked());
     }
 
     #[test]
