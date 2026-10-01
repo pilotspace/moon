@@ -770,12 +770,12 @@ mod tests {
         assert_eq!(out.as_ptr(), ptr);
     }
 
-    /// moon#1283 carries `clock_ms` on `Append` / `AppendSync`: at most one
-    /// more word per queued message. The mirror is the enum as it was before
-    /// (same variants and field types, no `clock_ms`); `--nocapture` prints
-    /// both sizes.
+    /// moon#1283 carries `clock_ms` on `Append` / `AppendSync`, moon#1300 the
+    /// record's `txn`: at most one more word per queued message each. The
+    /// mirror is the enum as it was before both (same variants and field
+    /// types, neither field); `--nocapture` prints both sizes.
     #[test]
-    fn the_clock_costs_at_most_one_word_per_message() {
+    fn the_clock_and_the_txn_cost_at_most_one_word_each_per_message() {
         use super::super::{AofAck, AofMessage, PerShardRewriteCoord, SharedDatabases, rewrite};
         use std::sync::Arc;
         #[allow(dead_code)]
@@ -813,7 +813,9 @@ mod tests {
             std::mem::size_of::<Before>(),
             std::mem::size_of::<AofMessage>(),
         );
-        println!("size_of::<AofMessage>(): {before} bytes before moon#1283, {after} after");
-        assert!(after <= before + 8, "{before} -> {after}");
+        println!(
+            "size_of::<AofMessage>(): {before} bytes before moon#1283, {after} after moon#1300"
+        );
+        assert!(after <= before + 16, "{before} -> {after}");
     }
 }
