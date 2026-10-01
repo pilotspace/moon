@@ -3389,6 +3389,13 @@ async fn handle_connection_body<
 
             if is_local {
                 local_dispatches = local_dispatches.saturating_add(1);
+                // moon#1295: wait while a large collection this write changes
+                // streams its epoch-start image into a running save.
+                if cmd_is_write && crate::persistence::snapshot_cow::is_armed() {
+                    let slot = conn.selected_db;
+                    crate::persistence::snapshot_cow::stream::wait_for_streams(slot, cmd, cmd_args)
+                        .await;
+                }
 
                 // T2.2 MOVE / T2.3 COPY ... DB n — intercept before write-path
                 // (needs two dbs). Direct name checks below subsume the outer

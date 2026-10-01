@@ -288,6 +288,12 @@ pub(crate) fn advance_snapshot_segment(
         if snap.stream_backlogged() {
             return false;
         }
+        // moon#1295: large keys writers wait for stream first (also while a
+        // test holds the walk); the walk stays paused while a block is open.
+        crate::persistence::snapshot_cow::stream::service(snap);
+        if snap.stream_failed() {
+            return true;
+        }
         // Test-only (`MOON_TEST_SNAPSHOT_HOLD_FILE`): hold the epoch open.
         if crate::shard::test_hooks::snapshot_hold_requested_for_test() {
             return false;
