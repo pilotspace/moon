@@ -71,7 +71,9 @@ fn strict() -> bool {
         Ok("1") => true,
         Ok("0") => false,
         _ => !matches!(
-            std::env::var("MOON_AOF_SHARD_WRITE").as_deref().map(str::trim),
+            std::env::var("MOON_AOF_SHARD_WRITE")
+                .as_deref()
+                .map(str::trim),
             Ok("0" | "off" | "no" | "false")
         ),
     }
