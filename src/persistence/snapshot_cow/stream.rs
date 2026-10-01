@@ -179,9 +179,26 @@ pub(crate) fn streamed_keys() -> u64 {
     STREAMED_KEYS.load(Ordering::Relaxed)
 }
 
-/// INFO `rdb_cow_stream_waits`: writes that waited for a stream, since start.
+/// INFO `rdb_cow_stream_waits`: writes that waited for a stream, since start
+/// (or `CONFIG RESETSTAT`). A write counts once however often it re-parks —
+/// it is woken by every stream end and re-checks ([`wait_for_streams`]); a
+/// MULTI body counts each of its commands that waited.
 pub(crate) fn parked_writes() -> u64 {
     PARKED_WRITES.load(Ordering::Relaxed)
+}
+
+/// Test-only: bump both counts (the RESETSTAT unit test).
+#[cfg(test)]
+pub(crate) fn add_counts_for_test(streamed: u64, waits: u64) {
+    STREAMED_KEYS.fetch_add(streamed, Ordering::Relaxed);
+    PARKED_WRITES.fetch_add(waits, Ordering::Relaxed);
+}
+
+/// `CONFIG RESETSTAT`: zero `rdb_cow_streamed_keys` and `rdb_cow_stream_waits`
+/// (monotonic event counts; nothing here is a gauge).
+pub(crate) fn reset_stats() {
+    STREAMED_KEYS.store(0, Ordering::Relaxed);
+    PARKED_WRITES.store(0, Ordering::Relaxed);
 }
 
 /// Read a test-only knob once: `MOON_TEST_COW_STREAM_*` (no deployment sets
@@ -359,8 +376,34 @@ pub(crate) fn admit_write_in(
 /// (other clients, the tick that streams); it ends when the stream ends or
 /// the save does.
 pub(crate) async fn wait_for_streams(slot: usize, cmd: &[u8], args: &[Frame]) {
+    let mut waits = WaitCount::new(&PARKED_WRITES);
     while let Some(rx) = admit_write(slot, cmd, args) {
+        waits.parked();
         let _ = rx.recv_async().await;
+    }
+}
+
+/// Counts one write in [`parked_writes`] on its first park only: a woken
+/// writer that parks again is the same write (R2b review: one writer read
+/// `rdb_cow_stream_waits:2`).
+struct WaitCount<'a> {
+    counter: &'a AtomicU64,
+    counted: bool,
+}
+
+impl<'a> WaitCount<'a> {
+    fn new(counter: &'a AtomicU64) -> Self {
+        Self {
+            counter,
+            counted: false,
+        }
+    }
+
+    fn parked(&mut self) {
+        if !self.counted {
+            self.counted = true;
+            self.counter.fetch_add(1, Ordering::Relaxed);
+        }
     }
 }
 
@@ -390,7 +433,6 @@ pub(crate) async fn wait_for_queued(mut slot: usize, queue: &[Frame]) {
 }
 
 fn park() -> flume::Receiver<()> {
-    PARKED_WRITES.fetch_add(1, Ordering::Relaxed);
     wait()
 }
 
@@ -735,5 +777,25 @@ fn start(snap: &mut SnapshotState, req: Request, lookup: Lookup<'_>) -> Option<A
             }
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod wait_count_tests {
+    use super::*;
+
+    /// R2b review: a writer woken by every stream end parks again; it is
+    /// still ONE write in `rdb_cow_stream_waits`.
+    #[test]
+    fn a_writer_that_re_parks_counts_once() {
+        let counter = AtomicU64::new(0);
+        let mut one = WaitCount::new(&counter);
+        one.parked();
+        one.parked();
+        one.parked();
+        assert_eq!(counter.load(Ordering::Relaxed), 1);
+        let mut another = WaitCount::new(&counter);
+        another.parked();
+        assert_eq!(counter.load(Ordering::Relaxed), 2);
     }
 }

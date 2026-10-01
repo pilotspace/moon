@@ -7,6 +7,9 @@
 //!   Shutdown now abandons the unfinishable save first (redis kills its
 //!   saving child), which releases the writer: it runs and is answered, and
 //!   the process exits at once.
+//! - `rdb_cow_stream_waits` counts writes: a writer that re-parks (woken by a
+//!   stream end, still blocked) is one write. `CONFIG RESETSTAT` zeroes it and
+//!   `rdb_cow_streamed_keys`.
 //!
 //! The save is HELD mid-walk (`MOON_TEST_SNAPSHOT_HOLD_FILE`); a stream still
 //! runs, 16 bytes a tick (`MOON_TEST_COW_STREAM_TICK_BYTES`), so a 20k-field
@@ -167,4 +170,50 @@ fn sigterm_releases_a_writer_parked_on_a_stream() {
         !log.contains("shutdown drain timed out"),
         "the connection drain timed out"
     );
+}
+
+/// Two writers, two large hashes: the second writer's key is queued behind
+/// the first's stream, so that stream's end wakes it and it parks again.
+/// Base: `rdb_cow_stream_waits:3` for two writes.
+#[test]
+#[ignore = "real server: run with --include-ignored"]
+fn a_writer_that_re_parks_is_one_wait_and_resetstat_zeroes_the_stream_counts() {
+    let dir = common::unique_test_dir("cow-stream-stats");
+    let _dir = DirGuard(dir.clone());
+    let (_server, port) = spawn(&dir);
+    let mut c = Conn::open(port);
+    load_hash(&mut c, "h1", 3000);
+    load_hash(&mut c, "h2", 3000);
+    assert_eq!(info_u64(&mut c, "rdb_cow_stream_waits"), 0);
+    // The walk is held; the streams still run (16 bytes a tick).
+    start_held_bgsave(&mut c, &dir);
+    let mut w1 = park_a_writer(&mut c, port, "h1");
+    let mut w2 = park_a_writer(&mut c, port, "h2");
+    assert_eq!(
+        w1.read_replies_within(1, Duration::from_secs(120)),
+        ":1\r\n"
+    );
+    assert_eq!(
+        w2.read_replies_within(1, Duration::from_secs(120)),
+        ":1\r\n"
+    );
+    assert!(
+        info_u64(&mut c, "rdb_cow_streamed_keys") >= 2,
+        "both hashes streamed"
+    );
+    assert_eq!(
+        info_u64(&mut c, "rdb_cow_stream_waits"),
+        2,
+        "two writes waited, whatever their re-parks"
+    );
+    std::fs::remove_file(hold_file(&dir)).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while info_field(&mut c, "rdb_bgsave_in_progress").as_deref() != Some("0") {
+        assert!(Instant::now() < deadline, "BGSAVE never finished");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    assert_eq!(c.send(&["CONFIG", "RESETSTAT"]), "+OK\r\n");
+    assert_eq!(info_u64(&mut c, "rdb_cow_stream_waits"), 0);
+    assert_eq!(info_u64(&mut c, "rdb_cow_streamed_keys"), 0);
 }
