@@ -70,7 +70,7 @@ use bytes::Bytes;
 
 use super::capture::{captured, mark_captured, record_entry, target};
 use super::{PENDING, is_armed};
-use crate::persistence::snapshot::key_stream::{KeyCursor, streamable_len};
+use crate::persistence::snapshot::key_stream::{ChunkLimit, KeyCursor, streamable_len};
 use crate::persistence::snapshot::{SnapshotState, Table};
 use crate::protocol::Frame;
 use crate::storage::db::Database;
@@ -82,8 +82,16 @@ use crate::storage::entry::Entry;
 /// for a stream of the same size (a tick or two).
 pub(crate) const STREAM_MIN_ELEMENTS: usize = 8192;
 
-/// Bytes a tick streams, across every key: 2 MiB, ~1–3 ms of serialization.
-const STREAM_TICK_BYTES: usize = 2 << 20;
+/// A tick serializes ONE chunk (across every key): at most this many
+/// bytes...
+const STREAM_TICK_BYTES: usize = 8 << 20;
+
+/// ...for about this long. Serialization is memory-bound (~200 ns an element
+/// for a hash of separately allocated fields: two cache misses), so a byte
+/// budget alone let one tick run 25 ms. A hash or sorted set re-skips to its
+/// position first (~2 ns an element) and may then serialize as long as the
+/// skip took: a tick is at most ~2x a full skip (~20 ms at 5M fields).
+const STREAM_TICK_TIME: std::time::Duration = std::time::Duration::from_millis(2);
 
 /// Where an active stream reads the value from.
 enum Source {
@@ -155,6 +163,9 @@ thread_local! {
     /// Test-only threshold override (unit tests run in parallel threads).
     #[cfg(test)]
     static MIN_OVERRIDE: Cell<Option<usize>> = const { Cell::new(None) };
+    /// Test-only per-tick byte budget (no time limit while set).
+    #[cfg(test)]
+    static TICK_OVERRIDE: Cell<Option<usize>> = const { Cell::new(None) };
 }
 
 static STREAMED_KEYS: AtomicU64 = AtomicU64::new(0);
@@ -187,16 +198,31 @@ fn min_elements() -> usize {
 }
 
 fn tick_bytes() -> usize {
+    #[cfg(test)]
+    if let Some(n) = TICK_OVERRIDE.with(Cell::get) {
+        return n.max(1);
+    }
     static KNOB: OnceLock<Option<usize>> = OnceLock::new();
     env_knob(&KNOB, "MOON_TEST_COW_STREAM_TICK_BYTES")
         .unwrap_or(STREAM_TICK_BYTES)
         .max(1)
 }
 
-/// Test-only: stream collections of at least `n` elements on this thread.
+/// A tick's chunk time ([`STREAM_TICK_TIME`]); none under a test budget.
+fn tick_time() -> Option<std::time::Duration> {
+    #[cfg(test)]
+    if TICK_OVERRIDE.with(Cell::get).is_some() {
+        return None;
+    }
+    Some(STREAM_TICK_TIME)
+}
+
+/// Test-only: stream collections of at least `n` elements, `tick` bytes a
+/// tick (no time limit), on this thread.
 #[cfg(test)]
-pub(crate) fn set_min_elements_for_test(n: Option<usize>) {
-    MIN_OVERRIDE.with(|c| c.set(n));
+pub(crate) fn set_knobs_for_test(min: Option<usize>, tick: Option<usize>) {
+    MIN_OVERRIDE.with(|c| c.set(min));
+    TICK_OVERRIDE.with(|c| c.set(tick));
 }
 
 /// Is a request queued or a stream active on this shard?
@@ -519,6 +545,7 @@ pub(crate) fn service(snap: &mut SnapshotState) {
 
 /// [`service`] with an explicit live-keyspace lookup (tests).
 pub(crate) fn service_with(snap: &mut SnapshotState, lookup: Lookup<'_>) {
+    // One chunk per tick: `budget` falls to 0 once it is written.
     let mut budget = tick_bytes();
     loop {
         if let Some(active) = ACTIVE.with(|a| a.borrow_mut().take()) {
@@ -598,24 +625,24 @@ fn pump(
             ..
         } = &mut active;
         let mut ok = false;
-        let mut wrote = 0usize;
-        let room = *budget;
+        let limit = ChunkLimit {
+            bytes: *budget,
+            time: tick_time(),
+        };
         with_source(source, key, lookup, &mut |entry| {
             let Some(entry) = entry.filter(|e| cursor.matches(e)) else {
                 return;
             };
             ok = true;
             snap.key_block_write(|out| {
-                let before = out.len();
-                cursor.write_some(entry, out, room);
-                wrote = out.len() - before;
+                cursor.write_some(entry, out, limit);
             });
         });
         if !ok {
             active.broken = true;
             return pump(snap, active, budget, lookup);
         }
-        *budget = budget.saturating_sub(wrote);
+        *budget = 0;
         // A save wait's stall watch: the epoch is making progress.
         crate::command::persistence::note_save_progress();
     }
@@ -679,13 +706,4 @@ fn start(snap: &mut SnapshotState, req: Request, lookup: Lookup<'_>) -> Option<A
             None
         }
     }
-}
-
-/// Test-only: is a stream active, and how many requests wait?
-#[cfg(test)]
-pub(crate) fn state_for_test() -> (bool, usize) {
-    (
-        ACTIVE.with(|a| a.borrow().is_some()),
-        QUEUE.with(|q| q.borrow().len()),
-    )
 }
