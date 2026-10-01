@@ -14,15 +14,16 @@
 //! per-shard incr, bare RESP otherwise, the #455 fold-floor drop), the
 //! per-thread binding and the flush points:
 //!
-//! - io_uring monoio (no SQPOLL): the vendored driver calls
-//!   [`flush_current`] before every `io_uring_enter` that submits (park, cold
-//!   submit, a full SQ), so the shard's whole iteration is ONE `write(2)`
-//!   ahead of its replies' SQEs ([`install_for_shard`]);
-//! - every other driver (monoio legacy/epoll/kqueue, SQPOLL, tokio) writes a
-//!   reply inside the task: the reply macros call
-//!   [`flush_before_reply_coalesced`] (tokio: one write per scheduler round;
-//!   monoio: one per connection batch), the rarer early flushes (before a
-//!   blocking command, SUBSCRIBE) [`flush_before_reply`];
+//! - io_uring monoio (no SQPOLL): the vendored driver runs a hook before
+//!   every `io_uring_enter` that submits (park, cold submit, a full SQ), so
+//!   the shard's whole iteration is ONE `write(2)` ahead of its replies'
+//!   SQEs ([`install_for_shard`]);
+//! - the other drivers write a reply inside the task: the reply macros await
+//!   [`flush_before_reply_coalesced`] — monoio's epoll/kqueue driver parks
+//!   the replies until the same hook, which it runs before every readiness
+//!   poll (one write per iteration again), tokio yields once per reply (one
+//!   write per scheduler round); the rarer early flushes (before a blocking
+//!   command, SUBSCRIBE) call [`flush_before_reply`];
 //! - a reply that leaves for ANOTHER thread (`OneshotSender::send`,
 //!   `ResponseSlot::fill`) calls [`flush_current`] first: the receiver may
 //!   put it on its socket before this thread's next park;
@@ -150,6 +151,10 @@ pub struct AofLane {
     /// A direct write landed since the writer last looked (its everysec
     /// deadline: [`Self::take_written`]).
     written: AtomicBool,
+    /// Bumped by every write attempt of the buffer (under the lock): a reply
+    /// that parked with records buffered knows they were written once it
+    /// moved (see [`ParkUntilHook`]).
+    flushes: AtomicU64,
     /// Direct writes issued (tests).
     #[cfg(test)]
     writes: AtomicU64,
@@ -194,6 +199,7 @@ impl AofLane {
             core: parking_lot::Mutex::new(LaneCore::new()),
             dirty: AtomicBool::new(false),
             written: AtomicBool::new(false),
+            flushes: AtomicU64::new(0),
             #[cfg(test)]
             writes: AtomicU64::new(0),
         })
@@ -311,6 +317,9 @@ impl AofLane {
     /// Bookkeeping after a write under the lock: the buffer is empty now.
     fn after_write(&self, flushed: Flushed) {
         self.dirty.store(false, Ordering::Release);
+        if flushed != Flushed::Nothing {
+            self.flushes.fetch_add(1, Ordering::Release);
+        }
         match flushed {
             Flushed::Nothing => {}
             Flushed::Wrote(_) => {
@@ -444,39 +453,61 @@ impl Drop for CloseOnExit {
 thread_local! {
     /// The lane of the shard this thread runs (see [`install_for_shard`]).
     static CURRENT: RefCell<Option<Arc<AofLane>>> = const { RefCell::new(None) };
-    /// Replies are written inside their task (every driver but io_uring
-    /// without SQPOLL): the reply macros flush first.
-    static INLINE_REPLIES: Cell<bool> = const { Cell::new(true) };
+    /// Where this thread's replies reach the kernel (see [`ReplyMode`]).
+    static REPLY_MODE: Cell<ReplyMode> = const { Cell::new(ReplyMode::InTask) };
     /// Records this thread buffered into its own lane (wrapping count): tells
-    /// [`flush_before_reply_coalesced`] whether its yield let other
-    /// connections add theirs.
+    /// a reply's yield whether the round's other connections added theirs.
     static HOME_APPENDS: Cell<u64> = const { Cell::new(0) };
-    /// [`flush_before_reply_coalesced`]'s adaptivity (see there).
+    /// The coalescing's adaptivity (see [`flush_before_reply_coalesced`]).
     static COALESCE: Cell<Coalesce> = const { Cell::new(Coalesce { misses: 0, skip: 0 }) };
+    /// Replies parked until the driver's next readiness poll
+    /// ([`ReplyMode::AtParkHook`]); reused, so no allocation once warm.
+    static DEFERRED: RefCell<Vec<std::task::Waker>> = const { RefCell::new(Vec::new()) };
 }
 
-/// Whether a reply on this thread yields before it flushes.
+/// Where a shard thread's replies reach the kernel, which decides its AOF
+/// flush point.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(feature = "runtime-monoio"), allow(dead_code))] // monoio drivers only
+enum ReplyMode {
+    /// At the io_uring driver's submit (monoio, no SQPOLL): the driver's
+    /// before-submit hook writes the lane once per iteration; replies need
+    /// nothing.
+    AtSubmit,
+    /// Inside the task, with the hook run before every readiness poll
+    /// (monoio's epoll/kqueue driver): a reply parks until that hook — which
+    /// writes the lane once for the whole round and then wakes the parked
+    /// replies.
+    AtParkHook,
+    /// Inside the task (tokio; monoio with SQPOLL): the reply flushes the lane
+    /// itself (under tokio after a yield that lets the round's other
+    /// connections add their records).
+    InTask,
+}
+
+/// Whether a reply on this thread coalesces before it flushes.
 #[derive(Clone, Copy)]
 struct Coalesce {
-    /// Consecutive yields after which no other connection had appended.
+    /// Consecutive rounds in which a reply's wait gathered no other
+    /// connection's records.
     misses: u32,
-    /// Replies left to flush without yielding (after a run of misses).
+    /// Replies left to flush at once (after a run of misses).
     skip: u32,
 }
 
 /// Whether a task that wakes itself is queued BEHIND the tasks already
 /// runnable (tokio's current-thread scheduler), so a yield lets the round's
-/// other connections run first. Not under monoio (see
-/// [`flush_before_reply_coalesced`]).
+/// other connections run first. monoio re-polls it BEFORE the rest of its
+/// queue (`LocalScheduler::yield_now` pushes to the front).
 const YIELD_REACHES_THE_ROUND: bool = !cfg!(feature = "runtime-monoio");
 
-/// A run of this many fruitless yields (a lone connection) ...
+/// A run of this many fruitless waits (a lone connection) ...
 const COALESCE_MISSES: u32 = 16;
-/// ... stops the yielding for this many replies, then it is tried again.
+/// ... stops the waiting for this many replies, then it is tried again.
 const COALESCE_SKIP: u32 = 256;
 
 /// Return `Pending` once (waking itself), so every task already runnable on
-/// this thread runs before the caller resumes.
+/// this thread runs before the caller resumes (tokio).
 struct YieldOnce(bool);
 
 impl std::future::Future for YieldOnce {
@@ -494,52 +525,147 @@ impl std::future::Future for YieldOnce {
     }
 }
 
-/// [`flush_before_reply`] for a connection's reply write, coalesced per
-/// scheduler round under tokio: when this thread has records buffered, the
-/// reply first yields once, so the other connections that are ready in the
-/// same round run their commands too, and ONE `write(2)` then covers all of
-/// them (the first of them to resume writes; the rest find the lane clean) —
-/// redis's one write per event-loop iteration, not one per connection. A lone
-/// connection gains nothing from the yield: after [`COALESCE_MISSES`]
-/// fruitless yields in a row the replies stop yielding for [`COALESCE_SKIP`]
-/// replies, then try again. The write still precedes the reply in every case.
-///
-/// monoio re-polls a task that woke itself BEFORE the rest of its queue
-/// (`LocalScheduler::yield_now` pushes it to the front), so a yield cannot
-/// let the round's other connections in: on monoio's epoll/kqueue driver (and
-/// SQPOLL) the reply flushes at once — one write per connection batch. (Its
-/// io_uring driver never gets here: the before-submit hook writes once per
-/// iteration.)
-pub async fn flush_before_reply_coalesced() {
-    if !INLINE_REPLIES.try_with(Cell::get).unwrap_or(true) || !current_dirty() {
-        return;
+/// Return `Pending` once, parked in [`DEFERRED`] until the driver's next
+/// before-poll hook ([`before_submit_hook`]) has written the lane and wakes
+/// it. A wake from anywhere else just ends the wait early (the caller then
+/// flushes itself).
+struct ParkUntilHook(bool);
+
+impl std::future::Future for ParkUntilHook {
+    type Output = ();
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<()> {
+        if self.0 {
+            return std::task::Poll::Ready(());
+        }
+        self.0 = true;
+        let parked = DEFERRED
+            .try_with(|d| d.borrow_mut().push(cx.waker().clone()))
+            .is_ok();
+        if parked {
+            std::task::Poll::Pending
+        } else {
+            std::task::Poll::Ready(())
+        }
     }
-    if !YIELD_REACHES_THE_ROUND {
-        flush_current();
-        return;
-    }
+}
+
+/// The coalescing state, and whether this reply waits for its round.
+fn coalesce_take() -> (Coalesce, bool) {
     let mut state = COALESCE
         .try_with(Cell::get)
         .unwrap_or(Coalesce { misses: 0, skip: 0 });
-    if state.skip > 0 {
+    let wait = if state.skip > 0 {
         state.skip -= 1;
+        false
     } else {
-        let before = HOME_APPENDS.try_with(Cell::get).unwrap_or(0);
-        YieldOnce(false).await;
-        if HOME_APPENDS.try_with(Cell::get).unwrap_or(0) == before {
-            state.misses += 1;
-            if state.misses >= COALESCE_MISSES {
-                state = Coalesce {
-                    misses: 0,
-                    skip: COALESCE_SKIP,
-                };
-            }
-        } else {
-            state.misses = 0;
+        true
+    };
+    (state, wait)
+}
+
+/// Record whether a round's wait gathered other connections' records.
+fn coalesce_note(mut state: Coalesce, gathered: bool) -> Coalesce {
+    if gathered {
+        state.misses = 0;
+    } else {
+        state.misses += 1;
+        if state.misses >= COALESCE_MISSES {
+            state = Coalesce {
+                misses: 0,
+                skip: COALESCE_SKIP,
+            };
         }
     }
-    let _ = COALESCE.try_with(|c| c.set(state));
+    state
+}
+
+/// Before a connection writes its replies: this shard's buffered AOF records
+/// reach the kernel first, coalesced so a scheduler round writes ONCE for
+/// all its connections (redis's one write per event-loop iteration):
+/// - io_uring (monoio): nothing to do — the before-submit hook writes;
+/// - epoll/kqueue (monoio): the reply parks until the driver's before-poll
+///   hook, which writes the whole round once, then wakes the parked replies;
+/// - tokio: the reply yields once, so the round's other connections append
+///   too; the first to resume writes them all, the rest find the lane clean;
+/// - monoio with SQPOLL: it flushes at once (a yield cannot reach the round).
+///
+/// A lone connection gains nothing from waiting: after [`COALESCE_MISSES`]
+/// fruitless waits in a row the replies flush at once for [`COALESCE_SKIP`]
+/// replies, then try again. The write precedes the reply in every case.
+pub async fn flush_before_reply_coalesced() {
+    let mode = REPLY_MODE.try_with(Cell::get).unwrap_or(ReplyMode::InTask);
+    if mode == ReplyMode::AtSubmit || !current_dirty() {
+        return;
+    }
+    let (state, wait) = coalesce_take();
+    match mode {
+        ReplyMode::AtParkHook if wait => {
+            // The hook does the adaptivity bookkeeping for the round.
+            let _ = COALESCE.try_with(|c| c.set(state));
+            let parked_at = current_flushes();
+            ParkUntilHook(false).await;
+            // Woken by the hook: it wrote the whole buffer — this reply's
+            // records with it — before waking anyone. Any later records are
+            // the next round's (their own replies wait for them).
+            if current_flushes() != parked_at {
+                return;
+            }
+        }
+        ReplyMode::InTask if wait && YIELD_REACHES_THE_ROUND => {
+            let before = HOME_APPENDS.try_with(Cell::get).unwrap_or(0);
+            YieldOnce(false).await;
+            let gathered = HOME_APPENDS.try_with(Cell::get).unwrap_or(0) != before;
+            let _ = COALESCE.try_with(|c| c.set(coalesce_note(state, gathered)));
+        }
+        _ => {
+            let _ = COALESCE.try_with(|c| c.set(state));
+        }
+    }
+    // Normally a no-op after a wait: the round's write already happened.
     flush_current();
+}
+
+/// The drivers' before-submit / before-poll hook (monoio): write the lane,
+/// THEN wake the replies parked for it. Whether any were woken (the legacy
+/// driver then polls without blocking).
+#[cfg(feature = "runtime-monoio")]
+fn before_submit_hook() -> bool {
+    flush_current();
+    let woken = DEFERRED
+        .try_with(|d| {
+            let mut d = d.borrow_mut();
+            let n = d.len();
+            for w in d.drain(..) {
+                w.wake();
+            }
+            n
+        })
+        .unwrap_or(0);
+    if woken > 0 {
+        let _ = COALESCE.try_with(|c| c.set(coalesce_note(c.get(), woken > 1)));
+    }
+    woken > 0
+}
+
+/// This thread's lane's write-attempt count (0 when unbound).
+#[cfg(feature = "runtime-monoio")]
+fn current_flushes() -> u64 {
+    CURRENT
+        .try_with(|c| {
+            c.borrow()
+                .as_ref()
+                .map_or(0, |l| l.flushes.load(Ordering::Acquire))
+        })
+        .unwrap_or(0)
+}
+
+/// Without monoio no reply parks for the hook.
+#[cfg(not(feature = "runtime-monoio"))]
+fn current_flushes() -> u64 {
+    0
 }
 
 /// Whether this thread's lane holds buffered records.
@@ -555,9 +681,7 @@ fn current_dirty() -> bool {
 }
 
 /// Bind this shard thread to its writer's lane (1A on and an AOF pool): its
-/// appends are then written at its flush points. On monoio with an io_uring
-/// driver that submits only on `io_uring_enter`, the driver's before-submit
-/// hook is the flush point for replies; otherwise the reply macros are.
+/// appends are then written at its flush points ([`ReplyMode`]).
 pub fn install_for_shard(shard_id: usize, pool: Option<&Arc<super::AofWriterPool>>) {
     let Some(pool) = pool else {
         return;
@@ -568,23 +692,21 @@ pub fn install_for_shard(shard_id: usize, pool: Option<&Arc<super::AofWriterPool
     let lane = Arc::clone(pool.lane_for(shard_id));
     let _ = CURRENT.try_with(|c| *c.borrow_mut() = Some(lane));
     #[cfg(feature = "runtime-monoio")]
-    {
-        let gated = monoio::set_before_submit_hook(Some(flush_current_hook));
-        let _ = INLINE_REPLIES.try_with(|c| c.set(!gated));
-        tracing::info!(
-            "Shard {shard_id}: AOF records are written on the shard thread (moon#1266 1A), \
-             before {}",
-            if gated {
-                "each io_uring submit"
-            } else {
-                "each reply write"
-            }
-        );
-    }
+    let mode = match monoio::set_before_submit_hook(Some(before_submit_hook)) {
+        monoio::IoWritePoint::AtSubmit => ReplyMode::AtSubmit,
+        monoio::IoWritePoint::AtParkHook => ReplyMode::AtParkHook,
+        monoio::IoWritePoint::InTask => ReplyMode::InTask,
+    };
     #[cfg(not(feature = "runtime-monoio"))]
+    let mode = ReplyMode::InTask;
+    let _ = REPLY_MODE.try_with(|c| c.set(mode));
     tracing::info!(
-        "Shard {shard_id}: AOF records are written on the shard thread (moon#1266 1A), before \
-         each reply write"
+        "Shard {shard_id}: AOF records are written on the shard thread (moon#1266 1A), {}",
+        match mode {
+            ReplyMode::AtSubmit => "once per iteration, before each io_uring submit",
+            ReplyMode::AtParkHook => "once per iteration, before each readiness poll",
+            ReplyMode::InTask => "before each round's reply writes",
+        }
     );
 }
 
@@ -596,11 +718,8 @@ pub fn uninstall_for_shard() {
         let _ = monoio::set_before_submit_hook(None);
     }
     let _ = CURRENT.try_with(|c| c.borrow_mut().take());
-}
-
-#[cfg(feature = "runtime-monoio")]
-fn flush_current_hook() {
-    flush_current();
+    // Nothing may stay parked on a hook that will not run again.
+    let _ = DEFERRED.try_with(|d| d.borrow_mut().drain(..).for_each(std::task::Waker::wake));
 }
 
 /// Write this thread's buffered AOF records now (one `write(2)`; nothing
@@ -615,11 +734,12 @@ pub fn flush_current() {
     });
 }
 
-/// [`flush_current`] for a reply about to be written to a socket by its
-/// task: needed unless the io_uring driver's submit hook flushes instead.
+/// [`flush_current`] for an early reply write a task does on its own (before
+/// a blocking command, SUBSCRIBE): needed unless the io_uring driver's submit
+/// hook flushes instead.
 #[inline]
 pub fn flush_before_reply() {
-    if INLINE_REPLIES.try_with(Cell::get).unwrap_or(true) {
+    if REPLY_MODE.try_with(Cell::get).unwrap_or(ReplyMode::InTask) != ReplyMode::AtSubmit {
         flush_current();
     }
 }
@@ -847,7 +967,7 @@ mod tests {
         let mut ctx = RecordCtx::new();
         assert!(lane.release(&rx, &mut ctx, FoldEpoch::INITIAL, file));
         let _ = CURRENT.try_with(|c| *c.borrow_mut() = Some(Arc::clone(&lane)));
-        let _ = INLINE_REPLIES.try_with(|c| c.set(true));
+        let _ = REPLY_MODE.try_with(|c| c.set(ReplyMode::InTask));
         let _ = COALESCE.try_with(|c| c.set(Coalesce { misses: 0, skip: 0 }));
         drop(rx);
         (lane, tx, dir)
@@ -938,6 +1058,87 @@ mod tests {
             "one write per reply when nothing coalesces"
         );
         unbind();
+    }
+
+    /// monoio's epoll/kqueue driver: replies parked for the round are woken
+    /// by the driver's before-poll hook, after its ONE write of the lane.
+    #[cfg(feature = "runtime-monoio")]
+    #[test]
+    fn the_legacy_driver_writes_a_round_once_before_its_replies() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("incr");
+        let mut rt = monoio::RuntimeBuilder::<monoio::LegacyDriver>::new()
+            .enable_timer()
+            .build()
+            .expect("legacy runtime");
+        let lane = AofLane::with_switch(false, true);
+        let writes = rt.block_on({
+            let lane = Arc::clone(&lane);
+            async move {
+                let file = std::fs::File::create(&path).expect("create");
+                let (tx, rx) = channel::mpsc_bounded::<AofMessage>(8);
+                let mut ctx = RecordCtx::new();
+                assert!(lane.release(&rx, &mut ctx, FoldEpoch::INITIAL, file));
+                let _ = CURRENT.try_with(|c| *c.borrow_mut() = Some(Arc::clone(&lane)));
+                // Rounds in which the hook found parked replies.
+                static ROUNDS: AtomicU64 = AtomicU64::new(0);
+                fn counting_hook() -> bool {
+                    if DEFERRED.with(|d| !d.borrow().is_empty()) {
+                        ROUNDS.fetch_add(1, Ordering::Relaxed);
+                    }
+                    before_submit_hook()
+                }
+                let point = monoio::set_before_submit_hook(Some(counting_hook));
+                assert_eq!(point, monoio::IoWritePoint::AtParkHook);
+                let _ = REPLY_MODE.try_with(|c| c.set(ReplyMode::AtParkHook));
+                let _ = COALESCE.try_with(|c| c.set(Coalesce { misses: 0, skip: 0 }));
+                let mut tasks = Vec::new();
+                for i in 0..5u8 {
+                    let lane = Arc::clone(&lane);
+                    let tx = tx.clone();
+                    tasks.push(monoio::spawn(async move {
+                        let body: &'static [u8] = match i {
+                            0 => b"*1\r\n$1\r\na\r\n",
+                            1 => b"*1\r\n$1\r\nb\r\n",
+                            2 => b"*1\r\n$1\r\nc\r\n",
+                            3 => b"*1\r\n$1\r\nd\r\n",
+                            _ => b"*1\r\n$1\r\ne\r\n",
+                        };
+                        assert!(matches!(lane.enqueue(append(0, 0, 0, body), &tx), Sent::Ok));
+                        let appended_at = lane.flushes.load(Ordering::Acquire);
+                        flush_before_reply_coalesced().await;
+                        // The reply may go now: a write after this task's
+                        // append (which wrote the whole buffer) has happened.
+                        assert!(lane.flushes.load(Ordering::Acquire) > appended_at);
+                    }));
+                }
+                for t in tasks {
+                    t.await;
+                }
+                let _ = monoio::set_before_submit_hook(None);
+                let _ = CURRENT.try_with(|c| c.borrow_mut().take());
+                drop(rx);
+                (
+                    lane.writes.load(Ordering::Relaxed),
+                    ROUNDS.load(Ordering::Relaxed),
+                )
+            }
+        });
+        // monoio's fairness cap can split the 5 replies over two rounds (the
+        // first round starts with only the spawning task queued); each round
+        // is ONE write, and no woken reply writes again.
+        let (writes, rounds) = writes;
+        assert!(rounds >= 1 && rounds <= 2, "rounds {rounds}");
+        assert_eq!(
+            writes, rounds,
+            "one write per round, none from the woken replies"
+        );
+        let got = std::fs::read(dir.path().join("incr")).expect("read");
+        assert_eq!(
+            got.iter().filter(|&&b| b == b'*').count(),
+            5,
+            "every record written"
+        );
     }
 
     #[test]

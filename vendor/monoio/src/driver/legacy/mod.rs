@@ -202,8 +202,9 @@ impl LegacyDriver {
 
     pub(crate) fn new_with_entries(entries: u32) -> io::Result<Self> {
         // moon patch (moon#1266 1A): this thread's writes run inside its
-        // tasks, not at a submit (see `driver::SUBMIT_GATES_IO`).
-        let _ = super::SUBMIT_GATES_IO.try_with(|c| c.set(false));
+        // tasks; the hook runs before every readiness poll (see
+        // `driver::WRITE_POINT`).
+        let _ = super::WRITE_POINT.try_with(|c| c.set(crate::IoWritePoint::AtParkHook));
         #[cfg(unix)]
         let poll = mio::Poll::new()?;
         #[cfg(windows)]
@@ -257,10 +258,13 @@ impl LegacyDriver {
     }
 
     fn inner_park(&self, mut timeout: Option<Duration>) -> io::Result<()> {
+        // moon patch (moon#1266 1A): the host's hook runs before every
+        // readiness poll; when it made tasks runnable, poll without blocking.
+        let hook_woke = super::run_before_submit();
         let inner = unsafe { &mut *self.inner.get() };
 
         #[allow(unused_mut)]
-        let mut need_wait = true;
+        let mut need_wait = !hook_woke;
         #[cfg(feature = "sync")]
         {
             // Process foreign wakers
