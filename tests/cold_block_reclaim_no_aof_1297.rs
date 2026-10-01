@@ -1007,6 +1007,87 @@ fn kill_after_adoption_and_the_next_snapshot_with_a_txn_open() {
     run_with_txn(Kill::AfterNextSnapshot);
 }
 
+// ── CONFIG RESETSTAT ─────────────────────────────────────────────────────────
+
+/// `CONFIG RESETSTAT` (the moon#1289 R1 rule: reset monotonic statistics,
+/// never a gauge of live state): the reclaim's event counts go to zero, the
+/// pending gauge keeps counting the compactions still waiting — before the
+/// adopting snapshot and after it.
+#[test]
+#[ignore]
+fn resetstat_zeroes_the_reclaim_statistics_and_keeps_the_pending_gauge() {
+    let port = common::reserve_port();
+    let dir = unique_dir("r1297-resetstat");
+    std::fs::create_dir_all(&dir).expect("create test dir");
+    let hold = dir.join("reclaim.hold");
+    std::fs::write(&hold, b"").expect("hold file");
+    let hold_s = hold.to_string_lossy().to_string();
+    let envs = [("MOON_TEST_COLD_RECLAIM_HOLD_FILE", hold_s.as_str())];
+    // No sweep, no save rule: nothing but the BGSAVE below commits.
+    let mut server = start_moon_with_env(port, &dir, 3600, "no", &SAVE, &envs);
+    wait_for_port(port);
+    let a: Vec<String> = (0..FILLER_COUNT)
+        .filter(|&i| in_a(i))
+        .map(filler_key)
+        .collect();
+    spill_probes(port, &dir);
+    bgsave_and_wait(port);
+    del_keys(port, &a);
+    bgsave_and_wait(port);
+    std::fs::remove_file(&hold).expect("release the compaction hold");
+    let compactions = wait_for_compactions(port);
+    std::fs::write(&hold, b"").expect("hold file");
+    let pending = info_u64(port, "cold_reclaim_compactions_pending").unwrap_or(0);
+    assert!(
+        compactions > 0 && pending > 0,
+        "precondition: compactions recorded ({compactions}) and waiting ({pending})"
+    );
+    let stats = [
+        "cold_reclaim_compactions",
+        "cold_reclaim_files_unlinked",
+        "cold_reclaim_bytes_unlinked",
+        "cold_reclaim_snapshots_requested",
+    ];
+    let mut wrong = Vec::new();
+    let mut check = |when: &str, pending: u64| {
+        redis_cmd(port, &["CONFIG", "RESETSTAT"]);
+        for f in stats {
+            let v = info_u64(port, f);
+            if v != Some(0) {
+                wrong.push(format!("{when}: {f} {v:?} after RESETSTAT, want 0"));
+            }
+        }
+        let p = info_u64(port, "cold_reclaim_compactions_pending");
+        if p != Some(pending) {
+            wrong.push(format!(
+                "{when}: the gauge cold_reclaim_compactions_pending {p:?} after RESETSTAT, \
+                 want {pending}"
+            ));
+        }
+    };
+    check("pending", pending);
+
+    // The adopting snapshot: the old files go, the counters count again.
+    bgsave_and_wait(port);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while info_u64(port, "cold_reclaim_compactions_pending") != Some(0)
+        || info_u64(port, "cold_reclaim_files_unlinked").unwrap_or(0) == 0
+    {
+        assert!(
+            Instant::now() < deadline,
+            "nothing adopted after the BGSAVE"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let unlinked = info_u64(port, "cold_reclaim_files_unlinked");
+    check("adopted", 0);
+    server.kill_now();
+    wait_for_port_down(port);
+    eprintln!("resetstat: compactions {compactions}, pending {pending}, unlinked {unlinked:?}");
+    finish(&dir, &wrong);
+    assert!(wrong.is_empty(), "{wrong:?}");
+}
+
 // ── disk held ────────────────────────────────────────────────────────────────
 
 /// A value no spill compression shrinks: `len` hex digits of a xorshift

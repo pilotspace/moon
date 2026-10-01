@@ -149,6 +149,28 @@ pub fn reclaim_totals() -> (u64, u64, u64) {
     )
 }
 
+/// `CONFIG RESETSTAT` (the moon#1289 R1 rule): zero the reclaim's event
+/// statistics — `cold_reclaim_compactions`, `cold_reclaim_files_unlinked`,
+/// `cold_reclaim_bytes_unlinked`. The pending gauge ([`awaiting_fold`],
+/// INFO `cold_reclaim_compactions_pending`) is live state and is kept: every
+/// adoption and every dropped index subtracts its own compactions from it,
+/// so zeroing it would wrap it, and a wrapped gauge also makes the AOF
+/// monitor dispatch folds for compactions that do not exist.
+pub fn reset_stats() {
+    for counter in [&COMPACTIONS_RECORDED, &FILES_UNLINKED, &BYTES_UNLINKED] {
+        counter.store(0, Ordering::Relaxed);
+    }
+}
+
+/// Add to every [`reclaim_totals`] counter (tests: the counters are
+/// process-wide, so a test proves a reset by a sum no other test reaches).
+#[cfg(test)]
+pub(crate) fn add_totals_for_test(n: u64) {
+    for counter in [&COMPACTIONS_RECORDED, &FILES_UNLINKED, &BYTES_UNLINKED] {
+        counter.fetch_add(n, Ordering::Relaxed);
+    }
+}
+
 /// How many compactions wait for a committed fold, process-wide.
 #[inline]
 pub fn awaiting_fold() -> usize {
