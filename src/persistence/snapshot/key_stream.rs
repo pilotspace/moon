@@ -226,8 +226,10 @@ pub(crate) struct ChunkLimit {
     /// Stop once about this many bytes are written.
     pub(crate) bytes: usize,
     /// Stop once serializing has taken this long — or as long as the
-    /// resume's re-skip took, whichever is longer, so a large hash's re-skip
-    /// is at most half of a chunk's time. Checked every 64 elements.
+    /// resume's re-skip took, up to [`Self::TIME_CAP`]: a large hash's
+    /// re-skip is then at most half of the chunk (fewer chunks, so less
+    /// re-skipping in all), and a tick at most the skip plus the cap.
+    /// Checked every 64 elements.
     pub(crate) time: Option<std::time::Duration>,
 }
 
@@ -237,12 +239,15 @@ impl ChunkLimit {
         time: None,
     };
 
+    /// The longest a chunk serializes after a long re-skip.
+    pub(crate) const TIME_CAP: std::time::Duration = std::time::Duration::from_millis(5);
+
     /// The deadline of a chunk whose positioning began at `began`.
     fn started(self, began: Option<std::time::Instant>) -> (usize, Option<std::time::Instant>) {
         let deadline = match (self.time, began) {
             (Some(time), Some(began)) => {
                 let now = std::time::Instant::now();
-                Some(now + time.max(now - began))
+                Some(now + time.max((now - began).min(Self::TIME_CAP)))
             }
             _ => None,
         };
