@@ -144,7 +144,9 @@ impl Active {
         }
         match current {
             Some(entry) if self.cursor.matches(entry) => {
-                self.cursor.write_rest(entry, &mut self.tail)
+                self.cursor.write_rest(entry, &mut self.tail);
+                // Never a block that cannot close (defence in depth).
+                self.broken |= !self.cursor.done();
             }
             _ => self.broken = true,
         }
@@ -650,6 +652,7 @@ fn pump(
             ..
         } = &mut active;
         let mut ok = false;
+        let before = cursor.position();
         let limit = ChunkLimit {
             bytes: *budget,
             time: tick_time(),
@@ -663,7 +666,9 @@ fn pump(
                 cursor.write_some(entry, out, limit);
             });
         });
-        if !ok {
+        // A chunk that wrote nothing would keep the walk paused and its
+        // writers waiting forever (defence in depth: `matches` rules it out).
+        if !ok || (!active.cursor.done() && active.cursor.position() == before) {
             active.broken = true;
             return pump(snap, active, budget, lookup);
         }
