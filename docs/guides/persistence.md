@@ -195,6 +195,17 @@ Watch it with `INFO`: `cold_held_files_stale_databases` and
 snapshot is taken: an AOF rewrite releases the held files instead
 (`cold_held_release_folds_requested`).
 
+The no-AOF cold reclaim (moon#1297) asks for a snapshot the same way. A
+mostly-dead spill file is compacted into a new file, and the compaction is
+adopted (the old file deleted) only once a snapshot that started after it
+has completed. When compactions have waited three sweeps with no snapshot,
+Moon requests one, under the same spacing: one snapshot serves both reasons.
+It runs with transactions open too: a key a `TXN` wrote is saved at its
+pre-transaction value, including a cold key the transaction read back from
+a spill file. While compactions wait, the old file and its compacted copy
+are both on disk (at most 64 waiting compactions per database). `INFO`:
+`cold_reclaim_compactions_pending` and `cold_reclaim_snapshots_requested`.
+
 ## Using both
 
 For maximum durability, enable both AOF and RDB:

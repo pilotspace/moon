@@ -22,6 +22,11 @@
 //! for a C key; after adoption the next snapshot carries no grave of an
 //! unlinked file.
 //!
+//! Every kill point also runs with a `TXN` open across the adopting
+//! snapshot and the kill, and the automatic round a compaction requests runs
+//! with one open (moon#1300: every snapshot stores the pre-TXN image): the
+//! restart must show none of the TXN's writes.
+//!
 //!   MOON_BIN=... [MOON_TEST_COLD_DEL_SHARDS=1] cargo test --test \
 //!     cold_block_reclaim_no_aof_1297 -- --include-ignored --test-threads 1
 
@@ -303,6 +308,25 @@ impl Kill {
     }
 }
 
+/// Wait until compactions have started and stopped (the count stable for
+/// 2 s, at most 60 s); the count.
+fn wait_for_compactions(port: u16) -> u64 {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut stable_since = Instant::now();
+    let mut last = 0;
+    while Instant::now() < deadline {
+        let c = info_u64(port, "cold_reclaim_compactions").unwrap_or(0);
+        if c != last {
+            last = c;
+            stable_since = Instant::now();
+        } else if c > 0 && stable_since.elapsed() >= Duration::from_secs(2) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    last
+}
+
 /// What a restart found wrong.
 #[derive(Debug, Default)]
 struct Outcome {
@@ -312,13 +336,27 @@ struct Outcome {
 }
 
 fn run(kill: Kill) {
-    let outcome = run_case(kill, false);
+    let outcome = run_case(kill, false, false);
     assert!(outcome.wrong.is_empty(), "{kill:?}: {:?}", outcome.wrong);
+}
+
+/// [`run`] with a `TXN` open across the adopting snapshot and the kill
+/// (moon#1300: every snapshot stores a held key's pre-transaction image).
+fn run_with_txn(kill: Kill) {
+    let outcome = run_case(kill, false, true);
+    assert!(
+        outcome.wrong.is_empty(),
+        "{kill:?} + TXN: {:?}",
+        outcome.wrong
+    );
 }
 
 /// One kill point. `sabotage`: remove every compacted file after the kill,
 /// before the restart — the instrument check (its keys must count as lost).
-fn run_case(kill: Kill, sabotage: bool) -> Outcome {
+/// `txn`: a `TXN` writes `{t}k`, `{t}new` and live cold survivors before
+/// the adopting snapshot and stays open through the kill
+/// ([`open_txn_over_survivors`]); the restart must show none of its writes.
+fn run_case(kill: Kill, sabotage: bool, txn: bool) -> Outcome {
     let n = shards();
     let port = common::reserve_port();
     let dir = unique_dir(&format!("r1297-{kill:?}"));
@@ -348,6 +386,7 @@ fn run_case(kill: Kill, sabotage: bool) -> Outcome {
         .map(filler_key)
         .collect();
 
+    redis_set(port, "{t}k", "original");
     spill_probes(port, &dir);
     bgsave_and_wait(port); // S0
     let deleted_a = del_keys(port, &a);
@@ -356,6 +395,12 @@ fn run_case(kill: Kill, sabotage: bool) -> Outcome {
     let max_id_at_s1: Vec<u64> = (0..n)
         .map(|s| heap_ids(&dir, s).into_iter().max().unwrap_or(0))
         .collect();
+    // The TXN of a `txn` case. At `compacted` the server stops as soon as a
+    // compaction is recorded, so the TXN opens before the release.
+    let mut open_txn = None;
+    if txn && kill == Kill::Compacted {
+        open_txn = Some(open_txn_over_survivors(port));
+    }
     std::fs::remove_file(&hold).expect("release the compaction hold");
 
     let mut compactions = 0;
@@ -363,21 +408,7 @@ fn run_case(kill: Kill, sabotage: bool) -> Outcome {
     if kill == Kill::Compacted {
         exit = wait_exit(&mut server, 60);
     } else {
-        // Wait until compactions have started and stopped (stable for 2 s).
-        let deadline = Instant::now() + Duration::from_secs(60);
-        let mut stable_since = Instant::now();
-        let mut last = 0;
-        while Instant::now() < deadline {
-            let c = info_u64(port, "cold_reclaim_compactions").unwrap_or(0);
-            if c != last {
-                last = c;
-                stable_since = Instant::now();
-            } else if c > 0 && stable_since.elapsed() >= Duration::from_secs(2) {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(200));
-        }
-        compactions = last;
+        compactions = wait_for_compactions(port);
         assert!(
             compactions > 0,
             "precondition: no compaction started (deleted {deleted_a} A keys)"
@@ -387,6 +418,12 @@ fn run_case(kill: Kill, sabotage: bool) -> Outcome {
         // again, and that second adoption, after `S3`, would unlink files
         // `S3`'s trailer rightly names. One generation per case.
         std::fs::write(&hold, b"").expect("hold file");
+        if txn {
+            // After the record: the survivors it promotes changed after the
+            // compaction read them, so the adopting trailer graves their
+            // compacted slots and the image must carry their pre-TXN values.
+            open_txn = Some(open_txn_over_survivors(port));
+        }
         let deleted_b = del_keys(port, &b);
         assert!(deleted_b > 0, "precondition: no B key to delete");
         match kill {
@@ -430,6 +467,10 @@ fn run_case(kill: Kill, sabotage: bool) -> Outcome {
     }
     server.kill_now();
     wait_for_port_down(port);
+    let touched: HashSet<usize> = open_txn
+        .take()
+        .map(|t| t.touched.iter().copied().collect())
+        .unwrap_or_default();
 
     // Per shard: did the adopting snapshot commit before the kill?
     let after = snapshot_ids(&dir);
@@ -477,6 +518,13 @@ fn run_case(kill: Kill, sabotage: bool) -> Outcome {
                     .strip_prefix("filler:")
                     .and_then(|s| s.parse().ok())
                     .unwrap_or(usize::MAX);
+                if touched.contains(&i) {
+                    // Written by the open TXN: promoted, so graved in the
+                    // file the compaction wrote — but it may also have been
+                    // spilled again since, live, with the TXN's value. The
+                    // restart below checks its value.
+                    continue;
+                }
                 let dead = i != usize::MAX && in_b(i);
                 let grave = graves.contains(*file_id, page, slot);
                 compacted_graves += usize::from(grave);
@@ -508,6 +556,7 @@ fn run_case(kill: Kill, sabotage: bool) -> Outcome {
         assert!(removed > 0, "no compacted file to remove");
     }
     let mut restarted = start_moon_alive_with(port, &dir, 3600, "no", &SAVE);
+    let (k, new) = (redis_get(port, "{t}k"), redis_get(port, "{t}new"));
     let probe_keys: Vec<String> = (0..PROBE_COUNT).map(probe_key).collect();
     let pv = probe_value().into_bytes();
     let probes_lost = get_all(port, &probe_keys)
@@ -532,13 +581,15 @@ fn run_case(kill: Kill, sabotage: bool) -> Outcome {
     wait_for_port_down(port);
 
     eprintln!(
-        "{kill:?} (shards {n}): compactions {compactions}, S2 committed on {s2:?}, graves in \
+        "{kill:?}{} (shards {n}): compactions {compactions}, S2 committed on {s2:?}, graves in \
          compacted files {compacted_graves}; after restart: {} resurrected, {} lost, {} wrong \
-         value, {probes_lost} probes lost; trailer faults {}",
+         value, {probes_lost} probes lost; trailer faults {}; TXN keys written {}",
+        if txn { " + TXN" } else { "" },
         resurrected.len(),
         lost.len(),
         wrong_value,
-        trailer_wrong.len()
+        trailer_wrong.len(),
+        touched.len()
     );
     let mut wrong = Vec::new();
     if !resurrected.is_empty() {
@@ -560,6 +611,12 @@ fn run_case(kill: Kill, sabotage: bool) -> Outcome {
             "{} trailer faults (first {:?})",
             trailer_wrong.len(),
             &trailer_wrong[..trailer_wrong.len().min(5)]
+        ));
+    }
+    if k.as_deref() != Some("original") || new.is_some() {
+        wrong.push(format!(
+            "an uncommitted TXN write survived the restart: GET {{t}}k -> {k:?} (want \
+             original), GET {{t}}new -> {new:?} (want nil)"
         ));
     }
     if sabotage {
@@ -624,13 +681,330 @@ fn kill_after_adoption_and_the_next_snapshot() {
 #[test]
 #[ignore]
 fn the_harness_counts_the_keys_of_a_removed_compacted_file_as_lost() {
-    let outcome = run_case(Kill::Unlinked, true);
+    let outcome = run_case(Kill::Unlinked, true, false);
     assert!(
         outcome.lost > 0,
         "a compacted file was removed after its old file was unlinked, and the harness saw \
          no loss: {outcome:?}"
     );
     assert_eq!(outcome.resurrected, 0, "{outcome:?}");
+}
+
+// ── a TXN open across the reclaim (moon#1300) ────────────────────────────────
+//
+// Every snapshot stores the keys an open `TXN` holds at their pre-transaction
+// image (moon#1300, `persistence::snapshot_cow::capture_held_pre_images`), the
+// automatic one a compaction requests (`SnapshotReason::ColdReclaim`)
+// included, so that round runs with a TXN open. A TXN write of a cold key
+// promotes it first (its hold keeps the promoted value), so a cold survivor
+// the TXN writes after a compaction is a CHANGED survivor: the adopting
+// trailer graves its compacted slot and the image carries its pre-TXN value.
+// These cases write such survivors (SET and DEL) plus `{t}k` / `{t}new`, keep
+// the TXN open through the kill, and require the restart to show none of its
+// writes, with no filler resurrected or lost.
+
+const OK: &str = "+OK\r\n";
+
+/// Live cold survivors the TXN writes (half SET, half DEL).
+const TXN_SURVIVORS: usize = 16;
+
+/// A connection with a `TXN` open that has written `{t}k = value`. A TXN
+/// writes only on its connection's shard (#499) and a connection's shard is
+/// not chosen by key, so at several shards reconnect until one lands there.
+fn txn_on_the_keys_shard(port: u16, value: &str) -> common::Conn {
+    for _ in 0..64 {
+        let mut t = common::Conn::open(port);
+        assert_eq!(t.send(&["TXN", "BEGIN"]), OK);
+        let reply = t.send(&["SET", "{t}k", value]);
+        if reply == OK {
+            return t;
+        }
+        assert!(reply.contains("cross-shard"), "TXN SET answered {reply:?}");
+        assert_eq!(t.send(&["TXN", "ABORT"]), OK);
+    }
+    panic!("no connection landed on the shard of {{t}}k in 64 tries");
+}
+
+/// An open `TXN`: kept alive until the kill (a closed connection aborts it).
+struct OpenTxn {
+    _conn: common::Conn,
+    /// The fillers it wrote: live (never in A or B), on `{t}k`'s shard, the
+    /// earliest written — so mostly cold, in files the reclaim compacts.
+    touched: Vec<usize>,
+}
+
+/// Open a `TXN` on `{t}k`'s shard and write `{t}k = aborted`,
+/// `{t}new = inserted`, and [`TXN_SURVIVORS`] live fillers (SET one, DEL the
+/// next). Nothing is committed.
+fn open_txn_over_survivors(port: u16) -> OpenTxn {
+    let n = shards();
+    let shard = moon::shard::dispatch::key_to_shard(b"{t}k", n);
+    let mut t = txn_on_the_keys_shard(port, "aborted");
+    assert_eq!(t.send(&["SET", "{t}new", "inserted"]), OK);
+    let touched: Vec<usize> = (0..FILLER_COUNT)
+        .filter(|&i| !in_a(i) && !in_b(i))
+        .filter(|&i| moon::shard::dispatch::key_to_shard(filler_key(i).as_bytes(), n) == shard)
+        .take(TXN_SURVIVORS)
+        .collect();
+    for (j, &i) in touched.iter().enumerate() {
+        let key = filler_key(i);
+        let reply = if j % 2 == 0 {
+            t.send(&["SET", &key, "txn-value"])
+        } else {
+            t.send(&["DEL", &key])
+        };
+        assert!(
+            reply == OK || reply == ":1\r\n",
+            "TXN write of {key} answered {reply:?}"
+        );
+    }
+    OpenTxn { _conn: t, touched }
+}
+
+/// Poll `cond` every 100 ms for up to `secs`, stopping early if the server
+/// exits; the exit code if it did.
+fn wait_or_exit(
+    server: &mut common::ServerGuard,
+    secs: u64,
+    mut cond: impl FnMut() -> bool,
+) -> Option<i32> {
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    while Instant::now() < deadline {
+        if let Ok(Some(status)) = server.as_mut().try_wait() {
+            return Some(status.code().unwrap_or(-1));
+        }
+        if cond() {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    None
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RoundEnd {
+    /// `MOON_TEST_COLD_RECLAIM_CRASH=adopt_ready`: stop the moment the
+    /// automatic round has committed a compaction.
+    AdoptReady,
+    /// The compactions are adopted (old files unlinked); then kill -9.
+    Adopted,
+    /// The compactions are adopted; then `SHUTDOWN` (its default save, a save
+    /// rule being configured) with the TXN still open.
+    Shutdown,
+}
+
+/// The automatic `ColdReclaim` round commits the compactions while a TXN
+/// holds survivors it compacted; the restart is that round's point in time,
+/// with none of the TXN's writes.
+fn reclaim_round_with_a_txn_open(end: RoundEnd) {
+    let n = shards();
+    let port = common::reserve_port();
+    let dir = unique_dir(&format!("r1297-txnround-{end:?}"));
+    std::fs::create_dir_all(&dir).expect("create test dir");
+    let hold = dir.join("reclaim.hold");
+    std::fs::write(&hold, b"").expect("hold file");
+    let hold_s = hold.to_string_lossy().to_string();
+    let mut envs = vec![("MOON_TEST_COLD_RECLAIM_HOLD_FILE", hold_s.as_str())];
+    if end == RoundEnd::AdoptReady {
+        envs.push(("MOON_TEST_COLD_RECLAIM_CRASH", "adopt_ready"));
+    }
+    // A 1 s sweep: compactions waiting three sweeps request the round. The
+    // save rule never fires (3600 s), so that round is the only snapshot.
+    let mut server = start_moon_with_env(port, &dir, 1, "no", &SAVE, &envs);
+    wait_for_port(port);
+
+    let fillers: Vec<String> = (0..FILLER_COUNT).map(filler_key).collect();
+    let a: Vec<String> = (0..FILLER_COUNT)
+        .filter(|&i| in_a(i))
+        .map(filler_key)
+        .collect();
+    redis_set(port, "{t}k", "original");
+    spill_probes(port, &dir);
+    bgsave_and_wait(port); // S0
+    del_keys(port, &a);
+    bgsave_and_wait(port); // S1: A's deletions are durable
+    let s1 = snapshot_ids(&dir);
+    let lastsave_s1 = integer_reply(&redis_cmd(port, &["LASTSAVE"]));
+    let requested_s1 = info_u64(port, "cold_reclaim_snapshots_requested").unwrap_or(0);
+    std::fs::remove_file(&hold).expect("release the compaction hold");
+    let compactions = wait_for_compactions(port);
+    // One generation (see `run_case`).
+    std::fs::write(&hold, b"").expect("hold file");
+    assert!(compactions > 0, "precondition: no compaction started");
+    let txn = open_txn_over_survivors(port);
+
+    let (mut requested, mut held_requested, mut lastsave) = (None, None, lastsave_s1);
+    let exit = match end {
+        RoundEnd::AdoptReady => wait_exit(&mut server, 90),
+        RoundEnd::Adopted | RoundEnd::Shutdown => {
+            let mut exit = wait_or_exit(&mut server, 90, || {
+                info_u64(port, "cold_reclaim_files_unlinked").unwrap_or(0) > 0
+                    && info_u64(port, "cold_reclaim_compactions_pending") == Some(0)
+            });
+            if exit.is_none() {
+                requested = info_u64(port, "cold_reclaim_snapshots_requested");
+                held_requested = info_u64(port, "cold_held_release_snapshots_requested");
+                lastsave = integer_reply(&redis_cmd(port, &["LASTSAVE"]));
+                if end == RoundEnd::Shutdown {
+                    let _ = std::process::Command::new("redis-cli")
+                        .args(["-p", &port.to_string(), "SHUTDOWN"])
+                        .output();
+                    exit = wait_exit(&mut server, 60);
+                }
+            }
+            exit
+        }
+    };
+    server.kill_now();
+    wait_for_port_down(port);
+    let touched = txn.touched.clone();
+    drop(txn);
+    let committed: Vec<bool> = snapshot_ids(&dir)
+        .iter()
+        .zip(&s1)
+        .map(|(now, s1)| now != s1)
+        .collect();
+
+    let mut restarted = start_moon_alive_with(port, &dir, 3600, "no", &SAVE);
+    let (k, new) = (redis_get(port, "{t}k"), redis_get(port, "{t}new"));
+    let probe_keys: Vec<String> = (0..PROBE_COUNT).map(probe_key).collect();
+    let pv = probe_value().into_bytes();
+    let probes_lost = get_all(port, &probe_keys)
+        .into_iter()
+        .filter(|v| v.as_deref() != Some(pv.as_slice()))
+        .count();
+    let fv = "F".repeat(FILLER_VALUE_LEN).into_bytes();
+    let (mut resurrected, mut lost, mut wrong_value, mut txn_kept) = (0usize, 0, 0, 0);
+    for (i, v) in get_all(port, &fillers).into_iter().enumerate() {
+        match (in_a(i), v) {
+            (true, Some(_)) => resurrected += 1,
+            (false, None) => lost += 1,
+            (false, Some(v)) if v != fv => wrong_value += 1,
+            (false, Some(_)) if touched.contains(&i) => txn_kept += 1,
+            _ => {}
+        }
+    }
+    restarted.kill_now();
+    wait_for_port_down(port);
+
+    eprintln!(
+        "{end:?} (shards {n}): compactions {compactions}, TXN wrote {} survivors; exit \
+         {exit:?}, reclaim snapshots requested {requested_s1} -> {requested:?} (held-file \
+         {held_requested:?}), committed {committed:?}; restart: k {k:?}, new {new:?}, {txn_kept} \
+         TXN-written survivors at their pre-TXN value, {resurrected} resurrected, {lost} lost, \
+         {wrong_value} wrong value, {probes_lost} probes lost",
+        touched.len()
+    );
+    let mut wrong = Vec::new();
+    match end {
+        RoundEnd::AdoptReady => {
+            if exit != Some(CRASH_EXIT) || !committed.iter().any(|c| *c) {
+                wrong.push(format!(
+                    "the automatic round never committed a compaction with the TXN open (exit \
+                     {exit:?}, committed {committed:?})"
+                ));
+            }
+        }
+        RoundEnd::Adopted | RoundEnd::Shutdown => {
+            let want_exit = if end == RoundEnd::Shutdown {
+                Some(0)
+            } else {
+                None
+            };
+            if exit != want_exit {
+                wrong.push(format!("exit {exit:?}, want {want_exit:?}"));
+            }
+            if requested.unwrap_or(0) <= requested_s1 || lastsave == lastsave_s1 {
+                wrong.push(format!(
+                    "no cold-reclaim snapshot published with the TXN open (requested \
+                     {requested_s1} -> {requested:?}, LASTSAVE {lastsave_s1:?} -> {lastsave:?})"
+                ));
+            }
+            if !committed.iter().all(|c| *c) {
+                wrong.push(format!("a shard did not commit: {committed:?}"));
+            }
+        }
+    }
+    if k.as_deref() != Some("original") || new.is_some() {
+        wrong.push(format!(
+            "an uncommitted TXN write survived the restart: GET {{t}}k -> {k:?} (want \
+             original), GET {{t}}new -> {new:?} (want nil)"
+        ));
+    }
+    if resurrected > 0 || lost > 0 || wrong_value > 0 || probes_lost > 0 {
+        wrong.push(format!(
+            "{resurrected} resurrected, {lost} fillers lost, {wrong_value} wrong values (a TXN \
+             SET kept), {probes_lost} probes lost"
+        ));
+    }
+    if txn_kept != touched.len() {
+        wrong.push(format!(
+            "{txn_kept} of the {} TXN-written survivors read back at their pre-TXN value",
+            touched.len()
+        ));
+    }
+    finish(&dir, &wrong);
+    assert!(wrong.is_empty(), "{end:?}: {wrong:?}");
+}
+
+#[test]
+#[ignore]
+fn the_automatic_reclaim_round_commits_with_a_txn_open() {
+    reclaim_round_with_a_txn_open(RoundEnd::AdoptReady);
+}
+
+#[test]
+#[ignore]
+fn an_adoption_with_a_txn_open_survives_kill_9_without_its_writes() {
+    reclaim_round_with_a_txn_open(RoundEnd::Adopted);
+}
+
+#[test]
+#[ignore]
+fn shutdown_with_a_txn_open_after_an_adoption_keeps_every_key_exact() {
+    reclaim_round_with_a_txn_open(RoundEnd::Shutdown);
+}
+
+#[test]
+#[ignore]
+fn kill_after_compaction_before_adoption_with_a_txn_open() {
+    run_with_txn(Kill::Compacted);
+}
+
+#[test]
+#[ignore]
+fn kill_as_the_adopting_snapshot_starts_with_a_txn_open() {
+    run_with_txn(Kill::SnapshotStart);
+}
+
+#[test]
+#[ignore]
+fn kill_during_the_adopting_snapshot_with_a_txn_open() {
+    run_with_txn(Kill::DuringSnapshot);
+}
+
+#[test]
+#[ignore]
+fn kill_after_the_snapshot_commits_before_listing_with_a_txn_open() {
+    run_with_txn(Kill::AdoptReady);
+}
+
+#[test]
+#[ignore]
+fn kill_between_the_listing_and_the_unlink_with_a_txn_open() {
+    run_with_txn(Kill::Listed);
+}
+
+#[test]
+#[ignore]
+fn kill_after_the_old_file_is_unlinked_with_a_txn_open() {
+    run_with_txn(Kill::Unlinked);
+}
+
+#[test]
+#[ignore]
+fn kill_after_adoption_and_the_next_snapshot_with_a_txn_open() {
+    run_with_txn(Kill::AfterNextSnapshot);
 }
 
 // ── disk held ────────────────────────────────────────────────────────────────

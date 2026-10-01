@@ -80,6 +80,27 @@
 //! (`persistence::snapshot_request`, [`SnapshotReason::ColdReclaim`]) under
 //! the moon#1289 spacing.
 //!
+//! # Open transactions (moon#1300)
+//!
+//! The requested snapshot runs whether a `TXN` is open or not: every
+//! snapshot stores a key an open transaction holds at its pre-transaction
+//! image (`persistence::snapshot_cow::capture_held_pre_images`, armed in the
+//! same synchronous section that encodes the trailer). Nothing here needs to
+//! know about transactions:
+//!
+//! - A connection's `TXN` write of a cold survivor reads it first
+//!   (`transaction::conn_capture`: `Database::get` promotes it, and the hold
+//!   keeps the promoted value), so the survivor is no longer where the
+//!   compaction read it: the trailer graves its `F'` slot like any changed
+//!   survivor, and the image carries its pre-transaction value. A crash at
+//!   any point above restores that value, not the transaction's
+//!   (`cold_block_reclaim_no_aof_1297`, every kill point with a `TXN` open).
+//! - The adoption moves only unchanged survivors and never reads a value, so
+//!   a key a transaction holds is never re-pointed under it.
+//! - A commit's writes land after the snapshot's start, like any write; an
+//!   abort's restore re-writes the held key, which a later trailer judges
+//!   like any other change.
+//!
 //! [`SnapshotReason::ColdReclaim`]: crate::persistence::snapshot_request::SnapshotReason::ColdReclaim
 
 use std::cell::Cell;
