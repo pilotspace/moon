@@ -327,7 +327,12 @@ tuning knobs — but understanding them explains the durability/throughput trade
   ready in the same round add their records, and one `write(2)` covers them
   all); and before any reply handed to another shard. The AOF writer thread keeps the fsync,
   rewrites and `always`, and takes the append position back for each of
-  them. No channel hop, no writer wake-up and no warm poll on the write path:
+  them. Whenever the writer holds the position for anything but a rewrite —
+  from the boot until it first hands it over, under `always`, and from
+  leaving `always` until it hands it back — the producers use the
+  `always` path (each reply waits for an fsync barrier queued after its
+  record), so no reply leaves before its record is written in those windows
+  either; the writer hands the position over at the top of its next wake. No channel hop, no writer wake-up and no warm poll on the write path:
   measured server CPU per write −10 to −35% under monoio (io_uring and epoll) at
   50 connections and −30 to −65% under tokio, `--shards 1` (see `plans/WS46-aof-1a`). A slow disk
   now stalls the shard's `write(2)` instead of filling a queue — redis's
@@ -341,7 +346,10 @@ tuning knobs — but understanding them explains the durability/throughput trade
   writer; a deadline that finds the previous one still running is postponed
   until it returns. `always` keeps its fsync on the writer, before the acks.
 - **`CONFIG SET appendfsync` applies at once, as in redis.** Every producer
-  and AOF writer uses the new policy from its next write. Leaving `everysec`
+  and AOF writer uses the new policy from its next write — except that after
+  leaving `always`, replies keep waiting for an fsync barrier until each
+  writer has handed its append position back to the shard threads (its next
+  wake; moon#1266 1A), so none is acknowledged before its `write(2)`. Leaving `everysec`
   first waits for an fsync still running on the agent (redis drains its
   background fsync the same way); a write already queued to be acknowledged
   after its fsync is fsynced before its ack whatever the switch. (Before the
@@ -387,13 +395,27 @@ of 240 reps, and before Option 3, 226 of 240 (median rep 1–1,100 keys).
 
 Two exceptions remain:
 - **Inside a BGREWRITEAOF fold.** The AOF writer takes the append position back
-  for the fold; records acknowledged while it runs reach the file when the
-  fold ends (its post-fold drain, normally milliseconds; longer with a large
-  dataset), as before 1A. A kill -9 inside that window can lose them. redis
-  has no such window — its multi-part manifest lists the new incr from the
-  rewrite's start. Closing it needs the same manifest change (follow-up).
+  for the whole fold; records acknowledged while it runs are queued (or
+  spilled) and reach the file only after the fold, at its post-fold drain, as
+  before 1A. The exposure is therefore the whole fold, not just the drain: it
+  grows with the dataset (the R2b review measured over 0.9 s at ~150 MB of
+  AOF), and automatic rewrites (`auto-aof-rewrite-percentage` 100 /
+  `auto-aof-rewrite-min-size` 64mb, the defaults) open it without any
+  operator action whenever the AOF doubles. A kill -9 inside a fold can lose
+  every write acknowledged during it. redis has no such window — its
+  multi-part manifest lists the new incr from the rewrite's start. Closing it
+  needs the same manifest change (follow-up).
 - **`MOON_AOF_SHARD_WRITE=0`** (the escape hatch) restores the writer-thread
   path, whose window is the writer's pickup latency plus any writer stall.
+
+There is no boot or policy-switch window: from the server's start until each
+writer first hands its append position to the shard threads, and from a
+`CONFIG SET appendfsync always` → `everysec`/`no` until it hands it back, the
+replies wait for an fsync barrier queued after their records
+(`tests/aof_shard_write_1266.rs`: a pipeline sent right after the first `PING`,
+and right after leaving `always`, survives a kill -9 on its last ack). (A
+latched AOF write error is not an exception of 1A: the writer then appends
+nothing at all until a rewrite — moon#1314.)
 
 **redis's own `everysec` is not absolutely kill-9-safe either.** When the
 previous background fsync is still running, redis *postpones the write* of its
