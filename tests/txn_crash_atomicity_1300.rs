@@ -325,7 +325,11 @@ fn txn_writes(t: &mut Conn, c: &mut Conn, k: &Keys, other_value: &str) {
 
 /// The pre-transaction state (plus the other client's write).
 fn assert_pre_txn(c: &mut Conn, k: &Keys, other_value: Option<&str>, when: &str) {
-    assert_eq!(c.send(&["GET", &k.upd]), bulk("original"), "{when}: update rolled back");
+    assert_eq!(
+        c.send(&["GET", &k.upd]),
+        bulk("original"),
+        "{when}: update rolled back"
+    );
     assert_eq!(c.send(&["GET", &k.new]), NIL, "{when}: insert rolled back");
     assert_eq!(
         c.send(&["LRANGE", &k.del, "0", "-1"]),
@@ -333,7 +337,11 @@ fn assert_pre_txn(c: &mut Conn, k: &Keys, other_value: Option<&str>, when: &str)
         "{when}: delete rolled back"
     );
     assert_eq!(c.send(&["HLEN", &k.hash]), int(2), "{when}: hash fields");
-    assert_eq!(c.send(&["HGET", &k.hash, "f1"]), bulk("v1"), "{when}: hash value");
+    assert_eq!(
+        c.send(&["HGET", &k.hash, "f1"]),
+        bulk("v1"),
+        "{when}: hash value"
+    );
     let fttl = c.send(&["HPTTL", &k.hash, "FIELDS", "2", "f1", "f2"]);
     assert!(
         fttl.starts_with("*2\r\n:") && fttl.ends_with(":-1\r\n") && !fttl.contains(":-2"),
@@ -341,20 +349,36 @@ fn assert_pre_txn(c: &mut Conn, k: &Keys, other_value: Option<&str>, when: &str)
     );
     assert_eq!(c.send(&["GET", &k.ctr]), NIL, "{when}: counter rolled back");
     match other_value {
-        Some(v) => assert_eq!(c.send(&["GET", &k.other]), bulk(v), "{when}: the other client's write stands"),
+        Some(v) => assert_eq!(
+            c.send(&["GET", &k.other]),
+            bulk(v),
+            "{when}: the other client's write stands"
+        ),
         None => assert_eq!(c.send(&["GET", &k.other]), NIL, "{when}: other"),
     }
 }
 
 /// The committed state.
 fn assert_committed(c: &mut Conn, k: &Keys, other_value: &str, when: &str) {
-    assert_eq!(c.send(&["GET", &k.upd]), bulk("uncommitted"), "{when}: update");
-    assert_eq!(c.send(&["GET", &k.new]), bulk("uncommitted"), "{when}: insert");
+    assert_eq!(
+        c.send(&["GET", &k.upd]),
+        bulk("uncommitted"),
+        "{when}: update"
+    );
+    assert_eq!(
+        c.send(&["GET", &k.new]),
+        bulk("uncommitted"),
+        "{when}: insert"
+    );
     assert_eq!(c.send(&["EXISTS", &k.del]), int(0), "{when}: delete");
     assert_eq!(c.send(&["HGET", &k.hash, "f1"]), bulk("X"), "{when}: hash");
     assert_eq!(c.send(&["HGET", &k.hash, "f3"]), bulk("Y"), "{when}: hash");
     assert_eq!(c.send(&["GET", &k.ctr]), bulk("1"), "{when}: counter");
-    assert_eq!(c.send(&["GET", &k.other]), bulk(other_value), "{when}: other");
+    assert_eq!(
+        c.send(&["GET", &k.other]),
+        bulk(other_value),
+        "{when}: other"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -386,7 +410,11 @@ fn crash_inside_an_open_txn(shards: usize) {
     drop(c);
     let srv = crash_restart(srv);
     let mut c = Conn::open(srv.port);
-    assert_eq!(c.send(&["GET", &k.upd]), bulk("next-session"), "a later session's write survives");
+    assert_eq!(
+        c.send(&["GET", &k.upd]),
+        bulk("next-session"),
+        "a later session's write survives"
+    );
     assert_eq!(c.send(&["GET", &k.new]), bulk("fresh"));
     assert_eq!(c.send(&["HGET", &k.hash, "f1"]), bulk("v1"));
     drop(c);
@@ -487,10 +515,8 @@ fn an_aborted_txn_replays_to_the_pre_txn_state_4_shards() {
 fn crash_between_restore_and_hpexpireat(shards: usize) {
     let dir = tmpdir("restore-crash");
     let mut cfg = Cfg::new(&dir, shards, true);
-    cfg.env.push((
-        "MOON_TEST_TXN_ABORT_CRASH_AFTER_RECORDS".into(),
-        "1".into(),
-    ));
+    cfg.env
+        .push(("MOON_TEST_TXN_ABORT_CRASH_AFTER_RECORDS".into(), "1".into()));
     let srv = start(&cfg);
     let mut t = Conn::open(srv.port);
     let tag = local_tag(&mut t);
@@ -573,8 +599,16 @@ fn torn_log(shards: usize) {
     drop(srv);
     let srv = start(&cfg);
     let mut c = Conn::open(srv.port);
-    assert_eq!(c.send(&["GET", &a]), bulk("original"), "torn block rolled back");
-    assert_eq!(c.send(&["GET", &b]), bulk("original"), "torn record not applied");
+    assert_eq!(
+        c.send(&["GET", &a]),
+        bulk("original"),
+        "torn block rolled back"
+    );
+    assert_eq!(
+        c.send(&["GET", &b]),
+        bulk("original"),
+        "torn record not applied"
+    );
     drop(c);
     drop(srv);
     let _ = std::fs::remove_dir_all(&dir);
@@ -649,7 +683,11 @@ fn txn_across_a_fold(shards: usize, ending: Ending) {
     drop(c);
     let srv = crash_restart(srv);
     let mut c = Conn::open(srv.port);
-    assert_eq!(c.send(&["GET", &late]), bulk("next"), "{when}: the next session");
+    assert_eq!(
+        c.send(&["GET", &late]),
+        bulk("next"),
+        "{when}: the next session"
+    );
     drop(c);
     drop(srv);
     let _ = std::fs::remove_dir_all(&dir);
@@ -713,18 +751,32 @@ fn clean_stop_with_a_txn_open(shards: usize) {
     assert!(status.success());
     let deadline = Instant::now() + Duration::from_secs(30);
     while srv.guard.as_mut().try_wait().ok().flatten().is_none() {
-        assert!(Instant::now() < deadline, "SIGTERM never stopped the server");
+        assert!(
+            Instant::now() < deadline,
+            "SIGTERM never stopped the server"
+        );
         std::thread::sleep(Duration::from_millis(50));
     }
     drop((t, c));
     let log = aof_bytes(&dir);
-    assert!(contains(&log, b"MOON.TXN"), "the transaction's block is in the log");
-    assert!(contains(&log, b"CLOSE"), "a clean stop ends the log with a clean-close marker");
+    assert!(
+        contains(&log, b"MOON.TXN"),
+        "the transaction's block is in the log"
+    );
+    assert!(
+        contains(&log, b"CLOSE"),
+        "a clean stop ends the log with a clean-close marker"
+    );
     let cfg = srv.cfg.clone();
     drop(srv);
     let srv = start(&cfg);
     let mut c = Conn::open(srv.port);
-    assert_pre_txn(&mut c, &k, Some("acked"), "after a clean stop with the TXN open");
+    assert_pre_txn(
+        &mut c,
+        &k,
+        Some("acked"),
+        "after a clean stop with the TXN open",
+    );
     assert_eq!(c.send(&["SET", &k.upd, "next-session"]), OK);
     drop(c);
     let srv = crash_restart(srv);
@@ -801,7 +853,10 @@ fn no_txn_no_markers(shards: usize) {
         assert_eq!(c.send(&["SET", &format!("k{i}"), "v"]), OK);
         assert_eq!(c.send(&["HSET", &format!("h{i}"), "f", "v"]), int(1));
     }
-    assert_eq!(c.send(&["EVAL", "redis.call('SET','{s}:a','b'); return 1", "0"]), int(1));
+    assert_eq!(
+        c.send(&["EVAL", "redis.call('SET','{s}:a','b'); return 1", "0"]),
+        int(1)
+    );
     assert_eq!(c.send(&["MULTI"]), OK);
     assert_eq!(c.send(&["INCR", "ctr"]), "+QUEUED\r\n");
     assert_eq!(c.send(&["EXEC"]), "*1\r\n:1\r\n");
@@ -815,7 +870,10 @@ fn no_txn_no_markers(shards: usize) {
     srv.guard.kill_now();
     let log = aof_bytes(&dir);
     assert!(!log.is_empty());
-    assert!(!contains(&log, b"MOON.TXN"), "no transaction wrote, no transaction record");
+    assert!(
+        !contains(&log, b"MOON.TXN"),
+        "no transaction wrote, no transaction record"
+    );
     drop(srv);
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -949,7 +1007,10 @@ fn shutdown_save_mid_txn(shards: usize) {
     let mut srv = srv;
     let deadline = Instant::now() + Duration::from_secs(30);
     while srv.guard.as_mut().try_wait().ok().flatten().is_none() {
-        assert!(Instant::now() < deadline, "SHUTDOWN SAVE never stopped the server");
+        assert!(
+            Instant::now() < deadline,
+            "SHUTDOWN SAVE never stopped the server"
+        );
         std::thread::sleep(Duration::from_millis(50));
     }
     drop((t, c));
@@ -986,13 +1047,19 @@ fn no_master_psync() -> bool {
 fn wait_for(what: &str, mut cond: impl FnMut() -> bool) {
     let start = Instant::now();
     while !cond() {
-        assert!(start.elapsed() < Duration::from_secs(30), "timed out waiting for {what}");
+        assert!(
+            start.elapsed() < Duration::from_secs(30),
+            "timed out waiting for {what}"
+        );
         std::thread::sleep(Duration::from_millis(50));
     }
 }
 
 fn settle(master: u16, replica: u16) {
-    let marker = format!("m{}", Instant::now().elapsed().as_nanos() ^ u128::from(std::process::id()));
+    let marker = format!(
+        "m{}",
+        Instant::now().elapsed().as_nanos() ^ u128::from(std::process::id())
+    );
     let marker = format!("{marker}-{}", rand_suffix());
     assert_eq!(Conn::open(master).send(&["SET", "settle", &marker]), OK);
     let want = bulk(&marker);
@@ -1029,7 +1096,8 @@ fn replica_txn(attach_mid_txn: bool, ending: ReplEnding) {
     let master = start(&Cfg::new(&dm, 1, false));
     let mut replica = start(&Cfg::new(&ds, 1, false));
     let attach = |replica: &Srv| {
-        let r = Conn::open(replica.port).send(&["REPLICAOF", "127.0.0.1", &master.port.to_string()]);
+        let r =
+            Conn::open(replica.port).send(&["REPLICAOF", "127.0.0.1", &master.port.to_string()]);
         assert!(r.starts_with('+'), "REPLICAOF answered {r:?}");
         wait_for("the replica link", || {
             Conn::open(replica.port)
@@ -1050,7 +1118,10 @@ fn replica_txn(attach_mid_txn: bool, ending: ReplEnding) {
         attach(&replica);
     }
     settle(master.port, replica.port);
-    let when = format!("replica (attached {}), {ending:?}", if attach_mid_txn { "mid-TXN" } else { "before" });
+    let when = format!(
+        "replica (attached {}), {ending:?}",
+        if attach_mid_txn { "mid-TXN" } else { "before" }
+    );
     match ending {
         ReplEnding::Commit => {
             assert_eq!(t.send(&["TXN", "COMMIT"]), OK);
