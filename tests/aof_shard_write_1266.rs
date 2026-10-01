@@ -21,7 +21,7 @@
 //!   outside a fold (W2B-1 of the R2b review): a pipeline sent right after
 //!   the FIRST `PING` of a fresh server, and one sent right after `CONFIG SET
 //!   appendfsync always` → `everysec`, survive a kill -9 on their last ack
-//!   (10 reps each); and leaving `always` under a steady write load hands the
+//!   (10 reps with one connection and 10 with 16, each); and leaving `always` under a steady write load hands the
 //!   position back to the shard threads (the hold does not livelock).
 //!
 //! The driver is the binary's default; run the suite again with
@@ -359,6 +359,10 @@ const KILL_REPS: usize = 10;
 /// pipeline is local to its own shard: its acks leave with no cross-shard
 /// hop to give a writer time).
 const CONNS: usize = 16;
+/// Each kill test runs `KILL_REPS` reps with ONE connection (its pipeline
+/// leaves the soonest after the first `PONG` / the `CONFIG SET`) and
+/// `KILL_REPS` with [`CONNS`] (some pipeline is local to its own shard).
+const SHAPES: [usize; 2] = [1, CONNS];
 const PIPELINE: usize = 200;
 
 /// Key `i` of connection `j`'s pipeline.
@@ -423,11 +427,11 @@ fn pipelines_then_kill_on_first_complete(
     acks.iter().map(|a| a.load(Ordering::Acquire)).collect()
 }
 
-/// Open `CONNS` raw connections at once, then PING them all at once (in the
+/// Open `n` raw connections at once, then PING them all at once (in the
 /// boot test these PONGs are the server's first).
-fn raw_conns(port: u16) -> Vec<std::net::TcpStream> {
+fn raw_conns(port: u16, n: usize) -> Vec<std::net::TcpStream> {
     use std::io::{Read, Write};
-    let mut streams: Vec<std::net::TcpStream> = (0..CONNS)
+    let mut streams: Vec<std::net::TcpStream> = (0..n)
         .map(|_| {
             let s = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
             s.set_nodelay(true).expect("nodelay");
@@ -485,28 +489,30 @@ fn lost_after_restart(
     lost
 }
 
-/// The boot window: right after the first `PONG`, `CONNS` connections each
+/// The boot window: right after the first `PONG`s, 1 or `CONNS` connections each
 /// send a SET pipeline; kill -9 the instant one has all its acks. The writer
 /// may not have handed the append position over yet — the replies must
 /// then wait for its acks (the lane is held from attach to the first
 /// hand-over).
 fn boot_window_kill_on_ack(shards: usize) {
     let mut lossy = Vec::new();
-    for rep in 0..KILL_REPS {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let (mut server, port) =
-            common::spawn_listening_guarded(|port| start_moon(port, dir.path(), shards, "1"));
-        let streams = raw_conns(port); // the server's first PONGs
-        let acked = pipelines_then_kill_on_first_complete(&mut server, port, streams, "boot");
-        let lost = lost_after_restart(dir.path(), shards, "boot", &acked);
-        if lost > 0 {
-            lossy.push((rep, lost, acked.iter().sum::<usize>()));
+    for conns in SHAPES {
+        for rep in 0..KILL_REPS {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let (mut server, port) =
+                common::spawn_listening_guarded(|port| start_moon(port, dir.path(), shards, "1"));
+            let streams = raw_conns(port, conns); // the server's first PONGs
+            let acked = pipelines_then_kill_on_first_complete(&mut server, port, streams, "boot");
+            let lost = lost_after_restart(dir.path(), shards, "boot", &acked);
+            if lost > 0 {
+                lossy.push((conns, rep, lost, acked.iter().sum::<usize>()));
+            }
         }
     }
     assert!(
         lossy.is_empty(),
         "shards={shards}: acked writes lost after a kill on ack in the boot window \
-         ((rep, keys lost, keys acked): {lossy:?})"
+         ((connections, rep, keys lost, keys acked): {lossy:?})"
     );
 }
 
@@ -524,36 +530,38 @@ fn boot_window_kill_on_ack_loses_nothing_s4() {
 
 /// The policy-switch window: `CONFIG SET appendfsync always` (writes acked
 /// under it, so every writer has taken the position back), then `everysec`,
-/// then at once `CONNS` SET pipelines; kill -9 the instant one has all its
+/// then at once 1 or `CONNS` SET pipelines; kill -9 the instant one has all its
 /// acks.
 fn after_always_kill_on_ack(shards: usize) {
     let mut lossy = Vec::new();
-    for rep in 0..KILL_REPS {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let (mut server, port) =
-            common::spawn_listening_guarded(|port| start_moon(port, dir.path(), shards, "1"));
-        let mut c = conn(port);
-        let streams = raw_conns(port);
-        std::thread::sleep(Duration::from_millis(100));
-        assert!(
-            c.send(&["CONFIG", "SET", "appendfsync", "always"])
-                .contains("OK")
-        );
-        pipelined_sets(&mut c, "warm", 64);
-        assert!(
-            c.send(&["CONFIG", "SET", "appendfsync", "everysec"])
-                .contains("OK")
-        );
-        let acked = pipelines_then_kill_on_first_complete(&mut server, port, streams, "cfg");
-        let lost = lost_after_restart(dir.path(), shards, "cfg", &acked);
-        if lost > 0 {
-            lossy.push((rep, lost, acked.iter().sum::<usize>()));
+    for conns in SHAPES {
+        for rep in 0..KILL_REPS {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let (mut server, port) =
+                common::spawn_listening_guarded(|port| start_moon(port, dir.path(), shards, "1"));
+            let mut c = conn(port);
+            let streams = raw_conns(port, conns);
+            std::thread::sleep(Duration::from_millis(100));
+            assert!(
+                c.send(&["CONFIG", "SET", "appendfsync", "always"])
+                    .contains("OK")
+            );
+            pipelined_sets(&mut c, "warm", 64);
+            assert!(
+                c.send(&["CONFIG", "SET", "appendfsync", "everysec"])
+                    .contains("OK")
+            );
+            let acked = pipelines_then_kill_on_first_complete(&mut server, port, streams, "cfg");
+            let lost = lost_after_restart(dir.path(), shards, "cfg", &acked);
+            if lost > 0 {
+                lossy.push((conns, rep, lost, acked.iter().sum::<usize>()));
+            }
         }
     }
     assert!(
         lossy.is_empty(),
         "shards={shards}: acked writes lost after a kill on ack right after leaving \
-         `always` ((rep, keys lost, keys acked): {lossy:?})"
+         `always` ((connections, rep, keys lost, keys acked): {lossy:?})"
     );
 }
 
