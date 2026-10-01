@@ -805,6 +805,9 @@ mod encode;
 pub mod fold_stream;
 /// An AOF fold while a `TXN` is open: re-opening its block (moon#1300).
 pub(crate) mod fold_txn;
+/// A fresh single-file generation carries the keyspace it was opened over
+/// (R2b review P1).
+pub mod fresh_generation;
 /// The everysec fsync agent: the once-per-second fsync off the writer's
 /// loop (moon#1266).
 mod fsync_agent;

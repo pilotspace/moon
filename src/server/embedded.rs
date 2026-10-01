@@ -165,6 +165,11 @@ pub async fn run_embedded(
     // `AofWriterPool` so every shard receives an Arc clone with a uniform
     // API. Channel close still drives writer termination — dropping the last
     // Arc drops the pool, which drops the underlying senders.
+    // R2b review P1: `--shards 1` may publish its fresh generation by rename
+    // after recovery (`fresh_generation`); the writer opens the file only once
+    // this guard is dropped.
+    let fresh_aof_gate = (num_shards == 1 && config.appendonly == "yes")
+        .then(aof::fresh_generation::hold_writer_open);
     let (aof_pool, aof_join): (
         Option<Arc<AofWriterPool>>,
         Option<std::thread::JoinHandle<()>>,
@@ -313,6 +318,32 @@ pub async fn run_embedded(
                 format!("refusing to start: cannot prove shard {id}'s cold file_id seed")
             })?;
     }
+
+    // R2b review P1: `appendonly.aof` holding a record is the next boot's only
+    // KV source (`KvSources::AofOnly`), so a generation opened over a loaded
+    // keyspace carries it as its RDB preamble. No `MOON.COLDCUT` head: this
+    // server never wrote one.
+    if fresh_aof_gate.is_some() {
+        let aof_path = PathBuf::from(&config.dir).join(&config.appendfilename);
+        let dbs = &shards[0].databases;
+        let base = || {
+            if dbs.iter().all(|db| db.len() == 0) {
+                return Ok(None);
+            }
+            crate::persistence::rdb::save_to_bytes(dbs)
+                .map(Some)
+                .map_err(std::io::Error::other)
+        };
+        aof::fresh_generation::open_fresh_flat_generation(&aof_path, base, None).with_context(
+            || {
+                format!(
+                    "embedded moon: failed to open the AOF generation {}",
+                    aof_path.display()
+                )
+            },
+        )?;
+    }
+    drop(fresh_aof_gate);
 
     // NOTE: multi-part AOF (appendonlydir/ manifest) is intentionally NOT used here.
     //
