@@ -201,6 +201,9 @@ impl LegacyDriver {
     }
 
     pub(crate) fn new_with_entries(entries: u32) -> io::Result<Self> {
+        // moon patch (moon#1266 1A): this thread's writes run inside its
+        // tasks, not at a submit (see `driver::SUBMIT_GATES_IO`).
+        let _ = super::SUBMIT_GATES_IO.try_with(|c| c.set(false));
         #[cfg(unix)]
         let poll = mio::Poll::new()?;
         #[cfg(windows)]
