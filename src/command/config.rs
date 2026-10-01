@@ -442,8 +442,9 @@ fn chrono_lite_now() -> String {
 /// `txn_conflicts_refused`, `cold_held_release_folds_requested`,
 /// `cold_held_release_snapshots_requested`, and moon#1297's
 /// `cold_reclaim_compactions`, `cold_reclaim_files_unlinked`,
-/// `cold_reclaim_bytes_unlinked`, `cold_reclaim_snapshots_requested`).
-/// Gauges of live state (`txn_open`, `txn_held_keys`,
+/// `cold_reclaim_bytes_unlinked`, `cold_reclaim_snapshots_requested`, and
+/// moon#1295's `rdb_cow_streamed_keys`, `rdb_cow_stream_waits`).
+/// Gauges of live state (`current_cow_size`, `txn_open`, `txn_held_keys`,
 /// `cold_held_files_stale_databases`, `cold_reclaim_compactions_pending`, …)
 /// are never reset. The other redis stats (`keyspace_hits`, `evicted_keys`,
 /// `total_commands_processed`, …) are still not reset here.
@@ -453,6 +454,7 @@ pub fn config_resetstat() -> Frame {
     crate::storage::tiered::held_release::reset_stats();
     crate::storage::tiered::cold_reclaim::reset_stats();
     crate::persistence::snapshot_request::reset_stats();
+    crate::persistence::snapshot_cow::stream::reset_stats();
     Frame::SimpleString(Bytes::from_static(b"OK"))
 }
 
@@ -497,6 +499,21 @@ mod tests {
             Frame::SimpleString(Bytes::from_static(b"OK"))
         );
         assert!(crate::admin::metrics_setup::expired_keys() < 1_000_000);
+    }
+
+    /// R2b review: `CONFIG RESETSTAT` zeroes moon#1295's monotonic stream
+    /// counts (process-wide, bumped in parallel elsewhere: "the million this
+    /// test added is gone").
+    #[test]
+    fn resetstat_zeroes_the_cow_stream_counts() {
+        use crate::persistence::snapshot_cow::stream;
+        stream::add_counts_for_test(1_000_000, 1_000_000);
+        assert!(stream::streamed_keys() >= 1_000_000 && stream::parked_writes() >= 1_000_000);
+        assert_eq!(
+            super::config_resetstat(),
+            Frame::SimpleString(Bytes::from_static(b"OK"))
+        );
+        assert!(stream::streamed_keys() < 1_000_000 && stream::parked_writes() < 1_000_000);
     }
 
     fn config_set_scoped(runtime_config: &mut RuntimeConfig, args: &[Frame]) -> Frame {
