@@ -131,6 +131,10 @@ moves the replication offset a replay recovers. A client that sends one gets
 | `MOON.TS <ms>` (moon#1283) | right after `MOON.COLDCUT` in every generation head, before the first record a writer appends to a file it reopened, then before any record whose shard clock differs from the last `MOON.TS` in the stream | sets the expiry-judgment clock (see below) |
 | `MOON.TS <ms> CLOSE` (moon#1283) | last record a writer appends when it stops in order (SHUTDOWN, SIGTERM) with the file still the live incr, made durable by its final sync | marks a clean close: what follows it up to the next stamp is another binary's (see below) |
 | `MOON.SPILLED <file_id> key…` | when a spill publishes keys into the cold index | demotes replay-built hot copies of those keys to their cold entries |
+| `MOON.TXN BEGIN <id>` (moon#1300) | before a record a cross-store `TXN` wrote, when the stream is not already in that transaction | the data records up to the next `MOON.TXN` belong to transaction `<id>` (see below) |
+| `MOON.TXN PAUSE <id>` (moon#1300) | before another client's record that follows a transaction's record | the records after it belong to no transaction; `<id>` stays open |
+| `MOON.TXN END <id>` (moon#1300) | after a transaction's last record: on `TXN COMMIT`, or after its abort's compensating records | `<id>` is over; its records stand |
+| `MOON.TXN RESET` (moon#1300) | first record a writer appends to a file whose replay ended inside a transaction block | every transaction still open is rolled back at this point |
 
 `MOON.TS <ms>` carries the shard's cached clock in unix milliseconds — the
 clock the command after it judged key expiry with — read in the same
@@ -203,6 +207,69 @@ not a storage-format bump:
 
 The per-shard WAL v3 KV log (`--appendonly no`) does not carry `MOON.TS`
 yet: its replay keeps the mtime judgment of its newest segment.
+
+#### Transaction blocks (`MOON.TXN`, moon#1300)
+
+A cross-store `TXN` applies its KV writes as they run, and each reaches the
+AOF at that moment, interleaved in the shard's one stream with other
+clients' writes. The writer brackets a transaction's records the way it
+brackets a db change with `SELECT`: every record carries its transaction id
+in memory, and the writer emits `MOON.TXN BEGIN <id>` before a record of a
+transaction the stream is not in, `MOON.TXN PAUSE <id>` before another
+client's record that follows it. `TXN COMMIT` appends `MOON.TXN END <id>`
+(on disk before the `+OK` under `appendfsync always`); `TXN ABORT` (and a
+disconnect, `RESET` or a refused commit) appends its compensating records
+inside the block, then the END. With no transaction writing, nothing is
+emitted: zero added records.
+
+Replay applies a block's records in place and captures, at each key's first
+write inside the block, the key's pre-transaction value. At the END the
+capture is dropped. A block still open at `MOON.TXN RESET`, at a clean-close
+marker (`MOON.TS <ms> CLOSE`), or at the end of the file was cut by a crash:
+its keys are restored to the captured values, so none of its writes survive
+— redis's rule for an unterminated `MULTI`, without dropping the other
+clients' acknowledged records that sit inside the block. (No other client can
+write a key an open transaction holds, moon#1299, so the restore is exactly
+"the block never ran".) A record outside a block that writes a key the block
+captured releases the key: a lost END can never roll back over an
+acknowledged write. Clock records inside a block apply where they sit.
+
+- **Abort compensation.** A hash with field deadlines is compensated as
+  `RESTORE … REPLACE ABSTTL` plus one `HPEXPIREAT` per deadline, all inside
+  the block, END last: a crash between them leaves the block open and the
+  replay restores the whole pre-transaction hash, deadlines included.
+- **Rewrite (`BGREWRITEAOF`) while a transaction is open.** The new base holds
+  each held key's PRE-transaction value; the new incr re-opens the block at
+  its head with the keys' live values (`RESTORE`/`DEL` tagged with the
+  transaction), and the transaction's later records, compensation and END
+  follow. A crash before the END rolls back to the base's values.
+- **Reopened file.** A writer that reopens a file whose replay ended inside a
+  block writes `MOON.TXN RESET` before its first record, so the next boot
+  rolls the dead transaction back there, before the new session's records.
+- **Snapshots (no AOF).** Every snapshot — `BGSAVE`, the save rules, the
+  `SHUTDOWN` save, the automatic held-file snapshot — stores a held key's
+  pre-transaction value, never its uncommitted one.
+- **Replicas.** A transaction's replicated records are wrapped as one push
+  `[MOON.TXN BEGIN <id>][record][MOON.TXN PAUSE <id>]`, then `MOON.TXN END`.
+  A replica applies them like the replay and rolls an open block back when it
+  stops following that master (`REPLICAOF NO ONE`, a new master). A full
+  sync while a transaction is open sends the pre-transaction values in the
+  image and re-opens the block right after it.
+
+**Compatibility.** No byte layout covered by §2 rule 4 changes:
+- *Upgrade:* a log without `MOON.TXN` replays as before.
+- *Downgrade:* an older binary sends `MOON.TXN` to command dispatch ("unknown
+  command") and skips it. A transaction that ENDED replays exactly as it ran.
+  **Not protected:** a block left OPEN by a crash of the newer binary — the
+  older binary replays its uncommitted records, as every binary did before
+  moon#1300 (it skips `MOON.TXN RESET` and the clean-close marker too).
+  **Procedure:** after a crash of the newer binary, start it once and run
+  `BGREWRITEAOF` before downgrading: its own boot rolled the block back in
+  memory, and the rewrite's new base holds that state, so no open block is
+  left in the generation the older binary replays. An older binary's own
+  `BGREWRITEAOF` drops every marker, which is fine.
+- *Replication:* an older replica answers "unknown command" to a streamed
+  `MOON.TXN`, logs it and applies the records around it as before.
 
 ## 4. Configuration Surface
 

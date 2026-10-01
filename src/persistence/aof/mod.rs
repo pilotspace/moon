@@ -356,12 +356,20 @@ pub enum AofMessage {
     /// with. Not on disk as a field: the writer emits a `MOON.TS <clock_ms>`
     /// record before this one whenever it differs from the last stamp in the
     /// stream ([`RecordCtx`]). 0 = unknown (no stamp).
+    ///
+    /// `txn` is the cross-store transaction the record belongs to
+    /// ([`AppendStamp::txn`], moon#1300): 0 for every record outside a `TXN`.
+    /// Not on disk as a field either: the writer emits `MOON.TXN BEGIN|PAUSE`
+    /// before a record whose transaction differs from the stream's
+    /// ([`RecordCtx`]); `id | TXN_END_FLAG` marks the transaction's END
+    /// record.
     Append {
         lsn: u64,
         db: usize,
         bytes: Bytes,
         epoch: FoldEpoch,
         clock_ms: u64,
+        txn: u64,
     },
     /// Append + fsync + ack rendezvous (RFC § 4 — Fix 2 for the H1
     /// data-loss vector exposed by `appendfsync=always`).
@@ -392,6 +400,7 @@ pub enum AofMessage {
         ack: crate::runtime::channel::OneshotSender<AofAck>,
         epoch: FoldEpoch,
         clock_ms: u64,
+        txn: u64,
     },
     /// Trigger a full AOF rewrite (compaction) using current database state.
     /// The [`rewrite::RewriteOverflow`] is this writer's rewrite-window spill
@@ -815,7 +824,7 @@ mod writer_task;
 
 pub use fsync_agent::{AOF_DELAYED_FSYNC, in_flight_fsyncs};
 pub use pool::{AofWriterPool, BoundedRefusal};
-pub use record_ctx::{AppendStamp, RecordCtx};
+pub use record_ctx::{AppendStamp, RecordCtx, TXN_END_FLAG, txn_end_record};
 pub(crate) use refusal::note_append_backpressure_refusal;
 pub use refusal::{
     AOF_APPEND_BACKPRESSURE_REFUSALS, AOF_BACKLOG_ERR, AOF_BARRIER_BACKLOG_ERR,
@@ -955,15 +964,18 @@ pub(crate) fn inject_record_prefixes(
             db,
             bytes,
             clock_ms,
+            txn,
             ..
         }
         | AofMessage::AppendSync {
             db,
             bytes,
             clock_ms,
+            txn,
             ..
         } => {
-            bytes.is_empty() || (!ctx.needs_prefix(*db, *clock_ms, false) && !is_folded(msg, floor))
+            bytes.is_empty()
+                || (!ctx.needs_prefix_for(*db, *clock_ms, *txn, false) && !is_folded(msg, floor))
         }
         _ => true,
     });
@@ -977,12 +989,13 @@ pub(crate) fn inject_record_prefixes(
         let Some(msg) = keep_unless_folded(msg, floor) else {
             continue;
         };
-        let (db, is_empty, epoch, clock_ms) = match &msg {
+        let (db, is_empty, epoch, clock_ms, txn) = match &msg {
             AofMessage::Append {
                 db,
                 bytes,
                 epoch,
                 clock_ms,
+                txn,
                 ..
             }
             | AofMessage::AppendSync {
@@ -990,17 +1003,19 @@ pub(crate) fn inject_record_prefixes(
                 bytes,
                 epoch,
                 clock_ms,
+                txn,
                 ..
-            } => (*db, bytes.is_empty(), *epoch, *clock_ms),
-            _ => (0, true, FoldEpoch::INITIAL, 0),
+            } => (*db, bytes.is_empty(), *epoch, *clock_ms, *txn),
+            _ => (0, true, FoldEpoch::INITIAL, 0, 0),
         };
-        for bytes in ctx.prefix(db, clock_ms, is_empty) {
+        for bytes in ctx.prefix_for(db, clock_ms, txn, is_empty) {
             out.push(AofMessage::Append {
                 lsn: 0,
                 db,
                 bytes,
                 epoch,
                 clock_ms: 0,
+                txn: 0,
             });
         }
         out.push(msg);
@@ -1087,6 +1102,20 @@ pub fn replay_aof(
 /// `MOON_AOF_BEST_EFFORT_RESYNC` — lets tests pin the branch deterministically
 /// regardless of the ambient environment.
 fn replay_aof_with_resync(
+    databases: &mut [Database],
+    path: &Path,
+    engine: &dyn CommandReplayEngine,
+    best_effort_resync: bool,
+) -> Result<usize, MoonError> {
+    let replayed = replay_aof_records(databases, path, engine, best_effort_resync);
+    // moon#1300: the end of the file — a `MOON.TXN` block a crash cut is
+    // rolled back (on an error too: the engine must not carry it further).
+    engine.finish_log(databases);
+    replayed
+}
+
+/// The body of [`replay_aof_with_resync`]: every record of the file.
+fn replay_aof_records(
     databases: &mut [Database],
     path: &Path,
     engine: &dyn CommandReplayEngine,
@@ -1899,6 +1928,7 @@ mod fold_floor_tests {
             bytes: Bytes::from_static(payload),
             epoch,
             clock_ms: 0,
+            txn: 0,
         }
     }
 
@@ -1927,6 +1957,7 @@ mod fold_floor_tests {
                 ack: ack_tx,
                 epoch: FoldEpoch(2),
                 clock_ms: 0,
+                txn: 0,
             },
             append(b"post", 0, FoldEpoch(3)),
         ];
@@ -1966,6 +1997,7 @@ mod fold_floor_tests {
             ack: ack_tx,
             epoch: FoldEpoch::INITIAL,
             clock_ms: 0,
+            txn: 0,
         }];
         let mut last_db = RecordCtx::new();
         let out = inject_record_prefixes(batch, FoldEpoch(9), &mut last_db);

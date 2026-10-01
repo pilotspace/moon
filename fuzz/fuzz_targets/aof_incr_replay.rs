@@ -4,10 +4,11 @@ use libfuzzer_sys::fuzz_target;
 use moon::persistence::aof_manifest::shard_replay::fuzz::{
     replay_framed, replay_framed_file, replay_resp, replay_resp_file,
 };
-use moon::persistence::replay::DispatchReplayEngine;
 use moon::persistence::replay::clock::{
     pin_replay_clock_ms, pinned_replay_clock_ms, take_open_foreign_segment,
 };
+use moon::persistence::replay::txn::take_reset_owed;
+use moon::persistence::replay::{CommandReplayEngine, DispatchReplayEngine};
 use moon::storage::Database;
 
 // Fuzz the AOF replay engine end to end (moon#1283): arbitrary log bytes
@@ -29,12 +30,20 @@ use moon::storage::Database;
 // from `MOON.TS` never outlives the replay's pin scope (a leak would make the
 // next replay on this thread — or a live read — judge by a stale log clock).
 //
+// moon#1300: the `MOON.TXN` transaction blocks — BEGIN / PAUSE / END /
+// RESET, matched and unmatched ids, END without BEGIN, a block cut by the end
+// of the file — through the same readers. Invariants: no reader panics, and
+// every reader ends its file with the engine's block state empty (a block
+// left open would roll back into the NEXT file's databases).
+//
 // Input: byte 0 picks the reader (low 2 bits), which well-formed pseudo
 // records to put in front of the fuzzed bytes (bits 2..5: COLDCUT, TS, a
 // malformed TS, a CLOSE marker), so the intercept arms are reached without
 // the fuzzer having to discover `MOON.TS`, and, in mode 3, the layout (bit
-// 6: framed); bytes 1..9 are the stamp / watermark value; the rest is the
-// log.
+// 6: framed); bit 7 adds a transaction-block prefix whose shape is the high
+// 16 bits of the value (BEGIN, a data record, PAUSE, an END of the same or
+// another id, RESET; id = low 4 bits + 1); bytes 1..9 are the stamp /
+// watermark value; the rest is the log.
 fn resp(parts: &[&[u8]]) -> Vec<u8> {
     let mut out = format!("*{}\r\n", parts.len()).into_bytes();
     for p in parts {
@@ -77,6 +86,34 @@ fuzz_target!(|data: &[u8]| {
     }
     if sel & 0b10_0000 != 0 {
         prefix.push(resp(&[b"MOON.TS", v.as_bytes(), b"CLOSE"]));
+    }
+    if sel & 0b1000_0000 != 0 {
+        let shape = value >> 48;
+        let id = ((value & 0xF) + 1).to_string();
+        let other = ((value & 0xF) + 2).to_string();
+        if shape & 0b1 != 0 {
+            prefix.push(resp(&[b"MOON.TXN", b"BEGIN", id.as_bytes()]));
+        }
+        if shape & 0b10 != 0 {
+            prefix.push(resp(&[b"SET", b"k", b"txn"]));
+            prefix.push(resp(&[b"HSET", b"h", b"f", b"txn"]));
+        }
+        if shape & 0b100 != 0 {
+            prefix.push(resp(&[b"MOON.TXN", b"PAUSE", id.as_bytes()]));
+            prefix.push(resp(&[b"SET", b"k", b"other"]));
+        }
+        if shape & 0b1000 != 0 {
+            prefix.push(resp(&[b"MOON.TXN", b"END", id.as_bytes()]));
+        }
+        if shape & 0b1_0000 != 0 {
+            prefix.push(resp(&[b"MOON.TXN", b"END", other.as_bytes()]));
+        }
+        if shape & 0b10_0000 != 0 {
+            prefix.push(resp(&[b"MOON.TXN", b"RESET"]));
+        }
+        if shape & 0b100_0000 != 0 {
+            prefix.push(resp(&[b"MOON.TXN", b"BEGIN"]));
+        }
     }
     let framed_file = mode == 3 && sel & 0b100_0000 != 0;
     let mut bytes = Vec::new();
@@ -122,8 +159,14 @@ fuzz_target!(|data: &[u8]| {
             // A segment open at the end of the file was reported for the
             // writer; nobody takes it here, so drop it (bounded registry).
             let _ = take_open_foreign_segment(&path);
+            let _ = take_reset_owed(&path);
         }
     }
+    assert_eq!(
+        engine.finish_log(&mut dbs),
+        0,
+        "a reader left a MOON.TXN block open past the end of its file"
+    );
     assert_eq!(
         pinned_replay_clock_ms(),
         None,

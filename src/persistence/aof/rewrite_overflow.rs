@@ -471,10 +471,11 @@ impl RewriteOverflow {
                             db,
                             bytes,
                             clock_ms,
+                            txn,
                             ..
                         } => {
                             let r = db_ctx
-                                .prefix(db, clock_ms, bytes.is_empty())
+                                .prefix_for(db, clock_ms, txn, bytes.is_empty())
                                 .try_for_each(|sel| write_record(file, 0, &sel))
                                 .and_then(|()| write_record(file, lsn, &bytes));
                             match r {
@@ -491,6 +492,7 @@ impl RewriteOverflow {
                             bytes,
                             ack,
                             clock_ms,
+                            txn,
                             ..
                         } => {
                             // Zero-length AppendSync = fsync barrier: no
@@ -501,7 +503,7 @@ impl RewriteOverflow {
                                 Ok(())
                             } else {
                                 db_ctx
-                                    .prefix(db, clock_ms, false)
+                                    .prefix_for(db, clock_ms, txn, false)
                                     .try_for_each(|sel| write_record(file, 0, &sel))
                                     .and_then(|()| write_record(file, lsn, &bytes))
                             };
@@ -666,6 +668,7 @@ mod tests {
             bytes: Bytes::from_static(payload),
             epoch,
             clock_ms: 0,
+            txn: 0,
         }
     }
 
@@ -942,6 +945,7 @@ mod tests {
                 ack: ack_tx,
                 epoch: ovf.stamp(),
                 clock_ms: 0,
+                txn: 0,
             })
             .is_ok()
         );
@@ -1095,6 +1099,7 @@ mod tests {
             ack: ack_tx,
             epoch: FoldEpoch::INITIAL,
             clock_ms: 0,
+            txn: 0,
         })
         .unwrap();
         let floor = ovf.advance_epoch();
@@ -1105,6 +1110,7 @@ mod tests {
                 bytes: Bytes::new(),
                 epoch: FoldEpoch::INITIAL,
                 clock_ms: 0,
+                txn: 0,
             },
             floor
         ));
@@ -1135,6 +1141,7 @@ mod tests {
                 ack: ack_tx,
                 epoch: FoldEpoch::INITIAL,
                 clock_ms: 0,
+                txn: 0,
             })
             .is_ok()
         );

@@ -488,7 +488,12 @@ fn append_resp_to_shards(
                 // the records after it, whichever shard they route to, so
                 // every shard's incr gets it in stream order (lsn 0, like the
                 // writer's own; never counted as a written command).
-                if cmd_upper.as_slice() == crate::persistence::replay::pseudo::TS {
+                // moon#1300: a `MOON.TXN` record is no key's either — the
+                // transaction block it opens, pauses or ends covers records
+                // that route to any shard, so every shard's incr gets it.
+                if cmd_upper.as_slice() == crate::persistence::replay::pseudo::TS
+                    || cmd_upper.as_slice() == crate::persistence::replay::pseudo::TXN
+                {
                     let mut resp_buf = BytesMut::new();
                     crate::protocol::serialize::serialize(&frame, &mut resp_buf);
                     for (sid, file) in shard_files.iter_mut().enumerate() {
@@ -780,6 +785,61 @@ mod tests {
             let incr = std::fs::read(manifest.shard_incr_path(sid)).expect("incr");
             assert_eq!(&incr[..8], &0u64.to_le_bytes(), "shard {sid}: lsn 0");
             assert_eq!(&incr[12..12 + stamp.len()], stamp.as_slice(), "shard {sid}");
+        }
+    }
+
+    /// moon#1300: a `MOON.TXN` record reaches every shard's incr too, and a
+    /// block migrated across shards still rolls back on each of them: the
+    /// keys it wrote land on several shards, each shard's incr brackets its
+    /// share.
+    #[test]
+    fn migrate_aof_copies_txn_records_to_every_shard() {
+        use crate::persistence::aof_manifest::replay_per_shard;
+        use crate::persistence::replay::DispatchReplayEngine;
+        let src_dir = tempfile::tempdir().unwrap();
+        let dst_dir = tempfile::tempdir().unwrap();
+        let mut aof_data: Vec<u8> = Vec::new();
+        for i in 0..8u32 {
+            aof_data.extend(set_resp(&format!("key{i}"), "original"));
+        }
+        aof_data.extend(cmd_resp(&["MOON.TXN", "BEGIN", "7"]));
+        for i in 0..8u32 {
+            aof_data.extend(set_resp(&format!("key{i}"), "uncommitted"));
+        }
+        // No END: the crash cut the block.
+        std::fs::write(src_dir.path().join("appendonly.aof"), &aof_data).expect("write source aof");
+        let result = migrate_aof(src_dir.path(), dst_dir.path(), 4).expect("migration succeeds");
+        assert_eq!(result.commands_written, 16, "markers are not commands");
+        let manifest = AofManifest::load(dst_dir.path())
+            .expect("load manifest")
+            .expect("manifest present");
+        let begin = cmd_resp(&["MOON.TXN", "BEGIN", "7"]);
+        for sid in 0..4u16 {
+            let incr = std::fs::read(manifest.shard_incr_path(sid)).expect("incr");
+            assert!(
+                incr.windows(begin.len()).any(|w| w == begin.as_slice()),
+                "shard {sid} has the block's BEGIN"
+            );
+        }
+        let mut shard_dbs: Vec<Vec<Database>> = (0..4).map(|_| vec![Database::new()]).collect();
+        let mut slices: Vec<&mut [Database]> =
+            shard_dbs.iter_mut().map(|v| v.as_mut_slice()).collect();
+        replay_per_shard(
+            &mut slices,
+            &manifest,
+            &(|| {
+                Box::new(DispatchReplayEngine::new())
+                    as Box<dyn crate::persistence::replay::CommandReplayEngine + Send>
+            }),
+        )
+        .expect("replay");
+        for i in 0..8u32 {
+            let key = format!("key{i}");
+            let shard = crate::shard::dispatch::key_to_shard(key.as_bytes(), 4);
+            let v = shard_dbs[shard][0]
+                .get(key.as_bytes())
+                .and_then(|e| e.value.as_bytes().map(<[u8]>::to_vec));
+            assert_eq!(v, Some(b"original".to_vec()), "{key}");
         }
     }
 

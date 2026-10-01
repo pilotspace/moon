@@ -49,7 +49,7 @@ fn stamp_of(frame: &Frame) -> Option<Option<u64>> {
     match pseudo::classify(name, args)? {
         Pseudo::Ts(ms) | Pseudo::Close(ms) => Some(Some(ms)),
         Pseudo::MalformedTs => Some(None),
-        Pseudo::ColdPlane => None,
+        Pseudo::ColdPlane | Pseudo::Txn(_) | Pseudo::MalformedTxn => None,
     }
 }
 

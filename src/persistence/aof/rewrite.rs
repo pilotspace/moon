@@ -569,9 +569,10 @@ pub(crate) fn drain_pending_appends_bounded(
                     bytes: data,
                     db,
                     clock_ms,
+                    txn,
                     ..
                 } => {
-                    for sel in db_ctx.prefix(db, clock_ms, data.is_empty()) {
+                    for sel in db_ctx.prefix_for(db, clock_ms, txn, data.is_empty()) {
                         file.write_all(&sel).map_err(|e| AofError::Io {
                             path: PathBuf::from("<aof toplevel incr drain>"),
                             source: e,
@@ -588,9 +589,10 @@ pub(crate) fn drain_pending_appends_bounded(
                     db,
                     ack,
                     clock_ms,
+                    txn,
                     ..
                 } => {
-                    for sel in db_ctx.prefix(db, clock_ms, data.is_empty()) {
+                    for sel in db_ctx.prefix_for(db, clock_ms, txn, data.is_empty()) {
                         file.write_all(&sel).map_err(|e| AofError::Io {
                             path: PathBuf::from("<aof toplevel incr drain>"),
                             source: e,
@@ -675,9 +677,10 @@ pub(crate) fn drain_pending_appends_framed(
                     db,
                     bytes: data,
                     clock_ms,
+                    txn,
                     ..
                 } => {
-                    for sel in db_ctx.prefix(db, clock_ms, data.is_empty()) {
+                    for sel in db_ctx.prefix_for(db, clock_ms, txn, data.is_empty()) {
                         write_framed(file, 0, &sel).map_err(|e| AofError::Io {
                             path: PathBuf::from("<aof per-shard incr drain>"),
                             source: e,
@@ -695,6 +698,7 @@ pub(crate) fn drain_pending_appends_framed(
                     bytes: data,
                     ack,
                     clock_ms,
+                    txn,
                     ..
                 } => {
                     // H1-BARRIER: a zero-length AppendSync is an fsync barrier
@@ -703,7 +707,7 @@ pub(crate) fn drain_pending_appends_framed(
                     // still counts toward `drained` (sender.len() counted it)
                     // and its ack still parks for the boundary fsync.
                     if !data.is_empty() {
-                        for sel in db_ctx.prefix(db, clock_ms, false) {
+                        for sel in db_ctx.prefix_for(db, clock_ms, txn, false) {
                             write_framed(file, 0, &sel).map_err(|e| AofError::Io {
                                 path: PathBuf::from("<aof per-shard incr drain>"),
                                 source: e,
@@ -1393,9 +1397,10 @@ pub(crate) fn rewrite_aof_sharded_sync(
                     db,
                     bytes: data,
                     clock_ms,
+                    txn,
                     ..
                 } => {
-                    for sel in last_db.prefix(db, clock_ms, data.is_empty()) {
+                    for sel in last_db.prefix_for(db, clock_ms, txn, data.is_empty()) {
                         old_file.write_all(&sel).map_err(|e| AofError::Io {
                             path: aof_path.to_path_buf(),
                             source: e,
@@ -1411,9 +1416,10 @@ pub(crate) fn rewrite_aof_sharded_sync(
                     bytes: data,
                     ack,
                     clock_ms,
+                    txn,
                     ..
                 } => {
-                    for sel in last_db.prefix(db, clock_ms, data.is_empty()) {
+                    for sel in last_db.prefix_for(db, clock_ms, txn, data.is_empty()) {
                         old_file.write_all(&sel).map_err(|e| AofError::Io {
                             path: aof_path.to_path_buf(),
                             source: e,
@@ -1499,9 +1505,10 @@ pub(crate) fn rewrite_aof_sharded_sync(
                         db,
                         bytes: data,
                         clock_ms,
+                        txn,
                         ..
                     } => {
-                        for sel in last_db.prefix(db, clock_ms, data.is_empty()) {
+                        for sel in last_db.prefix_for(db, clock_ms, txn, data.is_empty()) {
                             old_file.write_all(&sel).map_err(|e| AofError::Io {
                                 path: aof_path.to_path_buf(),
                                 source: e,
@@ -1518,9 +1525,10 @@ pub(crate) fn rewrite_aof_sharded_sync(
                         bytes: data,
                         ack,
                         clock_ms,
+                        txn,
                         ..
                     } => {
-                        for sel in last_db.prefix(db, clock_ms, data.is_empty()) {
+                        for sel in last_db.prefix_for(db, clock_ms, txn, data.is_empty()) {
                             old_file.write_all(&sel).map_err(|e| AofError::Io {
                                 path: aof_path.to_path_buf(),
                                 source: e,
@@ -1723,6 +1731,7 @@ mod fold_tests {
             bytes: Bytes::from_static(payload),
             epoch,
             clock_ms: 0,
+            txn: 0,
         }
     }
 
