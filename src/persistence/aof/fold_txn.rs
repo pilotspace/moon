@@ -25,7 +25,7 @@ pub(crate) fn enqueue_reopen(pool: &AofWriterPool, shard_id: usize) -> bool {
             .with_all_read(crate::transaction::reopen::reopen_records)
     });
     for (txn, db, record) in records {
-        let stamp = pool.fold_stamp(shard_id).in_txn(txn);
+        let stamp = pool.fold_stamp(shard_id).in_txn(shard_id, txn);
         if !pool.try_send_append_stamped(shard_id, 0, db, record, stamp) {
             tracing::error!(
                 shard_id,

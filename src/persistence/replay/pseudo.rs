@@ -22,6 +22,10 @@
 //! | `MOON.TXN END <id>` | transaction block | `<id>` ended (committed, or rolled back with its compensation logged before it) |
 //! | `MOON.TXN RESET` | transaction block | every open transaction is dead: rolled back here (a writer reopening a file a crash left inside a block) |
 //!
+//! A `MOON.TXN` `<id>` is a non-zero decimal `u64`: the writers log the
+//! transaction's LOG id, its origin shard above its shard's id
+//! (`aof::txn_log_id`, R2b W1) — unique in a merged replication stream.
+//!
 //! ## `MOON.TS <ms>` (moon#1283)
 //!
 //! `<ms>` is the shard's cached clock (`CachedClock`, the value

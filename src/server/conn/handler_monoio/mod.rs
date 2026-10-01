@@ -3877,7 +3877,7 @@ async fn handle_connection_body<
                         .map_or(aof::AppendStamp::INITIAL, |pool| {
                             pool.fold_stamp(ctx.shard_id)
                         })
-                        .in_txn(txn_id);
+                        .in_txn(ctx.shard_id, txn_id);
 
                     let mut response = match result {
                         DispatchResult::Response(f) => f,
@@ -3944,7 +3944,9 @@ async fn handle_connection_body<
                                         serialized.clone()
                                     } else {
                                         crate::server::conn::txn_log::repl_record(
-                                            txn_id, serialized,
+                                            ctx.shard_id,
+                                            txn_id,
+                                            serialized,
                                         )
                                     },
                                 );

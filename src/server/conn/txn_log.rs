@@ -12,13 +12,18 @@
 //! - The transaction ends with `MOON.TXN END <id>` in both ([`log_end`]):
 //!   after its last record on commit, after its compensation on abort.
 //!   Without it a crash (or a promotion, on a replica) rolls the block back.
+//! - `<id>` is the transaction's LOG id, `aof::txn_log_id(shard, txn_id)`:
+//!   each shard's transaction manager issues its own ids, and the merged
+//!   stream of a multi-shard master must not let shard X's `END 1` close
+//!   shard Y's block 1 (R2b W1). Every function here takes the shard and
+//!   the manager's id and encodes them itself.
 //!
 //! Nothing here runs for a connection with no transaction open, and a
 //! transaction that wrote no keyspace key logs no END.
 
 use bytes::{BufMut, Bytes, BytesMut};
 
-use crate::persistence::aof::{AppendStamp, txn_end_record};
+use crate::persistence::aof::{AppendStamp, txn_end_record, txn_log_id};
 use crate::persistence::replay::pseudo::{TxnMarker, TxnRecord};
 use crate::server::conn::core::ConnectionContext;
 use crate::server::conn::txn_abort::ReplicationRecorder;
@@ -31,14 +36,17 @@ pub(crate) fn stamp(ctx: &ConnectionContext, txn_id: u64) -> AppendStamp {
     ctx.aof_pool
         .as_ref()
         .map_or(AppendStamp::INITIAL, |pool| pool.fold_stamp(ctx.shard_id))
-        .in_txn(txn_id)
+        .in_txn(ctx.shard_id, txn_id)
 }
 
-/// `record` as transaction `txn_id`'s replicated write: one buffer
-/// `[MOON.TXN BEGIN id][record][MOON.TXN PAUSE id]` (see the module doc).
-pub(crate) fn repl_record(txn_id: u64, record: &[u8]) -> Bytes {
-    let begin = TxnRecord::new(TxnMarker::Begin(txn_id));
-    let pause = TxnRecord::new(TxnMarker::Pause(txn_id));
+/// `record` as the replicated write of transaction `txn_id` of shard
+/// `shard_id`: one buffer `[MOON.TXN BEGIN id][record][MOON.TXN PAUSE id]`,
+/// `id` its log id (`aof::txn_log_id` — unique across the master's shards,
+/// whose records share one stream; see the module doc).
+pub(crate) fn repl_record(shard_id: usize, txn_id: u64, record: &[u8]) -> Bytes {
+    let id = txn_log_id(shard_id, txn_id);
+    let begin = TxnRecord::new(TxnMarker::Begin(id));
+    let pause = TxnRecord::new(TxnMarker::Pause(id));
     let mut out =
         BytesMut::with_capacity(begin.as_bytes().len() + record.len() + pause.as_bytes().len());
     out.put_slice(begin.as_bytes());
@@ -68,7 +76,7 @@ pub(crate) async fn log_end(
     replicate: Option<ReplicationRecorder>,
     release: impl FnOnce(),
 ) -> Result<(), &'static [u8]> {
-    let end = txn_end_record(txn_id);
+    let end = txn_end_record(ctx.shard_id, txn_id);
     let mut release = Some(release);
     let mut run = |end: &Bytes| {
         // Replicated in the same section, before the keys are free.
@@ -85,7 +93,7 @@ pub(crate) async fn log_end(
     };
     // A marker, like the writer's own (`lsn = 0`): it never moves the
     // replication offset a replay recovers.
-    let txn = AppendStamp::INITIAL.end_of(txn_id).txn;
+    let txn = AppendStamp::INITIAL.end_of(ctx.shard_id, txn_id).txn;
     let outcome = pool
         .append_then_apply_in_txn(ctx.shard_id, 0, db, end.clone(), txn, || run(&end))
         .await;

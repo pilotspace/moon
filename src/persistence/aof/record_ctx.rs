@@ -75,6 +75,47 @@ use crate::persistence::replay::pseudo::{
 /// (moon#1300, see the module doc). Transaction ids never reach it.
 pub const TXN_END_FLAG: u64 = 1 << 63;
 
+/// Bits of a transaction's LOG id that hold the id its shard's transaction
+/// manager issued; the origin shard sits above them ([`txn_log_id`]).
+pub const TXN_LOCAL_BITS: u32 = 48;
+
+/// The low [`TXN_LOCAL_BITS`] of a log id.
+const TXN_LOCAL_MASK: u64 = (1 << TXN_LOCAL_BITS) - 1;
+
+/// The origin field of a log id: the bits between the local id and
+/// [`TXN_END_FLAG`] (15 bits).
+const TXN_ORIGIN_MASK: u64 = (TXN_END_FLAG >> TXN_LOCAL_BITS) - 1;
+
+/// The id transaction `txn_id` (0: none) of shard `shard_id` carries in the
+/// logs — every `MOON.TXN` record, AOF and replication stream (R2b W1).
+///
+/// Each shard's transaction manager issues its own ids (1, 2, 3, …), and a
+/// multi-shard master merges every shard's records into ONE replication
+/// stream: by the manager's id alone, shard X's `END 1` closed shard Y's
+/// open block 1 on the replica, and a promotion after the master died kept
+/// Y's uncommitted writes. The log id is `(shard + 1) << 48 | local`: unique
+/// across the shards of one process, never 0, and still a plain decimal
+/// `u64` — the `MOON.TXN` grammar is unchanged, and a log written before
+/// (bare manager ids, origin field 0) reads as before. Idempotent for one
+/// shard: re-encoding a log id of `shard_id` returns it unchanged.
+///
+/// The local part wraps after 2^48 transactions on one shard; two blocks
+/// collide only if one stays open across that whole span. Shard ids past
+/// 2^15 - 2 (far beyond any `--shards`) saturate the origin field.
+#[inline]
+#[must_use]
+pub const fn txn_log_id(shard_id: usize, txn_id: u64) -> u64 {
+    if txn_id == 0 {
+        return 0;
+    }
+    let origin = if (shard_id as u64) < TXN_ORIGIN_MASK {
+        shard_id as u64 + 1
+    } else {
+        TXN_ORIGIN_MASK
+    };
+    (origin << TXN_LOCAL_BITS) | (txn_id & TXN_LOCAL_MASK)
+}
+
 /// What a producer stamps a record with, read in the same synchronous section
 /// as the mutation (see the module doc).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -108,22 +149,24 @@ impl AppendStamp {
         }
     }
 
-    /// This stamp for a record transaction `txn_id` wrote (0: none).
+    /// This stamp for a record transaction `txn_id` (0: none) of shard
+    /// `shard_id` wrote: tagged with its log id ([`txn_log_id`]).
     #[inline]
     #[must_use]
-    pub fn in_txn(self, txn_id: u64) -> Self {
+    pub fn in_txn(self, shard_id: usize, txn_id: u64) -> Self {
         Self {
-            txn: txn_id & !TXN_END_FLAG,
+            txn: txn_log_id(shard_id, txn_id),
             ..self
         }
     }
 
-    /// This stamp for transaction `txn_id`'s END record.
+    /// This stamp for the END record of transaction `txn_id` of shard
+    /// `shard_id` ([`txn_log_id`]).
     #[inline]
     #[must_use]
-    pub fn end_of(self, txn_id: u64) -> Self {
+    pub fn end_of(self, shard_id: usize, txn_id: u64) -> Self {
         Self {
-            txn: txn_id | TXN_END_FLAG,
+            txn: txn_log_id(shard_id, txn_id) | TXN_END_FLAG,
             ..self
         }
     }
@@ -141,11 +184,12 @@ impl From<FoldEpoch> for AppendStamp {
     }
 }
 
-/// `MOON.TXN END <txn_id>`: the record a committed or rolled-back
-/// transaction appends last, stamped [`AppendStamp::end_of`] (moon#1300).
+/// `MOON.TXN END <log id>`: the record a committed or rolled-back
+/// transaction `txn_id` of shard `shard_id` appends last, stamped
+/// [`AppendStamp::end_of`] (moon#1300, [`txn_log_id`]).
 #[must_use]
-pub fn txn_end_record(txn_id: u64) -> Bytes {
-    Bytes::copy_from_slice(TxnRecord::new(TxnMarker::End(txn_id)).as_bytes())
+pub fn txn_end_record(shard_id: usize, txn_id: u64) -> Bytes {
+    Bytes::copy_from_slice(TxnRecord::new(TxnMarker::End(txn_log_id(shard_id, txn_id))).as_bytes())
 }
 
 /// `MOON.TS` records are carved out of one arena buffer this big, so emitting
@@ -682,14 +726,41 @@ mod tests {
 
     #[test]
     fn stamps_tag_and_end_a_transaction() {
-        let s = AppendStamp::now(FoldEpoch(2)).in_txn(5);
-        assert_eq!(s.txn, 5);
-        assert_eq!(s.end_of(5).txn, 5 | TXN_END_FLAG);
-        assert_eq!(s.in_txn(0).txn, 0);
+        let id = txn_log_id(0, 5);
+        let s = AppendStamp::now(FoldEpoch(2)).in_txn(0, 5);
+        assert_eq!(s.txn, id);
+        assert_eq!(s.end_of(0, 5).txn, id | TXN_END_FLAG);
+        assert_eq!(s.in_txn(0, 0).txn, 0);
         assert_eq!(
-            txn_end_record(5).as_ref(),
-            TxnRecord::new(TxnMarker::End(5)).as_bytes()
+            txn_end_record(0, 5).as_ref(),
+            TxnRecord::new(TxnMarker::End(id)).as_bytes()
         );
+    }
+
+    /// R2b W1: two shards' transactions with the same manager id carry
+    /// different log ids; the encoding is never 0, keeps the local id, is
+    /// idempotent per shard, and never reaches the END flag.
+    #[test]
+    fn log_ids_name_their_origin_shard() {
+        assert_eq!(txn_log_id(3, 0), 0, "no transaction stays 0");
+        assert_ne!(txn_log_id(0, 1), txn_log_id(1, 1));
+        assert_ne!(txn_log_id(0, 1), 1, "never a bare pre-fix id");
+        for shard in [0usize, 1, 7, 255, 4095] {
+            for local in [1u64, 2, 1 << 40, TXN_LOCAL_MASK] {
+                let id = txn_log_id(shard, local);
+                assert_ne!(id, 0);
+                assert_eq!(id & TXN_LOCAL_MASK, local);
+                assert_eq!(id & TXN_END_FLAG, 0);
+                assert_eq!(id >> TXN_LOCAL_BITS, shard as u64 + 1);
+                assert_eq!(txn_log_id(shard, id), id, "idempotent");
+            }
+        }
+        // A wrapped local id is still a non-zero id of its shard.
+        assert_eq!(txn_log_id(2, 1 << TXN_LOCAL_BITS), 3 << TXN_LOCAL_BITS);
+        // Fits the stack-encoded record.
+        let max = txn_log_id(usize::MAX, u64::MAX);
+        assert_eq!(max & TXN_END_FLAG, 0);
+        assert!(TxnRecord::new(TxnMarker::Pause(max)).as_bytes().len() <= TXN_RECORD_MAX_LEN);
     }
 
     fn payloads(batch: &[super::super::AofMessage]) -> Vec<Vec<u8>> {
