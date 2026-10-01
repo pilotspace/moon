@@ -80,7 +80,36 @@
 //! (`persistence::snapshot_request`, [`SnapshotReason::ColdReclaim`]) under
 //! the moon#1289 spacing.
 //!
+//! # Open transactions (moon#1289's rule)
+//!
+//! The requested snapshot is automatic, so it follows the held-file
+//! snapshot's rule ([`SnapshotReason::waits_for_open_txns`]): it is not
+//! requested while any `TXN` is open (INFO
+//! `cold_reclaim_snapshots_deferred_txn`), and its round is abandoned whole
+//! when a shard holds an uncommitted `TXN` write as it starts its part
+//! (`persistence::snapshot_request::txn_round`, INFO
+//! `cold_reclaim_snapshots_abandoned_txn`). Without that a crash-restart
+//! from the image would bring an aborted write back.
+//!
+//! An abandoned round commits no compaction. The floor a compaction waits
+//! for (`snapshot_hold`'s committed start) moves only when a snapshot
+//! PUBLISHES: a shard that abandons at its start runs no snapshot hook at
+//! all, and a shard that had started ends its part with
+//! `note_snapshot_finished(false)` (`shard::snapshot_txn_guard`). Its trailer
+//! — which named the compacted slots — is never published, so the last
+//! committed snapshot stays the authority every kill point above reasons
+//! from, and the compaction stays PENDING until a later round publishes.
+//!
+//! **Starvation, as moon#1289 documents it:** a `TXN` that stays open (or
+//! unbroken `TXN` traffic) keeps every automatic round from running. The
+//! compactions then wait, at most [`NO_AOF_MAX_PENDING_PER_DB`] per database,
+//! with both the old file and its unlisted output on disk, and no new one
+//! starts past that bound. A `BGSAVE`, `SAVE`, a save rule or `SHUTDOWN`'s
+//! save still commits them (moon#1300 is WS42's). There is no timeout, as
+//! for the held files.
+//!
 //! [`SnapshotReason::ColdReclaim`]: crate::persistence::snapshot_request::SnapshotReason::ColdReclaim
+//! [`SnapshotReason::waits_for_open_txns`]: crate::persistence::snapshot_request::SnapshotReason::waits_for_open_txns
 
 use std::cell::Cell;
 

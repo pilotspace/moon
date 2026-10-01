@@ -137,8 +137,9 @@ fn request_reclaim_snapshot(
              to start one (moon#1297); asking again in {:?}",
             held_release::spacing()
         ),
-        // Only for a reason that waits for open transactions (moon#1300):
-        // the slot is untouched and the next sweep asks again.
+        // A TXN is open somewhere: a snapshot now would keep its uncommitted
+        // writes (moon#1300). The slot is untouched, the compactions keep
+        // waiting, and the next sweep asks again.
         SnapshotRequest::TxnOpen => tracing::debug!(
             shard = shard_id,
             "compacted cold spill files: snapshot deferred while a transaction is open (moon#1300)"

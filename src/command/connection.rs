@@ -756,7 +756,9 @@ fn info_raw(db: &Database, facts: &InstanceFacts) -> String {
     );
     // moon#1297: the cold reclaim (with an AOF or without): compactions
     // recorded and still waiting for their commit point, old files unlinked
-    // by adoption and their bytes, and snapshots requested to commit them.
+    // by adoption and their bytes, and snapshots requested to commit them —
+    // deferred while a TXN was open, abandoned when a shard held a TXN write
+    // at its start (moon#1289's rule).
     let (compactions, files_unlinked, bytes_unlinked) =
         crate::storage::tiered::cold_reclaim::reclaim_totals();
     let _ = write!(
@@ -765,12 +767,20 @@ fn info_raw(db: &Database, facts: &InstanceFacts) -> String {
          cold_reclaim_compactions_pending:{}\r\n\
          cold_reclaim_files_unlinked:{}\r\n\
          cold_reclaim_bytes_unlinked:{}\r\n\
-         cold_reclaim_snapshots_requested:{}\r\n",
+         cold_reclaim_snapshots_requested:{}\r\n\
+         cold_reclaim_snapshots_deferred_txn:{}\r\n\
+         cold_reclaim_snapshots_abandoned_txn:{}\r\n",
         compactions,
         crate::storage::tiered::cold_reclaim::awaiting_fold(),
         files_unlinked,
         bytes_unlinked,
         crate::persistence::snapshot_request::started(
+            crate::persistence::snapshot_request::SnapshotReason::ColdReclaim
+        ),
+        crate::persistence::snapshot_request::deferred_for_open_txn(
+            crate::persistence::snapshot_request::SnapshotReason::ColdReclaim
+        ),
+        crate::persistence::snapshot_request::abandoned_for_open_txn(
             crate::persistence::snapshot_request::SnapshotReason::ColdReclaim
         ),
     );

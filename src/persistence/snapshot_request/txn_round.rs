@@ -302,6 +302,29 @@ mod tests {
         .unwrap();
     }
 
+    /// moon#1297: a cold-reclaim round is checked and abandoned like a
+    /// held-file one, and reports its own reason (its INFO counter and its
+    /// slot).
+    #[test]
+    fn a_cold_reclaim_round_is_abandoned_under_its_own_reason() {
+        let rounds = Rounds::new();
+        let reclaim = SnapshotReason::ColdReclaim;
+        rounds.register(9, reclaim, 2, 4_321);
+        assert_eq!(rounds.shard_starts(9, false).0, ShardStart::Proceed);
+        assert_eq!(rounds.shard_commit(9), ShardCommit::Wait);
+        assert_eq!(
+            rounds.shard_starts(9, true),
+            (
+                ShardStart::Abandon,
+                Some(Abandoned {
+                    reason: reclaim,
+                    slot_ms: 4_321
+                })
+            )
+        );
+        assert_eq!(rounds.shard_commit(9), ShardCommit::Abandon);
+    }
+
     #[test]
     fn epoch_zero_is_never_a_round() {
         let rounds = Rounds::new();

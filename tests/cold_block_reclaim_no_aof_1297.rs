@@ -22,6 +22,11 @@
 //! for a C key; after adoption the next snapshot carries no grave of an
 //! unlinked file.
 //!
+//! The automatic round a compaction may request (`ColdReclaim`) follows the
+//! moon#1289 TXN rule: a round abandoned because a shard held a `TXN` write
+//! at its start saves nothing and commits no compaction (the "TXN rule"
+//! section below).
+//!
 //!   MOON_BIN=... [MOON_TEST_COLD_DEL_SHARDS=1] cargo test --test \
 //!     cold_block_reclaim_no_aof_1297 -- --include-ignored --test-threads 1
 
@@ -303,6 +308,25 @@ impl Kill {
     }
 }
 
+/// Wait until compactions have started and stopped (the count stable for
+/// 2 s, at most 60 s); the count.
+fn wait_for_compactions(port: u16) -> u64 {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut stable_since = Instant::now();
+    let mut last = 0;
+    while Instant::now() < deadline {
+        let c = info_u64(port, "cold_reclaim_compactions").unwrap_or(0);
+        if c != last {
+            last = c;
+            stable_since = Instant::now();
+        } else if c > 0 && stable_since.elapsed() >= Duration::from_secs(2) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    last
+}
+
 /// What a restart found wrong.
 #[derive(Debug, Default)]
 struct Outcome {
@@ -363,21 +387,7 @@ fn run_case(kill: Kill, sabotage: bool) -> Outcome {
     if kill == Kill::Compacted {
         exit = wait_exit(&mut server, 60);
     } else {
-        // Wait until compactions have started and stopped (stable for 2 s).
-        let deadline = Instant::now() + Duration::from_secs(60);
-        let mut stable_since = Instant::now();
-        let mut last = 0;
-        while Instant::now() < deadline {
-            let c = info_u64(port, "cold_reclaim_compactions").unwrap_or(0);
-            if c != last {
-                last = c;
-                stable_since = Instant::now();
-            } else if c > 0 && stable_since.elapsed() >= Duration::from_secs(2) {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(200));
-        }
-        compactions = last;
+        compactions = wait_for_compactions(port);
         assert!(
             compactions > 0,
             "precondition: no compaction started (deleted {deleted_a} A keys)"
@@ -631,6 +641,278 @@ fn the_harness_counts_the_keys_of_a_removed_compacted_file_as_lost() {
          no loss: {outcome:?}"
     );
     assert_eq!(outcome.resurrected, 0, "{outcome:?}");
+}
+
+// ── the moon#1289 TXN rule ───────────────────────────────────────────────────
+//
+// The snapshot a compaction waits for may be the AUTOMATIC one this shard
+// requests (`SnapshotReason::ColdReclaim`). Like the held-file snapshot it
+// must never contain an open `TXN`'s uncommitted writes: it waits while one
+// is open, and each shard re-checks its own holds as it starts its part — one
+// hold abandons the whole round (`persistence::snapshot_request::txn_round`).
+// An abandoned round publishes nothing, so it must not commit a compaction
+// either: the floor a compaction waits for moves only when a snapshot
+// publishes (`snapshot_hold::note_snapshot_finished(true)`).
+//
+// The shape: S0, DEL A, S1; every shard is held at its start
+// (`MOON_TEST_SNAPSHOT_START_HOLD_FILE`); compactions run and wait; the
+// sweep requests the ColdReclaim round; a TXN writes `{t}k` and `{t}new`
+// inside the window (after the request's pre-check, before any start); the
+// starts are released. `MOON_TEST_COLD_RECLAIM_CRASH=adopt_ready` stops the
+// server the moment any compaction is ready, i.e. the moment a snapshot that
+// started after it committed.
+
+const OK: &str = "+OK\r\n";
+
+/// A connection with a `TXN` open that has written `{t}k = value`. A TXN
+/// writes only on its connection's shard (#499) and a connection's shard is
+/// not chosen by key, so at several shards reconnect until one lands there.
+fn txn_on_the_keys_shard(port: u16, value: &str) -> common::Conn {
+    for _ in 0..64 {
+        let mut t = common::Conn::open(port);
+        assert_eq!(t.send(&["TXN", "BEGIN"]), OK);
+        let reply = t.send(&["SET", "{t}k", value]);
+        if reply == OK {
+            return t;
+        }
+        assert!(reply.contains("cross-shard"), "TXN SET answered {reply:?}");
+        assert_eq!(t.send(&["TXN", "ABORT"]), OK);
+    }
+    panic!("no connection landed on the shard of {{t}}k in 64 tries");
+}
+
+fn saving(port: u16) -> bool {
+    !redis_cmd(port, &["INFO", "persistence"]).contains("rdb_bgsave_in_progress:0")
+}
+
+/// Poll `cond` every 100 ms for up to `secs`, stopping early if the server
+/// exits; the exit code if it did.
+fn wait_or_exit(
+    server: &mut common::ServerGuard,
+    secs: u64,
+    mut cond: impl FnMut() -> bool,
+) -> Option<i32> {
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    while Instant::now() < deadline {
+        if let Ok(Some(status)) = server.as_mut().try_wait() {
+            return Some(status.code().unwrap_or(-1));
+        }
+        if cond() {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    None
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AfterAbandon {
+    /// kill -9 with the TXN still open, compactions still pending.
+    KillWithTxnOpen,
+    /// `TXN ABORT`: the next sweep's round must publish and commit the
+    /// compactions (the `adopt_ready` hook stops the server there).
+    AbortAndRetry,
+}
+
+fn abandoned_reclaim_round(end: AfterAbandon) {
+    let n = shards();
+    let port = common::reserve_port();
+    let dir = unique_dir(&format!("r1297-txn-{end:?}"));
+    std::fs::create_dir_all(&dir).expect("create test dir");
+    let hold = dir.join("reclaim.hold");
+    std::fs::write(&hold, b"").expect("hold file");
+    let start_hold = dir.join("start.hold");
+    let hold_s = hold.to_string_lossy().to_string();
+    let start_hold_s = start_hold.to_string_lossy().to_string();
+    let envs = [
+        ("MOON_TEST_COLD_RECLAIM_HOLD_FILE", hold_s.as_str()),
+        ("MOON_TEST_SNAPSHOT_START_HOLD_FILE", start_hold_s.as_str()),
+        ("MOON_TEST_COLD_RECLAIM_CRASH", "adopt_ready"),
+    ];
+    // A 1 s sweep: compactions waiting three sweeps request the round.
+    let mut server = start_moon_with_env(port, &dir, 1, "no", &SAVE, &envs);
+    wait_for_port(port);
+
+    let fillers: Vec<String> = (0..FILLER_COUNT).map(filler_key).collect();
+    let a: Vec<String> = (0..FILLER_COUNT)
+        .filter(|&i| in_a(i))
+        .map(filler_key)
+        .collect();
+    redis_set(port, "{t}k", "original");
+    spill_probes(port, &dir);
+    bgsave_and_wait(port); // S0
+    del_keys(port, &a);
+    bgsave_and_wait(port); // S1: A's deletions are durable
+    let s1 = snapshot_ids(&dir);
+    let lastsave_s1 = integer_reply(&redis_cmd(port, &["LASTSAVE"]));
+
+    // Every shard now stops at the start of the next round.
+    std::fs::write(&start_hold, b"").expect("start hold");
+    std::fs::remove_file(&hold).expect("release the compaction hold");
+    let compactions = wait_for_compactions(port);
+    std::fs::write(&hold, b"").expect("hold file");
+    assert!(compactions > 0, "precondition: no compaction started");
+    assert_eq!(
+        wait_or_exit(&mut server, 60, || {
+            info_u64(port, "cold_reclaim_snapshots_requested").unwrap_or(0) >= 1 && saving(port)
+        }),
+        None,
+        "precondition: the server stopped before the round was requested"
+    );
+    std::thread::sleep(Duration::from_millis(200));
+    let pending = info_u64(port, "cold_reclaim_compactions_pending").unwrap_or(0);
+    assert!(
+        saving(port) && pending > 0,
+        "precondition: the ColdReclaim round is requested and held at every shard's start \
+         with compactions pending (pending {pending})"
+    );
+    assert_eq!(
+        info_u64(port, "cold_held_release_snapshots_requested"),
+        Some(0),
+        "precondition: the round is the cold reclaim's, not the held-file trigger's"
+    );
+
+    // The TXN begins and writes AFTER the request's pre-check, BEFORE any
+    // shard starts its part.
+    let mut t = txn_on_the_keys_shard(port, "aborted");
+    assert_eq!(t.send(&["SET", "{t}new", "inserted"]), OK);
+    std::fs::remove_file(&start_hold).expect("release the starts");
+    let mut stopped = wait_or_exit(&mut server, 60, || !saving(port));
+    // Three more sweeps with the TXN open: the slot given back is asked for
+    // again and deferred; nothing may adopt.
+    if stopped.is_none() {
+        stopped = wait_or_exit(&mut server, 4, || false);
+    }
+    let field = |f: &str| {
+        if stopped.is_none() {
+            info_u64(port, f)
+        } else {
+            None
+        }
+    };
+    let abandoned = field("cold_reclaim_snapshots_abandoned_txn");
+    let deferred = field("cold_reclaim_snapshots_deferred_txn");
+    let unlinked = field("cold_reclaim_files_unlinked");
+    let pending_after = field("cold_reclaim_compactions_pending");
+    let lastsave = if stopped.is_none() {
+        integer_reply(&redis_cmd(port, &["LASTSAVE"]))
+    } else {
+        lastsave_s1
+    };
+    let after_round = snapshot_ids(&dir);
+
+    let mut retried_exit = None;
+    if end == AfterAbandon::AbortAndRetry && stopped.is_none() {
+        assert_eq!(t.send(&["TXN", "ABORT"]), OK);
+        retried_exit = wait_exit(&mut server, 60);
+    }
+    drop(t);
+    server.kill_now();
+    wait_for_port_down(port);
+    let committed: Vec<bool> = snapshot_ids(&dir)
+        .iter()
+        .zip(&s1)
+        .map(|(now, s1)| now != s1)
+        .collect();
+
+    let mut restarted = start_moon_alive_with(port, &dir, 3600, "no", &SAVE);
+    let k = redis_get(port, "{t}k");
+    let new = redis_get(port, "{t}new");
+    let probe_keys: Vec<String> = (0..PROBE_COUNT).map(probe_key).collect();
+    let pv = probe_value().into_bytes();
+    let probes_lost = get_all(port, &probe_keys)
+        .into_iter()
+        .filter(|v| v.as_deref() != Some(pv.as_slice()))
+        .count();
+    let fv = "F".repeat(FILLER_VALUE_LEN).into_bytes();
+    let (mut resurrected, mut lost) = (0usize, 0usize);
+    for (i, v) in get_all(port, &fillers).into_iter().enumerate() {
+        match (in_a(i), v) {
+            (true, Some(_)) => resurrected += 1,
+            (false, None) => lost += 1,
+            (false, Some(v)) if v != fv => lost += 1,
+            _ => {}
+        }
+    }
+    restarted.kill_now();
+    wait_for_port_down(port);
+
+    eprintln!(
+        "{end:?} (shards {n}): compactions {compactions}, pending {pending} -> {pending_after:?}; \
+         after the round: stopped {stopped:?}, abandoned {abandoned:?}, deferred {deferred:?}, \
+         unlinked {unlinked:?}; retried exit {retried_exit:?}, committed {committed:?}; restart: \
+         k {k:?}, new {new:?}, {resurrected} resurrected, {lost} lost, {probes_lost} probes lost"
+    );
+    let mut wrong = Vec::new();
+    if let Some(code) = stopped {
+        wrong.push(format!(
+            "the server stopped (exit {code}) after the round that held a TXN write: a \
+             compaction became ready, so that round committed"
+        ));
+    }
+    if stopped.is_none() {
+        if abandoned != Some(1) {
+            wrong.push(format!(
+                "cold_reclaim_snapshots_abandoned_txn {abandoned:?}, want 1"
+            ));
+        }
+        if deferred.unwrap_or(0) == 0 {
+            wrong.push("no request deferred while the TXN stayed open".to_string());
+        }
+        if unlinked != Some(0) || pending_after != Some(pending) {
+            wrong.push(format!(
+                "the abandoned round moved the compactions: unlinked {unlinked:?}, pending \
+                 {pending} -> {pending_after:?}"
+            ));
+        }
+        if after_round != s1 || lastsave != lastsave_s1 {
+            wrong.push("the abandoned round published a snapshot (file or LASTSAVE)".to_string());
+        }
+    }
+    match end {
+        AfterAbandon::KillWithTxnOpen => {
+            if committed.iter().any(|c| *c) {
+                wrong.push(format!("a snapshot committed after S1: {committed:?}"));
+            }
+        }
+        AfterAbandon::AbortAndRetry => {
+            if stopped.is_none() && retried_exit != Some(CRASH_EXIT) {
+                wrong.push(format!(
+                    "the round retried after TXN ABORT did not commit the compactions \
+                     (exit {retried_exit:?}, committed {committed:?})"
+                ));
+            }
+        }
+    }
+    if k.as_deref() != Some("original") || new.is_some() {
+        wrong.push(format!(
+            "the TXN's uncommitted writes reached a snapshot: after kill -9 GET {{t}}k -> {k:?} \
+             (want original), GET {{t}}new -> {new:?} (want nil)"
+        ));
+    }
+    if resurrected > 0 || lost > 0 || probes_lost > 0 {
+        wrong.push(format!(
+            "{resurrected} resurrected, {lost} fillers lost, {probes_lost} probes lost"
+        ));
+    }
+    finish(&dir, &wrong);
+    assert!(wrong.is_empty(), "{end:?}: {wrong:?}");
+}
+
+/// The round is abandoned and moves nothing; kill -9 with the TXN open and
+/// the compactions pending restarts into S1 exactly.
+#[test]
+#[ignore]
+fn an_abandoned_reclaim_round_neither_saves_the_txn_nor_commits_a_compaction() {
+    abandoned_reclaim_round(AfterAbandon::KillWithTxnOpen);
+}
+
+/// The abandon is not a cancellation: once the TXN ends the next sweep's
+/// round publishes and commits the compactions.
+#[test]
+#[ignore]
+fn a_reclaim_round_retried_after_the_txn_ends_commits_the_compactions() {
+    abandoned_reclaim_round(AfterAbandon::AbortAndRetry);
 }
 
 // ── disk held ────────────────────────────────────────────────────────────────

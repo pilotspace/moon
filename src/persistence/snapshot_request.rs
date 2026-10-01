@@ -28,8 +28,8 @@
 //! durable to compensate them with: a crash-restart from that image brings
 //! the aborted writes back (moon#1300 F3). `BGSAVE`, `SAVE` and the save
 //! rules share that flaw and are WS42's to fix; an AUTOMATIC reason
-//! ([`SnapshotReason::waits_for_open_txns`]) must not add a new way to hit
-//! it, so while any shard has an open transaction [`request`] answers
+//! ([`SnapshotReason::waits_for_open_txns`]: the held-file snapshot and the
+//! no-AOF reclaim's) must not add a new way to hit it, so while any shard has an open transaction [`request`] answers
 //! [`SnapshotRequest::TxnOpen`] without touching the gate: the slot is not
 //! consumed, and the caller's next tick asks again. The signal is the
 //! process-wide published view behind `INFO txn_open`
@@ -78,17 +78,17 @@ impl SnapshotReason {
     }
 
     /// Whether this reason is automatic — nobody at a keyboard asked — and so
-    /// waits while any transaction is open (see the module docs). A caller
-    /// acting on an explicit request (none yet) would answer `false`.
-    ///
-    /// `ColdReclaim` answers `false` here as moon#1297 was built (before
-    /// moon#1289's TXN rule existed); the integration with that rule is its
-    /// own change.
+    /// waits while any transaction is open and registers its round for the
+    /// per-shard start check (see the module docs and [`txn_round`]). Every
+    /// reason is automatic today: the held-file snapshot (moon#1289) and the
+    /// snapshot that commits a no-AOF compaction (moon#1297) both run with
+    /// nobody asking, and either one publishing an open `TXN`'s writes would
+    /// bring them back after a crash. A caller acting on an explicit request
+    /// (none yet) would answer `false`.
     #[must_use]
     pub const fn waits_for_open_txns(self) -> bool {
         match self {
-            SnapshotReason::HeldColdFiles => true,
-            SnapshotReason::ColdReclaim => false,
+            SnapshotReason::HeldColdFiles | SnapshotReason::ColdReclaim => true,
         }
     }
 }
@@ -441,6 +441,50 @@ mod tests {
             SnapshotRequest::RateLimited,
             "and that start consumed the slot as usual"
         );
+    }
+
+    /// moon#1297 × moon#1289: the cold reclaim's snapshot is as automatic as
+    /// the held-file one. Both defer while a TXN is open without touching the
+    /// gate, and both register their round for the per-shard start check
+    /// (`request` registers exactly the reasons that wait).
+    #[test]
+    fn every_automatic_reason_defers_while_a_txn_is_open() {
+        for reason in [SnapshotReason::HeldColdFiles, SnapshotReason::ColdReclaim] {
+            assert!(reason.waits_for_open_txns(), "{reason:?}");
+            let gate = SnapshotGate::new();
+            let mut asked = false;
+            assert_eq!(
+                gated(
+                    &gate,
+                    1_000,
+                    SPACING,
+                    reason,
+                    || true,
+                    || {
+                        asked = true;
+                        StartOutcome::Started
+                    }
+                ),
+                SnapshotRequest::TxnOpen,
+                "{reason:?}"
+            );
+            assert!(
+                !asked,
+                "{reason:?}: a deferred request must not touch the server"
+            );
+            assert_eq!(
+                gated(
+                    &gate,
+                    1_001,
+                    SPACING,
+                    reason,
+                    || false,
+                    || StartOutcome::Started
+                ),
+                SnapshotRequest::Started,
+                "{reason:?}: the deferral did not consume the slot"
+            );
+        }
     }
 
     /// review N1: an abandoned round gives its slot back — the next sweep
