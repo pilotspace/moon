@@ -618,7 +618,22 @@ impl ColdIndex {
     ///
     /// Decrements the backing file's live-ref count; if this removes the file's
     /// last referrer, the `file_id` is queued for unlink by the next sweep.
+    #[inline]
     pub fn remove(&mut self, key: &[u8]) -> bool {
+        // Nothing spilled (the normal state with disk offload on): there is
+        // no entry and no older copy to release, so the outcome is `false`
+        // with no side effect. Every hot-key overwrite calls this
+        // (`set_recording`), and the walk below hashed the key and probed an
+        // empty map: ~200 instructions per `SET` (callgrind, R3 fix-e).
+        if self.map.is_empty() && self.older_copies.is_empty() {
+            return false;
+        }
+        self.remove_present(key)
+    }
+
+    /// [`Self::remove`] once the index holds anything.
+    #[inline(never)]
+    fn remove_present(&mut self, key: &[u8]) -> bool {
         self.release_older_copies_of(key);
         if let Some(old) = self.remove_raw(key) {
             if self.ref_dec(old.file_id) {
