@@ -46,6 +46,16 @@
 //! This file is compiled into `tests/loom_aof_lane.rs` through `#[path]`;
 //! keep it self-contained (`std` only).
 
+/// The buffer keeps at least this much capacity between writes (the AOF
+/// writer's `group_commit::BATCH_BUF_RETAIN_FLOOR`)...
+const BUF_RETAIN_FLOOR: usize = 64 * 1024;
+
+/// ...and gives a burst's capacity back only after this many consecutive
+/// writes used at most a quarter of it (`BATCH_BUF_SHRINK_AFTER`): a steady
+/// load settles to zero allocations per write, a one-off burst does not pin
+/// megabytes per shard forever.
+const BUF_SHRINK_AFTER: u32 = 64;
+
 /// Who owns the append position (see the module doc).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Mode {
@@ -98,6 +108,8 @@ pub(crate) struct LaneCore<C, F> {
     /// Producers between a full-channel `try_send` (decided under the lock)
     /// and the end of their slow send (spill, park, or give up).
     slow_senders: usize,
+    /// Consecutive small writes (see [`BUF_SHRINK_AFTER`]).
+    small_streak: u32,
 }
 
 impl<C, F> Default for LaneCore<C, F> {
@@ -117,6 +129,7 @@ impl<C, F> LaneCore<C, F> {
             buf: Vec::new(),
             write_failed: false,
             slow_senders: 0,
+            small_streak: 0,
         }
     }
 
@@ -170,7 +183,7 @@ impl<C, F> LaneCore<C, F> {
         };
         let len = self.buf.len();
         let result = write(file, &self.buf);
-        self.buf.clear();
+        self.retain_or_shrink();
         match result {
             Ok(()) => Flushed::Wrote(len),
             Err(_) => {
@@ -180,6 +193,23 @@ impl<C, F> LaneCore<C, F> {
                 Flushed::Failed
             }
         }
+    }
+
+    /// Empty the buffer after a write, keeping its capacity unless a long run
+    /// of small writes says a burst is over (shrink hysteresis).
+    fn retain_or_shrink(&mut self) {
+        let cap = self.buf.capacity();
+        if cap > BUF_RETAIN_FLOOR && self.buf.len() <= cap / 4 {
+            self.small_streak += 1;
+            if self.small_streak >= BUF_SHRINK_AFTER {
+                self.buf.clear();
+                self.buf.shrink_to(BUF_RETAIN_FLOOR);
+                self.small_streak = 0;
+            }
+        } else {
+            self.small_streak = 0;
+        }
+        self.buf.clear();
     }
 
     /// DIRECT → WRITER, writing the buffer first. The context stays parked
@@ -351,6 +381,28 @@ mod tests {
         assert_eq!(back.ctx, Some(7));
         // Taken back: the latch moved to the writer.
         assert!(c.may_release());
+    }
+
+    #[test]
+    fn a_burst_capacity_is_kept_then_given_back_after_small_writes() {
+        let mut c = direct();
+        assert!(c.frame_with(|_, buf| buf.resize(1 << 20, b'x')));
+        assert_eq!(c.flush(ok), Flushed::Wrote(1 << 20));
+        assert!(c.buf.capacity() >= 1 << 20, "a burst's capacity is kept");
+        for _ in 0..BUF_SHRINK_AFTER - 1 {
+            assert!(c.frame_with(|_, buf| buf.push(b'y')));
+            assert_eq!(c.flush(ok), Flushed::Wrote(1));
+        }
+        assert!(
+            c.buf.capacity() >= 1 << 20,
+            "not before the streak completes"
+        );
+        assert!(c.frame_with(|_, buf| buf.push(b'y')));
+        assert_eq!(c.flush(ok), Flushed::Wrote(1));
+        assert!(
+            c.buf.capacity() <= BUF_RETAIN_FLOOR,
+            "given back after the streak"
+        );
     }
 
     #[test]
