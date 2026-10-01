@@ -315,15 +315,21 @@ tuning knobs — but understanding them explains the durability/throughput trade
   single contiguous `write_all`, not one `write(2)` per record — so the writer
   thread is not syscall-bound at high pipeline depth (this is what makes
   `everysec` P16 beat Redis rather than trail it).
-- **Writer poll: warm, then parked (`everysec`/`no`).** While writes flow, the
-  AOF writer thread polls its channel every 500 µs instead of parking in a
-  blocking receive: a parked receiver forces every shard thread to issue a
-  futex wake on each write — at non-pipelined `everysec` load that was ~150k
-  wakes/sec of pure overhead on the hot path. After 5 ms with nothing queued it
-  parks, so the first write after an idle period wakes it at once (one futex
-  wake) instead of waiting out a poll step (moon#1266: that step was up to
-  50 ms). Under `always` the writer always parks (the client is already blocked
-  on the fsync ack, so receive latency there is client-visible RTT anyway).
+- **The shard thread writes its own AOF records (`everysec`/`no`, moon#1266
+  1A).** Each shard frames its records (the same `SELECT` / `MOON.TS` /
+  `MOON.TXN` records the writer emitted) into a per-shard buffer and writes
+  it with ONE `write(2)` per event-loop iteration, before that iteration's
+  replies leave: under monoio's io_uring driver right before the
+  `io_uring_enter` that submits the replies (redis's `beforeSleep`), under
+  the epoll/kqueue driver and tokio right before each reply write, and before
+  any reply handed to another shard. The AOF writer thread keeps the fsync,
+  rewrites and `always`, and takes the append position back for each of
+  them. No channel hop, no writer wake-up and no warm poll on the write path:
+  measured CPU per write drops 10–50% (see `plans/WS46-aof-1a`). A slow disk
+  now stalls the shard's `write(2)` instead of filling a queue — redis's
+  behaviour too. `MOON_AOF_SHARD_WRITE=0` restores the writer-thread path
+  (Option 3: the writer polls its channel every 500 µs while writes flow,
+  parks after 5 ms idle; `docs/internal/env-knobs.md`).
 - **The `everysec` fsync runs on an agent thread (moon#1266).** Each AOF writer
   has an `aof-fsync-<n>` thread; once a second the writer hands it the fsync and
   goes straight back to writing, so a slow disk no longer stops the writer from
@@ -362,26 +368,27 @@ sees no reply until it returns), `everysec` remains RPO ≤ 1 s against an OS cr
 or power loss. See `BENCHMARK.md` §7.3 for the measured before/after matrix.
 
 **What a process crash (`kill -9`, OOM kill, panic) can lose under `everysec`.**
-A SIGKILL does not touch the kernel page cache, so a record survives it once the
-AOF writer has `write(2)`-n it; only an OS crash or power loss needs the fsync.
-moon acknowledges a write when its record is queued to the shard's writer, so
-the exposure to a process crash is the time from the ack to that `write(2)`:
-one poll step (500 µs) while writes flow, one thread wake-up after an idle
-period, plus any time the writer thread is not scheduled or its `write(2)`
-blocks. `tests/aof_everysec_kill9_1266.rs` measures it: 10,000 acked SETs
-(unpipelined, or pipelined 100 deep) or one SET after an idle second, SIGKILL
-1 ms after the last ack, restart, count what is missing. On a 4-vCPU Linux
-container shared with other builds (2026-09-30, 20 reps per cell, `--shards`
-1 and 4): before moon#1266 Option 3, 226 of 240 reps lost acked writes (median
-rep 1–1,100 keys, worst 10,000); after it, 9 of 240 reps did in the run of
-the final binaries (monoio 5 of 120: 3, 18, 400, 546 and 1,100 keys; tokio 4 of
-120: 1, 1, 1 and 800). A second 20-rep tokio run lost in 7 of its 120 reps (up
-to 40 keys), so across both tokio runs the total is 16 of 360 reps. Every lossy
-rep was a writer stalled or descheduled for longer than the 1 ms kill delay. A kill inside that sub-millisecond window,
-or while the writer thread is starved of CPU or its `write(2)` stalls, can
-still lose the last acknowledged writes. redis
-has no such window: it `write(2)`s its AOF buffer before it sends the replies
-of an event-loop iteration (moon#1266 option 1A is the measured follow-up).
+A SIGKILL does not touch the kernel page cache, so a record survives it once it
+has been `write(2)`-n; only an OS crash or power loss needs the fsync. Since
+moon#1266 1A (the default) the shard thread writes its records before it sends
+the replies that acknowledge them (above), so **a process crash loses no
+acknowledged write** — redis's guarantee. `tests/aof_everysec_kill9_1266.rs`
+measures it: 10,000 acked SETs (unpipelined, or pipelined 100 deep) or one SET
+after an idle second, SIGKILL 1 ms after the last ack, restart, count what is
+missing; 20 reps per cell, `--shards` 1 and 4, both runtimes, on a 4-vCPU Linux
+container shared with other builds (2026-10-01): **0 of 240 reps lost
+anything**. Before 1A: Option 3 (writer thread, 500 µs pickup) lost in 9 of 240
+reps, and before Option 3, 226 of 240 (median rep 1–1,100 keys).
+
+Two exceptions remain:
+- **Inside a BGREWRITEAOF fold.** The AOF writer takes the append position back
+  for the fold; records acknowledged while it runs reach the file when the
+  fold ends (its post-fold drain, normally milliseconds; longer with a large
+  dataset), as before 1A. A kill -9 inside that window can lose them. redis
+  has no such window — its multi-part manifest lists the new incr from the
+  rewrite's start. Closing it needs the same manifest change (follow-up).
+- **`MOON_AOF_SHARD_WRITE=0`** (the escape hatch) restores the writer-thread
+  path, whose window is the writer's pickup latency plus any writer stall.
 
 **redis's own `everysec` is not absolutely kill-9-safe either.** When the
 previous background fsync is still running, redis *postpones the write* of its
@@ -392,9 +399,9 @@ and counts `aof_delayed_fsync`. So on a slow disk redis can lose up to ~2 s of
 acknowledged writes to a process crash (0 on a healthy disk). moon never
 postpones the write — only the fsync; its `aof_delayed_fsync` counts the same
 2 s periods —
-so a slow fsync by itself opens no window; a `write(2)` that the kernel makes
-wait behind that fsync still delays the record, and that wait is part of the
-window above.
+so a slow fsync by itself opens no window: a `write(2)` that the kernel makes
+wait behind that fsync delays the shard's replies (they wait for the write), it
+does not let one through ahead of its record.
 
 ### RDB snapshots
 

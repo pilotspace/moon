@@ -72,7 +72,7 @@ Moon ships three `appendfsync` modes and a disk-offload cold tier.
 | `appendfsync` | Process crash (SIGKILL) | OS crash / power loss | Disk full |
 |---|---|---|---|
 | `always` | RPO = 0 | RPO = 0 | Graceful `MOONERR diskfull`; no silent loss |
-| `everysec` (default) | RPO ≤ acked writes the AOF writer has not yet `write(2)`-n: its pickup latency (≤ ~0.5 ms while writing) plus any stall of the writer thread (moon#1266; `tests/aof_everysec_kill9_1266.rs`, production-guide "What a process crash can lose") | RPO ≤ 1 s (+ a slow fsync; never postpones the write) | Graceful `MOONERR diskfull` |
+| `everysec` (default) | RPO = 0 for acknowledged writes: the shard thread `write(2)`s its records before the replies that acknowledge them (moon#1266 1A; `tests/aof_everysec_kill9_1266.rs`). Exception: writes acknowledged inside a BGREWRITEAOF fold reach the file at the fold's end (production-guide "What a process crash can lose") | RPO ≤ 1 s (+ a slow fsync; never postpones the write) | Graceful `MOONERR diskfull` |
 | `no` | RPO = OS flush window | RPO = OS flush window (minutes) | Graceful `MOONERR diskfull` |
 
 `appendfsync=no` is cache-mode only — do not use for primary storage. Recovery order: RDB snapshot →

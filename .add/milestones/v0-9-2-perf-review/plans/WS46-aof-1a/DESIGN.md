@@ -77,5 +77,19 @@ full-channel `try_send` and their slow (parking) send.
 
 ## 4. Switch
 
-`MOON_AOF_SHARD_WRITE=1` enables 1A (read once). Off = Option 3 byte for byte
-(the pool skips the lane entirely). Same binary for the A/B.
+`MOON_AOF_SHARD_WRITE` (read once). Built default-off for the A/B, then
+flipped to default ON once the gate passed (SUMMARY). `0` = Option 3 byte for
+byte (the pool skips the lane entirely; the monoio writer warm-polls again) —
+the same-binary A/B knob and the escape hatch. The warm poll stays in the code
+for that path only: removing it would make the escape hatch a regression
+against Option 3 (a futex wake per record from every producer).
+
+## 5. Residual: a kill -9 inside a BGREWRITEAOF fold
+
+The writer holds the append position for the whole fold; records acked while
+it runs are written at the fold's post-fold drain (as in Option 3). redis has
+no such window because its multi-part manifest lists the new incr from the
+rewrite's start, so its main thread keeps writing to a file that is already
+part of the recoverable set. Closing it here needs the same manifest change
+(the new incr listed before the snapshot, the old generation kept until the
+fold commits) — a follow-up, not WS46.
