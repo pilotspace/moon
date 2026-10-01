@@ -347,3 +347,66 @@ fn whole_and_two_database_writes_release_their_keys() {
     );
     assert_eq!(get(&mut d, 0, b"c"), Some(b"moved".to_vec()));
 }
+
+/// Feed every RESP frame of `buf` (a replicated unit) to the engine.
+fn feed(engine: &DispatchReplayEngine, d: &mut [Database], sel: &mut usize, buf: &[u8]) {
+    let mut buf = bytes::BytesMut::from(buf);
+    let cfg = crate::protocol::ParseConfig::default();
+    while let Some(frame) = crate::protocol::parse::parse(&mut buf, &cfg).expect("parse") {
+        let Frame::Array(arr) = frame else {
+            panic!("not an array")
+        };
+        let Frame::BulkString(name) = &arr[0] else {
+            panic!("name")
+        };
+        engine.replay_command(d, name, &arr[1..], sel);
+    }
+    assert!(buf.is_empty());
+}
+
+fn set_record(key: &[u8], value: &[u8]) -> Vec<u8> {
+    let mut out = b"*3\r\n$3\r\nSET\r\n".to_vec();
+    for w in [key, value] {
+        out.extend_from_slice(format!("${}\r\n", w.len()).as_bytes());
+        out.extend_from_slice(w);
+        out.extend_from_slice(b"\r\n");
+    }
+    out
+}
+
+/// R2b W1: a multi-shard master merges its shards' records into one
+/// replication stream, and each shard's transaction manager issues the same
+/// ids (1, 2, 3, …). As written by the master (`txn_log::repl_record`,
+/// `aof::txn_end_record`), shard 0's END of its transaction 1 must not
+/// close shard 1's transaction 1: that block is still rolled back.
+#[test]
+fn two_shards_same_manager_id_stay_two_blocks() {
+    use crate::persistence::aof::txn_end_record;
+    use crate::server::conn::txn_log::repl_record;
+    let engine = DispatchReplayEngine::new();
+    let mut d = dbs();
+    let mut sel = 0;
+    rec(&engine, &mut d, &mut sel, &[b"SET", b"a", b"origA"]);
+    rec(&engine, &mut d, &mut sel, &[b"SET", b"b", b"origB"]);
+    feed(
+        &engine,
+        &mut d,
+        &mut sel,
+        &repl_record(0, 1, &set_record(b"a", b"txnA")),
+    );
+    feed(
+        &engine,
+        &mut d,
+        &mut sel,
+        &repl_record(1, 1, &set_record(b"b", b"txnB")),
+    );
+    feed(&engine, &mut d, &mut sel, &txn_end_record(0, 1));
+    assert_eq!(get(&mut d, 0, b"b"), Some(b"txnB".to_vec()));
+    assert_eq!(
+        engine.finish_log(&mut d),
+        1,
+        "shard 1's block is still open"
+    );
+    assert_eq!(get(&mut d, 0, b"a"), Some(b"txnA".to_vec()), "committed");
+    assert_eq!(get(&mut d, 0, b"b"), Some(b"origB".to_vec()), "rolled back");
+}
