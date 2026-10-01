@@ -425,7 +425,7 @@ fn a_held_key_streams_its_pre_transaction_image() {
         isolation::txn_begin(txn);
         let key = Bytes::from_static(b"big:h");
         let pre = dbs[0].data().get(b"big:h").cloned();
-        assert!(isolation::hold(0, &key, txn, || pre));
+        assert!(isolation::hold(0, &key, txn, pre));
         // The transaction's own write, before the save starts.
         let owner = isolation::OwnerScope::enter(txn);
         assert_eq!(
