@@ -42,6 +42,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::storage::compact_key::CompactKey;
+use crate::storage::dashtable::segment::{Segment, TOTAL_SLOTS, h2};
 use crate::storage::dashtable::{DashTable, hash_key};
 use crate::storage::entry::Entry;
 
@@ -292,16 +293,31 @@ impl ExpiryWheel {
 
 /// Find the live key a reference names: scan the one segment the hash selects
 /// for an entry whose OWN deadline is `ts` and whose hash agrees on the 56
-/// bits a reference carries. Cheap field test first, hash only on a match.
+/// bits a reference carries.
+///
+/// The scan walks the segment's control bytes only and touches a slot's key
+/// and value just when its 7-bit tag equals the hash's `h2` (the same filter
+/// a normal probe uses), so it costs one control-byte line plus ~1.5 candidate
+/// slots, not a read of all 60 entries. `iter_occupied` yields the occupied
+/// slots in ascending slot order, so zipping it with the ascending list of
+/// FULL slots recovers each slot's control byte without any unsafe access.
 pub(crate) fn resolve(
     data: &DashTable<CompactKey, Entry>,
     ts: u64,
     hash: u64,
 ) -> Option<&CompactKey> {
-    data.segment(data.segment_index_for_hash(hash))
-        .iter_occupied()
-        .find(|(k, e)| e.expires_at_ms() == ts && (hash_key(k.as_bytes()) & !0xFF) == hash)
-        .map(|(k, _)| k)
+    let seg = data.segment(data.segment_index_for_hash(hash));
+    let tag = h2(hash);
+    let full_slots = (0..TOTAL_SLOTS)
+        .filter(|s| Segment::<CompactKey, Entry>::is_full_ctrl_pub(seg.ctrl_byte(*s)));
+    full_slots
+        .zip(seg.iter_occupied())
+        .find(|(slot, (k, e))| {
+            seg.ctrl_byte(*slot) == tag
+                && e.expires_at_ms() == ts
+                && (hash_key(k.as_bytes()) & !0xFF) == hash
+        })
+        .map(|(_, (k, _))| k)
 }
 
 #[cfg(test)]

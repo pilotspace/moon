@@ -304,3 +304,141 @@ fn the_env_switch_selects_the_index_kind() {
     assert_eq!(Database::new().expiry_wheel_enabled(), want);
     assert_eq!(Database::with_capacity(16).expiry_wheel_enabled(), want);
 }
+
+// ── A/B micro-bench (ignored): the data-structure cost, in-process ───────
+//
+// `cargo test --profile release-fast --lib expiry_wheel_tests::bench_index_ab \
+//    -- --ignored --nocapture --test-threads 1`
+//
+// Single thread, pre-built keys, min of REPS interleaved reps per cell — far
+// less sensitive to a shared box than a server-level run, but it measures the
+// index + the keyspace write around it, NOT the network path: read the ratios,
+// not the absolutes.
+#[test]
+#[ignore = "A/B micro-bench: run with --ignored --nocapture"]
+fn bench_index_ab() {
+    use std::time::Instant;
+    const N: usize = 1_000_000;
+    const REPS: usize = 5;
+    let keys_short: Vec<String> = (0..N).map(|i| format!("k:{i:07}")).collect();
+    let keys_long: Vec<String> = (0..N)
+        .map(|i| format!("user:session:token:{i:010}"))
+        .collect();
+    let now = current_time_ms();
+    let mut rng = Rng(0x2545_F491_4F6C_DD1D);
+    let order: Vec<usize> = (0..N).map(|_| rng.below(N as u64) as usize).collect();
+    let fresh_db = |wheel: bool| {
+        let mut db = Database::with_capacity(N);
+        db.set_expiry_wheel(wheel);
+        db
+    };
+    // (cell, wheel) -> best ns/op over REPS.
+    let mut best = std::collections::BTreeMap::<(String, bool), f64>::new();
+    let mut put = |cell: &str, wheel: bool, ns: f64| {
+        let e = best.entry((cell.to_string(), wheel)).or_insert(f64::MAX);
+        if ns < *e {
+            *e = ns;
+        }
+    };
+    for rep in 0..REPS {
+        for &wheel in &[false, true] {
+            // Alternate which kind goes first per rep.
+            let wheel = wheel ^ (rep % 2 == 1);
+            for (kname, keys) in [("short", &keys_short), ("long", &keys_long)] {
+                // A. fresh TTL inserts, dense deadlines (same EX, rising clock).
+                let mut db = fresh_db(wheel);
+                let t = Instant::now();
+                for (i, k) in keys.iter().enumerate() {
+                    db.set(k.as_bytes(), volatile(now + 3_600_000 + (i / 100) as u64));
+                }
+                put(
+                    &format!("insert-dense/{kname}"),
+                    wheel,
+                    t.elapsed().as_nanos() as f64 / N as f64,
+                );
+                // B. TTL retarget (EXPIRE) of random existing keys.
+                let t = Instant::now();
+                for (j, &i) in order.iter().enumerate() {
+                    db.set_expiry(
+                        keys[i].as_bytes(),
+                        now + 3_600_000 + 50_000 + (j / 100) as u64,
+                    );
+                }
+                put(
+                    &format!("retarget/{kname}"),
+                    wheel,
+                    t.elapsed().as_nanos() as f64 / N as f64,
+                );
+                // C. volatile-ttl victim loop: nearest peek + remove.
+                let t = Instant::now();
+                let mut taken = 0usize;
+                while taken < N / 2 {
+                    let Some((_, k)) = db.peek_nearest_expiry() else {
+                        break;
+                    };
+                    db.remove(k.as_bytes());
+                    taken += 1;
+                }
+                put(
+                    &format!("nearest+remove/{kname}"),
+                    wheel,
+                    t.elapsed().as_nanos() as f64 / taken.max(1) as f64,
+                );
+                drop(db);
+                // D. drain a fully-due backlog through the real sweep.
+                let mut db = fresh_db(wheel);
+                for (i, k) in keys.iter().enumerate() {
+                    db.set(
+                        k.as_bytes(),
+                        volatile(now - 5_000 + (i / 100) as u64 % 4_000),
+                    );
+                }
+                let mut removed = 0usize;
+                let t = Instant::now();
+                while db.has_due_expiry(now) {
+                    expire_cycle_direct(&mut db, &mut |_| removed += 1);
+                }
+                put(
+                    &format!("drain/{kname}"),
+                    wheel,
+                    t.elapsed().as_nanos() as f64 / removed.max(1) as f64,
+                );
+            }
+        }
+    }
+    eprintln!(
+        "\n{:<24} {:>12} {:>12} {:>9}",
+        "cell (ns/op, min of 5)", "sorted-set", "wheel", "wheel/set"
+    );
+    let cells: std::collections::BTreeSet<String> = best.keys().map(|(c, _)| c.clone()).collect();
+    for c in cells {
+        let (a, b) = (best[&(c.clone(), false)], best[&(c.clone(), true)]);
+        eprintln!("{c:<24} {a:>12.1} {b:>12.1} {:>8.2}x", b / a);
+    }
+}
+
+/// `resolve` finds EVERY volatile key from its `(deadline, hash)` reference,
+/// across thousands of keys (many segments, splits, stash slots) — the
+/// control-byte zip must line up with `iter_occupied` slot for slot — and
+/// refuses a reference whose deadline differs by 1 ms.
+#[test]
+fn resolve_finds_every_key_and_only_at_its_own_deadline() {
+    use crate::storage::dashtable::hash_key;
+    use crate::storage::db::expiry_wheel::resolve;
+    let mut db = Database::new();
+    let now = current_time_ms();
+    for i in 0..20_000u64 {
+        db.set(key(i).as_bytes(), volatile(now + 1_000_000 + i % 977));
+    }
+    for i in 0..20_000u64 {
+        let k = key(i);
+        let ts = now + 1_000_000 + i % 977;
+        let h = hash_key(k.as_bytes()) & !0xFF;
+        let found = resolve(db.data(), ts, h).expect("resolvable");
+        assert_eq!(found.as_bytes(), k.as_bytes());
+        assert!(
+            resolve(db.data(), ts + 1, h).is_none(),
+            "deadline is authoritative"
+        );
+    }
+}
