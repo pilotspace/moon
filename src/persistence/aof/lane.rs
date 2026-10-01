@@ -20,9 +20,9 @@
 //!   ahead of its replies' SQEs ([`install_for_shard`]);
 //! - every other driver (monoio legacy/epoll/kqueue, SQPOLL, tokio) writes a
 //!   reply inside the task: the reply macros call
-//!   [`flush_before_reply_coalesced`] (one write per scheduler round), the
-//!   rarer early flushes (before a blocking command, SUBSCRIBE)
-//!   [`flush_before_reply`];
+//!   [`flush_before_reply_coalesced`] (tokio: one write per scheduler round;
+//!   monoio: one per connection batch), the rarer early flushes (before a
+//!   blocking command, SUBSCRIBE) [`flush_before_reply`];
 //! - a reply that leaves for ANOTHER thread (`OneshotSender::send`,
 //!   `ResponseSlot::fill`) calls [`flush_current`] first: the receiver may
 //!   put it on its socket before this thread's next park;
@@ -464,6 +464,12 @@ struct Coalesce {
     skip: u32,
 }
 
+/// Whether a task that wakes itself is queued BEHIND the tasks already
+/// runnable (tokio's current-thread scheduler), so a yield lets the round's
+/// other connections run first. Not under monoio (see
+/// [`flush_before_reply_coalesced`]).
+const YIELD_REACHES_THE_ROUND: bool = !cfg!(feature = "runtime-monoio");
+
 /// A run of this many fruitless yields (a lone connection) ...
 const COALESCE_MISSES: u32 = 16;
 /// ... stops the yielding for this many replies, then it is tried again.
@@ -489,17 +495,27 @@ impl std::future::Future for YieldOnce {
 }
 
 /// [`flush_before_reply`] for a connection's reply write, coalesced per
-/// scheduler round on the drivers whose writes run inside the task (epoll /
-/// kqueue, SQPOLL, tokio): when this thread has records buffered, the reply
-/// first yields once, so the other connections that are ready in the same
-/// round run their commands too, and ONE `write(2)` then covers all of them
-/// (the first of them to resume writes; the rest find the lane clean) —
+/// scheduler round under tokio: when this thread has records buffered, the
+/// reply first yields once, so the other connections that are ready in the
+/// same round run their commands too, and ONE `write(2)` then covers all of
+/// them (the first of them to resume writes; the rest find the lane clean) —
 /// redis's one write per event-loop iteration, not one per connection. A lone
 /// connection gains nothing from the yield: after [`COALESCE_MISSES`]
 /// fruitless yields in a row the replies stop yielding for [`COALESCE_SKIP`]
 /// replies, then try again. The write still precedes the reply in every case.
+///
+/// monoio re-polls a task that woke itself BEFORE the rest of its queue
+/// (`LocalScheduler::yield_now` pushes it to the front), so a yield cannot
+/// let the round's other connections in: on monoio's epoll/kqueue driver (and
+/// SQPOLL) the reply flushes at once — one write per connection batch. (Its
+/// io_uring driver never gets here: the before-submit hook writes once per
+/// iteration.)
 pub async fn flush_before_reply_coalesced() {
     if !INLINE_REPLIES.try_with(Cell::get).unwrap_or(true) || !current_dirty() {
+        return;
+    }
+    if !YIELD_REACHES_THE_ROUND {
+        flush_current();
         return;
     }
     let mut state = COALESCE
@@ -818,6 +834,7 @@ mod tests {
     }
 
     /// A released lane bound to this thread, over a temp file.
+    #[cfg(not(feature = "runtime-monoio"))]
     fn bound_direct_lane() -> (
         Arc<AofLane>,
         channel::MpscSender<AofMessage>,
@@ -836,12 +853,16 @@ mod tests {
         (lane, tx, dir)
     }
 
+    #[cfg(not(feature = "runtime-monoio"))]
     fn unbind() {
         let _ = CURRENT.try_with(|c| c.borrow_mut().take());
     }
 
     /// Connections ready in the same scheduler round share ONE write: each
     /// appends, then yields at its reply; the first to resume writes them all.
+    /// (The round here is a tokio `LocalSet`; under the monoio feature the
+    /// reply does not yield — see `YIELD_REACHES_THE_ROUND`.)
+    #[cfg(not(feature = "runtime-monoio"))]
     #[test]
     fn replies_in_one_round_share_one_write() {
         let (lane, tx, dir) = bound_direct_lane();
@@ -888,6 +909,7 @@ mod tests {
 
     /// A lone connection: after a run of fruitless yields the replies stop
     /// yielding (and still write before every reply).
+    #[cfg(not(feature = "runtime-monoio"))]
     #[test]
     fn a_lone_connection_stops_yielding() {
         let (lane, tx, _dir) = bound_direct_lane();
