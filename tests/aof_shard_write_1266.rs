@@ -17,6 +17,16 @@
 //! - `MOON.TXN` / `MOON.TS` / `SELECT` framing moved with the position: a
 //!   multi-db stream with a TXN that commits and one left open across the
 //!   kill recovers the committed one and rolls the open one back.
+//! - no reply-before-write window while the writer owns the append position
+//!   outside a fold (W2B-1 of the R2b review): a pipeline sent right after
+//!   the FIRST `PING` of a fresh server, and one sent right after `CONFIG SET
+//!   appendfsync always` → `everysec`, survive a kill -9 on their last ack
+//!   (10 reps each); and leaving `always` under a steady write load hands the
+//!   position back to the shard threads (the hold does not livelock).
+//!
+//! The driver is the binary's default; run the suite again with
+//! `MOON_NO_URING=1` in the environment for monoio's epoll driver (the
+//! servers inherit it).
 //!
 //! ```text
 //! MOON_BIN=/path/to/moon MOON_DISK_FREE_MIN_PCT=0 \
@@ -106,7 +116,8 @@ fn switch_decides_who_writes(shards: usize) {
         let (_server, port) =
             common::spawn_listening_guarded(|port| start_moon(port, dir.path(), shards, switch));
         let mut c = conn(port);
-        // The writer hands the position over at the end of its first wake.
+        // The writer hands the position over at the top of its first wake;
+        // the sleep only lets a slow box get there.
         std::thread::sleep(Duration::from_millis(300));
         let cmds: Vec<Vec<String>> = (0..200)
             .map(|i| vec!["SET".into(), format!("k{i}"), "v".into()])
@@ -325,4 +336,306 @@ fn framing_moves_with_the_append_position_s1() {
 #[ignore = "spawns real servers"]
 fn framing_moves_with_the_append_position_s4() {
     framing_moves_with_the_position(4);
+}
+
+/// SETs of `n` keys named `{prefix}{i}` (spread over the shards), pipelined
+/// in ONE write; every reply must be `+OK`.
+fn pipelined_sets(c: &mut common::Conn, prefix: &str, n: usize) {
+    let cmds: Vec<[String; 3]> = (0..n)
+        .map(|i| ["SET".into(), format!("{prefix}{i}"), i.to_string()])
+        .collect();
+    let refs: Vec<[&str; 3]> = cmds
+        .iter()
+        .map(|[a, b, v]| [a.as_str(), b.as_str(), v.as_str()])
+        .collect();
+    let slices: Vec<&[&str]> = refs.iter().map(|a| a.as_slice()).collect();
+    let replies = c.pipeline(&slices);
+    assert_eq!(replies.matches("+OK").count(), n, "{replies}");
+}
+
+const KILL_REPS: usize = 10;
+/// Connections that pipeline at once, each under its own hash tag (so each
+/// pipeline lives on ONE shard, and under `--shards 4` some connection's
+/// pipeline is local to its own shard: its acks leave with no cross-shard
+/// hop to give a writer time).
+const CONNS: usize = 16;
+const PIPELINE: usize = 200;
+
+/// Key `i` of connection `j`'s pipeline.
+fn tagged_key(prefix: &str, j: usize, i: usize) -> String {
+    format!("{{{prefix}{j}}}:{i}")
+}
+
+/// Kill on ack: every connection (already open) sends a `PIPELINE`-SET
+/// pipeline at once and counts its `+OK`s as they arrive; the instant the
+/// first connection has all of its acks, the server is SIGKILLed. Returns
+/// each connection's acks — every one of them was sent before the kill.
+fn pipelines_then_kill_on_first_complete(
+    server: &mut common::ServerGuard,
+    port: u16,
+    streams: Vec<std::net::TcpStream>,
+    prefix: &str,
+) -> Vec<usize> {
+    use std::io::{Read, Write};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let acks: std::sync::Arc<Vec<AtomicUsize>> =
+        std::sync::Arc::new((0..streams.len()).map(|_| AtomicUsize::new(0)).collect());
+    let readers: Vec<_> = streams
+        .into_iter()
+        .enumerate()
+        .map(|(j, mut s)| {
+            let mut out = Vec::new();
+            for i in 0..PIPELINE {
+                let key = tagged_key(prefix, j, i);
+                out.extend_from_slice(&common::encode(&["SET", &key, &i.to_string()]));
+            }
+            let acks = std::sync::Arc::clone(&acks);
+            std::thread::spawn(move || {
+                s.write_all(&out).expect("send pipeline");
+                let mut seen = Vec::new();
+                let mut buf = [0u8; 4096];
+                loop {
+                    match s.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            seen.extend_from_slice(&buf[..n]);
+                            let oks = seen.windows(5).filter(|w| w == b"+OK\r\n").count();
+                            acks[j].store(oks, Ordering::Release);
+                            if oks >= PIPELINE {
+                                break;
+                            }
+                        }
+                    }
+                }
+            })
+        })
+        .collect();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !acks.iter().any(|a| a.load(Ordering::Acquire) >= PIPELINE) {
+        assert!(Instant::now() < deadline, "no pipeline was acked in 30 s");
+        std::hint::spin_loop();
+    }
+    server.kill_now();
+    common::wait_for_port_down(port);
+    for r in readers {
+        r.join().expect("reader");
+    }
+    acks.iter().map(|a| a.load(Ordering::Acquire)).collect()
+}
+
+/// Open `CONNS` raw connections at once, then PING them all at once (in the
+/// boot test these PONGs are the server's first).
+fn raw_conns(port: u16) -> Vec<std::net::TcpStream> {
+    use std::io::{Read, Write};
+    let mut streams: Vec<std::net::TcpStream> = (0..CONNS)
+        .map(|_| {
+            let s = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
+            s.set_nodelay(true).expect("nodelay");
+            s
+        })
+        .collect();
+    for s in &mut streams {
+        s.write_all(&common::encode(&["PING"])).expect("ping");
+    }
+    for s in &mut streams {
+        let mut b = [0u8; 7];
+        s.read_exact(&mut b).expect("pong");
+        assert_eq!(&b, b"+PONG\r\n");
+    }
+    streams
+}
+
+/// Restart on `dir`; count the acked keys (connection `j`'s first
+/// `acked[j]`) that did not come back with their value.
+fn lost_after_restart(
+    dir: &std::path::Path,
+    shards: usize,
+    prefix: &str,
+    acked: &[usize],
+) -> usize {
+    let (_server, port) =
+        common::spawn_listening_guarded(|port| start_moon(port, dir, shards, "1"));
+    let mut c = wait_loaded(port);
+    let mut lost = 0;
+    for (j, &n) in acked.iter().enumerate() {
+        if n == 0 {
+            continue;
+        }
+        let keys: Vec<String> = (0..n).map(|i| tagged_key(prefix, j, i)).collect();
+        let gets: Vec<[&str; 2]> = keys.iter().map(|k| ["GET", k.as_str()]).collect();
+        let slices: Vec<&[&str]> = gets.iter().map(|a| a.as_slice()).collect();
+        let replies = c.pipeline(&slices);
+        // Bulk replies: `$<len>` then the value; nil is `$-1` (or `_`).
+        let mut values = Vec::with_capacity(n);
+        let mut lines = replies.lines();
+        while let Some(l) = lines.next() {
+            if l.starts_with("$-1") || l.starts_with('_') {
+                values.push(None);
+            } else if l.starts_with('$') {
+                values.push(lines.next().map(str::to_owned));
+            }
+        }
+        assert_eq!(values.len(), n, "{replies}");
+        lost += values
+            .iter()
+            .enumerate()
+            .filter(|(i, v)| v.as_deref() != Some(i.to_string().as_str()))
+            .count();
+    }
+    lost
+}
+
+/// The boot window: right after the first `PONG`, `CONNS` connections each
+/// send a SET pipeline; kill -9 the instant one has all its acks. The writer
+/// may not have handed the append position over yet — the replies must
+/// then wait for its acks (the lane is held from attach to the first
+/// hand-over).
+fn boot_window_kill_on_ack(shards: usize) {
+    let mut lossy = Vec::new();
+    for rep in 0..KILL_REPS {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut server, port) =
+            common::spawn_listening_guarded(|port| start_moon(port, dir.path(), shards, "1"));
+        let streams = raw_conns(port); // the server's first PONGs
+        let acked = pipelines_then_kill_on_first_complete(&mut server, port, streams, "boot");
+        let lost = lost_after_restart(dir.path(), shards, "boot", &acked);
+        if lost > 0 {
+            lossy.push((rep, lost, acked.iter().sum::<usize>()));
+        }
+    }
+    assert!(
+        lossy.is_empty(),
+        "shards={shards}: acked writes lost after a kill on ack in the boot window \
+         ((rep, keys lost, keys acked): {lossy:?})"
+    );
+}
+
+#[test]
+#[ignore = "spawns real servers"]
+fn boot_window_kill_on_ack_loses_nothing_s1() {
+    boot_window_kill_on_ack(1);
+}
+
+#[test]
+#[ignore = "spawns real servers"]
+fn boot_window_kill_on_ack_loses_nothing_s4() {
+    boot_window_kill_on_ack(4);
+}
+
+/// The policy-switch window: `CONFIG SET appendfsync always` (writes acked
+/// under it, so every writer has taken the position back), then `everysec`,
+/// then at once `CONNS` SET pipelines; kill -9 the instant one has all its
+/// acks.
+fn after_always_kill_on_ack(shards: usize) {
+    let mut lossy = Vec::new();
+    for rep in 0..KILL_REPS {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut server, port) =
+            common::spawn_listening_guarded(|port| start_moon(port, dir.path(), shards, "1"));
+        let mut c = conn(port);
+        let streams = raw_conns(port);
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(
+            c.send(&["CONFIG", "SET", "appendfsync", "always"])
+                .contains("OK")
+        );
+        pipelined_sets(&mut c, "warm", 64);
+        assert!(
+            c.send(&["CONFIG", "SET", "appendfsync", "everysec"])
+                .contains("OK")
+        );
+        let acked = pipelines_then_kill_on_first_complete(&mut server, port, streams, "cfg");
+        let lost = lost_after_restart(dir.path(), shards, "cfg", &acked);
+        if lost > 0 {
+            lossy.push((rep, lost, acked.iter().sum::<usize>()));
+        }
+    }
+    assert!(
+        lossy.is_empty(),
+        "shards={shards}: acked writes lost after a kill on ack right after leaving \
+         `always` ((rep, keys lost, keys acked): {lossy:?})"
+    );
+}
+
+#[test]
+#[ignore = "spawns real servers"]
+fn after_always_kill_on_ack_loses_nothing_s1() {
+    after_always_kill_on_ack(1);
+}
+
+#[test]
+#[ignore = "spawns real servers"]
+fn after_always_kill_on_ack_loses_nothing_s4() {
+    after_always_kill_on_ack(4);
+}
+
+/// Leaving `always` while 8 connections keep writing: the writers must hand
+/// the position back to the shard threads (`aof_shard_writes` grows again)
+/// even though the held producers keep their channel busy.
+fn leaving_always_under_load_hands_over(shards: usize) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (_server, port) =
+        common::spawn_listening_guarded(|port| start_moon(port, dir.path(), shards, "1"));
+    let mut c = conn(port);
+    assert!(
+        c.send(&["CONFIG", "SET", "appendfsync", "always"])
+            .contains("OK")
+    );
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let writers: Vec<_> = (0..8)
+        .map(|w| {
+            let stop = std::sync::Arc::clone(&stop);
+            std::thread::spawn(move || {
+                let mut c = conn(port);
+                let mut i = 0usize;
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    pipelined_sets(&mut c, &format!("load{w}:{i}:"), 16);
+                    i += 1;
+                }
+            })
+        })
+        .collect();
+    std::thread::sleep(Duration::from_millis(300));
+    let under_always = info_u64(&mut c, "aof_shard_writes");
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(
+        info_u64(&mut c, "aof_shard_writes"),
+        under_always,
+        "under `always` the writer owns the position"
+    );
+    assert!(
+        c.send(&["CONFIG", "SET", "appendfsync", "everysec"])
+            .contains("OK")
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let handed_over = loop {
+        std::thread::sleep(Duration::from_millis(50));
+        if info_u64(&mut c, "aof_shard_writes") > under_always {
+            break true;
+        }
+        if Instant::now() > deadline {
+            break false;
+        }
+    };
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    for w in writers {
+        w.join().expect("writer");
+    }
+    assert!(
+        handed_over,
+        "shards={shards}: 5 s after leaving `always` under load the shard threads still \
+         do not write their own records"
+    );
+}
+
+#[test]
+#[ignore = "spawns real servers"]
+fn leaving_always_under_load_hands_over_s1() {
+    leaving_always_under_load_hands_over(1);
+}
+
+#[test]
+#[ignore = "spawns real servers"]
+fn leaving_always_under_load_hands_over_s4() {
+    leaving_always_under_load_hands_over(4);
 }
