@@ -442,3 +442,59 @@ fn resolve_finds_every_key_and_only_at_its_own_deadline() {
         );
     }
 }
+
+/// Single-cell probe for `valgrind --tool=callgrind --toggle-collect=...`:
+/// instruction counts are deterministic where wall clocks on a shared box are
+/// not. `WS44_WHEEL=0|1 WS44_N=200000 WS44_LONG=0|1 WS44_MODE=drain|nearest`.
+#[test]
+#[ignore = "callgrind probe: run with --ignored --nocapture and the WS44_* env"]
+fn probe_one_cell() {
+    let env = |k: &str, d: &str| std::env::var(k).unwrap_or_else(|_| d.to_string());
+    let wheel = env("WS44_WHEEL", "0") == "1";
+    let n: usize = env("WS44_N", "200000").parse().unwrap();
+    let long = env("WS44_LONG", "0") == "1";
+    let mode = env("WS44_MODE", "drain");
+    let now = current_time_ms();
+    let mut db = Database::with_capacity(n);
+    db.set_expiry_wheel(wheel);
+    for i in 0..n {
+        let k = if long {
+            format!("user:session:token:{i:010}")
+        } else {
+            format!("k:{i:07}")
+        };
+        db.set(
+            k.as_bytes(),
+            volatile(now - 5_000 + (i / 100) as u64 % 4_000),
+        );
+    }
+    let mut removed = 0usize;
+    if mode == "drain" {
+        while db.has_due_expiry(now) {
+            probe_drain_step(&mut db, &mut removed);
+        }
+    } else {
+        for _ in 0..n / 2 {
+            if probe_nearest_step(&mut db) {
+                removed += 1;
+            }
+        }
+    }
+    eprintln!("probe wheel={wheel} mode={mode} long={long} n={n} removed={removed}");
+}
+
+#[inline(never)]
+fn probe_drain_step(db: &mut Database, removed: &mut usize) {
+    expire_cycle_direct(db, &mut |_| *removed += 1);
+}
+
+#[inline(never)]
+fn probe_nearest_step(db: &mut Database) -> bool {
+    match db.peek_nearest_expiry() {
+        Some((_, k)) => {
+            db.remove(k.as_bytes());
+            true
+        }
+        None => false,
+    }
+}
