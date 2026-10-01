@@ -26,8 +26,9 @@
 //! - the shard event loop flushes once per iteration (background records:
 //!   expiry, eviction), and once on exit.
 //!
-//! Off unless `MOON_AOF_SHARD_WRITE=1` ([`enabled`]): the pool then never
-//! touches a lane, and Option 3 runs unchanged.
+//! On by default; `MOON_AOF_SHARD_WRITE=0` ([`enabled`]) turns it off: the
+//! pool then never touches a lane, and Option 3 runs unchanged (the same-
+//! binary A/B, and the escape hatch).
 
 use std::cell::{Cell, RefCell};
 use std::sync::Arc;
@@ -43,8 +44,9 @@ use crate::runtime::channel;
 /// flushing iteration while 1A runs).
 pub static AOF_LANE_WRITES: AtomicU64 = AtomicU64::new(0);
 
-/// Option 1A when `MOON_AOF_SHARD_WRITE` is unset.
-const DEFAULT_ON: bool = false;
+/// Option 1A when `MOON_AOF_SHARD_WRITE` is unset: on (WS46 adopted it —
+/// `.add/milestones/v0-9-2-perf-review/plans/WS46-aof-1a/`).
+const DEFAULT_ON: bool = true;
 
 /// `MOON_AOF_SHARD_WRITE`: `1`/`on`/`yes`/`true` or `0`/`off`/`no`/`false`;
 /// anything else (or unset) is the default.
