@@ -712,6 +712,11 @@ enum AfterAbandon {
     /// `TXN ABORT`: the next sweep's round must publish and commit the
     /// compactions (the `adopt_ready` hook stops the server there).
     AbortAndRetry,
+    /// `TXN ABORT`, then `SHUTDOWN` (its default save, a save rule being
+    /// configured): the shutdown's save commits the pending compactions as
+    /// the process stops (or a retried round does first, and `adopt_ready`
+    /// stops it); the restart is that snapshot's point in time.
+    AbortAndShutdown,
 }
 
 fn abandoned_reclaim_round(end: AfterAbandon) {
@@ -802,8 +807,13 @@ fn abandoned_reclaim_round(end: AfterAbandon) {
     let after_round = snapshot_ids(&dir);
 
     let mut retried_exit = None;
-    if end == AfterAbandon::AbortAndRetry && stopped.is_none() {
+    if end != AfterAbandon::KillWithTxnOpen && stopped.is_none() {
         assert_eq!(t.send(&["TXN", "ABORT"]), OK);
+        if end == AfterAbandon::AbortAndShutdown {
+            let _ = std::process::Command::new("redis-cli")
+                .args(["-p", &port.to_string(), "SHUTDOWN"])
+                .output();
+        }
         retried_exit = wait_exit(&mut server, 60);
     }
     drop(t);
@@ -883,6 +893,23 @@ fn abandoned_reclaim_round(end: AfterAbandon) {
                 ));
             }
         }
+        AfterAbandon::AbortAndShutdown => {
+            // Exit 0: the shutdown's save published on every shard. Exit
+            // 87: a retried round committed first and one shard stopped at
+            // `adopt_ready`, maybe before the others published.
+            let ok = match retried_exit {
+                Some(0) => committed.iter().all(|c| *c),
+                Some(CRASH_EXIT) => committed.iter().any(|c| *c),
+                _ => false,
+            };
+            if stopped.is_none() && !ok {
+                wrong.push(format!(
+                    "SHUTDOWN after the abandoned round: exit {retried_exit:?} (want 0 with \
+                     every shard committed, or {CRASH_EXIT} if a retried round adopted \
+                     first), committed {committed:?}"
+                ));
+            }
+        }
     }
     if k.as_deref() != Some("original") || new.is_some() {
         wrong.push(format!(
@@ -913,6 +940,15 @@ fn an_abandoned_reclaim_round_neither_saves_the_txn_nor_commits_a_compaction() {
 #[ignore]
 fn a_reclaim_round_retried_after_the_txn_ends_commits_the_compactions() {
     abandoned_reclaim_round(AfterAbandon::AbortAndRetry);
+}
+
+/// SHUTDOWN right after an abandoned round, compactions pending: its save
+/// (not an automatic round) commits them as the process stops, and the
+/// restart loses and resurrects nothing.
+#[test]
+#[ignore]
+fn shutdown_after_an_abandoned_reclaim_round_keeps_every_key_exact() {
+    abandoned_reclaim_round(AfterAbandon::AbortAndShutdown);
 }
 
 /// `CONFIG RESETSTAT` (the moon#1289 R1 rule: reset monotonic statistics,
