@@ -754,6 +754,26 @@ fn info_raw(db: &Database, facts: &InstanceFacts) -> String {
             crate::persistence::snapshot_request::SnapshotReason::HeldColdFiles
         ),
     );
+    // moon#1297: the cold reclaim (with an AOF or without): compactions
+    // recorded and still waiting for their commit point, old files unlinked
+    // by adoption and their bytes, and snapshots requested to commit them.
+    let (compactions, files_unlinked, bytes_unlinked) =
+        crate::storage::tiered::cold_reclaim::reclaim_totals();
+    let _ = write!(
+        sections,
+        "cold_reclaim_compactions:{}\r\n\
+         cold_reclaim_compactions_pending:{}\r\n\
+         cold_reclaim_files_unlinked:{}\r\n\
+         cold_reclaim_bytes_unlinked:{}\r\n\
+         cold_reclaim_snapshots_requested:{}\r\n",
+        compactions,
+        crate::storage::tiered::cold_reclaim::awaiting_fold(),
+        files_unlinked,
+        bytes_unlinked,
+        crate::persistence::snapshot_request::started(
+            crate::persistence::snapshot_request::SnapshotReason::ColdReclaim
+        ),
+    );
     sections.push_str("\r\n");
 
     // # Reclamation — observability foundation for Wave-1 production hardening (P10).
