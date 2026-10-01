@@ -29,9 +29,10 @@
 //! the aborted writes back (moon#1300 F3). `BGSAVE`, `SAVE` and the save
 //! rules share that flaw and are WS42's to fix; an AUTOMATIC reason
 //! ([`SnapshotReason::waits_for_open_txns`]: the held-file snapshot and the
-//! no-AOF reclaim's) must not add a new way to hit it, so while any shard has an open transaction [`request`] answers
-//! [`SnapshotRequest::TxnOpen`] without touching the gate: the slot is not
-//! consumed, and the caller's next tick asks again. The signal is the
+//! no-AOF reclaim's) must not add a new way to hit it, so while any shard
+//! has an open transaction [`request`] answers [`SnapshotRequest::TxnOpen`]
+//! without touching the gate: the slot is not consumed, and the caller's
+//! next tick asks again. The signal is the
 //! process-wide published view behind `INFO txn_open`
 //! (`transaction::isolation::info`), never another shard's thread-local.
 //!
