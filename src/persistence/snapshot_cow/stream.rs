@@ -89,8 +89,8 @@ const STREAM_TICK_BYTES: usize = 8 << 20;
 /// ...for about this long. Serialization is memory-bound (~200 ns an element
 /// for a hash of separately allocated fields: two cache misses), so a byte
 /// budget alone let one tick run 25 ms. A hash or sorted set re-skips to its
-/// position first (~2 ns an element) and may then serialize as long as the
-/// skip took: a tick is at most ~2x a full skip (~20 ms at 5M fields).
+/// position first (~2 ns an element, ~10 ms at 5M fields) and may then
+/// serialize as long as the skip took, up to `ChunkLimit::TIME_CAP` (5 ms).
 const STREAM_TICK_TIME: std::time::Duration = std::time::Duration::from_millis(2);
 
 /// Where an active stream reads the value from.
@@ -362,6 +362,31 @@ pub(crate) async fn wait_for_streams(slot: usize, cmd: &[u8], args: &[Frame]) {
     }
 }
 
+/// [`wait_for_streams`] for every write of a MULTI body about to run as
+/// one atomic unit (its commands cannot wait individually): `slot` follows
+/// the body's own SELECTs.
+pub(crate) async fn wait_for_queued(mut slot: usize, queue: &[Frame]) {
+    for frame in queue {
+        let Some((cmd, args)) = crate::server::conn::util::extract_command(frame) else {
+            continue;
+        };
+        if cmd.eq_ignore_ascii_case(b"SELECT") {
+            if let Some(db) = args
+                .first()
+                .and_then(crate::command::helpers::extract_bytes)
+                .and_then(|b| std::str::from_utf8(b).ok()?.parse().ok())
+            {
+                slot = db;
+            }
+            continue;
+        }
+        if crate::shard::slice::try_with_shard(|s| slot < s.databases.db_count()) != Some(true) {
+            continue;
+        }
+        wait_for_streams(slot, cmd, args).await;
+    }
+}
+
 fn park() -> flume::Receiver<()> {
     PARKED_WRITES.fetch_add(1, Ordering::Relaxed);
     wait()
@@ -571,11 +596,11 @@ pub(crate) fn service_with(snap: &mut SnapshotState, lookup: Lookup<'_>) {
             refresh_busy();
             return;
         };
-        if let Some(active) = start(snap, req, lookup) {
-            ACTIVE.with(|a| *a.borrow_mut() = Some(active));
+        match start(snap, req, lookup) {
+            Some(active) => ACTIVE.with(|a| *a.borrow_mut() = Some(active)),
+            // Settled without a stream: its waiters re-check.
+            None => wake_all(),
         }
-        // A request settled without a stream: its waiters re-check.
-        wake_all();
         refresh_busy();
     }
 }
