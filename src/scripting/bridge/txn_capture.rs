@@ -518,6 +518,7 @@ mod tests {
                 UndoRecord::Insert { key } => (db, "insert", key),
                 UndoRecord::Update { key, .. } => (db, "update", key),
                 UndoRecord::Delete { key, .. } => (db, "delete", key),
+                UndoRecord::Held { key, .. } => (db, "held", key),
             })
             .collect();
         assert_eq!(

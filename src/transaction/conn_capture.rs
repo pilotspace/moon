@@ -5,8 +5,11 @@
 //! 1. refuses the write when another open transaction holds one of the keys
 //!    it may write ([`isolation::check_write`], moon#1299) — nothing is
 //!    captured and the transaction is poisoned (#499);
-//! 2. records each written key's pre-image in the undo log, a write intent
-//!    (read visibility, moon#807) and a hold (write isolation, moon#1299).
+//! 2. records each written key's undo record, a write intent (read
+//!    visibility, moon#807) and a hold (write isolation, moon#1299). The hold
+//!    owns the key's pre-transaction image — the only copy (R2b W2): the
+//!    undo log names the key (`UndoRecord::Held`) and the abort restores the
+//!    hold's image ([`capture_key`]).
 //!
 //! Dispatch then runs inside the returned capture's [`OwnerScope`], so the
 //! dispatch-level check admits this transaction's own keys.
@@ -71,29 +74,14 @@ pub(crate) fn capture_conn_write(
         keys: SmallVec::new(),
         _owner: owner,
     };
-    let (lsn, tid) = (txn.snapshot_lsn, txn.txn_id);
-    // `pre` is the key's before-image, recorded in the undo log; a NEW hold
-    // also keeps a copy for snapshots (moon#1300 — `isolation::hold`).
-    let mut note = |key: Bytes, pre: &Option<crate::storage::entry::Entry>| {
-        let prev_intent = intents.record_write(key.clone(), lsn, tid);
-        let newly_held = isolation::hold(sel_db, &key, tid, || pre.clone());
-        capture.keys.push(CapturedKey {
-            db: sel_db,
-            key,
-            prev_intent,
-            newly_held,
-        });
-    };
-    if cmd.eq_ignore_ascii_case(b"DEL") || cmd.eq_ignore_ascii_case(b"UNLINK") {
+    let deleting = cmd.eq_ignore_ascii_case(b"DEL") || cmd.eq_ignore_ascii_case(b"UNLINK");
+    if deleting {
         // A missing key's DEL writes nothing: no pre-image, no intent.
         for arg in args {
             if let Frame::BulkString(key) = arg
-                && let pre @ Some(_) = db.get(key.as_ref()).cloned()
+                && db.get(key.as_ref()).is_some()
             {
-                note(key.clone(), &pre);
-                if let Some(old_entry) = pre {
-                    txn.kv_undo.record_delete(sel_db, key.clone(), old_entry);
-                }
+                capture_key(&mut capture, txn, intents, db, sel_db, key.clone(), true);
             }
         }
     } else {
@@ -105,15 +93,57 @@ pub(crate) fn capture_conn_write(
         // back to the primary key; a write-free one (`SORT src`) captures
         // nothing — see `conn_txn_capture_keys`.
         for key in crate::transaction::conn_txn_capture_keys(cmd, args) {
-            let pre = db.get(key.as_ref()).cloned();
-            note(key.clone(), &pre);
-            match pre {
-                None => txn.kv_undo.record_insert(sel_db, key),
-                Some(entry) => txn.kv_undo.record_update(sel_db, key, entry),
-            }
+            capture_key(&mut capture, txn, intents, db, sel_db, key, false);
         }
     }
     Ok(capture)
+}
+
+/// Capture one key `cmd` may write (`deleting`: a `DEL` / `UNLINK` of a
+/// present key): its write intent, its hold and its undo record.
+///
+/// R2b W2: ONE copy of the key's pre-transaction value. Its first write
+/// clones the present value once and MOVES it into the new hold
+/// (`isolation::hold`), which every snapshot serializes and the abort
+/// restores from; the undo log records [`UndoRecord::Held`] (key and kind
+/// only). A later write of a key the transaction already holds copies
+/// nothing: the abort restores the first record only, and the commit's WAL
+/// image needs just the key and kind. An absent key is an
+/// [`UndoRecord::Insert`], as before.
+///
+/// [`UndoRecord::Held`]: crate::transaction::UndoRecord::Held
+/// [`UndoRecord::Insert`]: crate::transaction::UndoRecord::Insert
+fn capture_key(
+    capture: &mut ConnWriteCapture,
+    txn: &mut CrossStoreTxn,
+    intents: &mut KvWriteIntents,
+    db: &mut Database,
+    sel_db: usize,
+    key: Bytes,
+    deleting: bool,
+) {
+    let (lsn, tid) = (txn.snapshot_lsn, txn.txn_id);
+    let prev_intent = intents.record_write(key.clone(), lsn, tid);
+    let newly_held = if isolation::holder(sel_db, &key) == Some(tid) {
+        txn.kv_undo.record_held(sel_db, key.clone(), deleting);
+        false
+    } else {
+        let pre = db.get(key.as_ref()).cloned();
+        let present = pre.is_some();
+        let newly = isolation::hold(sel_db, &key, tid, pre);
+        if present {
+            txn.kv_undo.record_held(sel_db, key.clone(), deleting);
+        } else {
+            txn.kv_undo.record_insert(sel_db, key.clone());
+        }
+        newly
+    };
+    capture.keys.push(CapturedKey {
+        db: sel_db,
+        key,
+        prev_intent,
+        newly_held,
+    });
 }
 
 impl ConnWriteCapture {
@@ -238,6 +268,74 @@ mod tests {
             assert!(intents.get(b"j").is_none());
             assert!(!isolation::is_held(0, b"j"));
             isolation::txn_end(9);
+            assert!(!isolation::any_held());
+        });
+    }
+
+    /// R2b W2: a key's pre-transaction value is kept ONCE, by the hold. The
+    /// undo log names the key (`Held`: key and kind, no image) on its first
+    /// write and on every later one; the abort restores the hold's image.
+    #[test]
+    fn a_held_keys_image_is_kept_once_and_restored_from_the_hold() {
+        use crate::transaction::UndoRecord;
+        on_fresh_thread(|| {
+            let mut db = Database::new();
+            run(&mut db, "SET", &["k", "orig"]);
+            let mut txn = CrossStoreTxn::new(7, 6, 0);
+            isolation::txn_begin(7);
+            let mut intents = KvWriteIntents::new();
+            for (cmd, parts) in [
+                ("SET", &["k", "a"][..]),
+                ("APPEND", &["k", "b"][..]),
+                ("DEL", &["k"][..]),
+                ("SET", &["n", "new"][..]),
+                ("SET", &["n", "again"][..]),
+            ] {
+                let reply = txn_write(&mut txn, &mut intents, &mut db, cmd, parts);
+                assert!(!matches!(reply, Frame::Error(_)), "{cmd}: {reply:?}");
+            }
+            let kinds: Vec<_> = txn
+                .kv_undo
+                .records()
+                .iter()
+                .map(|r| match r {
+                    UndoRecord::Held { key, deleted } => (key.clone(), "held", *deleted),
+                    UndoRecord::Insert { key } => (key.clone(), "insert", false),
+                    UndoRecord::Update { .. } | UndoRecord::Delete { .. } => {
+                        panic!("a connection write copies no image into the undo log: {r:?}")
+                    }
+                })
+                .collect();
+            let (k, n) = (Bytes::from_static(b"k"), Bytes::from_static(b"n"));
+            assert_eq!(
+                kinds,
+                vec![
+                    (k.clone(), "held", false),
+                    (k.clone(), "held", false),
+                    (k.clone(), "held", true),
+                    (n.clone(), "insert", false),
+                    (n, "held", false),
+                ]
+            );
+            let held = isolation::with_held_pre(0, b"k", |p| {
+                p.and_then(|e| e.value.as_bytes().map(<[u8]>::to_vec))
+            });
+            assert_eq!(held.as_deref(), Some(&b"orig"[..]));
+            // The abort: the first record of each key, `k` from the hold.
+            let mut out = Vec::new();
+            let log = std::mem::take(&mut txn.kv_undo);
+            for (d, record) in crate::transaction::kv_compensation::first_per_key(log) {
+                crate::transaction::kv_compensation::undo_one(&mut db, d, record, &mut out);
+            }
+            assert_eq!(
+                run(&mut db, "GET", &["k"]),
+                Frame::BulkString(Bytes::from("orig"))
+            );
+            assert!(db.get(b"n").is_none(), "the insert is undone");
+            assert_eq!(out.len(), 2, "one compensating record per key");
+            // The hold keeps its image until the release.
+            assert!(isolation::is_held(0, b"k"));
+            isolation::txn_end(7);
             assert!(!isolation::any_held());
         });
     }

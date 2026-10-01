@@ -503,7 +503,11 @@ pub fn encode_xact_commit_payload(
     for record in undo_records {
         match record {
             crate::transaction::UndoRecord::Insert { key }
-            | crate::transaction::UndoRecord::Update { key, .. } => {
+            | crate::transaction::UndoRecord::Update { key, .. }
+            | crate::transaction::UndoRecord::Held {
+                key,
+                deleted: false,
+            } => {
                 // Read current (post-dispatch) value for forward-image WAL
                 if let Some(entry) = db.data().get(key.as_ref()) {
                     if let Some(value) = entry.value.as_bytes_owned() {
@@ -516,7 +520,8 @@ pub fn encode_xact_commit_payload(
                     }
                 }
             }
-            crate::transaction::UndoRecord::Delete { key, .. } => {
+            crate::transaction::UndoRecord::Delete { key, .. }
+            | crate::transaction::UndoRecord::Held { key, deleted: true } => {
                 payload.push(1u8); // op_type = DEL
                 payload.extend_from_slice(&(key.len() as u32).to_le_bytes());
                 payload.extend_from_slice(key);

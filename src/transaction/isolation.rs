@@ -106,9 +106,11 @@ struct ShardHolds {
     /// hold is released.
     rewake: Vec<(usize, Bytes)>,
     /// moon#1300: each held `(db, key)`'s pre-transaction image (`None`: the
-    /// key was absent) — the undo capture's first before-image, taken when
-    /// the hold was. Every snapshot of this shard serializes it instead of
-    /// the live, uncommitted value ([`with_held_keys`]).
+    /// key was absent) — the undo capture's first before-image, moved in
+    /// when the hold was taken. Every snapshot of this shard serializes it
+    /// instead of the live, uncommitted value ([`with_held_keys`]), and the
+    /// abort restores the key from it (R2b W2: the transaction's ONLY copy;
+    /// its undo record is an `UndoRecord::Held`).
     pre: HashMap<(usize, Bytes), Option<Entry>>,
 }
 
@@ -285,16 +287,14 @@ pub(crate) fn txn_begin(txn_id: u64) {
 /// what an erroring write takes back ([`unhold`]). The caller has already
 /// checked that no other transaction holds it.
 ///
-/// `pre` is the key's pre-transaction image (`None`: absent): the before-
-/// image the caller's undo capture just recorded. Called only for a NEW hold
-/// — a key the transaction already holds keeps its first image — and kept
-/// until the hold is released, for snapshots (moon#1300, [`with_held_keys`]).
-pub(crate) fn hold(
-    db: usize,
-    key: &Bytes,
-    txn_id: u64,
-    pre: impl FnOnce() -> Option<Entry>,
-) -> bool {
+/// `pre` is the key's pre-transaction image (`None`: absent), taken by MOVE
+/// for a NEW hold and kept until the hold is released — for snapshots
+/// (moon#1300, [`with_held_keys`]) and for the abort, which restores a key's
+/// first write from it (R2b W2: the undo log records that write as
+/// `UndoRecord::Held`, so the transaction keeps ONE copy of the image, not
+/// two). A key the transaction already holds keeps its first image and
+/// `pre` is dropped: callers check [`holder`] first and copy nothing then.
+pub(crate) fn hold(db: usize, key: &Bytes, txn_id: u64, pre: Option<Entry>) -> bool {
     let (newly, first_in_db) = with_holds(|h| {
         let holders = h.by_key.entry(key.clone()).or_default();
         if holders.iter().any(|(d, _)| *d == db) {
@@ -305,7 +305,7 @@ pub(crate) fn hold(
             h.per_db.resize(db + 1, 0);
         }
         h.per_db[db] += 1;
-        h.pre.insert((db, key.clone()), pre());
+        h.pre.insert((db, key.clone()), pre);
         (true, h.per_db[db] == 1)
     });
     if newly {
@@ -765,9 +765,9 @@ mod tests {
     fn a_held_key_refuses_other_writers_and_admits_its_owner() {
         on_fresh_thread(|| {
             txn_begin(7);
-            assert!(hold(0, &Bytes::from_static(b"k"), 7, || None));
+            assert!(hold(0, &Bytes::from_static(b"k"), 7, None));
             assert!(
-                !hold(0, &Bytes::from_static(b"k"), 7, || None),
+                !hold(0, &Bytes::from_static(b"k"), 7, None),
                 "second hold is not new"
             );
             let refused = check_write(0, b"SET", &args(&["k", "v"]));
@@ -806,7 +806,7 @@ mod tests {
     fn end_on_drop_releases() {
         on_fresh_thread(|| {
             txn_begin(51);
-            hold(0, &Bytes::from_static(b"k"), 51, || None);
+            hold(0, &Bytes::from_static(b"k"), 51, None);
             {
                 let _g = EndOnDrop::new(51);
                 assert!(any_held(), "held until the guard drops");
@@ -820,7 +820,7 @@ mod tests {
         on_fresh_thread(|| {
             txn_begin(3);
             let k = Bytes::from_static(b"k");
-            assert!(hold(2, &k, 3, || None));
+            assert!(hold(2, &k, 3, None));
             unhold(2, &k, 3);
             assert!(!is_held(2, b"k"));
             assert!(!any_held());
@@ -830,7 +830,7 @@ mod tests {
     }
 
     /// moon#1300: a hold keeps the key's FIRST pre-transaction image (a key
-    /// already held keeps its own: the closure is not even called), for
+    /// already held keeps its own: a later image is dropped), for
     /// every snapshot; an unhold or the transaction's end drops it.
     #[test]
     fn a_hold_keeps_the_first_pre_image_until_released() {
@@ -839,13 +839,19 @@ mod tests {
             txn_begin(5);
             let k = Bytes::from_static(b"k");
             let n = Bytes::from_static(b"n");
-            assert!(hold(0, &k, 5, || Some(Entry::new_string(
-                Bytes::from_static(b"v0")
-            ))));
-            assert!(!hold(0, &k, 5, || panic!(
-                "a held key keeps its first image"
-            )));
-            assert!(hold(1, &n, 5, || None));
+            assert!(hold(
+                0,
+                &k,
+                5,
+                Some(Entry::new_string(Bytes::from_static(b"v0")))
+            ));
+            assert!(!hold(
+                0,
+                &k,
+                5,
+                Some(Entry::new_string(Bytes::from_static(b"later")))
+            ));
+            assert!(hold(1, &n, 5, None));
             let seen = |db: usize, key: &[u8]| {
                 with_held_keys(|it| {
                     for h in &mut *it {
@@ -861,9 +867,12 @@ mod tests {
             assert_eq!(seen(1, b"n"), Some((5, None)));
             unhold(1, &n, 5);
             assert_eq!(seen(1, b"n"), None);
-            assert!(hold(1, &n, 5, || Some(Entry::new_string(
-                Bytes::from_static(b"again")
-            ))));
+            assert!(hold(
+                1,
+                &n,
+                5,
+                Some(Entry::new_string(Bytes::from_static(b"again")))
+            ));
             assert_eq!(seen(1, b"n"), Some((5, Some(b"again".to_vec()))));
             txn_end(5);
             assert_eq!(with_held_keys(|it| it.count()), 0);
@@ -875,7 +884,7 @@ mod tests {
     fn flush_and_swapdb_see_the_holding_database() {
         on_fresh_thread(|| {
             txn_begin(11);
-            hold(5, &Bytes::from_static(b"x"), 11, || None);
+            hold(5, &Bytes::from_static(b"x"), 11, None);
             assert!(check_flush(false, 5, 16).is_some());
             assert!(check_flush(true, 0, 16).is_some());
             assert_eq!(check_flush(false, 4, 16), None);
@@ -895,7 +904,7 @@ mod tests {
         let holder = std::thread::spawn(move || {
             PUBLISH_IN_TESTS.with(|p| p.set(true));
             txn_begin(21);
-            hold(62, &Bytes::from_static(b"y"), 21, || None);
+            hold(62, &Bytes::from_static(b"y"), 21, None);
             held_tx.send(()).expect("send");
             done_rx.recv().expect("recv");
             txn_end(21);
@@ -918,7 +927,7 @@ mod tests {
         on_fresh_thread(|| {
             txn_begin(4);
             let l = Bytes::from_static(b"list");
-            hold(0, &l, 4, || None);
+            hold(0, &l, 4, None);
             assert!(defer_wake_if_held(0, &l));
             assert!(!defer_wake_if_held(0, &Bytes::from_static(b"other")));
             txn_end(4);
@@ -944,7 +953,7 @@ mod tests {
                 );
             }
             txn_begin(41);
-            hold(db.db_index, &Bytes::from_static(b"held"), 41, || None);
+            hold(db.db_index, &Bytes::from_static(b"held"), 41, None);
             let mut reaped = Vec::new();
             let left = crate::server::expiration::expire_cycle_direct_scaled(
                 &mut db,
@@ -978,7 +987,7 @@ mod tests {
         on_fresh_thread(|| {
             PUBLISH_IN_TESTS.with(|p| p.set(true));
             txn_begin(31);
-            hold(62, &Bytes::from_static(b"a"), 31, || None);
+            hold(62, &Bytes::from_static(b"a"), 31, None);
             let now = crate::storage::entry::current_time_ms();
             let i = info(now + 250);
             assert!(i.open >= 1);
@@ -998,10 +1007,10 @@ mod tests {
             txn_begin(41);
             let keys: [&'static [u8]; 5] = [b"a", b"b", b"c", b"d", b"e"];
             for (n, key) in keys.into_iter().enumerate() {
-                assert!(hold(62, &Bytes::from_static(key), 41, || None));
+                assert!(hold(62, &Bytes::from_static(key), 41, None));
                 assert_eq!(mine(), n as u64 + 1, "after {} holds", n + 1);
             }
-            assert!(hold(63, &Bytes::from_static(b"z"), 41, || None));
+            assert!(hold(63, &Bytes::from_static(b"z"), 41, None));
             assert_eq!(mine(), 6);
             unhold(62, b"e", 41);
             assert_eq!(mine(), 5, "an unhold that leaves db 62 non-empty");
