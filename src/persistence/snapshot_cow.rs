@@ -69,6 +69,7 @@ use crate::storage::db::Database;
 use crate::storage::entry::Entry;
 
 mod capture;
+pub(crate) mod stream;
 use capture::capture_key;
 #[cfg(test)]
 pub(crate) use capture::pre_image_clones_for_test;
@@ -418,6 +419,7 @@ fn clear() {
         .filter_map(|(_, _, pre_image, _)| pre_image)
         .for_each(crate::persistence::snapshot::frozen::dispose);
     PENDING_KEYS.with(|k| k.borrow_mut().clear());
+    stream::clear(); // moon#1295: its waiters re-check against no epoch
     DEDUPE_BYTES.with(|b| b.set(0));
     REMOVAL_SLOT.with(|c| c.set(None));
     publish_cow_size(0);
@@ -484,6 +486,7 @@ pub(crate) fn note_swapdb(a: usize, b: usize) {
         true
     });
     if followed {
+        stream::note_swap(a, b); // moon#1295
         EVENTS.with(|e| e.borrow_mut().push(TableEvent::Swap(a, b)));
     } else if epoch_unfinished() {
         // No slot map (an epoch armed without a layout): the pre-moon#1228
@@ -564,6 +567,7 @@ pub(crate) fn note_cleared_table(
         // table. `table` drops here.
         return None;
     }
+    stream::note_cleared(db.db_index, &table); // moon#1295: finish from it
     enum Outcome {
         /// The epoch database, and its epoch-start bill.
         Freeze(usize, u64),
@@ -775,7 +779,6 @@ pub(crate) fn capture_dispatch_pre_image(
 /// the file. An argv the walker cannot enumerate falls back to the primary
 /// key, the pre-moon#1217 contract.
 fn capture_written_keys(db: &Database, db_index: usize, cmd: &[u8], args: &[Frame]) {
-    use crate::acl::keyspec::{KeyPositions, KeyRole, command_key_positions};
     // moon#1269: DEL / UNLINK only remove, and `command::key::{del, unlink}`
     // hand every hot entry they take out to the epoch as its pre-image by
     // MOVE (`capture_removed`). A copy here would deep-clone the whole value
@@ -787,24 +790,7 @@ fn capture_written_keys(db: &Database, db_index: usize, cmd: &[u8], args: &[Fram
         REMOVAL_SLOT.with(|c| c.set(Some(db_index)));
         return;
     }
-    match command_key_positions(cmd, args) {
-        KeyPositions::At(positions) | KeyPositions::AtPlusComputed(positions) => {
-            for at in positions.iter().filter(|at| at.role == KeyRole::Write) {
-                if let Some(key) = args
-                    .get(at.idx)
-                    .and_then(crate::command::helpers::extract_bytes)
-                {
-                    capture_key(db, db_index, key);
-                }
-            }
-        }
-        KeyPositions::None => {}
-        KeyPositions::Unknown => {
-            if let Some(key) = crate::server::conn::shared::extract_primary_key(cmd, args) {
-                capture_key(db, db_index, key);
-            }
-        }
-    }
+    stream::for_each_written_key(cmd, args, |key| capture_key(db, db_index, key));
 }
 
 thread_local! {

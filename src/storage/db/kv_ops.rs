@@ -544,6 +544,7 @@ impl Database {
     /// instead of by the lazy-free drain, which never sees it; the snapshot
     /// frees it off the shard thread once written.
     fn remove_hot_lazily_capturing(&mut self, key: &[u8], capture: Option<usize>) -> Option<bool> {
+        self.guard_streamed_key(key);
         let entry = self.data.remove(key)?;
         let expired = entry.is_expired_at(self.cached_now_ms);
         if entry.has_expiry() {
@@ -643,6 +644,21 @@ impl Database {
         self.cold_index.as_mut().is_some_and(|ci| ci.remove(key))
     }
 
+    /// moon#1295: a key whose epoch-start image is streaming into a save is
+    /// finished from its value before any removal takes it away (one
+    /// thread-local load when nothing streams). Every hot removal funnels
+    /// through [`Self::remove_hot_costed`] or `remove_hot_lazily_capturing`.
+    #[inline]
+    fn guard_streamed_key(&self, key: &[u8]) {
+        if crate::persistence::snapshot_cow::stream::busy() {
+            crate::persistence::snapshot_cow::stream::guard_write(
+                self.db_index,
+                key,
+                self.data.get(key),
+            );
+        }
+    }
+
     #[inline]
     pub(super) fn remove_hot(&mut self, key: &[u8]) -> Option<Entry> {
         self.remove_hot_costed(key).map(|(entry, _)| entry)
@@ -650,6 +666,7 @@ impl Database {
 
     /// [`Self::remove_hot`], also returning the bytes credited.
     fn remove_hot_costed(&mut self, key: &[u8]) -> Option<(Entry, usize)> {
+        self.guard_streamed_key(key);
         if let Some(entry) = self.data.remove(key) {
             let cost = entry_overhead(key, &entry);
             self.used_memory = self.used_memory.saturating_sub(cost);

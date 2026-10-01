@@ -338,7 +338,12 @@ pub(crate) fn unhold(db: usize, key: &[u8], txn_id: u64) {
         if !removed {
             return (false, false);
         }
-        h.pre.remove(&(db, Bytes::copy_from_slice(key)));
+        if let Some(pre) = h.pre.remove(&(db, Bytes::copy_from_slice(key))) {
+            // moon#1295: a save streaming this image takes it by move.
+            drop(crate::persistence::snapshot_cow::stream::held_released(
+                db, key, pre,
+            ));
+        }
         h.per_db[db] -= 1;
         (true, h.per_db[db] == 0)
     });
@@ -368,7 +373,12 @@ pub(crate) fn txn_end(txn_id: u64) {
             holders.retain(|(db, t)| {
                 if *t == txn_id {
                     per_db[*db] -= 1;
-                    pre.remove(&(*db, key.clone()));
+                    if let Some(image) = pre.remove(&(*db, key.clone())) {
+                        // moon#1295: a save streaming it takes it by move.
+                        drop(crate::persistence::snapshot_cow::stream::held_released(
+                            *db, key, image,
+                        ));
+                    }
                     released += 1;
                     false
                 } else {
@@ -433,6 +443,23 @@ pub(crate) fn with_held_keys<R>(f: impl FnOnce(&mut dyn Iterator<Item = HeldKey<
             })
         });
         f(&mut iter)
+    })
+}
+
+/// Run `f` over the pre-transaction image an open transaction's hold keeps
+/// for `(db, key)` (`None`: not held, or the key was absent then): the
+/// source a save streams a large held key from (moon#1295).
+pub(crate) fn with_held_pre<R>(db: usize, key: &[u8], f: impl FnOnce(Option<&Entry>) -> R) -> R {
+    if !any_held() {
+        return f(None);
+    }
+    HOLDS.with(|h| {
+        let h = h.borrow();
+        let pre = h
+            .as_ref()
+            .and_then(|h| h.pre.get(&(db, Bytes::copy_from_slice(key))))
+            .and_then(Option::as_ref);
+        f(pre)
     })
 }
 

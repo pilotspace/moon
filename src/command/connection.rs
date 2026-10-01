@@ -498,6 +498,8 @@ fn info_raw(db: &Database, facts: &InstanceFacts) -> String {
     sections.push_str(&format!(
         "loading:{}\r\n\
          current_cow_size:{}\r\n\
+         rdb_cow_streamed_keys:{}\r\n\
+         rdb_cow_stream_waits:{}\r\n\
          rdb_changes_since_last_save:{}\r\n\
          rdb_bgsave_in_progress:{}\r\n\
          rdb_last_save_time:{}\r\n\
@@ -543,6 +545,10 @@ fn info_raw(db: &Database, facts: &InstanceFacts) -> String {
         // (pre-images, tables a flush handed over) — redis's field for its
         // fork's COW memory; deliberately not in `used_memory`.
         crate::persistence::snapshot_cow::current_cow_size(),
+        // moon#1295: large collections streamed instead of copied, and the
+        // writes that waited for one.
+        crate::persistence::snapshot_cow::stream::streamed_keys(),
+        crate::persistence::snapshot_cow::stream::parked_writes(),
         // Keyspace mutations since the last COMPLETED save — the "is a save
         // worth doing" signal a backup script reads. A failed save does not
         // reset it: the dataset is still unpersisted.
