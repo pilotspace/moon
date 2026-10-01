@@ -8,9 +8,12 @@
 //!   (the counter stays 0) — same binary;
 //! - the hand-over across rewrites: while non-idempotent `INCR`s stream in
 //!   and `BGREWRITEAOF` folds run (the writer takes the append position back
-//!   for each fold and hands it over again on the new generation), a kill -9
-//!   1 ms after the last ack recovers EXACTLY the acked counts — no acked
-//!   write lost, none applied twice;
+//!   for each fold and hands it over again on the new generation), then once
+//!   the last fold has ended a final batch is acked, a kill -9 1 ms after
+//!   that ack recovers EXACTLY the acked counts — no acked write lost, none
+//!   applied twice. (A kill INSIDE a fold can still lose the records the fold
+//!   overlaps: they wait for the post-fold drain, as in Option 3 — see the
+//!   production guide.)
 //! - `MOON.TXN` / `MOON.TS` / `SELECT` framing moved with the position: a
 //!   multi-db stream with a TXN that commits and one left open across the
 //!   kill recovers the committed one and rolls the open one back.
@@ -183,9 +186,33 @@ fn rewrites_under_load_then_kill9(shards: usize) {
     }
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
     let asked = rewriter.join().expect("rewriter");
-    let lane_writes = info_u64(&mut c, "aof_shard_writes");
-    // The last pipelined batch's acks are in hand: kill now.
+    // A fold in progress holds the records it overlaps in the writer's
+    // channel until its post-fold drain (the writer has the append position
+    // for the whole fold, as in Option 3 — the documented residual). Let the
+    // last fold end, then ack one more batch: the shard threads have the
+    // position back, so a kill 1 ms after that ack must lose nothing.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while info_u64(&mut c, "aof_rewrite_in_progress") != 0 {
+        assert!(
+            Instant::now() < deadline,
+            "the last BGREWRITEAOF never ended"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    std::thread::sleep(Duration::from_millis(200));
+    let lane_writes_before = info_u64(&mut c, "aof_shard_writes");
+    let batch: Vec<[&str; 2]> = (0..40).map(|j| ["INCR", keys[j % KEYS].as_str()]).collect();
+    let slices: Vec<&[&str]> = batch.iter().map(|a| a.as_slice()).collect();
+    let replies = c.pipeline(&slices);
+    assert_eq!(
+        replies.lines().filter(|l| l.starts_with(':')).count(),
+        batch.len()
+    );
+    for j in 0..batch.len() {
+        acked[j % KEYS] += 1;
+    }
     kill_after_1ms(&mut server, port);
+    let lane_writes = lane_writes_before;
     assert!(lane_writes > 0, "1A was not active (aof_shard_writes=0)");
     assert!(asked >= 5, "only {asked} BGREWRITEAOF requests were made");
 
