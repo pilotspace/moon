@@ -29,6 +29,7 @@ mod insert;
 mod ops;
 #[cfg(test)]
 mod split_tests;
+mod tag_masks;
 
 pub use ops::home_buckets;
 

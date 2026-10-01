@@ -42,7 +42,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::storage::compact_key::CompactKey;
-use crate::storage::dashtable::segment::{Segment, TOTAL_SLOTS, h2};
+use crate::storage::dashtable::segment::h2;
 use crate::storage::dashtable::{DashTable, hash_key};
 use crate::storage::entry::Entry;
 
@@ -295,27 +295,20 @@ impl ExpiryWheel {
 /// for an entry whose OWN deadline is `ts` and whose hash agrees on the 56
 /// bits a reference carries.
 ///
-/// Control bytes only, until a tag matches: one pass over the segment's 60
-/// control bytes builds two bitmasks (FULL slots, and FULL slots whose 7-bit
-/// tag equals the hash's `h2` — the filter a normal probe uses). A candidate's
-/// key and value are read only then (~1.5 candidates per probe, not 40
-/// entries). `iter_occupied` yields occupied slots in ascending slot order,
-/// so a candidate slot's position in that iterator is the popcount of the
-/// FULL slots below it: no unsafe slot access is needed.
+/// Control bytes only, until a tag matches: [`Segment::tag_masks`] returns the
+/// FULL slots and the FULL slots whose 7-bit tag equals the hash's `h2` (the
+/// filter a normal probe uses) in one SWAR pass. A candidate's key and value
+/// are read only then (~1.5 candidates per probe, not 40 entries).
+/// `iter_occupied` yields occupied slots in ascending slot order, so a
+/// candidate slot's position in that iterator is the popcount of the FULL
+/// slots below it: no unsafe slot access is needed.
 pub(crate) fn resolve(
     data: &DashTable<CompactKey, Entry>,
     ts: u64,
     hash: u64,
 ) -> Option<&CompactKey> {
     let seg = data.segment(data.segment_index_for_hash(hash));
-    let tag = h2(hash);
-    let (mut full, mut cand) = (0u64, 0u64);
-    for slot in 0..TOTAL_SLOTS {
-        let c = seg.ctrl_byte(slot);
-        let is_full = u64::from(Segment::<CompactKey, Entry>::is_full_ctrl_pub(c));
-        full |= is_full << slot;
-        cand |= (is_full & u64::from(c == tag)) << slot;
-    }
+    let (full, cand) = seg.tag_masks(h2(hash));
     if cand == 0 {
         return None;
     }
