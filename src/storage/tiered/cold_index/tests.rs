@@ -695,3 +695,36 @@ fn an_unlink_error_does_not_lose_the_expired_count() {
     assert_eq!(ci.len(), 0, "the entries left the index");
     assert_eq!(counted() - before, 2, "and each is an expired key");
 }
+
+/// R3 fix-e: `remove` on an index holding nothing answers `false` without
+/// touching anything (the per-`SET` fast path), and the gate still sees a
+/// recovery-only older copy: removing a key that has one but no map entry
+/// releases the copy exactly as before.
+#[test]
+fn remove_on_an_empty_index_is_a_no_op_and_still_releases_older_copies() {
+    let mut idx = ColdIndex::new();
+    assert!(!idx.remove(b"absent"));
+    assert_eq!(idx.len(), 0);
+    assert_eq!(idx.pending_unlink_len(), 0);
+    assert_eq!(idx.dead_slot_bytes(), 0);
+    assert_eq!(idx.resident_bytes(), 0);
+
+    // An older copy with no entry in front of it: `map` is empty, so only
+    // the `older_copies` half of the gate keeps the release path live.
+    idx.older_copies
+        .insert(Bytes::from_static(b"k"), vec![loc_in(7, 0)]);
+    idx.ref_inc(7);
+    assert!(idx.map.is_empty());
+    assert!(!idx.remove(b"k"), "no live entry, so not present");
+    assert!(idx.older_copies.is_empty(), "the older copy was released");
+    assert_eq!(idx.pending_unlink_len(), 1, "its file lost its last ref");
+    assert!(
+        idx.dead_slot_bytes() > 0,
+        "the released slot is recorded dead"
+    );
+
+    // A live entry is still removed through the full path.
+    idx.insert(Bytes::from_static(b"live"), loc_in(8, 1));
+    assert!(idx.remove(b"live"));
+    assert!(idx.lookup(b"live").is_none());
+}
