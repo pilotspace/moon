@@ -39,7 +39,6 @@ pub mod segment_stall;
 pub mod self_msg;
 pub mod shared_databases;
 pub mod slice;
-pub(crate) mod snapshot_txn_guard;
 /// O3 adaptive busy-poll governor — the spin it gates exists only in the
 /// vendored monoio legacy driver, so the module is monoio-only.
 #[cfg(feature = "runtime-monoio")]

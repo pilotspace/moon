@@ -7,8 +7,9 @@
 //! F3, WS42). `BGSAVE` and the save rules share that flaw and are WS42's;
 //! WS39 added a snapshot nobody asks for — held cold files trigger one after
 //! three orphan sweeps — so any cold churn during a TXN made the abort come
-//! back after a crash. Until WS42 lands, the automatic trigger waits while any
-//! shard has a transaction open, and runs once the last one ends.
+//! back after a crash. moon#1300 (F3): every snapshot stores an open TXN's
+//! keys at their pre-transaction value, so the trigger runs while the TXN is
+//! open (no waiting, no starvation) and the abort still does not come back.
 //!
 //! ```text
 //! --appendonly no --save "" --disk-offload enable (1 s orphan sweep)
@@ -207,9 +208,19 @@ fn an_aborted_txn_does_not_come_back(tag: &str, shards: usize) {
 
     let mut t = txn_on_the_keys_shard(srv.port, "aborted");
     assert_eq!(t.send(&["SET", "{t}new", "inserted"]), OK);
-    std::thread::sleep(PAST_THE_TRIGGER);
+    slow_host::wait_until(
+        "the automatic snapshot to run and release the held files, the TXN open",
+        PAST_THE_TRIGGER * 4,
+        srv.port,
+        &srv.dir,
+        || {
+            srv.snapshots_requested() >= 1
+                && srv.info("rdb_bgsave_in_progress") == Some(0)
+                && srv.info("cold_files_pending_unlink") == Some(0)
+                && heap_files(&srv.dir) == 0
+        },
+    );
     let snaps_during_txn = srv.snapshots_requested();
-    let deferred = srv.info("cold_held_release_snapshots_deferred_txn");
     assert_eq!(t.send(&["TXN", "ABORT"]), OK);
     assert_eq!(
         c.send(&["GET", "{t}k"]),
@@ -233,21 +244,16 @@ fn an_aborted_txn_does_not_come_back(tag: &str, shards: usize) {
          snapshot taken while it was open ({snaps_during_txn} requested during the TXN): \
          GET k -> {k:?} (want \"original\"), GET new -> {new:?} (want nil)"
     );
-    assert_eq!(
-        snaps_during_txn, 0,
-        "{tag}: no automatic snapshot while a TXN is open"
-    );
     assert!(
-        deferred.unwrap_or(0) >= 1,
-        "{tag}: the held files were stale during the TXN, so the trigger must have deferred \
-         (cold_held_release_snapshots_deferred_txn = {deferred:?})"
+        snaps_during_txn >= 1,
+        "{tag}: moon#1300 — the automatic snapshot runs while a TXN is open"
     );
 }
 
-/// The deferral is not a cancellation: once the TXN ends, the next sweep
-/// takes the snapshot, the held files are released, and a crash after that
-/// restarts into the committed state.
-fn the_deferred_snapshot_runs_once_the_txn_ends(tag: &str, shards: usize) {
+/// moon#1300: the snapshot runs while the TXN is open and saves the
+/// PRE-transaction value; once the TXN commits, the next save holds the
+/// commit, and a crash after it restarts into the committed state.
+fn the_snapshot_runs_while_the_txn_is_open(tag: &str, shards: usize) {
     let dir = common::unique_test_dir(&format!("moon-1289-txn-after-{tag}"));
     let mut srv = start(&dir, shards);
     let mut c = Conn::open(srv.port);
@@ -255,17 +261,10 @@ fn the_deferred_snapshot_runs_once_the_txn_ends(tag: &str, shards: usize) {
     arm_the_trigger(&srv, &mut c);
 
     let mut t = txn_on_the_keys_shard(srv.port, "committed");
-    std::thread::sleep(PAST_THE_TRIGGER);
-    assert_eq!(
-        srv.snapshots_requested(),
-        0,
-        "{tag}: no automatic snapshot while a TXN is open"
-    );
-    let ended = Instant::now();
-    assert_eq!(t.send(&["TXN", "COMMIT"]), OK);
+    let began = Instant::now();
     slow_host::wait_until(
-        "the deferred snapshot to run and release the held files",
-        Duration::from_secs(60),
+        "the automatic snapshot to run and release the held files, the TXN open",
+        PAST_THE_TRIGGER * 4,
         srv.port,
         &srv.dir,
         || {
@@ -276,8 +275,22 @@ fn the_deferred_snapshot_runs_once_the_txn_ends(tag: &str, shards: usize) {
         },
     );
     eprintln!(
-        "{tag}: deferred snapshot ran and released the files {:?} after the TXN ended",
-        ended.elapsed()
+        "{tag}: the snapshot ran and released the files {:?} into the open TXN",
+        began.elapsed()
+    );
+    assert_eq!(t.send(&["TXN", "COMMIT"]), OK);
+    let lastsave = srv.info("rdb_last_save_time");
+    std::thread::sleep(Duration::from_millis(1_100));
+    assert!(c.send(&["BGSAVE"]).starts_with('+'));
+    slow_host::wait_until(
+        "the save after the commit",
+        Duration::from_secs(60),
+        srv.port,
+        &srv.dir,
+        || {
+            srv.info("rdb_bgsave_in_progress") == Some(0)
+                && srv.info("rdb_last_save_time") > lastsave
+        },
     );
     drop(t);
     drop(c);
@@ -310,6 +323,6 @@ fn an_aborted_txn_does_not_come_back_from_the_held_file_snapshot_4_shards() {
 
 #[test]
 #[ignore = "real-server suite: MOON_BIN pinned"]
-fn the_deferred_held_file_snapshot_runs_once_the_txn_ends() {
-    the_deferred_snapshot_runs_once_the_txn_ends("s1", 1);
+fn the_held_file_snapshot_runs_while_the_txn_is_open() {
+    the_snapshot_runs_while_the_txn_is_open("s1", 1);
 }

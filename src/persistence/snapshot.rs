@@ -1465,7 +1465,6 @@ pub fn shard_snapshot_load_with_graves<D: std::borrow::BorrowMut<Database>>(
     Ok(total_keys)
 }
 
-mod abandon;
 pub mod cold_graves;
 pub(crate) mod frozen;
 
