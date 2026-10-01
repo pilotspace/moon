@@ -440,8 +440,7 @@ fn chrono_lite_now() -> String {
 /// resets among the counters wave 2a touched — `expired_keys` — plus the
 /// moon-only STATISTICS those workstreams added (monotonic event counts:
 /// `txn_conflicts_refused`, `cold_held_release_folds_requested`,
-/// `cold_held_release_snapshots_requested`,
-/// `cold_held_release_snapshots_deferred_txn`). Gauges of live state
+/// `cold_held_release_snapshots_requested`). Gauges of live state
 /// (`txn_open`, `txn_held_keys`, `cold_held_files_stale_databases`, …) are
 /// never reset. The other redis stats (`keyspace_hits`, `evicted_keys`,
 /// `total_commands_processed`, …) are still not reset here.

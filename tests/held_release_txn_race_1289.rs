@@ -1,15 +1,14 @@
 //! moon#1289 R2 (review N1): the AUTOMATIC held-file snapshot must not
-//! capture a `TXN` that begins after the request's `txn_open` check but
-//! before a shard starts its part.
+//! capture a `TXN` that begins between the request and a shard's start of its
+//! part.
 //!
-//! `held_release_txn_open_1289` covers a TXN open across the request: the
-//! request defers. The check is one instant on the requesting shard, though,
-//! and every shard starts its part later, at its own tick: a TXN whose
-//! `BEGIN` + `SET` land in between was serialized — the reviewer's
-//! `txnrace.sh` (1 ms open, 0.2 ms gap) captured `k=aborted-N` in 12 of 12
-//! restarts at 4 shards on 057598f. The fix: each shard re-checks its own
-//! hold table as it starts, and one hold abandons the whole round — no file
-//! renamed, no held file released, the spacing slot given back.
+//! The reviewer's `txnrace.sh` (1 ms open, 0.2 ms gap) captured
+//! `k=aborted-N` in 12 of 12 restarts at 4 shards on 057598f. R2's fix
+//! deferred and abandoned the automatic round while a `TXN` held a key;
+//! moon#1300 (F3) replaced that: every snapshot stores a held key's
+//! PRE-transaction value, so the round runs, publishes and releases the held
+//! files while the transaction is open, and a crash still restarts into the
+//! pre-transaction state.
 //!
 //! The deterministic tests hold every shard at its start
 //! (`MOON_TEST_SNAPSHOT_START_HOLD_FILE`) so the TXN lands in the window by
@@ -226,7 +225,7 @@ fn txn_on_the_keys_shard(port: u16, value: &str) -> Conn {
     panic!("no connection landed on the shard of {{t}}k in 64 tries");
 }
 
-/// What the abandoned round left behind.
+/// What the round left behind.
 struct Window {
     srv: Server,
     c: Conn,
@@ -237,9 +236,9 @@ struct Window {
     lastsave_before: Option<u64>,
 }
 
-/// Up to the round's end: the request passed its `txn_open` pre-check with
-/// no TXN open, every shard is held at its start, the TXN writes, the
-/// shards are released, the round ends. The TXN is still open.
+/// Up to the round's end: the request is made with no TXN open, every shard
+/// is held at its start, the TXN writes, the shards are released, the round
+/// ends. The TXN is still open.
 fn txn_in_the_window(tag: &str, shards: usize) -> Window {
     let dir = common::unique_test_dir(&format!("moon-1289-race-{tag}"));
     let hold = dir.with_extension("start-hold");
@@ -250,7 +249,7 @@ fn txn_in_the_window(tag: &str, shards: usize) -> Window {
     arm_the_trigger(&srv, &mut c, || std::fs::write(&hold, b"hold").unwrap());
 
     slow_host::wait_until(
-        "the automatic snapshot request (its txn_open pre-check passed)",
+        "the automatic snapshot request",
         Duration::from_secs(60),
         srv.port,
         &srv.dir,
@@ -265,7 +264,7 @@ fn txn_in_the_window(tag: &str, shards: usize) -> Window {
          (MOON_TEST_SNAPSHOT_START_HOLD_FILE); a binary without the hook has already saved"
     );
 
-    // The TXN begins and writes AFTER the pre-check, BEFORE any shard starts.
+    // The TXN begins and writes AFTER the request, BEFORE any shard starts.
     let mut t = txn_on_the_keys_shard(srv.port, "aborted");
     assert_eq!(t.send(&["SET", "{t}new", "inserted"]), OK);
     std::fs::remove_file(&hold).unwrap();
@@ -300,11 +299,9 @@ fn crash_and_read(w: &mut Window, shards: usize) -> (String, String) {
 
 fn a_txn_in_the_window_is_not_saved(tag: &str, shards: usize) {
     let mut w = txn_in_the_window(tag, shards);
-    let abandoned = w.srv.info("cold_held_release_snapshots_abandoned_txn");
     let files_after = snapshot_files(&w.dir);
     let temps = files_named(&w.dir, ".tmp");
     let lastsave_after = w.srv.info("rdb_last_save_time");
-    let heap_after = heap_files(&w.dir);
     let status_ok = Conn::open(w.srv.port)
         .send(&["INFO", "persistence"])
         .contains("rdb_last_bgsave_status:ok");
@@ -313,29 +310,18 @@ fn a_txn_in_the_window_is_not_saved(tag: &str, shards: usize) {
 
     assert!(
         k == bulk("original") && new == NIL,
-        "{tag}: the automatic snapshot captured a TXN that began after its txn_open \
-         pre-check and before the shards started: after kill -9 + restart GET k -> {k:?} \
+        "{tag}: the automatic snapshot captured a TXN that began after the request and \
+         before the shards started: after kill -9 + restart GET k -> {k:?} \
          (want \"original\"), GET new -> {new:?} (want nil)"
     );
-    assert_eq!(
-        abandoned,
-        Some(1),
-        "{tag}: the round is counted abandoned once"
-    );
-    assert_eq!(
+    assert_ne!(
         files_after, w.files_before,
-        "{tag}: an abandoned round renames no shard file into place"
+        "{tag}: moon#1300 — the round publishes (with the TXN's keys at their \
+         pre-transaction value) instead of being abandoned"
     );
     assert!(temps.is_empty(), "{tag}: temp files left behind: {temps:?}");
-    assert_eq!(
-        lastsave_after, w.lastsave_before,
-        "{tag}: LASTSAVE did not move"
-    );
-    assert!(status_ok, "{tag}: an abandon is not a failed save");
-    assert!(
-        heap_after > 0,
-        "{tag}: no held file is released by an abandoned round"
-    );
+    assert_ne!(lastsave_after, w.lastsave_before, "{tag}: LASTSAVE moved");
+    assert!(status_ok, "{tag}: the save succeeded");
 }
 
 #[test]
@@ -352,31 +338,26 @@ fn a_txn_between_the_request_and_the_start_is_not_saved_4_shards() {
     a_txn_in_the_window_is_not_saved("s4", 4);
 }
 
-/// The abandon is not a cancellation: the slot was given back, the next
-/// sweep after the TXN ends takes the snapshot, the held files go, and the
-/// crash restarts into the aborted-to state.
+/// moon#1300: the round is not held back by the open TXN — the held files are
+/// released while it is still open (no starvation), and after its abort a
+/// crash restarts into the pre-transaction state.
 #[test]
 #[ignore = "real-server suite: MOON_BIN pinned"]
-fn an_abandoned_round_is_retried_once_the_txn_ends() {
-    let mut w = txn_in_the_window("retry", 4);
-    assert_eq!(w.t.send(&["TXN", "ABORT"]), OK);
-    let ended = Instant::now();
+fn the_held_files_are_released_while_the_txn_is_open() {
+    let mut w = txn_in_the_window("open", 4);
+    let started = Instant::now();
     slow_host::wait_until(
-        "the retried snapshot to run and release the held files",
+        "the held files to be released with the TXN still open",
         Duration::from_secs(60),
         w.srv.port,
         &w.dir,
-        || {
-            w.srv.requested() >= 2
-                && !w.srv.saving()
-                && w.srv.info("cold_files_pending_unlink") == Some(0)
-                && heap_files(&w.dir) == 0
-        },
+        || w.srv.info("cold_files_pending_unlink") == Some(0) && heap_files(&w.dir) == 0,
     );
     eprintln!(
-        "retried snapshot released the files {:?} after the TXN ended",
-        ended.elapsed()
+        "held files released {:?} after the round, TXN open",
+        started.elapsed()
     );
+    assert_eq!(w.t.send(&["TXN", "ABORT"]), OK);
     assert_eq!(w.c.send(&["GET", "{t}k"]), bulk("original"));
     let (k, new) = crash_and_read(&mut w, 4);
     let _ = std::fs::remove_dir_all(&w.dir);
@@ -386,9 +367,9 @@ fn an_abandoned_round_is_retried_once_the_txn_ends() {
 /// The reviewer's `txnrace` in-suite: one client loops `TXN BEGIN` +
 /// `SET {t}k aborted-N`, ~1 ms open, `TXN ABORT`, ~0.2 ms gap, while the held
 /// files wait for their snapshot. Every TXN aborts, so once a snapshot has
-/// published, a crash must restart into `original`. (If the flood starves
-/// the snapshot for 60 s — the documented cost of the guarantee — the gap
-/// widens so the test still ends on a published snapshot.)
+/// published, a crash must restart into `original`. Since moon#1300 the
+/// flood no longer starves the snapshot (the gap-widening fallback after
+/// 60 s is kept only as a bound on the test's run time).
 fn a_busy_txn_workload_never_reaches_the_snapshot(tag: &str, shards: usize) {
     let dir = common::unique_test_dir(&format!("moon-1289-busy-{tag}"));
     let hold = dir.with_extension("start-hold");
@@ -431,11 +412,8 @@ fn a_busy_txn_workload_never_reaches_the_snapshot(tag: &str, shards: usize) {
     let done = published();
     stop.store(true, Ordering::Relaxed);
     let cycles = flood.join().unwrap();
-    let abandoned = srv.info("cold_held_release_snapshots_abandoned_txn");
-    let deferred = srv.info("cold_held_release_snapshots_deferred_txn");
     eprintln!(
-        "{tag}: published={done} after {:?}, {cycles} TXNs, deferred={deferred:?} \
-         abandoned={abandoned:?}",
+        "{tag}: published={done} after {:?}, {cycles} TXNs",
         begun.elapsed()
     );
     assert!(done, "{tag}: no automatic snapshot published within 120 s");
