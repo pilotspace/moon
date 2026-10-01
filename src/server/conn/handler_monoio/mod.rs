@@ -3857,12 +3857,15 @@ async fn handle_connection_body<
                     // already holds this write drops the record instead of
                     // replaying it on top (for FLUSHDB: wiping writes the base
                     // took after it).
+                    // moon#1300: a TXN's record is tagged with it (its block).
+                    let txn_id = conn.active_cross_txn.as_ref().map_or(0, |t| t.txn_id);
                     let fold_stamp = ctx
                         .aof_pool
                         .as_ref()
                         .map_or(aof::AppendStamp::INITIAL, |pool| {
                             pool.fold_stamp(ctx.shard_id)
-                        });
+                        })
+                        .in_txn(txn_id);
 
                     let mut response = match result {
                         DispatchResult::Response(f) => f,
@@ -3925,7 +3928,13 @@ async fn handle_connection_body<
                                 ft::record_local_write_db(
                                     ctx,
                                     conn.selected_db,
-                                    serialized.clone(),
+                                    if txn_id == 0 {
+                                        serialized.clone()
+                                    } else {
+                                        crate::server::conn::txn_log::repl_record(
+                                            txn_id, serialized,
+                                        )
+                                    },
                                 );
                             }
                         }

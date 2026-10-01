@@ -148,6 +148,14 @@ thread_local! {
     static PUBLISH_IN_TESTS: Cell<bool> = const { Cell::new(false) };
 }
 
+/// The transaction whose own write is executing on this thread (0: none) —
+/// set by [`OwnerScope`]. moon#1300: a script's write effects inside a `TXN`
+/// are logged as that transaction's records (`replication::reason_del`).
+#[inline]
+pub(crate) fn current_owner() -> u64 {
+    OWNER.with(Cell::get)
+}
+
 /// Does this shard hold any key? One thread-local load: the gate every
 /// checked write takes first.
 #[inline]
