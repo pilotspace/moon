@@ -258,9 +258,10 @@ fn an_in_place_write_on_a_large_hash_during_a_save_does_not_stall_the_shard() {
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
     assert!(streamed >= 1, "the hash was not streamed (copied instead?)");
-    // Base: 1.26 s / +836 MB at 5M. A tick streams ~2 ms plus the hash's
-    // re-skip (~10 ms at 5M); the bound leaves room for a loaded host.
-    let gap_bound = Duration::from_millis(100.max(fields as u64 / 50_000 * 3) as u64);
+    // Base: 1.26 s / +836 MB at 5M. A tick streams 2-5 ms plus the hash's
+    // re-skip (~2 ns a field: ~10 ms at 5M quiet, 20-35 ms on a loaded
+    // 4-vCPU box); 150 ms at 5M leaves room for a loaded host.
+    let gap_bound = Duration::from_millis(50 + fields as u64 / 50_000);
     assert!(
         max_gap < gap_bound,
         "the shard stalled {max_gap:?} during the HSET (bound {gap_bound:?})"
