@@ -320,9 +320,11 @@ tuning knobs — but understanding them explains the durability/throughput trade
   `MOON.TXN` records the writer emitted) into a per-shard buffer and writes
   it with ONE `write(2)` per event-loop iteration, before that iteration's
   replies leave: under monoio's io_uring driver right before the
-  `io_uring_enter` that submits the replies (redis's `beforeSleep`), under
-  the epoll/kqueue driver and tokio right before each reply write, and before
-  any reply handed to another shard. The AOF writer thread keeps the fsync,
+  `io_uring_enter` that submits the replies (redis's `beforeSleep`); under
+  the epoll/kqueue driver and tokio before the replies of each scheduler
+  round (a reply yields once so the connections ready in the same round add
+  their records, and one `write(2)` covers them all); and before any reply
+  handed to another shard. The AOF writer thread keeps the fsync,
   rewrites and `always`, and takes the append position back for each of
   them. No channel hop, no writer wake-up and no warm poll on the write path:
   measured CPU per write drops 10–50% (see `plans/WS46-aof-1a`). A slow disk
