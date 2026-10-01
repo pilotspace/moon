@@ -32,6 +32,12 @@
 //! record ended anyway. A key written ten times costs one restore, one
 //! pre-image and one record.
 //!
+//! A connection or script write records the key's first write as
+//! `UndoRecord::Held` (R2b W2): its image is the transaction's hold's, the
+//! only copy the transaction keeps, and the restore copies it from there
+//! (the hold, and every snapshot's view of it, stays until the END releases
+//! it).
+//!
 //! # Snapshot pre-images, by move
 //!
 //! A BGSAVE epoch armed while the transaction was open holds the key's
@@ -89,7 +95,8 @@ pub(crate) fn record_key(record: &UndoRecord) -> &Bytes {
     match record {
         UndoRecord::Insert { key }
         | UndoRecord::Update { key, .. }
-        | UndoRecord::Delete { key, .. } => key,
+        | UndoRecord::Delete { key, .. }
+        | UndoRecord::Held { key, .. } => key,
     }
 }
 
@@ -111,6 +118,30 @@ pub(crate) fn undo_one(
             out.push((slot, encode_command(&[b"DEL", &key])));
         }
         UndoRecord::Update { key, old_entry } | UndoRecord::Delete { key, old_entry } => {
+            take_out_current(db, slot, &key);
+            push_restore_records(slot, &key, &old_entry, out);
+            db.set(&key, old_entry);
+        }
+        UndoRecord::Held { key, .. } => {
+            // R2b W2: the key's FIRST record (`first_per_key`), its image in
+            // the transaction's hold. Copied, not moved: the hold stays — and
+            // every snapshot keeps serializing that image — until the abort's
+            // END releases it (`isolation::txn_end`), a few awaits later.
+            // One transient copy at abort, where capture used to keep two
+            // for the transaction's whole life.
+            let Some(old_entry) =
+                crate::transaction::isolation::with_held_pre(slot, &key, |pre| pre.cloned())
+            else {
+                // Unreachable: a `Held` first record is written only with a
+                // present image moved into a NEW hold, released only after
+                // this restore (or taken back with the record, moon#1303).
+                // Restoring nothing beats deleting a key whose image is lost.
+                tracing::error!(
+                    db = slot,
+                    "TXN abort: the held pre-image of a key is missing -- key left as is"
+                );
+                return;
+            };
             take_out_current(db, slot, &key);
             push_restore_records(slot, &key, &old_entry, out);
             db.set(&key, old_entry);
