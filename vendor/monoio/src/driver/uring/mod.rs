@@ -115,6 +115,7 @@ impl IoUringDriver {
         entries: u32,
     ) -> io::Result<IoUringDriver> {
         let uring = ManuallyDrop::new(urb.build(entries)?);
+        let sqpoll = uring.params().is_setup_sqpoll();
 
         let inner = Rc::new(UnsafeCell::new(UringInner {
             #[cfg(feature = "poll-io")]
@@ -126,6 +127,8 @@ impl IoUringDriver {
             uring,
         }));
 
+        // moon patch (moon#1266 1A): see `driver::SUBMIT_GATES_IO`.
+        let _ = super::SUBMIT_GATES_IO.try_with(|c| c.set(!sqpoll));
         Ok(IoUringDriver {
             inner,
             timespec: Box::leak(Box::new(Timespec::new())) as *mut Timespec,
@@ -138,6 +141,7 @@ impl IoUringDriver {
         entries: u32,
     ) -> io::Result<IoUringDriver> {
         let uring = ManuallyDrop::new(urb.build(entries)?);
+        let sqpoll = uring.params().is_setup_sqpoll();
 
         // Create eventfd and register it to the ring.
         let waker = {
@@ -174,6 +178,8 @@ impl IoUringDriver {
         // Register unpark handle
         super::thread::register_unpark_handle(thread_id, driver.unpark().into());
         super::thread::register_waker_sender(thread_id, waker_sender);
+        // moon patch (moon#1266 1A): see `driver::SUBMIT_GATES_IO`.
+        let _ = super::SUBMIT_GATES_IO.try_with(|c| c.set(!sqpoll));
         Ok(driver)
     }
 
@@ -230,6 +236,9 @@ impl IoUringDriver {
     }
 
     fn inner_park(&self, timeout: Option<Duration>) -> io::Result<()> {
+        // moon patch (moon#1266 1A): every submit below happens after the
+        // host's before-submit hook.
+        super::run_before_submit();
         let inner = unsafe { &mut *self.inner.get() };
 
         #[allow(unused_mut)]
@@ -456,6 +465,8 @@ impl UringInner {
     }
 
     fn submit(&mut self) -> io::Result<()> {
+        // moon patch (moon#1266 1A): see `driver::run_before_submit`.
+        super::run_before_submit();
         loop {
             match self.uring.submit() {
                 #[cfg(feature = "unstable")]

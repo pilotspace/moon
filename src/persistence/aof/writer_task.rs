@@ -141,6 +141,8 @@ fn stall_everysec_fsync_for_test() {
 
 // The clean-close marker of an orderly stop (R2 review of moon#1283).
 mod close;
+// The writer's side of the moon#1266 1A lane.
+mod lane_hooks;
 // The monoio writers' channel receive: warm poll, then park (moon#1266).
 #[cfg(feature = "runtime-monoio")]
 mod poll;
@@ -261,9 +263,12 @@ pub async fn aof_writer_task(
         Arc<parking_lot::Mutex<ringbuf::HeapProd<crate::shard::dispatch::ShardMessage>>>,
         Arc<crate::runtime::channel::Notify>,
     )>,
+    lane: Arc<super::lane::AofLane>,
 ) {
     #[cfg(feature = "runtime-tokio")]
     use tokio::io::AsyncWriteExt;
+    // moon#1266 1A: however this task ends, the lane closes behind it.
+    let _lane_close = super::lane::CloseOnExit(Arc::clone(&lane));
 
     // Open file in append mode (create if not exists)
     #[cfg(feature = "runtime-tokio")]
@@ -473,6 +478,7 @@ pub async fn aof_writer_task(
                 }
                 Err(flume::RecvTimeoutError::Disconnected) => {
                     // Channel disconnected — final sync + shut down.
+                    lane_hooks::reclaim(&lane, &mut last_db, &mut write_error);
                     if !write_error {
                         close::append_sync(&mut file, &mut last_db, false);
                         if let Err(e) = file.flush().and_then(|_| file.sync_data()) {
@@ -485,6 +491,8 @@ pub async fn aof_writer_task(
             };
 
             if let Some(first) = first {
+                // moon#1266 1A: the append position is the writer's again.
+                lane_hooks::reclaim(&lane, &mut last_db, &mut write_error);
                 let mut batch = collect_group_commit_batch(
                     first,
                     || rx.try_recv().ok(),
@@ -673,6 +681,16 @@ pub async fn aof_writer_task(
                 }
             }
 
+            // moon#1266 1A: direct writes owe the deadline (learned before
+            // its claim); `always` takes the append position back.
+            lane_hooks::on_wake(
+                &lane,
+                fsync,
+                &mut everysec,
+                &mut idle_wait,
+                &mut last_db,
+                &mut write_error,
+            );
             // EverySec deadline — checked after every loop iteration
             // (message processed OR timeout); the only path that guarantees
             // the ~1s durability bound when no further messages arrive after
@@ -703,6 +721,9 @@ pub async fn aof_writer_task(
                     }
                 }
             }
+            // moon#1266 1A: hand the append position to the producers when
+            // nothing is in flight.
+            lane_hooks::offer_std(&lane, &rx, fsync, write_error, &mut last_db, fold_floor, &file);
         }
         return;
     }
@@ -733,6 +754,7 @@ pub async fn aof_writer_task(
                     rx.recv_async(),
                 ) => r,
                 _ = cancel.cancelled() => {
+                    lane_hooks::reclaim(&lane, &mut last_db, &mut write_error);
                     // Skip the final sync if the stream is torn — syncing past a
                     // partial record cannot recover it and risks a false durability
                     // signal (mirrors the monoio TopLevel disconnect/shutdown gate).
@@ -751,6 +773,7 @@ pub async fn aof_writer_task(
                 Err(_) => idle_wait.on_timeout(),
                 // Channel disconnected — final sync + shut down.
                 Ok(Err(_)) => {
+                    lane_hooks::reclaim(&lane, &mut last_db, &mut write_error);
                     if !write_error {
                         close::append_async(&mut writer, &mut last_db, false).await;
                         let _ = writer.flush().await;
@@ -760,6 +783,8 @@ pub async fn aof_writer_task(
                     break;
                 }
                 Ok(Ok(first)) => {
+                    // moon#1266 1A: the append position is the writer's again.
+                    lane_hooks::reclaim(&lane, &mut last_db, &mut write_error);
                     // A message just arrived (data or control): reset the idle
                     // wait to its fast floor so the deadline check after this
                     // block — and every subsequent poll while there is still
@@ -1047,6 +1072,16 @@ pub async fn aof_writer_task(
                     }
                 }
             }
+            // moon#1266 1A: direct writes owe the deadline (learned before
+            // its claim); `always` takes the append position back.
+            lane_hooks::on_wake(
+                &lane,
+                fsync,
+                &mut everysec,
+                &mut idle_wait,
+                &mut last_db,
+                &mut write_error,
+            );
             // EverySec deadline: the oldest unsynced byte reaches disk at
             // most ~1.2s after it was written (1s deadline + wake floor —
             // the wake floor only, never the escalated idle cadence: see
@@ -1092,6 +1127,17 @@ pub async fn aof_writer_task(
                     }
                 }
             }
+            // moon#1266 1A: hand the append position to the producers when
+            // nothing is in flight.
+            lane_hooks::offer_tokio(
+                &lane,
+                &rx,
+                fsync,
+                write_error,
+                &mut last_db,
+                fold_floor,
+                writer.get_ref(),
+            );
         }
     }
 }
@@ -1128,7 +1174,10 @@ pub async fn per_shard_aof_writer_task(
     shard_id: u16,
     configured_fsync: FsyncPolicy,
     cancel: CancellationToken,
+    lane: Arc<super::lane::AofLane>,
 ) {
+    // moon#1266 1A: however this task ends, the lane closes behind it.
+    let _lane_close = super::lane::CloseOnExit(Arc::clone(&lane));
     test_hooks::hold_writer_start(shard_id, &cancel);
     #[cfg(feature = "runtime-tokio")]
     {
@@ -1302,6 +1351,7 @@ pub async fn per_shard_aof_writer_task(
                         Err(_) => idle_wait.on_timeout(),
                         // Channel disconnected — final sync + shut down.
                         Ok(Err(_)) => {
+                            lane_hooks::reclaim(&lane, &mut last_db, &mut write_error);
                             if !write_error {
                                 close::append_async(&mut writer, &mut last_db, true).await;
                             }
@@ -1311,6 +1361,8 @@ pub async fn per_shard_aof_writer_task(
                             break;
                         }
                         Ok(Ok(first)) => {
+                            // moon#1266 1A: the append position is the writer's again.
+                            lane_hooks::reclaim(&lane, &mut last_db, &mut write_error);
                             // A message just arrived: reset to the fast floor
                             // (see TopLevel writer above for the full rationale).
                             idle_wait.on_message();
@@ -1568,6 +1620,7 @@ pub async fn per_shard_aof_writer_task(
                     }
                 }
                 _ = cancel.cancelled() => {
+                    lane_hooks::reclaim(&lane, &mut last_db, &mut write_error);
                     if !write_error {
                         close::append_async(&mut writer, &mut last_db, true).await;
                     }
@@ -1577,6 +1630,16 @@ pub async fn per_shard_aof_writer_task(
                     break;
                 }
             }
+            // moon#1266 1A: direct writes owe the deadline (learned before
+            // its claim); `always` takes the append position back.
+            lane_hooks::on_wake(
+                &lane,
+                fsync,
+                &mut everysec,
+                &mut idle_wait,
+                &mut last_db,
+                &mut write_error,
+            );
             // EverySec deadline — checked after EVERY wake (message OR timeout),
             // so it is NOT subject to select! fairness and holds the 1s bound
             // under sustained writes as well as when idle. (The old long-lived
@@ -1620,6 +1683,17 @@ pub async fn per_shard_aof_writer_task(
                     }
                 }
             }
+            // moon#1266 1A: hand the append position to the producers when
+            // nothing is in flight.
+            lane_hooks::offer_tokio(
+                &lane,
+                &rx,
+                fsync,
+                write_error,
+                &mut last_db,
+                fold_floor,
+                writer.get_ref(),
+            );
         }
     }
 
@@ -1775,6 +1849,7 @@ pub async fn per_shard_aof_writer_task(
                     None
                 }
                 Err(flume::RecvTimeoutError::Disconnected) => {
+                    lane_hooks::reclaim(&lane, &mut last_db, &mut write_error);
                     if !write_error {
                         close::append_sync(&mut file, &mut last_db, true);
                         if let Err(e) = file.flush().and_then(|_| file.sync_data()) {
@@ -1796,6 +1871,8 @@ pub async fn per_shard_aof_writer_task(
             };
 
             if let Some(first) = first {
+                // moon#1266 1A: the append position is the writer's again.
+                lane_hooks::reclaim(&lane, &mut last_db, &mut write_error);
                 // Group commit: drain a bounded batch so ONE fsync makes all
                 // framed records (`[u64 lsn][u32 len][RESP]`) durable.
                 let mut batch = collect_group_commit_batch(
@@ -2054,6 +2131,16 @@ pub async fn per_shard_aof_writer_task(
                     Some(_) => {}
                 }
             }
+            // moon#1266 1A: direct writes owe the deadline (learned before
+            // its claim); `always` takes the append position back.
+            lane_hooks::on_wake(
+                &lane,
+                fsync,
+                &mut everysec,
+                &mut idle_wait,
+                &mut last_db,
+                &mut write_error,
+            );
             // EverySec deadline — checked after every loop iteration
             // (message processed OR timeout). This is the only path that
             // guarantees the 1s fsync bound when no new Appends arrive
@@ -2085,6 +2172,9 @@ pub async fn per_shard_aof_writer_task(
                     }
                 }
             }
+            // moon#1266 1A: hand the append position to the producers when
+            // nothing is in flight.
+            lane_hooks::offer_std(&lane, &rx, fsync, write_error, &mut last_db, fold_floor, &file);
         }
     }
 }

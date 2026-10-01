@@ -122,6 +122,8 @@ impl super::Shard {
             aof_pool.as_ref().map(Arc::clone),
             repl_state_ext.clone(),
         );
+        // moon#1266 1A: this shard thread writes its own AOF records (when on).
+        crate::persistence::aof::lane::install_for_shard(self.id, aof_pool.as_ref());
 
         // Publish disk-offload status for INFO moonstore (set once per shard, idempotent).
         crate::vector::metrics::MOONSTORE_DISK_OFFLOAD_ENABLED.store(
@@ -1239,6 +1241,10 @@ impl super::Shard {
         );
 
         loop {
+            // moon#1266 1A: once per iteration, this shard's buffered AOF
+            // records (background writes: expiry, eviction) reach the kernel.
+            // Replies flush their own (or the io_uring submit hook does).
+            crate::persistence::aof::lane::flush_current();
             #[cfg(feature = "runtime-tokio")]
             tokio::select! {
                 // io_uring CQE notification: eventfd becomes readable when completions arrive.
@@ -2919,6 +2925,9 @@ impl super::Shard {
                 }
             }
         }
+
+        // moon#1266 1A: what this shard buffered goes out; unbind.
+        crate::persistence::aof::lane::uninstall_for_shard();
 
         // Close per-shard SO_REUSEPORT listener fd if created (Linux + tokio only).
         #[cfg(all(target_os = "linux", feature = "runtime-tokio"))]

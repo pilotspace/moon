@@ -56,6 +56,35 @@ pub(crate) fn set_legacy_spin_contended(contended: bool) {
     legacy::set_spin_contended(contended);
 }
 
+// moon patch (moon#1266 1A): a per-thread hook the io_uring driver runs
+// before every `io_uring_enter` that submits SQEs — the host writes its AOF
+// buffer there, so it reaches the kernel before the replies queued as SQEs in
+// the same iteration (redis's `beforeSleep`). `SUBMIT_GATES_IO` is set by the
+// io_uring driver on its thread when the kernel sees SQEs only at those
+// enters (no SQPOLL kernel thread); it stays `false` for the legacy driver,
+// whose writes run inside the task.
+std::thread_local! {
+    static BEFORE_SUBMIT: std::cell::Cell<Option<fn()>> = const { std::cell::Cell::new(None) };
+    pub(crate) static SUBMIT_GATES_IO: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// moon patch: run the calling thread's before-submit hook, if any.
+#[inline]
+#[allow(dead_code)] // only the io_uring driver calls it
+pub(crate) fn run_before_submit() {
+    if let Ok(Some(hook)) = BEFORE_SUBMIT.try_with(std::cell::Cell::get) {
+        hook();
+    }
+}
+
+/// moon patch: install (or clear) the calling thread's before-submit hook.
+/// Returns whether this thread's driver submits I/O only at the hooked
+/// points (io_uring without SQPOLL).
+pub(crate) fn set_before_submit_hook(hook: Option<fn()>) -> bool {
+    let _ = BEFORE_SUBMIT.try_with(|c| c.set(hook));
+    SUBMIT_GATES_IO.try_with(std::cell::Cell::get).unwrap_or(false)
+}
+
 /// Unpark a runtime of another thread.
 pub(crate) mod unpark {
     #[allow(unreachable_pub)]
