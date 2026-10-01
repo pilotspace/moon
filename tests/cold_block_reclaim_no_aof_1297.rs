@@ -804,7 +804,12 @@ fn reclaim_round_with_a_txn_open(end: RoundEnd) {
     let hold = dir.join("reclaim.hold");
     std::fs::write(&hold, b"").expect("hold file");
     let hold_s = hold.to_string_lossy().to_string();
-    let mut envs = vec![("MOON_TEST_COLD_RECLAIM_HOLD_FILE", hold_s.as_str())];
+    let start_hold = dir.join("start.hold");
+    let start_hold_s = start_hold.to_string_lossy().to_string();
+    let mut envs = vec![
+        ("MOON_TEST_COLD_RECLAIM_HOLD_FILE", hold_s.as_str()),
+        ("MOON_TEST_SNAPSHOT_START_HOLD_FILE", start_hold_s.as_str()),
+    ];
     if end == RoundEnd::AdoptReady {
         envs.push(("MOON_TEST_COLD_RECLAIM_CRASH", "adopt_ready"));
     }
@@ -826,12 +831,31 @@ fn reclaim_round_with_a_txn_open(end: RoundEnd) {
     let s1 = snapshot_ids(&dir);
     let lastsave_s1 = integer_reply(&redis_cmd(port, &["LASTSAVE"]));
     let requested_s1 = info_u64(port, "cold_reclaim_snapshots_requested").unwrap_or(0);
+    // Every shard waits at the start of the next snapshot: the round may be
+    // requested before the TXN opens (three sweeps after the first record),
+    // but no shard starts its part — captures pre-images, encodes the
+    // trailer — before the TXN has written.
+    std::fs::write(&start_hold, b"").expect("start hold");
     std::fs::remove_file(&hold).expect("release the compaction hold");
     let compactions = wait_for_compactions(port);
     // One generation (see `run_case`).
     std::fs::write(&hold, b"").expect("hold file");
     assert!(compactions > 0, "precondition: no compaction started");
     let txn = open_txn_over_survivors(port);
+    let requested_round = || {
+        info_u64(port, "cold_reclaim_snapshots_requested").unwrap_or(0) > requested_s1
+            && !redis_cmd(port, &["INFO", "persistence"]).contains("rdb_bgsave_in_progress:0")
+    };
+    assert_eq!(
+        wait_or_exit(&mut server, 60, requested_round),
+        None,
+        "precondition: the server stopped before the round was requested"
+    );
+    assert!(
+        requested_round(),
+        "precondition: the cold-reclaim round is requested and held at every shard's start"
+    );
+    std::fs::remove_file(&start_hold).expect("release the starts");
 
     let (mut requested, mut held_requested, mut lastsave) = (None, None, lastsave_s1);
     let exit = match end {
