@@ -328,7 +328,8 @@ tuning knobs — but understanding them explains the durability/throughput trade
   all); and before any reply handed to another shard. The AOF writer thread keeps the fsync,
   rewrites and `always`, and takes the append position back for each of
   them. No channel hop, no writer wake-up and no warm poll on the write path:
-  measured CPU per write drops 10–50% (see `plans/WS46-aof-1a`). A slow disk
+  measured server CPU per write −10 to −35% under monoio (io_uring and epoll) at
+  50 connections and −30 to −65% under tokio, `--shards 1` (see `plans/WS46-aof-1a`). A slow disk
   now stalls the shard's `write(2)` instead of filling a queue — redis's
   behaviour too. `MOON_AOF_SHARD_WRITE=0` restores the writer-thread path
   (Option 3: the writer polls its channel every 500 µs while writes flow,
@@ -378,10 +379,11 @@ the replies that acknowledge them (above), so **a process crash loses no
 acknowledged write** — redis's guarantee. `tests/aof_everysec_kill9_1266.rs`
 measures it: 10,000 acked SETs (unpipelined, or pipelined 100 deep) or one SET
 after an idle second, SIGKILL 1 ms after the last ack, restart, count what is
-missing; 20 reps per cell, `--shards` 1 and 4, both runtimes, on a 4-vCPU Linux
-container shared with other builds (2026-10-01): **0 of 240 reps lost
-anything**. Before 1A: Option 3 (writer thread, 500 µs pickup) lost in 9 of 240
-reps, and before Option 3, 226 of 240 (median rep 1–1,100 keys).
+missing; 20 reps per cell, `--shards` 1 and 4, under tokio and under monoio
+with each of its I/O drivers (io_uring, epoll), on a 4-vCPU Linux container
+shared with other builds (2026-10-01): **0 of 360 reps lost anything**. Before
+1A (monoio io_uring + tokio): Option 3 (writer thread, 500 µs pickup) lost in 9
+of 240 reps, and before Option 3, 226 of 240 (median rep 1–1,100 keys).
 
 Two exceptions remain:
 - **Inside a BGREWRITEAOF fold.** The AOF writer takes the append position back
