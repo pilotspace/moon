@@ -206,6 +206,11 @@ impl Database {
             // still go through `remove_hot` so the expiry index stays in
             // lock-step (moon#541).
             self.remove_hot(key);
+            // moon#1286: redis's `lookupKeyWrite` -> `expireIfNeeded` counts
+            // this reap; a replica applying its master's stream does not.
+            if !crate::replication::apply::applying_master_stream() {
+                crate::admin::metrics_setup::record_expired_key();
+            }
         }
         // Precondition established above; see this function's doc comment.
         self.promote_cold_known_absent(key, now_ms)

@@ -261,7 +261,12 @@ pub fn expire_cycle_direct_budget(
         }
         return false;
     }
-    expire_cycle_budget(db, on_removed, budget, hash_key_cap);
+    let skipped_held = expire_cycle_budget(db, on_removed, budget, hash_key_cap);
+    // moon#1299: what is left due may be only keys an open TXN holds; that is
+    // no backlog for the fast cycle to spin on — the slow cycle retries.
+    if skipped_held {
+        return false;
+    }
     // moon#1288: redis's `activeExpireCycle` keeps going while more than
     // ~10% of a SAMPLE is expired. The deadline indexes here are exact, not
     // sampled: their head being due after the budget ran out means the
@@ -298,10 +303,17 @@ fn drain_lazy_expired(db: &mut Database, on_removed: &mut dyn FnMut(&[u8])) {
         return;
     }
     for key in db.take_pending_lazy_expired() {
+        // moon#1299: a key an open TXN holds is not reaped under it; its
+        // expiry-index pair stays, so the sweep reaps it once released.
+        if crate::transaction::isolation::is_held(db.db_index, key.as_bytes()) {
+            continue;
+        }
         if db.is_key_expired(key.as_bytes()) {
             // moon#1190: a large expired value is freed by the lazy-free
             // drain, not inside this tick.
             db.remove_lazily(key.as_bytes());
+            // moon#1286: a lazily-discovered expiry is an expired key too.
+            crate::admin::metrics_setup::record_expired_key();
             on_removed(key.as_bytes());
             // moon#1013: a lazily-expired key is as gone as a swept one.
             crate::tracking::invalidation::invalidate_server_removed(key.as_bytes());
@@ -349,7 +361,7 @@ fn drain_lazy_expired(db: &mut Database, on_removed: &mut dyn FnMut(&[u8])) {
 /// is not incorrectly short-circuited on the next tick.
 #[cfg(test)]
 fn expire_cycle(db: &mut Database, on_removed: &mut dyn FnMut(&[u8])) {
-    expire_cycle_budget(
+    let _held = expire_cycle_budget(
         db,
         on_removed,
         Duration::from_millis(1),
@@ -365,8 +377,12 @@ fn expire_cycle_budget(
     on_removed: &mut dyn FnMut(&[u8]),
     budget: Duration,
     hash_key_cap: u32,
-) {
+) -> bool {
     let start = Instant::now();
+    // moon#1299: due pairs of keys an open TXN holds, put back after the
+    // sweep — the key is not reaped under its transaction.
+    let mut held: smallvec::SmallVec<[(u64, crate::storage::compact_key::CompactKey); 4]> =
+        smallvec::SmallVec::new();
     let hash_key_cap = hash_key_cap.max(1);
 
     // ── Sweep 1: deadline-ordered whole-key expiry (moon#541) ───────────────
@@ -378,8 +394,16 @@ fn expire_cycle_budget(
     let now_ms = current_time_ms();
     let mut popped = 0u32;
     while let Some((ts, key)) = db.pop_due_expiry(now_ms) {
+        if crate::transaction::isolation::is_held(db.db_index, key.as_bytes()) {
+            held.push((ts, key));
+            continue;
+        }
         match db.remove_expired_at(key.as_bytes(), ts, now_ms) {
             ExpiredRemoval::Removed => {
+                // moon#1286: `INFO expired_keys` counts every expiry-driven
+                // whole-key removal (not hash-field expiry). A per-thread
+                // striped bump: no shared cache line on the shard tick.
+                crate::admin::metrics_setup::record_expired_key();
                 on_removed(key.as_bytes());
                 // moon#1013: tell CLIENT TRACKING caches the key is gone. One
                 // relaxed load per key when nobody tracks.
@@ -431,7 +455,15 @@ fn expire_cycle_budget(
     // redis 7.0.15 counts neither a whole key nor a field reaped by its TTL.
     // The reap's `get_mut` and the `remove` of an emptied hash are muted.
     let _quiet = crate::admin::metrics_setup::mute_keyspace_changes();
+    let mut held_hash = false;
     while let Some((ts, key)) = db.peek_due_hash_expiry(hash_now_ms) {
+        // moon#1299: the head is a hash an open TXN holds. Its pair stays at
+        // the head, so the sweep stops here for this tick; a deferred field
+        // reap is invisible to reads (they filter expired fields).
+        if crate::transaction::isolation::is_held(db.db_index, key.as_bytes()) {
+            held_hash = true;
+            break;
+        }
         let outcome = db.reap_expired_fields_one_hash_at(
             key.as_bytes(),
             hash_now_ms,
@@ -461,9 +493,14 @@ fn expire_cycle_budget(
     // continue to run sweep 2. Both checks are O(1) now: the whole-key
     // side reads the index's emptiness, and the hash side reads the latch
     // sweep 2 just maintained from its own reap outcomes.
+    let held_any = held_hash || !held.is_empty();
+    for (ts, key) in held {
+        db.restore_expiry_pair(ts, key);
+    }
     if db.expiry_index_is_empty() && !db.hash_field_ttl_possible() {
         db.clear_maybe_has_expiring_keys();
     }
+    held_any
 }
 
 #[cfg(test)]
@@ -1397,3 +1434,8 @@ mod lazy_free_tokio_tests {
 #[cfg(test)]
 #[path = "expiration_lazy_free_tick_tests.rs"]
 mod lazy_free_tick_tests;
+
+/// moon#1286: `INFO expired_keys` counts each expiry-driven whole-key removal.
+#[cfg(test)]
+#[path = "expiration_expired_keys_tests.rs"]
+mod expired_keys_tests;

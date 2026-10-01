@@ -298,6 +298,10 @@ pub fn make_redis_call_fn(
                 && matches!(frame, Frame::Error(_))
             {
                 super::txn_capture::txn_undo_discard(mark);
+                // moon#1299: a key another open TXN holds — a guard refusal.
+                if crate::transaction::isolation::is_conflict_reply(&frame) {
+                    super::txn_capture::txn_note_conflict(&cmd_bytes);
+                }
             }
 
             // moon#685: a flush issued from Lua has to reach as far as the

@@ -93,6 +93,10 @@ fn settle_deletion(outcome: KeyDeletion, key: &[u8], db_index: usize) -> bool {
                 notify_del(key, db_index);
                 true
             } else {
+                // moon#1286: DEL/UNLINK found an expired key and reaped it, as
+                // redis's `expireIfNeeded` does (and counts). Not counted when
+                // applying the master's stream: a replica does not expire keys.
+                crate::admin::metrics_setup::record_expired_key();
                 crate::notify::notify_keyspace_event(
                     crate::notify::NotifyFlags::EXPIRED,
                     "expired",
@@ -134,6 +138,40 @@ pub(crate) fn expired_reaps() -> u64 {
 #[inline]
 pub(crate) fn notify_del(key: &[u8], db_index: usize) {
     crate::notify::notify_keyspace_event(crate::notify::NotifyFlags::GENERIC, "del", key, db_index);
+}
+
+/// redis's `checkAlreadyExpired`: is the absolute deadline `when_ms` at or
+/// before now, so the command deletes the key at once instead of storing it?
+/// Judged on the database clock, which a replay pins to the log's time
+/// (moon#1277). Never while applying the master's stream (review N2): a
+/// replica does not decide expiry by its own clock — a deadline its lag
+/// made past is stored like any other, and the master's own immediate delete
+/// arrives as `DEL` (`replication::effect_rewrite`).
+#[inline]
+pub(crate) fn deadline_already_past(db: &Database, when_ms: u64) -> bool {
+    when_ms <= db.now_ms() && !crate::replication::apply::applying_master_stream()
+}
+
+/// redis's `checkAlreadyExpired` arm of `EXPIRE` / `EXPIREAT` (and their
+/// `P` forms): a deadline at or before now deletes the key at once. It is a
+/// deletion, not an expiry — `del` is published and `expired_keys` does not
+/// move — answering 1 if the key existed (R1 findings 4 and 9).
+///
+/// A key whose own TTL already passed does not exist for the command
+/// (redis's `lookupKeyWrite` expires it first, and counts that): it answers
+/// 0 and is handed to the lazy drain, which reaps and counts it.
+pub(crate) fn delete_already_expired(db: &mut Database, key: &[u8]) -> Frame {
+    let now_ms = db.now_ms();
+    if db.data().get(key).is_some_and(|e| e.is_expired_at(now_ms)) {
+        db.note_lazy_expired(key);
+        return Frame::Integer(0);
+    }
+    if db.remove(key).is_some() {
+        notify_del(key, db.db_index);
+        Frame::Integer(1)
+    } else {
+        Frame::Integer(0)
+    }
 }
 
 /// EXISTS key [key ...]
@@ -281,11 +319,7 @@ pub fn expire(db: &mut Database, args: &[Frame]) -> Frame {
             Ok(false) => return Frame::Integer(0),
             Ok(true) => {}
         }
-        return if db.remove(key).is_some() {
-            Frame::Integer(1)
-        } else {
-            Frame::Integer(0)
-        };
+        return delete_already_expired(db, key);
     }
     // Guard the u64 arithmetic (seconds*1000 + now_ms can overflow) AND bound the
     // result to the i64 domain so PTTL — which casts the stored u64 back to i64 —
@@ -344,11 +378,7 @@ pub fn pexpire(db: &mut Database, args: &[Frame]) -> Frame {
             Ok(false) => return Frame::Integer(0),
             Ok(true) => {}
         }
-        return if db.remove(key).is_some() {
-            Frame::Integer(1)
-        } else {
-            Frame::Integer(0)
-        };
+        return delete_already_expired(db, key);
     }
     // Guard the u64 arithmetic against overflow AND bound the result to the i64
     // domain so PTTL never wraps negative on a live key (consistent with EXPIRE).
@@ -501,11 +531,7 @@ pub fn expireat(db: &mut Database, args: &[Frame]) -> Frame {
             Ok(false) => return Frame::Integer(0),
             Ok(true) => {}
         }
-        return if db.remove(key).is_some() {
-            Frame::Integer(1)
-        } else {
-            Frame::Integer(0)
-        };
+        return delete_already_expired(db, key);
     }
     // Guard the *1000 conversion against u64 overflow AND bound the result to the
     // i64 domain so PEXPIRETIME never wraps negative on a live key.
@@ -524,6 +550,11 @@ pub fn expireat(db: &mut Database, args: &[Frame]) -> Frame {
         Err(e) => return e,
         Ok(false) => return Frame::Integer(0),
         Ok(true) => {}
+    }
+    // R1 finding 4: a deadline already past deletes now, judged on the
+    // database clock (a replay's is the log's, moon#1277); not on a replica.
+    if deadline_already_past(db, expires_at_ms) {
+        return delete_already_expired(db, key);
     }
     if db.set_expiry(key, expires_at_ms) {
         Frame::Integer(1)
@@ -560,16 +591,16 @@ pub fn pexpireat(db: &mut Database, args: &[Frame]) -> Frame {
             Ok(false) => return Frame::Integer(0),
             Ok(true) => {}
         }
-        return if db.remove(key).is_some() {
-            Frame::Integer(1)
-        } else {
-            Frame::Integer(0)
-        };
+        return delete_already_expired(db, key);
     }
     match expire_condition_allows(db, key, &args[2..], timestamp_ms as u64) {
         Err(e) => return e,
         Ok(false) => return Frame::Integer(0),
         Ok(true) => {}
+    }
+    // R1 finding 4: see `expireat`.
+    if deadline_already_past(db, timestamp_ms as u64) {
+        return delete_already_expired(db, key);
     }
     if db.set_expiry(key, timestamp_ms as u64) {
         Frame::Integer(1)
@@ -1561,6 +1592,10 @@ pub fn touch_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
     }
     Frame::Integer(count)
 }
+
+#[cfg(test)]
+#[path = "expire_past_tests.rs"]
+mod expire_past_tests;
 
 #[cfg(test)]
 mod tests {

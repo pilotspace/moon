@@ -78,6 +78,7 @@ jobs:
           - parse_i64_bytes_differential
           - snapshot_cold_graves
           - graph_wal_replay
+          - aof_incr_replay
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@nightly
@@ -168,6 +169,7 @@ jobs:
           - parse_i64_bytes_differential
           - snapshot_cold_graves
           - graph_wal_replay
+          - aof_incr_replay
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@nightly

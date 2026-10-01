@@ -991,7 +991,7 @@ pub(crate) async fn persist_txn_aof(
     // body on recovery.
     aof_entries: Vec<(usize, Bytes)>,
     repl_recorded: bool,
-    fold_stamp: crate::persistence::aof::FoldEpoch,
+    fold_stamp: crate::persistence::aof::AppendStamp,
 ) -> Result<(), &'static [u8]> {
     if aof_entries.is_empty() {
         return Ok(());

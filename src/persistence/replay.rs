@@ -24,8 +24,15 @@ use crate::storage::db::HashTtlCond;
 
 /// The bounded streaming reader the RESP log replays use (moon#1160).
 pub(crate) mod chunks;
-/// The expiry-judgment clock of a replay (moon#1277).
+/// The expiry-judgment clock of a replay (moon#1277, moon#1283).
 pub mod clock;
+/// The forward scan across a foreign segment after a clean-close marker
+/// (the clock's positional rule, R2 review of moon#1283).
+pub mod log_segment;
+/// Replay-only `MOON.*` pseudo-commands and their intercept (moon#1283).
+pub mod pseudo;
+/// Marks a replay on this thread: expiries it causes are not counted (moon#1286).
+pub(crate) mod scope;
 
 /// Parse a Frame as an unsigned integer (BulkString or Integer).
 #[inline]
@@ -154,6 +161,10 @@ pub enum ReplayRoute {
     /// A replay-only cold-plane cut record (`MOON.COLDCUT` / `MOON.SPILLED`):
     /// it moves the cold-tier gate. It is not a key write.
     ColdPlane,
+    /// A replay-only log marker (`MOON.TS`; `MOON.TXN` with moon#1300): it
+    /// moves replay state — the expiry-judgment clock, a block boundary —
+    /// and never the keyspace. See [`pseudo`].
+    Marker,
     /// Diverted to the graph collector (well-formed or not). The graph engine
     /// applies it in its own pass, and it never reaches the keyspace.
     Graph,
@@ -348,6 +359,15 @@ impl CommandReplayEngine for DispatchReplayEngine {
         args: &[Frame],
         selected_db: &mut usize,
     ) -> ReplayRoute {
+        // moon#1286: nothing this record reaps is counted in `expired_keys`;
+        // the live server counted it when it happened.
+        let _replaying = scope::ReplayScope::enter();
+        // moon#1283: every `MOON.*` pseudo-command (the clock stamps, the
+        // cold-plane cut records) is applied here, FIRST — before anything
+        // that could skip a data record — and never reaches dispatch.
+        if let Some(route) = pseudo::intercept(databases, cmd, args, *selected_db) {
+            return route;
+        }
         // moon#1277: judge expiry by the log's time, not the replay's — and
         // hand the databases back on the wall clock after every record, so
         // nothing after the replay (a foreign read of an idle shard, before
@@ -376,17 +396,9 @@ impl DispatchReplayEngine {
         args: &[Frame],
         selected_db: &mut usize,
     ) -> ReplayRoute {
-        // moon#902: replay-only cold-plane cut records (`MOON.COLDCUT`,
-        // `MOON.SPILLED`) act on the databases directly and never reach
-        // dispatch — a client sending one gets "unknown command".
-        if crate::persistence::cold_records::replay_cold_plane_record(
-            databases,
-            cmd,
-            args,
-            *selected_db,
-        ) {
-            return ReplayRoute::ColdPlane;
-        }
+        // moon#902: the replay-only cold-plane cut records (`MOON.COLDCUT`,
+        // `MOON.SPILLED`) never get here: `replay_command` hands every
+        // `MOON.*` pseudo-command to `pseudo::intercept` first.
 
         // Intercept graph commands and route to the collector instead of KV dispatch.
         // Graph WAL records are collected during the first pass, then replayed in

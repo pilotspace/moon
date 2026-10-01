@@ -11,6 +11,7 @@ pub mod disk_monitor;
 pub mod dispatch;
 pub mod event_loop;
 pub mod exec_publish;
+pub(crate) mod held_release_tick;
 #[cfg(feature = "runtime-monoio")]
 pub(crate) mod idle_park;
 /// MA5: maintenance-window scheduler (cron-style budget multipliers).
@@ -38,6 +39,7 @@ pub mod segment_stall;
 pub mod self_msg;
 pub mod shared_databases;
 pub mod slice;
+pub(crate) mod snapshot_txn_guard;
 /// O3 adaptive busy-poll governor — the spin it gates exists only in the
 /// vendored monoio legacy driver, so the module is monoio-only.
 #[cfg(feature = "runtime-monoio")]
@@ -55,6 +57,7 @@ pub mod timers;
 pub mod uring_handler;
 /// moon#1182: multi-shard FT.SEARCH KNN legs on the cooperative search path.
 pub(crate) mod vector_scatter;
+pub mod wal_append;
 /// moon#1162: the post-write index/queue hooks every shard-side write path
 /// runs — one list, so the dispatch arms cannot drift apart again.
 pub(crate) mod write_hooks;

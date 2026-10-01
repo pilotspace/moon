@@ -170,6 +170,19 @@ pub fn restore(db: &mut Database, args: &[Frame]) -> Frame {
         }
     };
 
+    // redis `checkAlreadyExpired` (R1 finding 4): an ABSTTL already past
+    // writes nothing. With REPLACE the old key is deleted — a deletion, so
+    // `del` is published and `expired_keys` does not move; `+OK` either way.
+    // Judged on the database clock, which a replay pins to the log's time
+    // (moon#1277): WS27's abort compensation is a `RESTORE … ABSTTL REPLACE`.
+    // Not on a replica applying its master's stream (review N2).
+    if ttl > 0 && absttl && super::key::deadline_already_past(db, ttl as u64) {
+        if replace && db.remove(key).is_some() {
+            super::key::notify_del(key, db.db_index);
+        }
+        return Frame::SimpleString(Bytes::from_static(b"OK"));
+    }
+
     if ttl > 0 {
         // A relative TTL is measured from now; ABSTTL is already absolute.
         // Saturating, because `RESTORE k 9223372036854775807` must not wrap

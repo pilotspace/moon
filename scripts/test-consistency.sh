@@ -43,8 +43,11 @@ qgrep() { local _in; _in=$(cat); grep "$@" <<< "$_in" > /dev/null; }
 #   - the COMMAND GETKEYS text for a keyless command;
 #   - hash-field-expiry (HEXPIRE family) and its tracking rows;
 #   - DEBUG DIGEST values;
-#   - the moon#981 '-@all +get +set' ACL GETUSER row is FLAKY on 7.0: it
-#     renders per-command rules in dict order under a per-process random seed.
+#   - the moon#981 / moon#1296 ACL rule-order rows ('-@all +set +get' ...) FLIP
+#     on 7.0: it renders per-command rules in dict order under a per-process
+#     random seed. redis 7.2+ renders them in the order they were applied and
+#     moon does the same (moon#1296), so on a 7.2+ oracle those rows are
+#     deterministic.
 # The run prints the oracle's version at startup and warns below 7.2.
 ###############################################################################
 
@@ -6225,6 +6228,30 @@ ACL_U="n978:probe"
 # END acl-rule-token-section -- moon#979
 
 # ===========================================================================
+# moon#1286: INFO stats expired_keys counts every expiry-driven key removal
+# ===========================================================================
+# It read 0 forever (no production caller). Compared as a DELTA around 50
+# `SET k v PX 20` keys: nothing reads them (active expiry), then again with
+# every key read after its deadline (lazy expiry -- counted once, not twice).
+log "=== moon#1286: INFO expired_keys ==="
+ek1286() { redis-cli -p "$1" INFO stats 2>/dev/null | tr -d '\r' | awk -F: '/^expired_keys/{print $2}'; }
+for ek1286_mode in active lazy; do
+    ek1286_r0=$(ek1286 "$PORT_REDIS"); ek1286_m0=$(ek1286 "$PORT_RUST")
+    for ek1286_i in $(seq 1 50); do
+        both SET "ek1286:$ek1286_mode:$ek1286_i" v PX 20
+    done
+    if [[ "$ek1286_mode" == lazy ]]; then
+        sleep 0.1
+        for ek1286_i in $(seq 1 50); do both GET "ek1286:$ek1286_mode:$ek1286_i"; done
+    fi
+    sleep 1.5
+    assert_eq "moon#1286 expired_keys delta ($ek1286_mode)" \
+        "$(( $(ek1286 "$PORT_REDIS") - ek1286_r0 ))" "$(( $(ek1286 "$PORT_RUST") - ek1286_m0 ))"
+    assert_eq "moon#1286 expired_keys delta ($ek1286_mode) is 50" \
+        "50" "$(( $(ek1286 "$PORT_RUST") - ek1286_m0 ))"
+done
+
+# ===========================================================================
 # moon#981: ACL SAVE must write the base polarity the table holds in memory
 # ===========================================================================
 # `CommandPermissions::Specific` carries `base_allow` (moon#971), but the
@@ -6280,7 +6307,17 @@ if wait_for_port "$PORT_REDIS" && wait_for_port "$PORT_RUST"; then
         grep '^user rt ' "$1" | grep -o '[+-]@all.*' || true
     }
 
-    for f981_spec in "+@all -flushall" "-@all +get +set"; do
+    # moon#1296: the rules render in the order they were APPLIED, as redis
+    # 7.2+ does (`+set +get` is not `+get +set`; a re-applied rule moves to the
+    # end; grants and revocations stay interleaved; a bare `cmd` drops the
+    # `cmd|*` rules before it). Category tokens (`+@read`) are not in this list:
+    # moon expands a category into its commands where redis keeps the token.
+    for f981_spec in "+@all -flushall" "-@all +get +set" \
+        "-@all +set +get" "-@all +get +set +get" "+@all -set -get" \
+        "+@all -get -set +get -del" "-@all +get -set +append" \
+        "-@all +hset +hget +hdel" "-@all +config|get +config" \
+        "-@all +config +config|get" "+@all -config|set -config|get" \
+        "-@all +config|set +config|get +get"; do
         read -r -a f981_rules <<< "$f981_spec"
         both ACL DELUSER rt
         both ACL SETUSER rt on '>pw' '~*' '&*' "${f981_rules[@]}"

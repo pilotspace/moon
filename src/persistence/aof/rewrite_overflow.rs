@@ -329,7 +329,7 @@ impl RewriteOverflow {
         &self,
         rx: &channel::MpscReceiver<AofMessage>,
         file: &mut std::fs::File,
-        db_ctx: &mut usize,
+        db_ctx: &mut RecordCtx,
         floor: FoldEpoch,
     ) -> Result<(), MoonError> {
         self.finish_inner(rx, file, db_ctx, true, floor)
@@ -342,7 +342,7 @@ impl RewriteOverflow {
         &self,
         rx: &channel::MpscReceiver<AofMessage>,
         file: &mut std::fs::File,
-        db_ctx: &mut usize,
+        db_ctx: &mut RecordCtx,
         floor: FoldEpoch,
     ) -> Result<(), MoonError> {
         self.finish_inner(rx, file, db_ctx, false, floor)
@@ -353,7 +353,7 @@ impl RewriteOverflow {
         &self,
         rx: &channel::MpscReceiver<AofMessage>,
         file: &mut std::fs::File,
-        db_ctx: &mut usize,
+        db_ctx: &mut RecordCtx,
         framed: bool,
         floor: FoldEpoch,
     ) -> Result<(), MoonError> {
@@ -466,9 +466,16 @@ impl RewriteOverflow {
                         continue;
                     }
                     match msg {
-                        AofMessage::Append { lsn, db, bytes, .. } => {
-                            let r = select_prefix_if_needed(db, bytes.is_empty(), db_ctx)
-                                .map_or(Ok(()), |sel| write_record(file, 0, &sel))
+                        AofMessage::Append {
+                            lsn,
+                            db,
+                            bytes,
+                            clock_ms,
+                            ..
+                        } => {
+                            let r = db_ctx
+                                .prefix(db, clock_ms, bytes.is_empty())
+                                .try_for_each(|sel| write_record(file, 0, &sel))
                                 .and_then(|()| write_record(file, lsn, &bytes));
                             match r {
                                 Ok(()) => {
@@ -483,6 +490,7 @@ impl RewriteOverflow {
                             db,
                             bytes,
                             ack,
+                            clock_ms,
                             ..
                         } => {
                             // Zero-length AppendSync = fsync barrier: no
@@ -492,8 +500,9 @@ impl RewriteOverflow {
                             let r = if bytes.is_empty() {
                                 Ok(())
                             } else {
-                                select_prefix_if_needed(db, false, db_ctx)
-                                    .map_or(Ok(()), |sel| write_record(file, 0, &sel))
+                                db_ctx
+                                    .prefix(db, clock_ms, false)
+                                    .try_for_each(|sel| write_record(file, 0, &sel))
                                     .and_then(|()| write_record(file, lsn, &bytes))
                             };
                             match r {
@@ -656,6 +665,7 @@ mod tests {
             db: 0,
             bytes: Bytes::from_static(payload),
             epoch,
+            clock_ms: 0,
         }
     }
 
@@ -730,7 +740,7 @@ mod tests {
         {
             let _guard = ovf.arm_scoped();
             assert!(ovf.try_spill(append(1, b"a")).is_ok());
-            let mut db_ctx = 0usize;
+            let mut db_ctx = RecordCtx::new();
             ovf.finish_framed(&rx, &mut file, &mut db_ctx, FoldEpoch::INITIAL)
                 .unwrap();
             // finish disarmed the overflow; the guard drop below must be a
@@ -763,7 +773,7 @@ mod tests {
         let path = tmp.path().join("readonly.aof");
         std::fs::write(&path, b"").unwrap();
         let mut file = std::fs::OpenOptions::new().read(true).open(&path).unwrap();
-        let mut db_ctx = 0usize;
+        let mut db_ctx = RecordCtx::new();
         let before = AOF_BACKPRESSURE_DROPPED.load(std::sync::atomic::Ordering::Relaxed);
         let res = ovf.finish_framed(&rx, &mut file, &mut db_ctx, FoldEpoch::INITIAL);
         assert!(res.is_err(), "writes to a read-only handle must fail");
@@ -820,7 +830,7 @@ mod tests {
             .append(true)
             .open(&path)
             .unwrap();
-        let mut db_ctx = 0usize;
+        let mut db_ctx = RecordCtx::new();
         ovf.finish_framed(&rx, &mut file, &mut db_ctx, FoldEpoch::INITIAL)
             .unwrap();
 
@@ -888,11 +898,21 @@ mod tests {
             .append(true)
             .open(&path)
             .unwrap();
-        let mut db_ctx = 0usize;
+        let mut db_ctx = RecordCtx::new();
         pool.overflow_for(0)
             .finish_framed(&rx, &mut file, &mut db_ctx, FoldEpoch::INITIAL)
             .unwrap();
-        let lsns: Vec<u64> = read_framed(&path).into_iter().map(|(l, _)| l).collect();
+        // moon#1283: the spilled records keep their clock — a `MOON.TS`
+        // (lsn 0) leads them.
+        let records = read_framed(&path);
+        assert!(crate::persistence::replay::pseudo::is_ts_record(
+            &records[0].1
+        ));
+        let lsns: Vec<u64> = records
+            .into_iter()
+            .map(|(l, _)| l)
+            .filter(|&l| l != 0)
+            .collect();
         assert_eq!(lsns, vec![3, 4]);
 
         assert!(pool.try_send_append(0, 5, 0, Bytes::from_static(b"back-to-channel")));
@@ -921,6 +941,7 @@ mod tests {
                 bytes: Bytes::from_static(b"pre-b"),
                 ack: ack_tx,
                 epoch: ovf.stamp(),
+                clock_ms: 0,
             })
             .is_ok()
         );
@@ -930,7 +951,7 @@ mod tests {
 
         let tmp = tempfile::tempdir().unwrap();
         let (path, mut file) = incr_file(tmp.path(), "incr.aof");
-        let mut db_ctx = 0usize;
+        let mut db_ctx = RecordCtx::new();
         ovf.finish_framed(&rx, &mut file, &mut db_ctx, snapshot)
             .unwrap();
 
@@ -964,7 +985,7 @@ mod tests {
 
         let tmp = tempfile::tempdir().unwrap();
         let (path, mut file) = incr_file(tmp.path(), "incr.aof");
-        let mut db_ctx = 0usize;
+        let mut db_ctx = RecordCtx::new();
         ovf.finish_framed(&rx, &mut file, &mut db_ctx, snapshot)
             .unwrap();
 
@@ -990,7 +1011,7 @@ mod tests {
 
         let tmp = tempfile::tempdir().unwrap();
         let (path, mut file) = incr_file(tmp.path(), "incr.aof");
-        let mut db_ctx = 0usize;
+        let mut db_ctx = RecordCtx::new();
         ovf.finish_framed(&rx, &mut file, &mut db_ctx, floor_before)
             .unwrap();
 
@@ -1009,7 +1030,7 @@ mod tests {
         let (_tx, rx) = channel::mpsc_bounded::<AofMessage>(1);
         let ovf = RewriteOverflow::new();
         let tmp = tempfile::tempdir().unwrap();
-        let mut db_ctx = 0usize;
+        let mut db_ctx = RecordCtx::new();
 
         // Fold 1 takes effect.
         ovf.arm();
@@ -1073,6 +1094,7 @@ mod tests {
             bytes: Bytes::new(),
             ack: ack_tx,
             epoch: FoldEpoch::INITIAL,
+            clock_ms: 0,
         })
         .unwrap();
         let floor = ovf.advance_epoch();
@@ -1082,12 +1104,13 @@ mod tests {
                 db: 0,
                 bytes: Bytes::new(),
                 epoch: FoldEpoch::INITIAL,
+                clock_ms: 0,
             },
             floor
         ));
         let tmp = tempfile::tempdir().unwrap();
         let (path, mut file) = incr_file(tmp.path(), "incr.aof");
-        let mut db_ctx = 0usize;
+        let mut db_ctx = RecordCtx::new();
         ovf.finish_framed(&rx, &mut file, &mut db_ctx, floor)
             .unwrap();
 
@@ -1111,6 +1134,7 @@ mod tests {
                 bytes: Bytes::from_static(b"durable"),
                 ack: ack_tx,
                 epoch: FoldEpoch::INITIAL,
+                clock_ms: 0,
             })
             .is_ok()
         );
@@ -1122,7 +1146,7 @@ mod tests {
             .append(true)
             .open(&path)
             .unwrap();
-        let mut db_ctx = 0usize;
+        let mut db_ctx = RecordCtx::new();
         ovf.finish_framed(&rx, &mut file, &mut db_ctx, FoldEpoch::INITIAL)
             .unwrap();
 

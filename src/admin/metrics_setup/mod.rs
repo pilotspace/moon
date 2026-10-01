@@ -254,6 +254,12 @@ struct HotCounterSlot {
     spsc_notify_wakes: AtomicU64,
     spsc_drain_renotify: AtomicU64,
     spsc_notify_skipped: AtomicU64,
+    /// Unit-test probe for the exact-sum test: no production path touches it,
+    /// so a delta on it is immune to whatever else the test binary runs in
+    /// parallel (`expired_keys` used to serve, until expiry counted it —
+    /// moon#1286). Test builds only, so the slot stays two lines.
+    #[cfg(test)]
+    test_probe: AtomicU64,
 }
 
 #[allow(clippy::declare_interior_mutable_const)] // template for static array init only
@@ -269,6 +275,8 @@ const HOT_COUNTER_SLOT_ZERO: HotCounterSlot = HotCounterSlot {
     spsc_notify_wakes: AtomicU64::new(0),
     spsc_drain_renotify: AtomicU64::new(0),
     spsc_notify_skipped: AtomicU64::new(0),
+    #[cfg(test)]
+    test_probe: AtomicU64::new(0),
 };
 
 static HOT_COUNTERS: [HotCounterSlot; COMMAND_COUNTER_SLOTS] =
@@ -701,7 +709,55 @@ pub fn instantaneous_ops_per_sec() -> u64 {
 /// Record an expired key.
 #[inline]
 pub fn record_expired_key() {
-    bump_hot(|s| &s.expired_keys, 1);
+    record_expired_keys(1);
+}
+
+/// `CONFIG RESETSTAT`: zero `expired_keys` (redis `resetServerStats`
+/// resets `stat_expiredkeys`). Every slot is stored; an increment racing
+/// the reset lands before or after it, as with redis's single field.
+pub fn reset_expired_keys() {
+    for slot in &HOT_COUNTERS {
+        slot.expired_keys.store(0, Ordering::Relaxed);
+    }
+}
+
+/// Whether an expiry on this thread counts toward `expired_keys`.
+///
+/// Not while a replica applies its master's stream (the master decided; a
+/// replica expires nothing of its own — `expireIfNeeded` for the master
+/// client), and not while a log is replayed (redis counts nothing while
+/// loading; the live server already counted each logged reap, moon#1286).
+/// Two thread-local loads.
+#[inline]
+pub fn counts_expiry() -> bool {
+    !crate::persistence::replay::scope::replaying()
+        && !crate::replication::apply::applying_master_stream()
+}
+
+/// Record `n` expired keys at once (a batch reclaim, e.g. the cold TTL sweep).
+/// Nothing is recorded where [`counts_expiry`] says no.
+#[inline]
+pub fn record_expired_keys(n: u64) {
+    if n > 0 && counts_expiry() {
+        bump_hot(|s| &s.expired_keys, n);
+        #[cfg(test)]
+        THREAD_EXPIRED.with(|c| c.set(c.get() + n));
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Exact per-thread mirror of `expired_keys`, test builds only. The real
+    /// counter is a striped slot that test threads share round-robin, and
+    /// every expiry in any parallel test bumps it, so a test asserting "this
+    /// path counted N" reads this instead (moon#1286).
+    static THREAD_EXPIRED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Keys this thread has counted as expired (test builds only).
+#[cfg(test)]
+pub(crate) fn this_thread_expired_keys() -> u64 {
+    THREAD_EXPIRED.with(std::cell::Cell::get)
 }
 
 /// Record a refused connection.
@@ -850,17 +906,18 @@ mod tests {
     fn hot_counter_sum_is_exact_across_many_threads() {
         // A private counter array is not available (the slot scheme is
         // process-global by design), so drive a counter no other test in this
-        // binary touches and assert on the DELTA. `expired_keys` is bumped
-        // only by `record_expired_key`, which no other unit test calls.
+        // binary touches and assert on the DELTA. `test_probe` exists for this
+        // (moon#1286: `expired_keys` is bumped by every expiry, in any test
+        // running in parallel).
         const THREADS: u64 = 8;
         const PER_THREAD: u64 = 5_000;
 
-        let before = expired_keys();
+        let before = sum_hot(|s| &s.test_probe);
         let handles: Vec<_> = (0..THREADS)
             .map(|_| {
                 std::thread::spawn(|| {
                     for _ in 0..PER_THREAD {
-                        record_expired_key();
+                        bump_hot(|s| &s.test_probe, 1);
                     }
                 })
             })
@@ -868,7 +925,7 @@ mod tests {
         for h in handles {
             h.join().expect("worker thread");
         }
-        let after = expired_keys();
+        let after = sum_hot(|s| &s.test_probe);
 
         assert_eq!(
             after - before,

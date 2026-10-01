@@ -488,6 +488,12 @@ pub fn sweep_prefix(dbs: &mut [&mut crate::storage::Database], prefix: &[u8]) ->
             .collect();
         total += keys_to_delete.len() as u64;
         for key in &keys_to_delete {
+            // moon#1299: a key an open TXN holds is left to the TXN (its
+            // abort would restore it over the sweep anyway).
+            if crate::transaction::isolation::is_held(db_index, key) {
+                total -= 1;
+                continue;
+            }
             crate::persistence::snapshot_cow::capture_write_pre_image(db, db_index, key);
             db.remove(key);
         }

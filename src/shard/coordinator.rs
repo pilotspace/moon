@@ -275,21 +275,26 @@ pub(crate) async fn recv_reply_bounded<T: Send + 'static>(
 
 /// The reply for a multi-shard write whose leg on some shard answered `err`.
 ///
-/// A leg its owner refused before running it
-/// ([`AOF_BACKPRESSURE_REFUSED_ERR`](crate::shard::aof_admission::AOF_BACKPRESSURE_REFUSED_ERR))
-/// says "not executed", which is only true of the whole command when no
-/// other part of it ran. When the local slice or another leg was applied,
-/// the reply says the command was partially executed instead (moon#769).
-/// Every other error passes through unchanged.
+/// A leg refused before it ran — its owner's AOF writer stalled
+/// ([`AOF_BACKPRESSURE_REFUSED_ERR`](crate::shard::aof_admission::AOF_BACKPRESSURE_REFUSED_ERR)),
+/// or a key in it held by an open transaction
+/// ([`ERR_TXN_CONFLICT_KEY`](crate::transaction::isolation::ERR_TXN_CONFLICT_KEY),
+/// moon#1299) — reads as "not executed", which is only true of the whole
+/// command when no other part of it ran. When the local slice or another
+/// leg was applied, the reply says the command was partially executed
+/// instead (moon#769; moon#1299 R1). "Applied" means it changed something:
+/// every `MSET` leg that answered `+OK`, but only a `DEL`/`UNLINK` part that
+/// removed a key (moon#1299 R2 N2). Every other error passes through
+/// unchanged.
 fn refused_leg_error(err: Frame, other_parts_ran: bool) -> Frame {
+    use crate::shard::aof_admission::{AOF_BACKPRESSURE_PARTIAL_ERR, AOF_BACKPRESSURE_REFUSED_ERR};
+    use crate::transaction::isolation::{ERR_TXN_CONFLICT_KEY, ERR_TXN_CONFLICT_PARTIAL};
     match &err {
-        Frame::Error(e)
-            if other_parts_ran
-                && e.as_ref() == crate::shard::aof_admission::AOF_BACKPRESSURE_REFUSED_ERR =>
-        {
-            Frame::Error(Bytes::from_static(
-                crate::shard::aof_admission::AOF_BACKPRESSURE_PARTIAL_ERR,
-            ))
+        Frame::Error(e) if other_parts_ran && e.as_ref() == AOF_BACKPRESSURE_REFUSED_ERR => {
+            Frame::Error(Bytes::from_static(AOF_BACKPRESSURE_PARTIAL_ERR))
+        }
+        Frame::Error(e) if other_parts_ran && e.as_ref() == ERR_TXN_CONFLICT_KEY => {
+            Frame::Error(Bytes::from_static(ERR_TXN_CONFLICT_PARTIAL))
         }
         _ => err,
     }
@@ -682,7 +687,7 @@ async fn persist_local_leg(
     // record so the replica applies it in the same db.
     db: usize,
     serialized: Bytes,
-    fold_stamp: crate::persistence::aof::FoldEpoch,
+    fold_stamp: crate::persistence::aof::AppendStamp,
 ) -> Result<bool, crate::persistence::aof::AofAck> {
     let repl_active = crate::replication::state::fanout_active_for(repl_state);
     if !repl_active && aof_pool.is_none() {
@@ -715,14 +720,15 @@ async fn persist_local_leg(
         .await
 }
 
-/// The AOF fold epoch of `my_shard`'s writer, or the initial epoch when AOF is
-/// off. Read it in the same no-await stretch as the mutation it stamps.
+/// The AOF stamp of `my_shard`'s writer — its fold epoch and this shard's
+/// clock (moon#1283) — or the initial stamp when AOF is off. Read it in the
+/// same no-await stretch as the mutation it stamps.
 #[inline]
 fn local_fold_stamp(
     aof_pool: Option<&Arc<crate::persistence::aof::AofWriterPool>>,
     my_shard: usize,
-) -> crate::persistence::aof::FoldEpoch {
-    aof_pool.map_or(crate::persistence::aof::FoldEpoch::INITIAL, |pool| {
+) -> crate::persistence::aof::AppendStamp {
+    aof_pool.map_or(crate::persistence::aof::AppendStamp::INITIAL, |pool| {
         pool.fold_stamp(my_shard)
     })
 }
@@ -2005,6 +2011,16 @@ async fn coordinate_multi_del_or_exists(
         send_owner_legs(groups, my_shard, db_index, dispatch_tx, spsc_notifiers).await;
 
     let mut total_count: i64 = 0;
+    // Whether the local slice removed a key: what "applied" means for the
+    // partial-refusal wording below (moon#1299 R2 N2).
+    let mut local_removed = false;
+    // An error from the local slice — a `-TXNCONFLICT` for a key an open
+    // transaction holds (moon#1299), which refuses the whole slice: nothing
+    // in it was removed, so it is not logged, not counted as applied, and
+    // the command answers the error. Before R1 F2 it was dropped and the
+    // reply summed only the remote legs — a success count hiding keys that
+    // were never deleted (MSET's local slice already worked this way).
+    let mut local_err: Option<Frame> = None;
     if !local_group.is_empty() {
         let reaps = crate::command::key::expired_reaps();
         // moon#1162: through `run_local`, so this slice's deleted
@@ -2019,6 +2035,7 @@ async fn coordinate_multi_del_or_exists(
         let reaped = crate::command::key::expired_reaps() != reaps;
         if let Frame::Integer(n) = result {
             total_count += n;
+            local_removed = n > 0;
             // v3-5 carried gap: persist the local slice (synthesized over
             // ONLY the keys this shard owns — remote slices persist on
             // their owners via MultiExecute). Skip when nothing removed —
@@ -2038,20 +2055,30 @@ async fn coordinate_multi_del_or_exists(
                     }
                 }
             }
+        } else if matches!(result, Frame::Error(_)) {
+            local_err = Some(result);
         }
     }
 
     // Every leg is drained even after an error, so the reply can say
-    // whether any part of the command ran.
-    let mut leg_err: Option<Frame> = None;
-    let mut applied_parts = usize::from(!local_group.is_empty());
+    // whether any part of the command changed anything. A part that ran but
+    // removed nothing (`:0`, its keys were absent) does not count
+    // (moon#1299 R2 N2): `DEL missing_remote held` changed nothing, and
+    // answering "partially executed; … the rest were applied" over-claimed.
+    // The count is in the legs' own replies — no extra round trip.
+    let mut applied_parts = usize::from(local_removed);
+    let mut leg_err: Option<Frame> = local_err;
     for reply_rx in pending_shards {
         match recv_reply_bounded(reply_rx).await {
             Ok(frames) => {
                 let mut leg_failed = false;
+                let mut leg_removed: i64 = 0;
                 for frame in frames {
                     match frame {
-                        Frame::Integer(n) => total_count += n,
+                        Frame::Integer(n) => {
+                            total_count += n;
+                            leg_removed += n;
+                        }
                         Frame::Error(_) => {
                             leg_failed = true;
                             if leg_err.is_none() {
@@ -2061,7 +2088,7 @@ async fn coordinate_multi_del_or_exists(
                         _ => {}
                     }
                 }
-                if !leg_failed {
+                if !leg_failed && leg_removed > 0 {
                     applied_parts += 1;
                 }
             }

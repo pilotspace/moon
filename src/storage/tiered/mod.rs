@@ -15,6 +15,7 @@ mod cold_reclaim_tests;
 mod dead_slot_ledger_tests;
 pub mod dead_slots;
 pub mod file_id_seed;
+pub mod held_release;
 pub mod kv_serde;
 pub mod kv_spill;
 pub mod orphan_reservation;

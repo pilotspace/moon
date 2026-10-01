@@ -222,6 +222,7 @@ impl Database {
             crate::storage::entry::AccessTracking::Off
         };
         let now_secs = self.cached_now;
+        let now_ms = self.cached_now_ms;
 
         // `insert_or_update` invariant: exactly one of the two closures fires
         // exactly once per call, so the `Cell::take()` below cannot observe
@@ -300,7 +301,34 @@ impl Database {
             }
             InsertOrUpdate::Inserted(_) => {
                 self.used_memory += new_cost;
+                // moon#1286 review N4: the same reap for a key only the cold
+                // tier held. Its deadline is in the in-RAM index (no I/O),
+                // and the lookup runs only for a NEW hot key while anything
+                // is spilled. The dead entry goes now, so no later sweep or
+                // read counts it again. Live traffic only (`counts_expiry`):
+                // during a log replay the cold slot is the replayed write's
+                // own spill, which a later `MOON.SPILLED` marker names (the
+                // task #56 rule above), and a replica leaves it to its master.
+                if self
+                    .cold_index
+                    .as_ref()
+                    .is_some_and(|ci| ci.len() > 0 && ci.expired_at(key, now_ms))
+                    && crate::admin::metrics_setup::counts_expiry()
+                {
+                    self.remove_cold_only(key);
+                    crate::admin::metrics_setup::record_expired_key();
+                }
             }
+        }
+        // moon#1286: overwriting an entry whose TTL had passed reaps it, as
+        // redis's `lookupKeyWrite` -> `expireIfNeeded` does before the write
+        // (SET, SETNX, GETSET, APPEND, INCR*, SETBIT, PFADD, MSET, a COPY /
+        // RENAME destination, and a key a read hid for the lazy drain — the
+        // drain re-verifies and skips the fresh value, so it is counted
+        // once). One compare on the write path; the counter itself skips a
+        // replay and a replica's master stream (`counts_expiry`).
+        if old_ttl != 0 && now_ms >= old_ttl {
+            crate::admin::metrics_setup::record_expired_key();
         }
         if has_expiry {
             self.maybe_has_expiring_keys = true;

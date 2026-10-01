@@ -315,17 +315,86 @@ tuning knobs — but understanding them explains the durability/throughput trade
   single contiguous `write_all`, not one `write(2)` per record — so the writer
   thread is not syscall-bound at high pipeline depth (this is what makes
   `everysec` P16 beat Redis rather than trail it).
-- **Park-free writer poll (`everysec`/`no`).** The AOF writer thread does not park
-  in a blocking channel receive; it polls. This matters because a parked receiver
-  forces every shard thread to issue a futex wake on each write — at non-pipelined
-  `everysec` load that was ~150k wakes/sec of pure overhead on the hot path.
-  Polling keeps producer enqueues as plain userspace atomics, restoring P1 parity
-  with Redis. Under `always` the writer still parks (the client is already blocked
+- **Writer poll: warm, then parked (`everysec`/`no`).** While writes flow, the
+  AOF writer thread polls its channel every 500 µs instead of parking in a
+  blocking receive: a parked receiver forces every shard thread to issue a
+  futex wake on each write — at non-pipelined `everysec` load that was ~150k
+  wakes/sec of pure overhead on the hot path. After 5 ms with nothing queued it
+  parks, so the first write after an idle period wakes it at once (one futex
+  wake) instead of waiting out a poll step (moon#1266: that step was up to
+  50 ms). Under `always` the writer always parks (the client is already blocked
   on the fsync ack, so receive latency there is client-visible RTT anyway).
+- **The `everysec` fsync runs on an agent thread (moon#1266).** Each AOF writer
+  has an `aof-fsync-<n>` thread; once a second the writer hands it the fsync and
+  goes straight back to writing, so a slow disk no longer stops the writer from
+  draining acknowledged writes into the file. At most one fsync is in flight per
+  writer; a deadline that finds the previous one still running is postponed
+  until it returns. `always` keeps its fsync on the writer, before the acks.
+- **`CONFIG SET appendfsync` applies at once, as in redis.** Every producer
+  and AOF writer uses the new policy from its next write. Leaving `everysec`
+  first waits for an fsync still running on the agent (redis drains its
+  background fsync the same way); a write already queued to be acknowledged
+  after its fsync is fsynced before its ack whatever the switch. (Before the
+  R1 review fix the command answered `OK` and `CONFIG GET` showed the new
+  value while the writers kept their startup policy.)
+- **A slow or hung `everysec` fsync is loud, as in redis.** While a writer's
+  fsync has been running for 2 s or more, moon logs redis's
+  `Asynchronous AOF fsync is taking too long (disk is busy?)` (at most once
+  every 2 s), and a WARN when the fsync finally returns. `INFO persistence`
+  shows it while it lasts:
+  - `aof_pending_bio_fsync` — writers with an fsync in flight. redis's field
+    counts pending `BIO_AOF_FSYNC` jobs and is 0 or 1 in practice; moon's is
+    0 or 1 with one writer (`--shards 1`) but counts WRITERS, so it reaches
+    N at `--shards N` (per-shard writers, one agent each). Alert on `> 0`,
+    never on `== 1`;
+  - `aof_fsync_in_flight_ms` — how long the oldest of them has been running
+    (0 when none; moon-only);
+  - `aof_delayed_fsync` — counted as redis counts it: once for every 2 s an
+    fsync stays in flight while written data waits for the next one, so an
+    alert built for redis (`rate(aof_delayed_fsync) > 0`) fires the same way.
+  Writes keep being acknowledged and reach the kernel meanwhile (a process
+  crash loses nothing extra), but nothing written since the last completed
+  fsync survives an OS crash or power loss until the fsync returns.
 
-None of these weaken durability: `always` remains RPO = 0, `everysec` remains
-RPO ≤ 1 s, validated by the SIGKILL crash-recovery matrix (100% of acked writes
-recovered). See `BENCHMARK.md` §7.3 for the measured before/after matrix.
+None of these weaken durability: `always` remains RPO = 0 (an ack is sent only
+after its fsync — `tests/aof_everysec_kill9_1266.rs` holds the fsync open and
+sees no reply until it returns), `everysec` remains RPO ≤ 1 s against an OS crash
+or power loss. See `BENCHMARK.md` §7.3 for the measured before/after matrix.
+
+**What a process crash (`kill -9`, OOM kill, panic) can lose under `everysec`.**
+A SIGKILL does not touch the kernel page cache, so a record survives it once the
+AOF writer has `write(2)`-n it; only an OS crash or power loss needs the fsync.
+moon acknowledges a write when its record is queued to the shard's writer, so
+the exposure to a process crash is the time from the ack to that `write(2)`:
+one poll step (500 µs) while writes flow, one thread wake-up after an idle
+period, plus any time the writer thread is not scheduled or its `write(2)`
+blocks. `tests/aof_everysec_kill9_1266.rs` measures it: 10,000 acked SETs
+(unpipelined, or pipelined 100 deep) or one SET after an idle second, SIGKILL
+1 ms after the last ack, restart, count what is missing. On a 4-vCPU Linux
+container shared with other builds (2026-09-30, 20 reps per cell, `--shards`
+1 and 4): before moon#1266 Option 3, 226 of 240 reps lost acked writes (median
+rep 1–1,100 keys, worst 10,000); after it, 9 of 240 reps did in the run of
+the final binaries (monoio 5 of 120: 3, 18, 400, 546 and 1,100 keys; tokio 4 of
+120: 1, 1, 1 and 800). A second 20-rep tokio run lost in 7 of its 120 reps (up
+to 40 keys), so across both tokio runs the total is 16 of 360 reps. Every lossy
+rep was a writer stalled or descheduled for longer than the 1 ms kill delay. A kill inside that sub-millisecond window,
+or while the writer thread is starved of CPU or its `write(2)` stalls, can
+still lose the last acknowledged writes. redis
+has no such window: it `write(2)`s its AOF buffer before it sends the replies
+of an event-loop iteration (moon#1266 option 1A is the measured follow-up).
+
+**redis's own `everysec` is not absolutely kill-9-safe either.** When the
+previous background fsync is still running, redis *postpones the write* of its
+AOF buffer (the `write(2)`, not only the fsync) for up to 2 s, because on Linux
+a `write(2)` to a file whose fsync is in progress would block behind it
+anyway. Replies are still sent during those 2 s; past them redis writes anyway
+and counts `aof_delayed_fsync`. So on a slow disk redis can lose up to ~2 s of
+acknowledged writes to a process crash (0 on a healthy disk). moon never
+postpones the write — only the fsync; its `aof_delayed_fsync` counts the same
+2 s periods —
+so a slow fsync by itself opens no window; a `write(2)` that the kernel makes
+wait behind that fsync still delays the record, and that wait is part of the
+window above.
 
 ### RDB snapshots
 
@@ -413,9 +482,34 @@ clock (moon#1277). Keep those mtimes truthful:
   its OLD value (measured with the mtime set an hour back: 27–36 of 40 such
   keys, against 0 on a build that judged by the wall clock).
 
-Restore AOF files with their original mtimes (`cp -p`, `rsync -t`, `tar`).
-A time record inside the log (like redis's `aof-timestamp-enabled`) would
-remove the dependency; it is a format change tracked separately.
+Since moon#1283 the AOF carries that time itself: the writer stamps the log
+with `MOON.TS <ms>` records (the shard clock each record was judged under),
+and a replay judges every stamped record by its own stamp, whatever the
+file's mtime. The mtime still judges a log written before moon#1283 (and the
+stamp-less start of one an older binary began), so keep restoring AOF files
+with their original mtimes (`cp -p`, `rsync -t`, `tar`).
+
+**Downgrading and upgrading again.** An older binary appends to the same AOF
+without stamps. moon recognises those records by position — each orderly
+stop of the newer binary ends the file with a clean-close marker
+(`MOON.TS <ms> CLOSE`), and its first write after a restart is stamped — and
+judges them as the older binary did, on every later boot
+([`STORAGE-FORMAT-V1.md`](STORAGE-FORMAT-V1.md) §3.3). That works only if the
+newer binary was stopped cleanly:
+
+1. Stop the newer binary with `SHUTDOWN` or SIGTERM and check its log for
+   `AOF writers drained and synced` before starting the older one. A stop
+   that logs `WITHOUT their clean-close marker` (a writer with a latched
+   write error, a failed append or a panic) or an abandoned-writer error
+   instead did not protect the downgrade: fix the cause, then start and stop
+   the newer binary cleanly again. If it crashed (kill -9, OOM kill, power
+   loss), start it once and stop it cleanly first.
+2. If that was not done, run `BGREWRITEAOF` on the older binary as its last
+   action, and stop it once the rewrite completed, before upgrading again.
+
+Otherwise keys the older binary saw expire and restarted (an `INCR` on an
+expired counter) are judged by the newer binary's last stamp, which is stale,
+and replay onto their old value and deadline: they are lost.
 
 ### Persistence volume in Docker
 

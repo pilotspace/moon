@@ -1,13 +1,14 @@
 //! Per-subcommand (`+config|get`, `-config|set`) and first-argument
 //! (`+select|0`) command rules.
 //!
-//! Both are stored in the same `allowed` / `denied` sets as bare commands, as
-//! the lowercased token `cmd|arg`. Redis evaluates them per command ID with
+//! Both are stored in the same ordered rule map as bare commands
+//! ([`super::command_rules::CommandRules`]), as the lowercased token
+//! `cmd|arg`. Redis evaluates them per command ID with
 //! last-rule-wins, and this module reproduces that with one invariant:
 //!
 //! **A `cmd|arg` entry is always newer than any bare `cmd` entry.** Every rule
 //! that names `cmd` bare -- `+cmd`, `-cmd`, or a category containing `cmd` --
-//! drops all `cmd|*` entries from both sets ([`clear_first_arg_rules`]), so a
+//! drops all `cmd|*` entries ([`CommandRules::clear_first_arg_rules`]), so a
 //! surviving `cmd|arg` entry was applied after the bare verdict and overrides
 //! it ([`permits`]). `+@all` / `-@all` rebuild the sets and clear everything.
 //!
@@ -15,16 +16,9 @@
 //! `+@all -config|set` answered `+OK` and still let the user run
 //! `CONFIG SET`.
 
-use std::collections::HashSet;
-
 use crate::protocol::Frame;
 
 use super::table::CommandPermissions;
-
-/// First arguments up to this length are matched through a stack buffer;
-/// longer ones by a scan of the set. Either way nothing is allocated, so a
-/// restricted user's `ECHO <512 MB>` costs no copy of the argument.
-const INLINE_RULE_KEY: usize = 128;
 
 /// `argv[1]` as bytes, when it is a string frame.
 #[inline]
@@ -35,44 +29,6 @@ pub(crate) fn first_arg(args: &[Frame]) -> Option<&[u8]> {
     }
 }
 
-/// Does `set` hold the rule `bare|arg`? `bare` must already be lowercase;
-/// `arg` is compared ASCII-case-insensitively, as redis does for both
-/// subcommand names and first-arg rules. Allocation-free.
-fn contains_first_arg_rule(set: &HashSet<String>, bare: &str, arg: &[u8]) -> bool {
-    let total = bare.len() + 1 + arg.len();
-    if total <= INLINE_RULE_KEY {
-        let mut buf = [0u8; INLINE_RULE_KEY];
-        buf[..bare.len()].copy_from_slice(bare.as_bytes());
-        buf[bare.len()] = b'|';
-        for (dst, src) in buf[bare.len() + 1..total].iter_mut().zip(arg) {
-            *dst = src.to_ascii_lowercase();
-        }
-        // A non-UTF-8 argument cannot equal any stored rule (they are all
-        // `String`s), so failing the conversion is a correct "absent".
-        return std::str::from_utf8(&buf[..total]).is_ok_and(|key| set.contains(key));
-    }
-    set.iter().any(|rule| {
-        rule.len() == total
-            && rule.as_bytes().starts_with(bare.as_bytes())
-            && rule.as_bytes()[bare.len()] == b'|'
-            && rule.as_bytes()[bare.len() + 1..].eq_ignore_ascii_case(arg)
-    })
-}
-
-/// Drop every `cmd|*` rule, for each `cmd` in `cmds`, from `set`.
-///
-/// Called by every rule that names a command bare (directly or through a
-/// category): that rule is now the newest word on every subcommand of `cmd`,
-/// exactly as redis's per-ID bits are all rewritten by `+cmd` / `-cmd`.
-/// Skipping this is fail-OPEN: `-@all +config|get -@admin` would keep the
-/// stale `config|get` grant alive under the newer category revoke.
-pub(super) fn clear_first_arg_rules(set: &mut HashSet<String>, cmds: &[&str]) {
-    set.retain(|rule| match rule.split_once('|') {
-        Some((cmd, _)) => !cmds.contains(&cmd),
-        None => true,
-    });
-}
-
 /// The verdict for one invocation. `bare` is the lowercased command name,
 /// `first_arg` its `argv[1]`. A `bare|arg` rule, being newer than any bare
 /// rule (see the module docs), decides first; then the bare rule; then the
@@ -80,24 +36,14 @@ pub(super) fn clear_first_arg_rules(set: &mut HashSet<String>, cmds: &[&str]) {
 pub(super) fn permits(perms: &CommandPermissions, bare: &str, first_arg: Option<&[u8]>) -> bool {
     match perms {
         CommandPermissions::AllAllowed => true,
-        CommandPermissions::Specific {
-            base_allow,
-            allowed,
-            denied,
-        } => {
-            if let Some(arg) = first_arg {
-                if contains_first_arg_rule(denied, bare, arg) {
-                    return false;
-                }
-                if contains_first_arg_rule(allowed, bare, arg) {
-                    return true;
-                }
+        CommandPermissions::Specific { base_allow, rules } => {
+            if let Some(arg) = first_arg
+                && let Some(allow) = rules.first_arg_verdict(bare, arg)
+            {
+                return allow;
             }
-            if denied.contains(bare) {
-                return false;
-            }
-            if allowed.contains(bare) {
-                return true;
+            if let Some(allow) = rules.get(bare) {
+                return allow;
             }
             // Neither set names this command, so the answer is the base
             // polarity recorded when this `Specific` was created -- never

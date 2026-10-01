@@ -57,6 +57,20 @@ pub struct GroupCommitBatch {
     pub deferred_control: Option<AofMessage>,
 }
 
+/// Whether a batch must be fsynced before its acks: under `always`, and
+/// whenever it holds an `AppendSync` — a producer that saw a runtime switch
+/// to `always` (`runtime_fsync`) before its writer did must still get its ack
+/// only after the fsync, and a writer that already left `always` still owes
+/// the fsync to the `AppendSync`s queued before the switch.
+#[inline]
+pub(crate) fn batch_needs_fsync(policy: super::FsyncPolicy, batch: &GroupCommitBatch) -> bool {
+    policy == super::FsyncPolicy::Always
+        || batch
+            .data
+            .iter()
+            .any(|m| matches!(m, AofMessage::AppendSync { .. }))
+}
+
 /// True for the non-data control messages that must break (never join) a batch.
 #[inline]
 fn is_control(msg: &AofMessage) -> bool {

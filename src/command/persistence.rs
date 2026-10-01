@@ -52,6 +52,9 @@ pub static BGSAVE_LAST_STATUS: AtomicBool = AtomicBool::new(true);
 /// describe THAT save: `ok` when every shard succeeded, `err` when one did
 /// not — and back to `ok` on the next save that succeeds, as redis does.
 static BGSAVE_CURRENT_FAILED: AtomicBool = AtomicBool::new(false);
+/// Some shard abandoned its part of the current save (an automatic round a
+/// `TXN` hold abandoned, moon#1289 R2): nothing of it counts as saved.
+static BGSAVE_CURRENT_ABANDONED: AtomicBool = AtomicBool::new(false);
 
 /// Process-wide gate set at startup when the configuration combination
 /// `--shards >= 2 + --appendonly yes` is selected (see `Config::per_shard_aof_active`).
@@ -235,19 +238,32 @@ pub fn bgsave_start_sharded(
     snapshot_trigger: &crate::runtime::channel::WatchSender<u64>,
     num_shards: usize,
 ) -> Frame {
+    bgsave_start_sharded_announcing(snapshot_trigger, num_shards, |_| {})
+}
+
+/// [`bgsave_start_sharded`] that hands the new epoch to `announce` before any
+/// shard can see it (an automatic snapshot registers its round there,
+/// `persistence::snapshot_request::txn_round`).
+pub(crate) fn bgsave_start_sharded_announcing(
+    snapshot_trigger: &crate::runtime::channel::WatchSender<u64>,
+    num_shards: usize,
+    announce: impl FnOnce(u64),
+) -> Frame {
     bgsave_start_sharded_with(
         snapshot_trigger,
         num_shards,
         SNAPSHOT_DIR_ABSENT.load(Ordering::Relaxed),
+        announce,
     )
 }
 
-/// [`bgsave_start_sharded`] with the persistence-directory fact passed in
-/// (tests drive it without touching the process-wide flag).
+/// [`bgsave_start_sharded_announcing`] with the persistence-directory fact
+/// passed in (tests drive it without touching the process-wide flag).
 fn bgsave_start_sharded_with(
     snapshot_trigger: &crate::runtime::channel::WatchSender<u64>,
     num_shards: usize,
     snapshot_dir_absent: bool,
+    announce: impl FnOnce(u64),
 ) -> Frame {
     // Refuse up front, before anything is marked in progress: no shard has
     // anywhere to write, so "Background saving started" would be untrue.
@@ -259,6 +275,7 @@ fn bgsave_start_sharded_with(
     }
 
     BGSAVE_CURRENT_FAILED.store(false, Ordering::SeqCst);
+    BGSAVE_CURRENT_ABANDONED.store(false, Ordering::SeqCst);
     // moon#1232: before any shard picks the epoch up, so every change counted
     // here is in some shard's snapshot (a change between this and a shard's
     // pickup is saved AND stays counted: a spare save, never a lost one).
@@ -266,6 +283,7 @@ fn bgsave_start_sharded_with(
     let epoch = SNAPSHOT_EPOCH.fetch_add(1, Ordering::SeqCst) + 1;
     BGSAVE_SHARDS_REMAINING.store(num_shards as u64, Ordering::SeqCst);
     note_save_progress();
+    announce(epoch);
 
     // Broadcast epoch to all shards via watch channel.
     // Each shard picks this up on its next timer tick and starts its snapshot.
@@ -292,6 +310,21 @@ pub fn bgsave_shard_done(success: bool) {
     if !success {
         BGSAVE_CURRENT_FAILED.store(true, Ordering::SeqCst);
     }
+    shard_part_over();
+}
+
+/// A shard abandoned its part of an automatic snapshot round (moon#1289 R2,
+/// `persistence::snapshot_request::txn_round`): it published nothing. Once
+/// every shard is done the save ends WITHOUT an outcome — `LASTSAVE`,
+/// `rdb_last_bgsave_status` and `rdb_changes_since_last_save` keep what the
+/// last real save left — unless some shard genuinely failed.
+pub fn bgsave_shard_abandoned() {
+    BGSAVE_CURRENT_ABANDONED.store(true, Ordering::SeqCst);
+    shard_part_over();
+}
+
+/// The fan-in of [`bgsave_shard_done`] and [`bgsave_shard_abandoned`].
+fn shard_part_over() {
     // Use compare-exchange loop to prevent underflow below zero.
     // If the counter is already 0 (spurious call), do nothing.
     loop {
@@ -300,7 +333,7 @@ pub fn bgsave_shard_done(success: bool) {
             tracing::warn!("BGSAVE shard done called with counter already at 0 -- ignoring");
             // No counted save to attach it to; a failure still shows (the
             // next save that succeeds clears it).
-            if !success {
+            if BGSAVE_CURRENT_FAILED.swap(false, Ordering::SeqCst) {
                 BGSAVE_LAST_STATUS.store(false, Ordering::SeqCst);
             }
             return;
@@ -316,6 +349,13 @@ pub fn bgsave_shard_done(success: bool) {
                 if prev == 1 {
                     // Last shard to finish: publish THIS save's outcome.
                     let ok = !BGSAVE_CURRENT_FAILED.swap(false, Ordering::SeqCst);
+                    let abandoned = BGSAVE_CURRENT_ABANDONED.swap(false, Ordering::SeqCst);
+                    if ok && abandoned {
+                        // Nothing was published: no outcome to record.
+                        info!("automatic snapshot abandoned by every shard; nothing was saved");
+                        SAVE_IN_PROGRESS.store(false, Ordering::SeqCst);
+                        return;
+                    }
                     if ok {
                         // A completed save is the reset point for
                         // `rdb_changes_since_last_save`; a failed one is not
@@ -804,6 +844,60 @@ mod tests {
         assert!(!SAVE_IN_PROGRESS.load(Ordering::SeqCst));
     }
 
+    /// moon#1289 R2 (N1): a round an automatic snapshot abandoned ends with
+    /// no outcome — status, `LASTSAVE` untouched, whichever shard abandons
+    /// and whatever the others did — unless a shard genuinely failed. The
+    /// epoch reaches `announce` before any shard can see it.
+    #[test]
+    fn an_abandoned_round_ends_without_an_outcome() {
+        let _guard = BGSAVE_TEST_LOCK.lock();
+        SAVE_IN_PROGRESS.store(false, Ordering::SeqCst);
+        BGSAVE_SHARDS_REMAINING.store(0, Ordering::SeqCst);
+        for last_status in [true, false] {
+            for abandoning in [0usize, 3] {
+                BGSAVE_LAST_STATUS.store(last_status, Ordering::SeqCst);
+                LAST_SAVE_TIME.store(7, Ordering::SeqCst);
+                let (tx, rx) = crate::runtime::channel::watch(0u64);
+                let mut announced = None;
+                let reply = bgsave_start_sharded_announcing(&tx, 4, |epoch| {
+                    announced = Some((epoch, rx.borrow()));
+                });
+                assert!(matches!(reply, Frame::SimpleString(_)), "{reply:?}");
+                let (epoch, seen) = announced.expect("announced");
+                assert_eq!(
+                    rx.borrow(),
+                    epoch,
+                    "the announced epoch is the broadcast one"
+                );
+                assert!(seen < epoch, "announced before the broadcast");
+                for shard in 0..4 {
+                    if shard == abandoning {
+                        bgsave_shard_abandoned();
+                    } else {
+                        bgsave_shard_done(true);
+                    }
+                }
+                assert!(!SAVE_IN_PROGRESS.load(Ordering::SeqCst), "the save ended");
+                assert_eq!(BGSAVE_LAST_STATUS.load(Ordering::SeqCst), last_status);
+                assert_eq!(LAST_SAVE_TIME.load(Ordering::SeqCst), 7, "no LASTSAVE");
+            }
+        }
+        // A real failure in the same round still reports the failure.
+        BGSAVE_LAST_STATUS.store(true, Ordering::SeqCst);
+        let (tx, _rx) = crate::runtime::channel::watch(0u64);
+        assert!(matches!(
+            bgsave_start_sharded(&tx, 2),
+            Frame::SimpleString(_)
+        ));
+        bgsave_shard_abandoned();
+        bgsave_shard_done(false);
+        assert!(!BGSAVE_LAST_STATUS.load(Ordering::SeqCst));
+        // And the next ordinary save is not treated as abandoned.
+        sharded_save(&[true, true]);
+        assert!(BGSAVE_LAST_STATUS.load(Ordering::SeqCst));
+        assert!(LAST_SAVE_TIME.load(Ordering::SeqCst) > 7);
+    }
+
     /// PR #1233 review (moon#1230 area): with no persistence directory the
     /// save is refused up front — nothing marked in progress, no epoch sent
     /// to the shards, the last status untouched — instead of "Background
@@ -816,7 +910,7 @@ mod tests {
         BGSAVE_LAST_STATUS.store(true, Ordering::SeqCst);
         let (tx, rx) = crate::runtime::channel::watch(0u64);
         let before = rx.borrow();
-        let reply = bgsave_start_sharded_with(&tx, 4, true);
+        let reply = bgsave_start_sharded_with(&tx, 4, true, |_| {});
         assert!(
             matches!(&reply, Frame::Error(e) if e.starts_with(b"ERR background save unavailable")),
             "{reply:?}"
@@ -827,7 +921,7 @@ mod tests {
         assert!(BGSAVE_LAST_STATUS.load(Ordering::SeqCst));
         // With a directory the same call starts the save.
         assert!(matches!(
-            bgsave_start_sharded_with(&tx, 1, false),
+            bgsave_start_sharded_with(&tx, 1, false, |_| {}),
             Frame::SimpleString(_)
         ));
         bgsave_shard_done(true);
@@ -851,7 +945,7 @@ mod tests {
         BGSAVE_SHARDS_REMAINING.store(0, Ordering::SeqCst);
         let (tx, _rx) = crate::runtime::channel::watch(0u64);
         assert!(matches!(
-            bgsave_start_sharded_with(&tx, 1, false),
+            bgsave_start_sharded_with(&tx, 1, false, |_| {}),
             Frame::SimpleString(_)
         ));
         for _ in 0..5 {

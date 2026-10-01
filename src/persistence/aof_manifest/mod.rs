@@ -43,7 +43,7 @@ use crate::persistence::fsync::{create_dir_all_durable, fsync_directory};
 
 mod generation;
 mod orphans;
-mod shard_replay;
+pub mod shard_replay;
 mod shard_rewrite;
 pub(crate) mod test_hooks;
 

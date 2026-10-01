@@ -1465,6 +1465,7 @@ pub fn shard_snapshot_load_with_graves<D: std::borrow::BorrowMut<Database>>(
     Ok(total_keys)
 }
 
+mod abandon;
 pub mod cold_graves;
 pub(crate) mod frozen;
 
@@ -1509,3 +1510,5 @@ mod review_r2a_tests;
 
 #[cfg(test)]
 mod txn_abort_tests;
+#[cfg(test)]
+mod txn_after_start_tests;

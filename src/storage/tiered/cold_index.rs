@@ -618,7 +618,22 @@ impl ColdIndex {
     ///
     /// Decrements the backing file's live-ref count; if this removes the file's
     /// last referrer, the `file_id` is queued for unlink by the next sweep.
+    #[inline]
     pub fn remove(&mut self, key: &[u8]) -> bool {
+        // Nothing spilled (the normal state with disk offload on): there is
+        // no entry and no older copy to release, so the outcome is `false`
+        // with no side effect. Every hot-key overwrite calls this
+        // (`set_recording`), and the walk below hashed the key and probed an
+        // empty map: ~200 instructions per `SET` (callgrind, R3 fix-e).
+        if self.map.is_empty() && self.older_copies.is_empty() {
+            return false;
+        }
+        self.remove_present(key)
+    }
+
+    /// [`Self::remove`] once the index holds anything.
+    #[inline(never)]
+    fn remove_present(&mut self, key: &[u8]) -> bool {
         self.release_older_copies_of(key);
         if let Some(old) = self.remove_raw(key) {
             if self.ref_dec(old.file_id) {
@@ -657,6 +672,15 @@ impl ColdIndex {
 
     /// Look up a key's cold location (equal-hash range probe; the group is
     /// almost always a single entry at 48 bits).
+    /// Does `key` have an entry here whose TTL passed before `now_ms`? From
+    /// the in-RAM location alone (no I/O); the same judgement as the expiry
+    /// sweep and `remove_counting_cold`.
+    #[inline]
+    pub fn expired_at(&self, key: &[u8], now_ms: u64) -> bool {
+        self.lookup(key)
+            .is_some_and(|loc| loc.ttl_ms.is_some_and(|ttl| now_ms > ttl))
+    }
+
     pub fn lookup(&self, key: &[u8]) -> Option<ColdLocation> {
         let h = scan_h48(key);
         self.map
@@ -1033,6 +1057,12 @@ impl ColdIndex {
                 }
             }
         }
+
+        // moon#1286: each reclaimed entry is one expired key. Counted before
+        // Phase 3, whose I/O error returns early: the entries are already
+        // out of the index, expired whether or not their files unlink now
+        // (R1 finding 11).
+        crate::admin::metrics_setup::record_expired_keys(stats.entries_reclaimed as u64);
 
         // Phase 3: unlink now-zero-ref files (off the hot path).
         stats.bytes_reclaimed = self.drain_pending_unlink(shard_dir, manifest)?;

@@ -472,6 +472,11 @@ fn serve_ready_key(
     pending_from: usize,
     budget: &mut std::time::Duration,
 ) -> bool {
+    // moon#1299: serving a waiter would write a key an open TXN holds: leave
+    // every waiter parked; the wake is retried when the hold is released.
+    if crate::transaction::isolation::defer_wake_if_held(db_index, key) {
+        return false;
+    }
     // moon#1217: a wake below may pop `key`; an armed snapshot must hold its
     // epoch-start state first (one thread-local load when none is armed).
     crate::persistence::snapshot_cow::capture_wake_pre_image(db, db_index, key);
@@ -519,6 +524,10 @@ fn serve_list_key(
     // pops, pushes and put-backs below pass through are muted. A waiter
     // served inside its own registration is counted explicitly instead
     // (`registration_serve_changes`).
+    // moon#1299: see `serve_ready_key` (this is also reached directly).
+    if crate::transaction::isolation::defer_wake_if_held(db_index, key) {
+        return false;
+    }
     let _quiet = crate::admin::metrics_setup::mute_keyspace_changes();
     // moon#1217: the pops below write `key` (see `serve_ready_key`).
     crate::persistence::snapshot_cow::capture_wake_pre_image(db, db_index, key);
@@ -655,6 +664,14 @@ fn serve_list_key(
                 if let Some(err) = dest_err {
                     // No undo: nothing was popped.
                     (Some(err), None)
+                } else if destination != key
+                    && crate::transaction::isolation::is_held(db_index, destination)
+                {
+                    // moon#1299: the move would write a destination an open
+                    // TXN holds. Nothing popped: the waiter is put back below
+                    // and the key retried when the hold is released.
+                    crate::transaction::isolation::rewake_on_release(db_index, key);
+                    (None, None)
                 } else {
                     // moon#1217: the move also writes the destination.
                     crate::persistence::snapshot_cow::capture_wake_pre_image(
@@ -936,6 +953,10 @@ fn serve_zset_key(
     key: &Bytes,
     budget: &mut std::time::Duration,
 ) -> bool {
+    // moon#1299: see `serve_ready_key`.
+    if crate::transaction::isolation::defer_wake_if_held(db_index, key) {
+        return false;
+    }
     // moon#1232: not counted, as in `serve_list_key`.
     let _quiet = crate::admin::metrics_setup::mute_keyspace_changes();
     // moon#1217: the pops below write `key` (see `serve_ready_key`).

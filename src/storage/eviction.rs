@@ -549,6 +549,12 @@ fn sample_victim(
         let Some((k, v)) = pick_in_segment(seg, volatile_only, &mut rng) else {
             continue;
         };
+        // moon#1299: a key an open TXN holds is never a victim — its abort
+        // would restore it, its commit would find it gone. One thread-local
+        // load while no TXN holds anything.
+        if crate::transaction::isolation::is_held(db.db_index, k.as_bytes()) {
+            continue;
+        }
         judged += 1;
         if best.is_none_or(|(_, b)| better(v, b)) {
             best = Some((k, v));
@@ -1421,11 +1427,20 @@ fn select_victim(
             find_victim_lfu(db, config.maxmemory_samples, config.lfu_decay_time, false)
         }
         EvictionPolicy::AllKeysRandom => find_victim_random(db, false),
-        EvictionPolicy::VolatileLru => find_victim_lru(db, config.maxmemory_samples, true),
+        // A volatile sampler draws random SEGMENTS and gives up after
+        // `8 x samples` draws, so with few TTL keys among many segments it
+        // found none and the write was refused OOM while a volatile key
+        // existed (redis samples its expires dict and cannot miss). Fall back
+        // to the exact nearest-deadline victim (R2 review, item 5).
+        EvictionPolicy::VolatileLru => find_victim_lru(db, config.maxmemory_samples, true)
+            .or_else(|| find_victim_volatile_ttl(db)),
         EvictionPolicy::VolatileLfu => {
             find_victim_lfu(db, config.maxmemory_samples, config.lfu_decay_time, true)
+                .or_else(|| find_victim_volatile_ttl(db))
         }
-        EvictionPolicy::VolatileRandom => find_victim_random(db, true),
+        EvictionPolicy::VolatileRandom => {
+            find_victim_random(db, true).or_else(|| find_victim_volatile_ttl(db))
+        }
         EvictionPolicy::VolatileTtl => find_victim_volatile_ttl(db),
     }
 }
@@ -2016,6 +2031,12 @@ fn find_victim_volatile_ttl(db: &mut Database) -> Option<CompactKey> {
             .get(key.as_bytes())
             .is_some_and(|e| e.expires_at_ms() == ts)
         {
+            // moon#1299: the nearest deadline belongs to a key an open TXN
+            // holds — no victim this call (this sampler is exact, it cannot
+            // skip to the next deadline without walking the index).
+            if crate::transaction::isolation::is_held(db.db_index, key.as_bytes()) {
+                return None;
+            }
             return Some(key);
         }
         // Provably stale. `drop_expiry_index_pair` removes exactly the pair
@@ -4176,3 +4197,5 @@ mod aof_routing_tests;
 mod commit_failure_tests;
 #[cfg(test)]
 mod ledger_admission_tests;
+#[cfg(test)]
+mod volatile_fallback_tests;

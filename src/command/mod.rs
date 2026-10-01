@@ -179,6 +179,14 @@ fn dispatch_inner_unchecked(
     }
     let b0 = cmd[0] | 0x20; // lowercase first byte
 
+    // moon#1299: a write of a key an open cross-store TXN holds is refused
+    // (`-TXNCONFLICT`) — the TXN's ABORT would otherwise restore its
+    // pre-image over this write. The same funnel as the COW capture below;
+    // one thread-local load while no TXN on this shard holds a key.
+    if let Some(refused) = crate::transaction::isolation::check_write(*selected_db, cmd, args) {
+        return DispatchResult::Response(refused);
+    }
+
     // moon#558: snapshot copy-on-write for LOCAL writes. `dispatch` is the
     // single point every non-routed write path funnels through (monoio local
     // arm, tokio sharded local arm, handler_single, both MULTI/EXEC
@@ -781,6 +789,13 @@ fn dispatch_inner_unchecked(
         (7, b'f') => {
             // FLUSHDB
             if cmd.eq_ignore_ascii_case(b"FLUSHDB") {
+                // moon#1299: not while any shard holds a key of this db for
+                // an open TXN (every flush leg runs through here).
+                if let Some(refused) =
+                    crate::transaction::isolation::check_flush(false, *selected_db, db_count)
+                {
+                    return resp(refused);
+                }
                 return resp(server_admin::flushdb(db, args));
             }
         }
@@ -884,6 +899,12 @@ fn dispatch_inner_unchecked(
         (8, b'f') => {
             // FLUSHALL
             if cmd.eq_ignore_ascii_case(b"FLUSHALL") {
+                // moon#1299: see FLUSHDB.
+                if let Some(refused) =
+                    crate::transaction::isolation::check_flush(true, *selected_db, db_count)
+                {
+                    return resp(refused);
+                }
                 return resp(server_admin::flushall(db, args));
             }
         }

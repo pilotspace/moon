@@ -27,6 +27,7 @@
 //! A rewrite dispatched just before the stop no longer wedges a writer here:
 //! a fold whose shard has stopped fails at once (`rewrite::fold_reply`).
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -47,6 +48,20 @@ pub const GRACE: Duration = Duration::from_secs(2);
 /// How often `Shutdown` is re-sent to a writer still running.
 const RESEND_EVERY: Duration = Duration::from_millis(500);
 
+/// Clean-close markers (`MOON.TS <ms> CLOSE`, moon#1283) the writers have
+/// appended, process-wide. [`stop_writers`] compares the markers written
+/// during the stop with the writers it joined: a writer that skipped its
+/// marker (a latched write error), failed to append it, or panicked leaves
+/// the stop reading as a crash to the next boot, and the log must say so
+/// instead of "drained and synced" (the downgrade procedure keys on it).
+static CLOSE_MARKERS_WRITTEN: AtomicUsize = AtomicUsize::new(0);
+
+/// Count one clean-close marker appended (the writer's final sync makes it
+/// durable).
+pub(crate) fn note_close_marker() {
+    CLOSE_MARKERS_WRITTEN.fetch_add(1, Ordering::Relaxed);
+}
+
 /// Drain, fsync and join every AOF writer. Call once every producer (every
 /// shard thread) has stopped; `token` is the writers' own. Waits up to
 /// `bound` ([`STOP_BOUND`] in production), or [`HURRY_BOUND`] from the
@@ -59,6 +74,8 @@ pub fn stop_writers(
     hurry: &dyn Fn() -> bool,
 ) -> Result<(), Vec<String>> {
     let started = Instant::now();
+    let markers_before = CLOSE_MARKERS_WRITTEN.load(Ordering::Relaxed);
+    let joined = writers.len();
     let mut deadline = started + bound;
     let mut hurried = false;
     let mut cancelled_at: Option<Instant> = None;
@@ -109,7 +126,20 @@ pub fn stop_writers(
             error!("an AOF writer thread panicked during shutdown");
         }
     }
-    info!("AOF writers drained and synced in {:?}", started.elapsed());
+    let marked = CLOSE_MARKERS_WRITTEN
+        .load(Ordering::Relaxed)
+        .saturating_sub(markers_before);
+    if marked < joined {
+        warn!(
+            "AOF writers stopped in {:?}, {} of {joined} WITHOUT their clean-close marker \
+             (a latched write error, a failed append or a panic): the next boot reads this \
+             stop as a crash, so it does not protect a downgrade (STORAGE-FORMAT §3.3)",
+            started.elapsed(),
+            joined - marked
+        );
+    } else {
+        info!("AOF writers drained and synced in {:?}", started.elapsed());
+    }
     Ok(())
 }
 
@@ -159,6 +189,7 @@ mod tests {
             db: 0,
             bytes: bytes::Bytes::from_static(b"*1\r\n$4\r\nPING\r\n"),
             epoch: crate::persistence::aof::FoldEpoch::INITIAL,
+            clock_ms: 0,
         }
     }
 

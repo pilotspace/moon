@@ -6,6 +6,8 @@
 
 pub mod abort;
 pub mod commit_hooks;
+pub mod conn_capture;
+pub mod isolation;
 pub mod kv_compensation;
 pub mod kv_mvcc;
 pub mod undo_log;
