@@ -48,7 +48,11 @@ use std::collections::VecDeque;
 use lane_protocol::LaneCore;
 
 #[cfg(loom)]
+use loom::sync::atomic::{AtomicBool, Ordering};
+#[cfg(loom)]
 use loom::sync::{Arc, Mutex};
+#[cfg(not(loom))]
+use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(not(loom))]
 use std::sync::{Arc, Mutex};
 
@@ -83,6 +87,8 @@ struct World {
     chan: Mutex<VecDeque<Msg>>,
     /// The kernel page cache: record ids in write order.
     log: Arc<Mutex<Vec<u8>>>,
+    /// The producer has issued everything (the writer may stop waking).
+    done: AtomicBool,
 }
 
 fn write(sink: &mut Sink, bytes: &[u8]) -> std::io::Result<()> {
@@ -107,6 +113,7 @@ impl World {
             core: Mutex::new(LaneCore::new()),
             chan: Mutex::new(VecDeque::new()),
             log: Arc::new(Mutex::new(Vec::new())),
+            done: AtomicBool::new(false),
         }
     }
 
@@ -278,21 +285,28 @@ fn thread_spawn<T: Send + 'static>(
     std::thread::spawn(f)
 }
 
-/// The producer appends 1, flushes, sends an `AppendSync` 2, appends 3,
-/// sends a control message, appends 4 and flushes, while the writer wakes
-/// `wakes` times (each wake: a message if any, then an offer).
-fn model_lane(how: How, wakes: usize) {
-    let w = Arc::new(World::new());
-    let writer = {
-        let w = Arc::clone(&w);
-        thread_spawn(move || {
-            let mut ctx = Some(0u8);
-            for _ in 0..wakes {
-                w.writer_wake(&mut ctx);
+/// The writer thread: wakes (a message if any, then an offer) until the
+/// producer is done — a slow sender needs it to drain.
+fn spawn_writer(w: &Arc<World>) -> impl FnOnce() -> Option<u8> {
+    let w = Arc::clone(w);
+    let handle = thread_spawn(move || {
+        let mut ctx = Some(0u8);
+        loop {
+            w.writer_wake(&mut ctx);
+            if w.done.load(Ordering::Acquire) {
+                return ctx;
             }
-            ctx
-        })
-    };
+            yield_now();
+        }
+    });
+    move || handle.join().unwrap()
+}
+
+/// The producer appends 1, flushes, sends an `AppendSync` 2, appends 3,
+/// sends a control message, appends 4 and flushes, while the writer wakes.
+fn model_lane(how: How) {
+    let w = Arc::new(World::new());
+    let writer = spawn_writer(&w);
     let producer = {
         let w = Arc::clone(&w);
         thread_spawn(move || {
@@ -303,26 +317,18 @@ fn model_lane(how: How, wakes: usize) {
             w.control();
             w.append(4, how);
             w.flush();
+            w.done.store(true, Ordering::Release);
         })
     };
     producer.join().unwrap();
-    let ctx = writer.join().unwrap();
+    let ctx = writer();
     w.finish(ctx, 4);
 }
 
 /// A tighter shape for the slow path: two appends against a channel of 1.
 fn model_slow_path(how: How) {
     let w = Arc::new(World::new());
-    let writer = {
-        let w = Arc::clone(&w);
-        thread_spawn(move || {
-            let mut ctx = Some(0u8);
-            for _ in 0..3 {
-                w.writer_wake(&mut ctx);
-            }
-            ctx
-        })
-    };
+    let writer = spawn_writer(&w);
     let producer = {
         let w = Arc::clone(&w);
         thread_spawn(move || {
@@ -330,10 +336,11 @@ fn model_slow_path(how: How) {
             w.append(2, how);
             w.append(3, how);
             w.flush();
+            w.done.store(true, Ordering::Release);
         })
     };
     producer.join().unwrap();
-    let ctx = writer.join().unwrap();
+    let ctx = writer();
     w.finish(ctx, 3);
 }
 
@@ -349,7 +356,7 @@ mod loom_models {
 
     #[test]
     fn loom_lane_hand_over_keeps_order_and_context() {
-        model(|| model_lane(How::Correct, 3));
+        model(|| model_lane(How::Correct));
     }
 
     #[test]
@@ -376,10 +383,8 @@ mod smoke {
 
     #[test]
     fn smoke_lane_hand_over_keeps_order_and_context() {
-        for wakes in 0..6 {
-            for _ in 0..200 {
-                model_lane(How::Correct, wakes);
-            }
+        for _ in 0..1000 {
+            model_lane(How::Correct);
         }
     }
 
