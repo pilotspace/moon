@@ -518,6 +518,7 @@ fn info_raw(db: &Database, facts: &InstanceFacts) -> String {
          aof_delayed_fsync:{}\r\n\
          aof_pending_bio_fsync:{}\r\n\
          aof_fsync_in_flight_ms:{}\r\n\
+         aof_shard_writes:{}\r\n\
          aof_last_append_status:{}\r\n\
          aof_reason_del_dropped:{}\r\n\
          aof_rewrite_overflow_spilled:{}\r\n\
@@ -614,6 +615,9 @@ fn info_raw(db: &Database, facts: &InstanceFacts) -> String {
         // pending BIO_AOF_FSYNC jobs), and the oldest one's age in ms.
         aof_fsyncs_in_flight.0,
         aof_fsyncs_in_flight.1,
+        // moon#1266 1A: AOF write(2)s issued by the shard threads (0 while
+        // the writer threads append: MOON_AOF_SHARD_WRITE off).
+        crate::persistence::aof::lane::AOF_LANE_WRITES.load(std::sync::atomic::Ordering::Relaxed),
         if crate::persistence::aof::aof_last_append_ok() {
             "ok"
         } else {

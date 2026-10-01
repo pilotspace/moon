@@ -114,6 +114,8 @@ impl IoUringDriver {
         urb: &io_uring::Builder,
         entries: u32,
     ) -> io::Result<IoUringDriver> {
+        // moon patch (moon#1266 1A): unknown until this driver is built.
+        let _ = super::SUBMIT_GATES_IO.try_with(|c| c.set(false));
         let uring = ManuallyDrop::new(urb.build(entries)?);
         let sqpoll = uring.params().is_setup_sqpoll();
 
@@ -140,6 +142,8 @@ impl IoUringDriver {
         urb: &io_uring::Builder,
         entries: u32,
     ) -> io::Result<IoUringDriver> {
+        // moon patch (moon#1266 1A): unknown until this driver is built.
+        let _ = super::SUBMIT_GATES_IO.try_with(|c| c.set(false));
         let uring = ManuallyDrop::new(urb.build(entries)?);
         let sqpoll = uring.params().is_setup_sqpoll();
 

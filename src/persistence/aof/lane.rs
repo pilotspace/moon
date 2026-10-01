@@ -43,18 +43,59 @@ use crate::runtime::channel;
 /// flushing iteration while 1A runs).
 pub static AOF_LANE_WRITES: AtomicU64 = AtomicU64::new(0);
 
-/// Whether Option 1A is on: `MOON_AOF_SHARD_WRITE=1` (also `on`/`yes`/
-/// `true`). Read once per process.
+/// Option 1A when `MOON_AOF_SHARD_WRITE` is unset.
+const DEFAULT_ON: bool = false;
+
+/// `MOON_AOF_SHARD_WRITE`: `1`/`on`/`yes`/`true` or `0`/`off`/`no`/`false`;
+/// anything else (or unset) is the default.
+fn parse_switch(v: Option<&str>) -> bool {
+    match v.map(str::trim) {
+        Some(v)
+            if v == "1"
+                || v.eq_ignore_ascii_case("on")
+                || v.eq_ignore_ascii_case("yes")
+                || v.eq_ignore_ascii_case("true") =>
+        {
+            true
+        }
+        Some(v)
+            if v == "0"
+                || v.eq_ignore_ascii_case("off")
+                || v.eq_ignore_ascii_case("no")
+                || v.eq_ignore_ascii_case("false") =>
+        {
+            false
+        }
+        _ => DEFAULT_ON,
+    }
+}
+
+/// Whether Option 1A is on (`MOON_AOF_SHARD_WRITE`, [`DEFAULT_ON`] when
+/// unset). Read once per process.
+///
+/// The test hook `MOON_TEST_AOF_FSYNC_STALL_MS` (a writer held at its
+/// everysec deadline — the moon#769/#838/#1272 suites fill the writer's
+/// channel with it to exercise the backpressure refusals) keeps 1A off:
+/// with the shard writing its own records there is no queue to fill — a slow
+/// disk stalls the shard's `write(2)` instead, as in redis — and the channel
+/// path those suites pin is still live (`always`, folds, before the first
+/// hand-over).
 pub fn enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        std::env::var("MOON_AOF_SHARD_WRITE").is_ok_and(|v| {
-            let v = v.trim();
-            v == "1"
-                || v.eq_ignore_ascii_case("on")
-                || v.eq_ignore_ascii_case("yes")
-                || v.eq_ignore_ascii_case("true")
-        })
+        let on = parse_switch(std::env::var("MOON_AOF_SHARD_WRITE").ok().as_deref());
+        let stall_hook = std::env::var("MOON_TEST_AOF_FSYNC_STALL_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .is_some_and(|ms| ms > 0);
+        if on && stall_hook {
+            tracing::warn!(
+                "MOON_TEST_AOF_FSYNC_STALL_MS is set: AOF records go through the writer \
+                 thread (moon#1266 1A off for this test hook)"
+            );
+            return false;
+        }
+        on
     })
 }
 
@@ -432,10 +473,7 @@ pub fn install_for_shard(shard_id: usize, pool: Option<&Arc<super::AofWriterPool
 pub fn uninstall_for_shard() {
     flush_current();
     #[cfg(feature = "runtime-monoio")]
-    if CURRENT
-        .try_with(|c| c.borrow().is_some())
-        .unwrap_or(false)
-    {
+    if CURRENT.try_with(|c| c.borrow().is_some()).unwrap_or(false) {
         let _ = monoio::set_before_submit_hook(None);
     }
     let _ = CURRENT.try_with(|c| c.borrow_mut().take());
@@ -486,7 +524,12 @@ mod tests {
 
     /// What the writer loops write for `msgs`: `inject_record_prefixes`, then
     /// each body framed (per-shard) or bare (TopLevel).
-    fn writer_bytes(ctx: &mut RecordCtx, floor: FoldEpoch, framed: bool, msgs: Vec<AofMessage>) -> Vec<u8> {
+    fn writer_bytes(
+        ctx: &mut RecordCtx,
+        floor: FoldEpoch,
+        framed: bool,
+        msgs: Vec<AofMessage>,
+    ) -> Vec<u8> {
         let mut out = Vec::new();
         for m in crate::persistence::aof::inject_record_prefixes(msgs, floor, ctx) {
             if let AofMessage::Append { lsn, bytes, .. } = m {
@@ -499,7 +542,12 @@ mod tests {
         out
     }
 
-    fn lane_bytes(ctx: RecordCtx, floor: FoldEpoch, framed: bool, msgs: Vec<AofMessage>) -> (Vec<u8>, RecordCtx) {
+    fn lane_bytes(
+        ctx: RecordCtx,
+        floor: FoldEpoch,
+        framed: bool,
+        msgs: Vec<AofMessage>,
+    ) -> (Vec<u8>, RecordCtx) {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("incr");
         let file = std::fs::OpenOptions::new()
@@ -518,7 +566,10 @@ mod tests {
         assert!(rx.is_empty(), "DIRECT must not use the channel");
         let back = lane.take_back();
         assert!(!back.write_failed);
-        (std::fs::read(&path).expect("read"), back.ctx.expect("ctx").rec)
+        (
+            std::fs::read(&path).expect("read"),
+            back.ctx.expect("ctx").rec,
+        )
     }
 
     fn mixed() -> Vec<AofMessage> {
@@ -528,7 +579,12 @@ mod tests {
             append(2, 1_000, 0, b"*1\r\n$1\r\nc\r\n"),
             append(2, 1_001, 5, b"*1\r\n$1\r\nd\r\n"),
             append(2, 1_001, 0, b"*1\r\n$1\r\ne\r\n"),
-            append(2, 1_001, 5 | crate::persistence::aof::TXN_END_FLAG, b"*1\r\n$1\r\nf\r\n"),
+            append(
+                2,
+                1_001,
+                5 | crate::persistence::aof::TXN_END_FLAG,
+                b"*1\r\n$1\r\nf\r\n",
+            ),
             append(0, 0, 0, b""),
             append(1, 0, 0, b"*1\r\n$1\r\ng\r\n"),
         ]
@@ -555,11 +611,19 @@ mod tests {
         let mut wctx = RecordCtx::appending(&path);
         assert_eq!(wctx.db(), UNKNOWN_DB);
         let want = writer_bytes(&mut wctx, FoldEpoch::INITIAL, false, mixed());
-        let (got, _) = lane_bytes(RecordCtx::appending(&path), FoldEpoch::INITIAL, false, mixed());
+        let (got, _) = lane_bytes(
+            RecordCtx::appending(&path),
+            FoldEpoch::INITIAL,
+            false,
+            mixed(),
+        );
         // The session stamp carries the writer's clock when the first record
         // has none; the first record here has one, so the bytes match.
         assert_eq!(got, want);
-        assert!(got.windows(6).any(|w| w == b"SELECT"), "the first record selects its db");
+        assert!(
+            got.windows(6).any(|w| w == b"SELECT"),
+            "the first record selects its db"
+        );
     }
 
     #[test]
@@ -584,7 +648,10 @@ mod tests {
         // Buffered, not yet written (this test thread is not the lane's
         // shard thread, so it writes at once: bind it first).
         let _ = CURRENT.try_with(|c| *c.borrow_mut() = Some(Arc::clone(&lane)));
-        assert!(matches!(lane.enqueue(append(0, 0, 0, b"*1\r\n$1\r\na\r\n"), &tx), Sent::Ok));
+        assert!(matches!(
+            lane.enqueue(append(0, 0, 0, b"*1\r\n$1\r\na\r\n"), &tx),
+            Sent::Ok
+        ));
         assert!(std::fs::read(&path).expect("read").is_empty());
         let (ack, _rx) = channel::oneshot();
         let sync = AofMessage::AppendSync {
@@ -598,10 +665,16 @@ mod tests {
         };
         assert!(matches!(lane.enqueue(sync, &tx), Sent::Ok));
         assert_eq!(lane.mode(), Mode::Writer);
-        assert!(!std::fs::read(&path).expect("read").is_empty(), "written before the flip");
+        assert!(
+            !std::fs::read(&path).expect("read").is_empty(),
+            "written before the flip"
+        );
         assert_eq!(rx.len(), 1);
         // Now WRITER: the next append goes to the channel, behind the barrier.
-        assert!(matches!(lane.enqueue(append(0, 0, 0, b"*1\r\n$1\r\nb\r\n"), &tx), Sent::Ok));
+        assert!(matches!(
+            lane.enqueue(append(0, 0, 0, b"*1\r\n$1\r\nb\r\n"), &tx),
+            Sent::Ok
+        ));
         assert_eq!(rx.len(), 2);
         let _ = CURRENT.try_with(|c| c.borrow_mut().take());
     }
@@ -632,10 +705,25 @@ mod tests {
         let mut ctx = RecordCtx::new();
         assert!(lane.release(&rx, &mut ctx, FoldEpoch::INITIAL, file));
         assert!(!lane.take_written());
-        assert!(matches!(lane.enqueue(append(0, 0, 0, b"*1\r\n$1\r\na\r\n"), &tx), Sent::Ok));
+        assert!(matches!(
+            lane.enqueue(append(0, 0, 0, b"*1\r\n$1\r\na\r\n"), &tx),
+            Sent::Ok
+        ));
         assert!(!std::fs::read(&path).expect("read").is_empty());
         assert!(lane.take_written());
         assert!(!lane.take_written());
+    }
+
+    #[test]
+    fn the_switch_parses_both_ways_and_defaults() {
+        for on in ["1", "on", "YES", " true "] {
+            assert!(parse_switch(Some(on)), "{on}");
+        }
+        for off in ["0", "off", "No", "false"] {
+            assert!(!parse_switch(Some(off)), "{off}");
+        }
+        assert_eq!(parse_switch(None), DEFAULT_ON);
+        assert_eq!(parse_switch(Some("maybe")), DEFAULT_ON);
     }
 
     #[test]

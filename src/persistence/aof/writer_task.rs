@@ -467,7 +467,13 @@ pub async fn aof_writer_task(
             // to the EverySec proactive fsync at the end of the loop.
             // Park-free under EverySec/No so producer try_sends never pay a
             // futex wake on the shard thread — see `poll_recv`.
-            let first = match recv_next(&rx, &mut idle_wait, matches!(fsync, FsyncPolicy::Always)) {
+            let first = match recv_next(
+                &rx,
+                &mut idle_wait,
+                // moon#1266 1A: the shard threads write their own records, so
+                // the warm poll (pickup latency) has nothing to pick up — park.
+                matches!(fsync, FsyncPolicy::Always) || lane.is_on(),
+            ) {
                 Ok(m) => {
                     idle_wait.on_message();
                     Some(m)
@@ -723,7 +729,15 @@ pub async fn aof_writer_task(
             }
             // moon#1266 1A: hand the append position to the producers when
             // nothing is in flight.
-            lane_hooks::offer_std(&lane, &rx, fsync, write_error, &mut last_db, fold_floor, &file);
+            lane_hooks::offer_std(
+                &lane,
+                &rx,
+                fsync,
+                write_error,
+                &mut last_db,
+                fold_floor,
+                &file,
+            );
         }
         return;
     }
@@ -1836,7 +1850,13 @@ pub async fn per_shard_aof_writer_task(
             // `IdleWait` docs. Park-free under EverySec/No so producer
             // try_sends never pay a futex wake on the shard thread — see
             // `poll_recv`.
-            let first = match recv_next(&rx, &mut idle_wait, matches!(fsync, FsyncPolicy::Always)) {
+            let first = match recv_next(
+                &rx,
+                &mut idle_wait,
+                // moon#1266 1A: the shard threads write their own records, so
+                // the warm poll (pickup latency) has nothing to pick up — park.
+                matches!(fsync, FsyncPolicy::Always) || lane.is_on(),
+            ) {
                 Ok(m) => {
                     idle_wait.on_message();
                     Some(m)
@@ -2174,7 +2194,15 @@ pub async fn per_shard_aof_writer_task(
             }
             // moon#1266 1A: hand the append position to the producers when
             // nothing is in flight.
-            lane_hooks::offer_std(&lane, &rx, fsync, write_error, &mut last_db, fold_floor, &file);
+            lane_hooks::offer_std(
+                &lane,
+                &rx,
+                fsync,
+                write_error,
+                &mut last_db,
+                fold_floor,
+                &file,
+            );
         }
     }
 }
