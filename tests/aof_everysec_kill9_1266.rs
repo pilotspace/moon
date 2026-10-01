@@ -9,28 +9,29 @@
 //! postpones that write for up to 2 s while replies still go out — see
 //! `docs/production-guide.md`.)
 //!
-//! moon acknowledges a write once its record is queued to the shard's AOF
-//! writer. Before moon#1266 Option 3 the write(2) could lag that ack by:
+//! Before moon#1266 1A, moon acknowledged a write once its record was queued
+//! to the shard's AOF writer thread, and the write(2) could lag that ack by:
 //! - the monoio writer's park-free poll step (`wait/16`, 3 ms while writing,
 //!   up to 50 ms for the first write after an idle second);
 //! - the tokio writer's user-space `BufWriter` tail (up to 8 KiB per shard);
 //! - an inline everysec `fdatasync` on the writer thread, during which the
 //!   channel did not drain at all.
 //!
-//! Option 3 (this fix) shortens that lag to one 500 µs poll step or one
-//! thread wake-up — but the ack still does not wait for the `write(2)`, so a
-//! writer thread that is descheduled, or whose `write(2)` stalls (a VM's I/O
-//! jitter, dirty-page throttling, a journal commit behind the everysec
-//! fsync), for longer than the kill delay still loses the last acked writes.
-//! Closing that window needs the write before the reply (moon#1266 1A, WS46).
+//! Option 3 (WS40) shortened that lag to one 500 µs poll step or one thread
+//! wake-up, but a writer descheduled or stalled past the kill delay still
+//! lost the last acked writes. Option 1A (WS46, the default): the shard
+//! thread writes its own records, one `write(2)` per event-loop iteration,
+//! before that iteration's replies leave — redis's model — so nothing it
+//! acknowledged can be lost to a process crash.
 //!
 //! Each case below acks N SETs, kills the server with SIGKILL ~1 ms after the
 //! last ack (`MOON_1266_KILL_DELAY_US`, default 1000), restarts it on the same
 //! `--dir`, and counts acked keys that did not come back. Every rep's count
-//! is printed. The assertion is the Option-3 property: the MEDIAN rep loses
-//! nothing and at most a quarter of the reps lose anything (before the fix
-//! the median rep lost 1-1,100 keys in every cell). `MOON_1266_STRICT=1`
-//! asserts 0 lost in every rep — the bar for 1A.
+//! is printed. The assertion is 1A's: 0 lost in every rep. With
+//! `MOON_AOF_SHARD_WRITE=0` (Option 3) or `MOON_1266_STRICT=0` it is the
+//! Option-3 property instead: the MEDIAN rep loses nothing and at most a
+//! quarter of the reps lose anything (before Option 3 the median rep lost
+//! 1-1,100 keys in every cell).
 //!
 //! What this does NOT cover: power loss / OS crash (the page cache is lost
 //! there; everysec's bound is then ~1 s plus a slow fsync). Set
@@ -61,6 +62,19 @@ fn reps() -> usize {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(20)
+}
+
+/// 0 lost in every rep (1A, the default) unless Option 3 runs
+/// (`MOON_AOF_SHARD_WRITE=0`) or `MOON_1266_STRICT=0` relaxes it.
+fn strict() -> bool {
+    match std::env::var("MOON_1266_STRICT").as_deref() {
+        Ok("1") => true,
+        Ok("0") => false,
+        _ => !matches!(
+            std::env::var("MOON_AOF_SHARD_WRITE").as_deref().map(str::trim),
+            Ok("0" | "off" | "no" | "false")
+        ),
+    }
 }
 
 fn kill_delay() -> Duration {
@@ -289,7 +303,7 @@ fn run_case(shards: usize, shape: Shape, label: &str) {
         bin.display(),
         lost.iter().max().copied().unwrap_or(0)
     );
-    if std::env::var("MOON_1266_STRICT").as_deref() == Ok("1") {
+    if strict() {
         assert_eq!(
             total, 0,
             "{label} shards={shards}: {total} acknowledged SETs were lost to kill -9 under \
