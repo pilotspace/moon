@@ -72,10 +72,12 @@ fn deadline_of(bucket: u64, entry: u64) -> u64 {
     (bucket << BUCKET_SHIFT) | (entry >> HASH_BITS)
 }
 
+/// `Many` is boxed so the enum is 16 bytes: a sparse wheel (one key per
+/// bucket) pays 24 B per `BTreeMap` slot, not 40.
 #[derive(Debug)]
 enum Bucket {
     One(u64),
-    Many(BTreeSet<u64>),
+    Many(Box<BTreeSet<u64>>),
 }
 
 /// The wheel. `len` is the exact number of references held.
@@ -116,7 +118,7 @@ impl ExpiryWheel {
                         let mut set = BTreeSet::new();
                         set.insert(*x);
                         set.insert(e);
-                        *o.get_mut() = Bucket::Many(set);
+                        *o.get_mut() = Bucket::Many(Box::new(set));
                         self.len += 1;
                     }
                 }
@@ -190,6 +192,7 @@ impl ExpiryWheel {
         self.first().map(|(ts, _)| ts)
     }
 
+    #[cfg(test)]
     fn pop_first(&mut self) -> Option<(u64, u64)> {
         self.pop_first_through(u64::MAX)
     }
