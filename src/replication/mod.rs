@@ -12,4 +12,5 @@ pub mod reason_del;
 pub mod replica;
 pub mod state;
 pub mod stream_effect;
+pub(crate) mod txn_apply;
 pub mod ws_sync;

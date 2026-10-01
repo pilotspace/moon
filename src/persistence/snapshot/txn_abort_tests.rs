@@ -9,7 +9,10 @@
 //! all, so the walk serialized whatever the abort had restored.
 //!
 //! These drive the real undo (`kv_compensation::undo_one`) against the
-//! snapshot epoch harness.
+//! snapshot epoch harness, with NO hold table: the undo's own capture. Since
+//! moon#1300 a real transaction's keys are held, and an epoch armed while
+//! they are holds their PRE-transaction value from the start instead
+//! (`txn_after_start_tests::a_txn_write_before_the_start_is_saved_at_its_pre_txn_value`).
 
 use bytes::Bytes;
 

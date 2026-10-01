@@ -803,6 +803,8 @@ pub mod auto_rewrite;
 mod encode;
 /// Streamed base image for the rewrite fold (moon#1185).
 pub mod fold_stream;
+/// An AOF fold while a `TXN` is open: re-opening its block (moon#1300).
+pub(crate) mod fold_txn;
 /// The everysec fsync agent: the once-per-second fsync off the writer's
 /// loop (moon#1266).
 mod fsync_agent;

@@ -72,9 +72,11 @@ pub(crate) fn capture_conn_write(
         _owner: owner,
     };
     let (lsn, tid) = (txn.snapshot_lsn, txn.txn_id);
-    let mut note = |key: Bytes| {
+    // `pre` is the key's before-image, recorded in the undo log; a NEW hold
+    // also keeps a copy for snapshots (moon#1300 — `isolation::hold`).
+    let mut note = |key: Bytes, pre: &Option<crate::storage::entry::Entry>| {
         let prev_intent = intents.record_write(key.clone(), lsn, tid);
-        let newly_held = isolation::hold(sel_db, &key, tid);
+        let newly_held = isolation::hold(sel_db, &key, tid, || pre.clone());
         capture.keys.push(CapturedKey {
             db: sel_db,
             key,
@@ -86,10 +88,12 @@ pub(crate) fn capture_conn_write(
         // A missing key's DEL writes nothing: no pre-image, no intent.
         for arg in args {
             if let Frame::BulkString(key) = arg
-                && let Some(old_entry) = db.get(key.as_ref()).cloned()
+                && let pre @ Some(_) = db.get(key.as_ref()).cloned()
             {
-                txn.kv_undo.record_delete(sel_db, key.clone(), old_entry);
-                note(key.clone());
+                note(key.clone(), &pre);
+                if let Some(old_entry) = pre {
+                    txn.kv_undo.record_delete(sel_db, key.clone(), old_entry);
+                }
             }
         }
     } else {
@@ -101,11 +105,12 @@ pub(crate) fn capture_conn_write(
         // back to the primary key; a write-free one (`SORT src`) captures
         // nothing — see `conn_txn_capture_keys`.
         for key in crate::transaction::conn_txn_capture_keys(cmd, args) {
-            match db.get(key.as_ref()).cloned() {
-                None => txn.kv_undo.record_insert(sel_db, key.clone()),
-                Some(entry) => txn.kv_undo.record_update(sel_db, key.clone(), entry),
+            let pre = db.get(key.as_ref()).cloned();
+            note(key.clone(), &pre);
+            match pre {
+                None => txn.kv_undo.record_insert(sel_db, key),
+                Some(entry) => txn.kv_undo.record_update(sel_db, key, entry),
             }
-            note(key);
         }
     }
     Ok(capture)

@@ -295,6 +295,9 @@ fn arm_with_slots(num_databases: usize, slots: Vec<(usize, u64)>) {
             start_bills,
         })
     });
+    // moon#1300: keys an open transaction holds are saved at their
+    // pre-transaction image, never their uncommitted value.
+    capture::capture_held_pre_images();
 }
 
 /// A database's identity as a shard slot: its address.

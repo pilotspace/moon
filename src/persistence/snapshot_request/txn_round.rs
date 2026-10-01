@@ -292,7 +292,7 @@ mod tests {
             use crate::transaction::isolation;
             register(busy, R, 2, 0);
             isolation::txn_begin(9);
-            assert!(isolation::hold(0, &bytes::Bytes::from_static(b"k"), 9));
+            assert!(isolation::hold(0, &bytes::Bytes::from_static(b"k"), 9, || None));
             assert_eq!(shard_starts(busy, 0), ShardStart::Abandon);
             assert!(is_abandoned(busy));
             assert_eq!(shard_commit(busy), ShardCommit::Abandon);

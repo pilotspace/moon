@@ -105,6 +105,33 @@ pub(super) fn capture_key(db: &Database, slot: usize, key: &[u8]) {
     record_entry(db_index, owned, entry.clone(), None);
 }
 
+/// moon#1300: at a snapshot's start, file every key an open transaction
+/// holds on this shard under its PRE-TRANSACTION image — first capture, so
+/// no later write of the key (the transaction's own, or its abort's restore)
+/// replaces it. The snapshot then holds no uncommitted value, whatever the
+/// transaction does next: commit (its writes are after the epoch, like any
+/// write after a save starts), abort, or a crash.
+pub(super) fn capture_held_pre_images() {
+    crate::transaction::isolation::with_held_keys(|held| {
+        for h in held {
+            let Some(db_index) = target(h.db, h.key) else {
+                continue;
+            };
+            if captured(db_index, h.key) {
+                continue;
+            }
+            match h.pre {
+                // Absent before the transaction: a tombstone hides whatever it
+                // created (FIFO: the drain keeps this first capture).
+                None => {
+                    PENDING.with(|p| p.borrow_mut().push((db_index, h.key.clone(), None, None)))
+                }
+                Some(entry) => record_entry(db_index, h.key.clone(), entry.clone(), None),
+            }
+        }
+    });
+}
+
 /// What became of an entry handed to [`capture_removed`].
 #[derive(Debug)]
 pub(crate) enum Removed {
