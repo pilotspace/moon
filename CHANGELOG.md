@@ -269,6 +269,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Performance
 
+- **An overwrite no longer hashes the key into an empty cold-tier index.**
+  With disk offload enabled (the default) every hot-key overwrite asked the
+  cold index to drop a spilled copy; with nothing spilled that still cost a
+  64-bit key hash and a map probe. The index now answers at once when it holds
+  nothing: 7.2% fewer instructions per `SET` on the write path (callgrind, 300k
+  SETs, P16, `--shards 1`), about 2.5% less server CPU per op natively. The
+  same review measured wave 2a's own write-path additions (the moon#1299 hold
+  check and the moon#1286 overwrite check) at +11 instructions per `SET`
+  (+0.4%).
+
 - **A write that evicts against a backlogged AOF writer no longer stalls its
   shard for k × 500 ms** (moon#1294). Every connection-path eviction gate
   (monoio write gate, tokio per-command and MQ gates, script bridge, inline
