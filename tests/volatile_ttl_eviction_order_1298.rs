@@ -10,6 +10,15 @@
 //! contiguous prefix of the TTL order (minus the retargeted key), and no
 //! persistent key may be evicted.
 //!
+//! NOT a redis-parity oracle. This asserts moon's own guarantee — `volatile-ttl`
+//! evicts the EXACT nearest deadline first (its TTL index is ordered) — which
+//! is stricter than redis. redis's `volatile-ttl` SAMPLES
+//! (`maxmemory-samples`, default 5) into an eviction pool and evicts the best
+//! of the sample, so it evicts keys out of TTL order and fails this test (the
+//! R2b review ran the same shape against redis 7.2: a non-contiguous evicted
+//! set). Do not "fix" a failure here by comparing against redis, and do not
+//! port this test's assertions into a redis-compat suite.
+//!
 //! `MOON_BIN=<moon> cargo test --test volatile_ttl_eviction_order_1298 -- --include-ignored`
 
 #![cfg(unix)]
