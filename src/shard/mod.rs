@@ -337,9 +337,10 @@ impl Shard {
         self.restore_from_persistence_v2(persistence_dir, kv)
     }
 
-    /// Legacy recovery path: snapshot load + appendonly.aof (authority) /
-    /// WAL v3 (last-resort, AOF-absent-only) replay — the replay only with
-    /// [`KvSources::SnapshotAndLogs`] (not under `--appendonly no`).
+    /// Legacy recovery path: appendonly.aof alone when it holds a record
+    /// ([`KvSources::AofOnly`], R2b review P1), else the snapshot + the WAL v3
+    /// last resort (AOF-absent-only) — the replay only under `--appendonly
+    /// yes`.
     ///
     /// Pre-1.0 WAL-v3-only format freeze: the per-shard WAL v2 rung
     /// (`shard-N.wal`) was removed and is no longer replayed by this build —
@@ -362,6 +363,17 @@ impl Shard {
 
         let dir = std::path::Path::new(persistence_dir);
         let mut total_keys = 0;
+        // R2b review P1: `appendonly.aof` holding a record is the only KV
+        // source — the snapshot holds a prefix of its records.
+        let kv = kv.with_flat_aof(Some(dir));
+        let snap_skipped = dir.join(format!("shard-{}.rrdshard", self.id));
+        if kv == KvSources::AofOnly && snap_skipped.exists() {
+            info!(
+                "Shard {}: snapshot load skipped — {}",
+                self.id,
+                kv.why_no_snapshot()
+            );
+        }
 
         // Load per-shard snapshot -- unless the multi-part AOF replay that
         // follows this pass wipes it anyway (see `restore_from_persistence`).
