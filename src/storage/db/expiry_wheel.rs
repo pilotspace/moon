@@ -78,6 +78,9 @@ fn deadline_of(bucket: u64, entry: u64) -> u64 {
 #[derive(Debug)]
 enum Bucket {
     One(u64),
+    // Deliberate: the BTreeSet header is 24 B, which would make every enum
+    // slot (and so every sparse BTreeMap slot) 32 B; the box makes it 16 B.
+    #[allow(clippy::box_collection)]
     Many(Box<BTreeSet<u64>>),
 }
 
