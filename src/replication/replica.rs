@@ -52,6 +52,11 @@ static REPLICA_TASK_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::Ato
 /// Bump the generation (new REPLICAOF target, or NO ONE) and return the new
 /// ticket to hand to a freshly spawned task.
 pub fn bump_replica_task_epoch() -> u64 {
+    // moon#1300: the node stops following its master here (every REPLICAOF
+    // target change, `NO ONE`, `CLUSTER REPLICATE` bumps), on the shard
+    // thread, before a new task can apply anything: a transaction the old
+    // master never ended is rolled back, as its own crash recovery would.
+    crate::replication::txn_apply::roll_back_open();
     REPLICA_TASK_EPOCH.fetch_add(1, Ordering::AcqRel) + 1
 }
 

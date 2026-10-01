@@ -116,17 +116,10 @@ impl UndoLog {
         self.dbs.into_iter().zip(self.records)
     }
 
-    /// Every record's `(db, key)`, in capture order (moon#1299: the keys a
-    /// script's captures make the transaction hold).
-    pub fn keys_with_db(&self) -> impl Iterator<Item = (usize, &Bytes)> {
-        self.dbs
-            .iter()
-            .copied()
-            .zip(self.records.iter().map(|r| match r {
-                UndoRecord::Insert { key }
-                | UndoRecord::Update { key, .. }
-                | UndoRecord::Delete { key, .. } => key,
-            }))
+    /// Every record with its database, in capture order (moon#1300: a
+    /// script's first record of a key is the key's pre-transaction image).
+    pub fn records_with_db(&self) -> impl Iterator<Item = (usize, &UndoRecord)> {
+        self.dbs.iter().copied().zip(self.records.iter())
     }
 
     /// Get a reference to all records (for WAL serialization).

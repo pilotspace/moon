@@ -122,8 +122,15 @@ pub(crate) fn run_local_script<R>(txn: Option<&mut CrossStoreTxn>, run: impl FnO
     }
     // ... and every key it captured is held until COMMIT / ABORT, like the
     // connection leg's (`transaction::conn_capture`).
-    for (db, key) in undo.keys_with_db() {
-        crate::transaction::isolation::hold(db, key, txn.txn_id);
+    // moon#1300: the FIRST record of a key in this script holds its
+    // pre-transaction image (a key the transaction held before keeps its own).
+    for (db, record) in undo.records_with_db() {
+        let key = crate::transaction::kv_compensation::record_key(record);
+        crate::transaction::isolation::hold(db, key, txn.txn_id, || match record {
+            crate::transaction::UndoRecord::Insert { .. } => None,
+            crate::transaction::UndoRecord::Update { old_entry, .. }
+            | crate::transaction::UndoRecord::Delete { old_entry, .. } => Some(old_entry.clone()),
+        });
     }
     txn.kv_undo.append(undo);
     if !written.is_empty() {
