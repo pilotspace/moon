@@ -252,6 +252,21 @@ fn rewrites_under_load_then_kill9_recover_exactly_s4() {
     rewrites_under_load_then_kill9(4);
 }
 
+/// A hash tag whose keys this connection's shard owns (a `TXN` refuses a
+/// write to another shard's key), probed with a throwaway transaction.
+fn local_tag(c: &mut common::Conn) -> String {
+    for i in 0..512 {
+        let tag = format!("t{i}");
+        assert!(c.send(&["TXN", "BEGIN"]).contains("OK"));
+        let r = c.send(&["SET", &format!("{{{tag}}}:probe"), "1"]);
+        assert!(c.send(&["TXN", "ABORT"]).contains("OK"));
+        if r.contains("OK") {
+            return tag;
+        }
+    }
+    panic!("no hash tag is local to this connection's shard");
+}
+
 /// SELECTed dbs, a committed TXN and a TXN left open across the kill, all
 /// written by the shard threads: the replay must see the same SELECT /
 /// MOON.TXN framing the writer would have emitted.
@@ -266,16 +281,18 @@ fn framing_moves_with_the_position(shards: usize) {
     assert!(c.send(&["SELECT", "0"]).contains("OK"));
     assert!(c.send(&["SET", "db0key", "b"]).contains("OK"));
     // Committed TXN.
+    let t1 = format!("{{{}}}:t1", local_tag(&mut c));
     let begin = c.send(&["TXN", "BEGIN"]);
     assert!(begin.contains("OK"), "TXN BEGIN: {begin}");
-    assert!(c.send(&["SET", "t1", "committed"]).contains("OK"));
+    assert!(c.send(&["SET", &t1, "committed"]).contains("OK"));
     let commit = c.send(&["TXN", "COMMIT"]);
     assert!(!commit.starts_with('-'), "TXN COMMIT: {commit}");
     // Open TXN, left open across the kill (from a second connection, so
     // the first stays usable for the last plain write).
     let mut t = conn(port);
+    let t2 = format!("{{{}}}:t2", local_tag(&mut t));
     assert!(t.send(&["TXN", "BEGIN"]).contains("OK"));
-    assert!(t.send(&["SET", "t2", "uncommitted"]).contains("OK"));
+    assert!(t.send(&["SET", &t2, "uncommitted"]).contains("OK"));
     assert!(c.send(&["SET", "after", "x"]).contains("OK"));
     kill_after_1ms(&mut server, port);
 
@@ -284,8 +301,8 @@ fn framing_moves_with_the_position(shards: usize) {
     let mut c2 = wait_loaded(port2);
     assert!(c2.send(&["GET", "db0key"]).contains("b"));
     assert!(c2.send(&["GET", "after"]).contains("x"));
-    assert!(c2.send(&["GET", "t1"]).contains("committed"));
-    let open = c2.send(&["GET", "t2"]);
+    assert!(c2.send(&["GET", &t1]).contains("committed"));
+    let open = c2.send(&["GET", &t2]);
     assert!(
         open.starts_with("$-1") || open.starts_with('_'),
         "an open TXN's write must roll back: {open}"
