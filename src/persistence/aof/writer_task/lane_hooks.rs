@@ -2,17 +2,21 @@
 //! writer loops call these at fixed points, so the append position moves
 //! between the writer and the producers the same way in every loop.
 //!
+//! - [`on_policy`] at the top of every wake: under `always` the position is
+//!   the writer's (its group commit acks after the fsync);
 //! - [`reclaim`] before the writer handles any message, and before every
 //!   stop path: the position (and its `RecordCtx`) is the writer's again,
 //!   with whatever the producers buffered written first — so rewrites,
 //!   generation switches, overflow drains, `always` batches and the
-//!   clean-close marker all run exactly as in Option 3.
+//!   clean-close marker all run exactly as in Option 3;
 //! - [`on_wake`] on every wake, before the everysec deadline check: direct
 //!   writes owe the deadline (learned BEFORE the deadline's `claim`, so the
-//!   R1 heal rule counts only writes made after a failure was learned); a
-//!   switch to `always` takes the position back.
-//! - [`offer_std`] / `offer_tokio` at the end of a wake: hand the position
-//!   to the producers when nothing is in flight.
+//!   R1 heal rule counts only writes made after a failure was learned);
+//! - [`offer`] at the end of a wake: hand the position to the producers when
+//!   nothing is in flight;
+//! - [`park`]: while 1A is on the monoio writer parks in its receive — the
+//!   warm poll only shortened the pickup of records the shard threads now
+//!   write themselves.
 
 use super::*;
 use crate::persistence::aof::lane::AofLane;
@@ -33,75 +37,74 @@ pub(super) fn reclaim(lane: &AofLane, ctx: &mut RecordCtx, write_error: &mut boo
     }
 }
 
+/// Top of every wake: `always` (also after a runtime `CONFIG SET`) keeps the
+/// position on the writer.
+pub(super) fn on_policy(
+    lane: &AofLane,
+    fsync: FsyncPolicy,
+    ctx: &mut RecordCtx,
+    write_error: &mut bool,
+) {
+    if fsync == FsyncPolicy::Always && lane.is_direct() {
+        reclaim(lane, ctx, write_error);
+    }
+}
+
 /// Every wake, before the everysec deadline check (see the module doc).
 pub(super) fn on_wake(
     lane: &AofLane,
     fsync: FsyncPolicy,
     everysec: &mut EverysecSync,
     idle_wait: &mut IdleWait,
-    ctx: &mut RecordCtx,
-    write_error: &mut bool,
 ) {
-    if !lane.is_on() {
-        return;
-    }
     if lane.take_written() && fsync == FsyncPolicy::EverySec {
         everysec.note_written();
         idle_wait.mark_pending();
     }
-    if fsync == FsyncPolicy::Always && lane.is_direct() {
-        reclaim(lane, ctx, write_error);
-    }
 }
 
-/// Whether the writer may hand its position over at all now.
-fn may_offer(
-    lane: &AofLane,
-    rx: &channel::MpscReceiver<AofMessage>,
-    fsync: FsyncPolicy,
-    write_error: bool,
-) -> bool {
-    lane.is_on() && fsync != FsyncPolicy::Always && !write_error && lane.may_release(rx)
-}
-
-/// End of a wake, std-file writers (monoio).
+/// Whether the monoio writer parks in its receive (no warm poll).
 #[cfg(feature = "runtime-monoio")]
-pub(super) fn offer_std(
-    lane: &AofLane,
-    rx: &channel::MpscReceiver<AofMessage>,
-    fsync: FsyncPolicy,
-    write_error: bool,
-    ctx: &mut RecordCtx,
-    floor: FoldEpoch,
-    file: &std::fs::File,
-) {
-    if !may_offer(lane, rx, fsync, write_error) {
-        return;
-    }
-    match file.try_clone() {
-        Ok(dup) => {
-            lane.release(rx, ctx, floor, dup);
-        }
-        Err(e) => warn!("AOF writer: could not dup its file for the shard-thread write ({e})"),
+pub(super) fn park(lane: &AofLane, fsync: FsyncPolicy) -> bool {
+    fsync == FsyncPolicy::Always || lane.is_on()
+}
+
+/// A writer's file the producers can get a handle on.
+pub(super) trait DupFile {
+    fn dup(&self) -> std::io::Result<std::fs::File>;
+}
+
+impl DupFile for std::fs::File {
+    fn dup(&self) -> std::io::Result<std::fs::File> {
+        self.try_clone()
     }
 }
 
-/// End of a wake, tokio writers: the dup is taken synchronously from the
-/// raw handle (no lock is held across an await).
+/// The tokio writers: the dup is taken synchronously from the raw handle
+/// (no lock is held across an await). Their `BufWriter` is empty at the end
+/// of a wake: every batch ends with a flush to the kernel (moon#1266).
 #[cfg(feature = "runtime-tokio")]
-pub(super) fn offer_tokio(
+impl DupFile for tokio::io::BufWriter<tokio::fs::File> {
+    fn dup(&self) -> std::io::Result<std::fs::File> {
+        dup_tokio_file(self.get_ref())
+    }
+}
+
+/// End of a wake: hand the position to the producers when nothing is in
+/// flight (`AofLane::release` re-checks under the lane lock).
+pub(super) fn offer(
     lane: &AofLane,
     rx: &channel::MpscReceiver<AofMessage>,
     fsync: FsyncPolicy,
     write_error: bool,
     ctx: &mut RecordCtx,
     floor: FoldEpoch,
-    file: &tokio::fs::File,
+    file: &impl DupFile,
 ) {
-    if !may_offer(lane, rx, fsync, write_error) {
+    if fsync == FsyncPolicy::Always || write_error || !lane.may_release(rx) {
         return;
     }
-    match dup_tokio_file(file) {
+    match file.dup() {
         Ok(dup) => {
             lane.release(rx, ctx, floor, dup);
         }
