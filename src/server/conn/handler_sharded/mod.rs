@@ -2792,10 +2792,11 @@ async fn handle_connection_body<S: tokio::io::AsyncRead + tokio::io::AsyncWrite 
                             // epoch is read here, in the mutation's no-await
                             // stretch (see the monoio handler's generic write
                             // leg).
+                            // moon#1300: a TXN's record is tagged with it.
                             let fold_stamp = ctx.aof_pool.as_ref().map_or(
                                 aof::AppendStamp::INITIAL,
                                 |pool| pool.fold_stamp(ctx.shard_id),
-                            );
+                            ).in_txn(conn.active_cross_txn.as_ref().map_or(0, |t| t.txn_id));
 
                             let (mut response, ready): (Frame, crate::blocking::wakeup::ReadyKeys) = match write_outcome {
                                 Ok(t) => t,

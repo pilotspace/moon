@@ -29,6 +29,7 @@ pub mod subscriber_mode;
 #[cfg(all(test, feature = "runtime-monoio"))]
 mod tests;
 pub(crate) mod txn_abort;
+pub(crate) mod txn_log;
 pub(crate) mod txn_script;
 pub(crate) mod txn_script_undo;
 pub mod util;

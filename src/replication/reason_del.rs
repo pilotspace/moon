@@ -210,6 +210,8 @@ pub(crate) fn record_reason_del_conn(
         aof_pool,
         db,
         serialize_del(key),
+        // An eviction is no transaction's write, even inside a TXN's script.
+        0,
         aof_budget,
     );
 }
@@ -266,6 +268,9 @@ pub(crate) fn record_effect_write(
     // command, not a sweep (the per-run sharing of moon#1294 applies to the
     // eviction victims its gate reports, see `scripting::bridge`).
     let mut budget = crate::persistence::aof::AOF_REASON_DEL_BACKPRESSURE_BOUND;
+    // moon#1300: inside a `TXN` the script runs as the transaction's own
+    // write (`OwnerScope`), and its effects are the transaction's records.
+    let txn = crate::transaction::isolation::current_owner();
     for serialized in crate::persistence::aof::serialize_effect_for_log(&frame, reply) {
         record_bytes_conn(
             repl_state,
@@ -274,6 +279,7 @@ pub(crate) fn record_effect_write(
             aof_pool,
             db,
             serialized,
+            txn,
             &mut budget,
         );
     }
@@ -313,6 +319,7 @@ fn record_bytes_conn(
     aof_pool: Option<&std::sync::Arc<AofWriterPool>>,
     db: usize,
     bytes: Bytes,
+    txn: u64,
     budget: &mut std::time::Duration,
 ) {
     // Cheap first gate (one Relaxed load): skip the replication leg entirely
@@ -320,7 +327,13 @@ fn record_bytes_conn(
     // `handler_monoio::ft::replication_fanout_active`'s first check.
     #[cfg(feature = "runtime-monoio")]
     if crate::replication::state::fanout_hint_active() {
-        push_record_db(repl_state, shard_id, num_shards, db, bytes.clone());
+        // moon#1300: a transaction's record is replicated inside its block.
+        let record = if txn == 0 {
+            bytes.clone()
+        } else {
+            crate::server::conn::txn_log::repl_record(txn, &bytes)
+        };
+        push_record_db(repl_state, shard_id, num_shards, db, record);
     }
     #[cfg(not(feature = "runtime-monoio"))]
     let _ = (repl_state, num_shards);
@@ -328,7 +341,7 @@ fn record_bytes_conn(
         // #452.4: escalated bound + fail-loud accounting — see
         // `record_reason_del`'s comment for the resurrection rationale. The
         // bound is the caller's (moon#1294): shared by a whole eviction run.
-        if !pool.send_append_bounded_blocking(shard_id, 0, db, bytes.clone(), budget) {
+        if !pool.send_append_bounded_blocking_in_txn(shard_id, 0, db, bytes.clone(), txn, budget) {
             record_reason_del_dropped(&bytes);
         }
     }
