@@ -19,7 +19,10 @@
 //!   submit, a full SQ), so the shard's whole iteration is ONE `write(2)`
 //!   ahead of its replies' SQEs ([`install_for_shard`]);
 //! - every other driver (monoio legacy/epoll/kqueue, SQPOLL, tokio) writes a
-//!   reply inside the task: the reply macros call [`flush_before_reply`];
+//!   reply inside the task: the reply macros call
+//!   [`flush_before_reply_coalesced`] (one write per scheduler round), the
+//!   rarer early flushes (before a blocking command, SUBSCRIBE)
+//!   [`flush_before_reply`];
 //! - a reply that leaves for ANOTHER thread (`OneshotSender::send`,
 //!   `ResponseSlot::fill`) calls [`flush_current`] first: the receiver may
 //!   put it on its socket before this thread's next park;
@@ -147,6 +150,9 @@ pub struct AofLane {
     /// A direct write landed since the writer last looked (its everysec
     /// deadline: [`Self::take_written`]).
     written: AtomicBool,
+    /// Direct writes issued (tests).
+    #[cfg(test)]
+    writes: AtomicU64,
 }
 
 impl std::fmt::Debug for AofLane {
@@ -188,6 +194,8 @@ impl AofLane {
             core: parking_lot::Mutex::new(LaneCore::new()),
             dirty: AtomicBool::new(false),
             written: AtomicBool::new(false),
+            #[cfg(test)]
+            writes: AtomicU64::new(0),
         })
     }
 
@@ -250,7 +258,9 @@ impl AofLane {
                 if buffered {
                     if core.has_pending() {
                         self.dirty.store(true, Ordering::Release);
-                        if !self.is_home_thread() {
+                        if self.is_home_thread() {
+                            let _ = HOME_APPENDS.try_with(|n| n.set(n.get().wrapping_add(1)));
+                        } else {
                             self.flush_locked(&mut core);
                         }
                     }
@@ -305,6 +315,8 @@ impl AofLane {
             Flushed::Nothing => {}
             Flushed::Wrote(_) => {
                 AOF_LANE_WRITES.fetch_add(1, Ordering::Relaxed);
+                #[cfg(test)]
+                self.writes.fetch_add(1, Ordering::Relaxed);
                 self.written.store(true, Ordering::Release);
             }
             Flushed::Failed => error!(
@@ -435,6 +447,95 @@ thread_local! {
     /// Replies are written inside their task (every driver but io_uring
     /// without SQPOLL): the reply macros flush first.
     static INLINE_REPLIES: Cell<bool> = const { Cell::new(true) };
+    /// Records this thread buffered into its own lane (wrapping count): tells
+    /// [`flush_before_reply_coalesced`] whether its yield let other
+    /// connections add theirs.
+    static HOME_APPENDS: Cell<u64> = const { Cell::new(0) };
+    /// [`flush_before_reply_coalesced`]'s adaptivity (see there).
+    static COALESCE: Cell<Coalesce> = const { Cell::new(Coalesce { misses: 0, skip: 0 }) };
+}
+
+/// Whether a reply on this thread yields before it flushes.
+#[derive(Clone, Copy)]
+struct Coalesce {
+    /// Consecutive yields after which no other connection had appended.
+    misses: u32,
+    /// Replies left to flush without yielding (after a run of misses).
+    skip: u32,
+}
+
+/// A run of this many fruitless yields (a lone connection) ...
+const COALESCE_MISSES: u32 = 16;
+/// ... stops the yielding for this many replies, then it is tried again.
+const COALESCE_SKIP: u32 = 256;
+
+/// Return `Pending` once (waking itself), so every task already runnable on
+/// this thread runs before the caller resumes.
+struct YieldOnce(bool);
+
+impl std::future::Future for YieldOnce {
+    type Output = ();
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<()> {
+        if self.0 {
+            return std::task::Poll::Ready(());
+        }
+        self.0 = true;
+        cx.waker().wake_by_ref();
+        std::task::Poll::Pending
+    }
+}
+
+/// [`flush_before_reply`] for a connection's reply write, coalesced per
+/// scheduler round on the drivers whose writes run inside the task (epoll /
+/// kqueue, SQPOLL, tokio): when this thread has records buffered, the reply
+/// first yields once, so the other connections that are ready in the same
+/// round run their commands too, and ONE `write(2)` then covers all of them
+/// (the first of them to resume writes; the rest find the lane clean) —
+/// redis's one write per event-loop iteration, not one per connection. A lone
+/// connection gains nothing from the yield: after [`COALESCE_MISSES`]
+/// fruitless yields in a row the replies stop yielding for [`COALESCE_SKIP`]
+/// replies, then try again. The write still precedes the reply in every case.
+pub async fn flush_before_reply_coalesced() {
+    if !INLINE_REPLIES.try_with(Cell::get).unwrap_or(true) || !current_dirty() {
+        return;
+    }
+    let mut state = COALESCE
+        .try_with(Cell::get)
+        .unwrap_or(Coalesce { misses: 0, skip: 0 });
+    if state.skip > 0 {
+        state.skip -= 1;
+    } else {
+        let before = HOME_APPENDS.try_with(Cell::get).unwrap_or(0);
+        YieldOnce(false).await;
+        if HOME_APPENDS.try_with(Cell::get).unwrap_or(0) == before {
+            state.misses += 1;
+            if state.misses >= COALESCE_MISSES {
+                state = Coalesce {
+                    misses: 0,
+                    skip: COALESCE_SKIP,
+                };
+            }
+        } else {
+            state.misses = 0;
+        }
+    }
+    let _ = COALESCE.try_with(|c| c.set(state));
+    flush_current();
+}
+
+/// Whether this thread's lane holds buffered records.
+#[inline]
+fn current_dirty() -> bool {
+    CURRENT
+        .try_with(|c| {
+            c.borrow()
+                .as_ref()
+                .is_some_and(|l| l.dirty.load(Ordering::Acquire))
+        })
+        .unwrap_or(false)
 }
 
 /// Bind this shard thread to its writer's lane (1A on and an AOF pool): its
@@ -714,6 +815,107 @@ mod tests {
         assert!(!std::fs::read(&path).expect("read").is_empty());
         assert!(lane.take_written());
         assert!(!lane.take_written());
+    }
+
+    /// A released lane bound to this thread, over a temp file.
+    fn bound_direct_lane() -> (
+        Arc<AofLane>,
+        channel::MpscSender<AofMessage>,
+        tempfile::TempDir,
+    ) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = std::fs::File::create(dir.path().join("incr")).expect("create");
+        let (tx, rx) = channel::mpsc_bounded::<AofMessage>(8);
+        let lane = AofLane::with_switch(false, true);
+        let mut ctx = RecordCtx::new();
+        assert!(lane.release(&rx, &mut ctx, FoldEpoch::INITIAL, file));
+        let _ = CURRENT.try_with(|c| *c.borrow_mut() = Some(Arc::clone(&lane)));
+        let _ = INLINE_REPLIES.try_with(|c| c.set(true));
+        let _ = COALESCE.try_with(|c| c.set(Coalesce { misses: 0, skip: 0 }));
+        drop(rx);
+        (lane, tx, dir)
+    }
+
+    fn unbind() {
+        let _ = CURRENT.try_with(|c| c.borrow_mut().take());
+    }
+
+    /// Connections ready in the same scheduler round share ONE write: each
+    /// appends, then yields at its reply; the first to resume writes them all.
+    #[test]
+    fn replies_in_one_round_share_one_write() {
+        let (lane, tx, dir) = bound_direct_lane();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("rt");
+        let local = tokio::task::LocalSet::new();
+        local.block_on(&rt, async {
+            let mut tasks = Vec::new();
+            for i in 0..5u8 {
+                let lane = Arc::clone(&lane);
+                let tx = tx.clone();
+                tasks.push(tokio::task::spawn_local(async move {
+                    let body: &'static [u8] = match i {
+                        0 => b"*1\r\n$1\r\na\r\n",
+                        1 => b"*1\r\n$1\r\nb\r\n",
+                        2 => b"*1\r\n$1\r\nc\r\n",
+                        3 => b"*1\r\n$1\r\nd\r\n",
+                        _ => b"*1\r\n$1\r\ne\r\n",
+                    };
+                    assert!(matches!(lane.enqueue(append(0, 0, 0, body), &tx), Sent::Ok));
+                    flush_before_reply_coalesced().await;
+                    // The reply may go now: this task's record is written.
+                    assert!(!lane.dirty.load(Ordering::Acquire));
+                }));
+            }
+            for t in tasks {
+                t.await.expect("task");
+            }
+        });
+        assert_eq!(
+            lane.writes.load(Ordering::Relaxed),
+            1,
+            "one write for the round"
+        );
+        let got = std::fs::read(dir.path().join("incr")).expect("read");
+        assert_eq!(
+            got.iter().filter(|&&b| b == b'*').count(),
+            5,
+            "every record written"
+        );
+        unbind();
+    }
+
+    /// A lone connection: after a run of fruitless yields the replies stop
+    /// yielding (and still write before every reply).
+    #[test]
+    fn a_lone_connection_stops_yielding() {
+        let (lane, tx, _dir) = bound_direct_lane();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("rt");
+        let local = tokio::task::LocalSet::new();
+        local.block_on(&rt, async {
+            for _ in 0..COALESCE_MISSES {
+                assert!(matches!(
+                    lane.enqueue(append(0, 0, 0, b"*1\r\n$1\r\nx\r\n"), &tx),
+                    Sent::Ok
+                ));
+                flush_before_reply_coalesced().await;
+                assert!(!lane.dirty.load(Ordering::Acquire));
+            }
+        });
+        let state = COALESCE.try_with(Cell::get).expect("tls");
+        assert_eq!(
+            state.skip, COALESCE_SKIP,
+            "the misses switched yielding off"
+        );
+        assert_eq!(
+            lane.writes.load(Ordering::Relaxed),
+            u64::from(COALESCE_MISSES),
+            "one write per reply when nothing coalesces"
+        );
+        unbind();
     }
 
     #[test]

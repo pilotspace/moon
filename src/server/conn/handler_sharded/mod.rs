@@ -34,7 +34,7 @@ macro_rules! write_all_bounded {
         } else {
             // moon#1266 1A: this shard's AOF records reach the kernel before
             // the reply.
-            crate::persistence::aof::lane::flush_before_reply();
+            crate::persistence::aof::lane::flush_before_reply_coalesced().await;
             // Publish what this connection is holding, so a stalled reply is
             // visible in CLIENT LIST (`obl`/`omem`) while it happens.
             $live.begin_write(pending);
