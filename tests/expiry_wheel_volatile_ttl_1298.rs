@@ -100,7 +100,18 @@ fn run(wheel: bool) {
         c.send(&["CONFIG", "SET", "maxmemory-policy", "volatile-ttl"]),
         "+OK\r\n"
     );
-    let used = info_u64(&mut c, "memory", "used_memory");
+    // `used_memory` is published by the shard tick: wait for it to cover the
+    // load rather than racing the first publish.
+    let t0 = std::time::Instant::now();
+    let mut used = info_u64(&mut c, "memory", "used_memory");
+    while used < (VOLATILE * 1024) as u64 && t0.elapsed() < std::time::Duration::from_secs(10) {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        used = info_u64(&mut c, "memory", "used_memory");
+    }
+    assert!(
+        used >= (VOLATILE * 1024) as u64,
+        "used_memory never published: {used}"
+    );
     // Room for roughly 1100 of the 1600 keys: ~500 evictions.
     let cap = (used * 7 / 10).to_string();
     assert_eq!(c.send(&["CONFIG", "SET", "maxmemory", &cap]), "+OK\r\n");
@@ -112,7 +123,11 @@ fn run(wheel: bool) {
         );
     }
     let evicted = info_u64(&mut c, "stats", "evicted_keys");
-    assert!(evicted >= 100, "vacuity: only {evicted} keys were evicted");
+    assert!(
+        evicted >= 100,
+        "vacuity: only {evicted} keys were evicted (used={used} cap={cap} dbsize={})",
+        c.send(&["DBSIZE"])
+    );
     // Present/absent pattern over vt:1.. in TTL order.
     let present: Vec<bool> = (1..VOLATILE)
         .map(|i| exists(&mut c, &format!("vt:{i}")))
