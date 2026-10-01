@@ -295,12 +295,13 @@ impl ExpiryWheel {
 /// for an entry whose OWN deadline is `ts` and whose hash agrees on the 56
 /// bits a reference carries.
 ///
-/// The scan walks the segment's control bytes only and touches a slot's key
-/// and value just when its 7-bit tag equals the hash's `h2` (the same filter
-/// a normal probe uses), so it costs one control-byte line plus ~1.5 candidate
-/// slots, not a read of all 60 entries. `iter_occupied` yields the occupied
-/// slots in ascending slot order, so zipping it with the ascending list of
-/// FULL slots recovers each slot's control byte without any unsafe access.
+/// Control bytes only, until a tag matches: one pass over the segment's 60
+/// control bytes builds two bitmasks (FULL slots, and FULL slots whose 7-bit
+/// tag equals the hash's `h2` — the filter a normal probe uses). A candidate's
+/// key and value are read only then (~1.5 candidates per probe, not 40
+/// entries). `iter_occupied` yields occupied slots in ascending slot order,
+/// so a candidate slot's position in that iterator is the popcount of the
+/// FULL slots below it: no unsafe slot access is needed.
 pub(crate) fn resolve(
     data: &DashTable<CompactKey, Entry>,
     ts: u64,
@@ -308,12 +309,30 @@ pub(crate) fn resolve(
 ) -> Option<&CompactKey> {
     let seg = data.segment(data.segment_index_for_hash(hash));
     let tag = h2(hash);
-    let full_slots = (0..TOTAL_SLOTS)
-        .filter(|s| Segment::<CompactKey, Entry>::is_full_ctrl_pub(seg.ctrl_byte(*s)));
-    full_slots
-        .zip(seg.iter_occupied())
-        .find(|(slot, (k, e))| {
-            seg.ctrl_byte(*slot) == tag
+    let (mut full, mut cand) = (0u64, 0u64);
+    for slot in 0..TOTAL_SLOTS {
+        let c = seg.ctrl_byte(slot);
+        let is_full = u64::from(Segment::<CompactKey, Entry>::is_full_ctrl_pub(c));
+        full |= is_full << slot;
+        cand |= (is_full & u64::from(c == tag)) << slot;
+    }
+    if cand == 0 {
+        return None;
+    }
+    // Candidate slots -> their ranks among the occupied slots.
+    let mut ranks = 0u64;
+    let mut rest = cand;
+    while rest != 0 {
+        let slot = rest.trailing_zeros();
+        ranks |= 1u64 << (full & ((1u64 << slot) - 1)).count_ones();
+        rest &= rest - 1;
+    }
+    let last_rank = 63 - ranks.leading_zeros() as usize;
+    seg.iter_occupied()
+        .enumerate()
+        .take(last_rank + 1)
+        .find(|(rank, (k, e))| {
+            ranks >> rank & 1 == 1
                 && e.expires_at_ms() == ts
                 && (hash_key(k.as_bytes()) & !0xFF) == hash
         })
