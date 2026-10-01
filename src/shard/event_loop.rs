@@ -1975,6 +1975,7 @@ impl super::Shard {
                 }
                 _ = shutdown.cancelled() => {
                     info!("Shard {} shutting down", self.id);
+                    persistence_tick::abandon_snapshot_for_shutdown(&mut snapshot_state, &mut snapshot_reply_tx);
                     // F1 (#438): bounded connection drain BEFORE persistence
                     // teardown — the `break` below returns from `run`, and
                     // dropping the LocalSet/runtime kills every connection
@@ -2152,6 +2153,10 @@ impl super::Shard {
                 // Check shutdown before awaiting (non-blocking)
                 if shutdown.is_cancelled() {
                     info!("Shard {} shutting down (monoio)", self.id);
+                    persistence_tick::abandon_snapshot_for_shutdown(
+                        &mut snapshot_state,
+                        &mut snapshot_reply_tx,
+                    );
                     // F1 (#438): bounded connection drain BEFORE persistence
                     // teardown — the `break` below returns from `run`, and
                     // dropping the monoio runtime kills every connection task
