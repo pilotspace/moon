@@ -440,15 +440,19 @@ fn chrono_lite_now() -> String {
 /// resets among the counters wave 2a touched — `expired_keys` — plus the
 /// moon-only STATISTICS those workstreams added (monotonic event counts:
 /// `txn_conflicts_refused`, `cold_held_release_folds_requested`,
-/// `cold_held_release_snapshots_requested`,
-/// `cold_held_release_snapshots_deferred_txn`). Gauges of live state
-/// (`txn_open`, `txn_held_keys`, `cold_held_files_stale_databases`, …) are
-/// never reset. The other redis stats (`keyspace_hits`, `evicted_keys`,
+/// `cold_held_release_snapshots_{requested,deferred_txn,abandoned_txn}`,
+/// and moon#1297's `cold_reclaim_compactions`,
+/// `cold_reclaim_files_unlinked`, `cold_reclaim_bytes_unlinked`,
+/// `cold_reclaim_snapshots_{requested,deferred_txn,abandoned_txn}`). Gauges
+/// of live state (`txn_open`, `txn_held_keys`,
+/// `cold_held_files_stale_databases`, `cold_reclaim_compactions_pending`, …)
+/// are never reset. The other redis stats (`keyspace_hits`, `evicted_keys`,
 /// `total_commands_processed`, …) are still not reset here.
 pub fn config_resetstat() -> Frame {
     crate::admin::metrics_setup::reset_expired_keys();
     crate::transaction::isolation::reset_stats();
     crate::storage::tiered::held_release::reset_stats();
+    crate::storage::tiered::cold_reclaim::reset_stats();
     crate::persistence::snapshot_request::reset_stats();
     Frame::SimpleString(Bytes::from_static(b"OK"))
 }

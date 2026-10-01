@@ -413,6 +413,33 @@ fn removes_on_an_emptied_index_leave_a_pending_compactions_graves_exact() {
     );
 }
 
+/// `CONFIG RESETSTAT` (moon#1289 R1's rule): the reclaim's event counts are
+/// reset, the pending gauge is not — a compaction still waiting is still
+/// counted. The counters are process-wide and other tests record
+/// compactions in parallel, so the check is "the million this test added is
+/// gone".
+#[test]
+fn resetstat_zeroes_the_reclaim_statistics_and_keeps_the_pending_gauge() {
+    use super::cold_reclaim::{add_totals_for_test, awaiting_fold, reclaim_totals, reset_stats};
+    let _m = NoAof::on();
+    let (_t, dir, _m2, mut ci) = fixture(DEAD);
+    let mut next = NEW;
+    ci.compact_file(OLD, 0, &dir, &mut next, 0)
+        .expect("compact");
+    add_totals_for_test(1_000_000);
+    reset_stats();
+    let (compactions, files, bytes) = reclaim_totals();
+    assert!(
+        compactions < 1_000_000 && files < 1_000_000 && bytes < 1_000_000,
+        "RESETSTAT left ({compactions}, {files}, {bytes})"
+    );
+    assert_eq!(ci.pending_compactions(), 1);
+    assert!(
+        awaiting_fold() >= 1,
+        "the gauge still counts this test's pending compaction"
+    );
+}
+
 /// A compaction abandoned without a grave changing (its job could not be
 /// sent, or its spill thread died) makes its file a candidate again: the
 /// memo of an earlier empty scan must not hide it.
