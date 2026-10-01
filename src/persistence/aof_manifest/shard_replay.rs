@@ -142,6 +142,19 @@ fn replay_incr_resp(
     src: impl std::io::Read,
     engine: &dyn crate::persistence::replay::CommandReplayEngine,
 ) -> Result<usize, crate::error::MoonError> {
+    let replayed = replay_incr_resp_records(databases, src, engine);
+    // moon#1300: the end of the incr — roll back a `MOON.TXN` block a crash
+    // cut (on an error too: the engine must not carry it further).
+    engine.finish_log(databases);
+    replayed
+}
+
+/// The body of [`replay_incr_resp`]: every record of the incr.
+fn replay_incr_resp_records(
+    databases: &mut [crate::storage::Database],
+    src: impl std::io::Read,
+    engine: &dyn crate::persistence::replay::CommandReplayEngine,
+) -> Result<usize, crate::error::MoonError> {
     use crate::persistence::replay::chunks::{ReplayChunks, ReplayNext};
     use crate::protocol::Frame;
 
@@ -248,6 +261,20 @@ pub struct OrderedEntry {
 /// **Corruption:** a mid-stream RESP parse error inside an otherwise-complete
 /// payload is fatal (same reasoning as `replay_incr_resp`).
 fn replay_incr_framed(
+    shard_id: u16,
+    databases: &mut [crate::storage::Database],
+    data: &[u8],
+    engine: &dyn crate::persistence::replay::CommandReplayEngine,
+    ordered_buf: &mut Vec<OrderedEntry>,
+) -> Result<(usize, u64), crate::error::MoonError> {
+    let replayed = replay_incr_framed_records(shard_id, databases, data, engine, ordered_buf);
+    // moon#1300: the end of the incr — see `replay_incr_resp`.
+    engine.finish_log(databases);
+    replayed
+}
+
+/// The body of [`replay_incr_framed`]: every record of the incr.
+fn replay_incr_framed_records(
     shard_id: u16,
     databases: &mut [crate::storage::Database],
     data: &[u8],
@@ -711,6 +738,10 @@ pub fn replay_ordered_merge(
                 let mut selected_db: usize = 0;
                 let databases = &mut *per_shard_databases[shard_idx];
                 engine.replay_command(databases, cmd, &arr[1..], &mut selected_db);
+                // moon#1300: an ordered entry is one shard's one record, never
+                // a transaction block (a TXN writes on its own shard only);
+                // a block one names is closed here, on that shard.
+                engine.finish_log(databases);
                 replayed += 1;
             }
             other => {

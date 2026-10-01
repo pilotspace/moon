@@ -36,6 +36,23 @@
 //! A new generation owes no session stamp: its head carries one, and it
 //! holds no other binary's records.
 //!
+//! ## The transaction context (moon#1300)
+//!
+//! A record a cross-store `TXN` wrote carries its transaction id
+//! ([`AppendStamp::txn`]); every other record carries 0. The context tracks
+//! the transaction the stream is "in", like the db: before a record whose
+//! id differs, `MOON.TXN BEGIN <id>` (entering a transaction) or `MOON.TXN
+//! PAUSE <id>` (leaving one for another client's record) — see
+//! [`crate::persistence::replay::txn`]. A transaction's end is a record of
+//! its own, `MOON.TXN END <id>` stamped [`AppendStamp::end_of`]: it needs no
+//! context switch and leaves the stream outside the transaction. With no
+//! transaction open the context stays 0 and nothing is ever emitted for it.
+//! A new generation starts outside any transaction (a fold that cut one
+//! re-opens it in the new generation's own records). A reopened file whose
+//! replay ended inside a block owes `MOON.TXN RESET` before its first record
+//! ([`crate::persistence::replay::txn::take_reset_owed`], read at that first
+//! append: the writer may open the file before the boot's replay ran).
+//!
 //! [`AppendStamp`] is what a producer reads in the same synchronous section as
 //! the mutation its record logs: the fold epoch (#455) and the shard's cached
 //! clock — the value `Database::now_ms` judged the command with. Both ride the
@@ -50,7 +67,13 @@ use std::path::{Path, PathBuf};
 use bytes::{Bytes, BytesMut};
 
 use super::FoldEpoch;
-use crate::persistence::replay::pseudo::{TS_RECORD_MAX_LEN, TsRecord};
+use crate::persistence::replay::pseudo::{
+    TS_RECORD_MAX_LEN, TXN_RECORD_MAX_LEN, TsRecord, TxnMarker, TxnRecord,
+};
+
+/// The bit of a message's `txn` that marks the transaction's END record
+/// (moon#1300, see the module doc). Transaction ids never reach it.
+pub const TXN_END_FLAG: u64 = 1 << 63;
 
 /// What a producer stamps a record with, read in the same synchronous section
 /// as the mutation (see the module doc).
@@ -60,6 +83,9 @@ pub struct AppendStamp {
     pub epoch: FoldEpoch,
     /// The shard's cached clock at the mutation, unix ms (0 = unknown).
     pub clock_ms: u64,
+    /// moon#1300: the cross-store transaction the record belongs to (0 =
+    /// none), or its END record (`id | TXN_END_FLAG`). See the module doc.
+    pub txn: u64,
 }
 
 impl AppendStamp {
@@ -67,6 +93,7 @@ impl AppendStamp {
     pub const INITIAL: AppendStamp = AppendStamp {
         epoch: FoldEpoch::INITIAL,
         clock_ms: 0,
+        txn: 0,
     };
 
     /// `epoch` with this thread's cached clock (`current_time_ms`: the shard's
@@ -77,6 +104,27 @@ impl AppendStamp {
         Self {
             epoch,
             clock_ms: crate::storage::entry::current_time_ms(),
+            txn: 0,
+        }
+    }
+
+    /// This stamp for a record transaction `txn_id` wrote (0: none).
+    #[inline]
+    #[must_use]
+    pub fn in_txn(self, txn_id: u64) -> Self {
+        Self {
+            txn: txn_id & !TXN_END_FLAG,
+            ..self
+        }
+    }
+
+    /// This stamp for transaction `txn_id`'s END record.
+    #[inline]
+    #[must_use]
+    pub fn end_of(self, txn_id: u64) -> Self {
+        Self {
+            txn: txn_id | TXN_END_FLAG,
+            ..self
         }
     }
 }
@@ -85,8 +133,19 @@ impl AppendStamp {
 impl From<FoldEpoch> for AppendStamp {
     #[inline]
     fn from(epoch: FoldEpoch) -> Self {
-        Self { epoch, clock_ms: 0 }
+        Self {
+            epoch,
+            clock_ms: 0,
+            txn: 0,
+        }
     }
+}
+
+/// `MOON.TXN END <txn_id>`: the record a committed or rolled-back
+/// transaction appends last, stamped [`AppendStamp::end_of`] (moon#1300).
+#[must_use]
+pub fn txn_end_record(txn_id: u64) -> Bytes {
+    Bytes::copy_from_slice(TxnRecord::new(TxnMarker::End(txn_id)).as_bytes())
 }
 
 /// `MOON.TS` records are carved out of one arena buffer this big, so emitting
@@ -111,6 +170,8 @@ pub struct RecordCtx {
     /// The reopened file whose first append still owes a stamp (see the
     /// module doc); `None` once one is written, or for a new generation.
     session_owed: Option<PathBuf>,
+    /// moon#1300: the transaction the stream is in (0 = none).
+    txn: u64,
 }
 
 impl RecordCtx {
@@ -147,6 +208,7 @@ impl RecordCtx {
         self.db = 0;
         self.ts_ms = 0;
         self.session_owed = None;
+        self.txn = 0;
     }
 
     /// The db a replay of the stream so far has selected ([`UNKNOWN_DB`]
@@ -164,25 +226,42 @@ impl RecordCtx {
         self.ts_ms
     }
 
-    /// Whether a record (`db`, `clock_ms`, empty or not) needs a prefix.
+    /// Whether a record (`db`, `clock_ms`, transaction `txn`, empty or not)
+    /// needs a prefix — or moves the transaction context (an END record).
     /// A zero-length payload (the `fsync_barrier`) writes nothing, so it
-    /// never needs, nor moves, either part.
+    /// never needs, nor moves, anything.
     #[inline]
     #[must_use]
-    pub fn needs_prefix(&self, db: usize, clock_ms: u64, payload_is_empty: bool) -> bool {
+    pub fn needs_prefix_for(
+        &self,
+        db: usize,
+        clock_ms: u64,
+        txn: u64,
+        payload_is_empty: bool,
+    ) -> bool {
         !payload_is_empty
             && (db != self.db
                 || (clock_ms != 0 && clock_ms != self.ts_ms)
-                || self.session_owed.is_some())
+                || self.session_owed.is_some()
+                || txn != self.txn)
     }
 
     /// The records to write BEFORE a record, in order — the session stamps
-    /// of a reopened file's first append (the module doc), `MOON.TS
-    /// <clock_ms>` when the clock changed, then `SELECT <db>` when the db
-    /// changed — and the context advanced past them. Empty for a barrier and
-    /// for a record that changes nothing.
+    /// of a reopened file's first append (the module doc) and its owed
+    /// `MOON.TXN RESET`, `MOON.TS <clock_ms>` when the clock changed, the
+    /// transaction switch (`MOON.TXN BEGIN|PAUSE`) when the record's
+    /// transaction differs, then `SELECT <db>` when the db changed — and the
+    /// context advanced past them AND past the record itself (an END record
+    /// leaves its transaction). Empty for a barrier and for a record that
+    /// changes nothing.
     #[inline]
-    pub fn prefix(&mut self, db: usize, clock_ms: u64, payload_is_empty: bool) -> RecordPrefix {
+    pub fn prefix_for(
+        &mut self,
+        db: usize,
+        clock_ms: u64,
+        txn: u64,
+        payload_is_empty: bool,
+    ) -> RecordPrefix {
         let mut out = RecordPrefix::default();
         if payload_is_empty {
             return out;
@@ -194,16 +273,66 @@ impl RecordCtx {
             if clock_ms == 0 {
                 clock_ms = crate::storage::entry::current_time_ms();
             }
+            // moon#1300: the boot's replay of this file ended inside a
+            // transaction block (a crash): roll it back HERE, before this
+            // session's records — taken at the first append, after the
+            // replay that reported it.
+            if crate::persistence::replay::txn::take_reset_owed(&path) {
+                out.reset = Some(self.txn_bytes(TxnMarker::Reset));
+            }
         }
         if clock_ms != 0 && clock_ms != self.ts_ms {
             self.ts_ms = clock_ms;
             out.ts = Some(self.ts_bytes(clock_ms));
+        }
+        if txn != self.txn {
+            out.txn = self.switch_txn(txn);
         }
         if db != self.db {
             self.db = db;
             out.select = Some(super::serialize_select_record(db));
         }
         out
+    }
+
+    /// [`Self::prefix_for`] for a record of no transaction (tests).
+    #[cfg(test)]
+    pub fn prefix(&mut self, db: usize, clock_ms: u64, payload_is_empty: bool) -> RecordPrefix {
+        self.prefix_for(db, clock_ms, 0, payload_is_empty)
+    }
+
+    /// [`Self::needs_prefix_for`] for a record of no transaction (tests).
+    #[cfg(test)]
+    #[must_use]
+    pub fn needs_prefix(&self, db: usize, clock_ms: u64, payload_is_empty: bool) -> bool {
+        self.needs_prefix_for(db, clock_ms, 0, payload_is_empty)
+    }
+
+    /// The transaction the stream is in (0 = none).
+    #[inline]
+    #[must_use]
+    pub fn txn(&self) -> u64 {
+        self.txn
+    }
+
+    /// The marker that moves the stream from `self.txn` to a record stamped
+    /// `txn` (see the module doc), and the context advanced past that record.
+    fn switch_txn(&mut self, txn: u64) -> Option<Bytes> {
+        if txn & TXN_END_FLAG != 0 {
+            // `END <id>` closes `<id>` wherever it sits; the stream is then
+            // outside it (and still in any OTHER transaction it was in).
+            if self.txn == txn & !TXN_END_FLAG {
+                self.txn = 0;
+            }
+            return None;
+        }
+        let marker = if txn == 0 {
+            TxnMarker::Pause(self.txn)
+        } else {
+            TxnMarker::Begin(txn)
+        };
+        self.txn = txn;
+        Some(self.txn_bytes(marker))
     }
 
     /// The judgment the boot's replay gave a foreign segment at the end of
@@ -238,13 +367,25 @@ impl RecordCtx {
         self.arena.extend_from_slice(TsRecord::new(ms).as_bytes());
         self.arena.split().freeze()
     }
+
+    /// A `MOON.TXN` record as `Bytes` carved from the arena.
+    fn txn_bytes(&mut self, marker: TxnMarker) -> Bytes {
+        if self.arena.capacity() - self.arena.len() < TXN_RECORD_MAX_LEN {
+            self.arena.reserve(TS_ARENA_BYTES);
+        }
+        self.arena
+            .extend_from_slice(TxnRecord::new(marker).as_bytes());
+        self.arena.split().freeze()
+    }
 }
 
 /// The records [`RecordCtx::prefix`] asks for, iterated in write order.
 #[derive(Debug, Default)]
 pub struct RecordPrefix {
     session: Option<Bytes>,
+    reset: Option<Bytes>,
     ts: Option<Bytes>,
+    txn: Option<Bytes>,
     select: Option<Bytes>,
 }
 
@@ -253,7 +394,11 @@ impl RecordPrefix {
     #[inline]
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.session.is_none() && self.ts.is_none() && self.select.is_none()
+        self.session.is_none()
+            && self.reset.is_none()
+            && self.ts.is_none()
+            && self.txn.is_none()
+            && self.select.is_none()
     }
 }
 
@@ -264,7 +409,9 @@ impl Iterator for RecordPrefix {
     fn next(&mut self) -> Option<Bytes> {
         self.session
             .take()
+            .or_else(|| self.reset.take())
             .or_else(|| self.ts.take())
+            .or_else(|| self.txn.take())
             .or_else(|| self.select.take())
     }
 }
@@ -438,11 +585,111 @@ mod tests {
             s,
             AppendStamp {
                 epoch: FoldEpoch(3),
-                clock_ms: 0
+                clock_ms: 0,
+                txn: 0,
             }
         );
         assert_eq!(AppendStamp::INITIAL.clock_ms, 0);
         assert_ne!(AppendStamp::now(FoldEpoch(1)).clock_ms, 0);
+    }
+
+    fn txn_rec(marker: TxnMarker) -> Vec<u8> {
+        TxnRecord::new(marker).as_bytes().to_vec()
+    }
+
+    /// moon#1300: the transaction context moves like the db — BEGIN before a
+    /// transaction's record, PAUSE before another client's, nothing between
+    /// two records of the same context; an END record needs no switch and
+    /// leaves the stream outside its transaction.
+    #[test]
+    fn the_transaction_context_switches_like_the_db() {
+        let mut ctx = RecordCtx::new();
+        // No transaction: nothing, ever (zero added records).
+        assert!(ctx.prefix_for(0, 0, 0, false).is_empty());
+        assert!(!ctx.needs_prefix_for(0, 0, 0, false));
+        // Entering transaction 7: BEGIN after the clock, before the SELECT.
+        let got = collect(ctx.prefix_for(2, 5, 7, false));
+        assert_eq!(
+            got,
+            vec![
+                TsRecord::new(5).as_bytes().to_vec(),
+                txn_rec(TxnMarker::Begin(7)),
+                super::super::serialize_select_record(2).to_vec(),
+            ]
+        );
+        assert_eq!(ctx.txn(), 7);
+        // Its next record: nothing.
+        assert!(ctx.prefix_for(2, 5, 7, false).is_empty());
+        // Another client's record: PAUSE 7.
+        assert_eq!(
+            collect(ctx.prefix_for(2, 5, 0, false)),
+            vec![txn_rec(TxnMarker::Pause(7))]
+        );
+        assert_eq!(ctx.txn(), 0);
+        // Transaction 7 again, then transaction 8 directly: BEGIN each.
+        assert_eq!(
+            collect(ctx.prefix_for(2, 5, 7, false)),
+            vec![txn_rec(TxnMarker::Begin(7))]
+        );
+        assert_eq!(
+            collect(ctx.prefix_for(2, 5, 8, false)),
+            vec![txn_rec(TxnMarker::Begin(8))]
+        );
+        // END of 7 while the stream is in 8: no switch, still in 8.
+        assert!(ctx.needs_prefix_for(2, 5, 7 | TXN_END_FLAG, false));
+        assert!(ctx.prefix_for(2, 5, 7 | TXN_END_FLAG, false).is_empty());
+        assert_eq!(ctx.txn(), 8);
+        // END of 8 while in 8: no record, and the stream leaves 8 — the next
+        // plain record needs no PAUSE.
+        assert!(ctx.prefix_for(2, 5, 8 | TXN_END_FLAG, false).is_empty());
+        assert_eq!(ctx.txn(), 0);
+        assert!(ctx.prefix_for(2, 5, 0, false).is_empty());
+        // A barrier never moves it.
+        assert!(ctx.prefix_for(2, 5, 9, true).is_empty());
+        assert_eq!(ctx.txn(), 0);
+        // A new generation starts outside any transaction.
+        let _ = collect(ctx.prefix_for(2, 5, 9, false));
+        ctx.reset();
+        assert_eq!(ctx.txn(), 0);
+    }
+
+    /// moon#1300: a reopened file whose replay ended inside a block owes
+    /// `MOON.TXN RESET` before its first record (after the session stamp),
+    /// once.
+    #[test]
+    fn a_reopened_file_cut_inside_a_block_writes_reset_first() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("cut.aof");
+        std::fs::write(&path, b"").expect("write");
+        // The writer may open the file before the boot's replay reports it.
+        let mut ctx = RecordCtx::appending(&path);
+        crate::persistence::replay::txn::note_reset_owed(&path);
+        let got = collect(ctx.prefix_for(0, 9_000, 0, false));
+        assert_eq!(
+            got,
+            vec![
+                txn_rec(TxnMarker::Reset),
+                TsRecord::new(9_000).as_bytes().to_vec(),
+                super::super::serialize_select_record(0).to_vec(),
+            ]
+        );
+        assert!(ctx.prefix_for(0, 9_000, 0, false).is_empty(), "once");
+        // Not owed: no RESET.
+        let mut ctx = RecordCtx::appending(&path);
+        let got = collect(ctx.prefix_for(0, 9_000, 0, false));
+        assert!(!got.contains(&txn_rec(TxnMarker::Reset)));
+    }
+
+    #[test]
+    fn stamps_tag_and_end_a_transaction() {
+        let s = AppendStamp::now(FoldEpoch(2)).in_txn(5);
+        assert_eq!(s.txn, 5);
+        assert_eq!(s.end_of(5).txn, 5 | TXN_END_FLAG);
+        assert_eq!(s.in_txn(0).txn, 0);
+        assert_eq!(
+            txn_end_record(5).as_ref(),
+            TxnRecord::new(TxnMarker::End(5)).as_bytes()
+        );
     }
 
     fn payloads(batch: &[super::super::AofMessage]) -> Vec<Vec<u8>> {
@@ -471,6 +718,7 @@ mod tests {
             bytes: Bytes::from_static(payload),
             epoch: FoldEpoch::INITIAL,
             clock_ms,
+            txn: 0,
         };
         let ts = |ms: u64| {
             crate::persistence::replay::pseudo::TsRecord::new(ms)

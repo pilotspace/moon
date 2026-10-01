@@ -148,6 +148,7 @@ mod poll_recv_tests {
                 bytes: bytes::Bytes::from_static(b"x"),
                 epoch: FoldEpoch::INITIAL,
                 clock_ms: 0,
+                txn: 0,
             })
             .is_ok()
         );
@@ -172,6 +173,7 @@ mod poll_recv_tests {
                     bytes: bytes::Bytes::from_static(b"y"),
                     epoch: FoldEpoch::INITIAL,
                     clock_ms: 0,
+                    txn: 0,
                 })
                 .is_ok()
             );
@@ -213,6 +215,7 @@ mod poll_recv_tests {
             bytes: bytes::Bytes::from_static(b"z"),
             epoch: FoldEpoch::INITIAL,
             clock_ms: 0,
+            txn: 0,
         }
     }
 

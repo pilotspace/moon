@@ -371,6 +371,16 @@ pub fn keep_expired_image_entries(
     }
 }
 
+/// The file the innermost pin scope on this thread replays, if it pinned
+/// one ([`pin_replay_clock_to_log`]). moon#1300: where a replay that ended
+/// inside a `MOON.TXN` block reports it for the reopening writer.
+pub fn current_log_path() -> Option<PathBuf> {
+    if PIN_DEPTH.with(Cell::get) == 0 {
+        return None;
+    }
+    SRC.with(|c| c.borrow().path.clone())
+}
+
 /// The judgment clock of this thread's replay, if any: a foreign segment's
 /// judgment (the module doc), else the last `MOON.TS` of the current file,
 /// else the pin.
