@@ -223,6 +223,9 @@ fn a_waiting_write_streams_the_epoch_start_image_once_without_a_copy() {
     epoch.held_tick(&dbs);
     let state = epoch.state.as_ref().unwrap();
     assert!(state.key_block_open_for_test(), "streams across ticks");
+    // Starting the stream does not wake its waiters (each wake is a re-check
+    // and a counted wait).
+    assert!(matches!(rx.try_recv(), Err(flume::TryRecvError::Empty)));
     let cursor = state.cursor();
     // The walk is paused while the block is open.
     assert!(!epoch.tick(&dbs));

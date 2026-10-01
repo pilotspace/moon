@@ -76,6 +76,16 @@ Authoritative source: `src/persistence/snapshot.rs`.
 
 - **Preamble (35 bytes):** `RRDSHARD` magic + version=2 + shard_id (u16 LE) + epoch (u64 LE) + last_lsn (u64 LE) + created_at_unix_ms (u64 LE).
 - **Body:** value-encoded keys + entries (custom RDB-style, supports listpack / intset / hashtable / sorted-set / stream encodings).
+- **Blocks:** the body is a sequence of database selectors (`0xFE | db u8`) and
+  segment blocks (`0xFD | seg_idx u32 | entry_count u32 | entries | crc32 u32`,
+  the CRC over the entries). `seg_idx` is informational; readers only log it.
+- **Key blocks (writer behaviour, moon#1295 — not a format change):** a large
+  collection that a write was about to change while the save ran is written
+  OUT of walk order as a segment block of its own (`seg_idx = u32::MAX`,
+  `entry_count = 1`), preceded by a selector for its database; the walk then
+  re-selects the database it is in, so a selector may repeat. Each key is
+  still written exactly once. Every reader since v1 takes any number of
+  selectors and ignores `seg_idx`, so the version byte is not bumped.
 - **Per-field hash TTL trailer (v2-only):** every `TYPE_HASH` body is followed by
   `[ttl_count u32][field_len varint | field_bytes | ttl_ms u64]*`. `ttl_count = 0`
   for plain hashes (no per-field TTL). v1 readers stop after the hash body and
