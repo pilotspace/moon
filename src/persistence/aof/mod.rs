@@ -810,6 +810,11 @@ pub(crate) mod fold_txn;
 mod fsync_agent;
 /// The writer <-> fsync-agent hand-off state (loom-modeled, moon#1266).
 mod fsync_handoff;
+/// moon#1266 1A: the shard thread writes its own AOF records before its
+/// replies leave (the per-writer lane and its flush points).
+pub mod lane;
+/// The lane's hand-over state machine (loom-modeled).
+mod lane_protocol;
 /// Group-commit batching seam (coalesce concurrent pending writes into one fsync
 /// under `appendfsync=always`). `pub` so the §4 red suite can pin the pure seam.
 pub mod group_commit;

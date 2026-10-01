@@ -173,6 +173,13 @@ pub async fn run_embedded(
         let aof_token = cancel.child_token();
         let fsync = FsyncPolicy::from_str(&config.appendfsync);
         let aof_file_path = PathBuf::from(&config.dir).join(&config.appendfilename);
+        // The pool first: the writer takes its lane from it (moon#1266 1A).
+        let pool = AofWriterPool::top_level_with_policy(
+            tx,
+            fsync,
+            std::time::Duration::from_millis(config.aof_fsync_timeout_ms),
+        );
+        let lane = pool.lane(0);
         let handle = std::thread::Builder::new()
             .name("embedded-moon-aof".to_string())
             .spawn(move || {
@@ -181,19 +188,12 @@ pub async fn run_embedded(
                 crate::shard::numa::pin_current_aux_thread("embedded-moon-aof");
                 RuntimeFactoryImpl::block_on_local(
                     "embedded-moon-aof".to_string(),
-                    aof::aof_writer_task(rx, aof_file_path, fsync, aof_token, None),
+                    aof::aof_writer_task(rx, aof_file_path, fsync, aof_token, None, lane),
                 );
             })
             .context("embedded moon: failed to spawn AOF writer thread")?;
         info!("embedded moon: AOF enabled (fsync: {:?})", fsync);
-        (
-            Some(AofWriterPool::top_level_with_policy(
-                tx,
-                fsync,
-                std::time::Duration::from_millis(config.aof_fsync_timeout_ms),
-            )),
-            Some(handle),
-        )
+        (Some(pool), Some(handle))
     } else {
         (None, None)
     };

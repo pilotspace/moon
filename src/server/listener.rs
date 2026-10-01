@@ -166,19 +166,22 @@ pub async fn run_with_shutdown(
         let aof_token = token.child_token();
         let fsync = FsyncPolicy::from_str(&config.appendfsync);
         let aof_file_path = PathBuf::from(&config.dir).join(&config.appendfilename);
+        // The pool first: the writer takes its lane from it (moon#1266 1A).
+        let pool = AofWriterPool::top_level_with_policy(
+            tx,
+            fsync,
+            std::time::Duration::from_millis(config.aof_fsync_timeout_ms),
+        );
         tokio::spawn(aof::aof_writer_task(
             rx,
             aof_file_path,
             fsync,
             aof_token,
             None,
+            pool.lane(0),
         ));
         info!("AOF enabled with fsync policy: {:?}", fsync);
-        Some(AofWriterPool::top_level_with_policy(
-            tx,
-            fsync,
-            std::time::Duration::from_millis(config.aof_fsync_timeout_ms),
-        ))
+        Some(pool)
     } else {
         None
     };

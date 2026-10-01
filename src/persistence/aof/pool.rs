@@ -1,6 +1,7 @@
 //! AOF writer pool: per-shard / single writer-task handles and backpressure.
 #![allow(unused_imports, unused_variables, unreachable_code, clippy::empty_loop)]
 
+use super::lane::Sent;
 use super::rewrite::{do_rewrite_per_shard, drain_pending_appends_framed};
 use super::*;
 // `drain_pending_appends` (non-framed) exists only under the monoio runtime.
@@ -70,6 +71,9 @@ pub struct AofWriterPool {
     >,
     /// C4: per-shard Notify handles that wake the shard event loops after an AofFold push.
     fold_notifiers: Option<Vec<Arc<crate::runtime::channel::Notify>>>,
+    /// moon#1266 1A: per-writer lanes, parallel to `senders` (mapped like
+    /// [`Self::sender`]). Every send goes through [`Self::enqueue`].
+    lanes: Vec<Arc<super::lane::AofLane>>,
 }
 
 impl AofWriterPool {
@@ -94,6 +98,7 @@ impl AofWriterPool {
                 .map(|_| Arc::new(super::rewrite::RewriteOverflow::new()))
                 .collect(),
             senders: vec![sender],
+            lanes: vec![super::lane::AofLane::new(false)],
             layout: crate::persistence::aof_manifest::AofLayout::TopLevel,
             fsync_policy,
             fsync_timeout,
@@ -127,6 +132,10 @@ impl AofWriterPool {
                 .iter()
                 .map(|_| Arc::new(super::rewrite::RewriteOverflow::new()))
                 .collect(),
+            lanes: senders
+                .iter()
+                .map(|_| super::lane::AofLane::new(true))
+                .collect(),
             senders,
             layout: crate::persistence::aof_manifest::AofLayout::PerShard,
             fsync_policy,
@@ -155,6 +164,10 @@ impl AofWriterPool {
             overflow: senders
                 .iter()
                 .map(|_| Arc::new(super::rewrite::RewriteOverflow::new()))
+                .collect(),
+            lanes: senders
+                .iter()
+                .map(|_| super::lane::AofLane::new(true))
                 .collect(),
             senders,
             layout: crate::persistence::aof_manifest::AofLayout::PerShard,
@@ -203,6 +216,10 @@ impl AofWriterPool {
             overflow: senders
                 .iter()
                 .map(|_| Arc::new(super::rewrite::RewriteOverflow::new()))
+                .collect(),
+            lanes: senders
+                .iter()
+                .map(|_| super::lane::AofLane::new(true))
                 .collect(),
             senders,
             layout: crate::persistence::aof_manifest::AofLayout::PerShard,
@@ -536,10 +553,10 @@ impl AofWriterPool {
         } else {
             msg
         };
-        match self.sender(shard_id).try_send(msg) {
-            Ok(()) => AppendNow::Enqueued,
-            Err(flume::TrySendError::Disconnected(_)) => AppendNow::Refused(AofAck::WriteFailed),
-            Err(flume::TrySendError::Full(msg)) => match ovf.try_spill(msg) {
+        match self.enqueue(shard_id, msg) {
+            Sent::Ok => AppendNow::Enqueued,
+            Sent::Disconnected(_) => AppendNow::Refused(AofAck::WriteFailed),
+            Sent::Full(msg, _slow) => match ovf.try_spill(msg) {
                 Ok(()) => AppendNow::Enqueued,
                 Err(SpillReject::Disarmed(_)) => AppendNow::WouldBlock,
                 Err(SpillReject::CapExceeded) => AppendNow::Refused(AofAck::ChannelFull),
@@ -680,6 +697,30 @@ impl AofWriterPool {
         }
     }
 
+    /// The lane of the writer that owns `shard_id`'s AOF file (moon#1266 1A;
+    /// same mapping as [`Self::sender`]).
+    #[inline]
+    pub fn lane_for(&self, shard_id: usize) -> &Arc<super::lane::AofLane> {
+        use crate::persistence::aof_manifest::AofLayout;
+        match self.layout {
+            AofLayout::TopLevel => &self.lanes[0],
+            AofLayout::PerShard => &self.lanes[shard_id],
+        }
+    }
+
+    /// Writer `idx`'s lane, for its writer task.
+    pub fn lane(&self, idx: usize) -> Arc<super::lane::AofLane> {
+        Arc::clone(&self.lanes[idx])
+    }
+
+    /// Every send of a record to `shard_id`'s writer goes through its lane
+    /// (moon#1266 1A): buffered for the shard thread's next write while the
+    /// producers hold the append position, `try_send` otherwise.
+    #[inline]
+    fn enqueue(&self, shard_id: usize, msg: AofMessage) -> Sent<'_> {
+        self.lane_for(shard_id).enqueue(msg, self.sender(shard_id))
+    }
+
     /// Fire-and-forget append for the given shard, tagged with the LSN that
     /// was issued for this write (see [`AofMessage::Append`] docs for LSN
     /// semantics per layout). Call sites must source `lsn` from
@@ -754,30 +795,26 @@ impl AofWriterPool {
     /// counted drop. `lsn` is `msg`'s, for the log line.
     #[inline]
     fn try_send_append_no_spill(&self, shard_id: usize, lsn: u64, msg: AofMessage) -> bool {
-        match self.sender(shard_id).try_send(msg) {
-            Ok(()) => true,
-            Err(e) => {
-                let reason = match &e {
-                    flume::TrySendError::Full(_) => "full",
-                    flume::TrySendError::Disconnected(_) => "disconnected",
-                };
-                if let flume::TrySendError::Full(msg) = e {
-                    // #452.1: channel saturated — if a rewrite fold is holding
-                    // the writer out of its recv loop, spill instead of drop.
-                    if self.overflow_for(shard_id).try_spill(msg).is_ok() {
-                        return true;
-                    }
+        let reason = match self.enqueue(shard_id, msg) {
+            Sent::Ok => return true,
+            Sent::Full(msg, _slow) => {
+                // #452.1: channel saturated — if a rewrite fold is holding
+                // the writer out of its recv loop, spill instead of drop.
+                if self.overflow_for(shard_id).try_spill(msg).is_ok() {
+                    return true;
                 }
-                // #452.4: EVERY acked-append drop routes through the
-                // accounting helper (counter + sticky degraded latch).
-                super::record_append_dropped(self.overflow_for(shard_id), 1);
-                warn!(
-                    "AOF append dropped for shard {} (lsn {}): channel {}",
-                    shard_id, lsn, reason
-                );
-                false
+                "full"
             }
-        }
+            Sent::Disconnected(_) => "disconnected",
+        };
+        // #452.4: EVERY acked-append drop routes through the
+        // accounting helper (counter + sticky degraded latch).
+        super::record_append_dropped(self.overflow_for(shard_id), 1);
+        warn!(
+            "AOF append dropped for shard {} (lsn {}): channel {}",
+            shard_id, lsn, reason
+        );
+        false
     }
 
     /// The rewrite-window overflow slot for `shard_id`'s writer — same
@@ -1070,11 +1107,15 @@ impl AofWriterPool {
                 Err(SpillReject::CapExceeded) => return Err(BoundedRefusal::OverflowCap),
             }
         }
-        match self.sender(shard_id).try_send(msg) {
-            Ok(()) => return Ok(()),
-            Err(flume::TrySendError::Disconnected(_)) => return Err(BoundedRefusal::Disconnected),
-            Err(flume::TrySendError::Full(returned)) => msg = returned,
-        }
+        // moon#1266 1A: `_slow` holds the lane's hand-over until this send ends.
+        let _slow = match self.enqueue(shard_id, msg) {
+            Sent::Ok => return Ok(()),
+            Sent::Disconnected(_) => return Err(BoundedRefusal::Disconnected),
+            Sent::Full(returned, slow) => {
+                msg = returned;
+                slow
+            }
+        };
         // #452.1: channel saturated — spill instead of blocking/dropping when
         // a rewrite fold is holding the writer out of its recv loop.
         match ovf.try_spill(msg) {
@@ -1153,17 +1194,22 @@ impl AofWriterPool {
                 }
             }
         }
-        match self.sender(shard_id).try_send(msg) {
-            Ok(()) => return Ok(()),
-            Err(flume::TrySendError::Disconnected(_)) => {
+        // moon#1266 1A: `_slow` holds the lane's hand-over until this send
+        // ends (it lives across the park below; dropping the future ends it).
+        let _slow = match self.enqueue(shard_id, msg) {
+            Sent::Ok => return Ok(()),
+            Sent::Disconnected(_) => {
                 // A dead writer drops the record like a full one: count it,
                 // so a refusal a caller cannot report (a disconnect-time
                 // TXN rollback, moon#1285 review) is never silent.
                 super::record_append_dropped(self.overflow_for(shard_id), 1);
                 return Err(AofAck::WriteFailed);
             }
-            Err(flume::TrySendError::Full(returned)) => msg = returned,
-        }
+            Sent::Full(returned, slow) => {
+                msg = returned;
+                slow
+            }
+        };
         // Channel full: if a fold is in progress, spill instead of parking —
         // a parked `send_async` that completes mid-fold (slot freed by the
         // fold's own drains) would enter the channel AFTER newer appends
@@ -1309,9 +1355,11 @@ impl AofWriterPool {
                 }
             }
         }
-        match self.sender(shard_id).try_send(msg) {
-            Ok(()) => {}
-            Err(flume::TrySendError::Full(returned)) => {
+        // moon#1266 1A: an `AppendSync` flips the lane back to the writer
+        // (writing what is buffered first), so it follows every record.
+        match self.enqueue(shard_id, msg) {
+            Sent::Ok => {}
+            Sent::Full(returned, _slow) => {
                 // #452.1: channel saturated — spill if a fold is in
                 // progress (armed) before falling to the counted drop.
                 match self.overflow_for(shard_id).try_spill(returned) {
@@ -1340,7 +1388,7 @@ impl AofWriterPool {
                 let _ = pre_tx.send(AofAck::ChannelFull);
                 return pre_rx;
             }
-            Err(flume::TrySendError::Disconnected(_)) => {
+            Sent::Disconnected(_) => {
                 // Writer task is dead — let caller handle RecvError on ack_rx.
                 // ack_tx was dropped inside the Err value; ack_rx will
                 // resolve with RecvError, which try_send_append_durable maps
@@ -1408,9 +1456,9 @@ impl AofWriterPool {
         } else {
             msg
         };
-        match self.sender(shard_id).try_send(msg) {
-            Ok(()) => {}
-            Err(flume::TrySendError::Full(m)) => match overflow.try_spill(m) {
+        match self.enqueue(shard_id, msg) {
+            Sent::Ok => {}
+            Sent::Full(m, _slow) => match overflow.try_spill(m) {
                 Ok(()) => {}
                 Err(_) => {
                     super::record_append_dropped(self.overflow_for(shard_id), 1);
@@ -1419,7 +1467,7 @@ impl AofWriterPool {
                     );
                 }
             },
-            Err(flume::TrySendError::Disconnected(_)) => {
+            Sent::Disconnected(_) => {
                 super::record_append_dropped(self.overflow_for(shard_id), 1);
             }
         }
@@ -1466,6 +1514,8 @@ impl AofWriterPool {
         if self.layout == AofLayout::PerShard {
             return Err(AofPoolSendError::RewriteUnsupportedInPerShard);
         }
+        // moon#1266 1A: the writer gets the append position back first.
+        self.lanes[0].flip();
         self.senders[0]
             .try_send(msg)
             .map_err(|_| AofPoolSendError::SendFailed)
@@ -1602,6 +1652,8 @@ impl AofWriterPool {
                 .get(idx)
                 .cloned()
                 .expect("fold_notifiers len == senders len (debug_asserted at set_fold_channels)");
+            // moon#1266 1A: the writer gets the append position back first.
+            self.lanes[idx].flip();
             // Blocking send for guaranteed delivery — see the doc comment.
             if s.send(AofMessage::RewritePerShard {
                 shard_dbs: shard_dbs.clone(),
@@ -1644,7 +1696,9 @@ impl AofWriterPool {
     /// `try_send` to all first, then wait until `until` on the full ones only (A7).
     pub fn broadcast_shutdown(&self, until: std::time::Instant) {
         let mut full = Vec::new();
-        for s in &self.senders {
+        for (s, lane) in self.senders.iter().zip(&self.lanes) {
+            // moon#1266 1A: what the producers buffered goes out first.
+            lane.flip();
             if let Err(flume::TrySendError::Full(msg)) = s.try_send(AofMessage::Shutdown) {
                 full.push((s, msg));
             }
@@ -2470,6 +2524,7 @@ mod pool_tests {
             0,
             FsyncPolicy::Always,
             cancel.clone(),
+            crate::persistence::aof::lane::AofLane::with_switch(true, false),
         ));
 
         // 1: clean. 2: torn (header only). 3: must be suppressed by the latch.

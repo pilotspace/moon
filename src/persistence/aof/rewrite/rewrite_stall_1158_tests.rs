@@ -289,6 +289,7 @@ async fn the_toplevel_tokio_writer_drains_before_releasing_the_flag() {
         FsyncPolicy::EverySec,
         cancel.clone(),
         None,
+        crate::persistence::aof::lane::AofLane::with_switch(false, false),
     ));
     let overflow = Arc::new(RewriteOverflow::new());
     let (shard_dbs, _inits) = ShardDatabases::new(vec![vec![Database::new()]]);

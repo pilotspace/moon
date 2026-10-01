@@ -53,6 +53,9 @@ macro_rules! write_all_bounded {
             );
             false
         } else {
+            // moon#1266 1A: this shard's AOF records reach the kernel before
+            // the reply (a no-op when the io_uring submit hook does it).
+            crate::persistence::aof::lane::flush_before_reply();
             // Publish what this connection is holding, so a stalled reply is
             // visible in CLIENT LIST (`obl`/`omem`) while it happens.
             $live.begin_write(pending);
@@ -113,6 +116,8 @@ macro_rules! flush_write_buf_bounded {
             );
             false
         } else {
+            // moon#1266 1A: see `write_all_bounded!`.
+            crate::persistence::aof::lane::flush_before_reply();
             $live.begin_write(pending);
             let data = std::mem::take(&mut $buf);
             let ok = match super::util::arm_write_timeout(pending, $wt) {

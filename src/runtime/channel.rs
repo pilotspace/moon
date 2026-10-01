@@ -41,6 +41,11 @@ pub struct OneshotSender<T> {
 
 impl<T> OneshotSender<T> {
     pub fn send(self, value: T) -> Result<(), T> {
+        // moon#1266 1A: a reply leaving for another task (often another
+        // shard thread, which may put it on its socket before this thread's
+        // next park) follows this thread's buffered AOF records to the
+        // kernel. One TLS read when nothing is buffered.
+        crate::persistence::aof::lane::flush_current();
         self.tx.send(value).map_err(|e| e.into_inner())
     }
 
