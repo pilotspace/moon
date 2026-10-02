@@ -97,14 +97,34 @@ static LAST_STALL_WARN_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::Ato
 /// the everysec agent's and `always`'s per-batch one — while `<path>` exists.
 /// Lets a test hold an fsync open and watch what is acknowledged meanwhile.
 /// Read once per process; unset, it costs one cached `Option` check per fsync.
+///
+/// `MOON_TEST_AOF_SYNC_GATE_WRITERS=<n>[,<n>...]` narrows the gate to the
+/// per-shard writers `<n>` (threads `aof-writer-<n>` and their agents
+/// `aof-fsync-<n>`): moon#1322's suite holds ONE remote shard's fsync while
+/// the connection's own shard syncs freely.
 pub(super) fn sync_gate_for_test() {
     static GATE: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+    static ONLY: std::sync::OnceLock<Option<Vec<String>>> = std::sync::OnceLock::new();
     let gate = GATE.get_or_init(|| {
         std::env::var_os("MOON_TEST_AOF_SYNC_GATE")
             .filter(|v| !v.is_empty())
             .map(std::path::PathBuf::from)
     });
     if let Some(path) = gate {
+        let only = ONLY.get_or_init(|| {
+            let list = std::env::var("MOON_TEST_AOF_SYNC_GATE_WRITERS").ok()?;
+            Some(list.split(',').map(|n| n.trim().to_owned()).collect())
+        });
+        if let Some(only) = only {
+            let current = std::thread::current();
+            let suffix = current.name().and_then(|n| {
+                n.strip_prefix("aof-writer-")
+                    .or_else(|| n.strip_prefix("aof-fsync-"))
+            });
+            if !suffix.is_some_and(|s| only.iter().any(|o| o == s)) {
+                return;
+            }
+        }
         while path.exists() {
             std::thread::sleep(Duration::from_millis(1));
         }
