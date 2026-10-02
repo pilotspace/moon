@@ -31,6 +31,9 @@ pub fn flat_aof_path(dir: &Path) -> PathBuf {
 pub struct UnreadableAof {
     pub path: PathBuf,
     pub error: String,
+    /// The replay hit a parser LIMIT, not damage (R2b round 4 F2): the
+    /// message must not advise truncating the file.
+    pub limit: bool,
 }
 
 impl UnreadableAof {
@@ -38,12 +41,32 @@ impl UnreadableAof {
         Self {
             path: path.to_path_buf(),
             error: error.to_string(),
+            limit: false,
+        }
+    }
+
+    /// [`Self::new`] from the replay's error, keeping its class.
+    pub fn from_error(path: &Path, error: &crate::error::MoonError) -> Self {
+        let limit = matches!(
+            error,
+            crate::error::MoonError::Aof(crate::error::AofError::RecordTooLarge { .. })
+        );
+        Self {
+            limit,
+            ..Self::new(path, error)
         }
     }
 
     /// The operator-facing refusal: what failed, why nothing else is loaded,
     /// and the remedies.
     pub fn message(&self) -> String {
+        if self.limit {
+            return format!(
+                "refusing to start: {} could not be replayed: {}",
+                self.path.display(),
+                self.error
+            );
+        }
         format!(
             "refusing to start: {} could not be replayed ({}). With --appendonly yes it is the \
              only source of the dataset, so booting would serve an EMPTY dataset and append \

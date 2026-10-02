@@ -1308,6 +1308,14 @@ fn replay_aof_records(
                 offset: error_offset,
                 err: e,
             } => {
+                // R2b round 4 F2: a parser LIMIT is not corruption, and is
+                // never skipped past either.
+                if crate::persistence::replay::chunks::is_limit_violation(&e) {
+                    return Err(MoonError::from(crate::error::AofError::RecordTooLarge {
+                        offset: error_offset,
+                        detail: e.to_string(),
+                    }));
+                }
                 corruption_count += 1;
 
                 // Prod-hardening #12: DO NOT skip-and-resync by default.

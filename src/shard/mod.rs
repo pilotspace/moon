@@ -453,8 +453,9 @@ impl Shard {
                     aof_replayed = n > 0;
                 }
                 Err(e) => {
-                    let refusal =
-                        crate::persistence::aof::flat_file::UnreadableAof::new(&aof_path, e);
+                    let refusal = crate::persistence::aof::flat_file::UnreadableAof::from_error(
+                        &aof_path, &e,
+                    );
                     tracing::error!("Shard {}: {}", self.id, refusal.message());
                     self.aof_unreadable = Some(refusal);
                 }

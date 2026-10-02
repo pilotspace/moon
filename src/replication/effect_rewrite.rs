@@ -65,6 +65,28 @@ pub enum Propagation {
     Skip,
 }
 
+/// The most items one effect record carries (R2b round 4 F2): a write whose
+/// effect names more — an `SPOP` of a million members, a consumer-group read
+/// of a million entries — is logged as several records of at most this many,
+/// as redis batches its `SREM` propagation. One record of every item was
+/// past the replay parser's element cap, and the next boot refused the AOF.
+pub(crate) const EFFECT_CHUNK: usize = 1024;
+
+/// One record as [`Propagation::Rewritten`], several as
+/// [`Propagation::Records`].
+pub(crate) fn one_or_many(
+    mut records: crate::replication::stream_effect::StreamEffects,
+) -> Propagation {
+    match records.len() {
+        0 => Propagation::Skip,
+        1 => match records.pop() {
+            Some(r) => Propagation::Rewritten(r),
+            None => Propagation::Skip,
+        },
+        _ => Propagation::Records(records),
+    }
+}
+
 /// A command name or option keyword: a static literal, never copied
 /// (moon#1187).
 #[inline]
@@ -166,7 +188,8 @@ pub fn rewrite_effect_for_propagation(frame: &Frame, reply: &Frame, now_ms: u64)
     }
 }
 
-/// `SPOP key [count]` -> `SREM key <popped…>`.
+/// `SPOP key [count]` -> `SREM key <popped…>`, at most [`EFFECT_CHUNK`]
+/// members per record.
 ///
 /// The reply is the popped member (`BulkString`) or members (`Array`, or a
 /// RESP3 `Set` if a caller converts first). `SREM` removes the key when the
@@ -175,26 +198,30 @@ fn rewrite_spop(args: &FrameVec, reply: &Frame) -> Propagation {
     if args.len() < 2 {
         return Propagation::Verbatim;
     }
-    let mut out: Vec<Frame> = Vec::with_capacity(3);
-    out.push(lit(b"SREM"));
-    out.push(args[1].clone());
+    let srem = |members: &mut dyn Iterator<Item = Frame>| -> Frame {
+        let mut out: Vec<Frame> = Vec::with_capacity(2 + EFFECT_CHUNK.min(16));
+        out.push(lit(b"SREM"));
+        out.push(args[1].clone());
+        out.extend(members);
+        Frame::Array(FrameVec::from_vec(out))
+    };
     match reply {
-        Frame::BulkString(_) => out.push(reply.clone()),
+        Frame::BulkString(_) => Propagation::Rewritten(srem(&mut std::iter::once(reply.clone()))),
         Frame::Array(members) | Frame::Set(members) => {
-            out.extend(
-                members
-                    .iter()
-                    .filter(|m| matches!(m, Frame::BulkString(_)))
-                    .cloned(),
-            );
+            let popped: Vec<&Frame> = members
+                .iter()
+                .filter(|m| matches!(m, Frame::BulkString(_)))
+                .collect();
+            // Empty array: nothing popped, nothing to propagate.
+            let records: crate::replication::stream_effect::StreamEffects = popped
+                .chunks(EFFECT_CHUNK)
+                .map(|chunk| srem(&mut chunk.iter().map(|m| (*m).clone())))
+                .collect();
+            one_or_many(records)
         }
-        _ => return Propagation::Skip,
+        // Null: nothing popped.
+        _ => Propagation::Skip,
     }
-    if out.len() == 2 {
-        // Null / empty array: nothing popped, nothing to propagate.
-        return Propagation::Skip;
-    }
-    Propagation::Rewritten(Frame::Array(FrameVec::from_vec(out)))
 }
 
 /// `XADD key [NOMKSTREAM] [MAXLEN|MINID [=|~] threshold] <*|ms-*> f v …`
@@ -540,6 +567,40 @@ mod tests {
         let empty = Frame::Array(FrameVec::from_vec(vec![]));
         let p = rewrite_effect_for_propagation(&cmd(&[b"SPOP", b"s", b"3"]), &empty, NOW);
         assert!(matches!(p, Propagation::Skip));
+    }
+
+    /// R2b round 4 F2: a pop of more than `EFFECT_CHUNK` members is logged
+    /// as several `SREM`s of at most that many, every member exactly once,
+    /// in pop order.
+    #[test]
+    fn a_large_spop_is_logged_in_chunks() {
+        let n = EFFECT_CHUNK * 2 + 7;
+        let members: Vec<Frame> = (0..n).map(|i| bulk(format!("m{i}").as_bytes())).collect();
+        let reply = Frame::Array(FrameVec::from_vec(members));
+        let p = rewrite_effect_for_propagation(&cmd(&[b"SPOP", b"s", b"5000"]), &reply, NOW);
+        let Propagation::Records(records) = p else {
+            panic!("expected Records, got {p:?}");
+        };
+        assert_eq!(records.len(), 3);
+        let mut seen = Vec::new();
+        for r in &records {
+            let parts = parts_of(r);
+            assert_eq!(strs(&parts[..2]), ["SREM", "s"]);
+            assert!(parts.len() - 2 <= EFFECT_CHUNK);
+            seen.extend(parts[2..].iter().cloned());
+        }
+        let want: Vec<Vec<u8>> = (0..n).map(|i| format!("m{i}").into_bytes()).collect();
+        assert_eq!(seen, want);
+        // Exactly one chunk stays one record.
+        let one: Vec<Frame> = (0..EFFECT_CHUNK)
+            .map(|i| bulk(format!("m{i}").as_bytes()))
+            .collect();
+        let p = rewrite_effect_for_propagation(
+            &cmd(&[b"SPOP", b"s", b"5000"]),
+            &Frame::Array(FrameVec::from_vec(one)),
+            NOW,
+        );
+        assert_eq!(rewritten(p).len(), EFFECT_CHUNK + 2);
     }
 
     #[test]
