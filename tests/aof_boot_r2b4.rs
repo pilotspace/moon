@@ -209,11 +209,19 @@ fn failed_boot_appends_nothing(shards: usize) {
     let before = aof_files(&dir);
     let code = refused(&dir, shards);
     assert_ne!(code, Some(0), "s{shards}: the boot failed");
-    assert_eq!(
-        aof_files(&dir),
-        before,
-        "s{shards}: the failed boot appended nothing to the AOF"
-    );
+    // Nothing appended. The tokio single-file boot replays (and cuts the
+    // torn tail, saving it in a sidecar) before the cold seed fails, so
+    // each file is a prefix of what it was; the manifest boots fail before
+    // their replay and leave it byte for byte.
+    let after = aof_files(&dir);
+    assert_eq!(after.len(), before.len(), "s{shards}");
+    for ((path, now), (_, was)) in after.iter().zip(&before) {
+        assert!(
+            was.starts_with(now) && now.len() + 64 >= was.len(),
+            "s{shards}: the failed boot appended to (or emptied) {}",
+            path.display()
+        );
+    }
     std::fs::remove_file(&data).unwrap();
     if aside.exists() {
         std::fs::rename(&aside, &data).unwrap();
@@ -249,36 +257,44 @@ fn a_failed_boot_leaves_a_torn_aof_as_it_found_it_4_shards() {
 /// with data (what the pre-fix F-H bug left: a stale monoio manifest and a
 /// newer tokio-era file) is refused, and neither file is retired — the
 /// previous advice ("boot it with the monoio build") retired the flat file
-/// and its writes.
+/// and its writes. The manifest comes from a `--shards 1` boot when the
+/// build writes one there (monoio: TopLevel), and from a `--shards 4` boot
+/// (PerShard) on both builds; the refusal comes first at any shard count.
 #[test]
 #[ignore = "spawns moon; set MOON_BIN"]
 fn a_dir_with_a_manifest_and_a_flat_file_with_data_is_refused_untouched() {
-    for shards in [1usize, 4] {
-        let dir = common::unique_test_dir(&format!("r2b4-f6-s{shards}"));
-        let (mut srv, port) = boot(&dir, shards);
+    let mut checked = 0;
+    for (made_at, boot_at) in [(1usize, 1usize), (4, 1), (4, 4)] {
+        let dir = common::unique_test_dir(&format!("r2b4-f6-{made_at}-{boot_at}"));
+        let (mut srv, port) = boot(&dir, made_at);
         let mut c = ready(port);
         assert_eq!(c.send(&["SET", "manifest-era", "1"]), "+OK\r\n");
         drop(c);
         srv.kill_now();
-        assert!(dir.join("appendonlydir").exists(), "a manifest exists");
-        // The tokio-era flat file (a single-shard dir only has one at s1;
-        // the s4 case stands for any leftover file holding data).
+        if !dir.join("appendonlydir").exists() {
+            // tokio --shards 1 writes the single file, not a manifest.
+            let _ = std::fs::remove_dir_all(&dir);
+            continue;
+        }
         std::fs::write(
             dir.join("appendonly.aof"),
-            b"*3\r\n$3\r\nSET\r\n$9\r\nflat-era1\r\n$1\r\n1\r\n",
+            b"*3\r\n$3\r\nSET\r\n$8\r\nflat-era\r\n$1\r\n1\r\n",
         )
         .unwrap();
         let before = aof_files(&dir);
-        let code = refused(&dir, shards);
-        assert_eq!(code, Some(2), "s{shards}");
+        let code = refused(&dir, boot_at);
+        let what = format!("made at s{made_at}, booted at s{boot_at}");
+        assert_eq!(code, Some(2), "{what}");
         let log = std::fs::read_to_string(dir.join("server.err")).unwrap_or_default();
-        assert!(log.contains("BOTH"), "s{shards}: {log:.2000}");
+        assert!(log.contains("BOTH"), "{what}: {log:.2000}");
         assert_eq!(
             aof_files(&dir),
             before,
-            "s{shards}: nothing retired or written"
+            "{what}: nothing retired or written"
         );
-        assert!(dir.join("appendonly.aof").exists());
+        assert!(dir.join("appendonly.aof").exists(), "{what}");
+        checked += 1;
         let _ = std::fs::remove_dir_all(&dir);
     }
+    assert!(checked >= 2, "the per-shard manifest cases ran");
 }
