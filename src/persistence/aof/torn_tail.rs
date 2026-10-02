@@ -19,9 +19,11 @@
 //! to the file, `<name>.torn-<offset>` (never overwriting one), so a tail
 //! that was not a crash's — a damaged length field that made a later
 //! stretch of the file look torn — can still be inspected and recovered.
-//! A boot that cannot save the sidecar or cut the file refuses to start and
-//! leaves the file as it was: appending behind the torn bytes is the one
-//! outcome that loses data.
+//! A boot that cannot save the sidecar (other than for a full disk) or cut
+//! the file refuses to start and leaves the file as it was, with no partial
+//! sidecar: appending behind the torn bytes is the one outcome that loses
+//! data. On a full disk the file is cut without a sidecar and the cut is
+//! logged with a hex prefix of the bytes (R2b round 4 F4).
 //!
 //! The cut runs before any writer appends: the tokio flat writer opens the
 //! file only after recovery (`open_gate`); the monoio writers have their
@@ -48,8 +50,11 @@ pub struct Cut {
     pub kept: u64,
     /// Bytes removed from the file.
     pub removed: u64,
-    /// Where the removed bytes were saved.
+    /// Where the removed bytes were saved (empty: not saved — a full disk,
+    /// or nothing was cut).
     pub sidecar: PathBuf,
+    /// The first bytes cut (at most 64), for the log.
+    pub prefix: Vec<u8>,
 }
 
 /// The first free `<path>.torn-<offset>[.<n>]`.
@@ -70,9 +75,52 @@ fn sidecar_path(path: &Path, offset: u64) -> PathBuf {
 
 /// Cut `path` at `tail.offset`: copy the bytes from there to the end into a
 /// fresh sidecar (fsynced), truncate the file (fsynced), fsync the
-/// directory, restore the file's mtime. `Err`: nothing was cut (a sidecar
-/// may remain; it is a copy).
+/// directory, restore the file's mtime. `Err`: nothing was cut, and no
+/// sidecar is left behind.
+///
+/// On a full disk (ENOSPC) the sidecar cannot be written (R2b round 4 F4):
+/// its partial copy is removed and the file is truncated in place without
+/// one, as redis does, the cut recorded in the log instead ([`Cut::sidecar`]
+/// empty, [`Cut::prefix`] the first bytes cut). Refusing would keep the
+/// server down until space is freed — every retry used to leave another
+/// empty `.torn-<offset>.<n>` — and the bytes cut are a record the crash
+/// left incomplete.
 pub fn cut(path: &Path, tail: TornTail) -> std::io::Result<Cut> {
+    cut_with(path, tail, save_sidecar)
+}
+
+/// The sidecar writer: copy `len` bytes of `file` from its position into
+/// `sidecar` and fsync it.
+fn save_sidecar(file: &mut std::fs::File, sidecar: &Path, len: u64) -> std::io::Result<()> {
+    let mut out = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(sidecar)?;
+    let copied = std::io::copy(&mut file.take(len), &mut out)?;
+    if copied != len {
+        return Err(std::io::Error::other(format!(
+            "copied {copied} of {len} torn bytes into {}",
+            sidecar.display()
+        )));
+    }
+    out.flush()?;
+    out.sync_all()
+}
+
+/// `e` is a full disk (or quota).
+fn no_space(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::StorageFull | std::io::ErrorKind::QuotaExceeded
+    ) || e.raw_os_error() == Some(28)
+}
+
+/// [`cut`] with the sidecar writer injected (tests simulate a full disk).
+fn cut_with(
+    path: &Path,
+    tail: TornTail,
+    save: impl FnOnce(&mut std::fs::File, &Path, u64) -> std::io::Result<()>,
+) -> std::io::Result<Cut> {
     let mut file = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -86,29 +134,29 @@ pub fn cut(path: &Path, tail: TornTail) -> std::io::Result<Cut> {
             kept: len,
             removed: 0,
             sidecar: PathBuf::new(),
+            prefix: Vec::new(),
         });
     }
+    let removed = len - tail.offset;
     let mtime = meta.modified().ok();
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
-    let sidecar = sidecar_path(path, tail.offset);
-    {
-        let mut out = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&sidecar)?;
-        file.seek(SeekFrom::Start(tail.offset))?;
-        let copied = std::io::copy(&mut (&mut file).take(len - tail.offset), &mut out)?;
-        if copied != len - tail.offset {
-            return Err(std::io::Error::other(format!(
-                "copied {copied} of {} torn bytes into {}",
-                len - tail.offset,
-                sidecar.display()
-            )));
+    let mut prefix = vec![0u8; removed.min(PREFIX_LEN as u64) as usize];
+    file.seek(SeekFrom::Start(tail.offset))?;
+    file.read_exact(&mut prefix)?;
+    file.seek(SeekFrom::Start(tail.offset))?;
+    let mut sidecar = sidecar_path(path, tail.offset);
+    match save(&mut file, &sidecar, removed) {
+        Ok(()) => crate::persistence::fsync::fsync_directory(dir)?,
+        Err(e) => {
+            // Never leave a partial copy (it would also make the next
+            // retry's name `.torn-<offset>.1`).
+            let _ = std::fs::remove_file(&sidecar);
+            if !no_space(&e) {
+                return Err(e);
+            }
+            sidecar = PathBuf::new();
         }
-        out.flush()?;
-        out.sync_all()?;
     }
-    crate::persistence::fsync::fsync_directory(dir)?;
     file.set_len(tail.offset)?;
     file.sync_all()?;
     if let Some(t) = mtime {
@@ -117,9 +165,23 @@ pub fn cut(path: &Path, tail: TornTail) -> std::io::Result<Cut> {
     crate::persistence::fsync::fsync_directory(dir)?;
     Ok(Cut {
         kept: tail.offset,
-        removed: len - tail.offset,
+        removed,
         sidecar,
+        prefix,
     })
+}
+
+/// How many of the cut bytes a cut without a sidecar logs.
+const PREFIX_LEN: usize = 64;
+
+/// `bytes` as hex.
+fn hex(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        let _ = write!(out, "{b:02x}");
+    }
+    out
 }
 
 /// [`cut`] at a boot, logged at WARN (what was cut and where it was saved).
@@ -127,7 +189,18 @@ pub fn cut(path: &Path, tail: TornTail) -> std::io::Result<Cut> {
 pub fn cut_at_boot(path: &Path, tail: TornTail) -> Result<Cut, String> {
     match cut(path, tail) {
         Ok(c) => {
-            if c.removed > 0 {
+            if c.removed > 0 && c.sidecar.as_os_str().is_empty() {
+                tracing::warn!(
+                    "AOF {} ended in a record torn by a crash: cut {} byte(s) at offset {} \
+                     (the {} bytes before it are complete records and were replayed). The \
+                     disk is full, so the cut bytes were NOT saved; they began with (hex) {}",
+                    path.display(),
+                    c.removed,
+                    tail.offset,
+                    c.kept,
+                    hex(&c.prefix)
+                );
+            } else if c.removed > 0 {
                 tracing::warn!(
                     "AOF {} ended in a record torn by a crash: cut {} byte(s) at offset {} \
                      (the {} bytes before it are complete records and were replayed). The \
@@ -198,6 +271,61 @@ mod tests {
         let c2 = cut(&path, TornTail { offset: 14, len: 4 }).unwrap();
         assert_ne!(c2.sidecar, c.sidecar);
         assert_eq!(std::fs::read(&c.sidecar).unwrap().len(), 21);
+    }
+
+    fn torn_file(dir: &Path) -> (PathBuf, TornTail) {
+        let path = dir.join("appendonly.aof");
+        std::fs::write(&path, b"*1\r\n$4\r\nPING\r\n*3\r\n$3\r\nSET\r\n$4\r\ntorn").unwrap();
+        (
+            path,
+            TornTail {
+                offset: 14,
+                len: 21,
+            },
+        )
+    }
+
+    /// R2b round 4 F4: a full disk while saving the sidecar removes the
+    /// partial copy and cuts in place, keeping the cut's first bytes for the
+    /// log; any other failure leaves the file whole and no sidecar.
+    #[test]
+    fn a_full_disk_cuts_without_a_sidecar_and_other_errors_leave_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (path, tail) = torn_file(tmp.path());
+        let enospc = |f: &mut std::fs::File, side: &Path, _len: u64| {
+            let mut out = std::fs::File::create(side)?;
+            let mut part = [0u8; 4];
+            f.read_exact(&mut part)?;
+            out.write_all(&part)?;
+            Err(std::io::Error::from_raw_os_error(28))
+        };
+        let c = cut_with(&path, tail, enospc).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"*1\r\n$4\r\nPING\r\n");
+        assert!(c.sidecar.as_os_str().is_empty());
+        assert_eq!(c.prefix, b"*3\r\n$3\r\nSET\r\n$4\r\ntorn");
+        assert_eq!(hex(&c.prefix[..2]), "2a33");
+        let sidecars = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().contains(".torn-"))
+            .count();
+        assert_eq!(sidecars, 0, "no partial sidecar left");
+
+        let tmp = tempfile::tempdir().unwrap();
+        let (path, tail) = torn_file(tmp.path());
+        let before = std::fs::read(&path).unwrap();
+        let eio = |_f: &mut std::fs::File, side: &Path, _len: u64| {
+            std::fs::write(side, b"part")?;
+            Err(std::io::Error::other("injected I/O error"))
+        };
+        assert!(cut_with(&path, tail, eio).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before, "file left whole");
+        let sidecars = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().contains(".torn-"))
+            .count();
+        assert_eq!(sidecars, 0, "no partial sidecar left");
     }
 
     #[test]
