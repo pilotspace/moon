@@ -824,6 +824,7 @@ pub mod group_commit;
 pub mod lane;
 /// The lane's hand-over state machine (loom-modeled).
 mod lane_protocol;
+pub mod layout_guard;
 /// The tokio TopLevel writer's per-path open gate (R2b review P1, N5).
 pub mod open_gate;
 mod pool;

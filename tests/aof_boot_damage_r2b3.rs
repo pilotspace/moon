@@ -10,11 +10,19 @@
 //! - **F-B** — mid-stream corruption (not a tail) refuses the boot and
 //!   leaves the file as it was (reviewer E2: tokio served 12 of 20 keys and
 //!   lost a later acknowledged write at the next boot; redis 7.2.7 refuses).
+//! - **F-C** (moon#1321) — a flat `appendonly.aof` with no manifest refuses a
+//!   `--shards N` boot (it was replayed into every shard and stored N times);
+//!   the documented `--migrate-aof-*` remedy works.
+//! - **F-H** — a monoio `--shards 1` manifest refuses a tokio `--shards 1`
+//!   boot (it booted EMPTY and its writes were lost at the next monoio boot);
+//!   the documented remedy works. Needs `MOON_BIN_MONOIO` and
+//!   `MOON_BIN_TOKIO` (the case FAILS without them).
 //!
 //! Every server runs `--appendfsync always`: an acknowledged write is on disk.
 //!
 //! ```text
-//! MOON_BIN=<moon> cargo test --release --test aof_boot_damage_r2b3 -- --include-ignored
+//! MOON_BIN=<moon> MOON_BIN_MONOIO=<monoio moon> MOON_BIN_TOKIO=<tokio moon> \
+//!   cargo test --release --test aof_boot_damage_r2b3 -- --include-ignored
 //! ```
 
 #![cfg(any(feature = "runtime-monoio", feature = "runtime-tokio"))]
@@ -327,4 +335,109 @@ fn mid_file_corruption_refuses_the_boot_1_shard() {
 #[ignore = "spawns moon; set MOON_BIN"]
 fn mid_file_corruption_refuses_the_boot_4_shards() {
     corruption_mid_file(4);
+}
+
+/// F-C (moon#1321): a flat `appendonly.aof` refuses `--shards 4`; the
+/// migration it names loads each key once.
+#[test]
+#[ignore = "spawns moon; set MOON_BIN"]
+fn a_flat_aof_refuses_a_multi_shard_boot_and_migrates() {
+    let bin = common::find_moon_binary();
+    let dir = common::unique_test_dir("r2b3-fc");
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut flat = Vec::new();
+    for i in 1..=20 {
+        let (k, v) = (format!("k{i}"), format!("v{i}"));
+        flat.extend_from_slice(
+            format!(
+                "*3\r\n$3\r\nSET\r\n${}\r\n{k}\r\n${}\r\n{v}\r\n",
+                k.len(),
+                v.len()
+            )
+            .as_bytes(),
+        );
+    }
+    std::fs::write(dir.join("appendonly.aof"), &flat).unwrap();
+    let (code, log) = refused(&bin, &dir, &["--shards", "4", "--appendonly", "yes"]);
+    assert_eq!(code, Some(2), "{log:.3000}");
+    assert!(
+        log.contains("moon#1321") && log.contains("--migrate-aof-shards 4"),
+        "{log:.3000}"
+    );
+    assert_eq!(std::fs::read(dir.join("appendonly.aof")).unwrap(), flat);
+    assert!(
+        !dir.join("appendonlydir").exists(),
+        "nothing was written before the refusal"
+    );
+
+    // The remedy the refusal names.
+    let to = common::unique_test_dir("r2b3-fc-migrated");
+    let status = Command::new(&bin)
+        .arg("--migrate-aof-from")
+        .arg(&dir)
+        .arg("--migrate-aof-to")
+        .arg(&to)
+        .args(["--migrate-aof-shards", "4"])
+        .env("MOON_DISK_FREE_MIN_PCT", "0")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .unwrap();
+    assert!(status.success(), "migrate-aof: {status}");
+    let (mut srv, port) = boot_with(&bin, &to, 4, &[]);
+    let mut c = ready(port);
+    assert_eq!(c.send(&["DBSIZE"]), ":20\r\n", "each key once");
+    assert_eq!(c.send(&["GET", "k7"]), "$2\r\nv7\r\n");
+    drop(c);
+    srv.kill_now();
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&to);
+}
+
+/// F-H: a monoio `--shards 1` manifest refuses a tokio `--shards 1` boot;
+/// the remedy it names (BGSAVE on monoio, move appendonlydir aside) boots
+/// the tokio build with every key.
+#[test]
+#[ignore = "spawns moon; set MOON_BIN_MONOIO and MOON_BIN_TOKIO"]
+fn a_monoio_manifest_refuses_a_tokio_single_shard_boot() {
+    let monoio = common::required_runtime_bin("MOON_BIN_MONOIO");
+    let tokio = common::required_runtime_bin("MOON_BIN_TOKIO");
+    let dir = common::unique_test_dir("r2b3-fh");
+    let (mut srv, port) = boot_with(&monoio, &dir, 1, &[]);
+    let mut c = ready(port);
+    for i in 0..30 {
+        assert_eq!(c.send(&["SET", &format!("m{i}"), "v"]), "+OK\r\n");
+    }
+    let save_before = c.send(&["LASTSAVE"]);
+    std::thread::sleep(Duration::from_millis(1_100));
+    assert!(c.send(&["BGSAVE"]).starts_with('+'));
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while c.send(&["LASTSAVE"]) == save_before
+        || !c
+            .send(&["INFO", "persistence"])
+            .contains("rdb_bgsave_in_progress:0")
+    {
+        assert!(Instant::now() < deadline, "the save never finished");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    drop(c);
+    srv.kill_now();
+    let before = aof_files(&dir);
+
+    let (code, log) = refused(&tokio, &dir, &["--shards", "1", "--appendonly", "yes"]);
+    assert_eq!(code, Some(2), "{log:.3000}");
+    assert!(log.contains("monoio build"), "{log:.3000}");
+    assert_eq!(aof_files(&dir), before, "the AOF is untouched");
+    assert!(
+        !dir.join("appendonly.aof").exists(),
+        "no flat file was started"
+    );
+
+    std::fs::rename(dir.join("appendonlydir"), dir.join("appendonlydir.monoio")).unwrap();
+    let (mut srv, port) = boot_with(&tokio, &dir, 1, &[]);
+    let mut c = ready(port);
+    assert_eq!(c.send(&["DBSIZE"]), ":30\r\n", "the snapshot loads");
+    drop(c);
+    srv.kill_now();
+    let _ = std::fs::remove_dir_all(&dir);
 }
