@@ -69,6 +69,17 @@ impl UnreadableAof {
 /// which then booted without the manifest's data and appended to the stale
 /// file. Returns the new name, `None` when there was no flat file.
 pub fn retire(dir: &Path) -> std::io::Result<Option<PathBuf>> {
+    match rename_aside(dir)? {
+        None => Ok(None),
+        Some(to) => {
+            crate::persistence::fsync::fsync_directory(dir)?;
+            Ok(Some(to))
+        }
+    }
+}
+
+/// The rename of [`retire`], without the directory fsync.
+fn rename_aside(dir: &Path) -> std::io::Result<Option<PathBuf>> {
     let flat = flat_aof_path(dir);
     if !flat.exists() {
         return Ok(None);
@@ -80,25 +91,38 @@ pub fn retire(dir: &Path) -> std::io::Result<Option<PathBuf>> {
         n += 1;
     }
     std::fs::rename(&flat, &retired)?;
-    crate::persistence::fsync::fsync_directory(dir)?;
     Ok(Some(retired))
 }
 
 /// [`retire`], logged: a failure is loud (the next tokio `--shards 1` boot
 /// would take the stale file as its dataset), never fatal (this boot's
-/// manifest is already committed).
+/// manifest is already committed). A rename that succeeded but whose
+/// directory fsync failed is told apart: the file IS aside, but a power loss
+/// before the directory reaches disk can bring it back.
 pub fn retire_logged(dir: &Path) {
-    match retire(dir) {
-        Ok(Some(to)) => tracing::info!(
-            "Retired legacy AOF {} -> {} (the AOF manifest is the authority now)",
-            flat_aof_path(dir).display(),
-            to.display()
-        ),
+    let flat = flat_aof_path(dir);
+    match rename_aside(dir) {
+        Ok(Some(to)) => match crate::persistence::fsync::fsync_directory(dir) {
+            Ok(()) => tracing::info!(
+                "Retired legacy AOF {} -> {} (the AOF manifest is the authority now)",
+                flat.display(),
+                to.display()
+            ),
+            Err(e) => tracing::error!(
+                "Retired legacy AOF {} -> {}, but fsyncing {} failed: {e}. The rename may \
+                 not survive a power loss: after one, check that {} is gone before booting \
+                 this dir with tokio --shards 1 (it would load it as the whole dataset)",
+                flat.display(),
+                to.display(),
+                dir.display(),
+                flat.display()
+            ),
+        },
         Ok(None) => {}
         Err(e) => tracing::error!(
             "Failed to retire legacy AOF {}: {e}. Move it aside by hand: a tokio --shards 1 \
              boot of this dir would load it as the whole dataset",
-            flat_aof_path(dir).display()
+            flat.display()
         ),
     }
 }
