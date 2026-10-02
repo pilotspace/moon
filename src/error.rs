@@ -89,6 +89,12 @@ pub enum AofError {
     /// "AOF rewrite failed").
     #[error("AOF replay failed: {detail}")]
     Replay { detail: String },
+
+    /// A replay found a torn tail (a crash tore the LAST record) and could
+    /// not cut it (R2b round 4 F10): the file is unchanged and nothing is
+    /// damaged — `detail` is the whole operator-facing text.
+    #[error("{detail}")]
+    TornTailCutFailed { offset: u64, detail: String },
 }
 
 /// Errors originating from the RDB persistence subsystem.

@@ -86,7 +86,7 @@ pub fn replay_multi_part(
         let incr_len = std::fs::metadata(&incr_path).map(|m| m.len()).unwrap_or(0);
         if incr_len > 0 {
             return Err(crate::error::MoonError::from(
-                crate::error::AofError::RewriteFailed {
+                crate::error::AofError::Replay {
                     detail: format!(
                         "AOF base RDB missing at {} but incr {} is {} bytes; refusing to replay incr against empty state",
                         base_path.display(),
@@ -143,11 +143,25 @@ fn in_file(path: &std::path::Path, e: crate::error::MoonError) -> crate::error::
             detail: format!("{}: {detail}", path.display()),
         });
     }
-    crate::error::MoonError::from(crate::error::AofError::RewriteFailed {
+    // R2b round 4 F10: one "AOF replay failed:" prefix, not two.
+    let what = match e {
+        crate::error::MoonError::Aof(crate::error::AofError::Replay { detail }) => detail,
+        // A read error is not damage: no truncation advice.
+        io @ crate::error::MoonError::Aof(crate::error::AofError::Io { .. }) => {
+            return crate::error::MoonError::from(crate::error::AofError::Replay {
+                detail: format!("{}: {io}", path.display()),
+            });
+        }
+        other => other.to_string(),
+    };
+    crate::error::MoonError::from(crate::error::AofError::Replay {
         detail: format!(
-            "{}: {e}. The boot refuses a damaged AOF rather than serve a partial dataset and \
-             append behind the damage: restore appendonlydir/ from a backup, or truncate a \
-             copy of the file at the offset named above and boot from it",
+            "{}: {what}. This is damage inside the file, not a torn tail (a crash tears only \
+             the LAST record, which the boot cuts by itself), and the boot refuses it rather \
+             than serve the records before it and append behind it. Remedies: restore \
+             appendonlydir/ from a backup; or truncate a copy of the file at the offset named \
+             above (truncate -s <offset> <copy>), which keeps the records before the damage \
+             and DROPS every one after it, and boot from it",
             path.display()
         ),
     })
@@ -164,7 +178,7 @@ fn cut_torn_tail(
     crate::persistence::aof::torn_tail::cut_at_boot(path, tail)
         .map(|_| ())
         .map_err(|detail| {
-            crate::error::MoonError::from(crate::error::AofError::Corrupted {
+            crate::error::MoonError::from(crate::error::AofError::TornTailCutFailed {
                 offset: tail.offset,
                 detail,
             })
@@ -218,7 +232,7 @@ fn replay_incr_resp_records(
                             Frame::SimpleString(s) => s.as_ref(),
                             other => {
                                 return Err(crate::error::MoonError::from(
-                                    crate::error::AofError::RewriteFailed {
+                                    crate::error::AofError::Replay {
                                         detail: format!(
                                             "AOF incr command at offset {} has non-string name frame: {:?}",
                                             chunks.offset(),
@@ -232,7 +246,7 @@ fn replay_incr_resp_records(
                     }
                     other => {
                         return Err(crate::error::MoonError::from(
-                            crate::error::AofError::RewriteFailed {
+                            crate::error::AofError::Replay {
                                 detail: format!(
                                     "AOF incr non-array frame at offset {}: {:?}",
                                     chunks.offset(),
@@ -270,7 +284,7 @@ fn replay_incr_resp_records(
                     ));
                 }
                 return Err(crate::error::MoonError::from(
-                    crate::error::AofError::RewriteFailed {
+                    crate::error::AofError::Replay {
                         detail: format!("AOF incr parse error at offset {}: {:?}", offset, err),
                     },
                 ));
@@ -427,7 +441,7 @@ fn replay_incr_framed_records(
         // command).
         if data[payload_start] != b'*' {
             return Err(crate::error::MoonError::from(
-                crate::error::AofError::RewriteFailed {
+                crate::error::AofError::Replay {
                     detail: format!(
                         "AOF incr framed payload at offset {} (lsn {}, len {}) does not open \
                          with '*' (found {:#04x}); corrupt entry",
@@ -449,7 +463,7 @@ fn replay_incr_framed_records(
                             Frame::SimpleString(s) => s.as_ref(),
                             other => {
                                 return Err(crate::error::MoonError::from(
-                                    crate::error::AofError::RewriteFailed {
+                                    crate::error::AofError::Replay {
                                         detail: format!(
                                             "AOF incr framed command at offset {} (lsn {}) has non-string name frame: {:?}",
                                             offset,
@@ -464,7 +478,7 @@ fn replay_incr_framed_records(
                     }
                     other => {
                         return Err(crate::error::MoonError::from(
-                            crate::error::AofError::RewriteFailed {
+                            crate::error::AofError::Replay {
                                 detail: format!(
                                     "AOF incr framed non-array frame at offset {} (lsn {}): {:?}",
                                     offset,
@@ -491,7 +505,7 @@ fn replay_incr_framed_records(
                 // frame from those bytes. That's corruption inside a fully
                 // declared payload, not a truncated tail — escalate.
                 return Err(crate::error::MoonError::from(
-                    crate::error::AofError::RewriteFailed {
+                    crate::error::AofError::Replay {
                         detail: format!(
                             "AOF incr framed payload at offset {} (lsn {}, len {}) parsed as incomplete frame; corrupt entry",
                             offset, lsn, len
@@ -509,7 +523,7 @@ fn replay_incr_framed_records(
             }
             Err(e) => {
                 return Err(crate::error::MoonError::from(
-                    crate::error::AofError::RewriteFailed {
+                    crate::error::AofError::Replay {
                         detail: format!(
                             "AOF incr framed parse error at offset {} (lsn {}, len {}): {:?}",
                             offset, lsn, len, e
@@ -569,7 +583,7 @@ pub fn replay_per_shard(
     );
     if manifest.shards.len() != per_shard_databases.len() {
         return Err(crate::error::MoonError::from(
-            crate::error::AofError::RewriteFailed {
+            crate::error::AofError::Replay {
                 detail: format!(
                     "replay_per_shard shard-count mismatch: manifest has {} shards, caller passed {} database vectors",
                     manifest.shards.len(),
@@ -630,7 +644,7 @@ pub fn replay_per_shard(
                         std::fs::metadata(&incr_path).map(|m| m.len()).unwrap_or(0);
                     if incr_len > 0 {
                         return Err(crate::error::MoonError::from(
-                            crate::error::AofError::RewriteFailed {
+                            crate::error::AofError::Replay {
                                 detail: format!(
                                     "AOF shard-{} base RDB missing at {} but incr {} is {} bytes; refusing to replay incr against empty state",
                                     sid,
@@ -699,7 +713,7 @@ pub fn replay_per_shard(
             .map(|h| {
                 h.join().unwrap_or_else(|_| {
                     Err(crate::error::MoonError::from(
-                        crate::error::AofError::RewriteFailed {
+                        crate::error::AofError::Replay {
                             detail: "replay_per_shard worker thread panicked".to_owned(),
                         },
                     ))
@@ -803,7 +817,7 @@ pub fn replay_ordered_merge(
         let shard_idx = entry.shard_id as usize;
         if shard_idx >= per_shard_databases.len() {
             return Err(crate::error::MoonError::from(
-                crate::error::AofError::RewriteFailed {
+                crate::error::AofError::Replay {
                     detail: format!(
                         "OrderedAcrossShards entry references shard {} but only {} shards present",
                         entry.shard_id,
@@ -820,7 +834,7 @@ pub fn replay_ordered_merge(
                     Frame::SimpleString(s) => s.as_ref(),
                     _ => {
                         return Err(crate::error::MoonError::from(
-                            crate::error::AofError::RewriteFailed {
+                            crate::error::AofError::Replay {
                                 detail: format!(
                                     "OrderedAcrossShards entry at lsn {} has non-string command frame",
                                     entry.lsn
@@ -840,7 +854,7 @@ pub fn replay_ordered_merge(
             }
             other => {
                 return Err(crate::error::MoonError::from(
-                    crate::error::AofError::RewriteFailed {
+                    crate::error::AofError::Replay {
                         detail: format!(
                             "OrderedAcrossShards entry at lsn {} on shard {} did not parse as RESP array: {:?}",
                             entry.lsn,
@@ -1169,7 +1183,8 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(err.contains("shard-0"), "{err}");
-        assert!(err.contains("refuses a damaged AOF"), "{err}");
+        assert!(err.contains("damage inside the file"), "{err}");
+        assert!(!err.contains("rewrite failed"), "{err}");
         assert_eq!(fs::read(manifest.shard_incr_path(0)).unwrap(), bytes);
         fs::remove_dir_all(&dir).ok();
     }
