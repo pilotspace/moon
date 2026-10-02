@@ -168,8 +168,9 @@ pub async fn run_embedded(
     // R2b review P1: `--shards 1` may publish its fresh generation by rename
     // after recovery (`fresh_generation`); the writer opens the file only once
     // this guard is dropped.
-    let fresh_aof_gate = (num_shards == 1 && config.appendonly == "yes")
-        .then(aof::fresh_generation::hold_writer_open);
+    let fresh_aof_gate = (num_shards == 1 && config.appendonly == "yes").then(|| {
+        aof::open_gate::hold_writer_open(&PathBuf::from(&config.dir).join(&config.appendfilename))
+    });
     let (aof_pool, aof_join): (
         Option<Arc<AofWriterPool>>,
         Option<std::thread::JoinHandle<()>>,
