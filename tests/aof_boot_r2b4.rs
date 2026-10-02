@@ -244,3 +244,41 @@ fn a_failed_boot_leaves_a_torn_aof_as_it_found_it_1_shard() {
 fn a_failed_boot_leaves_a_torn_aof_as_it_found_it_4_shards() {
     failed_boot_appends_nothing(4);
 }
+
+/// F6: a dir holding BOTH a manifest with data and a flat `appendonly.aof`
+/// with data (what the pre-fix F-H bug left: a stale monoio manifest and a
+/// newer tokio-era file) is refused, and neither file is retired — the
+/// previous advice ("boot it with the monoio build") retired the flat file
+/// and its writes.
+#[test]
+#[ignore = "spawns moon; set MOON_BIN"]
+fn a_dir_with_a_manifest_and_a_flat_file_with_data_is_refused_untouched() {
+    for shards in [1usize, 4] {
+        let dir = common::unique_test_dir(&format!("r2b4-f6-s{shards}"));
+        let (mut srv, port) = boot(&dir, shards);
+        let mut c = ready(port);
+        assert_eq!(c.send(&["SET", "manifest-era", "1"]), "+OK\r\n");
+        drop(c);
+        srv.kill_now();
+        assert!(dir.join("appendonlydir").exists(), "a manifest exists");
+        // The tokio-era flat file (a single-shard dir only has one at s1;
+        // the s4 case stands for any leftover file holding data).
+        std::fs::write(
+            dir.join("appendonly.aof"),
+            b"*3\r\n$3\r\nSET\r\n$9\r\nflat-era1\r\n$1\r\n1\r\n",
+        )
+        .unwrap();
+        let before = aof_files(&dir);
+        let code = refused(&dir, shards);
+        assert_eq!(code, Some(2), "s{shards}");
+        let log = std::fs::read_to_string(dir.join("server.err")).unwrap_or_default();
+        assert!(log.contains("BOTH"), "s{shards}: {log:.2000}");
+        assert_eq!(
+            aof_files(&dir),
+            before,
+            "s{shards}: nothing retired or written"
+        );
+        assert!(dir.join("appendonly.aof").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
