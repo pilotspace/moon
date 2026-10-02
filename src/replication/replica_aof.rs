@@ -1,5 +1,5 @@
 //! A replica's own AOF holds the master's dataset (R2b round 2 R1, moon#1318;
-//! round 3 F-A, X1, F-E).
+//! round 3 F-A, X1, F-D, F-E).
 //!
 //! Since R2b P1 a replica's AOF is its only KV source at boot, exactly as in
 //! redis. So that a PROMOTED replica's restart keeps the master's data:
@@ -21,7 +21,8 @@
 //!    write's epoch (#455). redis blocks the replica rather than drop a
 //!    record; so does this. A record that still cannot be enqueued (the
 //!    writer is gone) marks `aof_last_write_status:err` (the pool's drop
-//!    accounting) and asks for a rewrite.
+//!    accounting) and asks for a rewrite. The record is logged in the
+//!    database the apply used (a replica with fewer `--databases` clamps).
 //! 3. **Dead master transactions.** The markers are the AOF's own
 //!    transaction records (moon#1300). When the replica stops following the
 //!    master, the blocks it never saw end are rolled back in memory AND
@@ -153,6 +154,15 @@ pub(crate) async fn admit(pool: &AofWriterPool) -> bool {
     }
 }
 
+/// The database the apply used for `rc` (`apply_local` clamps a db beyond
+/// this replica's `--databases` to the last one): the record is logged
+/// there (R2b round 3 F-D).
+fn applied_db(rc: &ReplCommand) -> usize {
+    crate::shard::slice::try_with_shard(|s| s.databases.db_count())
+        .filter(|&n| n > 0)
+        .map_or(rc.db_index, |n| rc.db_index.min(n - 1))
+}
+
 /// Append an applied master-stream record to the replica's own AOF. Call
 /// right after `apply_local` returned `Applied`, with no await in between,
 /// after [`admit`] (so the enqueue does not wait).
@@ -170,7 +180,7 @@ pub(crate) fn log_applied(aof_pool: Option<&Arc<AofWriterPool>>, rc: &ReplComman
     // Non-blocking: `admit` made room. A refusal here (the writer is gone,
     // or another producer took the room) is counted by the pool as a dropped
     // append (`aof_last_write_status:err` until a fold heals it).
-    if !pool.try_send_append(0, 0, rc.db_index, bytes) {
+    if !pool.try_send_append(0, 0, applied_db(rc), bytes) {
         tracing::error!(
             "replica: a master-stream record was NOT appended to this replica's AOF; \
              requesting a rewrite so the AOF holds the dataset again"
