@@ -1703,23 +1703,7 @@ fn main() -> anyhow::Result<()> {
                     // replay it via restore_from_persistence's fallback path.
                     // Rename (not delete) so an operator can recover if something
                     // went wrong.
-                    let legacy = base_dir.join("appendonly.aof");
-                    if legacy.exists() {
-                        let retired = base_dir.join("appendonly.aof.legacy");
-                        if let Err(e) = std::fs::rename(&legacy, &retired) {
-                            tracing::warn!(
-                                "Failed to retire legacy AOF {}: {}",
-                                legacy.display(),
-                                e
-                            );
-                        } else {
-                            info!(
-                                "Retired legacy AOF {} → {}",
-                                legacy.display(),
-                                retired.display()
-                            );
-                        }
-                    }
+                    moon::persistence::aof::flat_file::retire_logged(&base_dir);
                 }
                 #[cfg(not(feature = "runtime-monoio"))]
                 {
@@ -1825,19 +1809,7 @@ fn main() -> anyhow::Result<()> {
                 // Retire any stray legacy top-level appendonly.aof so the
                 // next boot doesn't double-replay it via v2 recovery in
                 // `restore_from_persistence`.
-                let legacy = base_dir.join("appendonly.aof");
-                if legacy.exists() {
-                    let retired = base_dir.join("appendonly.aof.legacy");
-                    if let Err(e) = std::fs::rename(&legacy, &retired) {
-                        tracing::warn!("Failed to retire legacy AOF {}: {}", legacy.display(), e);
-                    } else {
-                        info!(
-                            "Retired legacy AOF {} → {}",
-                            legacy.display(),
-                            retired.display()
-                        );
-                    }
-                }
+                moon::persistence::aof::flat_file::retire_logged(&base_dir);
             } else {
                 // TopLevel manifest (v1 / single-file layout) combined with
                 // --shards >= 2 is an unsafe combination: replaying a single
@@ -1903,17 +1875,7 @@ fn main() -> anyhow::Result<()> {
                     // Retire legacy appendonly.aof — its contents are now in
                     // the base RDB, and leaving it would cause v2 recovery on
                     // the next boot to double-replay it.
-                    let legacy = base_dir.join("appendonly.aof");
-                    if legacy.exists() {
-                        let retired = base_dir.join("appendonly.aof.legacy");
-                        if let Err(e) = std::fs::rename(&legacy, &retired) {
-                            tracing::warn!(
-                                "Failed to retire legacy AOF {}: {}",
-                                legacy.display(),
-                                e
-                            );
-                        }
-                    }
+                    moon::persistence::aof::flat_file::retire_logged(&base_dir);
                 }
             } else if num_shards >= 2 {
                 // Multi-shard fresh boot: create the PerShard manifest layout
@@ -1948,6 +1910,8 @@ fn main() -> anyhow::Result<()> {
                     &mut preserved_cold_wiring,
                     &spill_seeds,
                 )?;
+                // R2b round 2 F2: the manifest is the authority now.
+                moon::persistence::aof::flat_file::retire_logged(&base_dir);
                 info!(
                     "Initialized PerShard AOF manifest for {} shards at {}",
                     num_shards,
@@ -1965,6 +1929,11 @@ fn main() -> anyhow::Result<()> {
                         &mut preserved_cold_wiring,
                         &spill_seeds,
                     )?;
+                    // R2b round 2 F2: a flat file this boot replayed into
+                    // an empty keyspace (a tokio generation's head alone)
+                    // must not outlive the manifest: a later tokio
+                    // `--shards 1` boot would take it as the dataset.
+                    moon::persistence::aof::flat_file::retire_logged(&base_dir);
                 }
                 // tokio --shards 1 fresh: no manifest (v2 single-file recovery
                 // owns single-shard durability). Creating one here would trigger
