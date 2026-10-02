@@ -938,6 +938,12 @@ pub async fn handle_connection(
                                         // the ack between the two let another connection's write
                                         // land in memory before the swap but in the log after the
                                         // SWAPDB record, so a replay put it in the other db.
+                                        // #386 — replication plane, exactly once per client
+                                        // SWAPDB, inside the swap's synchronous section (R2b
+                                        // round 4 N1-REPL, as `coordinate_swapdb` does): emitted
+                                        // after the `always` barrier's await, another client's
+                                        // write could reach replicas ahead of it.
+                                        let repl_record = serialized.clone();
                                         let do_swap = || {
                                             let (lo, hi) = if a < b { (a, b) } else { (b, a) };
                                             // Acquire in ascending index order (deadlock prevention).
@@ -947,6 +953,11 @@ pub async fn handle_connection(
                                                 &mut guard_lo,
                                                 &mut guard_hi,
                                             );
+                                            drop(guard_hi);
+                                            drop(guard_lo);
+                                            crate::replication::state::record_local_write_global(
+                                                0, repl_record,
+                                            );
                                         };
                                         let swapped = if let Some(ref pool) = aof_pool {
                                             // Single-shard mode — shard_id = 0.
@@ -954,7 +965,7 @@ pub async fn handle_connection(
                                             // task #35: SWAPDB affects both `a` and `b` — no
                                             // single db context applies; pass 0.
                                             match pool
-                                                .append_then_apply(0, lsn, 0, serialized.clone(), do_swap)
+                                                .append_then_apply(0, lsn, 0, serialized, do_swap)
                                                 .await
                                             {
                                                 Ok(((), needs_barrier)) => {
@@ -978,18 +989,8 @@ pub async fn handle_connection(
                                             Err(None) => Frame::Error(Bytes::from_static(
                                                 b"ERR SWAPDB aborted: WAL enqueue failed (persistence backpressure)",
                                             )),
-                                            applied => {
-                                                // #386 — replication plane, exactly once per
-                                                // client SWAPDB, after the swap itself
-                                                // (mirrors the coordinator leg).
-                                                crate::replication::state::record_local_write_global(
-                                                    0, serialized,
-                                                );
-                                                match applied {
-                                                    Err(Some(refusal)) => refusal,
-                                                    _ => Frame::SimpleString(Bytes::from_static(b"OK")),
-                                                }
-                                            }
+                                            Err(Some(refusal)) => refusal,
+                                            Ok(()) => Frame::SimpleString(Bytes::from_static(b"OK")),
                                         }
                                     }
                                 }
