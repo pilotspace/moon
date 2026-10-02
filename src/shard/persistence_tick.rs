@@ -366,7 +366,7 @@ pub(crate) fn abandon_snapshot_for_shutdown(
         .is_some_and(|s| !s.finalize_started())
     {
         if let Some(snap) = snapshot_state.as_mut() {
-            snap.abort("the server is shutting down");
+            snap.abort_for_shutdown();
         }
         if let Some(tx) = snapshot_reply_tx.take() {
             let _ = tx.send(Err("the server is shutting down".to_string()));
