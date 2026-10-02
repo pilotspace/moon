@@ -369,7 +369,7 @@ impl Shard {
         let dir = std::path::Path::new(persistence_dir);
         let mut total_keys = 0;
         // R2b review P1: `appendonly.aof` holding a record is the only KV
-        // source — the snapshot holds a prefix of its records.
+        // source (redis's `appendonly yes` rule).
         let kv = kv.with_flat_aof(Some(dir));
         let snap_skipped = dir.join(format!("shard-{}.rrdshard", self.id));
         if kv == KvSources::AofOnly && snap_skipped.exists() {
@@ -377,6 +377,11 @@ impl Shard {
                 "Shard {}: snapshot load skipped — {}",
                 self.id,
                 kv.why_no_snapshot()
+            );
+            crate::persistence::aof::flat_file::note_skipped_snapshot(
+                &snap_skipped,
+                dir,
+                self.databases.len(),
             );
         }
 

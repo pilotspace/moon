@@ -253,6 +253,10 @@ pub fn recover_shard_v3_pitr(
             shard_id,
             kv.why_no_snapshot()
         );
+        if let (KvSources::AofOnly, Some(dir)) = (kv, v2_persistence_dir) {
+            use crate::persistence::aof::flat_file::note_skipped_snapshot;
+            note_skipped_snapshot(&snap_path, dir, databases.len());
+        }
     }
     if snap_path.exists() && kv.snapshot() {
         let snapshot_ok = if let Some(target) = recovery_target_lsn {

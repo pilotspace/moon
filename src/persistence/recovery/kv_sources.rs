@@ -93,7 +93,7 @@ impl KvSources {
         match self {
             Self::AofOnly => {
                 "appendonly.aof is the KV authority (redis loads only the AOF under \
-                 appendonly yes); the snapshot holds a prefix of its records"
+                 appendonly yes)"
             }
             _ => {
                 "the multi-part AOF is the KV authority and is replayed after this pass \

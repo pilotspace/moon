@@ -100,6 +100,58 @@ pub fn retire_logged(dir: &Path) {
     }
 }
 
+/// A snapshot the boot skips because `appendonly.aof` is the only KV source
+/// (R2b round 2 F3): when it was written AFTER the AOF was last appended and
+/// holds keys, it may be a backup the operator just restored — which this
+/// boot ignores. Say so, at WARN, with the remedy. (A crash right after a
+/// BGSAVE with no later write also matches; the line then costs nothing.)
+pub fn note_skipped_snapshot(snapshot: &Path, dir: &Path, databases: usize) {
+    if let Some(len) = newer_snapshot_holding_keys(snapshot, &flat_aof_path(dir), databases) {
+        tracing::warn!(
+            "snapshot {} ({len} bytes, written after {} was last appended) is NOT loaded: \
+             with --appendonly yes the AOF is the only source of the dataset. If you \
+             restored this snapshot from a backup, stop moon, move {} (and appendonlydir/, \
+             if present) aside, and restart: the snapshot then loads and a new AOF is \
+             opened over it",
+            snapshot.display(),
+            flat_aof_path(dir).display(),
+            FLAT_AOF_NAME
+        );
+    }
+}
+
+/// `Some(snapshot length)` when `snapshot` is newer than `aof` (mtime) and
+/// larger than an empty snapshot of `databases` databases.
+fn newer_snapshot_holding_keys(snapshot: &Path, aof: &Path, databases: usize) -> Option<u64> {
+    let snap = std::fs::metadata(snapshot).ok()?;
+    let aof = std::fs::metadata(aof).ok()?;
+    if snap.modified().ok()? <= aof.modified().ok()? {
+        return None;
+    }
+    (snap.len() > empty_snapshot_len(databases)?).then_some(snap.len())
+}
+
+/// The size of a snapshot holding no key, for `databases` databases (it
+/// carries per-database sections): written once to a temp file and measured.
+fn empty_snapshot_len(databases: usize) -> Option<u64> {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = std::env::temp_dir().join(format!(
+        "moon-empty-snapshot-{}-{seq}.rrdshard",
+        std::process::id()
+    ));
+    let dbs: Vec<crate::storage::Database> = (0..databases.max(1))
+        .map(|_| crate::storage::Database::new())
+        .collect();
+    let saved = crate::persistence::snapshot::shard_snapshot_save(0, 0, &dbs, &tmp);
+    let len = saved
+        .ok()
+        .and_then(|_| std::fs::metadata(&tmp).ok())
+        .map(|m| m.len());
+    let _ = std::fs::remove_file(&tmp);
+    len
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -114,6 +166,44 @@ mod tests {
         assert_eq!(
             flat_aof_path(Path::new("/d")),
             PathBuf::from("/d/appendonly.aof")
+        );
+    }
+
+    /// A snapshot written after the AOF and holding a key is flagged; an
+    /// older one, or an empty one, is not.
+    #[test]
+    fn a_newer_snapshot_with_keys_is_flagged() {
+        use crate::storage::{Database, Entry};
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
+        let aof = flat_aof_path(d);
+        std::fs::write(&aof, b"*1\r\n$4\r\nPING\r\n").unwrap();
+        let set_mtime = |p: &Path, ms: u64| {
+            std::fs::File::options()
+                .write(true)
+                .open(p)
+                .unwrap()
+                .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_millis(ms))
+                .unwrap();
+        };
+        set_mtime(&aof, 1_000_000);
+        let snap = d.join("shard-0.rrdshard");
+        let mut dbs: Vec<Database> = (0..16).map(|_| Database::new()).collect();
+        crate::persistence::snapshot::shard_snapshot_save(0, 1, &dbs, &snap).unwrap();
+        set_mtime(&snap, 2_000_000);
+        assert_eq!(newer_snapshot_holding_keys(&snap, &aof, 16), None, "empty");
+        dbs[0].set(b"k", Entry::new_string(bytes::Bytes::from_static(b"v")));
+        crate::persistence::snapshot::shard_snapshot_save(0, 1, &dbs, &snap).unwrap();
+        set_mtime(&snap, 2_000_000);
+        assert!(
+            newer_snapshot_holding_keys(&snap, &aof, 16).is_some(),
+            "newer, with a key"
+        );
+        set_mtime(&snap, 500_000);
+        assert_eq!(
+            newer_snapshot_holding_keys(&snap, &aof, 16),
+            None,
+            "older than the AOF"
         );
     }
 
