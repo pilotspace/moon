@@ -273,7 +273,7 @@ pub async fn aof_writer_task(
     // path by rename (`fresh_generation`); opening it first would leave this
     // writer appending to the replaced inode.
     #[cfg(feature = "runtime-tokio")]
-    if !super::fresh_generation::wait_writer_open(&cancel).await {
+    if !super::open_gate::wait_writer_open(&aof_path, &cancel).await {
         info!("AOF writer: cancelled before the boot opened its generation");
         return;
     }

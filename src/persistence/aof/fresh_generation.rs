@@ -16,80 +16,13 @@
 //! (one would make every later boot fail to load the AOF). The writer opens
 //! the same path with `O_APPEND` when it starts, which is BEFORE recovery
 //! runs, so a rename after that would leave it appending to the unlinked old
-//! inode: [`hold_writer_open`] keeps the tokio TopLevel writer from opening
-//! the file until the guard is dropped.
+//! inode: `open_gate::hold_writer_open` keeps the tokio TopLevel writer from
+//! opening the file until the guard is dropped.
 
 use std::io::Write;
 use std::path::Path;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::persistence::cold_records::ColdDeletes;
-
-/// A count of boots that may still publish a fresh generation by rename.
-pub struct OpenGate(AtomicUsize);
-
-impl OpenGate {
-    pub const fn new() -> Self {
-        Self(AtomicUsize::new(0))
-    }
-
-    /// Whether a writer may open its file now.
-    pub fn is_open(&self) -> bool {
-        self.0.load(Ordering::Acquire) == 0
-    }
-
-    /// Close the gate until the returned guard is dropped.
-    pub fn hold(&'static self) -> OpenGateGuard {
-        self.0.fetch_add(1, Ordering::AcqRel);
-        OpenGateGuard(self)
-    }
-}
-
-impl Default for OpenGate {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-/// Re-opens the gate when dropped — on every exit path of the boot.
-pub struct OpenGateGuard(&'static OpenGate);
-
-impl OpenGateGuard {
-    /// Never re-open the gate: the boot refused to start (R2b round 2 F1),
-    /// and the writer must not open — nor, at its stop, append to — the file
-    /// the boot could not read. It exits at cancellation without opening.
-    pub fn keep_closed(self) {
-        std::mem::forget(self);
-    }
-}
-
-impl Drop for OpenGateGuard {
-    fn drop(&mut self) {
-        self.0.0.fetch_sub(1, Ordering::AcqRel);
-    }
-}
-
-/// The gate the tokio TopLevel AOF writer waits on before it opens its file.
-static WRITER_OPEN_GATE: OpenGate = OpenGate::new();
-
-/// Keep the tokio TopLevel AOF writer from opening its file until the guard
-/// is dropped (after [`open_fresh_flat_generation`]).
-pub fn hold_writer_open() -> OpenGateGuard {
-    WRITER_OPEN_GATE.hold()
-}
-
-/// Wait until no boot holds the gate. `false` when `cancel` fired first (the
-/// writer then exits without opening anything, as it would have stopped).
-#[cfg(feature = "runtime-tokio")]
-pub async fn wait_writer_open(cancel: &crate::runtime::cancel::CancellationToken) -> bool {
-    while !WRITER_OPEN_GATE.is_open() {
-        if cancel.is_cancelled() {
-            return false;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
-    }
-    true
-}
 
 /// What [`open_fresh_flat_generation`] did.
 #[derive(Debug, PartialEq, Eq)]
@@ -111,7 +44,7 @@ pub enum FreshGeneration {
 ///
 /// With a base the generation is written to a temporary file, fsynced and
 /// renamed over `path` (directory fsynced), so it exists whole or not at
-/// all; the caller must hold [`hold_writer_open`] when a writer appends to
+/// all; the caller must hold `open_gate::hold_writer_open` when a writer appends to
 /// `path`. Without one the head is appended in place, as before.
 pub fn open_fresh_flat_generation(
     path: &Path,
@@ -234,18 +167,5 @@ mod tests {
         let out = open_fresh_flat_generation(&other, || Ok(None), None).unwrap();
         assert_eq!(out, FreshGeneration::HeadOnly);
         assert!(!other.exists());
-    }
-
-    #[test]
-    fn the_gate_closes_while_any_guard_lives() {
-        static GATE: OpenGate = OpenGate::new();
-        assert!(GATE.is_open());
-        let a = GATE.hold();
-        let b = GATE.hold();
-        assert!(!GATE.is_open());
-        drop(a);
-        assert!(!GATE.is_open());
-        drop(b);
-        assert!(GATE.is_open());
     }
 }
