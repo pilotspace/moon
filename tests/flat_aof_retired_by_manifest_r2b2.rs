@@ -9,7 +9,8 @@
 //! came up EMPTY (reviewer: DBSIZE 0, the snapshot held 20), appending to
 //! the stale file.
 //!
-//! Needs both runtimes' binaries:
+//! Needs both runtimes' binaries (the cases FAIL without them — they used to
+//! pass without running, R2b round 3 F-J):
 //!
 //! ```text
 //! MOON_BIN_TOKIO=<tokio moon> MOON_BIN_MONOIO=<monoio moon> \
@@ -67,10 +68,13 @@ fn bgsave(c: &mut Conn) {
     }
 }
 
+/// Both runtimes' binaries. Panics without them (R2b round 3 F-J: returning
+/// `None` made the case pass without running).
 fn bins() -> Option<(PathBuf, PathBuf)> {
-    let t = std::env::var_os("MOON_BIN_TOKIO")?;
-    let m = std::env::var_os("MOON_BIN_MONOIO")?;
-    Some((PathBuf::from(t), PathBuf::from(m)))
+    Some((
+        common::required_runtime_bin("MOON_BIN_TOKIO"),
+        common::required_runtime_bin("MOON_BIN_MONOIO"),
+    ))
 }
 
 fn tokio_monoio_tokio(shards_mid: usize) {
