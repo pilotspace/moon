@@ -830,18 +830,34 @@ docker cp moon:/data/ ./backup/
 
 ### Restore from backup
 
+With `--appendonly yes` (the default) the AOF is the **only** source of the
+dataset at boot, as in redis: a snapshot next to it is not loaded. The AOF is
+`appendonly.aof` (tokio `--shards 1`) or the `appendonlydir/` manifest
+(monoio, and every `--shards N` > 1). Restoring a snapshot backup therefore
+means moving the AOF aside first, or the boot ignores the restored snapshot
+(it logs a WARN naming it):
+
 ```bash
 # Stop the server
 docker compose down
 
-# Replace persistence files
-cp backup/dump.rdb /var/lib/moon/dump.rdb
-# OR for AOF:
-cp backup/appendonly.aof /var/lib/moon/appendonly.aof
+# Restore a SNAPSHOT backup: move the AOF aside, then put the snapshot back
+mv /var/lib/moon/appendonly.aof /var/lib/moon/appendonly.aof.before-restore 2>/dev/null
+mv /var/lib/moon/appendonlydir /var/lib/moon/appendonlydir.before-restore 2>/dev/null
+cp backup/dump.rdb /var/lib/moon/dump.rdb            # or the shard-N.rrdshard files
 
-# Start the server (will replay from persistence files)
+# OR restore an AOF backup (the whole persistence directory, AOF included)
+cp -a backup/data/. /var/lib/moon/
+
+# Start the server: it loads the snapshot (and opens a new AOF over it) or
+# replays the restored AOF
 docker compose up -d
 ```
+
+An `appendonly.aof` that cannot be read at all (for example a damaged RDB
+preamble) stops the boot with exit status 1 and a message naming the file;
+restore it from a backup, or move it aside to boot from the snapshot. A
+truncated tail is not an error: the valid prefix is replayed.
 
 ### Automated backup with cron
 
