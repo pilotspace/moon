@@ -374,7 +374,12 @@ fn monitor_loop(
         saw_in_progress = in_progress;
         if completed_since_last_tick || (!in_progress && shrunk_below_base) {
             record_base_size();
-            continue;
+            // R2b round 3 F-F: a pending forced rewrite is dispatched on this
+            // same tick (it used to wait one more tick, +1 s on every
+            // replica's post-sync window).
+            if !forced_pending {
+                continue;
+            }
         }
 
         let busy = in_progress
