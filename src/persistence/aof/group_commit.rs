@@ -57,18 +57,23 @@ pub struct GroupCommitBatch {
     pub deferred_control: Option<AofMessage>,
 }
 
-/// Whether a batch must be fsynced before its acks: under `always`, and
-/// whenever it holds an `AppendSync` — a producer that saw a runtime switch
-/// to `always` (`runtime_fsync`) before its writer did must still get its ack
-/// only after the fsync, and a writer that already left `always` still owes
-/// the fsync to the `AppendSync`s queued before the switch.
+/// Whether a batch must be fsynced before its acks: when the policy in force
+/// NOW is `always` — re-read here, since `policy` (the writer's view at the
+/// top of its wake) may predate a runtime `CONFIG SET appendfsync`
+/// (`runtime_fsync`). A producer that read `always` before sending its
+/// `AppendSync` happens-before this read, so this read sees `always` too (or
+/// a later switch): it never gets its ack without the fsync.
+///
+/// Every other `AppendSync` is acked once written, with no fsync: the
+/// barriers of a HELD lane (moon#1266 1A, W2B-1 — they only order the reply
+/// after the record's `write(2)`), and those queued under `always` but
+/// committed after the switch left it — redis acks those under the new
+/// policy too (its `beforeSleep` applies the policy in force). Before W2B-1
+/// any batch holding an `AppendSync` was fsynced, which made every reply in
+/// the window right after leaving `always` wait for an fsync.
 #[inline]
-pub(crate) fn batch_needs_fsync(policy: super::FsyncPolicy, batch: &GroupCommitBatch) -> bool {
-    policy == super::FsyncPolicy::Always
-        || batch
-            .data
-            .iter()
-            .any(|m| matches!(m, AofMessage::AppendSync { .. }))
+pub(crate) fn batch_needs_fsync(policy: super::FsyncPolicy) -> bool {
+    super::runtime_fsync::effective(policy) == super::FsyncPolicy::Always
 }
 
 /// True for the non-data control messages that must break (never join) a batch.
@@ -313,9 +318,10 @@ impl BatchBuf {
 ///     fsync returns.
 ///
 /// `do_fsync == false` (everysec/no) writes the batch without a per-batch fsync —
-/// the writer's deadline flush governs durability. Such batches are `Append`-only
-/// (an `AppendSync` is enqueued only under `Always`, see `pool::try_send_append_durable`
-/// / `pool::fsync_barrier`), so `synced == 0`.
+/// the writer's deadline flush governs durability. An `AppendSync` in such a
+/// batch (a held lane's barrier, or one queued before the policy left
+/// `always`: [`batch_needs_fsync`]) is acked `Synced` once its bytes are
+/// written — the everysec/no promise.
 pub fn commit_group_commit_batch<S: GroupCommitSink + ?Sized>(
     sink: &mut S,
     batch: &mut GroupCommitBatch,
@@ -366,6 +372,22 @@ pub(crate) fn commit_group_commit_batch_with<S: GroupCommitSink + ?Sized>(
     }
     // Step 3 — ack every AppendSync (only now, after the fsync has returned).
     ack_batch(batch, BatchAck::Synced)
+}
+
+#[cfg(test)]
+mod fsync_decision_tests {
+    use super::*;
+
+    /// moon#1266 W2B-1: only the policy in force decides a batch's fsync —
+    /// not whether it holds an `AppendSync` (a held lane's barrier needs
+    /// only its `write(2)`). Unit tests never set the process-wide runtime
+    /// override (`runtime_fsync`), so the policy given is the one in force.
+    #[test]
+    fn only_the_policy_in_force_decides_the_batch_fsync() {
+        assert!(batch_needs_fsync(super::super::FsyncPolicy::Always));
+        assert!(!batch_needs_fsync(super::super::FsyncPolicy::EverySec));
+        assert!(!batch_needs_fsync(super::super::FsyncPolicy::No));
+    }
 }
 
 #[cfg(test)]

@@ -335,6 +335,10 @@ impl EverysecSync {
             *self = Self {
                 heal_pending: self.heal_pending,
                 written_after_failure: self.written_after_failure,
+                // What an earlier policy wrote without its fsync (`no`, or a
+                // batch committed right after leaving `always`) is owed to
+                // the first deadline (moon#1266 W2B-1).
+                dirty: true,
                 ..Self::new(self.writer_idx, policy)
             };
         } else {
