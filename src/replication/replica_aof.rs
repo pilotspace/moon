@@ -19,10 +19,15 @@
 //!    the record, BEFORE the apply; [`log_applied`] enqueues it right after
 //!    the apply with no await in between, so the record's fold stamp is the
 //!    write's epoch (#455). redis blocks the replica rather than drop a
-//!    record; so does this. A record that still cannot be enqueued (the
-//!    writer is gone) marks `aof_last_write_status:err` (the pool's drop
-//!    accounting); the first one of an incident logs an ERROR and asks for a
-//!    rewrite, the rest of it are only counted ([`note_not_logged`]). The record is logged in the database the apply
+//!    record; so does this, within two limits: admission is advisory (a
+//!    rewrite fold's overflow disarming between [`admit`] and the enqueue
+//!    can leave the channel full — the enqueue then blocks the shard for up
+//!    to [`APPLIED_BUDGET`] before it gives up), and a fold's spill buffer
+//!    has a cap (256 MiB) past which every producer's append is dropped. A
+//!    record that is not logged marks `aof_last_write_status:err` (the
+//!    pool's drop accounting); the first one of an incident logs an ERROR
+//!    and asks for a rewrite, the rest of it are only counted
+//!    ([`note_not_logged`]). The record is logged in the database the apply
 //!    used (a replica with fewer `--databases` clamps).
 //! 3. **Dead master transactions.** The markers are the AOF's own
 //!    transaction records (moon#1300). When the replica stops following the
@@ -155,6 +160,11 @@ pub(crate) async fn admit(pool: &AofWriterPool) {
     }
 }
 
+/// How long [`log_applied`] may hold the shard thread when [`admit`]'s room
+/// was gone by the enqueue (a fold's overflow disarmed in between): the
+/// pool's generic bound for a synchronous producer.
+const APPLIED_BUDGET: std::time::Duration = crate::persistence::aof::AOF_SPSC_BACKPRESSURE_BOUND;
+
 /// Whether an incident of applied-but-unlogged records is under way (R2b
 /// round 4 MON-SPIN): from the first record that could not be logged until
 /// one is logged again.
@@ -195,7 +205,7 @@ fn applied_db(rc: &ReplCommand) -> usize {
 
 /// Append an applied master-stream record to the replica's own AOF. Call
 /// right after `apply_local` returned `Applied`, with no await in between,
-/// after [`admit`] (so the enqueue does not wait).
+/// after [`admit`] (so the enqueue normally does not wait).
 pub(crate) fn log_applied(aof_pool: Option<&Arc<AofWriterPool>>, rc: &ReplCommand) {
     let Some(pool) = aof_pool else {
         return;
@@ -214,10 +224,13 @@ pub(crate) fn log_applied(aof_pool: Option<&Arc<AofWriterPool>>, rc: &ReplComman
         return;
     }
     let bytes = crate::persistence::aof::serialize_command_for_log(&rc.command);
-    // Non-blocking: `admit` made room. A refusal here (another producer
-    // took the room) is counted by the pool as a dropped append
-    // (`aof_last_write_status:err` until a fold heals it).
-    if pool.try_send_append(0, 0, applied_db(rc), bytes) {
+    // `admit` made room, so this does not wait — unless the room went away
+    // in between (R2b round 4 X1-RACE): then it blocks for up to
+    // `APPLIED_BUDGET` instead of dropping at once. A refusal is counted by
+    // the pool as a dropped append (`aof_last_write_status:err` until a fold
+    // heals it). Synchronous: the fold stamp is this write's (#455).
+    let mut budget = APPLIED_BUDGET;
+    if pool.send_append_bounded_blocking(0, 0, applied_db(rc), bytes, &mut budget) {
         note_logged();
     } else {
         note_not_logged();
