@@ -1153,7 +1153,7 @@ pub fn replay_aof_at_boot(
     };
     if let Some(tail) = torn {
         torn_tail::cut_at_boot(path, tail).map_err(|detail| {
-            MoonError::from(crate::error::AofError::Corrupted {
+            MoonError::from(crate::error::AofError::TornTailCutFailed {
                 offset: tail.offset,
                 detail,
             })

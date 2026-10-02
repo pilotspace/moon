@@ -1710,7 +1710,7 @@ fn main() -> anyhow::Result<()> {
                         manifest,
                         &DispatchReplayEngine::new(),
                     )
-                    .unwrap_or_else(|e| refuse_damaged_aof("multi-part AOF replay failed", &e));
+                    .unwrap_or_else(|e| refuse_damaged_aof("multi-part AOF", &e));
                     info!(
                         "AOF multi-part loaded (seq {}): {} entries",
                         manifest.seq, loaded
@@ -1767,7 +1767,7 @@ fn main() -> anyhow::Result<()> {
                         manifest,
                         &engine_factory,
                     )
-                    .unwrap_or_else(|e| refuse_damaged_aof("per-shard AOF replay failed", &e))
+                    .unwrap_or_else(|e| refuse_damaged_aof("per-shard AOF", &e))
                 };
 
                 // Step 5: merge-replay `OrderedAcrossShards`-tagged entries

@@ -31,9 +31,21 @@ pub fn flat_aof_path(dir: &Path) -> PathBuf {
 pub struct UnreadableAof {
     pub path: PathBuf,
     pub error: String,
-    /// The replay hit a parser LIMIT, not damage (R2b round 4 F2): the
-    /// message must not advise truncating the file.
-    pub limit: bool,
+    /// What kind of failure, for the remedy (R2b round 4 F2, F10).
+    pub why: Unreadable,
+}
+
+/// Why [`UnreadableAof`] refused the file.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Unreadable {
+    /// It could not be read (I/O, an unparseable preamble).
+    Failed,
+    /// Damage inside the file: not a torn tail.
+    Damaged,
+    /// A torn tail the boot could not cut: the file is unchanged and intact.
+    TornTailUncut,
+    /// A record past a parser LIMIT: not damage, never to be truncated.
+    Limit,
 }
 
 impl UnreadableAof {
@@ -41,44 +53,56 @@ impl UnreadableAof {
         Self {
             path: path.to_path_buf(),
             error: error.to_string(),
-            limit: false,
+            why: Unreadable::Failed,
         }
     }
 
     /// [`Self::new`] from the replay's error, keeping its class.
     pub fn from_error(path: &Path, error: &crate::error::MoonError) -> Self {
-        let limit = matches!(
-            error,
-            crate::error::MoonError::Aof(crate::error::AofError::RecordTooLarge { .. })
-        );
+        use crate::error::{AofError, MoonError};
+        let why = match error {
+            MoonError::Aof(AofError::RecordTooLarge { .. }) => Unreadable::Limit,
+            MoonError::Aof(AofError::Corrupted { .. }) => Unreadable::Damaged,
+            MoonError::Aof(AofError::TornTailCutFailed { .. }) => Unreadable::TornTailUncut,
+            _ => Unreadable::Failed,
+        };
         Self {
-            limit,
+            why,
             ..Self::new(path, error)
         }
     }
 
-    /// The operator-facing refusal: what failed, why nothing else is loaded,
-    /// and the remedies.
+    /// The operator-facing refusal: what failed, why the boot stops, and
+    /// the remedies — per [`Unreadable`] class (R2b round 4 F10: a torn
+    /// tail that could not be cut, and damage after a readable prefix, read
+    /// "booting would serve an EMPTY dataset", which neither is).
     pub fn message(&self) -> String {
-        if self.limit {
-            return format!(
-                "refusing to start: {} could not be replayed: {}",
-                self.path.display(),
-                self.error
-            );
+        let path = self.path.display();
+        let error = &self.error;
+        match self.why {
+            Unreadable::Limit | Unreadable::TornTailUncut => {
+                format!("refusing to start: {path} could not be replayed: {error}")
+            }
+            Unreadable::Damaged => format!(
+                "refusing to start: {path} is damaged ({error}). The records before the damage \
+                 are readable; the damage is not a torn tail (a crash tears only the LAST \
+                 record, which the boot cuts by itself). Booting the records before it would \
+                 silently drop every one after it and append new writes behind the damage. \
+                 Remedies: restore the file from a backup; or truncate a copy at the byte \
+                 offset named above (truncate -s <offset> <copy>), which keeps the records \
+                 before the damage and DROPS every one after it, and boot from it; or, to boot \
+                 from the snapshot instead, move {FLAT_AOF_NAME} aside and restart (the \
+                 snapshot then loads and a new AOF is opened over it)."
+            ),
+            Unreadable::Failed => format!(
+                "refusing to start: {path} could not be replayed ({error}). With --appendonly \
+                 yes it is the only source of the dataset, so booting without it would serve \
+                 an EMPTY dataset and append new writes behind the unreadable bytes. Remedies: \
+                 restore the file from a backup; or fix the cause named above and restart; or, \
+                 to boot from the snapshot instead, move {FLAT_AOF_NAME} aside and restart \
+                 (the snapshot then loads and a new AOF is opened over it)."
+            ),
         }
-        format!(
-            "refusing to start: {} could not be replayed ({}). With --appendonly yes it is the \
-             only source of the dataset, so booting would serve an EMPTY dataset and append \
-             new writes behind the unreadable bytes. Remedies: restore the file from a backup; \
-             or, to keep the records before the damage, truncate a copy at the byte offset \
-             named above (truncate -s <offset> <copy>) and boot from it; or, to boot from the \
-             snapshot instead, move {} aside and restart (the snapshot then loads and a new \
-             AOF is opened over it).",
-            self.path.display(),
-            self.error,
-            FLAT_AOF_NAME
-        )
     }
 }
 
@@ -213,10 +237,48 @@ mod tests {
         assert!(m.contains("/d/appendonly.aof"), "{m}");
         assert!(m.contains("no valid EOF+CRC found"), "{m}");
         assert!(m.contains("move appendonly.aof aside"), "{m}");
+        assert!(!m.contains("truncate"), "a read failure is not damage: {m}");
         assert_eq!(
             flat_aof_path(Path::new("/d")),
             PathBuf::from("/d/appendonly.aof")
         );
+    }
+
+    /// R2b round 4 F10: each class names its own remedy — damage after a
+    /// readable prefix is not "an EMPTY dataset", an uncut torn tail is not
+    /// damage, a limit is never to be truncated.
+    #[test]
+    fn each_refusal_class_names_its_own_remedy() {
+        use crate::error::{AofError, MoonError};
+        let p = Path::new("/d/appendonly.aof");
+        let of = |e: AofError| UnreadableAof::from_error(p, &MoonError::Aof(e));
+        let damaged = of(AofError::Corrupted {
+            offset: 7,
+            detail: "x".into(),
+        });
+        assert_eq!(damaged.why, Unreadable::Damaged);
+        let m = damaged.message();
+        assert!(
+            m.contains("DROPS every one after it") && !m.contains("EMPTY"),
+            "{m}"
+        );
+        let uncut = of(AofError::TornTailCutFailed {
+            offset: 7,
+            detail: "cutting it failed: EROFS. The file is unchanged.".into(),
+        });
+        assert_eq!(uncut.why, Unreadable::TornTailUncut);
+        let m = uncut.message();
+        assert!(
+            m.contains("The file is unchanged") && !m.contains("EMPTY"),
+            "{m}"
+        );
+        assert!(!m.contains("damaged"), "{m}");
+        let limit = of(AofError::RecordTooLarge {
+            offset: 7,
+            detail: "x".into(),
+        });
+        assert_eq!(limit.why, Unreadable::Limit);
+        assert!(limit.message().contains("do NOT truncate"));
     }
 
     /// A snapshot written after the AOF and holding a key is flagged; an
