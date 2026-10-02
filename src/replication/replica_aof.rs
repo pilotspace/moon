@@ -8,12 +8,12 @@
 //! 1. The full sync's dataset is loaded straight into the keyspace; nothing
 //!    wrote it to the AOF. redis's `restartAOFAfterSYNC` starts an AOF
 //!    rewrite right after the sync, so the new generation's base is the
-//!    synced dataset. [`after_full_sync`] dispatches that rewrite at once
-//!    (the fold protocol keeps it exactly-once against the stream records
-//!    appended meanwhile); one that cannot start now (another rewrite is
-//!    running, whose image may predate the load) is left to the auto-rewrite
-//!    monitor ([`crate::persistence::aof::auto_rewrite::request_rewrite`]),
-//!    which runs it as soon as nothing is busy.
+//!    synced dataset. [`after_full_sync`] requests that rewrite from the
+//!    auto-rewrite monitor ([`crate::persistence::aof::auto_rewrite::request_rewrite`]),
+//!    which runs it at once — after a rewrite already running, whose image
+//!    may predate the load — and retries it until one completes OK (the fold
+//!    protocol keeps it exactly-once against the stream records appended
+//!    meanwhile). The embedded server runs no monitor: [`warn_if_no_rewriter`].
 //! 2. The master stream was applied with plain dispatch and never logged.
 //!    redis replicas feed it into their own AOF (`propagate` /
 //!    `feedAppendOnlyFile`). [`log_applied`] appends every applied KV write
@@ -39,27 +39,33 @@ use crate::persistence::aof::AofWriterPool;
 use crate::protocol::Frame;
 use crate::replication::apply::ReplCommand;
 
-/// After a full sync loaded the master's dataset: publish it as the base of
-/// a new AOF generation (see the module doc). No-op without an AOF.
-pub(crate) fn after_full_sync(
-    aof_pool: Option<&Arc<AofWriterPool>>,
-    shard_databases: &Arc<crate::shard::shared_databases::ShardDatabases>,
-) {
-    let Some(pool) = aof_pool else {
+/// After a full sync loaded the master's dataset: ask for the rewrite that
+/// makes it the base of a new AOF generation (redis `restartAOFAfterSYNC`).
+/// The auto-rewrite monitor wakes at once, waits out a rewrite already
+/// running (its image may predate the load), dispatches its own, and keeps
+/// the request until a rewrite it started completes OK (R2b round 3 F-E: a
+/// directly dispatched rewrite that later failed was never retried). No-op
+/// without an AOF.
+pub(crate) fn after_full_sync(aof_pool: Option<&Arc<AofWriterPool>>) {
+    if aof_pool.is_none() {
         return;
-    };
-    match crate::command::persistence::bgrewriteaof_start_sharded(pool, shard_databases.clone()) {
-        Frame::Error(e) => {
-            tracing::warn!(
-                "replica: cannot start the post-sync AOF rewrite now ({}); the auto-rewrite \
-                 monitor runs it as soon as nothing else is busy",
-                String::from_utf8_lossy(&e)
-            );
-            crate::persistence::aof::auto_rewrite::request_rewrite();
-        }
-        _ => tracing::info!(
-            "replica: full sync loaded; rewriting the AOF so its base is the synced dataset"
-        ),
+    }
+    tracing::info!(
+        "replica: full sync loaded; requesting an AOF rewrite so its base is the synced dataset"
+    );
+    crate::persistence::aof::auto_rewrite::request_rewrite();
+}
+
+/// At `REPLICAOF` with an AOF: say so when nothing will ever rewrite it (the
+/// embedded server runs no auto-rewrite monitor and cannot fold its TopLevel
+/// AOF), so a promoted replica's restart cannot hold the master's dataset.
+pub(crate) fn warn_if_no_rewriter(aof_pool: Option<&Arc<AofWriterPool>>) {
+    if aof_pool.is_some() && !crate::persistence::aof::auto_rewrite::monitor_running() {
+        tracing::warn!(
+            "replica: this server runs no AOF auto-rewrite monitor (embedded mode), so the \
+             synced dataset is never written to its AOF: after a promotion, a restart of this \
+             node holds only what its AOF had before the sync plus the stream since"
+        );
     }
 }
 
@@ -104,8 +110,9 @@ pub(crate) fn log_applied(aof_pool: Option<&Arc<AofWriterPool>>, rc: &ReplComman
     if !pool.send_append_bounded_blocking(0, 0, rc.db_index, bytes, &mut budget) {
         tracing::error!(
             "replica: a master-stream record was NOT appended to this replica's AOF (writer \
-             backpressure); a restart of this node after a promotion may miss it"
+             backpressure); requesting a rewrite so the AOF holds the dataset again"
         );
+        crate::persistence::aof::auto_rewrite::request_rewrite();
     }
 }
 
