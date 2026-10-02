@@ -117,6 +117,10 @@ fn poison(cmd: &[u8], reason: &str) -> bool {
 pub(crate) struct ReplCommand {
     pub db_index: usize,
     pub command: Arc<Frame>,
+    /// Bytes of the drained buffer up to and including this frame (R2b
+    /// round 4 X1-DBL): once it is applied, the replication offset may
+    /// advance by exactly this much of the drain, and no further.
+    pub end_offset: usize,
 }
 
 /// Outcome of draining complete frames out of the replication read buffer.
@@ -175,7 +179,7 @@ pub(crate) fn drain_replicated_commands_resumable(
         match parse::parse_resumable(buf, &config, state) {
             Ok(Some(frame)) => {
                 consumed += before - buf.len();
-                classify(frame, selected_db, &mut commands);
+                classify(frame, selected_db, consumed, &mut commands);
             }
             // Incomplete trailing frame: parser left `buf` untouched — wait for
             // the next socket read to complete it.
@@ -205,7 +209,7 @@ pub(crate) fn drain_replicated_commands_resumable(
 
 /// Route a single parsed frame: absorb `SELECT`, drop chatter, or record a data
 /// command bound to the current `selected_db`.
-fn classify(frame: Frame, selected_db: &mut usize, out: &mut Vec<ReplCommand>) {
+fn classify(frame: Frame, selected_db: &mut usize, end_offset: usize, out: &mut Vec<ReplCommand>) {
     let Some((cmd, args)) = command_parts(&frame) else {
         return; // non-array / empty — ignore (e.g. inline-newline keepalive)
     };
@@ -222,6 +226,7 @@ fn classify(frame: Frame, selected_db: &mut usize, out: &mut Vec<ReplCommand>) {
     out.push(ReplCommand {
         db_index: *selected_db,
         command: Arc::new(frame),
+        end_offset,
     });
 }
 
@@ -1478,6 +1483,7 @@ mod tests {
         ReplCommand {
             db_index: 0,
             command: Arc::new(Frame::Array(arr.into())),
+            end_offset: 0,
         }
     }
 
@@ -1938,7 +1944,7 @@ mod tests {
         );
         let mut db = 0usize;
         let mut out = Vec::new();
-        classify(frame, &mut db, &mut out);
+        classify(frame, &mut db, 0, &mut out);
         assert_eq!(db, 4);
         assert!(out.is_empty());
     }
