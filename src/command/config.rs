@@ -490,8 +490,15 @@ mod tests {
     /// `resetServerStats` does. The counter is process-wide and other tests
     /// bump it in parallel, so the check is "the million this test added is
     /// gone", not "exactly 0".
+    /// R2b round 2 N1: `config_resetstat()` zeroes process-wide counters, so
+    /// a test that bumps one and checks it is still there BEFORE calling it
+    /// raced every other RESETSTAT test (`cargo test --lib` runs them on
+    /// parallel threads). Each takes this lock for its whole body.
+    static RESETSTAT_TESTS: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
     #[test]
     fn resetstat_zeroes_expired_keys() {
+        let _serial = RESETSTAT_TESTS.lock();
         crate::admin::metrics_setup::record_expired_keys(1_000_000);
         assert!(crate::admin::metrics_setup::expired_keys() >= 1_000_000);
         assert_eq!(
@@ -506,6 +513,7 @@ mod tests {
     /// test added is gone").
     #[test]
     fn resetstat_zeroes_the_cow_stream_counts() {
+        let _serial = RESETSTAT_TESTS.lock();
         use crate::persistence::snapshot_cow::stream;
         stream::add_counts_for_test(1_000_000, 1_000_000);
         assert!(stream::streamed_keys() >= 1_000_000 && stream::parked_writes() >= 1_000_000);
