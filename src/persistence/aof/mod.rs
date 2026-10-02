@@ -824,6 +824,8 @@ pub mod group_commit;
 pub mod lane;
 /// The lane's hand-over state machine (loom-modeled).
 mod lane_protocol;
+/// The tokio TopLevel writer's per-path open gate (R2b review P1, N5).
+pub mod open_gate;
 mod pool;
 /// The writer's running record context (db + `MOON.TS` clock), moon#1283.
 mod record_ctx;

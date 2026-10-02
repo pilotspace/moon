@@ -943,7 +943,11 @@ fn main() -> anyhow::Result<()> {
     // only once this guard is dropped, below the generation seed.
     let fresh_aof_gate =
         (cfg!(not(feature = "runtime-monoio")) && num_shards == 1 && config.appendonly == "yes")
-            .then(moon::persistence::aof::fresh_generation::hold_writer_open);
+            .then(|| {
+                moon::persistence::aof::open_gate::hold_writer_open(
+                    &PathBuf::from(&config.dir).join(&config.appendfilename),
+                )
+            });
     let mut aof_pool: Option<std::sync::Arc<AofWriterPool>> = if config.appendonly == "yes" {
         let fsync = FsyncPolicy::from_str(&config.appendfsync);
         // PerShard writers required when num_shards >= 2 AND we'll have a
