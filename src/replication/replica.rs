@@ -144,6 +144,7 @@ pub struct ReplicaTaskConfig {
 /// Reconnects with exponential backoff on disconnect.
 #[cfg(feature = "runtime-tokio")]
 pub async fn run_replica_task(cfg: ReplicaTaskConfig) {
+    crate::replication::replica_aof::warn_if_no_rewriter(cfg.aof_pool.as_ref());
     // R0 streaming replication is single-shard only. A multi-shard replica would
     // misread the master's single diskless RDB bulk and mis-route the command
     // stream (see `apply::load_snapshot`, which is thread-local and clears all
@@ -400,10 +401,7 @@ async fn run_handshake_and_stream(
         }
         // R2b round 2 R1 (redis `restartAOFAfterSYNC`): the synced dataset
         // becomes the base of a new generation of this replica's own AOF.
-        crate::replication::replica_aof::after_full_sync(
-            cfg.aof_pool.as_ref(),
-            &cfg.shard_databases,
-        );
+        crate::replication::replica_aof::after_full_sync(cfg.aof_pool.as_ref());
 
         // Enter streaming mode
         {
@@ -568,6 +566,7 @@ async fn stream_commands_read_loop(
 /// monoio::time::sleep for backoff.
 #[cfg(feature = "runtime-monoio")]
 pub async fn run_replica_task(cfg: ReplicaTaskConfig) {
+    crate::replication::replica_aof::warn_if_no_rewriter(cfg.aof_pool.as_ref());
     // R0 streaming replication is single-shard only. A multi-shard replica would
     // misread the master's single diskless RDB bulk and mis-route the command
     // stream (see `apply::load_snapshot`, which is thread-local and clears all
@@ -826,10 +825,7 @@ async fn run_handshake_and_stream(
         }
         // R2b round 2 R1 (redis `restartAOFAfterSYNC`): the synced dataset
         // becomes the base of a new generation of this replica's own AOF.
-        crate::replication::replica_aof::after_full_sync(
-            cfg.aof_pool.as_ref(),
-            &cfg.shard_databases,
-        );
+        crate::replication::replica_aof::after_full_sync(cfg.aof_pool.as_ref());
 
         {
             let mut rs = cfg.repl_state.write();

@@ -290,6 +290,33 @@ pub fn next_trigger(
     }
 }
 
+/// A rewrite some part of the server asked for (R2b round 2 R1 / round 3
+/// F-E: a replica's full sync, a promotion that rolled back an open master
+/// transaction, a replica record its AOF could not take). The monitor treats
+/// it like the boot's forced rewrite: it wakes at once ([`request_rewrite`]
+/// unparks it), waits out a rewrite already running (that one started before
+/// the request), dispatches its own, and keeps the request until a rewrite
+/// it dispatched completes OK — a failed or unfinished one is dispatched
+/// again. Without an AOF there is no monitor, and the request is a no-op.
+static REWRITE_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+/// The monitor thread, so a request wakes it instead of waiting for its tick.
+static MONITOR_THREAD: std::sync::OnceLock<std::thread::Thread> = std::sync::OnceLock::new();
+
+/// Ask the monitor for one AOF rewrite (see [`REWRITE_REQUESTED`]).
+pub fn request_rewrite() {
+    REWRITE_REQUESTED.store(true, Ordering::SeqCst);
+    if let Some(t) = MONITOR_THREAD.get() {
+        t.unpark();
+    }
+}
+
+/// Whether this process runs the auto-rewrite monitor (main.rs with an AOF;
+/// never the embedded server), i.e. whether [`request_rewrite`] is served.
+pub fn monitor_running() -> bool {
+    MONITOR_THREAD.get().is_some()
+}
+
 /// Spawn the auto-rewrite monitor thread. `percentage == 0` still spawns the
 /// sampler (INFO size freshness) but never dispatches a growth rewrite.
 ///
@@ -300,18 +327,6 @@ pub fn next_trigger(
 /// Dispatches through [`crate::command::persistence::bgrewriteaof_start_sharded`],
 /// the exact entry the `BGREWRITEAOF` command uses — CAS on the in-progress
 /// flag, per-shard fan-out vs TopLevel routing, and error mapping included.
-/// A rewrite some part of the server asked for (R2b round 2 R1: a replica's
-/// full sync whose rewrite could not start at once, a promotion that rolled
-/// back an open master transaction). The monitor treats it like the boot's
-/// forced rewrite: dispatched on the first tick nothing is busy, retried
-/// until one completes. Without an AOF there is no monitor and no-op.
-static REWRITE_REQUESTED: AtomicBool = AtomicBool::new(false);
-
-/// Ask the monitor for one AOF rewrite (see [`REWRITE_REQUESTED`]).
-pub fn request_rewrite() {
-    REWRITE_REQUESTED.store(true, Ordering::SeqCst);
-}
-
 pub fn spawn_monitor(
     pool: Arc<super::AofWriterPool>,
     shard_databases: Arc<crate::shard::shared_databases::ShardDatabases>,
@@ -353,12 +368,16 @@ fn monitor_loop(
     // Compactions waiting at the previous tick, and since when some have.
     let mut prev_awaiting = 0usize;
     let mut awaiting_since: Option<std::time::Instant> = None;
+    let _ = MONITOR_THREAD.set(std::thread::current());
     info!(
         "aof-auto-rewrite monitor started (percentage={}%, min_size={} bytes)",
         percentage, min_size
     );
     loop {
-        std::thread::sleep(TICK);
+        // A tick, or at once when a rewrite is requested (`request_rewrite`).
+        if !REWRITE_REQUESTED.load(Ordering::SeqCst) {
+            std::thread::park_timeout(TICK);
+        }
 
         let in_progress = AOF_REWRITE_IN_PROGRESS.load(Ordering::SeqCst);
         let current = refresh_current_size();
@@ -505,6 +524,13 @@ fn monitor_loop(
                         AOF_REWRITE_IN_PROGRESS.load(Ordering::SeqCst),
                         super::AOF_REWRITE_LAST_OK.load(Ordering::SeqCst),
                     );
+                    // R2b round 3 F-E: a requested rewrite still running after
+                    // the wait has no outcome yet — keep it pending, so one
+                    // that then fails is dispatched again (the next tick waits
+                    // for it to finish first).
+                    if !forced_by_boot && AOF_REWRITE_IN_PROGRESS.load(Ordering::SeqCst) {
+                        forced_pending = true;
+                    }
                     forced_by_boot &= forced_pending;
                     if forced_pending {
                         cooldown_until = std::time::Instant::now() + FAILED_DISPATCH_COOLDOWN;
