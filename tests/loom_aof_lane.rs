@@ -41,6 +41,15 @@
 //!      and when an `AppendSync` that flips a DIRECT lane does not hold it
 //!      again (two negative controls).
 //!
+//!   6. two producers (R2b round 2 F4, `model_two_producers`): one may act on
+//!      a STALE hold (it read "held", the writer then handed the lane over,
+//!      and its `AppendSync` barrier flips the DIRECT lane and holds it
+//!      again) while the other appends; every reply still follows its
+//!      record's write. Negative control: a producer that reads the hold
+//!      BEFORE its append (the inline-SET gate shape before F2) is caught —
+//!      the other's stale barrier holds the lane between its read and its
+//!      append, and its record waits in the channel while it replies.
+//!
 //! Outside the models: a reply sent while the lane is WRITER and UNHELD — a
 //! rewrite fold and its post-fold drain, or a latched write error — may
 //! precede its record's `write(2)`; that is the documented fold residual
@@ -124,8 +133,17 @@ struct World {
     /// The lane's hold, as the producers read it (`AofLane::held`, one lane
     /// here): changed under the lane lock, read without it.
     holds: AtomicUsize,
-    /// The last barrier the writer acked.
+    /// The highest barrier the writer acked.
     acked: AtomicU8,
+    /// `model_two_producers`: the last record id handed out (under the lane
+    /// lock, so ids follow lock order).
+    next: AtomicU8,
+    /// `model_two_producers`: the record whose reply waits for its barrier's
+    /// ack — the reply leaves when the writer acks, so the writer checks it.
+    reply_at_ack: AtomicU8,
+    /// The channel's capacity ([`CAP`]; the two-producer model's finite
+    /// writer needs room for every message, or a slow sender would spin).
+    cap: usize,
 }
 
 fn write(sink: &mut Sink, bytes: &[u8]) -> std::io::Result<()> {
@@ -153,7 +171,64 @@ impl World {
             done: AtomicBool::new(false),
             holds: AtomicUsize::new(0),
             acked: AtomicU8::new(0),
+            next: AtomicU8::new(0),
+            reply_at_ack: AtomicU8::new(0),
+            cap: CAP,
         }
+    }
+
+    /// `AofLane::enqueue` of an `Append` whose id is allocated under the lane
+    /// lock (two producers).
+    fn append_next(&self) -> u8 {
+        let mut core = self.core.lock().unwrap();
+        let id = self.next.fetch_add(1, Ordering::Relaxed) + 1;
+        if core.frame_with(|ctx, buf| frame(ctx, id, buf)) {
+            return id;
+        }
+        self.send_writer_mode(core, Msg::Rec(id), How::Correct);
+        id
+    }
+
+    /// The other producer of the two-producer model: its record, then — on a
+    /// possibly STALE hold — its `AppendSync` barrier (flip, hold again,
+    /// send), without waiting for the ack: its own reply is
+    /// `model_replies`' business; here it only perturbs the lane.
+    fn stale_barrier_producer(&self) {
+        let id = self.append_next();
+        if self.held() {
+            let mut core = self.core.lock().unwrap();
+            core.flip(write);
+            if core.hold() {
+                self.holds.fetch_add(1, Ordering::AcqRel);
+            }
+            self.send_writer_mode(core, Msg::Barrier(id), How::Correct);
+        }
+    }
+
+    /// One acknowledged write of a two-producer model: append, the acked
+    /// path if the lane is held (read AFTER the append; before it with
+    /// `read_first` — the negative control), the flush point, the reply.
+    /// No spinning: on the acked path the reply leaves when the writer acks
+    /// the barrier, so the writer checks it there (`reply_at_ack`).
+    fn write_and_reply_next(&self, read_first: bool) {
+        let early = read_first && self.held();
+        let id = self.append_next();
+        let held = if read_first { early } else { self.held() };
+        if held {
+            self.reply_at_ack.store(id, Ordering::Release);
+            let mut core = self.core.lock().unwrap();
+            core.flip(write);
+            if core.hold() {
+                self.holds.fetch_add(1, Ordering::AcqRel);
+            }
+            self.send_writer_mode(core, Msg::Barrier(id), How::Correct);
+            return;
+        }
+        self.flush();
+        assert!(
+            self.log.lock().unwrap().contains(&id),
+            "write before reply violated: (6) record {id} acknowledged before its write"
+        );
     }
 
     /// A lane its writer was just attached to (`AofWriterPool::lane`): held.
@@ -241,7 +316,7 @@ impl World {
         }
         {
             let mut chan = self.chan.lock().unwrap();
-            if chan.len() < CAP {
+            if chan.len() < self.cap {
                 chan.push_back(msg);
                 return;
             }
@@ -262,7 +337,7 @@ impl World {
         loop {
             {
                 let mut chan = self.chan.lock().unwrap();
-                if chan.len() < CAP {
+                if chan.len() < self.cap {
                     chan.push_back(msg);
                     return;
                 }
@@ -276,7 +351,19 @@ impl World {
     /// The writer writes one channel record with its own context.
     fn writer_write(&self, ctx: &mut Option<u8>, msg: Msg) {
         if let Msg::Barrier(id) = msg {
-            self.acked.store(id, Ordering::Release);
+            // Monotonic: with two producers a later barrier can be acked
+            // first; everything before it in the channel is written.
+            self.acked.fetch_max(id, Ordering::AcqRel);
+            // A reply waiting for this ack leaves now (two-producer model).
+            let waiting = self.reply_at_ack.load(Ordering::Acquire);
+            if waiting != 0 && waiting <= id {
+                assert!(
+                    self.log.lock().unwrap().contains(&waiting),
+                    "write before reply violated: (6) record {waiting} acknowledged before \
+                     its write"
+                );
+                self.reply_at_ack.store(0, Ordering::Release);
+            }
             return;
         }
         if let Msg::Rec(id) = msg {
@@ -465,6 +552,48 @@ fn model_replies(how: Reply) {
     w.finish(ctx, 3);
 }
 
+/// The two-producer model's writer: a fixed number of wakes (nothing spins
+/// on it — a reply on the acked path is checked at its ack), then `finish`
+/// drains the rest.
+fn spawn_writer_steps(w: &Arc<World>, wakes: usize) -> impl FnOnce() -> Option<u8> {
+    let w = Arc::clone(w);
+    let handle = thread_spawn(move || {
+        let mut ctx = Some(0u8);
+        for _ in 0..wakes {
+            w.writer_wake(&mut ctx);
+        }
+        ctx
+    });
+    move || handle.join().unwrap()
+}
+
+/// Write before reply with two producers (checks 6.), from a held boot: one
+/// acknowledges a write, the other appends and barriers on a possibly stale
+/// hold.
+fn model_two_producers(read_first: bool) {
+    let mut world = World::attached();
+    world.cap = 8;
+    let w = Arc::new(world);
+    let writer = spawn_writer_steps(&w, 3);
+    let replier = {
+        let w = Arc::clone(&w);
+        thread_spawn(move || w.write_and_reply_next(read_first))
+    };
+    let stale = {
+        let w = Arc::clone(&w);
+        thread_spawn(move || w.stale_barrier_producer())
+    };
+    replier.join().unwrap();
+    stale.join().unwrap();
+    let ctx = writer();
+    w.finish(ctx, 2);
+    assert_eq!(
+        w.reply_at_ack.load(Ordering::Acquire),
+        0,
+        "a reply waited for an ack that never came"
+    );
+}
+
 /// The producer appends 1, flushes, sends an `AppendSync` 2, appends 3,
 /// sends a control message, appends 4 and flushes, while the writer wakes.
 fn model_lane(how: How) {
@@ -517,6 +646,15 @@ mod loom_models {
         builder.check(f);
     }
 
+    /// Three threads with a writer of several wakes take longer paths than
+    /// loom's default branch budget.
+    fn model_wide(f: impl Fn() + Sync + Send + 'static) {
+        let mut builder = loom::model::Builder::new();
+        builder.preemption_bound = Some(3);
+        builder.max_branches = 100_000;
+        builder.check(f);
+    }
+
     #[test]
     fn loom_lane_hand_over_keeps_order_and_context() {
         model(|| model_lane(How::Correct));
@@ -555,6 +693,17 @@ mod loom_models {
     fn loom_appendsync_flip_without_rehold_is_caught() {
         model(|| model_replies(Reply::NoRehold));
     }
+
+    #[test]
+    fn loom_two_producers_with_a_stale_hold_reply_after_the_write() {
+        model_wide(|| model_two_producers(false));
+    }
+
+    #[test]
+    #[should_panic(expected = "write before reply violated")]
+    fn loom_reading_the_hold_before_the_append_is_caught() {
+        model_wide(|| model_two_producers(true));
+    }
 }
 
 #[cfg(not(loom))]
@@ -579,6 +728,13 @@ mod smoke {
     fn smoke_held_lane_replies_after_the_write() {
         for _ in 0..500 {
             model_replies(Reply::Correct);
+        }
+    }
+
+    #[test]
+    fn smoke_two_producers_reply_after_the_write() {
+        for _ in 0..500 {
+            model_two_producers(false);
         }
     }
 }
