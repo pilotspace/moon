@@ -134,6 +134,15 @@ pub fn replay_multi_part(
 
 /// `e`, naming the incr file it was read from and the boot's options.
 fn in_file(path: &std::path::Path, e: crate::error::MoonError) -> crate::error::MoonError {
+    // R2b round 4 F2: a parser limit is not damage — no truncation advice.
+    if let crate::error::MoonError::Aof(crate::error::AofError::RecordTooLarge { offset, detail }) =
+        e
+    {
+        return crate::error::MoonError::from(crate::error::AofError::RecordTooLarge {
+            offset,
+            detail: format!("{}: {detail}", path.display()),
+        });
+    }
     crate::error::MoonError::from(crate::error::AofError::RewriteFailed {
         detail: format!(
             "{}: {e}. The boot refuses a damaged AOF rather than serve a partial dataset and \
@@ -252,6 +261,14 @@ fn replay_incr_resp_records(
                 break;
             }
             ReplayNext::Corrupt { offset, err } => {
+                if crate::persistence::replay::chunks::is_limit_violation(&err) {
+                    return Err(crate::error::MoonError::from(
+                        crate::error::AofError::RecordTooLarge {
+                            offset,
+                            detail: err.to_string(),
+                        },
+                    ));
+                }
                 return Err(crate::error::MoonError::from(
                     crate::error::AofError::RewriteFailed {
                         detail: format!("AOF incr parse error at offset {}: {:?}", offset, err),
@@ -322,14 +339,14 @@ fn replay_incr_framed_records(
     engine: &dyn crate::persistence::replay::CommandReplayEngine,
     ordered_buf: &mut Vec<OrderedEntry>,
 ) -> Result<(usize, u64, Option<TornTail>), crate::error::MoonError> {
-    use crate::protocol::{Frame, ParseConfig, parse};
+    use crate::protocol::{Frame, parse};
     use bytes::BytesMut;
 
     const HEADER_LEN: usize = 12; // u64 lsn LE + u32 len LE
 
     let total_len = data.len();
     let mut offset: usize = 0;
-    let config = ParseConfig::default();
+    let config = crate::persistence::replay::chunks::log_parse_config();
     let mut selected_db: usize = 0;
     let mut count: usize = 0;
     let mut max_lsn: u64 = 0;
@@ -479,6 +496,14 @@ fn replay_incr_framed_records(
                             "AOF incr framed payload at offset {} (lsn {}, len {}) parsed as incomplete frame; corrupt entry",
                             offset, lsn, len
                         ),
+                    },
+                ));
+            }
+            Err(e) if crate::persistence::replay::chunks::is_limit_violation(&e) => {
+                return Err(crate::error::MoonError::from(
+                    crate::error::AofError::RecordTooLarge {
+                        offset: offset as u64,
+                        detail: format!("lsn {lsn}, len {len}: {e}"),
                     },
                 ));
             }
@@ -726,7 +751,7 @@ pub fn replay_ordered_merge(
     mut entries: Vec<OrderedEntry>,
     engine: &dyn crate::persistence::replay::CommandReplayEngine,
 ) -> Result<usize, crate::error::MoonError> {
-    use crate::protocol::{Frame, ParseConfig, parse};
+    use crate::protocol::{Frame, parse};
     use bytes::BytesMut;
 
     if entries.is_empty() {
@@ -767,7 +792,7 @@ pub fn replay_ordered_merge(
         }
     }
 
-    let config = ParseConfig::default();
+    let config = crate::persistence::replay::chunks::log_parse_config();
     let mut replayed: usize = 0;
 
     for entry in entries {

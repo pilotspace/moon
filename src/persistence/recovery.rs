@@ -1015,8 +1015,9 @@ pub fn recover_shard_v3_pitr(
                         info!("Shard {}: AOF fallback replayed {} commands", shard_id, n);
                     }
                     Err(e) => {
-                        let refusal =
-                            crate::persistence::aof::flat_file::UnreadableAof::new(&aof_path, e);
+                        let refusal = crate::persistence::aof::flat_file::UnreadableAof::from_error(
+                            &aof_path, &e,
+                        );
                         tracing::error!("Shard {}: {}", shard_id, refusal.message());
                         result.aof_unreadable = Some(refusal);
                     }
