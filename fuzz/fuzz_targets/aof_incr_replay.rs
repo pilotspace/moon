@@ -30,6 +30,10 @@ use moon::storage::Database;
 // from `MOON.TS` never outlives the replay's pin scope (a leak would make the
 // next replay on this thread — or a live read — judge by a stale log clock).
 //
+// R2b round 3 F-B: mode 2 replays the flat file as a boot does
+// (`replay_aof_at_boot`), which cuts a torn tail: the cut keeps a prefix and
+// a second boot of the cut file cuts nothing.
+//
 // moon#1300: the `MOON.TXN` transaction blocks — BEGIN / PAUSE / END /
 // RESET, matched and unmatched ids, END without BEGIN, a block cut by the end
 // of the file — through the same readers. Invariants: no reader panics, and
@@ -162,7 +166,26 @@ fuzz_target!(|data: &[u8]| {
             let path = dir.path().join("appendonly.aof");
             if std::fs::write(&path, &bytes).is_ok() {
                 if mode == 2 {
-                    let _ = moon::persistence::aof::replay_aof(&mut dbs, &path, &engine);
+                    // R2b round 3 F-B: the boot reader cuts a torn tail. A
+                    // cut keeps a prefix of the file, and a second boot of
+                    // the cut file has nothing left to cut.
+                    let boot = moon::persistence::aof::replay_aof_at_boot;
+                    if boot(&mut dbs, &path, &engine).is_ok() {
+                        let now = std::fs::read(&path).unwrap_or_default();
+                        assert!(bytes.starts_with(&now), "a boot's cut keeps a prefix");
+                        let mut again: Vec<Database> = (0..4).map(|_| Database::new()).collect();
+                        assert!(
+                            boot(&mut again, &path, &engine).is_ok(),
+                            "a cut file replays at the next boot"
+                        );
+                        assert_eq!(
+                            std::fs::read(&path).unwrap_or_default(),
+                            now,
+                            "a cut file has nothing more to cut"
+                        );
+                        let _ = take_open_foreign_segment(&path);
+                        let _ = take_reset_owed(&path);
+                    }
                 } else if framed_file {
                     let _ = replay_framed_file(&mut dbs, &path, &engine);
                 } else {

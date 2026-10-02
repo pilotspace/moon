@@ -87,8 +87,26 @@ impl<R: Read> ReplayChunks<R> {
     }
 
     /// The next frame, or why there is none.
+    ///
+    /// Every record a writer logs is a RESP array (R2b round 3 F-B): a frame
+    /// that does not open with `*` is corruption, never an inline command —
+    /// the client parser's inline fallback would turn a damaged `*` into a
+    /// "command" and the following bulks into skipped frames, and the replay
+    /// would silently drop the record and carry on past the damage.
     pub(crate) fn next_frame(&mut self) -> std::io::Result<ReplayNext> {
         loop {
+            if let Some(&first) = self.buf.first()
+                && first != b'*'
+            {
+                return Ok(ReplayNext::Corrupt {
+                    offset: self.offset,
+                    err: ParseError::Invalid {
+                        kind: crate::protocol::ProtoFault::UnknownType(first),
+                        message: format!("a log record must open with '*', found {first:#04x}"),
+                        offset: 0,
+                    },
+                });
+            }
             if !self.buf.is_empty() {
                 let before = self.buf.len();
                 match parse_resumable(&mut self.buf, &self.config, &mut self.state) {
@@ -263,6 +281,26 @@ mod tests {
                 assert_eq!(len, log.len() - whole as usize);
             }
             other => panic!("{other:?}"),
+        }
+    }
+
+    /// R2b round 3 F-B: a damaged `*` is corruption at the record, not an
+    /// inline command the replay would skip past.
+    #[test]
+    fn a_record_that_does_not_open_with_a_star_is_corruption() {
+        let mut log = resp(&[b"SET", b"a", b"1"]);
+        let bad_at = log.len() as u64;
+        let mut damaged = resp(&[b"SET", b"b", b"2"]);
+        damaged[0] = b'?';
+        log.extend(damaged);
+        log.extend(resp(&[b"SET", b"c", b"3"]));
+        for chunk in [1usize, 4, 1 << 20] {
+            let mut r = ReplayChunks::with_chunk(&log[..], 0, chunk);
+            assert!(matches!(r.next_frame().unwrap(), ReplayNext::Frame(_)));
+            match r.next_frame().unwrap() {
+                ReplayNext::Corrupt { offset, .. } => assert_eq!(offset, bad_at, "chunk {chunk}"),
+                other => panic!("chunk {chunk}: {other:?}"),
+            }
         }
     }
 

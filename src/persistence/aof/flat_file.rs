@@ -10,8 +10,10 @@
 //! 7.2.7 exits with status 1 on the same file. A boot that meets one refuses to start instead,
 //! before any AOF writer opens the file ([`UnreadableAof`]).
 //!
-//! A clean truncated tail and mid-stream corruption are NOT refusals: replay
-//! keeps the valid prefix, as before.
+//! Mid-stream corruption is a refusal too (R2b round 3 F-B; redis "Bad file
+//! format"). A clean truncated tail — a record torn by a crash — is not: the
+//! boot cuts it off the file before anything is appended behind it
+//! ([`super::torn_tail`]).
 
 use std::path::{Path, PathBuf};
 
@@ -46,9 +48,10 @@ impl UnreadableAof {
             "refusing to start: {} could not be replayed ({}). With --appendonly yes it is the \
              only source of the dataset, so booting would serve an EMPTY dataset and append \
              new writes behind the unreadable bytes. Remedies: restore the file from a backup; \
-             or repair it (redis-check-aof --fix on a copy); or, to boot from the snapshot \
-             instead, move {} aside and restart (the snapshot then loads and a new AOF is \
-             opened over it).",
+             or, to keep the records before the damage, truncate a copy at the byte offset \
+             named above (truncate -s <offset> <copy>) and boot from it; or, to boot from the \
+             snapshot instead, move {} aside and restart (the snapshot then loads and a new \
+             AOF is opened over it).",
             self.path.display(),
             self.error,
             FLAT_AOF_NAME
