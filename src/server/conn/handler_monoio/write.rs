@@ -951,6 +951,7 @@ pub(super) async fn try_handle_multi_exec(
                                     ctx.num_shards,
                                     &ctx.dispatch_tx,
                                     &ctx.spsc_notifiers,
+                                    ctx.aof_pool.as_ref(), // moon#1322
                                 )
                                 .await;
                                 // moon#1264: a FLUSHALL in the body saves.
@@ -1175,6 +1176,7 @@ pub(super) async fn try_handle_multi_exec(
                 ctx.num_shards,
                 &ctx.dispatch_tx,
                 &ctx.spsc_notifiers,
+                ctx.aof_pool.as_ref(), // moon#1322
             )
             .await;
             // moon#1264: with save points, a FLUSHALL in the body saves the

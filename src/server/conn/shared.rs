@@ -3216,6 +3216,7 @@ pub(crate) async fn finish_script_flush(
             db_index,
             &ctx.dispatch_tx,
             &ctx.spsc_notifiers,
+            ctx.aof_pool.as_ref(), // moon#1322
         )
         .await
     {
