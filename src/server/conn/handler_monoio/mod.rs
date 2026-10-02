@@ -1861,6 +1861,15 @@ async fn handle_connection_body<
                 &mut probe,
             );
             drop(probe);
+            // moon#1266 F2: an inline SET whose record went to a held lane
+            // after the policy gate: confirm it before any reply leaves. On a
+            // failed barrier close rather than send an unconfirmed `+OK`.
+            if crate::persistence::aof::held_reply::take_owed()
+                && let Some(pool) = ctx.aof_pool.as_ref()
+                && pool.fsync_barrier(ctx.shard_id).await.is_err()
+            {
+                break;
+            }
             // moon#1164: the inline path consumes from the front of `read_buf`
             // behind the codec's back, so the codec's resume cursor no longer
             // describes those bytes. (It can never describe a frame the inline
