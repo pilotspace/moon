@@ -37,6 +37,12 @@
 //! - `save` change-count rules: the auto-save task needs a hook into the
 //!   sharded write path that does not yet exist, so embedded mode logs a
 //!   warning and skips the timer instead of silently promising snapshots.
+//! - AOF rewrites (no auto-rewrite monitor, and the TopLevel writer has no
+//!   fold channels, so `BGREWRITEAOF` fails). In particular a replica cannot
+//!   publish a full sync's dataset to its own AOF (moon#1318, R2b round 3
+//!   F-E): after a promotion, a restart of an embedded node holds only its
+//!   pre-sync AOF plus the stream applied since. The replica task says so
+//!   at `REPLICAOF` (`replica_aof::warn_if_no_rewriter`).
 
 #![cfg(feature = "runtime-tokio")]
 
