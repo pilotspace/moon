@@ -55,7 +55,7 @@ pub async fn coordinate_multi_key(
     local_barrier_pending: &mut bool,
     _response_pool: &(), // placeholder — coordinator uses oneshot internally
 ) -> Frame {
-    if cmd.eq_ignore_ascii_case(b"MGET") {
+    let reply = if cmd.eq_ignore_ascii_case(b"MGET") {
         coordinate_mget(
             args,
             my_shard,
@@ -150,8 +150,14 @@ pub async fn coordinate_multi_key(
             _response_pool,
         )
         .await
-    }
+    };
+    // moon#1322: the remote legs' records are queued at their owners — confirm
+    // them (write, plus the fsync under `always`) before the reply leaves.
+    remote_barrier::confirm_multi_key(aof_pool, cmd, args, my_shard, num_shards, reply).await
 }
+
+// moon#1322: barrier the written remote shards of a coordinated write.
+pub(crate) mod remote_barrier;
 
 // ---------------------------------------------------------------------------
 // Shared legs for the BITOP / COPY coordinators
@@ -1344,6 +1350,7 @@ pub(crate) async fn coordinate_flush_broadcast(
     db_index: usize,
     dispatch_tx: &Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
     spsc_notifiers: &[Arc<channel::Notify>],
+    aof_pool: Option<&Arc<crate::persistence::aof::AofWriterPool>>,
 ) -> Result<(), Frame> {
     let mut pending = Vec::with_capacity(num_shards.saturating_sub(1));
     for target in 0..num_shards {
@@ -1389,6 +1396,18 @@ pub(crate) async fn coordinate_flush_broadcast(
         }
     }
     match failed {
+        // moon#1322: every leg flushed — confirm their records (write, plus
+        // the fsync under `always`) before the flush is acknowledged.
+        None if remote_barrier::barrier_needed(aof_pool, num_shards) => {
+            let targets: remote_barrier::Targets =
+                (0..num_shards).filter(|&t| t != skip_shard).collect();
+            match aof_pool {
+                Some(pool) => remote_barrier::barrier_targets(pool, &targets)
+                    .await
+                    .map_err(crate::persistence::aof::barrier_refusal_frame),
+                None => Ok(()),
+            }
+        }
         None => Ok(()),
         Some(target) => {
             tracing::error!(
@@ -1436,6 +1455,7 @@ pub(crate) async fn broadcast_txn_flushes(
     num_shards: usize,
     dispatch_tx: &Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
     spsc_notifiers: &[Arc<channel::Notify>],
+    aof_pool: Option<&Arc<crate::persistence::aof::AofWriterPool>>,
 ) {
     if exec_flushes.is_empty() || num_shards <= 1 {
         return;
@@ -1449,6 +1469,7 @@ pub(crate) async fn broadcast_txn_flushes(
             *db_index,
             dispatch_tx,
             spsc_notifiers,
+            aof_pool,
         )
         .await
             && let Frame::Array(items) = result

@@ -3042,6 +3042,7 @@ async fn handle_connection_body<S: tokio::io::AsyncRead + tokio::io::AsyncWrite 
                                             conn.selected_db,
                                             &ctx.dispatch_tx,
                                             &ctx.spsc_notifiers,
+                                            ctx.aof_pool.as_ref(), // moon#1322
                                         )
                                         .await
                                     {
