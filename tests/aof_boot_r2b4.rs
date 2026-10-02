@@ -7,6 +7,11 @@
 //!   The effect is now logged in chunks and the replay parser has no element
 //!   cap; the restart keeps the pop and the later write.
 //!
+//! - **F5** — a boot that failed after its AOF writers opened the files and
+//!   before the replay cut a torn tail appended `MOON.TS … CLOSE` behind the
+//!   torn bytes (every later boot then refused the file). A failed boot now
+//!   leaves the AOF as it found it.
+//!
 //! ```text
 //! MOON_BIN=<moon> cargo test --release --test aof_boot_r2b4 -- --include-ignored
 //! ```
@@ -113,4 +118,129 @@ fn a_huge_spop_replays_after_a_restart_1_shard() {
 #[ignore = "spawns moon; set MOON_BIN"]
 fn a_huge_spop_replays_after_a_restart_4_shards() {
     large_spop_survives_a_restart(4);
+}
+
+/// Every AOF file under `dir` (flat file, incr files), with its bytes.
+fn aof_files(dir: &Path) -> Vec<(std::path::PathBuf, Vec<u8>)> {
+    let mut out = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        for e in std::fs::read_dir(&d).into_iter().flatten().flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                stack.push(p);
+                continue;
+            }
+            let name = p.file_name().unwrap().to_string_lossy().to_string();
+            if name == "appendonly.aof" || name.ends_with(".incr.aof") {
+                let b = std::fs::read(&p).unwrap();
+                out.push((p, b));
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// Boot `dir` expecting a refusal: the exit code.
+fn refused(dir: &Path, shards: usize) -> Option<i32> {
+    let mut child = Command::new(common::find_moon_binary())
+        .args(["--port", &common::reserve_port().to_string(), "--dir"])
+        .arg(dir)
+        .args([
+            "--shards",
+            &shards.to_string(),
+            "--disk-free-min-pct",
+            "0",
+            "--appendonly",
+            "yes",
+        ])
+        .env("MOON_DISK_FREE_MIN_PCT", "0")
+        .stdout(Stdio::null())
+        .stderr(common::server_stderr(dir))
+        .spawn()
+        .expect("spawn moon");
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        if let Some(s) = child.try_wait().unwrap() {
+            return s.code();
+        }
+        if Instant::now() >= deadline {
+            common::sigkill(&mut child);
+            panic!("moon booted (or hung) on {}", dir.display());
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// F5: a boot that fails after its writers opened the AOF, and before the
+/// replay cut the torn tail (here: an unprovable cold file-id seed), used to
+/// append `MOON.TS … CLOSE` behind the torn bytes — every later boot then
+/// refused the file as mid-file corruption. Now the failed boot leaves the
+/// AOF as it found it, and the next good boot cuts the tail and keeps the
+/// later writes.
+fn failed_boot_appends_nothing(shards: usize) {
+    let dir = common::unique_test_dir(&format!("r2b4-f5-s{shards}"));
+    let (mut srv, port) = boot(&dir, shards);
+    let mut c = ready(port);
+    for i in 0..10 {
+        assert_eq!(c.send(&["SET", &format!("k{i}"), "v"]), "+OK\r\n");
+    }
+    drop(c);
+    srv.kill_now();
+    let (path, _) = aof_files(&dir)
+        .into_iter()
+        .find(|(_, b)| b.windows(2).any(|w| w == b"k9"))
+        .expect("the AOF that holds k9");
+    use std::io::Write as _;
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap()
+        .write_all(b"*3\r\n$3\r\nSE")
+        .unwrap();
+    // An unprovable cold file-id seed: shard-0/data is a regular file.
+    let data = dir.join("shard-0").join("data");
+    let aside = dir.join("shard-0").join("data.aside");
+    if data.exists() {
+        std::fs::rename(&data, &aside).unwrap();
+    }
+    std::fs::write(&data, b"not a directory").unwrap();
+    let before = aof_files(&dir);
+    let code = refused(&dir, shards);
+    assert_ne!(code, Some(0), "s{shards}: the boot failed");
+    assert_eq!(
+        aof_files(&dir),
+        before,
+        "s{shards}: the failed boot appended nothing to the AOF"
+    );
+    std::fs::remove_file(&data).unwrap();
+    if aside.exists() {
+        std::fs::rename(&aside, &data).unwrap();
+    }
+    let (mut srv, port) = boot(&dir, shards);
+    let mut c = ready(port);
+    assert_eq!(c.send(&["DBSIZE"]), ":10\r\n", "s{shards}");
+    assert_eq!(c.send(&["SET", "after", "1"]), "+OK\r\n");
+    drop(c);
+    srv.kill_now();
+    let (mut srv, port) = boot(&dir, shards);
+    let mut c = ready(port);
+    assert_eq!(c.send(&["GET", "after"]), "$1\r\n1\r\n", "s{shards}");
+    assert_eq!(c.send(&["DBSIZE"]), ":11\r\n", "s{shards}");
+    drop(c);
+    srv.kill_now();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+#[ignore = "spawns moon; set MOON_BIN"]
+fn a_failed_boot_leaves_a_torn_aof_as_it_found_it_1_shard() {
+    failed_boot_appends_nothing(1);
+}
+
+#[test]
+#[ignore = "spawns moon; set MOON_BIN"]
+fn a_failed_boot_leaves_a_torn_aof_as_it_found_it_4_shards() {
+    failed_boot_appends_nothing(4);
 }
