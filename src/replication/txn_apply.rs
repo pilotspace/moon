@@ -106,6 +106,9 @@ pub(crate) fn roll_back_open() {
         tracing::warn!(
             "replica: {n} transaction(s) of the former master never ended -- rolled back"
         );
+        // R2b round 2 R1: the AOF still holds their open blocks; a rewrite
+        // replaces them with the rolled-back keyspace.
+        crate::replication::replica_aof::after_promotion_rollback(n);
     }
 }
 

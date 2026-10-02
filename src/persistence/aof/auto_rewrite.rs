@@ -300,6 +300,18 @@ pub fn next_trigger(
 /// Dispatches through [`crate::command::persistence::bgrewriteaof_start_sharded`],
 /// the exact entry the `BGREWRITEAOF` command uses — CAS on the in-progress
 /// flag, per-shard fan-out vs TopLevel routing, and error mapping included.
+/// A rewrite some part of the server asked for (R2b round 2 R1: a replica's
+/// full sync whose rewrite could not start at once, a promotion that rolled
+/// back an open master transaction). The monitor treats it like the boot's
+/// forced rewrite: dispatched on the first tick nothing is busy, retried
+/// until one completes. Without an AOF there is no monitor and no-op.
+static REWRITE_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+/// Ask the monitor for one AOF rewrite (see [`REWRITE_REQUESTED`]).
+pub fn request_rewrite() {
+    REWRITE_REQUESTED.store(true, Ordering::SeqCst);
+}
+
 pub fn spawn_monitor(
     pool: Arc<super::AofWriterPool>,
     shard_databases: Arc<crate::shard::shared_databases::ShardDatabases>,
@@ -347,6 +359,7 @@ fn monitor_loop(
 
         let in_progress = AOF_REWRITE_IN_PROGRESS.load(Ordering::SeqCst);
         let current = refresh_current_size();
+        forced_pending |= REWRITE_REQUESTED.swap(false, Ordering::SeqCst);
 
         // A rewrite completed since the last tick (ours or a manual
         // BGREWRITEAOF): the compacted size is the new growth baseline.
@@ -398,8 +411,9 @@ fn monitor_loop(
 
         match trigger {
             RewriteTrigger::Forced => info!(
-                "aof-auto-rewrite: triggering the one boot-time BGREWRITEAOF so the AOF \
-                 opens with its MOON.COLDCUT (moon#914; current={} bytes)",
+                "aof-auto-rewrite: triggering a required BGREWRITEAOF (the boot-time moon#914 \
+                 repair, or a replica's synced dataset / rolled-back transaction; \
+                 current={} bytes)",
                 current
             ),
             RewriteTrigger::Growth => info!(
@@ -496,20 +510,21 @@ fn monitor_loop(
 fn finish_forced_rewrite(still_running: bool, last_ok: bool) -> bool {
     if still_running {
         warn!(
-            "aof-auto-rewrite: the boot-time moon#914 rewrite is still running after the \
-             monitor's wait; not re-dispatching. If it fails, the next boot retries it"
+            "aof-auto-rewrite: the required rewrite is still running after the \
+             monitor's wait; not re-dispatching. If it fails, run BGREWRITEAOF (a \
+             boot-time moon#914 repair is retried at the next boot)"
         );
         false
     } else if last_ok {
         info!(
-            "aof-auto-rewrite: boot-time moon#914 rewrite complete; the AOF now opens with \
-             its MOON.COLDCUT and later boots replay it gated"
+            "aof-auto-rewrite: required rewrite complete; the AOF's new generation \
+             holds the whole dataset and opens with its MOON.COLDCUT"
         );
         false
     } else {
         warn!(
-            "aof-auto-rewrite: the boot-time moon#914 rewrite FAILED; the AOF still has no \
-             MOON.COLDCUT. Retrying in {:?}",
+            "aof-auto-rewrite: the required rewrite FAILED; the previous AOF \
+             generation stays. Retrying in {:?}",
             FAILED_DISPATCH_COOLDOWN
         );
         true

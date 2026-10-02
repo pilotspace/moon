@@ -132,6 +132,10 @@ pub struct ReplicaTaskConfig {
     /// without waking (tests that drive `apply_local` directly).
     pub blocking_registry:
         Option<std::rc::Rc<std::cell::RefCell<crate::blocking::BlockingRegistry>>>,
+    /// This node's AOF writers, so the replica's own AOF holds the synced
+    /// dataset and the applied stream (R2b round 2 R1, `replica_aof`).
+    /// `None` with `--appendonly no` (and in tests driving the task).
+    pub aof_pool: Option<Arc<crate::persistence::aof::AofWriterPool>>,
 }
 
 /// Entry point for the outbound replica task.
@@ -394,6 +398,12 @@ async fn run_handshake_and_stream(
                 }
             }
         }
+        // R2b round 2 R1 (redis `restartAOFAfterSYNC`): the synced dataset
+        // becomes the base of a new generation of this replica's own AOF.
+        crate::replication::replica_aof::after_full_sync(
+            cfg.aof_pool.as_ref(),
+            &cfg.shard_databases,
+        );
 
         // Enter streaming mode
         {
@@ -502,7 +512,11 @@ async fn stream_commands_read_loop(
                 &cfg.shard_databases,
                 cfg.blocking_registry.as_deref(),
             ) {
-                ApplyOutcome::Applied => {}
+                // R2b round 2 R1: logged to this replica's own AOF, right
+                // after the apply (no await between them).
+                ApplyOutcome::Applied => {
+                    crate::replication::replica_aof::log_applied(cfg.aof_pool.as_ref(), rc);
+                }
                 // Unified poison-record policy (task #48): a malformed
                 // record has already been logged + counted inside
                 // `apply_local`; drop the connection so the reconnect loop
@@ -810,6 +824,12 @@ async fn run_handshake_and_stream(
                 }
             }
         }
+        // R2b round 2 R1 (redis `restartAOFAfterSYNC`): the synced dataset
+        // becomes the base of a new generation of this replica's own AOF.
+        crate::replication::replica_aof::after_full_sync(
+            cfg.aof_pool.as_ref(),
+            &cfg.shard_databases,
+        );
 
         {
             let mut rs = cfg.repl_state.write();
@@ -927,7 +947,11 @@ async fn stream_commands_read_loop(
                 &cfg.shard_databases,
                 cfg.blocking_registry.as_deref(),
             ) {
-                ApplyOutcome::Applied => {}
+                // R2b round 2 R1: logged to this replica's own AOF, right
+                // after the apply (no await between them).
+                ApplyOutcome::Applied => {
+                    crate::replication::replica_aof::log_applied(cfg.aof_pool.as_ref(), rc);
+                }
                 // Unified poison-record policy (task #48): a malformed
                 // record has already been logged + counted inside
                 // `apply_local`; drop the connection so the reconnect loop
