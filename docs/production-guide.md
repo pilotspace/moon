@@ -105,7 +105,7 @@ All options are command-line flags. Run `moon --help` for the full list.
 | `--appendfilename` | `appendonly.aof` | AOF filename |
 | `--save` | *(none)* | RDB auto-save rules (e.g., `"3600 1 300 100"`) |
 | `--dir` | `.` | Directory for persistence files |
-| `--dbfilename` | `dump.rdb` | RDB snapshot filename |
+| `--dbfilename` | `dump.rdb` | Accepted for redis compatibility; the sharded server's snapshots are `<dir>/shard-<N>/shard-<N>.rrdshard` |
 
 ### Memory and Eviction
 
@@ -805,17 +805,25 @@ For datasets larger than a single node's memory or for high availability:
 
 ## Backup and Restore
 
-### RDB snapshot backup
+### Snapshot backup
+
+The sharded server writes one snapshot file per shard,
+`<dir>/shard-<N>/shard-<N>.rrdshard` — there is no `dump.rdb`
+(`--dbfilename` does not name it). Back up every shard's file, keeping the
+`shard-<N>/` directory names:
 
 ```bash
-# Trigger a background save
+# Trigger a background save, then wait until LASTSAVE moves past its old value
+before=$(redis-cli -p 6379 LASTSAVE)
 redis-cli -p 6379 BGSAVE
+while [ "$(redis-cli -p 6379 LASTSAVE)" = "$before" ]; do sleep 1; done
 
-# Wait for completion
-redis-cli -p 6379 LASTSAVE
-
-# Copy the dump file
-docker cp moon:/data/dump.rdb ./backup/dump.rdb
+# Copy each shard's snapshot file (SHARDS = the server's --shards)
+SHARDS=4
+for n in $(seq 0 $((SHARDS - 1))); do
+  mkdir -p ./backup/shard-$n
+  docker cp moon:/data/shard-$n/shard-$n.rrdshard ./backup/shard-$n/
+done
 ```
 
 ### AOF backup
@@ -841,10 +849,11 @@ means moving the AOF aside first, or the boot ignores the restored snapshot
 # Stop the server
 docker compose down
 
-# Restore a SNAPSHOT backup: move the AOF aside, then put the snapshot back
+# Restore a SNAPSHOT backup: move the AOF aside, then put each shard's
+# snapshot file back in its shard-N/ directory (same --shards as the backup)
 mv /var/lib/moon/appendonly.aof /var/lib/moon/appendonly.aof.before-restore 2>/dev/null
 mv /var/lib/moon/appendonlydir /var/lib/moon/appendonlydir.before-restore 2>/dev/null
-cp backup/dump.rdb /var/lib/moon/dump.rdb            # or the shard-N.rrdshard files
+cp -r backup/shard-* /var/lib/moon/                  # shard-0/shard-0.rrdshard, ...
 
 # OR restore an AOF backup (the whole persistence directory, AOF included)
 cp -a backup/data/. /var/lib/moon/
@@ -854,16 +863,25 @@ cp -a backup/data/. /var/lib/moon/
 docker compose up -d
 ```
 
-An `appendonly.aof` that cannot be read at all (for example a damaged RDB
-preamble) stops the boot with exit status 1 and a message naming the file;
-restore it from a backup, or move it aside to boot from the snapshot. A
-truncated tail is not an error: the valid prefix is replayed.
+This recipe was verified on both runtimes at `--shards 1` and `--shards 4`,
+restoring into the original directory and into an empty one: the restored
+server holds exactly the snapshot's keys.
+
+An AOF that cannot be read (a damaged RDB preamble, or corruption in the
+middle of the file) stops the boot with exit status 1 and a message naming
+the file and the byte offset; restore it from a backup, truncate a copy at
+that offset to keep the records before the damage, or move it aside to boot
+from the snapshot. A record torn by a crash at the end of the file is not an
+error: the complete records before it are replayed, and the torn bytes are
+cut off the file (saved next to it as `<file>.torn-<offset>`) before
+anything is appended, as redis does with `aof-load-truncated yes`.
 
 ### Automated backup with cron
 
 ```bash
 # /etc/cron.d/moon-backup
-0 */6 * * * root docker exec moon redis-cli BGSAVE && sleep 5 && docker cp moon:/data/dump.rdb /backup/moon/dump-$(date +\%Y\%m\%d-\%H\%M).rdb
+# (a 4-shard server; one shard-N/shard-N.rrdshard file per shard)
+0 */6 * * * root docker exec moon redis-cli BGSAVE && sleep 5 && d=/backup/moon/$(date +\%Y\%m\%d-\%H\%M) && for n in 0 1 2 3; do mkdir -p $d/shard-$n && docker cp moon:/data/shard-$n/shard-$n.rrdshard $d/shard-$n/; done
 ```
 
 ## Security Checklist
