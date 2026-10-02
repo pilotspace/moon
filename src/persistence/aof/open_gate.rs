@@ -9,15 +9,19 @@
 //! embedded instances in one process (different `--dir`s) never wait on each
 //! other's boot; an unheld path is open (every writer that no boot gates —
 //! the legacy listener, tests — opens at once).
+//!
+//! A boot that refuses to start stops ITS writer through the writer's own
+//! cancellation token (which [`wait_writer_open`] watches), joins it, then
+//! drops its guard. The refusal is that writer's alone (R2b round 4
+//! F-G-SHARE: a flag on the shared path entry stopped every instance's
+//! writer waiting on the path).
 
 use std::path::{Path, PathBuf};
 
-/// One gated path: how many boots hold it, and whether one refused to start
-/// (its writer must exit without opening the file).
+/// One gated path and how many boots hold it.
 struct Held {
     path: PathBuf,
     holders: usize,
-    refused: bool,
 }
 
 /// Gated paths (a path is open when absent). A `Vec`: a process holds one
@@ -32,7 +36,6 @@ pub fn hold_writer_open(path: &Path) -> OpenGateGuard {
         None => held.push(Held {
             path: path.to_path_buf(),
             holders: 1,
-            refused: false,
         }),
     }
     OpenGateGuard(path.to_path_buf())
@@ -43,28 +46,8 @@ pub fn is_open(path: &Path) -> bool {
     !HELD.lock().iter().any(|h| h.path == path && h.holders > 0)
 }
 
-/// Whether a boot holding `path`'s gate refused to start: its writer must
-/// exit without opening the file.
-pub fn is_refused(path: &Path) -> bool {
-    HELD.lock().iter().any(|h| h.path == path && h.refused)
-}
-
 /// Re-opens the gate when dropped — on every exit path of the boot.
 pub struct OpenGateGuard(PathBuf);
-
-impl OpenGateGuard {
-    /// The boot refused to start (R2b round 2 F1): the writer waiting on this
-    /// gate exits without opening — nor, at its stop, appending to — the file
-    /// the boot could not read. The caller joins the writer, THEN drops the
-    /// guard, which removes the gate (R2b round 3 F-G: the old `mem::forget`
-    /// leaked it, and a later instance on the same dir never opened its
-    /// writer).
-    pub fn refuse(&self) {
-        if let Some(h) = HELD.lock().iter_mut().find(|h| h.path == self.0) {
-            h.refused = true;
-        }
-    }
-}
 
 impl Drop for OpenGateGuard {
     fn drop(&mut self) {
@@ -79,14 +62,15 @@ impl Drop for OpenGateGuard {
 }
 
 /// Wait until no boot holds the gate of `path`. `false` when `cancel` fired
-/// first (the writer then exits without opening anything).
+/// first — the writer's shutdown, or its own boot refusing to start (the
+/// writer then exits without opening anything).
 #[cfg(feature = "runtime-tokio")]
 pub async fn wait_writer_open(
     path: &Path,
     cancel: &crate::runtime::cancel::CancellationToken,
 ) -> bool {
     while !is_open(path) {
-        if cancel.is_cancelled() || is_refused(path) {
+        if cancel.is_cancelled() {
             return false;
         }
         tokio::time::sleep(std::time::Duration::from_millis(2)).await;
@@ -114,24 +98,41 @@ mod tests {
         assert!(is_open(&a));
     }
 
-    /// R2b round 3 F-G: a refused boot's gate tells its writer to exit, and
-    /// dropping the guard afterwards leaves the path open for the next
-    /// instance (it used to stay held for the life of the process).
-    #[test]
-    fn a_refused_gate_stops_its_writer_and_is_released_on_drop() {
+    /// R2b round 3 F-G / round 4 F-G-SHARE: a refused boot stops its own
+    /// writer (its token) and nobody else's — another instance's writer
+    /// waiting on the same path keeps waiting, and opens once every guard is
+    /// dropped.
+    #[cfg(feature = "runtime-tokio")]
+    #[tokio::test]
+    async fn a_refusal_stops_only_the_refused_boots_writer() {
+        use crate::runtime::cancel::CancellationToken;
         let tmp = tempfile::tempdir().unwrap();
         let a = tmp.path().join("appendonly.aof");
-        let g = hold_writer_open(&a);
-        assert!(!is_refused(&a));
-        g.refuse();
-        assert!(is_refused(&a) && !is_open(&a));
-        drop(g);
+        let refused_boot = hold_writer_open(&a);
+        let other_boot = hold_writer_open(&a);
+        let refused_writer = CancellationToken::new();
+        let other_writer = CancellationToken::new();
+        refused_writer.cancel();
         assert!(
-            is_open(&a) && !is_refused(&a),
-            "the next instance opens its writer"
+            !wait_writer_open(&a, &refused_writer).await,
+            "the refused boot's writer exits without opening"
         );
-        let again = hold_writer_open(&a);
-        assert!(!is_refused(&a), "a new boot starts unrefused");
-        drop(again);
+        drop(refused_boot);
+        let waiting = {
+            let a = a.clone();
+            let other_writer = other_writer.clone();
+            tokio::spawn(async move { wait_writer_open(&a, &other_writer).await })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        assert!(
+            !waiting.is_finished(),
+            "the other instance's writer still waits"
+        );
+        drop(other_boot);
+        assert!(
+            waiting.await.unwrap(),
+            "and opens once its boot releases the gate"
+        );
+        assert!(is_open(&a), "nothing stays held");
     }
 }
