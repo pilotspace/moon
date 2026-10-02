@@ -52,6 +52,9 @@ pub async fn coordinate_multi_key(
     // under appendfsync=always. The connection handler MUST then issue ONE
     // `fsync_barrier(my_shard)` for the batch before acking the client, and
     // overwrite this command's response with AOF_FSYNC_ERR on barrier failure.
+    // R2b round 3 P1: whenever barriers are owed, the coordinator
+    // sends the local one alongside the remote ones, awaits all together, clears
+    // this flag (the reply is already confirmed).
     local_barrier_pending: &mut bool,
     _response_pool: &(), // placeholder — coordinator uses oneshot internally
 ) -> Frame {
@@ -153,7 +156,16 @@ pub async fn coordinate_multi_key(
     };
     // moon#1322: the remote legs' records are queued at their owners — confirm
     // them (write, plus the fsync under `always`) before the reply leaves.
-    remote_barrier::confirm_multi_key(aof_pool, cmd, args, my_shard, num_shards, reply).await
+    remote_barrier::confirm_multi_key(
+        aof_pool,
+        cmd,
+        args,
+        my_shard,
+        num_shards,
+        local_barrier_pending,
+        reply,
+    )
+    .await
 }
 
 // moon#1322: barrier the written remote shards of a coordinated write.

@@ -666,7 +666,7 @@ impl AofWriterPool {
     /// established `cluster::failover` pattern — monoio 0.2 has no
     /// `time::timeout`); tokio uses `tokio::time::timeout`. Both resolve the
     /// ack first if it arrives within the bound, otherwise `TimedOut`.
-    async fn await_ack(
+    pub(super) async fn await_ack(
         rx: crate::runtime::channel::OneshotReceiver<AofAck>,
         timeout: Duration,
     ) -> AckOutcome {
