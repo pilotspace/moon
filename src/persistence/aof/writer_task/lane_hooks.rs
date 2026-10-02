@@ -140,7 +140,10 @@ pub(super) fn offer(
         lane.unhold();
         return;
     }
-    if fsync == FsyncPolicy::Always || !lane.may_release(rx) {
+    if fsync == FsyncPolicy::Always
+        || !lane.may_release(rx)
+        || !crate::persistence::aof::lane_test_hook::offer_allowed()
+    {
         return;
     }
     match file.dup() {

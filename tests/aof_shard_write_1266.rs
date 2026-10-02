@@ -41,6 +41,17 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 fn start_moon(port: u16, dir: &std::path::Path, shards: usize, shard_write: &str) -> Child {
+    start_moon_env(port, dir, shards, shard_write, &[])
+}
+
+/// [`start_moon`] with extra environment (test hooks).
+fn start_moon_env(
+    port: u16,
+    dir: &std::path::Path,
+    shards: usize,
+    shard_write: &str,
+    env: &[(&str, &str)],
+) -> Child {
     Command::new(common::find_moon_binary())
         .args([
             "--port",
@@ -60,6 +71,7 @@ fn start_moon(port: u16, dir: &std::path::Path, shards: usize, shard_write: &str
         .arg(dir)
         .env("MOON_DISK_FREE_MIN_PCT", "0")
         .env("MOON_AOF_SHARD_WRITE", shard_write)
+        .envs(env.iter().copied())
         .stdout(Stdio::null())
         .stderr(common::server_stderr(dir))
         .spawn()
@@ -489,6 +501,13 @@ fn lost_after_restart(
     lost
 }
 
+/// R2b round 2 F3: the writers keep their append position this long after
+/// boot (`MOON_TEST_AOF_FIRST_OFFER_DELAY_MS`; `main` then skips its boot
+/// wait), so the boot test's pipelines provably meet HELD lanes — without
+/// the hook `main`'s `await_hand_over` had usually handed every lane over
+/// before the first client connected, and the test could not reach the hold.
+const BOOT_HOLD_MS: &str = "3000";
+
 /// The boot window: right after the first `PONG`s, 1 or `CONNS` connections each
 /// send a SET pipeline; kill -9 the instant one has all its acks. The writer
 /// may not have handed the append position over yet — the replies must
@@ -499,8 +518,15 @@ fn boot_window_kill_on_ack(shards: usize) {
     for conns in SHAPES {
         for rep in 0..KILL_REPS {
             let dir = tempfile::tempdir().expect("tempdir");
-            let (mut server, port) =
-                common::spawn_listening_guarded(|port| start_moon(port, dir.path(), shards, "1"));
+            let (mut server, port) = common::spawn_listening_guarded(|port| {
+                start_moon_env(
+                    port,
+                    dir.path(),
+                    shards,
+                    "1",
+                    &[("MOON_TEST_AOF_FIRST_OFFER_DELAY_MS", BOOT_HOLD_MS)],
+                )
+            });
             let streams = raw_conns(port, conns); // the server's first PONGs
             let acked = pipelines_then_kill_on_first_complete(&mut server, port, streams, "boot");
             let lost = lost_after_restart(dir.path(), shards, "boot", &acked);
