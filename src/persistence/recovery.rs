@@ -1008,7 +1008,7 @@ pub fn recover_shard_v3_pitr(
                      ({} non-KV command record(s) in the WAL: graph / cold-plane / unhandled)",
                     shard_id, aof_path, wal_non_kv_commands
                 );
-                match crate::persistence::aof::replay_aof(databases, &aof_path, engine) {
+                match crate::persistence::aof::replay_aof_at_boot(databases, &aof_path, engine) {
                     Ok(n) => {
                         result.commands_replayed += n;
                         aof_replayed = n > 0;

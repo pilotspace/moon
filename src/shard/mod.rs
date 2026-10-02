@@ -441,7 +441,8 @@ impl Shard {
             kv.note_unreplayed_logs(self.id, dir);
         } else if aof_path.exists() {
             let mut aof_replayed = false;
-            match crate::persistence::aof::replay_aof(
+            // R2b round 3 F-B: a torn tail is cut before the writer appends.
+            match crate::persistence::aof::replay_aof_at_boot(
                 &mut self.databases,
                 &aof_path,
                 &DispatchReplayEngine::new(),

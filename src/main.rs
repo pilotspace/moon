@@ -1696,7 +1696,7 @@ fn main() -> anyhow::Result<()> {
                         manifest,
                         &DispatchReplayEngine::new(),
                     )
-                    .with_context(|| "multi-part AOF replay failed")?;
+                    .unwrap_or_else(|e| refuse_damaged_aof("multi-part AOF replay failed", &e));
                     info!(
                         "AOF multi-part loaded (seq {}): {} entries",
                         manifest.seq, loaded
@@ -1766,7 +1766,7 @@ fn main() -> anyhow::Result<()> {
                         manifest,
                         &engine_factory,
                     )
-                    .with_context(|| "per-shard AOF replay failed")?
+                    .unwrap_or_else(|e| refuse_damaged_aof("per-shard AOF replay failed", &e))
                 };
 
                 // Step 5: merge-replay `OrderedAcrossShards`-tagged entries
@@ -2636,6 +2636,16 @@ pub fn should_warn_undersubscription(maxclients: usize, num_shards: usize) -> Op
 /// is EMFILE on the persistence path mid-flight.
 pub fn rlimit_reserved_fds(num_shards: usize) -> u64 {
     64 + (num_shards as u64) * 16
+}
+
+/// R2b round 3 F-B: a damaged AOF found by the manifest replay (monoio
+/// `--shards 1`, every `--shards N`). Exit at once, like the flat file's
+/// `UnreadableAof` refusal: returning `Err` from `main` ran the orderly
+/// writer shutdown, which appended its clean-close stamp behind the damage.
+fn refuse_damaged_aof(what: &str, e: &moon::error::MoonError) -> ! {
+    tracing::error!("refusing to start: {what}: {e}");
+    eprintln!("moon: refusing to start: {what}: {e}");
+    std::process::exit(1);
 }
 
 #[cfg(test)]

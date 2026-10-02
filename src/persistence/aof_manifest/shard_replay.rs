@@ -25,6 +25,8 @@ type ColdWiring = Vec<(
 /// silent cold no-ops, so a key deleted in the incr tail resurrects via cold
 /// read-through after restart (its manifest entry stays Active until the
 /// orphan sweep).
+use crate::persistence::aof::torn_tail::TornTail;
+
 fn take_cold_wiring(databases: &mut [crate::storage::Database]) -> ColdWiring {
     databases
         .iter_mut()
@@ -113,17 +115,51 @@ pub fn replay_multi_part(
                 crate::persistence::replay::clock::LogFormat::Resp,
             );
             // Pure RESP — no RDB preamble detection needed.
-            let count = replay_incr_resp(databases, file, engine)?;
+            let (count, torn) =
+                replay_incr_resp(databases, file, engine).map_err(|e| in_file(&incr_path, e))?;
             info!(
                 "AOF incr replayed: {} commands from {}",
                 count,
                 incr_path.display()
             );
             total += count;
+            // R2b round 3 F-B: the writer appends to this incr — cut a torn
+            // tail first, or it swallows every later record.
+            cut_torn_tail(&incr_path, torn)?;
         }
     }
 
     Ok(total)
+}
+
+/// `e`, naming the incr file it was read from and the boot's options.
+fn in_file(path: &std::path::Path, e: crate::error::MoonError) -> crate::error::MoonError {
+    crate::error::MoonError::from(crate::error::AofError::RewriteFailed {
+        detail: format!(
+            "{}: {e}. The boot refuses a damaged AOF rather than serve a partial dataset and \
+             append behind the damage: restore appendonlydir/ from a backup, or truncate a \
+             copy of the file at the offset named above and boot from it",
+            path.display()
+        ),
+    })
+}
+
+/// Cut the torn tail a replay of `path` reported ([`crate::persistence::aof::torn_tail`]).
+fn cut_torn_tail(
+    path: &std::path::Path,
+    torn: Option<crate::persistence::aof::torn_tail::TornTail>,
+) -> Result<(), crate::error::MoonError> {
+    let Some(tail) = torn else {
+        return Ok(());
+    };
+    crate::persistence::aof::torn_tail::cut_at_boot(path, tail)
+        .map(|_| ())
+        .map_err(|detail| {
+            crate::error::MoonError::from(crate::error::AofError::Corrupted {
+                offset: tail.offset,
+                detail,
+            })
+        })
 }
 
 /// Replay pure RESP commands from `src`, streamed through the bounded
@@ -141,7 +177,7 @@ fn replay_incr_resp(
     databases: &mut [crate::storage::Database],
     src: impl std::io::Read,
     engine: &dyn crate::persistence::replay::CommandReplayEngine,
-) -> Result<usize, crate::error::MoonError> {
+) -> Result<(usize, Option<TornTail>), crate::error::MoonError> {
     let replayed = replay_incr_resp_records(databases, src, engine);
     // moon#1300: the end of the incr — roll back a `MOON.TXN` block a crash
     // cut (on an error too: the engine must not carry it further).
@@ -154,13 +190,14 @@ fn replay_incr_resp_records(
     databases: &mut [crate::storage::Database],
     src: impl std::io::Read,
     engine: &dyn crate::persistence::replay::CommandReplayEngine,
-) -> Result<usize, crate::error::MoonError> {
+) -> Result<(usize, Option<TornTail>), crate::error::MoonError> {
     use crate::persistence::replay::chunks::{ReplayChunks, ReplayNext};
     use crate::protocol::Frame;
 
     let mut chunks = ReplayChunks::new(src, 0);
     let mut selected_db: usize = 0;
     let mut count: usize = 0;
+    let mut torn = None;
 
     loop {
         match chunks.next_frame()? {
@@ -208,6 +245,10 @@ fn replay_incr_resp_records(
                     "AOF incr truncated tail: {} bytes at offset {} (treating as crash-time EOF)",
                     len, offset
                 );
+                torn = Some(TornTail {
+                    offset,
+                    len: len as u64,
+                });
                 break;
             }
             ReplayNext::Corrupt { offset, err } => {
@@ -220,7 +261,7 @@ fn replay_incr_resp_records(
         }
     }
 
-    Ok(count)
+    Ok((count, torn))
 }
 
 /// An entry that was tagged `OrderedAcrossShards` (RFC § 2 Rule 2) and
@@ -266,7 +307,7 @@ fn replay_incr_framed(
     data: &[u8],
     engine: &dyn crate::persistence::replay::CommandReplayEngine,
     ordered_buf: &mut Vec<OrderedEntry>,
-) -> Result<(usize, u64), crate::error::MoonError> {
+) -> Result<(usize, u64, Option<TornTail>), crate::error::MoonError> {
     let replayed = replay_incr_framed_records(shard_id, databases, data, engine, ordered_buf);
     // moon#1300: the end of the incr — see `replay_incr_resp`.
     engine.finish_log(databases);
@@ -280,7 +321,7 @@ fn replay_incr_framed_records(
     data: &[u8],
     engine: &dyn crate::persistence::replay::CommandReplayEngine,
     ordered_buf: &mut Vec<OrderedEntry>,
-) -> Result<(usize, u64), crate::error::MoonError> {
+) -> Result<(usize, u64, Option<TornTail>), crate::error::MoonError> {
     use crate::protocol::{Frame, ParseConfig, parse};
     use bytes::BytesMut;
 
@@ -292,6 +333,7 @@ fn replay_incr_framed_records(
     let mut selected_db: usize = 0;
     let mut count: usize = 0;
     let mut max_lsn: u64 = 0;
+    let mut torn = None;
 
     while offset < total_len {
         if total_len - offset < HEADER_LEN {
@@ -300,6 +342,10 @@ fn replay_incr_framed_records(
                 total_len - offset,
                 offset
             );
+            torn = Some(TornTail {
+                offset: offset as u64,
+                len: (total_len - offset) as u64,
+            });
             break;
         }
         // SAFETY: line 1491 guarantees `total_len - offset >= HEADER_LEN` (=12),
@@ -320,6 +366,10 @@ fn replay_incr_framed_records(
                 len,
                 total_len - payload_start
             );
+            torn = Some(TornTail {
+                offset: offset as u64,
+                len: (total_len - offset) as u64,
+            });
             break;
         }
 
@@ -355,6 +405,20 @@ fn replay_incr_framed_records(
             continue;
         }
 
+        // R2b round 3 F-B: a record is a RESP array; anything else is
+        // corruption (the parser's inline fallback would take it for a
+        // command).
+        if data[payload_start] != b'*' {
+            return Err(crate::error::MoonError::from(
+                crate::error::AofError::RewriteFailed {
+                    detail: format!(
+                        "AOF incr framed payload at offset {} (lsn {}, len {}) does not open \
+                         with '*' (found {:#04x}); corrupt entry",
+                        offset, lsn, len, data[payload_start]
+                    ),
+                },
+            ));
+        }
         // Parse RESP from the payload slice. A standalone slice ensures one
         // header maps to exactly one command — no implicit pipelining across
         // headers.
@@ -433,7 +497,7 @@ fn replay_incr_framed_records(
         offset = payload_end;
     }
 
-    Ok((count, max_lsn))
+    Ok((count, max_lsn, torn))
 }
 
 /// Replay a PerShard multi-part AOF into N parallel `Vec<Database>` buffers.
@@ -574,13 +638,18 @@ pub fn replay_per_shard(
                             &incr_path,
                             crate::persistence::replay::clock::LogFormat::Framed,
                         );
-                        let (count, max_lsn) = replay_incr_framed(
+                        let (count, max_lsn, torn) = replay_incr_framed(
                             sid,
                             *databases,
                             &data,
                             engine.as_ref(),
                             &mut shard_ordered,
-                        )?;
+                        )
+                        .map_err(|e| in_file(&incr_path, e))?;
+                        drop(data);
+                        // R2b round 3 F-B: cut a torn tail before this
+                        // shard's writer appends behind it.
+                        cut_torn_tail(&incr_path, torn)?;
                         info!(
                             "AOF shard-{} incr replayed: {} commands from {} (max lsn {})",
                             sid,
@@ -836,7 +905,7 @@ mod tests {
         let mut dbs: Vec<crate::storage::Database> = vec![crate::storage::Database::new()];
         let engine = RecordingEngine::new();
         let mut ordered: Vec<OrderedEntry> = Vec::new();
-        let (count, max_lsn) =
+        let (count, max_lsn, _) =
             replay_incr_framed(0, &mut dbs, &bytes, &engine, &mut ordered).expect("framed replay");
         assert!(ordered.is_empty(), "no ordered entries in this stream");
 
@@ -866,7 +935,7 @@ mod tests {
         let mut dbs: Vec<crate::storage::Database> = vec![crate::storage::Database::new()];
         let engine = RecordingEngine::new();
         let mut ordered: Vec<OrderedEntry> = Vec::new();
-        let (_count, max_lsn) =
+        let (_count, max_lsn, _) =
             replay_incr_framed(0, &mut dbs, &bytes, &engine, &mut ordered).expect("framed replay");
 
         // Last entry: start 114 + len 16 = 130. The next write MUST get >= 130.
@@ -890,7 +959,7 @@ mod tests {
         let mut dbs: Vec<crate::storage::Database> = vec![crate::storage::Database::new()];
         let engine = RecordingEngine::new();
         let mut ordered: Vec<OrderedEntry> = Vec::new();
-        let (count, max_lsn) = replay_incr_framed(0, &mut dbs, &bytes, &engine, &mut ordered)
+        let (count, max_lsn, _) = replay_incr_framed(0, &mut dbs, &bytes, &engine, &mut ordered)
             .expect("zero-length record must not be treated as corruption");
 
         assert_eq!(count, 2, "both real commands replay; barrier is skipped");
@@ -908,10 +977,12 @@ mod tests {
         let mut dbs: Vec<crate::storage::Database> = vec![crate::storage::Database::new()];
         let engine = RecordingEngine::new();
         let mut ordered: Vec<OrderedEntry> = Vec::new();
-        let (count, max_lsn) = replay_incr_framed(0, &mut dbs, &bytes, &engine, &mut ordered)
+        let (count, max_lsn, torn) = replay_incr_framed(0, &mut dbs, &bytes, &engine, &mut ordered)
             .expect("truncated-header is EOF");
 
         assert_eq!(count, 1);
+        // R2b round 3 F-B: reported, so the boot cuts it.
+        assert_eq!(torn, Some(TornTail { offset: 26, len: 5 }));
         // F5: next-free offset = PING entry start 3 + RESP len 14 = 17.
         assert_eq!(max_lsn, 17);
     }
@@ -927,10 +998,11 @@ mod tests {
         let mut dbs: Vec<crate::storage::Database> = vec![crate::storage::Database::new()];
         let engine = RecordingEngine::new();
         let mut ordered: Vec<OrderedEntry> = Vec::new();
-        let (count, max_lsn) = replay_incr_framed(0, &mut dbs, &bytes, &engine, &mut ordered)
+        let (count, max_lsn, torn) = replay_incr_framed(0, &mut dbs, &bytes, &engine, &mut ordered)
             .expect("truncated-payload is EOF");
 
         assert_eq!(count, 0);
+        assert_eq!(torn, Some(TornTail { offset: 0, len: 17 }));
         assert_eq!(max_lsn, 0);
     }
 
@@ -997,6 +1069,83 @@ mod tests {
         assert!(shard0[0].len() >= 1, "shard 0 has k0");
         assert!(shard1[0].len() >= 1, "shard 1 has k1");
 
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// R2b round 3 F-B: a torn framed record at the end of a shard's incr
+    /// is cut before that shard's writer appends; a later append replays.
+    /// The single-shard RESP incr is cut the same way (`replay_multi_part`).
+    #[test]
+    fn a_torn_incr_tail_is_cut_so_the_next_append_replays() {
+        let dir = temp_dir();
+        let manifest = AofManifest::initialize_multi(&dir, 2).expect("initialize_multi 2 shards");
+        let set_k0 = frame_entry(10, b"*3\r\n$3\r\nSET\r\n$2\r\nk0\r\n$2\r\nv0\r\n");
+        let mut torn = set_k0.clone();
+        // A header declaring 400 bytes, 7 of them written.
+        torn.extend_from_slice(&39u64.to_le_bytes());
+        torn.extend_from_slice(&400u32.to_le_bytes());
+        torn.extend_from_slice(b"*3\r\n$3\r");
+        fs::write(manifest.shard_incr_path(0), &torn).expect("write shard-0 incr");
+        fs::write(manifest.shard_incr_path(1), b"").expect("write shard-1 incr");
+        let engine = || {
+            Box::new(crate::persistence::replay::DispatchReplayEngine::new())
+                as Box<dyn crate::persistence::replay::CommandReplayEngine + Send>
+        };
+        let replay = |manifest: &AofManifest| {
+            let mut shard0 = vec![crate::storage::Database::new()];
+            let mut shard1 = vec![crate::storage::Database::new()];
+            {
+                let mut slices: Vec<&mut [crate::storage::Database]> =
+                    vec![&mut shard0, &mut shard1];
+                replay_per_shard(&mut slices, manifest, &engine).expect("per-shard replay");
+            }
+            shard0
+        };
+        replay(&manifest);
+        assert_eq!(
+            fs::read(manifest.shard_incr_path(0)).unwrap(),
+            set_k0,
+            "cut at the torn record"
+        );
+        let mut later = fs::OpenOptions::new()
+            .append(true)
+            .open(manifest.shard_incr_path(0))
+            .unwrap();
+        std::io::Write::write_all(
+            &mut later,
+            &frame_entry(39, b"*3\r\n$3\r\nSET\r\n$2\r\nk9\r\n$2\r\nv9\r\n"),
+        )
+        .unwrap();
+        drop(later);
+        let mut shard0 = replay(&manifest);
+        assert!(shard0[0].get(b"k9").is_some(), "the later append replays");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Mid-stream corruption of an incr names the file and refuses.
+    #[test]
+    fn a_corrupt_incr_names_its_file() {
+        let dir = temp_dir();
+        let manifest = AofManifest::initialize_multi(&dir, 2).expect("initialize_multi");
+        let mut bytes = frame_entry(1, b"XXXX");
+        bytes.extend_from_slice(&frame_entry(5, b"*1\r\n$4\r\nPING\r\n"));
+        fs::write(manifest.shard_incr_path(0), &bytes).unwrap();
+        let mut shard0 = vec![crate::storage::Database::new()];
+        let mut shard1 = vec![crate::storage::Database::new()];
+        let mut slices: Vec<&mut [crate::storage::Database]> = vec![&mut shard0, &mut shard1];
+        let err = replay_per_shard(
+            &mut slices,
+            &manifest,
+            &(|| {
+                Box::new(crate::persistence::replay::DispatchReplayEngine::new())
+                    as Box<dyn crate::persistence::replay::CommandReplayEngine + Send>
+            }),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("shard-0"), "{err}");
+        assert!(err.contains("refuses a damaged AOF"), "{err}");
+        assert_eq!(fs::read(manifest.shard_incr_path(0)).unwrap(), bytes);
         fs::remove_dir_all(&dir).ok();
     }
 
@@ -1123,7 +1272,7 @@ mod tests {
         let mut dbs: Vec<crate::storage::Database> = vec![crate::storage::Database::new()];
         let engine = RecordingEngine::new();
         let mut ordered: Vec<OrderedEntry> = Vec::new();
-        let (count, max_lsn) = replay_incr_framed(3, &mut dbs, &bytes, &engine, &mut ordered)
+        let (count, max_lsn, _) = replay_incr_framed(3, &mut dbs, &bytes, &engine, &mut ordered)
             .expect("framed replay with ordered");
 
         assert_eq!(count, 2, "two inline entries dispatched (PING, DBSIZE)");
