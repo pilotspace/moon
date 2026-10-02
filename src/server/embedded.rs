@@ -139,6 +139,23 @@ pub async fn run_embedded(
     }
     let num_shards = config.shards;
 
+    // R2b round 4 F7: the binary's AOF layout refusals, before recovery and
+    // before the writer opens anything. The embedded server replays only the
+    // single-file AOF (never a manifest), so it is the tokio --shards 1 case
+    // whatever the runtime.
+    if config.appendonly == "yes" {
+        let dir = std::path::Path::new(&config.dir);
+        let manifest = crate::persistence::aof_manifest::AofManifest::load(dir)
+            .ok()
+            .flatten()
+            .map(|m| m.layout);
+        if let Some(msg) =
+            aof::layout_guard::refusal(dir, num_shards, manifest, false, &config.appendfilename)
+        {
+            anyhow::bail!("embedded moon: refusing to start: {msg}");
+        }
+    }
+
     info!(
         "embedded moon: starting with {} shard(s) on {}:{}",
         num_shards, config.bind, config.port
