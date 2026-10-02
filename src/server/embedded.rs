@@ -308,6 +308,16 @@ pub async fn run_embedded(
         })
         .collect();
 
+    // R2b round 2 F1: an `appendonly.aof` that is the only KV source and
+    // could not be replayed — refuse to start, and keep the writer from ever
+    // opening the file (it exits at cancellation, unopened).
+    if let Some(refusal) = shards.iter().find_map(|s| s.aof_unreadable.clone()) {
+        if let Some(gate) = fresh_aof_gate {
+            gate.keep_closed();
+        }
+        anyhow::bail!("embedded moon: {}", refusal.message());
+    }
+
     // moon#997 / moon#893: the cold file_id startup gate — same rule as
     // main.rs. An unprovable seed is refused, never guessed.
     for shard in &mut shards {
