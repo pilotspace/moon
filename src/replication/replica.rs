@@ -71,6 +71,16 @@ fn superseded(epoch: u64) -> bool {
     REPLICA_TASK_EPOCH.load(Ordering::Acquire) != epoch
 }
 
+/// `Err` when the task holding `epoch` was superseded (`at` names the step):
+/// called after an await, before the replication state or the keyspace is
+/// touched, with no await in between (R2b round 4 PROMO-RDB).
+fn ensure_live(epoch: u64, at: &str) -> anyhow::Result<()> {
+    if superseded(epoch) {
+        anyhow::bail!("replica task superseded {at}");
+    }
+    Ok(())
+}
+
 /// The reply for any command that would turn a multi-shard node into a
 /// replica (`REPLICAOF host port`, `SLAVEOF host port`, `CLUSTER REPLICATE`).
 ///
@@ -285,6 +295,11 @@ async fn run_handshake_and_stream(
         }};
     }
 
+    // R2b round 4 PROMO-RDB: every await of this handshake can outlive the
+    // task's generation (`REPLICAOF NO ONE`, a new target). Each mutation of
+    // the replication state or the keyspace below is preceded by a
+    // generation check with no await in between ([`ensure_live`]).
+    ensure_live(cfg.epoch, "before the handshake")?;
     // Step 1: PING
     {
         let mut rs = cfg.repl_state.write();
@@ -316,6 +331,7 @@ async fn run_handshake_and_stream(
     let _ = read_line(&mut stream).await?; // +OK
 
     // Step 4: PSYNC <repl_id> <offset>
+    ensure_live(cfg.epoch, "during the handshake")?;
     let (repl_id, offset) = {
         let rs = cfg.repl_state.read();
         let offset = rs.master_repl_offset.load(Ordering::Relaxed);
@@ -345,6 +361,9 @@ async fn run_handshake_and_stream(
 
     // Step 5: Parse master response
     let response = read_line(&mut stream).await?;
+    // A node promoted (or re-pointed) while this reply was in flight must
+    // keep its own replication id and offset.
+    ensure_live(cfg.epoch, "before its PSYNC reply was applied")?;
     if response.starts_with(b"+FULLRESYNC") {
         // Parse: +FULLRESYNC <repl_id> <offset>
         let parts: Vec<&[u8]> = response[1..].splitn(3, |&b| b == b' ').collect();
@@ -383,11 +402,13 @@ async fn run_handshake_and_stream(
         // bulk and we load it into this thread's ShardSlice. `load_snapshot`
         // clears existing state first (full resync = authoritative). Multi-shard
         // replicas (merged-RDB load) are R2.
-        if superseded(cfg.epoch) {
-            anyhow::bail!("replica task superseded before snapshot load");
-        }
         for shard_id in 0..cfg.num_shards {
             let rdb_bytes = read_rdb_bulk(&mut stream).await?;
+            // The transfer can take minutes: a `REPLICAOF NO ONE` meanwhile
+            // promoted this node, which may have acknowledged local writes
+            // since — the old master's snapshot must not replace them (nor a
+            // new target's data). No await between this check and the load.
+            ensure_live(cfg.epoch, "during the snapshot transfer; not loading it")?;
             crate::replication::txn_apply::discard_logged(cfg.aof_pool.as_ref());
             match crate::replication::apply::load_snapshot(&rdb_bytes, &cfg.shard_databases) {
                 Ok(keys) => info!(
@@ -734,6 +755,11 @@ async fn run_handshake_and_stream(
         }};
     }
 
+    // R2b round 4 PROMO-RDB: every await of this handshake can outlive the
+    // task's generation (`REPLICAOF NO ONE`, a new target). Each mutation of
+    // the replication state or the keyspace below is preceded by a
+    // generation check with no await in between ([`ensure_live`]).
+    ensure_live(cfg.epoch, "before the handshake")?;
     // Step 1: PING
     {
         let mut rs = cfg.repl_state.write();
@@ -765,6 +791,7 @@ async fn run_handshake_and_stream(
     let _ = read_line(&mut stream).await?;
 
     // Step 4: PSYNC <repl_id> <offset>
+    ensure_live(cfg.epoch, "during the handshake")?;
     let (repl_id, offset) = {
         let rs = cfg.repl_state.read();
         let offset = rs.master_repl_offset.load(Ordering::Relaxed);
@@ -794,6 +821,9 @@ async fn run_handshake_and_stream(
 
     // Step 5: Parse master response
     let response = read_line(&mut stream).await?;
+    // A node promoted (or re-pointed) while this reply was in flight must
+    // keep its own replication id and offset.
+    ensure_live(cfg.epoch, "before its PSYNC reply was applied")?;
     if response.starts_with(b"+FULLRESYNC") {
         let parts: Vec<&[u8]> = response[1..].splitn(3, |&b| b == b' ').collect();
         if parts.len() >= 3 {
@@ -826,11 +856,13 @@ async fn run_handshake_and_stream(
         // R0 = single-shard: the master sends one diskless RDB bulk, loaded into
         // this thread's ShardSlice (clears existing state first — full resync is
         // authoritative). Multi-shard merged-RDB load is R2.
-        if superseded(cfg.epoch) {
-            anyhow::bail!("replica task superseded before snapshot load");
-        }
         for shard_id in 0..cfg.num_shards {
             let rdb_bytes = read_rdb_bulk(&mut stream).await?;
+            // The transfer can take minutes: a `REPLICAOF NO ONE` meanwhile
+            // promoted this node, which may have acknowledged local writes
+            // since — the old master's snapshot must not replace them (nor a
+            // new target's data). No await between this check and the load.
+            ensure_live(cfg.epoch, "during the snapshot transfer; not loading it")?;
             crate::replication::txn_apply::discard_logged(cfg.aof_pool.as_ref());
             match crate::replication::apply::load_snapshot(&rdb_bytes, &cfg.shard_databases) {
                 Ok(keys) => info!(
