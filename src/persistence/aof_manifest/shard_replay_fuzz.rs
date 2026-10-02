@@ -23,7 +23,7 @@ pub fn replay_framed(
     engine: &dyn CommandReplayEngine,
 ) -> Option<usize> {
     let mut ordered = Vec::new();
-    let (count, _max_lsn) =
+    let (count, _max_lsn, _torn) =
         super::replay_incr_framed(0, databases, data, engine, &mut ordered).ok()?;
     let mut per_shard: [&mut [Database]; 1] = [databases];
     let _ = super::replay_ordered_merge(&mut per_shard, ordered, engine);
@@ -37,7 +37,9 @@ pub fn replay_resp(
     data: &[u8],
     engine: &dyn CommandReplayEngine,
 ) -> Option<usize> {
-    super::replay_incr_resp(databases, data, engine).ok()
+    super::replay_incr_resp(databases, data, engine)
+        .ok()
+        .map(|(n, _)| n)
 }
 
 /// Replay the framed per-shard incr at `path` as `replay_per_shard` does:
@@ -64,7 +66,9 @@ pub fn replay_resp_file(
     use crate::persistence::replay::clock::{LogFormat, pin_replay_clock_to_log};
     let file = std::fs::File::open(path).ok()?;
     let _clock = pin_replay_clock_to_log(path, LogFormat::Resp);
-    super::replay_incr_resp(databases, file, engine).ok()
+    super::replay_incr_resp(databases, file, engine)
+        .ok()
+        .map(|(n, _)| n)
 }
 
 /// A stable-toolchain smoke run of the fuzz target's contract (the libFuzzer
