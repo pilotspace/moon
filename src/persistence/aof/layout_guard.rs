@@ -18,6 +18,13 @@
 //!   A flat file that holds no data — a fresh tokio generation's head alone
 //!   (`MOON.COLDCUT`, its dead-slot DELs, clock stamps) — is not refused: the
 //!   multi-shard boot retires it (R2b round 2 F2).
+//! - **R2b round 4 F6:** a dir with BOTH a manifest and a flat file holding
+//!   data (left by the pre-fix F-H bug: a stale monoio manifest and a newer
+//!   tokio flat file) was refused with "boot it with the monoio build" —
+//!   whose boot retires the flat file and its writes. Neither layout may be
+//!   picked silently: the refusal says both hold data and how to recover.
+//!   The F-H refusal names only a single-shard (TopLevel) manifest (F8: a
+//!   per-shard one gets the shard-count refusal instead).
 //! - **moon#1321 (other half):** `--appendfilename` with the tokio flat
 //!   layout: the writer appended to the named file, recovery replayed only
 //!   `appendonly.aof` — every write was lost at the next boot (DBSIZE 0).
@@ -25,21 +32,41 @@
 use std::path::Path;
 
 use super::flat_file::{FLAT_AOF_NAME, flat_aof_path};
+use crate::persistence::aof_manifest::AofLayout;
 
-/// Why this boot must not start, or `None`. `has_manifest`: an AOF manifest
-/// exists in `dir`. `reads_single_shard_manifest`: this build replays a
-/// `--shards 1` manifest (monoio). `appendfilename`: `--appendfilename`.
+/// Why this boot must not start, or `None`. `manifest`: the layout of the
+/// AOF manifest in `dir`, if any. `reads_single_shard_manifest`: this build
+/// replays a `--shards 1` manifest (monoio). `appendfilename`:
+/// `--appendfilename`.
 #[must_use]
 pub fn refusal(
     dir: &Path,
     num_shards: usize,
-    has_manifest: bool,
+    manifest: Option<AofLayout>,
     reads_single_shard_manifest: bool,
     appendfilename: &str,
 ) -> Option<String> {
     let flat = flat_aof_path(dir);
     let flat_len = std::fs::metadata(&flat).map(|m| m.len()).unwrap_or(0);
-    if !has_manifest && num_shards >= 2 && flat_len > 0 && holds_data(&flat) {
+    let flat_data = flat_len > 0 && holds_data(&flat);
+    let has_manifest = manifest.is_some();
+    if has_manifest && flat_data {
+        let aofdir = dir.join("appendonlydir");
+        return Some(format!(
+            "{dir} holds BOTH an AOF manifest ({aofdir}) and a single-file {FLAT_AOF_NAME} \
+             with data ({flat_len} bytes). A manifest boot would retire the file and the \
+             writes only it holds; a single-file boot would ignore the manifest. Neither is \
+             retired automatically. Decide which holds the data you need: to keep the \
+             manifest's, move {flat} aside and boot; to keep the single file's, move \
+             {aofdir} aside and boot with --shards 1 (the build that wrote it); to merge \
+             them, boot each on its own copy of this directory (one copy without the file, \
+             one without {aofdir}) and copy the keys you need across (DUMP / RESTORE)",
+            dir = dir.display(),
+            aofdir = aofdir.display(),
+            flat = flat.display(),
+        ));
+    }
+    if !has_manifest && num_shards >= 2 && flat_data {
         return Some(format!(
             "{} ({flat_len} bytes) is a single-shard AOF and this boot has --shards \
              {num_shards}: replaying it would load the whole dataset into every shard \
@@ -51,7 +78,7 @@ pub fn refusal(
             dir.display()
         ));
     }
-    if has_manifest && num_shards == 1 && !reads_single_shard_manifest {
+    if manifest == Some(AofLayout::TopLevel) && num_shards == 1 && !reads_single_shard_manifest {
         return Some(format!(
             "{} holds a single-shard AOF manifest (written by the monoio build), which this \
              build (tokio) does not replay at --shards 1: booting would serve an EMPTY \
@@ -123,61 +150,77 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let d = tmp.path();
         assert!(
-            refusal(d, 4, false, true, FLAT_AOF_NAME).is_none(),
+            refusal(d, 4, None, true, FLAT_AOF_NAME).is_none(),
             "no file"
         );
         std::fs::write(flat_aof_path(d), b"").unwrap();
         assert!(
-            refusal(d, 4, false, true, FLAT_AOF_NAME).is_none(),
+            refusal(d, 4, None, true, FLAT_AOF_NAME).is_none(),
             "an empty file"
         );
         // A fresh generation's head alone: no data, the boot retires it.
         let head = b"*2\r\n$12\r\nMOON.COLDCUT\r\n$1\r\n7\r\n*2\r\n$3\r\nDEL\r\n$1\r\nk\r\n";
         std::fs::write(flat_aof_path(d), head).unwrap();
         assert!(
-            refusal(d, 4, false, false, FLAT_AOF_NAME).is_none(),
+            refusal(d, 4, None, false, FLAT_AOF_NAME).is_none(),
             "a head alone"
         );
         let mut data = head.to_vec();
         data.extend_from_slice(b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n");
         std::fs::write(flat_aof_path(d), &data).unwrap();
-        let m = refusal(d, 4, false, false, FLAT_AOF_NAME).expect("refused");
+        let m = refusal(d, 4, None, false, FLAT_AOF_NAME).expect("refused");
         assert!(m.contains("--migrate-aof-shards 4"), "{m}");
         assert!(m.contains("moon#1321"), "{m}");
         assert!(
-            refusal(d, 1, false, false, FLAT_AOF_NAME).is_none(),
+            refusal(d, 1, None, false, FLAT_AOF_NAME).is_none(),
             "--shards 1 reads it"
         );
         // An RDB preamble is data, and so is damage the scan cannot read.
         std::fs::write(flat_aof_path(d), b"MOON\x0bpreamble").unwrap();
         assert!(
-            refusal(d, 4, false, false, FLAT_AOF_NAME).is_some(),
+            refusal(d, 4, None, false, FLAT_AOF_NAME).is_some(),
             "preamble"
         );
         std::fs::write(flat_aof_path(d), b"?garbage\r\n").unwrap();
         assert!(
-            refusal(d, 4, false, false, FLAT_AOF_NAME).is_some(),
+            refusal(d, 4, None, false, FLAT_AOF_NAME).is_some(),
             "unreadable"
         );
+        // F6: a manifest AND a flat file with data: both refused, whatever
+        // the runtime or shard count; a head-only flat file is retired.
+        let m = refusal(d, 4, Some(AofLayout::PerShard), true, FLAT_AOF_NAME).expect("both");
+        assert!(m.contains("BOTH") && m.contains("DUMP / RESTORE"), "{m}");
+        assert!(refusal(d, 1, Some(AofLayout::TopLevel), true, FLAT_AOF_NAME).is_some());
+        std::fs::write(flat_aof_path(d), head).unwrap();
         assert!(
-            refusal(d, 4, true, true, FLAT_AOF_NAME).is_none(),
-            "a manifest owns the dir"
+            refusal(d, 4, Some(AofLayout::PerShard), true, FLAT_AOF_NAME).is_none(),
+            "a manifest owns the dir; the head-only file is retired"
         );
+    }
+
+    /// F8: the F-H refusal is for a single-shard (TopLevel) manifest only; a
+    /// per-shard one under --shards 1 gets main.rs's shard-count refusal.
+    #[test]
+    fn only_a_top_level_manifest_gets_the_tokio_single_shard_refusal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
+        assert!(refusal(d, 1, Some(AofLayout::PerShard), false, FLAT_AOF_NAME).is_none());
+        assert!(refusal(d, 1, Some(AofLayout::TopLevel), false, FLAT_AOF_NAME).is_some());
     }
 
     #[test]
     fn a_single_shard_manifest_refuses_a_build_that_does_not_read_it() {
         let tmp = tempfile::tempdir().unwrap();
         let d = tmp.path();
-        let m = refusal(d, 1, true, false, FLAT_AOF_NAME).expect("refused");
+        let m = refusal(d, 1, Some(AofLayout::TopLevel), false, FLAT_AOF_NAME).expect("refused");
         assert!(m.contains("monoio build"), "{m}");
         assert!(m.contains("BGSAVE"), "{m}");
         assert!(
-            refusal(d, 1, true, true, FLAT_AOF_NAME).is_none(),
+            refusal(d, 1, Some(AofLayout::TopLevel), true, FLAT_AOF_NAME).is_none(),
             "monoio reads it"
         );
         assert!(
-            refusal(d, 1, false, false, FLAT_AOF_NAME).is_none(),
+            refusal(d, 1, None, false, FLAT_AOF_NAME).is_none(),
             "no manifest"
         );
     }
@@ -188,14 +231,14 @@ mod tests {
     fn a_non_default_appendfilename_refuses_the_flat_layout() {
         let tmp = tempfile::tempdir().unwrap();
         let d = tmp.path();
-        let m = refusal(d, 1, false, false, "foo.aof").expect("refused");
+        let m = refusal(d, 1, None, false, "foo.aof").expect("refused");
         assert!(m.contains("--appendfilename foo.aof"), "{m}");
         assert!(
-            refusal(d, 1, false, true, "foo.aof").is_none(),
+            refusal(d, 1, None, true, "foo.aof").is_none(),
             "monoio ignores it"
         );
         assert!(
-            refusal(d, 4, false, false, "foo.aof").is_none(),
+            refusal(d, 4, None, false, "foo.aof").is_none(),
             "per-shard ignores it"
         );
     }

@@ -918,7 +918,7 @@ fn main() -> anyhow::Result<()> {
         && let Some(msg) = moon::persistence::aof::layout_guard::refusal(
             std::path::Path::new(&config.dir),
             num_shards,
-            existing_manifest.is_some(),
+            existing_manifest.as_ref().map(|m| m.layout),
             cfg!(feature = "runtime-monoio"),
             &config.appendfilename,
         )
