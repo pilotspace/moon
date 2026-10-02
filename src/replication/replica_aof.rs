@@ -21,8 +21,9 @@
 //!    write's epoch (#455). redis blocks the replica rather than drop a
 //!    record; so does this. A record that still cannot be enqueued (the
 //!    writer is gone) marks `aof_last_write_status:err` (the pool's drop
-//!    accounting) and asks for a rewrite. The record is logged in the
-//!    database the apply used (a replica with fewer `--databases` clamps).
+//!    accounting); the first one of an incident logs an ERROR and asks for a
+//!    rewrite, the rest of it are only counted ([`note_not_logged`]). The record is logged in the database the apply
+//!    used (a replica with fewer `--databases` clamps).
 //! 3. **Dead master transactions.** The markers are the AOF's own
 //!    transaction records (moon#1300). When the replica stops following the
 //!    master, the blocks it never saw end are rolled back in memory AND
@@ -134,23 +135,52 @@ pub(crate) fn will_log(aof_pool: Option<&Arc<AofWriterPool>>, rc: &ReplCommand) 
 /// Before applying a record [`log_applied`] will append: wait until writer 0
 /// can take it. Awaits (the replication link stalls, the shard keeps
 /// serving); never times out while the writer lives — redis blocks the
-/// replica, it never drops. `false` when the writer is gone.
-pub(crate) async fn admit(pool: &AofWriterPool) -> bool {
+/// replica rather than drop. Returns at once when the writer is gone
+/// ([`log_applied`] accounts the record).
+pub(crate) async fn admit(pool: &AofWriterPool) {
     let mut warned = false;
     loop {
         match pool.await_append_room(0, 1).await {
-            Ok(()) => return true,
+            Ok(()) => return,
             Err(crate::persistence::aof::AofAck::ChannelFull) => {
                 if !warned {
                     warned = true;
                     tracing::warn!(
-                        "replica: the AOF writer is behind; the replication stream waits for it \
-                         (records are never dropped)"
+                        "replica: the AOF writer is behind; the replication stream waits for it"
                     );
                 }
             }
-            Err(_) => return false,
+            Err(_) => return,
         }
+    }
+}
+
+/// Whether an incident of applied-but-unlogged records is under way (R2b
+/// round 4 MON-SPIN): from the first record that could not be logged until
+/// one is logged again.
+static NOT_LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// An applied record was not logged. The first of an incident logs an ERROR
+/// and asks for one rewrite; the rest are only counted by the pool (one
+/// ERROR and one wake-up of the rewrite monitor per record used to flood
+/// both while the writer was gone or the spill cap held).
+fn note_not_logged() {
+    use std::sync::atomic::Ordering;
+    if !NOT_LOGGED.swap(true, Ordering::Relaxed) {
+        tracing::error!(
+            "replica: a master-stream record was NOT appended to this replica's AOF \
+             (aof_last_write_status:err); requesting a rewrite so the AOF holds the dataset \
+             again. Further records of this incident are counted, not logged"
+        );
+        crate::persistence::aof::auto_rewrite::request_rewrite();
+    }
+}
+
+/// An applied record was logged: an incident in progress is over.
+fn note_logged() {
+    use std::sync::atomic::Ordering;
+    if NOT_LOGGED.load(Ordering::Relaxed) && NOT_LOGGED.swap(false, Ordering::Relaxed) {
+        tracing::info!("replica: master-stream records are appended to this replica's AOF again");
     }
 }
 
@@ -176,16 +206,21 @@ pub(crate) fn log_applied(aof_pool: Option<&Arc<AofWriterPool>>, rc: &ReplComman
     if !is_logged(cmd, args) {
         return;
     }
+    // The writer is gone: nothing can log this record. Counted as a dropped
+    // append (`aof_last_write_status:err`) without the pool's per-record line.
+    if pool.append_writer_gone(0) {
+        crate::persistence::aof::record_append_dropped(pool.overflow_for(0), 1);
+        note_not_logged();
+        return;
+    }
     let bytes = crate::persistence::aof::serialize_command_for_log(&rc.command);
-    // Non-blocking: `admit` made room. A refusal here (the writer is gone,
-    // or another producer took the room) is counted by the pool as a dropped
-    // append (`aof_last_write_status:err` until a fold heals it).
-    if !pool.try_send_append(0, 0, applied_db(rc), bytes) {
-        tracing::error!(
-            "replica: a master-stream record was NOT appended to this replica's AOF; \
-             requesting a rewrite so the AOF holds the dataset again"
-        );
-        crate::persistence::aof::auto_rewrite::request_rewrite();
+    // Non-blocking: `admit` made room. A refusal here (another producer
+    // took the room) is counted by the pool as a dropped append
+    // (`aof_last_write_status:err` until a fold heals it).
+    if pool.try_send_append(0, 0, applied_db(rc), bytes) {
+        note_logged();
+    } else {
+        note_not_logged();
     }
 }
 

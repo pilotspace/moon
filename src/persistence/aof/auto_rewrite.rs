@@ -317,6 +317,22 @@ pub fn monitor_running() -> bool {
     MONITOR_THREAD.get().is_some()
 }
 
+/// The monitor's wait for its next tick: [`TICK`], cut short by a
+/// [`request_rewrite`] (its unpark) — unless the last tick was `busy` (a
+/// rewrite or BGSAVE running, a cooldown): nothing can be dispatched before
+/// that ends, so the whole tick is slept, however many requests arrive (R2b
+/// round 4 MON-SPIN: a request pending while busy made the monitor skip its
+/// park and spin).
+fn wait_for_tick(busy: bool) {
+    let start = std::time::Instant::now();
+    loop {
+        std::thread::park_timeout(TICK.saturating_sub(start.elapsed()));
+        if !busy || start.elapsed() >= TICK {
+            return;
+        }
+    }
+}
+
 /// Spawn the auto-rewrite monitor thread. `percentage == 0` still spawns the
 /// sampler (INFO size freshness) but never dispatches a growth rewrite.
 ///
@@ -368,16 +384,17 @@ fn monitor_loop(
     // Compactions waiting at the previous tick, and since when some have.
     let mut prev_awaiting = 0usize;
     let mut awaiting_since: Option<std::time::Instant> = None;
+    // The last tick could not dispatch anything (see `wait_for_tick`).
+    let mut busy_last_tick = false;
     let _ = MONITOR_THREAD.set(std::thread::current());
     info!(
         "aof-auto-rewrite monitor started (percentage={}%, min_size={} bytes)",
         percentage, min_size
     );
     loop {
-        // A tick, or at once when a rewrite is requested (`request_rewrite`).
-        if !REWRITE_REQUESTED.load(Ordering::SeqCst) {
-            std::thread::park_timeout(TICK);
-        }
+        // A tick, or at once when a rewrite is requested and one can start.
+        wait_for_tick(busy_last_tick);
+        busy_last_tick = false;
 
         let in_progress = AOF_REWRITE_IN_PROGRESS.load(Ordering::SeqCst);
         let current = refresh_current_size();
@@ -404,6 +421,7 @@ fn monitor_loop(
         let busy = in_progress
             || SAVE_IN_PROGRESS.load(Ordering::SeqCst)
             || std::time::Instant::now() < cooldown_until;
+        busy_last_tick = busy;
         let base = AOF_BASE_SIZE.load(Ordering::Relaxed);
         let compactions = crate::storage::tiered::cold_reclaim::awaiting_fold();
         let held_ledger = crate::storage::tiered::cold_reclaim::held_files_pressure();
@@ -608,8 +626,23 @@ fn note_held_release_fold(
 #[cfg(test)]
 mod tests {
     use super::{
-        RewriteTrigger, finish_forced_rewrite, next_trigger, note_held_release_fold, should_trigger,
+        RewriteTrigger, TICK, finish_forced_rewrite, next_trigger, note_held_release_fold,
+        should_trigger, wait_for_tick,
     };
+
+    /// R2b round 4 MON-SPIN: a request (an unpark) cuts an idle tick short,
+    /// never a busy one — the monitor no longer spins while a rewrite runs.
+    #[test]
+    fn a_request_wakes_an_idle_monitor_but_not_a_busy_one() {
+        std::thread::current().unpark();
+        let t = std::time::Instant::now();
+        wait_for_tick(false);
+        assert!(t.elapsed() < TICK / 2, "an idle tick is cut short");
+        std::thread::current().unpark();
+        let t = std::time::Instant::now();
+        wait_for_tick(true);
+        assert!(t.elapsed() >= TICK, "a busy tick is slept whole");
+    }
 
     /// R1 finding 10: a held-release fold whose dispatch failed is neither
     /// counted nor allowed to push the next held-release fold a whole

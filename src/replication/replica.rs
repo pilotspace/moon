@@ -571,15 +571,9 @@ async fn stream_commands_read_loop(
             if let Some(pool) = cfg.aof_pool.as_ref()
                 && crate::replication::replica_aof::will_log(Some(pool), rc)
             {
-                let live = crate::replication::replica_aof::admit(pool).await;
+                crate::replication::replica_aof::admit(pool).await;
                 if superseded(cfg.epoch) {
                     anyhow::bail!("replica task superseded while waiting for the AOF writer");
-                }
-                if !live {
-                    tracing::error!(
-                        "replica: this node's AOF writer is gone; the stream is applied but \
-                         no longer logged"
-                    );
                 }
             }
             match crate::replication::apply::apply_local(
@@ -1035,15 +1029,9 @@ async fn stream_commands_read_loop(
             if let Some(pool) = cfg.aof_pool.as_ref()
                 && crate::replication::replica_aof::will_log(Some(pool), rc)
             {
-                let live = crate::replication::replica_aof::admit(pool).await;
+                crate::replication::replica_aof::admit(pool).await;
                 if superseded(cfg.epoch) {
                     anyhow::bail!("replica task superseded while waiting for the AOF writer");
-                }
-                if !live {
-                    tracing::error!(
-                        "replica: this node's AOF writer is gone; the stream is applied but \
-                         no longer logged"
-                    );
                 }
             }
             match crate::replication::apply::apply_local(
