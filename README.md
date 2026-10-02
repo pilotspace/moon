@@ -280,16 +280,23 @@ classic gaps too:
   `everysec` p=16 is a **1.32× win** (both measured 2026-07-08, GCE
   c3-standard-8, `--shards 2`; **not** re-measured on the current tree —
   [archive](docs/internal/benchmark-history.md) §7.3). `everysec`'s fsync runs off the writer on a
-  background thread (redis's model). An acknowledged write reaches the kernel
-  page cache — which survives a `kill -9` — within the AOF writer's pickup
-  latency: ≤ ~0.5 ms while writing, immediately after idle. A kill inside that
-  window, or while the writer thread is stalled, can still lose the last
-  acknowledged writes. Measured with SIGKILL 1 ms after the last ack, 20 reps
-  per cell (`tests/aof_everysec_kill9_1266.rs`, 2026-09-30, 4-vCPU Linux
-  container): losses in 9 of 240 reps (16 of 360 across both tokio runs), down
-  from 226 of 240. See the production guide, "What a process crash can lose
-  under `everysec`" in [docs/production-guide.md](docs/production-guide.md).
-  Use `appendfsync always` for zero acknowledged-write loss.
+  background thread (redis's model), and each shard thread `write(2)`s its AOF
+  records once per event-loop iteration *before* the replies that acknowledge
+  them (redis's `beforeSleep`; moon#1266) — also from boot until the AOF writer
+  first hands its file to the shard threads, and right after a `CONFIG SET
+  appendfsync` from `always` to `everysec`, when each reply waits until the
+  writer has written its record — so a `kill -9` loses no acknowledged write.
+  Measured with SIGKILL 1 ms after the last ack, 20 reps per cell, `--shards` 1
+  and 4, tokio and monoio (io_uring and epoll)
+  (`tests/aof_everysec_kill9_1266.rs`, 2026-10-01, 4-vCPU Linux container):
+  losses in 0 of 360 reps, down from 9 of 240 (writer-thread path) and 226 of
+  240 before it; and with SIGKILL on the ack right after the first `PING` or
+  right after leaving `always` (`tests/aof_shard_write_1266.rs`): 0 lost. The
+  exception is a write acknowledged during a BGREWRITEAOF fold — exposed for the
+  whole fold; see "What a process crash can lose under `everysec`" in
+  [docs/production-guide.md](docs/production-guide.md). An OS crash or power
+  loss can still lose up to ~1 s; use `appendfsync always` for zero
+  acknowledged-write loss against those.
 - **Vector time-to-index-green** (bulk load → searchable at target recall)
   beats Qdrant **1.6–2.3×** on GCE with the parallel HNSW build. Measured
   2026-07-08; not re-measured on the current tree —
