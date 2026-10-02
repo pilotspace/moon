@@ -427,3 +427,70 @@ fn a_stalled_replica_aof_writer_throttles_the_link_and_drops_nothing() {
     let _ = std::fs::remove_dir_all(&dm);
     let _ = std::fs::remove_dir_all(&dr);
 }
+
+// ── F-D: a record for a db beyond the replica's count ─────────────────────
+
+/// Master `--databases 32`, replica 16: the apply clamps `SELECT 20` to db
+/// 15, and the replica's AOF must log the record there too. It logged db 20,
+/// which the replay put in db 0 — overwriting db 0's own key after a restart.
+#[test]
+#[ignore = "spawns moon; set MOON_BIN (replica) and MOON_BIN_MONOIO (master)"]
+fn a_clamped_db_is_logged_as_applied() {
+    let Some(master) = master_bin() else {
+        eprintln!("SKIPPED: set MOON_BIN_MONOIO (the master needs master-side PSYNC)");
+        return;
+    };
+    let replica = common::find_moon_binary();
+    let dm = common::unique_test_dir("r2b3-clamp-m");
+    let dr = common::unique_test_dir("r2b3-clamp-r");
+    let (mut msrv, mport) = boot(
+        &master,
+        &dm,
+        &["--appendonly", "no", "--databases", "32"],
+        &[],
+    );
+    let r_args = ["--appendonly", "yes", "--databases", "16"];
+    let (mut rsrv, rport) = boot(&replica, &dr, &r_args, &[]);
+    let mut m = ready(mport);
+    let mut r = ready(rport);
+    assert_eq!(m.send(&["SET", "hi20", "master-db0"]), "+OK\r\n");
+    assert_eq!(
+        r.send(&["REPLICAOF", "127.0.0.1", &mport.to_string()]),
+        "+OK\r\n"
+    );
+    wait_until("the full sync", 30, || {
+        r.send(&["GET", "hi20"]) == bulk("master-db0")
+    });
+    // After the post-sync rewrite, so the record lives in the log's tail.
+    std::thread::sleep(Duration::from_millis(1500));
+    assert_eq!(m.send(&["SELECT", "20"]), "+OK\r\n");
+    assert_eq!(m.send(&["SET", "hi20", "master-db20"]), "+OK\r\n");
+    assert_eq!(r.send(&["SELECT", "15"]), "+OK\r\n");
+    wait_until("the clamped write", 30, || {
+        r.send(&["GET", "hi20"]) == bulk("master-db20")
+    });
+    assert_eq!(r.send(&["REPLICAOF", "NO", "ONE"]), "+OK\r\n");
+    drop(m);
+    msrv.kill_now();
+    drop(r);
+    std::thread::sleep(Duration::from_millis(1500));
+    rsrv.kill_now();
+
+    let (mut rsrv, rport) = boot(&replica, &dr, &r_args, &[]);
+    let mut r = ready(rport);
+    assert_eq!(
+        r.send(&["GET", "hi20"]),
+        bulk("master-db0"),
+        "db 0 keeps its own value"
+    );
+    assert_eq!(r.send(&["SELECT", "15"]), "+OK\r\n");
+    assert_eq!(
+        r.send(&["GET", "hi20"]),
+        bulk("master-db20"),
+        "db 15, as applied live"
+    );
+    drop(r);
+    rsrv.kill_now();
+    let _ = std::fs::remove_dir_all(&dm);
+    let _ = std::fs::remove_dir_all(&dr);
+}
