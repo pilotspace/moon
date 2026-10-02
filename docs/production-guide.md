@@ -330,9 +330,12 @@ tuning knobs — but understanding them explains the durability/throughput trade
   them. Whenever the writer holds the position for anything but a rewrite —
   from the boot until it first hands it over, under `always`, and from
   leaving `always` until it hands it back — the producers use the
-  `always` path (each reply waits for an fsync barrier queued after its
-  record), so no reply leaves before its record is written in those windows
-  either; the writer hands the position over at the top of its next wake. No channel hop, no writer wake-up and no warm poll on the write path:
+  `always` path: each reply waits for the writer's ack of a barrier queued
+  after its record, which comes once the record is written (with an fsync
+  only while the policy is `always`). No reply leaves before its record is
+  written in those windows either; the writer hands the position over at the
+  top of its next wake, and the server waits (up to 2 s) for that before its
+  shards start. No channel hop, no writer wake-up and no warm poll on the write path:
   measured server CPU per write −10 to −35% under monoio (io_uring and epoll) at
   50 connections and −30 to −65% under tokio, `--shards 1` (see `plans/WS46-aof-1a`). A slow disk
   now stalls the shard's `write(2)` instead of filling a queue — redis's
@@ -347,12 +350,16 @@ tuning knobs — but understanding them explains the durability/throughput trade
   until it returns. `always` keeps its fsync on the writer, before the acks.
 - **`CONFIG SET appendfsync` applies at once, as in redis.** Every producer
   and AOF writer uses the new policy from its next write — except that after
-  leaving `always`, replies keep waiting for an fsync barrier until each
-  writer has handed its append position back to the shard threads (its next
-  wake; moon#1266 1A), so none is acknowledged before its `write(2)`. Leaving `everysec`
-  first waits for an fsync still running on the agent (redis drains its
-  background fsync the same way); a write already queued to be acknowledged
-  after its fsync is fsynced before its ack whatever the switch. (Before the
+  leaving `always`, replies keep waiting for the writer to have written their
+  records (no fsync) until each writer has handed its append position back to
+  the shard threads (its next wake; moon#1266 1A), so none is acknowledged
+  before its `write(2)`. Leaving `everysec` first waits for an fsync still
+  running on the agent (redis drains its background fsync the same way). A
+  batch is fsynced before its acks when the policy in force at its commit is
+  `always`, so a write sent under `always` is never acknowledged without its
+  fsync while `always` holds; one still queued when the policy leaves `always`
+  is acknowledged under the new policy once written — as redis acknowledges
+  writes under the policy its `beforeSleep` finds. (Before the
   R1 review fix the command answered `OK` and `CONFIG GET` showed the new
   value while the writers kept their startup policy.)
 - **A slow or hung `everysec` fsync is loud, as in redis.** While a writer's
@@ -411,7 +418,8 @@ Two exceptions remain:
 There is no boot or policy-switch window: from the server's start until each
 writer first hands its append position to the shard threads, and from a
 `CONFIG SET appendfsync always` → `everysec`/`no` until it hands it back, the
-replies wait for an fsync barrier queued after their records
+replies wait for the writer to have written their records (a barrier acked
+after the write; no fsync)
 (`tests/aof_shard_write_1266.rs`: a pipeline sent right after the first `PING`,
 and right after leaving `always`, survives a kill -9 on its last ack). (A
 latched AOF write error is not an exception of 1A: the writer then appends

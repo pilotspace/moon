@@ -52,8 +52,9 @@
 //! hand-over ([`LaneCore::hold`] when the writer is attached), under
 //! `appendfsync always`, and after a producer's `AppendSync` flipped a DIRECT
 //! lane. While any lane of a pool is held the pool reports `always` to its
-//! producers: their replies wait for the writer's fsync barrier, which comes
-//! after the record's `write(2)`. A successful [`LaneCore::release`] clears
+//! producers: their replies wait for the writer's ack of a barrier queued after
+//! the record, which comes after the record's `write(2)` (with no fsync
+//! unless the policy is `always`: `group_commit::batch_needs_fsync`). A successful [`LaneCore::release`] clears
 //! it (DIRECT needs no hold: the flush points write before the replies), and
 //! so does [`LaneCore::close`]. What stays unheld in WRITER mode is the
 //! documented residual: a rewrite fold (and its post-fold drain) and a latched
