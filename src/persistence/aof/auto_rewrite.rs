@@ -343,6 +343,9 @@ fn monitor_loop(
     let mut cooldown_until = std::time::Instant::now();
     let mut saw_in_progress = false;
     let mut forced_pending = force_once;
+    // Which forced rewrite is pending: the boot's moon#914 repair, or one
+    // requested at runtime (only names it in the log).
+    let mut forced_by_boot = force_once;
     let mut last_reclaim_rewrite: Option<std::time::Instant> = None;
     // moon#1289: the last fold dispatched for held files that waited for
     // nothing; the next one is one `held_release::spacing` away.
@@ -410,10 +413,13 @@ fn monitor_loop(
         };
 
         match trigger {
+            RewriteTrigger::Forced if forced_by_boot => info!(
+                "aof-auto-rewrite: triggering the one boot-time BGREWRITEAOF so the AOF \
+                 opens with its MOON.COLDCUT (moon#914; current={} bytes)",
+                current
+            ),
             RewriteTrigger::Forced => info!(
-                "aof-auto-rewrite: triggering a required BGREWRITEAOF (the boot-time moon#914 \
-                 repair, or a replica's synced dataset / rolled-back transaction; \
-                 current={} bytes)",
+                "aof-auto-rewrite: triggering the {REQUESTED_REWRITE} (current={} bytes)",
                 current
             ),
             RewriteTrigger::Growth => info!(
@@ -484,10 +490,17 @@ fn monitor_loop(
                 record_base_size();
                 saw_in_progress = false;
                 if trigger == RewriteTrigger::Forced {
-                    forced_pending = finish_forced_rewrite(
+                    let what = if forced_by_boot {
+                        BOOT_REWRITE
+                    } else {
+                        REQUESTED_REWRITE
+                    };
+                    forced_pending = finish_forced_rewrite_of(
+                        what,
                         AOF_REWRITE_IN_PROGRESS.load(Ordering::SeqCst),
                         super::AOF_REWRITE_LAST_OK.load(Ordering::SeqCst),
                     );
+                    forced_by_boot &= forced_pending;
                     if forced_pending {
                         cooldown_until = std::time::Instant::now() + FAILED_DISPATCH_COOLDOWN;
                     }
@@ -507,24 +520,36 @@ fn monitor_loop(
 /// - Still running past the wait: not pending. Dispatching again would only
 ///   be refused as "already in progress", and the writer logs the outcome.
 ///   If that rewrite fails, the next boot detects the cut-less file again.
+#[cfg(test)]
 fn finish_forced_rewrite(still_running: bool, last_ok: bool) -> bool {
+    finish_forced_rewrite_of(BOOT_REWRITE, still_running, last_ok)
+}
+
+/// The forced rewrite's name in the monitor's lines: the boot-time
+/// moon#914 repair (its wording is what tests and operators grep for), or a
+/// rewrite requested at runtime ([`request_rewrite`]).
+const BOOT_REWRITE: &str = "boot-time moon#914 rewrite";
+const REQUESTED_REWRITE: &str = "requested rewrite (replica sync / promotion rollback)";
+
+/// [`finish_forced_rewrite`] for the forced rewrite named `what`.
+fn finish_forced_rewrite_of(what: &str, still_running: bool, last_ok: bool) -> bool {
     if still_running {
         warn!(
-            "aof-auto-rewrite: the required rewrite is still running after the \
-             monitor's wait; not re-dispatching. If it fails, run BGREWRITEAOF (a \
-             boot-time moon#914 repair is retried at the next boot)"
+            "aof-auto-rewrite: the {what} is still running after the monitor's wait; not \
+             re-dispatching. If it fails, run BGREWRITEAOF (a boot-time moon#914 repair is \
+             retried at the next boot)"
         );
         false
     } else if last_ok {
         info!(
-            "aof-auto-rewrite: required rewrite complete; the AOF's new generation \
-             holds the whole dataset and opens with its MOON.COLDCUT"
+            "aof-auto-rewrite: {what} complete; the AOF's new generation holds the whole \
+             dataset and opens with its MOON.COLDCUT"
         );
         false
     } else {
         warn!(
-            "aof-auto-rewrite: the required rewrite FAILED; the previous AOF \
-             generation stays. Retrying in {:?}",
+            "aof-auto-rewrite: the {what} FAILED; the previous AOF generation stays. \
+             Retrying in {:?}",
             FAILED_DISPATCH_COOLDOWN
         );
         true
