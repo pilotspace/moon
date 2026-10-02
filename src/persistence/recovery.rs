@@ -86,6 +86,9 @@ pub struct RecoveryResult {
     /// tokio `--shards 1` AOF). The caller decides whether to rewrite it so
     /// the next replay is gated; see `main.rs`.
     pub aof_replayed_without_cold_cut: bool,
+    /// R2b round 2 F1: Phase 4b could not replay `appendonly.aof` at all (it
+    /// is the only KV source then): the boot must refuse to start.
+    pub aof_unreadable: Option<crate::persistence::aof::flat_file::UnreadableAof>,
     // NOTE: the ColdIndex rebuilt in Phase 3 is attached directly to
     // `databases[0]` BEFORE Phase 4 replay (never returned here) so that
     // replayed deletes tombstone the cold plane — see the Phase 3 comment.
@@ -1008,12 +1011,10 @@ pub fn recover_shard_v3_pitr(
                         info!("Shard {}: AOF fallback replayed {} commands", shard_id, n);
                     }
                     Err(e) => {
-                        tracing::error!(
-                            "Shard {}: AOF fallback {:?} failed: {}",
-                            shard_id,
-                            aof_path,
-                            e
-                        );
+                        let refusal =
+                            crate::persistence::aof::flat_file::UnreadableAof::new(&aof_path, e);
+                        tracing::error!("Shard {}: {}", shard_id, refusal.message());
+                        result.aof_unreadable = Some(refusal);
                     }
                 }
             } else {

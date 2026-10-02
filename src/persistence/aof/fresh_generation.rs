@@ -54,6 +54,15 @@ impl Default for OpenGate {
 /// Re-opens the gate when dropped — on every exit path of the boot.
 pub struct OpenGateGuard(&'static OpenGate);
 
+impl OpenGateGuard {
+    /// Never re-open the gate: the boot refused to start (R2b round 2 F1),
+    /// and the writer must not open — nor, at its stop, append to — the file
+    /// the boot could not read. It exits at cancellation without opening.
+    pub fn keep_closed(self) {
+        std::mem::forget(self);
+    }
+}
+
 impl Drop for OpenGateGuard {
     fn drop(&mut self) {
         self.0.0.fetch_sub(1, Ordering::AcqRel);
