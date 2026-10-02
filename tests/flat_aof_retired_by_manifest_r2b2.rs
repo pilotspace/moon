@@ -112,8 +112,40 @@ fn tokio_monoio_tokio(shards_mid: usize) {
         "renamed, not deleted"
     );
 
-    // 3. tokio s1 again: no stale flat AOF, so the snapshot is the base.
+    // 3. tokio s1 again. R2b round 3 F-H: it refuses a dir whose AOF is a
+    //    monoio single-shard manifest (booting it served the snapshot, then a
+    //    later monoio boot replayed the stale manifest and retired every
+    //    tokio-era write). The documented remedy — move appendonlydir/ aside
+    //    — boots the snapshot: no stale flat AOF shadows it.
     if shards_mid == 1 {
+        let mut child = Command::new(&tokio)
+            .args([
+                "--port",
+                &common::reserve_port().to_string(),
+                "--shards",
+                "1",
+            ])
+            .arg("--dir")
+            .arg(&dir)
+            .args(["--disk-free-min-pct", "0", "--appendonly", "yes"])
+            .env("MOON_DISK_FREE_MIN_PCT", "0")
+            .stdout(Stdio::null())
+            .stderr(common::server_stderr(&dir))
+            .spawn()
+            .expect("spawn moon");
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let status = loop {
+            if let Some(s) = child.try_wait().unwrap() {
+                break s;
+            }
+            if Instant::now() >= deadline {
+                common::sigkill(&mut child);
+                panic!("tokio booted over a monoio single-shard manifest");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert_eq!(status.code(), Some(2), "F-H refusal");
+        std::fs::rename(dir.join("appendonlydir"), dir.join("appendonlydir.monoio")).unwrap();
         let (mut srv, port) = boot(&tokio, &dir, 1);
         let mut c = ready(port);
         assert_eq!(c.send(&["DBSIZE"]), ":20\r\n", "tokio kept the monoio data");
