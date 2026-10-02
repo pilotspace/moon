@@ -120,8 +120,31 @@ impl<R: Read> ReplayChunks<R> {
     /// the client parser's inline fallback would turn a damaged `*` into a
     /// "command" and the following bulks into skipped frames, and the replay
     /// would silently drop the record and carry on past the damage.
+    ///
+    /// A line opening with `#` at a record boundary is skipped, as redis's
+    /// loader skips it (R2b round 4 F10): redis 7 writes `#TS:<unix>`
+    /// annotations into its AOF with `aof-timestamp-enabled yes`, and moon
+    /// writes no such line, so a damaged `*` read as `#` still fails on the
+    /// bytes after the skipped line. A `#` line cut by the end of the file is
+    /// a torn tail.
     pub(crate) fn next_frame(&mut self) -> std::io::Result<ReplayNext> {
         loop {
+            if self.buf.first() == Some(&b'#') {
+                if let Some(nl) = memchr::memchr(b'\n', &self.buf) {
+                    let _ = self.buf.split_to(nl + 1);
+                    self.offset += (nl + 1) as u64;
+                    self.state = ParseState::new();
+                    continue;
+                }
+                if !self.eof {
+                    self.fill()?;
+                    continue;
+                }
+                return Ok(ReplayNext::Truncated {
+                    offset: self.offset,
+                    len: self.buf.len(),
+                });
+            }
             if let Some(&first) = self.buf.first()
                 && first != b'*'
             {
@@ -345,6 +368,33 @@ mod tests {
 
     /// R2b round 3 F-B: a damaged `*` is corruption at the record, not an
     /// inline command the replay would skip past.
+    /// R2b round 4 F10: redis's `#TS:` annotation lines are skipped at a
+    /// record boundary, across chunk boundaries; one cut by the end of the
+    /// file is a torn tail at its own offset.
+    #[test]
+    fn redis_annotation_lines_are_skipped() {
+        let set = resp(&[b"SET", b"k", b"v"]);
+        let mut log = b"#TS:1700000000\r\n".to_vec();
+        log.extend_from_slice(&set);
+        log.extend_from_slice(b"#TS:1700000001\r\n");
+        log.extend_from_slice(&set);
+        let torn_at = log.len() as u64;
+        log.extend_from_slice(b"#TS:17000");
+        for chunk in [1, 3, 7, 1 << 20] {
+            let mut r = ReplayChunks::with_chunk(&log[..], 0, chunk);
+            for _ in 0..2 {
+                let ReplayNext::Frame(f) = r.next_frame().unwrap() else {
+                    panic!("chunk {chunk}: a frame");
+                };
+                assert_eq!(args(&f)[0].as_ref(), b"SET");
+            }
+            assert!(
+                matches!(r.next_frame().unwrap(), ReplayNext::Truncated { offset, len: 9 } if offset == torn_at),
+                "chunk {chunk}"
+            );
+        }
+    }
+
     #[test]
     fn a_record_that_does_not_open_with_a_star_is_corruption() {
         let mut log = resp(&[b"SET", b"a", b"1"]);

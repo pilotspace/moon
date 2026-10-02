@@ -45,7 +45,7 @@
 //! yes`.
 
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use tracing::{info, warn};
 
@@ -68,7 +68,7 @@ pub struct MigrateAofResult {
 }
 
 fn fail(detail: String) -> crate::error::MoonError {
-    crate::error::MoonError::from(crate::error::AofError::RewriteFailed { detail })
+    crate::error::MoonError::Other(detail)
 }
 
 fn io_err(path: &Path, e: std::io::Error) -> crate::error::MoonError {
