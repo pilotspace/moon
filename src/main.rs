@@ -949,6 +949,9 @@ fn main() -> anyhow::Result<()> {
         None;
 
     let (aof_writer_token, mut aof_writers) = (CancellationToken::new(), Vec::new()); // moon#1274
+    // R2b round 4 F5: until the replay below has cut any torn tail, a writer
+    // that stops (a failed boot) appends nothing.
+    moon::persistence::aof::writer_stop::boot_started();
     // R2b review P1: tokio `--shards 1` may publish its fresh generation by
     // rename after recovery (`fresh_generation`); its writer opens the file
     // only once this guard is dropped, below the generation seed.
@@ -1994,6 +1997,7 @@ fn main() -> anyhow::Result<()> {
             }
         }
     }
+    moon::persistence::aof::writer_stop::boot_completed();
     drop(fresh_aof_gate);
 
     // (The former standalone tokio "multi-part AOF ignored" warn block was

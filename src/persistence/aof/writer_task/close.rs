@@ -27,6 +27,19 @@ pub(super) fn close_bytes(ctx: &mut RecordCtx, framed: bool) -> Vec<u8> {
     out
 }
 
+/// R2b round 4 F5: a writer stopping before the boot completed appends no
+/// close records ([`crate::persistence::aof::writer_stop::boot_pending`]).
+fn skip_for_pending_boot() -> bool {
+    let pending = crate::persistence::aof::writer_stop::boot_pending();
+    if pending {
+        info!(
+            "AOF writer stopping before the boot completed: no clean-close marker appended \
+             (the file stays as the boot found it)"
+        );
+    }
+    pending
+}
+
 fn warn_unwritten(e: &std::io::Error) {
     error!(
         "AOF clean-close marker not written ({e}): the next boot reads this stop as a crash, \
@@ -38,6 +51,9 @@ fn warn_unwritten(e: &std::io::Error) {
 /// caller's final sync makes them durable.
 #[cfg(feature = "runtime-monoio")]
 pub(super) fn append_sync(file: &mut impl std::io::Write, ctx: &mut RecordCtx, framed: bool) {
+    if skip_for_pending_boot() {
+        return;
+    }
     match file.write_all(&close_bytes(ctx, framed)) {
         Ok(()) => crate::persistence::aof::writer_stop::note_close_marker(),
         Err(e) => warn_unwritten(&e),
@@ -52,6 +68,9 @@ where
     W: tokio::io::AsyncWrite + Unpin,
 {
     use tokio::io::AsyncWriteExt;
+    if skip_for_pending_boot() {
+        return;
+    }
     match writer.write_all(&close_bytes(ctx, framed)).await {
         Ok(()) => crate::persistence::aof::writer_stop::note_close_marker(),
         Err(e) => warn_unwritten(&e),
