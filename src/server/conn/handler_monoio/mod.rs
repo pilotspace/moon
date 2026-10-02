@@ -4022,6 +4022,7 @@ async fn handle_connection_body<
                                 conn.selected_db,
                                 &ctx.dispatch_tx,
                                 &ctx.spsc_notifiers,
+                                ctx.aof_pool.as_ref(), // moon#1322
                             )
                             .await
                             {
