@@ -273,7 +273,8 @@ pub(super) fn try_handle_replicaof(
                     // replica task (old REPLICAOF target) sees itself
                     // superseded and exits instead of double-applying the
                     // stream alongside the new task.
-                    let epoch = crate::replication::replica::bump_replica_task_epoch();
+                    let epoch =
+                        crate::replication::replica::bump_replica_task_epoch(ctx.aof_pool.as_ref());
                     let cfg = crate::replication::replica::ReplicaTaskConfig {
                         master_host: host,
                         master_port: port,
@@ -302,7 +303,8 @@ pub(super) fn try_handle_replicaof(
                     // Kill the running replica task — flipping the role alone
                     // left it streaming + applying forever (each NO ONE →
                     // re-attach cycle stacked one more live applier).
-                    let _ = crate::replication::replica::bump_replica_task_epoch();
+                    let _ =
+                        crate::replication::replica::bump_replica_task_epoch(ctx.aof_pool.as_ref());
                     let mut rs_guard = rs.write();
                     rs_guard.repl_id2 = rs_guard.repl_id.clone();
                     rs_guard.repl_id = generate_repl_id();

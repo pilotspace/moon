@@ -91,11 +91,22 @@ pub(crate) fn before_data(
 /// The replica stops following its master: roll back every transaction
 /// block still open. Called where the role changes, on the shard thread,
 /// before any new replica task runs.
-pub(crate) fn roll_back_open() {
+///
+/// R2b round 3 F-A: the rollback is in memory, and this node's AOF holds the
+/// blocks' records (`replica_aof::log_applied`), so it also gets a
+/// `MOON.TXN RESET` here — synchronously, before the role changes, hence
+/// before any local write is logged: replay rolls the blocks back at exactly
+/// this point, so no later local write lands in (or is rolled back with) a
+/// dead master block, and a local transaction that reuses a block's log id
+/// opens a fresh block.
+pub(crate) fn roll_back_open(
+    aof_pool: Option<&std::sync::Arc<crate::persistence::aof::AofWriterPool>>,
+) {
     let open = BLOCKS.with(|b| !b.borrow().is_idle());
     if !open {
         return;
     }
+    crate::replication::replica_aof::log_txn_reset(aof_pool);
     let rolled = crate::shard::slice::try_with_shard(|s| {
         s.databases
             .with_all(|dbs| BLOCKS.with(|b| b.borrow_mut().finish(dbs)))
@@ -110,6 +121,19 @@ pub(crate) fn roll_back_open() {
         // replaces them with the rolled-back keyspace.
         crate::replication::replica_aof::after_promotion_rollback(n);
     }
+}
+
+/// A full resync is about to replace the dataset: forget every block, and
+/// end them in this node's AOF too (`MOON.TXN RESET`, R2b round 3 F-A), so
+/// the records streamed after the load are never attributed to a block of
+/// the previous stream. Call before `apply::load_snapshot`.
+pub(crate) fn discard_logged(
+    aof_pool: Option<&std::sync::Arc<crate::persistence::aof::AofWriterPool>>,
+) {
+    if BLOCKS.with(|b| !b.borrow().is_idle()) {
+        crate::replication::replica_aof::log_txn_reset(aof_pool);
+    }
+    discard();
 }
 
 /// A full resync replaced the dataset: forget every block.
