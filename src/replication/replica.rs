@@ -89,6 +89,32 @@ fn ensure_live(epoch: u64, at: &str) -> anyhow::Result<()> {
 pub const MULTI_SHARD_REPLICA_REFUSAL: &[u8] = b"ERR replica mode requires --shards 1: \
 this node runs more than one shard and multi-shard replicas are not supported yet (moon#406)";
 
+/// Whether `REPLICAOF host port` names the master this node already follows
+/// — connected, syncing or reconnecting (redis 7.2 `replicaofCommand`: the
+/// same `masterhost`, compared case-insensitively, and `masterport`). Such a
+/// command changes nothing: restarting the link would only cost a resync,
+/// and the running task keeps its place in the stream (R2b round 4 X1-DBL).
+#[must_use]
+pub fn already_following(rs: &ReplicationState, host: &str, port: u16) -> bool {
+    matches!(
+        &rs.role,
+        ReplicationRole::Replica { host: h, port: p, .. }
+            if *p == port && h.eq_ignore_ascii_case(host)
+    )
+}
+
+/// redis's reply to a `REPLICAOF` that names the current master.
+#[must_use]
+pub fn already_following_reply() -> crate::protocol::Frame {
+    tracing::info!(
+        "REPLICAOF would result into synchronization with the master we are already \
+         connected with. No operation performed."
+    );
+    crate::protocol::Frame::SimpleString(Bytes::from_static(
+        b"OK Already connected to specified master",
+    ))
+}
+
 /// Whether a node with `num_shards` shards can run the replica task.
 ///
 /// The ONE predicate behind both the command-time refusal
@@ -510,6 +536,10 @@ async fn stream_commands_read_loop(
     // the db context the stream was in when the link dropped — see
     // `ReplicaTaskConfig::stream_db`.
     let mut selected_db = cfg.stream_db.load(Ordering::Relaxed);
+    // R2b round 4 X1-DBL: the offset follows every applied record.
+    let mut prefix = crate::replication::applied_prefix::AppliedPrefix::new(Arc::clone(
+        &cfg.repl_state.read().master_repl_offset,
+    ));
 
     loop {
         let n = stream.read_buf(&mut buf).await?;
@@ -530,12 +560,14 @@ async fn stream_commands_read_loop(
             &mut selected_db,
             &mut parse_state,
         );
+        prefix.start_batch();
         for rc in &outcome.commands {
             use crate::replication::apply::ApplyOutcome;
             // R2b round 3 X1: room in this node's AOF writer BEFORE the apply
-            // (an await: the link stalls, the shard keeps serving), so the
-            // append right after it never waits and never drops. A task
-            // superseded while it waited must not apply.
+            // (an await: the link stalls, the shard keeps serving). A task
+            // superseded while it waited must not apply; the records it did
+            // apply are already in the offset (`prefix`), so its successor's
+            // PSYNC resumes after them (R2b round 4 X1-DBL).
             if let Some(pool) = cfg.aof_pool.as_ref()
                 && crate::replication::replica_aof::will_log(Some(pool), rc)
             {
@@ -559,6 +591,7 @@ async fn stream_commands_read_loop(
                 // after the apply (no await between them).
                 ApplyOutcome::Applied => {
                     crate::replication::replica_aof::log_applied(cfg.aof_pool.as_ref(), rc);
+                    prefix.applied(rc, &cfg.stream_db);
                 }
                 // Unified poison-record policy (task #48): a malformed
                 // record has already been logged + counted inside
@@ -587,16 +620,10 @@ async fn stream_commands_read_loop(
                 }
             }
         }
-        if outcome.consumed > 0 {
-            {
-                let rs = cfg.repl_state.read();
-                rs.master_repl_offset
-                    .fetch_add(outcome.consumed as u64, Ordering::Relaxed);
-            }
-        }
-        // Persist the drain's db context so a reconnect (+CONTINUE) resumes
-        // in the same logical db (HIGH-2, task #22).
-        cfg.stream_db.store(selected_db, Ordering::Relaxed);
+        // The whole batch is applied: the offset covers every consumed frame
+        // and the db context is the drain's, so a reconnect (+CONTINUE)
+        // resumes in the same logical db (HIGH-2, task #22).
+        prefix.finish(outcome.consumed, selected_db, &cfg.stream_db);
         if outcome.fatal {
             return Err(anyhow::anyhow!(
                 "replication stream parse error — dropping connection to force resync"
@@ -969,6 +996,10 @@ async fn stream_commands_read_loop(
     // the db context the stream was in when the link dropped — see
     // `ReplicaTaskConfig::stream_db`.
     let mut selected_db = cfg.stream_db.load(Ordering::Relaxed);
+    // R2b round 4 X1-DBL: the offset follows every applied record.
+    let mut prefix = crate::replication::applied_prefix::AppliedPrefix::new(Arc::clone(
+        &cfg.repl_state.read().master_repl_offset,
+    ));
 
     loop {
         let tmp = vec![0u8; 65536];
@@ -993,12 +1024,14 @@ async fn stream_commands_read_loop(
             &mut selected_db,
             &mut parse_state,
         );
+        prefix.start_batch();
         for rc in &outcome.commands {
             use crate::replication::apply::ApplyOutcome;
             // R2b round 3 X1: room in this node's AOF writer BEFORE the apply
-            // (an await: the link stalls, the shard keeps serving), so the
-            // append right after it never waits and never drops. A task
-            // superseded while it waited must not apply.
+            // (an await: the link stalls, the shard keeps serving). A task
+            // superseded while it waited must not apply; the records it did
+            // apply are already in the offset (`prefix`), so its successor's
+            // PSYNC resumes after them (R2b round 4 X1-DBL).
             if let Some(pool) = cfg.aof_pool.as_ref()
                 && crate::replication::replica_aof::will_log(Some(pool), rc)
             {
@@ -1022,6 +1055,7 @@ async fn stream_commands_read_loop(
                 // after the apply (no await between them).
                 ApplyOutcome::Applied => {
                     crate::replication::replica_aof::log_applied(cfg.aof_pool.as_ref(), rc);
+                    prefix.applied(rc, &cfg.stream_db);
                 }
                 // Unified poison-record policy (task #48): a malformed
                 // record has already been logged + counted inside
@@ -1050,16 +1084,10 @@ async fn stream_commands_read_loop(
                 }
             }
         }
-        if outcome.consumed > 0 {
-            {
-                let rs = cfg.repl_state.read();
-                rs.master_repl_offset
-                    .fetch_add(outcome.consumed as u64, Ordering::Relaxed);
-            }
-        }
-        // Persist the drain's db context so a reconnect (+CONTINUE) resumes
-        // in the same logical db (HIGH-2, task #22).
-        cfg.stream_db.store(selected_db, Ordering::Relaxed);
+        // The whole batch is applied: the offset covers every consumed frame
+        // and the db context is the drain's, so a reconnect (+CONTINUE)
+        // resumes in the same logical db (HIGH-2, task #22).
+        prefix.finish(outcome.consumed, selected_db, &cfg.stream_db);
         if outcome.fatal {
             return Err(anyhow::anyhow!(
                 "replication stream parse error — dropping connection to force resync"
@@ -1197,6 +1225,30 @@ fn encode_replconf_ack(offset: u64) -> Vec<u8> {
 mod tests {
     use super::*;
     use crate::protocol::Frame;
+
+    /// R2b round 4 X1-DBL (redis 7.2 `replicaofCommand`): only the same
+    /// host string (any case) and port is the current master; another name
+    /// for the same address restarts the link, as in redis.
+    #[test]
+    fn replicaof_the_current_master_is_recognised() {
+        let mut rs = ReplicationState::new(1, "a".repeat(40), "0".repeat(40));
+        assert!(
+            !already_following(&rs, "127.0.0.1", 6379),
+            "a master follows nobody"
+        );
+        rs.set_role(ReplicationRole::Replica {
+            host: "LocalHost".to_string(),
+            port: 6379,
+            state: ReplicaHandshakeState::PingPending,
+        });
+        assert!(already_following(&rs, "localhost", 6379));
+        assert!(!already_following(&rs, "localhost", 6380));
+        assert!(!already_following(&rs, "127.0.0.1", 6379));
+        assert!(matches!(
+            already_following_reply(),
+            Frame::SimpleString(ref s) if &s[..] == b"OK Already connected to specified master"
+        ));
+    }
 
     /// moon#1015: the command-time refusal and the task's own guard share ONE
     /// predicate, so a shard count the task refuses is always refused first.

@@ -257,6 +257,15 @@ pub(super) fn try_handle_replicaof(
         responses.push(refusal);
         return true;
     }
+    // redis `replicaofCommand` (R2b round 4 X1-DBL): the master this node
+    // already follows — no new task, no epoch bump, no role reset.
+    if let (Some(ReplicaofAction::StartReplication { host, port }), Some(rs)) =
+        (&action, ctx.repl_state.as_ref())
+        && crate::replication::replica::already_following(&rs.read(), host, *port)
+    {
+        responses.push(crate::replication::replica::already_following_reply());
+        return true;
+    }
     if let Some(action) = action {
         if let Some(ref rs) = ctx.repl_state {
             match action {

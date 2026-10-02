@@ -1,3 +1,4 @@
+pub(crate) mod applied_prefix;
 pub mod apply;
 pub mod backlog;
 pub mod effect_rewrite;
