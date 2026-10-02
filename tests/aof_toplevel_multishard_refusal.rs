@@ -184,13 +184,18 @@ fn toplevel_manifest_with_single_shard_is_allowed() {
         match child.as_mut().try_wait().expect("try_wait") {
             Some(status) => {
                 let code = status.code().unwrap_or(-1);
-                // If it exited with code 2 it incorrectly refused a single-shard TopLevel boot.
-                assert_ne!(
-                    code,
-                    2,
+                let stderr = fs::read_to_string(&stderr_log).unwrap_or_default();
+                // If it exited with code 2 it incorrectly refused a single-shard TopLevel
+                // boot — unless this is the tokio build, which does not replay a
+                // single-shard manifest and refuses it (R2b round 3 F-H; a separate
+                // refusal from the multi-shard one this suite is about).
+                let tokio_f_h = stderr
+                    .contains("single-shard AOF manifest (written by the monoio build)")
+                    && !stderr.contains("legacy TopLevel AOF manifest");
+                assert!(
+                    code != 2 || tokio_f_h,
                     "Moon must NOT refuse single-shard + TopLevel manifest; got exit 2. \
-                     stderr: {}",
-                    fs::read_to_string(&stderr_log).unwrap_or_default()
+                     stderr: {stderr}"
                 );
                 // Any other exit (e.g., port conflict) is fine for this test's purposes.
                 break;
