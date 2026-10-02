@@ -14,6 +14,9 @@
 //!   booted EMPTY with a WARN, wrote a new flat file, and the next monoio
 //!   boot replayed the stale manifest and retired that newer file: every
 //!   tokio-era write was lost.
+//! - **moon#1321 (other half):** `--appendfilename` with the tokio flat
+//!   layout: the writer appended to the named file, recovery replayed only
+//!   `appendonly.aof` — every write was lost at the next boot (DBSIZE 0).
 
 use std::path::Path;
 
@@ -21,13 +24,14 @@ use super::flat_file::{FLAT_AOF_NAME, flat_aof_path};
 
 /// Why this boot must not start, or `None`. `has_manifest`: an AOF manifest
 /// exists in `dir`. `reads_single_shard_manifest`: this build replays a
-/// `--shards 1` manifest (monoio).
+/// `--shards 1` manifest (monoio). `appendfilename`: `--appendfilename`.
 #[must_use]
 pub fn refusal(
     dir: &Path,
     num_shards: usize,
     has_manifest: bool,
     reads_single_shard_manifest: bool,
+    appendfilename: &str,
 ) -> Option<String> {
     let flat = flat_aof_path(dir);
     let flat_len = std::fs::metadata(&flat).map(|m| m.len()).unwrap_or(0);
@@ -55,6 +59,14 @@ pub fn refusal(
             dir.join("appendonlydir").display()
         ));
     }
+    if num_shards == 1 && !reads_single_shard_manifest && appendfilename != FLAT_AOF_NAME {
+        return Some(format!(
+            "--appendfilename {appendfilename}: this build (tokio --shards 1) appends to that \
+             file but its recovery replays only {FLAT_AOF_NAME} (moon#1321), so every write \
+             would be lost at the next boot. Drop the option (rename an existing \
+             {appendfilename} to {FLAT_AOF_NAME} first)"
+        ));
+    }
     None
 }
 
@@ -66,16 +78,25 @@ mod tests {
     fn a_flat_aof_with_data_refuses_a_multi_shard_boot_without_a_manifest() {
         let tmp = tempfile::tempdir().unwrap();
         let d = tmp.path();
-        assert!(refusal(d, 4, false, true).is_none(), "no file");
+        assert!(
+            refusal(d, 4, false, true, FLAT_AOF_NAME).is_none(),
+            "no file"
+        );
         std::fs::write(flat_aof_path(d), b"").unwrap();
-        assert!(refusal(d, 4, false, true).is_none(), "an empty file");
+        assert!(
+            refusal(d, 4, false, true, FLAT_AOF_NAME).is_none(),
+            "an empty file"
+        );
         std::fs::write(flat_aof_path(d), b"*1\r\n$4\r\nPING\r\n").unwrap();
-        let m = refusal(d, 4, false, false).expect("refused");
+        let m = refusal(d, 4, false, false, FLAT_AOF_NAME).expect("refused");
         assert!(m.contains("--migrate-aof-shards 4"), "{m}");
         assert!(m.contains("moon#1321"), "{m}");
-        assert!(refusal(d, 1, false, false).is_none(), "--shards 1 reads it");
         assert!(
-            refusal(d, 4, true, true).is_none(),
+            refusal(d, 1, false, false, FLAT_AOF_NAME).is_none(),
+            "--shards 1 reads it"
+        );
+        assert!(
+            refusal(d, 4, true, true, FLAT_AOF_NAME).is_none(),
             "a manifest owns the dir"
         );
     }
@@ -84,10 +105,34 @@ mod tests {
     fn a_single_shard_manifest_refuses_a_build_that_does_not_read_it() {
         let tmp = tempfile::tempdir().unwrap();
         let d = tmp.path();
-        let m = refusal(d, 1, true, false).expect("refused");
+        let m = refusal(d, 1, true, false, FLAT_AOF_NAME).expect("refused");
         assert!(m.contains("monoio build"), "{m}");
         assert!(m.contains("BGSAVE"), "{m}");
-        assert!(refusal(d, 1, true, true).is_none(), "monoio reads it");
-        assert!(refusal(d, 1, false, false).is_none(), "no manifest");
+        assert!(
+            refusal(d, 1, true, true, FLAT_AOF_NAME).is_none(),
+            "monoio reads it"
+        );
+        assert!(
+            refusal(d, 1, false, false, FLAT_AOF_NAME).is_none(),
+            "no manifest"
+        );
+    }
+
+    /// moon#1321's other half: the tokio flat layout's writer honours
+    /// `--appendfilename` but its recovery does not.
+    #[test]
+    fn a_non_default_appendfilename_refuses_the_flat_layout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
+        let m = refusal(d, 1, false, false, "foo.aof").expect("refused");
+        assert!(m.contains("--appendfilename foo.aof"), "{m}");
+        assert!(
+            refusal(d, 1, false, true, "foo.aof").is_none(),
+            "monoio ignores it"
+        );
+        assert!(
+            refusal(d, 4, false, false, "foo.aof").is_none(),
+            "per-shard ignores it"
+        );
     }
 }
