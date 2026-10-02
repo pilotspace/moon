@@ -102,7 +102,7 @@ All options are command-line flags. Run `moon --help` for the full list.
 |------|---------|-------------|
 | `--appendonly` | `no` | Enable AOF persistence (`yes`/`no`) |
 | `--appendfsync` | `everysec` | AOF fsync policy: `always`, `everysec`, or `no` |
-| `--appendfilename` | `appendonly.aof` | AOF filename |
+| `--appendfilename` | `appendonly.aof` | AOF filename. Only the default is supported: tokio `--shards 1` refuses another name (its recovery reads `appendonly.aof`, moon#1321); the manifest layout (monoio, `--shards N`) ignores it |
 | `--save` | *(none)* | RDB auto-save rules (e.g., `"3600 1 300 100"`) |
 | `--dir` | `.` | Directory for persistence files |
 | `--dbfilename` | `dump.rdb` | Accepted for redis compatibility; the sharded server's snapshots are `<dir>/shard-<N>/shard-<N>.rrdshard` |

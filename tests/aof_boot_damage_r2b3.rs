@@ -13,6 +13,8 @@
 //! - **F-C** (moon#1321) — a flat `appendonly.aof` with no manifest refuses a
 //!   `--shards N` boot (it was replayed into every shard and stored N times);
 //!   the documented `--migrate-aof-*` remedy works.
+//! - **moon#1321** — tokio `--shards 1` refuses `--appendfilename`, which its
+//!   recovery never read (the writes were lost at the next boot).
 //! - **F-H** — a monoio `--shards 1` manifest refuses a tokio `--shards 1`
 //!   boot (it booted EMPTY and its writes were lost at the next monoio boot);
 //!   the documented remedy works. Needs `MOON_BIN_MONOIO` and
@@ -439,5 +441,32 @@ fn a_monoio_manifest_refuses_a_tokio_single_shard_boot() {
     assert_eq!(c.send(&["DBSIZE"]), ":30\r\n", "the snapshot loads");
     drop(c);
     srv.kill_now();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// moon#1321's other half: tokio `--shards 1` appended to `--appendfilename`
+/// but recovered only `appendonly.aof` (10 keys came back as DBSIZE 0); it
+/// now refuses the option.
+#[test]
+#[ignore = "spawns moon; set MOON_BIN_TOKIO"]
+fn tokio_refuses_an_appendfilename_its_recovery_ignores() {
+    let tokio = common::required_runtime_bin("MOON_BIN_TOKIO");
+    let dir = common::unique_test_dir("r2b3-afn");
+    std::fs::create_dir_all(&dir).unwrap();
+    let (code, log) = refused(
+        &tokio,
+        &dir,
+        &[
+            "--shards",
+            "1",
+            "--appendonly",
+            "yes",
+            "--appendfilename",
+            "foo.aof",
+        ],
+    );
+    assert_eq!(code, Some(2), "{log:.3000}");
+    assert!(log.contains("--appendfilename foo.aof"), "{log:.3000}");
+    assert!(!dir.join("foo.aof").exists(), "nothing was written");
     let _ = std::fs::remove_dir_all(&dir);
 }

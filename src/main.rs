@@ -923,6 +923,7 @@ fn main() -> anyhow::Result<()> {
             num_shards,
             existing_manifest.is_some(),
             cfg!(feature = "runtime-monoio"),
+            &config.appendfilename,
         )
     {
         eprintln!("REFUSING TO START: {msg}");
