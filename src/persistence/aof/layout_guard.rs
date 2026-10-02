@@ -14,6 +14,10 @@
 //!   booted EMPTY with a WARN, wrote a new flat file, and the next monoio
 //!   boot replayed the stale manifest and retired that newer file: every
 //!   tokio-era write was lost.
+//!
+//!   A flat file that holds no data — a fresh tokio generation's head alone
+//!   (`MOON.COLDCUT`, its dead-slot DELs, clock stamps) — is not refused: the
+//!   multi-shard boot retires it (R2b round 2 F2).
 //! - **moon#1321 (other half):** `--appendfilename` with the tokio flat
 //!   layout: the writer appended to the named file, recovery replayed only
 //!   `appendonly.aof` — every write was lost at the next boot (DBSIZE 0).
@@ -35,7 +39,7 @@ pub fn refusal(
 ) -> Option<String> {
     let flat = flat_aof_path(dir);
     let flat_len = std::fs::metadata(&flat).map(|m| m.len()).unwrap_or(0);
-    if !has_manifest && num_shards >= 2 && flat_len > 0 {
+    if !has_manifest && num_shards >= 2 && flat_len > 0 && holds_data(&flat) {
         return Some(format!(
             "{} ({flat_len} bytes) is a single-shard AOF and this boot has --shards \
              {num_shards}: replaying it would load the whole dataset into every shard \
@@ -70,6 +74,46 @@ pub fn refusal(
     None
 }
 
+/// Whether the flat AOF at `path` holds a record that may create data: an
+/// RDB preamble, or any record other than the pseudo-records (`MOON.*`),
+/// `SELECT` and the deletions a fresh generation's head carries. Streams the
+/// file and stops at the first such record; an unreadable file counts as
+/// data (refusing is the safe side).
+fn holds_data(path: &Path) -> bool {
+    use crate::persistence::replay::chunks::{ReplayChunks, ReplayNext};
+    use crate::protocol::Frame;
+    use std::io::Read;
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return true;
+    };
+    let mut magic = [0u8; 4];
+    if file.read_exact(&mut magic).is_ok() && &magic == b"MOON" {
+        return true;
+    }
+    let Ok(file) = std::fs::File::open(path) else {
+        return true;
+    };
+    let mut chunks = ReplayChunks::new(file, 0);
+    loop {
+        match chunks.next_frame() {
+            Ok(ReplayNext::Frame(Frame::Array(arr))) => {
+                let Some(Frame::BulkString(cmd)) = arr.first() else {
+                    return true;
+                };
+                let harmless = cmd.len() > 5 && cmd[..5].eq_ignore_ascii_case(b"MOON.")
+                    || [&b"SELECT"[..], b"DEL", b"UNLINK"]
+                        .iter()
+                        .any(|c| cmd.eq_ignore_ascii_case(c));
+                if !harmless {
+                    return true;
+                }
+            }
+            Ok(ReplayNext::End) | Ok(ReplayNext::Truncated { .. }) => return false,
+            Ok(_) | Err(_) => return true,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -87,13 +131,33 @@ mod tests {
             refusal(d, 4, false, true, FLAT_AOF_NAME).is_none(),
             "an empty file"
         );
-        std::fs::write(flat_aof_path(d), b"*1\r\n$4\r\nPING\r\n").unwrap();
+        // A fresh generation's head alone: no data, the boot retires it.
+        let head = b"*2\r\n$12\r\nMOON.COLDCUT\r\n$1\r\n7\r\n*2\r\n$3\r\nDEL\r\n$1\r\nk\r\n";
+        std::fs::write(flat_aof_path(d), head).unwrap();
+        assert!(
+            refusal(d, 4, false, false, FLAT_AOF_NAME).is_none(),
+            "a head alone"
+        );
+        let mut data = head.to_vec();
+        data.extend_from_slice(b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n");
+        std::fs::write(flat_aof_path(d), &data).unwrap();
         let m = refusal(d, 4, false, false, FLAT_AOF_NAME).expect("refused");
         assert!(m.contains("--migrate-aof-shards 4"), "{m}");
         assert!(m.contains("moon#1321"), "{m}");
         assert!(
             refusal(d, 1, false, false, FLAT_AOF_NAME).is_none(),
             "--shards 1 reads it"
+        );
+        // An RDB preamble is data, and so is damage the scan cannot read.
+        std::fs::write(flat_aof_path(d), b"MOON\x0bpreamble").unwrap();
+        assert!(
+            refusal(d, 4, false, false, FLAT_AOF_NAME).is_some(),
+            "preamble"
+        );
+        std::fs::write(flat_aof_path(d), b"?garbage\r\n").unwrap();
+        assert!(
+            refusal(d, 4, false, false, FLAT_AOF_NAME).is_some(),
+            "unreadable"
         );
         assert!(
             refusal(d, 4, true, true, FLAT_AOF_NAME).is_none(),
