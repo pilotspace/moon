@@ -147,6 +147,7 @@ pub(super) fn try_handle_cluster(
             stream_db: std::sync::atomic::AtomicUsize::new(0),
             blocking_registry: Some(ctx.blocking_registry.clone()),
             shard_databases: ctx.shard_databases.clone(),
+            aof_pool: ctx.aof_pool.clone(),
         };
         tokio::task::spawn_local(crate::replication::replica::run_replica_task(cfg));
     }

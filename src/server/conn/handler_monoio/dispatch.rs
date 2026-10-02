@@ -199,6 +199,7 @@ pub(super) fn try_handle_cluster(
                 stream_db: std::sync::atomic::AtomicUsize::new(0),
                 blocking_registry: Some(ctx.blocking_registry.clone()),
                 shard_databases: ctx.shard_databases.clone(),
+                aof_pool: ctx.aof_pool.clone(),
             };
             monoio::spawn(crate::replication::replica::run_replica_task(cfg));
         }
@@ -701,6 +702,7 @@ pub(super) fn try_handle_replicaof(
                         stream_db: std::sync::atomic::AtomicUsize::new(0),
                         blocking_registry: Some(ctx.blocking_registry.clone()),
                         shard_databases: ctx.shard_databases.clone(),
+                        aof_pool: ctx.aof_pool.clone(),
                     };
                     release_clients_blocked_as_master(ctx);
                     monoio::spawn(crate::replication::replica::run_replica_task(cfg));
