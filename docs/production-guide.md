@@ -813,18 +813,43 @@ The sharded server writes one snapshot file per shard,
 `shard-<N>/` directory names:
 
 ```bash
-# Trigger a background save, then wait until LASTSAVE moves past its old value
-before=$(redis-cli -p 6379 LASTSAVE)
-redis-cli -p 6379 BGSAVE
-while [ "$(redis-cli -p 6379 LASTSAVE)" = "$before" ]; do sleep 1; done
+#!/bin/sh
+# moon-backup.sh: BGSAVE, wait for it (bounded), check it succeeded, copy.
+set -eu
+CLI="redis-cli -p 6379"
+SHARDS=4                     # the server's --shards
+TIMEOUT=600                  # seconds to wait for the save
+DEST=./backup/$(date +%Y%m%d-%H%M)
 
-# Copy each shard's snapshot file (SHARDS = the server's --shards)
-SHARDS=4
+# `Background saving started` means the save is marked in progress before
+# the reply, so rdb_bgsave_in_progress cannot read 0 for this save early.
+reply=$($CLI BGSAVE)
+case "$reply" in
+  "Background saving started") ;;
+  *) echo "BGSAVE refused: $reply" >&2; exit 1 ;;
+esac
+waited=0
+while $CLI INFO persistence | grep -q '^rdb_bgsave_in_progress:1'; do
+  [ "$waited" -ge "$TIMEOUT" ] && { echo "BGSAVE still running after ${TIMEOUT}s" >&2; exit 1; }
+  sleep 1; waited=$((waited + 1))
+done
+# A failed save leaves the previous snapshot files in place (and LASTSAVE
+# where it was): never copy them as if they were this save.
+if ! $CLI INFO persistence | grep -q '^rdb_last_bgsave_status:ok'; then
+  echo "BGSAVE failed (rdb_last_bgsave_status is not ok): see the server log" >&2
+  exit 1
+fi
+
+# Copy each shard's snapshot file
 for n in $(seq 0 $((SHARDS - 1))); do
-  mkdir -p ./backup/shard-$n
-  docker cp moon:/data/shard-$n/shard-$n.rrdshard ./backup/shard-$n/
+  mkdir -p "$DEST/shard-$n"
+  docker cp moon:/data/shard-$n/shard-$n.rrdshard "$DEST/shard-$n/"
 done
 ```
+
+Do not wait for `LASTSAVE` to change instead: it has one-second resolution
+and moves only when a save succeeds, so after a failed save (a full disk, an
+unwritable directory) an unbounded `while LASTSAVE == before` loop never ends.
 
 ### AOF backup
 
@@ -878,10 +903,16 @@ anything is appended, as redis does with `aof-load-truncated yes`.
 
 ### Automated backup with cron
 
+Run the script above from cron rather than a fixed `sleep`: a save of a
+large dataset takes longer than any fixed delay, and copying before it ends
+(or after it failed) backs up the PREVIOUS snapshot without a word. The
+script exits non-zero, so cron mails the failure, when the save is refused,
+fails, or outlives its timeout.
+
 ```bash
 # /etc/cron.d/moon-backup
-# (a 4-shard server; one shard-N/shard-N.rrdshard file per shard)
-0 */6 * * * root docker exec moon redis-cli BGSAVE && sleep 5 && d=/backup/moon/$(date +\%Y\%m\%d-\%H\%M) && for n in 0 1 2 3; do mkdir -p $d/shard-$n && docker cp moon:/data/shard-$n/shard-$n.rrdshard $d/shard-$n/; done
+# (moon-backup.sh as above, with DEST=/backup/moon/$(date +%Y%m%d-%H%M))
+0 */6 * * * root /usr/local/bin/moon-backup.sh
 ```
 
 ## Security Checklist
