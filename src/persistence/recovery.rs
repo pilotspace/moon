@@ -158,7 +158,7 @@ pub fn recover_shard_v3_with_fallback(
 /// and the WAL's `Command` records plus the Phase 4b legacy fallback only
 /// with `SnapshotAndLogs` (with `--appendonly no` they are stale, moon#1267
 /// review F3). A `v2_persistence_dir/appendonly.aof` holding a record turns
-/// `SnapshotAndLogs` into `AofOnly` (no PITR target): that file alone, as
+/// `SnapshotAndLogs` into `AofOnly` (a PITR target refuses it): that file alone, as
 /// redis loads only the AOF under `appendonly yes` (R2b review P1). Not KV
 /// history, so always recovered: the cold index, warm vector segments,
 /// orphan classification, FPI repair, `last_lsn`, CLOG.
@@ -173,11 +173,11 @@ pub fn recover_shard_v3_pitr(
 ) -> Result<RecoveryResult, crate::error::MoonError> {
     let mut result = RecoveryResult::default();
     // R2b review P1: a legacy `appendonly.aof` holding a record is the only
-    // KV source (`KvSources::AofOnly`). PITR keeps the snapshot + WAL model.
-    let kv = match recovery_target_lsn {
-        None => kv.with_flat_aof(v2_persistence_dir),
-        Some(_) => kv,
-    };
+    // KV source (`KvSources::AofOnly`). PITR keeps the snapshot + WAL model
+    // and refuses such a file (round 4 F9, `KvSources::for_target`).
+    let kv = kv
+        .for_target(v2_persistence_dir, recovery_target_lsn)
+        .map_err(crate::error::MoonError::Other)?;
 
     // ── Phase 1: ENTRY POINT ──────────────────────────────────────────
     let control_path = ShardControlFile::control_path(shard_dir, shard_id);
