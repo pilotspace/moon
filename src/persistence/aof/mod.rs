@@ -832,6 +832,8 @@ mod record_ctx;
 mod refusal;
 // moon#1266 R2b-2 F2: a reply whose record went to a held lane after its policy read.
 pub mod held_reply;
+// R2b-3 P1: several fsync barriers sent first, awaited together.
+pub mod barrier_set;
 // R2b-2 F3: test hook delaying the writers' start (lanes stay held).
 pub mod lane_test_hook;
 pub mod rewrite;

@@ -18,11 +18,18 @@
 //! Zero-cost in the steady state: [`barrier_needed`] is one Acquire load
 //! (the pool-wide view is `always` only under `always` or while some lane is
 //! held), and only then are the written keys hashed to their owners.
+//!
+//! The barriers — every written remote shard's, plus the local leg's when it
+//! owes one — are SENT first and awaited together under one deadline
+//! (`aof::barrier_set`, R2b round 3 P1): the reply waits for the slowest
+//! fsync, not their sum, and a stalled disk costs one `fsync_timeout`, not
+//! one per shard.
 
 use std::sync::Arc;
 
 use smallvec::SmallVec;
 
+use crate::persistence::aof::barrier_set::PendingBarriers;
 use crate::persistence::aof::{AofAck, AofWriterPool, FsyncPolicy};
 use crate::protocol::Frame;
 use crate::shard::dispatch::key_to_shard;
@@ -83,21 +90,22 @@ pub(crate) fn written_remote_shards(
     out
 }
 
-/// One `fsync_barrier` per target, every one of them even after a failure
-/// (each shard's durability is confirmed or reported); the first failure is
+/// One barrier per target — all SENT before any is awaited, then awaited
+/// together under one deadline; every one is awaited even after a failure
+/// (each shard's durability is confirmed or reported), the first failure is
 /// returned.
 pub(crate) async fn barrier_targets(pool: &AofWriterPool, targets: &[usize]) -> Result<(), AofAck> {
-    let mut first: Option<AofAck> = None;
+    let mut set = PendingBarriers::new();
     for &t in targets {
-        if let Err(ack) = pool.fsync_barrier(t).await {
-            first.get_or_insert(ack);
-        }
+        set.begin(pool, t);
     }
-    first.map_or(Ok(()), Err)
+    set.wait(pool).await
 }
 
 /// `coordinate_multi_key`'s tail: confirm the remote legs of a write before
-/// `reply` leaves. A failed barrier replaces a successful reply (the write
+/// `reply` leaves — and the local leg with them when it owes a barrier
+/// (`local_barrier_pending`, then cleared: the handler need not barrier this
+/// reply again). A failed barrier replaces a successful reply (the write
 /// stands in memory; its durability is unconfirmed), never an error reply.
 pub(crate) async fn confirm_multi_key(
     pool: Option<&Arc<AofWriterPool>>,
@@ -105,12 +113,16 @@ pub(crate) async fn confirm_multi_key(
     args: &[Frame],
     my_shard: usize,
     num_shards: usize,
+    local_barrier_pending: &mut bool,
     reply: Frame,
 ) -> Frame {
     let Some(p) = pool.filter(|_| barrier_needed(pool, num_shards)) else {
         return reply;
     };
-    let targets = written_remote_shards(cmd, args, my_shard, num_shards);
+    let mut targets = written_remote_shards(cmd, args, my_shard, num_shards);
+    if std::mem::take(local_barrier_pending) {
+        targets.push(my_shard);
+    }
     match barrier_targets(p, &targets).await {
         Err(ack) if !matches!(reply, Frame::Error(_)) => {
             crate::persistence::aof::barrier_refusal_frame(ack)
