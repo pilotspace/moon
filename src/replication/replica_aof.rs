@@ -49,6 +49,15 @@
 //! full-syncs again. The embedded server runs no auto-rewrite monitor (and
 //! cannot fold its TopLevel AOF), so step 1 never happens there: it warns at
 //! `REPLICAOF` ([`warn_if_no_rewriter`]).
+//!
+//! Residual (step 3): a fold taken while a master transaction is open
+//! writes its uncommitted values into the new base, and the block's later
+//! records land in the new generation with no `BEGIN` before them; neither
+//! is undone by the promotion's `RESET` — only by the rewrite the promotion
+//! then requests ([`after_promotion_rollback`]), so a crash before that
+//! rewrite commits restarts with them. And the `RESET` waits for writer room
+//! on the shard thread, up to [`RESET_BUDGET`] (10 s): with a stalled writer
+//! a promotion freezes the shard — `PING`, `INFO`, every client — that long.
 
 use std::sync::Arc;
 
