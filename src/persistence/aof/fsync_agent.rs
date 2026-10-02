@@ -268,6 +268,11 @@ pub(super) enum Claim {
 pub(super) struct EverysecSync {
     writer_idx: usize,
     agent: Option<AofFsyncAgent>,
+    /// The policy this state was built for is `everysec` — with or without
+    /// an agent: a writer whose agent could not be spawned fsyncs inline, and
+    /// must not be rebuilt (re-WARNed, deadline reset) on every wake (R2b
+    /// round 2 F6).
+    everysec: bool,
     last_handoff: Instant,
     dirty: bool,
     /// When the fsync now (or last) in flight was handed to the agent.
@@ -307,6 +312,7 @@ impl EverysecSync {
         Self {
             writer_idx,
             agent,
+            everysec: policy == FsyncPolicy::EverySec,
             last_handoff: Instant::now(),
             dirty: false,
             dispatched_at: Instant::now(),
@@ -328,7 +334,7 @@ impl EverysecSync {
     /// the everysec state changed (the caller's pending deadline is void).
     pub(super) fn set_policy(&mut self, policy: FsyncPolicy) -> bool {
         let everysec = policy == FsyncPolicy::EverySec;
-        if everysec == self.agent.is_some() {
+        if everysec == self.everysec {
             return false;
         }
         if everysec {
@@ -350,6 +356,7 @@ impl EverysecSync {
                 self.observe_settled_job(handoff.last_failed());
             }
             self.dirty = false;
+            self.everysec = false;
         }
         true
     }
@@ -362,6 +369,7 @@ impl EverysecSync {
         Self {
             writer_idx,
             agent: AofFsyncAgent::spawn_with_backend(writer_idx, backend).ok(),
+            everysec: true,
             last_handoff: Instant::now(),
             dirty: false,
             dispatched_at: Instant::now(),
@@ -891,6 +899,26 @@ mod tests {
         s.backdate(EVERYSEC);
         assert_eq!(s.claim(), Claim::Owned);
         assert!(s.dispatch(file()));
+    }
+
+    /// R2b round 2 F6: a writer whose agent could not be spawned stays an
+    /// inline-fsync everysec writer — the same policy on the next wake is a
+    /// no-op, so the deadline is not reset (it used to be rebuilt, re-WARNed
+    /// and its `last_handoff` reset every wake, so `due()` never fired).
+    #[test]
+    fn an_everysec_writer_without_an_agent_is_not_rebuilt_every_wake() {
+        let mut s = EverysecSync::new(0, FsyncPolicy::EverySec);
+        // What a failed `AofFsyncAgent::spawn` leaves.
+        s.agent = None;
+        s.note_written();
+        s.backdate(EVERYSEC);
+        assert!(!s.set_policy(FsyncPolicy::EverySec), "same policy: no-op");
+        assert!(s.due(), "the deadline survives the wake");
+        assert_eq!(s.claim(), Claim::Inline);
+        // Leaving and re-entering everysec still rebuilds (and retries).
+        assert!(s.set_policy(FsyncPolicy::No));
+        assert!(!s.set_policy(FsyncPolicy::No));
+        assert!(s.set_policy(FsyncPolicy::EverySec));
     }
 
     /// R1 review NIT: an agent that unwinds mid-fsync settles its job as a
