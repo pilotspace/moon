@@ -12,44 +12,66 @@
 
 use std::path::{Path, PathBuf};
 
-/// Holders per path (a path is open when absent). A `Vec`: a process holds
-/// one gate per instance booting at once, and a `const` mutex needs no lazy
-/// init.
-static HELD: parking_lot::Mutex<Vec<(PathBuf, usize)>> = parking_lot::Mutex::new(Vec::new());
+/// One gated path: how many boots hold it, and whether one refused to start
+/// (its writer must exit without opening the file).
+struct Held {
+    path: PathBuf,
+    holders: usize,
+    refused: bool,
+}
+
+/// Gated paths (a path is open when absent). A `Vec`: a process holds one
+/// gate per instance booting at once, and a `const` mutex needs no lazy init.
+static HELD: parking_lot::Mutex<Vec<Held>> = parking_lot::Mutex::new(Vec::new());
 
 /// Keep the writer of `path` from opening it until the guard is dropped.
 pub fn hold_writer_open(path: &Path) -> OpenGateGuard {
     let mut held = HELD.lock();
-    match held.iter_mut().find(|(p, _)| p == path) {
-        Some((_, n)) => *n += 1,
-        None => held.push((path.to_path_buf(), 1)),
+    match held.iter_mut().find(|h| h.path == path) {
+        Some(h) => h.holders += 1,
+        None => held.push(Held {
+            path: path.to_path_buf(),
+            holders: 1,
+            refused: false,
+        }),
     }
     OpenGateGuard(path.to_path_buf())
 }
 
 /// Whether the writer of `path` may open it now.
 pub fn is_open(path: &Path) -> bool {
-    !HELD.lock().iter().any(|(p, n)| p == path && *n > 0)
+    !HELD.lock().iter().any(|h| h.path == path && h.holders > 0)
+}
+
+/// Whether a boot holding `path`'s gate refused to start: its writer must
+/// exit without opening the file.
+pub fn is_refused(path: &Path) -> bool {
+    HELD.lock().iter().any(|h| h.path == path && h.refused)
 }
 
 /// Re-opens the gate when dropped — on every exit path of the boot.
 pub struct OpenGateGuard(PathBuf);
 
 impl OpenGateGuard {
-    /// Never re-open the gate: the boot refused to start (R2b round 2 F1),
-    /// and the writer must not open — nor, at its stop, append to — the file
-    /// the boot could not read. It exits at cancellation without opening.
-    pub fn keep_closed(self) {
-        std::mem::forget(self);
+    /// The boot refused to start (R2b round 2 F1): the writer waiting on this
+    /// gate exits without opening — nor, at its stop, appending to — the file
+    /// the boot could not read. The caller joins the writer, THEN drops the
+    /// guard, which removes the gate (R2b round 3 F-G: the old `mem::forget`
+    /// leaked it, and a later instance on the same dir never opened its
+    /// writer).
+    pub fn refuse(&self) {
+        if let Some(h) = HELD.lock().iter_mut().find(|h| h.path == self.0) {
+            h.refused = true;
+        }
     }
 }
 
 impl Drop for OpenGateGuard {
     fn drop(&mut self) {
         let mut held = HELD.lock();
-        if let Some(i) = held.iter().position(|(p, _)| *p == self.0) {
-            held[i].1 -= 1;
-            if held[i].1 == 0 {
+        if let Some(i) = held.iter().position(|h| h.path == self.0) {
+            held[i].holders -= 1;
+            if held[i].holders == 0 {
                 held.swap_remove(i);
             }
         }
@@ -64,7 +86,7 @@ pub async fn wait_writer_open(
     cancel: &crate::runtime::cancel::CancellationToken,
 ) -> bool {
     while !is_open(path) {
-        if cancel.is_cancelled() {
+        if cancel.is_cancelled() || is_refused(path) {
             return false;
         }
         tokio::time::sleep(std::time::Duration::from_millis(2)).await;
@@ -90,7 +112,26 @@ mod tests {
         assert!(!is_open(&a));
         drop(g2);
         assert!(is_open(&a));
-        hold_writer_open(&b).keep_closed();
-        assert!(!is_open(&b), "a refused boot keeps its writer out");
+    }
+
+    /// R2b round 3 F-G: a refused boot's gate tells its writer to exit, and
+    /// dropping the guard afterwards leaves the path open for the next
+    /// instance (it used to stay held for the life of the process).
+    #[test]
+    fn a_refused_gate_stops_its_writer_and_is_released_on_drop() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("appendonly.aof");
+        let g = hold_writer_open(&a);
+        assert!(!is_refused(&a));
+        g.refuse();
+        assert!(is_refused(&a) && !is_open(&a));
+        drop(g);
+        assert!(
+            is_open(&a) && !is_refused(&a),
+            "the next instance opens its writer"
+        );
+        let again = hold_writer_open(&a);
+        assert!(!is_refused(&a), "a new boot starts unrefused");
+        drop(again);
     }
 }
