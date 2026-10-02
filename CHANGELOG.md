@@ -333,7 +333,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   not walk it again. UNLINK of a 5M-field hash mid-save: 586-676 ms → 69-83 ms
   on monoio, 852-1624 ms → 65-80 ms on tokio (worst PING gap on another
   connection 807-898 ms → 70-83 ms on monoio); DEL 876-2392 ms → 75-101 ms. An
-  in-place write to a large collection (HSET of one field) still copies it.
+  in-place write to a large collection (HSET of one field) is streamed into
+  the snapshot instead of copied (moon#1295, below).
 
 - **Cold-tier reclaim runs off the shard thread** (moon#1240): it no longer reads, writes or fsyncs spill files, or waits for manifest fsyncs, on the shard thread. Same-host A/B: PING p99 during cold-delete churn −23%, p99.9 about 3× lower. Holding the spill files of a large cold tier after a FLUSHALL no longer costs O(N²) on the shard thread, and the per-tick "does a held file need a rewrite" check is O(1).
 - **The moon#1232 change counting costs no measurable throughput**: release A/B at `--shards 1`, SET/HSET/LPUSH/SADD/ZADD at pipeline 1 and 16, every row within ±3% of main or faster, CPU per op unchanged.
@@ -551,14 +552,19 @@ shared 4-vCPU Linux container against HEAD `935c555` — re-measure on the GCE r
   write after idle is picked up at once instead of after up to 50 ms. With
   `SIGKILL` 1 ms after the last acknowledgement, 20 reps per cell: losses in 9
   of 240 reps (16 of 360 across both tokio runs), down from 226 of 240 (4-vCPU
-  Linux container). The remaining sub-millisecond window is moon#1266 Option
-  1A. `appendfsync always` is unchanged. A stalled fsync is reported as redis
+  Linux container). Option 1A, in the next entry, closes the remaining
+  sub-millisecond window and is the default write path; the writer-thread path
+  described here is what `MOON_AOF_SHARD_WRITE=0` restores. `appendfsync
+  always` is unchanged. A stalled fsync is reported as redis
   does: the log line "Asynchronous AOF fsync is taking too long (disk is
   busy?)", new `INFO` fields `aof_pending_bio_fsync` (writers with an fsync
   in flight: 0..N at `--shards N`) and `aof_fsync_in_flight_ms`, and `aof_delayed_fsync` counted once per 2 s of an
   ongoing postpone (unlike redis, the write itself is never postponed). A
-  failed post-rewrite fsync is recorded and retried within about 100 ms.
-  Diagnostic knob: `MOON_AOF_WARM_POLL_US`.
+  failed post-rewrite fsync is recorded and retried within about 100 ms. A
+  writer whose fsync thread could not be started fsyncs inline, logs one WARN
+  and retries the start at most once a minute.
+  Diagnostic knob: `MOON_AOF_WARM_POLL_US` (inert while Option 1A writes, except
+  inside a rewrite fold or after a latched write error).
 
 - **`CONFIG SET appendfsync` answered `OK` but the writers kept their startup
   policy**, so writes were acknowledged without the fsync `always` promises.
@@ -602,18 +608,16 @@ shared 4-vCPU Linux container against HEAD `935c555` — re-measure on the GCE r
   auto-rewrite monitor folds, and without one a rate-limited snapshot is
   requested, at most one per 10 sweep intervals (10 minutes by default).
   Without an AOF this automatic snapshot runs **even with `save ""`** and
-  overwrites the dump file like any `BGSAVE`. It never contains a `TXN`'s
-  uncommitted writes: it waits while any `TXN` is open, and it is abandoned
-  whole — no shard file replaced, `LASTSAVE` unmoved, no held file released —
-  and retried at a later sweep if any shard holds an uncommitted `TXN` write
-  when that shard starts its part; `TXN` writes after a shard's start are
-  saved at their pre-transaction value. An open `TXN`, or unbroken `TXN`
-  traffic, therefore keeps held files on disk (and `SWAPDB` refused) until a
-  snapshot can run. `BGSAVE`, `SAVE` and the save rules are not covered yet
-  (moon#1300). New `INFO` fields: `cold_held_files_stale_databases`,
-  `cold_held_release_folds_requested`, `cold_held_release_snapshots_requested`,
-  `cold_held_release_snapshots_deferred_txn`,
-  `cold_held_release_snapshots_abandoned_txn`.
+  overwrites the dump file like any `BGSAVE`. Like every snapshot (`BGSAVE`,
+  the save rules, the `SHUTDOWN` save), it stores a key an open `TXN` holds at
+  its pre-transaction value, whether the transaction wrote the key before the
+  snapshot started or during it (moon#1300), so it never contains uncommitted
+  writes and never waits for, or is abandoned because of, an open `TXN`: a
+  long transaction or unbroken `TXN` traffic does not delay the release. A
+  database with held files still refuses `SWAPDB` until they are released.
+  New `INFO` fields: `cold_held_files_stale_databases`,
+  `cold_held_release_folds_requested`,
+  `cold_held_release_snapshots_requested`.
 
 - **`volatile-lru`, `volatile-lfu` and `volatile-random` could answer OOM while
   a key with a TTL existed.** Victim sampling draws random table segments and
