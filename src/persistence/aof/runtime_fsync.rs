@@ -15,10 +15,13 @@
 //!   which JOINS it, so an fsync still in flight finishes first (redis's
 //!   `bioDrainWorker(BIO_AOF_FSYNC)` on the same switch); entering it starts
 //!   an agent.
-//! * A batch holding an `AppendSync` is fsynced before its acks whatever the
-//!   writer's policy of the moment (`group_commit::batch_needs_fsync`), so a
-//!   producer that switched to `always` a moment before its writer did never
-//!   gets an ack without the fsync.
+//! * A batch is fsynced before its acks when the policy in force at its
+//!   commit is `always` — re-read there (`group_commit::batch_needs_fsync`),
+//!   so a producer that switched to `always` a moment before its writer did
+//!   never gets an ack without the fsync. An `AppendSync` committed after the
+//!   policy left `always` is acked once written, as redis acks a write under
+//!   the policy in force (moon#1266 W2B-1: the barriers of a held lane only
+//!   order a reply after its record's `write(2)`).
 //!
 //! The override is process-wide, like the other live `CONFIG SET` parameters
 //! (`publish_lfu_params`): one server per process. It stays unset until a

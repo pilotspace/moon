@@ -35,7 +35,8 @@
 //! hand-over, under `appendfsync always`, after a producer's `AppendSync`
 //! flipped the lane — the lane is HELD ([`super::lane_protocol`]): the pool
 //! then reports `always` to its producers ([`AofLane::any_held`]), so every
-//! reply waits for the fsync barrier that follows its record's `write(2)`.
+//! reply waits for the ack of a barrier queued after its record — acked once
+//! the record is `write(2)`-n (fsynced only under `always`).
 //! No reply leaves before its record is written in those windows either
 //! (W2B-1 of the R2b review).
 //!

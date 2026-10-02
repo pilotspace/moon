@@ -524,7 +524,7 @@ pub async fn aof_writer_task(
                         // AppendSync waiter — never a false durability claim.
                         let _ = group_commit::ack_batch(&mut batch, BatchAck::WriteFailed);
                     } else {
-                        let do_fsync = group_commit::batch_needs_fsync(fsync, &batch);
+                        let do_fsync = group_commit::batch_needs_fsync(fsync);
                         let mut sink = FileGroupSink {
                             file: &mut file,
                             fail_sync: fail_fsync_for_test,
@@ -545,8 +545,8 @@ pub async fn aof_writer_task(
                             write_error = true;
                         }
                         // EverySec: the batch was written but not per-batch-fsynced
-                        // (do_fsync=false; there are no AppendSync waiters under
-                        // everysec). The end-of-loop hand-off to the fsync agent
+                        // (do_fsync=false; any AppendSync was acked once written,
+                        // `batch_needs_fsync`). The end-of-loop hand-off to the fsync agent
                         // makes it durable within the 1s bound — pin the idle
                         // wait at its fast floor until that hand-off clears it.
                         if fsync == FsyncPolicy::EverySec && !write_error {
@@ -842,7 +842,7 @@ pub async fn aof_writer_task(
                                     break;
                                 }
                             }
-                            let do_fsync = group_commit::batch_needs_fsync(fsync, &batch);
+                            let do_fsync = group_commit::batch_needs_fsync(fsync);
                             // moon#1266: the whole batch reaches the kernel
                             // before the loop moves on — nothing acked stays
                             // in user space for a SIGKILL to take. (Always
@@ -879,17 +879,10 @@ pub async fn aof_writer_task(
                                     BatchAck::Synced
                                 }
                             } else {
-                                // EverySec/No: batch buffered; the deadline check
-                                // after this block fsyncs. An AppendSync is enqueued
-                                // ONLY under Always (pool::try_send_append_durable /
-                                // fsync_barrier), so this branch acks no waiter.
-                                debug_assert!(
-                                    !batch
-                                        .data
-                                        .iter()
-                                        .any(|m| matches!(m, AofMessage::AppendSync { .. })),
-                                    "everysec/no batch must contain no AppendSync"
-                                );
+                                // EverySec/No: in the kernel (flushed above); the
+                                // deadline check after this block fsyncs. An
+                                // AppendSync here is acked once written
+                                // (`batch_needs_fsync`, moon#1266 W2B-1).
                                 if fsync == FsyncPolicy::EverySec {
                                     // Bytes are in the kernel but not yet
                                     // durable — pin the idle wait at its floor
@@ -1467,7 +1460,7 @@ pub async fn per_shard_aof_writer_task(
                                         }
                                     }
 
-                                    let do_fsync = group_commit::batch_needs_fsync(fsync, &batch);
+                                    let do_fsync = group_commit::batch_needs_fsync(fsync);
                                     // moon#1266: see the TopLevel tokio loop.
                                     if !write_failed
                                         && !do_fsync
@@ -1960,7 +1953,7 @@ pub async fn per_shard_aof_writer_task(
                         // after a sustained run of small batches.
                         batch_buf.finish();
 
-                        let do_fsync = group_commit::batch_needs_fsync(fsync, &batch);
+                        let do_fsync = group_commit::batch_needs_fsync(fsync);
                         let verdict = if write_failed {
                             // A torn write may leave a partial record — latch so no
                             // further bytes are appended after the tear.
@@ -1986,7 +1979,7 @@ pub async fn per_shard_aof_writer_task(
                             }
                         } else {
                             // EverySec/No: the everysec hand-off below makes the
-                            // batch durable; no AppendSync waiters under everysec/no.
+                            // batch durable; an AppendSync is acked once written.
                             if fsync == FsyncPolicy::EverySec {
                                 everysec.note_written();
                                 idle_wait.mark_pending();

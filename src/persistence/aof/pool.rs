@@ -733,7 +733,7 @@ impl AofWriterPool {
     /// handed its append position to the shard threads — or `bound` passes —
     /// so the first client writes find the lanes DIRECT. Correctness does not
     /// depend on it (a held lane sends the replies through the acked path);
-    /// it only keeps the first writes off the fsync barrier. Returns at once
+    /// it only keeps the first writes off the barrier round trip. Returns at once
     /// under `always` (the writers keep the position) or with 1A off.
     pub fn await_hand_over(&self, bound: Duration) -> bool {
         if super::runtime_fsync::effective(self.fsync_policy) == FsyncPolicy::Always {
@@ -744,7 +744,7 @@ impl AofWriterPool {
             if std::time::Instant::now() >= deadline {
                 tracing::warn!(
                     "AOF writers did not hand their append position to the shard threads \
-                     within {bound:?} of boot; the first writes wait for an fsync barrier \
+                     within {bound:?} of boot; the first writes wait for a writer barrier \
                      until they do"
                 );
                 return false;
