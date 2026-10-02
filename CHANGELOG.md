@@ -18787,8 +18787,11 @@ path (below), or replay them on a pre-freeze build first and re-persist.
   fast path AND the scattered local slice) executed in memory but never
   reached the owning shard's AOF — deleted keys **resurrected** from
   their seed writes on restart, and BITOP/COPY results on the
-  connection's own shard silently vanished (carried v3-4 follow-up;
-  remote legs were always durable via MultiExecute). All four now
+  connection's own shard silently vanished (carried v3-4 follow-up). The
+  remote legs did reach their owners' AOF via MultiExecute, but nothing
+  fsync-barriered them before the reply until moon#1322 (see Unreleased):
+  under `appendfsync always` a spanning write was acknowledged with no
+  fsync of the remote shard's file. All four now
   persist through the same `persist_local_leg` group-commit path as
   MSET/MSETNX: synthesized over only locally-owned keys, skipped when
   nothing was written (DEL of missing keys), and confirmed by the
