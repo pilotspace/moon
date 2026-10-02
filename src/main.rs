@@ -915,6 +915,19 @@ fn main() -> anyhow::Result<()> {
         );
         std::process::exit(2);
     }
+    // R2b round 3 F-C (moon#1321) / F-H: a flat AOF booted with --shards N,
+    // or a single-shard manifest booted by a build that does not replay it.
+    if config.appendonly == "yes"
+        && let Some(msg) = moon::persistence::aof::layout_guard::refusal(
+            std::path::Path::new(&config.dir),
+            num_shards,
+            existing_manifest.is_some(),
+            cfg!(feature = "runtime-monoio"),
+        )
+    {
+        eprintln!("REFUSING TO START: {msg}");
+        std::process::exit(2);
+    }
     // Shard-count mismatch guard for non-TopLevel manifests (PerShard layout
     // with a different shard count than currently configured). A v1 TopLevel
     // manifest always records shards=1; that case is already handled above.
@@ -1709,21 +1722,8 @@ fn main() -> anyhow::Result<()> {
                     // went wrong.
                     moon::persistence::aof::flat_file::retire_logged(&base_dir);
                 }
-                #[cfg(not(feature = "runtime-monoio"))]
-                {
-                    // tokio + --shards 1: single-shard multi-part replay is
-                    // monoio-only. Legacy v2 (appendonly.aof) recovery already
-                    // ran in restore_from_persistence; warn so an operator who
-                    // switched from monoio knows multi-part data isn't loaded by
-                    // this build.
-                    tracing::warn!(
-                        "multi-part AOF manifest at {}/appendonlydir/ found but runtime is \
-                         tokio with --shards 1; single-shard multi-part replay is monoio-only. \
-                         Legacy v2 (appendonly.aof) recovery active. Switch to monoio to load \
-                         multi-part single-shard data.",
-                        base_dir.display()
-                    );
-                }
+                // tokio + --shards 1 never reaches here: it refused to start
+                // before recovery (`aof::layout_guard`, R2b round 3 F-H).
             } else if manifest.layout == moon::persistence::aof_manifest::AofLayout::PerShard {
                 // Per-shard AOF replay (RFC § 2 rules 1-3, Option B step 4).
                 //
