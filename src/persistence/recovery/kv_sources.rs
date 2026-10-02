@@ -68,6 +68,32 @@ impl KvSources {
         }
     }
 
+    /// The sources for a recovery to `target` (`None`: the whole history).
+    /// With no target this is [`KvSources::with_flat_aof`]. A point-in-time
+    /// target refuses an `appendonly.aof` that would make the pass
+    /// [`KvSources::AofOnly`] (R2b round 4 F9): the snapshot + WAL recovery
+    /// to the target left that file unread and its torn tail uncut, yet it
+    /// stays the KV authority — its writer appends behind the torn bytes
+    /// (every later boot refuses the file), and the next boot without a
+    /// target replays every write in it, past the target too, undoing the
+    /// recovery. Refused before anything is read or written.
+    pub fn for_target(self, dir: Option<&Path>, target: Option<u64>) -> Result<Self, String> {
+        let Some(target) = target else {
+            return Ok(self.with_flat_aof(dir));
+        };
+        match (self.with_flat_aof(dir), dir) {
+            (Self::AofOnly, Some(d)) => Err(format!(
+                "refusing point-in-time recovery to LSN {target}: {} holds records and is \
+                 this dataset's KV authority under --appendonly yes. It carries every write, \
+                 past the target too, so the next boot would replay them all and undo the \
+                 recovery. Copy it somewhere safe and move it out of the directory to \
+                 recover to the target, or drop --recovery-target-*",
+                crate::persistence::aof::flat_file::flat_aof_path(d).display()
+            )),
+            _ => Ok(self),
+        }
+    }
+
     /// Load the snapshot.
     pub fn snapshot(self) -> bool {
         matches!(self, Self::SnapshotAndLogs | Self::SnapshotOnly)
@@ -173,5 +199,34 @@ mod tests {
         for other in [KvSources::SnapshotOnly, KvSources::Elsewhere] {
             assert_eq!(other.with_flat_aof(Some(dir)), other);
         }
+    }
+
+    /// R2b round 4 F9: a recovery target refuses a flat AOF holding records
+    /// (the snapshot + WAL pass to the target would leave it uncut and
+    /// authoritative); without one, or without such a file, it is the
+    /// classic choice.
+    #[test]
+    fn a_recovery_target_refuses_a_flat_aof_with_records() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let logs = KvSources::SnapshotAndLogs;
+        assert_eq!(logs.for_target(Some(dir), Some(5)), Ok(logs), "no AOF");
+        std::fs::write(dir.join("appendonly.aof"), b"").unwrap();
+        assert_eq!(logs.for_target(Some(dir), Some(5)), Ok(logs), "empty AOF");
+        std::fs::write(dir.join("appendonly.aof"), b"*1\r\n$4\r\nPING\r\n").unwrap();
+        let err = logs.for_target(Some(dir), Some(5)).unwrap_err();
+        assert!(
+            err.contains("LSN 5") && err.contains("appendonly.aof"),
+            "{err}"
+        );
+        assert_eq!(logs.for_target(Some(dir), None), Ok(KvSources::AofOnly));
+        for other in [KvSources::SnapshotOnly, KvSources::Elsewhere] {
+            assert_eq!(other.for_target(Some(dir), Some(5)), Ok(other));
+        }
+        assert_eq!(
+            std::fs::read(dir.join("appendonly.aof")).unwrap(),
+            b"*1\r\n$4\r\nPING\r\n",
+            "untouched"
+        );
     }
 }
