@@ -34,8 +34,9 @@ use crate::persistence::aof::{AofAck, AofWriterPool, FsyncPolicy};
 use crate::protocol::Frame;
 use crate::shard::dispatch::key_to_shard;
 
-/// Owner shards of a coordinated write, beyond the coordinator's own.
-pub(crate) type Targets = SmallVec<[usize; 8]>;
+/// Owner shards of a coordinated write, beyond the coordinator's own —
+/// inline up to 16 shards (R2b round 3 N3: the consistency suite runs 12).
+pub(crate) type Targets = SmallVec<[usize; 16]>;
 
 /// Whether any remote leg could owe a barrier now: the policy is `always`, or
 /// a lane of this pool is held. When this reads `false`, every remote record
