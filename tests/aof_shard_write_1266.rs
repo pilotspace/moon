@@ -501,12 +501,15 @@ fn lost_after_restart(
     lost
 }
 
-/// R2b round 2 F3: the writers keep their append position this long after
-/// boot (`MOON_TEST_AOF_FIRST_OFFER_DELAY_MS`; `main` then skips its boot
-/// wait), so the boot test's pipelines provably meet HELD lanes — without
-/// the hook `main`'s `await_hand_over` had usually handed every lane over
-/// before the first client connected, and the test could not reach the hold.
-const BOOT_HOLD_MS: &str = "3000";
+/// R2b round 2 F3: every writer starts this late
+/// (`MOON_TEST_AOF_WRITER_START_DELAY_MS`; `main` then skips its boot wait),
+/// so the boot test's pipelines provably meet HELD lanes: their replies wait
+/// for the writer's barrier ack (under the 2 s `--aof-fsync-timeout-ms`).
+/// Without the hold they would be acknowledged from the channel of a writer
+/// that has not started, and the kill on ack loses them. Without the hook
+/// `main`'s `await_hand_over` had usually handed every lane over before the
+/// first client connected, and the test could not reach the hold.
+const BOOT_HOLD_MS: &str = "1000";
 
 /// The boot window: right after the first `PONG`s, 1 or `CONNS` connections each
 /// send a SET pipeline; kill -9 the instant one has all its acks. The writer
@@ -524,7 +527,7 @@ fn boot_window_kill_on_ack(shards: usize) {
                     dir.path(),
                     shards,
                     "1",
-                    &[("MOON_TEST_AOF_FIRST_OFFER_DELAY_MS", BOOT_HOLD_MS)],
+                    &[("MOON_TEST_AOF_WRITER_START_DELAY_MS", BOOT_HOLD_MS)],
                 )
             });
             let streams = raw_conns(port, conns); // the server's first PONGs

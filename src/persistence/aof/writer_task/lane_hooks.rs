@@ -67,6 +67,7 @@ pub(super) fn top_of_wake(
     floor: FoldEpoch,
     file: &impl DupFile,
 ) {
+    crate::persistence::aof::lane_test_hook::delay_writer_start_once();
     on_policy(lane, fsync, ctx, write_error);
     offer(lane, rx, fsync, *write_error, ctx, floor, file);
 }
@@ -140,10 +141,7 @@ pub(super) fn offer(
         lane.unhold();
         return;
     }
-    if fsync == FsyncPolicy::Always
-        || !lane.may_release(rx)
-        || !crate::persistence::aof::lane_test_hook::offer_allowed()
-    {
+    if fsync == FsyncPolicy::Always || !lane.may_release(rx) {
         return;
     }
     match file.dup() {
