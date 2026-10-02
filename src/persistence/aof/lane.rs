@@ -94,8 +94,12 @@ fn parse_switch(v: Option<&str>) -> bool {
 /// channel with it to exercise the backpressure refusals) keeps 1A off:
 /// with the shard writing its own records there is no queue to fill — a slow
 /// disk stalls the shard's `write(2)` instead, as in redis — and the channel
-/// path those suites pin is still live (`always`, folds, before the first
-/// hand-over).
+/// path those suites pin is still live (`always`, folds). So does
+/// `MOON_TEST_AOF_WRITER_HOLD` (a writer held before it starts — the
+/// moon#1274 suites queue acknowledged records behind it to pin the shutdown
+/// drain): under 1A that writer's lane stays held, so those writes would wait
+/// for it and fail at `--aof-fsync-timeout-ms` instead of being acknowledged
+/// from its queue (W2B-1: no reply before its record is written).
 pub fn enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
@@ -104,10 +108,11 @@ pub fn enabled() -> bool {
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
             .is_some_and(|ms| ms > 0);
-        if on && stall_hook {
+        let hold_hook = std::env::var_os("MOON_TEST_AOF_WRITER_HOLD").is_some();
+        if on && (stall_hook || hold_hook) {
             tracing::warn!(
-                "MOON_TEST_AOF_FSYNC_STALL_MS is set: AOF records go through the writer \
-                 thread (moon#1266 1A off for this test hook)"
+                "MOON_TEST_AOF_FSYNC_STALL_MS or MOON_TEST_AOF_WRITER_HOLD is set: AOF \
+                 records go through the writer thread (moon#1266 1A off for this test hook)"
             );
             return false;
         }
