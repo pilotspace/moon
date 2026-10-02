@@ -1969,14 +1969,7 @@ fn main() -> anyhow::Result<()> {
             // RDB preamble — the AOF is the only KV source of the next boot.
             use moon::persistence::aof::fresh_generation::{self, FreshGeneration};
             let dbs = &shards[0].databases;
-            let base = || {
-                if dbs.iter().all(|db| db.len() == 0) {
-                    return Ok(None);
-                }
-                moon::persistence::rdb::save_to_bytes(dbs)
-                    .map(Some)
-                    .map_err(std::io::Error::other)
-            };
+            let base = || fresh_generation::keyspace_base(dbs);
             let head = (
                 cold_file_watermark(&spill_seeds, 0),
                 fresh_deletes(&shards, 0),
@@ -2066,9 +2059,10 @@ fn main() -> anyhow::Result<()> {
             // The replay reads `<dir>/appendonly.aof`; the writer appends to
             // `<dir>/<appendfilename>`. A rewrite can only repair the file
             // that was replayed.
-            let replayed = std::path::Path::new(&config.dir).join("appendonly.aof");
+            use moon::persistence::aof::flat_file::{FLAT_AOF_NAME, flat_aof_path};
+            let replayed = flat_aof_path(std::path::Path::new(&config.dir));
             let aof_bytes = std::fs::metadata(&replayed).map_or(0, |m| m.len());
-            let writes_replayed_file = config.appendfilename == "appendonly.aof";
+            let writes_replayed_file = config.appendfilename == FLAT_AOF_NAME;
             if aof_pool.is_some() && writes_replayed_file {
                 tracing::warn!(
                     "moon#914: replayed a legacy appendonly.aof ({}, {} bytes) with no \

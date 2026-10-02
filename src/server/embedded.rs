@@ -337,14 +337,7 @@ pub async fn run_embedded(
     if fresh_aof_gate.is_some() {
         let aof_path = PathBuf::from(&config.dir).join(&config.appendfilename);
         let dbs = &shards[0].databases;
-        let base = || {
-            if dbs.iter().all(|db| db.len() == 0) {
-                return Ok(None);
-            }
-            crate::persistence::rdb::save_to_bytes(dbs)
-                .map(Some)
-                .map_err(std::io::Error::other)
-        };
+        let base = || aof::fresh_generation::keyspace_base(dbs);
         aof::fresh_generation::open_fresh_flat_generation(&aof_path, base, None).with_context(
             || {
                 format!(
