@@ -511,6 +511,24 @@ async fn stream_commands_read_loop(
         );
         for rc in &outcome.commands {
             use crate::replication::apply::ApplyOutcome;
+            // R2b round 3 X1: room in this node's AOF writer BEFORE the apply
+            // (an await: the link stalls, the shard keeps serving), so the
+            // append right after it never waits and never drops. A task
+            // superseded while it waited must not apply.
+            if let Some(pool) = cfg.aof_pool.as_ref()
+                && crate::replication::replica_aof::will_log(Some(pool), rc)
+            {
+                let live = crate::replication::replica_aof::admit(pool).await;
+                if superseded(cfg.epoch) {
+                    anyhow::bail!("replica task superseded while waiting for the AOF writer");
+                }
+                if !live {
+                    tracing::error!(
+                        "replica: this node's AOF writer is gone; the stream is applied but \
+                         no longer logged"
+                    );
+                }
+            }
             match crate::replication::apply::apply_local(
                 rc,
                 &cfg.shard_databases,
@@ -945,6 +963,24 @@ async fn stream_commands_read_loop(
         );
         for rc in &outcome.commands {
             use crate::replication::apply::ApplyOutcome;
+            // R2b round 3 X1: room in this node's AOF writer BEFORE the apply
+            // (an await: the link stalls, the shard keeps serving), so the
+            // append right after it never waits and never drops. A task
+            // superseded while it waited must not apply.
+            if let Some(pool) = cfg.aof_pool.as_ref()
+                && crate::replication::replica_aof::will_log(Some(pool), rc)
+            {
+                let live = crate::replication::replica_aof::admit(pool).await;
+                if superseded(cfg.epoch) {
+                    anyhow::bail!("replica task superseded while waiting for the AOF writer");
+                }
+                if !live {
+                    tracing::error!(
+                        "replica: this node's AOF writer is gone; the stream is applied but \
+                         no longer logged"
+                    );
+                }
+            }
             match crate::replication::apply::apply_local(
                 rc,
                 &cfg.shard_databases,

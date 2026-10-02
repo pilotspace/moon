@@ -1,37 +1,47 @@
-//! A replica's own AOF holds the master's dataset (R2b round 2 R1, moon#1318).
+//! A replica's own AOF holds the master's dataset (R2b round 2 R1, moon#1318;
+//! round 3 F-A, X1, F-E).
 //!
 //! Since R2b P1 a replica's AOF is its only KV source at boot, exactly as in
-//! redis. Two things made it incomplete, so a PROMOTED replica restarted with
-//! almost nothing (reviewer: master 100 keys, replica synced, BGSAVE,
-//! `REPLICAOF NO ONE`, `SET promoted 1`, kill -9 -> DBSIZE 1):
+//! redis. So that a PROMOTED replica's restart keeps the master's data:
 //!
-//! 1. The full sync's dataset is loaded straight into the keyspace; nothing
-//!    wrote it to the AOF. redis's `restartAOFAfterSYNC` starts an AOF
-//!    rewrite right after the sync, so the new generation's base is the
-//!    synced dataset. [`after_full_sync`] requests that rewrite from the
-//!    auto-rewrite monitor ([`crate::persistence::aof::auto_rewrite::request_rewrite`]),
-//!    which runs it at once — after a rewrite already running, whose image
-//!    may predate the load — and retries it until one completes OK (the fold
-//!    protocol keeps it exactly-once against the stream records appended
-//!    meanwhile). The embedded server runs no monitor: [`warn_if_no_rewriter`].
-//! 2. The master stream was applied with plain dispatch and never logged.
-//!    redis replicas feed it into their own AOF (`propagate` /
-//!    `feedAppendOnlyFile`). [`log_applied`] appends every applied KV write
-//!    and every `MOON.TXN` marker, right after the apply on the shard thread
-//!    (no await between them, so the record's fold stamp is the write's
-//!    epoch, #455). The markers are the AOF's own transaction records
-//!    (moon#1300): a master transaction the replica never saw end is rolled
-//!    back by the replay as by the replica at promotion.
+//! 1. **The synced dataset.** A full sync loads it straight into the
+//!    keyspace. redis's `restartAOFAfterSYNC` rewrites the AOF right after,
+//!    so the new generation's base is the synced dataset. [`after_full_sync`]
+//!    asks the auto-rewrite monitor for that rewrite
+//!    ([`crate::persistence::aof::auto_rewrite::request_rewrite`]): the
+//!    monitor wakes at once, waits out any rewrite already running (its image
+//!    may predate the load), dispatches its own, and keeps the request until
+//!    a rewrite IT started completes OK — a failed one is retried.
+//! 2. **The applied stream.** redis replicas feed it into their own AOF
+//!    (`propagate` / `feedAppendOnlyFile`). Every applied KV write and every
+//!    `MOON.TXN` marker is appended: [`admit`] waits — asynchronously, the
+//!    link stalls instead of the shard thread — until the writer can take
+//!    the record, BEFORE the apply; [`log_applied`] enqueues it right after
+//!    the apply with no await in between, so the record's fold stamp is the
+//!    write's epoch (#455). redis blocks the replica rather than drop a
+//!    record; so does this. A record that still cannot be enqueued (the
+//!    writer is gone) marks `aof_last_write_status:err` (the pool's drop
+//!    accounting) and asks for a rewrite.
+//! 3. **Dead master transactions.** The markers are the AOF's own
+//!    transaction records (moon#1300). When the replica stops following the
+//!    master, the blocks it never saw end are rolled back in memory AND
+//!    ended in this AOF with `MOON.TXN RESET` ([`log_txn_reset`], from
+//!    `txn_apply::roll_back_open` / `discard_logged`), before any local
+//!    write is logged — so replay rolls them back at that point, and a local
+//!    transaction reusing a block's log id opens a fresh block.
 //!
 //! Not logged: the planes that are not KV history in the AOF (`FT.*`,
 //! `GRAPH.*`, `MQ.*` replication effects, `TEMPORAL.*`, `WS.*`), as the
-//! master's own AOF does not carry them either; they recover from their own
-//! stores. Replicas are single-shard (`replica::replica_supported`).
+//! master's own AOF does not carry them either. Replicas are single-shard
+//! (`replica::replica_supported`), so every record goes to writer 0.
 //!
-//! A promotion that rolls back a master transaction still open asks for a
-//! rewrite too ([`after_promotion_rollback`]): the AOF then holds the
-//! rolled-back keyspace instead of an open block whose id a later local
-//! transaction could reuse.
+//! Residual: until the post-sync rewrite commits, the AOF's base is the
+//! dataset this node held BEFORE the sync (plus the stream applied since);
+//! a crash in that window that is then promoted without resyncing restarts
+//! with that former dataset, not the master's. A node restarted as a replica
+//! full-syncs again. The embedded server runs no auto-rewrite monitor (and
+//! cannot fold its TopLevel AOF), so step 1 never happens there: it warns at
+//! `REPLICAOF` ([`warn_if_no_rewriter`]).
 
 use std::sync::Arc;
 
@@ -40,11 +50,7 @@ use crate::protocol::Frame;
 use crate::replication::apply::ReplCommand;
 
 /// After a full sync loaded the master's dataset: ask for the rewrite that
-/// makes it the base of a new AOF generation (redis `restartAOFAfterSYNC`).
-/// The auto-rewrite monitor wakes at once, waits out a rewrite already
-/// running (its image may predate the load), dispatches its own, and keeps
-/// the request until a rewrite it started completes OK (R2b round 3 F-E: a
-/// directly dispatched rewrite that later failed was never retried). No-op
+/// makes it the base of a new AOF generation (see the module doc). No-op
 /// without an AOF.
 pub(crate) fn after_full_sync(aof_pool: Option<&Arc<AofWriterPool>>) {
     if aof_pool.is_none() {
@@ -57,8 +63,8 @@ pub(crate) fn after_full_sync(aof_pool: Option<&Arc<AofWriterPool>>) {
 }
 
 /// At `REPLICAOF` with an AOF: say so when nothing will ever rewrite it (the
-/// embedded server runs no auto-rewrite monitor and cannot fold its TopLevel
-/// AOF), so a promoted replica's restart cannot hold the master's dataset.
+/// embedded server), so a promoted replica's restart cannot hold the
+/// master's dataset.
 pub(crate) fn warn_if_no_rewriter(aof_pool: Option<&Arc<AofWriterPool>>) {
     if aof_pool.is_some() && !crate::persistence::aof::auto_rewrite::monitor_running() {
         tracing::warn!(
@@ -70,7 +76,7 @@ pub(crate) fn warn_if_no_rewriter(aof_pool: Option<&Arc<AofWriterPool>>) {
 }
 
 /// A promotion rolled back `rolled` master transactions still open: ask for
-/// a rewrite so the AOF holds the rolled-back keyspace.
+/// a rewrite (compaction: the AOF then no longer carries the dead blocks).
 pub(crate) fn after_promotion_rollback(rolled: usize) {
     if rolled > 0 {
         crate::persistence::aof::auto_rewrite::request_rewrite();
@@ -82,15 +88,8 @@ pub(crate) fn after_promotion_rollback(rolled: usize) {
 /// write, so it waits far longer than a data record's bound.
 const RESET_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// Append `MOON.TXN RESET` to this node's AOF, synchronously, on the shard
-/// thread (R2b round 3 F-A). Called from `txn_apply::roll_back_open` (inside
-/// `replica::bump_replica_task_epoch`, before every caller flips the role,
-/// so it precedes every local write) and `txn_apply::discard_logged` (before
-/// a full sync's load): replay then rolls the dead master blocks back at
-/// exactly this point. Without it the blocks stayed open in the AOF until a
-/// rewrite committed, and local writes after the promotion replayed against
-/// them: attributed to a block cut between BEGIN and PAUSE and rolled back
-/// at EOF, or committed by a local transaction whose log id was the same.
+/// Append `MOON.TXN RESET` to this node's AOF, synchronously (see the module
+/// doc, step 3). Called on the shard thread before the role changes.
 pub(crate) fn log_txn_reset(aof_pool: Option<&Arc<AofWriterPool>>) {
     use crate::persistence::replay::pseudo::{TxnMarker, TxnRecord};
     let Some(pool) = aof_pool else {
@@ -124,8 +123,39 @@ fn is_logged(cmd: &[u8], args: &[Frame]) -> bool {
     crate::command::metadata::is_write(cmd)
 }
 
+/// Whether `rc` will be appended by [`log_applied`].
+pub(crate) fn will_log(aof_pool: Option<&Arc<AofWriterPool>>, rc: &ReplCommand) -> bool {
+    aof_pool.is_some()
+        && crate::shard::spsc_handler::extract_command_static(&rc.command)
+            .is_some_and(|(cmd, args)| is_logged(cmd, args))
+}
+
+/// Before applying a record [`log_applied`] will append: wait until writer 0
+/// can take it. Awaits (the replication link stalls, the shard keeps
+/// serving); never times out while the writer lives — redis blocks the
+/// replica, it never drops. `false` when the writer is gone.
+pub(crate) async fn admit(pool: &AofWriterPool) -> bool {
+    let mut warned = false;
+    loop {
+        match pool.await_append_room(0, 1).await {
+            Ok(()) => return true,
+            Err(crate::persistence::aof::AofAck::ChannelFull) => {
+                if !warned {
+                    warned = true;
+                    tracing::warn!(
+                        "replica: the AOF writer is behind; the replication stream waits for it \
+                         (records are never dropped)"
+                    );
+                }
+            }
+            Err(_) => return false,
+        }
+    }
+}
+
 /// Append an applied master-stream record to the replica's own AOF. Call
-/// right after `apply_local` returned `Applied`, with no await in between.
+/// right after `apply_local` returned `Applied`, with no await in between,
+/// after [`admit`] (so the enqueue does not wait).
 pub(crate) fn log_applied(aof_pool: Option<&Arc<AofWriterPool>>, rc: &ReplCommand) {
     let Some(pool) = aof_pool else {
         return;
@@ -137,11 +167,13 @@ pub(crate) fn log_applied(aof_pool: Option<&Arc<AofWriterPool>>, rc: &ReplComman
         return;
     }
     let bytes = crate::persistence::aof::serialize_command_for_log(&rc.command);
-    let mut budget = crate::persistence::aof::AOF_REASON_DEL_BACKPRESSURE_BOUND;
-    if !pool.send_append_bounded_blocking(0, 0, rc.db_index, bytes, &mut budget) {
+    // Non-blocking: `admit` made room. A refusal here (the writer is gone,
+    // or another producer took the room) is counted by the pool as a dropped
+    // append (`aof_last_write_status:err` until a fold heals it).
+    if !pool.try_send_append(0, 0, rc.db_index, bytes) {
         tracing::error!(
-            "replica: a master-stream record was NOT appended to this replica's AOF (writer \
-             backpressure); requesting a rewrite so the AOF holds the dataset again"
+            "replica: a master-stream record was NOT appended to this replica's AOF; \
+             requesting a rewrite so the AOF holds the dataset again"
         );
         crate::persistence::aof::auto_rewrite::request_rewrite();
     }
