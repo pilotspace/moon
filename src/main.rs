@@ -2195,7 +2195,7 @@ fn main() -> anyhow::Result<()> {
     // shard threads before any client can write (bounded; a lane still held
     // then is safe, only slower — its replies wait for a writer barrier).
     if let Some(ref pool) = aof_pool
-        && moon::persistence::aof::lane_test_hook::first_offer_delay().is_none()
+        && moon::persistence::aof::lane_test_hook::writer_start_delay().is_none()
     {
         pool.await_hand_over(std::time::Duration::from_secs(2));
     }
