@@ -36,6 +36,33 @@ pub(crate) enum ReplayNext {
     Corrupt { offset: u64, err: ParseError },
 }
 
+/// The parser limits for replaying a log (R2b round 4 F2): the client
+/// protocol's, but with no element-count cap. A record is what a writer
+/// emitted, and the writer is not held to the client limits: an `SPOP` of
+/// 1,060,000 members was logged as ONE `SREM` of that many — over the
+/// client cap of 1,048,576 — and the replay then refused the file as
+/// corrupt. The bytes on disk bound a record: the parser walks every
+/// element before it allocates the frame, so a count the file cannot back
+/// is a torn tail (or a malformed frame), never an allocation. The bulk
+/// size and nesting caps stay (every record is a flat array of bulks no
+/// larger than a client may send).
+#[must_use]
+pub(crate) fn log_parse_config() -> ParseConfig {
+    ParseConfig {
+        max_array_length: usize::MAX,
+        ..ParseConfig::default()
+    }
+}
+
+/// `err` is a parser limit, not malformed bytes (R2b round 4 F2): every
+/// limit error reads "… exceeds maximum …". A boot must not call it
+/// corruption — truncating the file there drops the record and every later
+/// write.
+#[must_use]
+pub(crate) fn is_limit_violation(err: &ParseError) -> bool {
+    matches!(err, ParseError::Invalid { message, .. } if message.contains("exceeds maximum"))
+}
+
 /// Streams RESP frames out of `src` through a bounded buffer.
 pub(crate) struct ReplayChunks<R> {
     src: R,
@@ -67,7 +94,7 @@ impl<R: Read> ReplayChunks<R> {
             src,
             buf: BytesMut::new(),
             state: ParseState::new(),
-            config: ParseConfig::default(),
+            config: log_parse_config(),
             offset: base_offset,
             chunk: chunk.max(1),
             eof: false,
@@ -280,6 +307,38 @@ mod tests {
                 assert_eq!(offset, 100 + whole);
                 assert_eq!(len, log.len() - whole as usize);
             }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// R2b round 4 F2: a record of more elements than the client protocol's
+    /// cap (what an `SPOP` of 1,060,000 members was logged as) replays; a
+    /// bulk past the size cap is a LIMIT, not corruption.
+    #[test]
+    fn a_record_past_the_client_element_cap_replays_and_limits_are_classified() {
+        let n = crate::protocol::ParseConfig::default().max_array_length + 10;
+        let mut log = format!("*{}\r\n$4\r\nSREM\r\n$1\r\ns\r\n", n + 2).into_bytes();
+        for _ in 0..n {
+            log.extend_from_slice(b"$1\r\na\r\n");
+        }
+        log.extend(resp(&[b"SET", b"after", b"1"]));
+        let mut r = ReplayChunks::new(&log[..], 0);
+        match r.next_frame().unwrap() {
+            ReplayNext::Frame(Frame::Array(a)) => assert_eq!(a.len(), n + 2),
+            other => panic!("{other:?}"),
+        }
+        assert!(matches!(r.next_frame().unwrap(), ReplayNext::Frame(_)));
+        assert!(matches!(r.next_frame().unwrap(), ReplayNext::End));
+
+        let huge = b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$600000000\r\nxx";
+        let mut r = ReplayChunks::new(&huge[..], 0);
+        match r.next_frame().unwrap() {
+            ReplayNext::Corrupt { err, .. } => assert!(is_limit_violation(&err), "{err:?}"),
+            other => panic!("{other:?}"),
+        }
+        let mut r = ReplayChunks::new(&b"*2\r\n$zz\r\n"[..], 0);
+        match r.next_frame().unwrap() {
+            ReplayNext::Corrupt { err, .. } => assert!(!is_limit_violation(&err), "{err:?}"),
             other => panic!("{other:?}"),
         }
     }

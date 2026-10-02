@@ -305,7 +305,7 @@ pub fn replay_resp_payload<E: CommandReplayEngine + ?Sized>(
     mut on_route: impl FnMut(ReplayRoute),
 ) -> usize {
     let mut buf = bytes::BytesMut::from(payload);
-    let parse_cfg = crate::protocol::ParseConfig::default();
+    let parse_cfg = chunks::log_parse_config();
     let mut replayed = 0usize;
     while let Ok(Some(frame)) = crate::protocol::parse::parse(&mut buf, &parse_cfg) {
         let Frame::Array(ref arr) = frame else {

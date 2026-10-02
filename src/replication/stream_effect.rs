@@ -77,7 +77,7 @@
 use bytes::Bytes;
 
 use crate::protocol::{Frame, FrameVec};
-use crate::replication::effect_rewrite::Propagation;
+use crate::replication::effect_rewrite::{Propagation, one_or_many};
 use crate::storage::stream::StreamId;
 
 /// Effect records of one command, in log order.
@@ -148,23 +148,31 @@ fn element_id(e: &Frame) -> Option<StreamId> {
     }
 }
 
-/// `XCLAIM key group consumer 0 <ids> <tail>`.
-fn xclaim_record(
+/// `XCLAIM key group consumer 0 <ids> <tail>`, at most
+/// `effect_rewrite::EFFECT_CHUNK` ids per record (R2b round 4 F2). Every
+/// option the tail carries acts per id (`TIME`, `RETRYCOUNT`, `FORCE`,
+/// `JUSTID`) or only raises the group's cursor (`LASTID`), so the chunks
+/// replay to the state one claim of every id leaves.
+fn xclaim_records(
     key: &Frame,
     group: &Frame,
     consumer: &Frame,
     ids: &[StreamId],
     tail: &[Frame],
-) -> Frame {
-    let mut v: Vec<Frame> = Vec::with_capacity(5 + ids.len() + tail.len());
-    v.push(stat(b"XCLAIM"));
-    v.push(key.clone());
-    v.push(group.clone());
-    v.push(consumer.clone());
-    v.push(stat(b"0"));
-    v.extend(ids.iter().map(|&id| id_frame(id)));
-    v.extend_from_slice(tail);
-    Frame::Array(FrameVec::from_vec(v))
+) -> StreamEffects {
+    ids.chunks(crate::replication::effect_rewrite::EFFECT_CHUNK)
+        .map(|chunk| {
+            let mut v: Vec<Frame> = Vec::with_capacity(5 + chunk.len() + tail.len());
+            v.push(stat(b"XCLAIM"));
+            v.push(key.clone());
+            v.push(group.clone());
+            v.push(consumer.clone());
+            v.push(stat(b"0"));
+            v.extend(chunk.iter().map(|&id| id_frame(id)));
+            v.extend_from_slice(tail);
+            Frame::Array(FrameVec::from_vec(v))
+        })
+        .collect()
 }
 
 /// `XREADGROUP GROUP g c [COUNT n] [BLOCK ms] [NOACK] STREAMS k.. id..` ->
@@ -260,7 +268,7 @@ pub(crate) fn rewrite_xreadgroup(args: &FrameVec, reply: &Frame, now_ms: u64) ->
         } else {
             // `read_group_new` stamps every entry `current_time_ms()` with
             // count 1 — the cached clock `now_ms` is read from.
-            out.push(xclaim_record(
+            out.extend(xclaim_records(
                 key,
                 group,
                 consumer,
@@ -357,7 +365,7 @@ pub(crate) fn rewrite_xclaim(args: &FrameVec, reply: &Frame, now_ms: u64) -> Pro
         return match last_id {
             // Raise-only cursor move, and nothing claimed: `0-0` is never
             // an entry (see the module docs).
-            Some(last) => Propagation::Rewritten(xclaim_record(
+            Some(last) => one_or_many(xclaim_records(
                 &args[1],
                 &args[2],
                 &args[3],
@@ -385,7 +393,7 @@ pub(crate) fn rewrite_xclaim(args: &FrameVec, reply: &Frame, now_ms: u64) -> Pro
         tail.push(stat(b"LASTID"));
         tail.push(last.clone());
     }
-    Propagation::Rewritten(xclaim_record(&args[1], &args[2], &args[3], &ids, &tail))
+    one_or_many(xclaim_records(&args[1], &args[2], &args[3], &ids, &tail))
 }
 
 /// `XAUTOCLAIM key group consumer min-idle start [COUNT n] [JUSTID]` -> one
@@ -418,7 +426,7 @@ pub(crate) fn rewrite_xautoclaim(args: &FrameVec, reply: &Frame, now_ms: u64) ->
     if justid {
         tail.push(stat(b"JUSTID"));
     }
-    Propagation::Rewritten(xclaim_record(&args[1], &args[2], &args[3], &ids, &tail))
+    one_or_many(xclaim_records(&args[1], &args[2], &args[3], &ids, &tail))
 }
 
 #[cfg(test)]
@@ -838,6 +846,59 @@ mod tests {
         );
         assert_eq!(got, vec!["XCLAIM s g c 0 0-0 LASTID 1-2"]);
         assert_eq!(state(&mut live, "s"), state(&mut replay, "s"));
+    }
+
+    /// R2b round 4 F2: a consumer-group read of more entries than
+    /// `EFFECT_CHUNK` is logged as several `XCLAIM`s of at most that many
+    /// ids, which replay to the same group state.
+    #[test]
+    fn a_large_group_read_is_logged_in_chunked_claims() {
+        let (mut live, mut replay) = twins(&[&["XGROUP", "CREATE", "big", "g", "$", "MKSTREAM"]]);
+        let n = crate::replication::effect_rewrite::EFFECT_CHUNK * 2 + 3;
+        for i in 1..=n {
+            let id = format!("5-{i}");
+            run(&mut live, &cmd(&["XADD", "big", &id, "f", "v"]));
+            run(&mut replay, &cmd(&["XADD", "big", &id, "f", "v"]));
+        }
+        let count = n.to_string();
+        let _clock = crate::storage::entry::ClockPin::set(1_700_000_000, 1_700_000_000_123);
+        let now = crate::storage::entry::current_time_ms();
+        let got = propagate(
+            &mut live,
+            &mut replay,
+            &[
+                "XREADGROUP",
+                "GROUP",
+                "g",
+                "c",
+                "COUNT",
+                &count,
+                "STREAMS",
+                "big",
+                ">",
+            ],
+            now,
+        );
+        assert_eq!(got.len(), 3, "three chunks");
+        let limit = crate::replication::effect_rewrite::EFFECT_CHUNK;
+        for r in &got {
+            let ids = r.split(' ').filter(|w| w.starts_with("5-")).count();
+            assert!(ids <= limit + 1, "{ids} ids (LASTID included)");
+        }
+        let pel = |db: &mut Database| {
+            let st = db.get_stream(b"big").unwrap().unwrap();
+            let g = &st.groups[b"g".as_ref()];
+            (
+                g.last_delivered_id,
+                g.pel
+                    .iter()
+                    .map(|(id, pe)| (*id, pe.consumer.clone(), pe.delivery_count))
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let (live_pel, replay_pel) = (pel(&mut live), pel(&mut replay));
+        assert_eq!(live_pel.1.len(), n);
+        assert_eq!(live_pel, replay_pel);
     }
 
     #[test]
