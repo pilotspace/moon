@@ -637,6 +637,27 @@ impl SnapshotState {
                 self.epoch,
                 why
             );
+        }
+        self.abandon(why);
+    }
+
+    /// [`Self::abort`] for a save the server abandons on purpose (shutdown,
+    /// as redis kills its saving child): the same release, logged at WARN —
+    /// it is not a failure (R2b round 2 N2).
+    pub fn abort_for_shutdown(&mut self) {
+        if self.aborted.is_none() {
+            tracing::warn!(
+                "Shard {}: snapshot epoch {} abandoned: the server is shutting down \
+                 (the previous snapshot file stays)",
+                self.shard_id,
+                self.epoch
+            );
+        }
+        self.abandon("the server is shutting down");
+    }
+
+    fn abandon(&mut self, why: &'static str) {
+        if self.aborted.is_none() {
             self.aborted = Some(why);
         }
         let maps = self.overflow.iter_mut().map(std::mem::take);
