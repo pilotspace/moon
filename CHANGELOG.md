@@ -506,44 +506,43 @@ shared 4-vCPU Linux container against HEAD `935c555` — re-measure on the GCE r
 
 ### Fixed
 
-- **A cross-store `TXN` was not crash-atomic: a `kill -9`, a torn log or a stop
-  with a `TXN` open kept its uncommitted writes** (moon#1300, which also closes
-  the moon#1285 review findings). With an AOF, a transaction's records are now
-  bracketed by `MOON.TXN BEGIN`, `PAUSE` and `END <id>` markers, and replay
-  rolls back every block that never reached its `END`: a crash mid-transaction,
-  a crash in the middle of an abort's compensating records, a torn log, or a
-  clean stop with a transaction open. This holds in both AOF layouts and across
-  `BGREWRITEAOF` folds, which re-open the block in the new file. A commit adds
-  one `END` record, and under `appendfsync always` one fsync for it (a `BEGIN`,
-  `SET`, `HSET`, `COMMIT` round trip: 1.84 to 2.26 ms; 3,000 iterations on a
-  shared 4-vCPU Linux container); an `END` that an OS crash loses under
-  `everysec` rolls the whole transaction back, never half of it. Writes outside
-  a transaction add no records and no measurable cost (`SET` at pipeline 16,
-  within the ±10% run-to-run spread).
-
-  Without an AOF, every snapshot (`BGSAVE`, the save rules, the `SHUTDOWN` save
-  and the held-file release snapshot) stores an open transaction's keys at their
-  pre-transaction values, so an abort or a crash after a mid-transaction
-  snapshot no longer brings back uncommitted writes. An open transaction holds a
-  single copy of each key it writes (the first write to a 300k-field, 51 MB hash
-  adds 44 MB of RSS; later writes to it add nothing).
-
-  A replica applies a transaction's records as one block and rolls it back if
-  its master goes away before the `END` (a `REPLICAOF` change or `REPLICAOF NO
-  ONE`); a full sync during an open transaction sends the pre-transaction values
-  and re-opens the block. Block ids name their origin shard, so transactions on
-  different shards of a `--shards N` master stay separate blocks on the replica
-  and in the AOF; ids in older logs replay as before. A promoted replica appends
-  `MOON.TXN RESET` to its own AOF before it accepts writes (see the replica AOF
-  entry below).
-
-  Not covered: graph writes and vector-index updates inside a `TXN` are not
-  bracketed, so a crash keeps the uncommitted ones; a replica's own snapshots
-  taken while a master transaction is open are not covered; if the AOF refuses a
-  transaction's `END`, `TXN COMMIT` answers an error and the commit stands in
-  memory, so a crash before the next rewrite rolls it back. **Downgrade:** an
-  older binary replays a block that a crash left open. Start the new binary once
-  and run `BGREWRITEAOF` before downgrading (docs/STORAGE-FORMAT-V1.md §3.3).
+- **A cross-store `TXN` is now crash-atomic with an AOF** (moon#1300, which also
+  closes the moon#1285 review findings). A `kill -9`, a torn log or a stop with
+  a `TXN` open used to keep the transaction's uncommitted writes after the
+  restart; replay now rolls back every transaction that did not reach its `END`.
+  - With an AOF, a transaction's records are bracketed by `MOON.TXN BEGIN`,
+    `PAUSE` and `END <id>` markers. Replay rolls back an unfinished block after
+    a crash mid-transaction, a crash in the middle of an abort's compensating
+    records, a torn log, or a clean stop with a transaction open, in both AOF
+    layouts and across `BGREWRITEAOF` folds. Writes outside a transaction add no
+    records and no measurable cost (`SET` at pipeline 16, within the ±10%
+    run-to-run spread).
+  - A commit adds one `END` record, and under `appendfsync always` one fsync for
+    it (a `BEGIN`, `SET`, `HSET`, `COMMIT` round trip: 1.84 to 2.26 ms; 3,000
+    iterations on a shared 4-vCPU Linux container). An `END` that an OS crash
+    loses under `everysec` rolls the whole transaction back, never half of it.
+  - Without an AOF, every snapshot (`BGSAVE`, the save rules, the `SHUTDOWN`
+    save and the held-file release snapshot) stores an open transaction's keys
+    at their pre-transaction values, so an abort or a crash after a
+    mid-transaction snapshot no longer brings back uncommitted writes. An open
+    transaction holds a single copy of each key it writes (the first write to a
+    300k-field, 51 MB hash adds 44 MB of RSS; later writes to it add nothing).
+  - A replica applies a transaction's records as one block and rolls it back if
+    its master goes away before the `END` (a `REPLICAOF` change or `REPLICAOF NO
+    ONE`). A full sync during an open transaction sends the pre-transaction
+    values. Transactions on different shards of a `--shards N` master stay
+    separate blocks on the replica and in the AOF; ids in older logs replay as
+    before. A promoted replica appends `MOON.TXN RESET` to its own AOF before it
+    accepts writes (see the replica AOF entry below).
+  - Not covered: graph writes and vector-index updates inside a `TXN` are not
+    bracketed, so a crash keeps the uncommitted ones; a replica's own snapshots
+    taken while a master transaction is open are not covered; if the AOF refuses
+    a transaction's `END`, `TXN COMMIT` answers the refusal instead of `+OK` and
+    the commit stands in memory, so a crash before the next rewrite rolls it
+    back.
+  - **Downgrade:** an older binary replays a block that a crash left open. Start
+    the new binary once and run `BGREWRITEAOF` before downgrading
+    (docs/STORAGE-FORMAT-V1.md §3.3).
 
 - **Without an AOF, the spill files of deleted or overwritten cold keys were
   never reclaimed** (moon#1297). A file with at least 256 dead slots that make
@@ -615,46 +614,48 @@ shared 4-vCPU Linux container against HEAD `935c555` — re-measure on the GCE r
   upgrade note.
 
 - **A torn or damaged AOF was served as if it were intact, and writes
-  acknowledged after that boot were lost at the next restart** (redis
-  `aof-load-truncated` parity). A record torn by a crash at the end of the AOF
-  (flat file, monoio incr, per-shard incr) is now cut at the last complete
-  record before anything is appended: the cut bytes are first saved as
-  `<file>.torn-<offset>` (never overwriting one), then the file is truncated and
-  fsynced. On a full disk the tail is truncated without a sidecar and the log
-  gives its offset, length and first 64 bytes in hex; a partial sidecar is never
-  left behind. If the cut itself fails, the boot is refused with the file
-  unchanged. Corruption anywhere else, including a zero-filled tail and a record
-  that does not open with `*` (it used to be read as an inline command and
-  skipped), refuses the boot with exit status 1, naming the file, the byte
-  offset and the remedy, and leaves the file untouched;
-  `MOON_AOF_BEST_EFFORT_RESYNC=1` restores the old skip-ahead. An AOF that
-  cannot be replayed at all (a damaged RDB preamble, say) refuses the same way,
-  where it used to boot an empty server that appended behind the bad bytes. Each
-  refusal names its own cause: read failure, damage inside the file (truncating
-  it drops every later record), a torn tail that could not be cut, or a record
-  over a parser limit. A boot that fails before its replay cut no longer appends
-  a clean-close marker behind the damage.
+  acknowledged after that boot were lost at the next restart.** moon now cuts a
+  torn tail and refuses any other damage, as redis does (`aof-load-truncated`).
+  - **Torn tail:** a record torn by a crash at the end of the AOF (flat file,
+    monoio incr, per-shard incr) is cut at the last complete record before
+    anything is appended. The cut bytes are first saved as
+    `<file>.torn-<offset>` (never overwriting one), then the file is truncated
+    and fsynced. On a full disk the tail is truncated without a sidecar and the
+    log gives its offset, length and first 64 bytes in hex; a partial sidecar is
+    never left behind. If the cut itself fails, the boot is refused with the
+    file unchanged.
+  - **Other corruption** (mid-file, a zero-filled tail, or a record that does
+    not open with `*`, which used to be read as an inline command and skipped)
+    refuses the boot with exit status 1, naming the file, the byte offset and
+    the remedy, and leaves the file untouched. `MOON_AOF_BEST_EFFORT_RESYNC=1`
+    restores the old skip-ahead.
+  - **Unreadable AOF** (a damaged RDB preamble, say): the same refusal, where it
+    used to boot an empty server that appended behind the bad bytes.
+  - Each refusal names its own cause: read failure, damage inside the file
+    (truncating it drops every later record), a torn tail that could not be cut,
+    or a record over a parser limit. A boot that fails before its replay cut no
+    longer appends a clean-close marker behind the damage.
 
-- **AOF layouts that a boot would mis-replay are refused** (moon#1321). The boot
+- **Booting a directory whose AOF layout the build would mis-replay is now
+  refused** (moon#1321), where it used to duplicate or lose data. The boot
   refusals below exit with status 2, name the cause and the remedy, and leave
   the files untouched.
-
   - A flat `appendonly.aof` holding data no longer boots `--shards N`: it used
-    to load the whole dataset into every shard (4 keys read as `DBSIZE` 16).
-    The message names the `--migrate-aof-*` command; a head-only flat file
-    still boots and is retired.
-  - tokio `--shards 1` refuses an `--appendfilename` other than
-    `appendonly.aof` (its recovery reads only that name, so every write was
-    lost at the next restart; honouring the name is still open) and a
-    directory holding a monoio single-shard manifest (it booted empty, and the
-    next monoio boot dropped the writes made in between). For a multi-shard
-    manifest the message reports the changed shard count.
+    to load the whole dataset into every shard (4 keys read as `DBSIZE` 16). The
+    message names the `--migrate-aof-*` command; a head-only flat file still
+    boots and is retired.
+  - tokio `--shards 1` refuses an `--appendfilename` other than `appendonly.aof`
+    (its recovery reads only that name, so every write was lost at the next
+    restart; honouring the name is still open) and a directory holding a monoio
+    single-shard manifest (it booted empty, and the next monoio boot dropped the
+    writes made in between). For a multi-shard manifest the message reports the
+    changed shard count.
   - A directory whose AOF manifest and flat `appendonly.aof` both hold data is
     refused (the message says "BOTH" and lists the recovery steps) instead of
     silently retiring the flat file. Nothing is renamed.
   - The embedded server applies the same refusals before recovery.
-  - A point-in-time recovery target refuses a flat AOF that holds records,
-    which it would skip and never cut. The server binary does not pass
+  - A point-in-time recovery target refuses a flat AOF that holds records, which
+    it would skip and never cut. The server binary does not pass
     `--recovery-target-*` into recovery yet, so today this guards the library
     API only.
 
@@ -686,36 +687,38 @@ shared 4-vCPU Linux container against HEAD `935c555` — re-measure on the GCE r
 
 - **A promoted replica restarted with only its own writes** (moon#1318): 100
   keys synced from the master plus one write after `REPLICAOF NO ONE` came back
-  as 1 key, because a replica's own AOF held neither the dataset it had synced
-  nor the stream it applied. After a full sync the replica now rewrites its own
-  AOF with the synced dataset as base (the auto-rewrite monitor retries until a
-  rewrite that started after the load succeeds), then logs every applied KV
-  write and `MOON.TXN` marker to it, as redis replicas do, each in the database
-  it was applied to (the replica's `databases` caps the master's index). FT,
-  GRAPH, MQ, TEMPORAL and workspace records are not logged. With 10 `INCR` and
-  10 `RPUSH` streamed after the sync, a restarted promoted replica read `c` 10
-  and `LLEN` 10 (applied once), on both runtimes. Replicas are single-shard
-  (moon#406).
-
-  A promotion appends `MOON.TXN RESET` to the replica's AOF, waiting up to 10 s
-  for writer room, before it accepts writes, so a restart cannot let the dead
-  master's open transaction block swallow or commit the node's own writes (with
-  a stalled AOF writer the promotion, and every client, waits that long). The
-  replication stream waits for writer room before applying a record instead of
-  blocking the shard and dropping it: with the writer's fsync held and 15,000
-  `SET`s streamed, the link was throttled, `PING` stayed under 1.5 s and nothing
-  was lost (`DBSIZE` 16001 after a restart). A record whose room vanishes
-  between the check and the append blocks up to 5 ms before it can be dropped. A
-  logging failure logs one ERROR and requests one rewrite per incident.
-
-  **Known residuals.** A crash after the full-sync load but before the post-sync
-  rewrite commits restarts with the node's former dataset plus the streamed
-  tail, as redis's `restartAOFAfterSYNC` does (milliseconds for a small dataset,
-  and a replica that restarts as a replica full-syncs again). A rewrite that
-  folds a master's open transaction into the new base before a promotion leaves
-  its uncommitted writes there until the rewrite requested after the rollback
-  commits. The embedded server has no rewrite monitor: an embedded replica warns
-  and cannot publish its synced dataset to its AOF.
+  as 1 key. A replica now keeps the dataset it synced and the stream it applied
+  in its own AOF, so a promoted replica survives a restart. Replicas are
+  single-shard (moon#406).
+  - **What is logged:** after a full sync the replica rewrites its own AOF with
+    the synced dataset as base (the auto-rewrite monitor retries until a rewrite
+    that started after the load succeeds), then logs every applied KV write and
+    `MOON.TXN` marker, as redis replicas do, each in the database it was applied
+    to (the replica's `databases` caps the master's index). FT, GRAPH, MQ,
+    TEMPORAL and workspace records are not logged. With 10 `INCR` and 10 `RPUSH`
+    streamed after the sync, a restarted promoted replica read `c` 10 and `LLEN`
+    10 (applied once), on both runtimes.
+  - **Promotion:** it appends `MOON.TXN RESET` to the replica's AOF, waiting up
+    to 10 s for writer room, before it accepts writes, so a restart cannot let
+    the dead master's open transaction block swallow or commit the node's own
+    writes. With a stalled AOF writer the promotion, and every client, waits
+    that long.
+  - **Slow AOF writer:** the replication stream waits for writer room before
+    applying a record instead of blocking the shard and dropping it. With a
+    replica under `appendfsync always`, its fsync held and 15,000 `SET`s
+    streamed, `PING` stayed under 1.5 s and nothing was lost (`DBSIZE` 16001
+    after a promoted restart; `tests/promoted_replica_r2b3.rs`). A record whose
+    room vanishes between the check and the append blocks up to 5 ms before it
+    can be dropped. A logging failure logs one ERROR and requests one rewrite
+    per incident.
+  - **Known residuals:** a crash after the full-sync load but before the
+    post-sync rewrite commits restarts with the node's former dataset plus the
+    streamed tail, as redis's `restartAOFAfterSYNC` does (milliseconds for a
+    small dataset, and a replica that restarts as a replica full-syncs again). A
+    rewrite that folds a master's open transaction into the new base before a
+    promotion leaves its uncommitted writes there until the rewrite requested
+    after the rollback commits. The embedded server has no rewrite monitor: an
+    embedded replica warns and cannot publish its synced dataset to its AOF.
 
 - **`REPLICAOF NO ONE` during a full sync was undone by the old master's
   snapshot** (moon#1318). A snapshot transfer or a `+FULLRESYNC` reply still in
@@ -823,53 +826,48 @@ shared 4-vCPU Linux container against HEAD `935c555` — re-measure on the GCE r
   `MOON_AOF_WARM_POLL_US` (inert while Option 1A writes, except inside a rewrite
   fold or after a latched write error).
 
-- **`appendfsync everysec` and `no` still lost acknowledged writes to a process
-  crash in a sub-millisecond window** (moon#1266, Option 1A). Each shard thread
-  now frames its own AOF records and writes them with one `write(2)` per
-  event-loop iteration, before that iteration's replies leave: under monoio's
-  io_uring driver from a before-submit hook, under its epoll/kqueue driver from
-  a before-poll hook, under tokio once per scheduler round, and before any reply
-  handed to another shard. The AOF writer thread keeps the fsync agent,
-  rewrites, `always` group commit and the clean-close marker. A `kill -9`
-  therefore loses no acknowledged write, as in redis: with `SIGKILL` 1 ms after
-  the last acknowledgement, 20 reps per cell, `--shards` 1 and 4, tokio and both
-  monoio drivers, 0 of 360 reps lost anything (Option 3: 9 of 240; before it:
-  226 of 240).
-
-  While the writer thread holds the append position outside a rewrite (from boot
-  until its first hand-over, under `always`, and right after `CONFIG SET
-  appendfsync` leaves `always`), each reply waits until the writer has written
-  its record, with an fsync only under `always`. At boot the server waits up to
-  2 s for the first hand-over before its shards start, and warns if it times
-  out. A pipeline sent right after the first `PING` reply, or right after
-  leaving `always`, and killed on its last acknowledgement lost 0 keys on monoio
-  io_uring, monoio epoll and tokio at `--shards` 1 and 4 (20 reps per window,
-  half on one connection, half on 16). A writer that never starts fails its
-  shard's writes at `--aof-fsync-timeout-ms` instead of acknowledging them
-  unwritten. A write sent under `always` but committed after the policy leaves
-  `always` is acknowledged once written, without an fsync, as redis does at its
-  `beforeSleep`; every batch committed under `always` is still fsynced before
-  its acknowledgements.
-
-  **One exception remains.** Writes acknowledged while a `BGREWRITEAOF` fold
-  runs reach the file only after it, so a `kill -9` inside a fold can lose every
-  write acknowledged during it. The exposure is the whole fold (over 0.9 s at
-  about 150 MB of AOF), and automatic rewrites open it whenever the AOF doubles.
-  redis has no such window because its manifest lists the new incr file from the
-  start of the rewrite; closing it here needs the same manifest change. On tokio
-  and the epoll driver, pub/sub pushes and replication bytes to other
-  connections can leave before the record is written; acknowledgements cannot.
-  An OS crash or power loss can still lose up to about 1 s under `everysec`.
-
-  Against the writer-thread path it replaces (`redis-benchmark -t set`, paired
-  medians of 5 reps on a shared 4-vCPU Linux container, measured before the
-  held-window rule above, which adds one atomic load per write): throughput from
-  -6.6% (one connection, io_uring) to +80% (tokio, pipeline 16), server CPU per
-  write from -65% to +1%, p99 from -38% to +4%. A slow disk now stalls the
-  shard's `write(2)` instead of filling a queue, as in redis; the fsync stays
-  off the shard thread. `MOON_AOF_SHARD_WRITE=0` restores the writer-thread
-  path. New `INFO` field: `aof_shard_writes`, the shard threads' write count (0
-  when off).
+- **`appendfsync everysec` and `no` now lose no acknowledged write to a `kill
+  -9`** (moon#1266, Option 1A). Each shard thread writes its AOF records to the
+  file before the replies that acknowledge them leave, as redis does. With
+  `SIGKILL` 1 ms after the last acknowledgement, 20 reps per cell, `--shards` 1
+  and 4, tokio and both monoio drivers, 0 of 360 reps lost anything (Option 3: 9
+  of 240; before it: 226 of 240). An OS crash or power loss can still lose up to
+  about 1 s under `everysec`.
+  - **How:** one `write(2)` per event-loop iteration (monoio io_uring: before
+    the submit; monoio epoll/kqueue: before the poll; tokio: once per scheduler
+    round), and before any reply handed to another shard. The AOF writer thread
+    keeps the fsync, rewrites, `always` group commit and the clean-close marker.
+    `MOON_AOF_SHARD_WRITE=0` restores the writer-thread path. New `INFO` field:
+    `aof_shard_writes`, the shard threads' write count (0 when off).
+  - **Boot and `always` windows:** while the writer thread holds the append
+    position outside a rewrite (from boot until its first hand-over, under
+    `always`, and right after `CONFIG SET appendfsync` leaves `always`), each
+    reply waits until the writer has written its record, with an fsync only
+    under `always`. At boot the server waits up to 2 s for the first hand-over
+    before its shards start, and warns if it times out. A pipeline sent right
+    after the first `PING` reply, or right after leaving `always`, and killed on
+    its last acknowledgement lost 0 keys on monoio io_uring, monoio epoll and
+    tokio at `--shards` 1 and 4 (20 reps per window, half on one connection,
+    half on 16). A writer that never starts fails its shard's writes at
+    `--aof-fsync-timeout-ms` instead of acknowledging them unwritten.
+  - **Fsync rule:** a write sent under `always` but committed after the policy
+    leaves `always` is acknowledged once written, without an fsync, as redis
+    does at its `beforeSleep`; every batch committed under `always` is still
+    fsynced before its acknowledgements.
+  - **One exception remains:** writes acknowledged while a `BGREWRITEAOF` fold
+    runs reach the file only after it, so a `kill -9` inside a fold can lose
+    every write acknowledged during it. The exposure is the whole fold (over 0.9
+    s at about 150 MB of AOF), and automatic rewrites open it whenever the AOF
+    doubles. redis has no such window because its manifest lists the new incr
+    file from the start of the rewrite; closing it here needs the same manifest
+    change.
+  - **Cost**, against the writer-thread path it replaces (`redis-benchmark -t
+    set`, paired medians of 5 reps on a shared 4-vCPU Linux container, measured
+    before the held-window rule above, which adds one atomic load per write):
+    throughput from -6.6% (one connection, io_uring) to +80% (tokio, pipeline
+    16), server CPU per write from -65% to +1%, p99 from -38% to +4%. A slow
+    disk now stalls the shard's `write(2)` instead of filling a queue, as in
+    redis; the fsync stays off the shard thread.
 
 - **`CONFIG SET appendfsync` answered `OK` but the writers kept their startup
   policy**, so writes were acknowledged without the fsync `always` promises.
