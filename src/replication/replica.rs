@@ -51,12 +51,17 @@ static REPLICA_TASK_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::Ato
 
 /// Bump the generation (new REPLICAOF target, or NO ONE) and return the new
 /// ticket to hand to a freshly spawned task.
-pub fn bump_replica_task_epoch() -> u64 {
+pub fn bump_replica_task_epoch(
+    aof_pool: Option<&Arc<crate::persistence::aof::AofWriterPool>>,
+) -> u64 {
     // moon#1300: the node stops following its master here (every REPLICAOF
     // target change, `NO ONE`, `CLUSTER REPLICATE` bumps), on the shard
     // thread, before a new task can apply anything: a transaction the old
-    // master never ended is rolled back, as its own crash recovery would.
-    crate::replication::txn_apply::roll_back_open();
+    // master never ended is rolled back, as its own crash recovery would —
+    // in memory and, with `MOON.TXN RESET`, in this node's AOF (R2b round 3
+    // F-A). Every caller runs this before it flips the role, in the same
+    // synchronous stretch, so the RESET precedes every local write.
+    crate::replication::txn_apply::roll_back_open(aof_pool);
     REPLICA_TASK_EPOCH.fetch_add(1, Ordering::AcqRel) + 1
 }
 
@@ -383,6 +388,7 @@ async fn run_handshake_and_stream(
         }
         for shard_id in 0..cfg.num_shards {
             let rdb_bytes = read_rdb_bulk(&mut stream).await?;
+            crate::replication::txn_apply::discard_logged(cfg.aof_pool.as_ref());
             match crate::replication::apply::load_snapshot(&rdb_bytes, &cfg.shard_databases) {
                 Ok(keys) => info!(
                     "Replica: loaded shard {} RDB snapshot ({} bytes, {} keys)",
@@ -807,6 +813,7 @@ async fn run_handshake_and_stream(
         }
         for shard_id in 0..cfg.num_shards {
             let rdb_bytes = read_rdb_bulk(&mut stream).await?;
+            crate::replication::txn_apply::discard_logged(cfg.aof_pool.as_ref());
             match crate::replication::apply::load_snapshot(&rdb_bytes, &cfg.shard_databases) {
                 Ok(keys) => info!(
                     "Replica: loaded shard {} RDB snapshot ({} bytes, {} keys)",

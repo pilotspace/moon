@@ -77,6 +77,37 @@ pub(crate) fn after_promotion_rollback(rolled: usize) {
     }
 }
 
+/// How long [`log_txn_reset`] may hold the shard thread for writer room: a
+/// promotion is rare, and a lost RESET would misattribute every later local
+/// write, so it waits far longer than a data record's bound.
+const RESET_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Append `MOON.TXN RESET` to this node's AOF, synchronously, on the shard
+/// thread (R2b round 3 F-A). Called from `txn_apply::roll_back_open` (inside
+/// `replica::bump_replica_task_epoch`, before every caller flips the role,
+/// so it precedes every local write) and `txn_apply::discard_logged` (before
+/// a full sync's load): replay then rolls the dead master blocks back at
+/// exactly this point. Without it the blocks stayed open in the AOF until a
+/// rewrite committed, and local writes after the promotion replayed against
+/// them: attributed to a block cut between BEGIN and PAUSE and rolled back
+/// at EOF, or committed by a local transaction whose log id was the same.
+pub(crate) fn log_txn_reset(aof_pool: Option<&Arc<AofWriterPool>>) {
+    use crate::persistence::replay::pseudo::{TxnMarker, TxnRecord};
+    let Some(pool) = aof_pool else {
+        return;
+    };
+    let record = TxnRecord::new(TxnMarker::Reset);
+    let bytes = bytes::Bytes::copy_from_slice(record.as_bytes());
+    let mut budget = RESET_BUDGET;
+    if !pool.send_append_bounded_blocking(0, 0, 0, bytes, &mut budget) {
+        tracing::error!(
+            "replica: MOON.TXN RESET was NOT appended to this node's AOF; requesting a rewrite \
+             so the dead master transaction's records leave it"
+        );
+        crate::persistence::aof::auto_rewrite::request_rewrite();
+    }
+}
+
 /// Whether an applied stream record is KV history for the replica's AOF.
 fn is_logged(cmd: &[u8], args: &[Frame]) -> bool {
     use crate::persistence::replay::pseudo::{Pseudo, classify};

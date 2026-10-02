@@ -135,7 +135,7 @@ pub(super) fn try_handle_cluster(
                 port,
                 state: crate::replication::handshake::ReplicaHandshakeState::PingPending,
             });
-        let epoch = crate::replication::replica::bump_replica_task_epoch();
+        let epoch = crate::replication::replica::bump_replica_task_epoch(ctx.aof_pool.as_ref());
         let cfg = crate::replication::replica::ReplicaTaskConfig {
             master_host: host,
             master_port: port,
