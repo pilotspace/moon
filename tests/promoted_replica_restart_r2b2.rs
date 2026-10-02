@@ -10,7 +10,8 @@
 //! KV record is appended to the replica's own AOF.
 //!
 //! The master must be a monoio build (tokio has no master-side PSYNC):
-//! `MOON_BIN_MONOIO` (the test is skipped, saying so, without it). The replica is `MOON_BIN` — run once
+//! `MOON_BIN_MONOIO` (the test FAILS without it — it used to pass without
+//! running, R2b round 3 F-J). The replica is `MOON_BIN` — run once
 //! per runtime. Replicas are single-shard (`replica_supported`, moon#406).
 //!
 //! ```text
@@ -65,8 +66,10 @@ fn wait_until(what: &str, mut ok: impl FnMut() -> bool) {
     }
 }
 
+/// The master's binary. Panics without `MOON_BIN_MONOIO` (R2b round 3 F-J:
+/// returning `None` made the case pass without running).
 fn master_bin() -> Option<PathBuf> {
-    std::env::var_os("MOON_BIN_MONOIO").map(PathBuf::from)
+    Some(common::required_runtime_bin("MOON_BIN_MONOIO"))
 }
 
 /// `with_stream`: the master also writes AFTER the sync (non-idempotent

@@ -26,7 +26,7 @@
 //! ```
 //!
 //! `tokio_dir_booted_by_monoio` needs `MOON_BIN_TOKIO` and `MOON_BIN_MONOIO`
-//! (it is skipped, saying so, without them).
+//! (it FAILS without them, R2b round 3 F-J; skip it by name to run the rest).
 
 #![cfg(any(feature = "runtime-monoio", feature = "runtime-tokio"))]
 
@@ -287,14 +287,12 @@ fn appendonly_no_to_yes_four_shards() {
 #[test]
 #[ignore = "spawns moon; set MOON_BIN_TOKIO and MOON_BIN_MONOIO"]
 fn tokio_dir_booted_by_monoio() {
-    let (Some(tokio), Some(monoio)) = (
-        std::env::var_os("MOON_BIN_TOKIO"),
-        std::env::var_os("MOON_BIN_MONOIO"),
-    ) else {
-        eprintln!("SKIPPED: set MOON_BIN_TOKIO and MOON_BIN_MONOIO to run the upgrade case");
-        return;
-    };
-    let (tokio, monoio) = (PathBuf::from(tokio), PathBuf::from(monoio));
+    // R2b round 3 F-J: fails without the two binaries (it used to pass
+    // without running).
+    let (tokio, monoio) = (
+        common::required_runtime_bin("MOON_BIN_TOKIO"),
+        common::required_runtime_bin("MOON_BIN_MONOIO"),
+    );
     let d = dir("upgrade");
     let (mut srv, port) = boot(&tokio, &d, 1, &[]);
     let mut c = ready(port);
