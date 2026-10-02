@@ -177,12 +177,16 @@ pub async fn run_embedded(
     let fresh_aof_gate = (num_shards == 1 && config.appendonly == "yes").then(|| {
         aof::open_gate::hold_writer_open(&PathBuf::from(&config.dir).join(&config.appendfilename))
     });
-    let (aof_pool, aof_join): (
+    // `aof_writer_cancel`: the writer's own token, so a refused boot stops
+    // this writer and no other (R2b round 4 F-G-SHARE).
+    let (aof_pool, aof_join, aof_writer_cancel): (
         Option<Arc<AofWriterPool>>,
         Option<std::thread::JoinHandle<()>>,
+        Option<crate::runtime::cancel::CancellationToken>,
     ) = if config.appendonly == "yes" {
         let (tx, rx) = channel::mpsc_bounded::<AofMessage>(10_000);
         let aof_token = cancel.child_token();
+        let writer_cancel = aof_token.clone();
         let fsync = FsyncPolicy::from_str(&config.appendfsync);
         let aof_file_path = PathBuf::from(&config.dir).join(&config.appendfilename);
         // The pool first: the writer takes its lane from it (moon#1266 1A).
@@ -205,9 +209,9 @@ pub async fn run_embedded(
             })
             .context("embedded moon: failed to spawn AOF writer thread")?;
         info!("embedded moon: AOF enabled (fsync: {:?})", fsync);
-        (Some(pool), Some(handle))
+        (Some(pool), Some(handle), Some(writer_cancel))
     } else {
-        (None, None)
+        (None, None, None)
     };
 
     let bind_addr = format!("{}:{}", config.bind, config.port);
@@ -316,14 +320,17 @@ pub async fn run_embedded(
         .collect();
 
     // R2b round 2 F1: an `appendonly.aof` that is the only KV source and
-    // could not be replayed — refuse to start. The writer is told to exit
-    // without opening the file and joined, THEN the gate is released (R2b
+    // could not be replayed — refuse to start. This boot's writer (still
+    // waiting at the gate) is cancelled, so it exits without opening the
+    // file, and joined off the async runtime; THEN the gate is released (R2b
     // round 3 F-G), so a later instance on this dir opens its writer.
     if let Some(refusal) = shards.iter().find_map(|s| s.aof_unreadable.clone()) {
         if let Some(gate) = fresh_aof_gate {
-            gate.refuse();
+            if let Some(writer_cancel) = aof_writer_cancel {
+                writer_cancel.cancel();
+            }
             if let Some(handle) = aof_join {
-                let _ = handle.join();
+                let _ = tokio::task::spawn_blocking(move || handle.join()).await;
             }
             drop(gate);
         }
