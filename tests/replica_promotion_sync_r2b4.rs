@@ -59,14 +59,6 @@ fn ready(port: u16) -> Conn {
     }
 }
 
-fn wait_until(what: &str, secs: u64, mut ok: impl FnMut() -> bool) {
-    let deadline = Instant::now() + Duration::from_secs(secs);
-    while !ok() {
-        assert!(Instant::now() < deadline, "timed out waiting for {what}");
-        std::thread::sleep(Duration::from_millis(20));
-    }
-}
-
 fn master_bin() -> Option<PathBuf> {
     std::env::var_os("MOON_BIN_MONOIO").map(PathBuf::from)
 }
