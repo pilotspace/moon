@@ -370,7 +370,9 @@ impl AofWriterPool {
                 // enqueue surfaces as Err so the client never gets a false
                 // success for a write the durability machinery never saw.
                 self.send_append_backpressure(shard_id, lsn, db, bytes, stamp)
-                    .await
+                    .await?;
+                // moon#1266 F2: re-read after the enqueue (`aof::held_reply`).
+                self.fsync_barrier(shard_id).await
             }
         }
     }
