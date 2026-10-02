@@ -243,11 +243,8 @@ fn main() -> anyhow::Result<()> {
             moon::persistence::migrate_aof::migrate_aof(from, to, config.migrate_aof_shards)
                 .map_err(|e| anyhow::anyhow!("AOF migration failed: {}", e))?;
         info!(
-            "AOF migration complete: {} RDB keys migrated, {} commands read, {} written, {} skipped",
-            result.rdb_keys_migrated,
-            result.commands_read,
-            result.commands_written,
-            result.commands_skipped
+            "AOF migration complete: {} source records replayed, {} keys written ({:?} per shard)",
+            result.records_replayed, result.keys_migrated, result.keys_per_shard
         );
         return Ok(());
     }
