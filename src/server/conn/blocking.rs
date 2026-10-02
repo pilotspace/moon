@@ -2642,8 +2642,11 @@ pub(crate) fn try_inline_dispatch(
     // read-only commands are fine to inline. The non-inline dispatch
     // path (handler_monoio/handler_sharded) uses
     // `AofWriterPool::try_send_append_durable` and awaits the ack.
+    // moon#1266 F5: the lane of THIS shard (the inline SET writes only local
+    // keys); a hold after this read is caught after the append (F2).
     if let Some(pool) = aof_pool {
-        if pool.fsync_policy() == crate::persistence::aof::FsyncPolicy::Always && buf[1] == b'3'
+        if pool.fsync_policy_for(shard_id) == crate::persistence::aof::FsyncPolicy::Always
+            && buf[1] == b'3'
         // SET shape (*3 ...); GETs (*2) are still safe to inline.
         {
             return 0;
@@ -3294,6 +3297,9 @@ pub(crate) fn try_inline_dispatch(
             );
             return 1;
         }
+        // moon#1266 F2: held since the gate above? The handler barriers
+        // before this `+OK` leaves (`aof::held_reply`).
+        crate::persistence::aof::held_reply::note_after_append(pool, shard_id);
     }
 
     write_buf.extend_from_slice(b"+OK\r\n");

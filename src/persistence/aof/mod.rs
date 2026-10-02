@@ -825,6 +825,8 @@ mod pool;
 /// The writer's running record context (db + `MOON.TS` clock), moon#1283.
 mod record_ctx;
 mod refusal;
+// moon#1266 R2b-2 F2: a reply whose record went to a held lane after its policy read.
+pub mod held_reply;
 pub mod rewrite;
 pub mod rewrite_overflow;
 /// `CONFIG SET appendfsync` at runtime (R1 review, finding 8).
