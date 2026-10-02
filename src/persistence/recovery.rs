@@ -1001,7 +1001,7 @@ pub fn recover_shard_v3_pitr(
     }
     if kv_commands_replayed == 0 && kv.logs() {
         if let Some(v2_dir) = v2_persistence_dir {
-            let aof_path = v2_dir.join("appendonly.aof");
+            let aof_path = crate::persistence::aof::flat_file::flat_aof_path(v2_dir);
             if aof_path.exists() {
                 info!(
                     "Shard {}: WAL carried no KV commands, falling back to AOF replay from {:?} \

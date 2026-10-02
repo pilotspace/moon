@@ -428,7 +428,7 @@ impl Shard {
 
         // AOF is the recovery authority (see doc comment: WAL v3 KV coverage
         // is intentionally partial post-#211, so it must never shadow the AOF).
-        let aof_path = dir.join("appendonly.aof");
+        let aof_path = crate::persistence::aof::flat_file::flat_aof_path(dir);
         if kv == KvSources::Elsewhere {
             info!(
                 "Shard {}: legacy snapshot/appendonly.aof/WAL replay skipped — the \

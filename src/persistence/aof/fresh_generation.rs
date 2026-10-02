@@ -24,6 +24,18 @@ use std::path::Path;
 
 use crate::persistence::cold_records::ColdDeletes;
 
+/// The boot's keyspace as a fresh generation's RDB base: `None` when it is
+/// empty (the generation is then the head alone). The `base` argument of
+/// [`open_fresh_flat_generation`] for main.rs and the embedded server.
+pub fn keyspace_base(databases: &[crate::storage::Database]) -> std::io::Result<Option<Vec<u8>>> {
+    if databases.iter().all(|db| db.len() == 0) {
+        return Ok(None);
+    }
+    crate::persistence::rdb::save_to_bytes(databases)
+        .map(Some)
+        .map_err(std::io::Error::other)
+}
+
 /// What [`open_fresh_flat_generation`] did.
 #[derive(Debug, PartialEq, Eq)]
 pub enum FreshGeneration {

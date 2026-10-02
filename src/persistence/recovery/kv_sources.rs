@@ -59,7 +59,8 @@ impl KvSources {
     /// boot opens the generation over it. Every other value is returned as is.
     pub fn with_flat_aof(self, dir: Option<&Path>) -> Self {
         let holds_records = |d: &Path| {
-            std::fs::metadata(d.join("appendonly.aof")).is_ok_and(|m| m.is_file() && m.len() > 0)
+            std::fs::metadata(crate::persistence::aof::flat_file::flat_aof_path(d))
+                .is_ok_and(|m| m.is_file() && m.len() > 0)
         };
         match (self, dir) {
             (Self::SnapshotAndLogs, Some(d)) if holds_records(d) => Self::AofOnly,
@@ -122,7 +123,10 @@ impl KvSources {
             return;
         }
         let multi_part = dir.join("appendonlydir").join("moon.aof.manifest");
-        for log in [dir.join("appendonly.aof"), multi_part] {
+        for log in [
+            crate::persistence::aof::flat_file::flat_aof_path(dir),
+            multi_part,
+        ] {
             if log.exists() {
                 warn!(
                     "{} is NOT loaded: {}. Switching --appendonly yes -> no? Run BGSAVE (or \
