@@ -91,6 +91,10 @@ pub fn in_flight_fsyncs() -> (usize, u64) {
 
 /// When [`EverysecSync::due`] last logged a stalled fsync (process-wide, in
 /// [`mono_ms`]): the log line is rate-limited to one per [`STALL`].
+/// How often an everysec writer whose fsync agent could not be spawned
+/// tries again (R2b round 3 N2).
+const AGENT_SPAWN_RETRY: Duration = Duration::from_secs(60);
+
 static LAST_STALL_WARN_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Test-only: `MOON_TEST_AOF_SYNC_GATE=<path>` holds every AOF data fsync —
@@ -293,6 +297,10 @@ pub(super) struct EverysecSync {
     /// must not be rebuilt (re-WARNed, deadline reset) on every wake (R2b
     /// round 2 F6).
     everysec: bool,
+    /// An everysec writer whose agent could not be spawned retries the spawn
+    /// at its deadline once this passes (R2b round 3 N2; one WARN at the
+    /// first failure, the retries are quiet).
+    spawn_retry_at: Instant,
     last_handoff: Instant,
     dirty: bool,
     /// When the fsync now (or last) in flight was handed to the agent.
@@ -333,6 +341,7 @@ impl EverysecSync {
             writer_idx,
             agent,
             everysec: policy == FsyncPolicy::EverySec,
+            spawn_retry_at: Instant::now() + AGENT_SPAWN_RETRY,
             last_handoff: Instant::now(),
             dirty: false,
             dispatched_at: Instant::now(),
@@ -390,6 +399,7 @@ impl EverysecSync {
             writer_idx,
             agent: AofFsyncAgent::spawn_with_backend(writer_idx, backend).ok(),
             everysec: true,
+            spawn_retry_at: Instant::now() + AGENT_SPAWN_RETRY,
             last_handoff: Instant::now(),
             dirty: false,
             dispatched_at: Instant::now(),
@@ -508,6 +518,7 @@ impl EverysecSync {
 
     /// Claim the next fsync.
     pub(super) fn claim(&mut self) -> Claim {
+        self.retry_agent_spawn();
         let Some(agent) = self.agent.as_ref() else {
             return Claim::Inline;
         };
@@ -532,6 +543,28 @@ impl EverysecSync {
                 }
                 Claim::Postponed
             }
+        }
+    }
+
+    /// An everysec writer without an agent (its spawn failed) tries again, at
+    /// most once per [`AGENT_SPAWN_RETRY`]; meanwhile it fsyncs inline.
+    fn retry_agent_spawn(&mut self) {
+        if self.agent.is_some() || !self.everysec || Instant::now() < self.spawn_retry_at {
+            return;
+        }
+        self.spawn_retry_at = Instant::now() + AGENT_SPAWN_RETRY;
+        match AofFsyncAgent::spawn(self.writer_idx) {
+            Ok(agent) => {
+                tracing::info!(
+                    "AOF writer {}: everysec fsync agent started on retry",
+                    self.writer_idx
+                );
+                self.agent = Some(agent);
+            }
+            Err(e) => tracing::debug!(
+                "AOF writer {}: fsync agent retry failed ({e}); still fsyncing inline",
+                self.writer_idx
+            ),
         }
     }
 
@@ -934,7 +967,16 @@ mod tests {
         s.backdate(EVERYSEC);
         assert!(!s.set_policy(FsyncPolicy::EverySec), "same policy: no-op");
         assert!(s.due(), "the deadline survives the wake");
-        assert_eq!(s.claim(), Claim::Inline);
+        assert_eq!(
+            s.claim(),
+            Claim::Inline,
+            "no retry before AGENT_SPAWN_RETRY"
+        );
+        // R2b round 3 N2: once the retry is due, the deadline spawns again.
+        s.spawn_retry_at = Instant::now();
+        assert_eq!(s.claim(), Claim::Owned, "the retried agent owns the fsync");
+        assert!(s.agent.is_some());
+        s.agent = None;
         // Leaving and re-entering everysec still rebuilds (and retries).
         assert!(s.set_policy(FsyncPolicy::No));
         assert!(!s.set_policy(FsyncPolicy::No));
