@@ -124,6 +124,9 @@ pub struct Shard {
     /// replay read every cold file ungated. Read by `main.rs`, which rewrites
     /// the AOF once so later boots are gated.
     pub replayed_aof_without_cold_cut: bool,
+    /// R2b round 2 F1: `appendonly.aof` (the only KV source) could not be
+    /// replayed; the caller refuses to start.
+    pub aof_unreadable: Option<crate::persistence::aof::flat_file::UnreadableAof>,
     /// First cold-tier `file_id` this shard may allocate, proven above every
     /// id in use (moon#997, moon#893) by [`Self::prove_spill_file_id_seed`] —
     /// the startup gate `main` and the embedded server run after recovery,
@@ -185,6 +188,7 @@ impl Shard {
             recovered_warm_segments: Vec::new(),
             pending_heap_orphans: Vec::new(),
             replayed_aof_without_cold_cut: false,
+            aof_unreadable: None,
             spill_file_id_seed: None,
         }
     }
@@ -319,6 +323,7 @@ impl Shard {
                         // the background once this shard is serving traffic.
                         self.pending_heap_orphans = result.pending_heap_orphans;
                         self.replayed_aof_without_cold_cut = result.aof_replayed_without_cold_cut;
+                        self.aof_unreadable = result.aof_unreadable;
                         return result.commands_replayed;
                     }
                     Err(e) => {
@@ -442,7 +447,10 @@ impl Shard {
                     aof_replayed = n > 0;
                 }
                 Err(e) => {
-                    tracing::error!("Shard {}: AOF replay failed: {}", self.id, e);
+                    let refusal =
+                        crate::persistence::aof::flat_file::UnreadableAof::new(&aof_path, e);
+                    tracing::error!("Shard {}: {}", self.id, refusal.message());
+                    self.aof_unreadable = Some(refusal);
                 }
             }
             // moon#914: close the replay generation on every database. The

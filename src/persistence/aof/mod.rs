@@ -801,6 +801,9 @@ pub const DEFAULT_AOF_FSYNC_TIMEOUT: Duration = Duration::from_millis(2000);
 pub mod auto_rewrite;
 /// Exactly-sized, allocation-lean record encoding (moon#1187).
 mod encode;
+/// The legacy single-file AOF's name and its unreadable-file refusal (R2b
+/// round 2).
+pub mod flat_file;
 /// Streamed base image for the rewrite fold (moon#1185).
 pub mod fold_stream;
 /// An AOF fold while a `TXN` is open: re-opening its block (moon#1300).

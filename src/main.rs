@@ -1455,6 +1455,16 @@ fn main() -> anyhow::Result<()> {
         })
         .collect();
 
+    // R2b round 2 F1: an `appendonly.aof` that is the only KV source and
+    // could not be replayed. Exit here, before the tokio writer's open gate
+    // is released and before any manifest is created: no AOF writer has
+    // opened (or appended to) the file.
+    if let Some(refusal) = shards.iter().find_map(|s| s.aof_unreadable.as_ref()) {
+        tracing::error!("{}", refusal.message());
+        eprintln!("moon: {}", refusal.message());
+        std::process::exit(1);
+    }
+
     // moon#997 / moon#893: prove every shard's cold file_id seed before any
     // shard can spill or transition a vector segment. The seed must clear
     // every id a spill file, a warm segment or a manifest entry holds; one
