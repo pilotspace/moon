@@ -10,17 +10,18 @@ Written 2026-10-04. Read this first; it replaces the session scratchpad, which a
 | Wave 2b | Branch **`w2/int-2b`** (pushed) @ `9d85dbc` = fa3f751 + WS42/43/45/46 + review rounds R2b 1–4 + docs. Code identical to `fe6fb20` (later commits are CHANGELOG/README only). |
 | Wave 2b gate | `fe6fb20`, Linux container, not merge bar: fmt, clippy ×2, fuzz check OK; lib monoio 7150/0, tokio 6206/0; 216 integration suites (both runtimes) — only the known reds in §4; loom fsync_agent 5/5, aof_lane 17/17; epoll (`MOON_NO_URING=1`) aof_everysec_kill9 10/10, aof_shard_write 12/12, aof_fsync_stall 4/4. Full status: `bench/gateR8-status.txt`. |
 | Wave 2b bench | Quiet-box A/B 2a (`fa3f751`) vs 2b (`fe6fb20`): `bench/summary-*`. Wins and two regressions, see §3. |
-| Open fix lanes | **`w2/r2b5-reclaim-oom`** (moon#1297 −OOM regression) and **`w2/r2b5-coalesce`** (moon#1322 pipeline cost), both branched from `9d85dbc`, started 2026-10-04. If they are not pushed when you start, they were lost with the old container: redo them from §3. |
+| Open fix lanes | **STOPPED by the maintainer on 2026-10-04 mid-task — WIP, unverified, pushed.** Both branched from `9d85dbc`. See §3a for exactly what each holds and what is missing. |
+| PR branch | **Maintainer decision: the wave-2b PR goes on a NEW branch `w2/2b-on-main`** (not `claude/gifted-mendel-e9wiz5`). |
 | All lane branches | `w2/*` on origin (backup, no PRs). `w2/2b-docs` = the docs commits already on int-2b. |
 
 ## 2. What is left to ship wave 2b (in order)
 
-1. **Finish the two R2b5 fixes** (§3). Each needs: a red→green regression test, the bench cell re-run vs `fa3f751` and `fe6fb20`, gates on both runtimes. Write `plans/R2b5-*/SUMMARY.md`.
+1. **Finish the two R2b5 fixes** from their WIP branches (§3a). Each needs: review of the WIP commits, a red→green regression test, the bench cell re-run vs `fa3f751` and `fe6fb20` (≥5 reps), gates on both runtimes. Write `plans/R2b5-*/SUMMARY.md`.
 2. **Integrate** onto `w2/int-2b` by cherry-pick (issue order), push.
 3. **Re-gate** the integrated tree with `tooling/gate.sh` (resumable; see §5). Expect only the §4 reds.
 4. **Re-bench** cells 3 and 5 (and cell 1 tokio everysec as a sanity check) with `tooling/`; replace the regression paragraphs in the Performance section below.
 5. **CHANGELOG**: update the moon#1297 and moon#1322 entries (add the OOM fix / coalescing and the measured costs). Keep the Keep-a-Changelog style; no internal names (R2b, WS4x, lanes).
-6. **#1316 was squash-merged on 2026-10-04** as `9ffa7f5` on `main`; its tree is byte-identical to `fa3f751` (`git diff fa3f751 origin/main` is empty). So replay wave 2b with `git rebase --onto origin/main fa3f751 w2/int-2b` (or cherry-pick `fa3f751..w2/int-2b`) — do NOT merge, which would re-add the wave-2a commits. The designated branch `claude/gifted-mendel-e9wiz5` still points at the old `fa3f751`; resetting it to `main` needs a force push, which the agent's permission mode refused — the maintainer either allows that reset or names another branch for the wave-2b PR. Open the **wave 2b PR** with `.github/pull_request_template.md` (Summary / Checklist / Performance Impact / Notes), body ending with the Claude Code footer. Then dispatch the hosted `ci.yml` (maintainer, if 403).
+6. **#1316 was squash-merged on 2026-10-04** as `9ffa7f5` on `main`; its tree is byte-identical to `fa3f751` (`git diff fa3f751 origin/main` is empty). So build the PR branch with `git fetch origin main && git checkout -b w2/2b-on-main origin/main && git cherry-pick fa3f751..w2/int-2b` (after step 2) — do NOT merge, which would re-add the wave-2a commits. Push `w2/2b-on-main` and open the **wave 2b PR** from it into `main` (maintainer decision; `claude/gifted-mendel-e9wiz5` stays at the old `fa3f751`). Use `.github/pull_request_template.md` (Summary / Checklist / Performance Impact / Notes), body ending with the Claude Code footer. Then dispatch the hosted `ci.yml` (maintainer, if 403).
 
 No more adversarial review rounds were requested by the maintainer for wave 2b ("integrate, gate, ship"); the two R2b5 fixes still need their own red→green evidence.
 
@@ -33,6 +34,24 @@ No more adversarial review rounds were requested by the maintainer for wave 2b (
 - Fix candidates: don't start no-AOF compactions while used_memory ≥ maxmemory (or on a tick that evicted); keep pending-compaction bytes out of the eviction target; scale the pending cap to maxmemory; rate-limit spill-thread compaction work. Acceptance: 0 `-OOM` in ≥5 reps both runtimes, rps/CPU inside ±6% of 2a, reclaim still reclaims, cold-tier suites green.
 
 **moon#1322 cross-shard barriers — pipelined spanning writes under `appendfsync always`.** s4, spanning MSET (10 keys, c50) vs 2a: P16 −70% monoio (107K → 32K rps) / −60% tokio (66K → 26K); P1 −16% / −9%; single MSET p50 +17% / +14%. Same-shard and everysec unchanged/better. 2a was only faster because it skipped the remote fsync (the bug). Cause (consistent with evidence, not profiled): each spanning write in a pipeline awaits its own barrier set before the next command runs. Fix: coalesce one barrier set per pipeline batch (accumulate written shards, pay once before the batch's replies flush; every mid-batch flush path pays first). Acceptance: P16 near 2a, `tooling/sc3.py` 0 violations (always / after-always / boot; tokio + monoio epoll), `cross_shard_write_barrier_1322` and `loom_aof_lane` green.
+
+## 3a. Newest state of the two R2b5 fix lanes (stopped 2026-10-04 ~16:45 UTC)
+
+**`w2/r2b5-reclaim-oom`** (moon#1297; 5 commits on `9d85dbc`, last `031147f`):
+- `5abb1fe` feat(info): `cold_reclaim_pending_bytes` — INFO gauge of the RAM the reclaim's compaction records hold.
+- `c55e77e` fix(storage): no-AOF reclaim records stay under 1/16 of the shard budget, "so they never refuse a write".
+- `58e98fe` fix(storage): a spilling shard starts at most one no-AOF compaction per second.
+- `123020b` chore(storage): debug line when a no-AOF compaction start is deferred.
+- `031147f` WIP `tests/cold_reclaim_no_aof_oom_r2b5.rs` — committed by the orchestrator at stop time, **never run**.
+- Evidence gathered before the stop (session scratchpad, not in the repo): INFO polling during the 400K s4 workload with the gauge build reproduced `-OOM` in 3/3 pre-fix runs (mechanism confirmation). One run of the fixed monoio build (`r2b5-v1`) completed 400K SETs with **no `-OOM`, at 66.1K rps** — that is far below wave 2a's ~171K on the same workload, so the throttle may cost far more than intended, or the run differs in setup: **verify before trusting**. No gates, no tokio run, no reps.
+- To do: check that the 1/16 cap and the 1/s start rate still reclaim space (INFO reclaim counters, disk bytes vs 2a); run the new test red on `fe6fb20` and green on the fix; ≥5-rep A/B for `-OOM` count and rps on both runtimes; cold-tier suites.
+
+**`w2/r2b5-coalesce`** (moon#1322; 3 commits on `9d85dbc`, last `caed7b9`):
+- `369cf13` feat(aof): `BarrierDebt` — a batch's owed fsync barriers, settled in one set.
+- `a78b610` perf(conn): coalesce cross-shard write barriers per pipeline batch.
+- `caed7b9` test(1322): a pipeline of spanning writes pays one barrier set before any reply.
+- A monoio build `r2bfb5-a78b610-monoio` was made; **no measurements, no gates, sc3.py not run**. The agent was adding the pipelined test when stopped.
+- To do: complete the handler paths (every mid-batch flush pays the debt first, both runtimes, handler_single), loom model if the ack protocol changed, sc3.py 0 violations, P16/P1 spanning MSET A/B vs `fa3f751` and `fe6fb20`.
 
 ## 4. Known reds (red before wave 2b too — not regressions)
 
