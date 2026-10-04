@@ -4908,7 +4908,7 @@ mod as_of_tests {
 }
 
 /// moon#831: does the script that JUST ran on this thread owe the batch-end
-/// `fsync_barrier` (`resolve_local_leg_barrier`) before its reply is sent?
+/// barrier (`settle_barrier_debt`) before its reply is sent?
 ///
 /// `wrote` is `bridge::take_script_had_write()`, which the caller MUST read
 /// immediately after the VM returns and BEFORE any `.await` — the flag is a
@@ -4958,45 +4958,41 @@ pub(crate) async fn confirm_routed_script_write(
     reply
 }
 
-/// Resolve the pending v3-5 local-leg group-commit barrier, if any.
+/// Settle the batch's barrier debt (v3-5 group commit, moon#1322, R2b round 5
+/// coalescing), if any.
 ///
-/// Coordinator local-leg writes (MSET/MSETNX/BITOP/COPY/DEL/UNLINK legs owned
-/// by the connection's own shard) enqueue their AOF append fire-and-forget
-/// under `appendfsync=always` and record their response index here; ONE
-/// `fsync_barrier` per batch confirms them all. This MUST run before ANY
-/// flush of `responses` to the client — the batch end, but also the early
-/// flushes (blocking commands, SUBSCRIBE entry, PSYNC hijack). Skipping it
-/// there would (a) ack a write whose durability was never confirmed and
-/// (b) leave stale indexes that panic or misattribute errors when the
-/// response vec is replaced (PR #213 review finding).
+/// Writes of the batch record what they owe in `debt` instead of awaiting:
+/// coordinator local legs (MSET/MSETNX/BITOP/COPY/DEL/UNLINK legs owned by
+/// the connection's own shard, enqueued fire-and-forget under
+/// `appendfsync=always`), the written REMOTE shards of those coordinated
+/// writes, pipelined single-key writes sent to remote shards, scripts that
+/// wrote. ONE `PendingBarriers` set over every owed shard confirms them all.
+/// This MUST run before ANY flush of `responses` to the client — the batch
+/// end, but also the early flushes (blocking commands, SUBSCRIBE entry,
+/// PSYNC hijack). Skipping it there would (a) ack a write whose durability
+/// was never confirmed and (b) leave stale indexes that panic or
+/// misattribute errors when the response vec is replaced (PR #213 review
+/// finding).
 ///
-/// Always drains `idxs`. On barrier failure every recorded response is
-/// overwritten with `barrier_refusal_reply` (`AOF_FSYNC_ERR`, or the backlog
-/// text when the barrier was refused for backlog) — never a false `+OK`.
+/// Always empties `debt`. On a barrier failure every reply that waited on the
+/// failed shard is overwritten with `barrier_refusal_reply` (`AOF_FSYNC_ERR`,
+/// or the backlog text when the barrier was refused for backlog) — never a
+/// false `+OK`.
 ///
 /// moon#831: script arms (`EVAL`/`EVALSHA`/`FCALL`) that wrote join the same
 /// set — see [`script_write_joins_barrier`].
-pub async fn resolve_local_leg_barrier(
+pub async fn settle_barrier_debt(
     aof_pool: &Option<Arc<crate::persistence::aof::AofWriterPool>>,
-    shard_id: usize,
-    idxs: &mut Vec<usize>,
+    debt: &mut crate::persistence::aof::barrier_set::BarrierDebt,
     responses: &mut [Frame],
 ) {
-    if idxs.is_empty() {
+    if debt.is_empty() {
         return;
     }
-    if let Some(pool) = aof_pool {
-        if let Err(ack) = pool.fsync_barrier(shard_id).await {
-            // moon#1272 review round 2b: a backlog refusal is not an fsync failure.
-            let err = crate::persistence::aof::barrier_refusal_reply(ack);
-            for idx in idxs.iter() {
-                if let Some(slot) = responses.get_mut(*idx) {
-                    *slot = Frame::Error(Bytes::from_static(err));
-                }
-            }
-        }
+    match aof_pool {
+        Some(pool) => debt.settle(pool, responses).await,
+        None => debt.clear(),
     }
-    idxs.clear();
 }
 
 #[cfg(test)]

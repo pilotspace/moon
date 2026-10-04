@@ -101,7 +101,7 @@ where
 {
     // Phase 1 — group commit: the appends went out fire-and-forget as each
     // write was applied; ONE fsync barrier (Always) confirms the whole batch
-    // — same contract as the sharded handlers' resolve_local_leg_barrier. On
+    // — same contract as the sharded handlers' settle_barrier_debt. On
     // barrier failure every enqueued write in the batch is unconfirmed, so
     // every joined slot is patched.
     aof_log.settle(&mut responses).await;

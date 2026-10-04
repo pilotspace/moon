@@ -687,7 +687,7 @@ async fn handle_connection_body<S: tokio::io::AsyncRead + tokio::io::AsyncWrite 
                 let mut responses: Vec<Frame> = Vec::with_capacity(batch.len());
                 // v3-5 group commit: response indexes of coordinator LOCAL-leg
                 // writes pending the batch-end fsync_barrier(ctx.shard_id).
-                let mut local_leg_write_idxs: Vec<usize> = Vec::new();
+                let mut barrier_debt = crate::persistence::aof::barrier_set::BarrierDebt::new(ctx.shard_id);
                 let mut should_quit = false;
                 // moon#513 (A2a): the leading index is a `ReplySink`, not a bare
                 // `responses` index — see the twin in `handler_monoio`.
@@ -1398,7 +1398,7 @@ async fn handle_connection_body<S: tokio::io::AsyncRead + tokio::io::AsyncWrite 
                         if crate::server::conn::shared::script_write_joins_barrier(
                             wrote, &response,
                         ) {
-                            local_leg_write_idxs.push(responses.len());
+                            barrier_debt.push(responses.len());
                         }
                         responses.push(response);
                         continue;
@@ -1602,7 +1602,7 @@ async fn handle_connection_body<S: tokio::io::AsyncRead + tokio::io::AsyncWrite 
                             if crate::server::conn::shared::script_write_joins_barrier(
                                 wrote, &response,
                             ) {
-                                local_leg_write_idxs.push(responses.len());
+                                barrier_debt.push(responses.len());
                             }
                             responses.push(response);
                             continue;
@@ -1743,10 +1743,9 @@ async fn handle_connection_body<S: tokio::io::AsyncRead + tokio::io::AsyncWrite 
                         // local-leg writes — confirm (or fail-loud) them before
                         // this early flush; the replacement of `responses` below
                         // would otherwise leave stale indexes (PR #213 review).
-                        crate::server::conn::shared::resolve_local_leg_barrier(
+                        crate::server::conn::shared::settle_barrier_debt(
                             &ctx.aof_pool,
-                            ctx.shard_id,
-                            &mut local_leg_write_idxs,
+                            &mut barrier_debt,
                             &mut responses,
                         )
                         .await;
@@ -1870,7 +1869,7 @@ async fn handle_connection_body<S: tokio::io::AsyncRead + tokio::io::AsyncWrite 
                     if let Some(action) = pubsub::try_handle_subscribe(
                         cmd, cmd_args, &mut stream, &mut write_buf,
                         conn, ctx, &peer_addr, &mut responses,
-                        &mut local_leg_write_idxs,
+                        &mut barrier_debt,
                     ).await {
                         match action {
                             pubsub::SubscriberAction::Continue => { continue; }
@@ -2241,13 +2240,9 @@ async fn handle_connection_body<S: tokio::io::AsyncRead + tokio::io::AsyncWrite 
                         )
                         .is_some_and(|owner| owner != ctx.shard_id)
                     {
-                        let mut local_barrier_pending = false;
-                        let response = crate::shard::coordinator::coordinate_multi_key(cmd, cmd_args, ctx.shard_id, ctx.num_shards, conn.selected_db, &ctx.shard_databases, &ctx.dispatch_tx, &ctx.spsc_notifiers, &ctx.cached_clock, ctx.aof_pool.as_ref(), &ctx.repl_state, &mut local_barrier_pending, &()).await;
-                        // Only successful writes join the barrier set — an error
-                        // response must not be overwritten by a barrier failure.
-                        if local_barrier_pending && !matches!(response, Frame::Error(_)) {
-                            local_leg_write_idxs.push(responses.len());
-                        }
+                        // Records its owed barriers in `barrier_debt` (R2b
+                        // round 5); the batch settles them before any flush.
+                        let response = crate::shard::coordinator::coordinate_multi_key(cmd, cmd_args, ctx.shard_id, ctx.num_shards, conn.selected_db, &ctx.shard_databases, &ctx.dispatch_tx, &ctx.spsc_notifiers, &ctx.cached_clock, ctx.aof_pool.as_ref(), &ctx.repl_state, &mut barrier_debt, responses.len(), &()).await;
                         // moon#1069: the coordinator ran this shard's leg
                         // outside every write tail — serve whoever is blocked
                         // on a key it wrote here (see the monoio twin).
@@ -2441,10 +2436,10 @@ async fn handle_connection_body<S: tokio::io::AsyncRead + tokio::io::AsyncWrite 
                                             .await
                                         {
                                             // Always: one fsync_barrier per batch
-                                            // (resolve_local_leg_barrier) instead of
+                                            // (settle_barrier_debt) instead of
                                             // an awaited fsync per command.
                                             Ok(true) => {
-                                                local_leg_write_idxs.push(responses.len())
+                                                barrier_debt.push(responses.len())
                                             }
                                             Ok(false) => {}
                                             Err(ack) => aof_refusal = Some(ack),
@@ -2543,10 +2538,10 @@ async fn handle_connection_body<S: tokio::io::AsyncRead + tokio::io::AsyncWrite 
                                                 .await
                                             {
                                                 // Always: one fsync_barrier per batch
-                                                // (resolve_local_leg_barrier) instead of
+                                                // (settle_barrier_debt) instead of
                                                 // an awaited fsync per command.
                                                 Ok(true) => {
-                                                    local_leg_write_idxs.push(responses.len())
+                                                    barrier_debt.push(responses.len())
                                                 }
                                                 Ok(false) => {}
                                                 Err(ack) => aof_refusal = Some(ack),
@@ -2971,7 +2966,7 @@ async fn handle_connection_body<S: tokio::io::AsyncRead + tokio::io::AsyncWrite 
                             // Always-mode local writes join the per-batch group
                             // commit: append enqueued fire-and-forget, confirmed by
                             // ONE fsync_barrier before serialization
-                            // (resolve_local_leg_barrier) — previously each command
+                            // (settle_barrier_debt) — previously each command
                             // awaited its own fsync (the 8x P16 deficit vs Redis).
                             let mut aof_failed = false;
                             let mut aof_barrier_pending = false;
@@ -3092,7 +3087,7 @@ async fn handle_connection_body<S: tokio::io::AsyncRead + tokio::io::AsyncWrite 
                             // Only successful writes join the barrier set — an error
                             // response must not be overwritten by a barrier failure.
                             if aof_barrier_pending && !matches!(response, Frame::Error(_)) {
-                                local_leg_write_idxs.push(responses.len());
+                                barrier_debt.push(responses.len());
                             }
                             responses.push(response);
                         } else {
@@ -3422,9 +3417,8 @@ async fn handle_connection_body<S: tokio::io::AsyncRead + tokio::io::AsyncWrite 
                             continue;
                         };
 
-                        // H1-BARRIER: collect the resp_idxs of persisted writes so
-                        // we can overwrite write responses on fsync failure below.
-                        let mut write_resp_idxs: Vec<usize> = Vec::new();
+                        // H1-BARRIER: a persisted write's reply owes `target`'s
+                        // barrier (`barrier_debt`, settled with the batch below).
                         for (RemoteMeta { sink, persisted_write, track_keys, shape: resp3_shape }, resp) in meta.drain(..).zip(shard_responses) {
                             // moon#513 (A2a): a fan-out PART is an intermediate —
                             // stored raw (the RESP3 shape belongs to the FOLDED
@@ -3448,7 +3442,7 @@ async fn handle_connection_body<S: tokio::io::AsyncRead + tokio::io::AsyncWrite 
                             // Shape classified at enqueue, where the args still existed.
                             let converted = crate::protocol::resp3::apply_shape(resp3_shape, resp, proto_ver);
                             if persisted_write && !matches!(converted, Frame::Error(_)) {
-                                write_resp_idxs.push(resp_idx);
+                                barrier_debt.owe(Some(resp_idx), [target]);
                             }
                             // CLIENT TRACKING: remote write confirmed — invalidate
                             // the keys captured at enqueue time.
@@ -3466,24 +3460,14 @@ async fn handle_connection_body<S: tokio::io::AsyncRead + tokio::io::AsyncWrite 
                         // moon#1177: the drained bookkeeping keeps its capacity.
                         remote_groups.recycle(target, meta);
 
-                        // H1-BARRIER (C4-FOLD-FIX follow-up): under appendfsync=always,
-                        // call fsync_barrier once per target shard AFTER responses are
-                        // collected. The SPSC arm enqueued the Append fire-and-forget;
-                        // the barrier enqueues a zero-length AppendSync into the SAME
-                        // shard channel. Because the writer processes messages in order,
-                        // an acked barrier proves all prior Appends to this shard are on
-                        // durable storage. Under EverySec/No this is a zero-cost noop.
-                        if !write_resp_idxs.is_empty() {
-                            if let Some(ref pool) = ctx.aof_pool {
-                                if let Err(ack) = pool.fsync_barrier(target).await {
-                                    // moon#1272: a backlogged writer is not a failed fsync.
-                                    let err = aof::barrier_refusal_reply(ack);
-                                    for idx in write_resp_idxs {
-                                        responses[idx] = Frame::Error(Bytes::from_static(err));
-                                    }
-                                }
-                            }
-                        }
+                        // H1-BARRIER (C4-FOLD-FIX follow-up): under
+                        // appendfsync=always every target shard a persisted
+                        // write went to owes ONE barrier (a zero-length
+                        // AppendSync behind its Appends in the same ordered
+                        // channel). R2b round 5: recorded in `barrier_debt` and
+                        // paid with the batch's other debts in ONE parallel set
+                        // (`settle_barrier_debt` below), not one awaited
+                        // barrier per target in turn.
                     }
                 }
 
@@ -3499,16 +3483,17 @@ async fn handle_connection_body<S: tokio::io::AsyncRead + tokio::io::AsyncWrite 
                     );
                 }
 
-                // v3-5 GROUP-COMMIT BARRIER: coordinator LOCAL legs were enqueued
-                // fire-and-forget into MY shard's AOF writer during dispatch; ONE
-                // barrier confirms all of them with a single fsync instead of the
-                // retired per-command awaited fsync. Runs BEFORE response
-                // serialization — no +OK without confirmed durability. Early-flush
-                // paths (blocking, SUBSCRIBE) resolve the same barrier first.
-                crate::server::conn::shared::resolve_local_leg_barrier(
+                // v3-5 GROUP-COMMIT BARRIER, coalesced (R2b round 5): the
+                // batch's writes recorded what they owe in `barrier_debt` —
+                // coordinator LOCAL legs, the written remote shards of
+                // coordinated writes (moon#1322), the targets of pipelined
+                // remote writes (H1). ONE parallel barrier set confirms them
+                // all. Runs BEFORE response serialization — no +OK without
+                // confirmed durability. Early-flush paths (blocking,
+                // SUBSCRIBE) settle the same debt first.
+                crate::server::conn::shared::settle_barrier_debt(
                     &ctx.aof_pool,
-                    ctx.shard_id,
-                    &mut local_leg_write_idxs,
+                    &mut barrier_debt,
                     &mut responses,
                 )
                 .await;

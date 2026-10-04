@@ -7,8 +7,9 @@
 //! the bridge itself emits one effect record per successful inner
 //! `redis.call` (`emit_effect` → `record_effect_write` →
 //! `send_append_bounded_blocking`, fire-and-forget, no waiter). Ordinary
-//! writes then join the batch-end barrier set (`local_leg_write_idxs`) and
-//! `resolve_local_leg_barrier` awaits ONE `fsync_barrier` before the batch is
+//! writes then join the batch-end barrier set (`barrier_debt`, formerly
+//! `local_leg_write_idxs`) and `settle_barrier_debt` (formerly
+//! `resolve_local_leg_barrier`) awaits ONE barrier set before the batch is
 //! serialized. The script arms — `try_handle_eval` / `try_handle_evalsha` /
 //! FCALL in `try_handle_functions` (monoio), the inline arms in
 //! `handler_sharded` (tokio), and `route_script_elsewhere` for a script that

@@ -1,6 +1,7 @@
 //! Pub/sub command handlers: subscriber-mode loop, SUBSCRIBE/PSUBSCRIBE,
 //! PUBLISH, UNSUBSCRIBE/PUNSUBSCRIBE, and PUBSUB introspection.
 
+use crate::persistence::aof::barrier_set::BarrierDebt;
 use bytes::{Bytes, BytesMut};
 use std::collections::HashMap;
 
@@ -408,7 +409,7 @@ pub(super) async fn try_handle_subscribe<
     ctx: &ConnectionContext,
     peer_addr: &str,
     responses: &mut Vec<Frame>,
-    local_leg_write_idxs: &mut Vec<usize>,
+    barrier_debt: &mut BarrierDebt,
 ) -> Option<SubscriberAction> {
     use tokio::io::AsyncWriteExt;
 
@@ -456,13 +457,7 @@ pub(super) async fn try_handle_subscribe<
     }
     // Earlier frames in this batch may hold barrier-pending local-leg
     // writes — confirm (or fail-loud) them before this early flush.
-    crate::server::conn::shared::resolve_local_leg_barrier(
-        &ctx.aof_pool,
-        ctx.shard_id,
-        local_leg_write_idxs,
-        responses,
-    )
-    .await;
+    crate::server::conn::shared::settle_barrier_debt(&ctx.aof_pool, barrier_debt, responses).await;
     // Flush accumulated responses before entering subscriber mode
     if !responses.is_empty() {
         write_buf.clear();
