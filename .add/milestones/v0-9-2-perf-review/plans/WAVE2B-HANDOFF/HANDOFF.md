@@ -6,7 +6,7 @@ Written 2026-10-04. Read this first; it replaces the session scratchpad, which a
 
 | item | state |
 |---|---|
-| Wave 2a | PR **pilotspace/moon#1316**, branch `claude/gifted-mendel-e9wiz5` @ `fa3f751`. All PR checks green. **Blocked only on a maintainer approval.** The hosted `ci.yml` dispatch (Windows/MSRV/memory) returned 403 from the agent: the maintainer must run it (`gh workflow run ci.yml --ref claude/gifted-mendel-e9wiz5`). |
+| Wave 2a | PR **pilotspace/moon#1316** — **MERGED 2026-10-04** (squash, `9ffa7f5` on main, tree = `fa3f751`). The hosted `ci.yml` dispatch (Windows/MSRV/memory) returned 403 from the agent: the maintainer must run it (`gh workflow run ci.yml --ref claude/gifted-mendel-e9wiz5`). |
 | Wave 2b | Branch **`w2/int-2b`** (pushed) @ `9d85dbc` = fa3f751 + WS42/43/45/46 + review rounds R2b 1–4 + docs. Code identical to `fe6fb20` (later commits are CHANGELOG/README only). |
 | Wave 2b gate | `fe6fb20`, Linux container, not merge bar: fmt, clippy ×2, fuzz check OK; lib monoio 7150/0, tokio 6206/0; 216 integration suites (both runtimes) — only the known reds in §4; loom fsync_agent 5/5, aof_lane 17/17; epoll (`MOON_NO_URING=1`) aof_everysec_kill9 10/10, aof_shard_write 12/12, aof_fsync_stall 4/4. Full status: `bench/gateR8-status.txt`. |
 | Wave 2b bench | Quiet-box A/B 2a (`fa3f751`) vs 2b (`fe6fb20`): `bench/summary-*`. Wins and two regressions, see §3. |
@@ -20,7 +20,7 @@ Written 2026-10-04. Read this first; it replaces the session scratchpad, which a
 3. **Re-gate** the integrated tree with `tooling/gate.sh` (resumable; see §5). Expect only the §4 reds.
 4. **Re-bench** cells 3 and 5 (and cell 1 tokio everysec as a sanity check) with `tooling/`; replace the regression paragraphs in the Performance section below.
 5. **CHANGELOG**: update the moon#1297 and moon#1322 entries (add the OOM fix / coalescing and the measured costs). Keep the Keep-a-Changelog style; no internal names (R2b, WS4x, lanes).
-6. **After #1316 merges**: restart `claude/gifted-mendel-e9wiz5` from the new `main`, merge `w2/int-2b` in (it is based on fa3f751, so only wave-2b commits are new), push, open the **wave 2b PR** with `.github/pull_request_template.md` (Summary / Checklist / Performance Impact / Notes), body ending with the Claude Code footer. Then dispatch the hosted `ci.yml` (maintainer, if 403).
+6. **#1316 was squash-merged on 2026-10-04** as `9ffa7f5` on `main`; its tree is byte-identical to `fa3f751` (`git diff fa3f751 origin/main` is empty). So replay wave 2b with `git rebase --onto origin/main fa3f751 w2/int-2b` (or cherry-pick `fa3f751..w2/int-2b`) — do NOT merge, which would re-add the wave-2a commits. The designated branch `claude/gifted-mendel-e9wiz5` still points at the old `fa3f751`; resetting it to `main` needs a force push, which the agent's permission mode refused — the maintainer either allows that reset or names another branch for the wave-2b PR. Open the **wave 2b PR** with `.github/pull_request_template.md` (Summary / Checklist / Performance Impact / Notes), body ending with the Claude Code footer. Then dispatch the hosted `ci.yml` (maintainer, if 403).
 
 No more adversarial review rounds were requested by the maintainer for wave 2b ("integrate, gate, ship"); the two R2b5 fixes still need their own red→green evidence.
 
