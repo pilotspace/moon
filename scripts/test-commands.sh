@@ -46,8 +46,8 @@ qgrep() { local _in; _in=$(cat); grep "$@" <<< "$_in" > /dev/null; }
 # of moon bugs: listpack set/list encodings, ZRANK ... WITHSCORE, the NOPERM
 # text "User <name> has no permissions ...", the COMMAND GETKEYS keyless
 # text, hash-field-expiry tracking, DEBUG DIGEST values, and the moon#981
-# '-@all +get +set' ACL GETUSER row (flaky on 7.0: dict-order rendering under
-# a per-process random seed). The run prints the oracle's version at startup
+# moon#981/#1296 ACL rule-order rows ('-@all +set +get' ...; they flip on 7.0:
+# dict-order rendering under a per-process random seed; deterministic on 7.2+). The run prints the oracle's version at startup
 # and warns below 7.2.
 ###############################################################################
 
@@ -1500,6 +1500,35 @@ if should_run "connection"; then
     assert_moon_ok "SELECT 0"          SELECT 0
     assert_moon_ok "SELECT 1"          SELECT 1
     assert_moon_contains "INFO server" "redis_version" INFO server
+    # moon#1286: `INFO stats` expired_keys counted nothing (no production
+    # caller). 50 short-TTL keys nobody reads (active expiry) must move the
+    # counter by exactly 50 on both servers; the same keys read after their
+    # deadline (lazy expiry) must count once, not twice.
+    ek1286() { redis-cli -p "$1" INFO stats 2>/dev/null | tr -d '\r' | awk -F: '/^expired_keys/{print $2}'; }
+    for ek1286_mode in active lazy; do
+        ek1286_r0=$(ek1286 "$PORT_REDIS"); ek1286_m0=$(ek1286 "$PORT_RUST")
+        for ek1286_i in $(seq 1 50); do
+            rcli SET "ek1286:$ek1286_mode:$ek1286_i" v PX 20 >/dev/null
+            mcli SET "ek1286:$ek1286_mode:$ek1286_i" v PX 20 >/dev/null
+        done
+        if [[ "$ek1286_mode" == lazy ]]; then
+            sleep 0.1
+            for ek1286_i in $(seq 1 50); do
+                rcli GET "ek1286:$ek1286_mode:$ek1286_i" >/dev/null
+                mcli GET "ek1286:$ek1286_mode:$ek1286_i" >/dev/null
+            done
+        fi
+        sleep 1.5
+        TOTAL=$((TOTAL + 1))
+        ek1286_rd=$(( $(ek1286 "$PORT_REDIS") - ek1286_r0 ))
+        ek1286_md=$(( $(ek1286 "$PORT_RUST") - ek1286_m0 ))
+        if [[ "$ek1286_rd" == 50 && "$ek1286_md" == 50 ]]; then
+            PASS=$((PASS + 1))
+        else
+            FAIL=$((FAIL + 1))
+            echo "  FAIL: moon#1286 INFO expired_keys delta ($ek1286_mode): redis=$ek1286_rd moon=$ek1286_md (want 50/50)"
+        fi
+    done
     assert_moon_ok "DBSIZE"            DBSIZE
     assert_moon_ok "COMMAND"           COMMAND
     assert_moon_ok "COMMAND COUNT"     COMMAND COUNT
@@ -1861,6 +1890,24 @@ if should_run "acl"; then
     assert_match "ACL SETUSER ~a %R~b allkeys" \
         ACL SETUSER tc:acl:a on '>pw' '~tc:acl:x' '%R~tc:acl:y' allkeys +@all
     assert_acl_field "allkeys replaces earlier patterns" tc:acl:a keys
+
+    # --- #1296: command rules render in the order they were applied ---------
+    # redis 7.2+ keeps application order (`+set +get` is not `+get +set`; a
+    # re-applied rule moves to the end; grants and revocations stay
+    # interleaved; a bare `cmd` drops the `cmd|*` rules before it). Categories
+    # (`+@read`) are left out: moon expands them, redis keeps the token. On a
+    # redis 7.0 oracle these rows flip (dict-order rendering).
+    for acl_spec in "-@all +set +get" "-@all +get +set +get" "+@all -set -get" \
+        "+@all -get -set +get -del" "-@all +get -set +append" \
+        "-@all +hset +hget +hdel" "-@all +config|get +config" \
+        "-@all +config +config|get" "+@all -config|set -config|get" \
+        "-@all +config|set +config|get +get" "+@all -get +get"; do
+        read -r -a acl_spec_rules <<< "$acl_spec"
+        acl_both ACL DELUSER tc:acl:o
+        acl_both ACL SETUSER tc:acl:o on '>pw' '~*' '&*' "${acl_spec_rules[@]}"
+        assert_acl_field "#1296 rule order '$acl_spec' (GETUSER commands)" tc:acl:o commands
+    done
+    acl_both ACL DELUSER tc:acl:o
 
     # --- #970: %RW~ / lowercase %r~ / %W~ key selectors ------------------------
     acl_both ACL DELUSER tc:acl:s

@@ -93,6 +93,7 @@ fn swapdb_waiting_for_room_across_a_fold_snapshot_keeps_its_record() {
         db: 0,
         bytes: Bytes::from_static(b"filler"),
         epoch: FoldEpoch::INITIAL,
+        clock_ms: 0,
     })
     .expect("fill the one-slot writer channel");
     let pool = std::sync::Arc::new(AofWriterPool::top_level_with_policy(

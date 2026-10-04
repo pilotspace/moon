@@ -494,6 +494,7 @@ fn info_raw(db: &Database, facts: &InstanceFacts) -> String {
     } else {
         0
     };
+    let aof_fsyncs_in_flight = crate::persistence::aof::in_flight_fsyncs();
     sections.push_str(&format!(
         "loading:{}\r\n\
          current_cow_size:{}\r\n\
@@ -514,6 +515,9 @@ fn info_raw(db: &Database, facts: &InstanceFacts) -> String {
          txn_rollback_wal_dropped:{}\r\n\
          aof_last_fsync_status:{}\r\n\
          aof_fsync_failures:{}\r\n\
+         aof_delayed_fsync:{}\r\n\
+         aof_pending_bio_fsync:{}\r\n\
+         aof_fsync_in_flight_ms:{}\r\n\
          aof_last_append_status:{}\r\n\
          aof_reason_del_dropped:{}\r\n\
          aof_rewrite_overflow_spilled:{}\r\n\
@@ -601,6 +605,15 @@ fn info_raw(db: &Database, facts: &InstanceFacts) -> String {
             "err"
         },
         crate::persistence::aof::AOF_FSYNC_FAILURES.load(std::sync::atomic::Ordering::Relaxed),
+        // moon#1266 + R1 review: redis's cadence — one count per 2 s an
+        // everysec fsync stays in flight while written data waits for the
+        // next one (redis counts its postponed WRITES at the same moments;
+        // moon keeps writing and postpones only the fsync).
+        crate::persistence::aof::AOF_DELAYED_FSYNC.load(std::sync::atomic::Ordering::Relaxed),
+        // Writers with an everysec fsync in flight on their agent (redis:
+        // pending BIO_AOF_FSYNC jobs), and the oldest one's age in ms.
+        aof_fsyncs_in_flight.0,
+        aof_fsyncs_in_flight.1,
         if crate::persistence::aof::aof_last_append_ok() {
             "ok"
         } else {
@@ -716,6 +729,31 @@ fn info_raw(db: &Database, facts: &InstanceFacts) -> String {
             }
         }
     }
+    // moon#1289: held cold files that waited for a fold or snapshot nobody
+    // asked for. Process-wide atomics, so present whatever the sweep
+    // published: databases stale now, and the folds / snapshots requested for
+    // them since boot (both stay 0 on a server with no held file), and the
+    // snapshot requests deferred because a TXN was open (moon#1300), and the
+    // rounds abandoned because a shard held a TXN write at its start.
+    let _ = write!(
+        sections,
+        "cold_held_files_stale_databases:{}\r\n\
+         cold_held_release_folds_requested:{}\r\n\
+         cold_held_release_snapshots_requested:{}\r\n\
+         cold_held_release_snapshots_deferred_txn:{}\r\n\
+         cold_held_release_snapshots_abandoned_txn:{}\r\n",
+        crate::storage::tiered::held_release::stale_databases(),
+        crate::storage::tiered::held_release::folds_requested(),
+        crate::persistence::snapshot_request::started(
+            crate::persistence::snapshot_request::SnapshotReason::HeldColdFiles
+        ),
+        crate::persistence::snapshot_request::deferred_for_open_txn(
+            crate::persistence::snapshot_request::SnapshotReason::HeldColdFiles
+        ),
+        crate::persistence::snapshot_request::abandoned_for_open_txn(
+            crate::persistence::snapshot_request::SnapshotReason::HeldColdFiles
+        ),
+    );
     sections.push_str("\r\n");
 
     // # Reclamation — observability foundation for Wave-1 production hardening (P10).
@@ -809,6 +847,9 @@ fn info_raw(db: &Database, facts: &InstanceFacts) -> String {
         facts.pubsub_channels,
         facts.pubsub_patterns,
     );
+    // moon#1299: open cross-store transactions, the oldest one's age, the
+    // keys they hold and the writes refused on them.
+    crate::transaction::isolation::write_info(&mut sections);
     sections.push_str("\r\n");
 
     // # CPU

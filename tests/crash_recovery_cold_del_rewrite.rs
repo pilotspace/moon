@@ -351,10 +351,139 @@ fn appended_value() -> String {
     format!("{}+", probe_value())
 }
 
-/// moon#1231 scenario (see the section comment). With `second_rewrite`, a
-/// second BGREWRITEAOF follows the touches: it captures the promoted probes in
-/// its base, after which the sweep must release the spill files it held — the
-/// hold is a wait for a fold, not a leak — and a kill -9 still loses nothing.
+/// Sum of the base sequence numbers of every AOF generation in `dir` (per
+/// shard dir and top level): it grows exactly when a rewrite commits a new
+/// generation somewhere.
+fn base_generation(dir: &std::path::Path) -> u64 {
+    fn seqs(d: &std::path::Path) -> u64 {
+        std::fs::read_dir(d).map_or(0, |files| {
+            files
+                .flatten()
+                .filter_map(|f| {
+                    let name = f.file_name().to_string_lossy().to_string();
+                    name.strip_prefix("moon.aof.")
+                        .and_then(|r| r.strip_suffix(".base.rdb"))
+                        .and_then(|seq| seq.parse::<u64>().ok())
+                })
+                .max()
+                .unwrap_or(0)
+        })
+    }
+    let aof_dir = dir.join("appendonlydir");
+    let per_shard: u64 = std::fs::read_dir(&aof_dir).map_or(0, |entries| {
+        entries
+            .flatten()
+            .filter(|e| e.path().is_dir())
+            .map(|e| seqs(&e.path()))
+            .sum()
+    });
+    per_shard + seqs(&aof_dir)
+}
+
+/// Every `heap-*.mpf` spill file under `dir/off`, by path.
+fn heap_file_set(dir: &std::path::Path) -> std::collections::BTreeSet<std::path::PathBuf> {
+    fn walk(p: &std::path::Path, acc: &mut std::collections::BTreeSet<std::path::PathBuf>) {
+        let Ok(rd) = std::fs::read_dir(p) else {
+            return;
+        };
+        for path in rd.flatten().map(|e| e.path()) {
+            if path.is_dir() {
+                walk(&path, acc);
+            } else if path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("heap-") && n.ends_with(".mpf"))
+            {
+                acc.insert(path);
+            }
+        }
+    }
+    let mut acc = std::collections::BTreeSet::new();
+    walk(&dir.join("off"), &mut acc);
+    acc
+}
+
+/// moon#1231's invariant, sampled once: every spill file that was on disk
+/// right after the fold (`at_fold`; the hold covers each of them) and is gone
+/// now was unlinked only after a LATER fold committed. Returns how many are
+/// gone.
+///
+/// The listing is taken BEFORE the generation is read: a file already missing
+/// from it was unlinked before that read, so a fold that committed ahead of
+/// the unlink is visible to it. A flat legacy `appendonly.aof` (tokio
+/// `--shards 1`) has no base sequence (`gen_at_fold == 0`); there the
+/// held-release fold counter is the best evidence available.
+fn check_fold_before_unlink(
+    port: u16,
+    dir: &std::path::Path,
+    at_fold: &std::collections::BTreeSet<std::path::PathBuf>,
+    gen_at_fold: u64,
+) -> usize {
+    let present = heap_file_set(dir);
+    let gen_now = base_generation(dir);
+    let gone = at_fold.iter().filter(|f| !present.contains(*f)).count();
+    if gone > 0 {
+        let flat_evidence = gen_at_fold == 0
+            && info_u64(port, "cold_held_release_folds_requested").unwrap_or(0) > 0;
+        assert!(
+            gen_now > gen_at_fold || flat_evidence,
+            "{gone} of the {} spill files on disk at the fold (the only copy of every probe \
+             cold at it) were unlinked before any later fold committed ({} files now, AOF \
+             generation {gen_at_fold} -> {gen_now})",
+            at_fold.len(),
+            present.len()
+        );
+    }
+    gone
+}
+
+/// The promote scenario's second BGREWRITEAOF, waited on until a NEW
+/// generation has committed (`rewrite_and_wait` cannot tell: every shard
+/// already has a compacted base from the first fold). A moon#1289 automatic
+/// fold may hold the in-progress flag when it is sent; it is then refused
+/// ("already in progress") and sent again once that fold is done.
+fn second_rewrite_and_wait(port: u16, dir: &std::path::Path) {
+    let gen_before = base_generation(dir);
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let out = Command::new("redis-cli")
+            .args(["-p", &port.to_string(), "BGREWRITEAOF"])
+            .output()
+            .expect("redis-cli BGREWRITEAOF");
+        let reply = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if !reply.contains("already in progress") {
+            assert_no_error_reply("BGREWRITEAOF", &out);
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "BGREWRITEAOF refused for 60s: {reply}"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    loop {
+        let info = redis_cmd(port, &["INFO", "persistence"]);
+        // A flat legacy file has no sequence to watch: idle is all there is.
+        if info.contains("aof_rewrite_in_progress:0")
+            && (gen_before == 0 || base_generation(dir) > gen_before)
+        {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the second rewrite committed no new AOF generation within 60s (generation \
+             {gen_before} -> {}); INFO:\n{info}",
+            base_generation(dir)
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+/// moon#1231 scenario (see the section comment). With `second_rewrite`, the
+/// spill files the sweep held must be released once a later fold has
+/// committed — the hold is a wait for a fold, not a leak — by a moon#1289
+/// automatic fold inside the orphan-sweep wait or, if none came, by a second
+/// BGREWRITEAOF; and a kill -9 still loses nothing.
 fn run_promote_scenario(suffix: &str, touch: Touch, second_rewrite: bool) {
     let port = common::reserve_port();
     let dir = unique_dir(suffix);
@@ -383,6 +512,10 @@ fn run_promote_scenario(suffix: &str, touch: Touch, second_rewrite: bool) {
 
     // The fold: the probes that are cold now are in no base.
     rewrite_and_wait(port, &dir);
+    // Every spill file on disk now is covered by the unlink hold: below the
+    // fold's cut, or minted before the first sweep that saw the new epoch.
+    let at_fold = heap_file_set(&dir);
+    let gen_at_fold = base_generation(&dir);
     del_fillers(port);
     let expected = match touch {
         Touch::Get => val.clone(),
@@ -407,20 +540,68 @@ fn run_promote_scenario(suffix: &str, touch: Touch, second_rewrite: bool) {
             }
         }
     }
-    // Several 1 s orphan sweeps run.
-    std::thread::sleep(Duration::from_secs(5));
+    // Several 1 s orphan sweeps run. moon#1289: a database whose files stay
+    // held for three sweeps asks the auto-rewrite monitor for a fold, and with
+    // 1 s sweeps that fold can commit and release the held files inside this
+    // wait. That is a later fold capturing the probes too, but only if it
+    // COMMITTED before the files went: every 100 ms, check that no file on
+    // disk at the fold is gone before a later generation (moon#1231's
+    // invariant). Not every file goes: a probe that is still cold keeps its
+    // file referenced — a tokio GET can serve a cold key without promoting it
+    // (the read-only `get_cold_value` path) — so "no spill file left" is not
+    // the sign that the held ones were released.
+    let wait_end = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < wait_end {
+        check_fold_before_unlink(port, &dir, &at_fold, gen_at_fold);
+        if count_heap_files(&dir) == 0 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
     let files_before_second = count_heap_files(&dir);
+    // Held (or queued) zero-ref files, published by every sweep.
+    let held_before_second = info_u64(port, "cold_files_pending_unlink")
+        .expect("INFO cold_files_pending_unlink is published by the 1 s orphan sweeps");
 
+    // (files, held) after the second rewrite's release.
     let mut released = None;
     if second_rewrite {
-        assert!(
-            files_before_second > 0,
-            "the spill files that backed the probes at the fold were unlinked before any \
-             later fold captured them ({heap_files} at the fold, 0 now)"
-        );
-        rewrite_and_wait(port, &dir);
-        std::thread::sleep(Duration::from_secs(4));
-        released = Some(count_heap_files(&dir));
+        if held_before_second > 0 {
+            second_rewrite_and_wait(port, &dir);
+            // The release happens at the sweep after the commit (1 s sweeps).
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut held = held_before_second;
+            while Instant::now() < deadline {
+                held = info_u64(port, "cold_files_pending_unlink").unwrap_or(held);
+                if held == 0 {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(200));
+            }
+            released = Some((count_heap_files(&dir), held));
+            eprintln!(
+                "held spill files: {held_before_second} held after the wait, {held} held after \
+                 the second BGREWRITEAOF"
+            );
+        } else {
+            // Nothing is held any more: an automatic fold committed and the
+            // sweep after it released every held file inside the wait. The
+            // order was checked at every sample; check it once more, and that
+            // a release happened at all — otherwise nothing was ever held
+            // and this case proved nothing.
+            let gone = check_fold_before_unlink(port, &dir, &at_fold, gen_at_fold);
+            assert!(
+                gone > 0,
+                "no spill file was ever held: none of the {} files on disk at the fold was \
+                 released, and none is pending unlink ({files_before_second} files now)",
+                at_fold.len()
+            );
+            eprintln!(
+                "held spill files: released inside the wait by a fold that committed first \
+                 ({gone} of {} files gone, {files_before_second} files still on disk)",
+                at_fold.len()
+            );
+        }
     }
 
     server.kill_now();
@@ -463,14 +644,15 @@ fn run_promote_scenario(suffix: &str, touch: Touch, second_rewrite: bool) {
         lost,
         wrong.first(),
         heap_files,
-        released.unwrap_or(files_before_second),
+        released.map_or(files_before_second, |(files, _)| files),
         cold_keys
     );
-    if let Some(after) = released {
+    if let Some((after, held_after)) = released {
         assert!(
-            after < files_before_second,
-            "the second rewrite committed but the sweep released no held spill file \
-             ({files_before_second} before, {after} after)"
+            held_after == 0 && after < files_before_second,
+            "the second rewrite committed but the sweeps after it did not release every held \
+             spill file within 10s ({files_before_second} files and {held_before_second} held \
+             before; {after} files and {held_after} held after)"
         );
     }
 }

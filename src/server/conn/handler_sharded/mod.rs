@@ -82,12 +82,16 @@ use super::affinity::MigratedConnectionState;
 use crate::server::response_slot::ResponseSlotPool;
 
 mod dispatch;
+mod exit;
 mod ft;
 mod pubsub;
 mod read;
 mod txn;
 mod txn_intercepts;
 mod write;
+
+use exit::BodyExit;
+pub(crate) use exit::handle_connection_sharded_inner;
 
 /// Result of `handle_connection_sharded_inner` execution.
 ///
@@ -325,30 +329,32 @@ pub(crate) async fn handle_connection_sharded(
     }
 }
 
-/// Generic inner handler for sharded connections (Tokio runtime).
+/// Generic connection body for sharded connections (Tokio runtime).
 ///
 /// Works with any stream implementing `AsyncRead + AsyncWrite + Unpin`,
 /// enabling both plain TCP (`TcpStream`) and TLS (`tokio_rustls::server::TlsStream<TcpStream>`).
 ///
-/// Returns `(HandlerResult, Option<S>)`: the stream is returned when migration is triggered
-/// so the concrete caller can extract the raw FD. `can_migrate` controls whether the
-/// AffinityTracker is active (set to `false` for TLS connections).
-pub(crate) async fn handle_connection_sharded_inner<
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
->(
+/// Returns the stream in a [`BodyExit`]: open for a migration hand-off,
+/// otherwise for the wrapper to close.
+///
+/// moon#1299: entered ONLY through [`exit::handle_connection_sharded_inner`],
+/// which owns `conn` and runs the connection's exit epilogue (the open-TXN
+/// abort) after this returns — by ANY `return`, `break` or hand-off — and
+/// closes the socket only after it (moon#1299 R2 N1).
+async fn handle_connection_body<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
     stream: S,
     peer_addr: String,
     ctx: &super::core::ConnectionContext,
     shutdown: CancellationToken,
     client_id: u64,
-    can_migrate: bool,
     initial_read_buf: BytesMut,
-    migrated_state: Option<&MigratedConnectionState>,
     // Raw socket fd for CLIENT KILL force-close (R-3), or -1 if unavailable
     // (non-unix). Threaded from the concrete spawn site; the generic `S` here
     // has no `AsRawFd` bound.
     kill_fd: i32,
-) -> (HandlerResult, Option<S>) {
+    // Owned by the exit wrapper, which ends its open TXN (moon#1299).
+    conn: &mut super::core::ConnectionState,
+) -> (HandlerResult, BodyExit<S>) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     // Solo-conn spin gate (L1 convoy fix): register this connection on the
@@ -380,17 +386,6 @@ pub(crate) async fn handle_connection_sharded_inner<
     // `read_buf`, so a large upload is scanned once, not once per read. Every
     // other consumer of `read_buf`'s front resets it (see `ParseState`).
     let mut parse_state = crate::protocol::ParseState::new();
-    let mut conn = super::core::ConnectionState::new(
-        client_id,
-        peer_addr.clone(),
-        &ctx.requirepass,
-        ctx.shard_id,
-        ctx.num_shards,
-        can_migrate,
-        ctx.runtime_config.read().acllog_max_len,
-        migrated_state,
-    );
-    conn.refresh_acl_cache(&ctx.acl_table);
 
     // Register in global client registry for CLIENT LIST/INFO/KILL.
     // RegistryGuard ensures deregister on all exit paths (including early returns).
@@ -505,7 +500,7 @@ pub(crate) async fn handle_connection_sharded_inner<
         crate::server::conn::shared::publish_pubsub_counts(
             &client_live,
             &ctx.shard_pubsub(),
-            &mut conn,
+            conn,
             ctx.cached_clock.ms(),
         );
 
@@ -532,7 +527,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                 &mut read_buf,
                 &mut write_buf,
                 &parse_config,
-                &mut conn,
+                conn,
                 ctx,
                 &peer_addr,
                 &shutdown,
@@ -550,7 +545,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                     break;
                 }
                 pubsub::SubscriberAction::EarlyReturn => {
-                    return (HandlerResult::Done, None);
+                    return (HandlerResult::Done, BodyExit::Close(stream));
                 }
             }
         }
@@ -791,7 +786,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                                     // were produced under the OLD protocol and
                                     // keep it — see `encode_response_batch`.
                                     crate::server::conn::shared::note_protocol_switch(
-                                        &mut conn,
+                                        conn,
                                         responses.len(),
                                         new_proto,
                                     );
@@ -979,7 +974,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                         && txn_intercepts::try_handle_auth(
                             cmd,
                             cmd_args,
-                            &mut conn,
+                            conn,
                             ctx,
                             &peer_addr,
                             &mut auth_delay_ms,
@@ -994,7 +989,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                         && txn_intercepts::try_handle_hello(
                             cmd,
                             cmd_args,
-                            &mut conn,
+                            conn,
                             ctx,
                             client_id,
                             &peer_addr,
@@ -1017,17 +1012,19 @@ pub(crate) async fn handle_connection_sharded_inner<
                     // Shared with handler_monoio: a per-handler copy of this is
                     // how RESET came to exist ONLY inside this handler's
                     // subscribe-mode loop and nowhere else.
-                    if crate::server::conn::shared::try_handle_reset(
+                    // moon#1299 R1: RESET also ends an open TXN (`txn_abort`).
+                    if crate::server::conn::txn_abort::try_handle_reset(
+                        ctx,
+                        None,
                         cmd,
                         cmd_args,
                         client_id,
-                        &mut conn,
-                        &ctx.requirepass,
-                        &ctx.tracking_table,
-                        &ctx.shard_pubsub(),
+                        conn,
                         &mut responses,
                         None,
-                    ) {
+                    )
+                    .await
+                    {
                         continue;
                     }
 
@@ -1188,7 +1185,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                         // never a PUBLISH channel — refuse a denied one HERE so
                         // the block aborts, instead of at EXEC after the rest ran.
                         if let Some(err) = crate::server::conn::shared::conn_queued_publish_channel_deny(
-                            &conn,
+                            &*conn,
                             &ctx.acl_table,
                             cmd,
                             cmd_args,
@@ -1462,7 +1459,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                         cmd,
                         cmd_args,
                         client_id,
-                        &mut conn,
+                        conn,
                         ctx,
                         &peer_addr,
                         &mut responses,
@@ -1640,7 +1637,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                     }
 
                     // --- INFO ---
-                    if dispatch::try_handle_info(cmd, cmd_args, &conn, ctx, shaped!()).await {
+                    if dispatch::try_handle_info(cmd, cmd_args, &*conn, ctx, shaped!()).await {
                         continue;
                     }
 
@@ -1661,18 +1658,18 @@ pub(crate) async fn handle_connection_sharded_inner<
                     }
 
                     // --- CLIENT subcommands ---
-                    if dispatch::try_handle_client_command(cmd, cmd_args, client_id, &mut conn, ctx, shaped!()) {
+                    if dispatch::try_handle_client_command(cmd, cmd_args, client_id, conn, ctx, shaped!()) {
                         continue;
                     }
 
                     // --- TXN.BEGIN / TXN.COMMIT / TXN.ABORT ---
-                    if txn::try_handle_txn_begin(cmd, cmd_args, &mut conn, ctx, &mut responses) {
+                    if txn::try_handle_txn_begin(cmd, cmd_args, conn, ctx, &mut responses) {
                         continue;
                     }
-                    if txn::try_handle_txn_commit(cmd, cmd_args, &mut conn, ctx, &mut responses).await {
+                    if txn::try_handle_txn_commit(cmd, cmd_args, conn, ctx, &mut responses).await {
                         continue;
                     }
-                    if txn::try_handle_txn_abort(cmd, cmd_args, &mut conn, ctx, &mut responses)
+                    if txn::try_handle_txn_abort(cmd, cmd_args, conn, ctx, &mut responses)
                         .await
                     {
                         continue;
@@ -1695,18 +1692,18 @@ pub(crate) async fn handle_connection_sharded_inner<
                     }
 
                     // --- WS.* ---
-                    if write::try_handle_ws_command(cmd, cmd_args, &mut conn, ctx, &mut responses).await {
+                    if write::try_handle_ws_command(cmd, cmd_args, conn, ctx, &mut responses).await {
                         continue;
                     }
 
                     // --- MQ.* ---
-                    if write::try_handle_mq_command(cmd, cmd_args, &frame, &mut conn, ctx, &mut responses).await {
+                    if write::try_handle_mq_command(cmd, cmd_args, &frame, conn, ctx, &mut responses).await {
                         continue;
                     }
 
                     // --- MULTI / EXEC_CMD / DISCARD ---
                     let mut exec_publishes: Vec<crate::shard::exec_publish::ExecPublish> = Vec::new();
-                    if write::try_handle_multi_exec(cmd, cmd_args, &mut conn, ctx, &mut responses, &mut exec_publishes, &shutdown, &func_registry).await {
+                    if write::try_handle_multi_exec(cmd, cmd_args, conn, ctx, &mut responses, &mut exec_publishes, &shutdown, &func_registry).await {
                         // C2: a PUBLISH or SPUBLISH (moon#1043) queued inside MULTI
                         // fans out only now — after the transaction body has been
                         // applied — into its own namespace, and its placeholder in
@@ -1718,7 +1715,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                                 // security): a denied channel is patched with
                                 // NOPERM and never fanned out.
                                 let patched = match crate::server::conn::shared::conn_publish_channel_acl_deny(
-                                    &conn,
+                                    &*conn,
                                     &ctx.acl_table,
                                     &p.channel,
                                 ) {
@@ -1755,11 +1752,11 @@ pub(crate) async fn handle_connection_sharded_inner<
                         // moves the protocol partway through the batch, and the
                         // replies produced before it must keep the old encoding.
                         crate::server::conn::shared::encode_response_batch(
-                            &mut conn,
+                            conn,
                             &responses,
                             &mut write_buf,
                         );
-                        if !write_all_bounded!(stream, &write_buf, write_timeout, out_cap_normal, client_live, client_id) { arena.reset(); return (HandlerResult::Done, None); }
+                        if !write_all_bounded!(stream, &write_buf, write_timeout, out_cap_normal, client_live, client_id) { arena.reset(); return (HandlerResult::Done, BodyExit::Close(stream)); }
                         // c10k A1: `read_buf` doubles as the carry buffer — it
                         // holds only the unparsed tail of this batch here, so
                         // bytes the client pipelines while blocked append in
@@ -1786,7 +1783,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                             // down, nothing to reply to, close the connection.
                             crate::server::conn::blocking::BlockingOutcome::PeerGone => {
                                 arena.reset();
-                                return (HandlerResult::Done, None);
+                                return (HandlerResult::Done, BodyExit::Close(stream));
                             }
                         };
                     // moon#644: the blocking path modifies the keyspace, so it owes tracking
@@ -1805,7 +1802,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                         if peer_gone_after_serve {
                             // Nobody left to write the reply to.
                             arena.reset();
-                            return (HandlerResult::Done, None);
+                            return (HandlerResult::Done, BodyExit::Close(stream));
                         }
                     // moon#827 / moon#1056: the pop's record is already in the
                     // AOF of the shard that OWNS the key, written in the pop's
@@ -1861,7 +1858,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                     // queue (it used to execute immediately, fanning out before
                     // the transaction's writes were applied).
                     if !conn.in_multi
-                        && pubsub::try_handle_publish(cmd, cmd_args, &conn, ctx, &mut responses, &mut publish_batches)
+                        && pubsub::try_handle_publish(cmd, cmd_args, &*conn, ctx, &mut responses, &mut publish_batches)
                     {
                         continue;
                     }
@@ -1869,7 +1866,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                     // --- SUBSCRIBE / PSUBSCRIBE ---
                     if let Some(action) = pubsub::try_handle_subscribe(
                         cmd, cmd_args, &mut stream, &mut write_buf,
-                        &mut conn, ctx, &peer_addr, &mut responses,
+                        conn, ctx, &peer_addr, &mut responses,
                         &mut local_leg_write_idxs,
                     ).await {
                         match action {
@@ -1883,7 +1880,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                                 }
                                 break;
                             }
-                            pubsub::SubscriberAction::EarlyReturn => { return (HandlerResult::Done, None); }
+                            pubsub::SubscriberAction::EarlyReturn => { return (HandlerResult::Done, BodyExit::Close(stream)); }
                         }
                     }
                     // UNSUBSCRIBE/PUNSUBSCRIBE in normal mode (not subscribed)
@@ -1910,25 +1907,25 @@ pub(crate) async fn handle_connection_sharded_inner<
                     }
 
                     // --- SWAPDB: handler-layer intercept (needs async + multi-db access) ---
-                    if dispatch::try_handle_swapdb(cmd, cmd_args, &mut conn, ctx, shaped!())
+                    if dispatch::try_handle_swapdb(cmd, cmd_args, conn, ctx, shaped!())
                         .await
                     {
                         continue;
                     }
 
                     // --- Cross-shard aggregation: KEYS, SCAN, DBSIZE, RANDOMKEY ---
-                    if dispatch::try_handle_cross_shard_scan(cmd, cmd_args, &conn, ctx, shaped!()).await {
+                    if dispatch::try_handle_cross_shard_scan(cmd, cmd_args, &*conn, ctx, shaped!()).await {
                         continue;
                     }
 
                     // --- FT.* vector search commands ---
-                    if ft::try_handle_ft_command(cmd, cmd_args, &frame, &conn, ctx, &mut responses).await {
+                    if ft::try_handle_ft_command(cmd, cmd_args, &frame, &*conn, ctx, &mut responses).await {
                         continue;
                     }
 
                     // --- GRAPH.* graph commands ---
                     #[cfg(feature = "graph")]
-                    if write::try_handle_graph_command(cmd, cmd_args, &frame, &mut conn, ctx, &mut responses).await {
+                    if write::try_handle_graph_command(cmd, cmd_args, &frame, conn, ctx, &mut responses).await {
                         continue;
                     }
 
@@ -2725,49 +2722,22 @@ pub(crate) async fn handle_connection_sharded_inner<
                                     drop(rt);
                                 }
 
-                                // KV undo-log capture for active cross-store transactions.
-                                // MUST happen BEFORE dispatch() overwrites the database entry.
-                                if let Some(ref mut txn) = conn.active_cross_txn {
-                                    if cmd.eq_ignore_ascii_case(b"DEL") || cmd.eq_ignore_ascii_case(b"UNLINK") {
-                                        for arg in cmd_args.iter() {
-                                            if let Frame::BulkString(key_bytes) = arg {
-                                                if let Some(old_entry) = db.get(key_bytes.as_ref()).cloned() {
-                                                    txn.kv_undo.record_delete(conn.selected_db, key_bytes.clone(), old_entry);
-                                                    let lsn = txn.snapshot_lsn;
-                                                    let tid = txn.txn_id;
-                                                    // Direct field access — `s` is this
-                                                    // closure's own param; re-entering
-                                                    // with_shard here panics.
-                                                    s.kv_write_intents.record_write(key_bytes.clone(), lsn, tid);
-                                                }
-                                            }
-                                        }
-                                    } else {
-                                        // moon#500 — twin of the monoio capture
-                                        // (`handler_monoio/mod.rs`); see the full
-                                        // rationale there. `extract_primary_key`
-                                        // returns ONE key, so a multi-key write
-                                        // rolled back only its first key on
-                                        // TXN ABORT. `written_keys` is filtered to
-                                        // `KeyRole::Write`, so reads stay out of
-                                        // `kv_write_intents`.
-                                        // An unenumerable argv falls back to
-                                        // the primary key; a write-free one
-                                        // (`SORT src`) captures nothing.
-                                        let lsn = txn.snapshot_lsn;
-                                        let tid = txn.txn_id;
-                                        let written =
-                                            crate::transaction::conn_txn_capture_keys(cmd, cmd_args);
-                                        for key in written {
-                                            match db.get(key.as_ref()).cloned() {
-                                                None => txn.kv_undo.record_insert(conn.selected_db, key.clone()),
-                                                Some(entry) => txn.kv_undo.record_update(conn.selected_db, key.clone(), entry),
-                                            }
-                                            // Direct field access — see DEL/UNLINK arm above.
-                                            s.kv_write_intents.record_write(key, lsn, tid);
-                                        }
-                                    }
-                                }
+                                // KV undo-log capture for active cross-store transactions,
+                                // BEFORE dispatch — twin of the monoio leg: pre-images,
+                                // intents and moon#1299 holds, or the TXNCONFLICT refusal
+                                // (`transaction::conn_capture`).
+                                let sel_db = conn.selected_db;
+                                let txn_capture = match conn.active_cross_txn.as_deref_mut() {
+                                    Some(txn) => Some(crate::transaction::conn_capture::capture_conn_write(
+                                        txn,
+                                        &mut s.kv_write_intents,
+                                        db,
+                                        sel_db,
+                                        cmd,
+                                        cmd_args,
+                                    )?),
+                                    None => None,
+                                };
 
                                 db.refresh_now_from_cache(&ctx.cached_clock);
                                 let mut probe = crate::admin::metrics_setup::LatencyProbe::new(
@@ -2784,6 +2754,12 @@ pub(crate) async fn handle_connection_sharded_inner<
                                     DispatchResult::Response(f) => f,
                                     DispatchResult::Quit(f) => { should_quit = true; f }
                                 };
+                                // moon#1303: an erroring TXN write takes its capture back.
+                                if let (Some(capture), Some(txn)) =
+                                    (txn_capture, conn.active_cross_txn.as_deref_mut())
+                                {
+                                    capture.finish(matches!(response, Frame::Error(_)), txn, &mut s.kv_write_intents);
+                                }
                                 // moon#595/moon#1069: the shared hook — see
                                 // the twin in handler_monoio. It wakes the
                                 // waiters on every key this write touched.
@@ -2810,14 +2786,14 @@ pub(crate) async fn handle_connection_sharded_inner<
 
                             // Unconditional slice path: ShardSlice is always initialized.
                             let write_outcome: WriteOutcome =
-                                crate::shard::slice::with_shard(|s| do_write(s, &mut conn));
+                                crate::shard::slice::with_shard(|s| do_write(s, conn));
                             // #455: the AOF record below can park on a full
                             // writer channel before it is enqueued; its fold
                             // epoch is read here, in the mutation's no-await
                             // stretch (see the monoio handler's generic write
                             // leg).
                             let fold_stamp = ctx.aof_pool.as_ref().map_or(
-                                aof::FoldEpoch::INITIAL,
+                                aof::AppendStamp::INITIAL,
                                 |pool| pool.fold_stamp(ctx.shard_id),
                             );
 
@@ -3633,12 +3609,12 @@ pub(crate) async fn handle_connection_sharded_inner<
                 // protocol partway through the batch, and the replies produced
                 // before it must keep the old encoding.
                 crate::server::conn::shared::encode_response_batch(
-                    &mut conn,
+                    conn,
                     &responses,
                     &mut write_buf,
                 );
                 if !write_all_bounded!(stream, &write_buf, write_timeout, out_cap_normal, client_live, client_id) {
-                    return (HandlerResult::Done, None);
+                    return (HandlerResult::Done, BodyExit::Close(stream));
                 }
 
                 // Deliver anything this batch's commands queued. Once per
@@ -3650,7 +3626,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                 // E4: a timed-out cross-shard reply slot must never be reused
                 // — the error replies are flushed above, now close.
                 if xshard_reply_fatal {
-                    return (HandlerResult::Done, None);
+                    return (HandlerResult::Done, BodyExit::Close(stream));
                 }
 
                 // Update live state after each batch — lock-free (QW8, 2026-06
@@ -3663,7 +3639,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                 crate::server::conn::shared::publish_pubsub_counts(
                     &client_live,
                     &ctx.shard_pubsub(),
-                    &mut conn,
+                    conn,
                     ctx.cached_clock.ms(),
                 );
 
@@ -3694,7 +3670,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                     };
                     return (
                         HandlerResult::MigrateConnection { state: migrated_state, target_shard },
-                        Some(stream),
+                        BodyExit::HandOff(stream),
                     );
                 }
 
@@ -3811,24 +3787,9 @@ pub(crate) async fn handle_connection_sharded_inner<
         }
     }
 
-    // Phase 166: release any leaked cross-store TXN (client disconnected mid-txn).
-    // Idempotent: TXN.ABORT already takes() active_cross_txn so this is a no-op if abort ran.
-    // Closes T-161-05 — without this, a disconnect after TXN.BEGIN + SET would leak
-    // kv_intents and pin the key invisible for all subsequent readers.
-    if let Some(txn) = conn.active_cross_txn.take() {
-        // Box::pin (c10k future diet): this ~5.4 KB rollback state machine
-        // otherwise sits inline in EVERY connection future; boxing costs one
-        // alloc on the leaked-txn teardown path only.
-        // A refusal is counted by the pool and logged by `abort_logged`
-        // (moon#1285 review MINOR 5); there is no client left to tell.
-        let _refused = Box::pin(crate::server::conn::txn_abort::abort_logged(
-            ctx,
-            *txn,
-            None,
-            crate::server::conn::txn_abort::AbortCause::Disconnect,
-        ))
-        .await;
-    }
+    // Phase 166 / moon#1299: an open cross-store TXN is ended by the exit
+    // wrapper (`exit.rs`) after this body returns — on this path and on
+    // every early `return` above alike.
 
     // Detach from the MONITOR feed. A retained dead sink would keep the feed
     // formatting into a closed channel and keep `any_attached()` true, which
@@ -3893,5 +3854,5 @@ pub(crate) async fn handle_connection_sharded_inner<
         ctx.tracking_table.lock().untrack_all(client_id);
     }
 
-    (HandlerResult::Done, None)
+    (HandlerResult::Done, BodyExit::Close(stream))
 }

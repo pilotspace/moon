@@ -99,6 +99,19 @@ pub(crate) fn execute_mq_on_owner(
         Err(e) => return e,
     };
 
+    // moon#1299: every mutating subcommand writes the queue's stream key;
+    // refused while an open TXN holds it (a TXN's `DEL q` / `XADD q` would
+    // otherwise be restored over this write on abort).
+    if crate::transaction::isolation::any_held()
+        && !sub.eq_ignore_ascii_case(b"DLQLEN")
+        && let Some(Frame::BulkString(raw_key)) = cmd_args.get(1)
+        && let Some(refused) = crate::transaction::isolation::check_keys([(
+            db_index,
+            effective_key(&key_prefix, raw_key).as_ref(),
+        )])
+    {
+        return refused;
+    }
     if sub.eq_ignore_ascii_case(b"CREATE") {
         return handle_create(cmd_args, &key_prefix, db_index, gate);
     }
@@ -222,20 +235,17 @@ fn derive_trig_key(key_prefix: &Bytes, raw_queue_key: &Bytes) -> Bytes {
 // ── WAL append helper ─────────────────────────────────────────────────────────
 
 /// Append a WAL record on the current shard thread via the slice's
-/// `wal_append_tx` channel (fire-and-forget), tagged with its REAL
-/// `record_type` (K1a) — the payload is UNFRAMED (no nested `write_wal_v3_record`
-/// pre-framing); the event-loop drain calls `wal.append(record_type, &payload)`
-/// directly.
+/// `wal_append_tx` channel, tagged with its REAL `record_type` (K1a) — the
+/// payload is UNFRAMED (no nested `write_wal_v3_record` pre-framing); the
+/// event-loop drain calls `wal.append(record_type, &payload)` directly.
 ///
-/// Failure policy (CodeRabbit PR #291): `try_send` is structurally required
-/// here — every caller runs ON the shard thread, which is also the channel's
-/// sole consumer (the 1ms-tick drain in `event_loop.rs`), so blocking on a
-/// full channel would deadlock the drain that empties it. Overflow therefore
-/// needs >4096 records enqueued within a single tick. When it DOES happen
-/// the mutation has already been applied and cannot be unwound mid-commit,
-/// so the record loss is made LOUD instead of silent: `tracing::error!` +
-/// the `RECL_WAL_APPEND_CHANNEL_DROPPED_TOTAL` INFO counter, giving
-/// operators a durability-gap signal to alert on.
+/// Lossless (moon#1302): every caller runs ON the shard thread, which is also
+/// the channel's sole consumer, so a full channel spills to the thread's
+/// overflow queue, appended by the same tick right after the channel's
+/// records (`shard::wal_append`). A `TXN.COMMIT` materializing thousands of
+/// `MQ PUBLISH`es used to lose every `MqPush` past the channel's 4096 slots.
+/// A record that still cannot be enqueued — the writer is gone — is counted
+/// in `reclamation_wal_append_channel_dropped_total` and logged.
 ///
 /// `pub(crate)`: also called from `src/server/conn/handler_monoio/txn.rs` and
 /// `src/server/conn/handler_sharded/txn.rs` (MQ.PUBLISH self-fold) and
@@ -246,22 +256,21 @@ pub(crate) fn wal_append_on_slice(
     record_type: crate::persistence::wal_v3::record::WalRecordType,
     payload: bytes::Bytes,
 ) {
-    crate::shard::slice::with_shard(|s| {
-        if let Some(ref tx) = s.wal_append_tx {
-            if tx.try_send((record_type, payload)).is_err() {
-                crate::command::info_reclamation::RECL_WAL_APPEND_CHANNEL_DROPPED_TOTAL
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                tracing::error!(
-                    ?record_type,
-                    "WAL append channel rejected a plane record AFTER the \
-                     in-memory mutation was applied — this record will be \
-                     MISSING from crash recovery. The channel is drained by \
-                     this same shard thread every 1ms (capacity 4096), so \
-                     this indicates a pathological single-tick burst."
-                );
-            }
-        }
-    });
+    crate::shard::slice::with_shard(|s| slice_wal_append(s, record_type, payload));
+}
+
+/// [`wal_append_on_slice`] for a caller already holding the slice.
+#[inline]
+fn slice_wal_append(
+    s: &crate::shard::slice::ShardSlice,
+    record_type: crate::persistence::wal_v3::record::WalRecordType,
+    payload: bytes::Bytes,
+) {
+    if let Some(ref tx) = s.wal_append_tx
+        && let Err(why) = crate::shard::wal_append::enqueue(tx, s.shard_id, record_type, payload)
+    {
+        crate::shard::wal_append::report_dropped(why, s.shard_id, record_type);
+    }
 }
 
 /// TXN.COMMIT's MQ.PUBLISH materialization on the queue's owner shard: add
@@ -462,25 +471,11 @@ fn emit_mq_drops(s: &mut crate::shard::slice::ShardSlice, db_index: usize, dropp
     for key in dropped {
         let payload = crate::mq::wal::encode_mq_drop(db_index as u32, key);
         replicate_mq_record(shard_id, db_index, crate::mq::wal::MQ_REPL_DROP, &payload);
-        if let Some(ref tx) = s.wal_append_tx {
-            if tx
-                .try_send((
-                    crate::persistence::wal_v3::record::WalRecordType::MqDrop,
-                    Bytes::from(payload),
-                ))
-                .is_err()
-            {
-                crate::command::info_reclamation::RECL_WAL_APPEND_CHANNEL_DROPPED_TOTAL
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                tracing::error!(
-                    "MqDrop WAL append channel rejected a tombstone record for a deleted \
-                     durable MQ stream AFTER the in-memory removal was applied — this \
-                     queue may resurrect on crash recovery. The channel is drained by \
-                     this same shard thread every 1ms (capacity 4096), so this indicates \
-                     a pathological single-tick burst."
-                );
-            }
-        }
+        slice_wal_append(
+            s,
+            crate::persistence::wal_v3::record::WalRecordType::MqDrop,
+            Bytes::from(payload),
+        );
     }
 }
 

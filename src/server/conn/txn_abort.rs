@@ -8,9 +8,11 @@
 //! this logs them the way the connection's generic write path logs a write:
 //!
 //! 1. the undo and everything below it up to the first await form ONE
-//!    synchronous stretch: the AOF fold epoch is read, the replication
-//!    records are recorded (monoio), the graph WAL records are appended —
-//!    checked, a refused record fails the reply (PR #1301 review);
+//!    synchronous stretch: the AOF fold epoch is read, the graph WAL records
+//!    are appended — checked, a refused record fails the reply (PR #1301
+//!    review), with no capacity limit on this thread (moon#1302) — and then
+//!    the replication records are recorded (monoio), the graph ones only as
+//!    far as the WAL accepted them;
 //! 2. the KV records are appended to this shard's AOF through the MULTI/EXEC
 //!    group commit ([`persist_txn_aof`]) — one `fsync` barrier under
 //!    `appendfsync always`, so an `+OK` means the abort is on disk;
@@ -35,6 +37,15 @@ pub(crate) enum AbortCause {
     DirtyCommit,
     /// Disconnect cleanup: there is no client left to tell.
     Disconnect,
+    /// `RESET` (moon#1299 R1): like redis's RESET discarding MULTI state, it
+    /// ends the transaction; the client is answered `+RESET` whatever the
+    /// rollback's durability.
+    Reset,
+    /// A `TXN.COMMIT` refused because its snapshot was killed
+    /// (`KILL SNAPSHOT` / `old_snapshot_threshold`): the client is answered
+    /// `snapshot too old`, which says nothing about the rollback's
+    /// durability.
+    KilledCommit,
 }
 
 impl AbortCause {
@@ -43,6 +54,8 @@ impl AbortCause {
             AbortCause::Explicit => "TXN.ABORT",
             AbortCause::DirtyCommit => "TXN.COMMIT rollback (rejected ops)",
             AbortCause::Disconnect => "disconnect rollback",
+            AbortCause::Reset => "RESET rollback",
+            AbortCause::KilledCommit => "TXN.COMMIT rollback (snapshot killed)",
         }
     }
 }
@@ -57,8 +70,9 @@ pub(crate) type ReplicationRecorder = fn(&ConnectionContext, usize, Bytes);
 /// `replication_fanout_active`); the tokio runtime passes `None`.
 ///
 /// `Err(reply)` when the AOF refused the records or their barrier, when the
-/// WAL channel refused a graph rollback record (local or on a remote leg's
-/// owner — PR #1301 review), or when a remote graph leg was not delivered or
+/// shard's WAL writer refused a graph rollback record (local or on a remote
+/// leg's owner — PR #1301 review; since moon#1302 only a writer that is gone
+/// refuses, there is no capacity limit), or when a remote graph leg was not delivered or
 /// acknowledged — the stores ARE rolled back either way (a remote leg that
 /// was never delivered excepted, which its reply says). A refusal is never
 /// silent (wave-1 review MINOR 5): it is counted where it happens
@@ -67,8 +81,9 @@ pub(crate) type ReplicationRecorder = fn(&ConnectionContext, usize, Bytes);
 /// `txn_rollback_wal_dropped` for graph WAL records), and this logs it with
 /// its `cause` — at WARN for an explicit `TXN.ABORT`, whose client is
 /// answered the refusal, and at ERROR for a dirty-commit or disconnect
-/// rollback, where no client learns of it and the master's logs lack records
-/// its replicas already received.
+/// rollback, where no client learns of it and the master's AOF may lack KV
+/// records its replicas already received (the graph records are replicated
+/// only as far as the WAL accepted them, moon#1302).
 ///
 /// Durability parity (PR #1301 review): the graph records get what the
 /// FORWARD graph writes get — enqueued in the no-await stretch, drained into
@@ -81,6 +96,14 @@ pub(crate) async fn abort_logged(
     cause: AbortCause,
 ) -> Result<(), Bytes> {
     let txn_id = txn.txn_id;
+    // moon#1299: the transaction's keys stay held until the restore is
+    // applied AND its compensating records are enqueued (or refused and
+    // reported) — released earlier, another client's write in the window
+    // could reach the log AHEAD of the compensation that overwrites it on
+    // replay. Released when this guard drops: at the end of this function,
+    // or if the future is dropped mid-await, so a cancelled abort can never
+    // leave the keys held forever.
+    let _release = crate::transaction::isolation::EndOnDrop::new(txn_id);
     let graph_db = txn.db_index;
     let (log, remote) = crate::transaction::abort::abort_local(ctx.shard_id, ctx.num_shards, txn);
 
@@ -90,9 +113,25 @@ pub(crate) async fn abort_logged(
     let fold_stamp = ctx
         .aof_pool
         .as_ref()
-        .map_or(crate::persistence::aof::FoldEpoch::INITIAL, |pool| {
+        .map_or(crate::persistence::aof::AppendStamp::INITIAL, |pool| {
             pool.fold_stamp(ctx.shard_id)
         });
+    // moon#1302: the graph records are appended FIRST and only the accepted
+    // prefix is replicated. Replicated first (the pre-fix order), a refusal
+    // left the replica holding the whole rollback while this node's WAL held
+    // a prefix — after a restart the two disagreed for good. The append has
+    // no capacity limit on this thread, so a refusal now means the WAL writer
+    // is gone; it is still counted, logged and answered (PR #1301 review).
+    let graph_wal = crate::transaction::abort::append_graph_rollback_wal(
+        &ctx.shard_databases,
+        ctx.shard_id,
+        txn_id,
+        &log.graph,
+    );
+    let graph_logged = match graph_wal {
+        Ok(()) => log.graph.len(),
+        Err(refused) => refused.accepted,
+    };
     if let Some(record) = replicate {
         for (db, bytes) in &log.kv {
             record(ctx, *db, bytes.clone());
@@ -100,19 +139,11 @@ pub(crate) async fn abort_logged(
         // Graph replication is single-shard scope, exactly like the forward
         // GRAPH.* leg (`try_handle_graph_command`).
         if ctx.num_shards == 1 {
-            for bytes in &log.graph {
+            for bytes in &log.graph[..graph_logged] {
                 record(ctx, graph_db, bytes.clone());
             }
         }
     }
-    // PR #1301 review: checked. A record the WAL channel refuses is counted
-    // and logged, and the abort answers the refusal instead of `+OK`.
-    let graph_wal = crate::transaction::abort::append_graph_rollback_wal(
-        &ctx.shard_databases,
-        ctx.shard_id,
-        txn_id,
-        log.graph,
-    );
     // -----------------------------------------------------------------------
 
     let persisted =
@@ -130,7 +161,7 @@ pub(crate) async fn abort_logged(
     // legs) is the reply; every one was already counted and logged where it
     // happened.
     let outcome = persisted
-        .and(graph_wal)
+        .and(graph_wal.map_err(|_| crate::transaction::abort::ROLLBACK_WAL_REFUSED_ERR))
         .map_err(Bytes::from_static)
         .and(remote_legs);
     if let Err(reply) = &outcome {
@@ -154,4 +185,63 @@ pub(crate) async fn abort_logged(
         }
     }
     outcome
+}
+
+/// End `conn`'s open transaction, if it has one: roll it back and log the
+/// rollback ([`abort_logged`]), releasing its key holds (moon#1299). `None`
+/// when no transaction was open.
+///
+/// Idempotent — the transaction is `take()`n first, so a second call (or a
+/// call after `TXN.ABORT` / `TXN.COMMIT`) is a no-op. The rollback future is
+/// boxed (c10k future diet: ~5.4 KB that would otherwise sit inline in every
+/// connection future); the allocation happens only when a transaction is
+/// actually open.
+pub(crate) async fn end_open_txn(
+    ctx: &ConnectionContext,
+    conn: &mut crate::server::conn::core::ConnectionState,
+    replicate: Option<ReplicationRecorder>,
+    cause: AbortCause,
+) -> Option<Result<(), Bytes>> {
+    let txn = conn.active_cross_txn.take()?;
+    Some(Box::pin(abort_logged(ctx, *txn, replicate, cause)).await)
+}
+
+/// `RESET` on the sharded runtimes: [`shared::try_handle_reset`], after
+/// ending the connection's open cross-store transaction (moon#1299 R1).
+///
+/// redis's RESET discards the connection's MULTI state; a `TXN` left open
+/// across it kept every key it wrote held — a pooled connection's
+/// RESET-and-return locked them until the pool closed the socket. The
+/// rollback runs FIRST and is awaited, so a command pipelined after RESET
+/// already sees the pre-transaction values. A RESET refused for its arity
+/// changes nothing, the transaction included.
+///
+/// [`shared::try_handle_reset`]: crate::server::conn::shared::try_handle_reset
+pub(crate) async fn try_handle_reset(
+    ctx: &ConnectionContext,
+    replicate: Option<ReplicationRecorder>,
+    cmd: &[u8],
+    args: &[crate::protocol::Frame],
+    client_id: u64,
+    conn: &mut crate::server::conn::core::ConnectionState,
+    responses: &mut Vec<crate::protocol::Frame>,
+    codec: Option<&mut crate::server::codec::RespCodec>,
+) -> bool {
+    if !cmd.eq_ignore_ascii_case(b"RESET") {
+        return false;
+    }
+    if args.is_empty() {
+        let _ = end_open_txn(ctx, conn, replicate, AbortCause::Reset).await;
+    }
+    crate::server::conn::shared::try_handle_reset(
+        cmd,
+        args,
+        client_id,
+        conn,
+        &ctx.requirepass,
+        &ctx.tracking_table,
+        &ctx.shard_pubsub(),
+        responses,
+        codec,
+    )
 }

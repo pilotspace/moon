@@ -269,6 +269,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Performance
 
+- **An overwrite no longer hashes the key into an empty cold-tier index.**
+  With disk offload enabled (the default) every hot-key overwrite asked the
+  cold index to drop a spilled copy; with nothing spilled that still cost a
+  64-bit key hash and a map probe. The index now answers at once when it holds
+  nothing: 7.2% fewer instructions per `SET` on the write path (callgrind, 300k
+  SETs, P16, `--shards 1`), about 2.5% less server CPU per op natively. The
+  same review measured wave 2a's own write-path additions (the moon#1299 hold
+  check and the moon#1286 overwrite check) at +11 instructions per `SET`
+  (+0.4%).
+
 - **A write that evicts against a backlogged AOF writer no longer stalls its
   shard for k × 500 ms** (moon#1294). Every connection-path eviction gate
   (monoio write gate, tokio per-command and MQ gates, script bridge, inline
@@ -461,6 +471,157 @@ shared 4-vCPU Linux container against HEAD `935c555` — re-measure on the GCE r
   and reads in chunks on a CDC read pool (a poll at a ~1M-record tail 5.8 s → 0.17 ms).
 
 ### Fixed
+
+- **A `TXN ABORT` could overwrite another client's acknowledged write to a key
+  the transaction had touched** (moon#1299). A **KV** key written inside an
+  open cross-store `TXN` is now held until `TXN COMMIT` / `TXN ABORT`: another
+  client's write to it answers `-TXNCONFLICT key held by an open transaction`
+  on every write path (plain, inline, MULTI/EXEC, scripts, blocking pops,
+  `MOVE`/`COPY ... DB`, MQ, routed), and `FLUSHDB` / `FLUSHALL` / `SWAPDB` on a
+  database with held keys answer `-TXNCONFLICT database has keys held by an
+  open transaction`. A cross-shard `MSET` / `DEL` / `UNLINK` refused on one
+  shard while others applied says so: `-TXNCONFLICT key held by an open
+  transaction: command partially executed; ...`. Eviction and active expiry
+  skip held keys; blocked clients are served once the key is released. A
+  replica applies its master's stream unconditionally. There is no idle
+  timeout: a transaction holds its keys until it ends or its connection
+  closes, and every connection exit — a protocol error, a blocked pop whose
+  client vanished, an output-buffer-limit disconnect, `QUIT` or an error in
+  subscriber mode, `PSYNC` — now rolls an open transaction back and releases
+  its keys before the socket closes, so a client that has seen its `QUIT`
+  reply finds the keys free (`CLIENT KILL` still replies first, moon#1312).
+  `RESET` ends an open `TXN` the same way, as redis `RESET` discards
+  `MULTI` state. New `INFO stats` fields: `txn_open`, `txn_oldest_age_ms`,
+  `txn_held_keys`, `txn_conflicts_refused`. Graph writes are not isolated yet
+  (moon#1307).
+
+- **A TXN connection write that answered an error kept its undo capture**
+  (moon#1303). `SET k v BADOPT`, `INCR` of a non-number or a `WRONGTYPE` inside
+  a `TXN` no longer leaves a write intent, key hold or pre-image behind, so
+  `TXN ABORT` can no longer restore a stale value over another client's write.
+
+- **`TXN.COMMIT` refused with `snapshot too old` (after `KILL SNAPSHOT`) kept
+  the transaction's writes.** It now rolls them back, as its reply says the
+  commit failed.
+
+- **Graph, MQ, workspace and temporal WAL records past the shard's 4096-slot
+  append channel were acknowledged but dropped** (moon#1302). A 6000-node
+  Cypher `CREATE` kept 4096 nodes after `kill -9`, and a `TXN COMMIT` of 6000
+  `MQ PUBLISH` kept 4096. Records past the channel now wait in an in-memory
+  queue on the shard's own thread, which the next 1 ms tick appends in order; a
+  graceful shutdown appends them before its final WAL flush. The on-disk format
+  is unchanged. New `INFO` field: `reclamation_wal_append_overflow_total`.
+  `TXN ABORT` of a large graph rollback no longer answers
+  `MOONERR WAL backpressure`: the rollback is written to the WAL before it is
+  replicated, and only what the WAL accepted is replicated, so a master and its
+  replica agree after a restart.
+
+- **After a restart, writes to db 0 could replay into another database.** A
+  reopened AOF writer assumed its stream was at db 0, but the file ended at the
+  previous run's last `SELECT`, so `SELECT 3; SET a 1`, restart, `SET b 1`,
+  restart put `b` in db 3. A reopened writer now starts at an unknown db, as
+  redis does (`aof_selected_db = -1`), so its first record always carries a
+  `SELECT`. Every AOF layout, graceful and `kill -9` restarts alike, was
+  affected.
+
+- **AOF replay judged key expiry by the log file's mtime** (moon#1283). Keys
+  that expired while the server ran, and were rewritten before their `DEL` was
+  logged, came back with old values when a log's mtime was earlier than its
+  last write (a clock stepped back, a lagging network filesystem, a
+  `touch -d` restore). The writer now emits a `MOON.TS <ms>` record whenever
+  the shard clock changes and at every generation head, and replay pins its
+  clock to it. Logs written before this change replay as before; an older
+  binary skips `MOON.TS` as an unknown command. A clean stop (`SHUTDOWN`,
+  `SIGTERM`) ends each incr with a close marker `MOON.TS <ms> CLOSE` and a
+  restarted writer stamps its first write, so records an older binary appends
+  after a downgrade are recognised by their position and judged as the older
+  binary judged them, on the re-upgrade boot and every boot after it, with no
+  rewrite; a `touch` or `cp` of the AOF never re-judges its last writes. Not
+  protected: a downgrade after an unclean stop of the newer binary — stop it
+  cleanly first, or run `BGREWRITEAOF` as the older binary's last action
+  (docs/STORAGE-FORMAT-V1.md §3.3). `size_of::<AofMessage>()` is 80
+  bytes (was 72). New fuzz target `aof_incr_replay`.
+
+- **`appendfsync everysec` lost most acknowledged writes to a process crash**
+  (moon#1266, Option 3). The once-a-second fsync now runs on a per-writer agent
+  thread (`aof-fsync-<n>`), so a slow disk no longer stops the AOF writer from
+  draining acknowledged writes into the file. The tokio writer flushes every
+  batch to the kernel (the 8 KiB user-space tail is gone); the monoio writer
+  polls every 500 µs while writes stream in and parks otherwise, so the first
+  write after idle is picked up at once instead of after up to 50 ms. With
+  `SIGKILL` 1 ms after the last acknowledgement, 20 reps per cell: losses in 9
+  of 240 reps (16 of 360 across both tokio runs), down from 226 of 240 (4-vCPU
+  Linux container). The remaining sub-millisecond window is moon#1266 Option
+  1A. `appendfsync always` is unchanged. A stalled fsync is reported as redis
+  does: the log line "Asynchronous AOF fsync is taking too long (disk is
+  busy?)", new `INFO` fields `aof_pending_bio_fsync` (writers with an fsync
+  in flight: 0..N at `--shards N`) and `aof_fsync_in_flight_ms`, and `aof_delayed_fsync` counted once per 2 s of an
+  ongoing postpone (unlike redis, the write itself is never postponed). A
+  failed post-rewrite fsync is recorded and retried within about 100 ms.
+  Diagnostic knob: `MOON_AOF_WARM_POLL_US`.
+
+- **`CONFIG SET appendfsync` answered `OK` but the writers kept their startup
+  policy**, so writes were acknowledged without the fsync `always` promises.
+  The change now takes effect at once, as in redis; leaving `everysec` first
+  waits for an in-flight background fsync, and values other than
+  `always|everysec|no` are rejected.
+
+- **After a failed `everysec` fsync, `aof_last_fsync_status` returned to `ok`
+  on a retry with nothing new written.** It now clears only once a write issued
+  after the failure has been fsynced. (Refusing writes meanwhile, as redis's
+  `-MISCONF` does, is moon#1309.)
+
+- **`INFO stats` `expired_keys` counted nothing** (moon#1286). It now counts
+  every expiry-driven whole-key removal: the active cycle (including moon#1288's
+  fast slices), the lazy-reap drain, a `DEL` / `UNLINK` or write that lands on
+  an expired key (`SET`, `SETNX`, `GETSET`, `APPEND`, `INCR*`, `SETBIT`,
+  `PFADD`, `MSET`, a `COPY` / `RENAME` / `*STORE` destination, a key a read had
+  hidden, a key only the cold tier held), and the cold-tier TTL sweep and
+  on-read reclaim. AOF replay counts nothing, a replica applying its master's
+  `DEL` does not count it, and `CONFIG RESETSTAT` resets it, as redis 7.2.7
+  does; hash-field expiry is not counted. An absolute deadline already in the
+  past (`EXPIREAT` / `PEXPIREAT`, `GETEX ... EXAT/PXAT`, `RESTORE ... ABSTTL`)
+  now deletes the key at once and publishes `del` rather than counting an
+  expiry, and the master propagates that delete as `DEL`; a replica applying
+  its master's stream stores the deadline instead. `EXPIRE k -1` publishes
+  `del`, and `GETEX k EX -1` answers `ERR invalid expire time in 'getex'
+  command`.
+
+- **`ACL GETUSER`, `ACL LIST` and `ACL SAVE` sorted command rules
+  alphabetically** (moon#1296). They now render them in the order they were
+  applied, as redis 7.2+ does, and a command grant under `+@all`
+  (`+@all +get -set`) is kept, so `ACL SAVE` / `ACL LOAD` reproduce the rules
+  exactly. Existing ACL files re-save with a different rule order; permissions
+  are unchanged, but diff-based config management sees a one-time change.
+  Category tokens (`+@read`) are still expanded into their commands, unlike
+  redis (moon#1306).
+
+- **Held cold spill files were released only by a manual `BGREWRITEAOF` or
+  `BGSAVE`** (moon#1289). After three orphan sweeps (about two minutes by
+  default) with no committed fold, moon releases them itself: with an AOF the
+  auto-rewrite monitor folds, and without one a rate-limited snapshot is
+  requested, at most one per 10 sweep intervals (10 minutes by default).
+  Without an AOF this automatic snapshot runs **even with `save ""`** and
+  overwrites the dump file like any `BGSAVE`. It never contains a `TXN`'s
+  uncommitted writes: it waits while any `TXN` is open, and it is abandoned
+  whole — no shard file replaced, `LASTSAVE` unmoved, no held file released —
+  and retried at a later sweep if any shard holds an uncommitted `TXN` write
+  when that shard starts its part; `TXN` writes after a shard's start are
+  saved at their pre-transaction value. An open `TXN`, or unbroken `TXN`
+  traffic, therefore keeps held files on disk (and `SWAPDB` refused) until a
+  snapshot can run. `BGSAVE`, `SAVE` and the save rules are not covered yet
+  (moon#1300). New `INFO` fields: `cold_held_files_stale_databases`,
+  `cold_held_release_folds_requested`, `cold_held_release_snapshots_requested`,
+  `cold_held_release_snapshots_deferred_txn`,
+  `cold_held_release_snapshots_abandoned_txn`.
+
+- **`volatile-lru`, `volatile-lfu` and `volatile-random` could answer OOM while
+  a key with a TTL existed.** Victim sampling draws random table segments and
+  gives up after `8 × maxmemory-samples` draws, so a database with a few TTL
+  keys among many could miss them all (1 TTL key in 301: 14 misses in 3,000
+  runs). When sampling finds no candidate, these policies now fall back to the
+  key with the nearest deadline, as redis's sampling of its expires dict
+  cannot miss one.
 
 - **A crash while a boot opened a fresh AOF generation could bring back cold
   keys deleted before the switch to `--appendonly yes`** (moon#1293). The

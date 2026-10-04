@@ -4,6 +4,46 @@ This box: 4 vCPU x86_64 Linux, 15 GB RAM, ~25 GB free disk, shared by up to 7 ag
 Building the 414K-line crate is the scarce resource. These rules exist so the team
 does not OOM, fill the disk, or corrupt each other's work.
 
+## 00. Wave-2 addendum (2026-09-30). This overrides everything below where they conflict.
+- **Base:** main `cf6fa65` plus the plan docs `992194a`. The plan is `.add/milestones/v0-9-2-perf-review/plans/WAVE2-PLAN.md`. "Red" means red on a binary built from your lane's base commit, before your changes.
+- **Worktrees and branches:**
+
+  | lane | worktree | first branch |
+  |---|---|---|
+  | A | `/home/user/wt/lane-a` | `w2/ws36-txn-isolation` |
+  | B | `/home/user/wt/lane-b` | `w2/ws37-aof-ts` |
+  | C | `/home/user/wt/lane-c` | `w2/ws38-parity` |
+
+- **Private build targets: no shared target any more.** Use `export CARGO_TARGET_DIR=/home/user/wt/target-<lane> CARGO_INCREMENTAL=0`.
+  - Budget: 8 GB per lane.
+  - Run `df -h /` before each release build. If Avail is under 6G, stop and report.
+  - The artifact aliasing risk in §2 goes away with private targets. Still copy binaries out in the same command that builds them, and verify each with a `strings` marker.
+- **Binaries:** `/home/user/wt/bin/<lane>-<label>-{monoio,tokio}`. Build your base binaries first, from the untouched worktree; those are your red proof.
+- **Ports:**
+
+  | who | range |
+  |---|---|
+  | lane A | 7600–7619 |
+  | lane B | 7620–7639 |
+  | lane C | 7640–7659 |
+  | reviewers | 7660–7699 |
+
+  Integration tests pick their own ports.
+- **Every real-server run:**
+  - Set `MOON_DISK_FREE_MIN_PCT=0`: this box's disk guard otherwise answers `diskfull`.
+  - Pin `MOON_BIN`.
+  - Run integration suites with `--include-ignored` (the real-server tests are `#[ignore]`d).
+- **Known failures, report them but don't chase them:**
+  - These three tokio replica tests always fail here, because tokio has no master-side PSYNC:
+    - `script_move_copy_db_replica_agrees_{1,4}_shard_master`
+    - `script_effects_in_exec_reach_the_replica_in_order`
+  - In lane A, two tests in `review_w1_txn_abort_no_aof_snapshot_1285.rs` stay red until WS42 (#1300): `…survives_a_restart_without_an_aof` and `…does_not_keep_its_uncommitted_writes`.
+- **Oracles:**
+  - redis 7.0.15 is on PATH.
+  - A redis **7.2.7** oracle is built at `/tmp/claude-0/-home-user-moon/d1b785a6-84fa-5659-9361-52c93e4ab21f/scratchpad/redis-7.2/src/redis-server`.
+- **Big files:** do not split the over-cap files mid-wave. Put new logic in new modules and keep growth in the listed big files minimal.
+- **Benchmarks:** ask the orchestrator for a quiet window (report "READY TO BENCH"), or bench only while no other lane is building. Use interleaved A/B, at least 3 reps.
+
 ## 0. Part-3 addendum (WS7, WS8, WS10, WS15 — read this first; it overrides the base numbers below)
 - Base is main **`ae21476`** (PR #1221 + PR #1227 merged). Wherever this file says `935c555`, read `ae21476`:
   regression tests must FAIL on `ae21476` and pass after; the HEAD baseline binary is `/home/user/wt/bin/baseline-ae21476`.

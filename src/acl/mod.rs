@@ -1,3 +1,4 @@
+pub mod command_rules;
 pub mod io;
 // `pub` rather than `pub(crate)`: the key-position walker is a contract shared
 // by ACL, cache invalidation and command introspection, and it parses attacker

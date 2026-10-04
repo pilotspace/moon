@@ -37,6 +37,7 @@ fn append(lsn: u64, payload: &'static [u8]) -> AofMessage {
         db: 0,
         bytes: Bytes::from_static(payload),
         epoch: FoldEpoch::INITIAL,
+        clock_ms: 0,
     }
 }
 
@@ -137,7 +138,7 @@ fn a_rewrite_request_surfacing_in_the_overflow_drain_is_resolved_not_swallowed()
         .append(true)
         .open(&path)
         .expect("incr");
-    let mut db_ctx = 0usize;
+    let mut db_ctx = crate::persistence::aof::RecordCtx::new();
     ovf.finish_framed(&rx, &mut file, &mut db_ctx, FoldEpoch::INITIAL)
         .expect("drain");
     assert!(

@@ -48,53 +48,37 @@ pub fn key_pattern_to_rule(kp: &KeyPattern) -> Option<String> {
 }
 
 /// Render command permissions as the ACL rule tokens that rebuild them:
-/// the base polarity (`+@all` / `-@all`) first, then the named sets.
+/// the base polarity (`+@all` / `-@all`) first, then the rules in the order
+/// they were applied, as redis 7.2+ does (moon#1296).
 ///
 /// moon#981: this is the ONE serializer behind `ACL SAVE`, `ACL LIST` and
 /// `ACL GETUSER`. It used to emit `-@all` for every `Specific` value,
 /// discarding `base_allow` (moon#971), so a `+@all -flushall` user was
 /// written to disk as `-@all -flushall` and reloaded able to run nothing.
 ///
-/// The rule parser is the reader. `+@all` yields `AllAllowed`, and the first
-/// `-<cmd>` after it is what transitions to `Specific { base_allow: true }`,
-/// so under an allow base the revocations must precede the re-grants: a
-/// `+get` emitted while the user is still `AllAllowed` is a no-op, and the
-/// later `-@string` expansion would then deny `get` again. Under a deny base
-/// the grants precede the revocations, exactly as before, so every existing
-/// file line is byte-identical. Both sets are written even where one is
-/// redundant with the base, so nothing the operator granted is dropped.
+/// moon#1296: it used to sort the two sets alphabetically, so the text was
+/// not redis's (`-@all +set +get` came back as `-@all +get +set`) and, before
+/// the sort, changed between runs. The rule map keeps application order, and
+/// grants and revocations stay interleaved as typed.
+///
+/// The rule parser is the reader, and application order is exactly what it
+/// needs: replaying the tokens rebuilds the same rules. Two of the reader's
+/// behaviours are why order matters for safety, not just for looks:
+/// - a bare `+cmd` / `-cmd` clears every `cmd|*` rule applied before it, so
+///   `cmd|arg` tokens must not precede their bare `cmd` token
+///   ([`CommandRules::tokens`] guarantees it);
+/// - the first `+<cmd>` or `-<cmd>` after `+@all` is what transitions to
+///   `Specific { base_allow: true }`. A grant is recorded there too (R1
+///   finding 7), so `+@all +get -set` reloads as itself; when grants were
+///   dropped it reloaded as `+@all -set`, the same permission but not the
+///   same text, and redis 7.2 keeps it.
 pub fn command_rules_to_string(perms: &CommandPermissions) -> String {
     match perms {
         CommandPermissions::AllAllowed => "+@all".to_string(),
-        CommandPermissions::Specific {
-            base_allow,
-            allowed,
-            denied,
-        } => {
-            // Bare `cmd` tokens first, `cmd|arg` tokens after: on reload a
-            // bare `+cmd` / `-cmd` clears every `cmd|*` rule applied before
-            // it (`acl::subcommand`), so a `-config|set` written ahead of a
-            // `+config` would reload as `CONFIG SET` allowed -- fail-open.
-            // `cmd|arg` rules are always the newer ones in the live set, so
-            // this order reproduces them exactly.
-            fn sorted(set: &std::collections::HashSet<String>, sub: bool) -> Vec<&String> {
-                let mut v: Vec<&String> = set.iter().filter(|r| r.contains('|') == sub).collect();
-                v.sort();
-                v
-            }
-            let mut parts: Vec<String> = Vec::with_capacity(1 + allowed.len() + denied.len());
+        CommandPermissions::Specific { base_allow, rules } => {
+            let mut parts: Vec<String> = Vec::with_capacity(1 + rules.len());
             parts.push(if *base_allow { "+@all" } else { "-@all" }.to_string());
-            for sub in [false, true] {
-                let grants = sorted(allowed, sub).into_iter().map(|a| format!("+{a}"));
-                let revocations = sorted(denied, sub).into_iter().map(|d| format!("-{d}"));
-                if *base_allow {
-                    parts.extend(revocations);
-                    parts.extend(grants);
-                } else {
-                    parts.extend(grants);
-                    parts.extend(revocations);
-                }
-            }
+            parts.extend(rules.tokens());
             parts.join(" ")
         }
     }

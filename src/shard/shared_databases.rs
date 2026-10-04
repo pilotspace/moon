@@ -280,7 +280,7 @@ impl ShardDatabases {
     pub fn set_wal_append_tx(
         &self,
         shard_id: usize,
-        tx: crate::runtime::channel::MpscSender<(WalRecordType, bytes::Bytes)>,
+        tx: crate::runtime::channel::MpscSender<crate::shard::wal_append::WalAppendMsg>,
     ) {
         if self.wal_append_txs[shard_id].set(tx).is_err() {
             tracing::warn!(
@@ -295,19 +295,27 @@ impl ShardDatabases {
     /// `wal.append(record_type, &data)` directly — no nested-Command
     /// re-framing, so replay sees the record's true outer type.
     /// No-op when persistence is disabled.
+    ///
+    /// Lossless on the shard's own thread (moon#1302): a full channel spills
+    /// to the thread's overflow queue, appended by the same tick in order
+    /// (`shard::wal_append`). A record that still cannot be enqueued (the
+    /// writer is gone) is counted in `reclamation_wal_append_channel_dropped_total`.
     #[inline]
     pub fn wal_append(&self, shard_id: usize, record_type: WalRecordType, data: bytes::Bytes) {
-        if let Some(tx) = self.wal_append_txs[shard_id].get() {
-            let _ = tx.try_send((record_type, data));
+        if let Some(tx) = self.wal_append_txs[shard_id].get()
+            && let Err(why) = crate::shard::wal_append::enqueue(tx, shard_id, record_type, data)
+        {
+            crate::shard::wal_append::report_dropped(why, shard_id, record_type);
         }
     }
 
-    /// Strict variant of [`wal_append`]: returns `true` if the message was
-    /// either accepted by the WAL channel **or** persistence is disabled
-    /// (no durability requirement). Returns `false` only when persistence is
-    /// configured but the channel rejected the send — in that case the caller
-    /// must NOT proceed with a state mutation that depends on this WAL
-    /// record's durability (e.g. SWAPDB has no command-level rollback).
+    /// Strict variant of [`wal_append`]: returns `true` if the record was
+    /// enqueued (channel or, on the shard's own thread, its overflow — moon#1302)
+    /// **or** persistence is disabled (no durability requirement). Returns
+    /// `false` only when persistence is configured but the record could not
+    /// be enqueued (the writer is gone) — in that case the caller must NOT
+    /// proceed with a state mutation that depends on this WAL record's
+    /// durability (e.g. SWAPDB has no command-level rollback).
     #[inline]
     #[must_use = "callers must check the result and skip the mutation on WAL failure"]
     pub fn try_wal_append_required(
@@ -317,35 +325,35 @@ impl ShardDatabases {
         data: bytes::Bytes,
     ) -> bool {
         match self.wal_append_txs[shard_id].get() {
-            Some(tx) => tx.try_send((record_type, data)).is_ok(),
+            Some(tx) => crate::shard::wal_append::enqueue(tx, shard_id, record_type, data).is_ok(),
             None => true, // persistence disabled — no durability requirement
         }
     }
 
     /// Checked, ordered append of a record SEQUENCE (moon#1285, PR #1301
-    /// review): `Ok(())` when every record was accepted by this shard's WAL
-    /// channel or persistence is disabled; otherwise `Err(dropped)`, the
-    /// number of records NOT enqueued.
+    /// review): `Ok(())` when every record was enqueued or persistence is
+    /// disabled; otherwise `Err(dropped)`, the number of records NOT enqueued.
     ///
-    /// Stops at the first refusal, so what reached the WAL is always a
-    /// PREFIX of `records` — a replay applies the leading steps in order and
-    /// never a later step without an earlier one. Continuing would not save
-    /// more anyway: the only drainer of this channel is the shard's own event
-    /// loop, which cannot run while the caller holds its thread.
+    /// Has no capacity limit on the shard's own thread (moon#1302): records
+    /// past the channel's free slots take the overflow, so `Err` means the
+    /// writer is gone (or the caller is off the shard's thread). Stops at the
+    /// first refusal, so what reached the WAL is always a PREFIX of `records`
+    /// — a replay applies the leading steps in order and never a later step
+    /// without an earlier one. The caller keeps `records` (the replication
+    /// leg sends the same accepted prefix).
     #[must_use = "a refused rollback record must be reported, never dropped silently"]
     pub fn try_wal_append_all(
         &self,
         shard_id: usize,
         record_type: WalRecordType,
-        records: Vec<bytes::Bytes>,
+        records: &[bytes::Bytes],
     ) -> Result<(), usize> {
         let Some(tx) = self.wal_append_txs[shard_id].get() else {
             return Ok(()); // persistence disabled — no durability requirement
         };
-        let total = records.len();
-        for (sent, data) in records.into_iter().enumerate() {
-            if tx.try_send((record_type, data)).is_err() {
-                return Err(total - sent);
+        for (sent, data) in records.iter().enumerate() {
+            if crate::shard::wal_append::enqueue(tx, shard_id, record_type, data.clone()).is_err() {
+                return Err(records.len() - sent);
             }
         }
         Ok(())

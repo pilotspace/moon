@@ -660,6 +660,60 @@ fn held_files_pressure_is_signalled_apart_from_compactions() {
     );
 }
 
+/// moon#1289: a held file that no fold is coming for turns its database stale
+/// after three sweeps, and only a committed fold's release clears it. Nothing
+/// held, or a layout no fold can cover, is never stale.
+#[test]
+fn a_held_file_waiting_for_nothing_makes_its_database_stale() {
+    use super::held_release::STALE_AFTER_SWEEPS;
+    use super::unlink_hold::FoldView;
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let dir = tmp.path().join("shard-0");
+    std::fs::create_dir_all(&dir).expect("dir");
+    let mut manifest = ShardManifest::create(&dir.join("shard-0.manifest")).expect("manifest");
+    spill(&dir, &mut manifest, OLD, &keys(4));
+    let mut ci = ColdIndex::rebuild_from_manifest(&dir, &manifest);
+    assert!(
+        !ci.note_held_sweep(0, true),
+        "an index with no held file is never stale"
+    );
+    for (k, _) in keys(4) {
+        assert!(ci.remove(k.as_bytes()));
+    }
+    let view = |epoch, committed_floor| FoldView {
+        epoch,
+        committed_floor,
+        next_file_id: OLD + 1,
+        hold_all: false,
+    };
+    // A fold cut moved `hold_below` above OLD, then its keys died: held,
+    // stamped epoch 1, with nothing committed.
+    ci.observe_fold(view(1, 0));
+    ci.sweep_known_orphans(Vec::new(), &dir, Some(&mut manifest))
+        .expect("sweep");
+    assert!(ci.is_unlink_held(OLD) && heap(&dir, OLD).exists());
+
+    for sweep in 1..STALE_AFTER_SWEEPS {
+        assert!(!ci.note_held_sweep(0, true), "sweep {sweep}: not yet");
+    }
+    assert!(
+        ci.note_held_sweep(0, true),
+        "held at {STALE_AFTER_SWEEPS} sweeps running: stale"
+    );
+    assert!(
+        !ci.note_held_sweep(0, false),
+        "no fold can cover this shard: a trigger would fold for nothing"
+    );
+
+    // A fold cut after the stamp commits: the next sweep releases OLD and the
+    // count clears.
+    ci.observe_fold(view(3, 2));
+    ci.sweep_known_orphans(Vec::new(), &dir, Some(&mut manifest))
+        .expect("sweep");
+    assert!(!ci.is_unlink_held(OLD) && !heap(&dir, OLD).exists());
+    assert!(!ci.note_held_sweep(2, true), "released: nothing awaits");
+}
+
 /// moon#1231 review, moon#1240's split adoption: an output is LISTED in phase
 /// A because some survivor was unchanged, and every survivor changes before
 /// phase B (the listing's commit is in flight). Phase B re-points nothing

@@ -79,6 +79,12 @@ pub(crate) fn try_wake_stream_waiter_budgeted(
     key: &Bytes,
     budget: &mut std::time::Duration,
 ) -> bool {
+    // moon#1299: a group read writes the stream (its PEL / last id); while an
+    // open TXN holds the key every reader stays parked and is retried when
+    // the hold is released.
+    if crate::transaction::isolation::defer_wake_if_held(db_index, key) {
+        return false;
+    }
     // Decide (and, for a group read, claim and read) in ONE pass over the
     // queue with every waiter still in place, so a decision of "cannot serve"
     // costs nothing and leaves FIFO order untouched; take and answer the

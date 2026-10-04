@@ -140,6 +140,11 @@ pub(crate) fn try_exec_blocking_in_txn(
     // straight through `Database` methods, outside `command::dispatch`, so it
     // takes the armed snapshot's pre-images of the keys first, as dispatch
     // would. One thread-local `bool` load when no snapshot is in flight.
+    // moon#1299: the pop below writes its keys — refused, like any write,
+    // when an open TXN holds one.
+    if let Some(refused) = crate::transaction::isolation::check_write(db_index, cmd, args) {
+        return Some(BlockingTxnOutcome::reply_only(refused));
+    }
     crate::persistence::snapshot_cow::capture_dispatch_pre_image(db, db_index, cmd, args);
 
     for key_frame in &args[..args.len() - 1] {

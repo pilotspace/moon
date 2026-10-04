@@ -656,3 +656,75 @@ fn test_sweep_expired_noop_when_nothing_expired() {
     assert!(!ci.has_pending_unlink());
     assert_eq!(ci.len(), 1);
 }
+
+/// R1 finding 11 (moon#1286): the expiry sweep counts every entry it took
+/// out of the index in `expired_keys` even when the unlink phase that
+/// follows fails (here: its manifest commit). The entries are gone from the
+/// index either way; the early `?` used to skip the count.
+#[test]
+fn an_unlink_error_does_not_lose_the_expired_count() {
+    use crate::admin::metrics_setup::this_thread_expired_keys as counted;
+    let tmp = make_shard_with_heap(&[21]);
+    let shard_dir = tmp.path();
+    let mut manifest =
+        crate::persistence::manifest::ShardManifest::create(&shard_dir.join("shard.manifest"))
+            .unwrap();
+    let mut ci = ColdIndex::new();
+    for (slot, key) in [b"exp:a", b"exp:b"].into_iter().enumerate() {
+        ci.insert(
+            Bytes::from_static(key),
+            ColdLocation {
+                file_id: 21,
+                page_idx: 0,
+                slot_idx: slot as u16,
+                ttl_ms: Some(1_000),
+                value_type: crate::persistence::kv_page::ValueType::String,
+            },
+        );
+    }
+    manifest.set_inject_persist_error(true);
+    let before = counted();
+    let result = ci.sweep_expired(
+        2_000,
+        shard_dir,
+        Some(&mut manifest),
+        MAX_EXPIRED_SWEEP_BATCH,
+    );
+    manifest.set_inject_persist_error(false);
+    assert!(result.is_err(), "precondition: the commit failed");
+    assert_eq!(ci.len(), 0, "the entries left the index");
+    assert_eq!(counted() - before, 2, "and each is an expired key");
+}
+
+/// R3 fix-e: `remove` on an index holding nothing answers `false` without
+/// touching anything (the per-`SET` fast path), and the gate still sees a
+/// recovery-only older copy: removing a key that has one but no map entry
+/// releases the copy exactly as before.
+#[test]
+fn remove_on_an_empty_index_is_a_no_op_and_still_releases_older_copies() {
+    let mut idx = ColdIndex::new();
+    assert!(!idx.remove(b"absent"));
+    assert_eq!(idx.len(), 0);
+    assert_eq!(idx.pending_unlink_len(), 0);
+    assert_eq!(idx.dead_slot_bytes(), 0);
+    assert_eq!(idx.resident_bytes(), 0);
+
+    // An older copy with no entry in front of it: `map` is empty, so only
+    // the `older_copies` half of the gate keeps the release path live.
+    idx.older_copies
+        .insert(Bytes::from_static(b"k"), vec![loc_in(7, 0)]);
+    idx.ref_inc(7);
+    assert!(idx.map.is_empty());
+    assert!(!idx.remove(b"k"), "no live entry, so not present");
+    assert!(idx.older_copies.is_empty(), "the older copy was released");
+    assert_eq!(idx.pending_unlink_len(), 1, "its file lost its last ref");
+    assert!(
+        idx.dead_slot_bytes() > 0,
+        "the released slot is recorded dead"
+    );
+
+    // A live entry is still removed through the full path.
+    idx.insert(Bytes::from_static(b"live"), loc_in(8, 1));
+    assert!(idx.remove(b"live"));
+    assert!(idx.lookup(b"live").is_none());
+}

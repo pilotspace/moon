@@ -108,8 +108,10 @@ pub fn replay_multi_part(
         let file = std::fs::File::open(&incr_path)?;
         if file.metadata()?.len() > 0 {
             // moon#1277: judge expiry by the time the log was last written.
-            let _clock =
-                crate::persistence::replay::clock::pin_replay_clock_to_files(&[&incr_path]);
+            let _clock = crate::persistence::replay::clock::pin_replay_clock_to_log(
+                &incr_path,
+                crate::persistence::replay::clock::LogFormat::Resp,
+            );
             // Pure RESP — no RDB preamble detection needed.
             let count = replay_incr_resp(databases, file, engine)?;
             info!(
@@ -181,6 +183,9 @@ fn replay_incr_resp(
                         ));
                     }
                 };
+                // R2 review of moon#1283: where a clean-close marker's
+                // segment starts.
+                crate::persistence::replay::clock::at_record_end(chunks.offset());
                 engine.replay_command(databases, cmd, cmd_args, &mut selected_db);
                 count += 1;
             }
@@ -362,6 +367,9 @@ fn replay_incr_framed(
                         ));
                     }
                 };
+                // R2 review of moon#1283: where a clean-close marker's
+                // segment starts.
+                crate::persistence::replay::clock::at_record_end(payload_end as u64);
                 engine.replay_command(databases, cmd, cmd_args, &mut selected_db);
                 count += 1;
                 // F5: next-free offset = entry start LSN + RESP byte length.
@@ -533,9 +541,11 @@ pub fn replay_per_shard(
                         })
                     })?;
                     if !data.is_empty() {
-                        // moon#1277: judge expiry by the log's last write.
-                        let _clock = crate::persistence::replay::clock::pin_replay_clock_to_files(
-                            &[&incr_path],
+                        // moon#1277: judge expiry by the log's last write;
+                        // a foreign segment positionally (R2 review of #1283).
+                        let _clock = crate::persistence::replay::clock::pin_replay_clock_to_log(
+                            &incr_path,
+                            crate::persistence::replay::clock::LogFormat::Framed,
                         );
                         let (count, max_lsn) = replay_incr_framed(
                             sid,
@@ -720,6 +730,11 @@ pub fn replay_ordered_merge(
 
     Ok(replayed)
 }
+
+/// Fuzzing entry points into the readers above (moon#1283).
+#[cfg(any(test, feature = "fuzzing"))]
+#[path = "shard_replay_fuzz.rs"]
+pub mod fuzz;
 
 #[cfg(test)]
 mod tests {

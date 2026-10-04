@@ -112,6 +112,97 @@ Authoritative source: `src/persistence/aof.rs`, `src/persistence/aof_manifest.rs
 - **Base file:** optional RDB-format snapshot of state at last rewrite.
 - **Incremental files:** RESP-encoded write commands appended since last rewrite.
 - **Legacy single-file `appendonly.aof`** is recognized on first boot, captured as seq-1 of the multi-part structure, and the legacy file is renamed to `appendonly.aof.legacy`. Older v0.1.x AOF files are read once, never written.
+- **Per-shard incremental files** (`--shards` ≥ 2) frame every record as `[u64 lsn LE][u32 len LE][RESP command]`; the multi-part top-level incr and the flat `appendonly.aof` hold bare RESP.
+
+#### Replay-only records (`MOON.*` pseudo-commands)
+
+Besides client write commands, the writer interleaves a few records that only
+a replay acts on. Each is an ordinary RESP array (never a `#…` annotation
+line, which moon's parser reads as a malformed RESP3 boolean, and never a new
+WAL record type byte), written with `lsn = 0` in the framed layout so it never
+moves the replication offset a replay recovers. A client that sends one gets
+`ERR unknown command`. Authoritative source:
+`src/persistence/replay/pseudo.rs` and `src/persistence/cold_records.rs`.
+
+| Record | Written | Replay effect |
+|---|---|---|
+| `SELECT <db>` | before a record whose execution db differs from the stream's | switches the db the following records apply to |
+| `MOON.COLDCUT <watermark>` | first record of every generation (boot head, rewrite head) | opens the cold-tier replay gate: cold files with `file_id < watermark` are a valid base for what follows |
+| `MOON.TS <ms>` (moon#1283) | right after `MOON.COLDCUT` in every generation head, before the first record a writer appends to a file it reopened, then before any record whose shard clock differs from the last `MOON.TS` in the stream | sets the expiry-judgment clock (see below) |
+| `MOON.TS <ms> CLOSE` (moon#1283) | last record a writer appends when it stops in order (SHUTDOWN, SIGTERM) with the file still the live incr, made durable by its final sync | marks a clean close: what follows it up to the next stamp is another binary's (see below) |
+| `MOON.SPILLED <file_id> key…` | when a spill publishes keys into the cold index | demotes replay-built hot copies of those keys to their cold entries |
+
+`MOON.TS <ms>` carries the shard's cached clock in unix milliseconds — the
+clock the command after it judged key expiry with — read in the same
+synchronous section as the mutation. It is at most one record per 1 ms clock
+tick in which the shard logged a write (≤ 44 bytes each), plus one per record
+whose producer parked between its mutation and its enqueue. It is AOF-only:
+the replication stream never carries it.
+
+A replay judges every record by the **last** `MOON.TS` read in the current
+file (not a running maximum: a parked producer's record carries an older
+stamp than the records it lands after), except a foreign segment (below).
+Until a file's first `MOON.TS` — an older binary's log, or the stamp-less
+prefix of a file an older binary started — it falls back to the file's
+modification time capped at the wall clock (moon#1277), exactly as before. A
+`MOON.TS` of 0, past the year 9999, or malformed is skipped. Clock stamps are
+observations, not data: a replay that skips a block of data records still
+applies the stamps inside it.
+
+**Foreign segments (positional).** A writer that reopens a file writes a
+`MOON.TS` before its first append, and one that stops in order ends the file
+with `MOON.TS <ms> CLOSE`. So the records after a `CLOSE` and before the next
+stamp (plain or `CLOSE`) were not written by a binary that knows this rule:
+they are a foreign segment — an older binary's appends after a downgrade.
+The replay judges them by that next stamp (the later session's first stamp,
+never earlier than their own write time; late is how the older binary itself
+judges them, by the mtime), or, when the segment runs to the end of the file,
+by `max(<ms> of the CLOSE, the file's mtime capped at the wall clock)`. The
+boot that meets such a segment at the end of the file writes that judgment as
+the first stamp of its own appends, so every later boot judges the segment
+exactly as it did. The rule depends only on record positions: no rewrite is
+needed, a file's mtime moved forward (`touch`, a `cp` restore) re-judges
+nothing, and a `CLOSE` immediately followed by a stamp (a clean restart) is
+an empty segment.
+
+**Compatibility.** Adding `MOON.TS` changes no byte layout covered by §2
+rule 4 (WAL v3 records, the RDB v2 preamble, the manifest framing), so it is
+not a storage-format bump:
+- *Upgrade:* a log without stamps replays exactly as before (mtime judgment).
+- *Downgrade:* a binary that predates `MOON.TS` sends it — and `MOON.TS <ms>
+  CLOSE` — to command dispatch, gets "unknown command", counts it as an
+  unhandled record, and replays every data record around it with its own
+  (mtime) expiry judgment. The boot does not fail. (A build that knows only
+  the one-argument `MOON.TS` skips the `CLOSE` form as a malformed stamp.)
+  An older binary's own `BGREWRITEAOF` drops every marker, which is fine.
+- *Downgrade, then re-upgrade:* the older binary appends to the same file
+  with no stamps. After a CLEAN stop of the newer binary those records form
+  a foreign segment and are judged as above; keys the older binary saw expire
+  and restarted (`INCR` onto an expired counter, with no `DEL` logged first)
+  come back as they were live, on the re-upgrade boot and on every boot after
+  it, however the re-upgraded server is stopped later.
+
+  **Not protected:** a downgrade after an UNCLEAN stop of the newer binary
+  (kill -9, OOM kill, crash, power loss) — there is no `CLOSE`, so the older
+  binary's records follow the newer binary's last stamp, hours or days stale,
+  and those keys replay onto their old value and deadline and are lost.
+  **Procedure:** stop the newer binary cleanly (`SHUTDOWN`, SIGTERM) before
+  downgrading; after it crashed, start it once and stop it cleanly first.
+  Otherwise, as the older binary's last action, run `BGREWRITEAOF` and stop
+  it once the rewrite completed: its history is then in the new base, an
+  image that judges nothing, and only what it appended after the rewrite
+  replays as a stamp-less prefix (mtime judgment, as on any upgrade). Also
+  not protected:
+  a newer binary whose writer could not finish its stop (abandoned after the
+  stop timeout, a torn write it latched, a failed marker append, a panic) —
+  its log shows no "AOF writers drained and synced" line: it shows
+  "AOF writers stopped ... WITHOUT their clean-close marker" (or the
+  abandoned-writer error) instead.
+- *Redis:* a redis server cannot load a moon AOF regardless (`MOON.COLDCUT`
+  is already an unknown command there).
+
+The per-shard WAL v3 KV log (`--appendonly no`) does not carry `MOON.TS`
+yet: its replay keeps the mtime judgment of its newest segment.
 
 ## 4. Configuration Surface
 

@@ -183,11 +183,44 @@ static CORRECTION_BITS: AtomicU64 = AtomicU64::new(0);
 /// over-evicting on an unmeasured process.
 #[inline]
 pub fn footprint_correction() -> f64 {
+    #[cfg(test)]
+    if let Some(pinned) = CORRECTION_PIN.with(std::cell::Cell::get) {
+        return pinned;
+    }
     let bits = CORRECTION_BITS.load(Ordering::Relaxed);
     if bits == 0 {
         return 1.0;
     }
     f64::from_bits(bits)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only per-thread value of [`footprint_correction`]. The published
+    /// word is process-global: `correction_round_trips_a_published_ratio`
+    /// stores 2.5 in it and any in-process shard chore republishes it, so a
+    /// test whose eviction budget has no slack pins the neutral value here
+    /// instead of racing them ([`pin_footprint_correction_for_test`]).
+    static CORRECTION_PIN: std::cell::Cell<Option<f64>> = const { std::cell::Cell::new(None) };
+}
+
+/// Pin [`footprint_correction`] to `ratio` on this thread until the guard
+/// drops (tests only).
+#[cfg(test)]
+#[must_use = "the pin ends when the guard drops"]
+pub(crate) fn pin_footprint_correction_for_test(ratio: f64) -> CorrectionPin {
+    CorrectionPin(CORRECTION_PIN.with(|c| c.replace(Some(ratio))))
+}
+
+/// Guard of [`pin_footprint_correction_for_test`]; restores the previous pin.
+#[cfg(test)]
+pub(crate) struct CorrectionPin(Option<f64>);
+
+#[cfg(test)]
+impl Drop for CorrectionPin {
+    fn drop(&mut self) {
+        CORRECTION_PIN.with(|c| c.set(self.0));
+    }
 }
 
 /// Re-measure the footprint and republish the correction.

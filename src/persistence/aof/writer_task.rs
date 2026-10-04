@@ -6,6 +6,8 @@ use super::rewrite::{
     sync_and_fulfill_drain,
 };
 use super::*;
+// moon#1266: the everysec fsync runs on a per-writer agent thread.
+use super::fsync_agent::{Claim, EverysecSync, sync_gate_for_test};
 // `do_rewrite_single` / `do_rewrite_sharded` exist only under the monoio runtime.
 #[cfg(feature = "runtime-monoio")]
 use super::rewrite::{do_rewrite_sharded, do_rewrite_single};
@@ -22,13 +24,6 @@ use super::group_commit::{
 #[cfg(feature = "runtime-monoio")]
 use super::group_commit::{BatchBuf, GroupCommitSink, commit_group_commit_batch_with};
 
-/// User-space bytes a tokio AOF writer may hold between batches without a
-/// `flush()` into the kernel — the pre-moon#1187 `BufWriter` default
-/// capacity, i.e. the tail a SIGKILL can lose under `everysec`/`no` (the
-/// kernel page cache survives a process kill; a `BufWriter` does not).
-#[cfg(feature = "runtime-tokio")]
-const AOF_TOKIO_UNFLUSHED_TAIL_BOUND: usize = 8 * 1024;
-
 /// Capacity of the tokio writers' `BufWriter`: `tokio::fs::File`'s own
 /// per-operation maximum (tokio's `DEFAULT_MAX_BUF_SIZE`, 2 MiB). A
 /// `tokio::fs::File` hands at most that much to one blocking-pool hop,
@@ -38,8 +33,8 @@ const AOF_TOKIO_BUF_CAPACITY: usize = 2 * 1024 * 1024;
 
 /// The tokio writers' `BufWriter` (moon#1187): large enough that a batch
 /// reaches the kernel in one `tokio::fs` blocking-pool hop per 2 MiB instead
-/// of one per 8 KiB (~128 per 1 MiB batch). The durability bound is kept by
-/// the batch-end [`flush_tail_if_over_bound`], not by the capacity.
+/// of one per 8 KiB (~128 per 1 MiB batch). The capacity is not a durability
+/// bound: every batch ends with [`flush_batch_to_kernel`].
 ///
 /// Sized at [`AOF_TOKIO_BUF_CAPACITY`], not at a whole group-commit batch
 /// (moon#1226): it was `AOF_GROUP_COMMIT_MAX_BYTES` (8 MiB) per writer, one
@@ -52,20 +47,23 @@ fn aof_buf_writer<W: tokio::io::AsyncWrite>(file: W) -> tokio::io::BufWriter<W> 
     tokio::io::BufWriter::with_capacity(AOF_TOKIO_BUF_CAPACITY, file)
 }
 
-/// After a batch is buffered: push it to the kernel when more than
-/// [`AOF_TOKIO_UNFLUSHED_TAIL_BOUND`] bytes sit in user space, so a SIGKILL
-/// never loses more than the pre-moon#1187 8 KiB `BufWriter` could. A batch
-/// smaller than the bound stays buffered exactly as before.
+/// After a batch is buffered: push it to the kernel (moon#1266). A SIGKILL
+/// does not touch the kernel page cache, so once `write(2)` has returned the
+/// batch survives a process crash under every `appendfsync` policy — what
+/// redis guarantees by writing its AOF buffer before it sends the replies of
+/// an event-loop iteration. It used to stay in the `BufWriter` until 8 KiB
+/// had accumulated, and a SIGKILL took that tail with it.
+///
+/// `flush()` also waits for the write `tokio::fs::File` may still have in
+/// flight on the blocking pool (its `poll_write` returns before the write
+/// is done), so on `Ok` the bytes are in the kernel, not merely handed off.
+/// Cost: one blocking-pool hop per batch instead of one per 8 KiB.
 #[cfg(feature = "runtime-tokio")]
-async fn flush_tail_if_over_bound(
+async fn flush_batch_to_kernel(
     writer: &mut tokio::io::BufWriter<tokio::fs::File>,
 ) -> std::io::Result<()> {
     use tokio::io::AsyncWriteExt;
-    if writer.buffer().len() >= AOF_TOKIO_UNFLUSHED_TAIL_BOUND {
-        writer.flush().await
-    } else {
-        Ok(())
-    }
+    writer.flush().await
 }
 
 /// Idle-adaptive wake cadence for a background AOF writer's channel poll
@@ -91,7 +89,8 @@ async fn flush_tail_if_over_bound(
 /// [`Self::mark_pending`] has been called and not yet cleared by
 /// [`Self::clear_pending`] — i.e. whenever there is a write buffered under
 /// `FsyncPolicy::EverySec` that has not yet been fsynced, or a manually
-/// back-dated `last_fsync` (the F6 post-fold drain trick) representing an
+/// back-dated everysec deadline (`EverysecSync::backdate`, the F6 post-fold
+/// drain trick) representing an
 /// imminent deadline. `FsyncPolicy::Always` never buffers past its own
 /// batch (fsynced same-iteration) and `FsyncPolicy::No` has no deadline at
 /// all, so neither ever calls `mark_pending` — both escalate freely once
@@ -99,6 +98,9 @@ async fn flush_tail_if_over_bound(
 struct IdleWait {
     step: usize,
     pending: bool,
+    /// The last receive returned a message that arrived promptly: poll
+    /// before parking (see `poll::recv_next`).
+    warm: bool,
 }
 
 /// Escalation ladder: fast floor for responsiveness right after activity,
@@ -109,15 +111,20 @@ const AOF_IDLE_WAIT_STEPS: &[std::time::Duration] = &[
     std::time::Duration::from_secs(1),
 ];
 
-/// Test-only stall injection for the EverySec proactive fsync (moon#838 /
-/// moon#769 pinning tests): `MOON_TEST_AOF_FSYNC_STALL_MS=<ms>` holds the
-/// writer thread for that long immediately before each proactive
-/// `sync_data`, inside the window the fsync metric measures, so a slow
-/// device — the one condition that reliably fills the 10k writer channel
-/// under pipelined load — can be modelled deterministically on any host.
-/// While it holds, nothing drains: exactly what a real inline fsync stall
-/// does to this loop. Read once; unset or unparsable is a no-op. Production
-/// cost: one `OnceLock` load per proactive fsync (≤ 1/s).
+/// Test-only WRITER stall at the EverySec deadline (moon#838 / moon#769
+/// pinning tests): `MOON_TEST_AOF_FSYNC_STALL_MS=<ms>` holds the writer
+/// thread for that long each time its everysec deadline comes due, just
+/// before it hands the fsync to the agent. While it holds, nothing drains —
+/// the condition that fills the 10k writer channel under pipelined load,
+/// made deterministic on any host.
+///
+/// Since moon#1266 a slow fsync runs on the agent thread and no longer holds
+/// the writer by itself; what this still models is a writer that cannot make
+/// progress while the disk is slow (on Linux a `write(2)` to a file whose
+/// fdatasync is running can block behind it — redis's reason for its
+/// postpone rule). `MOON_TEST_AOF_SYNC_GATE` holds the fsync itself.
+/// Read once; unset or unparsable is a no-op. Production cost: one
+/// `OnceLock` load per everysec deadline (<= 1/s).
 fn stall_everysec_fsync_for_test() {
     static STALL: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
     let stall = *STALL.get_or_init(|| {
@@ -132,74 +139,27 @@ fn stall_everysec_fsync_for_test() {
     }
 }
 
-/// Park-free bounded receive for the std-thread writer loops under
-/// `FsyncPolicy::EverySec`/`No`.
-///
-/// A parked `recv_timeout` registers this thread as a flume waiter, so every
-/// producer `try_send` from a shard thread pays a futex WAKE **on the shard
-/// thread** — measured at 149,718 futex calls (63% of shard-thread syscall
-/// time) during an 8s p1 SET run under everysec, the mechanism behind the
-/// esec p1 SET deficit vs Redis (whose AOF append is a plain memcpy into
-/// `aof_buf`). Polling with `try_recv` + short sleeps never registers a
-/// waiter, so producer sends stay pure userspace atomics.
-///
-/// Latency/CPU trade (why this is safe ONLY for EverySec/No): a message may
-/// sit unobserved for up to one sleep step. The step scales with the wait
-/// (`wait/16`, clamped to 500µs..50ms), so at the 50ms fast floor the
-/// EverySec deadline is still checked within ~3ms slack, and at the idle 1s
-/// escalated wait the writer wakes ≤20×/s (vs the parked recv's 1×/s —
-/// the accepted cost of this fix; still far below the pre-wave-5 fixed
-/// 50ms cadence). Under load `try_recv` returns immediately and no sleep
-/// happens at all. `Always` keeps the parked recv: its callers block on the
-/// per-batch fsync ack, so added receive latency is user-visible RTT.
+// The clean-close marker of an orderly stop (R2 review of moon#1283).
+mod close;
+// The monoio writers' channel receive: warm poll, then park (moon#1266).
 #[cfg(feature = "runtime-monoio")]
-fn poll_recv(
-    rx: &channel::MpscReceiver<AofMessage>,
-    wait: std::time::Duration,
-) -> Result<AofMessage, flume::RecvTimeoutError> {
-    let step = (wait / 16).clamp(
-        std::time::Duration::from_micros(500),
-        std::time::Duration::from_millis(50),
-    );
-    let deadline = std::time::Instant::now() + wait;
-    loop {
-        match rx.try_recv() {
-            Ok(m) => return Ok(m),
-            Err(flume::TryRecvError::Disconnected) => {
-                return Err(flume::RecvTimeoutError::Disconnected);
-            }
-            Err(flume::TryRecvError::Empty) => {
-                if std::time::Instant::now() >= deadline {
-                    return Err(flume::RecvTimeoutError::Timeout);
-                }
-                std::thread::sleep(step);
-            }
-        }
-    }
-}
-
-/// Bounded receive for the std-thread writer loops: parked under `Always`
-/// (ack latency is client-visible), park-free polling otherwise (producer
-/// sends must not pay a futex wake — see [`poll_recv`]).
+mod poll;
 #[cfg(feature = "runtime-monoio")]
-fn recv_next(
-    rx: &channel::MpscReceiver<AofMessage>,
-    wait: std::time::Duration,
-    park: bool,
-) -> Result<AofMessage, flume::RecvTimeoutError> {
-    if park {
-        rx.recv_timeout(wait)
-    } else {
-        poll_recv(rx, wait)
-    }
-}
+use poll::recv_next;
 
 impl IdleWait {
     fn new() -> Self {
         Self {
             step: 0,
             pending: false,
+            warm: false,
         }
+    }
+
+    /// The last receive returned a message: poll before parking.
+    #[cfg_attr(not(feature = "runtime-monoio"), allow(dead_code))] // monoio poll only
+    fn warm(&self) -> bool {
+        self.warm
     }
 
     /// Wait duration to use for the next channel poll.
@@ -210,6 +170,7 @@ impl IdleWait {
     /// A message (data or control) was just received: reset to the fast
     /// floor so the very next poll — which re-checks the EverySec deadline
     /// — happens promptly again, exactly like the old fixed cadence did.
+    /// (Whether the next receive warm-polls is `recv_next`'s call.)
     fn on_message(&mut self) {
         self.step = 0;
     }
@@ -220,14 +181,15 @@ impl IdleWait {
     /// `on_message` just reset it) step so the deadline is re-checked
     /// promptly instead of drifting out to the escalated cadence.
     fn on_timeout(&mut self) {
+        self.warm = false;
         if !self.pending {
             self.step = (self.step + 1).min(AOF_IDLE_WAIT_STEPS.len() - 1);
         }
     }
 
-    /// Mark that `last_fsync` now represents an unflushed/imminent deadline
+    /// Mark that the everysec deadline is now owed (unsynced/imminent)
     /// (a batch was buffered under `FsyncPolicy::EverySec` without an
-    /// immediate fsync, or `last_fsync` was manually back-dated). Blocks
+    /// immediate fsync, or the deadline was manually back-dated). Blocks
     /// further escalation until [`Self::clear_pending`].
     fn mark_pending(&mut self) {
         self.pending = true;
@@ -237,77 +199,6 @@ impl IdleWait {
     /// succeeded) — escalation may resume from here.
     fn clear_pending(&mut self) {
         self.pending = false;
-    }
-}
-
-#[cfg(all(test, feature = "runtime-monoio"))]
-mod poll_recv_tests {
-    use super::*;
-
-    #[test]
-    fn returns_queued_message_immediately() {
-        let (tx, rx) = channel::mpsc_bounded::<AofMessage>(4);
-        assert!(
-            tx.try_send(AofMessage::Append {
-                lsn: 7,
-                db: 0,
-                bytes: bytes::Bytes::from_static(b"x"),
-                epoch: FoldEpoch::INITIAL,
-            })
-            .is_ok()
-        );
-        let start = std::time::Instant::now();
-        let Ok(got) = poll_recv(&rx, std::time::Duration::from_secs(1)) else {
-            panic!("expected message");
-        };
-        assert!(matches!(got, AofMessage::Append { lsn: 7, .. }));
-        // No sleep step should have been taken for an already-queued message.
-        assert!(start.elapsed() < std::time::Duration::from_millis(50));
-    }
-
-    #[test]
-    fn picks_up_message_sent_mid_wait() {
-        let (tx, rx) = channel::mpsc_bounded::<AofMessage>(4);
-        let sender = std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(20));
-            assert!(
-                tx.try_send(AofMessage::Append {
-                    lsn: 1,
-                    db: 0,
-                    bytes: bytes::Bytes::from_static(b"y"),
-                    epoch: FoldEpoch::INITIAL,
-                })
-                .is_ok()
-            );
-        });
-        let Ok(got) = poll_recv(&rx, std::time::Duration::from_secs(5)) else {
-            panic!("expected message");
-        };
-        assert!(matches!(got, AofMessage::Append { lsn: 1, .. }));
-        assert!(sender.join().is_ok());
-    }
-
-    #[test]
-    fn times_out_when_empty() {
-        let (_tx, rx) = channel::mpsc_bounded::<AofMessage>(4);
-        let start = std::time::Instant::now();
-        // AofMessage has no Debug impl — match instead of unwrap_err.
-        let Err(err) = poll_recv(&rx, std::time::Duration::from_millis(30)) else {
-            panic!("expected timeout");
-        };
-        assert!(matches!(err, flume::RecvTimeoutError::Timeout));
-        assert!(start.elapsed() >= std::time::Duration::from_millis(30));
-    }
-
-    #[test]
-    fn reports_disconnect() {
-        let (tx, rx) = channel::mpsc_bounded::<AofMessage>(4);
-        drop(tx);
-        // AofMessage has no Debug impl — match instead of unwrap_err.
-        let Err(err) = poll_recv(&rx, std::time::Duration::from_secs(1)) else {
-            panic!("expected disconnect");
-        };
-        assert!(matches!(err, flume::RecvTimeoutError::Disconnected));
     }
 }
 
@@ -342,6 +233,7 @@ impl GroupCommitSink for FileGroupSink<'_> {
         if self.fail_sync {
             return Err(std::io::Error::other("MOON_TEST_AOF_FSYNC_FAIL"));
         }
+        sync_gate_for_test();
         let t = Instant::now();
         let r = self.file.flush().and_then(|_| self.file.sync_data());
         if r.is_ok() {
@@ -363,7 +255,7 @@ impl GroupCommitSink for FileGroupSink<'_> {
 pub async fn aof_writer_task(
     rx: channel::MpscReceiver<AofMessage>,
     aof_path: PathBuf,
-    fsync: FsyncPolicy,
+    configured_fsync: FsyncPolicy,
     cancel: CancellationToken,
     fold_channels: Option<(
         Arc<parking_lot::Mutex<ringbuf::HeapProd<crate::shard::dispatch::ShardMessage>>>,
@@ -390,8 +282,9 @@ pub async fn aof_writer_task(
 
     #[cfg(feature = "runtime-tokio")]
     let mut writer = aof_buf_writer(file);
+    // moon#1266: the everysec deadline and its fsync agent.
     #[cfg(feature = "runtime-tokio")]
-    let mut last_fsync = Instant::now();
+    let mut everysec = EverysecSync::new(0, super::runtime_fsync::effective(configured_fsync));
     // Torn-write latch (tokio TopLevel): once a batch write fails partway, the
     // plain-RESP stream may carry a partial record — never append more bytes nor
     // claim durability after the tear. Latched for the writer's lifetime; reset
@@ -415,9 +308,10 @@ pub async fn aof_writer_task(
     let mut idle_wait = IdleWait::new();
     // task #35: AOF db-aware writer — see the monoio TopLevel loop above for
     // the full rationale. Resets to 0 on every successful rewrite (fresh
-    // file: replay starts a segment at db 0).
+    // file: replay starts a segment at db 0); starts unknown, because the
+    // file opened above may end in the previous run's `SELECT` (R1 review).
     #[cfg(feature = "runtime-tokio")]
-    let mut last_db: usize = 0;
+    let mut last_db = RecordCtx::appending(&aof_path);
     // #455: snapshot epoch of the generation this writer appends to; records
     // stamped below it are already in that generation's base and are dropped
     // wherever they are dequeued. Moves only when a fold's generation is
@@ -520,7 +414,8 @@ pub async fn aof_writer_task(
             incr_path.display()
         );
 
-        let mut last_fsync = Instant::now();
+        // moon#1266: the everysec deadline and its fsync agent.
+        let mut everysec = EverysecSync::new(0, super::runtime_fsync::effective(configured_fsync));
 
         let mut write_error = false;
 
@@ -539,12 +434,14 @@ pub async fn aof_writer_task(
         // The bounded recv + end-of-loop proactive fsync below restore the
         // ~1s EverySec bound exactly like the PerShard writers.
         let mut idle_wait = IdleWait::new();
-        // task #35: AOF db-aware writer. Tracks the db the last-written
-        // record executed in; a non-empty record whose db differs gets a
-        // `SELECT <db>` record injected first (see `inject_select_records`).
-        // Resets to 0 whenever a NEW incr/base file becomes the append
-        // target (fresh manifest segment — replay starts each incr at db 0).
-        let mut last_db: usize = 0;
+        // task #35 + moon#1283: the writer's record context. A non-empty
+        // record whose db differs gets a `SELECT <db>` first, and one whose
+        // clock differs from the last stamp a `MOON.TS <ms>` first (see
+        // `inject_record_prefixes`). Reset whenever a NEW incr/base file
+        // becomes the append target (replay starts each incr at db 0, with
+        // no clock). It STARTS unknown (`appending`): the incr opened above
+        // may be the previous run's, ending in any `SELECT` (R1 review).
+        let mut last_db = RecordCtx::appending(&incr_path);
         // #455: see the tokio declaration above.
         let mut fold_floor = FoldEpoch::INITIAL;
         // moon#1187: persistent batch-coalescing buffer (shrink hysteresis) —
@@ -552,6 +449,12 @@ pub async fn aof_writer_task(
         let mut batch_scratch = BatchBuf::new();
 
         loop {
+            // R1 review, finding 8: `CONFIG SET appendfsync` applies from this
+            // wake on (`runtime_fsync`); leaving everysec drains the agent.
+            let fsync = super::runtime_fsync::effective(configured_fsync);
+            if everysec.set_policy(fsync) {
+                idle_wait.clear_pending();
+            }
             // Group commit: wait (bounded) for one message, then
             // opportunistically drain whatever else is already queued into a
             // bounded batch so a single fsync makes the whole batch durable
@@ -559,11 +462,7 @@ pub async fn aof_writer_task(
             // to the EverySec proactive fsync at the end of the loop.
             // Park-free under EverySec/No so producer try_sends never pay a
             // futex wake on the shard thread — see `poll_recv`.
-            let first = match recv_next(
-                &rx,
-                idle_wait.current(),
-                matches!(fsync, FsyncPolicy::Always),
-            ) {
+            let first = match recv_next(&rx, &mut idle_wait, matches!(fsync, FsyncPolicy::Always)) {
                 Ok(m) => {
                     idle_wait.on_message();
                     Some(m)
@@ -575,6 +474,7 @@ pub async fn aof_writer_task(
                 Err(flume::RecvTimeoutError::Disconnected) => {
                     // Channel disconnected — final sync + shut down.
                     if !write_error {
+                        close::append_sync(&mut file, &mut last_db, false);
                         if let Err(e) = file.flush().and_then(|_| file.sync_data()) {
                             error!("AOF final sync failed (seq {}): {}", manifest.seq, e);
                         }
@@ -595,7 +495,7 @@ pub async fn aof_writer_task(
                 // before committing — rides the same write path as any other
                 // record (raw bytes on this TopLevel format). #455: drops
                 // records already folded into the committed base first.
-                batch.data = inject_select_records(
+                batch.data = inject_record_prefixes(
                     std::mem::take(&mut batch.data),
                     fold_floor,
                     &mut last_db,
@@ -608,7 +508,7 @@ pub async fn aof_writer_task(
                         // AppendSync waiter — never a false durability claim.
                         let _ = group_commit::ack_batch(&mut batch, BatchAck::WriteFailed);
                     } else {
-                        let do_fsync = matches!(fsync, FsyncPolicy::Always);
+                        let do_fsync = group_commit::batch_needs_fsync(fsync, &batch);
                         let mut sink = FileGroupSink {
                             file: &mut file,
                             fail_sync: fail_fsync_for_test,
@@ -630,10 +530,11 @@ pub async fn aof_writer_task(
                         }
                         // EverySec: the batch was written but not per-batch-fsynced
                         // (do_fsync=false; there are no AppendSync waiters under
-                        // everysec). The end-of-loop proactive fsync makes it
-                        // durable within the 1s bound — pin the idle wait at its
-                        // fast floor until that fsync clears it.
+                        // everysec). The end-of-loop hand-off to the fsync agent
+                        // makes it durable within the 1s bound — pin the idle
+                        // wait at its fast floor until that hand-off clears it.
                         if fsync == FsyncPolicy::EverySec && !write_error {
+                            everysec.note_written();
                             idle_wait.mark_pending();
                         }
                     }
@@ -647,6 +548,7 @@ pub async fn aof_writer_task(
                     None => {}
                     Some(AofMessage::Shutdown) => {
                         if !write_error {
+                            close::append_sync(&mut file, &mut last_db, false);
                             if let Err(e) = file.flush().and_then(|_| file.sync_data()) {
                                 error!("AOF final sync failed (seq {}): {}", manifest.seq, e);
                             }
@@ -693,6 +595,12 @@ pub async fn aof_writer_task(
                                 "AOF rewrite overflow drain failed (seq {}): {}",
                                 manifest.seq, e
                             );
+                            // R1 review, finding 6: the boundary fsync failed —
+                            // record it and retry within ~100 ms.
+                            if fsync == FsyncPolicy::EverySec {
+                                everysec.boundary_fsync_failed();
+                                idle_wait.mark_pending();
+                            }
                         }
                         crate::command::persistence::AOF_REWRITE_IN_PROGRESS
                             .store(false, std::sync::atomic::Ordering::SeqCst);
@@ -740,6 +648,12 @@ pub async fn aof_writer_task(
                                 "AOF rewrite overflow drain failed (seq {}): {}",
                                 manifest.seq, e
                             );
+                            // R1 review, finding 6: the boundary fsync failed —
+                            // record it and retry within ~100 ms.
+                            if fsync == FsyncPolicy::EverySec {
+                                everysec.boundary_fsync_failed();
+                                idle_wait.mark_pending();
+                            }
                         }
                         crate::command::persistence::AOF_REWRITE_IN_PROGRESS
                             .store(false, std::sync::atomic::Ordering::SeqCst);
@@ -759,27 +673,34 @@ pub async fn aof_writer_task(
                 }
             }
 
-            // EverySec proactive fsync — runs after every loop iteration
+            // EverySec deadline — checked after every loop iteration
             // (message processed OR timeout); the only path that guarantees
             // the ~1s durability bound when no further messages arrive after
-            // a buffered batch (idle-after-a-burst).
-            if fsync == FsyncPolicy::EverySec
-                && !write_error
-                && last_fsync.elapsed() >= std::time::Duration::from_secs(1)
-            {
-                let t = Instant::now();
+            // a buffered batch (idle-after-a-burst). moon#1266: the fsync is
+            // handed to the agent thread; this loop goes straight back to
+            // its channel. Inline only without an agent.
+            if fsync == FsyncPolicy::EverySec && !write_error && everysec.due() {
                 stall_everysec_fsync_for_test();
-                if let Err(e) = file.flush().and_then(|_| file.sync_data()) {
-                    error!("AOF sync failed (seq {}, everysec): {}", manifest.seq, e);
-                    crate::persistence::aof::record_everysec_fsync_result(0, false);
-                    // Non-fatal for everysec: retry next interval (status
-                    // stays latched "err" in INFO — the failed window's
-                    // pages are already gone even if the retry "succeeds").
-                } else {
-                    crate::admin::metrics_setup::record_aof_fsync(t.elapsed().as_micros() as u64);
-                    crate::persistence::aof::record_everysec_fsync_result(0, true);
-                    last_fsync = Instant::now();
-                    idle_wait.clear_pending();
+                match everysec.claim() {
+                    // The previous fsync is still running: stays pending,
+                    // re-checked on the next wake (fast floor).
+                    Claim::Postponed => {}
+                    Claim::Owned if everysec.dispatch(file.try_clone()) => {
+                        idle_wait.clear_pending();
+                    }
+                    Claim::Owned | Claim::Inline => {
+                        let t = Instant::now();
+                        if let Err(e) = file.flush().and_then(|_| file.sync_data()) {
+                            error!("AOF sync failed (seq {}, everysec): {}", manifest.seq, e);
+                            everysec.inline_done(false);
+                        } else {
+                            crate::admin::metrics_setup::record_aof_fsync(
+                                t.elapsed().as_micros() as u64
+                            );
+                            everysec.inline_done(true);
+                            idle_wait.clear_pending();
+                        }
+                    }
                 }
             }
         }
@@ -789,6 +710,12 @@ pub async fn aof_writer_task(
     loop {
         #[cfg(feature = "runtime-tokio")]
         {
+            // R1 review, finding 8: `CONFIG SET appendfsync` applies from this
+            // wake on (`runtime_fsync`); leaving everysec drains the agent.
+            let fsync = super::runtime_fsync::effective(configured_fsync);
+            if everysec.set_policy(fsync) {
+                idle_wait.clear_pending();
+            }
             // Bounded recv (EverySec durability): wake at least every
             // `idle_wait.current()` (50ms floor, escalates to 1s while truly
             // idle — see `IdleWait` docs) even when idle so the flush deadline
@@ -810,6 +737,7 @@ pub async fn aof_writer_task(
                     // partial record cannot recover it and risks a false durability
                     // signal (mirrors the monoio TopLevel disconnect/shutdown gate).
                     if !write_error {
+                        close::append_async(&mut writer, &mut last_db, false).await;
                         let _ = writer.flush().await;
                         let _ = writer.get_ref().sync_data().await;
                     }
@@ -824,6 +752,7 @@ pub async fn aof_writer_task(
                 // Channel disconnected — final sync + shut down.
                 Ok(Err(_)) => {
                     if !write_error {
+                        close::append_async(&mut writer, &mut last_db, false).await;
                         let _ = writer.flush().await;
                         let _ = writer.get_ref().sync_data().await;
                     }
@@ -848,7 +777,7 @@ pub async fn aof_writer_task(
                     // switch before committing (see the monoio TopLevel loop
                     // above). #455: drops records already folded into the
                     // committed base first.
-                    batch.data = inject_select_records(
+                    batch.data = inject_record_prefixes(
                         std::mem::take(&mut batch.data),
                         fold_floor,
                         &mut last_db,
@@ -873,13 +802,14 @@ pub async fn aof_writer_task(
                                     break;
                                 }
                             }
-                            let do_fsync = matches!(fsync, FsyncPolicy::Always);
-                            // moon#1187: the batch reaches the kernel in one
-                            // hop; the user-space tail stays within the old
-                            // 8 KiB SIGKILL bound. (Always flushes below.)
+                            let do_fsync = group_commit::batch_needs_fsync(fsync, &batch);
+                            // moon#1266: the whole batch reaches the kernel
+                            // before the loop moves on — nothing acked stays
+                            // in user space for a SIGKILL to take. (Always
+                            // flushes below, before its fsync.)
                             if !write_failed
                                 && !do_fsync
-                                && let Err(e) = flush_tail_if_over_bound(&mut writer).await
+                                && let Err(e) = flush_batch_to_kernel(&mut writer).await
                             {
                                 error!("AOF batch flush error: {}", e);
                                 write_failed = true;
@@ -895,6 +825,7 @@ pub async fn aof_writer_task(
                                 BatchAck::FsyncFailed
                             } else if do_fsync {
                                 let mut fsync_failed = false;
+                                sync_gate_for_test();
                                 if let Err(e) = writer.flush().await {
                                     error!("AOF batch flush error: {}", e);
                                     fsync_failed = true;
@@ -920,10 +851,11 @@ pub async fn aof_writer_task(
                                     "everysec/no batch must contain no AppendSync"
                                 );
                                 if fsync == FsyncPolicy::EverySec {
-                                    // Bytes are buffered but not yet durable —
-                                    // pin the idle wait at its floor until the
-                                    // deadline check below (or a future
-                                    // iteration's) clears it.
+                                    // Bytes are in the kernel but not yet
+                                    // durable — pin the idle wait at its floor
+                                    // until the deadline check below (or a
+                                    // future iteration's) clears it.
+                                    everysec.note_written();
                                     idle_wait.mark_pending();
                                 }
                                 BatchAck::Synced
@@ -953,7 +885,7 @@ pub async fn aof_writer_task(
                                 // whatever it already was.
                                 Ok(()) => {
                                     write_error = false;
-                                    last_db = 0;
+                                    last_db.reset();
                                 }
                                 Err(e) => error!("AOF rewrite failed: {}", e),
                             }
@@ -996,6 +928,12 @@ pub async fn aof_writer_task(
                                     overflow.finish_raw(&rx, &mut sf, &mut last_db, fold_floor)
                                 {
                                     error!("AOF rewrite overflow drain failed: {}", e);
+                                    // R1 review, finding 6: the boundary fsync failed —
+                                    // record it and retry within ~100 ms.
+                                    if fsync == FsyncPolicy::EverySec {
+                                        everysec.boundary_fsync_failed();
+                                        idle_wait.mark_pending();
+                                    }
                                 }
                                 writer = aof_buf_writer(tokio::fs::File::from_std(sf));
                             }
@@ -1008,7 +946,7 @@ pub async fn aof_writer_task(
                             // a pending deadline — pin the idle wait at its
                             // floor so escalation cannot push the next check
                             // past the intended window.
-                            last_fsync = Instant::now() - std::time::Duration::from_millis(900);
+                            everysec.backdate(std::time::Duration::from_millis(900));
                             idle_wait.mark_pending();
                         }
                         Some(AofMessage::RewriteSharded(shard_dbs, overflow)) => {
@@ -1065,6 +1003,12 @@ pub async fn aof_writer_task(
                                 overflow.finish_raw(&rx, &mut active, &mut last_db, fold_floor)
                             {
                                 error!("AOF rewrite overflow drain failed: {}", e);
+                                // R1 review, finding 6: the boundary fsync failed —
+                                // record it and retry within ~100 ms.
+                                if fsync == FsyncPolicy::EverySec {
+                                    everysec.boundary_fsync_failed();
+                                    idle_wait.mark_pending();
+                                }
                             }
                             // Released only after the drain (moon#1158): a
                             // rewrite dispatched earlier would be consumed by
@@ -1077,7 +1021,7 @@ pub async fn aof_writer_task(
                             // + wake floor — a SIGKILL shortly after rewrite
                             // completion must not take the tail with it. Pin the
                             // idle wait at its floor until this deadline fires.
-                            last_fsync = Instant::now() - std::time::Duration::from_millis(900);
+                            everysec.backdate(std::time::Duration::from_millis(900));
                             idle_wait.mark_pending();
                         }
                         // [F6] TopLevel writer never owns per-shard files — routing
@@ -1091,6 +1035,7 @@ pub async fn aof_writer_task(
                         }
                         Some(AofMessage::Shutdown) => {
                             if !write_error {
+                                close::append_async(&mut writer, &mut last_db, false).await;
                                 let _ = writer.flush().await;
                                 let _ = writer.get_ref().sync_data().await;
                             }
@@ -1102,40 +1047,48 @@ pub async fn aof_writer_task(
                     }
                 }
             }
-            // EverySec deadline: the oldest unflushed byte reaches disk at
+            // EverySec deadline: the oldest unsynced byte reaches disk at
             // most ~1.2s after it was written (1s deadline + wake floor —
             // the wake floor only, never the escalated idle cadence: see
             // `IdleWait`, which `mark_pending`/`clear_pending` keep pinned
-            // at the floor for exactly this check). tokio's BufWriter holds
-            // up to 8KB in userspace — a SIGKILL takes that tail with it, so
-            // the bound must hold even when the recv arm is saturated with
-            // messages. Skip if torn: syncing past a partial record cannot
+            // at the floor for exactly this check), plus the fsync itself.
+            // moon#1266: the fsync runs on the agent thread; every batch
+            // was already flushed to the kernel, so nothing acked is in user
+            // space. Skip if torn: syncing past a partial record cannot
             // recover it.
-            if fsync == FsyncPolicy::EverySec
-                && !write_error
-                && last_fsync.elapsed() >= std::time::Duration::from_secs(1)
-            {
-                let t = Instant::now();
+            if fsync == FsyncPolicy::EverySec && !write_error && everysec.due() {
                 stall_everysec_fsync_for_test();
-                let res = match writer.flush().await {
-                    Ok(()) => writer.get_ref().sync_data().await,
-                    Err(e) => Err(e),
+                let claim = everysec.claim();
+                let dispatched = claim == Claim::Owned && {
+                    let dup = match writer.get_ref().try_clone().await {
+                        Ok(f) => Ok(f.into_std().await),
+                        Err(e) => Err(e),
+                    };
+                    everysec.dispatch(dup)
                 };
-                match res {
-                    Err(e) => {
-                        error!("AOF sync failed (everysec, tokio TopLevel): {}", e);
-                        crate::persistence::aof::record_everysec_fsync_result(0, false);
-                        // Keep last_fsync unadvanced so the deadline stays
-                        // armed — a silent success-record here would let the
-                        // failed window's loss self-heal invisibly.
-                    }
-                    Ok(()) => {
-                        crate::admin::metrics_setup::record_aof_fsync(
-                            t.elapsed().as_micros() as u64
-                        );
-                        crate::persistence::aof::record_everysec_fsync_result(0, true);
-                        last_fsync = Instant::now();
-                        idle_wait.clear_pending();
+                if dispatched {
+                    idle_wait.clear_pending();
+                } else if claim != Claim::Postponed {
+                    let t = Instant::now();
+                    let res = match writer.flush().await {
+                        Ok(()) => writer.get_ref().sync_data().await,
+                        Err(e) => Err(e),
+                    };
+                    match res {
+                        Err(e) => {
+                            error!("AOF sync failed (everysec, tokio TopLevel): {}", e);
+                            // The deadline stays armed — a silent success-record
+                            // here would let the failed window's loss self-heal
+                            // invisibly.
+                            everysec.inline_done(false);
+                        }
+                        Ok(()) => {
+                            crate::admin::metrics_setup::record_aof_fsync(
+                                t.elapsed().as_micros() as u64
+                            );
+                            everysec.inline_done(true);
+                            idle_wait.clear_pending();
+                        }
                     }
                 }
             }
@@ -1173,7 +1126,7 @@ pub async fn per_shard_aof_writer_task(
     rx: channel::MpscReceiver<AofMessage>,
     base_dir: PathBuf,
     shard_id: u16,
-    fsync: FsyncPolicy,
+    configured_fsync: FsyncPolicy,
     cancel: CancellationToken,
 ) {
     test_hooks::hold_writer_start(shard_id, &cancel);
@@ -1280,13 +1233,18 @@ pub async fn per_shard_aof_writer_task(
         );
 
         let mut writer = aof_buf_writer(file);
-        let mut last_fsync = Instant::now();
+        // moon#1266: the everysec deadline and its fsync agent.
+        let mut everysec = EverysecSync::new(
+            usize::from(shard_id),
+            super::runtime_fsync::effective(configured_fsync),
+        );
         // Idle-adaptive channel-poll wake cadence (RSS/CPU wave 5, item B) —
         // see `IdleWait` docs near the top of this file.
         let mut idle_wait = IdleWait::new();
         // task #35: AOF db-aware writer — see the monoio TopLevel loop's docs
-        // near the top of this file for the full rationale.
-        let mut last_db: usize = 0;
+        // near the top of this file for the full rationale (starts unknown:
+        // the reopened incr may end in any `SELECT`).
+        let mut last_db = RecordCtx::appending(&incr_path);
         // #455: see the TopLevel declaration near the top of this file.
         let mut fold_floor = FoldEpoch::INITIAL;
         // (No `interval` here: the EverySec flush deadline is enforced by the
@@ -1321,6 +1279,11 @@ pub async fn per_shard_aof_writer_task(
         let mut test_append_ordinal: usize = 0;
 
         loop {
+            // R1 review, finding 8: see the TopLevel loops.
+            let fsync = super::runtime_fsync::effective(configured_fsync);
+            if everysec.set_policy(fsync) {
+                idle_wait.clear_pending();
+            }
             tokio::select! {
                 biased;
                 // Bounded recv (EverySec durability): wake at least every
@@ -1339,6 +1302,9 @@ pub async fn per_shard_aof_writer_task(
                         Err(_) => idle_wait.on_timeout(),
                         // Channel disconnected — final sync + shut down.
                         Ok(Err(_)) => {
+                            if !write_error {
+                                close::append_async(&mut writer, &mut last_db, true).await;
+                            }
                             let _ = writer.flush().await;
                             let _ = writer.get_ref().sync_data().await;
                             info!("AOF writer shard {} shutting down", shard_id);
@@ -1359,7 +1325,7 @@ pub async fn per_shard_aof_writer_task(
                             );
                             // task #35: inject SELECT <db> records on db-context
                             // changes before this batch's framed writes go out.
-                            batch.data = inject_select_records(
+                            batch.data = inject_record_prefixes(
                                 std::mem::take(&mut batch.data),
                                 fold_floor,
                                 &mut last_db,
@@ -1436,12 +1402,12 @@ pub async fn per_shard_aof_writer_task(
                                         }
                                     }
 
-                                    let do_fsync = matches!(fsync, FsyncPolicy::Always);
-                                    // moon#1187: see the TopLevel tokio loop.
+                                    let do_fsync = group_commit::batch_needs_fsync(fsync, &batch);
+                                    // moon#1266: see the TopLevel tokio loop.
                                     if !write_failed
                                         && !do_fsync
                                         && let Err(e) =
-                                            flush_tail_if_over_bound(&mut writer).await
+                                            flush_batch_to_kernel(&mut writer).await
                                     {
                                         error!(
                                             "AOF batch flush error shard {}: {}",
@@ -1460,6 +1426,7 @@ pub async fn per_shard_aof_writer_task(
                                         BatchAck::FsyncFailed
                                     } else if do_fsync {
                                         let mut ff = false;
+                                        sync_gate_for_test();
                                         if let Err(e) = writer.flush().await {
                                             error!(
                                                 "AOF batch flush error shard {}: {}",
@@ -1482,6 +1449,7 @@ pub async fn per_shard_aof_writer_task(
                                         // EverySec/No: the deadline check fsyncs; no
                                         // AppendSync waiters under everysec/no.
                                         if fsync == FsyncPolicy::EverySec {
+                                            everysec.note_written();
                                             idle_wait.mark_pending();
                                         }
                                         BatchAck::Synced
@@ -1574,11 +1542,20 @@ pub async fn per_shard_aof_writer_task(
                                                  drain failed: {}",
                                                 shard_id, e
                                             );
+                                            // R1 review, finding 6: the boundary fsync failed —
+                                            // record it and retry within ~100 ms.
+                                            if fsync == FsyncPolicy::EverySec {
+                                                everysec.boundary_fsync_failed();
+                                                idle_wait.mark_pending();
+                                            }
                                         }
                                         writer = aof_buf_writer(tokio::fs::File::from_std(sf));
                                     }
                                 }
                                 Some(AofMessage::Shutdown) => {
+                                    if !write_error {
+                                        close::append_async(&mut writer, &mut last_db, true).await;
+                                    }
                                     let _ = writer.flush().await;
                                     let _ = writer.get_ref().sync_data().await;
                                     info!("AOF writer shard {} shutting down", shard_id);
@@ -1591,6 +1568,9 @@ pub async fn per_shard_aof_writer_task(
                     }
                 }
                 _ = cancel.cancelled() => {
+                    if !write_error {
+                        close::append_async(&mut writer, &mut last_db, true).await;
+                    }
                     let _ = writer.flush().await;
                     let _ = writer.get_ref().sync_data().await;
                     info!("AOF writer shard {} cancelled", shard_id);
@@ -1601,39 +1581,42 @@ pub async fn per_shard_aof_writer_task(
             // so it is NOT subject to select! fairness and holds the 1s bound
             // under sustained writes as well as when idle. (The old long-lived
             // `interval.tick()` arm could be starved by the always-ready recv
-            // arm under load, leaving >1s of writes buffered in the BufWriter
-            // and lost on SIGKILL — the COMPOSE crash-matrix failure.)
-            if fsync == FsyncPolicy::EverySec
-                && !write_error
-                && last_fsync.elapsed() >= std::time::Duration::from_secs(1)
-            {
-                let t = Instant::now();
+            // arm under load, leaving >1s of writes unsynced — the COMPOSE
+            // crash-matrix failure.) moon#1266: the fsync itself runs on the
+            // agent thread, and every batch was already flushed to the kernel.
+            if fsync == FsyncPolicy::EverySec && !write_error && everysec.due() {
                 stall_everysec_fsync_for_test();
-                let res = match writer.flush().await {
-                    Ok(()) => writer.get_ref().sync_data().await,
-                    Err(e) => Err(e),
+                let claim = everysec.claim();
+                let dispatched = claim == Claim::Owned && {
+                    let dup = match writer.get_ref().try_clone().await {
+                        Ok(f) => Ok(f.into_std().await),
+                        Err(e) => Err(e),
+                    };
+                    everysec.dispatch(dup)
                 };
-                match res {
-                    Err(e) => {
-                        error!(
-                            "AOF sync failed shard {} (everysec, tokio PerShard): {}",
-                            shard_id, e
-                        );
-                        crate::persistence::aof::record_everysec_fsync_result(
-                            usize::from(shard_id),
-                            false,
-                        );
-                    }
-                    Ok(()) => {
-                        crate::admin::metrics_setup::record_aof_fsync(
-                            t.elapsed().as_micros() as u64
-                        );
-                        crate::persistence::aof::record_everysec_fsync_result(
-                            usize::from(shard_id),
-                            true,
-                        );
-                        last_fsync = Instant::now();
-                        idle_wait.clear_pending();
+                if dispatched {
+                    idle_wait.clear_pending();
+                } else if claim != Claim::Postponed {
+                    let t = Instant::now();
+                    let res = match writer.flush().await {
+                        Ok(()) => writer.get_ref().sync_data().await,
+                        Err(e) => Err(e),
+                    };
+                    match res {
+                        Err(e) => {
+                            error!(
+                                "AOF sync failed shard {} (everysec, tokio PerShard): {}",
+                                shard_id, e
+                            );
+                            everysec.inline_done(false);
+                        }
+                        Ok(()) => {
+                            crate::admin::metrics_setup::record_aof_fsync(
+                                t.elapsed().as_micros() as u64
+                            );
+                            everysec.inline_done(true);
+                            idle_wait.clear_pending();
+                        }
                     }
                 }
             }
@@ -1734,7 +1717,11 @@ pub async fn per_shard_aof_writer_task(
             incr_path.display()
         );
 
-        let mut last_fsync = Instant::now();
+        // moon#1266: the everysec deadline and its fsync agent.
+        let mut everysec = EverysecSync::new(
+            usize::from(shard_id),
+            super::runtime_fsync::effective(configured_fsync),
+        );
         let mut write_error = false;
         let mut _dbg_processed: u64 = 0;
         let _dbg_start = Instant::now();
@@ -1747,8 +1734,9 @@ pub async fn per_shard_aof_writer_task(
         // see `IdleWait` docs near the top of this file.
         let mut idle_wait = IdleWait::new();
         // task #35: AOF db-aware writer — see the monoio TopLevel loop's docs
-        // near the top of this file for the full rationale.
-        let mut last_db: usize = 0;
+        // near the top of this file for the full rationale (starts unknown:
+        // the reopened incr may end in any `SELECT`).
+        let mut last_db = RecordCtx::appending(&incr_path);
         // #455: see the TopLevel declaration near the top of this file.
         let mut fold_floor = FoldEpoch::INITIAL;
         // Test-only fault injection: if MOON_TEST_AOF_FSYNC_FAIL=1 is set in
@@ -1758,6 +1746,11 @@ pub async fn per_shard_aof_writer_task(
         let fail_fsync_for_test = std::env::var("MOON_TEST_AOF_FSYNC_FAIL").as_deref() == Ok("1");
 
         loop {
+            // R1 review, finding 8: see the TopLevel loops.
+            let fsync = super::runtime_fsync::effective(configured_fsync);
+            if everysec.set_policy(fsync) {
+                idle_wait.clear_pending();
+            }
             // Use recv_timeout so the EverySec fsync fires even when no new
             // Appends arrive after a fold (or when the client stops writing).
             // Without a timeout, the writer blocks forever in rx.recv() and
@@ -1769,11 +1762,7 @@ pub async fn per_shard_aof_writer_task(
             // `IdleWait` docs. Park-free under EverySec/No so producer
             // try_sends never pay a futex wake on the shard thread — see
             // `poll_recv`.
-            let first = match recv_next(
-                &rx,
-                idle_wait.current(),
-                matches!(fsync, FsyncPolicy::Always),
-            ) {
+            let first = match recv_next(&rx, &mut idle_wait, matches!(fsync, FsyncPolicy::Always)) {
                 Ok(m) => {
                     idle_wait.on_message();
                     Some(m)
@@ -1787,6 +1776,7 @@ pub async fn per_shard_aof_writer_task(
                 }
                 Err(flume::RecvTimeoutError::Disconnected) => {
                     if !write_error {
+                        close::append_sync(&mut file, &mut last_db, true);
                         if let Err(e) = file.flush().and_then(|_| file.sync_data()) {
                             error!(
                                 "AOF final sync failed shard {} (seq {}): {}",
@@ -1816,7 +1806,7 @@ pub async fn per_shard_aof_writer_task(
                 );
                 // task #35: inject SELECT <db> records on db-context changes
                 // before this batch's framed writes go into batch_buf.
-                batch.data = inject_select_records(
+                batch.data = inject_record_prefixes(
                     std::mem::take(&mut batch.data),
                     fold_floor,
                     &mut last_db,
@@ -1881,7 +1871,7 @@ pub async fn per_shard_aof_writer_task(
                         // after a sustained run of small batches.
                         batch_buf.finish();
 
-                        let do_fsync = matches!(fsync, FsyncPolicy::Always);
+                        let do_fsync = group_commit::batch_needs_fsync(fsync, &batch);
                         let verdict = if write_failed {
                             // A torn write may leave a partial record — latch so no
                             // further bytes are appended after the tear.
@@ -1891,6 +1881,7 @@ pub async fn per_shard_aof_writer_task(
                             // Injected: bytes written, the batch fsync "fails".
                             BatchAck::FsyncFailed
                         } else if do_fsync {
+                            sync_gate_for_test();
                             let t = Instant::now();
                             if let Err(e) = file.flush().and_then(|_| file.sync_data()) {
                                 error!(
@@ -1905,9 +1896,10 @@ pub async fn per_shard_aof_writer_task(
                                 BatchAck::Synced
                             }
                         } else {
-                            // EverySec/No: the proactive fsync below makes the batch
-                            // durable; no AppendSync waiters under everysec/no.
+                            // EverySec/No: the everysec hand-off below makes the
+                            // batch durable; no AppendSync waiters under everysec/no.
                             if fsync == FsyncPolicy::EverySec {
+                                everysec.note_written();
                                 idle_wait.mark_pending();
                             }
                             BatchAck::Synced
@@ -1985,53 +1977,63 @@ pub async fn per_shard_aof_writer_task(
                             );
                         }
                         // EverySec post-fold drain+fsync: the fold runs synchronously
-                        // and does NOT update `last_fsync`. Appends that arrived during
+                        // and does NOT move the everysec deadline. Appends that arrived during
                         // the fold queue in the bounded AOF channel; they land on the NEW
                         // incr but are NOT fsynced until the EverySec timer fires.
                         // Strategy: drain what's currently in the channel and fsync now
                         // (covers appends that landed before this drain), then set
-                        // `last_fsync` 900ms in the past so the proactive check below
+                        // the deadline 900ms in the past so the everysec hand-off below
                         // fires within the NEXT 100ms window (≤150ms total, since the
                         // recv_timeout is 50ms). That second fsync covers any appends
                         // that arrived between the drain and that window close.
                         // Combined, the two fsyncs bound the post-fold EverySec window
                         // to ≤150ms — well within the test's 1500ms kill margin.
                         if !write_error {
-                            if let Ok(mut post_drain) = drain_pending_appends_framed(
+                            let drained = drain_pending_appends_framed(
                                 &rx,
                                 &mut file,
                                 usize::MAX,
                                 &mut last_db,
                                 fold_floor,
-                            ) {
-                                if let Err(e) = sync_and_fulfill_drain(
+                            )
+                            .and_then(|mut post_drain| {
+                                sync_and_fulfill_drain(
                                     &mut post_drain,
                                     &mut file,
                                     std::path::PathBuf::from("<aof per-shard new-incr post-fold>"),
-                                ) {
-                                    error!(
-                                        "F6 per-shard rewrite: shard {} post-fold fsync \
-                                         failed: {}. EverySec window open until next Append.",
-                                        shard_id, e
-                                    );
-                                } else {
-                                    // Back-date last_fsync by 900ms: the proactive check
-                                    // (threshold=1s) fires within the next 100ms, covering
-                                    // any appends that arrived after the drain above. This
-                                    // IS a pending deadline — pin the idle wait at its
-                                    // floor (`on_message` already reset it for this
-                                    // iteration; `mark_pending` keeps it there) so
-                                    // escalation cannot push the next check out past the
-                                    // ≤150ms window the comment above promises.
-                                    last_fsync =
-                                        Instant::now() - std::time::Duration::from_millis(900);
+                                )
+                            });
+                            if let Err(e) = drained {
+                                // R1 review, finding 6: record it and retry
+                                // within ~100 ms — `due()` is gated on dirty,
+                                // so nothing else would fsync before the
+                                // next Append.
+                                error!(
+                                    "F6 per-shard rewrite: shard {} post-fold drain/fsync \
+                                         failed: {}. Retrying the fsync within ~100 ms.",
+                                    shard_id, e
+                                );
+                                if fsync == FsyncPolicy::EverySec {
+                                    everysec.boundary_fsync_failed();
                                     idle_wait.mark_pending();
                                 }
+                            } else {
+                                // Back-date the deadline by 900ms: the hand-off
+                                // (threshold=1s) fires within the next 100ms, covering
+                                // any appends that arrived after the drain above. This
+                                // IS a pending deadline — pin the idle wait at its
+                                // floor (`on_message` already reset it for this
+                                // iteration; `mark_pending` keeps it there) so
+                                // escalation cannot push the next check out past the
+                                // ≤150ms window the comment above promises.
+                                everysec.backdate(std::time::Duration::from_millis(900));
+                                idle_wait.mark_pending();
                             }
                         }
                     }
                     Some(AofMessage::Shutdown) => {
                         if !write_error {
+                            close::append_sync(&mut file, &mut last_db, true);
                             if let Err(e) = file.flush().and_then(|_| file.sync_data()) {
                                 error!(
                                     "AOF final sync failed shard {} (seq {}): {}",
@@ -2052,38 +2054,35 @@ pub async fn per_shard_aof_writer_task(
                     Some(_) => {}
                 }
             }
-            // EverySec proactive fsync — runs after every loop iteration
+            // EverySec deadline — checked after every loop iteration
             // (message processed OR timeout). This is the only path that
             // guarantees the 1s fsync bound when no new Appends arrive
             // (e.g. after BGREWRITEAOF completes and the client stops writing).
-            if fsync == FsyncPolicy::EverySec
-                && !write_error
-                && last_fsync.elapsed() >= std::time::Duration::from_secs(1)
-            {
-                tracing::debug!(
-                    "AOF EverySec proactive fsync firing shard {} (elapsed={:.3}s)",
-                    shard_id,
-                    last_fsync.elapsed().as_secs_f64()
-                );
-                let t = Instant::now();
+            // moon#1266: the fsync runs on the agent thread; inline only
+            // without an agent.
+            if fsync == FsyncPolicy::EverySec && !write_error && everysec.due() {
                 stall_everysec_fsync_for_test();
-                if let Err(e) = file.flush().and_then(|_| file.sync_data()) {
-                    error!(
-                        "AOF EverySec proactive sync failed shard {} (seq {}): {}",
-                        shard_id, manifest.seq, e
-                    );
-                    crate::persistence::aof::record_everysec_fsync_result(
-                        usize::from(shard_id),
-                        false,
-                    );
-                } else {
-                    crate::admin::metrics_setup::record_aof_fsync(t.elapsed().as_micros() as u64);
-                    crate::persistence::aof::record_everysec_fsync_result(
-                        usize::from(shard_id),
-                        true,
-                    );
-                    last_fsync = Instant::now();
-                    idle_wait.clear_pending();
+                match everysec.claim() {
+                    Claim::Postponed => {}
+                    Claim::Owned if everysec.dispatch(file.try_clone()) => {
+                        idle_wait.clear_pending();
+                    }
+                    Claim::Owned | Claim::Inline => {
+                        let t = Instant::now();
+                        if let Err(e) = file.flush().and_then(|_| file.sync_data()) {
+                            error!(
+                                "AOF EverySec sync failed shard {} (seq {}): {}",
+                                shard_id, manifest.seq, e
+                            );
+                            everysec.inline_done(false);
+                        } else {
+                            crate::admin::metrics_setup::record_aof_fsync(
+                                t.elapsed().as_micros() as u64
+                            );
+                            everysec.inline_done(true);
+                            idle_wait.clear_pending();
+                        }
+                    }
                 }
             }
         }

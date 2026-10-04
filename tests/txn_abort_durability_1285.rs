@@ -35,7 +35,8 @@
 //!
 //! PR #1301 review: a graph rollback whose WAL records overflow the shard's
 //! WAL append channel (local leg at `--shards 1`, remote owner leg at `4`)
-//! must answer the refusal, never `+OK` followed by resurrected writes.
+//! must never answer `+OK` followed by resurrected writes — since moon#1302
+//! it answers `+OK` and stays aborted (no capacity limit on the owner).
 //!
 //! PR #1301 review, round 2: a script write `dispatch` cannot run (`FT.*`,
 //! `GRAPH.*`, `MQ`, blocking pops) captures no keyspace key; a write with
@@ -597,11 +598,11 @@ fn remote_tag(c: &mut Conn) -> Option<String> {
 }
 
 /// The invariant: a `TXN.ABORT` that answered `+OK` must not come back after
-/// a kill -9. On the unfixed code the rollback's records past the channel's
+/// a kill -9. Before PR #1301 the rollback's records past the channel's
 /// capacity were dropped silently: `+OK`, 0 nodes live, 1904 after restart.
-/// Fixed, an abort whose records do not all fit answers the WAL refusal and
-/// counts the dropped records (the rollback is still applied in memory); one
-/// whose records fit answers `+OK` and stays aborted.
+/// PR #1301 answered the WAL refusal instead; since moon#1302 the records
+/// past the channel's free slots take the shard's overflow queue, so the
+/// abort answers `+OK` and stays aborted.
 fn graph_rollback_overflow_case(shards: usize, remote: bool) {
     let dir = tempfile::tempdir().expect("tempdir");
     let server = start(dir.path(), shards, true);
@@ -643,18 +644,14 @@ fn graph_rollback_overflow_case(shards: usize, remote: bool) {
         "the rollback is applied in memory whatever its reply ({abort:?})"
     );
     let dropped_after = info_int(&mut c, "txn_rollback_wal_dropped");
-    if abort == OK {
-        assert_eq!(dropped_after, dropped_before, "+OK with dropped records");
-    } else {
-        assert!(
-            abort.starts_with("-MOONERR WAL backpressure"),
-            "a refused rollback answers the WAL refusal: {abort:?}"
-        );
-        assert!(
-            dropped_after > dropped_before,
-            "a refused rollback record is counted in INFO txn_rollback_wal_dropped"
-        );
-    }
+    // moon#1302: the rollback's append has no capacity limit on the owning
+    // shard's thread, so a live writer never refuses it — the abort answers
+    // `+OK` and nothing is counted as dropped.
+    assert_eq!(
+        abort, OK,
+        "a {OVERFLOW_NODES}-record graph rollback must be accepted whole (moon#1302)"
+    );
+    assert_eq!(dropped_after, dropped_before, "+OK with dropped records");
     eprintln!(
         "shards={shards} remote={remote}: TXN.ABORT -> {abort:?}, \
          txn_rollback_wal_dropped {dropped_before} -> {dropped_after}"
@@ -664,12 +661,10 @@ fn graph_rollback_overflow_case(shards: usize, remote: bool) {
     let server = restart(server, dir.path(), shards);
     let mut c = Conn::open(server.port);
     let after = node_count(&mut c, &graph);
-    if abort == OK {
-        assert_eq!(
-            after, 0,
-            "TXN.ABORT answered +OK, yet {after} aborted graph nodes came back after kill -9"
-        );
-    }
+    assert_eq!(
+        after, 0,
+        "TXN.ABORT answered +OK, yet {after} aborted graph nodes came back after kill -9"
+    );
 }
 
 #[test]

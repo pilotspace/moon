@@ -108,9 +108,33 @@ impl ColdDeletes {
 /// tombstones the cold plane through the replay gate, moon#257), so an older
 /// binary reading this generation keeps the deletes too. `framed` selects
 /// the per-shard `[lsn=0][len][RESP]` encoding for every record.
+///
+/// moon#1283: right after the `MOON.COLDCUT` comes a `MOON.TS <now>`, the
+/// clock this generation opened at (`replay::pseudo`), so no record of a
+/// stamped generation is judged by the file's mtime. An older binary skips
+/// it like any unknown command. The writer's own stamps follow with its first
+/// record (its record context starts every generation with no clock).
 pub fn write_generation_head_to(
     out: &mut impl std::io::Write,
     watermark: u64,
+    deletes: ColdDeletes,
+    framed: bool,
+) -> std::io::Result<usize> {
+    write_generation_head_at(
+        out,
+        watermark,
+        crate::storage::entry::current_time_ms(),
+        deletes,
+        framed,
+    )
+}
+
+/// [`write_generation_head_to`] with its `MOON.TS` value given: `head_ts_ms`,
+/// or no `MOON.TS` at all when it is 0 (the byte-exact test fixtures).
+pub fn write_generation_head_at(
+    out: &mut impl std::io::Write,
+    watermark: u64,
+    head_ts_ms: u64,
     deletes: ColdDeletes,
     framed: bool,
 ) -> std::io::Result<usize> {
@@ -122,6 +146,9 @@ pub fn write_generation_head_to(
         }
     };
     put(&serialize_cold_cut(watermark))?;
+    if head_ts_ms != 0 {
+        put(crate::persistence::replay::pseudo::TsRecord::new(head_ts_ms).as_bytes())?;
+    }
     let mut selected = 0usize;
     let mut written = 0usize;
     for chunk in deletes.chunks {
@@ -151,13 +178,13 @@ pub fn write_generation_head_to(
     Ok(written)
 }
 
-/// [`write_generation_head_to`] into a buffer — tests only; production
-/// streams straight into the incr.
+/// [`write_generation_head_at`] into a buffer, with no `MOON.TS` — tests
+/// only (byte-exact fixtures); production streams straight into the incr.
 #[cfg(test)]
 pub fn generation_head(watermark: u64, deletes: &ColdDeletes, framed: bool) -> Vec<u8> {
     let mut out = Vec::new();
     #[allow(clippy::unwrap_used)] // writing into a Vec cannot fail
-    write_generation_head_to(&mut out, watermark, deletes.clone(), framed).unwrap();
+    write_generation_head_at(&mut out, watermark, 0, deletes.clone(), framed).unwrap();
     out
 }
 
@@ -390,19 +417,37 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("appendonly.aof");
 
+        let before = crate::storage::entry::current_time_ms();
         assert!(seed_cold_cut_if_fresh(&path, 9).unwrap(), "absent → seeded");
+        let after = crate::storage::entry::current_time_ms();
+        // moon#1283: `MOON.COLDCUT 9`, then the `MOON.TS` the generation
+        // opened at.
+        let head = std::fs::read(&path).unwrap();
+        let cut = serialize_cold_cut(9);
+        assert!(head.starts_with(&cut), "the cut comes first");
+        let (name, args) = parse_one(&Bytes::copy_from_slice(&head[cut.len()..]));
+        assert_eq!(name, b"MOON.TS");
+        let ts = match crate::persistence::replay::pseudo::classify(&name, &args) {
+            Some(crate::persistence::replay::pseudo::Pseudo::Ts(ms)) => ms,
+            other => panic!("not a stamp: {other:?}"),
+        };
+        assert!(
+            (before..=after).contains(&ts),
+            "{before} <= {ts} <= {after}"
+        );
         assert_eq!(
-            std::fs::read(&path).unwrap(),
-            serialize_cold_cut(9).as_ref()
+            head.len(),
+            cut.len()
+                + crate::persistence::replay::pseudo::TsRecord::new(ts)
+                    .as_bytes()
+                    .len(),
+            "nothing but the cut and the stamp"
         );
         assert!(
             !seed_cold_cut_if_fresh(&path, 12).unwrap(),
             "a second boot must not append another head"
         );
-        assert_eq!(
-            std::fs::read(&path).unwrap(),
-            serialize_cold_cut(9).as_ref()
-        );
+        assert_eq!(std::fs::read(&path).unwrap(), head);
 
         let empty = dir.path().join("empty.aof");
         std::fs::write(&empty, b"").unwrap();

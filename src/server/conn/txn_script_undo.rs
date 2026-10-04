@@ -111,10 +111,19 @@ pub(crate) fn run_local_script<R>(txn: Option<&mut CrossStoreTxn>, run: impl FnO
     let Some(txn) = txn else {
         return run();
     };
+    // moon#1299: the script's writes run as this transaction's own — keys it
+    // already holds pass the isolation check, keys another TXN holds do not.
+    let owner = crate::transaction::isolation::OwnerScope::enter(txn.txn_id);
     let (out, captured) = crate::scripting::bridge::capture_txn_undo(run);
+    drop(owner);
     let (undo, written, refused) = captured.into_parts();
     if let Some((cmd, count)) = refused {
         txn.record_rejected_ops(&cmd, count);
+    }
+    // ... and every key it captured is held until COMMIT / ABORT, like the
+    // connection leg's (`transaction::conn_capture`).
+    for (db, key) in undo.keys_with_db() {
+        crate::transaction::isolation::hold(db, key, txn.txn_id);
     }
     txn.kv_undo.append(undo);
     if !written.is_empty() {

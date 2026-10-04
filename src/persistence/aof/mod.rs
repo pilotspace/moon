@@ -128,8 +128,10 @@ pub static AOF_FSYNC_FAILURES: std::sync::atomic::AtomicU64 = std::sync::atomic:
 /// would otherwise mask a failing shard's hole (deep-review P2). Kernel
 /// semantics make a *retry* of a failed fsync succeed trivially while the
 /// failed window's pages are already gone (fsyncgate), so each writer's bit
-/// clears only when a fsync that follows a successful write batch completes
-/// on THAT writer — operators must treat any "err" observation as "an AOF
+/// clears only when a successful fsync covers a successful write batch that
+/// THAT writer issued after it learned of the failure — a retry with nothing
+/// new written leaves it set (`fsync_agent::EverysecSync`'s heal rule, R1
+/// review finding 7). Operators must treat any "err" observation as "an AOF
 /// has a hole".
 pub static AOF_FSYNC_ERR_WRITERS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
@@ -348,11 +350,18 @@ pub enum AofMessage {
     ///
     /// `epoch` is the writer's [`FoldEpoch`] read in the same synchronous
     /// section as the mutation this record logs (#455) — never on disk.
+    ///
+    /// `clock_ms` is the shard's cached clock read in that same section
+    /// ([`AppendStamp`], moon#1283) — the clock the command judged expiry
+    /// with. Not on disk as a field: the writer emits a `MOON.TS <clock_ms>`
+    /// record before this one whenever it differs from the last stamp in the
+    /// stream ([`RecordCtx`]). 0 = unknown (no stamp).
     Append {
         lsn: u64,
         db: usize,
         bytes: Bytes,
         epoch: FoldEpoch,
+        clock_ms: u64,
     },
     /// Append + fsync + ack rendezvous (RFC § 4 — Fix 2 for the H1
     /// data-loss vector exposed by `appendfsync=always`).
@@ -373,14 +382,16 @@ pub enum AofMessage {
     /// AppendSync vs Append) is wired in step 9 before lifting the
     /// `--unsafe-multishard-aof` gate.
     ///
-    /// `epoch`: see [`AofMessage::Append`]. A zero-length barrier is never
-    /// folded away — it logs no mutation, it only waits for the fsync.
+    /// `epoch`, `clock_ms`: see [`AofMessage::Append`]. A zero-length
+    /// barrier is never folded away — it logs no mutation, it only waits for
+    /// the fsync — and never emits a stamp.
     AppendSync {
         lsn: u64,
         db: usize,
         bytes: Bytes,
         ack: crate::runtime::channel::OneshotSender<AofAck>,
         epoch: FoldEpoch,
+        clock_ms: u64,
     },
     /// Trigger a full AOF rewrite (compaction) using current database state.
     /// The [`rewrite::RewriteOverflow`] is this writer's rewrite-window spill
@@ -783,17 +794,28 @@ pub mod auto_rewrite;
 mod encode;
 /// Streamed base image for the rewrite fold (moon#1185).
 pub mod fold_stream;
+/// The everysec fsync agent: the once-per-second fsync off the writer's
+/// loop (moon#1266).
+mod fsync_agent;
+/// The writer <-> fsync-agent hand-off state (loom-modeled, moon#1266).
+mod fsync_handoff;
 /// Group-commit batching seam (coalesce concurrent pending writes into one fsync
 /// under `appendfsync=always`). `pub` so the §4 red suite can pin the pure seam.
 pub mod group_commit;
 mod pool;
+/// The writer's running record context (db + `MOON.TS` clock), moon#1283.
+mod record_ctx;
 mod refusal;
 pub mod rewrite;
 pub mod rewrite_overflow;
+/// `CONFIG SET appendfsync` at runtime (R1 review, finding 8).
+pub mod runtime_fsync;
 pub mod writer_stop;
 mod writer_task;
 
+pub use fsync_agent::{AOF_DELAYED_FSYNC, in_flight_fsyncs};
 pub use pool::{AofWriterPool, BoundedRefusal};
+pub use record_ctx::{AppendStamp, RecordCtx};
 pub(crate) use refusal::note_append_backpressure_refusal;
 pub use refusal::{
     AOF_APPEND_BACKPRESSURE_REFUSALS, AOF_BACKLOG_ERR, AOF_BARRIER_BACKLOG_ERR,
@@ -900,85 +922,85 @@ pub fn serialize_select_record(db: usize) -> Bytes {
     Bytes::from(buf)
 }
 
-/// Returns `Some(serialize_select_record(db))` and advances `*last_db` when a
-/// non-barrier record's execution db differs from the writer's running
-/// context (task #35 db-aware writer). Returns `None` (no state change) for
-/// a zero-length barrier payload (`payload_is_empty` — `pool::fsync_barrier`
-/// writes no record and must never trigger nor observe a db switch) or when
-/// `db == *last_db`. Shared by every AOF write site — the batched writer
-/// loops (via [`inject_select_records`]) and the rewrite-fold per-message
-/// inline drains (`rewrite.rs`) alike — so the db-switch rule has exactly one
-/// definition.
-pub(crate) fn select_prefix_if_needed(
-    db: usize,
-    payload_is_empty: bool,
-    last_db: &mut usize,
-) -> Option<Bytes> {
-    if payload_is_empty || db == *last_db {
-        return None;
-    }
-    *last_db = db;
-    Some(serialize_select_record(db))
-}
-
-/// Insert a synthetic `SELECT <db>` [`AofMessage::Append`] (lsn=0) before
-/// every message in `data` whose db differs from the writer's running
-/// `last_db` context (task #35). Barriers (zero-length payload) never
-/// trigger nor observe a switch. `last_db` is updated in place so
-/// consecutive batches stay consistent across writer-loop iterations.
+/// Insert the synthetic records [`RecordCtx::prefix`] asks for — a
+/// `MOON.TS <ms>` when a record's clock differs from the last stamp in the
+/// stream (moon#1283), a `SELECT <db>` when its db differs from the writer's
+/// running db (task #35) — as [`AofMessage::Append`]s (lsn=0) before it.
+/// Barriers (zero-length payload) never trigger nor observe either. `ctx` is
+/// updated in place so consecutive batches stay consistent across
+/// writer-loop iterations.
 ///
 /// Used by all four batch-write writer loci (TopLevel/PerShard x
 /// monoio/tokio) immediately after `collect_group_commit_batch` returns —
-/// the injected message then rides the SAME write path as any other record
+/// the injected messages then ride the SAME write path as any other record
 /// (a framed `[u64 lsn=0][u32 len]` header for the PerShard loops, raw bytes
-/// for TopLevel), so no per-loop special-casing of the SELECT bytes is
-/// needed.
+/// for TopLevel), so no per-loop special-casing is needed. The rewrite and
+/// overflow drains apply the same [`RecordCtx::prefix`] per record.
 ///
 /// It first drops every record already folded into the committed base
 /// (`floor`, see [`keep_unless_folded`]). That makes this the single place
 /// where all four batch loops apply the #455 filter.
-pub(crate) fn inject_select_records(
+pub(crate) fn inject_record_prefixes(
     data: Vec<AofMessage>,
     floor: FoldEpoch,
-    last_db: &mut usize,
+    ctx: &mut RecordCtx,
 ) -> Vec<AofMessage> {
     // moon#1187 fast path: a batch in which every record executed in the
-    // writer's current db and none is already folded — every batch of a
-    // single-db workload between rewrites — needs no SELECT and no drop, so
-    // it is returned as is instead of being copied into a fresh `Vec`.
-    // `last_db` does not move: no record switches the db.
-    let current = *last_db;
+    // writer's current db, under the last stamped clock, and none is already
+    // folded — every batch of a single-db workload within one clock tick
+    // between rewrites — needs no prefix and no drop, so it is returned as
+    // is instead of being copied into a fresh `Vec`. `ctx` does not move.
     let untouched = data.iter().all(|msg| match msg {
-        AofMessage::Append { db, bytes, .. } | AofMessage::AppendSync { db, bytes, .. } => {
-            bytes.is_empty() || (*db == current && !is_folded(msg, floor))
+        AofMessage::Append {
+            db,
+            bytes,
+            clock_ms,
+            ..
+        }
+        | AofMessage::AppendSync {
+            db,
+            bytes,
+            clock_ms,
+            ..
+        } => {
+            bytes.is_empty() || (!ctx.needs_prefix(*db, *clock_ms, false) && !is_folded(msg, floor))
         }
         _ => true,
     });
     if untouched {
         return data;
     }
-    let mut out = Vec::with_capacity(data.len());
+    let mut out = Vec::with_capacity(data.len() + 2);
     for msg in data {
         // #455: a record already folded into the committed base is dropped
-        // BEFORE the db-context bookkeeping, so it never injects a SELECT.
+        // BEFORE the context bookkeeping, so it never injects a prefix.
         let Some(msg) = keep_unless_folded(msg, floor) else {
             continue;
         };
-        let (db, is_empty, epoch) = match &msg {
+        let (db, is_empty, epoch, clock_ms) = match &msg {
             AofMessage::Append {
-                db, bytes, epoch, ..
-            } => (*db, bytes.is_empty(), *epoch),
-            AofMessage::AppendSync {
-                db, bytes, epoch, ..
-            } => (*db, bytes.is_empty(), *epoch),
-            _ => (0, true, FoldEpoch::INITIAL),
+                db,
+                bytes,
+                epoch,
+                clock_ms,
+                ..
+            }
+            | AofMessage::AppendSync {
+                db,
+                bytes,
+                epoch,
+                clock_ms,
+                ..
+            } => (*db, bytes.is_empty(), *epoch, *clock_ms),
+            _ => (0, true, FoldEpoch::INITIAL, 0),
         };
-        if let Some(select_bytes) = select_prefix_if_needed(db, is_empty, last_db) {
+        for bytes in ctx.prefix(db, clock_ms, is_empty) {
             out.push(AofMessage::Append {
                 lsn: 0,
                 db,
-                bytes: select_bytes,
+                bytes,
                 epoch,
+                clock_ms: 0,
             });
         }
         out.push(msg);
@@ -1054,7 +1076,10 @@ pub fn replay_aof(
     path: &Path,
     engine: &dyn CommandReplayEngine,
 ) -> Result<usize, MoonError> {
-    let _clock = crate::persistence::replay::clock::pin_replay_clock_to_files(&[path]);
+    let _clock = crate::persistence::replay::clock::pin_replay_clock_to_log(
+        path,
+        crate::persistence::replay::clock::LogFormat::Resp,
+    );
     replay_aof_with_resync(databases, path, engine, aof_best_effort_resync_enabled())
 }
 
@@ -1165,6 +1190,9 @@ fn replay_aof_with_resync(
                         continue;
                     }
                 };
+                // R2 review of moon#1283: where a clean-close marker's
+                // segment starts (absolute: the reader includes the preamble).
+                crate::persistence::replay::clock::at_record_end(chunks.offset());
                 engine.replay_command(databases, cmd, cmd_args, &mut selected_db);
                 count += 1;
             }
@@ -1870,6 +1898,7 @@ mod fold_floor_tests {
             db,
             bytes: Bytes::from_static(payload),
             epoch,
+            clock_ms: 0,
         }
     }
 
@@ -1897,11 +1926,12 @@ mod fold_floor_tests {
                 bytes: Bytes::from_static(b"pre-sync"),
                 ack: ack_tx,
                 epoch: FoldEpoch(2),
+                clock_ms: 0,
             },
             append(b"post", 0, FoldEpoch(3)),
         ];
-        let mut last_db = 0usize;
-        let out = inject_select_records(batch, floor, &mut last_db);
+        let mut last_db = RecordCtx::new();
+        let out = inject_record_prefixes(batch, floor, &mut last_db);
         assert_eq!(payloads(&out), vec![b"post".to_vec()]);
         assert_eq!(
             ack_rx.try_recv(),
@@ -1920,10 +1950,10 @@ mod fold_floor_tests {
             append(b"pre-db5", 5, FoldEpoch::INITIAL),
             append(b"post-db0", 0, FoldEpoch(1)),
         ];
-        let mut last_db = 0usize;
-        let out = inject_select_records(batch, floor, &mut last_db);
+        let mut last_db = RecordCtx::new();
+        let out = inject_record_prefixes(batch, floor, &mut last_db);
         assert_eq!(payloads(&out), vec![b"post-db0".to_vec()]);
-        assert_eq!(last_db, 0);
+        assert_eq!(last_db.db(), 0);
     }
 
     #[test]
@@ -1935,9 +1965,10 @@ mod fold_floor_tests {
             bytes: Bytes::new(),
             ack: ack_tx,
             epoch: FoldEpoch::INITIAL,
+            clock_ms: 0,
         }];
-        let mut last_db = 0usize;
-        let out = inject_select_records(batch, FoldEpoch(9), &mut last_db);
+        let mut last_db = RecordCtx::new();
+        let out = inject_record_prefixes(batch, FoldEpoch(9), &mut last_db);
         assert_eq!(out.len(), 1, "the barrier must reach the fsync");
         assert!(
             ack_rx.try_recv().is_err(),
@@ -1948,8 +1979,8 @@ mod fold_floor_tests {
     #[test]
     fn no_record_is_below_the_initial_floor() {
         let batch = vec![append(b"x", 0, FoldEpoch::INITIAL)];
-        let mut last_db = 0usize;
-        let out = inject_select_records(batch, FoldEpoch::INITIAL, &mut last_db);
+        let mut last_db = RecordCtx::new();
+        let out = inject_record_prefixes(batch, FoldEpoch::INITIAL, &mut last_db);
         assert_eq!(out.len(), 1);
     }
 
@@ -1964,14 +1995,15 @@ mod fold_floor_tests {
             append(b"b", 2, FoldEpoch(5)),
         ];
         let ptr = batch.as_ptr();
-        let mut last_db = 2usize;
-        let out = inject_select_records(batch, FoldEpoch(4), &mut last_db);
+        let mut last_db = RecordCtx::new();
+        assert_eq!(last_db.prefix(2, 0, false).count(), 1, "SELECT 2");
+        let out = inject_record_prefixes(batch, FoldEpoch(4), &mut last_db);
         assert_eq!(out.as_ptr(), ptr, "fast path must not reallocate");
         assert_eq!(
             payloads(&out),
             vec![b"a".to_vec(), b"".to_vec(), b"b".to_vec()]
         );
-        assert_eq!(last_db, 2);
+        assert_eq!(last_db.db(), 2);
     }
 
     /// The fast path hands over exactly what the full path would produce:
@@ -1986,8 +2018,8 @@ mod fold_floor_tests {
                 append(b"d", 0, FoldEpoch(9)),
             ]
         };
-        let mut last_db = 0usize;
-        let out = inject_select_records(mk(), FoldEpoch(4), &mut last_db);
+        let mut last_db = RecordCtx::new();
+        let out = inject_record_prefixes(mk(), FoldEpoch(4), &mut last_db);
         assert_eq!(
             payloads(&out),
             vec![
@@ -1998,6 +2030,6 @@ mod fold_floor_tests {
                 b"d".to_vec(),
             ]
         );
-        assert_eq!(last_db, 0);
+        assert_eq!(last_db.db(), 0);
     }
 }

@@ -4,12 +4,16 @@
 //! Extracted from `server/connection.rs` (Plan 48-02).
 
 mod dispatch;
+mod exit;
 mod ft;
 pub(crate) mod idle_park;
 mod pubsub;
 mod read;
 mod txn;
 mod write;
+
+use exit::BodyExit;
+pub(crate) use exit::handle_connection_sharded_monoio;
 
 /// c10k C1 — bound a reply write so a peer that stops reading cannot park the
 /// handler forever.
@@ -376,11 +380,15 @@ fn run_write_eviction_gate(
     if shrink_only { Ok(()) } else { db_quota_result }
 }
 
-/// Monoio connection handler using ownership-based I/O (AsyncReadRent/AsyncWriteRent).
+/// Monoio connection body using ownership-based I/O (AsyncReadRent/AsyncWriteRent).
 /// Dispatches commands through `crate::command::dispatch()` with monoio's ownership I/O model.
+///
+/// moon#1299: entered ONLY through [`exit::handle_connection_sharded_monoio`],
+/// which owns `conn` and runs the connection's exit epilogue (the open-TXN
+/// abort) after this returns — by ANY `return`, `break` or hand-off — and
+/// closes the socket only after it (a [`BodyExit`], moon#1299 R2 N1).
 #[cfg(feature = "runtime-monoio")]
-#[tracing::instrument(skip_all, level = "debug")]
-pub(crate) async fn handle_connection_sharded_monoio<
+async fn handle_connection_body<
     S: monoio::io::AsyncReadRent + monoio::io::AsyncWriteRent + idle_park::IdleParkRead,
 >(
     mut stream: S,
@@ -388,7 +396,6 @@ pub(crate) async fn handle_connection_sharded_monoio<
     ctx: &super::core::ConnectionContext,
     shutdown: CancellationToken,
     client_id: u64,
-    can_migrate: bool,
     initial_read_buf: BytesMut,
     migrated_state: Option<&MigratedConnectionState>,
     // Raw socket fd for CLIENT KILL force-close (R-3), or -1 if unavailable
@@ -398,7 +405,9 @@ pub(crate) async fn handle_connection_sharded_monoio<
     // c1M P1 park plumbing: opt-in flag + optional registration carried
     // across a park/wake cycle (see [`ParkArgs`]).
     park: ParkArgs,
-) -> (MonoioHandlerResult, Option<S>) {
+    // Owned by the exit wrapper, which ends its open TXN (moon#1299).
+    conn: &mut super::core::ConnectionState,
+) -> (MonoioHandlerResult, BodyExit<S>) {
     use monoio::io::AsyncWriteRentExt;
 
     // Solo-conn spin gate (L1 convoy fix): register this connection on the
@@ -436,17 +445,6 @@ pub(crate) async fn handle_connection_sharded_monoio<
     // more (pipelined tails crossing a migration stalled indefinitely).
     let mut carried_input = !read_buf.is_empty();
     let mut codec = RespCodec::default();
-    let mut conn = super::core::ConnectionState::new(
-        client_id,
-        peer_addr.clone(),
-        &ctx.requirepass,
-        ctx.shard_id,
-        ctx.num_shards,
-        can_migrate,
-        ctx.runtime_config.read().acllog_max_len,
-        migrated_state,
-    );
-    conn.refresh_acl_cache(&ctx.acl_table);
     let db_count = ctx.shard_databases.db_count();
 
     // Register in global client registry for CLIENT LIST/INFO/KILL. A
@@ -645,7 +643,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
         crate::server::conn::shared::publish_pubsub_counts(
             &client_live,
             &ctx.shard_pubsub(),
-            &mut conn,
+            conn,
             ctx.cached_clock.ms(),
         );
 
@@ -726,7 +724,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                                                         codec.encode_frame(&err, &mut resp_buf);
                                                         let data = resp_buf.freeze();
                                                         let (wr, _): (std::io::Result<usize>, bytes::Bytes) = stream.write_all(data).await;
-                                                        if wr.is_err() { return (MonoioHandlerResult::Done, None); }
+                                                        if wr.is_err() { return (MonoioHandlerResult::Done, BodyExit::Close(stream)); }
                                                         continue;
                                                     }
                                                     for arg in cmd_args {
@@ -742,7 +740,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                                                                 codec.encode_frame(&err, &mut resp_buf);
                                                                 let data = resp_buf.freeze();
                                                                 let (wr, _): (std::io::Result<usize>, bytes::Bytes) = stream.write_all(data).await;
-                                                                if wr.is_err() { return (MonoioHandlerResult::Done, None); }
+                                                                if wr.is_err() { return (MonoioHandlerResult::Done, BodyExit::Close(stream)); }
                                                                 continue;
                                                             }
                                                             #[allow(clippy::unwrap_used)] // conn.pubsub_tx is always Some when in subscriber mode
@@ -765,7 +763,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                                                             codec.encode_frame(&resp, &mut resp_buf);
                                                             let data = resp_buf.freeze();
                                                             let (wr, _): (std::io::Result<usize>, bytes::Bytes) = stream.write_all(data).await;
-                                                            if wr.is_err() { return (MonoioHandlerResult::Done, None); }
+                                                            if wr.is_err() { return (MonoioHandlerResult::Done, BodyExit::Close(stream)); }
                                                         }
                                                     }
                                                 }
@@ -786,7 +784,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                                                         codec.encode_frame(&err, &mut resp_buf);
                                                         let data = resp_buf.freeze();
                                                         let (wr, _): (std::io::Result<usize>, bytes::Bytes) = stream.write_all(data).await;
-                                                        if wr.is_err() { return (MonoioHandlerResult::Done, None); }
+                                                        if wr.is_err() { return (MonoioHandlerResult::Done, BodyExit::Close(stream)); }
                                                         continue;
                                                     }
                                                     for arg in cmd_args {
@@ -801,7 +799,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                                                                 codec.encode_frame(&err, &mut resp_buf);
                                                                 let data = resp_buf.freeze();
                                                                 let (wr, _): (std::io::Result<usize>, bytes::Bytes) = stream.write_all(data).await;
-                                                                if wr.is_err() { return (MonoioHandlerResult::Done, None); }
+                                                                if wr.is_err() { return (MonoioHandlerResult::Done, BodyExit::Close(stream)); }
                                                                 continue;
                                                             }
                                                             #[allow(clippy::unwrap_used)] // conn.pubsub_tx is always Some in subscriber mode
@@ -818,7 +816,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                                                             codec.encode_frame(&resp, &mut resp_buf);
                                                             let data = resp_buf.freeze();
                                                             let (wr, _): (std::io::Result<usize>, bytes::Bytes) = stream.write_all(data).await;
-                                                            if wr.is_err() { return (MonoioHandlerResult::Done, None); }
+                                                            if wr.is_err() { return (MonoioHandlerResult::Done, BodyExit::Close(stream)); }
                                                         }
                                                     }
                                                 }
@@ -835,7 +833,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                                                         codec.encode_frame(&resp, &mut resp_buf);
                                                         let data = resp_buf.freeze();
                                                         let (wr, _): (std::io::Result<usize>, bytes::Bytes) = stream.write_all(data).await;
-                                                        if wr.is_err() { return (MonoioHandlerResult::Done, None); }
+                                                        if wr.is_err() { return (MonoioHandlerResult::Done, BodyExit::Close(stream)); }
                                                     } else {
                                                         for ch in &targets {
                                                             ctx.pubsub_registry.write().sunsubscribe(ch.as_ref(), conn.subscriber_id);
@@ -846,7 +844,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                                                             codec.encode_frame(&resp, &mut resp_buf);
                                                             let data = resp_buf.freeze();
                                                             let (wr, _): (std::io::Result<usize>, bytes::Bytes) = stream.write_all(data).await;
-                                                            if wr.is_err() { return (MonoioHandlerResult::Done, None); }
+                                                            if wr.is_err() { return (MonoioHandlerResult::Done, BodyExit::Close(stream)); }
                                                         }
                                                     }
                                                 }
@@ -863,7 +861,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                                                             codec.encode_frame(&resp, &mut resp_buf);
                                                             let data = resp_buf.freeze();
                                                             let (wr, _): (std::io::Result<usize>, bytes::Bytes) = stream.write_all(data).await;
-                                                            if wr.is_err() { return (MonoioHandlerResult::Done, None); }
+                                                            if wr.is_err() { return (MonoioHandlerResult::Done, BodyExit::Close(stream)); }
                                                         } else {
                                                             for ch in &removed {
                                                                 conn.subscription_count = conn.subscription_count.saturating_sub(1);
@@ -872,7 +870,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                                                                 codec.encode_frame(&resp, &mut resp_buf);
                                                                 let data = resp_buf.freeze();
                                                                 let (wr, _): (std::io::Result<usize>, bytes::Bytes) = stream.write_all(data).await;
-                                                                if wr.is_err() { return (MonoioHandlerResult::Done, None); }
+                                                                if wr.is_err() { return (MonoioHandlerResult::Done, BodyExit::Close(stream)); }
                                                             }
                                                         }
                                                     } else {
@@ -886,7 +884,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                                                                 codec.encode_frame(&resp, &mut resp_buf);
                                                                 let data = resp_buf.freeze();
                                                                 let (wr, _): (std::io::Result<usize>, bytes::Bytes) = stream.write_all(data).await;
-                                                                if wr.is_err() { return (MonoioHandlerResult::Done, None); }
+                                                                if wr.is_err() { return (MonoioHandlerResult::Done, BodyExit::Close(stream)); }
                                                             }
                                                         }
                                                     }
@@ -898,7 +896,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                                                         codec.encode_frame(&err, &mut resp_buf);
                                                         let data = resp_buf.freeze();
                                                         let (wr, _): (std::io::Result<usize>, bytes::Bytes) = stream.write_all(data).await;
-                                                        if wr.is_err() { return (MonoioHandlerResult::Done, None); }
+                                                        if wr.is_err() { return (MonoioHandlerResult::Done, BodyExit::Close(stream)); }
                                                         continue;
                                                     }
                                                     for arg in cmd_args {
@@ -914,7 +912,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                                                                 codec.encode_frame(&err, &mut resp_buf);
                                                                 let data = resp_buf.freeze();
                                                                 let (wr, _): (std::io::Result<usize>, bytes::Bytes) = stream.write_all(data).await;
-                                                                if wr.is_err() { return (MonoioHandlerResult::Done, None); }
+                                                                if wr.is_err() { return (MonoioHandlerResult::Done, BodyExit::Close(stream)); }
                                                                 continue;
                                                             }
                                                             #[allow(clippy::unwrap_used)] // conn.pubsub_tx is always Some when in subscriber mode
@@ -937,7 +935,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                                                             codec.encode_frame(&resp, &mut resp_buf);
                                                             let data = resp_buf.freeze();
                                                             let (wr, _): (std::io::Result<usize>, bytes::Bytes) = stream.write_all(data).await;
-                                                            if wr.is_err() { return (MonoioHandlerResult::Done, None); }
+                                                            if wr.is_err() { return (MonoioHandlerResult::Done, BodyExit::Close(stream)); }
                                                         }
                                                     }
                                                 }
@@ -954,7 +952,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                                                             codec.encode_frame(&resp, &mut resp_buf);
                                                             let data = resp_buf.freeze();
                                                             let (wr, _): (std::io::Result<usize>, bytes::Bytes) = stream.write_all(data).await;
-                                                            if wr.is_err() { return (MonoioHandlerResult::Done, None); }
+                                                            if wr.is_err() { return (MonoioHandlerResult::Done, BodyExit::Close(stream)); }
                                                         } else {
                                                             for pat in &removed {
                                                                 conn.subscription_count = conn.subscription_count.saturating_sub(1);
@@ -963,7 +961,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                                                                 codec.encode_frame(&resp, &mut resp_buf);
                                                                 let data = resp_buf.freeze();
                                                                 let (wr, _): (std::io::Result<usize>, bytes::Bytes) = stream.write_all(data).await;
-                                                                if wr.is_err() { return (MonoioHandlerResult::Done, None); }
+                                                                if wr.is_err() { return (MonoioHandlerResult::Done, BodyExit::Close(stream)); }
                                                             }
                                                         }
                                                     } else {
@@ -977,7 +975,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                                                                 codec.encode_frame(&resp, &mut resp_buf);
                                                                 let data = resp_buf.freeze();
                                                                 let (wr, _): (std::io::Result<usize>, bytes::Bytes) = stream.write_all(data).await;
-                                                                if wr.is_err() { return (MonoioHandlerResult::Done, None); }
+                                                                if wr.is_err() { return (MonoioHandlerResult::Done, BodyExit::Close(stream)); }
                                                             }
                                                         }
                                                     }
@@ -991,7 +989,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                                                     codec.encode_frame(&resp, &mut resp_buf);
                                                     let data = resp_buf.freeze();
                                                     let (wr, _): (std::io::Result<usize>, bytes::Bytes) = stream.write_all(data).await;
-                                                    if wr.is_err() { return (MonoioHandlerResult::Done, None); }
+                                                    if wr.is_err() { return (MonoioHandlerResult::Done, BodyExit::Close(stream)); }
                                                 }
                                                 _ if cmd.eq_ignore_ascii_case(b"QUIT") => {
                                                     let resp = Frame::SimpleString(Bytes::from_static(b"OK"));
@@ -1000,7 +998,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                                                     let data = resp_buf.freeze();
                                                     let (wr, _): (std::io::Result<usize>, bytes::Bytes) = stream.write_all(data).await;
                                                     let _ = wr; // ignore write error on quit
-                                                    return (MonoioHandlerResult::Done, None); // exit connection
+                                                    return (MonoioHandlerResult::Done, BodyExit::Close(stream)); // exit connection
                                                 }
                                                 _ if cmd.eq_ignore_ascii_case(b"RESET") => {
                                                     // The sanctioned way out of subscriber mode, and
@@ -1013,24 +1011,24 @@ pub(crate) async fn handle_connection_sharded_monoio<
                                                     // into the reply stream of a connection that
                                                     // believes it is back to ordinary commands.
                                                     let mut out: Vec<Frame> = Vec::with_capacity(1);
-                                                    crate::server::conn::shared::try_handle_reset(
+                                                    // moon#1299 R1: also ends an open TXN.
+                                                    crate::server::conn::txn_abort::try_handle_reset(
+                                                        ctx,
+                                                        ft::abort_replicator(ctx),
                                                         cmd,
                                                         cmd_args,
                                                         client_id,
-                                                        &mut conn,
-                                                        &ctx.requirepass,
-                                                        &ctx.tracking_table,
-                                                        &ctx.shard_pubsub(),
+                                                        conn,
                                                         &mut out,
                                                         Some(&mut codec),
-                                                    );
+                                                    ).await;
                                                     let mut resp_buf = BytesMut::new();
                                                     for resp in &out {
                                                         codec.encode_frame(resp, &mut resp_buf);
                                                     }
                                                     let data = resp_buf.freeze();
                                                     let (wr, _): (std::io::Result<usize>, bytes::Bytes) = stream.write_all(data).await;
-                                                    if wr.is_err() { return (MonoioHandlerResult::Done, None); }
+                                                    if wr.is_err() { return (MonoioHandlerResult::Done, BodyExit::Close(stream)); }
                                                     // The count is 0 now: the check below hands the
                                                     // rest of the batch back to the normal path.
                                                 }
@@ -1043,7 +1041,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                                                     codec.encode_frame(&err, &mut resp_buf);
                                                     let data = resp_buf.freeze();
                                                     let (wr, _): (std::io::Result<usize>, bytes::Bytes) = stream.write_all(data).await;
-                                                    if wr.is_err() { return (MonoioHandlerResult::Done, None); }
+                                                    if wr.is_err() { return (MonoioHandlerResult::Done, BodyExit::Close(stream)); }
                                                 }
                                             }
                                         }
@@ -1069,7 +1067,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                                             let (_wr, _b): (std::io::Result<usize>, bytes::Bytes) =
                                                 stream.write_all(data).await;
                                         }
-                                        return (MonoioHandlerResult::Done, None);
+                                        return (MonoioHandlerResult::Done, BodyExit::Close(stream));
                                     }
                                 }
                             }
@@ -1463,7 +1461,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                                 state,
                                 registry_guard,
                             },
-                            Some(stream),
+                            BodyExit::HandOff(stream),
                         );
                     }
                 }
@@ -1756,9 +1754,9 @@ pub(crate) async fn handle_connection_sharded_monoio<
             // cross-store transaction the generic write leg captures an undo
             // record (`txn.kv_undo.record_insert` / `record_update`) and a
             // write intent (`s.kv_write_intents.record_write`) BEFORE
-            // dispatching — all three in the cross-txn arm further down THIS
-            // file; grep the names rather than trusting a line number, the
-            // two cited here had already drifted by ~120 lines once.
+            // dispatching — `transaction::conn_capture::capture_conn_write`,
+            // called from the cross-txn arm further down THIS file (grep the
+            // name rather than trusting a line number).
             // `try_inline_dispatch` does
             // neither — grepping `cross_txn`/`kv_undo`/`write_intent` in
             // `server/conn/blocking.rs` returns nothing.
@@ -1936,7 +1934,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                     client_live,
                     client_id
                 );
-                return (MonoioHandlerResult::Done, None);
+                return (MonoioHandlerResult::Done, BodyExit::Close(stream));
             }
             continue;
         }
@@ -2030,7 +2028,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
             // --- AUTH gate ---
             match dispatch::check_auth_gate(
                 &frame,
-                &mut conn,
+                conn,
                 ctx,
                 &peer_addr,
                 client_id,
@@ -2226,7 +2224,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 && dispatch::try_handle_auth(
                     cmd,
                     cmd_args,
-                    &mut conn,
+                    conn,
                     ctx,
                     &peer_addr,
                     &mut auth_delay_ms,
@@ -2240,7 +2238,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 && dispatch::try_handle_hello(
                     cmd,
                     cmd_args,
-                    &mut conn,
+                    conn,
                     ctx,
                     client_id,
                     &peer_addr,
@@ -2258,18 +2256,19 @@ pub(crate) async fn handle_connection_sharded_monoio<
             // lost track of that state. It is also above the MULTI queueing
             // step below — measured on redis-server 8.6.1, RESET inside MULTI
             // executes immediately and discards the transaction.
+            // moon#1299 R1: RESET also ends an open TXN (`txn_abort`).
             if cmd_len == 5
-                && crate::server::conn::shared::try_handle_reset(
+                && crate::server::conn::txn_abort::try_handle_reset(
+                    ctx,
+                    ft::abort_replicator(ctx),
                     cmd,
                     cmd_args,
                     client_id,
-                    &mut conn,
-                    &ctx.requirepass,
-                    &ctx.tracking_table,
-                    &ctx.shard_pubsub(),
+                    conn,
                     &mut responses,
                     Some(&mut codec),
                 )
+                .await
             {
                 continue;
             }
@@ -2305,7 +2304,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 continue;
             }
 
-            if dispatch::try_enforce_acl(cmd, cmd_args, &mut conn, ctx, &peer_addr, shaped!()) {
+            if dispatch::try_enforce_acl(cmd, cmd_args, conn, ctx, &peer_addr, shaped!()) {
                 continue;
             }
 
@@ -2400,7 +2399,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 // a PUBLISH channel — refuse a denied one HERE so the block
                 // aborts, instead of at EXEC after the rest of it ran.
                 if let Some(err) = crate::server::conn::shared::conn_queued_publish_channel_deny(
-                    &conn,
+                    &*conn,
                     &ctx.acl_table,
                     cmd,
                     cmd_args,
@@ -2534,7 +2533,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 && dispatch::try_handle_evalsha(
                     cmd,
                     cmd_args,
-                    &mut conn,
+                    conn,
                     ctx,
                     shaped!(),
                     &mut local_leg_write_idxs,
@@ -2547,7 +2546,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 && dispatch::try_handle_eval(
                     cmd,
                     cmd_args,
-                    &mut conn,
+                    conn,
                     ctx,
                     &shutdown,
                     shaped!(),
@@ -2562,11 +2561,11 @@ pub(crate) async fn handle_connection_sharded_monoio<
             {
                 continue;
             }
-            if dispatch::try_handle_cluster_routing(cmd, cmd_args, &mut conn, ctx, shaped!()) {
+            if dispatch::try_handle_cluster_routing(cmd, cmd_args, conn, ctx, shaped!()) {
                 continue;
             }
             if cmd_len == 3
-                && dispatch::try_handle_acl(cmd, cmd_args, &mut conn, ctx, &peer_addr, shaped!())
+                && dispatch::try_handle_acl(cmd, cmd_args, conn, ctx, &peer_addr, shaped!())
             {
                 continue;
             }
@@ -2609,7 +2608,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                     )
                     .await;
                     crate::server::conn::shared::encode_response_batch(
-                        &mut conn,
+                        conn,
                         &responses,
                         &mut write_buf,
                     );
@@ -2623,7 +2622,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                             client_live,
                             client_id
                         ) {
-                            return (MonoioHandlerResult::Done, None);
+                            return (MonoioHandlerResult::Done, BodyExit::Close(stream));
                         }
                     }
                     return (
@@ -2632,7 +2631,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                             client_offset: offset,
                             peer_addr: peer_addr.clone(),
                         },
-                        Some(stream),
+                        BodyExit::HandOff(stream),
                     );
                 }
                 // try_handle_psync may have pushed an error response (multi-shard,
@@ -2643,7 +2642,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
             }
             if !skip_name_gates
                 && cmd_len == 4
-                && dispatch::try_handle_info(cmd, cmd_args, &conn, ctx, shaped!()).await
+                && dispatch::try_handle_info(cmd, cmd_args, &*conn, ctx, shaped!()).await
             {
                 continue;
             }
@@ -2664,7 +2663,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
             }
             // CLIENT early (ID, SETNAME, GETNAME, TRACKING) -- admin subcmds fall through to ACL gate
             if cmd_len == 6
-                && dispatch::try_handle_client_early(cmd, cmd_args, client_id, &mut conn, shaped!())
+                && dispatch::try_handle_client_early(cmd, cmd_args, client_id, conn, shaped!())
             {
                 continue;
             }
@@ -2676,7 +2675,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 && pubsub::try_handle_publish(
                     cmd,
                     cmd_args,
-                    &conn,
+                    &*conn,
                     ctx,
                     &mut responses,
                     &mut publish_batches,
@@ -2687,7 +2686,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
             match pubsub::try_handle_subscribe_entry(
                 cmd,
                 cmd_args,
-                &mut conn,
+                conn,
                 ctx,
                 &peer_addr,
                 &mut responses,
@@ -2718,7 +2717,9 @@ pub(crate) async fn handle_connection_sharded_monoio<
                     }
                     break;
                 }
-                pubsub::SubscribeResult::WriteError => return (MonoioHandlerResult::Done, None),
+                pubsub::SubscribeResult::WriteError => {
+                    return (MonoioHandlerResult::Done, BodyExit::Close(stream));
+                }
             }
             if !skip_name_gates && pubsub::try_handle_unsubscribe(cmd, &mut responses) {
                 continue;
@@ -2748,7 +2749,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
             // the invariant the code above it violated.
             // --- SWAPDB: handler-layer intercept (needs async + multi-db access) ---
             if !skip_name_gates
-                && dispatch::try_handle_swapdb(cmd, cmd_args, &mut conn, ctx, shaped!()).await
+                && dispatch::try_handle_swapdb(cmd, cmd_args, conn, ctx, shaped!()).await
             {
                 continue;
             }
@@ -2757,7 +2758,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                     cmd,
                     cmd_args,
                     client_id,
-                    &conn,
+                    &*conn,
                     &ctx.shard_pubsub(),
                     shaped!(),
                 )
@@ -2771,7 +2772,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                     cmd,
                     cmd_args,
                     client_id,
-                    &mut conn,
+                    conn,
                     ctx,
                     shaped!(),
                 )
@@ -2791,7 +2792,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 && dispatch::try_handle_functions(
                     cmd,
                     cmd_args,
-                    &mut conn,
+                    conn,
                     ctx,
                     &func_registry,
                     &shutdown,
@@ -2805,17 +2806,17 @@ pub(crate) async fn handle_connection_sharded_monoio<
 
             // --- TXN.BEGIN / TXN.COMMIT / TXN.ABORT ---
             if !skip_name_gates
-                && txn::try_handle_txn_begin(cmd, cmd_args, &mut conn, ctx, &mut responses)
+                && txn::try_handle_txn_begin(cmd, cmd_args, conn, ctx, &mut responses)
             {
                 continue;
             }
             if !skip_name_gates
-                && txn::try_handle_txn_commit(cmd, cmd_args, &mut conn, ctx, &mut responses).await
+                && txn::try_handle_txn_commit(cmd, cmd_args, conn, ctx, &mut responses).await
             {
                 continue;
             }
             if !skip_name_gates
-                && txn::try_handle_txn_abort(cmd, cmd_args, &mut conn, ctx, &mut responses).await
+                && txn::try_handle_txn_abort(cmd, cmd_args, conn, ctx, &mut responses).await
             {
                 continue;
             }
@@ -2835,22 +2836,15 @@ pub(crate) async fn handle_connection_sharded_monoio<
 
             // --- WS.* ---
             if !skip_name_gates
-                && write::try_handle_ws_command(cmd, cmd_args, &mut conn, ctx, &mut responses).await
+                && write::try_handle_ws_command(cmd, cmd_args, conn, ctx, &mut responses).await
             {
                 continue;
             }
 
             // --- MQ.* ---
             if !skip_name_gates
-                && write::try_handle_mq_command(
-                    cmd,
-                    cmd_args,
-                    &frame,
-                    &mut conn,
-                    ctx,
-                    &mut responses,
-                )
-                .await
+                && write::try_handle_mq_command(cmd, cmd_args, &frame, conn, ctx, &mut responses)
+                    .await
             {
                 continue;
             }
@@ -2861,7 +2855,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 && write::try_handle_multi_exec(
                     cmd,
                     cmd_args,
-                    &mut conn,
+                    conn,
                     ctx,
                     &mut responses,
                     &mut exec_publishes,
@@ -2882,7 +2876,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                         // a denied channel is patched with NOPERM, never sent.
                         let patched =
                             match crate::server::conn::shared::conn_publish_channel_acl_deny(
-                                &conn,
+                                &*conn,
                                 &ctx.acl_table,
                                 &p.channel,
                             ) {
@@ -2908,7 +2902,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
             match dispatch::try_handle_blocking(
                 cmd,
                 cmd_args,
-                &mut conn,
+                conn,
                 ctx,
                 &mut responses,
                 &mut local_leg_write_idxs,
@@ -2936,10 +2930,14 @@ pub(crate) async fn handle_connection_sharded_monoio<
                     }
                     break;
                 }
-                dispatch::BlockingResult::WriteError => return (MonoioHandlerResult::Done, None),
+                dispatch::BlockingResult::WriteError => {
+                    return (MonoioHandlerResult::Done, BodyExit::Close(stream));
+                }
                 // c10k A1: peer vanished mid-block. Nothing to write; the
                 // registry entry and maxclients slot are released by returning.
-                dispatch::BlockingResult::PeerGone => return (MonoioHandlerResult::Done, None),
+                dispatch::BlockingResult::PeerGone => {
+                    return (MonoioHandlerResult::Done, BodyExit::Close(stream));
+                }
                 // The node became a replica: write the `-UNBLOCKED` reply and
                 // close, dropping anything pipelined behind it, as redis does.
                 dispatch::BlockingResult::HandledThenClose => {
@@ -3205,7 +3203,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 && dispatch::try_handle_cross_shard_commands(
                     cmd,
                     cmd_args,
-                    &conn,
+                    &*conn,
                     ctx,
                     shaped!(),
                     &mut local_leg_write_idxs,
@@ -3217,7 +3215,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
 
             // --- FT.* vector search commands ---
             if !skip_name_gates
-                && ft::try_handle_ft_command(cmd, cmd_args, &frame, &conn, ctx, &mut responses)
+                && ft::try_handle_ft_command(cmd, cmd_args, &frame, &*conn, ctx, &mut responses)
                     .await
             {
                 continue;
@@ -3226,15 +3224,8 @@ pub(crate) async fn handle_connection_sharded_monoio<
             // --- GRAPH.* graph commands ---
             #[cfg(feature = "graph")]
             if !skip_name_gates
-                && write::try_handle_graph_command(
-                    cmd,
-                    cmd_args,
-                    &frame,
-                    &mut conn,
-                    ctx,
-                    &mut responses,
-                )
-                .await
+                && write::try_handle_graph_command(cmd, cmd_args, &frame, conn, ctx, &mut responses)
+                    .await
             {
                 continue;
             }
@@ -3667,76 +3658,24 @@ pub(crate) async fn handle_connection_sharded_monoio<
                             run_write_eviction_gate(ctx, db, sel_db, cmd)?;
                         }
 
-                        // KV undo-log capture (MUST precede dispatch)
-                        if let Some(ref mut txn) = conn.active_cross_txn {
-                            if cmd.eq_ignore_ascii_case(b"DEL")
-                                || cmd.eq_ignore_ascii_case(b"UNLINK")
-                            {
-                                for arg in cmd_args.iter() {
-                                    if let Frame::BulkString(key_bytes) = arg {
-                                        if let Some(old_entry) = db.get(key_bytes.as_ref()).cloned()
-                                        {
-                                            txn.kv_undo.record_delete(
-                                                sel_db,
-                                                key_bytes.clone(),
-                                                old_entry,
-                                            );
-                                            let lsn = txn.snapshot_lsn;
-                                            let tid = txn.txn_id;
-                                            // Direct field access — the outer with_shard
-                                            // closure already owns `s`; re-entering
-                                            // with_shard here panics (slice re-entrancy
-                                            // guard). `db` borrows s.databases only, so
-                                            // s.kv_write_intents is a disjoint field (NLL).
-                                            s.kv_write_intents.record_write(
-                                                key_bytes.clone(),
-                                                lsn,
-                                                tid,
-                                            );
-                                        }
-                                    }
-                                }
-                            } else {
-                                // moon#500: this used to capture
-                                // `extract_primary_key`, which returns exactly
-                                // ONE key. A multi-key write (MSET, MSETNX,
-                                // BITOP, COPY, SINTERSTORE, ...) therefore
-                                // logged an undo record for its FIRST key only,
-                                // and `TXN ABORT` restored that one while
-                                // leaving the rest at their new values — an
-                                // acked abort landing a keyspace that is
-                                // neither the pre- nor the post-TXN image.
-                                //
-                                // `written_keys` walks the same key spec the
-                                // ACL and cache-invalidation paths use, and is
-                                // filtered to `KeyRole::Write`: reads are NOT
-                                // captured. That filter is load-bearing —
-                                // capturing read keys would inflate
-                                // `kv_write_intents`, which is the cross-shard
-                                // conflict surface, turning working
-                                // transactions into spurious conflicts.
-                                //
-                                // An argv the walker cannot enumerate falls
-                                // back to the historical single-key capture;
-                                // one it read and found write-free (`SORT
-                                // src`, no `STORE`) captures nothing — see
-                                // `conn_txn_capture_keys`.
-                                let lsn = txn.snapshot_lsn;
-                                let tid = txn.txn_id;
-                                let written =
-                                    crate::transaction::conn_txn_capture_keys(cmd, cmd_args);
-                                for key in written {
-                                    match db.get(key.as_ref()).cloned() {
-                                        None => txn.kv_undo.record_insert(sel_db, key.clone()),
-                                        Some(entry) => {
-                                            txn.kv_undo.record_update(sel_db, key.clone(), entry)
-                                        }
-                                    }
-                                    // Direct field access — see DEL/UNLINK arm above.
-                                    s.kv_write_intents.record_write(key, lsn, tid);
-                                }
+                        // KV undo-log capture (MUST precede dispatch):
+                        // pre-images, write intents and moon#1299 holds of
+                        // every key this write may write — or the TXNCONFLICT
+                        // refusal when another TXN holds one. moon#500 /
+                        // moon#1303 rationale in `transaction::conn_capture`.
+                        let txn_capture = match conn.active_cross_txn.as_deref_mut() {
+                            Some(txn) => {
+                                Some(crate::transaction::conn_capture::capture_conn_write(
+                                    txn,
+                                    &mut s.kv_write_intents,
+                                    db,
+                                    sel_db,
+                                    cmd,
+                                    cmd_args,
+                                )?)
                             }
-                        }
+                            None => None,
+                        };
 
                         // Dispatch — the timed interval is exactly this call.
                         let mut new_sel_db = sel_db;
@@ -3750,6 +3689,12 @@ pub(crate) async fn handle_connection_sharded_monoio<
                         // Borrow, never clone: this is a one-bit question and
                         // the reply may be a whole `Frame::Array`.
                         let is_error = result.is_error();
+                        // moon#1303: an erroring TXN write takes its capture back.
+                        if let (Some(capture), Some(txn)) =
+                            (txn_capture, conn.active_cross_txn.as_deref_mut())
+                        {
+                            capture.finish(is_error, txn, &mut s.kv_write_intents);
+                        }
 
                         // HSET auto-index: disjoint field borrows (NLL)
                         // &mut s.vector_store + &mut s.text_store are separate
@@ -3915,7 +3860,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                     let fold_stamp = ctx
                         .aof_pool
                         .as_ref()
-                        .map_or(aof::FoldEpoch::INITIAL, |pool| {
+                        .map_or(aof::AppendStamp::INITIAL, |pool| {
                             pool.fold_stamp(ctx.shard_id)
                         });
 
@@ -4903,7 +4848,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
         // Serialize all responses into write_buf, then do ONE write_all syscall.
         // `encode_batch`, not a bare loop: a pipelined HELLO changes the protocol
         // partway through and the replies before it must keep the old encoding.
-        crate::server::conn::shared::encode_response_batch(&mut conn, &responses, &mut write_buf);
+        crate::server::conn::shared::encode_response_batch(conn, &responses, &mut write_buf);
 
         // Write all responses in one batch using ownership I/O
         let write_high_water = write_buf.len();
@@ -4936,7 +4881,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
         crate::server::conn::shared::publish_pubsub_counts(
             &client_live,
             &ctx.shard_pubsub(),
-            &mut conn,
+            conn,
             ctx.cached_clock.ms(),
         );
 
@@ -4972,7 +4917,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                     state: migrated_state,
                     target_shard,
                 },
-                Some(stream),
+                BodyExit::HandOff(stream),
             );
         }
 
@@ -4989,7 +4934,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
         if !frames_carried && let Some(kind) = proto_fault.take() {
             let data = bytes::Bytes::from(super::util::proto_error_frame(kind));
             let (_wr, _b): (std::io::Result<usize>, bytes::Bytes) = stream.write_all(data).await;
-            return (MonoioHandlerResult::Done, None);
+            return (MonoioHandlerResult::Done, BodyExit::Close(stream));
         }
 
         // Check shutdown (polled after each batch -- acceptable for MVP)
@@ -5042,31 +4987,10 @@ pub(crate) async fn handle_connection_sharded_monoio<
         }
     }
 
-    // --- Graceful TCP shutdown: send FIN to client to avoid CLOSE_WAIT ---
-    // Uses monoio's own shutdown() which properly manages the fd through
-    // the runtime (unlike raw libc::shutdown which corrupts monoio state).
-    let _ = stream.shutdown().await;
-
-    // Phase 166: release any leaked cross-store TXN (client disconnected mid-txn).
-    // Idempotent: TXN.ABORT already takes() active_cross_txn so this is a no-op if abort ran.
-    // Closes T-161-05 — without this, a disconnect after TXN.BEGIN + SET would leak
-    // kv_intents and pin the key invisible for all subsequent readers. Mirrors the
-    // sharded runtime block in handler_sharded.rs so both paths delegate to the same
-    // shared helper. FIN has already been sent; shard state is still intact.
-    if let Some(txn) = conn.active_cross_txn.take() {
-        // Box::pin (c10k future diet): this ~5.4 KB rollback state machine
-        // otherwise sits inline in EVERY connection future; boxing costs one
-        // alloc on the leaked-txn teardown path only.
-        // A refusal is counted by the pool and logged by `abort_logged`
-        // (moon#1285 review MINOR 5); there is no client left to tell.
-        let _refused = Box::pin(crate::server::conn::txn_abort::abort_logged(
-            ctx,
-            *txn,
-            ft::abort_replicator(ctx),
-            crate::server::conn::txn_abort::AbortCause::Disconnect,
-        ))
-        .await;
-    }
+    // Phase 166 / moon#1299: the exit wrapper (`exit.rs`) ends an open
+    // cross-store TXN after this body returns, THEN closes the socket — the
+    // graceful `shutdown()` (FIN) for this path (`BodyExit::Shutdown`), a
+    // drop for every early `return` above (`BodyExit::Close`).
 
     // --- Disconnect cleanup: propagate unsubscribe to all shards' remote subscriber maps ---
     if conn.subscriber_id > 0 {
@@ -5150,5 +5074,5 @@ pub(crate) async fn handle_connection_sharded_monoio<
     // AtomicU64 counter — it wraps to u64::MAX on the second subtraction
     // and all subsequent `try_accept_connection` comparisons against
     // `maxclients` reject new connections.
-    (MonoioHandlerResult::Done, None)
+    (MonoioHandlerResult::Done, BodyExit::Shutdown(stream))
 }

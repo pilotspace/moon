@@ -173,3 +173,8 @@ doc = false
 name = "graph_wal_replay"
 path = "fuzz_targets/graph_wal_replay.rs"
 doc = false
+
+[[bin]]
+name = "aof_incr_replay"
+path = "fuzz_targets/aof_incr_replay.rs"
+doc = false

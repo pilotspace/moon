@@ -169,6 +169,53 @@ Moon uses forkless compartmentalized snapshots instead of Redis's `fork()` appro
 - DashTable segments are iterated asynchronously
 - Snapshot runs alongside normal operations without blocking
 
+### Automatic snapshots with disk offload
+
+With `--appendonly no` and `--disk-offload enable`, a cold key's spill file
+that is no longer referenced (the key was deleted, overwritten or promoted)
+is **held** on disk until a snapshot that started after it went unused has
+completed: until then that file is the key's only durable copy, and deleting
+it early could bring a deleted key back after a crash, or lose a live one.
+
+Nobody may ever run `BGSAVE` on such a server, so Moon requests the snapshot
+itself (moon#1289). After three cold orphan sweeps with a held file (about
+two minutes at the default `--cold-orphan-sweep-interval-secs 60`), it starts
+one, at most one per ten sweep intervals (about ten minutes). This happens
+**even with `save ""`**, and the snapshot is an ordinary `BGSAVE`: it
+overwrites the dump file in `--dir`, and moves `LASTSAVE`.
+
+The automatic snapshot never contains a `TXN`'s uncommitted writes:
+
+- While any `TXN` is open it is not requested; the next sweep asks again.
+- Each shard checks again as it starts its part. If an uncommitted `TXN`
+  write is in memory on that shard (one began after the request), the
+  whole snapshot is abandoned: no shard's file is replaced, `LASTSAVE` and
+  `rdb_last_bgsave_status` do not change, no held file is released, and a
+  later sweep asks again.
+- A `TXN` write that lands on a shard after that shard started is saved at
+  its pre-transaction value (copy-on-write).
+
+This guarantee covers only this automatic snapshot. `BGSAVE`, `SAVE`, the
+`--save` rules and `SHUTDOWN`'s save still capture uncommitted writes
+(moon#1300).
+
+The cost is starvation: a `TXN` left open, or `TXN` traffic that never
+pauses, keeps the snapshot from running. The held files then stay on disk,
+and `SWAPDB` stays refused for their databases, until a snapshot does run.
+There is no timeout. End or abort long transactions, or run `BGSAVE` in a
+quiet moment. `INFO` shows it: `cold_held_release_snapshots_deferred_txn`
+counts requests deferred for an open `TXN`, and
+`cold_held_release_snapshots_abandoned_txn` counts snapshots abandoned at a
+shard's start. Both keep growing while `cold_held_files_stale_databases`
+stays above 0.
+
+Watch it with `INFO`: `cold_held_files_stale_databases`,
+`cold_held_release_snapshots_requested`,
+`cold_held_release_snapshots_deferred_txn` and
+`cold_held_release_snapshots_abandoned_txn`. With `--appendonly yes` no
+snapshot is taken: an AOF rewrite releases the held files instead
+(`cold_held_release_folds_requested`).
+
 ## Using both
 
 For maximum durability, enable both AOF and RDB:

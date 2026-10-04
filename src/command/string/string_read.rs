@@ -4,7 +4,7 @@ use crate::protocol::Frame;
 use crate::storage::Database;
 use crate::storage::entry::current_time_ms;
 
-use super::{parse_i64, parse_positive_i64};
+use super::parse_i64;
 use crate::command::helpers::{err_wrong_args, extract_bytes};
 
 /// GET command handler.
@@ -273,68 +273,69 @@ pub fn getex(db: &mut Database, args: &[Frame]) -> Frame {
         // expiry index.
         if opt.eq_ignore_ascii_case(b"PERSIST") {
             db.set_expiry(key, 0);
-        } else if opt.eq_ignore_ascii_case(b"EX") {
-            if args.len() < 3 {
-                return Frame::Error(Bytes::from_static(b"ERR syntax error"));
-            }
-            match parse_positive_i64(&args[2]).and_then(|secs| (secs as u64).checked_mul(1000)) {
-                Some(ms) => {
-                    db.set_expiry(key, current_time_ms().saturating_add(ms));
-                }
-                None => {
-                    return Frame::Error(Bytes::from_static(
-                        b"ERR value is not an integer or out of range",
-                    ));
-                }
-            }
-        } else if opt.eq_ignore_ascii_case(b"PX") {
-            if args.len() < 3 {
-                return Frame::Error(Bytes::from_static(b"ERR syntax error"));
-            }
-            match parse_positive_i64(&args[2]) {
-                Some(ms) => {
-                    db.set_expiry(key, current_time_ms() + ms as u64);
-                }
-                None => {
-                    return Frame::Error(Bytes::from_static(
-                        b"ERR value is not an integer or out of range",
-                    ));
-                }
-            }
-        } else if opt.eq_ignore_ascii_case(b"EXAT") {
-            if args.len() < 3 {
-                return Frame::Error(Bytes::from_static(b"ERR syntax error"));
-            }
-            match parse_positive_i64(&args[2]).and_then(|ts| (ts as u64).checked_mul(1000)) {
-                Some(ms) => {
-                    db.set_expiry(key, ms);
-                }
-                None => {
-                    return Frame::Error(Bytes::from_static(
-                        b"ERR value is not an integer or out of range",
-                    ));
-                }
-            }
-        } else if opt.eq_ignore_ascii_case(b"PXAT") {
-            if args.len() < 3 {
-                return Frame::Error(Bytes::from_static(b"ERR syntax error"));
-            }
-            match parse_positive_i64(&args[2]) {
-                Some(ts_ms) => {
-                    db.set_expiry(key, ts_ms as u64);
-                }
-                None => {
-                    return Frame::Error(Bytes::from_static(
-                        b"ERR value is not an integer or out of range",
-                    ));
-                }
-            }
         } else {
-            return Frame::Error(Bytes::from_static(b"ERR syntax error"));
+            // (milliseconds per unit, absolute)
+            let (unit_ms, absolute) = if opt.eq_ignore_ascii_case(b"EX") {
+                (1000, false)
+            } else if opt.eq_ignore_ascii_case(b"PX") {
+                (1, false)
+            } else if opt.eq_ignore_ascii_case(b"EXAT") {
+                (1000, true)
+            } else if opt.eq_ignore_ascii_case(b"PXAT") {
+                (1, true)
+            } else {
+                return Frame::Error(Bytes::from_static(b"ERR syntax error"));
+            };
+            let Some(raw) = args.get(2) else {
+                return Frame::Error(Bytes::from_static(b"ERR syntax error"));
+            };
+            let when = match getex_deadline_ms(raw, unit_ms, absolute) {
+                Ok(ms) => ms,
+                Err(e) => return e,
+            };
+            // redis `checkAlreadyExpired` (R1 finding 4): an EXAT / PXAT
+            // already past deletes the key now — a deletion (`del`), not an
+            // expiry — and still answers the value. Judged on the database
+            // clock, which a replay pins to the log's time (moon#1277); never
+            // on a replica applying its master's stream (review N2).
+            if absolute && crate::command::key::deadline_already_past(db, when) {
+                if db.remove(key).is_some() {
+                    crate::command::key::notify_del(key, db.db_index);
+                }
+                return Frame::BulkString(value);
+            }
+            db.set_expiry(key, when);
         }
     }
 
     Frame::BulkString(value)
+}
+
+/// GETEX's deadline in unix milliseconds, with redis's replies
+/// (`getExpireMillisecondsOrReply`): not an integer -> "value is not an
+/// integer or out of range"; non-positive, or a seconds value or a relative
+/// deadline that overflows -> "invalid expire time in 'getex' command".
+fn getex_deadline_ms(raw: &Frame, unit_ms: i64, absolute: bool) -> Result<u64, Frame> {
+    let invalid = || {
+        Frame::Error(Bytes::from_static(
+            b"ERR invalid expire time in 'getex' command",
+        ))
+    };
+    let Some(n) = parse_i64(raw) else {
+        return Err(Frame::Error(Bytes::from_static(
+            b"ERR value is not an integer or out of range",
+        )));
+    };
+    if n <= 0 {
+        return Err(invalid());
+    }
+    let mut ms = n.checked_mul(unit_ms).ok_or_else(invalid)?;
+    if !absolute {
+        ms = ms
+            .checked_add(current_time_ms() as i64)
+            .ok_or_else(invalid)?;
+    }
+    Ok(ms as u64)
 }
 
 // ---------------------------------------------------------------------------

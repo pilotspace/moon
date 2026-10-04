@@ -40,6 +40,7 @@ fn append(data: &[u8]) -> AofMessage {
         db: 0,
         bytes: Bytes::copy_from_slice(data),
         epoch: FoldEpoch::INITIAL,
+        clock_ms: 0,
     }
 }
 
@@ -52,6 +53,7 @@ fn append_sync(data: &[u8]) -> (AofMessage, OneshotReceiver<AofAck>) {
             bytes: Bytes::copy_from_slice(data),
             ack: tx,
             epoch: FoldEpoch::INITIAL,
+            clock_ms: 0,
         },
         rx,
     )

@@ -510,7 +510,7 @@ pub const COLD_ORPHAN_SWEEP_INTERVAL_SECS: u64 = 300;
 
 /// The unlink hold's view of this shard right now (moon#1231 / moon#1260):
 /// the AOF fold state with a writer, the snapshot lifecycle without one.
-fn fold_view_now(
+pub(crate) fn fold_view_now(
     shard_id: usize,
     aof_pool: Option<&Arc<crate::persistence::aof::AofWriterPool>>,
     floor_covers_this_shard: bool,

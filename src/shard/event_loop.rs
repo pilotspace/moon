@@ -544,10 +544,11 @@ impl super::Shard {
 
         // Per-shard WAL append channel for local writes.
         // Connection handlers send serialized write commands here; we drain on the 1ms tick.
-        let (wal_append_tx, wal_append_rx) = channel::mpsc_bounded::<(
-            crate::persistence::wal_v3::record::WalRecordType,
-            bytes::Bytes,
-        )>(4096);
+        // moon#1302: the bound is the fast path's, not a per-command limit —
+        // a full channel spills to this thread's overflow (`shard::wal_append`),
+        // which `drain_into` appends right after the channel's records.
+        let (wal_append_tx, wal_append_rx) =
+            channel::mpsc_bounded::<crate::shard::wal_append::WalAppendMsg>(4096);
         // INVARIANT: gate the sender wiring on `wal_writer.is_some()` — NOT on
         // `appendonly_enabled || disk_offload_enabled()` — because that OR is
         // broader than the condition that actually produced a writer above
@@ -575,6 +576,7 @@ impl super::Shard {
                 s.wal_append_tx = Some(wal_append_tx.clone());
             });
             shard_databases.set_wal_append_tx(shard_id, wal_append_tx);
+            crate::shard::wal_append::register_owner(shard_id);
         }
 
         // Per-shard PageCache (None when disk-offload is disabled).
@@ -1678,11 +1680,7 @@ impl super::Shard {
                     // Drain local-write WAL channel (connection handler inline writes).
                     // K1a: the channel carries the producer's REAL record type —
                     // append it as-is instead of re-wrapping everything as `Command`.
-                    while let Ok((record_type, data)) = wal_append_rx.try_recv() {
-                        if let Some(ref mut wal) = wal_writer {
-                            wal.append(record_type, &data);
-                        }
-                    }
+                    crate::shard::wal_append::drain_into(&wal_append_rx, &mut wal_writer);
 
                     persistence_tick::flush_wal_v3_if_needed(&mut wal_writer);
 
@@ -1858,6 +1856,11 @@ impl super::Shard {
                             cached_clock.ms(),
                             aof_pool.as_ref(),
                             &spill_file_id,
+                        );
+                        // moon#1289: held files that no fold/snapshot is coming for.
+                        crate::shard::held_release_tick::after_sweep(
+                            &shard_databases, shard_id, aof_pool.as_ref(), &spill_file_id,
+                            &snapshot_trigger_tx, orphan_sweep_interval_secs,
                         );
                     }
                 }
@@ -2039,6 +2042,8 @@ impl super::Shard {
                             shard_id,
                         );
                     });
+                    // moon#1302: what the last tick left queued is acked too.
+                    crate::shard::wal_append::drain_into(&wal_append_rx, &mut wal_writer);
                     if let Some(ref mut wal) = wal_writer {
                         let _ = wal.flush_sync();
                     }
@@ -2239,6 +2244,8 @@ impl super::Shard {
                             shard_id,
                         );
                     });
+                    // moon#1302: what the last tick left queued is acked too.
+                    crate::shard::wal_append::drain_into(&wal_append_rx, &mut wal_writer);
                     if let Some(ref mut wal) = wal_writer {
                         let _ = wal.flush_sync();
                     }
@@ -2519,11 +2526,7 @@ impl super::Shard {
 
                 // Drain local-write WAL channel. K1a: append with the producer's
                 // REAL record type instead of forcing `Command` for everything.
-                while let Ok((record_type, data)) = wal_append_rx.try_recv() {
-                    if let Some(ref mut wal) = wal_writer {
-                        wal.append(record_type, &data);
-                    }
-                }
+                crate::shard::wal_append::drain_into(&wal_append_rx, &mut wal_writer);
 
                 persistence_tick::flush_wal_v3_if_needed(&mut wal_writer);
 
@@ -2833,6 +2836,15 @@ impl super::Shard {
                         aof_pool.as_ref(),
                         &spill_file_id,
                     );
+                    // moon#1289: held files that no fold/snapshot is coming for.
+                    crate::shard::held_release_tick::after_sweep(
+                        &shard_databases,
+                        shard_id,
+                        aof_pool.as_ref(),
+                        &spill_file_id,
+                        &snapshot_trigger_tx,
+                        orphan_sweep_interval_secs,
+                    );
                 }
 
                 // #373 phase 2: decide the next park. The chores above are
@@ -2884,7 +2896,7 @@ impl super::Shard {
                 let quiet = wal_writer
                     .as_ref()
                     .is_none_or(|w| w.buffered_bytes() == 0 && !w.flush_backing_off())
-                    && wal_append_rx.is_empty()
+                    && crate::shard::wal_append::is_drained(&wal_append_rx)
                     && snapshot_state.is_none()
                     && !bgsave_checkpoint_requested
                     && checkpoint_manager.as_ref().is_none_or(|m| !m.is_active())
