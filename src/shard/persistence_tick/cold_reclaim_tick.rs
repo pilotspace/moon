@@ -45,6 +45,68 @@ const LEDGER_SHARE_DIVISOR: usize = 4;
 /// Without `maxmemory` the ledger is still RAM; reclaim past this.
 const LEDGER_CEILING_UNLIMITED: usize = 64 << 20;
 
+// ── No-AOF starts (R2b5: the moon#1297 regression) ───────────────────────
+//
+// Without an AOF a compaction waits for a SNAPSHOT that started after it —
+// with no save rule firing, minutes (three orphan sweeps, then a requested
+// snapshot). Its record (every survivor's key and both locations, ~110 B a
+// survivor) is charged to write admission with the dead-slot ledger until
+// then (`ColdIndex::dead_slot_bytes`), and eviction cannot free a byte of it.
+// Bounded only by a count (64 per database), a write flood at `maxmemory`
+// (WS43 bench: 600 B values, `--shards 4`, 8 MB) ran ~190 compactions up to
+// 4.6 MB of records in three seconds: past half a shard's budget, where
+// `evict_to_budget` answers -OOM instead of draining the hot set, and every
+// one of them read and rewrote a file on the spill threads the shards were
+// waiting on (-22% SET throughput, +21% CPU per op at 4 vCPUs). The rule:
+//
+// - RAM: a shard starts a compaction only while its records (plus an
+//   estimate for those in flight) stay under `1/NO_AOF_RAM_SHARE_DIVISOR`
+//   of its budget, so they can never come near the half that refuses a
+//   write, and lower the eviction target by at most that share.
+
+/// A shard's no-AOF compaction records stay under this share of its budget.
+const NO_AOF_RAM_SHARE_DIVISOR: usize = 16;
+/// No-AOF compactions of one shard on the spill thread at once, at most.
+const NO_AOF_MAX_IN_FLIGHT: usize = 2;
+/// A shard's no-AOF reclaim at one tick, for [`no_aof_starts`].
+#[derive(Debug, Clone, Copy)]
+pub(super) struct NoAofLoad {
+    /// RAM its compaction records hold (pending and being adopted).
+    pub(super) record_bytes: usize,
+    /// Compactions pending adoption.
+    pub(super) pending: usize,
+    /// Compactions with a job on the spill thread.
+    pub(super) in_flight: usize,
+}
+
+/// The RAM cap of a shard's no-AOF compaction records: its share of the
+/// per-shard budget, none without `maxmemory` (no write is refused there).
+pub(super) fn no_aof_record_cap(maxmemory: usize, per_shard_budget: usize) -> usize {
+    if maxmemory == 0 {
+        usize::MAX
+    } else {
+        per_shard_budget / NO_AOF_RAM_SHARE_DIVISOR
+    }
+}
+
+/// How many no-AOF compactions this shard may start now (see the rules
+/// above): none while its records, with an average record for each one in
+/// flight, reach `cap`, or while [`NO_AOF_MAX_IN_FLIGHT`] are in flight;
+/// otherwise up to [`FILES_PER_TICK`].
+pub(super) fn no_aof_starts(load: NoAofLoad, cap: usize) -> usize {
+    if load.in_flight >= NO_AOF_MAX_IN_FLIGHT {
+        return 0;
+    }
+    let per_record = load.record_bytes.checked_div(load.pending).unwrap_or(0);
+    let committed = load
+        .record_bytes
+        .saturating_add(per_record.saturating_mul(load.in_flight));
+    if committed >= cap {
+        return 0;
+    }
+    FILES_PER_TICK.min(NO_AOF_MAX_IN_FLIGHT - load.in_flight)
+}
+
 /// The ledger size past which this shard compacts: a quarter of its memory
 /// budget, or [`LEDGER_CEILING_UNLIMITED`] with no `maxmemory`.
 pub(super) fn reclaim_threshold(maxmemory: usize, per_shard_budget: usize) -> usize {
@@ -225,17 +287,24 @@ pub(super) fn run(
         reclaim_threshold(rt.maxmemory, rt.maxmemory_per_shard())
     };
     let over = ledger_bytes > threshold;
-    let mut in_flight = 0usize;
+    let mut load = NoAofLoad {
+        record_bytes: 0,
+        pending: 0,
+        in_flight: 0,
+    };
     for db_index in 0..db_count {
         crate::shard::slice::with_shard_db(db_index, |db| {
             if let Some(ci) = db.cold_index.as_mut() {
                 if !no_aof {
                     ci.note_held_files_pressure(over, committed);
                 }
-                in_flight += ci.compactions_in_flight();
+                load.in_flight += ci.compactions_in_flight();
+                load.pending += ci.pending_compactions();
+                load.record_bytes += ci.reclaim_resident_bytes();
             }
         });
     }
+    let in_flight = load.in_flight;
     // moon#1265 review round 3: a shard whose reclaim jobs spent the
     // reclaim-death budget starts no compaction any more (adoption of those
     // already written still runs above).
@@ -252,7 +321,15 @@ pub(super) fn run(
     } else {
         MAX_PENDING_PER_DB
     };
-    let mut files_left = FILES_PER_TICK.min(MAX_IN_FLIGHT.saturating_sub(in_flight));
+    let mut files_left = if no_aof {
+        let cap = {
+            let rt = runtime_config.read();
+            no_aof_record_cap(rt.maxmemory, rt.maxmemory_per_shard())
+        };
+        no_aof_starts(load, cap)
+    } else {
+        FILES_PER_TICK.min(MAX_IN_FLIGHT.saturating_sub(in_flight))
+    };
     for db_index in 0..db_count {
         if files_left == 0 {
             break;
@@ -407,4 +484,36 @@ fn warn_not_compacted(shard_id: usize, db_index: usize, file_id: u64, why: &str)
         why = %why,
         "cold reclaim: file not compacted"
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn load(record_bytes: usize, pending: usize, in_flight: usize) -> NoAofLoad {
+        NoAofLoad {
+            record_bytes,
+            pending,
+            in_flight,
+        }
+    }
+
+    /// R2b5: the records can never reach the half of the budget where a
+    /// write is refused — a shard stops starting at its sixteenth, counting
+    /// an average record for each compaction still in flight.
+    #[test]
+    fn records_at_their_share_of_the_budget_start_nothing() {
+        let cap = no_aof_record_cap(8 << 20, 2 << 20);
+        assert_eq!(cap, 128 << 10);
+        assert_eq!(no_aof_starts(load(0, 0, 0), cap), 2);
+        assert_eq!(no_aof_starts(load(cap - 1, 4, 0), cap), 2);
+        assert_eq!(no_aof_starts(load(cap, 4, 0), cap), 0);
+        // 100 KB in 4 records (25 KB each) + 1 in flight = 125 KB: one more.
+        assert_eq!(no_aof_starts(load(100 << 10, 4, 1), cap), 1);
+        // + 2 in flight would be 150 KB: none (and 2 in flight is the limit).
+        assert_eq!(no_aof_starts(load(100 << 10, 4, 2), cap), 0);
+        assert_eq!(no_aof_starts(load(112 << 10, 4, 1), cap), 0);
+        // No maxmemory: no write is ever refused, only the in-flight limit.
+        assert_eq!(no_aof_record_cap(0, 0), usize::MAX);
+    }
 }

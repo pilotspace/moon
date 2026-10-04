@@ -395,6 +395,13 @@ impl ColdIndex {
         self.reclaim.pending()
     }
 
+    /// RAM this database's compaction records hold (pending and being
+    /// adopted): the reclaim's part of [`Self::dead_slot_bytes`].
+    #[inline]
+    pub fn reclaim_resident_bytes(&self) -> usize {
+        self.reclaim.resident_bytes()
+    }
+
     /// Compactions with a job on the spill thread (moon#1240).
     #[inline]
     pub fn compactions_in_flight(&self) -> usize {
