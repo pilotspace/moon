@@ -755,7 +755,8 @@ fn info_raw(db: &Database, facts: &InstanceFacts) -> String {
         ),
     );
     // moon#1297: the cold reclaim (with an AOF or without): compactions
-    // recorded and still waiting for their commit point, old files unlinked
+    // recorded and still waiting for their commit point (and the RAM their
+    // records hold, charged at write admission), old files unlinked
     // by adoption and their bytes, and snapshots requested to commit them.
     let (compactions, files_unlinked, bytes_unlinked) =
         crate::storage::tiered::cold_reclaim::reclaim_totals();
@@ -763,11 +764,13 @@ fn info_raw(db: &Database, facts: &InstanceFacts) -> String {
         sections,
         "cold_reclaim_compactions:{}\r\n\
          cold_reclaim_compactions_pending:{}\r\n\
+         cold_reclaim_pending_bytes:{}\r\n\
          cold_reclaim_files_unlinked:{}\r\n\
          cold_reclaim_bytes_unlinked:{}\r\n\
          cold_reclaim_snapshots_requested:{}\r\n",
         compactions,
         crate::storage::tiered::cold_reclaim::awaiting_fold(),
+        crate::storage::tiered::cold_reclaim::resident_bytes_total(),
         files_unlinked,
         bytes_unlinked,
         crate::persistence::snapshot_request::started(
