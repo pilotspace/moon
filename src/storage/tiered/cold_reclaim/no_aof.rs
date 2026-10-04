@@ -76,7 +76,8 @@
 //! [`NO_AOF_MAX_PENDING_PER_DB`] bounds the unlisted outputs waiting for a
 //! snapshot. Their records are RAM charged to write admission until then,
 //! so the shard tick also keeps them under a sixteenth of the shard's
-//! budget (R2b5, `shard::persistence_tick::cold_reclaim_tick`): unbounded,
+//! budget, and starts at most one compaction a second while the shard is
+//! spilling (R2b5, `shard::persistence_tick::cold_reclaim_tick`): unbounded,
 //! a write flood at `maxmemory` ran them past half the budget, where writes
 //! are refused. A save rule usually supplies that snapshot; when compactions
 //! wait for [`super::super::held_release::STALE_AFTER_SWEEPS`] sweeps with no
