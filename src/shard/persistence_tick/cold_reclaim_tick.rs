@@ -364,7 +364,19 @@ pub(super) fn run(
             let rt = runtime_config.read();
             no_aof_record_cap(rt.maxmemory, rt.maxmemory_per_shard())
         };
-        no_aof_starts(load, cap, LAST_NO_AOF_START.get(), now)
+        let starts = no_aof_starts(load, cap, LAST_NO_AOF_START.get(), now);
+        if starts == 0 {
+            tracing::debug!(
+                shard_id,
+                record_bytes = load.record_bytes,
+                cap,
+                in_flight = load.in_flight,
+                spilling = load.spilling,
+                "cold reclaim: no-AOF compaction start deferred (records at their budget share, \
+                 jobs in flight, or the shard is spilling)"
+            );
+        }
+        starts
     } else {
         FILES_PER_TICK.min(MAX_IN_FLIGHT.saturating_sub(in_flight))
     };
