@@ -203,8 +203,12 @@ Moon requests one, under the same spacing: one snapshot serves both reasons.
 It runs with transactions open too: a key a `TXN` wrote is saved at its
 pre-transaction value, including a cold key the transaction read back from
 a spill file. While compactions wait, the old file and its compacted copy
-are both on disk (at most 64 waiting compactions per database). `INFO`:
-`cold_reclaim_compactions_pending` and `cold_reclaim_snapshots_requested`.
+are both on disk (at most 64 waiting compactions per database), and the
+bookkeeping of the waiting compactions counts toward `maxmemory`: a shard
+keeps it under a sixteenth of its memory budget and, while it is evicting
+to disk, starts at most one compaction a second, so the reclaim never
+crowds out writes. `INFO`: `cold_reclaim_compactions_pending`,
+`cold_reclaim_pending_bytes` and `cold_reclaim_snapshots_requested`.
 
 ## Using both
 

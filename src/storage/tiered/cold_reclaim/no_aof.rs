@@ -74,7 +74,12 @@
 //! starts compacting once its candidates hold [`NO_AOF_MIN_DEAD_SLOTS`] dead
 //! slots between them (a quarter of a full durable batch), most dead first.
 //! [`NO_AOF_MAX_PENDING_PER_DB`] bounds the unlisted outputs waiting for a
-//! snapshot. A save rule usually supplies that snapshot; when compactions
+//! snapshot. Their records are RAM charged to write admission until then,
+//! so the shard tick also keeps them under a sixteenth of the shard's
+//! budget, and starts at most one compaction a second while the shard is
+//! spilling (`shard::persistence_tick::cold_reclaim_tick`): unbounded,
+//! a write flood at `maxmemory` ran them past half the budget, where writes
+//! are refused. A save rule usually supplies that snapshot; when compactions
 //! wait for [`super::super::held_release::STALE_AFTER_SWEEPS`] sweeps with no
 //! snapshot committing, the shard requests one
 //! (`persistence::snapshot_request`, [`SnapshotReason::ColdReclaim`]) under

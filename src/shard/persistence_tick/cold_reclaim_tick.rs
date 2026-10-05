@@ -45,6 +45,99 @@ const LEDGER_SHARE_DIVISOR: usize = 4;
 /// Without `maxmemory` the ledger is still RAM; reclaim past this.
 const LEDGER_CEILING_UNLIMITED: usize = 64 << 20;
 
+// ── No-AOF starts (moon#1297) ────────────────────────────────────────────
+//
+// Without an AOF a compaction waits for a SNAPSHOT that started after it —
+// with no save rule firing, minutes (three orphan sweeps, then a requested
+// snapshot). Its record (every survivor's key and both locations, ~110 B a
+// survivor) is charged to write admission with the dead-slot ledger until
+// then (`ColdIndex::dead_slot_bytes`), and eviction cannot free a byte of it.
+// Bounded only by a count (64 per database), a write flood at `maxmemory`
+// (600 B values, `--shards 4`, 8 MB) ran ~170 compactions up to 4.2 MB of
+// records (INFO `cold_reclaim_pending_bytes`) in a few seconds: past half a
+// shard's budget, where `evict_to_budget` answers -OOM instead of draining
+// the hot set; and every one of them read and rewrote a file on the spill
+// threads the shards were waiting on. Two rules:
+//
+// - RAM: a shard starts a compaction only while its records (plus an
+//   estimate for those in flight) stay under `1/NO_AOF_RAM_SHARE_DIVISOR`
+//   of its budget, so they can never come near the half that refuses a
+//   write.
+// - CPU: while the shard is spilling (it minted a spill file since the
+//   previous tick: eviction is under way and the spill thread is busy), at
+//   most one compaction starts per `NO_AOF_START_SPACING_WHILE_SPILLING`.
+//   Once the writes stop, compaction runs at the full pace again.
+
+/// A shard's no-AOF compaction records stay under this share of its budget.
+const NO_AOF_RAM_SHARE_DIVISOR: usize = 16;
+/// No-AOF compactions of one shard on the spill thread at once, at most.
+const NO_AOF_MAX_IN_FLIGHT: usize = 2;
+/// While the shard spills, one no-AOF compaction start per this long.
+const NO_AOF_START_SPACING_WHILE_SPILLING: std::time::Duration = std::time::Duration::from_secs(1);
+
+thread_local! {
+    /// The shard's spill-file counter after the previous tick's reclaim
+    /// minted its own ids: a higher counter at the next tick means
+    /// something spilled in between.
+    static SPILL_MARK: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+    /// When this shard last started a no-AOF compaction.
+    static LAST_NO_AOF_START: std::cell::Cell<Option<std::time::Instant>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// A shard's no-AOF reclaim at one tick, for [`no_aof_starts`].
+#[derive(Debug, Clone, Copy)]
+pub(super) struct NoAofLoad {
+    /// RAM its compaction records hold (pending and being adopted).
+    pub(super) record_bytes: usize,
+    /// Compactions pending adoption.
+    pub(super) pending: usize,
+    /// Compactions with a job on the spill thread.
+    pub(super) in_flight: usize,
+    /// It minted a spill file since the previous tick.
+    pub(super) spilling: bool,
+}
+
+/// The RAM cap of a shard's no-AOF compaction records: its share of the
+/// per-shard budget, none without `maxmemory` (no write is refused there).
+pub(super) fn no_aof_record_cap(maxmemory: usize, per_shard_budget: usize) -> usize {
+    if maxmemory == 0 {
+        usize::MAX
+    } else {
+        per_shard_budget / NO_AOF_RAM_SHARE_DIVISOR
+    }
+}
+
+/// How many no-AOF compactions this shard may start now (see the rules
+/// above): none while its records, with an average record for each one in
+/// flight, reach `cap`, or while [`NO_AOF_MAX_IN_FLIGHT`] are in flight; one
+/// per [`NO_AOF_START_SPACING_WHILE_SPILLING`] while it spills; otherwise up
+/// to [`FILES_PER_TICK`].
+pub(super) fn no_aof_starts(
+    load: NoAofLoad,
+    cap: usize,
+    last_start: Option<std::time::Instant>,
+    now: std::time::Instant,
+) -> usize {
+    if load.in_flight >= NO_AOF_MAX_IN_FLIGHT {
+        return 0;
+    }
+    let per_record = load.record_bytes.checked_div(load.pending).unwrap_or(0);
+    let committed = load
+        .record_bytes
+        .saturating_add(per_record.saturating_mul(load.in_flight));
+    if committed >= cap {
+        return 0;
+    }
+    if load.spilling {
+        let spaced = last_start.is_none_or(|t| {
+            now.saturating_duration_since(t) >= NO_AOF_START_SPACING_WHILE_SPILLING
+        });
+        return usize::from(spaced);
+    }
+    FILES_PER_TICK.min(NO_AOF_MAX_IN_FLIGHT - load.in_flight)
+}
+
 /// The ledger size past which this shard compacts: a quarter of its memory
 /// budget, or [`LEDGER_CEILING_UNLIMITED`] with no `maxmemory`.
 pub(super) fn reclaim_threshold(maxmemory: usize, per_shard_budget: usize) -> usize {
@@ -83,6 +176,10 @@ pub(super) fn run(
     spill_thread: Option<&SpillThread>,
     ledger_bytes: usize,
 ) {
+    // Did anything spill since the previous tick (the counter moved past what
+    // that tick's reclaim left it at)? Taken, so a tick that returns before
+    // setting it below leaves no stale mark to read as a spill next time.
+    let spilling = SPILL_MARK.take().is_some_and(|mark| *next_file_id > mark);
     let (Some(shard_dir), Some(manifest)) = (offload_shard_dir, shard_manifest.as_mut()) else {
         return;
     };
@@ -133,6 +230,8 @@ pub(super) fn run(
             apply_done(done, st, shard_id, shard_dir, next_file_id, &stamps, no_aof);
         }
     }
+    // Nothing below mints a file id: the next tick compares against this.
+    SPILL_MARK.set(Some(*next_file_id));
     // moon#1265: a dead spill thread answers nothing more. Abandon what it
     // still held (its queued jobs are dropped by the shard's reconcile; a
     // write it finished unannounced is an unlisted file the startup orphan
@@ -225,17 +324,25 @@ pub(super) fn run(
         reclaim_threshold(rt.maxmemory, rt.maxmemory_per_shard())
     };
     let over = ledger_bytes > threshold;
-    let mut in_flight = 0usize;
+    let mut load = NoAofLoad {
+        record_bytes: 0,
+        pending: 0,
+        in_flight: 0,
+        spilling,
+    };
     for db_index in 0..db_count {
         crate::shard::slice::with_shard_db(db_index, |db| {
             if let Some(ci) = db.cold_index.as_mut() {
                 if !no_aof {
                     ci.note_held_files_pressure(over, committed);
                 }
-                in_flight += ci.compactions_in_flight();
+                load.in_flight += ci.compactions_in_flight();
+                load.pending += ci.pending_compactions();
+                load.record_bytes += ci.reclaim_resident_bytes();
             }
         });
     }
+    let in_flight = load.in_flight;
     // moon#1265 review round 3: a shard whose reclaim jobs spent the
     // reclaim-death budget starts no compaction any more (adoption of those
     // already written still runs above).
@@ -252,7 +359,29 @@ pub(super) fn run(
     } else {
         MAX_PENDING_PER_DB
     };
-    let mut files_left = FILES_PER_TICK.min(MAX_IN_FLIGHT.saturating_sub(in_flight));
+    let now = std::time::Instant::now();
+    let mut files_left = if no_aof {
+        let cap = {
+            let rt = runtime_config.read();
+            no_aof_record_cap(rt.maxmemory, rt.maxmemory_per_shard())
+        };
+        let starts = no_aof_starts(load, cap, LAST_NO_AOF_START.get(), now);
+        if starts == 0 {
+            tracing::debug!(
+                shard_id,
+                record_bytes = load.record_bytes,
+                cap,
+                in_flight = load.in_flight,
+                spilling = load.spilling,
+                "cold reclaim: no-AOF compaction start deferred (records at their budget share, \
+                 jobs in flight, or the shard is spilling)"
+            );
+        }
+        starts
+    } else {
+        FILES_PER_TICK.min(MAX_IN_FLIGHT.saturating_sub(in_flight))
+    };
+    let allowed = files_left;
     for db_index in 0..db_count {
         if files_left == 0 {
             break;
@@ -270,6 +399,9 @@ pub(super) fn run(
             };
             start_reads(ci, st, db_index, candidates, shard_dir, &mut files_left);
         });
+    }
+    if no_aof && files_left < allowed {
+        LAST_NO_AOF_START.set(Some(now));
     }
 }
 
@@ -407,4 +539,62 @@ fn warn_not_compacted(shard_id: usize, db_index: usize, file_id: u64, why: &str)
         why = %why,
         "cold reclaim: file not compacted"
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    fn load(record_bytes: usize, pending: usize, in_flight: usize, spilling: bool) -> NoAofLoad {
+        NoAofLoad {
+            record_bytes,
+            pending,
+            in_flight,
+            spilling,
+        }
+    }
+
+    /// The records can never reach the half of the budget where a
+    /// write is refused — a shard stops starting at its sixteenth, counting
+    /// an average record for each compaction still in flight.
+    #[test]
+    fn records_at_their_share_of_the_budget_start_nothing() {
+        let now = Instant::now();
+        let cap = no_aof_record_cap(8 << 20, 2 << 20);
+        assert_eq!(cap, 128 << 10);
+        assert_eq!(no_aof_starts(load(0, 0, 0, false), cap, None, now), 2);
+        assert_eq!(no_aof_starts(load(cap - 1, 4, 0, false), cap, None, now), 2);
+        assert_eq!(no_aof_starts(load(cap, 4, 0, false), cap, None, now), 0);
+        // 100 KB in 4 records (25 KB each) + 1 in flight = 125 KB: one more.
+        assert_eq!(
+            no_aof_starts(load(100 << 10, 4, 1, false), cap, None, now),
+            1
+        );
+        // + 2 in flight would be 150 KB: none (and 2 in flight is the limit).
+        assert_eq!(
+            no_aof_starts(load(100 << 10, 4, 2, false), cap, None, now),
+            0
+        );
+        assert_eq!(
+            no_aof_starts(load(112 << 10, 4, 1, false), cap, None, now),
+            0
+        );
+        // No maxmemory: no write is ever refused, only the in-flight limit.
+        assert_eq!(no_aof_record_cap(0, 0), usize::MAX);
+    }
+
+    /// While the shard spills, one start per second; once it stops,
+    /// the full pace again.
+    #[test]
+    fn a_spilling_shard_starts_one_compaction_per_second() {
+        let cap = usize::MAX;
+        let t0 = Instant::now();
+        assert_eq!(no_aof_starts(load(0, 0, 0, true), cap, None, t0), 1);
+        let soon = t0 + Duration::from_millis(500);
+        assert_eq!(no_aof_starts(load(0, 0, 0, true), cap, Some(t0), soon), 0);
+        let later = t0 + Duration::from_secs(1);
+        assert_eq!(no_aof_starts(load(0, 0, 0, true), cap, Some(t0), later), 1);
+        assert_eq!(no_aof_starts(load(0, 0, 0, false), cap, Some(t0), soon), 2);
+    }
 }
