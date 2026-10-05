@@ -565,8 +565,23 @@ shared 4-vCPU Linux container against HEAD `935c555` — re-measure on the GCE r
   their pre-transaction values (moon#1300). New `INFO` fields:
   `cold_reclaim_compactions`, `cold_reclaim_compactions_pending`,
   `cold_reclaim_files_unlinked`, `cold_reclaim_bytes_unlinked` and
-  `cold_reclaim_snapshots_requested`; `CONFIG RESETSTAT` resets all of them
-  except the `cold_reclaim_compactions_pending` gauge.
+  `cold_reclaim_snapshots_requested`, and the `cold_reclaim_pending_bytes` gauge
+  (the RAM held by compactions waiting for their snapshot); `CONFIG RESETSTAT`
+  resets all of them except the two gauges.
+
+  That waiting bookkeeping (about 110 bytes per surviving key) counts toward
+  `maxmemory` and cannot be evicted. A shard keeps it under a sixteenth of its
+  memory budget and, while it is evicting to disk, starts at most one
+  compaction a second; once the writes stop the reclaim runs at full pace.
+  Without that bound a steady write flood at `maxmemory` (`redis-benchmark -t
+  set -r 50000 -d 600 -c 16 -P 16 -n 400000`, `--shards 4`, 8 MB, no AOF) pushed
+  it past half a shard's budget and was answered `-OOM` in every run. With it:
+  0 `-OOM` in 5 of 5 runs on each runtime, throughput 0.97x (monoio) and 1.01x
+  (tokio) of the release without the reclaim, CPU per `SET` +1-4%, spill
+  directory the same size during the flood; after the flood the reclaim frees
+  the dead files within a minute of its snapshot (4-vCPU Linux container,
+  5 interleaved runs). At a small `maxmemory` the bound limits one snapshot
+  cycle to about a dozen compactions per shard.
 
 - **Cross-shard writes were acknowledged before their remote legs were durable**
   (moon#1322). A spanning `MSET`, `MSETNX`, `DEL`, `UNLINK`, `BITOP` or `COPY`,
@@ -582,10 +597,23 @@ shared 4-vCPU Linux container against HEAD `935c555` — re-measure on the GCE r
   the Option 1A entry). Steady state costs one atomic load. A 4-shard `MSET`
   under `always` has p50 ≈ 0.85 ms on monoio and ≈ 1.05 ms on tokio; sending the
   barriers one after another measured ≈ 1.09 and ≈ 1.42 ms (6 alternating pairs,
-  shared 4-vCPU Linux container). In a pipeline of spanning writes under
-  `always`, each write now confirms its own local leg too, where one local
-  barrier used to cover the batch, so the pipeline pays more local fsyncs; the
-  writer group-commits concurrent barriers.
+  shared 4-vCPU Linux container).
+
+  A pipeline pays these barriers once per batch, not once per command: every
+  write of the batch (spanning or same-shard multi-key writes, pipelined
+  writes to other shards, scripts that wrote) records the shards it owes, and
+  one parallel barrier set over all of them runs before the first reply of the
+  batch is sent — at the batch end and before every early flush (blocking
+  commands, `SUBSCRIBE`, `PSYNC`). A failed barrier fails exactly the replies
+  that waited on the failed shard. Later commands of the batch run while an
+  earlier one's barrier is pending, as local group commit always did; none of
+  their replies leaves before it. A 16-deep pipeline of spanning `MSET`s under
+  `always` runs at 0.89x (monoio) and 0.86x (tokio) of the speed it had when
+  the remote fsync was skipped; paying one barrier set per command it ran at
+  0.31x and 0.38x. Same-shard `MSET` pipelines run at 0.94-0.98x (were
+  0.30-0.33x). A single spanning write still waits for its shards' fsyncs after
+  its legs reply (p50 +10-14%); `everysec` is unaffected (5 interleaved runs,
+  4-vCPU Linux container).
 
   With the barriers removed, a held remote fsync no longer delays the reply
   (0.2-5 ms) on monoio io_uring, epoll and tokio; with them, no reply leaves
