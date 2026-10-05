@@ -48,6 +48,10 @@ fn start(port: u16, dir: &std::path::Path, gate: &std::path::Path) -> Child {
             "0",
             "--disk-free-min-pct",
             "0",
+            // The held fsync must not run into the 2 s barrier timeout (the
+            // pipeline test holds it for seconds on a loaded box).
+            "--aof-fsync-timeout-ms",
+            "30000",
         ])
         .arg("--dir")
         .arg(dir)
@@ -175,6 +179,159 @@ fn cross_shard_writes_wait_for_the_remote_fsync_under_always() {
         violations.is_empty(),
         "local shard {local}, gated {GATED}, third {third}: cross-shard writes acknowledged \
          before the remote shard's fsync:\n{}",
+        violations.join("\n")
+    );
+}
+
+/// The barriers of a PIPELINE are coalesced — every command of
+/// the batch runs, then ONE barrier set covers them all — and no reply of the
+/// batch, not even one whose own write was local, leaves before the gated
+/// remote fsync.
+///
+/// Pipeline: a local `SET`, then 16 spanning `MSET`s, each writing its own key
+/// on the gated shard and one on a third. With `G`'s fsync held:
+///  * no byte of the batch's replies may arrive (the local `SET`'s `+OK` is
+///    behind the batch barrier too);
+///  * the second `MSET` has already RUN — its key is readable from another
+///    connection. Before coalescing, the first `MSET` awaited its own barrier
+///    set before the next command ran, so a pipeline of `N` spanning writes
+///    paid `N` serial barrier sets (P16 −70% under `always`). This read is an
+///    observation of batch execution, not a durability claim: the write is
+///    applied in memory, unacknowledged, exactly like a local leg awaiting
+///    the batch's group-commit fsync.
+///
+/// After the release all 17 replies arrive, all `+OK`.
+#[test]
+#[ignore = "real-server: run with --include-ignored and MOON_BIN pinned"]
+fn a_pipeline_of_spanning_writes_pays_one_barrier_set_before_any_reply() {
+    const N: usize = 16;
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let dir = tmp.path();
+    let gate = dir.join("sync.gate");
+    let (_server, port) = common::spawn_listening_guarded(|port| start(port, dir, &gate));
+    let (mut c, local) = (0..16)
+        .map(|_| {
+            let mut c = common::Conn::open(port);
+            let l = own_shard(&mut c);
+            (c, l)
+        })
+        .find(|(_, l)| *l != GATED)
+        .expect("a connection off the gated shard");
+    let third = (0..SHARDS)
+        .find(|s| *s != local && *s != GATED)
+        .expect("a third shard");
+    let mut reader = common::Conn::open(port);
+    let kl = key_on(local, "l");
+    let kg: Vec<String> = (0..N).map(|i| key_on(GATED, &format!("g{i}_"))).collect();
+    let kt: Vec<String> = (0..N).map(|i| key_on(third, &format!("t{i}_"))).collect();
+
+    let mut pipeline = common::encode(&["SET", &kl, "local"]);
+    for i in 0..N {
+        let v = i.to_string();
+        pipeline.extend(common::encode(&["MSET", &kg[i], &v, &kt[i], &v]));
+    }
+    std::fs::write(&gate, b"held").expect("hold the fsync");
+    let t = Instant::now();
+    c.sock.write_all(&pipeline).expect("send the pipeline");
+    c.sock.set_read_timeout(Some(HOLD)).expect("timeout");
+    let mut buf = [0u8; 512];
+    let early = match c.sock.read(&mut buf) {
+        Ok(n) if n > 0 => Some(String::from_utf8_lossy(&buf[..n]).into_owned()),
+        _ => None,
+    };
+    // Still held: the batch's second MSET has run (coalesced, not serialized).
+    // Polled, not read once: on a loaded box the shard may need a moment to get
+    // through the batch. Serialized barriers never get there, so the poll
+    // simply times out — with the fsync still held — and the assertion fires.
+    let mut second = reader.send(&["GET", &kg[1]]);
+    let poll_until = Instant::now() + Duration::from_secs(5);
+    while !second.contains("\r\n1\r\n") && Instant::now() < poll_until {
+        std::thread::sleep(Duration::from_millis(20));
+        second = reader.send(&["GET", &kg[1]]);
+    }
+    std::fs::remove_file(&gate).expect("release the fsync");
+    assert!(
+        early.is_none(),
+        "local shard {local}, gated {GATED}: the pipeline replied {early:?} after {:?} while \
+         the remote writer's fsync was held",
+        t.elapsed()
+    );
+    assert!(
+        second.contains("\r\n1\r\n"),
+        "the batch's second MSET had not run while the first one's barrier was pending \
+         (GET {} -> {second:?}): the pipeline's barriers are serialized per command",
+        kg[1]
+    );
+    c.sock
+        .set_read_timeout(Some(Duration::from_millis(200)))
+        .expect("timeout");
+    let replies = c.read_replies(N + 1);
+    assert_eq!(
+        replies.matches("+OK\r\n").count(),
+        N + 1,
+        "every reply of the batch is +OK after the release: {replies:?}"
+    );
+}
+
+/// A command that flushes the batch's replies EARLY — SUBSCRIBE entry, a
+/// blocking command — settles the batch's barrier debt first: with the gated
+/// remote fsync held, neither the spanning `MSET`'s `+OK` nor the early
+/// command's own reply may arrive; both arrive, in order, once it is released.
+#[test]
+#[ignore = "real-server: run with --include-ignored and MOON_BIN pinned"]
+fn an_early_flush_waits_for_the_batch_debt_before_replying() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let dir = tmp.path();
+    let gate = dir.join("sync.gate");
+    let (_server, port) = common::spawn_listening_guarded(|port| start(port, dir, &gate));
+    let mut violations = Vec::new();
+    for early in [
+        vec!["SUBSCRIBE", "ch1322"],
+        vec!["BLPOP", "no_such_list_1322", "1"],
+    ] {
+        let (mut c, local) = (0..16)
+            .map(|_| {
+                let mut c = common::Conn::open(port);
+                let l = own_shard(&mut c);
+                (c, l)
+            })
+            .find(|(_, l)| *l != GATED)
+            .expect("a connection off the gated shard");
+        let third = (0..SHARDS)
+            .find(|s| *s != local && *s != GATED)
+            .expect("a third shard");
+        let kg = key_on(GATED, "eg");
+        let kt = key_on(third, "et");
+        let mut pipeline = common::encode(&["MSET", &kg, "1", &kt, "2"]);
+        pipeline.extend(common::encode(&early));
+        std::fs::write(&gate, b"held").expect("hold the fsync");
+        let t = Instant::now();
+        c.sock.write_all(&pipeline).expect("send");
+        c.sock.set_read_timeout(Some(HOLD)).expect("timeout");
+        let mut buf = [0u8; 512];
+        let reply = match c.sock.read(&mut buf) {
+            Ok(n) if n > 0 => Some(String::from_utf8_lossy(&buf[..n]).into_owned()),
+            _ => None,
+        };
+        std::fs::remove_file(&gate).expect("release the fsync");
+        if let Some(r) = reply {
+            violations.push(format!(
+                "MSET + {early:?}: replied {r:?} after {:?} while the remote writer's fsync was held",
+                t.elapsed()
+            ));
+            continue;
+        }
+        c.sock
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .expect("timeout");
+        let replies = c.read_replies(2);
+        if !replies.starts_with("+OK\r\n") {
+            violations.push(format!("MSET + {early:?}: replies {replies:?}"));
+        }
+    }
+    assert!(
+        violations.is_empty(),
+        "an early-flush command sent a reply before the batch's barrier:\n{}",
         violations.join("\n")
     );
 }
