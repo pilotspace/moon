@@ -155,7 +155,8 @@ pub fn reclaim_totals() -> (u64, u64, u64) {
 /// INFO `cold_reclaim_compactions_pending`) is live state and is kept: every
 /// adoption and every dropped index subtracts its own compactions from it,
 /// so zeroing it would wrap it, and a wrapped gauge also makes the AOF
-/// monitor dispatch folds for compactions that do not exist.
+/// monitor dispatch folds for compactions that do not exist. The same goes
+/// for the RAM the pending records hold ([`resident_bytes_total`]).
 pub fn reset_stats() {
     for counter in [&COMPACTIONS_RECORDED, &FILES_UNLINKED, &BYTES_UNLINKED] {
         counter.store(0, Ordering::Relaxed);
@@ -169,6 +170,21 @@ pub(crate) fn add_totals_for_test(n: u64) {
     for counter in [&COMPACTIONS_RECORDED, &FILES_UNLINKED, &BYTES_UNLINKED] {
         counter.fetch_add(n, Ordering::Relaxed);
     }
+}
+
+/// RAM the reclaim's compaction records hold (pending and being adopted),
+/// process-wide: the part of the write-admission ledger
+/// ([`ColdIndex::dead_slot_bytes`]) that is the reclaim's own (INFO
+/// `cold_reclaim_pending_bytes`, moon#1297). Mirrors every
+/// `ReclaimState::bytes` change, and like `cold_reclaim_compactions_pending`
+/// is a gauge: `CONFIG RESETSTAT` leaves it.
+static RESIDENT_BYTES: AtomicUsize = AtomicUsize::new(0);
+
+/// RAM the reclaim's compaction records hold, process-wide (see
+/// [`RESIDENT_BYTES`]).
+#[inline]
+pub fn resident_bytes_total() -> usize {
+    RESIDENT_BYTES.load(Ordering::Relaxed)
 }
 
 /// How many compactions wait for a committed fold, process-wide.
@@ -263,6 +279,7 @@ impl Drop for ReclaimState {
         // A cold index dropped with compactions pending leaves their
         // unlisted files to the next startup orphan sweep.
         AWAITING_FOLD.fetch_sub(self.pending.len(), Ordering::Relaxed);
+        RESIDENT_BYTES.fetch_sub(self.bytes, Ordering::Relaxed);
         HELD_FILES_PRESSURE.fetch_sub(usize::from(self.held_signal), Ordering::Relaxed);
     }
 }
@@ -291,6 +308,19 @@ impl ReclaimState {
     #[cfg(test)]
     pub(crate) fn no_aof_idle_at_for_test(&self) -> Option<usize> {
         self.no_aof_idle_at
+    }
+
+    /// Charge `n` bytes of compaction records (and the process-wide total).
+    fn charge(&mut self, n: usize) {
+        self.bytes += n;
+        RESIDENT_BYTES.fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// Release `n` bytes of compaction records, never below zero.
+    fn release(&mut self, n: usize) {
+        let n = n.min(self.bytes);
+        self.bytes -= n;
+        RESIDENT_BYTES.fetch_sub(n, Ordering::Relaxed);
     }
 
     /// Never compact `file_id` again in this process (see [`FILES_GIVEN_UP`]).
@@ -365,6 +395,13 @@ impl ColdIndex {
     #[inline]
     pub fn pending_compactions(&self) -> usize {
         self.reclaim.pending()
+    }
+
+    /// RAM this database's compaction records hold (pending and being
+    /// adopted): the reclaim's part of [`Self::dead_slot_bytes`].
+    #[inline]
+    pub fn reclaim_resident_bytes(&self) -> usize {
+        self.reclaim.resident_bytes()
     }
 
     /// Compactions with a job on the spill thread (moon#1240).
@@ -646,7 +683,7 @@ impl ColdIndex {
         }
         // Compacted: whatever death it was suspected of was not its doing.
         self.reclaim.suspects.remove(&old_file);
-        self.reclaim.bytes += bytes;
+        self.reclaim.charge(bytes);
         self.reclaim.pending.push(PendingCompaction {
             old_file,
             epoch,
@@ -767,7 +804,7 @@ impl ColdIndex {
             }
         }
         if outputs.is_empty() {
-            self.reclaim.bytes = self.reclaim.bytes.saturating_sub(bytes);
+            self.reclaim.release(bytes);
             return report;
         }
         report.files_listed = outputs.len();
@@ -805,7 +842,7 @@ impl ColdIndex {
                 self.reclaim.adopting.push(adopting);
                 continue;
             };
-            self.reclaim.bytes = self.reclaim.bytes.saturating_sub(adopting.bytes);
+            self.reclaim.release(adopting.bytes);
             if let Err(e) = outcome {
                 self.reclaim.candidates_changed();
                 for out in &adopting.outputs {

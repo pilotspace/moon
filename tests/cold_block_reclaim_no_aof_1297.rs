@@ -1090,7 +1090,19 @@ fn resetstat_zeroes_the_reclaim_statistics_and_keeps_the_pending_gauge() {
             ));
         }
     };
+    // The RAM the waiting records hold is a gauge too: there while they
+    // wait, untouched by RESETSTAT, gone with the adoption.
+    let record_bytes = info_u64(port, "cold_reclaim_pending_bytes");
+    assert!(
+        record_bytes.is_some_and(|b| b > 0),
+        "{pending} compactions pending but cold_reclaim_pending_bytes is {record_bytes:?}"
+    );
     check("pending", pending);
+    assert_eq!(
+        info_u64(port, "cold_reclaim_pending_bytes"),
+        record_bytes,
+        "CONFIG RESETSTAT changed the cold_reclaim_pending_bytes gauge"
+    );
 
     // The adopting snapshot: the old files go, the counters count again.
     bgsave_and_wait(port);
@@ -1106,6 +1118,11 @@ fn resetstat_zeroes_the_reclaim_statistics_and_keeps_the_pending_gauge() {
     }
     let unlinked = info_u64(port, "cold_reclaim_files_unlinked");
     check("adopted", 0);
+    assert_eq!(
+        info_u64(port, "cold_reclaim_pending_bytes"),
+        Some(0),
+        "the adopted compactions' records are still counted"
+    );
     server.kill_now();
     wait_for_port_down(port);
     eprintln!("resetstat: compactions {compactions}, pending {pending}, unlinked {unlinked:?}");
