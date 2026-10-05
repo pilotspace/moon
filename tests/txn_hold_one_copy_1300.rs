@@ -15,6 +15,7 @@
 //! MOON_BIN=/path/to/moon cargo test --test txn_hold_one_copy_1300 -- --include-ignored
 //! ```
 
+#![cfg(target_os = "linux")]
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 mod common;
@@ -27,7 +28,6 @@ use common::Conn;
 const FIELDS: usize = 300_000;
 const BATCH: usize = 1_000;
 
-#[cfg(target_os = "linux")]
 fn rss_mb(pid: u32) -> f64 {
     let status = std::fs::read_to_string(format!("/proc/{pid}/status")).expect("proc status");
     let kb: f64 = status
@@ -40,14 +40,12 @@ fn rss_mb(pid: u32) -> f64 {
 }
 
 /// RSS once the server has settled (a write's transient buffers returned).
-#[cfg(target_os = "linux")]
 fn settled_rss_mb(c: &mut Conn, pid: u32) -> f64 {
     assert_eq!(c.send(&["PING"]), "+PONG\r\n");
     std::thread::sleep(Duration::from_millis(500));
     rss_mb(pid)
 }
 
-#[cfg(target_os = "linux")]
 #[test]
 #[ignore = "real-server suite: MOON_BIN pinned"]
 fn a_txn_write_to_a_large_hash_keeps_one_copy_of_it() {
