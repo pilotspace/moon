@@ -48,16 +48,19 @@ pub async fn coordinate_multi_key(
     // persistence (tests / no-AOF deployments).
     aof_pool: Option<&Arc<crate::persistence::aof::AofWriterPool>>,
     repl_state: ReplStateRef<'_>,
-    // v3-5 group commit: set to true when a local-leg append was enqueued
-    // under appendfsync=always. The connection handler MUST then issue ONE
-    // `fsync_barrier(my_shard)` for the batch before acking the client, and
-    // overwrite this command's response with AOF_FSYNC_ERR on barrier failure.
-    // R2b round 3 P1: whenever barriers are owed, the coordinator
-    // sends the local one alongside the remote ones, awaits all together, clears
-    // this flag (the reply is already confirmed).
-    local_barrier_pending: &mut bool,
+    // The connection batch's barrier debt. The command records
+    // what it owes here — its own shard when a local-leg append rode group
+    // commit (v3-5), every written remote shard under `always` or a held lane
+    // (moon#1322) — with `resp_idx`, the index its reply will take in the
+    // batch. Nothing is awaited here: the handler MUST settle the debt
+    // (`BarrierDebt::settle`) before ANY reply of the batch is flushed; a
+    // failed barrier then turns this reply into AOF_FSYNC_ERR.
+    barrier_debt: &mut crate::persistence::aof::barrier_set::BarrierDebt,
+    resp_idx: usize,
     _response_pool: &(), // placeholder — coordinator uses oneshot internally
 ) -> Frame {
+    let mut local_barrier_pending = false;
+    let local_barrier_pending = &mut local_barrier_pending;
     let reply = if cmd.eq_ignore_ascii_case(b"MGET") {
         coordinate_mget(
             args,
@@ -154,18 +157,21 @@ pub async fn coordinate_multi_key(
         )
         .await
     };
-    // moon#1322: the remote legs' records are queued at their owners — confirm
-    // them (write, plus the fsync under `always`) before the reply leaves.
-    remote_barrier::confirm_multi_key(
+    // moon#1322: the remote legs' records are queued at their owners — they
+    // owe a confirmation (write, plus the fsync under `always`) before the
+    // reply leaves; the batch pays it with every other command's.
+    remote_barrier::owe_multi_key(
         aof_pool,
         cmd,
         args,
         my_shard,
         num_shards,
-        local_barrier_pending,
-        reply,
-    )
-    .await
+        *local_barrier_pending,
+        &reply,
+        resp_idx,
+        barrier_debt,
+    );
+    reply
 }
 
 // moon#1322: barrier the written remote shards of a coordinated write.

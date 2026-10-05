@@ -21,28 +21,38 @@
 //!
 //! The barriers — every written remote shard's, plus the local leg's when it
 //! owes one — are SENT first and awaited together under one deadline
-//! (`aof::barrier_set`, R2b round 3 P1): the reply waits for the slowest
+//! (`aof::barrier_set`): the reply waits for the slowest
 //! fsync, not their sum, and a stalled disk costs one `fsync_timeout`, not
-//! one per shard.
+//! one per shard. A coordinated multi-key write does not await them itself:
+//! it records them in the connection's `BarrierDebt` ([`owe_multi_key`]) and
+//! the batch pays every command's debt with ONE such set before
+//! its replies are flushed — a pipeline of spanning writes no longer
+//! serializes on one barrier set per command.
 
 use std::sync::Arc;
 
 use smallvec::SmallVec;
 
-use crate::persistence::aof::barrier_set::PendingBarriers;
+use crate::persistence::aof::barrier_set::{BarrierDebt, PendingBarriers};
 use crate::persistence::aof::{AofAck, AofWriterPool, FsyncPolicy};
 use crate::protocol::Frame;
 use crate::shard::dispatch::key_to_shard;
 
 /// Owner shards of a coordinated write, beyond the coordinator's own —
-/// inline up to 16 shards (R2b round 3 N3: the consistency suite runs 12).
+/// inline up to 16 shards (the consistency suite runs 12).
 pub(crate) type Targets = SmallVec<[usize; 16]>;
 
-/// Whether any remote leg could owe a barrier now: the policy is `always`, or
-/// a lane of this pool is held. When this reads `false`, every remote record
-/// already reached its file before the leg replied (a DIRECT lane flushes
-/// before `OneshotSender::send`), or was queued on a lane whose hand-over —
-/// which needs an empty channel — has since written it.
+/// Whether any remote leg could owe a barrier now: the pool's policy view
+/// ([`AofWriterPool::fsync_policy`]) reads `always` — which it does under
+/// `appendfsync always` AND while any lane of the pool is held (a writer that
+/// has not yet handed over after boot or after leaving `always`, moon#1266).
+/// The held case needs no test of its own here: it is folded into that
+/// read, and the per-shard decision is re-made by
+/// `AofWriterPool::fsync_policy_for` when the barrier is sent. When this reads
+/// `false`, every remote record already reached its file before the leg
+/// replied (a DIRECT lane flushes before `OneshotSender::send`), or was queued
+/// on a lane whose hand-over — which needs an empty channel — has since
+/// written it.
 #[inline]
 pub(crate) fn barrier_needed(pool: Option<&Arc<AofWriterPool>>, num_shards: usize) -> bool {
     num_shards > 1 && pool.is_some_and(|p| p.fsync_policy() == FsyncPolicy::Always)
@@ -103,32 +113,34 @@ pub(crate) async fn barrier_targets(pool: &AofWriterPool, targets: &[usize]) -> 
     set.wait(pool).await
 }
 
-/// `coordinate_multi_key`'s tail: confirm the remote legs of a write before
-/// `reply` leaves — and the local leg with them when it owes a barrier
-/// (`local_barrier_pending`, then cleared: the handler need not barrier this
-/// reply again). A failed barrier replaces a successful reply (the write
-/// stands in memory; its durability is unconfirmed), never an error reply.
-pub(crate) async fn confirm_multi_key(
+/// `coordinate_multi_key`'s tail: record what the write OWES before `reply`
+/// may leave — its written remote shards when any remote leg could owe a
+/// barrier ([`barrier_needed`]), and its own shard when the local leg's append
+/// rode group commit (`local_pending`). Nothing is awaited here:
+/// the connection's batch pays every command's debt with one barrier set
+/// before its first reply is flushed. A successful reply waits on the debt
+/// (a failed barrier replaces it — the write stands in memory, its durability
+/// is unconfirmed); an error reply only adds its shards, so they are still
+/// confirmed before anything leaves but the error stands.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn owe_multi_key(
     pool: Option<&Arc<AofWriterPool>>,
     cmd: &[u8],
     args: &[Frame],
     my_shard: usize,
     num_shards: usize,
-    local_barrier_pending: &mut bool,
-    reply: Frame,
-) -> Frame {
-    let Some(p) = pool.filter(|_| barrier_needed(pool, num_shards)) else {
-        return reply;
-    };
-    let mut targets = written_remote_shards(cmd, args, my_shard, num_shards);
-    if std::mem::take(local_barrier_pending) {
-        targets.push(my_shard);
-    }
-    match barrier_targets(p, &targets).await {
-        Err(ack) if !matches!(reply, Frame::Error(_)) => {
-            crate::persistence::aof::barrier_refusal_frame(ack)
-        }
-        _ => reply,
+    local_pending: bool,
+    reply: &Frame,
+    resp_idx: usize,
+    debt: &mut BarrierDebt,
+) {
+    let waiter = (!matches!(reply, Frame::Error(_))).then_some(resp_idx);
+    let local = local_pending.then_some(my_shard);
+    if barrier_needed(pool, num_shards) {
+        let remote = written_remote_shards(cmd, args, my_shard, num_shards);
+        debt.owe(waiter, remote.into_iter().chain(local));
+    } else if local.is_some() {
+        debt.owe(waiter, local);
     }
 }
 
@@ -198,5 +210,41 @@ mod tests {
         // Everysec, nothing held: nothing owed.
         assert!(!barrier_needed(Some(&pool), 4));
         assert!(!barrier_needed(Some(&pool), 1));
+    }
+
+    /// A coordinated write records its debt instead of awaiting it: nothing
+    /// remote while no barrier can be owed (only a pending local leg), every
+    /// written remote owner plus the local leg once one can be; an error
+    /// reply's shards are owed but nobody waits on them.
+    #[test]
+    fn a_multi_key_write_records_its_owed_shards() {
+        use crate::persistence::aof::barrier_set::BarrierDebt;
+        let me = 0;
+        let rk = remote_keys(me);
+        let mset = [bulk(&rk[0].0), bulk("v"), bulk(&rk[1].0), bulk("v")];
+        let ok = Frame::SimpleString(Bytes::from_static(b"OK"));
+        let (tx, _rx) = crate::runtime::channel::mpsc_bounded(8);
+        let pool = AofWriterPool::top_level(tx);
+
+        // Everysec, nothing held: only the local leg's own debt.
+        let mut d = BarrierDebt::new(me);
+        owe_multi_key(Some(&pool), b"MSET", &mset, me, 4, false, &ok, 0, &mut d);
+        assert!(d.is_empty());
+        owe_multi_key(Some(&pool), b"MSET", &mset, me, 4, true, &ok, 1, &mut d);
+        assert_eq!(d.shards(), &[me]);
+
+        if !crate::persistence::aof::lane::enabled() {
+            return; // MOON_AOF_SHARD_WRITE=0 in this test's environment
+        }
+        // A held lane: barriers can be owed — the remote owners join.
+        let _lane = pool.lane(0);
+        assert!(barrier_needed(Some(&pool), 4));
+        let mut d = BarrierDebt::new(me);
+        owe_multi_key(Some(&pool), b"MSET", &mset, me, 4, true, &ok, 3, &mut d);
+        assert_eq!(d.shards(), &[rk[0].1, rk[1].1, me]);
+        let err = Frame::Error(Bytes::from_static(b"ERR x"));
+        let del = [bulk(&rk[2].0)];
+        owe_multi_key(Some(&pool), b"DEL", &del, me, 4, false, &err, 4, &mut d);
+        assert_eq!(d.shards(), &[rk[0].1, rk[1].1, me, rk[2].1]);
     }
 }

@@ -7,6 +7,7 @@
 //!
 //! Each helper returns `true` if the command was consumed (caller should `continue`).
 
+use crate::persistence::aof::barrier_set::BarrierDebt;
 use bytes::Bytes;
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -225,7 +226,7 @@ pub(super) async fn try_handle_evalsha(
     responses: &mut crate::server::conn::intercept::InterceptReplies<'_>,
     // moon#831: reply slots of local-leg writes pending the batch-end
     // `fsync_barrier(ctx.shard_id)` — a script that wrote joins it.
-    local_leg_write_idxs: &mut Vec<usize>,
+    barrier_debt: &mut BarrierDebt,
 ) -> bool {
     // `EVALSHA_RO` is `EVALSHA` with writes refused, and shares every step
     // below — resolving the caller, routing, the cached body. The ONE
@@ -314,7 +315,7 @@ pub(super) async fn try_handle_evalsha(
     // are already in this shard's AOF writer (fire-and-forget from the
     // bridge); the reply must wait for the batch-end barrier like any SET.
     if crate::server::conn::shared::script_write_joins_barrier(wrote, &response) {
-        local_leg_write_idxs.push(responses.len());
+        barrier_debt.push(responses.len());
     }
     responses.push(response);
     true
@@ -333,7 +334,7 @@ pub(super) async fn try_handle_eval(
     shutdown: &crate::runtime::cancel::CancellationToken,
     responses: &mut crate::server::conn::intercept::InterceptReplies<'_>,
     // moon#831: see `try_handle_evalsha`.
-    local_leg_write_idxs: &mut Vec<usize>,
+    barrier_debt: &mut BarrierDebt,
 ) -> bool {
     // `EVAL_RO` — see `try_handle_evalsha`.
     let read_only = cmd.eq_ignore_ascii_case(b"EVAL_RO");
@@ -421,7 +422,7 @@ pub(super) async fn try_handle_eval(
     // are already in this shard's AOF writer (fire-and-forget from the
     // bridge); the reply must wait for the batch-end barrier like any SET.
     if crate::server::conn::shared::script_write_joins_barrier(wrote, &response) {
-        local_leg_write_idxs.push(responses.len());
+        barrier_debt.push(responses.len());
     }
     responses.push(response);
     true
@@ -1628,7 +1629,7 @@ pub(super) async fn try_handle_functions(
     responses: &mut crate::server::conn::intercept::InterceptReplies<'_>,
     // moon#831: see `try_handle_evalsha` — an FCALL that wrote joins the
     // batch barrier.
-    local_leg_write_idxs: &mut Vec<usize>,
+    barrier_debt: &mut BarrierDebt,
 ) -> bool {
     if conn.in_multi {
         return false;
@@ -1762,7 +1763,7 @@ pub(super) async fn try_handle_functions(
         )
         .await;
         if crate::server::conn::shared::script_write_joins_barrier(wrote, &response) {
-            local_leg_write_idxs.push(responses.len());
+            barrier_debt.push(responses.len());
         }
         responses.push(response);
         return true;
@@ -1781,7 +1782,7 @@ pub(super) async fn try_handle_cross_shard_commands(
     responses: &mut crate::server::conn::intercept::InterceptReplies<'_>,
     // v3-5 group commit: response indexes of local-leg writes pending the
     // batch-end fsync_barrier(ctx.shard_id) (appendfsync=always only).
-    local_leg_write_idxs: &mut Vec<usize>,
+    barrier_debt: &mut BarrierDebt,
 ) -> bool {
     if ctx.num_shards <= 1 {
         return false;
@@ -1902,7 +1903,9 @@ pub(super) async fn try_handle_cross_shard_commands(
         {
             return false;
         }
-        let mut local_barrier_pending = false;
+        // The command records the barriers it owes (local leg, written remote
+        // shards) in `barrier_debt` under the index its reply takes; the
+        // batch settles them all before its first flush.
         let response = crate::shard::coordinator::coordinate_multi_key(
             cmd,
             cmd_args,
@@ -1915,15 +1918,11 @@ pub(super) async fn try_handle_cross_shard_commands(
             &ctx.cached_clock,
             ctx.aof_pool.as_ref(),
             &ctx.repl_state,
-            &mut local_barrier_pending,
+            barrier_debt,
+            responses.len(),
             &(), // monoio: coordinator uses oneshot, not response_pool
         )
         .await;
-        // A response that is already an error must not be overwritten by a
-        // barrier failure; only successful writes join the barrier set.
-        if local_barrier_pending && !matches!(response, Frame::Error(_)) {
-            local_leg_write_idxs.push(responses.len());
-        }
         // moon#1069: the coordinator ran this shard's leg (a same-shard
         // `COPY`, or this shard's slice of a spanning write) outside every
         // write tail — serve whoever is blocked on a key it wrote here.
@@ -1999,7 +1998,7 @@ pub(super) async fn try_handle_blocking<
     // the RESP3 policy itself, below — see `conn::intercept` for the two paths
     // that are allowed to.
     responses: &mut Vec<Frame>,
-    local_leg_write_idxs: &mut Vec<usize>,
+    barrier_debt: &mut BarrierDebt,
     codec: &mut crate::server::codec::RespCodec,
     write_buf: &mut bytes::BytesMut,
     read_buf: &mut bytes::BytesMut,
@@ -2024,13 +2023,7 @@ pub(super) async fn try_handle_blocking<
     // Earlier frames in this batch may hold barrier-pending local-leg
     // writes — confirm (or fail-loud) them before this early flush, and
     // clear the indexes so the batch-end barrier never sees stale ones.
-    crate::server::conn::shared::resolve_local_leg_barrier(
-        &ctx.aof_pool,
-        ctx.shard_id,
-        local_leg_write_idxs,
-        responses,
-    )
-    .await;
+    crate::server::conn::shared::settle_barrier_debt(&ctx.aof_pool, barrier_debt, responses).await;
 
     // Flush accumulated responses before blocking
     for resp in &*responses {

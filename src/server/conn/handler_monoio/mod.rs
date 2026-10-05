@@ -602,10 +602,11 @@ async fn handle_connection_body<
     // moon#1179 item 3: both grow on first cross-shard use, not at connect.
     let mut fanout_scratch: Vec<(usize, Frame, usize)> = Vec::new();
     let mut reply_futures: Vec<(Vec<RemoteMeta>, usize)> = Vec::new();
-    // v3-5 group commit: response indexes of coordinator LOCAL-leg writes whose
-    // AOF append was enqueued but not yet fsync-confirmed (appendfsync=always).
-    // Drained by ONE fsync_barrier(ctx.shard_id) at end of batch.
-    let mut local_leg_write_idxs: Vec<usize> = Vec::new();
+    // The fsync barriers the current batch owes (v3-5 group commit, moon#1322):
+    // recorded by its writes, paid in ONE set by `settle_barrier_debt` before
+    // any of its replies is flushed. Per connection, cleared at each batch
+    // start, so recording a waiter never allocates once warm.
+    let mut barrier_debt = crate::persistence::aof::barrier_set::BarrierDebt::new(ctx.shard_id);
 
     // Pre-allocated response slots for zero-allocation cross-shard dispatch
     // (L3b, tokio parity — handler_sharded/mod.rs). One slot per target shard;
@@ -1970,7 +1971,7 @@ async fn handle_connection_body<
         // Maintained beside the map so the ordering guard can ask "does this
         // command touch a shard with pending work?" without walking it.
         let mut pending_mask: u64 = 0;
-        local_leg_write_idxs.clear();
+        barrier_debt.clear();
         // The trailing bool marks a SHARDED publish. One batch map, split at flush:
         // the two namespaces share the fan-out plumbing but never the destination.
         let mut publish_batches: std::collections::HashMap<
@@ -2550,7 +2551,7 @@ async fn handle_connection_body<
                     conn,
                     ctx,
                     shaped!(),
-                    &mut local_leg_write_idxs,
+                    &mut barrier_debt,
                 )
                 .await
             {
@@ -2564,7 +2565,7 @@ async fn handle_connection_body<
                     ctx,
                     &shutdown,
                     shaped!(),
-                    &mut local_leg_write_idxs,
+                    &mut barrier_debt,
                 )
                 .await
             {
@@ -2614,10 +2615,9 @@ async fn handle_connection_body<
                 {
                     // Earlier frames in this batch may hold barrier-pending
                     // local-leg writes — confirm them before this early flush.
-                    crate::server::conn::shared::resolve_local_leg_barrier(
+                    crate::server::conn::shared::settle_barrier_debt(
                         &ctx.aof_pool,
-                        ctx.shard_id,
-                        &mut local_leg_write_idxs,
+                        &mut barrier_debt,
                         &mut responses,
                     )
                     .await;
@@ -2704,7 +2704,7 @@ async fn handle_connection_body<
                 ctx,
                 &peer_addr,
                 &mut responses,
-                &mut local_leg_write_idxs,
+                &mut barrier_debt,
                 &mut codec,
                 &mut write_buf,
                 &mut stream,
@@ -2811,7 +2811,7 @@ async fn handle_connection_body<
                     &func_registry,
                     &shutdown,
                     shaped!(),
-                    &mut local_leg_write_idxs,
+                    &mut barrier_debt,
                 )
                 .await
             {
@@ -2919,7 +2919,7 @@ async fn handle_connection_body<
                 conn,
                 ctx,
                 &mut responses,
-                &mut local_leg_write_idxs,
+                &mut barrier_debt,
                 &mut codec,
                 &mut write_buf,
                 &mut read_buf,
@@ -3220,7 +3220,7 @@ async fn handle_connection_body<
                     &*conn,
                     ctx,
                     shaped!(),
-                    &mut local_leg_write_idxs,
+                    &mut barrier_debt,
                 )
                 .await
             {
@@ -3492,10 +3492,10 @@ async fn handle_connection_body<
                                     .await
                                 {
                                     // Always: durability confirmed by ONE
-                                    // fsync_barrier per batch (resolve_local_leg_barrier
+                                    // fsync_barrier per batch (settle_barrier_debt
                                     // before serialization) instead of an awaited
                                     // fsync per pipelined command.
-                                    Ok(true) => local_leg_write_idxs.push(responses.len()),
+                                    Ok(true) => barrier_debt.push(responses.len()),
                                     Ok(false) => {}
                                     Err(ack) => aof_refusal = Some(ack),
                                 }
@@ -3604,7 +3604,7 @@ async fn handle_connection_body<
                                         .await
                                     {
                                         // Same one-barrier-per-batch contract as MOVE.
-                                        Ok(true) => local_leg_write_idxs.push(responses.len()),
+                                        Ok(true) => barrier_debt.push(responses.len()),
                                         Ok(false) => {}
                                         Err(ack) => aof_refusal = Some(ack),
                                     }
@@ -3913,7 +3913,7 @@ async fn handle_connection_body<
                     // Always-mode local writes join the per-batch group commit:
                     // the append is enqueued fire-and-forget here and confirmed
                     // by ONE fsync_barrier before response serialization
-                    // (resolve_local_leg_barrier), amortizing the fsync across
+                    // (settle_barrier_debt), amortizing the fsync across
                     // the whole pipelined batch — previously each command
                     // awaited its own fsync ack (~1 fsync per write, the
                     // measured 8x deficit vs Redis at P16).
@@ -4088,7 +4088,7 @@ async fn handle_connection_body<
                     // Only successful writes join the barrier set — an error
                     // response must not be overwritten by a barrier failure.
                     if aof_barrier_pending && !matches!(response, Frame::Error(_)) {
-                        local_leg_write_idxs.push(responses.len());
+                        barrier_debt.push(responses.len());
                     }
                     responses.push(response);
                 } else {
@@ -4773,9 +4773,8 @@ async fn handle_connection_body<
                     // nothing durable to confirm for these entries.
                     continue;
                 };
-                // H1-BARRIER: collect write resp_idxs before consuming meta
-                // so we can overwrite them if the fsync barrier fails.
-                let mut write_resp_idxs: Vec<usize> = Vec::new();
+                // H1-BARRIER: a persisted write's reply owes `target`'s barrier
+                // (`barrier_debt`, settled with the batch's other debts below).
                 for (
                     RemoteMeta {
                         sink,
@@ -4811,7 +4810,7 @@ async fn handle_connection_body<
                         conn.protocol_version,
                     );
                     if persisted_write && !matches!(resp, Frame::Error(_)) {
-                        write_resp_idxs.push(resp_idx);
+                        barrier_debt.owe(Some(resp_idx), [target]);
                     }
                     // CLIENT TRACKING: remote write confirmed — invalidate the
                     // keys captured at enqueue time.
@@ -4830,23 +4829,15 @@ async fn handle_connection_body<
                 remote_groups.recycle(target, meta);
 
                 // H1-BARRIER (C4-FOLD-FIX follow-up): under appendfsync=always,
-                // call fsync_barrier once per target shard AFTER responses are
-                // collected. The SPSC arm enqueued the Append fire-and-forget;
-                // the barrier enqueues a zero-length AppendSync into the SAME
-                // shard channel. Because the writer processes messages in order,
-                // an acked barrier proves all prior Appends to this shard are on
-                // durable storage. Under EverySec/No this is a zero-cost noop.
-                if !write_resp_idxs.is_empty() {
-                    if let Some(ref pool) = ctx.aof_pool {
-                        if let Err(ack) = pool.fsync_barrier(target).await {
-                            // moon#1272: a backlogged writer is not a failed fsync.
-                            let err = aof::barrier_refusal_reply(ack);
-                            for idx in write_resp_idxs {
-                                responses[idx] = Frame::Error(Bytes::from_static(err));
-                            }
-                        }
-                    }
-                }
+                // every target shard a persisted write went to owes ONE
+                // barrier. The SPSC arm enqueued the Append fire-and-forget; the
+                // barrier enqueues a zero-length AppendSync into the SAME shard
+                // channel, and the writer processes messages in order, so an
+                // acked barrier proves every prior Append to that shard is on
+                // durable storage. Recorded in `barrier_debt` above
+                // and paid with the batch's other debts in ONE parallel set
+                // (`settle_barrier_debt` below) — no longer one awaited barrier
+                // per target, in turn. Under EverySec/No the set sends nothing.
             }
         }
 
@@ -4858,17 +4849,19 @@ async fn handle_connection_body<
             crate::server::conn::fanout::fold(&fanout_state, &mut responses, conn.protocol_version);
         }
 
-        // v3-5 GROUP-COMMIT BARRIER: coordinator LOCAL legs were enqueued
-        // fire-and-forget into MY shard's AOF writer during dispatch; one
-        // barrier here confirms every one of them with a single fsync instead
-        // of the retired per-command awaited fsync (2000ms tail stack). Runs
-        // BEFORE response serialization — the client never sees +OK for a
-        // write whose durability was not confirmed. Early-flush paths (PSYNC,
-        // blocking, SUBSCRIBE) resolve the same barrier before THEIR flushes.
-        crate::server::conn::shared::resolve_local_leg_barrier(
+        // v3-5 GROUP-COMMIT BARRIER, coalesced: the batch's
+        // writes recorded what they owe in `barrier_debt` — coordinator LOCAL
+        // legs enqueued fire-and-forget into MY shard's writer, the written
+        // remote shards of coordinated writes (moon#1322), the targets of
+        // pipelined remote writes (H1). ONE parallel barrier set here confirms
+        // them all instead of one awaited set per command (2000ms tail stack;
+        // −70% P16 spanning MSET under `always`). Runs BEFORE response
+        // serialization — the client never sees +OK for a write whose
+        // durability was not confirmed. Early-flush paths (PSYNC, blocking,
+        // SUBSCRIBE) settle the same debt before THEIR flushes.
+        crate::server::conn::shared::settle_barrier_debt(
             &ctx.aof_pool,
-            ctx.shard_id,
-            &mut local_leg_write_idxs,
+            &mut barrier_debt,
             &mut responses,
         )
         .await;
