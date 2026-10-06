@@ -6234,7 +6234,7 @@ ACL_U="n978:probe"
 # `SET k v PX 20` keys: nothing reads them (active expiry), then again with
 # every key read after its deadline (lazy expiry -- counted once, not twice).
 log "=== moon#1286: INFO expired_keys ==="
-ek1286() { redis-cli -p "$1" INFO stats 2>/dev/null | tr -d '\r' | awk -F: '/^expired_keys/{print $2}'; }
+ek1286() { redis-cli -p "$1" INFO stats 2>/dev/null | tr -d '\r' | awk -F: '/^expired_keys:/{print $2}'; }
 for ek1286_mode in active lazy; do
     ek1286_r0=$(ek1286 "$PORT_REDIS"); ek1286_m0=$(ek1286 "$PORT_RUST")
     for ek1286_i in $(seq 1 50); do
