@@ -1019,7 +1019,11 @@ assert_both "ZUNIONSTORE dangling AGGREGATE"    ZUNIONSTORE {z969}:d 1 {z969}:sr
 assert_both "ZUNIONSTORE numkeys overruns"      ZUNIONSTORE {z969}:d 2 {z969}:src
 assert_both "ZUNION numkeys overruns"           ZUNION 2 {z969}:src
 assert_both "ZINTERCARD numkeys overruns"       ZINTERCARD 2 {z969}:src
-assert_both "ZMPOP numkeys overruns"            ZMPOP 2 z:969:lp MIN
+# numkeys 2 swallows the direction token MIN as a second key. Tag the real
+# key {MIN} so both "keys" hash like the bare word MIN: one shard at every
+# --shards N, so this compares the parser, not the routing (an untagged key
+# answers CROSSSLOT at --shards 12 -- as Redis Cluster does).
+assert_both "ZMPOP numkeys overruns"            ZMPOP 2 {MIN}:z969 MIN
 assert_both "ZUNIONSTORE unknown token"         ZUNIONSTORE {z969}:d 1 {z969}:src BOGUS
 assert_both "ZINTERCARD dangling LIMIT"         ZINTERCARD 1 z:969:lp LIMIT
 assert_both "ZMPOP dangling COUNT"              ZMPOP 1 z:969:lp MIN COUNT
@@ -1038,7 +1042,8 @@ assert_both "ZRANGEBYSCORE LIMIT offset"        ZRANGEBYSCORE z:969:ok 0 5 LIMIT
 assert_both "ZRANGEBYSCORE LIMIT count"         ZRANGEBYSCORE z:969:ok 0 5 LIMIT 0 notanint
 assert_both "ZREVRANGEBYSCORE LIMIT offset"     ZREVRANGEBYSCORE z:969:ok 5 0 LIMIT notanint 5
 assert_both "ZRANDMEMBER count stays generic"   ZRANDMEMBER z:969:ok notanint
-assert_both "ZRANGESTORE rank stays generic"    ZRANGESTORE {z969}:d z:969:ok notanint 5
+# Both keys {z969}-tagged: dst and src on one shard at every --shards N.
+assert_both "ZRANGESTORE rank stays generic"    ZRANGESTORE {z969}:d {z969}:src notanint 5
 # moon#792: CH counts a rescore EXACTLY, as Redis does. `1.0000000000000002`
 # is nextafter(1.0), whose distance from 1.0 is exactly f64::EPSILON -- so the
 # old `.abs() > f64::EPSILON` window called this real move "unchanged" while
