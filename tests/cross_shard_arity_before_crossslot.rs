@@ -225,9 +225,13 @@ fn script_wrong_arity_matches_one_shard() {
     let wide = spawn_moon(WIDE);
     let at_wide = argv(&mut Conn::open(wide.port));
 
+    // An arity error, in either wording: moon's `wrong number of arguments
+    // for 'rename'` today, Redis's `Wrong number of args calling Redis
+    // command from script` once pilotspace/moon#1333 lands. Pinning today's
+    // text exactly would freeze that known divergence.
     assert!(
-        !at_one.starts_with("-CROSSSLOT"),
-        "control: one shard cannot span: {at_one:?}"
+        at_one.starts_with("-ERR ") && at_one.contains("rong number of arg"),
+        "a malformed RENAME in redis.call must raise an arity error: {at_one:?}"
     );
     assert_eq!(
         at_wide, at_one,
