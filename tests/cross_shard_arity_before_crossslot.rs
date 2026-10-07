@@ -185,6 +185,30 @@ fn wrong_arity_is_reported_not_crossslot_at_twelve_shards() {
     arity_wins_at(WIDE);
 }
 
+/// The MULTI queue-time gate shares the arity check with the cross-shard
+/// guard. A spanning wrong-arity command is refused when queued (not
+/// `+QUEUED`), poisons the block, and nothing runs at `EXEC`.
+#[test]
+fn wrong_arity_is_refused_at_multi_queue_time() {
+    let moon = spawn_moon(WIDE);
+    let mut c = Conn::open(moon.port);
+    let (src, dst) = spanning_pair();
+    assert_eq!(c.send(&["SET", &src, "v"]), "+OK\r\n");
+
+    assert_eq!(c.send(&["MULTI"]), "+OK\r\n");
+    assert_eq!(
+        c.send(&["RENAME", &src, &dst, "extra"]),
+        wrong_args("rename"),
+        "a wrong-arity spanning RENAME must be refused at queue time"
+    );
+    assert_eq!(
+        c.send(&["EXEC"]),
+        "-EXECABORT Transaction discarded because of previous errors.\r\n"
+    );
+    assert_eq!(c.send(&["GET", &src]), "$1\r\nv\r\n");
+    assert_eq!(c.send(&["EXISTS", &dst]), ":0\r\n");
+}
+
 /// The Lua bridge consults the same key walk. A `redis.call` with the wrong
 /// argument count must answer what the one-shard server answers — whatever
 /// moon's script-arity wording is, it is not a function of the shard count.
