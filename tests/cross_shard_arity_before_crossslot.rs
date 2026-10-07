@@ -46,6 +46,7 @@ const WIDE: usize = 12;
 
 const CROSS_SHARD_PREFIX: &str = "-CROSSSLOT Keys in request don't hash to the same shard";
 
+/// A running server plus its private `--dir`, both torn down on drop.
 struct Moon {
     _guard: ServerGuard,
     port: u16,
@@ -53,11 +54,14 @@ struct Moon {
 }
 
 impl Drop for Moon {
+    /// The guard kills the server; this removes the data directory it used.
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
 
+/// Start a release `moon` (`MOON_BIN` when set) at `shards` with no AOF and
+/// a fresh data directory, and wait until it accepts connections.
 fn spawn_moon(shards: usize) -> Moon {
     let bin = common::find_moon_binary();
     let dir = common::unique_test_dir("moon-arity-xshard");
@@ -103,6 +107,7 @@ fn spanning_pair() -> (String, String) {
     (src, dst)
 }
 
+/// Substitute `{s}`/`{d}` in an argv template with the source and destination.
 fn fill(shape: &[&str], src: &str, dst: &str) -> Vec<String> {
     shape
         .iter()
@@ -114,11 +119,13 @@ fn fill(shape: &[&str], src: &str, dst: &str) -> Vec<String> {
         .collect()
 }
 
+/// Send an owned argv and return the raw RESP reply.
 fn send(c: &mut Conn, argv: &[String]) -> String {
     let parts: Vec<&str> = argv.iter().map(String::as_str).collect();
     c.send(&parts)
 }
 
+/// Redis's arity error for `name`, as RESP bytes.
 fn wrong_args(name: &str) -> String {
     format!("-ERR wrong number of arguments for '{name}' command\r\n")
 }
@@ -139,6 +146,8 @@ const WRONG_ARITY: &[(&str, &[&str])] = &[
     ("lmove", &["LMOVE", "{s}", "{d}", "LEFT"]),
 ];
 
+/// Every `WRONG_ARITY` row earns its arity error at `shards`, and none of
+/// them touches the source or creates the destination.
 fn arity_wins_at(shards: usize) {
     let moon = spawn_moon(shards);
     let mut c = Conn::open(moon.port);
@@ -163,13 +172,14 @@ fn arity_wins_at(shards: usize) {
     assert_eq!(c.send(&["EXISTS", &dst]), ":0\r\n", "--shards {shards}");
 }
 
-/// Both legs, the same expected bytes: the shard count must not change the
-/// answer to a malformed command.
+/// Both legs expect the same bytes: the shard count must not change the
+/// answer to a malformed command. This is the one-shard control.
 #[test]
 fn wrong_arity_is_reported_at_one_shard() {
     arity_wins_at(1);
 }
 
+/// The leg that was red: at `WIDE` every row's keys span shards.
 #[test]
 fn wrong_arity_is_reported_not_crossslot_at_twelve_shards() {
     arity_wins_at(WIDE);
