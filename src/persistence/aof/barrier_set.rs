@@ -107,6 +107,13 @@ impl PendingBarriers {
     }
 }
 
+/// The reply list's steady capacity, and the capacity above which
+/// [`BarrierDebt::clear`] shrinks it back (the handlers' batch-vec policy,
+/// `server::conn::util::shrink_batch_vec`): a deep pipeline grows it to the
+/// 1024-frame batch cap, a p99 batch never past the trigger.
+const WAITERS_STEADY_CAP: usize = 64;
+const WAITERS_SHRINK_TRIGGER: usize = 256;
+
 /// `shard`'s bit in a reply's shard mask. Above 64 shards two shards share a
 /// bit — a failure then also fails the replies of the shard it aliases:
 /// conservative (an unconfirmed reply is never sent as confirmed), and the
@@ -135,7 +142,8 @@ fn shard_bit(shard: usize) -> u64 {
 /// earlier one's key is shard-local order, unaffected.
 ///
 /// No heap on the hot path: the shard set is inline up to 16 shards; the
-/// reply list is a per-connection `Vec` cleared (capacity kept) each batch.
+/// reply list is a per-connection `Vec` cleared each batch, keeping its
+/// capacity unless a deep pipeline grew it past [`WAITERS_SHRINK_TRIGGER`].
 pub struct BarrierDebt {
     /// The connection's own shard (the target of [`Self::push`]).
     home: usize,
@@ -206,6 +214,9 @@ impl BarrierDebt {
         self.shards.clear();
         self.seen = 0;
         self.waiters.clear();
+        if self.waiters.capacity() > WAITERS_SHRINK_TRIGGER {
+            self.waiters.shrink_to(WAITERS_STEADY_CAP);
+        }
     }
 
     /// Pay the debt: one barrier per owed shard, all SENT before any is
@@ -297,6 +308,31 @@ mod tests {
         assert!(d.is_empty());
         assert!(d.waiters.is_empty());
         assert_eq!(d.seen, 0);
+    }
+
+    /// A deep pipeline grows the reply list to the batch cap; clearing it
+    /// must give that capacity back, or every connection that once pipelined
+    /// keeps it for life (16 B per reply, 1024 replies: 16 KiB a connection).
+    #[test]
+    fn clearing_after_a_deep_batch_gives_the_reply_list_back() {
+        let mut d = BarrierDebt::new(0);
+        for i in 0..1024 {
+            d.owe(Some(i), [1]);
+        }
+        d.clear();
+        assert!(d.is_empty());
+        assert!(
+            d.waiters.capacity() <= WAITERS_STEADY_CAP,
+            "capacity {} kept after clear",
+            d.waiters.capacity()
+        );
+        // A small batch never pays a shrink: its capacity is kept.
+        for i in 0..8 {
+            d.owe(Some(i), [1]);
+        }
+        let cap = d.waiters.capacity();
+        d.clear();
+        assert_eq!(d.waiters.capacity(), cap);
     }
 
     /// Nothing owed under `everysec`: settling sends nothing and touches no
