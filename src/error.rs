@@ -75,6 +75,26 @@ pub enum AofError {
 
     #[error("AOF rewrite failed: {detail}")]
     RewriteFailed { detail: String },
+
+    /// A record the replay parser refused for a LIMIT, not for malformed
+    /// bytes (R2b round 4 F2): never to be "repaired" by truncation.
+    #[error(
+        "AOF record at byte {offset} exceeds the replay parser's limits ({detail}). This is \
+         not corruption: do NOT truncate the file -- that drops the record and every later \
+         write. Keep the file as it is and report it (moon issue tracker)"
+    )]
+    RecordTooLarge { offset: u64, detail: String },
+
+    /// A replay of an AOF at boot failed (R2b round 4 F10: was reported as
+    /// "AOF rewrite failed").
+    #[error("AOF replay failed: {detail}")]
+    Replay { detail: String },
+
+    /// A replay found a torn tail (a crash tore the LAST record) and could
+    /// not cut it (R2b round 4 F10): the file is unchanged and nothing is
+    /// damaged — `detail` is the whole operator-facing text.
+    #[error("{detail}")]
+    TornTailCutFailed { offset: u64, detail: String },
 }
 
 /// Errors originating from the RDB persistence subsystem.

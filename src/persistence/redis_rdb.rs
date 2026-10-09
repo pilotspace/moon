@@ -590,6 +590,10 @@ pub fn write_rdb_refs_with_moon_aux(
 pub fn write_rdb_body_refs(databases: &[&Database], buf: &mut Vec<u8>) {
     let now_ms = current_time_ms();
 
+    // moon#1300: a key an open transaction holds goes into a replica's sync
+    // image at its PRE-transaction image; the master re-opens the
+    // transaction in the stream right after it (`transaction::reopen`).
+    let held = crate::transaction::isolation::any_held();
     for (db_idx, db) in databases.iter().enumerate() {
         let data = db.data();
 
@@ -597,14 +601,31 @@ pub fn write_rdb_body_refs(databases: &[&Database], buf: &mut Vec<u8>) {
         let live: Vec<_> = data
             .iter()
             .filter(|(_, entry)| !entry.is_expired_at(now_ms))
+            .filter(|(key, _)| {
+                !held || !crate::transaction::isolation::is_held(db_idx, key.as_bytes())
+            })
             .collect();
+        let pre: Vec<(bytes::Bytes, crate::storage::entry::Entry)> = if held {
+            crate::transaction::isolation::with_held_keys(|keys| {
+                keys.filter(|h| h.db == db_idx)
+                    .filter_map(|h| {
+                        h.pre
+                            .filter(|e| !e.is_expired_at(now_ms))
+                            .map(|e| (h.key.clone(), e.clone()))
+                    })
+                    .collect()
+            })
+        } else {
+            Vec::new()
+        };
 
-        if live.is_empty() {
+        if live.is_empty() && pre.is_empty() {
             continue;
         }
 
         // Count entries with expiry for RESIZEDB
-        let expires_count = live.iter().filter(|(_, e)| e.has_expiry()).count();
+        let expires_count = live.iter().filter(|(_, e)| e.has_expiry()).count()
+            + pre.iter().filter(|(_, e)| e.has_expiry()).count();
 
         // SELECTDB
         buf.push(RDB_OPCODE_SELECTDB);
@@ -612,11 +633,14 @@ pub fn write_rdb_body_refs(databases: &[&Database], buf: &mut Vec<u8>) {
 
         // RESIZEDB (per-shard slice size — a presize hint only, safe to repeat)
         buf.push(RDB_OPCODE_RESIZEDB);
-        write_length(buf, live.len() as u64);
+        write_length(buf, (live.len() + pre.len()) as u64);
         write_length(buf, expires_count as u64);
 
         for (key, entry) in &live {
             write_rdb_entry(buf, key.as_bytes(), entry);
+        }
+        for (key, entry) in &pre {
+            write_rdb_entry(buf, key, entry);
         }
     }
 }

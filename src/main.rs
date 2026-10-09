@@ -243,11 +243,8 @@ fn main() -> anyhow::Result<()> {
             moon::persistence::migrate_aof::migrate_aof(from, to, config.migrate_aof_shards)
                 .map_err(|e| anyhow::anyhow!("AOF migration failed: {}", e))?;
         info!(
-            "AOF migration complete: {} RDB keys migrated, {} commands read, {} written, {} skipped",
-            result.rdb_keys_migrated,
-            result.commands_read,
-            result.commands_written,
-            result.commands_skipped
+            "AOF migration complete: {} source records replayed, {} keys written ({:?} per shard)",
+            result.records_replayed, result.keys_migrated, result.keys_per_shard
         );
         return Ok(());
     }
@@ -915,6 +912,20 @@ fn main() -> anyhow::Result<()> {
         );
         std::process::exit(2);
     }
+    // R2b round 3 F-C (moon#1321) / F-H: a flat AOF booted with --shards N,
+    // or a single-shard manifest booted by a build that does not replay it.
+    if config.appendonly == "yes"
+        && let Some(msg) = moon::persistence::aof::layout_guard::refusal(
+            std::path::Path::new(&config.dir),
+            num_shards,
+            existing_manifest.as_ref().map(|m| m.layout),
+            cfg!(feature = "runtime-monoio"),
+            &config.appendfilename,
+        )
+    {
+        eprintln!("REFUSING TO START: {msg}");
+        std::process::exit(2);
+    }
     // Shard-count mismatch guard for non-TopLevel manifests (PerShard layout
     // with a different shard count than currently configured). A v1 TopLevel
     // manifest always records shards=1; that case is already handled above.
@@ -938,6 +949,19 @@ fn main() -> anyhow::Result<()> {
         None;
 
     let (aof_writer_token, mut aof_writers) = (CancellationToken::new(), Vec::new()); // moon#1274
+    // R2b round 4 F5: until the replay below has cut any torn tail, a writer
+    // that stops (a failed boot) appends nothing.
+    moon::persistence::aof::writer_stop::boot_started();
+    // R2b review P1: tokio `--shards 1` may publish its fresh generation by
+    // rename after recovery (`fresh_generation`); its writer opens the file
+    // only once this guard is dropped, below the generation seed.
+    let fresh_aof_gate =
+        (cfg!(not(feature = "runtime-monoio")) && num_shards == 1 && config.appendonly == "yes")
+            .then(|| {
+                moon::persistence::aof::open_gate::hold_writer_open(
+                    &PathBuf::from(&config.dir).join(&config.appendfilename),
+                )
+            });
     let mut aof_pool: Option<std::sync::Arc<AofWriterPool>> = if config.appendonly == "yes" {
         let fsync = FsyncPolicy::from_str(&config.appendfsync);
         // PerShard writers required when num_shards >= 2 AND we'll have a
@@ -957,9 +981,21 @@ fn main() -> anyhow::Result<()> {
 
         if use_per_shard {
             let base_dir = PathBuf::from(&config.dir);
-            let mut senders = Vec::with_capacity(num_shards);
-            for sid in 0..num_shards {
-                let (tx, rx) = channel::mpsc_bounded::<AofMessage>(10_000);
+            // The pool first: each writer takes its lane from it (moon#1266 1A).
+            let (senders, receivers): (Vec<_>, Vec<_>) = (0..num_shards)
+                .map(|_| channel::mpsc_bounded::<AofMessage>(10_000))
+                .unzip();
+            // [F6] per_shard_with_base_dir records the persistence base dir so a
+            // per-shard BGREWRITEAOF can load the authoritative manifest fresh
+            // at rewrite time (try_send_rewrite_per_shard).
+            let pool = AofWriterPool::per_shard_with_base_dir(
+                senders,
+                fsync,
+                std::time::Duration::from_millis(config.aof_fsync_timeout_ms),
+                base_dir.clone(),
+            );
+            for (sid, rx) in receivers.into_iter().enumerate() {
+                let lane = pool.lane(sid);
                 let aof_token = aof_writer_token.clone();
                 let base_dir = base_dir.clone();
                 let thread_name = format!("aof-writer-{sid}");
@@ -973,27 +1009,18 @@ fn main() -> anyhow::Result<()> {
                         RuntimeFactoryImpl::block_on_local(
                             thread_name_inner,
                             aof::per_shard_aof_writer_task(
-                                rx, base_dir, sid as u16, fsync, aof_token,
+                                rx, base_dir, sid as u16, fsync, aof_token, lane,
                             ),
                         );
                     })
                     .expect("failed to spawn per-shard AOF writer thread");
                 aof_writers.push(writer);
-                senders.push(tx);
             }
             info!(
                 "AOF enabled (PerShard, {} writers, fsync: {:?})",
                 num_shards, fsync
             );
-            // [F6] per_shard_with_base_dir records the persistence base dir so a
-            // per-shard BGREWRITEAOF can load the authoritative manifest fresh
-            // at rewrite time (try_send_rewrite_per_shard).
-            Some(AofWriterPool::per_shard_with_base_dir(
-                senders,
-                fsync,
-                std::time::Duration::from_millis(config.aof_fsync_timeout_ms),
-                base_dir.clone(),
-            ))
+            Some(pool)
         } else {
             let (tx, rx) = channel::mpsc_bounded::<AofMessage>(10_000);
             let aof_token = aof_writer_token.clone();
@@ -1012,6 +1039,13 @@ fn main() -> anyhow::Result<()> {
             // fold channels for the writer task
             let writer_fold_channels = Some((tl_fold_producer.clone(), tl_fold_notifier.clone()));
 
+            // The pool first: the writer takes its lane from it (moon#1266 1A).
+            let pool = AofWriterPool::top_level_with_policy(
+                tx,
+                fsync,
+                std::time::Duration::from_millis(config.aof_fsync_timeout_ms),
+            );
+            let lane = pool.lane(0);
             // Legacy single-writer thread; each shard clones the outer `aof_pool` Arc.
             let writer = std::thread::Builder::new()
                 .name("aof-writer".to_string())
@@ -1027,6 +1061,7 @@ fn main() -> anyhow::Result<()> {
                             fsync,
                             aof_token,
                             writer_fold_channels,
+                            lane,
                         ),
                     );
                 })
@@ -1039,11 +1074,7 @@ fn main() -> anyhow::Result<()> {
             toplevel_pool_fold_producer = Some(tl_fold_producer);
             toplevel_pool_fold_notifier = Some(tl_fold_notifier);
 
-            Some(AofWriterPool::top_level_with_policy(
-                tx,
-                fsync,
-                std::time::Duration::from_millis(config.aof_fsync_timeout_ms),
-            ))
+            Some(pool)
         }
     } else {
         None
@@ -1442,6 +1473,16 @@ fn main() -> anyhow::Result<()> {
         })
         .collect();
 
+    // R2b round 2 F1: an `appendonly.aof` that is the only KV source and
+    // could not be replayed. Exit here, before the tokio writer's open gate
+    // is released and before any manifest is created: no AOF writer has
+    // opened (or appended to) the file.
+    if let Some(refusal) = shards.iter().find_map(|s| s.aof_unreadable.as_ref()) {
+        tracing::error!("{}", refusal.message());
+        eprintln!("moon: {}", refusal.message());
+        std::process::exit(1);
+    }
+
     // moon#997 / moon#893: prove every shard's cold file_id seed before any
     // shard can spill or transition a vector segment. The seed must clear
     // every id a spill file, a warm segment or a manifest entry holds; one
@@ -1669,7 +1710,7 @@ fn main() -> anyhow::Result<()> {
                         manifest,
                         &DispatchReplayEngine::new(),
                     )
-                    .with_context(|| "multi-part AOF replay failed")?;
+                    .unwrap_or_else(|e| refuse_damaged_aof("multi-part AOF", &e));
                     info!(
                         "AOF multi-part loaded (seq {}): {} entries",
                         manifest.seq, loaded
@@ -1680,39 +1721,10 @@ fn main() -> anyhow::Result<()> {
                     // replay it via restore_from_persistence's fallback path.
                     // Rename (not delete) so an operator can recover if something
                     // went wrong.
-                    let legacy = base_dir.join("appendonly.aof");
-                    if legacy.exists() {
-                        let retired = base_dir.join("appendonly.aof.legacy");
-                        if let Err(e) = std::fs::rename(&legacy, &retired) {
-                            tracing::warn!(
-                                "Failed to retire legacy AOF {}: {}",
-                                legacy.display(),
-                                e
-                            );
-                        } else {
-                            info!(
-                                "Retired legacy AOF {} → {}",
-                                legacy.display(),
-                                retired.display()
-                            );
-                        }
-                    }
+                    moon::persistence::aof::flat_file::retire_logged(&base_dir);
                 }
-                #[cfg(not(feature = "runtime-monoio"))]
-                {
-                    // tokio + --shards 1: single-shard multi-part replay is
-                    // monoio-only. Legacy v2 (appendonly.aof) recovery already
-                    // ran in restore_from_persistence; warn so an operator who
-                    // switched from monoio knows multi-part data isn't loaded by
-                    // this build.
-                    tracing::warn!(
-                        "multi-part AOF manifest at {}/appendonlydir/ found but runtime is \
-                         tokio with --shards 1; single-shard multi-part replay is monoio-only. \
-                         Legacy v2 (appendonly.aof) recovery active. Switch to monoio to load \
-                         multi-part single-shard data.",
-                        base_dir.display()
-                    );
-                }
+                // tokio + --shards 1 never reaches here: it refused to start
+                // before recovery (`aof::layout_guard`, R2b round 3 F-H).
             } else if manifest.layout == moon::persistence::aof_manifest::AofLayout::PerShard {
                 // Per-shard AOF replay (RFC § 2 rules 1-3, Option B step 4).
                 //
@@ -1755,7 +1767,7 @@ fn main() -> anyhow::Result<()> {
                         manifest,
                         &engine_factory,
                     )
-                    .with_context(|| "per-shard AOF replay failed")?
+                    .unwrap_or_else(|e| refuse_damaged_aof("per-shard AOF", &e))
                 };
 
                 // Step 5: merge-replay `OrderedAcrossShards`-tagged entries
@@ -1802,19 +1814,7 @@ fn main() -> anyhow::Result<()> {
                 // Retire any stray legacy top-level appendonly.aof so the
                 // next boot doesn't double-replay it via v2 recovery in
                 // `restore_from_persistence`.
-                let legacy = base_dir.join("appendonly.aof");
-                if legacy.exists() {
-                    let retired = base_dir.join("appendonly.aof.legacy");
-                    if let Err(e) = std::fs::rename(&legacy, &retired) {
-                        tracing::warn!("Failed to retire legacy AOF {}: {}", legacy.display(), e);
-                    } else {
-                        info!(
-                            "Retired legacy AOF {} → {}",
-                            legacy.display(),
-                            retired.display()
-                        );
-                    }
-                }
+                moon::persistence::aof::flat_file::retire_logged(&base_dir);
             } else {
                 // TopLevel manifest (v1 / single-file layout) combined with
                 // --shards >= 2 is an unsafe combination: replaying a single
@@ -1880,17 +1880,7 @@ fn main() -> anyhow::Result<()> {
                     // Retire legacy appendonly.aof — its contents are now in
                     // the base RDB, and leaving it would cause v2 recovery on
                     // the next boot to double-replay it.
-                    let legacy = base_dir.join("appendonly.aof");
-                    if legacy.exists() {
-                        let retired = base_dir.join("appendonly.aof.legacy");
-                        if let Err(e) = std::fs::rename(&legacy, &retired) {
-                            tracing::warn!(
-                                "Failed to retire legacy AOF {}: {}",
-                                legacy.display(),
-                                e
-                            );
-                        }
-                    }
+                    moon::persistence::aof::flat_file::retire_logged(&base_dir);
                 }
             } else if num_shards >= 2 {
                 // Multi-shard fresh boot: create the PerShard manifest layout
@@ -1925,6 +1915,8 @@ fn main() -> anyhow::Result<()> {
                     &mut preserved_cold_wiring,
                     &spill_seeds,
                 )?;
+                // R2b round 2 F2: the manifest is the authority now.
+                moon::persistence::aof::flat_file::retire_logged(&base_dir);
                 info!(
                     "Initialized PerShard AOF manifest for {} shards at {}",
                     num_shards,
@@ -1942,6 +1934,11 @@ fn main() -> anyhow::Result<()> {
                         &mut preserved_cold_wiring,
                         &spill_seeds,
                     )?;
+                    // R2b round 2 F2: a flat file this boot replayed into
+                    // an empty keyspace (a tokio generation's head alone)
+                    // must not outlive the manifest: a later tokio
+                    // `--shards 1` boot would take it as the dataset.
+                    moon::persistence::aof::flat_file::retire_logged(&base_dir);
                 }
                 // tokio --shards 1 fresh: no manifest (v2 single-file recovery
                 // owns single-shard durability). Creating one here would trigger
@@ -1968,25 +1965,40 @@ fn main() -> anyhow::Result<()> {
             // Its head's DELs read the ledger in the cold index (moon#1281 round 2b).
             reattach_cold_wiring(&mut shards, &mut preserved_cold_wiring);
             let aof_path = base_dir.join(&config.appendfilename);
-            let seeded = moon::persistence::cold_records::seed_generation_head_if_fresh(
-                &aof_path,
+            // R2b review P1: a generation opened over a non-empty keyspace (a
+            // snapshot loaded because no AOF held a record) carries it as its
+            // RDB preamble — the AOF is the only KV source of the next boot.
+            use moon::persistence::aof::fresh_generation::{self, FreshGeneration};
+            let dbs = &shards[0].databases;
+            let base = || fresh_generation::keyspace_base(dbs);
+            let head = (
                 cold_file_watermark(&spill_seeds, 0),
                 fresh_deletes(&shards, 0),
-            )
-            .with_context(|| {
-                format!(
-                    "failed to seed the AOF cold-plane cut in {} (moon#914)",
-                    aof_path.display()
-                )
-            })?;
-            if seeded {
-                info!(
+            );
+            let opened = fresh_generation::open_fresh_flat_generation(&aof_path, base, Some(head))
+                .with_context(|| {
+                    format!(
+                        "failed to open the AOF generation {} (moon#914, R2b review P1)",
+                        aof_path.display()
+                    )
+                })?;
+            match opened {
+                FreshGeneration::Existing => {}
+                FreshGeneration::HeadOnly => info!(
                     "Opened AOF generation {} with its MOON.COLDCUT head (moon#914)",
                     aof_path.display()
-                );
+                ),
+                FreshGeneration::WithBase { bytes } => info!(
+                    "Opened AOF generation {} with the loaded keyspace as its RDB preamble \
+                     ({} bytes) and its MOON.COLDCUT head",
+                    aof_path.display(),
+                    bytes
+                ),
             }
         }
     }
+    moon::persistence::aof::writer_stop::boot_completed();
+    drop(fresh_aof_gate);
 
     // (The former standalone tokio "multi-part AOF ignored" warn block was
     // removed: multi-shard PerShard AOF is now loaded on tokio too, and the
@@ -2049,9 +2061,10 @@ fn main() -> anyhow::Result<()> {
             // The replay reads `<dir>/appendonly.aof`; the writer appends to
             // `<dir>/<appendfilename>`. A rewrite can only repair the file
             // that was replayed.
-            let replayed = std::path::Path::new(&config.dir).join("appendonly.aof");
+            use moon::persistence::aof::flat_file::{FLAT_AOF_NAME, flat_aof_path};
+            let replayed = flat_aof_path(std::path::Path::new(&config.dir));
             let aof_bytes = std::fs::metadata(&replayed).map_or(0, |m| m.len());
-            let writes_replayed_file = config.appendfilename == "appendonly.aof";
+            let writes_replayed_file = config.appendfilename == FLAT_AOF_NAME;
             if aof_pool.is_some() && writes_replayed_file {
                 tracing::warn!(
                     "moon#914: replayed a legacy appendonly.aof ({}, {} bytes) with no \
@@ -2155,6 +2168,15 @@ fn main() -> anyhow::Result<()> {
             min_size,
             force_legacy_aof_rewrite,
         );
+    }
+
+    // moon#1266 1A (W2B-1): the writers hand their append position to the
+    // shard threads before any client can write (bounded; a lane still held
+    // then is safe, only slower — its replies wait for a writer barrier).
+    if let Some(ref pool) = aof_pool
+        && moon::persistence::aof::lane_test_hook::writer_start_delay().is_none()
+    {
+        pool.await_hand_over(std::time::Duration::from_secs(2));
     }
 
     // All shards recovered — mark server as ready for /readyz.
@@ -2616,6 +2638,16 @@ pub fn should_warn_undersubscription(maxclients: usize, num_shards: usize) -> Op
 /// is EMFILE on the persistence path mid-flight.
 pub fn rlimit_reserved_fds(num_shards: usize) -> u64 {
     64 + (num_shards as u64) * 16
+}
+
+/// R2b round 3 F-B: a damaged AOF found by the manifest replay (monoio
+/// `--shards 1`, every `--shards N`). Exit at once, like the flat file's
+/// `UnreadableAof` refusal: returning `Err` from `main` ran the orderly
+/// writer shutdown, which appended its clean-close stamp behind the damage.
+fn refuse_damaged_aof(what: &str, e: &moon::error::MoonError) -> ! {
+    tracing::error!("refusing to start: {what}: {e}");
+    eprintln!("moon: refusing to start: {what}: {e}");
+    std::process::exit(1);
 }
 
 #[cfg(test)]

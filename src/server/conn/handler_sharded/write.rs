@@ -653,6 +653,13 @@ pub(super) async fn try_handle_multi_exec(
             // committed and the aborted outcome, and a stale watch surviving
             // an abort is how a CAS retry loop livelocks.
             let watched = std::mem::take(&mut conn.watched_keys);
+            // moon#1295: the body cannot wait once it runs; the large
+            // collections it writes stream into a running save first.
+            if crate::persistence::snapshot_cow::is_armed() {
+                let queue = &conn.command_queue;
+                crate::persistence::snapshot_cow::stream::wait_for_queued(conn.selected_db, queue)
+                    .await;
+            }
             // CLIENT TRACKING: the modes the body starts under. The intercept
             // pass applies any queued CLIENT TRACKING/CACHING before the body
             // is bookkept, so it is replayed from here.
@@ -816,6 +823,7 @@ pub(super) async fn try_handle_multi_exec(
                                     ctx.num_shards,
                                     &ctx.dispatch_tx,
                                     &ctx.spsc_notifiers,
+                                    ctx.aof_pool.as_ref(), // moon#1322
                                 )
                                 .await;
                                 // moon#1264: a FLUSHALL in the body saves.
@@ -981,6 +989,7 @@ pub(super) async fn try_handle_multi_exec(
                 ctx.num_shards,
                 &ctx.dispatch_tx,
                 &ctx.spsc_notifiers,
+                ctx.aof_pool.as_ref(), // moon#1322
             )
             .await;
             // moon#1264: with save points, a FLUSHALL in the body saves the

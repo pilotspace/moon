@@ -91,20 +91,44 @@ pub fn in_flight_fsyncs() -> (usize, u64) {
 
 /// When [`EverysecSync::due`] last logged a stalled fsync (process-wide, in
 /// [`mono_ms`]): the log line is rate-limited to one per [`STALL`].
+/// How often an everysec writer whose fsync agent could not be spawned
+/// tries again (R2b round 3 N2).
+const AGENT_SPAWN_RETRY: Duration = Duration::from_secs(60);
+
 static LAST_STALL_WARN_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Test-only: `MOON_TEST_AOF_SYNC_GATE=<path>` holds every AOF data fsync —
 /// the everysec agent's and `always`'s per-batch one — while `<path>` exists.
 /// Lets a test hold an fsync open and watch what is acknowledged meanwhile.
 /// Read once per process; unset, it costs one cached `Option` check per fsync.
+///
+/// `MOON_TEST_AOF_SYNC_GATE_WRITERS=<n>[,<n>...]` narrows the gate to the
+/// per-shard writers `<n>` (threads `aof-writer-<n>` and their agents
+/// `aof-fsync-<n>`): moon#1322's suite holds ONE remote shard's fsync while
+/// the connection's own shard syncs freely.
 pub(super) fn sync_gate_for_test() {
     static GATE: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+    static ONLY: std::sync::OnceLock<Option<Vec<String>>> = std::sync::OnceLock::new();
     let gate = GATE.get_or_init(|| {
         std::env::var_os("MOON_TEST_AOF_SYNC_GATE")
             .filter(|v| !v.is_empty())
             .map(std::path::PathBuf::from)
     });
     if let Some(path) = gate {
+        let only = ONLY.get_or_init(|| {
+            let list = std::env::var("MOON_TEST_AOF_SYNC_GATE_WRITERS").ok()?;
+            Some(list.split(',').map(|n| n.trim().to_owned()).collect())
+        });
+        if let Some(only) = only {
+            let current = std::thread::current();
+            let suffix = current.name().and_then(|n| {
+                n.strip_prefix("aof-writer-")
+                    .or_else(|| n.strip_prefix("aof-fsync-"))
+            });
+            if !suffix.is_some_and(|s| only.iter().any(|o| o == s)) {
+                return;
+            }
+        }
         while path.exists() {
             std::thread::sleep(Duration::from_millis(1));
         }
@@ -268,6 +292,15 @@ pub(super) enum Claim {
 pub(super) struct EverysecSync {
     writer_idx: usize,
     agent: Option<AofFsyncAgent>,
+    /// The policy this state was built for is `everysec` — with or without
+    /// an agent: a writer whose agent could not be spawned fsyncs inline, and
+    /// must not be rebuilt (re-WARNed, deadline reset) on every wake (R2b
+    /// round 2 F6).
+    everysec: bool,
+    /// An everysec writer whose agent could not be spawned retries the spawn
+    /// at its deadline once this passes (R2b round 3 N2; one WARN at the
+    /// first failure, the retries are quiet).
+    spawn_retry_at: Instant,
     last_handoff: Instant,
     dirty: bool,
     /// When the fsync now (or last) in flight was handed to the agent.
@@ -307,6 +340,8 @@ impl EverysecSync {
         Self {
             writer_idx,
             agent,
+            everysec: policy == FsyncPolicy::EverySec,
+            spawn_retry_at: Instant::now() + AGENT_SPAWN_RETRY,
             last_handoff: Instant::now(),
             dirty: false,
             dispatched_at: Instant::now(),
@@ -328,13 +363,17 @@ impl EverysecSync {
     /// the everysec state changed (the caller's pending deadline is void).
     pub(super) fn set_policy(&mut self, policy: FsyncPolicy) -> bool {
         let everysec = policy == FsyncPolicy::EverySec;
-        if everysec == self.agent.is_some() {
+        if everysec == self.everysec {
             return false;
         }
         if everysec {
             *self = Self {
                 heal_pending: self.heal_pending,
                 written_after_failure: self.written_after_failure,
+                // What an earlier policy wrote without its fsync (`no`, or a
+                // batch committed right after leaving `always`) is owed to
+                // the first deadline (moon#1266 W2B-1).
+                dirty: true,
                 ..Self::new(self.writer_idx, policy)
             };
         } else {
@@ -346,6 +385,7 @@ impl EverysecSync {
                 self.observe_settled_job(handoff.last_failed());
             }
             self.dirty = false;
+            self.everysec = false;
         }
         true
     }
@@ -358,6 +398,8 @@ impl EverysecSync {
         Self {
             writer_idx,
             agent: AofFsyncAgent::spawn_with_backend(writer_idx, backend).ok(),
+            everysec: true,
+            spawn_retry_at: Instant::now() + AGENT_SPAWN_RETRY,
             last_handoff: Instant::now(),
             dirty: false,
             dispatched_at: Instant::now(),
@@ -476,6 +518,7 @@ impl EverysecSync {
 
     /// Claim the next fsync.
     pub(super) fn claim(&mut self) -> Claim {
+        self.retry_agent_spawn();
         let Some(agent) = self.agent.as_ref() else {
             return Claim::Inline;
         };
@@ -500,6 +543,28 @@ impl EverysecSync {
                 }
                 Claim::Postponed
             }
+        }
+    }
+
+    /// An everysec writer without an agent (its spawn failed) tries again, at
+    /// most once per [`AGENT_SPAWN_RETRY`]; meanwhile it fsyncs inline.
+    fn retry_agent_spawn(&mut self) {
+        if self.agent.is_some() || !self.everysec || Instant::now() < self.spawn_retry_at {
+            return;
+        }
+        self.spawn_retry_at = Instant::now() + AGENT_SPAWN_RETRY;
+        match AofFsyncAgent::spawn(self.writer_idx) {
+            Ok(agent) => {
+                tracing::info!(
+                    "AOF writer {}: everysec fsync agent started on retry",
+                    self.writer_idx
+                );
+                self.agent = Some(agent);
+            }
+            Err(e) => tracing::debug!(
+                "AOF writer {}: fsync agent retry failed ({e}); still fsyncing inline",
+                self.writer_idx
+            ),
         }
     }
 
@@ -887,6 +952,35 @@ mod tests {
         s.backdate(EVERYSEC);
         assert_eq!(s.claim(), Claim::Owned);
         assert!(s.dispatch(file()));
+    }
+
+    /// R2b round 2 F6: a writer whose agent could not be spawned stays an
+    /// inline-fsync everysec writer — the same policy on the next wake is a
+    /// no-op, so the deadline is not reset (it used to be rebuilt, re-WARNed
+    /// and its `last_handoff` reset every wake, so `due()` never fired).
+    #[test]
+    fn an_everysec_writer_without_an_agent_is_not_rebuilt_every_wake() {
+        let mut s = EverysecSync::new(0, FsyncPolicy::EverySec);
+        // What a failed `AofFsyncAgent::spawn` leaves.
+        s.agent = None;
+        s.note_written();
+        s.backdate(EVERYSEC);
+        assert!(!s.set_policy(FsyncPolicy::EverySec), "same policy: no-op");
+        assert!(s.due(), "the deadline survives the wake");
+        assert_eq!(
+            s.claim(),
+            Claim::Inline,
+            "no retry before AGENT_SPAWN_RETRY"
+        );
+        // R2b round 3 N2: once the retry is due, the deadline spawns again.
+        s.spawn_retry_at = Instant::now();
+        assert_eq!(s.claim(), Claim::Owned, "the retried agent owns the fsync");
+        assert!(s.agent.is_some());
+        s.agent = None;
+        // Leaving and re-entering everysec still rebuilds (and retries).
+        assert!(s.set_policy(FsyncPolicy::No));
+        assert!(!s.set_policy(FsyncPolicy::No));
+        assert!(s.set_policy(FsyncPolicy::EverySec));
     }
 
     /// R1 review NIT: an agent that unwinds mid-fsync settles its job as a

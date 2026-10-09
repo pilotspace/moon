@@ -290,6 +290,55 @@ pub fn next_trigger(
     }
 }
 
+/// A rewrite some part of the server asked for (R2b round 2 R1 / round 3
+/// F-E: a replica's full sync, a promotion that rolled back an open master
+/// transaction, a replica record its AOF could not take). The monitor treats
+/// it like the boot's forced rewrite: it wakes at once ([`request_rewrite`]
+/// unparks it), waits out a rewrite already running (that one started before
+/// the request), dispatches its own, and keeps the request until a rewrite
+/// it dispatched completes OK — a failed one is dispatched again; one still
+/// running after the monitor's wait is judged by its own outcome when it
+/// ends (R2b round 4 F-E-DUP: an OK one used to be followed by a second
+/// full rewrite). Without an AOF there is no monitor, and the request is a
+/// no-op.
+static REWRITE_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+/// The monitor thread, so a request wakes it instead of waiting for its tick.
+/// The latest monitor started (R2b round 4: a `OnceLock` kept the first, so
+/// a process that started a second one — tests — woke the wrong thread).
+static MONITOR_THREAD: parking_lot::Mutex<Option<std::thread::Thread>> =
+    parking_lot::Mutex::new(None);
+
+/// Ask the monitor for one AOF rewrite (see [`REWRITE_REQUESTED`]).
+pub fn request_rewrite() {
+    REWRITE_REQUESTED.store(true, Ordering::SeqCst);
+    if let Some(t) = MONITOR_THREAD.lock().as_ref() {
+        t.unpark();
+    }
+}
+
+/// Whether this process runs the auto-rewrite monitor (main.rs with an AOF;
+/// never the embedded server), i.e. whether [`request_rewrite`] is served.
+pub fn monitor_running() -> bool {
+    MONITOR_THREAD.lock().is_some()
+}
+
+/// The monitor's wait for its next tick: [`TICK`], cut short by a
+/// [`request_rewrite`] (its unpark) — unless the last tick was `busy` (a
+/// rewrite or BGSAVE running, a cooldown): nothing can be dispatched before
+/// that ends, so the whole tick is slept, however many requests arrive (R2b
+/// round 4 MON-SPIN: a request pending while busy made the monitor skip its
+/// park and spin).
+fn wait_for_tick(busy: bool) {
+    let start = std::time::Instant::now();
+    loop {
+        std::thread::park_timeout(TICK.saturating_sub(start.elapsed()));
+        if !busy || start.elapsed() >= TICK {
+            return;
+        }
+    }
+}
+
 /// Spawn the auto-rewrite monitor thread. `percentage == 0` still spawns the
 /// sampler (INFO size freshness) but never dispatches a growth rewrite.
 ///
@@ -331,6 +380,9 @@ fn monitor_loop(
     let mut cooldown_until = std::time::Instant::now();
     let mut saw_in_progress = false;
     let mut forced_pending = force_once;
+    // Which forced rewrite is pending: the boot's moon#914 repair, or one
+    // requested at runtime (only names it in the log).
+    let mut forced_by_boot = force_once;
     let mut last_reclaim_rewrite: Option<std::time::Instant> = None;
     // moon#1289: the last fold dispatched for held files that waited for
     // nothing; the next one is one `held_release::spacing` away.
@@ -338,15 +390,34 @@ fn monitor_loop(
     // Compactions waiting at the previous tick, and since when some have.
     let mut prev_awaiting = 0usize;
     let mut awaiting_since: Option<std::time::Instant> = None;
+    // The last tick could not dispatch anything (see `wait_for_tick`).
+    let mut busy_last_tick = false;
+    // A requested rewrite this monitor dispatched that was still running
+    // when its wait ended: its own outcome, once it ends, decides whether
+    // the request is served (R2b round 4 F-E-DUP).
+    let mut requested_outstanding = false;
+    *MONITOR_THREAD.lock() = Some(std::thread::current());
     info!(
         "aof-auto-rewrite monitor started (percentage={}%, min_size={} bytes)",
         percentage, min_size
     );
     loop {
-        std::thread::sleep(TICK);
+        // A tick, or at once when a rewrite is requested and one can start.
+        wait_for_tick(busy_last_tick);
+        busy_last_tick = false;
 
         let in_progress = AOF_REWRITE_IN_PROGRESS.load(Ordering::SeqCst);
         let current = refresh_current_size();
+        forced_pending |= REWRITE_REQUESTED.swap(false, Ordering::SeqCst);
+        // The requested rewrite that outlived the wait has ended (no other
+        // can start while it holds the flag): it served the request if it
+        // committed. A rewrite that ran entirely between two ticks after it
+        // also started after the request, so its outcome serves as well.
+        forced_pending |= settle_outstanding(
+            &mut requested_outstanding,
+            in_progress,
+            super::AOF_REWRITE_LAST_OK.load(Ordering::SeqCst),
+        );
 
         // A rewrite completed since the last tick (ours or a manual
         // BGREWRITEAOF): the compacted size is the new growth baseline.
@@ -358,12 +429,18 @@ fn monitor_loop(
         saw_in_progress = in_progress;
         if completed_since_last_tick || (!in_progress && shrunk_below_base) {
             record_base_size();
-            continue;
+            // R2b round 3 F-F: a pending forced rewrite is dispatched on this
+            // same tick (it used to wait one more tick, +1 s on every
+            // replica's post-sync window).
+            if !forced_pending {
+                continue;
+            }
         }
 
         let busy = in_progress
             || SAVE_IN_PROGRESS.load(Ordering::SeqCst)
             || std::time::Instant::now() < cooldown_until;
+        busy_last_tick = busy;
         let base = AOF_BASE_SIZE.load(Ordering::Relaxed);
         let compactions = crate::storage::tiered::cold_reclaim::awaiting_fold();
         let held_ledger = crate::storage::tiered::cold_reclaim::held_files_pressure();
@@ -397,9 +474,13 @@ fn monitor_loop(
         };
 
         match trigger {
-            RewriteTrigger::Forced => info!(
+            RewriteTrigger::Forced if forced_by_boot => info!(
                 "aof-auto-rewrite: triggering the one boot-time BGREWRITEAOF so the AOF \
                  opens with its MOON.COLDCUT (moon#914; current={} bytes)",
+                current
+            ),
+            RewriteTrigger::Forced => info!(
+                "aof-auto-rewrite: triggering the {REQUESTED_REWRITE} (current={} bytes)",
                 current
             ),
             RewriteTrigger::Growth => info!(
@@ -469,11 +550,30 @@ fn monitor_loop(
                 }
                 record_base_size();
                 saw_in_progress = false;
-                if trigger == RewriteTrigger::Forced {
-                    forced_pending = finish_forced_rewrite(
-                        AOF_REWRITE_IN_PROGRESS.load(Ordering::SeqCst),
+                let still_running = AOF_REWRITE_IN_PROGRESS.load(Ordering::SeqCst);
+                if trigger == RewriteTrigger::Forced && !forced_by_boot && still_running {
+                    // R2b round 3 F-E / round 4 F-E-DUP: a requested rewrite
+                    // still running after the wait has no outcome yet; the
+                    // tick that sees it end judges it (a failed one is
+                    // dispatched again, an OK one is not repeated).
+                    warn!(
+                        "aof-auto-rewrite: the {REQUESTED_REWRITE} is still running after the \
+                         monitor's wait; its outcome is checked when it ends"
+                    );
+                    forced_pending = false;
+                    requested_outstanding = true;
+                } else if trigger == RewriteTrigger::Forced {
+                    let what = if forced_by_boot {
+                        BOOT_REWRITE
+                    } else {
+                        REQUESTED_REWRITE
+                    };
+                    forced_pending = finish_forced_rewrite_of(
+                        what,
+                        still_running,
                         super::AOF_REWRITE_LAST_OK.load(Ordering::SeqCst),
                     );
+                    forced_by_boot &= forced_pending;
                     if forced_pending {
                         cooldown_until = std::time::Instant::now() + FAILED_DISPATCH_COOLDOWN;
                     }
@@ -493,24 +593,59 @@ fn monitor_loop(
 /// - Still running past the wait: not pending. Dispatching again would only
 ///   be refused as "already in progress", and the writer logs the outcome.
 ///   If that rewrite fails, the next boot detects the cut-less file again.
+#[cfg(test)]
 fn finish_forced_rewrite(still_running: bool, last_ok: bool) -> bool {
+    finish_forced_rewrite_of(BOOT_REWRITE, still_running, last_ok)
+}
+
+/// The forced rewrite's name in the monitor's lines: the boot-time
+/// moon#914 repair (its wording is what tests and operators grep for), or a
+/// rewrite requested at runtime ([`request_rewrite`]).
+const BOOT_REWRITE: &str = "boot-time moon#914 rewrite";
+const REQUESTED_REWRITE: &str = "requested rewrite (replica sync / promotion rollback)";
+
+/// [`finish_forced_rewrite`] for the forced rewrite named `what`.
+fn finish_forced_rewrite_of(what: &str, still_running: bool, last_ok: bool) -> bool {
     if still_running {
         warn!(
-            "aof-auto-rewrite: the boot-time moon#914 rewrite is still running after the \
-             monitor's wait; not re-dispatching. If it fails, the next boot retries it"
+            "aof-auto-rewrite: the {what} is still running after the monitor's wait; not \
+             re-dispatching. If it fails, run BGREWRITEAOF (a boot-time moon#914 repair is \
+             retried at the next boot)"
         );
         false
     } else if last_ok {
         info!(
-            "aof-auto-rewrite: boot-time moon#914 rewrite complete; the AOF now opens with \
-             its MOON.COLDCUT and later boots replay it gated"
+            "aof-auto-rewrite: {what} complete; the AOF's new generation holds the whole \
+             dataset and opens with its MOON.COLDCUT"
         );
         false
     } else {
         warn!(
-            "aof-auto-rewrite: the boot-time moon#914 rewrite FAILED; the AOF still has no \
-             MOON.COLDCUT. Retrying in {:?}",
+            "aof-auto-rewrite: the {what} FAILED; the previous AOF generation stays. \
+             Retrying in {:?}",
             FAILED_DISPATCH_COOLDOWN
+        );
+        true
+    }
+}
+
+/// Settle a requested rewrite that outlived the monitor's wait
+/// (`outstanding`, R2b round 4 F-E-DUP) once no rewrite is `in_progress`:
+/// no other rewrite could start while it held the flag, so `last_ok` is its
+/// outcome — or that of a rewrite that ran entirely between two ticks after
+/// it, which also started after the request and serves it as well. Returns
+/// whether the request must be dispatched again (it failed).
+fn settle_outstanding(outstanding: &mut bool, in_progress: bool, last_ok: bool) -> bool {
+    if !*outstanding || in_progress {
+        return false;
+    }
+    *outstanding = false;
+    if last_ok {
+        info!("aof-auto-rewrite: the {REQUESTED_REWRITE} completed after the wait");
+        false
+    } else {
+        warn!(
+            "aof-auto-rewrite: the {REQUESTED_REWRITE} FAILED after the wait; dispatching it again"
         );
         true
     }
@@ -537,8 +672,51 @@ fn note_held_release_fold(
 #[cfg(test)]
 mod tests {
     use super::{
-        RewriteTrigger, finish_forced_rewrite, next_trigger, note_held_release_fold, should_trigger,
+        RewriteTrigger, TICK, finish_forced_rewrite, next_trigger, note_held_release_fold,
+        settle_outstanding, should_trigger, wait_for_tick,
     };
+
+    /// R2b round 4 F-E-DUP: a requested rewrite that outlived the wait is
+    /// judged once, by its own outcome when it ends — an OK one is not
+    /// dispatched a second time, a failed one is.
+    #[test]
+    fn an_outstanding_requested_rewrite_is_settled_by_its_own_outcome() {
+        let mut outstanding = true;
+        assert!(
+            !settle_outstanding(&mut outstanding, true, false),
+            "still running"
+        );
+        assert!(outstanding);
+        assert!(
+            !settle_outstanding(&mut outstanding, false, true),
+            "ended OK: served"
+        );
+        assert!(!outstanding);
+        assert!(
+            !settle_outstanding(&mut outstanding, false, false),
+            "settled once"
+        );
+        let mut outstanding = true;
+        assert!(
+            settle_outstanding(&mut outstanding, false, false),
+            "ended failed: again"
+        );
+        assert!(!outstanding);
+    }
+
+    /// R2b round 4 MON-SPIN: a request (an unpark) cuts an idle tick short,
+    /// never a busy one — the monitor no longer spins while a rewrite runs.
+    #[test]
+    fn a_request_wakes_an_idle_monitor_but_not_a_busy_one() {
+        std::thread::current().unpark();
+        let t = std::time::Instant::now();
+        wait_for_tick(false);
+        assert!(t.elapsed() < TICK / 2, "an idle tick is cut short");
+        std::thread::current().unpark();
+        let t = std::time::Instant::now();
+        wait_for_tick(true);
+        assert!(t.elapsed() >= TICK, "a busy tick is slept whole");
+    }
 
     /// R1 finding 10: a held-release fold whose dispatch failed is neither
     /// counted nor allowed to push the next held-release fold a whole

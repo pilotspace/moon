@@ -49,7 +49,7 @@ fn stamp_of(frame: &Frame) -> Option<Option<u64>> {
     match pseudo::classify(name, args)? {
         Pseudo::Ts(ms) | Pseudo::Close(ms) => Some(Some(ms)),
         Pseudo::MalformedTs => Some(None),
-        Pseudo::ColdPlane => None,
+        Pseudo::ColdPlane | Pseudo::Txn(_) | Pseudo::MalformedTxn => None,
     }
 }
 
@@ -110,9 +110,9 @@ fn scan_resp(src: impl Read, offset: u64) -> SegmentScan {
 /// how many bytes the file holds past the start: a declared length beyond it
 /// is a torn tail, never an allocation of that size.
 fn scan_framed(mut src: impl Read, mut remaining: u64) -> SegmentScan {
-    use crate::protocol::{ParseConfig, parse};
+    use crate::protocol::parse;
     const HEADER_LEN: u64 = 12;
-    let config = ParseConfig::default();
+    let config = super::chunks::log_parse_config();
     let mut records = 0u64;
     let mut payload = bytes::BytesMut::new();
     let end = |records| SegmentScan {

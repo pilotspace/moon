@@ -81,6 +81,36 @@ pub fn set_legacy_spin_hooks(advertise: Box<dyn Fn(bool)>, probe: Box<dyn Fn() -
     driver::set_legacy_spin_hooks(advertise, probe)
 }
 
+/// moon patch (moon#1266 1A): where the CALLING thread's driver lets the I/O
+/// its tasks queue reach the kernel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IoWritePoint {
+    /// Inside the task's poll (a socket write runs its syscall right away):
+    /// io_uring with an SQPOLL kernel thread, or no driver built yet. The
+    /// before-submit hook does not order anything.
+    InTask,
+    /// Only at an `io_uring_enter` that submits (io_uring without SQPOLL):
+    /// the hook runs before every one of them, so whatever it writes reaches
+    /// the kernel before any I/O queued since the previous submit.
+    AtSubmit,
+    /// Inside the task's poll, and the hook runs before every readiness poll
+    /// (the epoll/kqueue driver): a task that parks until the hook wakes it
+    /// writes after the hook's own write; when the hook reports woken tasks
+    /// the driver polls without blocking.
+    AtParkHook,
+}
+
+/// moon patch (moon#1266 1A): install (`Some`) or clear (`None`) the CALLING
+/// thread's before-submit hook — run before every `io_uring_enter` that
+/// submits SQEs (park, cold-path submit, a full submission queue) on the
+/// io_uring driver, and before every readiness poll on the legacy driver.
+/// The hook returns whether it made tasks runnable. Returns where this
+/// thread's driver lets queued writes reach the kernel ([`IoWritePoint`]).
+/// Call on the runtime's own thread, after it was built.
+pub fn set_before_submit_hook(hook: Option<fn() -> bool>) -> IoWritePoint {
+    driver::set_before_submit_hook(hook)
+}
+
 /// Start a monoio runtime.
 ///
 /// # Examples

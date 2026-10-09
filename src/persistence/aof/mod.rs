@@ -356,12 +356,20 @@ pub enum AofMessage {
     /// with. Not on disk as a field: the writer emits a `MOON.TS <clock_ms>`
     /// record before this one whenever it differs from the last stamp in the
     /// stream ([`RecordCtx`]). 0 = unknown (no stamp).
+    ///
+    /// `txn` is the cross-store transaction the record belongs to
+    /// ([`AppendStamp::txn`], moon#1300): 0 for every record outside a `TXN`.
+    /// Not on disk as a field either: the writer emits `MOON.TXN BEGIN|PAUSE`
+    /// before a record whose transaction differs from the stream's
+    /// ([`RecordCtx`]); `id | TXN_END_FLAG` marks the transaction's END
+    /// record.
     Append {
         lsn: u64,
         db: usize,
         bytes: Bytes,
         epoch: FoldEpoch,
         clock_ms: u64,
+        txn: u64,
     },
     /// Append + fsync + ack rendezvous (RFC § 4 — Fix 2 for the H1
     /// data-loss vector exposed by `appendfsync=always`).
@@ -392,6 +400,7 @@ pub enum AofMessage {
         ack: crate::runtime::channel::OneshotSender<AofAck>,
         epoch: FoldEpoch,
         clock_ms: u64,
+        txn: u64,
     },
     /// Trigger a full AOF rewrite (compaction) using current database state.
     /// The [`rewrite::RewriteOverflow`] is this writer's rewrite-window spill
@@ -792,8 +801,16 @@ pub const DEFAULT_AOF_FSYNC_TIMEOUT: Duration = Duration::from_millis(2000);
 pub mod auto_rewrite;
 /// Exactly-sized, allocation-lean record encoding (moon#1187).
 mod encode;
+/// The legacy single-file AOF's name and its unreadable-file refusal (R2b
+/// round 2).
+pub mod flat_file;
 /// Streamed base image for the rewrite fold (moon#1185).
 pub mod fold_stream;
+/// An AOF fold while a `TXN` is open: re-opening its block (moon#1300).
+pub(crate) mod fold_txn;
+/// A fresh single-file generation carries the keyspace it was opened over
+/// (R2b review P1).
+pub mod fresh_generation;
 /// The everysec fsync agent: the once-per-second fsync off the writer's
 /// loop (moon#1266).
 mod fsync_agent;
@@ -802,20 +819,35 @@ mod fsync_handoff;
 /// Group-commit batching seam (coalesce concurrent pending writes into one fsync
 /// under `appendfsync=always`). `pub` so the §4 red suite can pin the pure seam.
 pub mod group_commit;
+/// moon#1266 1A: the shard thread writes its own AOF records before its
+/// replies leave (the per-writer lane and its flush points).
+pub mod lane;
+/// The lane's hand-over state machine (loom-modeled).
+mod lane_protocol;
+pub mod layout_guard;
+/// The tokio TopLevel writer's per-path open gate (R2b review P1, N5).
+pub mod open_gate;
 mod pool;
 /// The writer's running record context (db + `MOON.TS` clock), moon#1283.
 mod record_ctx;
 mod refusal;
+// moon#1266 R2b-2 F2: a reply whose record went to a held lane after its policy read.
+pub mod held_reply;
+// R2b-3 P1: several fsync barriers sent first, awaited together.
+pub mod barrier_set;
+// R2b-2 F3: test hook delaying the writers' start (lanes stay held).
+pub mod lane_test_hook;
 pub mod rewrite;
 pub mod rewrite_overflow;
 /// `CONFIG SET appendfsync` at runtime (R1 review, finding 8).
 pub mod runtime_fsync;
+pub mod torn_tail;
 pub mod writer_stop;
 mod writer_task;
 
 pub use fsync_agent::{AOF_DELAYED_FSYNC, in_flight_fsyncs};
 pub use pool::{AofWriterPool, BoundedRefusal};
-pub use record_ctx::{AppendStamp, RecordCtx};
+pub use record_ctx::{AppendStamp, RecordCtx, TXN_END_FLAG, txn_end_record, txn_log_id};
 pub(crate) use refusal::note_append_backpressure_refusal;
 pub use refusal::{
     AOF_APPEND_BACKPRESSURE_REFUSALS, AOF_BACKLOG_ERR, AOF_BARRIER_BACKLOG_ERR,
@@ -955,15 +987,18 @@ pub(crate) fn inject_record_prefixes(
             db,
             bytes,
             clock_ms,
+            txn,
             ..
         }
         | AofMessage::AppendSync {
             db,
             bytes,
             clock_ms,
+            txn,
             ..
         } => {
-            bytes.is_empty() || (!ctx.needs_prefix(*db, *clock_ms, false) && !is_folded(msg, floor))
+            bytes.is_empty()
+                || (!ctx.needs_prefix_for(*db, *clock_ms, *txn, false) && !is_folded(msg, floor))
         }
         _ => true,
     });
@@ -977,12 +1012,13 @@ pub(crate) fn inject_record_prefixes(
         let Some(msg) = keep_unless_folded(msg, floor) else {
             continue;
         };
-        let (db, is_empty, epoch, clock_ms) = match &msg {
+        let (db, is_empty, epoch, clock_ms, txn) = match &msg {
             AofMessage::Append {
                 db,
                 bytes,
                 epoch,
                 clock_ms,
+                txn,
                 ..
             }
             | AofMessage::AppendSync {
@@ -990,17 +1026,19 @@ pub(crate) fn inject_record_prefixes(
                 bytes,
                 epoch,
                 clock_ms,
+                txn,
                 ..
-            } => (*db, bytes.is_empty(), *epoch, *clock_ms),
-            _ => (0, true, FoldEpoch::INITIAL, 0),
+            } => (*db, bytes.is_empty(), *epoch, *clock_ms, *txn),
+            _ => (0, true, FoldEpoch::INITIAL, 0, 0),
         };
-        for bytes in ctx.prefix(db, clock_ms, is_empty) {
+        for bytes in ctx.prefix_for(db, clock_ms, txn, is_empty) {
             out.push(AofMessage::Append {
                 lsn: 0,
                 db,
                 bytes,
                 epoch,
                 clock_ms: 0,
+                txn: 0,
             });
         }
         out.push(msg);
@@ -1064,11 +1102,12 @@ fn aof_best_effort_resync_enabled() -> bool {
 ///
 /// Returns the number of commands successfully replayed.
 ///
-/// **Corruption recovery (#12):** A clean truncated tail is handled gracefully
-/// (warn + stop). On genuine mid-stream corruption the default is to STOP
-/// replay — keeping only the valid prefix already applied and never dispatching
-/// bytes past the corruption point (which, in unframed RESP, could be a `*`
-/// inside a binary value → misaligned garbage commands). Set
+/// **Corruption recovery (#12, R2b round 3 F-B):** A clean truncated tail is
+/// handled gracefully (warn + stop; [`replay_aof_at_boot`] also cuts it off
+/// the file). On genuine mid-stream corruption the default is to stop and
+/// return `Err` — never dispatching bytes past the corruption point (which,
+/// in unframed RESP, could be a `*` inside a binary value → misaligned
+/// garbage commands); a boot refuses to start on it, as redis does. Set
 /// `MOON_AOF_BEST_EFFORT_RESYNC=1` to opt into the legacy skip-to-next-`*`
 /// resync (loud warnings; may misapply corrupted data).
 pub fn replay_aof(
@@ -1092,6 +1131,58 @@ fn replay_aof_with_resync(
     engine: &dyn CommandReplayEngine,
     best_effort_resync: bool,
 ) -> Result<usize, MoonError> {
+    replay_aof_reporting(databases, path, engine, best_effort_resync).map(|(n, _)| n)
+}
+
+/// [`replay_aof`] at a boot that then appends to `path` (R2b round 3 F-B):
+/// a record torn by a crash at the end of the file is cut there, before
+/// anything is appended behind it ([`torn_tail`]). `Err`: the boot must
+/// refuse — mid-stream corruption, or a torn tail that could not be cut (the
+/// file is unchanged then).
+pub fn replay_aof_at_boot(
+    databases: &mut [Database],
+    path: &Path,
+    engine: &dyn CommandReplayEngine,
+) -> Result<usize, MoonError> {
+    let (n, torn) = {
+        let _clock = crate::persistence::replay::clock::pin_replay_clock_to_log(
+            path,
+            crate::persistence::replay::clock::LogFormat::Resp,
+        );
+        replay_aof_reporting(databases, path, engine, aof_best_effort_resync_enabled())?
+    };
+    if let Some(tail) = torn {
+        torn_tail::cut_at_boot(path, tail).map_err(|detail| {
+            MoonError::from(crate::error::AofError::TornTailCutFailed {
+                offset: tail.offset,
+                detail,
+            })
+        })?;
+    }
+    Ok(n)
+}
+
+/// [`replay_aof_with_resync`], also reporting a torn tail.
+fn replay_aof_reporting(
+    databases: &mut [Database],
+    path: &Path,
+    engine: &dyn CommandReplayEngine,
+    best_effort_resync: bool,
+) -> Result<(usize, Option<torn_tail::TornTail>), MoonError> {
+    let replayed = replay_aof_records(databases, path, engine, best_effort_resync);
+    // moon#1300: the end of the file — a `MOON.TXN` block a crash cut is
+    // rolled back (on an error too: the engine must not carry it further).
+    engine.finish_log(databases);
+    replayed
+}
+
+/// The body of [`replay_aof_with_resync`]: every record of the file.
+fn replay_aof_records(
+    databases: &mut [Database],
+    path: &Path,
+    engine: &dyn CommandReplayEngine,
+    best_effort_resync: bool,
+) -> Result<(usize, Option<torn_tail::TornTail>), MoonError> {
     use crate::persistence::replay::chunks::{ReplayChunks, ReplayNext};
     use std::io::{Read, Seek};
 
@@ -1101,7 +1192,7 @@ fn replay_aof_with_resync(
     // sliced that one buffer, pinning all of it after boot.
     let mut file = std::fs::File::open(path)?;
     if file.metadata()?.len() == 0 {
-        return Ok(0);
+        return Ok((0, None));
     }
     let mut magic = [0u8; 4];
     let has_preamble = file.read_exact(&mut magic).is_ok() && &magic == b"MOON";
@@ -1160,7 +1251,7 @@ fn replay_aof_with_resync(
 
     // If the entire file was RDB (no RESP tail), we're done
     if resp_start >= file_len {
-        return Ok(rdb_keys);
+        return Ok((rdb_keys, None));
     }
 
     file.seek(std::io::SeekFrom::Start(resp_start))?;
@@ -1168,6 +1259,7 @@ fn replay_aof_with_resync(
     let mut selected_db: usize = 0;
     let mut count: usize = 0;
     let mut corruption_count: usize = 0;
+    let mut torn = None;
 
     loop {
         match chunks.next_frame()? {
@@ -1206,12 +1298,24 @@ fn replay_aof_with_resync(
                     "AOF truncated: {} unparseable bytes at offset {} (end of file)",
                     len, offset
                 );
+                torn = Some(torn_tail::TornTail {
+                    offset,
+                    len: len as u64,
+                });
                 break;
             }
             ReplayNext::Corrupt {
                 offset: error_offset,
                 err: e,
             } => {
+                // R2b round 4 F2: a parser LIMIT is not corruption, and is
+                // never skipped past either.
+                if crate::persistence::replay::chunks::is_limit_violation(&e) {
+                    return Err(MoonError::from(crate::error::AofError::RecordTooLarge {
+                        offset: error_offset,
+                        detail: e.to_string(),
+                    }));
+                }
                 corruption_count += 1;
 
                 // Prod-hardening #12: DO NOT skip-and-resync by default.
@@ -1225,17 +1329,21 @@ fn replay_aof_with_resync(
                 // default (matching the per-shard `shard_replay` sibling)
                 // stops here, keeping only the valid prefix already applied,
                 // and never dispatches anything past the corruption point.
+                // R2b round 3 F-B: and the replay FAILS. The file is the only
+                // KV source of the boot (`KvSources::AofOnly`); booting the
+                // prefix served a partial dataset, then appended behind the
+                // damage, and every write of that boot was lost at the next
+                // one. redis 7.2.7 refuses the same file ("Bad file
+                // format"); the boot now does too (`UnreadableAof`).
                 if !best_effort_resync {
-                    error!(
-                        "AOF corruption at byte offset {} after {} commands: {}. \
-                         Stopping replay to avoid dispatching misaligned bytes as \
-                         live commands; the {} commands before this point are kept. \
-                         Run redis-check-aof (or set MOON_AOF_BEST_EFFORT_RESYNC=1 to \
-                         opt into the legacy skip-and-resync, which MAY misapply \
-                         corrupted data).",
-                        error_offset, count, e, count
-                    );
-                    break;
+                    return Err(MoonError::from(crate::error::AofError::Corrupted {
+                        offset: error_offset,
+                        detail: format!(
+                            "{e:?} after {count} complete command(s): mid-file corruption, not \
+                             a torn tail (opt into the legacy skip-and-resync, which MAY \
+                             misapply data, with MOON_AOF_BEST_EFFORT_RESYNC=1)"
+                        ),
+                    }));
                 }
 
                 // Opt-in legacy best-effort resync (loud): skip past the
@@ -1266,7 +1374,7 @@ fn replay_aof_with_resync(
         );
     }
 
-    Ok(rdb_keys + count)
+    Ok((rdb_keys + count, torn))
 }
 
 #[cfg(test)]
@@ -1350,28 +1458,31 @@ mod tests {
 
     #[test]
     fn test_aof_replay_stops_at_midstream_corruption_by_default() {
-        // Prod-hardening #12: a genuine mid-stream parse error must STOP replay
-        // (keeping the valid prefix), NOT skip forward to the next `*` and
-        // dispatch misaligned bytes as live commands. The resync mode is pinned
-        // explicitly so an ambient MOON_AOF_BEST_EFFORT_RESYNC in a dev shell
-        // or CI cannot flip this test onto the legacy branch.
+        // Prod-hardening #12: a genuine mid-stream parse error must STOP replay,
+        // NOT skip forward to the next `*` and dispatch misaligned bytes as
+        // live commands. R2b round 3 F-B: and it fails, so a boot refuses
+        // (redis "Bad file format") instead of serving the prefix and
+        // appending behind the damage. The resync mode is pinned explicitly
+        // so an ambient MOON_AOF_BEST_EFFORT_RESYNC in a dev shell or CI
+        // cannot flip this test onto the legacy branch.
         let dir = tempdir().unwrap();
         let aof_path = write_midstream_corrupt_aof(&dir);
+        let before = std::fs::read(&aof_path).unwrap();
 
         let mut dbs = vec![Database::new()];
-        let count =
-            replay_aof_with_resync(&mut dbs, &aof_path, &DispatchReplayEngine::new(), false)
-                .unwrap();
-
-        assert_eq!(count, 1, "only the pre-corruption command is replayed");
-        assert!(
-            dbs[0].get(b"before").is_some(),
-            "valid prefix command must be applied"
-        );
+        let err = replay_aof_with_resync(&mut dbs, &aof_path, &DispatchReplayEngine::new(), false)
+            .unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("corrupted at byte"), "{text}");
+        assert!(text.contains("1 complete command"), "{text}");
         assert!(
             dbs[0].get(b"after").is_none(),
             "post-corruption command must NOT be dispatched (no skip-resync by default)"
         );
+        // The boot reader refuses the same and leaves the file as it was.
+        let mut dbs = vec![Database::new()];
+        assert!(replay_aof_at_boot(&mut dbs, &aof_path, &DispatchReplayEngine::new()).is_err());
+        assert_eq!(std::fs::read(&aof_path).unwrap(), before);
     }
 
     #[test]
@@ -1516,6 +1627,56 @@ mod tests {
         // Should have loaded the first command
         assert_eq!(count, 1);
         assert!(dbs[0].get(b"k1").is_some());
+        assert_eq!(
+            std::fs::read(&aof_path).unwrap(),
+            aof_data.as_ref(),
+            "a plain replay never touches the file"
+        );
+    }
+
+    /// R2b round 3 F-B: a boot cuts the torn tail before anything is appended
+    /// behind it — after an append the file replays every record (the torn
+    /// bulk's declared length used to swallow the later writes).
+    #[test]
+    fn a_boot_cuts_a_torn_tail_so_later_appends_replay() {
+        use std::io::Write as _;
+        let dir = tempdir().unwrap();
+        for preamble in [false, true] {
+            let aof_path = dir.path().join(format!("torn-{preamble}.aof"));
+            let mut aof_data = BytesMut::new();
+            if preamble {
+                let mut base = vec![Database::new()];
+                base[0].set_string(b"base", Bytes::from_static(b"b"));
+                aof_data.extend_from_slice(&crate::persistence::rdb::save_to_bytes(&base).unwrap());
+            }
+            serialize::serialize(&make_command(&[b"SET", b"k1", b"v1"]), &mut aof_data);
+            let whole = aof_data.len() as u64;
+            // A 400-byte value torn after 10 bytes.
+            aof_data.extend_from_slice(b"*3\r\n$3\r\nSET\r\n$3\r\nbig\r\n$400\r\nxxxxxxxxxx");
+            std::fs::write(&aof_path, &aof_data).unwrap();
+
+            let mut dbs = vec![Database::new()];
+            replay_aof_at_boot(&mut dbs, &aof_path, &DispatchReplayEngine::new()).unwrap();
+            assert!(dbs[0].get(b"k1").is_some());
+            assert_eq!(std::fs::metadata(&aof_path).unwrap().len(), whole);
+            let sidecar = dir.path().join(format!("torn-{preamble}.aof.torn-{whole}"));
+            assert!(sidecar.exists(), "the cut bytes are saved");
+
+            // What the next session appends, then the next boot.
+            let mut later = BytesMut::new();
+            serialize::serialize(&make_command(&[b"SET", b"after", b"acked"]), &mut later);
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(&aof_path)
+                .unwrap()
+                .write_all(&later)
+                .unwrap();
+            let mut dbs = vec![Database::new()];
+            replay_aof_at_boot(&mut dbs, &aof_path, &DispatchReplayEngine::new()).unwrap();
+            assert!(dbs[0].get(b"after").is_some(), "preamble={preamble}");
+            assert!(dbs[0].get(b"big").is_none());
+            assert_eq!(dbs[0].get(b"base").is_some(), preamble);
+        }
     }
 
     // --- FsyncPolicy tests ---
@@ -1899,6 +2060,7 @@ mod fold_floor_tests {
             bytes: Bytes::from_static(payload),
             epoch,
             clock_ms: 0,
+            txn: 0,
         }
     }
 
@@ -1927,6 +2089,7 @@ mod fold_floor_tests {
                 ack: ack_tx,
                 epoch: FoldEpoch(2),
                 clock_ms: 0,
+                txn: 0,
             },
             append(b"post", 0, FoldEpoch(3)),
         ];
@@ -1966,6 +2129,7 @@ mod fold_floor_tests {
             ack: ack_tx,
             epoch: FoldEpoch::INITIAL,
             clock_ms: 0,
+            txn: 0,
         }];
         let mut last_db = RecordCtx::new();
         let out = inject_record_prefixes(batch, FoldEpoch(9), &mut last_db);

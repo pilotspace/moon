@@ -17,6 +17,16 @@ pub enum UndoRecord {
     Update { key: Bytes, old_entry: Entry },
     /// Key was deleted — restore old_entry on rollback.
     Delete { key: Bytes, old_entry: Entry },
+    /// R2b W2 (moon#1300): a `TXN` connection or script write whose
+    /// before-image lives in the transaction's HOLD (`isolation::hold`), not
+    /// here — one copy of a key's pre-transaction value, shared by every
+    /// snapshot and the abort. Either the key's FIRST write (the key was
+    /// present; the hold took the image by move: the abort restores from it)
+    /// or a LATER write of a key the transaction already holds (the abort
+    /// restores the first record only, so no image is needed at all).
+    /// `deleted`: the write was a `DEL` / `UNLINK` (a [`Self::Delete`]'s
+    /// kind; otherwise an [`Self::Update`]'s, for the commit's WAL image).
+    Held { key: Bytes, deleted: bool },
 }
 
 /// Per-transaction undo log.
@@ -60,6 +70,13 @@ impl UndoLog {
     #[inline]
     pub fn record_delete(&mut self, db: usize, key: Bytes, old_entry: Entry) {
         self.push(db, UndoRecord::Delete { key, old_entry });
+    }
+
+    /// Record a write in database `db` whose before-image the transaction's
+    /// hold keeps ([`UndoRecord::Held`]).
+    #[inline]
+    pub fn record_held(&mut self, db: usize, key: Bytes, deleted: bool) {
+        self.push(db, UndoRecord::Held { key, deleted });
     }
 
     #[inline]
@@ -116,17 +133,10 @@ impl UndoLog {
         self.dbs.into_iter().zip(self.records)
     }
 
-    /// Every record's `(db, key)`, in capture order (moon#1299: the keys a
-    /// script's captures make the transaction hold).
-    pub fn keys_with_db(&self) -> impl Iterator<Item = (usize, &Bytes)> {
-        self.dbs
-            .iter()
-            .copied()
-            .zip(self.records.iter().map(|r| match r {
-                UndoRecord::Insert { key }
-                | UndoRecord::Update { key, .. }
-                | UndoRecord::Delete { key, .. } => key,
-            }))
+    /// Every record with its database, in capture order (moon#1300: a
+    /// script's first record of a key is the key's pre-transaction image).
+    pub fn records_with_db(&self) -> impl Iterator<Item = (usize, &UndoRecord)> {
+        self.dbs.iter().copied().zip(self.records.iter())
     }
 
     /// Get a reference to all records (for WAL serialization).
@@ -212,12 +222,14 @@ mod tests {
             Bytes::from_static(b"c"),
             Entry::new_string(Bytes::from_static(b"w")),
         );
+        log.record_held(4, Bytes::from_static(b"d"), true);
         let got: Vec<(usize, Bytes)> = log
             .into_records_with_db()
             .map(|(db, r)| match r {
                 UndoRecord::Insert { key }
                 | UndoRecord::Update { key, .. }
-                | UndoRecord::Delete { key, .. } => (db, key),
+                | UndoRecord::Delete { key, .. }
+                | UndoRecord::Held { key, .. } => (db, key),
             })
             .collect();
         assert_eq!(
@@ -226,6 +238,7 @@ mod tests {
                 (3, Bytes::from_static(b"a")),
                 (5, Bytes::from_static(b"b")),
                 (3, Bytes::from_static(b"c")),
+                (4, Bytes::from_static(b"d")),
             ]
         );
     }

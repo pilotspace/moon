@@ -122,10 +122,7 @@ pub(crate) fn run_local_script<R>(txn: Option<&mut CrossStoreTxn>, run: impl FnO
     }
     // ... and every key it captured is held until COMMIT / ABORT, like the
     // connection leg's (`transaction::conn_capture`).
-    for (db, key) in undo.keys_with_db() {
-        crate::transaction::isolation::hold(db, key, txn.txn_id);
-    }
-    txn.kv_undo.append(undo);
+    txn.kv_undo.append(hold_script_undo(txn.txn_id, undo));
     if !written.is_empty() {
         let (lsn, tid) = (txn.snapshot_lsn, txn.txn_id);
         crate::shard::slice::with_shard(|s| {
@@ -133,6 +130,52 @@ pub(crate) fn run_local_script<R>(txn: Option<&mut CrossStoreTxn>, run: impl FnO
                 s.kv_write_intents.record_write(key, lsn, tid);
             }
         });
+    }
+    out
+}
+
+/// Hold every key a script captured for `txn_id` and return its undo records
+/// as they join the transaction's log (moon#1300, R2b W2: ONE copy of each
+/// pre-transaction image).
+///
+/// - A key's FIRST record in the transaction (no hold yet): its before-image
+///   moves into the new hold, which every snapshot serializes and the abort
+///   restores from — the record becomes `Held` (key and kind). An `Insert`
+///   (the key was absent) stays as it is.
+/// - A key the transaction already holds (an earlier write, or an earlier
+///   record of this script): the abort restores that first record only, so
+///   this record's copy is dropped — `Held`, key and kind only.
+fn hold_script_undo(txn_id: u64, undo: crate::transaction::UndoLog) -> crate::transaction::UndoLog {
+    use crate::transaction::UndoRecord;
+    use crate::transaction::isolation;
+    let mut out = crate::transaction::UndoLog::new();
+    for (db, record) in undo.into_records_with_db() {
+        let already =
+            isolation::holder(db, crate::transaction::kv_compensation::record_key(&record))
+                == Some(txn_id);
+        match record {
+            UndoRecord::Insert { key } => {
+                if already {
+                    out.record_held(db, key, false);
+                } else {
+                    isolation::hold(db, &key, txn_id, None);
+                    out.record_insert(db, key);
+                }
+            }
+            UndoRecord::Update { key, old_entry } => {
+                if !already {
+                    isolation::hold(db, &key, txn_id, Some(old_entry));
+                }
+                out.record_held(db, key, false);
+            }
+            UndoRecord::Delete { key, old_entry } => {
+                if !already {
+                    isolation::hold(db, &key, txn_id, Some(old_entry));
+                }
+                out.record_held(db, key, true);
+            }
+            UndoRecord::Held { key, deleted } => out.record_held(db, key, deleted),
+        }
     }
     out
 }

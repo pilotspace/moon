@@ -14,11 +14,12 @@
 //!    the replication records are recorded (monoio), the graph ones only as
 //!    far as the WAL accepted them;
 //! 2. the KV records are appended to this shard's AOF through the MULTI/EXEC
-//!    group commit ([`persist_txn_aof`]) — one `fsync` barrier under
+//!    group commit, inside the transaction's `MOON.TXN` block and followed
+//!    by its END (moon#1300, [`txn_log`]) — one `fsync` barrier under
 //!    `appendfsync always`, so an `+OK` means the abort is on disk;
 //! 3. only then do the remote graph legs of a multi-shard abort await.
 //!
-//! [`persist_txn_aof`]: crate::server::conn::shared::persist_txn_aof
+//! [`txn_log`]: crate::server::conn::txn_log
 
 use bytes::Bytes;
 
@@ -100,22 +101,20 @@ pub(crate) async fn abort_logged(
     // applied AND its compensating records are enqueued (or refused and
     // reported) — released earlier, another client's write in the window
     // could reach the log AHEAD of the compensation that overwrites it on
-    // replay. Released when this guard drops: at the end of this function,
-    // or if the future is dropped mid-await, so a cancelled abort can never
-    // leave the keys held forever.
-    let _release = crate::transaction::isolation::EndOnDrop::new(txn_id);
+    // replay. Released in the synchronous section that enqueues the
+    // transaction's END (moon#1300, `txn_log::log_end`), or when this guard
+    // drops — before the remote graph legs, or if the future is dropped
+    // mid-await — so a cancelled abort can never leave the keys held forever.
+    let release = crate::transaction::isolation::EndOnDrop::new(txn_id);
     let graph_db = txn.db_index;
     let (log, remote) = crate::transaction::abort::abort_local(ctx.shard_id, ctx.num_shards, txn);
 
     // --- the no-await stretch of the undo ---------------------------------
     // #455: a fold that snapshots this shard after the undo but before the
     // records are enqueued must drop them, not replay them on its base.
-    let fold_stamp = ctx
-        .aof_pool
-        .as_ref()
-        .map_or(crate::persistence::aof::AppendStamp::INITIAL, |pool| {
-            pool.fold_stamp(ctx.shard_id)
-        });
+    // moon#1300: the compensation is the transaction's own records — inside
+    // its `MOON.TXN` block, which the END below closes.
+    let fold_stamp = super::txn_log::stamp(ctx, txn_id);
     // moon#1302: the graph records are appended FIRST and only the accepted
     // prefix is replicated. Replicated first (the pre-fix order), a refusal
     // left the replica holding the whole rollback while this node's WAL held
@@ -134,7 +133,11 @@ pub(crate) async fn abort_logged(
     };
     if let Some(record) = replicate {
         for (db, bytes) in &log.kv {
-            record(ctx, *db, bytes.clone());
+            record(
+                ctx,
+                *db,
+                super::txn_log::repl_record(ctx.shard_id, txn_id, bytes),
+            );
         }
         // Graph replication is single-shard scope, exactly like the forward
         // GRAPH.* leg (`try_handle_graph_command`).
@@ -146,9 +149,21 @@ pub(crate) async fn abort_logged(
     }
     // -----------------------------------------------------------------------
 
-    let persisted =
-        crate::server::conn::shared::persist_txn_aof(ctx, log.kv, replicate.is_some(), fold_stamp)
-            .await;
+    // moon#1300: the compensation inside the block, then the END — only once
+    // every compensating record is in: a block whose compensation was cut
+    // (refused, or a crash) stays open and is rolled back on replay, never
+    // ended over a partial restore. The keys are released in the END's
+    // synchronous section (`txn_log::log_end`), or when `release` drops.
+    let end_db = log.kv.last().map_or(graph_db, |(db, _)| *db);
+    let wrote_kv = !log.kv.is_empty();
+    let mut persisted =
+        super::txn_log::persist_compensation(ctx, log.kv, replicate.is_some(), fold_stamp).await;
+    if wrote_kv && persisted.is_ok() {
+        persisted =
+            super::txn_log::log_end(ctx, txn_id, end_db, replicate, move || drop(release)).await;
+    } else {
+        drop(release);
+    }
     let remote_legs = crate::transaction::abort::send_remote_graph_rollbacks(
         ctx.shard_id,
         txn_id,

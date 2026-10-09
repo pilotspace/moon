@@ -497,6 +497,31 @@ fn test_ssm3_shape_no_ws_field_in_slice() {
 /// - Nested `with_shard` calls would be flagged by the reentrancy check at
 ///   runtime; the borrow-across-await check here is an additional structural pin.
 ///
+/// True when `line` holds an `.await` expression, not merely the text: a
+/// method such as `.awaits_reclaim_snapshot(` starts with `.await` but is a
+/// plain call, so the keyword must not be followed by an identifier char.
+fn has_await_expr(line: &str) -> bool {
+    line.match_indices(".await").any(|(at, m)| {
+        !line[at + m.len()..]
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_alphanumeric() || c == '_')
+    })
+}
+
+#[test]
+fn has_await_expr_matches_the_keyword_not_a_method_named_after_it() {
+    assert!(has_await_expr("rx.await;"));
+    assert!(has_await_expr("let v = fut.await?;"));
+    assert!(has_await_expr("    .await"));
+    assert!(has_await_expr("a.awaits(); b.await"));
+    assert!(!has_await_expr(
+        "awaiting |= ci.awaits_reclaim_snapshot(floor);"
+    ));
+    assert!(!has_await_expr("x.await_all()"));
+    assert!(!has_await_expr("no keyword here"));
+}
+
 /// GREEN today: all with_shard closures are synchronous.
 #[test]
 fn test_reject_borrow_across_await() {
@@ -561,7 +586,7 @@ fn test_reject_borrow_across_await() {
                 for (j, &span_line) in lines.iter().enumerate().take(span_end + 1).skip(span_start)
                 {
                     let span_t = span_line.trim_start();
-                    if !span_t.starts_with("//") && span_line.contains(".await") {
+                    if !span_t.starts_with("//") && has_await_expr(span_line) {
                         violations.push(format!(
                             "{}:{}: .await inside with_shard closure — line: {}",
                             path.display(),

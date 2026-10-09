@@ -48,14 +48,20 @@ pub async fn coordinate_multi_key(
     // persistence (tests / no-AOF deployments).
     aof_pool: Option<&Arc<crate::persistence::aof::AofWriterPool>>,
     repl_state: ReplStateRef<'_>,
-    // v3-5 group commit: set to true when a local-leg append was enqueued
-    // under appendfsync=always. The connection handler MUST then issue ONE
-    // `fsync_barrier(my_shard)` for the batch before acking the client, and
-    // overwrite this command's response with AOF_FSYNC_ERR on barrier failure.
-    local_barrier_pending: &mut bool,
+    // The connection batch's barrier debt. The command records
+    // what it owes here — its own shard when a local-leg append rode group
+    // commit (v3-5), every written remote shard under `always` or a held lane
+    // (moon#1322) — with `resp_idx`, the index its reply will take in the
+    // batch. Nothing is awaited here: the handler MUST settle the debt
+    // (`BarrierDebt::settle`) before ANY reply of the batch is flushed; a
+    // failed barrier then turns this reply into AOF_FSYNC_ERR.
+    barrier_debt: &mut crate::persistence::aof::barrier_set::BarrierDebt,
+    resp_idx: usize,
     _response_pool: &(), // placeholder — coordinator uses oneshot internally
 ) -> Frame {
-    if cmd.eq_ignore_ascii_case(b"MGET") {
+    let mut local_barrier_pending = false;
+    let local_barrier_pending = &mut local_barrier_pending;
+    let reply = if cmd.eq_ignore_ascii_case(b"MGET") {
         coordinate_mget(
             args,
             my_shard,
@@ -150,8 +156,26 @@ pub async fn coordinate_multi_key(
             _response_pool,
         )
         .await
-    }
+    };
+    // moon#1322: the remote legs' records are queued at their owners — they
+    // owe a confirmation (write, plus the fsync under `always`) before the
+    // reply leaves; the batch pays it with every other command's.
+    remote_barrier::owe_multi_key(
+        aof_pool,
+        cmd,
+        args,
+        my_shard,
+        num_shards,
+        *local_barrier_pending,
+        &reply,
+        resp_idx,
+        barrier_debt,
+    );
+    reply
 }
+
+// moon#1322: barrier the written remote shards of a coordinated write.
+pub(crate) mod remote_barrier;
 
 // ---------------------------------------------------------------------------
 // Shared legs for the BITOP / COPY coordinators
@@ -1344,6 +1368,7 @@ pub(crate) async fn coordinate_flush_broadcast(
     db_index: usize,
     dispatch_tx: &Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
     spsc_notifiers: &[Arc<channel::Notify>],
+    aof_pool: Option<&Arc<crate::persistence::aof::AofWriterPool>>,
 ) -> Result<(), Frame> {
     let mut pending = Vec::with_capacity(num_shards.saturating_sub(1));
     for target in 0..num_shards {
@@ -1389,6 +1414,18 @@ pub(crate) async fn coordinate_flush_broadcast(
         }
     }
     match failed {
+        // moon#1322: every leg flushed — confirm their records (write, plus
+        // the fsync under `always`) before the flush is acknowledged.
+        None if remote_barrier::barrier_needed(aof_pool, num_shards) => {
+            let targets: remote_barrier::Targets =
+                (0..num_shards).filter(|&t| t != skip_shard).collect();
+            match aof_pool {
+                Some(pool) => remote_barrier::barrier_targets(pool, &targets)
+                    .await
+                    .map_err(crate::persistence::aof::barrier_refusal_frame),
+                None => Ok(()),
+            }
+        }
         None => Ok(()),
         Some(target) => {
             tracing::error!(
@@ -1436,6 +1473,7 @@ pub(crate) async fn broadcast_txn_flushes(
     num_shards: usize,
     dispatch_tx: &Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
     spsc_notifiers: &[Arc<channel::Notify>],
+    aof_pool: Option<&Arc<crate::persistence::aof::AofWriterPool>>,
 ) {
     if exec_flushes.is_empty() || num_shards <= 1 {
         return;
@@ -1449,6 +1487,7 @@ pub(crate) async fn broadcast_txn_flushes(
             *db_index,
             dispatch_tx,
             spsc_notifiers,
+            aof_pool,
         )
         .await
             && let Frame::Array(items) = result

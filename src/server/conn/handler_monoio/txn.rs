@@ -170,7 +170,23 @@ pub(super) async fn try_handle_txn_commit(
                     s.deferred_hnsw_inserts.drain_for_txn(txn_id).count()
                 });
                 // moon#1299: committed — its keys are free to other writers.
-                crate::transaction::isolation::txn_end(txn_id);
+                // moon#1300: in the same synchronous section as its AOF END
+                // (`txn_log::log_end`), which closes its `MOON.TXN` block;
+                // boxed like the abort (c10k future diet), and only for a
+                // transaction that wrote a keyspace key.
+                let end_logged = if txn.kv_undo.is_empty() {
+                    crate::transaction::isolation::txn_end(txn_id);
+                    Ok(())
+                } else {
+                    Box::pin(crate::server::conn::txn_log::log_end(
+                        ctx,
+                        txn_id,
+                        txn.db_index,
+                        super::ft::abort_replicator(ctx),
+                        || crate::transaction::isolation::txn_end(txn_id),
+                    ))
+                    .await
+                };
                 if drain_count > 0 {
                     tracing::debug!(txn_id, count = drain_count, "Drained deferred HNSW inserts");
                 }
@@ -285,7 +301,12 @@ pub(super) async fn try_handle_txn_commit(
                     }
                 }
 
-                responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
+                // moon#1300: an END the AOF refused leaves the commit applied
+                // but not durable — answered like any refused write.
+                responses.push(match end_logged {
+                    Ok(()) => Frame::SimpleString(Bytes::from_static(b"OK")),
+                    Err(reply) => Frame::Error(Bytes::from_static(reply)),
+                });
             } else {
                 responses.push(Frame::Error(Bytes::from_static(b"ERR not in transaction")));
             }

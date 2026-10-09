@@ -6,6 +6,7 @@
 //! stream to be passed by value into `monoio::select!`, which is tightly coupled to
 //! the connection loop state machine.
 
+use crate::persistence::aof::barrier_set::BarrierDebt;
 use bytes::Bytes;
 
 use crate::protocol::Frame;
@@ -153,7 +154,7 @@ pub(super) async fn try_handle_subscribe_entry<S: monoio::io::AsyncWriteRent>(
     ctx: &super::super::core::ConnectionContext,
     peer_addr: &str,
     responses: &mut Vec<Frame>,
-    local_leg_write_idxs: &mut Vec<usize>,
+    barrier_debt: &mut BarrierDebt,
     codec: &mut crate::server::codec::RespCodec,
     write_buf: &mut bytes::BytesMut,
     stream: &mut S,
@@ -218,13 +219,7 @@ pub(super) async fn try_handle_subscribe_entry<S: monoio::io::AsyncWriteRent>(
     }
     // Earlier frames in this batch may hold barrier-pending local-leg
     // writes — confirm (or fail-loud) them before this early flush.
-    crate::server::conn::shared::resolve_local_leg_barrier(
-        &ctx.aof_pool,
-        ctx.shard_id,
-        local_leg_write_idxs,
-        responses,
-    )
-    .await;
+    crate::server::conn::shared::settle_barrier_debt(&ctx.aof_pool, barrier_debt, responses).await;
     // Flush accumulated responses before entering subscriber mode
     for resp in &*responses {
         codec.encode_frame(resp, write_buf);
@@ -294,6 +289,8 @@ pub(super) async fn try_handle_subscribe_entry<S: monoio::io::AsyncWriteRent>(
     // Flush responses and re-enter loop (next iteration enters subscriber mode)
     if !write_buf.is_empty() {
         use monoio::io::AsyncWriteRentExt;
+        // moon#1266 1A: the batch's AOF records reach the kernel first.
+        crate::persistence::aof::lane::flush_before_reply();
         let data = write_buf.split().freeze();
         let (result, _): (std::io::Result<usize>, bytes::Bytes) = stream.write_all(data).await;
         if result.is_err() {

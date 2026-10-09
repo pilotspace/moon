@@ -232,6 +232,9 @@ pub async fn handle_psync_inline_single_shard(
                         );
                     });
                 });
+                // moon#1300: the image holds an open TXN's keys at their
+                // pre-transaction state; re-open the TXN right after it.
+                crate::replication::txn_apply::stream_reopen(0);
                 off
             };
             let response = format!("+FULLRESYNC {} {}\r\n", repl_id, snapshot_offset);

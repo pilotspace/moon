@@ -216,8 +216,11 @@ pub struct SnapshotState {
     file_path: PathBuf,
     /// Whether the header has been written.
     header_written: bool,
-    /// Whether we need to write a DB selector for the current database.
-    db_selector_written: Vec<bool>,
+    /// The database the last selector written selects (moon#1295: a key
+    /// block of another database re-selects, `key_stream`).
+    last_selector: Option<usize>,
+    /// A key block is open (moon#1295): the walk waits for it to close.
+    key_block_open: bool,
     /// WAL LSN at which this snapshot was taken (v0.2 PITR field).
     /// 0 means "unknown — recovery should replay all WAL from origin".
     /// Set via `set_last_lsn` before the first segment is serialized.
@@ -335,7 +338,8 @@ impl SnapshotState {
             file_path,
             header_written: false,
             cold_graves_trailer: Vec::new(),
-            db_selector_written: vec![false; num_databases],
+            last_selector: None,
+            key_block_open: false,
             last_lsn: 0,
             created_at_unix_ms: current_time_ms() as u64,
             aborted: None,
@@ -614,16 +618,6 @@ impl SnapshotState {
         self.overflow_bytes + frozen
     }
 
-    /// Test-only: how many segments the table a flush froze for epoch
-    /// database `db` has, if one is frozen (moon#1228 review 5).
-    #[cfg(test)]
-    pub(crate) fn frozen_segments_for_test(&self, db: usize) -> Option<usize> {
-        match self.sources.get(db) {
-            Some(Source::Frozen(frozen)) => Some(frozen.table.segment_count()),
-            _ => None,
-        }
-    }
-
     /// Pre-images captured and not yet written, across every database.
     #[inline]
     pub fn pending_pre_images(&self) -> usize {
@@ -643,6 +637,27 @@ impl SnapshotState {
                 self.epoch,
                 why
             );
+        }
+        self.abandon(why);
+    }
+
+    /// [`Self::abort`] for a save the server abandons on purpose (shutdown,
+    /// as redis kills its saving child): the same release, logged at WARN —
+    /// it is not a failure (R2b round 2 N2).
+    pub fn abort_for_shutdown(&mut self) {
+        if self.aborted.is_none() {
+            tracing::warn!(
+                "Shard {}: snapshot epoch {} abandoned: the server is shutting down \
+                 (the previous snapshot file stays)",
+                self.shard_id,
+                self.epoch
+            );
+        }
+        self.abandon("the server is shutting down");
+    }
+
+    fn abandon(&mut self, why: &'static str) {
+        if self.aborted.is_none() {
             self.aborted = Some(why);
         }
         let maps = self.overflow.iter_mut().map(std::mem::take);
@@ -730,39 +745,6 @@ impl SnapshotState {
         matches!(self.sources.get(self.current_db), Some(Source::Frozen(f)) if f.rebuilding())
     }
 
-    /// Test-only: the frozen table of `db` is trimmed to its epoch-start
-    /// rows (review 6); `None` when `db` has no frozen table.
-    #[cfg(test)]
-    pub(crate) fn frozen_trimmed_for_test(&self, db: usize) -> Option<bool> {
-        match self.sources.get(db) {
-            Some(Source::Frozen(frozen)) => Some(frozen.trimmed()),
-            _ => None,
-        }
-    }
-
-    /// Test-only: the frozen table of `db`: its bill, and what its rows
-    /// hold at `entry_overhead` (review 6, N1).
-    #[cfg(test)]
-    pub(crate) fn frozen_bill_and_rows_for_test(&self, db: usize) -> Option<(u64, u64)> {
-        match self.sources.get(db) {
-            Some(Source::Frozen(frozen)) => Some((
-                frozen.bill,
-                frozen
-                    .table
-                    .iter()
-                    .map(|(k, e)| crate::storage::db::entry_overhead(k.as_bytes(), e) as u64)
-                    .sum(),
-            )),
-            _ => None,
-        }
-    }
-
-    /// Test-only: row operations the last drain's trim did.
-    #[cfg(test)]
-    pub(crate) fn trim_ops_last_drain_for_test(&self) -> usize {
-        self.trim_ops_last_drain
-    }
-
     /// Run `f` over the current database's epoch-start table: the frozen
     /// table when a flush detached it, else `db` (which the caller borrowed
     /// from [`Self::source_db_index`]). A frozen table is released, off the
@@ -810,7 +792,7 @@ impl SnapshotState {
         if self.current_db >= self.num_databases || self.aborted.is_some() {
             return true;
         }
-        if self.current_table_rebuilding() {
+        if self.walk_paused() {
             return false;
         }
         self.with_current_table(db, |s, table| s.advance_segment_inner(table))
@@ -837,7 +819,7 @@ impl SnapshotState {
         if self.current_db >= self.num_databases || self.aborted.is_some() {
             return true;
         }
-        if self.current_table_rebuilding() {
+        if self.walk_paused() {
             return false;
         }
         // moon#1228: the budgets grow with the pre-image backlog.
@@ -878,7 +860,7 @@ impl SnapshotState {
         if self.current_db >= self.num_databases || self.aborted.is_some() {
             return true;
         }
-        if self.current_table_rebuilding() {
+        if self.walk_paused() {
             return false;
         }
         let db = &databases[self.source_db_index()];
@@ -931,11 +913,11 @@ impl SnapshotState {
         let now_ms = current_time_ms();
         let bytes_before = self.output_buf.len();
 
-        // Write DB selector if this is the first segment of a new database
-        if !self.db_selector_written[self.current_db] {
+        // Select the database (its first segment, or after a key block).
+        if self.last_selector != Some(self.current_db) {
             self.output_buf.push(DB_SELECTOR);
             self.output_buf.push(self.current_db as u8);
-            self.db_selector_written[self.current_db] = true;
+            self.last_selector = Some(self.current_db);
         }
 
         // moon#1216: the segment covering the cursor, and the hash block it
@@ -1465,49 +1447,40 @@ pub fn shard_snapshot_load_with_graves<D: std::borrow::BorrowMut<Database>>(
     Ok(total_keys)
 }
 
-mod abandon;
 pub mod cold_graves;
 pub(crate) mod frozen;
+pub(crate) mod key_stream;
 
 mod meta;
 pub use meta::read_snapshot_metadata;
-
-#[cfg(test)]
-mod tests;
-
-#[cfg(test)]
-mod stream_tests;
-
-#[cfg(test)]
-mod epoch_harness;
-
-#[cfg(test)]
-mod split_epoch_tests;
-
-#[cfg(test)]
-mod table_swap_tests;
-
-#[cfg(test)]
-mod prop_tests;
-
-#[cfg(test)]
-mod multi_key_cow_tests;
-
 #[cfg(test)]
 mod capture_gap_tests;
-
 #[cfg(test)]
 mod cow_budget_tests;
-
+#[cfg(test)]
+mod epoch_harness;
 #[cfg(test)]
 mod eviction_capture_tests;
-
+#[cfg(test)]
+mod key_stream_tests;
+#[cfg(test)]
+mod multi_key_cow_tests;
+#[cfg(test)]
+mod prop_tests;
 #[cfg(test)]
 mod removal_move_tests;
-
 #[cfg(test)]
 mod review_r2a_tests;
-
+#[cfg(test)]
+mod split_epoch_tests;
+#[cfg(test)]
+mod stream_tests;
+#[cfg(test)]
+mod table_swap_tests;
+#[cfg(test)]
+mod test_access;
+#[cfg(test)]
+mod tests;
 #[cfg(test)]
 mod txn_abort_tests;
 #[cfg(test)]

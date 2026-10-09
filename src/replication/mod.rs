@@ -1,3 +1,4 @@
+pub(crate) mod applied_prefix;
 pub mod apply;
 pub mod backlog;
 pub mod effect_rewrite;
@@ -10,6 +11,8 @@ pub mod master_addr;
 pub mod mq_sync;
 pub mod reason_del;
 pub mod replica;
+pub(crate) mod replica_aof;
 pub mod state;
 pub mod stream_effect;
+pub(crate) mod txn_apply;
 pub mod ws_sync;

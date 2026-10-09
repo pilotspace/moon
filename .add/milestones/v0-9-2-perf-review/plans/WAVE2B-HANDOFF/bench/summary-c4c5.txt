@@ -1,0 +1,10 @@
+WS43 ab.sh (100K SETs, 3 reps)
+  monoio s1: 148.6K (123.2-151.3) -> 140.3K (136.2-147.7)  -5.6%  paired -2.4% [-6..+11]
+  monoio s4: 150.6K (142.9-155.3) -> 145.3K (139.5-152.0)  -3.5%  paired -2.4% [-3..-2]
+  tokio s1: 106.4K (96.8-114.0) -> 105.0K (101.9-106.4)  -1.3%  paired -4.2% [-8..+10]
+  tokio s4: 133.3K (132.5-138.9) -> 122.9K (121.7-128.7)  -7.9%  paired -8.2% [-12..-3]
+WS45 bench.py (5M-field hash, 3 reps)
+  ('monoio', 'i2b'): write_ms 687.8 (642.4-768.5) | max_gap_ms 30.1 (29.9-30.1) | gaps>20ms [21, 15, 15] | rss_spike_mb 3.2 (3.2-3.2) | release_gap_ms 0.7 (0.6-1.2) | size_after_restart {5000000} newfield {0} ok {True}
+  ('monoio', 'w2a'): write_ms 683.2 (678.7-774.2) | max_gap_ms 748.1 (743.1-842.9) | gaps>20ms [1, 1, 1] | rss_spike_mb 836.3 (836.2-836.3) | release_gap_ms 463.7 (414.4-474.6) | size_after_restart {5000000} newfield {0} ok {True}
+  ('tokio', 'i2b'): write_ms 737.4 (666.1-740.0) | max_gap_ms 28.9 (27.4-30.1) | gaps>20ms [18, 18, 16] | rss_spike_mb 3.7 (3.3-4.0) | release_gap_ms 1.5 (1.0-2.6) | size_after_restart {5000000} newfield {0} ok {True}
+  ('tokio', 'w2a'): write_ms 681.8 (666.4-691.4) | max_gap_ms 746.4 (731.2-758.2) | gaps>20ms [1, 1, 1] | rss_spike_mb 837.3 (835.2-837.3) | release_gap_ms 403.5 (388.7-419.0) | size_after_restart {5000000} newfield {0} ok {True}

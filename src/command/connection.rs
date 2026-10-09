@@ -498,6 +498,8 @@ fn info_raw(db: &Database, facts: &InstanceFacts) -> String {
     sections.push_str(&format!(
         "loading:{}\r\n\
          current_cow_size:{}\r\n\
+         rdb_cow_streamed_keys:{}\r\n\
+         rdb_cow_stream_waits:{}\r\n\
          rdb_changes_since_last_save:{}\r\n\
          rdb_bgsave_in_progress:{}\r\n\
          rdb_last_save_time:{}\r\n\
@@ -518,6 +520,7 @@ fn info_raw(db: &Database, facts: &InstanceFacts) -> String {
          aof_delayed_fsync:{}\r\n\
          aof_pending_bio_fsync:{}\r\n\
          aof_fsync_in_flight_ms:{}\r\n\
+         aof_shard_writes:{}\r\n\
          aof_last_append_status:{}\r\n\
          aof_reason_del_dropped:{}\r\n\
          aof_rewrite_overflow_spilled:{}\r\n\
@@ -543,6 +546,10 @@ fn info_raw(db: &Database, facts: &InstanceFacts) -> String {
         // (pre-images, tables a flush handed over) — redis's field for its
         // fork's COW memory; deliberately not in `used_memory`.
         crate::persistence::snapshot_cow::current_cow_size(),
+        // moon#1295: large collections streamed instead of copied, and the
+        // writes that waited for one.
+        crate::persistence::snapshot_cow::stream::streamed_keys(),
+        crate::persistence::snapshot_cow::stream::parked_writes(),
         // Keyspace mutations since the last COMPLETED save — the "is a save
         // worth doing" signal a backup script reads. A failed save does not
         // reset it: the dataset is still unpersisted.
@@ -614,6 +621,9 @@ fn info_raw(db: &Database, facts: &InstanceFacts) -> String {
         // pending BIO_AOF_FSYNC jobs), and the oldest one's age in ms.
         aof_fsyncs_in_flight.0,
         aof_fsyncs_in_flight.1,
+        // moon#1266 1A: AOF write(2)s issued by the shard threads (0 while
+        // the writer threads append: MOON_AOF_SHARD_WRITE off).
+        crate::persistence::aof::lane::AOF_LANE_WRITES.load(std::sync::atomic::Ordering::Relaxed),
         if crate::persistence::aof::aof_last_append_ok() {
             "ok"
         } else {
@@ -732,26 +742,39 @@ fn info_raw(db: &Database, facts: &InstanceFacts) -> String {
     // moon#1289: held cold files that waited for a fold or snapshot nobody
     // asked for. Process-wide atomics, so present whatever the sweep
     // published: databases stale now, and the folds / snapshots requested for
-    // them since boot (both stay 0 on a server with no held file), and the
-    // snapshot requests deferred because a TXN was open (moon#1300), and the
-    // rounds abandoned because a shard held a TXN write at its start.
+    // them since boot (both stay 0 on a server with no held file).
     let _ = write!(
         sections,
         "cold_held_files_stale_databases:{}\r\n\
          cold_held_release_folds_requested:{}\r\n\
-         cold_held_release_snapshots_requested:{}\r\n\
-         cold_held_release_snapshots_deferred_txn:{}\r\n\
-         cold_held_release_snapshots_abandoned_txn:{}\r\n",
+         cold_held_release_snapshots_requested:{}\r\n",
         crate::storage::tiered::held_release::stale_databases(),
         crate::storage::tiered::held_release::folds_requested(),
         crate::persistence::snapshot_request::started(
             crate::persistence::snapshot_request::SnapshotReason::HeldColdFiles
         ),
-        crate::persistence::snapshot_request::deferred_for_open_txn(
-            crate::persistence::snapshot_request::SnapshotReason::HeldColdFiles
-        ),
-        crate::persistence::snapshot_request::abandoned_for_open_txn(
-            crate::persistence::snapshot_request::SnapshotReason::HeldColdFiles
+    );
+    // moon#1297: the cold reclaim (with an AOF or without): compactions
+    // recorded and still waiting for their commit point (and the RAM their
+    // records hold, charged at write admission), old files unlinked
+    // by adoption and their bytes, and snapshots requested to commit them.
+    let (compactions, files_unlinked, bytes_unlinked) =
+        crate::storage::tiered::cold_reclaim::reclaim_totals();
+    let _ = write!(
+        sections,
+        "cold_reclaim_compactions:{}\r\n\
+         cold_reclaim_compactions_pending:{}\r\n\
+         cold_reclaim_pending_bytes:{}\r\n\
+         cold_reclaim_files_unlinked:{}\r\n\
+         cold_reclaim_bytes_unlinked:{}\r\n\
+         cold_reclaim_snapshots_requested:{}\r\n",
+        compactions,
+        crate::storage::tiered::cold_reclaim::awaiting_fold(),
+        crate::storage::tiered::cold_reclaim::resident_bytes_total(),
+        files_unlinked,
+        bytes_unlinked,
+        crate::persistence::snapshot_request::started(
+            crate::persistence::snapshot_request::SnapshotReason::ColdReclaim
         ),
     );
     sections.push_str("\r\n");

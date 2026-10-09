@@ -10,6 +10,8 @@ pub mod cold_read;
 pub mod cold_read_pool;
 pub mod cold_reclaim;
 #[cfg(test)]
+mod cold_reclaim_no_aof_tests;
+#[cfg(test)]
 mod cold_reclaim_tests;
 #[cfg(test)]
 mod dead_slot_ledger_tests;

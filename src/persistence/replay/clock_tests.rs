@@ -142,13 +142,15 @@ fn the_wal_pin_is_the_newest_segment_capped_at_the_wall_clock() {
 }
 
 /// REVIEW-FINAL-P5B item 4 (b): with KV logs replayed over a snapshot
-/// (`KvSources::SnapshotAndLogs`, here the legacy `appendonly.aof` of the
-/// non-offload boot), the snapshot's loader skipped a key whose TTL passed
-/// while the server was down, on the WALL clock — while the log replayed over
-/// it judges on the pinned clock, to which the key was alive: `APPEND s x`
-/// then built a new persistent `x`. Kept, it lands on `v` and keeps its TTL.
+/// (`KvSources::SnapshotAndLogs` — since R2b review P1 only without an
+/// `appendonly.aof` holding a record, here the non-offload boot's last-resort
+/// WAL v3), the snapshot's loader skipped a key whose TTL passed while the
+/// server was down, on the WALL clock — while the log replayed over it judges
+/// on the pinned clock, to which the key was alive: `APPEND s x` then built a
+/// new persistent `x`. Kept, it lands on `v` and keeps its TTL.
 #[test]
 fn a_snapshot_under_replayed_logs_keeps_a_key_the_log_saw_alive() {
+    use crate::persistence::wal_v3::record::{WalRecordType, write_wal_v3_record};
     use crate::storage::entry::Entry;
     let dir = tempfile::tempdir().expect("tempdir");
     let deadline = current_time_ms() + 400;
@@ -164,9 +166,20 @@ fn a_snapshot_under_replayed_logs_keeps_a_key_the_log_saw_alive() {
         &dir.path().join("shard-0.rrdshard"),
     )
     .expect("save");
-    let aof = dir.path().join("appendonly.aof");
-    std::fs::write(&aof, resp(&[b"APPEND", b"s", b"x"])).expect("write aof");
-    touch_mtime(&aof, deadline - 200);
+    let wal_dir = dir.path().join("shard-0").join("wal-v3");
+    std::fs::create_dir_all(&wal_dir).expect("wal dir");
+    let mut wal = vec![0u8; 64];
+    wal[0..6].copy_from_slice(b"RRDWAL");
+    wal[6] = 3;
+    write_wal_v3_record(
+        &mut wal,
+        1,
+        WalRecordType::Command,
+        &resp(&[b"APPEND", b"s", b"x"]),
+    );
+    let segment = wal_dir.join("000000000001.wal");
+    std::fs::write(&segment, &wal).expect("write wal");
+    touch_mtime(&segment, deadline - 200);
     while current_time_ms() <= deadline {
         std::thread::sleep(Duration::from_millis(20));
     }
@@ -177,6 +190,36 @@ fn a_snapshot_under_replayed_logs_keeps_a_key_the_log_saw_alive() {
         raw(&shard.databases[0], b"s"),
         Some((b"vx".to_vec(), deadline)),
         "the APPEND must land on the snapshot's value and keep its TTL"
+    );
+}
+
+/// R2b review P1: a flat `appendonly.aof` holding a record is the only KV
+/// source, so it is never replayed over a snapshot — a snapshot saved while it
+/// was appended holds a prefix of it. The image's `s` is not loaded.
+#[test]
+fn a_flat_aof_is_not_replayed_over_the_snapshot() {
+    use crate::storage::entry::Entry;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut image = vec![Database::new()];
+    image[0].set(b"s", Entry::new_string(bytes::Bytes::from_static(b"v")));
+    crate::persistence::snapshot::shard_snapshot_save(
+        0,
+        1,
+        &image,
+        &dir.path().join("shard-0.rrdshard"),
+    )
+    .expect("save");
+    std::fs::write(
+        dir.path().join("appendonly.aof"),
+        resp(&[b"APPEND", b"s", b"x"]),
+    )
+    .expect("write aof");
+    let config = crate::config::RuntimeConfig::default(); // appendonly yes
+    let mut shard = crate::shard::Shard::new(0, 1, 1, config);
+    shard.restore_from_persistence(dir.path().to_str().expect("utf8"), None, false);
+    assert_eq!(
+        raw(&shard.databases[0], b"s").map(|(v, _)| v),
+        Some(b"x".to_vec())
     );
 }
 

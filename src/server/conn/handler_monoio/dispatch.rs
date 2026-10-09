@@ -7,6 +7,7 @@
 //!
 //! Each helper returns `true` if the command was consumed (caller should `continue`).
 
+use crate::persistence::aof::barrier_set::BarrierDebt;
 use bytes::Bytes;
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -187,7 +188,7 @@ pub(super) fn try_handle_cluster(
                 });
             // Bump the generation FIRST so any previously spawned replica task
             // sees itself superseded and exits instead of double-applying.
-            let epoch = crate::replication::replica::bump_replica_task_epoch();
+            let epoch = crate::replication::replica::bump_replica_task_epoch(ctx.aof_pool.as_ref());
             let cfg = crate::replication::replica::ReplicaTaskConfig {
                 master_host: host,
                 master_port: port,
@@ -199,6 +200,7 @@ pub(super) fn try_handle_cluster(
                 stream_db: std::sync::atomic::AtomicUsize::new(0),
                 blocking_registry: Some(ctx.blocking_registry.clone()),
                 shard_databases: ctx.shard_databases.clone(),
+                aof_pool: ctx.aof_pool.clone(),
             };
             monoio::spawn(crate::replication::replica::run_replica_task(cfg));
         }
@@ -224,7 +226,7 @@ pub(super) async fn try_handle_evalsha(
     responses: &mut crate::server::conn::intercept::InterceptReplies<'_>,
     // moon#831: reply slots of local-leg writes pending the batch-end
     // `fsync_barrier(ctx.shard_id)` — a script that wrote joins it.
-    local_leg_write_idxs: &mut Vec<usize>,
+    barrier_debt: &mut BarrierDebt,
 ) -> bool {
     // `EVALSHA_RO` is `EVALSHA` with writes refused, and shares every step
     // below — resolving the caller, routing, the cached body. The ONE
@@ -313,7 +315,7 @@ pub(super) async fn try_handle_evalsha(
     // are already in this shard's AOF writer (fire-and-forget from the
     // bridge); the reply must wait for the batch-end barrier like any SET.
     if crate::server::conn::shared::script_write_joins_barrier(wrote, &response) {
-        local_leg_write_idxs.push(responses.len());
+        barrier_debt.push(responses.len());
     }
     responses.push(response);
     true
@@ -332,7 +334,7 @@ pub(super) async fn try_handle_eval(
     shutdown: &crate::runtime::cancel::CancellationToken,
     responses: &mut crate::server::conn::intercept::InterceptReplies<'_>,
     // moon#831: see `try_handle_evalsha`.
-    local_leg_write_idxs: &mut Vec<usize>,
+    barrier_debt: &mut BarrierDebt,
 ) -> bool {
     // `EVAL_RO` — see `try_handle_evalsha`.
     let read_only = cmd.eq_ignore_ascii_case(b"EVAL_RO");
@@ -420,7 +422,7 @@ pub(super) async fn try_handle_eval(
     // are already in this shard's AOF writer (fire-and-forget from the
     // bridge); the reply must wait for the batch-end barrier like any SET.
     if crate::server::conn::shared::script_write_joins_barrier(wrote, &response) {
-        local_leg_write_idxs.push(responses.len());
+        barrier_debt.push(responses.len());
     }
     responses.push(response);
     true
@@ -673,6 +675,15 @@ pub(super) fn try_handle_replicaof(
         responses.push(refusal);
         return true;
     }
+    // redis `replicaofCommand` (R2b round 4 X1-DBL): the master this node
+    // already follows — no new task, no epoch bump, no role reset.
+    if let (Some(ReplicaofAction::StartReplication { host, port }), Some(rs)) =
+        (&action, ctx.repl_state.as_ref())
+        && crate::replication::replica::already_following(&rs.read(), host, *port)
+    {
+        responses.push(crate::replication::replica::already_following_reply());
+        return true;
+    }
     if let Some(action) = action {
         if let Some(ref rs) = ctx.repl_state {
             match action {
@@ -689,7 +700,8 @@ pub(super) fn try_handle_replicaof(
                     // replica task (old REPLICAOF target) sees itself
                     // superseded and exits instead of double-applying the
                     // stream alongside the new task.
-                    let epoch = crate::replication::replica::bump_replica_task_epoch();
+                    let epoch =
+                        crate::replication::replica::bump_replica_task_epoch(ctx.aof_pool.as_ref());
                     let cfg = crate::replication::replica::ReplicaTaskConfig {
                         master_host: host,
                         master_port: port,
@@ -701,6 +713,7 @@ pub(super) fn try_handle_replicaof(
                         stream_db: std::sync::atomic::AtomicUsize::new(0),
                         blocking_registry: Some(ctx.blocking_registry.clone()),
                         shard_databases: ctx.shard_databases.clone(),
+                        aof_pool: ctx.aof_pool.clone(),
                     };
                     release_clients_blocked_as_master(ctx);
                     monoio::spawn(crate::replication::replica::run_replica_task(cfg));
@@ -710,7 +723,8 @@ pub(super) fn try_handle_replicaof(
                     // Kill the running replica task — flipping the role alone
                     // left it streaming + applying forever (each NO ONE →
                     // re-attach cycle stacked one more live applier).
-                    let _ = crate::replication::replica::bump_replica_task_epoch();
+                    let _ =
+                        crate::replication::replica::bump_replica_task_epoch(ctx.aof_pool.as_ref());
                     let mut rs_guard = rs.write();
                     rs_guard.repl_id2 = rs_guard.repl_id.clone();
                     rs_guard.repl_id = generate_repl_id();
@@ -1615,7 +1629,7 @@ pub(super) async fn try_handle_functions(
     responses: &mut crate::server::conn::intercept::InterceptReplies<'_>,
     // moon#831: see `try_handle_evalsha` — an FCALL that wrote joins the
     // batch barrier.
-    local_leg_write_idxs: &mut Vec<usize>,
+    barrier_debt: &mut BarrierDebt,
 ) -> bool {
     if conn.in_multi {
         return false;
@@ -1749,7 +1763,7 @@ pub(super) async fn try_handle_functions(
         )
         .await;
         if crate::server::conn::shared::script_write_joins_barrier(wrote, &response) {
-            local_leg_write_idxs.push(responses.len());
+            barrier_debt.push(responses.len());
         }
         responses.push(response);
         return true;
@@ -1768,7 +1782,7 @@ pub(super) async fn try_handle_cross_shard_commands(
     responses: &mut crate::server::conn::intercept::InterceptReplies<'_>,
     // v3-5 group commit: response indexes of local-leg writes pending the
     // batch-end fsync_barrier(ctx.shard_id) (appendfsync=always only).
-    local_leg_write_idxs: &mut Vec<usize>,
+    barrier_debt: &mut BarrierDebt,
 ) -> bool {
     if ctx.num_shards <= 1 {
         return false;
@@ -1889,7 +1903,9 @@ pub(super) async fn try_handle_cross_shard_commands(
         {
             return false;
         }
-        let mut local_barrier_pending = false;
+        // The command records the barriers it owes (local leg, written remote
+        // shards) in `barrier_debt` under the index its reply takes; the
+        // batch settles them all before its first flush.
         let response = crate::shard::coordinator::coordinate_multi_key(
             cmd,
             cmd_args,
@@ -1902,15 +1918,11 @@ pub(super) async fn try_handle_cross_shard_commands(
             &ctx.cached_clock,
             ctx.aof_pool.as_ref(),
             &ctx.repl_state,
-            &mut local_barrier_pending,
+            barrier_debt,
+            responses.len(),
             &(), // monoio: coordinator uses oneshot, not response_pool
         )
         .await;
-        // A response that is already an error must not be overwritten by a
-        // barrier failure; only successful writes join the barrier set.
-        if local_barrier_pending && !matches!(response, Frame::Error(_)) {
-            local_leg_write_idxs.push(responses.len());
-        }
         // moon#1069: the coordinator ran this shard's leg (a same-shard
         // `COPY`, or this shard's slice of a spanning write) outside every
         // write tail — serve whoever is blocked on a key it wrote here.
@@ -1986,7 +1998,7 @@ pub(super) async fn try_handle_blocking<
     // the RESP3 policy itself, below — see `conn::intercept` for the two paths
     // that are allowed to.
     responses: &mut Vec<Frame>,
-    local_leg_write_idxs: &mut Vec<usize>,
+    barrier_debt: &mut BarrierDebt,
     codec: &mut crate::server::codec::RespCodec,
     write_buf: &mut bytes::BytesMut,
     read_buf: &mut bytes::BytesMut,
@@ -2011,13 +2023,7 @@ pub(super) async fn try_handle_blocking<
     // Earlier frames in this batch may hold barrier-pending local-leg
     // writes — confirm (or fail-loud) them before this early flush, and
     // clear the indexes so the batch-end barrier never sees stale ones.
-    crate::server::conn::shared::resolve_local_leg_barrier(
-        &ctx.aof_pool,
-        ctx.shard_id,
-        local_leg_write_idxs,
-        responses,
-    )
-    .await;
+    crate::server::conn::shared::settle_barrier_debt(&ctx.aof_pool, barrier_debt, responses).await;
 
     // Flush accumulated responses before blocking
     for resp in &*responses {
@@ -2025,6 +2031,8 @@ pub(super) async fn try_handle_blocking<
     }
     if !write_buf.is_empty() {
         use monoio::io::AsyncWriteRentExt;
+        // moon#1266 1A: the batch's AOF records reach the kernel first.
+        crate::persistence::aof::lane::flush_before_reply();
         let data = write_buf.split().freeze();
         let (result, _): (std::io::Result<usize>, bytes::Bytes) = stream.write_all(data).await;
         if result.is_err() {

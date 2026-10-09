@@ -184,37 +184,31 @@ one, at most one per ten sweep intervals (about ten minutes). This happens
 **even with `save ""`**, and the snapshot is an ordinary `BGSAVE`: it
 overwrites the dump file in `--dir`, and moves `LASTSAVE`.
 
-The automatic snapshot never contains a `TXN`'s uncommitted writes:
+Like every snapshot (`BGSAVE`, the `--save` rules, `SHUTDOWN`'s save), the
+automatic snapshot never contains a `TXN`'s uncommitted writes (moon#1300): a
+key an open transaction holds is saved at its pre-transaction value, whether
+the transaction wrote it before the snapshot started or during it. So the
+snapshot runs whenever it is due, transactions open or not.
 
-- While any `TXN` is open it is not requested; the next sweep asks again.
-- Each shard checks again as it starts its part. If an uncommitted `TXN`
-  write is in memory on that shard (one began after the request), the
-  whole snapshot is abandoned: no shard's file is replaced, `LASTSAVE` and
-  `rdb_last_bgsave_status` do not change, no held file is released, and a
-  later sweep asks again.
-- A `TXN` write that lands on a shard after that shard started is saved at
-  its pre-transaction value (copy-on-write).
-
-This guarantee covers only this automatic snapshot. `BGSAVE`, `SAVE`, the
-`--save` rules and `SHUTDOWN`'s save still capture uncommitted writes
-(moon#1300).
-
-The cost is starvation: a `TXN` left open, or `TXN` traffic that never
-pauses, keeps the snapshot from running. The held files then stay on disk,
-and `SWAPDB` stays refused for their databases, until a snapshot does run.
-There is no timeout. End or abort long transactions, or run `BGSAVE` in a
-quiet moment. `INFO` shows it: `cold_held_release_snapshots_deferred_txn`
-counts requests deferred for an open `TXN`, and
-`cold_held_release_snapshots_abandoned_txn` counts snapshots abandoned at a
-shard's start. Both keep growing while `cold_held_files_stale_databases`
-stays above 0.
-
-Watch it with `INFO`: `cold_held_files_stale_databases`,
-`cold_held_release_snapshots_requested`,
-`cold_held_release_snapshots_deferred_txn` and
-`cold_held_release_snapshots_abandoned_txn`. With `--appendonly yes` no
+Watch it with `INFO`: `cold_held_files_stale_databases` and
+`cold_held_release_snapshots_requested`. With `--appendonly yes` no
 snapshot is taken: an AOF rewrite releases the held files instead
 (`cold_held_release_folds_requested`).
+
+The no-AOF cold reclaim (moon#1297) asks for a snapshot the same way. A
+mostly-dead spill file is compacted into a new file, and the compaction is
+adopted (the old file deleted) only once a snapshot that started after it
+has completed. When compactions have waited three sweeps with no snapshot,
+Moon requests one, under the same spacing: one snapshot serves both reasons.
+It runs with transactions open too: a key a `TXN` wrote is saved at its
+pre-transaction value, including a cold key the transaction read back from
+a spill file. While compactions wait, the old file and its compacted copy
+are both on disk (at most 64 waiting compactions per database), and the
+bookkeeping of the waiting compactions counts toward `maxmemory`: a shard
+keeps it under a sixteenth of its memory budget and, while it is evicting
+to disk, starts at most one compaction a second, so the reclaim never
+crowds out writes. `INFO`: `cold_reclaim_compactions_pending`,
+`cold_reclaim_pending_bytes` and `cold_reclaim_snapshots_requested`.
 
 ## Using both
 

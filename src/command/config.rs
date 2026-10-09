@@ -440,16 +440,21 @@ fn chrono_lite_now() -> String {
 /// resets among the counters wave 2a touched — `expired_keys` — plus the
 /// moon-only STATISTICS those workstreams added (monotonic event counts:
 /// `txn_conflicts_refused`, `cold_held_release_folds_requested`,
-/// `cold_held_release_snapshots_requested`,
-/// `cold_held_release_snapshots_deferred_txn`). Gauges of live state
-/// (`txn_open`, `txn_held_keys`, `cold_held_files_stale_databases`, …) are
-/// never reset. The other redis stats (`keyspace_hits`, `evicted_keys`,
+/// `cold_held_release_snapshots_requested`, and moon#1297's
+/// `cold_reclaim_compactions`, `cold_reclaim_files_unlinked`,
+/// `cold_reclaim_bytes_unlinked`, `cold_reclaim_snapshots_requested`, and
+/// moon#1295's `rdb_cow_streamed_keys`, `rdb_cow_stream_waits`).
+/// Gauges of live state (`current_cow_size`, `txn_open`, `txn_held_keys`,
+/// `cold_held_files_stale_databases`, `cold_reclaim_compactions_pending`, …)
+/// are never reset. The other redis stats (`keyspace_hits`, `evicted_keys`,
 /// `total_commands_processed`, …) are still not reset here.
 pub fn config_resetstat() -> Frame {
     crate::admin::metrics_setup::reset_expired_keys();
     crate::transaction::isolation::reset_stats();
     crate::storage::tiered::held_release::reset_stats();
+    crate::storage::tiered::cold_reclaim::reset_stats();
     crate::persistence::snapshot_request::reset_stats();
+    crate::persistence::snapshot_cow::stream::reset_stats();
     Frame::SimpleString(Bytes::from_static(b"OK"))
 }
 
@@ -485,8 +490,15 @@ mod tests {
     /// `resetServerStats` does. The counter is process-wide and other tests
     /// bump it in parallel, so the check is "the million this test added is
     /// gone", not "exactly 0".
+    /// R2b round 2 N1: `config_resetstat()` zeroes process-wide counters, so
+    /// a test that bumps one and checks it is still there BEFORE calling it
+    /// raced every other RESETSTAT test (`cargo test --lib` runs them on
+    /// parallel threads). Each takes this lock for its whole body.
+    static RESETSTAT_TESTS: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
     #[test]
     fn resetstat_zeroes_expired_keys() {
+        let _serial = RESETSTAT_TESTS.lock();
         crate::admin::metrics_setup::record_expired_keys(1_000_000);
         assert!(crate::admin::metrics_setup::expired_keys() >= 1_000_000);
         assert_eq!(
@@ -494,6 +506,22 @@ mod tests {
             Frame::SimpleString(Bytes::from_static(b"OK"))
         );
         assert!(crate::admin::metrics_setup::expired_keys() < 1_000_000);
+    }
+
+    /// R2b review: `CONFIG RESETSTAT` zeroes moon#1295's monotonic stream
+    /// counts (process-wide, bumped in parallel elsewhere: "the million this
+    /// test added is gone").
+    #[test]
+    fn resetstat_zeroes_the_cow_stream_counts() {
+        let _serial = RESETSTAT_TESTS.lock();
+        use crate::persistence::snapshot_cow::stream;
+        stream::add_counts_for_test(1_000_000, 1_000_000);
+        assert!(stream::streamed_keys() >= 1_000_000 && stream::parked_writes() >= 1_000_000);
+        assert_eq!(
+            super::config_resetstat(),
+            Frame::SimpleString(Bytes::from_static(b"OK"))
+        );
+        assert!(stream::streamed_keys() < 1_000_000 && stream::parked_writes() < 1_000_000);
     }
 
     fn config_set_scoped(runtime_config: &mut RuntimeConfig, args: &[Frame]) -> Frame {

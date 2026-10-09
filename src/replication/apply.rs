@@ -117,6 +117,10 @@ fn poison(cmd: &[u8], reason: &str) -> bool {
 pub(crate) struct ReplCommand {
     pub db_index: usize,
     pub command: Arc<Frame>,
+    /// Bytes of the drained buffer up to and including this frame (R2b
+    /// round 4 X1-DBL): once it is applied, the replication offset may
+    /// advance by exactly this much of the drain, and no further.
+    pub end_offset: usize,
 }
 
 /// Outcome of draining complete frames out of the replication read buffer.
@@ -175,7 +179,7 @@ pub(crate) fn drain_replicated_commands_resumable(
         match parse::parse_resumable(buf, &config, state) {
             Ok(Some(frame)) => {
                 consumed += before - buf.len();
-                classify(frame, selected_db, &mut commands);
+                classify(frame, selected_db, consumed, &mut commands);
             }
             // Incomplete trailing frame: parser left `buf` untouched — wait for
             // the next socket read to complete it.
@@ -205,7 +209,7 @@ pub(crate) fn drain_replicated_commands_resumable(
 
 /// Route a single parsed frame: absorb `SELECT`, drop chatter, or record a data
 /// command bound to the current `selected_db`.
-fn classify(frame: Frame, selected_db: &mut usize, out: &mut Vec<ReplCommand>) {
+fn classify(frame: Frame, selected_db: &mut usize, end_offset: usize, out: &mut Vec<ReplCommand>) {
     let Some((cmd, args)) = command_parts(&frame) else {
         return; // non-array / empty — ignore (e.g. inline-newline keepalive)
     };
@@ -222,6 +226,7 @@ fn classify(frame: Frame, selected_db: &mut usize, out: &mut Vec<ReplCommand>) {
     out.push(ReplCommand {
         db_index: *selected_db,
         command: Arc::new(frame),
+        end_offset,
     });
 }
 
@@ -347,6 +352,10 @@ pub(crate) fn apply_local(
     let Some((cmd, args)) = extract_command_static(&rc.command) else {
         return ApplyOutcome::Applied; // not an array command — nothing to apply (defensive)
     };
+    // moon#1300: the master's transaction blocks (`replication::txn_apply`).
+    if crate::replication::txn_apply::try_apply_marker(cmd, args) {
+        return ApplyOutcome::Applied;
+    }
     // moon#1299: the master already decided — a replica applies its stream
     // whatever keys a local transaction holds (it cannot hold any: a replica
     // refuses client writes). Scoped to this apply.
@@ -385,6 +394,9 @@ pub(crate) fn apply_local(
             return true;
         }
         let db_idx = rc.db_index.min(db_count - 1);
+        // moon#1300: inside a master transaction's block, capture what this
+        // record overwrites; outside one, release what it writes.
+        crate::replication::txn_apply::before_data(s, db_idx, cmd, args);
         if db_idx != rc.db_index {
             // Replica configured with fewer logical dbs than the master: a
             // high-index write is clamped rather than lost, but that is a
@@ -1072,6 +1084,8 @@ pub(crate) fn load_snapshot(
     // multi-shard master's merged snapshot carries one MQ registry aux
     // entry PER shard.
     let mq_blobs = redis_rdb::read_moon_aux_all(rdb, redis_rdb::MOON_AUX_MQ_REGISTRY);
+    // moon#1300: the new dataset is the master's: forget every open block.
+    crate::replication::txn_apply::discard();
     let result: anyhow::Result<usize> = match crate::shard::slice::try_with_shard(|s| {
         // moon#1227 review F6: this replaces every table outside `dispatch`;
         // a BGSAVE epoch still writing on this shard (the replica's own
@@ -1469,6 +1483,7 @@ mod tests {
         ReplCommand {
             db_index: 0,
             command: Arc::new(Frame::Array(arr.into())),
+            end_offset: 0,
         }
     }
 
@@ -1929,7 +1944,7 @@ mod tests {
         );
         let mut db = 0usize;
         let mut out = Vec::new();
-        classify(frame, &mut db, &mut out);
+        classify(frame, &mut db, 0, &mut out);
         assert_eq!(db, 4);
         assert!(out.is_empty());
     }

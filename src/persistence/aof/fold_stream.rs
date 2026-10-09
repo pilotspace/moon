@@ -196,10 +196,17 @@ pub fn stream_fold_image(dbs: &[&Database], now_ms: u64, mut sink: FoldImageSink
     let mut shadows: Vec<Vec<Bytes>> = Vec::with_capacity(dbs.len());
     let result = (|| -> Result<(), MoonError> {
         let mut w = RdbStreamWriter::new(&mut sink)?;
+        // moon#1300: a key an open transaction holds goes into the base at
+        // its PRE-transaction image; the fold re-opens the transaction in the
+        // new generation with its live value (`transaction::reopen`).
+        let held = crate::transaction::isolation::any_held();
         for (db_idx, db) in dbs.iter().enumerate() {
             let cold = db.cold_index.as_ref().filter(|ci| ci.len() > 0);
             let mut expired_shadows: Vec<Bytes> = Vec::new();
             for (key, entry) in db.data().iter() {
+                if held && crate::transaction::isolation::is_held(db_idx, key.as_bytes()) {
+                    continue;
+                }
                 if entry.is_expired_at(now_ms) {
                     if cold.is_some_and(|ci| shadow_can_return(ci, key.as_bytes(), now_ms)) {
                         expired_shadows.push(Bytes::copy_from_slice(key.as_bytes()));
@@ -211,6 +218,18 @@ pub fn stream_fold_image(dbs: &[&Database], now_ms: u64, mut sink: FoldImageSink
             // Same db, right after its hot entries: the writer needs one
             // database's entries contiguous.
             write_in_flight_entries(&mut w, db_idx, db, now_ms)?;
+            if held {
+                crate::transaction::isolation::with_held_keys(|keys| {
+                    for h in keys.filter(|h| h.db == db_idx) {
+                        if let Some(entry) = h.pre
+                            && !entry.is_expired_at(now_ms)
+                        {
+                            w.write_entry(db_idx, h.key, entry)?;
+                        }
+                    }
+                    Ok::<(), MoonError>(())
+                })?;
+            }
             shadows.push(expired_shadows);
         }
         w.finish()?;

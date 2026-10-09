@@ -39,7 +39,6 @@ pub mod segment_stall;
 pub mod self_msg;
 pub mod shared_databases;
 pub mod slice;
-pub(crate) mod snapshot_txn_guard;
 /// O3 adaptive busy-poll governor — the spin it gates exists only in the
 /// vendored monoio legacy driver, so the module is monoio-only.
 #[cfg(feature = "runtime-monoio")]
@@ -125,6 +124,9 @@ pub struct Shard {
     /// replay read every cold file ungated. Read by `main.rs`, which rewrites
     /// the AOF once so later boots are gated.
     pub replayed_aof_without_cold_cut: bool,
+    /// R2b round 2 F1: `appendonly.aof` (the only KV source) could not be
+    /// replayed; the caller refuses to start.
+    pub aof_unreadable: Option<crate::persistence::aof::flat_file::UnreadableAof>,
     /// First cold-tier `file_id` this shard may allocate, proven above every
     /// id in use (moon#997, moon#893) by [`Self::prove_spill_file_id_seed`] —
     /// the startup gate `main` and the embedded server run after recovery,
@@ -186,6 +188,7 @@ impl Shard {
             recovered_warm_segments: Vec::new(),
             pending_heap_orphans: Vec::new(),
             replayed_aof_without_cold_cut: false,
+            aof_unreadable: None,
             spill_file_id_seed: None,
         }
     }
@@ -320,6 +323,7 @@ impl Shard {
                         // the background once this shard is serving traffic.
                         self.pending_heap_orphans = result.pending_heap_orphans;
                         self.replayed_aof_without_cold_cut = result.aof_replayed_without_cold_cut;
+                        self.aof_unreadable = result.aof_unreadable;
                         return result.commands_replayed;
                     }
                     Err(e) => {
@@ -338,9 +342,10 @@ impl Shard {
         self.restore_from_persistence_v2(persistence_dir, kv)
     }
 
-    /// Legacy recovery path: snapshot load + appendonly.aof (authority) /
-    /// WAL v3 (last-resort, AOF-absent-only) replay — the replay only with
-    /// [`KvSources::SnapshotAndLogs`] (not under `--appendonly no`).
+    /// Legacy recovery path: appendonly.aof alone when it holds a record
+    /// ([`KvSources::AofOnly`], R2b review P1), else the snapshot + the WAL v3
+    /// last resort (AOF-absent-only) — the replay only under `--appendonly
+    /// yes`.
     ///
     /// Pre-1.0 WAL-v3-only format freeze: the per-shard WAL v2 rung
     /// (`shard-N.wal`) was removed and is no longer replayed by this build —
@@ -363,6 +368,22 @@ impl Shard {
 
         let dir = std::path::Path::new(persistence_dir);
         let mut total_keys = 0;
+        // R2b review P1: `appendonly.aof` holding a record is the only KV
+        // source (redis's `appendonly yes` rule).
+        let kv = kv.with_flat_aof(Some(dir));
+        let snap_skipped = dir.join(format!("shard-{}.rrdshard", self.id));
+        if kv == KvSources::AofOnly && snap_skipped.exists() {
+            info!(
+                "Shard {}: snapshot load skipped — {}",
+                self.id,
+                kv.why_no_snapshot()
+            );
+            crate::persistence::aof::flat_file::note_skipped_snapshot(
+                &snap_skipped,
+                dir,
+                self.databases.len(),
+            );
+        }
 
         // Load per-shard snapshot -- unless the multi-part AOF replay that
         // follows this pass wipes it anyway (see `restore_from_persistence`).
@@ -407,7 +428,7 @@ impl Shard {
 
         // AOF is the recovery authority (see doc comment: WAL v3 KV coverage
         // is intentionally partial post-#211, so it must never shadow the AOF).
-        let aof_path = dir.join("appendonly.aof");
+        let aof_path = crate::persistence::aof::flat_file::flat_aof_path(dir);
         if kv == KvSources::Elsewhere {
             info!(
                 "Shard {}: legacy snapshot/appendonly.aof/WAL replay skipped — the \
@@ -420,7 +441,8 @@ impl Shard {
             kv.note_unreplayed_logs(self.id, dir);
         } else if aof_path.exists() {
             let mut aof_replayed = false;
-            match crate::persistence::aof::replay_aof(
+            // R2b round 3 F-B: a torn tail is cut before the writer appends.
+            match crate::persistence::aof::replay_aof_at_boot(
                 &mut self.databases,
                 &aof_path,
                 &DispatchReplayEngine::new(),
@@ -431,7 +453,11 @@ impl Shard {
                     aof_replayed = n > 0;
                 }
                 Err(e) => {
-                    tracing::error!("Shard {}: AOF replay failed: {}", self.id, e);
+                    let refusal = crate::persistence::aof::flat_file::UnreadableAof::from_error(
+                        &aof_path, &e,
+                    );
+                    tracing::error!("Shard {}: {}", self.id, refusal.message());
+                    self.aof_unreadable = Some(refusal);
                 }
             }
             // moon#914: close the replay generation on every database. The

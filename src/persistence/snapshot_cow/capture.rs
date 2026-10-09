@@ -33,7 +33,7 @@ pub(crate) fn pre_image_clones_for_test() -> usize {
 /// file holds its epoch-start bytes and the drain would drop the copy. Skip it
 /// BEFORE the deep clone. moon#1228: nor does a write to a slot whose epoch
 /// table a flush detached (its contents are post-epoch).
-fn target(slot: usize, key: &[u8]) -> Option<usize> {
+pub(super) fn target(slot: usize, key: &[u8]) -> Option<usize> {
     PROGRESS.with(|p| match p.borrow().as_ref() {
         None => Some(slot),
         Some(progress) => {
@@ -47,7 +47,7 @@ fn target(slot: usize, key: &[u8]) -> Option<usize> {
 
 /// Already captured this epoch — the FIRST pre-image is the epoch-start
 /// state; a later one would be a state the snapshot must not contain.
-fn captured(db_index: usize, key: &[u8]) -> bool {
+pub(super) fn captured(db_index: usize, key: &[u8]) -> bool {
     PENDING_KEYS.with(|k| {
         k.borrow()
             .get(db_index)
@@ -55,18 +55,23 @@ fn captured(db_index: usize, key: &[u8]) -> bool {
     })
 }
 
-/// Queue `entry` as `key`'s pre-image and enter it in the epoch dedupe set.
-fn record_entry(db_index: usize, owned: Bytes, entry: Entry, bytes: Option<u64>) {
+/// Enter `key` in the epoch dedupe set: no later write copies it.
+pub(super) fn mark_captured(db_index: usize, key: &Bytes) {
     PENDING_KEYS.with(|k| {
         let mut sets = k.borrow_mut();
         if sets.len() <= db_index {
             sets.resize_with(db_index + 1, HashSet::new);
         }
-        if sets[db_index].insert(owned.clone()) {
+        if sets[db_index].insert(key.clone()) {
             // The key's bytes plus a hash-set slot and its `Bytes` header.
-            DEDUPE_BYTES.with(|b| b.set(b.get() + owned.len() as u64 + 48));
+            DEDUPE_BYTES.with(|b| b.set(b.get() + key.len() as u64 + 48));
         }
     });
+}
+
+/// Queue `entry` as `key`'s pre-image and enter it in the epoch dedupe set.
+pub(super) fn record_entry(db_index: usize, owned: Bytes, entry: Entry, bytes: Option<u64>) {
+    mark_captured(db_index, &owned);
     let pre_image: PreImage = Some(entry);
     PENDING.with(|p| p.borrow_mut().push((db_index, owned, pre_image, bytes)));
 }
@@ -78,6 +83,11 @@ fn record_entry(db_index: usize, owned: Bytes, entry: Entry, bytes: Option<u64>)
 /// slot now (moon#1228 — a SWAPDB moves tables between slots, a flush
 /// detaches one).
 pub(super) fn capture_key(db: &Database, slot: usize, key: &[u8]) {
+    // moon#1295: a key streaming into the snapshot is finished (or its
+    // request dropped) before anything writes it.
+    if super::stream::busy() {
+        super::stream::guard_write(slot, key, db.data().get(key));
+    }
     let Some(db_index) = target(slot, key) else {
         return;
     };
@@ -103,6 +113,35 @@ pub(super) fn capture_key(db: &Database, slot: usize, key: &[u8]) {
     #[cfg(test)]
     CLONES.with(|c| c.set(c.get() + 1));
     record_entry(db_index, owned, entry.clone(), None);
+}
+
+/// moon#1300: at a snapshot's start, file every key an open transaction
+/// holds on this shard under its PRE-TRANSACTION image — first capture, so
+/// no later write of the key (the transaction's own, or its abort's restore)
+/// replaces it. The snapshot then holds no uncommitted value, whatever the
+/// transaction does next: commit (its writes are after the epoch, like any
+/// write after a save starts), abort, or a crash.
+pub(super) fn capture_held_pre_images() {
+    crate::transaction::isolation::with_held_keys(|held| {
+        for h in held {
+            let Some(db_index) = target(h.db, h.key) else {
+                continue;
+            };
+            if captured(db_index, h.key) {
+                continue;
+            }
+            match h.pre {
+                // Absent before the transaction: a tombstone hides whatever it
+                // created (FIFO: the drain keeps this first capture).
+                None => {
+                    PENDING.with(|p| p.borrow_mut().push((db_index, h.key.clone(), None, None)))
+                }
+                // moon#1295: a large image streams from the hold, uncopied.
+                Some(entry) if super::stream::request_held(h.db, db_index, h.key, entry) => {}
+                Some(entry) => record_entry(db_index, h.key.clone(), entry.clone(), None),
+            }
+        }
+    });
 }
 
 /// What became of an entry handed to [`capture_removed`].

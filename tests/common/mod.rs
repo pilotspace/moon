@@ -417,6 +417,23 @@ fn settled(child: &mut Child, settle: Duration) -> Result<(), std::process::Exit
 // skip it there and note it for a follow-up task instead").
 // ---------------------------------------------------------------------------
 
+/// The binary named by env var `var` (`MOON_BIN_TOKIO`, `MOON_BIN_MONOIO`):
+/// a suite that needs a specific runtime's build. It PANICS when the var is
+/// unset or names no file (R2b round 3 F-J): these suites are `#[ignore]`d,
+/// so they run only when asked for (`--include-ignored`), and a run that
+/// skipped its case while reporting `ok` passed vacuously.
+pub fn required_runtime_bin(var: &str) -> PathBuf {
+    let Some(bin) = std::env::var_os(var).filter(|v| !v.is_empty()) else {
+        panic!(
+            "{var} is not set: this case needs that runtime's moon binary. Set {var} \
+             (see the test file's header), or skip the case by name"
+        );
+    };
+    let p = PathBuf::from(bin);
+    assert!(p.is_file(), "{var}={} does not name a file", p.display());
+    p
+}
+
 /// Resolve the `moon` server binary for crash/integration suites.
 ///
 /// Precedence: `MOON_BIN` env var (when set and non-empty) →

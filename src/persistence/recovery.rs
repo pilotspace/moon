@@ -86,6 +86,9 @@ pub struct RecoveryResult {
     /// tokio `--shards 1` AOF). The caller decides whether to rewrite it so
     /// the next replay is gated; see `main.rs`.
     pub aof_replayed_without_cold_cut: bool,
+    /// R2b round 2 F1: Phase 4b could not replay `appendonly.aof` at all (it
+    /// is the only KV source then): the boot must refuse to start.
+    pub aof_unreadable: Option<crate::persistence::aof::flat_file::UnreadableAof>,
     // NOTE: the ColdIndex rebuilt in Phase 3 is attached directly to
     // `databases[0]` BEFORE Phase 4 replay (never returned here) so that
     // replayed deletes tombstone the cold plane — see the Phase 3 comment.
@@ -154,8 +157,11 @@ pub fn recover_shard_v3_with_fallback(
 /// AOF; on a 2.2M-key instance this pass discarded 13.8 s of snapshot load),
 /// and the WAL's `Command` records plus the Phase 4b legacy fallback only
 /// with `SnapshotAndLogs` (with `--appendonly no` they are stale, moon#1267
-/// review F3). Not KV history, so always recovered: the cold index, warm
-/// vector segments, orphan classification, FPI repair, `last_lsn`, CLOG.
+/// review F3). A `v2_persistence_dir/appendonly.aof` holding a record turns
+/// `SnapshotAndLogs` into `AofOnly` (a PITR target refuses it): that file alone, as
+/// redis loads only the AOF under `appendonly yes` (R2b review P1). Not KV
+/// history, so always recovered: the cold index, warm vector segments,
+/// orphan classification, FPI repair, `last_lsn`, CLOG.
 pub fn recover_shard_v3_pitr(
     databases: &mut [crate::storage::Database],
     shard_id: usize,
@@ -166,6 +172,12 @@ pub fn recover_shard_v3_pitr(
     kv: KvSources,
 ) -> Result<RecoveryResult, crate::error::MoonError> {
     let mut result = RecoveryResult::default();
+    // R2b review P1: a legacy `appendonly.aof` holding a record is the only
+    // KV source (`KvSources::AofOnly`). PITR keeps the snapshot + WAL model
+    // and refuses such a file (round 4 F9, `KvSources::for_target`).
+    let kv = kv
+        .for_target(v2_persistence_dir, recovery_target_lsn)
+        .map_err(crate::error::MoonError::Other)?;
 
     // ── Phase 1: ENTRY POINT ──────────────────────────────────────────
     let control_path = ShardControlFile::control_path(shard_dir, shard_id);
@@ -237,10 +249,14 @@ pub fn recover_shard_v3_pitr(
     let mut snapshot_graves: Option<crate::persistence::snapshot::cold_graves::ColdGraves> = None;
     if snap_path.exists() && !kv.snapshot() {
         info!(
-            "Shard {}: snapshot load skipped — the multi-part AOF is the KV authority \
-             and is replayed after this pass (loading it here was discarded)",
-            shard_id
+            "Shard {}: snapshot load skipped — {}",
+            shard_id,
+            kv.why_no_snapshot()
         );
+        if let (KvSources::AofOnly, Some(dir)) = (kv, v2_persistence_dir) {
+            use crate::persistence::aof::flat_file::note_skipped_snapshot;
+            note_skipped_snapshot(&snap_path, dir, databases.len());
+        }
     }
     if snap_path.exists() && kv.snapshot() {
         let snapshot_ok = if let Some(target) = recovery_target_lsn {
@@ -647,9 +663,10 @@ pub fn recover_shard_v3_pitr(
         let on_command = &mut |record: &WalRecord| {
             match record.record_type {
                 WalRecordType::Command => {
-                    if !kv.logs() {
+                    if !kv.wal_kv() {
                         // The multi-part AOF replays this write after this
-                        // pass, or it is stale (`--appendonly no`): fn docs.
+                        // pass, `appendonly.aof` below carries it (AofOnly),
+                        // or it is stale (`--appendonly no`): fn docs.
                         kv_commands_skipped += 1;
                         return;
                     }
@@ -962,11 +979,11 @@ pub fn recover_shard_v3_pitr(
     // source. The WAL v2 rung (per-shard `shard-N.wal`) was removed in the
     // pre-1.0 WAL-v3-only format freeze and is never replayed by this build.
     //
-    // Known follow-up: when the Phase-4 WAL DID carry some KV records
-    // (`--wal-kv-log on` / CDC active) alongside an existing AOF, this gate
-    // keeps the WAL's partial KV view and still skips the AOF (replaying
-    // both would double-apply non-idempotent commands). Resolving that needs
-    // an AOF-first redesign of Phase 4, tracked in the roadmap.
+    // R2b review P1 (AOF-first): when `appendonly.aof` holds a record it is
+    // the only KV source (`KvSources::AofOnly`) — Phase 3 skipped the
+    // snapshot and Phase 4 the WAL's KV records, both of which hold a prefix
+    // of it — so this gate always opens for it. The WAL's partial KV view
+    // over the snapshot is used only when no such AOF exists.
     //
     // `!kv.logs()`: neither rung runs. `--appendonly no` wrote neither (they
     // are stale, moon#1267 review F3); with the multi-part AOF replayed after
@@ -984,26 +1001,25 @@ pub fn recover_shard_v3_pitr(
     }
     if kv_commands_replayed == 0 && kv.logs() {
         if let Some(v2_dir) = v2_persistence_dir {
-            let aof_path = v2_dir.join("appendonly.aof");
+            let aof_path = crate::persistence::aof::flat_file::flat_aof_path(v2_dir);
             if aof_path.exists() {
                 info!(
                     "Shard {}: WAL carried no KV commands, falling back to AOF replay from {:?} \
                      ({} non-KV command record(s) in the WAL: graph / cold-plane / unhandled)",
                     shard_id, aof_path, wal_non_kv_commands
                 );
-                match crate::persistence::aof::replay_aof(databases, &aof_path, engine) {
+                match crate::persistence::aof::replay_aof_at_boot(databases, &aof_path, engine) {
                     Ok(n) => {
                         result.commands_replayed += n;
                         aof_replayed = n > 0;
                         info!("Shard {}: AOF fallback replayed {} commands", shard_id, n);
                     }
                     Err(e) => {
-                        tracing::error!(
-                            "Shard {}: AOF fallback {:?} failed: {}",
-                            shard_id,
-                            aof_path,
-                            e
+                        let refusal = crate::persistence::aof::flat_file::UnreadableAof::from_error(
+                            &aof_path, &e,
                         );
+                        tracing::error!("Shard {}: {}", shard_id, refusal.message());
+                        result.aof_unreadable = Some(refusal);
                     }
                 }
             } else {
@@ -1080,7 +1096,7 @@ pub fn recover_shard_v3_pitr(
     // call (the task #56 demote for a pre-#902 log, unchanged); dbs 1..N are
     // closed only when their generation is open, so a pre-#902 log sees no
     // new cold-wins demote there.
-    if let (true, Some((db0, rest))) = (kv.snapshot(), databases.split_first_mut()) {
+    if let (true, Some((db0, rest))) = (kv.authority_here(), databases.split_first_mut()) {
         let mut r = db0.finish_replay_cold_reconcile();
         let rest = crate::storage::db::close_replay_generation(rest);
         r.gated |= rest.gated;
@@ -2092,9 +2108,9 @@ mod tests {
 
         let engine = crate::persistence::replay::DispatchReplayEngine::new();
 
-        // Control: without the flag all three sources land in the keyspace
-        // (the WAL carried a KV record, so Phase 4b does not engage — the
-        // snapshot and the WAL key are what arrive).
+        // Control: without the flag the legacy `appendonly.aof` holds a
+        // record, so it is the only KV source (R2b review P1, AOF-first): the
+        // snapshot and the WAL's KV record hold a prefix of it and are skipped.
         let mut control = vec![Database::new()];
         let r = recover_shard_v3_with_fallback(
             &mut control,
@@ -2106,12 +2122,12 @@ mod tests {
         )
         .unwrap();
         assert!(
-            control[0].get(b"snap:key").is_some(),
-            "control: snapshot loaded"
+            control[0].get(b"aof:key").is_some(),
+            "control: AOF replayed"
         );
         assert!(
-            control[0].get(b"wal:key").is_some(),
-            "control: WAL KV record applied"
+            control[0].get(b"snap:key").is_none() && control[0].get(b"wal:key").is_none(),
+            "control: the AOF is the only KV source"
         );
         assert_eq!(r.commands_replayed, 1);
         assert_eq!(r.last_lsn, 7);
@@ -2133,6 +2149,54 @@ mod tests {
             "skipped KV records are not counted as replayed"
         );
         assert_eq!(r.last_lsn, 7, "the WAL is still walked for its last_lsn");
+    }
+
+    /// R2b review P1: a snapshot saved while `appendonly.aof` was appended
+    /// holds a prefix of its records. Loading both applied that prefix twice
+    /// (`RPUSH l a b; INCR c; BGSAVE; kill -9` came back as `a b a b`, 2).
+    #[test]
+    fn a_snapshot_under_a_flat_aof_is_not_applied_twice() {
+        let tmp = tempfile::tempdir().unwrap();
+        let shard_dir = tmp.path().join("shard-0");
+        std::fs::create_dir_all(&shard_dir).unwrap();
+        let v2_dir = tmp.path().join("legacy");
+        std::fs::create_dir_all(&v2_dir).unwrap();
+        let aof = b"*4\r\n$5\r\nRPUSH\r\n$1\r\nl\r\n$1\r\na\r\n$1\r\nb\r\n\
+                    *2\r\n$4\r\nINCR\r\n$1\r\nc\r\n";
+        std::fs::write(v2_dir.join("appendonly.aof"), aof).unwrap();
+        // The BGSAVE image of the same two writes.
+        let engine = crate::persistence::replay::DispatchReplayEngine::new();
+        let mut image = vec![Database::new()];
+        crate::persistence::aof::replay_aof(&mut image, &v2_dir.join("appendonly.aof"), &engine)
+            .unwrap();
+        let snap = shard_dir.join("shard-0.rrdshard");
+        crate::persistence::snapshot::shard_snapshot_save(0, 1, &image, &snap).unwrap();
+        std::fs::copy(&snap, v2_dir.join("shard-0.rrdshard")).unwrap();
+
+        let check = |dbs: &mut Vec<Database>, path: &str| {
+            use crate::storage::compact_value::RedisValueRef;
+            assert_eq!(dbs[0].len(), 2, "{path}: two keys");
+            let c = dbs[0].get(b"c").map(|e| match e.value.as_redis_value() {
+                RedisValueRef::String(b) => b.to_vec(),
+                _ => Vec::new(),
+            });
+            assert_eq!(c.as_deref(), Some(&b"1"[..]), "{path}: INCR applied once");
+            let len = dbs[0].get(b"l").map(|e| match e.value.as_redis_value() {
+                RedisValueRef::List(l) => l.len(),
+                RedisValueRef::ListListpack(lp) => lp.len(),
+                _ => 0,
+            });
+            assert_eq!(len, Some(2), "{path}: RPUSH applied once");
+        };
+        // The disk-offload (v3) path.
+        let mut dbs = vec![Database::new()];
+        recover_shard_v3_with_fallback(&mut dbs, 0, &shard_dir, &engine, Some(&v2_dir), false)
+            .unwrap();
+        check(&mut dbs, "v3");
+        // The legacy (v2) path: snapshot in the persistence dir.
+        let mut shard = crate::shard::Shard::new(0, 1, 1, Default::default());
+        shard.restore_from_persistence(v2_dir.to_str().unwrap(), None, false);
+        check(&mut shard.databases, "v2");
     }
 
     #[test]

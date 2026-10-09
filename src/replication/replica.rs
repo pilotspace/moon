@@ -51,7 +51,17 @@ static REPLICA_TASK_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::Ato
 
 /// Bump the generation (new REPLICAOF target, or NO ONE) and return the new
 /// ticket to hand to a freshly spawned task.
-pub fn bump_replica_task_epoch() -> u64 {
+pub fn bump_replica_task_epoch(
+    aof_pool: Option<&Arc<crate::persistence::aof::AofWriterPool>>,
+) -> u64 {
+    // moon#1300: the node stops following its master here (every REPLICAOF
+    // target change, `NO ONE`, `CLUSTER REPLICATE` bumps), on the shard
+    // thread, before a new task can apply anything: a transaction the old
+    // master never ended is rolled back, as its own crash recovery would —
+    // in memory and, with `MOON.TXN RESET`, in this node's AOF (R2b round 3
+    // F-A). Every caller runs this before it flips the role, in the same
+    // synchronous stretch, so the RESET precedes every local write.
+    crate::replication::txn_apply::roll_back_open(aof_pool);
     REPLICA_TASK_EPOCH.fetch_add(1, Ordering::AcqRel) + 1
 }
 
@@ -61,6 +71,16 @@ fn superseded(epoch: u64) -> bool {
     REPLICA_TASK_EPOCH.load(Ordering::Acquire) != epoch
 }
 
+/// `Err` when the task holding `epoch` was superseded (`at` names the step):
+/// called after an await, before the replication state or the keyspace is
+/// touched, with no await in between (R2b round 4 PROMO-RDB).
+fn ensure_live(epoch: u64, at: &str) -> anyhow::Result<()> {
+    if superseded(epoch) {
+        anyhow::bail!("replica task superseded {at}");
+    }
+    Ok(())
+}
+
 /// The reply for any command that would turn a multi-shard node into a
 /// replica (`REPLICAOF host port`, `SLAVEOF host port`, `CLUSTER REPLICATE`).
 ///
@@ -68,6 +88,32 @@ fn superseded(epoch: u64) -> bool {
 /// the top of [`run_replica_task`]); multi-shard replicas are moon#406.
 pub const MULTI_SHARD_REPLICA_REFUSAL: &[u8] = b"ERR replica mode requires --shards 1: \
 this node runs more than one shard and multi-shard replicas are not supported yet (moon#406)";
+
+/// Whether `REPLICAOF host port` names the master this node already follows
+/// — connected, syncing or reconnecting (redis 7.2 `replicaofCommand`: the
+/// same `masterhost`, compared case-insensitively, and `masterport`). Such a
+/// command changes nothing: restarting the link would only cost a resync,
+/// and the running task keeps its place in the stream (R2b round 4 X1-DBL).
+#[must_use]
+pub fn already_following(rs: &ReplicationState, host: &str, port: u16) -> bool {
+    matches!(
+        &rs.role,
+        ReplicationRole::Replica { host: h, port: p, .. }
+            if *p == port && h.eq_ignore_ascii_case(host)
+    )
+}
+
+/// redis's reply to a `REPLICAOF` that names the current master.
+#[must_use]
+pub fn already_following_reply() -> crate::protocol::Frame {
+    tracing::info!(
+        "REPLICAOF would result into synchronization with the master we are already \
+         connected with. No operation performed."
+    );
+    crate::protocol::Frame::SimpleString(Bytes::from_static(
+        b"OK Already connected to specified master",
+    ))
+}
 
 /// Whether a node with `num_shards` shards can run the replica task.
 ///
@@ -127,6 +173,10 @@ pub struct ReplicaTaskConfig {
     /// without waking (tests that drive `apply_local` directly).
     pub blocking_registry:
         Option<std::rc::Rc<std::cell::RefCell<crate::blocking::BlockingRegistry>>>,
+    /// This node's AOF writers, so the replica's own AOF holds the synced
+    /// dataset and the applied stream (R2b round 2 R1, `replica_aof`).
+    /// `None` with `--appendonly no` (and in tests driving the task).
+    pub aof_pool: Option<Arc<crate::persistence::aof::AofWriterPool>>,
 }
 
 /// Entry point for the outbound replica task.
@@ -135,6 +185,7 @@ pub struct ReplicaTaskConfig {
 /// Reconnects with exponential backoff on disconnect.
 #[cfg(feature = "runtime-tokio")]
 pub async fn run_replica_task(cfg: ReplicaTaskConfig) {
+    crate::replication::replica_aof::warn_if_no_rewriter(cfg.aof_pool.as_ref());
     // R0 streaming replication is single-shard only. A multi-shard replica would
     // misread the master's single diskless RDB bulk and mis-route the command
     // stream (see `apply::load_snapshot`, which is thread-local and clears all
@@ -270,6 +321,11 @@ async fn run_handshake_and_stream(
         }};
     }
 
+    // R2b round 4 PROMO-RDB: every await of this handshake can outlive the
+    // task's generation (`REPLICAOF NO ONE`, a new target). Each mutation of
+    // the replication state or the keyspace below is preceded by a
+    // generation check with no await in between ([`ensure_live`]).
+    ensure_live(cfg.epoch, "before the handshake")?;
     // Step 1: PING
     {
         let mut rs = cfg.repl_state.write();
@@ -301,6 +357,7 @@ async fn run_handshake_and_stream(
     let _ = read_line(&mut stream).await?; // +OK
 
     // Step 4: PSYNC <repl_id> <offset>
+    ensure_live(cfg.epoch, "during the handshake")?;
     let (repl_id, offset) = {
         let rs = cfg.repl_state.read();
         let offset = rs.master_repl_offset.load(Ordering::Relaxed);
@@ -330,6 +387,9 @@ async fn run_handshake_and_stream(
 
     // Step 5: Parse master response
     let response = read_line(&mut stream).await?;
+    // A node promoted (or re-pointed) while this reply was in flight must
+    // keep its own replication id and offset.
+    ensure_live(cfg.epoch, "before its PSYNC reply was applied")?;
     if response.starts_with(b"+FULLRESYNC") {
         // Parse: +FULLRESYNC <repl_id> <offset>
         let parts: Vec<&[u8]> = response[1..].splitn(3, |&b| b == b' ').collect();
@@ -368,11 +428,14 @@ async fn run_handshake_and_stream(
         // bulk and we load it into this thread's ShardSlice. `load_snapshot`
         // clears existing state first (full resync = authoritative). Multi-shard
         // replicas (merged-RDB load) are R2.
-        if superseded(cfg.epoch) {
-            anyhow::bail!("replica task superseded before snapshot load");
-        }
         for shard_id in 0..cfg.num_shards {
             let rdb_bytes = read_rdb_bulk(&mut stream).await?;
+            // The transfer can take minutes: a `REPLICAOF NO ONE` meanwhile
+            // promoted this node, which may have acknowledged local writes
+            // since — the old master's snapshot must not replace them (nor a
+            // new target's data). No await between this check and the load.
+            ensure_live(cfg.epoch, "during the snapshot transfer; not loading it")?;
+            crate::replication::txn_apply::discard_logged(cfg.aof_pool.as_ref());
             match crate::replication::apply::load_snapshot(&rdb_bytes, &cfg.shard_databases) {
                 Ok(keys) => info!(
                     "Replica: loaded shard {} RDB snapshot ({} bytes, {} keys)",
@@ -389,6 +452,9 @@ async fn run_handshake_and_stream(
                 }
             }
         }
+        // R2b round 2 R1 (redis `restartAOFAfterSYNC`): the synced dataset
+        // becomes the base of a new generation of this replica's own AOF.
+        crate::replication::replica_aof::after_full_sync(cfg.aof_pool.as_ref());
 
         // Enter streaming mode
         {
@@ -470,6 +536,10 @@ async fn stream_commands_read_loop(
     // the db context the stream was in when the link dropped — see
     // `ReplicaTaskConfig::stream_db`.
     let mut selected_db = cfg.stream_db.load(Ordering::Relaxed);
+    // R2b round 4 X1-DBL: the offset follows every applied record.
+    let mut prefix = crate::replication::applied_prefix::AppliedPrefix::new(Arc::clone(
+        &cfg.repl_state.read().master_repl_offset,
+    ));
 
     loop {
         let n = stream.read_buf(&mut buf).await?;
@@ -490,14 +560,33 @@ async fn stream_commands_read_loop(
             &mut selected_db,
             &mut parse_state,
         );
+        prefix.start_batch();
         for rc in &outcome.commands {
             use crate::replication::apply::ApplyOutcome;
+            // R2b round 3 X1: room in this node's AOF writer BEFORE the apply
+            // (an await: the link stalls, the shard keeps serving). A task
+            // superseded while it waited must not apply; the records it did
+            // apply are already in the offset (`prefix`), so its successor's
+            // PSYNC resumes after them (R2b round 4 X1-DBL).
+            if let Some(pool) = cfg.aof_pool.as_ref()
+                && crate::replication::replica_aof::will_log(Some(pool), rc)
+            {
+                crate::replication::replica_aof::admit(pool).await;
+                if superseded(cfg.epoch) {
+                    anyhow::bail!("replica task superseded while waiting for the AOF writer");
+                }
+            }
             match crate::replication::apply::apply_local(
                 rc,
                 &cfg.shard_databases,
                 cfg.blocking_registry.as_deref(),
             ) {
-                ApplyOutcome::Applied => {}
+                // R2b round 2 R1: logged to this replica's own AOF, right
+                // after the apply (no await between them).
+                ApplyOutcome::Applied => {
+                    crate::replication::replica_aof::log_applied(cfg.aof_pool.as_ref(), rc);
+                    prefix.applied(rc, &cfg.stream_db);
+                }
                 // Unified poison-record policy (task #48): a malformed
                 // record has already been logged + counted inside
                 // `apply_local`; drop the connection so the reconnect loop
@@ -525,16 +614,10 @@ async fn stream_commands_read_loop(
                 }
             }
         }
-        if outcome.consumed > 0 {
-            {
-                let rs = cfg.repl_state.read();
-                rs.master_repl_offset
-                    .fetch_add(outcome.consumed as u64, Ordering::Relaxed);
-            }
-        }
-        // Persist the drain's db context so a reconnect (+CONTINUE) resumes
-        // in the same logical db (HIGH-2, task #22).
-        cfg.stream_db.store(selected_db, Ordering::Relaxed);
+        // The whole batch is applied: the offset covers every consumed frame
+        // and the db context is the drain's, so a reconnect (+CONTINUE)
+        // resumes in the same logical db (HIGH-2, task #22).
+        prefix.finish(outcome.consumed, selected_db, &cfg.stream_db);
         if outcome.fatal {
             return Err(anyhow::anyhow!(
                 "replication stream parse error — dropping connection to force resync"
@@ -549,6 +632,7 @@ async fn stream_commands_read_loop(
 /// monoio::time::sleep for backoff.
 #[cfg(feature = "runtime-monoio")]
 pub async fn run_replica_task(cfg: ReplicaTaskConfig) {
+    crate::replication::replica_aof::warn_if_no_rewriter(cfg.aof_pool.as_ref());
     // R0 streaming replication is single-shard only. A multi-shard replica would
     // misread the master's single diskless RDB bulk and mis-route the command
     // stream (see `apply::load_snapshot`, which is thread-local and clears all
@@ -692,6 +776,11 @@ async fn run_handshake_and_stream(
         }};
     }
 
+    // R2b round 4 PROMO-RDB: every await of this handshake can outlive the
+    // task's generation (`REPLICAOF NO ONE`, a new target). Each mutation of
+    // the replication state or the keyspace below is preceded by a
+    // generation check with no await in between ([`ensure_live`]).
+    ensure_live(cfg.epoch, "before the handshake")?;
     // Step 1: PING
     {
         let mut rs = cfg.repl_state.write();
@@ -723,6 +812,7 @@ async fn run_handshake_and_stream(
     let _ = read_line(&mut stream).await?;
 
     // Step 4: PSYNC <repl_id> <offset>
+    ensure_live(cfg.epoch, "during the handshake")?;
     let (repl_id, offset) = {
         let rs = cfg.repl_state.read();
         let offset = rs.master_repl_offset.load(Ordering::Relaxed);
@@ -752,6 +842,9 @@ async fn run_handshake_and_stream(
 
     // Step 5: Parse master response
     let response = read_line(&mut stream).await?;
+    // A node promoted (or re-pointed) while this reply was in flight must
+    // keep its own replication id and offset.
+    ensure_live(cfg.epoch, "before its PSYNC reply was applied")?;
     if response.starts_with(b"+FULLRESYNC") {
         let parts: Vec<&[u8]> = response[1..].splitn(3, |&b| b == b' ').collect();
         if parts.len() >= 3 {
@@ -784,11 +877,14 @@ async fn run_handshake_and_stream(
         // R0 = single-shard: the master sends one diskless RDB bulk, loaded into
         // this thread's ShardSlice (clears existing state first — full resync is
         // authoritative). Multi-shard merged-RDB load is R2.
-        if superseded(cfg.epoch) {
-            anyhow::bail!("replica task superseded before snapshot load");
-        }
         for shard_id in 0..cfg.num_shards {
             let rdb_bytes = read_rdb_bulk(&mut stream).await?;
+            // The transfer can take minutes: a `REPLICAOF NO ONE` meanwhile
+            // promoted this node, which may have acknowledged local writes
+            // since — the old master's snapshot must not replace them (nor a
+            // new target's data). No await between this check and the load.
+            ensure_live(cfg.epoch, "during the snapshot transfer; not loading it")?;
+            crate::replication::txn_apply::discard_logged(cfg.aof_pool.as_ref());
             match crate::replication::apply::load_snapshot(&rdb_bytes, &cfg.shard_databases) {
                 Ok(keys) => info!(
                     "Replica: loaded shard {} RDB snapshot ({} bytes, {} keys)",
@@ -805,6 +901,9 @@ async fn run_handshake_and_stream(
                 }
             }
         }
+        // R2b round 2 R1 (redis `restartAOFAfterSYNC`): the synced dataset
+        // becomes the base of a new generation of this replica's own AOF.
+        crate::replication::replica_aof::after_full_sync(cfg.aof_pool.as_ref());
 
         {
             let mut rs = cfg.repl_state.write();
@@ -891,6 +990,10 @@ async fn stream_commands_read_loop(
     // the db context the stream was in when the link dropped — see
     // `ReplicaTaskConfig::stream_db`.
     let mut selected_db = cfg.stream_db.load(Ordering::Relaxed);
+    // R2b round 4 X1-DBL: the offset follows every applied record.
+    let mut prefix = crate::replication::applied_prefix::AppliedPrefix::new(Arc::clone(
+        &cfg.repl_state.read().master_repl_offset,
+    ));
 
     loop {
         let tmp = vec![0u8; 65536];
@@ -915,14 +1018,33 @@ async fn stream_commands_read_loop(
             &mut selected_db,
             &mut parse_state,
         );
+        prefix.start_batch();
         for rc in &outcome.commands {
             use crate::replication::apply::ApplyOutcome;
+            // R2b round 3 X1: room in this node's AOF writer BEFORE the apply
+            // (an await: the link stalls, the shard keeps serving). A task
+            // superseded while it waited must not apply; the records it did
+            // apply are already in the offset (`prefix`), so its successor's
+            // PSYNC resumes after them (R2b round 4 X1-DBL).
+            if let Some(pool) = cfg.aof_pool.as_ref()
+                && crate::replication::replica_aof::will_log(Some(pool), rc)
+            {
+                crate::replication::replica_aof::admit(pool).await;
+                if superseded(cfg.epoch) {
+                    anyhow::bail!("replica task superseded while waiting for the AOF writer");
+                }
+            }
             match crate::replication::apply::apply_local(
                 rc,
                 &cfg.shard_databases,
                 cfg.blocking_registry.as_deref(),
             ) {
-                ApplyOutcome::Applied => {}
+                // R2b round 2 R1: logged to this replica's own AOF, right
+                // after the apply (no await between them).
+                ApplyOutcome::Applied => {
+                    crate::replication::replica_aof::log_applied(cfg.aof_pool.as_ref(), rc);
+                    prefix.applied(rc, &cfg.stream_db);
+                }
                 // Unified poison-record policy (task #48): a malformed
                 // record has already been logged + counted inside
                 // `apply_local`; drop the connection so the reconnect loop
@@ -950,16 +1072,10 @@ async fn stream_commands_read_loop(
                 }
             }
         }
-        if outcome.consumed > 0 {
-            {
-                let rs = cfg.repl_state.read();
-                rs.master_repl_offset
-                    .fetch_add(outcome.consumed as u64, Ordering::Relaxed);
-            }
-        }
-        // Persist the drain's db context so a reconnect (+CONTINUE) resumes
-        // in the same logical db (HIGH-2, task #22).
-        cfg.stream_db.store(selected_db, Ordering::Relaxed);
+        // The whole batch is applied: the offset covers every consumed frame
+        // and the db context is the drain's, so a reconnect (+CONTINUE)
+        // resumes in the same logical db (HIGH-2, task #22).
+        prefix.finish(outcome.consumed, selected_db, &cfg.stream_db);
         if outcome.fatal {
             return Err(anyhow::anyhow!(
                 "replication stream parse error — dropping connection to force resync"
@@ -1097,6 +1213,30 @@ fn encode_replconf_ack(offset: u64) -> Vec<u8> {
 mod tests {
     use super::*;
     use crate::protocol::Frame;
+
+    /// R2b round 4 X1-DBL (redis 7.2 `replicaofCommand`): only the same
+    /// host string (any case) and port is the current master; another name
+    /// for the same address restarts the link, as in redis.
+    #[test]
+    fn replicaof_the_current_master_is_recognised() {
+        let mut rs = ReplicationState::new(1, "a".repeat(40), "0".repeat(40));
+        assert!(
+            !already_following(&rs, "127.0.0.1", 6379),
+            "a master follows nobody"
+        );
+        rs.set_role(ReplicationRole::Replica {
+            host: "LocalHost".to_string(),
+            port: 6379,
+            state: ReplicaHandshakeState::PingPending,
+        });
+        assert!(already_following(&rs, "localhost", 6379));
+        assert!(!already_following(&rs, "localhost", 6380));
+        assert!(!already_following(&rs, "127.0.0.1", 6379));
+        assert!(matches!(
+            already_following_reply(),
+            Frame::SimpleString(ref s) if &s[..] == b"OK Already connected to specified master"
+        ));
+    }
 
     /// moon#1015: the command-time refusal and the task's own guard share ONE
     /// predicate, so a shard count the task refuses is always refused first.

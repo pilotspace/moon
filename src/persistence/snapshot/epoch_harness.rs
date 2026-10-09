@@ -85,12 +85,26 @@ impl Epoch {
         }
     }
 
+    /// A HELD tick that also streams (moon#1295): the drain, then the
+    /// stream service the tick runs before the walk — no segment is written.
+    pub(super) fn held_tick(&mut self, dbs: &[Database]) {
+        if let Some(state) = self.state.as_mut() {
+            snapshot_cow::drain_pending_for_test(state);
+            service(state, dbs);
+        }
+    }
+
     fn step(&mut self, dbs: &[Database], budgeted: bool) -> bool {
         let Some(state) = self.state.as_mut() else {
             return true;
         };
         snapshot_cow::drain_pending_for_test(state);
         if state.is_complete() || state.aborted().is_some() {
+            return true;
+        }
+        // moon#1295: as the tick — streams first, the walk paused meanwhile.
+        service(state, dbs);
+        if state.aborted().is_some() {
             return true;
         }
         let done = if budgeted {
@@ -120,6 +134,14 @@ impl Epoch {
         snapshot_cow::disarm();
         outcome.map(|()| read_records(&self.path))
     }
+}
+
+/// The tick's stream service over a plain database slice (`dbs[i]` is
+/// shard slot `i`).
+pub(super) fn service(state: &mut SnapshotState, dbs: &[Database]) {
+    snapshot_cow::stream::service_with(state, &|slot, key, f| {
+        f(dbs.get(slot).and_then(|db| db.data().get(key)))
+    });
 }
 
 /// Run `cmd args..` against `dbs[db]` through the generic dispatch path — the

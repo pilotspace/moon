@@ -1,0 +1,5 @@
+base sh=4 n=100000(benchmark) Ir=6617150194 Ir_per_cmd=66171 [pre-restart run]
+hold2b sh=4 n=100000(benchmark) Ir=6613176402 Ir_per_cmd=66131 [pre-restart run]
+base300 sh=4 cmds=300000 Ir=13749642005 Ir_per_cmd=45832
+def2b300 sh=4 cmds=300000 Ir=15323864117 Ir_per_cmd=51079
+hold2b300 sh=4 cmds=300000 Ir=13743511128 Ir_per_cmd=45811

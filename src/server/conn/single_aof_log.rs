@@ -206,6 +206,7 @@ mod tests {
             bytes: Bytes::from_static(b"filler"),
             epoch: FoldEpoch::INITIAL,
             clock_ms: 0,
+            txn: 0,
         })
         .expect("pre-fill the only slot");
         let pool = AofWriterPool::top_level_with_policy(

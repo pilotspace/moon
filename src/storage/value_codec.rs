@@ -115,13 +115,13 @@ pub fn value_type_of(val: &RedisValueRef) -> ValueType {
 // ── Encode helpers ──
 
 #[inline]
-fn put_len_bytes(buf: &mut Vec<u8>, data: &[u8]) {
+pub(crate) fn put_len_bytes(buf: &mut Vec<u8>, data: &[u8]) {
     buf.extend_from_slice(&(data.len() as u32).to_le_bytes());
     buf.extend_from_slice(data);
 }
 
 #[inline]
-fn put_u32(buf: &mut Vec<u8>, v: u32) {
+pub(crate) fn put_u32(buf: &mut Vec<u8>, v: u32) {
     buf.extend_from_slice(&v.to_le_bytes());
 }
 
@@ -131,7 +131,7 @@ fn put_u64(buf: &mut Vec<u8>, v: u64) {
 }
 
 #[inline]
-fn put_f64(buf: &mut Vec<u8>, v: f64) {
+pub(crate) fn put_f64(buf: &mut Vec<u8>, v: f64) {
     buf.extend_from_slice(&v.to_le_bytes());
 }
 

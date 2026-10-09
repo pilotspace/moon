@@ -135,7 +135,7 @@ pub(super) fn try_handle_cluster(
                 port,
                 state: crate::replication::handshake::ReplicaHandshakeState::PingPending,
             });
-        let epoch = crate::replication::replica::bump_replica_task_epoch();
+        let epoch = crate::replication::replica::bump_replica_task_epoch(ctx.aof_pool.as_ref());
         let cfg = crate::replication::replica::ReplicaTaskConfig {
             master_host: host,
             master_port: port,
@@ -147,6 +147,7 @@ pub(super) fn try_handle_cluster(
             stream_db: std::sync::atomic::AtomicUsize::new(0),
             blocking_registry: Some(ctx.blocking_registry.clone()),
             shard_databases: ctx.shard_databases.clone(),
+            aof_pool: ctx.aof_pool.clone(),
         };
         tokio::task::spawn_local(crate::replication::replica::run_replica_task(cfg));
     }

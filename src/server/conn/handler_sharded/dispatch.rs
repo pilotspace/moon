@@ -257,6 +257,15 @@ pub(super) fn try_handle_replicaof(
         responses.push(refusal);
         return true;
     }
+    // redis `replicaofCommand` (R2b round 4 X1-DBL): the master this node
+    // already follows — no new task, no epoch bump, no role reset.
+    if let (Some(ReplicaofAction::StartReplication { host, port }), Some(rs)) =
+        (&action, ctx.repl_state.as_ref())
+        && crate::replication::replica::already_following(&rs.read(), host, *port)
+    {
+        responses.push(crate::replication::replica::already_following_reply());
+        return true;
+    }
     if let Some(action) = action {
         if let Some(ref rs) = ctx.repl_state {
             match action {
@@ -273,7 +282,8 @@ pub(super) fn try_handle_replicaof(
                     // replica task (old REPLICAOF target) sees itself
                     // superseded and exits instead of double-applying the
                     // stream alongside the new task.
-                    let epoch = crate::replication::replica::bump_replica_task_epoch();
+                    let epoch =
+                        crate::replication::replica::bump_replica_task_epoch(ctx.aof_pool.as_ref());
                     let cfg = crate::replication::replica::ReplicaTaskConfig {
                         master_host: host,
                         master_port: port,
@@ -285,6 +295,7 @@ pub(super) fn try_handle_replicaof(
                         stream_db: std::sync::atomic::AtomicUsize::new(0),
                         blocking_registry: Some(ctx.blocking_registry.clone()),
                         shard_databases: ctx.shard_databases.clone(),
+                        aof_pool: ctx.aof_pool.clone(),
                     };
                     // Every client parked here as a master is answered
                     // `-UNBLOCKED` and closed (redis's
@@ -301,7 +312,8 @@ pub(super) fn try_handle_replicaof(
                     // Kill the running replica task — flipping the role alone
                     // left it streaming + applying forever (each NO ONE →
                     // re-attach cycle stacked one more live applier).
-                    let _ = crate::replication::replica::bump_replica_task_epoch();
+                    let _ =
+                        crate::replication::replica::bump_replica_task_epoch(ctx.aof_pool.as_ref());
                     let mut rs_guard = rs.write();
                     rs_guard.repl_id2 = rs_guard.repl_id.clone();
                     rs_guard.repl_id = generate_repl_id();

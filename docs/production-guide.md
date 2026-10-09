@@ -102,10 +102,10 @@ All options are command-line flags. Run `moon --help` for the full list.
 |------|---------|-------------|
 | `--appendonly` | `no` | Enable AOF persistence (`yes`/`no`) |
 | `--appendfsync` | `everysec` | AOF fsync policy: `always`, `everysec`, or `no` |
-| `--appendfilename` | `appendonly.aof` | AOF filename |
+| `--appendfilename` | `appendonly.aof` | AOF filename. Only the default is supported: tokio `--shards 1` refuses another name (its recovery reads `appendonly.aof`, moon#1321); the manifest layout (monoio, `--shards N`) ignores it |
 | `--save` | *(none)* | RDB auto-save rules (e.g., `"3600 1 300 100"`) |
 | `--dir` | `.` | Directory for persistence files |
-| `--dbfilename` | `dump.rdb` | RDB snapshot filename |
+| `--dbfilename` | `dump.rdb` | Accepted for redis compatibility; the sharded server's snapshots are `<dir>/shard-<N>/shard-<N>.rrdshard` |
 
 ### Memory and Eviction
 
@@ -315,15 +315,33 @@ tuning knobs — but understanding them explains the durability/throughput trade
   single contiguous `write_all`, not one `write(2)` per record — so the writer
   thread is not syscall-bound at high pipeline depth (this is what makes
   `everysec` P16 beat Redis rather than trail it).
-- **Writer poll: warm, then parked (`everysec`/`no`).** While writes flow, the
-  AOF writer thread polls its channel every 500 µs instead of parking in a
-  blocking receive: a parked receiver forces every shard thread to issue a
-  futex wake on each write — at non-pipelined `everysec` load that was ~150k
-  wakes/sec of pure overhead on the hot path. After 5 ms with nothing queued it
-  parks, so the first write after an idle period wakes it at once (one futex
-  wake) instead of waiting out a poll step (moon#1266: that step was up to
-  50 ms). Under `always` the writer always parks (the client is already blocked
-  on the fsync ack, so receive latency there is client-visible RTT anyway).
+- **The shard thread writes its own AOF records (`everysec`/`no`, moon#1266
+  1A).** Each shard frames its records (the same `SELECT` / `MOON.TS` /
+  `MOON.TXN` records the writer emitted) into a per-shard buffer and writes
+  it with ONE `write(2)` per event-loop iteration, before that iteration's
+  replies leave: under monoio's io_uring driver right before the
+  `io_uring_enter` that submits the replies (redis's `beforeSleep`); under
+  monoio's epoll/kqueue driver right before each readiness poll, with the
+  iteration's replies parked until that write; under tokio before the
+  replies of each scheduler round (a reply yields once so the connections
+  ready in the same round add their records, and one `write(2)` covers them
+  all); and before any reply handed to another shard. The AOF writer thread keeps the fsync,
+  rewrites and `always`, and takes the append position back for each of
+  them. Whenever the writer holds the position for anything but a rewrite —
+  from the boot until it first hands it over, under `always`, and from
+  leaving `always` until it hands it back — the producers use the
+  `always` path: each reply waits for the writer's ack of a barrier queued
+  after its record, which comes once the record is written (with an fsync
+  only while the policy is `always`). No reply leaves before its record is
+  written in those windows either; the writer hands the position over at the
+  top of its next wake, and the server waits (up to 2 s) for that before its
+  shards start. No channel hop, no writer wake-up and no warm poll on the write path:
+  measured server CPU per write −10 to −35% under monoio (io_uring and epoll) at
+  50 connections and −30 to −65% under tokio, `--shards 1` (see `plans/WS46-aof-1a`). A slow disk
+  now stalls the shard's `write(2)` instead of filling a queue — redis's
+  behaviour too. `MOON_AOF_SHARD_WRITE=0` restores the writer-thread path
+  (Option 3: the writer polls its channel every 500 µs while writes flow,
+  parks after 5 ms idle; `docs/internal/env-knobs.md`).
 - **The `everysec` fsync runs on an agent thread (moon#1266).** Each AOF writer
   has an `aof-fsync-<n>` thread; once a second the writer hands it the fsync and
   goes straight back to writing, so a slow disk no longer stops the writer from
@@ -331,10 +349,17 @@ tuning knobs — but understanding them explains the durability/throughput trade
   writer; a deadline that finds the previous one still running is postponed
   until it returns. `always` keeps its fsync on the writer, before the acks.
 - **`CONFIG SET appendfsync` applies at once, as in redis.** Every producer
-  and AOF writer uses the new policy from its next write. Leaving `everysec`
-  first waits for an fsync still running on the agent (redis drains its
-  background fsync the same way); a write already queued to be acknowledged
-  after its fsync is fsynced before its ack whatever the switch. (Before the
+  and AOF writer uses the new policy from its next write — except that after
+  leaving `always`, replies keep waiting for the writer to have written their
+  records (no fsync) until each writer has handed its append position back to
+  the shard threads (its next wake; moon#1266 1A), so none is acknowledged
+  before its `write(2)`. Leaving `everysec` first waits for an fsync still
+  running on the agent (redis drains its background fsync the same way). A
+  batch is fsynced before its acks when the policy in force at its commit is
+  `always`, so a write sent under `always` is never acknowledged without its
+  fsync while `always` holds; one still queued when the policy leaves `always`
+  is acknowledged under the new policy once written — as redis acknowledges
+  writes under the policy its `beforeSleep` finds. (Before the
   R1 review fix the command answered `OK` and `CONFIG GET` showed the new
   value while the writers kept their startup policy.)
 - **A slow or hung `everysec` fsync is loud, as in redis.** While a writer's
@@ -362,26 +387,43 @@ sees no reply until it returns), `everysec` remains RPO ≤ 1 s against an OS cr
 or power loss. See `BENCHMARK.md` §7.3 for the measured before/after matrix.
 
 **What a process crash (`kill -9`, OOM kill, panic) can lose under `everysec`.**
-A SIGKILL does not touch the kernel page cache, so a record survives it once the
-AOF writer has `write(2)`-n it; only an OS crash or power loss needs the fsync.
-moon acknowledges a write when its record is queued to the shard's writer, so
-the exposure to a process crash is the time from the ack to that `write(2)`:
-one poll step (500 µs) while writes flow, one thread wake-up after an idle
-period, plus any time the writer thread is not scheduled or its `write(2)`
-blocks. `tests/aof_everysec_kill9_1266.rs` measures it: 10,000 acked SETs
-(unpipelined, or pipelined 100 deep) or one SET after an idle second, SIGKILL
-1 ms after the last ack, restart, count what is missing. On a 4-vCPU Linux
-container shared with other builds (2026-09-30, 20 reps per cell, `--shards`
-1 and 4): before moon#1266 Option 3, 226 of 240 reps lost acked writes (median
-rep 1–1,100 keys, worst 10,000); after it, 9 of 240 reps did in the run of
-the final binaries (monoio 5 of 120: 3, 18, 400, 546 and 1,100 keys; tokio 4 of
-120: 1, 1, 1 and 800). A second 20-rep tokio run lost in 7 of its 120 reps (up
-to 40 keys), so across both tokio runs the total is 16 of 360 reps. Every lossy
-rep was a writer stalled or descheduled for longer than the 1 ms kill delay. A kill inside that sub-millisecond window,
-or while the writer thread is starved of CPU or its `write(2)` stalls, can
-still lose the last acknowledged writes. redis
-has no such window: it `write(2)`s its AOF buffer before it sends the replies
-of an event-loop iteration (moon#1266 option 1A is the measured follow-up).
+A SIGKILL does not touch the kernel page cache, so a record survives it once it
+has been `write(2)`-n; only an OS crash or power loss needs the fsync. Since
+moon#1266 1A (the default) the shard thread writes its records before it sends
+the replies that acknowledge them (above), so **a process crash loses no
+acknowledged write** — redis's guarantee. `tests/aof_everysec_kill9_1266.rs`
+measures it: 10,000 acked SETs (unpipelined, or pipelined 100 deep) or one SET
+after an idle second, SIGKILL 1 ms after the last ack, restart, count what is
+missing; 20 reps per cell, `--shards` 1 and 4, under tokio and under monoio
+with each of its I/O drivers (io_uring, epoll), on a 4-vCPU Linux container
+shared with other builds (2026-10-01): **0 of 360 reps lost anything**. Before
+1A (monoio io_uring + tokio): Option 3 (writer thread, 500 µs pickup) lost in 9
+of 240 reps, and before Option 3, 226 of 240 (median rep 1–1,100 keys).
+
+Two exceptions remain:
+- **Inside a BGREWRITEAOF fold.** The AOF writer takes the append position back
+  for the whole fold; records acknowledged while it runs are queued (or
+  spilled) and reach the file only after the fold, at its post-fold drain, as
+  before 1A. The exposure is therefore the whole fold, not just the drain: it
+  grows with the dataset (the R2b review measured over 0.9 s at ~150 MB of
+  AOF), and automatic rewrites (`auto-aof-rewrite-percentage` 100 /
+  `auto-aof-rewrite-min-size` 64mb, the defaults) open it without any
+  operator action whenever the AOF doubles. A kill -9 inside a fold can lose
+  every write acknowledged during it. redis has no such window — its
+  multi-part manifest lists the new incr from the rewrite's start. Closing it
+  needs the same manifest change (follow-up).
+- **`MOON_AOF_SHARD_WRITE=0`** (the escape hatch) restores the writer-thread
+  path, whose window is the writer's pickup latency plus any writer stall.
+
+There is no boot or policy-switch window: from the server's start until each
+writer first hands its append position to the shard threads, and from a
+`CONFIG SET appendfsync always` → `everysec`/`no` until it hands it back, the
+replies wait for the writer to have written their records (a barrier acked
+after the write; no fsync)
+(`tests/aof_shard_write_1266.rs`: a pipeline sent right after the first `PING`,
+and right after leaving `always`, survives a kill -9 on its last ack). (A
+latched AOF write error is not an exception of 1A: the writer then appends
+nothing at all until a rewrite — moon#1314.)
 
 **redis's own `everysec` is not absolutely kill-9-safe either.** When the
 previous background fsync is still running, redis *postpones the write* of its
@@ -392,9 +434,9 @@ and counts `aof_delayed_fsync`. So on a slow disk redis can lose up to ~2 s of
 acknowledged writes to a process crash (0 on a healthy disk). moon never
 postpones the write — only the fsync; its `aof_delayed_fsync` counts the same
 2 s periods —
-so a slow fsync by itself opens no window; a `write(2)` that the kernel makes
-wait behind that fsync still delays the record, and that wait is part of the
-window above.
+so a slow fsync by itself opens no window: a `write(2)` that the kernel makes
+wait behind that fsync delays the shard's replies (they wait for the write), it
+does not let one through ahead of its record.
 
 ### RDB snapshots
 
@@ -763,18 +805,51 @@ For datasets larger than a single node's memory or for high availability:
 
 ## Backup and Restore
 
-### RDB snapshot backup
+### Snapshot backup
+
+The sharded server writes one snapshot file per shard,
+`<dir>/shard-<N>/shard-<N>.rrdshard` — there is no `dump.rdb`
+(`--dbfilename` does not name it). Back up every shard's file, keeping the
+`shard-<N>/` directory names:
 
 ```bash
-# Trigger a background save
-redis-cli -p 6379 BGSAVE
+#!/bin/sh
+# moon-backup.sh: BGSAVE, wait for it (bounded), check it succeeded, copy.
+set -eu
+CLI="redis-cli -p 6379"
+SHARDS=4                     # the server's --shards
+TIMEOUT=600                  # seconds to wait for the save
+DEST=./backup/$(date +%Y%m%d-%H%M)
 
-# Wait for completion
-redis-cli -p 6379 LASTSAVE
+# `Background saving started` means the save is marked in progress before
+# the reply, so rdb_bgsave_in_progress cannot read 0 for this save early.
+reply=$($CLI BGSAVE)
+case "$reply" in
+  "Background saving started") ;;
+  *) echo "BGSAVE refused: $reply" >&2; exit 1 ;;
+esac
+waited=0
+while $CLI INFO persistence | grep -q '^rdb_bgsave_in_progress:1'; do
+  [ "$waited" -ge "$TIMEOUT" ] && { echo "BGSAVE still running after ${TIMEOUT}s" >&2; exit 1; }
+  sleep 1; waited=$((waited + 1))
+done
+# A failed save leaves the previous snapshot files in place (and LASTSAVE
+# where it was): never copy them as if they were this save.
+if ! $CLI INFO persistence | grep -q '^rdb_last_bgsave_status:ok'; then
+  echo "BGSAVE failed (rdb_last_bgsave_status is not ok): see the server log" >&2
+  exit 1
+fi
 
-# Copy the dump file
-docker cp moon:/data/dump.rdb ./backup/dump.rdb
+# Copy each shard's snapshot file
+for n in $(seq 0 $((SHARDS - 1))); do
+  mkdir -p "$DEST/shard-$n"
+  docker cp moon:/data/shard-$n/shard-$n.rrdshard "$DEST/shard-$n/"
+done
 ```
+
+Do not wait for `LASTSAVE` to change instead: it has one-second resolution
+and moves only when a save succeeds, so after a failed save (a full disk, an
+unwritable directory) an unbounded `while LASTSAVE == before` loop never ends.
 
 ### AOF backup
 
@@ -788,24 +863,56 @@ docker cp moon:/data/ ./backup/
 
 ### Restore from backup
 
+With `--appendonly yes` (the default) the AOF is the **only** source of the
+dataset at boot, as in redis: a snapshot next to it is not loaded. The AOF is
+`appendonly.aof` (tokio `--shards 1`) or the `appendonlydir/` manifest
+(monoio, and every `--shards N` > 1). Restoring a snapshot backup therefore
+means moving the AOF aside first, or the boot ignores the restored snapshot
+(it logs a WARN naming it):
+
 ```bash
 # Stop the server
 docker compose down
 
-# Replace persistence files
-cp backup/dump.rdb /var/lib/moon/dump.rdb
-# OR for AOF:
-cp backup/appendonly.aof /var/lib/moon/appendonly.aof
+# Restore a SNAPSHOT backup: move the AOF aside, then put each shard's
+# snapshot file back in its shard-N/ directory (same --shards as the backup)
+mv /var/lib/moon/appendonly.aof /var/lib/moon/appendonly.aof.before-restore 2>/dev/null
+mv /var/lib/moon/appendonlydir /var/lib/moon/appendonlydir.before-restore 2>/dev/null
+cp -r backup/shard-* /var/lib/moon/                  # shard-0/shard-0.rrdshard, ...
 
-# Start the server (will replay from persistence files)
+# OR restore an AOF backup (the whole persistence directory, AOF included)
+cp -a backup/data/. /var/lib/moon/
+
+# Start the server: it loads the snapshot (and opens a new AOF over it) or
+# replays the restored AOF
 docker compose up -d
 ```
 
+This recipe was verified on both runtimes at `--shards 1` and `--shards 4`,
+restoring into the original directory and into an empty one: the restored
+server holds exactly the snapshot's keys.
+
+An AOF that cannot be read (a damaged RDB preamble, or corruption in the
+middle of the file) stops the boot with exit status 1 and a message naming
+the file and the byte offset; restore it from a backup, truncate a copy at
+that offset to keep the records before the damage, or move it aside to boot
+from the snapshot. A record torn by a crash at the end of the file is not an
+error: the complete records before it are replayed, and the torn bytes are
+cut off the file (saved next to it as `<file>.torn-<offset>`) before
+anything is appended, as redis does with `aof-load-truncated yes`.
+
 ### Automated backup with cron
+
+Run the script above from cron rather than a fixed `sleep`: a save of a
+large dataset takes longer than any fixed delay, and copying before it ends
+(or after it failed) backs up the PREVIOUS snapshot without a word. The
+script exits non-zero, so cron mails the failure, when the save is refused,
+fails, or outlives its timeout.
 
 ```bash
 # /etc/cron.d/moon-backup
-0 */6 * * * root docker exec moon redis-cli BGSAVE && sleep 5 && docker cp moon:/data/dump.rdb /backup/moon/dump-$(date +\%Y\%m\%d-\%H\%M).rdb
+# (moon-backup.sh as above, with DEST=/backup/moon/$(date +%Y%m%d-%H%M))
+0 */6 * * * root /usr/local/bin/moon-backup.sh
 ```
 
 ## Security Checklist

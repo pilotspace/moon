@@ -764,13 +764,24 @@ mod lazy_free_1190 {
         drain_all(&mut db);
         assert!(probe.is_unique(), "elements are freed by the drain itself");
         assert_eq!(db.estimated_memory(), 0);
+        // A spawned thread names itself once it first runs, so on a loaded
+        // machine the helper can exist for a while under its parent's name:
+        // wait for the name, bounded, rather than read it once.
         #[cfg(target_os = "linux")]
         {
-            let helper = std::fs::read_dir("/proc/self/task")
-                .expect("procfs")
-                .filter_map(Result::ok)
-                .filter_map(|t| std::fs::read_to_string(t.path().join("comm")).ok())
-                .any(|name| name.trim() == "moon-lazyfree");
+            let named = || {
+                std::fs::read_dir("/proc/self/task")
+                    .expect("procfs")
+                    .filter_map(Result::ok)
+                    .filter_map(|t| std::fs::read_to_string(t.path().join("comm")).ok())
+                    .any(|name| name.trim() == "moon-lazyfree")
+            };
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let mut helper = named();
+            while !helper && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+                helper = named();
+            }
             assert!(helper, "the shell-dropping helper thread was never started");
         }
     }

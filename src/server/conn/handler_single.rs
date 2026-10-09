@@ -101,7 +101,7 @@ where
 {
     // Phase 1 — group commit: the appends went out fire-and-forget as each
     // write was applied; ONE fsync barrier (Always) confirms the whole batch
-    // — same contract as the sharded handlers' resolve_local_leg_barrier. On
+    // — same contract as the sharded handlers' settle_barrier_debt. On
     // barrier failure every enqueued write in the batch is unconfirmed, so
     // every joined slot is patched.
     aof_log.settle(&mut responses).await;
@@ -914,14 +914,11 @@ pub async fn handle_connection(
                                     } else if crate::storage::db::swap_refused_for_cold(&db, a, b) {
                                         Frame::Error(Bytes::from_static(crate::storage::db::ERR_SWAPDB_COLD))
                                     } else {
-                                        // WAL must be durable BEFORE the swap (no rollback
-                                        // path for SWAPDB). Use try_send_append_durable so
-                                        // that the fsync policy is honoured:
-                                        //   - appendfsync=always  → await AppendSync ack
-                                        //     (rendezvous guarantees data is on disk before +OK)
-                                        //   - appendfsync=everysec/no → fire-and-forget (fast)
-                                        // On any Err the caller aborts and leaves both DBs
-                                        // untouched, preserving atomicity from the WAL's perspective.
+                                        // The record is enqueued and the swap applied together
+                                        // (`append_then_apply`); a refused enqueue aborts with both
+                                        // dbs untouched. Under `always` (or a held lane) the `+OK`
+                                        // then waits for the fsync barrier; a failed barrier reports
+                                        // a swap that stays applied, like every other `always` write.
                                         let mut a_buf = itoa::Buffer::new();
                                         let mut b_buf = itoa::Buffer::new();
                                         let wal_frame = Frame::Array(crate::framevec![
@@ -935,32 +932,20 @@ pub async fn handle_connection(
                                         ]);
                                         let serialized =
                                             crate::persistence::aof::serialize_command(&wal_frame);
-                                        let wal_ok = if let Some(ref pool) = aof_pool {
-                                            // Single-shard mode — shard_id = 0.
-                                            let lsn = crate::persistence::aof::AofWriterPool::issue_append_lsn(&repl_state, 0, serialized.len());
-                                            // task #35: SWAPDB affects both `a` and
-                                            // `b` — no single db context applies;
-                                            // pass 0 (writer may emit a harmless
-                                            // redundant SELECT 0).
-                                            pool.try_send_append_durable(
-                                                0,
-                                                lsn,
-                                                0,
-                                                serialized.clone(),
-                                                pool.fold_stamp(0),
-                                            )
-                                            .await
-                                                .is_ok()
-                                        } else {
-                                            true // persistence disabled — no durability requirement
-                                        };
-                                        if !wal_ok {
-                                            Frame::Error(Bytes::from_static(
-                                                b"ERR SWAPDB aborted: WAL enqueue failed (persistence backpressure)",
-                                            ))
-                                        } else {
-                                            let (lo, hi) =
-                                                if a < b { (a, b) } else { (b, a) };
+                                        // R2b round 3 N1: the record's enqueue and the swap in ONE
+                                        // synchronous section (no await between), then the
+                                        // durability barrier — as `coordinate_swapdb` does. Awaiting
+                                        // the ack between the two let another connection's write
+                                        // land in memory before the swap but in the log after the
+                                        // SWAPDB record, so a replay put it in the other db.
+                                        // #386 — replication plane, exactly once per client
+                                        // SWAPDB, inside the swap's synchronous section (R2b
+                                        // round 4 N1-REPL, as `coordinate_swapdb` does): emitted
+                                        // after the `always` barrier's await, another client's
+                                        // write could reach replicas ahead of it.
+                                        let repl_record = serialized.clone();
+                                        let do_swap = || {
+                                            let (lo, hi) = if a < b { (a, b) } else { (b, a) };
                                             // Acquire in ascending index order (deadlock prevention).
                                             let mut guard_lo = db[lo].write();
                                             let mut guard_hi = db[hi].write();
@@ -970,13 +955,42 @@ pub async fn handle_connection(
                                             );
                                             drop(guard_hi);
                                             drop(guard_lo);
-                                            // #386 — replication plane, exactly once per
-                                            // client SWAPDB, AFTER the durability gate and
-                                            // the swap itself (mirrors the coordinator leg).
                                             crate::replication::state::record_local_write_global(
-                                                0, serialized,
+                                                0, repl_record,
                                             );
-                                            Frame::SimpleString(Bytes::from_static(b"OK"))
+                                        };
+                                        let swapped = if let Some(ref pool) = aof_pool {
+                                            // Single-shard mode — shard_id = 0.
+                                            let lsn = crate::persistence::aof::AofWriterPool::issue_append_lsn(&repl_state, 0, serialized.len());
+                                            // task #35: SWAPDB affects both `a` and `b` — no
+                                            // single db context applies; pass 0.
+                                            match pool
+                                                .append_then_apply(0, lsn, 0, serialized, do_swap)
+                                                .await
+                                            {
+                                                Ok(((), needs_barrier)) => {
+                                                    if needs_barrier
+                                                        && let Err(ack) = pool.fsync_barrier(0).await
+                                                    {
+                                                        // Applied, durability unconfirmed.
+                                                        Err(Some(crate::persistence::aof::swapdb_barrier_refusal_frame(ack, true)))
+                                                    } else {
+                                                        Ok(())
+                                                    }
+                                                }
+                                                // Never enqueued, nothing swapped.
+                                                Err(_) => Err(None),
+                                            }
+                                        } else {
+                                            do_swap(); // persistence disabled
+                                            Ok(())
+                                        };
+                                        match swapped {
+                                            Err(None) => Frame::Error(Bytes::from_static(
+                                                b"ERR SWAPDB aborted: WAL enqueue failed (persistence backpressure)",
+                                            )),
+                                            Err(Some(refusal)) => refusal,
+                                            Ok(()) => Frame::SimpleString(Bytes::from_static(b"OK")),
                                         }
                                     }
                                 }
@@ -1032,7 +1046,7 @@ pub async fn handle_connection(
                                             // handler_single spawns no replica task itself, but
                                             // bump the generation anyway so any task spawned by
                                             // another handler path stops applying.
-                                            let _ = crate::replication::replica::bump_replica_task_epoch();
+                                            let _ = crate::replication::replica::bump_replica_task_epoch(None);
                                             let mut rs_guard = rs.write();
                                             rs_guard.repl_id2 = rs_guard.repl_id.clone();
                                             rs_guard.repl_id = generate_repl_id();

@@ -9,6 +9,12 @@
 //! driven here — whose copy-on-write capture stores the key's epoch-start
 //! image first; first capture wins, so neither the write nor a later abort
 //! restore can reach the file. These tests pin that half of the argument.
+//!
+//! moon#1300 (F3) closes the other half for EVERY snapshot: a write the
+//! transaction made BEFORE the start is held, and the arm files the held
+//! key's pre-transaction image as its first capture
+//! (`snapshot_cow::capture_held_pre_images`) —
+//! [`a_txn_write_before_the_start_is_saved_at_its_pre_txn_value`].
 
 use super::epoch_harness::{Epoch, Record, run, string_of};
 use super::*;
@@ -137,5 +143,65 @@ fn an_abort_during_the_walk_does_not_reach_the_file_either() {
         let image = epoch.finish(&dbs);
         assert_eq!(values(&image, b"k"), vec![b"original".to_vec()]);
         assert_eq!(values(&image, b"gone"), vec![b"was-here".to_vec()]);
+    });
+}
+
+/// moon#1300 (F3): the `TXN` writes BEFORE the epoch starts and stays open
+/// through the publish, then is aborted: the image holds the pre-`TXN`
+/// keyspace — the updated key's old value, the deleted key, no inserted key
+/// — and the abort's restore during the walk changes nothing in it.
+#[test]
+fn a_txn_write_before_the_start_is_saved_at_its_pre_txn_value() {
+    on_fresh_thread(|| {
+        let mut dbs = fixture();
+        let mut txn = CrossStoreTxn::new(43, 0, 0);
+        isolation::txn_begin(43);
+        let mut intents = KvWriteIntents::new();
+        let (t, i) = (&mut txn, &mut intents);
+        txn_write(t, i, &mut dbs, &[b"SET", b"k", b"uncommitted"]);
+        txn_write(t, i, &mut dbs, &[b"SET", b"new", b"inserted"]);
+        txn_write(t, i, &mut dbs, &[b"DEL", b"gone"]);
+        txn_write(t, i, &mut dbs, &[b"SET", b"f00007", b"txn"]);
+        assert!(isolation::any_held());
+
+        let mut epoch = Epoch::begin(&dbs);
+        let _ = epoch.tick_one(&dbs);
+        // More of the transaction, then its abort, mid-walk.
+        txn_write(&mut txn, &mut intents, &mut dbs, &[b"SET", b"k", b"again"]);
+        let mut compensation = Vec::new();
+        let log = std::mem::take(&mut txn.kv_undo);
+        for (db, record) in kv_compensation::first_per_key(log) {
+            kv_compensation::undo_one(&mut dbs[db], db, record, &mut compensation);
+        }
+        isolation::txn_end(43);
+        let image = epoch.finish(&dbs);
+        assert_eq!(values(&image, b"k"), vec![b"original".to_vec()]);
+        assert!(values(&image, b"new").is_empty(), "the insert is not saved");
+        assert_eq!(values(&image, b"gone"), vec![b"was-here".to_vec()]);
+        assert_eq!(values(&image, b"f00007"), vec![b"x".to_vec()]);
+    });
+}
+
+/// moon#1300 (F3): the same with the transaction still OPEN when the image
+/// is published (a crash would follow): no uncommitted value in the file.
+#[test]
+fn an_open_txn_before_the_start_never_reaches_the_file() {
+    on_fresh_thread(|| {
+        let mut dbs = fixture();
+        let mut txn = CrossStoreTxn::new(44, 0, 0);
+        isolation::txn_begin(44);
+        let mut intents = KvWriteIntents::new();
+        txn_write(
+            &mut txn,
+            &mut intents,
+            &mut dbs,
+            &[b"SET", b"k", b"uncommitted"],
+        );
+        txn_write(&mut txn, &mut intents, &mut dbs, &[b"DEL", b"gone"]);
+        let epoch = Epoch::begin(&dbs);
+        let image = epoch.finish(&dbs);
+        assert_eq!(values(&image, b"k"), vec![b"original".to_vec()]);
+        assert_eq!(values(&image, b"gone"), vec![b"was-here".to_vec()]);
+        isolation::txn_end(44);
     });
 }

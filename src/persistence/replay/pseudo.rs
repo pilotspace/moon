@@ -17,6 +17,14 @@
 //! | `MOON.TS <ms> CLOSE` | clock observation | a clean close by this binary: ends its session in the file ([`super::clock`]) |
 //! | `MOON.COLDCUT <watermark>` | cold plane | opens the cold replay gate ([`crate::persistence::cold_records`]) |
 //! | `MOON.SPILLED <file_id> key…` | cold plane | demotes replay-built hot copies to their cold entries |
+//! | `MOON.TXN BEGIN <id>` | transaction block | the data records up to the next `MOON.TXN` belong to open transaction `<id>` ([`super::txn`]) |
+//! | `MOON.TXN PAUSE <id>` | transaction block | the records after it belong to no transaction; `<id>` stays open |
+//! | `MOON.TXN END <id>` | transaction block | `<id>` ended (committed, or rolled back with its compensation logged before it) |
+//! | `MOON.TXN RESET` | transaction block | every open transaction is dead: rolled back here (a writer reopening a file a crash left inside a block) |
+//!
+//! A `MOON.TXN` `<id>` is a non-zero decimal `u64`: the writers log the
+//! transaction's LOG id, its origin shard above its shard's id
+//! (`aof::txn_log_id`, R2b W1) — unique in a merged replication stream.
 //!
 //! ## `MOON.TS <ms>` (moon#1283)
 //!
@@ -60,11 +68,11 @@
 //! block would be judged by a clock older than the one it was written
 //! under. [`intercept`] therefore runs FIRST, before any data-skipping
 //! decision, and a clock record's route ([`ReplayRoute::Marker`]) is never
-//! KV history. A block-buffering replay that defers data records until a
-//! terminator must keep each `MOON.TS` IN ORDER with the deferred records it
-//! precedes (so a committed block replays under the clocks it was written
-//! under) and, when it discards the block, still apply the block's last
-//! `MOON.TS` ([`apply`] on the [`Pseudo::Ts`] it buffered).
+//! KV history. The `MOON.TXN` blocks (moon#1300, [`super::txn`]) keep it by
+//! construction: a block's data records are applied in place, under the
+//! clocks around them, and a cut block is rolled back by restoring captured
+//! pre-images — nothing is buffered, so no clock record is ever deferred or
+//! dropped with one.
 
 use crate::protocol::Frame;
 use crate::storage::Database;
@@ -73,6 +81,10 @@ use super::ReplayRoute;
 
 /// `MOON.TS <ms>`: the clock the records after it were judged under.
 pub const TS: &[u8] = b"MOON.TS";
+
+/// `MOON.TXN BEGIN|PAUSE|END <id>` / `MOON.TXN RESET`: the cross-store
+/// transaction blocks (moon#1300, [`super::txn`]).
+pub const TXN: &[u8] = b"MOON.TXN";
 
 /// The largest `MOON.TS` a replay accepts: 9999-12-31T23:59:59.999Z. A
 /// larger value is not a clock reading — a corrupt record — and is skipped
@@ -146,6 +158,79 @@ impl TsRecord {
     }
 }
 
+/// The verb of a `MOON.TXN` record (moon#1300, see [`super::txn`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TxnMarker {
+    /// `MOON.TXN BEGIN <id>`: the data records up to the next `MOON.TXN`
+    /// record belong to transaction `<id>`, which is opened the first time
+    /// it is named and resumed after a [`TxnMarker::Pause`].
+    Begin(u64),
+    /// `MOON.TXN PAUSE <id>`: the records after it belong to no transaction
+    /// (another client's writes); `<id>` stays open.
+    Pause(u64),
+    /// `MOON.TXN END <id>`: `<id>` is over — committed, or rolled back with
+    /// its compensating records logged before this marker. Its records stand.
+    End(u64),
+    /// `MOON.TXN RESET`: every transaction still open is dead (the process
+    /// that ran it is gone) and is rolled back at this point.
+    Reset,
+}
+
+/// Longest RESP encoding of a `MOON.TXN` record:
+/// `*3\r\n$8\r\nMOON.TXN\r\n$5\r\nPAUSE\r\n$20\r\n<20 digits>\r\n` = 56 bytes.
+pub const TXN_RECORD_MAX_LEN: usize = 56;
+
+/// A `MOON.TXN` record encoded on the stack — no allocation.
+#[derive(Clone, Copy)]
+pub struct TxnRecord {
+    buf: [u8; TXN_RECORD_MAX_LEN],
+    len: usize,
+}
+
+impl TxnRecord {
+    /// Encode `marker`.
+    #[must_use]
+    pub fn new(marker: TxnMarker) -> Self {
+        let (verb, id): (&[u8], Option<u64>) = match marker {
+            TxnMarker::Begin(id) => (b"BEGIN", Some(id)),
+            TxnMarker::Pause(id) => (b"PAUSE", Some(id)),
+            TxnMarker::End(id) => (b"END", Some(id)),
+            TxnMarker::Reset => (b"RESET", None),
+        };
+        let mut buf = [0u8; TXN_RECORD_MAX_LEN];
+        let mut len = 0;
+        let mut put = |part: &[u8]| {
+            buf[len..len + part.len()].copy_from_slice(part);
+            len += part.len();
+        };
+        put(if id.is_some() { b"*3\r\n" } else { b"*2\r\n" });
+        put(b"$8\r\nMOON.TXN\r\n$");
+        let mut vl = itoa::Buffer::new();
+        put(vl.format(verb.len()).as_bytes());
+        put(b"\r\n");
+        put(verb);
+        put(b"\r\n");
+        if let Some(id) = id {
+            let mut digits = itoa::Buffer::new();
+            let d = digits.format(id).as_bytes();
+            let mut dl = itoa::Buffer::new();
+            put(b"$");
+            put(dl.format(d.len()).as_bytes());
+            put(b"\r\n");
+            put(d);
+            put(b"\r\n");
+        }
+        Self { buf, len }
+    }
+
+    /// The RESP bytes.
+    #[inline]
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.buf[..self.len]
+    }
+}
+
 /// A recognised pseudo-command.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Pseudo {
@@ -161,6 +246,12 @@ pub enum Pseudo {
     /// `MOON.COLDCUT` / `MOON.SPILLED` (applied by
     /// [`crate::persistence::cold_records::replay_cold_plane_record`]).
     ColdPlane,
+    /// A well-formed `MOON.TXN` record (moon#1300): applied by the replay's
+    /// transaction state ([`super::txn`]), not by [`apply`].
+    Txn(TxnMarker),
+    /// `MOON.TXN` with an unknown verb, a missing, extra, non-numeric or zero
+    /// `<id>`: skipped; no block opens, closes or rolls back.
+    MalformedTxn,
 }
 
 impl Pseudo {
@@ -169,7 +260,11 @@ impl Pseudo {
     #[must_use]
     pub fn route(self) -> ReplayRoute {
         match self {
-            Pseudo::Ts(_) | Pseudo::Close(_) | Pseudo::MalformedTs => ReplayRoute::Marker,
+            Pseudo::Ts(_)
+            | Pseudo::Close(_)
+            | Pseudo::MalformedTs
+            | Pseudo::Txn(_)
+            | Pseudo::MalformedTxn => ReplayRoute::Marker,
             Pseudo::ColdPlane => ReplayRoute::ColdPlane,
         }
     }
@@ -203,12 +298,39 @@ pub fn classify(cmd: &[u8], args: &[Frame]) -> Option<Pseudo> {
             _ => Pseudo::MalformedTs,
         });
     }
+    if cmd.eq_ignore_ascii_case(TXN) {
+        return Some(classify_txn(args).map_or(Pseudo::MalformedTxn, Pseudo::Txn));
+    }
     if cmd.eq_ignore_ascii_case(crate::persistence::cold_records::COLD_CUT)
         || cmd.eq_ignore_ascii_case(crate::persistence::cold_records::SPILLED)
     {
         return Some(Pseudo::ColdPlane);
     }
     None
+}
+
+/// `MOON.TXN <verb> [<id>]` → its marker, `None` when malformed.
+fn classify_txn(args: &[Frame]) -> Option<TxnMarker> {
+    let verb = match args.first()? {
+        Frame::BulkString(b) | Frame::SimpleString(b) => b,
+        _ => return None,
+    };
+    if verb.eq_ignore_ascii_case(b"RESET") {
+        return (args.len() == 1).then_some(TxnMarker::Reset);
+    }
+    let [_, id] = args else {
+        return None;
+    };
+    let id = frame_ms(id).filter(|&id| id != 0)?;
+    if verb.eq_ignore_ascii_case(b"BEGIN") {
+        Some(TxnMarker::Begin(id))
+    } else if verb.eq_ignore_ascii_case(b"PAUSE") {
+        Some(TxnMarker::Pause(id))
+    } else if verb.eq_ignore_ascii_case(b"END") {
+        Some(TxnMarker::End(id))
+    } else {
+        None
+    }
 }
 
 /// Apply a classified pseudo-command.
@@ -239,6 +361,14 @@ pub fn apply(
                 selected_db,
             );
         }
+        // The transaction state lives in the engine ([`super::txn`]); an
+        // engine without one (or this free function) moves nothing.
+        Pseudo::Txn(_) => {}
+        Pseudo::MalformedTxn => tracing::warn!(
+            "AOF replay: malformed MOON.TXN ({} args) skipped; no transaction block \
+             opened, closed or rolled back",
+            args.len()
+        ),
     }
     record.route()
 }

@@ -27,7 +27,7 @@
 //! A rewrite dispatched just before the stop no longer wedges a writer here:
 //! a fold whose shard has stopped fails at once (`rewrite::fold_reply`).
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -55,6 +55,32 @@ const RESEND_EVERY: Duration = Duration::from_millis(500);
 /// the stop reading as a crash to the next boot, and the log must say so
 /// instead of "drained and synced" (the downgrade procedure keys on it).
 static CLOSE_MARKERS_WRITTEN: AtomicUsize = AtomicUsize::new(0);
+
+/// A boot started that has not finished replaying (and cutting) the AOF
+/// (R2b round 4 F5). Set by `main.rs` before the writers spawn, cleared once
+/// the replay's torn-tail cuts are done.
+static BOOT_PENDING: AtomicBool = AtomicBool::new(false);
+
+/// `main.rs`: the writers are about to spawn and the AOF is not replayed
+/// yet.
+pub fn boot_started() {
+    BOOT_PENDING.store(true, Ordering::Release);
+}
+
+/// `main.rs`: the AOF is replayed and any torn tail cut; a writer that stops
+/// from now on closes its file as usual.
+pub fn boot_completed() {
+    BOOT_PENDING.store(false, Ordering::Release);
+}
+
+/// A writer stopping now was never released by a completed boot: it must
+/// append nothing — not even its clean-close marker. The boot may be failing
+/// on a file whose torn tail it has not cut yet, and `MOON.TS … CLOSE`
+/// appended behind those bytes turned the tail into "mid-file corruption"
+/// that every later boot refused (R2b round 4 F5).
+pub(crate) fn boot_pending() -> bool {
+    BOOT_PENDING.load(Ordering::Acquire)
+}
 
 /// Count one clean-close marker appended (the writer's final sync makes it
 /// durable).
@@ -190,6 +216,7 @@ mod tests {
             bytes: bytes::Bytes::from_static(b"*1\r\n$4\r\nPING\r\n"),
             epoch: crate::persistence::aof::FoldEpoch::INITIAL,
             clock_ms: 0,
+            txn: 0,
         }
     }
 

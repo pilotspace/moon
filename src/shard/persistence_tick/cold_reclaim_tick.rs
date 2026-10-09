@@ -9,14 +9,25 @@
 //! and come back as answers this tick applies; the adoption's manifest commit
 //! is handed to the manifest-sync thread and its ack polled on a later tick.
 //! What this thread does is choose, filter and re-point — in memory.
+//!
+//! moon#1297: without an AOF the same tick runs the pipeline with a committed
+//! snapshot as the commit point (`storage::tiered::cold_reclaim::no_aof`):
+//! compactions are stamped with the shard's snapshot epoch when recorded,
+//! adopted once a snapshot that started after them has committed, and
+//! started from the grave record's dead-slot counts instead of the ledger.
 
 use std::path::Path;
 use std::sync::Arc;
 
 use crate::persistence::aof::AofWriterPool;
 use crate::persistence::manifest::ShardManifest;
+use crate::storage::tiered::cold_index::ColdIndex;
 use crate::storage::tiered::cold_reclaim::CulpritOutcome;
+use crate::storage::tiered::cold_reclaim::test_hooks::{
+    ReclaimCrashPoint, compaction_held_for_test, crash_point,
+};
 use crate::storage::tiered::reclaim_io::{ReclaimDone, ReclaimJob};
+use crate::storage::tiered::snapshot_hold;
 use crate::storage::tiered::spill_thread::SpillThread;
 
 /// Files whose compaction starts per shard tick at most. The disk work runs
@@ -34,6 +45,99 @@ const LEDGER_SHARE_DIVISOR: usize = 4;
 /// Without `maxmemory` the ledger is still RAM; reclaim past this.
 const LEDGER_CEILING_UNLIMITED: usize = 64 << 20;
 
+// ── No-AOF starts (moon#1297) ────────────────────────────────────────────
+//
+// Without an AOF a compaction waits for a SNAPSHOT that started after it —
+// with no save rule firing, minutes (three orphan sweeps, then a requested
+// snapshot). Its record (every survivor's key and both locations, ~110 B a
+// survivor) is charged to write admission with the dead-slot ledger until
+// then (`ColdIndex::dead_slot_bytes`), and eviction cannot free a byte of it.
+// Bounded only by a count (64 per database), a write flood at `maxmemory`
+// (600 B values, `--shards 4`, 8 MB) ran ~170 compactions up to 4.2 MB of
+// records (INFO `cold_reclaim_pending_bytes`) in a few seconds: past half a
+// shard's budget, where `evict_to_budget` answers -OOM instead of draining
+// the hot set; and every one of them read and rewrote a file on the spill
+// threads the shards were waiting on. Two rules:
+//
+// - RAM: a shard starts a compaction only while its records (plus an
+//   estimate for those in flight) stay under `1/NO_AOF_RAM_SHARE_DIVISOR`
+//   of its budget, so they can never come near the half that refuses a
+//   write.
+// - CPU: while the shard is spilling (it minted a spill file since the
+//   previous tick: eviction is under way and the spill thread is busy), at
+//   most one compaction starts per `NO_AOF_START_SPACING_WHILE_SPILLING`.
+//   Once the writes stop, compaction runs at the full pace again.
+
+/// A shard's no-AOF compaction records stay under this share of its budget.
+const NO_AOF_RAM_SHARE_DIVISOR: usize = 16;
+/// No-AOF compactions of one shard on the spill thread at once, at most.
+const NO_AOF_MAX_IN_FLIGHT: usize = 2;
+/// While the shard spills, one no-AOF compaction start per this long.
+const NO_AOF_START_SPACING_WHILE_SPILLING: std::time::Duration = std::time::Duration::from_secs(1);
+
+thread_local! {
+    /// The shard's spill-file counter after the previous tick's reclaim
+    /// minted its own ids: a higher counter at the next tick means
+    /// something spilled in between.
+    static SPILL_MARK: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+    /// When this shard last started a no-AOF compaction.
+    static LAST_NO_AOF_START: std::cell::Cell<Option<std::time::Instant>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// A shard's no-AOF reclaim at one tick, for [`no_aof_starts`].
+#[derive(Debug, Clone, Copy)]
+pub(super) struct NoAofLoad {
+    /// RAM its compaction records hold (pending and being adopted).
+    pub(super) record_bytes: usize,
+    /// Compactions pending adoption.
+    pub(super) pending: usize,
+    /// Compactions with a job on the spill thread.
+    pub(super) in_flight: usize,
+    /// It minted a spill file since the previous tick.
+    pub(super) spilling: bool,
+}
+
+/// The RAM cap of a shard's no-AOF compaction records: its share of the
+/// per-shard budget, none without `maxmemory` (no write is refused there).
+pub(super) fn no_aof_record_cap(maxmemory: usize, per_shard_budget: usize) -> usize {
+    if maxmemory == 0 {
+        usize::MAX
+    } else {
+        per_shard_budget / NO_AOF_RAM_SHARE_DIVISOR
+    }
+}
+
+/// How many no-AOF compactions this shard may start now (see the rules
+/// above): none while its records, with an average record for each one in
+/// flight, reach `cap`, or while [`NO_AOF_MAX_IN_FLIGHT`] are in flight; one
+/// per [`NO_AOF_START_SPACING_WHILE_SPILLING`] while it spills; otherwise up
+/// to [`FILES_PER_TICK`].
+pub(super) fn no_aof_starts(
+    load: NoAofLoad,
+    cap: usize,
+    last_start: Option<std::time::Instant>,
+    now: std::time::Instant,
+) -> usize {
+    if load.in_flight >= NO_AOF_MAX_IN_FLIGHT {
+        return 0;
+    }
+    let per_record = load.record_bytes.checked_div(load.pending).unwrap_or(0);
+    let committed = load
+        .record_bytes
+        .saturating_add(per_record.saturating_mul(load.in_flight));
+    if committed >= cap {
+        return 0;
+    }
+    if load.spilling {
+        let spaced = last_start.is_none_or(|t| {
+            now.saturating_duration_since(t) >= NO_AOF_START_SPACING_WHILE_SPILLING
+        });
+        return usize::from(spaced);
+    }
+    FILES_PER_TICK.min(NO_AOF_MAX_IN_FLIGHT - load.in_flight)
+}
+
 /// The ledger size past which this shard compacts: a quarter of its memory
 /// budget, or [`LEDGER_CEILING_UNLIMITED`] with no `maxmemory`.
 pub(super) fn reclaim_threshold(maxmemory: usize, per_shard_budget: usize) -> usize {
@@ -44,12 +148,22 @@ pub(super) fn reclaim_threshold(maxmemory: usize, per_shard_budget: usize) -> us
     }
 }
 
+/// What commits a compaction on this shard.
+#[derive(Clone, Copy)]
+enum CommitPoint<'a> {
+    /// A committed AOF fold (the ledger bound, moon#1215).
+    Fold(&'a crate::persistence::aof::rewrite::RewriteOverflow),
+    /// A committed snapshot: no AOF writer in this process (moon#1297).
+    Snapshot,
+}
+
 /// One tick of reclaim. `ledger_bytes` is the shard's ledger as this tick
-/// published it. A no-op without an AOF writer (no ledger exists then),
-/// without disk offload, or in the legacy multi-shard TopLevel layout, where
-/// one fold epoch spans several shards and so cannot say which shard's
-/// compaction a commit covers. Without a spill thread no new compaction
-/// starts (adoption still runs).
+/// published it. A no-op without disk offload, or in the legacy multi-shard
+/// TopLevel AOF layout, where one fold epoch spans several shards and so
+/// cannot say which shard's compaction a commit covers. With an AOF writer a
+/// committed fold commits a compaction and the ledger drives it; without one
+/// (moon#1297) a committed snapshot commits it and the grave record drives
+/// it. Without a spill thread no new compaction starts (adoption still runs).
 #[allow(clippy::too_many_arguments)]
 pub(super) fn run(
     shard_databases: &Arc<crate::shard::shared_databases::ShardDatabases>,
@@ -62,18 +176,30 @@ pub(super) fn run(
     spill_thread: Option<&SpillThread>,
     ledger_bytes: usize,
 ) {
-    let (Some(pool), Some(shard_dir), Some(manifest)) =
-        (aof_pool, offload_shard_dir, shard_manifest.as_mut())
-    else {
+    // Did anything spill since the previous tick (the counter moved past what
+    // that tick's reclaim left it at)? Taken, so a tick that returns before
+    // setting it below leaves no stale mark to read as a spill next time.
+    let spilling = SPILL_MARK.take().is_some_and(|mark| *next_file_id > mark);
+    let (Some(shard_dir), Some(manifest)) = (offload_shard_dir, shard_manifest.as_mut()) else {
         return;
     };
-    if pool.layout() == crate::persistence::aof_manifest::AofLayout::TopLevel
-        && shard_databases.num_shards() > 1
-    {
-        return;
-    }
-    let overflow = pool.overflow_for(shard_id);
-    let committed = overflow.committed_floor().0;
+    let commit_point = match aof_pool {
+        Some(pool) => {
+            if pool.layout() == crate::persistence::aof_manifest::AofLayout::TopLevel
+                && shard_databases.num_shards() > 1
+            {
+                return;
+            }
+            CommitPoint::Fold(pool.overflow_for(shard_id))
+        }
+        None if snapshot_hold::applies() => CommitPoint::Snapshot,
+        None => return,
+    };
+    let committed = match commit_point {
+        CommitPoint::Fold(overflow) => overflow.committed_floor().0,
+        CommitPoint::Snapshot => snapshot_hold::snapshot_fold_view(0).committed_floor,
+    };
+    let no_aof = matches!(commit_point, CommitPoint::Snapshot);
     let db_count = shard_databases.db_count();
     // moon#1265: sampled before the answers are drained, so everything a
     // dead thread sent is applied below before its other jobs are abandoned.
@@ -85,14 +211,27 @@ pub(super) fn run(
     // 1. Apply what the spill thread finished: a read becomes a write job
     //    (survivors filtered, output ids minted and the fold epoch stamped
     //    in this one synchronous section), a write becomes a pending
-    //    compaction.
+    //    compaction. Without an AOF the stamp is the snapshot epoch at the
+    //    record instead (moon#1297): the adopting snapshot must START after
+    //    the compaction is known, so its trailer can name the compacted
+    //    slots of the survivors that changed.
     if let Some(st) = spill_thread {
+        let stamps = Stamps {
+            plan: &|| match commit_point {
+                CommitPoint::Fold(overflow) => overflow.stamp().0,
+                CommitPoint::Snapshot => 0,
+            },
+            record: &|planned| match commit_point {
+                CommitPoint::Fold(_) => planned,
+                CommitPoint::Snapshot => snapshot_hold::epoch_before_start(),
+            },
+        };
         for done in st.drain_reclaim_done() {
-            apply_done(done, st, shard_id, shard_dir, next_file_id, || {
-                overflow.stamp().0
-            });
+            apply_done(done, st, shard_id, shard_dir, next_file_id, &stamps, no_aof);
         }
     }
+    // Nothing below mints a file id: the next tick compares against this.
+    SPILL_MARK.set(Some(*next_file_id));
     // moon#1265: a dead spill thread answers nothing more. Abandon what it
     // still held (its queued jobs are dropped by the shard's reconcile; a
     // write it finished unannounced is an unlisted file the startup orphan
@@ -152,9 +291,15 @@ pub(super) fn run(
                         keys_moved = r.keys_moved,
                         files_unlinked = r.files_unlinked,
                         bytes_unlinked = r.bytes_unlinked,
-                        "cold reclaim: adopted compacted spill files after a committed AOF fold"
+                        commit_point = if no_aof { "snapshot" } else { "AOF fold" },
+                        "cold reclaim: adopted compacted spill files after their commit point (a committed AOF \
+                         fold, or a snapshot without an AOF)"
                     );
                 }
+            }
+            if no_aof && ci.compactions_ready(committed) > 0 {
+                // moon#1297 kill point: the snapshot committed, nothing listed.
+                crash_point(ReclaimCrashPoint::AdoptReady);
             }
             if ci.pending_compactions() > 0 {
                 let r = ci.begin_adoption(committed, shard_dir, manifest);
@@ -179,25 +324,64 @@ pub(super) fn run(
         reclaim_threshold(rt.maxmemory, rt.maxmemory_per_shard())
     };
     let over = ledger_bytes > threshold;
-    let mut in_flight = 0usize;
+    let mut load = NoAofLoad {
+        record_bytes: 0,
+        pending: 0,
+        in_flight: 0,
+        spilling,
+    };
     for db_index in 0..db_count {
         crate::shard::slice::with_shard_db(db_index, |db| {
             if let Some(ci) = db.cold_index.as_mut() {
-                ci.note_held_files_pressure(over, committed);
-                in_flight += ci.compactions_in_flight();
+                if !no_aof {
+                    ci.note_held_files_pressure(over, committed);
+                }
+                load.in_flight += ci.compactions_in_flight();
+                load.pending += ci.pending_compactions();
+                load.record_bytes += ci.reclaim_resident_bytes();
             }
         });
     }
+    let in_flight = load.in_flight;
     // moon#1265 review round 3: a shard whose reclaim jobs spent the
     // reclaim-death budget starts no compaction any more (adoption of those
     // already written still runs above).
     let Some(st) = spill_thread.filter(|st| !st.reclaim_disabled()) else {
         return;
     };
-    if !over {
+    // Without an AOF there is no ledger: each database's grave record says
+    // whether it has enough dead slots to compact (moon#1297).
+    if !(over || no_aof) || (no_aof && compaction_held_for_test()) {
         return;
     }
-    let mut files_left = FILES_PER_TICK.min(MAX_IN_FLIGHT.saturating_sub(in_flight));
+    let max_pending = if no_aof {
+        crate::storage::tiered::cold_reclaim::NO_AOF_MAX_PENDING_PER_DB
+    } else {
+        MAX_PENDING_PER_DB
+    };
+    let now = std::time::Instant::now();
+    let mut files_left = if no_aof {
+        let cap = {
+            let rt = runtime_config.read();
+            no_aof_record_cap(rt.maxmemory, rt.maxmemory_per_shard())
+        };
+        let starts = no_aof_starts(load, cap, LAST_NO_AOF_START.get(), now);
+        if starts == 0 {
+            tracing::debug!(
+                shard_id,
+                record_bytes = load.record_bytes,
+                cap,
+                in_flight = load.in_flight,
+                spilling = load.spilling,
+                "cold reclaim: no-AOF compaction start deferred (records at their budget share, \
+                 jobs in flight, or the shard is spilling)"
+            );
+        }
+        starts
+    } else {
+        FILES_PER_TICK.min(MAX_IN_FLIGHT.saturating_sub(in_flight))
+    };
+    let allowed = files_left;
     for db_index in 0..db_count {
         if files_left == 0 {
             break;
@@ -207,26 +391,55 @@ pub(super) fn run(
                 return;
             };
             let busy = ci.pending_compactions() + ci.compactions_in_flight();
-            let room = MAX_PENDING_PER_DB.saturating_sub(busy);
-            for file_id in ci.reclaim_candidates(files_left.min(room)) {
-                if !ci.start_compaction(file_id) {
-                    continue;
-                }
-                let job = ReclaimJob::Read {
-                    db_index,
-                    file_id,
-                    shard_dir: shard_dir.to_path_buf(),
-                };
-                if st.try_submit_reclaim(job).is_err() {
-                    // Queue full or thread gone: try again on a later tick.
-                    ci.abandon_compaction(file_id, false);
-                    files_left = 0;
-                    break;
-                }
-                files_left -= 1;
-            }
+            let room = files_left.min(max_pending.saturating_sub(busy));
+            let candidates = if no_aof {
+                ci.reclaim_candidates_no_aof(room)
+            } else {
+                ci.reclaim_candidates(room)
+            };
+            start_reads(ci, st, db_index, candidates, shard_dir, &mut files_left);
         });
     }
+    if no_aof && files_left < allowed {
+        LAST_NO_AOF_START.set(Some(now));
+    }
+}
+
+/// Send a `Read` job for each of `candidates` (step 3 of [`run`]), counting
+/// them off `files_left`; a full queue ends this tick's starts.
+fn start_reads(
+    ci: &mut ColdIndex,
+    st: &SpillThread,
+    db_index: usize,
+    candidates: Vec<u64>,
+    shard_dir: &Path,
+    files_left: &mut usize,
+) {
+    for file_id in candidates {
+        if !ci.start_compaction(file_id) {
+            continue;
+        }
+        let job = ReclaimJob::Read {
+            db_index,
+            file_id,
+            shard_dir: shard_dir.to_path_buf(),
+        };
+        if st.try_submit_reclaim(job).is_err() {
+            // Queue full or thread gone: try again on a later tick.
+            ci.abandon_compaction(file_id, false);
+            *files_left = 0;
+            return;
+        }
+        *files_left -= 1;
+    }
+}
+
+/// The epoch a compaction is stamped with: `plan` when its output ids are
+/// minted (carried by the write job), `record` maps that to the stamp it is
+/// recorded under when the write comes back.
+struct Stamps<'a> {
+    plan: &'a dyn Fn() -> u64,
+    record: &'a dyn Fn(u64) -> u64,
 }
 
 /// Apply one answer from the spill thread (step 1 of [`run`]).
@@ -236,7 +449,8 @@ fn apply_done(
     shard_id: usize,
     shard_dir: &Path,
     next_file_id: &mut u64,
-    stamp: impl Fn() -> u64,
+    stamps: &Stamps<'_>,
+    no_aof: bool,
 ) {
     match done {
         ReclaimDone::Read {
@@ -261,7 +475,7 @@ fn apply_done(
                         // The fold epoch at the instant the output ids were
                         // minted (same synchronous section): adoption waits
                         // for a committed fold cut after them.
-                        epoch: stamp(),
+                        epoch: (stamps.plan)(),
                         moved: plan.moved,
                         requests: plan.requests,
                         shard_dir: shard_dir.to_path_buf(),
@@ -291,6 +505,7 @@ fn apply_done(
             moved,
             result,
         } => {
+            let epoch = (stamps.record)(epoch);
             let recorded =
                 crate::shard::slice::with_shard_db(db_index, |db| match db.cold_index.as_mut() {
                     Some(ci) => ci.record_compaction(old_file, epoch, moved, result, shard_dir),
@@ -306,8 +521,11 @@ fn apply_done(
                         Err("the database has no cold index any more".to_string())
                     }
                 });
-            if let Err(why) = recorded {
-                warn_not_compacted(shard_id, db_index, old_file, &why);
+            match recorded {
+                Err(why) => warn_not_compacted(shard_id, db_index, old_file, &why),
+                // moon#1297 kill point: `F'` written and fsynced, unlisted.
+                Ok(()) if no_aof => crash_point(ReclaimCrashPoint::Compacted),
+                Ok(()) => {}
             }
         }
     }
@@ -321,4 +539,62 @@ fn warn_not_compacted(shard_id: usize, db_index: usize, file_id: u64, why: &str)
         why = %why,
         "cold reclaim: file not compacted"
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    fn load(record_bytes: usize, pending: usize, in_flight: usize, spilling: bool) -> NoAofLoad {
+        NoAofLoad {
+            record_bytes,
+            pending,
+            in_flight,
+            spilling,
+        }
+    }
+
+    /// The records can never reach the half of the budget where a
+    /// write is refused — a shard stops starting at its sixteenth, counting
+    /// an average record for each compaction still in flight.
+    #[test]
+    fn records_at_their_share_of_the_budget_start_nothing() {
+        let now = Instant::now();
+        let cap = no_aof_record_cap(8 << 20, 2 << 20);
+        assert_eq!(cap, 128 << 10);
+        assert_eq!(no_aof_starts(load(0, 0, 0, false), cap, None, now), 2);
+        assert_eq!(no_aof_starts(load(cap - 1, 4, 0, false), cap, None, now), 2);
+        assert_eq!(no_aof_starts(load(cap, 4, 0, false), cap, None, now), 0);
+        // 100 KB in 4 records (25 KB each) + 1 in flight = 125 KB: one more.
+        assert_eq!(
+            no_aof_starts(load(100 << 10, 4, 1, false), cap, None, now),
+            1
+        );
+        // + 2 in flight would be 150 KB: none (and 2 in flight is the limit).
+        assert_eq!(
+            no_aof_starts(load(100 << 10, 4, 2, false), cap, None, now),
+            0
+        );
+        assert_eq!(
+            no_aof_starts(load(112 << 10, 4, 1, false), cap, None, now),
+            0
+        );
+        // No maxmemory: no write is ever refused, only the in-flight limit.
+        assert_eq!(no_aof_record_cap(0, 0), usize::MAX);
+    }
+
+    /// While the shard spills, one start per second; once it stops,
+    /// the full pace again.
+    #[test]
+    fn a_spilling_shard_starts_one_compaction_per_second() {
+        let cap = usize::MAX;
+        let t0 = Instant::now();
+        assert_eq!(no_aof_starts(load(0, 0, 0, true), cap, None, t0), 1);
+        let soon = t0 + Duration::from_millis(500);
+        assert_eq!(no_aof_starts(load(0, 0, 0, true), cap, Some(t0), soon), 0);
+        let later = t0 + Duration::from_secs(1);
+        assert_eq!(no_aof_starts(load(0, 0, 0, true), cap, Some(t0), later), 1);
+        assert_eq!(no_aof_starts(load(0, 0, 0, false), cap, Some(t0), soon), 2);
+    }
 }

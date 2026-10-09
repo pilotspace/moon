@@ -2,7 +2,7 @@
 //! `fuzz/fuzz_targets/aof_incr_replay.rs` drives arbitrary bytes through
 //! them into real databases, with the production [`DispatchReplayEngine`]
 //! and its pseudo-command intercept (`MOON.TS`, `MOON.COLDCUT`,
-//! `MOON.SPILLED`; `MOON.TXN` once moon#1300 adds it).
+//! `MOON.SPILLED`, `MOON.TXN`).
 //!
 //! The flat `appendonly.aof` reader (`aof::replay_aof`) is public already;
 //! the target reaches it through a temp file.
@@ -23,7 +23,7 @@ pub fn replay_framed(
     engine: &dyn CommandReplayEngine,
 ) -> Option<usize> {
     let mut ordered = Vec::new();
-    let (count, _max_lsn) =
+    let (count, _max_lsn, _torn) =
         super::replay_incr_framed(0, databases, data, engine, &mut ordered).ok()?;
     let mut per_shard: [&mut [Database]; 1] = [databases];
     let _ = super::replay_ordered_merge(&mut per_shard, ordered, engine);
@@ -37,7 +37,9 @@ pub fn replay_resp(
     data: &[u8],
     engine: &dyn CommandReplayEngine,
 ) -> Option<usize> {
-    super::replay_incr_resp(databases, data, engine).ok()
+    super::replay_incr_resp(databases, data, engine)
+        .ok()
+        .map(|(n, _)| n)
 }
 
 /// Replay the framed per-shard incr at `path` as `replay_per_shard` does:
@@ -64,7 +66,9 @@ pub fn replay_resp_file(
     use crate::persistence::replay::clock::{LogFormat, pin_replay_clock_to_log};
     let file = std::fs::File::open(path).ok()?;
     let _clock = pin_replay_clock_to_log(path, LogFormat::Resp);
-    super::replay_incr_resp(databases, file, engine).ok()
+    super::replay_incr_resp(databases, file, engine)
+        .ok()
+        .map(|(n, _)| n)
 }
 
 /// A stable-toolchain smoke run of the fuzz target's contract (the libFuzzer
@@ -108,6 +112,22 @@ mod tests {
             resp(&[b"MOON.TS", b"1790000000500", b"CLOSE"]),
             resp(&[b"MOON.TS", b"1", b"OPEN"]),
             resp(&[b"DEL", b"k"]),
+            // moon#1300: transaction blocks — ended, paused, reset, cut by
+            // the end of the file, malformed.
+            resp(&[b"MOON.TXN", b"BEGIN", b"7"]),
+            resp(&[b"SET", b"k", b"txn"]),
+            resp(&[b"MOON.TXN", b"PAUSE", b"7"]),
+            resp(&[b"SET", b"o", b"other"]),
+            resp(&[b"MOON.TXN", b"BEGIN", b"7"]),
+            resp(&[b"HSET", b"h", b"f", b"txn"]),
+            resp(&[b"MOON.TXN", b"END", b"7"]),
+            resp(&[b"MOON.TXN", b"END", b"9"]),
+            resp(&[b"MOON.TXN", b"BEGIN", b"8"]),
+            resp(&[b"INCR", b"c"]),
+            resp(&[b"MOON.TXN", b"RESET"]),
+            resp(&[b"MOON.TXN", b"BEGIN", b"0"]),
+            resp(&[b"MOON.TXN", b"BEGIN", b"3"]),
+            resp(&[b"APPEND", b"s", b"y"]),
         ];
         let mut out = Vec::new();
         for (i, r) in records.iter().enumerate() {
@@ -180,7 +200,10 @@ mod tests {
                     let _ = replay_resp_file(&mut dbs, &path, &engine);
                 }
                 assert_eq!(pinned_replay_clock_ms(), None, "the replay clock leaked");
+                // moon#1300: every reader closes the blocks of its file.
+                assert_eq!(engine.finish_log(&mut dbs), 0, "a block outlived its file");
                 let _ = crate::persistence::replay::clock::take_open_foreign_segment(&path);
+                let _ = crate::persistence::replay::txn::take_reset_owed(&path);
             }
         }
     }

@@ -37,6 +37,12 @@
 //! - `save` change-count rules: the auto-save task needs a hook into the
 //!   sharded write path that does not yet exist, so embedded mode logs a
 //!   warning and skips the timer instead of silently promising snapshots.
+//! - AOF rewrites (no auto-rewrite monitor, and the TopLevel writer has no
+//!   fold channels, so `BGREWRITEAOF` fails). In particular a replica cannot
+//!   publish a full sync's dataset to its own AOF (moon#1318, R2b round 3
+//!   F-E): after a promotion, a restart of an embedded node holds only its
+//!   pre-sync AOF plus the stream applied since. The replica task says so
+//!   at `REPLICAOF` (`replica_aof::warn_if_no_rewriter`).
 
 #![cfg(feature = "runtime-tokio")]
 
@@ -133,6 +139,23 @@ pub async fn run_embedded(
     }
     let num_shards = config.shards;
 
+    // R2b round 4 F7: the binary's AOF layout refusals, before recovery and
+    // before the writer opens anything. The embedded server replays only the
+    // single-file AOF (never a manifest), so it is the tokio --shards 1 case
+    // whatever the runtime.
+    if config.appendonly == "yes" {
+        let dir = std::path::Path::new(&config.dir);
+        let manifest = crate::persistence::aof_manifest::AofManifest::load(dir)
+            .ok()
+            .flatten()
+            .map(|m| m.layout);
+        if let Some(msg) =
+            aof::layout_guard::refusal(dir, num_shards, manifest, false, &config.appendfilename)
+        {
+            anyhow::bail!("embedded moon: refusing to start: {msg}");
+        }
+    }
+
     info!(
         "embedded moon: starting with {} shard(s) on {}:{}",
         num_shards, config.bind, config.port
@@ -165,14 +188,31 @@ pub async fn run_embedded(
     // `AofWriterPool` so every shard receives an Arc clone with a uniform
     // API. Channel close still drives writer termination — dropping the last
     // Arc drops the pool, which drops the underlying senders.
-    let (aof_pool, aof_join): (
+    // R2b review P1: `--shards 1` may publish its fresh generation by rename
+    // after recovery (`fresh_generation`); the writer opens the file only once
+    // this guard is dropped.
+    let fresh_aof_gate = (num_shards == 1 && config.appendonly == "yes").then(|| {
+        aof::open_gate::hold_writer_open(&PathBuf::from(&config.dir).join(&config.appendfilename))
+    });
+    // `aof_writer_cancel`: the writer's own token, so a refused boot stops
+    // this writer and no other (R2b round 4 F-G-SHARE).
+    let (aof_pool, aof_join, aof_writer_cancel): (
         Option<Arc<AofWriterPool>>,
         Option<std::thread::JoinHandle<()>>,
+        Option<crate::runtime::cancel::CancellationToken>,
     ) = if config.appendonly == "yes" {
         let (tx, rx) = channel::mpsc_bounded::<AofMessage>(10_000);
         let aof_token = cancel.child_token();
+        let writer_cancel = aof_token.clone();
         let fsync = FsyncPolicy::from_str(&config.appendfsync);
         let aof_file_path = PathBuf::from(&config.dir).join(&config.appendfilename);
+        // The pool first: the writer takes its lane from it (moon#1266 1A).
+        let pool = AofWriterPool::top_level_with_policy(
+            tx,
+            fsync,
+            std::time::Duration::from_millis(config.aof_fsync_timeout_ms),
+        );
+        let lane = pool.lane(0);
         let handle = std::thread::Builder::new()
             .name("embedded-moon-aof".to_string())
             .spawn(move || {
@@ -181,21 +221,14 @@ pub async fn run_embedded(
                 crate::shard::numa::pin_current_aux_thread("embedded-moon-aof");
                 RuntimeFactoryImpl::block_on_local(
                     "embedded-moon-aof".to_string(),
-                    aof::aof_writer_task(rx, aof_file_path, fsync, aof_token, None),
+                    aof::aof_writer_task(rx, aof_file_path, fsync, aof_token, None, lane),
                 );
             })
             .context("embedded moon: failed to spawn AOF writer thread")?;
         info!("embedded moon: AOF enabled (fsync: {:?})", fsync);
-        (
-            Some(AofWriterPool::top_level_with_policy(
-                tx,
-                fsync,
-                std::time::Duration::from_millis(config.aof_fsync_timeout_ms),
-            )),
-            Some(handle),
-        )
+        (Some(pool), Some(handle), Some(writer_cancel))
     } else {
-        (None, None)
+        (None, None, None)
     };
 
     let bind_addr = format!("{}:{}", config.bind, config.port);
@@ -303,6 +336,24 @@ pub async fn run_embedded(
         })
         .collect();
 
+    // R2b round 2 F1: an `appendonly.aof` that is the only KV source and
+    // could not be replayed — refuse to start. This boot's writer (still
+    // waiting at the gate) is cancelled, so it exits without opening the
+    // file, and joined off the async runtime; THEN the gate is released (R2b
+    // round 3 F-G), so a later instance on this dir opens its writer.
+    if let Some(refusal) = shards.iter().find_map(|s| s.aof_unreadable.clone()) {
+        if let Some(gate) = fresh_aof_gate {
+            if let Some(writer_cancel) = aof_writer_cancel {
+                writer_cancel.cancel();
+            }
+            if let Some(handle) = aof_join {
+                let _ = tokio::task::spawn_blocking(move || handle.join()).await;
+            }
+            drop(gate);
+        }
+        anyhow::bail!("embedded moon: {}", refusal.message());
+    }
+
     // moon#997 / moon#893: the cold file_id startup gate — same rule as
     // main.rs. An unprovable seed is refused, never guessed.
     for shard in &mut shards {
@@ -313,6 +364,25 @@ pub async fn run_embedded(
                 format!("refusing to start: cannot prove shard {id}'s cold file_id seed")
             })?;
     }
+
+    // R2b review P1: `appendonly.aof` holding a record is the next boot's only
+    // KV source (`KvSources::AofOnly`), so a generation opened over a loaded
+    // keyspace carries it as its RDB preamble. No `MOON.COLDCUT` head: this
+    // server never wrote one.
+    if fresh_aof_gate.is_some() {
+        let aof_path = PathBuf::from(&config.dir).join(&config.appendfilename);
+        let dbs = &shards[0].databases;
+        let base = || aof::fresh_generation::keyspace_base(dbs);
+        aof::fresh_generation::open_fresh_flat_generation(&aof_path, base, None).with_context(
+            || {
+                format!(
+                    "embedded moon: failed to open the AOF generation {}",
+                    aof_path.display()
+                )
+            },
+        )?;
+    }
+    drop(fresh_aof_gate);
 
     // NOTE: multi-part AOF (appendonlydir/ manifest) is intentionally NOT used here.
     //

@@ -141,6 +141,8 @@ fn stall_everysec_fsync_for_test() {
 
 // The clean-close marker of an orderly stop (R2 review of moon#1283).
 mod close;
+// The writer's side of the moon#1266 1A lane.
+mod lane_hooks;
 // The monoio writers' channel receive: warm poll, then park (moon#1266).
 #[cfg(feature = "runtime-monoio")]
 mod poll;
@@ -261,10 +263,20 @@ pub async fn aof_writer_task(
         Arc<parking_lot::Mutex<ringbuf::HeapProd<crate::shard::dispatch::ShardMessage>>>,
         Arc<crate::runtime::channel::Notify>,
     )>,
+    lane: Arc<super::lane::AofLane>,
 ) {
     #[cfg(feature = "runtime-tokio")]
     use tokio::io::AsyncWriteExt;
+    let _lane_close = super::lane::CloseOnExit(Arc::clone(&lane)); // moon#1266 1A
 
+    // R2b review P1: main.rs may still publish a fresh generation over this
+    // path by rename (`fresh_generation`); opening it first would leave this
+    // writer appending to the replaced inode.
+    #[cfg(feature = "runtime-tokio")]
+    if !super::open_gate::wait_writer_open(&aof_path, &cancel).await {
+        info!("AOF writer: cancelled before the boot opened its generation");
+        return;
+    }
     // Open file in append mode (create if not exists)
     #[cfg(feature = "runtime-tokio")]
     let file: tokio::fs::File = match tokio::fs::OpenOptions::new()
@@ -378,7 +390,7 @@ pub async fn aof_writer_task(
                         );
                         return;
                     }
-                    std::thread::sleep(std::time::Duration::from_millis(50));
+                    std::thread::sleep(std::time::Duration::from_millis(5));
                 }
                 Err(e) => {
                     error!(
@@ -455,6 +467,16 @@ pub async fn aof_writer_task(
             if everysec.set_policy(fsync) {
                 idle_wait.clear_pending();
             }
+            // moon#1266 1A (W2B-1): hold under always, else offer before the receive.
+            lane_hooks::top_of_wake(
+                &lane,
+                &rx,
+                fsync,
+                &mut write_error,
+                &mut last_db,
+                fold_floor,
+                &file,
+            );
             // Group commit: wait (bounded) for one message, then
             // opportunistically drain whatever else is already queued into a
             // bounded batch so a single fsync makes the whole batch durable
@@ -462,7 +484,7 @@ pub async fn aof_writer_task(
             // to the EverySec proactive fsync at the end of the loop.
             // Park-free under EverySec/No so producer try_sends never pay a
             // futex wake on the shard thread — see `poll_recv`.
-            let first = match recv_next(&rx, &mut idle_wait, matches!(fsync, FsyncPolicy::Always)) {
+            let first = match recv_next(&rx, &mut idle_wait, lane_hooks::park(&lane, fsync)) {
                 Ok(m) => {
                     idle_wait.on_message();
                     Some(m)
@@ -473,6 +495,7 @@ pub async fn aof_writer_task(
                 }
                 Err(flume::RecvTimeoutError::Disconnected) => {
                     // Channel disconnected — final sync + shut down.
+                    lane_hooks::reclaim(&lane, &mut last_db, &mut write_error);
                     if !write_error {
                         close::append_sync(&mut file, &mut last_db, false);
                         if let Err(e) = file.flush().and_then(|_| file.sync_data()) {
@@ -485,6 +508,7 @@ pub async fn aof_writer_task(
             };
 
             if let Some(first) = first {
+                lane_hooks::reclaim(&lane, &mut last_db, &mut write_error); // moon#1266 1A
                 let mut batch = collect_group_commit_batch(
                     first,
                     || rx.try_recv().ok(),
@@ -508,7 +532,7 @@ pub async fn aof_writer_task(
                         // AppendSync waiter — never a false durability claim.
                         let _ = group_commit::ack_batch(&mut batch, BatchAck::WriteFailed);
                     } else {
-                        let do_fsync = group_commit::batch_needs_fsync(fsync, &batch);
+                        let do_fsync = group_commit::batch_needs_fsync(fsync);
                         let mut sink = FileGroupSink {
                             file: &mut file,
                             fail_sync: fail_fsync_for_test,
@@ -529,8 +553,8 @@ pub async fn aof_writer_task(
                             write_error = true;
                         }
                         // EverySec: the batch was written but not per-batch-fsynced
-                        // (do_fsync=false; there are no AppendSync waiters under
-                        // everysec). The end-of-loop hand-off to the fsync agent
+                        // (do_fsync=false; any AppendSync was acked once written,
+                        // `batch_needs_fsync`). The end-of-loop hand-off to the fsync agent
                         // makes it durable within the 1s bound — pin the idle
                         // wait at its fast floor until that hand-off clears it.
                         if fsync == FsyncPolicy::EverySec && !write_error {
@@ -673,6 +697,7 @@ pub async fn aof_writer_task(
                 }
             }
 
+            lane_hooks::on_wake(&lane, fsync, &mut everysec, &mut idle_wait); // moon#1266 1A
             // EverySec deadline — checked after every loop iteration
             // (message processed OR timeout); the only path that guarantees
             // the ~1s durability bound when no further messages arrive after
@@ -703,6 +728,16 @@ pub async fn aof_writer_task(
                     }
                 }
             }
+            // moon#1266 1A: hand the append position over when nothing is in flight.
+            lane_hooks::offer(
+                &lane,
+                &rx,
+                fsync,
+                write_error,
+                &mut last_db,
+                fold_floor,
+                &file,
+            );
         }
         return;
     }
@@ -716,6 +751,16 @@ pub async fn aof_writer_task(
             if everysec.set_policy(fsync) {
                 idle_wait.clear_pending();
             }
+            // moon#1266 1A (W2B-1): hold under always, else offer before the receive.
+            lane_hooks::top_of_wake(
+                &lane,
+                &rx,
+                fsync,
+                &mut write_error,
+                &mut last_db,
+                fold_floor,
+                &writer,
+            );
             // Bounded recv (EverySec durability): wake at least every
             // `idle_wait.current()` (50ms floor, escalates to 1s while truly
             // idle — see `IdleWait` docs) even when idle so the flush deadline
@@ -733,6 +778,7 @@ pub async fn aof_writer_task(
                     rx.recv_async(),
                 ) => r,
                 _ = cancel.cancelled() => {
+                    lane_hooks::reclaim(&lane, &mut last_db, &mut write_error);
                     // Skip the final sync if the stream is torn — syncing past a
                     // partial record cannot recover it and risks a false durability
                     // signal (mirrors the monoio TopLevel disconnect/shutdown gate).
@@ -751,6 +797,7 @@ pub async fn aof_writer_task(
                 Err(_) => idle_wait.on_timeout(),
                 // Channel disconnected — final sync + shut down.
                 Ok(Err(_)) => {
+                    lane_hooks::reclaim(&lane, &mut last_db, &mut write_error);
                     if !write_error {
                         close::append_async(&mut writer, &mut last_db, false).await;
                         let _ = writer.flush().await;
@@ -760,6 +807,7 @@ pub async fn aof_writer_task(
                     break;
                 }
                 Ok(Ok(first)) => {
+                    lane_hooks::reclaim(&lane, &mut last_db, &mut write_error); // moon#1266 1A
                     // A message just arrived (data or control): reset the idle
                     // wait to its fast floor so the deadline check after this
                     // block — and every subsequent poll while there is still
@@ -802,7 +850,7 @@ pub async fn aof_writer_task(
                                     break;
                                 }
                             }
-                            let do_fsync = group_commit::batch_needs_fsync(fsync, &batch);
+                            let do_fsync = group_commit::batch_needs_fsync(fsync);
                             // moon#1266: the whole batch reaches the kernel
                             // before the loop moves on — nothing acked stays
                             // in user space for a SIGKILL to take. (Always
@@ -839,17 +887,10 @@ pub async fn aof_writer_task(
                                     BatchAck::Synced
                                 }
                             } else {
-                                // EverySec/No: batch buffered; the deadline check
-                                // after this block fsyncs. An AppendSync is enqueued
-                                // ONLY under Always (pool::try_send_append_durable /
-                                // fsync_barrier), so this branch acks no waiter.
-                                debug_assert!(
-                                    !batch
-                                        .data
-                                        .iter()
-                                        .any(|m| matches!(m, AofMessage::AppendSync { .. })),
-                                    "everysec/no batch must contain no AppendSync"
-                                );
+                                // EverySec/No: in the kernel (flushed above); the
+                                // deadline check after this block fsyncs. An
+                                // AppendSync here is acked once written
+                                // (`batch_needs_fsync`, moon#1266 W2B-1).
                                 if fsync == FsyncPolicy::EverySec {
                                     // Bytes are in the kernel but not yet
                                     // durable — pin the idle wait at its floor
@@ -1047,6 +1088,7 @@ pub async fn aof_writer_task(
                     }
                 }
             }
+            lane_hooks::on_wake(&lane, fsync, &mut everysec, &mut idle_wait); // moon#1266 1A
             // EverySec deadline: the oldest unsynced byte reaches disk at
             // most ~1.2s after it was written (1s deadline + wake floor —
             // the wake floor only, never the escalated idle cadence: see
@@ -1092,6 +1134,16 @@ pub async fn aof_writer_task(
                     }
                 }
             }
+            // moon#1266 1A: hand the append position over when nothing is in flight.
+            lane_hooks::offer(
+                &lane,
+                &rx,
+                fsync,
+                write_error,
+                &mut last_db,
+                fold_floor,
+                &writer,
+            );
         }
     }
 }
@@ -1128,7 +1180,9 @@ pub async fn per_shard_aof_writer_task(
     shard_id: u16,
     configured_fsync: FsyncPolicy,
     cancel: CancellationToken,
+    lane: Arc<super::lane::AofLane>,
 ) {
+    let _lane_close = super::lane::CloseOnExit(Arc::clone(&lane)); // moon#1266 1A
     test_hooks::hold_writer_start(shard_id, &cancel);
     #[cfg(feature = "runtime-tokio")]
     {
@@ -1161,7 +1215,7 @@ pub async fn per_shard_aof_writer_task(
                         );
                         return;
                     }
-                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
                 }
                 Err(e) => {
                     error!(
@@ -1284,6 +1338,16 @@ pub async fn per_shard_aof_writer_task(
             if everysec.set_policy(fsync) {
                 idle_wait.clear_pending();
             }
+            // moon#1266 1A (W2B-1): hold under always, else offer before the receive.
+            lane_hooks::top_of_wake(
+                &lane,
+                &rx,
+                fsync,
+                &mut write_error,
+                &mut last_db,
+                fold_floor,
+                &writer,
+            );
             tokio::select! {
                 biased;
                 // Bounded recv (EverySec durability): wake at least every
@@ -1302,6 +1366,7 @@ pub async fn per_shard_aof_writer_task(
                         Err(_) => idle_wait.on_timeout(),
                         // Channel disconnected — final sync + shut down.
                         Ok(Err(_)) => {
+                            lane_hooks::reclaim(&lane, &mut last_db, &mut write_error);
                             if !write_error {
                                 close::append_async(&mut writer, &mut last_db, true).await;
                             }
@@ -1311,6 +1376,7 @@ pub async fn per_shard_aof_writer_task(
                             break;
                         }
                         Ok(Ok(first)) => {
+                            lane_hooks::reclaim(&lane, &mut last_db, &mut write_error); // 1A
                             // A message just arrived: reset to the fast floor
                             // (see TopLevel writer above for the full rationale).
                             idle_wait.on_message();
@@ -1402,7 +1468,7 @@ pub async fn per_shard_aof_writer_task(
                                         }
                                     }
 
-                                    let do_fsync = group_commit::batch_needs_fsync(fsync, &batch);
+                                    let do_fsync = group_commit::batch_needs_fsync(fsync);
                                     // moon#1266: see the TopLevel tokio loop.
                                     if !write_failed
                                         && !do_fsync
@@ -1568,6 +1634,7 @@ pub async fn per_shard_aof_writer_task(
                     }
                 }
                 _ = cancel.cancelled() => {
+                    lane_hooks::reclaim(&lane, &mut last_db, &mut write_error);
                     if !write_error {
                         close::append_async(&mut writer, &mut last_db, true).await;
                     }
@@ -1577,6 +1644,7 @@ pub async fn per_shard_aof_writer_task(
                     break;
                 }
             }
+            lane_hooks::on_wake(&lane, fsync, &mut everysec, &mut idle_wait); // moon#1266 1A
             // EverySec deadline — checked after EVERY wake (message OR timeout),
             // so it is NOT subject to select! fairness and holds the 1s bound
             // under sustained writes as well as when idle. (The old long-lived
@@ -1620,6 +1688,16 @@ pub async fn per_shard_aof_writer_task(
                     }
                 }
             }
+            // moon#1266 1A: hand the append position over when nothing is in flight.
+            lane_hooks::offer(
+                &lane,
+                &rx,
+                fsync,
+                write_error,
+                &mut last_db,
+                fold_floor,
+                &writer,
+            );
         }
     }
 
@@ -1652,7 +1730,7 @@ pub async fn per_shard_aof_writer_task(
                         );
                         return;
                     }
-                    std::thread::sleep(std::time::Duration::from_millis(50));
+                    std::thread::sleep(std::time::Duration::from_millis(5));
                 }
                 Err(e) => {
                     error!(
@@ -1751,6 +1829,16 @@ pub async fn per_shard_aof_writer_task(
             if everysec.set_policy(fsync) {
                 idle_wait.clear_pending();
             }
+            // moon#1266 1A (W2B-1): hold under always, else offer before the receive.
+            lane_hooks::top_of_wake(
+                &lane,
+                &rx,
+                fsync,
+                &mut write_error,
+                &mut last_db,
+                fold_floor,
+                &file,
+            );
             // Use recv_timeout so the EverySec fsync fires even when no new
             // Appends arrive after a fold (or when the client stops writing).
             // Without a timeout, the writer blocks forever in rx.recv() and
@@ -1762,7 +1850,7 @@ pub async fn per_shard_aof_writer_task(
             // `IdleWait` docs. Park-free under EverySec/No so producer
             // try_sends never pay a futex wake on the shard thread — see
             // `poll_recv`.
-            let first = match recv_next(&rx, &mut idle_wait, matches!(fsync, FsyncPolicy::Always)) {
+            let first = match recv_next(&rx, &mut idle_wait, lane_hooks::park(&lane, fsync)) {
                 Ok(m) => {
                     idle_wait.on_message();
                     Some(m)
@@ -1775,6 +1863,7 @@ pub async fn per_shard_aof_writer_task(
                     None
                 }
                 Err(flume::RecvTimeoutError::Disconnected) => {
+                    lane_hooks::reclaim(&lane, &mut last_db, &mut write_error);
                     if !write_error {
                         close::append_sync(&mut file, &mut last_db, true);
                         if let Err(e) = file.flush().and_then(|_| file.sync_data()) {
@@ -1796,6 +1885,7 @@ pub async fn per_shard_aof_writer_task(
             };
 
             if let Some(first) = first {
+                lane_hooks::reclaim(&lane, &mut last_db, &mut write_error); // moon#1266 1A
                 // Group commit: drain a bounded batch so ONE fsync makes all
                 // framed records (`[u64 lsn][u32 len][RESP]`) durable.
                 let mut batch = collect_group_commit_batch(
@@ -1871,7 +1961,7 @@ pub async fn per_shard_aof_writer_task(
                         // after a sustained run of small batches.
                         batch_buf.finish();
 
-                        let do_fsync = group_commit::batch_needs_fsync(fsync, &batch);
+                        let do_fsync = group_commit::batch_needs_fsync(fsync);
                         let verdict = if write_failed {
                             // A torn write may leave a partial record — latch so no
                             // further bytes are appended after the tear.
@@ -1897,7 +1987,7 @@ pub async fn per_shard_aof_writer_task(
                             }
                         } else {
                             // EverySec/No: the everysec hand-off below makes the
-                            // batch durable; no AppendSync waiters under everysec/no.
+                            // batch durable; an AppendSync is acked once written.
                             if fsync == FsyncPolicy::EverySec {
                                 everysec.note_written();
                                 idle_wait.mark_pending();
@@ -2054,6 +2144,7 @@ pub async fn per_shard_aof_writer_task(
                     Some(_) => {}
                 }
             }
+            lane_hooks::on_wake(&lane, fsync, &mut everysec, &mut idle_wait); // moon#1266 1A
             // EverySec deadline — checked after every loop iteration
             // (message processed OR timeout). This is the only path that
             // guarantees the 1s fsync bound when no new Appends arrive
@@ -2085,6 +2176,16 @@ pub async fn per_shard_aof_writer_task(
                     }
                 }
             }
+            // moon#1266 1A: hand the append position over when nothing is in flight.
+            lane_hooks::offer(
+                &lane,
+                &rx,
+                fsync,
+                write_error,
+                &mut last_db,
+                fold_floor,
+                &file,
+            );
         }
     }
 }
