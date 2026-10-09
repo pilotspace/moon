@@ -155,7 +155,7 @@ impl TxnReplay {
         if self.open.is_empty() {
             return;
         }
-        if databases.is_empty() {
+        if databases.is_empty() || is_non_kv_plane(cmd) {
             return;
         }
         // The replay engine resets an out-of-range db to 0 before applying.
@@ -225,6 +225,18 @@ impl TxnReplay {
 }
 
 /// The databases a whole-database write clears or moves (`None`: not one).
+/// A record of a plane whose first argument names an index, graph, queue,
+/// timeline or workspace, never a KV key (`FT.*`, `GRAPH.*`, `MQ.*`,
+/// `TEMPORAL.*`, `WS.*`). A block is KV-only: such a record neither captures
+/// nor releases a KV key that happens to share its name. A replica applies
+/// them through [`TxnReplay::before_data`]; the KV AOF never holds them.
+pub(crate) fn is_non_kv_plane(cmd: &[u8]) -> bool {
+    const PLANES: [&[u8]; 5] = [b"FT.", b"GRAPH.", b"MQ.", b"TEMPORAL.", b"WS."];
+    PLANES
+        .iter()
+        .any(|p| cmd.len() >= p.len() && cmd[..p.len()].eq_ignore_ascii_case(p))
+}
+
 fn whole_db_scope(
     cmd: &[u8],
     args: &[Frame],

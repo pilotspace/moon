@@ -410,3 +410,40 @@ fn two_shards_same_manager_id_stay_two_blocks() {
     assert_eq!(get(&mut d, 0, b"a"), Some(b"txnA".to_vec()), "committed");
     assert_eq!(get(&mut d, 0, b"b"), Some(b"origB".to_vec()), "rolled back");
 }
+
+/// A record of another plane (`GRAPH.*`, `FT.*`, `MQ.*`, …) names a graph,
+/// index or queue, not a KV key: outside a block it must not release a
+/// transaction's capture of a KV key that happens to share the name (a
+/// replica applies those planes through the same hook).
+#[test]
+fn a_non_kv_record_never_releases_a_kv_capture() {
+    use crate::persistence::replay::txn::TxnReplay;
+    let mut d = dbs();
+    d[0].set(
+        b"users",
+        crate::storage::entry::Entry::new_string(Bytes::from_static(b"orig")),
+    );
+    let mut t = TxnReplay::default();
+    t.on_marker(&mut d, TxnMarker::Begin(7));
+    t.before_data(&mut d, 0, b"SET", &[bulk(b"users"), bulk(b"txn")]);
+    d[0].set(
+        b"users",
+        crate::storage::entry::Entry::new_string(Bytes::from_static(b"txn")),
+    );
+    t.on_marker(&mut d, TxnMarker::Pause(7));
+    for cmd in [
+        &b"GRAPH.QUERY"[..],
+        b"FT.CREATE",
+        b"MQ.PUSH",
+        b"TEMPORAL.SET",
+        b"WS.CREATE",
+    ] {
+        t.before_data(&mut d, 0, cmd, &[bulk(b"users"), bulk(b"x")]);
+    }
+    assert_eq!(t.finish(&mut d), 1);
+    assert_eq!(
+        get(&mut d, 0, b"users"),
+        Some(b"orig".to_vec()),
+        "the cut transaction's write is rolled back despite the GRAPH/FT/MQ records"
+    );
+}

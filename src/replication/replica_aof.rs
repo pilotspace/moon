@@ -129,11 +129,7 @@ fn is_logged(cmd: &[u8], args: &[Frame]) -> bool {
     if matches!(classify(cmd, args), Some(Pseudo::Txn(_))) {
         return true;
     }
-    let starts = |p: &[u8]| cmd.len() >= p.len() && cmd[..p.len()].eq_ignore_ascii_case(p);
-    if [&b"FT."[..], b"GRAPH.", b"MQ.", b"TEMPORAL.", b"WS."]
-        .iter()
-        .any(|p| starts(p))
-    {
+    if crate::persistence::replay::txn::is_non_kv_plane(cmd) {
         return false;
     }
     crate::command::metadata::is_write(cmd)
