@@ -761,6 +761,18 @@ shared 4-vCPU Linux container against HEAD `935c555` — re-measure on the GCE r
   part of the stream twice (20,000 increments on both runtimes: counter 20,000,
   also after a restart).
 
+- **A wrong argument count on keys that span shards answered `CROSSSLOT`
+  instead of the arity error.** The cross-shard guard for the multi-key family
+  read key positions but never the argument count, so at `--shards 12`
+  `RENAME k1 k2 extra`, `SMOVE k1 k2`, `ZRANGESTORE dst src 0`,
+  `GEOSEARCHSTORE dst src FROMMEMBER m` and the same calls made through
+  `redis.call` were refused with a hint to co-locate the keys. redis-server
+  8.6.1 answers `wrong number of arguments` both standalone and in cluster mode,
+  because arity is checked before the slot check. Now arity wins. Every other
+  argument error on spanning keys (`ZMPOP 2 a b` with no direction, a
+  non-integer `ZRANGESTORE` rank) is still `CROSSSLOT`, which is what Redis
+  Cluster answers too.
+
 - **A `TXN ABORT` could overwrite another client's acknowledged write to a key
   the transaction had touched** (moon#1299). A **KV** key written inside an
   open cross-store `TXN` is now held until `TXN COMMIT` / `TXN ABORT`: another

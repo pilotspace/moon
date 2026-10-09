@@ -2395,10 +2395,44 @@ fn keys_span_shards_rejection(cmd: &[u8], args: &[Frame], num_shards: usize) -> 
         match owner {
             None => owner = Some(shard),
             Some(existing) if existing == shard => {}
-            Some(_) => return Some(Frame::Error(Bytes::from_static(CROSS_SHARD_WRITE_ERROR))),
+            Some(_) => return Some(spanning_refusal(cmd, args)),
         }
     }
     None
+}
+
+/// What a key set that spans shards is answered: its arity error when the
+/// argument COUNT is wrong, `CROSSSLOT` otherwise.
+///
+/// The key walker reads positions, not counts, so `RENAME k1 k2 extra` names
+/// two spanning keys and used to be refused — measured at `--shards 12`, where
+/// redis-server 8.6.1 answers `wrong number of arguments for 'rename'` both
+/// standalone AND in cluster mode: `processCommand` checks arity before the
+/// cluster slot check. Every OTHER argument error (`ZMPOP 2 a b` with no
+/// direction, a non-integer `ZRANGESTORE` rank) is the command's own parser's,
+/// which in Redis Cluster runs after the slot check and so loses to
+/// `CROSSSLOT` there too; those stay refused.
+///
+/// Decided only on the refusal path, so a command that is not refused pays
+/// nothing for it.
+fn spanning_refusal(cmd: &[u8], args: &[Frame]) -> Frame {
+    crate::command::metadata::lookup(cmd)
+        .and_then(|meta| arity_rejection(meta, args))
+        .unwrap_or_else(|| Frame::Error(Bytes::from_static(CROSS_SHARD_WRITE_ERROR)))
+}
+
+/// The arity error `meta` owes an argv of `args` (command name excluded), or
+/// `None` when the count is acceptable. `arity` counts the command name:
+/// positive = exact, negative = minimum (variadic).
+fn arity_rejection(meta: &crate::command::metadata::CommandMeta, args: &[Frame]) -> Option<Frame> {
+    let given = args.len() + 1;
+    let want = usize::from(meta.arity.unsigned_abs());
+    let bad = if meta.arity >= 0 {
+        given != want
+    } else {
+        given < want
+    };
+    bad.then(|| crate::command::helpers::err_wrong_args(meta.name))
 }
 
 /// The cross-shard refusal a `redis.call` from Lua is owed: the connection
@@ -2945,20 +2979,12 @@ pub(crate) fn queue_time_rejection(cmd: &[u8], args: &[Frame]) -> Option<Frame> 
         return Some(crate::command::helpers::err_unknown_command(cmd, args));
     };
 
-    // `arity` counts the command name itself, so compare against args + 1.
-    // Positive = exact; negative = minimum (variadic).
-    let given = args.len() as i16 + 1;
-    let bad_arity = if meta.arity >= 0 {
-        given != meta.arity
-    } else {
-        given < -meta.arity
-    };
-    if bad_arity {
-        return Some(Frame::Error(Bytes::from(format!(
-            "ERR wrong number of arguments for '{}' command",
-            meta.name.to_lowercase()
-        ))));
+    if let Some(err) = arity_rejection(meta, args) {
+        return Some(err);
     }
+    // The word count including the command name — the subcommand check below
+    // reuses it.
+    let given = args.len() as i16 + 1;
 
     // moon#670: a container's SUBCOMMAND is validated here too, because Redis
     // validates it here.
@@ -5828,6 +5854,53 @@ mod multikey_read_family_tests {
                 "{cmd} {args:?}: a malformed argv must keep its own error"
             );
         }
+    }
+
+    /// A wrong argument COUNT on spanning keys is answered with the arity
+    /// error, as redis-server 8.6.1 answers it standalone and in cluster mode
+    /// (arity is checked before the slot check). The same argv with the right
+    /// count is still refused, so only the count outranks the refusal.
+    #[test]
+    fn wrong_arity_outranks_the_cross_shard_refusal() {
+        let a = "mksrc";
+        let far = far_from(a);
+        let wrong_args = |name: &str| {
+            Some(Frame::Error(Bytes::from(format!(
+                "ERR wrong number of arguments for '{name}' command"
+            ))))
+        };
+        let cases: &[(&str, &str, Vec<Frame>)] = &[
+            ("RENAME", "rename", vec![bulk(a), bulk(&far), bulk("x")]),
+            ("RENAMENX", "renamenx", vec![bulk(a), bulk(&far), bulk("x")]),
+            ("SMOVE", "smove", vec![bulk(a), bulk(&far)]),
+            (
+                "ZRANGESTORE",
+                "zrangestore",
+                vec![bulk(&far), bulk(a), bulk("0")],
+            ),
+            (
+                "GEOSEARCHSTORE",
+                "geosearchstore",
+                vec![bulk(&far), bulk(a), bulk("FROMMEMBER"), bulk("m")],
+            ),
+        ];
+        for (cmd, name, args) in cases {
+            assert_eq!(
+                cross_shard_multikey_rejection(cmd.as_bytes(), args, N),
+                wrong_args(name),
+                "{cmd} {args:?}: wrong arity must not become CROSSSLOT"
+            );
+            assert_eq!(
+                super::script_cross_shard_rejection(cmd.as_bytes(), args, N),
+                wrong_args(name),
+                "{cmd} {args:?}: the Lua bridge shares the key walk"
+            );
+        }
+        assert_eq!(
+            cross_shard_multikey_rejection(b"RENAME", &[bulk(a), bulk(&far)], N),
+            Some(Frame::Error(Bytes::from_static(CROSS_SHARD_WRITE_ERROR))),
+            "the right count on spanning keys is still refused"
+        );
     }
 
     /// `TOUCH` is the exception, and both halves of its treatment are pinned.
