@@ -151,7 +151,7 @@ impl ColdIndex {
         if max == 0 || !self.older_copies.is_empty() {
             return Vec::new();
         }
-        let graves = self.graves.len();
+        let graves = self.graves.generation();
         if self.reclaim.no_aof_idle_at == Some(graves) {
             return Vec::new();
         }

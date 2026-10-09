@@ -175,16 +175,21 @@ fn a_small_mostly_dead_file_waits_for_the_floor_and_the_scan_is_memoized() {
         ci.reclaim_candidates_no_aof(4).is_empty(),
         "90 dead slots are under the floor: not worth a snapshot"
     );
-    assert_eq!(ci.reclaim.no_aof_idle_at_for_test(), Some(90));
+    let seen = ci.graves.generation();
+    assert_eq!(ci.reclaim.no_aof_idle_at_for_test(), Some(seen));
     assert!(ci.reclaim_candidates_no_aof(4).is_empty());
     assert!(ci.remove(key(95).as_bytes()));
+    assert_ne!(ci.graves.generation(), seen);
     assert_eq!(
         ci.reclaim.no_aof_idle_at_for_test(),
-        Some(90),
+        Some(seen),
         "the memo is only compared, the next scan refreshes it"
     );
     assert!(ci.reclaim_candidates_no_aof(4).is_empty());
-    assert_eq!(ci.reclaim.no_aof_idle_at_for_test(), Some(91));
+    assert_eq!(
+        ci.reclaim.no_aof_idle_at_for_test(),
+        Some(ci.graves.generation())
+    );
 }
 
 /// The acceptance's exactness: the adopting snapshot's trailer is the old
@@ -419,4 +424,40 @@ fn an_abandoned_compaction_is_found_again_without_a_grave_changing() {
     assert!(ci.reclaim_candidates_no_aof(4).is_empty());
     ci.abandon_compactions_in_flight();
     assert_eq!(ci.reclaim_candidates_no_aof(4), vec![OLD]);
+}
+
+/// The scan memo must not be fooled by a grave count that went down and
+/// back up: an orphan sweep forgets a dead file's graves, then as many new
+/// deaths land in an eligible file — same count, but now past the floor.
+#[test]
+fn the_scan_memo_sees_graves_that_were_forgotten_and_replaced() {
+    let _m = NoAof::on();
+    const DEAD_FILE: u64 = 77;
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let dir = tmp.path().join("shard-0");
+    std::fs::create_dir_all(&dir).expect("dir");
+    let mut manifest = ShardManifest::create(&dir.join("shard-0.manifest")).expect("manifest");
+    spill(&dir, &mut manifest, OLD, 600);
+    let mut ci = ColdIndex::rebuild_from_manifest(&dir, &manifest);
+    // 200 dead of 600: eligible (200 * 2 >= 400 live) but under the floor.
+    for i in 0..200 {
+        assert!(ci.remove(key(i).as_bytes()));
+    }
+    // A file with no live key left: its graves count, it is no candidate.
+    for slot in 0..100 {
+        ci.graves.note_unconditionally(DEAD_FILE, slot);
+    }
+    assert!(ci.reclaim_candidates_no_aof(4).is_empty(), "200 < floor");
+    // The orphan sweep unlinks the dead file; 100 more deaths at OLD bring
+    // the grave count back to exactly what the memo saw.
+    ci.graves.forget_file(DEAD_FILE);
+    for i in 200..300 {
+        assert!(ci.remove(key(i).as_bytes()));
+    }
+    const { assert!(300 >= NO_AOF_MIN_DEAD_SLOTS) };
+    assert_eq!(
+        ci.reclaim_candidates_no_aof(4),
+        vec![OLD],
+        "300 dead of 600 is past the floor: the scan must run"
+    );
 }

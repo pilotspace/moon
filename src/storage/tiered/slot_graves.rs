@@ -68,6 +68,9 @@ pub fn totals() -> (u64, u64) {
 pub struct SlotGraves {
     by_file: HashMap<u64, Vec<u64>>,
     len: usize,
+    /// Bumped by every change to the record; `len` alone can go down and
+    /// back up to the same value between two looks ([`Self::generation`]).
+    generation: u64,
 }
 
 impl Drop for SlotGraves {
@@ -92,6 +95,7 @@ impl SlotGraves {
             .or_default()
             .push(pack_slot(page_idx, slot_idx));
         self.len += 1;
+        self.generation = self.generation.wrapping_add(1);
         GRAVE_SLOTS_TOTAL.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -100,6 +104,7 @@ impl SlotGraves {
     pub(crate) fn note_unconditionally(&mut self, file_id: u64, packed: u64) {
         self.by_file.entry(file_id).or_default().push(packed);
         self.len += 1;
+        self.generation = self.generation.wrapping_add(1);
         GRAVE_SLOTS_TOTAL.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -107,6 +112,7 @@ impl SlotGraves {
     pub fn forget_file(&mut self, file_id: u64) {
         if let Some(v) = self.by_file.remove(&file_id) {
             self.len -= v.len();
+            self.generation = self.generation.wrapping_add(1);
             GRAVE_SLOTS_TOTAL.fetch_sub(v.len() as u64, Ordering::Relaxed);
         }
     }
@@ -116,7 +122,11 @@ impl SlotGraves {
         for (file_id, slots) in std::mem::take(&mut other.by_file) {
             self.by_file.entry(file_id).or_default().extend(slots);
         }
-        self.len += std::mem::take(&mut other.len);
+        let moved = std::mem::take(&mut other.len);
+        if moved != 0 {
+            self.len += moved;
+            self.generation = self.generation.wrapping_add(1);
+        }
     }
 
     /// Take the slots of every file `moves` selects into a new record (a
@@ -127,6 +137,7 @@ impl SlotGraves {
         for file_id in files {
             if let Some(v) = self.by_file.remove(&file_id) {
                 self.len -= v.len();
+                self.generation = self.generation.wrapping_add(1);
                 out.len += v.len();
                 out.by_file.insert(file_id, v);
             }
@@ -139,6 +150,14 @@ impl SlotGraves {
     #[must_use]
     pub fn len(&self) -> usize {
         self.len
+    }
+
+    /// A value that changes whenever the record does (a slot noted, a file
+    /// forgotten, a merge or split). Equal generations mean an unchanged
+    /// record; equal [`Self::len`]s do not.
+    #[inline]
+    pub fn generation(&self) -> u64 {
+        self.generation
     }
 
     #[inline]

@@ -268,10 +268,10 @@ pub struct ReclaimState {
     /// moon#1289: how long a held file has waited for a fold that no one
     /// asked for ([`super::held_release`]).
     pub(super) held_wait: super::held_release::HeldWait,
-    /// moon#1297: the grave count at the last no-AOF candidate scan that
-    /// started nothing; the next scan is skipped until it changes
-    /// ([`ColdIndex::reclaim_candidates_no_aof`]).
-    no_aof_idle_at: Option<usize>,
+    /// moon#1297: the grave record's generation at the last no-AOF
+    /// candidate scan that started nothing; the next scan is skipped until
+    /// it changes ([`ColdIndex::reclaim_candidates_no_aof`]).
+    no_aof_idle_at: Option<u64>,
 }
 
 impl Drop for ReclaimState {
@@ -306,7 +306,7 @@ impl ReclaimState {
 
     /// The no-AOF scan memo (tests).
     #[cfg(test)]
-    pub(crate) fn no_aof_idle_at_for_test(&self) -> Option<usize> {
+    pub(crate) fn no_aof_idle_at_for_test(&self) -> Option<u64> {
         self.no_aof_idle_at
     }
 
