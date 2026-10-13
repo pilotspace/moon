@@ -1,0 +1,100 @@
+name: Soak (nightly)
+
+# The 4-hour continuous mixed-load soak (scripts/soak.sh) on main, nightly,
+# on the self-hosted moon-dev VM.
+#
+# Why it exists: v0.8.10's release soak found two blockers that ci-local,
+# the hosted matrix and the crash matrix all passed — #1055's allkeys-*
+# write lockout and #1158's AOF rewrite that never commits. Both regress
+# silently, and both were only found because a release happened to run a
+# soak. This makes that soak a nightly fact about main instead of a
+# once-per-release discovery, so a regression is found the morning after
+# it lands rather than hours into a release gate.
+#
+# The 10-minute --stress variant runs in scripts/ci-local.sh on every push.
+#
+# Schedule: 19:07 UTC (02:07 +07). ~4.5h with the build, so it finishes
+# before the crash matrix's 03:17 UTC slot on the same single runner. Main
+# pushes landing overnight queue behind it; that is the price of running on
+# the one machine with io_uring and a real disk.
+on:
+  schedule:
+    - cron: '7 19 * * *'
+  workflow_dispatch:
+    inputs:
+      duration:
+        description: 'Soak length in seconds (default 4h)'
+        required: false
+        default: '14400'
+      stress:
+        description: 'Use --stress (4mb rewrite threshold, 1-min samples)'
+        required: false
+        default: false
+        type: boolean
+
+concurrency:
+  group: soak-nightly-${{ github.ref }}
+  cancel-in-progress: false  # a cancelled soak proves nothing
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_PROFILE_RELEASE_DEBUG: "0"
+
+jobs:
+  soak:
+    name: Soak (4h, shipped config)
+    runs-on: [self-hosted, moon-dev]
+    timeout-minutes: 330
+    env:
+      CARGO_TARGET_DIR: /home/tindang/ci-target/soak-nightly
+      CARGO_BUILD_JOBS: "6"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.94.1
+      - name: Build release binary (monoio, io_uring live)
+        run: cargo build --release
+      - name: Soak
+        # Data and output under $HOME, not /tmp: /tmp is tmpfs on moon-dev
+        # and #1158 only reproduced on a real disk. Port 16510 keeps clear of
+        # ci-local's stress leg (16500) and of a hand-run soak (6500).
+        # --tolerate OOM until #1156 (transient -OOM under allkeys-* while
+        # spilling catches up) is fixed; every other error class fails.
+        env:
+          SOAK_DURATION: ${{ inputs.duration || '14400' }}
+          SOAK_STRESS: ${{ inputs.stress && 'yes' || '' }}
+        run: |
+          case "$SOAK_DURATION" in ''|*[!0-9]*) echo "duration must be an integer"; exit 2 ;; esac
+          scripts/soak.sh --bin "$CARGO_TARGET_DIR/release/moon" \
+            --duration "$SOAK_DURATION" ${SOAK_STRESS:+--stress} \
+            --port 16510 --dir "$HOME/soak-nightly-data" --out "$HOME/soak-nightly-out" \
+            --tolerate OOM
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo '### Soak'
+            echo '```'
+            grep -E 'criterion|VERDICT|rewrites|samples=|kill -9|restart|load errors|tolerated' "$HOME/soak-nightly-out/driver.log" || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Collect artifacts
+        if: failure()
+        run: |
+          mkdir -p soak-artifacts
+          cp "$HOME/soak-nightly-out"/* soak-artifacts/ 2>/dev/null || true
+          if [ -f soak-artifacts/moon.log ]; then
+            tail -c 50000000 soak-artifacts/moon.log > soak-artifacts/moon.tail.log
+            rm -f soak-artifacts/moon.log
+          fi
+      - name: Upload artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: soak-nightly-failure-${{ github.run_id }}
+          path: soak-artifacts
+          retention-days: 14
+      - name: Free the VM disk
+        # A failed run's data dir is kept by soak.sh as evidence; the artifact
+        # above has the logs, and a full VM root wedges OrbStack.
+        if: always()
+        run: rm -rf "$HOME/soak-nightly-data"

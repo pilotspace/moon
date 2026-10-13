@@ -8,7 +8,8 @@
 #   default : THE MERGE BAR (= --full since moon#732). Host lint gates, the
 #             two full suites in the moon-dev VM — monoio (the SHIPPED
 #             runtime, io_uring live) and tokio (the CI-parity leg) — then
-#             the client-compat harness and the macOS host suite.
+#             the client-compat harness, a 10-minute stress soak and the
+#             macOS host suite.
 #   --quick : host lint gates only (fmt, unsafe/unwrap audits, clippy x3)
 #             — no VM legs, so no disk pre-flight.
 #   --fast  : the pre-#732 default — lint gates + the two VM suites, WITHOUT
@@ -765,6 +766,21 @@ if [ "$MODE" = "full" ]; then
   VM_CONSISTENCY_CMD='MOON_BIN=$HOME/ci-target/local-compat/release/moon MOON_NO_URING=1 MOON_DISK_FREE_MIN_PCT=0 ./scripts/consistency-gate.sh --skip-build'
   run_step "VM FT.* consistency suite (moon#762, io_uring monoio)" \
     vm "$VM_CONSISTENCY_CMD"
+  # ── Phase 2c: 10-minute stress soak (moon#1158) ─────────────────────
+  # Every suite above finishes in seconds per test, and none of them ever
+  # sustained mixed writes across enough AOF rewrites to see a rewrite that
+  # is dispatched and never commits. #1158 shipped past this whole bar and
+  # the hosted matrix; only the v0.8.10 4-hour soak found it. --stress
+  # lowers auto-aof-rewrite-min-size to 4mb so rewrites fire back to back
+  # and the stall reproduces in minutes. Same binary as the compat leg; a
+  # port of its own and a data dir on the VM disk (/tmp is tmpfs, and the
+  # stall only reproduced on a real disk). The 4-hour default-config soak
+  # runs nightly on main instead: .github/workflows/soak-nightly.yml.
+  # --tolerate OOM: allkeys-* with disk offload still answers transient -OOM
+  # while spilling catches up (#1156). Counted and logged, not failed; drop
+  # the flag when #1156 closes.
+  run_step "VM stress soak (10 min, AOF rewrite churn, moon#1158)" \
+    vm 'scripts/soak.sh --bin $HOME/ci-target/local-compat/release/moon --duration 600 --stress --port 16500 --dir $HOME/ci-soak-data --out $HOME/ci-soak-out --tolerate OOM'
   # ── Phase 3: macOS host suite (tokio — kqueue) ──────────────────────
   # Runs through HOST_TEST_TOKIO — the same nextest-or-fallback shape the VM
   # legs and `--native` already use. This leg was the one place still on a

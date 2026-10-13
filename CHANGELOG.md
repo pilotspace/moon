@@ -8,6 +8,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **A soak on every push and every night** (refs moon#1158). `scripts/soak.sh`
+  runs four continuous mixed loads (SET/GET, HSET, XADD, XREADGROUP) against
+  the shipped config and fails on a dead server, refused writes, a DBSIZE
+  that stops growing, RSS/FD/p99 drift, an AOF rewrite dispatched and never
+  committed, a LOST append, a panic, any DBSIZE/DEBUG DIGEST change
+  across kill -9, or any error reply a load received (by class; `OOM` is
+  tolerated while #1156 is open). `scripts/ci-local.sh` runs its 10-minute `--stress` mode
+  (4mb rewrite threshold, rewrites back to back) in the merge bar, and
+  `.github/workflows/soak-nightly.yml` runs the 4-hour default on main
+  nightly on moon-dev. The v0.8.10 release soak found #1055 and #1158 after
+  every other gate had passed both.
+
 - **`CLIENT TRACKINGINFO` and `CLIENT GETREDIR`** (refs moon#632), matching
   redis 8.6.1 byte for byte: flags (`on`/`off`, `bcast`, `optin`,
   `caching-yes`, `optout`, `caching-no`, `noloop`, `broken_redirect`), the
