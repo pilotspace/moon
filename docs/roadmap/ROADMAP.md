@@ -1,6 +1,6 @@
 # Moon Product Roadmap — v0.7 → v1.0 → Enterprise
 
-**Status:** Owner-approved · **Rev 2:** 2026-07-15 (post-v0.7.1; v0.8 re-slotted to Storage Kernel GA) · **Current release:** v0.8.1 (2026-07-19)
+**Status:** Owner-approved · **Rev 2:** 2026-07-15 (post-v0.7.1; v0.8 re-slotted to Storage Kernel GA) · **Rev 3:** 2026-09-23 (status refresh through v0.8.10; v0.9/v0.10/v1.0 plans unchanged; #771 L4 claim corrected) · **Current release:** v0.8.10 (2026-09-23)
 **Companion docs:** [Scale & HA architecture](scale-ha-architecture.md) · [Standalone horizontal scale](standalone-horizontal-scale.md)
 *(The commercial Enterprise Edition plan is maintained privately.)*
 
@@ -17,23 +17,28 @@ architecture with a unified WAL v3 log and 6-phase crash recovery.
 
 | Area | Standing | Source |
 |---|---|---|
-| Pipelined KV throughput | 1.7–2.6× Redis at P=64 across x86/ARM/macOS | BENCHMARK.md §1 |
-| p=1 single-op | Wins x86 +4.7% (n=3); loses ~8% on ARM — arch-split, needs `--io-busy-poll-us` | tmp/KV-FULLPROOF.md |
-| Vector vs Qdrant | 8.9–10.9× ingest, 2.5–3.4× search QPS at iso-recall ≥0.999 | BENCHMARK.md §10.7–10.9 |
-| Graph vs FalkorDB | 21–26× build; wins/ties point queries after P1+P2 waves | BENCHMARK.md §11 |
+| Pipelined KV throughput | GET / plain SET beat Redis at pipeline depth on x86 and ARM (`--shards 1`); every other family is **slower** than Redis at p≥8 — see the gap row below | BENCHMARK.md §1 (measured on v0.8.9) |
+| p=1 single-op | Roughly parity: 0.89–1.08× Redis x86, 0.77–1.05× ARM across families | BENCHMARK.md §1 |
+| Vector vs Qdrant | 8.9–10.9× ingest, 2.5–3.4× search QPS at iso-recall ≥0.999 (not re-measured since 2026-07) | docs/internal/benchmark-history.md §10.7–10.9 |
+| Graph vs FalkorDB | 21–26× build; wins/ties point queries after P1+P2 waves (not re-measured since) | docs/internal/benchmark-history.md §11 |
 | Durability engineering | WAL v3 unified log, group commit, crash-matrix + jepsen-lite CI, kill-9 suites | integration-tests.yml |
 | Replication (v0.7 GA) | Multi-shard master → streaming replica across all 6 data planes, real WAIT/ACK; 24h kill-9 soak, zero acked-write loss | RELEASES.md v0.7.0 |
 | Storage kernel | Typed WAL plane, per-plane durable floors + min-across-planes recycle, atomic-write util, per-plane memory accounting; 42-cell cross-plane crash matrix | PRs #286–#301 (kernel M0–M3) |
 | Tiered storage (10× RAM) | 2.6GB dataset on 256MB cap: 95% hot-hit p99 1.84× in-RAM, kill-9 restart-to-PONG 3.7s | G2 acceptance 2026-07-13 |
-| Quality posture | ~4,980 tests, 11 fuzz targets, loom models, unsafe/unwrap ratchets, RSS-regression CI gate | ci.yml, fuzz/ |
+| Quality posture | Unit + integration suites, fuzz targets (both matrices in fuzz.yml), loom models, unsafe/unwrap ratchets, RSS-regression CI gate, live-redis-server oracle harnesses | ci.yml, fuzz/, scripts/ |
 | Release engineering | Docker/musl/deb/rpm/systemd/Homebrew, CycloneDX SBOM, cosign signing | release.yml |
 | Hidden assets | React admin console (RedisInsight-class, embedded), CLIENT TRACKING fully wired, Debezium CDC (alpha) | console/, src/tracking/, src/cdc/ |
 
 ### Reality check — what is capped or missing
 
 *(Rev 2 note: the v0.6.1/v0.7.0 cycle closed the original top gaps — multi-shard master PSYNC,
-real WAIT/ACK, cold-tier TTL leak, ACL early-intercept hole, shardslice waiver (retired at
-v0.7.0), and the hygiene ledger. Remaining gaps below.)*
+real WAIT/ACK, cold-tier TTL leak, ACL early-intercept hole, and the hygiene ledger. Remaining
+gaps below.)*
+
+*(Rev 3 correction, #771: Rev 2 also listed the shardslice cross-shard-read waiver as "retired at
+v0.7.0 (L4 validated, PR #325)". That was false — PR #325 changed only `CHANGELOG.md` and
+`docs/PRODUCTION-CONTRACT.md`, no source. The L4 shared-read plane first shipped in v0.8.8
+(#777); see the XSHARD-READ-01 row below.)*
 
 *(2026-07-16 correction: this Rev 2 pass had re-listed "atomic-write stragglers (task #49)" as
 an open v0.8 gap below and as v0.8 item 1 in §4. Verified against the code during v0.8 close-out
@@ -45,12 +50,14 @@ been removed/struck accordingly.)*
 
 | Gap | Detail | Impact |
 |---|---|---|
-| **Streaming replica is single-shard only** | Multi-shard work in v0.7 is master-side (merged N-shard PSYNC feed); replicas run `--shards 1` | Disclosed v0.7 limitation; replica can't use thread-per-core — slotted v0.9 |
-| **Cluster mode is alpha, tokio-only** | Bus/gossip spawn only in the tokio startup block; monoio (production) startup omits it (`main.rs`) | Cluster mode does not run on the production runtime — slotted v0.9 |
-| `used_memory` accounting under offload (task #56) | Reports 406–762MB against a 256MB cap during 10×-RAM runs (worse post-restart) | Undermines the 10×-RAM claim's operator story — v0.8 close-out |
-| Spill format scale | One-file-per-key heap spill → O(keys) file counts; sweep/manifest scale with it | v0.8 close-out (batch into segments) |
+| **Streaming replica is single-shard only** | Multi-shard work in v0.7 is master-side (merged N-shard PSYNC feed); replicas run `--shards 1`. Since #1028 (v0.8.10) a multi-shard node refuses `REPLICAOF` / `CLUSTER REPLICATE` with an error instead of acking `+OK` and holding no data | Disclosed v0.7 limitation; replica can't use thread-per-core — multi-shard replicas (#406) stay the v0.9 headline |
+| **Cluster mode is unsoaked** | ~~tokio-only~~ — the control plane runs on a dedicated `cluster-ctl` thread on both runtimes since C-1 (#450, v0.8.5); cluster-client bootstrap (#493, v0.8.6) added honest `cluster_state`, `CLUSTER SHARDS`/`MYSHARDID`, `READONLY`/`READWRITE`. Slot-migration chaos, failover↔PSYNC continuity, jepsen soak, announce/config-file parity remain open | Not GA-hardened — v0.9 |
+| **Cross-shard read plane (XSHARD-READ-01)** | L4 S1–S4 shipped in v0.8.8 (#777): a foreign-shard read is served under a shared `try_read` guard instead of an SPSC hop; `--cross-shard-fast-path` defaults to `auto` — on for the monoio handler at `--shards > 1` (#785). It declines multi-key reads, non-resident (cold-tier) keys and connections with in-flight remote work. `docs/PRODUCTION-CONTRACT.md` still carries the row unticked and RELEASES.md v0.8.8/v0.8.9 still list it as the open GA gap | Contract re-tick with acceptance evidence outstanding (#771) — v1.0 gate |
+| **Pipelined throughput outside GET/SET** | Only `GET` and plain `SET` take the inline byte path; every other family runs 0.45–0.87× Redis at p≥8 on both arches (improved +5–23% since v0.8.7) | Weakens the "faster than Redis" headline for non-string workloads — see BENCHMARK.md §1 |
+| ~~`used_memory` accounting under offload (task #56)~~ | ✅ closed v0.8.0 (PR #349) | — |
+| ~~Spill format scale~~ | ✅ closed v0.8.0 (PR #350, segment files) | — |
 | No encryption at rest | WAL/AOF/RDB plaintext | Blocks regulated buyers — v0.10 |
-| No keyspace notifications, no MONITOR | Slipped from v0.7 (R5) | Common SRE/integration expectations — re-rank at v0.9 planning |
+| ~~No keyspace notifications, no MONITOR~~ | ✅ shipped v0.8.6 — keyspace notifications (#481), `MONITOR` (#484) | — |
 | `moon://` URI implementation | Spec doc shipped (H-7); `src/uri.rs` implementation (R6) slipped | Re-rank at v0.9 planning |
 | Vector 384d recall/QPS | Trails RediSearch ~16× QPS at 384d (quantization codebook mis-fit at low d) | Diagnosed; TQ⁺ per-coordinate calibration is the candidate fix — v0.10 |
 | Client ecosystem | Only redis-py/go-redis/redis-rs CI-tested; Java/Node/.NET "planned" | Enterprise adoption friction — v0.10 |
@@ -84,8 +91,8 @@ mindmap
       TTL + eviction policies
       Per-db maxmemory quotas
       ::icon(fa fa-flask)
+      Keyspace notifications v0.8.6
       Planned: JSON type
-      Planned: keyspace notifications
       Planned: probabilistic (Bloom/CMS/TopK)
     Vector Search
       HNSW + TurboQuant/SQ8
@@ -126,9 +133,9 @@ mindmap
       16384 slots + gossip bus alpha
       MOVED/ASK + slot migration
       Quorum failover election
-      v0.9: monoio wiring
+      Control plane on monoio v0.8.5
+      CLUSTER SHARDS v0.8.6
       v0.9: soak + jepsen hardening
-      v0.9: CLUSTER SHARDS
     Multi-tenancy
       Workspaces WS.*
       Per-db index isolation v0.6
@@ -145,7 +152,7 @@ mindmap
       React admin console
       SLOWLOG / LATENCY
       Runbooks + versioning policy
-      Planned: MONITOR
+      MONITOR v0.8.6
       Planned: Helm chart + K8s operator
       Planned: JSON structured logs
     Protocol
@@ -174,7 +181,7 @@ mindmap
 
 ## 4. Release train
 
-Observed velocity: 19 releases in ~3.5 months; ~4-day point-release cycle. The train below is
+Observed velocity (at Rev 2): 19 releases in ~3.5 months; ~4-day point-release cycle. The train below is
 deliberately aggressive but each release has a **single headline** and hard exit criteria.
 
 | Release | Target | Headline | Theme |
@@ -184,6 +191,7 @@ deliberately aggressive but each release has a **single headline** and hard exit
 | **v0.7.1** | ✅ **shipped 2026-07-15** | SQ8 CPU-storm fix + deterministic replica TTL | Patch |
 | **v0.8.0** | ✅ **shipped 2026-07-16** | **One Storage Kernel: kill-9-lossless on every plane + 10× RAM datasets** | Close-out + verification of the already-built kernel (owner decision 2026-07-15) |
 | **v0.8.1** | ✅ **shipped 2026-07-19** | Deploy-safe busy-poll (O3 governor) + single-shard tuning preset; CPU-cache digest closed | Patch — folds the post-v0.8.0 perf/correctness train (#361–#392) + `conf/moon-standalone.conf` |
+| **v0.8.2 – v0.8.10** | ✅ **shipped 2026-07-20 → 2026-09-24** | Patch train: storage unification, c1M connection plane, durability + wire-parity waves | Nine patches — one line each in the block below |
 | **v0.9.0** | 2026-10 | **Horizontal scale: cluster GA-hardened on monoio + multi-shard replicas** | Re-slotted from v0.8; adds the replica-side shard gap |
 | **v0.10.0** | 2026-12 | **Enterprise foundation** | Encryption at rest, audit, ecosystem (re-slotted from v0.9) |
 | **v1.0.0** | 2027-Q1 | **GA / production contract fulfilled** | Stability promise, LTS |
@@ -234,17 +242,32 @@ hygiene (recall canaries → nightly job, PR #354). Disclosed follow-ups: task #
 (read-vs-spill fairness), issue #355 (`DBSIZE` resident-only under offload), AOF-rewrite
 cadence bounds restart time.
 
+### v0.8.1–v0.8.10 — SHIPPED (2026-07-19 → 2026-09-24)
+
+Patch releases on the v0.8 line; full evidence per entry in `RELEASES.md` and `CHANGELOG.md`.
+
+- **v0.8.1** (2026-07-19) — deploy-safe `--io-busy-poll-us` via the O3 contention governor (#392); CPU-cache digest closed (O4 THP opt-in, O1/O2 rejected); SWAPDB durability (#385).
+- **v0.8.2** (2026-07-20) — storage-unification W1–W6 (#396–#401) + `storage::db` split (#403); ms-TTL keys no longer expire up to 999 ms early (#398).
+- **v0.8.3** (2026-07-29) — c10k/c1M connection plane (#421, #422): idle memory 56.5 → 3.25 KB/conn.
+- **v0.8.4** (2026-07-29) — fixes a v0.8.3 bug where an RST on a parked connection spun a shard at 100% CPU; TLS task-exit parking (PR #424).
+- **v0.8.5** (2026-08-08) — AOF rewrite no longer drops acked writes under load (#452, PR #454) + 2026-08 deep-review wave (#453); cluster control plane on the default runtime (C-1, #450); automatic AOF rewrite, multi-shard BGREWRITEAOF un-gated (#443).
+- **v0.8.6** (2026-08-22) — v0-9-client-compat milestone + wire-parity wave (98 PRs): ACL-bypass and remote-DoS fixes, two-key cross-shard write loss (#592), keyspace notifications (#481), `MONITOR` (#484), cluster-client bootstrap (#493).
+- **v0.8.7** (2026-08-22) — blocking pops invalidate CLIENT TRACKING (#644, PR #646); MULTI queue gate — eight families no longer execute at queue time (#639, PR #654); teardown paths indexed.
+- **v0.8.8** (2026-09-01) — client-parity + search correctness (63 PRs): DEBUG DIGEST, DUMP/RESTORE, EVAL_RO; FT.SEARCH stoplist fix (#690/#691/#693); L4 cross-shard read plane (#777), default `auto` (#785).
+- **v0.8.9** (2026-09-04) — propagation-gate audit: a command no longer writes what it cannot propagate (#823, PR #824).
+- **v0.8.10** (2026-09-23) — the 2026-09 durability/correctness issue campaign (137 PRs since v0.8.9: cold-tier replay gating, AOF fold exactly-once #455, WAL v3 replay, blocking pops and stream group reads logged on the owning shard, vector lifecycle across restart, tracking, parity; SPOP/`XADD *` propagation #825); `REPLICAOF` refused on multi-shard nodes (#1028); five durability fixes — #1099 (PR #1145), #1133 (PR #1144), #1130 (PR #1146), #1124 (PR #1147), #1114 (PR #1148); RUSTSEC-2026-0293 `ringbuf` bump (#1143).
+
 ### v0.9.0 — Horizontal scale: cluster hardening + multi-shard replicas
 
 Exit criterion: *3-master × 3-replica cluster on monoio survives node kill (auto-failover < node_timeout×2),
 live slot migration under load with zero lost acknowledged writes, 72h soak, jepsen-lite green.*
 
-1. **Wire cluster bus + gossip into the monoio startup path** (today tokio-only) — the single
-   highest-leverage cluster task.
+1. ~~**Wire cluster bus + gossip into the monoio startup path**~~ ✅ shipped early in v0.8.5
+   (C-1, #450) — dedicated `cluster-ctl` thread on both runtimes.
 2. Slot-migration atomicity soak: MIGRATING/IMPORTING under write load, ASK correctness,
    per-key transfer loop verification (arch review flagged this as possibly incomplete).
-3. Failover safety: epoch fencing end-to-end; promoted replica continues PSYNC2 offsets; add
-   `CLUSTER SHARDS` (Redis 7 clients probe it).
+3. Failover safety: epoch fencing end-to-end; promoted replica continues PSYNC2 offsets.
+   (`CLUSTER SHARDS` ✅ shipped v0.8.6 with cluster-client bootstrap, #493.)
 4. Cluster-aware client CI: redis-py-cluster, go-redis cluster, redis-rs cluster against a real 3×3.
 5. `cluster-announce-ip/port`, `cluster-config-file` config parity for real deployments (NAT/k8s).
 6. **Helm chart + StatefulSet manifests** (operator alpha can follow in v0.9) — k8s is where
@@ -253,9 +276,10 @@ live slot migration under load with zero lost acknowledged writes, 72h soak, jep
    indexes are keyspace-global — define and test their slot-migration story.
 8. **Multi-shard replicas** — close v0.7's disclosed limitation: a `--shards N` master
    replicates to `--shards M` replicas (replica-side demux of the merged PSYNC feed through
-   `key_to_shard` routing); kill-9 matrix extended to s∈{1,4}×s∈{1,4}.
-9. Re-rank the v0.7 slips here: keyspace notifications + MONITOR (R5), `moon://` URI
-   implementation (R6).
+   `key_to_shard` routing); kill-9 matrix extended to s∈{1,4}×s∈{1,4}. Tracked as #406; until it
+   lands a multi-shard node refuses `REPLICAOF` with an error (#1028, v0.8.10).
+9. Re-rank the v0.7 slips here: ~~keyspace notifications + MONITOR (R5)~~ ✅ shipped v0.8.6
+   (#481, #484); `moon://` URI implementation (R6) still open.
 
 ### v0.10.0 — Enterprise foundation
 
@@ -285,16 +309,17 @@ Exit criterion: *a security-conscious enterprise can run Moon and pass an infose
 
 | Item | Deadline / trigger | Owner action |
 |---|---|---|
-| ~~shardslice cross-shard-read waiver~~ | ✅ retired at v0.7.0 (L4 validated, PR #325) | done |
+| shardslice cross-shard-read waiver (XSHARD-READ-01) | **not** retired at v0.7.0 — PR #325 was docs-only (#771). L4 read plane shipped v0.8.8 (#777, default `auto` via #785); contract row still unticked | re-tick `PRODUCTION-CONTRACT.md` with acceptance evidence, or restate the gap |
+| A roadmap/contract ✅ backed only by a docs PR (#771) | every release | cite the source-changing PR for any "shipped" tick |
 | ~~v0.6.0 tag + RELEASES.md · PRODUCTION-CONTRACT refresh · cold-tier TTL leak · ACL registry bypass · doc contradictions~~ | ✅ closed in the v0.6.1/v0.7.0 cycle | done |
 | ~~Task #49 bare-write sites (ACL SAVE et al.)~~ | ✅ shipped v0.7.0 (PR #304, merged 2026-07-13) | done — mis-listed as open in Rev 2, corrected 2026-07-16 |
-| Task #56 `used_memory` under offload | v0.8 | accounting reconcile (v0.8 item 2) |
-| Spill one-file-per-key scale | v0.8 | segment batching (v0.8 item 3) |
-| rustls-pemfile → rustls-pki-types (task #66, RUSTSEC ignore) | in flight 2026-07-15 | Wave-0 PR |
-| clippy `--tests` debt (task #39) | in flight 2026-07-15 | Wave-0 PR |
+| ~~Task #56 `used_memory` under offload~~ | ✅ shipped v0.8.0 (PR #349) | done |
+| ~~Spill one-file-per-key scale~~ | ✅ shipped v0.8.0 (PR #350) | done |
+| ~~rustls-pemfile → rustls-pki-types (task #66, RUSTSEC ignore)~~ | ✅ shipped v0.8.0 (PR #338) | done |
+| ~~clippy `--tests` debt (task #39)~~ | ✅ shipped v0.8.0 (PR #339) | done |
 | GitHub issue backlog (~40 open, Mar–Jun era) | in flight 2026-07-15 | Wave-0 triage sweep with commit evidence |
-| BGREWRITEAOF multi-shard gate (`--experimental-per-shard-rewrite`) | v0.8 | replication soak passed — promote to default |
-| Keyspace notifications + MONITOR (R5) · `moon://` impl (R6) | v0.9 planning | re-rank |
+| ~~BGREWRITEAOF multi-shard gate (`--experimental-per-shard-rewrite`)~~ | ✅ default since v0.8.5 (#443); flag is a deprecated no-op | remove the flag in a future release |
+| ~~Keyspace notifications + MONITOR (R5)~~ · `moon://` impl (R6) | R5 ✅ v0.8.6 (#481, #484); R6 at v0.9 planning | re-rank R6 |
 | Offload perf deferrals (PageCache dormant, <256B never compressed; cold-read blocking ✅ fixed #323) | v0.9+ | re-rank after v0.8 |
 
 ---
@@ -339,7 +364,7 @@ verification artifact (test/CI job/bench) in the same PR — no "tests later".
 | H-6 | gitignore/relocate `replication.state` root artifact | repo root | clean `git status` | S |
 | H-7 | **`moon://` / `moons://` URI spec** (doc-only): write `docs/protocol/moon-uri.md` — ABNF grammar, `redis(s)://` parity table, TLS/downgrade failure semantics; implementation is v0.7.0 R6 | [§8.5](#85-cross-cutting-native-moon--moons-connection-uri-scheme) | Doc CI link check; grammar block present | S |
 
-### 8.2 v0.7.0 — Replication GA *(✅ shipped 2026-07-14; R5 + R6 implementation slipped, replica side capped at `--shards 1` — both re-slotted to v0.9)*
+### 8.2 v0.7.0 — Replication GA *(✅ shipped 2026-07-14; R4 not delivered (see below); R5 + R6 implementation slipped, replica side capped at `--shards 1` — both re-slotted to v0.9; R5 later shipped in v0.8.6)*
 
 Workstream R1 — multi-shard PSYNC (XL, the release):
 - R1a: wire format — extend PSYNC2 payload frames with `(shard_id: u16, shard_lsn: u64)` header;
@@ -368,8 +393,10 @@ offset; old-master rejoin achieves partial resync. Test: promote → old master 
 
 Workstream R4 — L4 lock-free cross-shard reads (L): per `tmp/MULTISHARD-REDESIGN.md`; retire the
 shardslice waiver (deadline 2026-08-01) or re-issue with fresh evidence before the date.
+*Status: not delivered in v0.7.0 (PR #325 was docs-only, #771). S1–S4 shipped in v0.8.8 (#777),
+default `auto` via #785; the XSHARD-READ-01 contract row is not yet re-ticked.*
 
-Workstream R5 — keyspace notifications + MONITOR (M): notifications publish through the existing
+Workstream R5 — keyspace notifications + MONITOR (M) *(✅ shipped v0.8.6: #481, #484)*: notifications publish through the existing
 per-shard pubsub registry on write commit (flag-gated, off by default — measure overhead ≤2% when off);
 MONITOR taps dispatch with a fan-in channel, `SKIP_MONITOR` ACL flag already exists.
 
@@ -386,14 +413,14 @@ Workstream R6 — native `moon://` / `moons://` URI scheme (M): implement the sp
   diagnostic, never hangs, never downgrades), workspace-selection test (`?workspace=t1` lands the
   session in tenant `t1` pre-first-command).
 
-### 8.3 v0.9.0 — Cluster hardening *(re-slotted from v0.8; add multi-shard replicas + R5/R6 slips at v0.9 planning)*
+### 8.3 v0.9.0 — Cluster hardening *(re-slotted from v0.8; add multi-shard replicas (#406) + R6 slip at v0.9 planning; C-1 shipped early in v0.8.5, `CLUSTER SHARDS` in v0.8.6)*
 
 | ID | Task | Anchor | Verification | Size |
 |---|---|---|---|---|
-| C-1 | Cluster control plane under monoio: run bus+gossip+election on a dedicated std thread with a current-thread tokio runtime (control plane is not latency-critical; do NOT port to monoio yet) | `src/main.rs:1617,1655-1693` | 3-node monoio cluster forms, gossips, elects | M |
+| C-1 ✅ | *(shipped v0.8.5, #450)* Cluster control plane under monoio: run bus+gossip+election on a dedicated std thread with a current-thread tokio runtime (control plane is not latency-critical; do NOT port to monoio yet) | `src/main.rs:1617,1655-1693` | 3-node monoio cluster forms, gossips, elects | M |
 | C-2 | Slot-migration completion + soak: verify per-key MIGRATE loop end-to-end; crash mid-migration both directions | `src/cluster/migration.rs`, `command.rs` SETSLOT | New `tests/cluster_slot_migration_chaos.rs`; zero acked loss under load | L |
 | C-3 | Failover ↔ PSYNC2 continuity: election win updates `ReplicationRole`, repl ids; replicas of failed master re-attach with partial resync | `src/cluster/failover.rs` + `src/replication/state.rs` | Partition test: promote, heal, `+CONTINUE` observed | L |
-| C-4 | `CLUSTER SHARDS`, `cluster-announce-ip/port`, `cluster-config-file` | `src/cluster/command.rs`, `config.rs` | redis-cli 7.x + go-redis cluster CI green | M |
+| C-4 | ~~`CLUSTER SHARDS`~~ (✅ v0.8.6, #493), `cluster-announce-ip/port`, `cluster-config-file` | `src/cluster/command.rs`, `config.rs` | redis-cli 7.x + go-redis cluster CI green | M |
 | C-5 | Jepsen-lite cluster suite in CI (partition, kill, migrate churn; 72h scheduled soak on GCE) | `.github/workflows/integration-tests.yml` | weekly green + failure artifacts uploaded | L |
 | C-6 | Helm chart + StatefulSet, readiness = `/readyz` + `CLUSTER INFO ok` | new `deploy/helm/` | kind-based CI install test | M |
 | C-7 | Multi-engine slot semantics: graph-unit migration test (hash-tagged), FT index entries follow their hash's slot | `src/vector/`, `src/graph/` | migration test with live FT.SEARCH during move | L |
